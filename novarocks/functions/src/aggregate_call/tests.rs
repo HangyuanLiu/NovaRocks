@@ -177,7 +177,7 @@ impl FunctionEffectOwner for Fixture {
             .into());
         }
         for (argument, expected) in input.request.arguments.iter().zip(&self.arguments) {
-            if argument != expected {
+            if !argument.equals_observed(expected, CompilePhase::FunctionSpecialization, control)? {
                 return Err(FunctionBindingError::InvalidBinding(
                     "fixture aggregate argument differs".into(),
                 )

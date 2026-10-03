@@ -185,6 +185,8 @@ pub(crate) fn validate_expression(
             )),
         },
         ExprKind::Literal(literal) => validate_literal_type(literal, &expression.ty, &path, errors),
+        // Exact table/address/value checks are mandatory at plan/package publication.
+        ExprKind::Constant(_) => {}
         ExprKind::LambdaParameter { lambda, ordinal } => {
             match fragment.expressions().get(*lambda) {
                 Some(crate::ExprNode {
@@ -1002,6 +1004,10 @@ pub(crate) fn window_offset_literal_is_valid(
     units: crate::WindowFrameUnits,
 ) -> bool {
     match (units, kind) {
+        (
+            crate::WindowFrameUnits::Rows | crate::WindowFrameUnits::Groups,
+            ExprKind::Constant(_),
+        ) => true,
         (
             crate::WindowFrameUnits::Rows | crate::WindowFrameUnits::Groups,
             ExprKind::Literal(crate::LiteralValue::UInt64(_)),

@@ -1172,6 +1172,7 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
             cohort_id,
             session.execution(),
             session.context(),
+            self.kernel.constant_policy(),
             &crate::query_execution::planning::sql_compile_control_from_execution(
                 session.execution(),
             ),
@@ -1491,6 +1492,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
     cohort_id: ConnectorWriteCohortId,
     execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     context: &novarocks_spi::connector::ConnectorRequestContext,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &novarocks_sql::compiler::SqlCompileControl,
 ) -> Result<PreparedDistributedRewriteCohort, novarocks_sql::compiler::SqlCompileError> {
     let cohort = session
@@ -1675,12 +1677,15 @@ fn prepare_frozen_rewrite_cohort_with_ports(
             .sql_mode()
             .decimal_overflow_policy(),
         execution.sql_semantics().sql_mode().allow_throw_exception(),
+        constant_policy,
         control,
     )?;
     let version = plan.version();
     let candidate =
-        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)
-            .map_err(|error| error.to_string())?;
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(
+            plan, control,
+        )
+        .map_err(|error| error.to_string())?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,
     )

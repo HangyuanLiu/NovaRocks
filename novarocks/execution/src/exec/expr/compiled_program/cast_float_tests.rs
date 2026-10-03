@@ -317,10 +317,7 @@ pub(super) fn inherited_round_fixture_with_target(
         author(
             &functions,
             "round",
-            vec![
-                argument(decimal, None),
-                argument(digits_type, Some(FunctionLiteral::Int64(-1))),
-            ],
+            vec![argument(decimal, None), integer_argument(digits_type, -1)],
             ControlShape::Eager,
         ),
         vec![decimal_expr, digits],

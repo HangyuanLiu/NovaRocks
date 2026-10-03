@@ -184,7 +184,7 @@ impl FunctionBindingResolver for Owner {
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
-        _control: &dyn novarocks_type_contract::PureCompileControl,
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         if let Some(error) = *self.binding_failure.lock().unwrap() {
             return Err(error.into());
@@ -195,7 +195,20 @@ impl FunctionBindingResolver for Owner {
         } else {
             higher_arguments()
         };
-        if request.arguments != expected
+        let mut arguments_match = request.arguments.len() == expected.len();
+        if arguments_match {
+            for (actual, expected) in request.arguments.iter().zip(&expected) {
+                if !actual.equals_observed(
+                    expected,
+                    CompilePhase::FunctionSpecialization,
+                    control,
+                )? {
+                    arguments_match = false;
+                    break;
+                }
+            }
+        }
+        if !arguments_match
             || request.logical_argument_count != expected.len()
             || selected.argument_types
                 != expected

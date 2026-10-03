@@ -655,6 +655,7 @@ fn plan_query_for_ctas_source(
         state.function_catalog().as_ref(),
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
+        state.constant_policy(),
         compile_control.clone(),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
@@ -786,8 +787,11 @@ fn prepare_planned_ctas_connector_write(
         &completion_control,
     )?;
     let candidate =
-        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)
-            .map_err(|error| error.to_string())?;
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(
+            plan,
+            &completion_control,
+        )
+        .map_err(|error| error.to_string())?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,
     )

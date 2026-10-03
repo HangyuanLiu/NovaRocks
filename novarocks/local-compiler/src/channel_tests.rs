@@ -19,8 +19,8 @@ use super::*;
 use arrow_array::{ArrayRef, Float64Array, Int64Array};
 use arrow_schema::DataType;
 use novarocks_functions::{
-    CallEffectInput, ConstantPolicy, EngineFunctionCatalogBuilder, EvaluatedArgument,
-    FunctionArgument, FunctionBindingRequest, FunctionId, FunctionKind, FunctionLiteral,
+    CallEffectInput, ConstantPolicy, ConstantValue, EngineFunctionCatalogBuilder,
+    EvaluatedArgument, FunctionArgument, FunctionBindingRequest, FunctionId, FunctionKind,
     FunctionOverloadId, FunctionResultType, InstalledPureKernel, KernelEvaluationControl,
     KernelFailure, PureCallPreparation, PureEngineFunctionCatalog, PureImplementationDeclaration,
     PureImplementationId, PureKernelAbi, ScalarEvaluationInstance, ScopedExpressionEffects,
@@ -167,7 +167,17 @@ fn package_with_outputs(
     let arguments = [FunctionArgument::Value {
         value_type: seed_type.clone(),
         constant: if matches!(mode, SeedMode::DirectConstant) {
-            Some(FunctionLiteral::Int64(42))
+            Some(
+                ConstantValue::from_i64(
+                    Arc::new(seed_type.try_to_field("fixture").unwrap()),
+                    seed_type.clone(),
+                    42,
+                    options(1).constants,
+                    CompilePhase::FunctionSpecialization,
+                    &FixtureControl,
+                )
+                .unwrap(),
+            )
         } else {
             None
         },
@@ -478,6 +488,7 @@ fn package_with_outputs(
             FragmentPackageInput {
                 version: PlanVersionId::try_new([72; 16]).unwrap(),
                 required: RequiredContracts::default(),
+                constants: novarocks_physical_plan::ConstantPools::empty(),
                 pruning: FrozenFragmentPruning::try_new(fragment_id, vec![], &FixtureControl)
                     .unwrap(),
                 fragment,

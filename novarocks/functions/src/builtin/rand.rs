@@ -207,9 +207,10 @@ fn output_capacity(rows: usize) -> Result<(), KernelFailure> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::catalogue::constant_binding_tests as cv;
     use super::*;
     use crate::{
-        ConstantPolicy, ConstantPool, FunctionLiteral, FunctionValueType, ScalarEvaluationInstance,
+        ConstantPolicy, ConstantPool, ConstantValue, FunctionValueType, ScalarEvaluationInstance,
         Selection,
     };
     use arrow_array::Float64Array;
@@ -287,11 +288,11 @@ mod tests {
     fn prepared(
         name: &str,
         source: Option<FunctionValueType>,
-        literal: Option<FunctionLiteral>,
+        literal: Option<ConstantValue>,
     ) -> Arc<dyn crate::PreparedScalarKernel> {
         super::super::rand_owner::prepared_for_test(name, source, literal).unwrap()
     }
-    fn instance(name: &str, literal: Option<FunctionLiteral>) -> ScalarEvaluationInstance {
+    fn instance(name: &str, literal: Option<ConstantValue>) -> ScalarEvaluationInstance {
         ScalarEvaluationInstance::instantiate(prepared(
             name,
             Some(FunctionValueType::new(DataType::Int64, true)),
@@ -317,7 +318,7 @@ mod tests {
     fn constant_seeds_match_independent_locked_rng_bits_for_both_actual_owners() {
         for name in ["rand", "random"] {
             for (seed, expected) in [(0, ZERO), (1, ONE), (-1, NEGATIVE), (42, FORTY_TWO)] {
-                let mut instance = instance(name, Some(FunctionLiteral::Int64(seed)));
+                let mut instance = instance(name, Some(cv::i64(seed, true)));
                 let array: ArrayRef = Arc::new(Int64Array::from(vec![seed]));
                 let arguments = [EvaluatedArgument::Scalar(&array)];
                 assert_eq!(
@@ -334,7 +335,7 @@ mod tests {
 
     #[test]
     fn constant_sequence_continues_across_batches_empty_calls_and_sparse_domains() {
-        let mut instance = instance("rand", Some(FunctionLiteral::Int64(42)));
+        let mut instance = instance("rand", Some(cv::i64(42, true)));
         let array: ArrayRef = Arc::new(Int64Array::from(vec![42]));
         let arguments = [EvaluatedArgument::Scalar(&array)];
         let rows = [2, 8];
@@ -367,7 +368,7 @@ mod tests {
         let prepared = prepared(
             "rand",
             Some(FunctionValueType::new(DataType::Int64, true)),
-            Some(FunctionLiteral::Int64(1)),
+            Some(cv::i64(1, true)),
         );
         let mut left = ScalarEvaluationInstance::instantiate(prepared.clone()).unwrap();
         let mut right = ScalarEvaluationInstance::instantiate(prepared).unwrap();
@@ -533,7 +534,13 @@ mod tests {
         .unwrap();
         let constant = pool.value(2).unwrap();
         let arguments = [EvaluatedArgument::Constant(&constant)];
-        let mut instance = instance("rand", Some(FunctionLiteral::Int64(-1)));
+        let prepared = super::super::rand_owner::prepared_for_test(
+            "rand",
+            Some(constant.value_type().clone()),
+            Some(constant.clone()),
+        )
+        .unwrap();
+        let mut instance = ScalarEvaluationInstance::instantiate(prepared).unwrap();
         assert_eq!(
             bits(
                 instance
@@ -555,7 +562,7 @@ mod tests {
 
     #[test]
     fn constant_null_seed_has_zero_sequence_without_null_output() {
-        let mut instance = instance("rand", Some(FunctionLiteral::Null));
+        let mut instance = instance("rand", Some(cv::null(DataType::Int64)));
         let array: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(0), None]));
         let arguments = [EvaluatedArgument::Column(&array)];
         assert_eq!(
@@ -570,7 +577,7 @@ mod tests {
 
     #[test]
     fn runtime_constant_mismatch_is_outer_failure_and_forbids_replay() {
-        let mut instance = instance("rand", Some(FunctionLiteral::Int64(1)));
+        let mut instance = instance("rand", Some(cv::i64(1, true)));
         let array: ArrayRef = Arc::new(Int64Array::from(vec![1, 1, 2]));
         let arguments = [EvaluatedArgument::Column(&array)];
         assert!(matches!(
@@ -587,7 +594,7 @@ mod tests {
 
     #[test]
     fn constant_consistency_checks_only_actual_selected_seeds() {
-        let mut instance = instance("rand", Some(FunctionLiteral::Int64(1)));
+        let mut instance = instance("rand", Some(cv::i64(1, true)));
         let array: ArrayRef = Arc::new(Int64Array::from(vec![999, 1, -1, 1]));
         let arguments = [EvaluatedArgument::Column(&array)];
         let rows = [1, 3];
@@ -604,7 +611,7 @@ mod tests {
 
     #[test]
     fn empty_domain_skips_body_and_first_nonempty_domain_starts_sequence() {
-        let mut instance = instance("rand", Some(FunctionLiteral::Int64(42)));
+        let mut instance = instance("rand", Some(cv::i64(42, true)));
         let array: ArrayRef = Arc::new(Int64Array::from(vec![42]));
         let arguments = [EvaluatedArgument::Scalar(&array)];
         let control = Control::default();
@@ -674,7 +681,7 @@ mod tests {
         let array: ArrayRef = Arc::new(Int64Array::from(vec![1]));
         let arguments = [EvaluatedArgument::Scalar(&array)];
         let selection = Selection::all(320);
-        let mut baseline = instance("rand", Some(FunctionLiteral::Int64(1)));
+        let mut baseline = instance("rand", Some(cv::i64(1, true)));
         let control = Control::default();
         baseline.evaluate(selection, &arguments, &control).unwrap();
         let calls = control.calls();
@@ -717,7 +724,7 @@ mod tests {
             KernelFailure::ResourceExhausted,
         ] {
             for at in refusal_indices.iter().copied() {
-                let mut instance = instance("rand", Some(FunctionLiteral::Int64(1)));
+                let mut instance = instance("rand", Some(cv::i64(1, true)));
                 let control = Control::refusing(at, error.clone());
                 assert_eq!(
                     instance
@@ -750,7 +757,7 @@ mod tests {
         assert_eq!(control.calls(), [0, 0]);
         let array: ArrayRef = Arc::new(Int64Array::from(vec![1]));
         let arguments = [EvaluatedArgument::Scalar(&array)];
-        let mut seeded = instance("rand", Some(FunctionLiteral::Int64(1)));
+        let mut seeded = instance("rand", Some(cv::i64(1, true)));
         let control = Control::default();
         assert_eq!(
             seeded

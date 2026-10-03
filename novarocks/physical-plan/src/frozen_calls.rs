@@ -429,6 +429,7 @@ fn visit_calls<'a>(
             ExprKind::Value(_)
             | ExprKind::LambdaParameter { .. }
             | ExprKind::Literal(_)
+            | ExprKind::Constant(_)
             | ExprKind::Unary { .. }
             | ExprKind::Binary { .. }
             | ExprKind::Conjunction { .. }

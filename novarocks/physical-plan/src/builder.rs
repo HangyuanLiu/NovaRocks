@@ -1016,6 +1016,7 @@ impl FragmentBuilder {
 }
 
 pub struct PlanBuilder {
+    constants: crate::ConstantPools,
     parameters: SemanticParameters,
     version: PlanVersionId,
     next_edge: u32,
@@ -1030,6 +1031,7 @@ pub struct PlanBuilder {
 impl PlanBuilder {
     pub fn new(version: PlanVersionId) -> Self {
         Self {
+            constants: crate::ConstantPools::empty(),
             // An empty table supplies no semantic value or implicit flag.
             parameters: SemanticParameters::default(),
             version,
@@ -1041,6 +1043,23 @@ impl PlanBuilder {
             required: RequiredContracts::default(),
             annotations: Vec::new(),
         }
+    }
+
+    pub fn constants(&self) -> &crate::ConstantPools {
+        &self.constants
+    }
+
+    pub fn with_constant_pools(mut self, constants: crate::ConstantPools) -> Self {
+        self.constants = constants;
+        self
+    }
+
+    pub fn insert_constant_pool(
+        &mut self,
+        id: crate::ConstantPoolId,
+        pool: crate::ConstantPool,
+    ) -> Result<(), crate::ConstantReferenceError> {
+        self.constants.insert(id, pool)
     }
 
     /// Install the authored parameter values consumed by exact expression refs.
@@ -1115,8 +1134,41 @@ impl PlanBuilder {
     }
 
     // Design: ADR-0153 (docs/adr/ADR-0153-completed-physical-plan-is-the-static-execution-authority.md)
-    pub fn finish(self) -> Result<PhysicalPlan, ValidationErrors> {
+    pub fn finish_observed(
+        self,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<PhysicalPlan, PlanConstructionError> {
         let plan = PhysicalPlan::from(PhysicalPlanParts {
+            constants: self.constants,
+            parameters: self.parameters,
+            version: self.version,
+            fragments: self.fragments,
+            edges: self.edges,
+            runtime_filters: self.runtime_filters,
+            result_port: self.result_port,
+            required: self.required,
+            annotations: self.annotations.into_boxed_slice(),
+        });
+        validate_plan_observed(&plan, control)?;
+        Ok(plan)
+    }
+    pub fn finish(self) -> Result<PhysicalPlan, ValidationErrors> {
+        if self.fragments.values().any(|fragment| {
+            fragment
+                .expressions()
+                .iter()
+                .any(|(_, node)| matches!(node.kind, crate::ExprKind::Constant(_)))
+        }) || !self.constants.entries().is_empty()
+        {
+            let mut errors = crate::validation::ValidationContext::new();
+            errors.push(crate::ValidationError::new(
+                "constants",
+                "constant references require caller-observed plan publication",
+            ));
+            return Err(crate::ValidationErrors::from_collector(errors));
+        }
+        let plan = PhysicalPlan::from(PhysicalPlanParts {
+            constants: self.constants,
             parameters: self.parameters,
             version: self.version,
             fragments: self.fragments,
@@ -1406,4 +1458,50 @@ mod sparse_node_identity_tests {
         };
         assert_eq!(rows.len(), 1);
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlanConstructionError {
+    Constants(crate::ConstantReferenceError),
+    Structure(crate::ValidationErrors),
+}
+impl From<crate::ConstantReferenceError> for PlanConstructionError {
+    fn from(error: crate::ConstantReferenceError) -> Self {
+        Self::Constants(error)
+    }
+}
+impl From<crate::ValidationErrors> for PlanConstructionError {
+    fn from(error: crate::ValidationErrors) -> Self {
+        Self::Structure(error)
+    }
+}
+impl fmt::Display for PlanConstructionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Constants(error) => error.fmt(formatter),
+            Self::Structure(error) => error.fmt(formatter),
+        }
+    }
+}
+impl std::error::Error for PlanConstructionError {}
+
+/// Publish/consume a complete source using the caller's original observation.
+/// The unobserved structural validator alone does not admit checked sources.
+pub fn validate_plan_observed(
+    plan: &PhysicalPlan,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(), PlanConstructionError> {
+    crate::constants::validate_plan_constants_observed(plan, control)?;
+    // Structural validation is still an opaque legacy traversal. Observe its
+    // entry and ordinary/success completion with the original control without
+    // claiming internal cooperative work or an allocation grant.
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        control,
+        novarocks_type_contract::CompilePhase::Validate,
+    )
+    .map_err(crate::ConstantReferenceError::from)?;
+    let result = validate_plan(plan).map_err(PlanConstructionError::from);
+    work.step().map_err(crate::ConstantReferenceError::from)?;
+    work.finish().map_err(crate::ConstantReferenceError::from)?;
+    result
 }

@@ -1722,7 +1722,9 @@ impl SqlCompiler {
     /// batch or validates and returns the completed plan.
     pub fn start(
         request: SqlCompileRequest,
+        control: &super::SqlCompileControl,
     ) -> Result<SqlCompileProgress, SqlCompileProgressError> {
+        control.check()?;
         advance_step(
             request.first_step,
             CompletionTracking {
@@ -1730,6 +1732,7 @@ impl SqlCompiler {
                 limits: request.limits,
                 usage: CompletionUsage::default(),
             },
+            control,
         )
     }
 
@@ -1773,7 +1776,7 @@ impl SqlCompiler {
         // consumes both before publishing the next batch; compiler graph
         // memory belongs to the caller's WorkScope reservation.
         tracking.usage.exchange_bytes = 0;
-        advance_step(step, tracking)
+        advance_step(step, tracking, control)
     }
 }
 
@@ -2184,6 +2187,7 @@ impl From<CompletionProtocolError> for SqlCompileProgressError {
 fn advance_step(
     step: CompilerStep,
     mut tracking: CompletionTracking,
+    control: &super::SqlCompileControl,
 ) -> Result<SqlCompileProgress, SqlCompileProgressError> {
     match step {
         CompilerStep::Need {
@@ -2209,7 +2213,13 @@ fn advance_step(
             builder,
             display_intent,
             display_annotations,
-        } => complete(version, builder, display_intent, display_annotations),
+        } => complete(
+            version,
+            builder,
+            display_intent,
+            display_annotations,
+            control,
+        ),
     }
 }
 
@@ -2276,10 +2286,18 @@ fn complete(
     builder: PlanBuilder,
     display_intent: SqlDisplayIntent,
     display_annotations: Box<[SqlDisplayAnnotation]>,
+    control: &super::SqlCompileControl,
 ) -> Result<SqlCompileProgress, SqlCompileProgressError> {
     let plan = builder
-        .finish()
-        .map_err(|error| CompletionProtocolError::PlanValidation(error.to_string()))?;
+        .finish_observed(control)
+        .map_err(|error| match error {
+            novarocks_physical_plan::PlanConstructionError::Constants(
+                novarocks_physical_plan::ConstantReferenceError::Control(error),
+            ) => SqlCompileProgressError::Compile(SqlCompileError::from(error)),
+            error => SqlCompileProgressError::Protocol(CompletionProtocolError::PlanValidation(
+                error.to_string(),
+            )),
+        })?;
     if plan.version() != version {
         return Err(CompletionProtocolError::PlanVersionMismatch {
             expected: version,
@@ -3728,10 +3746,11 @@ mod tests {
             [SqlDisplayAnnotation::try_new("optimizer", "stable").unwrap()],
             DEFAULT_COMPLETION_LIMITS,
         );
-        let completed = SqlCompiler::start(request)
-            .unwrap()
-            .into_complete()
-            .unwrap();
+        let completed =
+            SqlCompiler::start(request, &crate::compiler::SqlCompileControl::unbounded())
+                .unwrap()
+                .into_complete()
+                .unwrap();
         assert_eq!(completed.plan().version(), version);
         assert_eq!(completed.display_annotations()[0].key(), "optimizer");
     }
@@ -3744,8 +3763,11 @@ mod tests {
                 mode: TableLookupMode::ExplainStats,
             },
         );
-        let progress =
-            SqlCompiler::start(catalog_request(need, DEFAULT_COMPLETION_LIMITS)).unwrap();
+        let progress = SqlCompiler::start(
+            catalog_request(need, DEFAULT_COMPLETION_LIMITS),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
         let SqlCompileProgress::Incomplete(compilation) = progress else {
             panic!("expected catalog need");
         };
@@ -3844,7 +3866,11 @@ mod tests {
             },
         );
         let compilation = incomplete(
-            SqlCompiler::start(catalog_request(need.clone(), DEFAULT_COMPLETION_LIMITS)).unwrap(),
+            SqlCompiler::start(
+                catalog_request(need.clone(), DEFAULT_COMPLETION_LIMITS),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap(),
         );
         assert!(matches!(
             SqlCompiler::finish(
@@ -3858,7 +3884,11 @@ mod tests {
         ));
 
         let compilation = incomplete(
-            SqlCompiler::start(catalog_request(need.clone(), DEFAULT_COMPLETION_LIMITS)).unwrap(),
+            SqlCompiler::start(
+                catalog_request(need.clone(), DEFAULT_COMPLETION_LIMITS),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap(),
         );
         let fact = || CatalogRelationFact::missing(&need, "missing").unwrap();
         assert!(matches!(
@@ -3887,7 +3917,11 @@ mod tests {
         )
         .unwrap();
         let compilation = incomplete(
-            SqlCompiler::start(catalog_request(need, DEFAULT_COMPLETION_LIMITS)).unwrap(),
+            SqlCompiler::start(
+                catalog_request(need, DEFAULT_COMPLETION_LIMITS),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap(),
         );
         assert!(matches!(
             SqlCompiler::finish(
@@ -4060,8 +4094,13 @@ mod tests {
             },
         );
         let limits = CompletionLimits::try_new(1, 1, 256).unwrap();
-        let compilation =
-            incomplete(SqlCompiler::start(catalog_request(need.clone(), limits)).unwrap());
+        let compilation = incomplete(
+            SqlCompiler::start(
+                catalog_request(need.clone(), limits),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap(),
+        );
         let fact = CatalogRelationFact::missing(&need, "x".repeat(1024)).unwrap();
         assert!(matches!(
             SqlCompiler::finish(
@@ -4087,8 +4126,13 @@ mod tests {
             },
         );
         let limits = CompletionLimits::try_new(1, 1, 64 * 1024).unwrap();
-        let compilation =
-            incomplete(SqlCompiler::start(catalog_request(need.clone(), limits)).unwrap());
+        let compilation = incomplete(
+            SqlCompiler::start(
+                catalog_request(need.clone(), limits),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap(),
+        );
         let planner = TableDef {
             name: "orders".to_string(),
             columns: Vec::new(),

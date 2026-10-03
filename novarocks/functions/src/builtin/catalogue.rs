@@ -254,7 +254,7 @@ impl BuiltinAggregateResolver {
         selected: Option<&FunctionOverloadId>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
-        binding_control::request_types(request, work)?;
+        request_types_with_constants(request, work)?;
         let values = binding_control::scalar_types(request, work)?;
         let mut argument_types = Vec::with_capacity(values.len());
         for value in &values {
@@ -1171,7 +1171,7 @@ impl FunctionBindingResolver for BuiltinScalarResolver {
         control: &dyn PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         binding_control::scope(control, |work| {
-            binding_control::request_types(request, work)?;
+            request_types_with_constants(request, work)?;
             let argument_types = binding_control::scalar_types(request, work)?;
             work.flush()?;
             let (index, resolved) = resolver::resolve_scalar_value_signature_with_overload(
@@ -1191,7 +1191,7 @@ impl FunctionBindingResolver for BuiltinScalarResolver {
         control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         binding_control::scope(control, |work| {
-            binding_control::request_types(request, work)?;
+            request_types_with_constants(request, work)?;
             let mut index = None;
             for (ordinal, overload) in self.overloads.iter().enumerate() {
                 work.step()?;
@@ -1319,7 +1319,7 @@ impl FunctionBindingResolver for BuiltinUnnestResolver {
         control: &dyn PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         binding_control::scope(control, |work| {
-            binding_control::request_types(request, work)?;
+            request_types_with_constants(request, work)?;
             bind_builtin_unnest(request, work)
         })
     }
@@ -1331,7 +1331,7 @@ impl FunctionBindingResolver for BuiltinUnnestResolver {
         control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         binding_control::scope(control, |work| {
-            binding_control::request_types(request, work)?;
+            request_types_with_constants(request, work)?;
             if selected.overload.as_str() != BUILTIN_UNNEST_OVERLOAD_ID {
                 return Err(FunctionBindingError::UnknownOverload(
                     selected.overload.clone(),
@@ -1413,14 +1413,53 @@ fn dynamic_argument_data_types(
     Ok(types)
 }
 
-fn utf8_constant(argument: Option<&FunctionArgument>) -> Option<&str> {
+/// Direct family entrypoints retain the same exact source gate as the shared
+/// catalogue, including constants whose payload is not read by this family.
+pub(super) fn request_types_with_constants(
+    request: FunctionBindingRequest<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), FunctionBindingError> {
+    binding_control::request_types(request, work)?;
+    for argument in request.arguments {
+        constant_source(Some(argument), work)?;
+        work.step()?;
+    }
+    Ok(())
+}
+
+pub(super) fn constant_source<'a>(
+    argument: Option<&'a FunctionArgument>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<&'a crate::ConstantValue>, FunctionBindingError> {
     match argument {
         Some(FunctionArgument::Value {
-            constant: Some(crate::FunctionLiteral::Utf8(value)),
-            ..
-        }) => Some(value),
-        _ => None,
+            value_type,
+            constant: Some(value),
+        }) => {
+            if !binding_control::exact_type(value_type, value.value_type(), work)? {
+                return Err(FunctionBindingError::InvalidBinding(
+                    "constant source type differs from its argument type".into(),
+                ));
+            }
+            Ok(Some(value))
+        }
+        _ => Ok(None),
     }
+}
+
+fn utf8_constant<'a>(
+    argument: Option<&'a FunctionArgument>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<&'a str>, FunctionBindingError> {
+    let Some(value) = constant_source(argument, work)? else {
+        return Ok(None);
+    };
+    work.flush()?;
+    let text = value.utf8_observed(
+        novarocks_type_contract::CompilePhase::FunctionSpecialization,
+        work.control(),
+    )?;
+    Ok(text)
 }
 
 fn struct_field_type(
@@ -1832,7 +1871,7 @@ fn bind_dynamic_scalar_result(
             DataType::List(Arc::new(arrow_schema::Field::new("item", item_type, true)))
         }
         "__struct_subfield" => {
-            let Some(field_name) = utf8_constant(request.arguments.get(1)) else {
+            let Some(field_name) = utf8_constant(request.arguments.get(1), work)? else {
                 return Err(FunctionBindingError::NoMatchingOverload);
             };
             struct_field_type(
@@ -1843,7 +1882,7 @@ fn bind_dynamic_scalar_result(
             .ok_or(FunctionBindingError::NoMatchingOverload)?
         }
         "__array_struct_subfield" => {
-            let Some(field_name) = utf8_constant(request.arguments.get(1)) else {
+            let Some(field_name) = utf8_constant(request.arguments.get(1), work)? else {
                 return Err(FunctionBindingError::NoMatchingOverload);
             };
             let Some(DataType::List(item)) = argument_types.first() else {
@@ -1860,7 +1899,7 @@ fn bind_dynamic_scalar_result(
             let mut fields = Vec::with_capacity(request.arguments.len() / 2);
             for pair in request.arguments.chunks_exact(2) {
                 work.step()?;
-                let Some(field_name) = utf8_constant(pair.first()) else {
+                let Some(field_name) = utf8_constant(pair.first(), work)? else {
                     return Err(FunctionBindingError::NoMatchingOverload);
                 };
                 let FunctionArgument::Value { value_type, .. } = &pair[1] else {
@@ -1898,12 +1937,12 @@ fn bind_dynamic_scalar_result(
     };
     if matches!(name, "variant_get" | "try_variant_get") {
         if !(2..=3).contains(&request.arguments.len())
-            || utf8_constant(request.arguments.get(1)).is_none()
+            || utf8_constant(request.arguments.get(1), work)?.is_none()
         {
             return Err(FunctionBindingError::NoMatchingOverload);
         }
         if request.arguments.len() == 3 {
-            let Some(target) = utf8_constant(request.arguments.get(2)) else {
+            let Some(target) = utf8_constant(request.arguments.get(2), work)? else {
                 return Err(FunctionBindingError::NoMatchingOverload);
             };
             result = novarocks_type_contract::variant_get_target_type(target)
@@ -2078,7 +2117,7 @@ fn bind_dynamic_scalar_result(
                     .chunks_exact(2)
                     .map(|pair| {
                         work.step()?;
-                        let name = utf8_constant(pair.first())
+                        let name = utf8_constant(pair.first(), work)?
                             .ok_or(FunctionBindingError::NoMatchingOverload)?;
                         let FunctionArgument::Value { value_type, .. } = &pair[1] else {
                             return Err(FunctionBindingError::NoMatchingOverload);
@@ -2103,7 +2142,7 @@ fn bind_dynamic_scalar_result(
             full_result.data_type = DataType::Struct(fields.into());
         }
         "__struct_subfield" | "__array_struct_subfield" => {
-            let name = utf8_constant(request.arguments.get(1))
+            let name = utf8_constant(request.arguments.get(1), work)?
                 .ok_or(FunctionBindingError::NoMatchingOverload)?;
             if value(1)?.logical_type != ValueLogicalType::Physical {
                 return Err(FunctionBindingError::NoMatchingOverload);
@@ -2198,7 +2237,7 @@ impl FunctionBindingResolver for BuiltinDynamicScalarResolver {
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         binding_control::scope(control, |work| {
             if !matches!(self.canonical_name.as_ref(), "round" | "truncate") {
-                binding_control::request_types(request, work)?;
+                request_types_with_constants(request, work)?;
             }
             if request.logical_argument_count != request.arguments.len() {
                 return Err(FunctionBindingError::NoMatchingOverload);
@@ -2247,7 +2286,7 @@ impl FunctionBindingResolver for BuiltinDynamicScalarResolver {
         control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         binding_control::scope(control, |work| {
-            binding_control::request_types(request, work)?;
+            request_types_with_constants(request, work)?;
             if request.logical_argument_count != request.arguments.len() {
                 return Err(FunctionBindingError::NoMatchingOverload);
             }
@@ -2646,7 +2685,7 @@ mod tests {
     fn value_argument(
         data_type: DataType,
         nullable: bool,
-        constant: Option<crate::FunctionLiteral>,
+        constant: Option<crate::ConstantValue>,
     ) -> FunctionArgument {
         FunctionArgument::Value {
             value_type: FunctionValueType::new(data_type, nullable),
@@ -2775,13 +2814,13 @@ mod tests {
             value_argument(
                 DataType::Utf8,
                 false,
-                Some(crate::FunctionLiteral::Utf8("left".into())),
+                Some(constant_binding_tests::utf8("left", false)),
             ),
             value_argument(DataType::Int64, false, None),
             value_argument(
                 DataType::Utf8,
                 false,
-                Some(crate::FunctionLiteral::Utf8("right".into())),
+                Some(constant_binding_tests::utf8("right", false)),
             ),
             value_argument(DataType::Boolean, true, None),
         ];
@@ -2802,7 +2841,7 @@ mod tests {
                 value_argument(
                     DataType::Int64,
                     false,
-                    Some(crate::FunctionLiteral::Int64(2)),
+                    Some(constant_binding_tests::i64(2, false)),
                 ),
             ],
         );
@@ -2827,12 +2866,12 @@ mod tests {
                 value_argument(
                     DataType::Utf8,
                     false,
-                    Some(crate::FunctionLiteral::Utf8("$.x".into())),
+                    Some(constant_binding_tests::utf8("$.x", false)),
                 ),
                 value_argument(
                     DataType::Utf8,
                     false,
-                    Some(crate::FunctionLiteral::Utf8("BIGINT".into())),
+                    Some(constant_binding_tests::utf8("BIGINT", false)),
                 ),
             ],
         );
@@ -2912,7 +2951,7 @@ mod tests {
                     value_argument(
                         DataType::Int64,
                         false,
-                        Some(crate::FunctionLiteral::Int64(digits)),
+                        Some(constant_binding_tests::i64(digits, false)),
                     ),
                 ];
                 let expected_override = FunctionValueType::new(DataType::Int32, false);
@@ -4284,3 +4323,7 @@ fn observed_all<T>(
     }
     Ok(true)
 }
+
+#[cfg(test)]
+#[path = "constant_binding_tests.rs"]
+pub(super) mod constant_binding_tests;

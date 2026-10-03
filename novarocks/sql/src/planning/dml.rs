@@ -581,6 +581,17 @@ fn final_lowering_error(
     }
 }
 
+fn final_plan_construction_error(
+    error: novarocks_physical_plan::PlanConstructionError,
+) -> crate::compiler::SqlCompileError {
+    match error {
+        novarocks_physical_plan::PlanConstructionError::Constants(
+            novarocks_physical_plan::ConstantReferenceError::Control(error),
+        ) => error.into(),
+        other => crate::compiler::SqlCompileError::Compilation(other.to_string()),
+    }
+}
+
 /// Build the final write contract for one already-frozen connector source.
 ///
 /// The source reads exactly one provider-frozen cohort, so the occurrence the
@@ -601,6 +612,7 @@ pub fn build_final_frozen_connector_write_plan(
     final_write: DmlFinalWritePlanContext,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     root_allow_throw_exception: bool,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError> {
     let scan_occurrence = final_write
@@ -624,6 +636,7 @@ pub fn build_final_frozen_connector_write_plan(
         ],
         functions,
         decimal_overflow_policy,
+        constant_policy,
         control,
     )?;
     complete_connector_write_plan(
@@ -636,6 +649,7 @@ pub fn build_final_frozen_connector_write_plan(
         final_write,
         functions,
         root_allow_throw_exception,
+        constant_policy,
         control,
     )
 }
@@ -648,6 +662,7 @@ pub fn build_final_frozen_connector_write_plan(
 /// accounted for under, so the two halves are separated here -- the needs
 /// leave, the facts come back, and the plan is lowered against them.
 pub struct DmlWriteCompletion {
+    constant_policy: novarocks_functions::ConstantPolicy,
     root_allow_throw_exception: bool,
     functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
@@ -669,6 +684,7 @@ pub fn begin_final_connector_write_plan(
     (DmlWriteCompletion, Box<[crate::compiler::ProviderReadNeed]>),
     crate::compiler::SqlCompileError,
 > {
+    let constant_policy = request.constant_policy();
     let control = request.control().clone();
     let compiled = crate::compiler::SqlCompiler::optimize(request)?
         .into_optimized_output()
@@ -686,6 +702,7 @@ pub fn begin_final_connector_write_plan(
         ],
         compiled.function_catalog.as_ref(),
         decimal_overflow_policy,
+        constant_policy,
         &control,
     )?;
     // Runtime filters are placed before the reads are stated, because a filter
@@ -703,6 +720,7 @@ pub fn begin_final_connector_write_plan(
     )?;
     Ok((
         DmlWriteCompletion {
+            constant_policy,
             root_allow_throw_exception: compiled.root_allow_throw_exception,
             functions: compiled.function_catalog,
             query_statistics: compiled.statistics.snapshot,
@@ -738,13 +756,14 @@ impl DmlWriteCompletion {
             },
             self.functions.as_ref(),
             self.root_allow_throw_exception,
+            self.constant_policy,
             control,
         )
         .map_err(final_lowering_error)?;
         self.query_statistics.annotate_final_plan(&mut builder);
         builder
-            .finish()
-            .map_err(|error| crate::compiler::SqlCompileError::Compilation(error.to_string()))
+            .finish_observed(control)
+            .map_err(final_plan_construction_error)
     }
 }
 
@@ -758,6 +777,7 @@ pub fn compile_final_connector_write_plan(
     final_write: DmlFinalWritePlanContext,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
 ) -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError> {
+    let constant_policy = request.constant_policy();
     let control = request.control().clone();
     let compiled = crate::compiler::SqlCompiler::optimize(request)?
         .into_optimized_output()
@@ -775,6 +795,7 @@ pub fn compile_final_connector_write_plan(
         ],
         compiled.function_catalog.as_ref(),
         decimal_overflow_policy,
+        constant_policy,
         &control,
     )?;
     complete_connector_write_plan(
@@ -787,6 +808,7 @@ pub fn compile_final_connector_write_plan(
         final_write,
         compiled.function_catalog.as_ref(),
         compiled.root_allow_throw_exception,
+        constant_policy,
         &control,
     )
 }
@@ -802,6 +824,7 @@ fn complete_connector_write_plan(
     final_write: DmlFinalWritePlanContext,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
     root_allow_throw_exception: bool,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError> {
     crate::planner::physical::runtime_filter_placement::place_runtime_filters(
@@ -823,17 +846,19 @@ fn complete_connector_write_plan(
         },
         functions,
         root_allow_throw_exception,
+        constant_policy,
         control,
     )
     .map_err(final_lowering_error)?;
     query_statistics.annotate_final_plan(&mut builder);
     builder
-        .finish()
-        .map_err(|error| crate::compiler::SqlCompileError::Compilation(error.to_string()))
+        .finish_observed(control)
+        .map_err(final_plan_construction_error)
 }
 
 /// One internal DML read, optimized and waiting for its provider facts.
 pub struct DmlReadCompletion {
+    constant_policy: novarocks_functions::ConstantPolicy,
     root_allow_throw_exception: bool,
     functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
@@ -847,6 +872,7 @@ pub fn begin_final_dml_read_plan(
     (DmlReadCompletion, Box<[crate::compiler::ProviderReadNeed]>),
     crate::compiler::SqlCompileError,
 > {
+    let constant_policy = request.constant_policy();
     let control = request.control().clone();
     let compiled = crate::compiler::SqlCompiler::optimize(request)?
         .into_optimized_output()
@@ -865,6 +891,7 @@ pub fn begin_final_dml_read_plan(
     )?;
     Ok((
         DmlReadCompletion {
+            constant_policy,
             root_allow_throw_exception: compiled.root_allow_throw_exception,
             functions: compiled.function_catalog,
             physical,
@@ -891,6 +918,7 @@ impl DmlReadCompletion {
                     reads,
                     self.functions.as_ref(),
                     self.root_allow_throw_exception,
+                    self.constant_policy,
                     control,
                 )
             }
@@ -900,14 +928,15 @@ impl DmlReadCompletion {
                 dop_domain,
                 self.functions.as_ref(),
                 self.root_allow_throw_exception,
+                self.constant_policy,
                 control,
             ),
         }
         .map_err(final_lowering_error)?;
         self.query_statistics.annotate_final_plan(&mut builder);
         builder
-            .finish()
-            .map_err(|error| crate::compiler::SqlCompileError::Compilation(error.to_string()))
+            .finish_observed(control)
+            .map_err(final_plan_construction_error)
     }
 }
 
@@ -916,6 +945,7 @@ impl DmlReadCompletion {
 /// stable capture fingerprint, and sealed write plan derived from it.
 #[derive(Clone, Debug)]
 pub struct DmlCtasSourcePlan {
+    constant_policy: novarocks_functions::ConstantPolicy,
     root_allow_throw_exception: bool,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     optimized: crate::optimizer::OptimizedOperatorNode,
@@ -969,10 +999,12 @@ impl DmlCtasSourcePlan {
 pub fn compile_ctas_source(
     request: crate::compiler::SqlOptimizeRequest<'_>,
 ) -> Result<DmlCtasSourcePlan, crate::compiler::SqlCompileError> {
+    let constant_policy = request.constant_policy();
     let compiled = crate::compiler::SqlCompiler::optimize(request)?
         .into_optimized_output()
         .map_err(|_| "CTAS source did not produce optimized SQL facts".to_string())?;
     Ok(DmlCtasSourcePlan {
+        constant_policy,
         root_allow_throw_exception: compiled.root_allow_throw_exception,
         query_statistics: compiled.statistics.snapshot,
         optimized: compiled.optimized_tree,
@@ -1007,6 +1039,7 @@ pub fn begin_final_ctas_connector_write_plan(
         ],
         source.function_catalog.as_ref(),
         decimal_overflow_policy,
+        source.constant_policy,
         control,
     )?;
     crate::planner::physical::runtime_filter_placement::place_runtime_filters(
@@ -1021,6 +1054,7 @@ pub fn begin_final_ctas_connector_write_plan(
     )?;
     Ok((
         DmlWriteCompletion {
+            constant_policy: source.constant_policy,
             root_allow_throw_exception: source.root_allow_throw_exception,
             functions: source.function_catalog.clone(),
             query_statistics: source.query_statistics.clone(),
@@ -1161,6 +1195,7 @@ pub struct DmlFinalChangeStreamPlan {
 /// An optimized change stream whose provider reads have been stated but not
 /// frozen. The application supplies their exact facts before lowering.
 pub struct DmlChangeStreamCompletion {
+    constant_policy: novarocks_functions::ConstantPolicy,
     root_allow_throw_exception: bool,
     functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
@@ -1189,13 +1224,14 @@ impl DmlChangeStreamCompletion {
             },
             self.functions.as_ref(),
             self.root_allow_throw_exception,
+            self.constant_policy,
             control,
         )
         .map_err(final_lowering_error)?;
         self.query_statistics.annotate_final_plan(&mut builder);
         let physical_plan = builder
-            .finish()
-            .map_err(|error| crate::compiler::SqlCompileError::Compilation(error.to_string()))?;
+            .finish_observed(control)
+            .map_err(final_plan_construction_error)?;
         let writer_routes = completed_change_stream_writer_routes(&physical_plan)?;
         Ok(DmlFinalChangeStreamPlan {
             physical_plan,
@@ -1216,6 +1252,7 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
     shape: DmlWritePlanShape,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     root_allow_throw_exception: bool,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
@@ -1244,6 +1281,7 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
         statistics_targets,
         functions.as_ref(),
         decimal_overflow_policy,
+        constant_policy,
         control,
     )?;
     let dag = bind_route_layout(&producer.output_columns, routes, effect_output_ordinal)?;
@@ -1274,6 +1312,7 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
     )?;
     Ok((
         DmlChangeStreamCompletion {
+            constant_policy,
             root_allow_throw_exception,
             functions,
             query_statistics,
@@ -1320,6 +1359,7 @@ pub fn begin_final_dml_change_stream(
     ),
     crate::compiler::SqlCompileError,
 > {
+    let constant_policy = request.optimize_request.constant_policy();
     let control = request.optimize_request.control().clone();
     let compiled = crate::compiler::SqlCompiler::optimize(request.optimize_request)?
         .into_optimized_output()
@@ -1366,6 +1406,7 @@ pub fn begin_final_dml_change_stream(
         request.shape,
         decimal_overflow_policy,
         compiled.root_allow_throw_exception,
+        constant_policy,
         &control,
     )
 }
@@ -1375,6 +1416,7 @@ pub fn compile_final_dml_change_stream(
     request: DmlFinalChangeStreamCompileRequest<'_>,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
 ) -> Result<DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
+    let constant_policy = request.optimize_request.constant_policy();
     let control = request.optimize_request.control().clone();
     let compiled = crate::compiler::SqlCompiler::optimize(request.optimize_request)?
         .into_optimized_output()
@@ -1418,6 +1460,7 @@ pub fn compile_final_dml_change_stream(
         },
         decimal_overflow_policy,
         compiled.root_allow_throw_exception,
+        constant_policy,
         &control,
     )
 }
@@ -1435,6 +1478,7 @@ pub(crate) fn seal_final_change_stream_producer(
     context: DmlFinalChangeStreamSealContext,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     root_allow_throw_exception: bool,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
     let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
@@ -1467,6 +1511,7 @@ pub(crate) fn seal_final_change_stream_producer(
         context,
         decimal_overflow_policy,
         root_allow_throw_exception,
+        constant_policy,
         control,
     )
 }
@@ -1482,6 +1527,7 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
     context: DmlFinalChangeStreamSealContext,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     root_allow_throw_exception: bool,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
     let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
@@ -1506,6 +1552,7 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
         statistics_targets,
         functions,
         decimal_overflow_policy,
+        constant_policy,
         control,
     )?;
     let dag = bind_route_layout(&producer.output_columns, routes, effect_output_ordinal)?;
@@ -1542,13 +1589,14 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
         },
         functions,
         root_allow_throw_exception,
+        constant_policy,
         control,
     )
     .map_err(final_lowering_error)?;
     query_statistics.annotate_final_plan(&mut builder);
     let physical_plan = builder
-        .finish()
-        .map_err(|error| crate::compiler::SqlCompileError::Compilation(error.to_string()))?;
+        .finish_observed(control)
+        .map_err(final_plan_construction_error)?;
     let writer_routes = completed_change_stream_writer_routes(&physical_plan)?;
     Ok(DmlFinalChangeStreamPlan {
         physical_plan,
@@ -1595,6 +1643,7 @@ fn plan_change_stream_writer_statistics(
     statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<
     crate::planner::distributed::write::auxiliary::WriterAuxiliaryPlan,
@@ -1674,6 +1723,7 @@ fn plan_change_stream_writer_statistics(
         &inputs,
         functions,
         decimal_overflow_policy,
+        constant_policy,
         control,
     )
 }
@@ -2278,6 +2328,7 @@ pub fn build_final_statistics_connector_plan(
     final_context: DmlFinalPlanContext,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     root_allow_throw_exception: bool,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError> {
     if required.is_empty() {
@@ -2300,6 +2351,7 @@ pub fn build_final_statistics_connector_plan(
         functions,
         scan_occurrence,
         decimal_overflow_policy,
+        constant_policy,
         control,
     )?;
     crate::planner::physical::runtime_filter_placement::place_runtime_filters(
@@ -2314,12 +2366,13 @@ pub fn build_final_statistics_connector_plan(
             reads,
             functions,
             root_allow_throw_exception,
+            constant_policy,
             control,
         )
         .map_err(final_lowering_error)?;
     builder
-        .finish()
-        .map_err(|error| crate::compiler::SqlCompileError::Compilation(error.to_string()))
+        .finish_observed(control)
+        .map_err(final_plan_construction_error)
 }
 
 fn build_statistics_connector_physical(
@@ -2328,6 +2381,7 @@ fn build_statistics_connector_physical(
     functions: &dyn crate::compiler::SqlFunctionCatalog,
     scan_occurrence: novarocks_physical_plan::ProviderReadOccurrenceId,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::planner::physical::PhysicalPlanNode, crate::compiler::SqlCompileError> {
     if required.is_empty() {
@@ -2475,6 +2529,7 @@ fn build_statistics_connector_physical(
             &args,
             &[],
             true,
+            constant_policy,
             control,
         )
         .map_err(|error| match error {
@@ -2777,6 +2832,41 @@ mod tests {
         StatisticsNumericNature, StatisticsRowCoverage,
     };
 
+    #[test]
+    fn observed_plan_publication_preserves_control_and_ordinary_diagnostics() {
+        use novarocks_physical_plan::{ConstantReferenceError, PlanConstructionError};
+        use novarocks_type_contract::CompileControlError;
+        for (cause, expected) in [
+            (
+                CompileControlError::Cancelled,
+                crate::compiler::SqlCompileError::Cancelled,
+            ),
+            (
+                CompileControlError::DeadlineExceeded,
+                crate::compiler::SqlCompileError::DeadlineExceeded,
+            ),
+            (
+                CompileControlError::ResourceExhausted,
+                crate::compiler::SqlCompileError::ResourceExhausted,
+            ),
+        ] {
+            assert_eq!(
+                super::final_plan_construction_error(PlanConstructionError::Constants(
+                    ConstantReferenceError::Control(cause),
+                )),
+                expected,
+            );
+        }
+        let ordinary = PlanConstructionError::Constants(ConstantReferenceError::InvalidConsumer(
+            "cancelled is only diagnostic text",
+        ));
+        let expected = ordinary.to_string();
+        assert_eq!(
+            super::final_plan_construction_error(ordinary),
+            crate::compiler::SqlCompileError::Compilation(expected),
+        );
+    }
+
     fn statistics_scan_with_type(
         value_type: novarocks_type_contract::FunctionValueType,
     ) -> super::StatisticsConnectorScan {
@@ -2850,6 +2940,7 @@ mod tests {
             &functions,
             novarocks_physical_plan::ProviderReadOccurrenceId::new(37),
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap_err();
@@ -3020,6 +3111,7 @@ mod tests {
             statistics_final_context(),
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             false,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("ANALYZE plan");
@@ -3425,6 +3517,7 @@ mod tests {
             vec![empty_statistics_target(0)],
             functions,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("missing target must fail");
@@ -3438,6 +3531,7 @@ mod tests {
             vec![empty_statistics_target(0), empty_statistics_target(0)],
             functions,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("duplicate target must fail");
@@ -3451,6 +3545,7 @@ mod tests {
             vec![empty_statistics_target(0), empty_statistics_target(1)],
             functions,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("extraneous target must fail");
@@ -3469,6 +3564,7 @@ mod tests {
             vec![empty_statistics_target(0), empty_statistics_target(1)],
             crate::functions::builtin_sql_function_catalog(),
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("exact empty requirements are a valid ordinary mutation plan");
@@ -3546,6 +3642,7 @@ mod tests {
             ],
             &functions,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("production helper plans routed statistics");
@@ -3759,6 +3856,10 @@ mod tests {
         let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
         let catalog = SqlPlannerTableSnapshot::new(&catalog);
         let statistics = DmlStatisticsSnapshot::empty();
+        let constant_policy = novarocks_functions::ConstantPolicy {
+            max_rows: 73,
+            ..crate::constant::test_constant_policy()
+        };
         for (session_mode, sql, expected) in [
             ("32", "SELECT 1", false),
             ("ALLOW_THROW_EXCEPTION", "SELECT 1", true),
@@ -3800,6 +3901,7 @@ mod tests {
                     crate::functions::builtin_sql_function_catalog(),
                     crate::compiler::noop_constant_evaluator(),
                     None,
+                    constant_policy,
                     SqlCompileControl::unbounded(),
                 ))
                 .unwrap()
@@ -3818,8 +3920,10 @@ mod tests {
             .unwrap();
             assert!(reads.is_empty());
             assert_eq!(completion.root_allow_throw_exception, expected);
+            assert_eq!(completion.constant_policy, constant_policy);
             let source = super::compile_ctas_source(request(SqlCompileIntent::Query)).unwrap();
             assert_eq!(source.root_allow_throw_exception, expected);
+            assert_eq!(source.constant_policy, constant_policy);
             assert_eq!(source.output_columns().len(), 1);
         }
     }
@@ -3850,6 +3954,7 @@ mod tests {
                 crate::functions::builtin_sql_function_catalog(),
                 crate::compiler::noop_constant_evaluator(),
                 None,
+                crate::constant::test_constant_policy(),
                 SqlCompileControl::unbounded(),
             ))
             .unwrap()

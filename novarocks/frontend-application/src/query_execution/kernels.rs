@@ -47,6 +47,7 @@ use novarocks_spi::connector::MvStorageObservationPort;
 #[derive(Clone)]
 pub struct QueryPreparationKernel {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    constant_policy: novarocks_functions::ConstantPolicy,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -109,9 +110,11 @@ impl QueryPreparationKernel {
         query_execution: QueryExecutionService,
         backend_topology: BackendTopologyService,
         exchange_port: u16,
+        constant_policy: novarocks_functions::ConstantPolicy,
     ) -> Self {
         Self {
             functions,
+            constant_policy,
             catalog_service,
             catalog_application,
             connector_control,
@@ -121,6 +124,10 @@ impl QueryPreparationKernel {
             backend_topology,
             exchange_port,
         }
+    }
+
+    pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy
     }
 
     pub(crate) fn function_catalog(&self) -> &Arc<novarocks_functions::EngineFunctionCatalog> {
@@ -173,6 +180,7 @@ impl QueryPreparationKernel {
 #[derive(Clone)]
 pub struct DmlExecutionKernel {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    constant_policy: novarocks_functions::ConstantPolicy,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -189,6 +197,7 @@ pub struct DmlExecutionKernel {
 #[derive(Clone)]
 pub struct DmlPlanningServices {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    constant_policy: novarocks_functions::ConstantPolicy,
     catalog_service: Arc<QueryCatalogService>,
 }
 
@@ -196,11 +205,17 @@ impl DmlPlanningServices {
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
+        constant_policy: novarocks_functions::ConstantPolicy,
     ) -> Self {
         Self {
             functions,
+            constant_policy,
             catalog_service,
         }
+    }
+
+    pub const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy
     }
 }
 
@@ -216,10 +231,12 @@ impl DmlExecutionKernel {
     ) -> Self {
         let DmlPlanningServices {
             functions,
+            constant_policy,
             catalog_service,
         } = planning;
         Self {
             functions,
+            constant_policy,
             catalog_service,
             catalog_application,
             connector_control,
@@ -252,6 +269,10 @@ impl DmlExecutionKernel {
                 crate::connector::connector_request_context_for_execution(query_options, execution)
             }
         }
+    }
+
+    pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy
     }
 
     pub(crate) fn function_catalog(&self) -> &Arc<novarocks_functions::EngineFunctionCatalog> {
@@ -365,6 +386,7 @@ impl CatalogCommandKernel {
 /// View command dependencies.
 #[derive(Clone)]
 pub struct ViewExecutionKernel {
+    constant_policy: novarocks_functions::ConstantPolicy,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
@@ -379,8 +401,10 @@ impl ViewExecutionKernel {
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         view_service: Arc<dyn ViewService>,
+        constant_policy: novarocks_functions::ConstantPolicy,
     ) -> Self {
         Self {
+            constant_policy,
             functions,
             catalog_service,
             catalog_application,
@@ -408,11 +432,15 @@ impl ViewExecutionKernel {
     pub fn view_service(&self) -> &Arc<dyn ViewService> {
         &self.view_service
     }
+    pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy
+    }
 }
 
 /// Table-maintenance command dependencies.
 #[derive(Clone)]
 pub struct MaintenanceExecutionKernel {
+    constant_policy: novarocks_functions::ConstantPolicy,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
@@ -434,8 +462,10 @@ impl MaintenanceExecutionKernel {
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         query_execution: QueryExecutionService,
         service: Arc<dyn TableMaintenanceService>,
+        constant_policy: novarocks_functions::ConstantPolicy,
     ) -> Self {
         Self {
+            constant_policy,
             functions,
             catalog_service,
             catalog_application,
@@ -478,6 +508,9 @@ impl MaintenanceExecutionKernel {
 
     pub(crate) fn service(&self) -> &Arc<dyn TableMaintenanceService> {
         &self.service
+    }
+    pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy
     }
 }
 

@@ -511,6 +511,7 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
             FragmentPackageInput {
                 version: PlanVersionId::try_new([93; 16]).unwrap(),
                 required: RequiredContracts::default(),
+                constants: novarocks_physical_plan::ConstantPools::empty(),
                 fragment: fixture.fragment,
                 expression_uses,
                 calls,

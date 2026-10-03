@@ -49,7 +49,7 @@ fn collect_scalar_column_ids(
         ScalarNode::ColumnRef(column_id) => {
             out.insert(*column_id);
         }
-        ScalarNode::Literal(_) => {}
+        ScalarNode::Literal(_) | ScalarNode::Constant(_) => {}
         ScalarNode::BinaryOp { left, right, .. } => {
             collect_scalar_column_ids(arena, *left, out);
             collect_scalar_column_ids(arena, *right, out);

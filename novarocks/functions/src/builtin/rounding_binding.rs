@@ -18,11 +18,9 @@
 //! Observed actual ROUND/TRUNCATE cast capability and result recipes.
 //! This is the exact binder prerequisite, not an encoded runtime kernel.
 
+#[cfg(test)]
 use super::binding_control;
-use crate::{
-    FunctionArgument, FunctionBindingError, FunctionBindingRequest, FunctionLiteral,
-    FunctionValueType,
-};
+use crate::{FunctionArgument, FunctionBindingError, FunctionBindingRequest, FunctionValueType};
 use arrow_schema::{DataType, Field, UnionFields};
 use novarocks_type_contract::{
     CompileCheckpoints, MAX_VALUE_TYPE_DEPTH, ValueLogicalType, field_logical_type,
@@ -205,7 +203,7 @@ pub(super) fn bind_result(
     {
         return Err(FunctionBindingError::NoMatchingOverload);
     }
-    binding_control::request_types(request, work)?;
+    super::catalogue::request_types_with_constants(request, work)?;
     let value = |index: usize| match &request.arguments[index] {
         FunctionArgument::Value { value_type, .. } => value_type,
         FunctionArgument::Lambda { .. } => unreachable!("value arguments checked above"),
@@ -242,13 +240,18 @@ pub(super) fn bind_result(
     let result = match &value(0).data_type {
         DataType::Decimal128(_, scale) => {
             let scale = if request.arguments.len() == 2 {
-                match &request.arguments[1] {
-                    FunctionArgument::Value {
-                        constant: Some(FunctionLiteral::Int64(digits)),
-                        ..
-                    } => (*digits as i8).max(0).min(*scale),
-                    _ => *scale,
-                }
+                let digits = if let Some(value) =
+                    super::catalogue::constant_source(request.arguments.get(1), work)?
+                {
+                    work.flush()?;
+                    value.signed_integer_observed(
+                        novarocks_type_contract::CompilePhase::FunctionSpecialization,
+                        work.control(),
+                    )?
+                } else {
+                    None
+                };
+                digits.map_or(*scale, |digits| (digits as i8).max(0).min(*scale))
             } else {
                 *scale
             };
@@ -263,6 +266,7 @@ pub(super) fn bind_result(
 
 #[cfg(test)]
 mod tests {
+    use super::super::catalogue::constant_binding_tests as cv;
     use super::*;
     use arrow_schema::{IntervalUnit, TimeUnit, UnionFields, UnionMode};
     use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
@@ -502,7 +506,7 @@ mod tests {
                     arg(DataType::Decimal128(12, 5)),
                     FunctionArgument::Value {
                         value_type: FunctionValueType::new(DataType::Int64, false),
-                        constant: Some(FunctionLiteral::Int64(digits)),
+                        constant: Some(cv::i64(digits, false)),
                     },
                 ];
                 let expected = FunctionValueType::new(DataType::Float64, false);
@@ -640,8 +644,8 @@ mod tests {
             FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
                 .unwrap();
         let args = [FunctionArgument::Value {
-            value_type: nominal,
-            constant: Some(FunctionLiteral::Utf8("12".into())),
+            value_type: nominal.clone(),
+            constant: Some(cv::utf8_typed("12", nominal)),
         }];
         assert!(bind("round", &args).is_err());
         for ty in [

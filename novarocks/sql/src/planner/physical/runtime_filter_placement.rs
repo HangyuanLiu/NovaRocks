@@ -252,6 +252,7 @@ fn collect_typed_expr_column_ids(expr: &TypedExpr, out: &mut Vec<ColumnId>) {
         }
         ExprKind::Lambda { body, .. } => collect_typed_expr_column_ids(body, out),
         ExprKind::Literal(_)
+        | ExprKind::Constant(_)
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::SubqueryPlaceholder { .. } => {}
     }
@@ -474,6 +475,7 @@ fn bind_expression_to_columns(
                 }
             }
             ExprKind::Literal(_)
+            | ExprKind::Constant(_)
             | ExprKind::LambdaParamRef { .. }
             | ExprKind::SubqueryPlaceholder { .. } => {}
         }

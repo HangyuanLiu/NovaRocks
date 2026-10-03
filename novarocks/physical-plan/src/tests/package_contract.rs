@@ -179,6 +179,7 @@ fn intrinsic_reference(id: u32) -> SemanticParameterRef {
 
 fn fixture_plan_parameters(plan: &PhysicalPlan, parameters: SemanticParameters) -> PhysicalPlan {
     let plan = crate::plan::PhysicalPlanParts {
+        constants: crate::ConstantPools::empty(),
         parameters,
         version: plan.version(),
         fragments: plan.fragments().clone(),
@@ -239,6 +240,7 @@ fn package_input_with_controls(
     )
     .unwrap();
     FragmentPackageInput {
+        constants: crate::ConstantPools::empty(),
         version: version(),
         required: RequiredContracts::default(),
         expression_uses,
@@ -1290,6 +1292,25 @@ fn result_and_annotation_facts_are_checked_at_the_local_boundary() {
     );
 }
 
+// These legacy fixtures have no checked backing. Compare every owned fact;
+// adding a backing must explicitly migrate this fixture's comparison.
+fn assert_no_constant_package_equal(left: &FragmentPackage, right: &FragmentPackage) {
+    assert!(left.constants().entries().is_empty());
+    assert!(right.constants().entries().is_empty());
+    assert_eq!(left.version(), right.version());
+    assert_eq!(left.required(), right.required());
+    assert_eq!(left.fragment(), right.fragment());
+    assert_eq!(left.expression_uses(), right.expression_uses());
+    assert_eq!(left.calls(), right.calls());
+    assert_eq!(left.pruning(), right.pruning());
+    assert_eq!(left.cuts(), right.cuts());
+    assert_eq!(left.result(), right.result());
+    assert_eq!(left.parameters(), right.parameters());
+    assert_eq!(left.scans(), right.scans());
+    assert_eq!(left.writes(), right.writes());
+    assert_eq!(left.annotations(), right.annotations());
+}
+
 #[test]
 fn remote_plan_statistics_do_not_grow_a_fragment_package() {
     let (fragment, _) = literal_fragment(FragmentId::new(81), FragmentSink::Noop, false);
@@ -1305,10 +1326,16 @@ fn remote_plan_statistics_do_not_grow_a_fragment_package() {
     });
     let after = builder.finish().unwrap();
     let parameters = SemanticParameters::default();
+    let before_packages =
+        extract(&before, &BTreeMap::new(), &parameters, &BTreeMap::new()).unwrap();
+    let after_packages = extract(&after, &BTreeMap::new(), &parameters, &BTreeMap::new()).unwrap();
     assert_eq!(
-        extract(&before, &BTreeMap::new(), &parameters, &BTreeMap::new()).unwrap(),
-        extract(&after, &BTreeMap::new(), &parameters, &BTreeMap::new()).unwrap()
+        before_packages.keys().collect::<Vec<_>>(),
+        after_packages.keys().collect::<Vec<_>>()
     );
+    for (id, before) in &before_packages {
+        assert_no_constant_package_equal(before, &after_packages[id]);
+    }
     assert_eq!(after.annotations().len(), 1);
 }
 
@@ -2043,7 +2070,7 @@ fn extraction_preserves_per_occurrence_decimal_policy_and_package_receipt_identi
     let mut changed = input;
     changed.calls = original;
     let changed = FragmentPackage::try_new(changed, &Control).unwrap();
-    assert_ne!(checked, changed);
+    assert_ne!(checked.calls(), changed.calls());
     let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment.clone()).unwrap();
     let plan = builder.finish().unwrap();
@@ -2058,7 +2085,7 @@ fn extraction_preserves_per_occurrence_decimal_policy_and_package_receipt_identi
     )
     .unwrap();
     assert_eq!(packages[&fragment.id()].calls(), &calls);
-    assert_eq!(packages[&fragment.id()], checked);
+    assert_no_constant_package_equal(&packages[&fragment.id()], &checked);
 }
 
 fn intrinsic_package_fixture() -> FragmentPackageInput {
@@ -2220,7 +2247,7 @@ fn intrinsic_arithmetic_and_cast_use_the_only_plan_table_with_sparse_false_true_
         &Control,
     )
     .unwrap();
-    assert_eq!(packages[&checked.fragment().id()], checked);
+    assert_no_constant_package_equal(&packages[&checked.fragment().id()], &checked);
 }
 
 #[test]

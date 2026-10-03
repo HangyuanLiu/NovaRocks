@@ -39,8 +39,9 @@ use crate::{
 
 /// An owned input for the same checked constructor on FE and BE. It contains
 /// neither generated DTOs nor runtime handles. Sparse IDs remain map keys.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct FragmentPackageInput {
+    pub constants: crate::ConstantPools,
     pub version: PlanVersionId,
     pub required: RequiredContracts,
     pub fragment: Fragment,
@@ -63,7 +64,7 @@ pub struct FragmentPackageInput {
     pub annotations: Box<[PlanAnnotation]>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct FragmentPackage(FragmentPackageInput);
 
 impl FragmentPackage {
@@ -74,6 +75,16 @@ impl FragmentPackage {
         control
             .checkpoint(CompilePhase::Validate, 0)
             .map_err(FragmentPackageError::Control)?;
+        crate::constants::validate_fragment_constants_observed(
+            &input.fragment,
+            &input.constants,
+            true,
+            control,
+        )
+        .map_err(|error| match error {
+            crate::ConstantReferenceError::Control(error) => FragmentPackageError::Control(error),
+            error => FragmentPackageError::Constant(error),
+        })?;
         let call_items =
             input
                 .calls
@@ -89,13 +100,22 @@ impl FragmentPackage {
         let counts =
             visit_fragment_parameter_references(&input.fragment, &input.calls, control, |_| {})
                 .map_err(parameter_error)?;
-        crate::validation::validate_package(
+        let mut resource_work = CompileCheckpoints::try_new(control, CompilePhase::Validate)
+            .map_err(FragmentPackageError::Control)?;
+        let resource_result = crate::validation::validate_package(
             &input,
             call_items
                 .saturating_add(pruning_items)
                 .saturating_add(counts.intrinsic),
-        )
-        .map_err(FragmentPackageError::Structure)?;
+            &mut resource_work,
+        );
+        if matches!(resource_result, Err(FragmentPackageError::Control(_))) {
+            return resource_result.map(|_| Self(input));
+        }
+        resource_work
+            .finish()
+            .map_err(FragmentPackageError::Control)?;
+        resource_result?;
         input
             .calls
             .validate_fragment(&input.fragment, &input.expression_uses, control)
@@ -140,6 +160,10 @@ impl FragmentPackage {
 
     pub const fn required(&self) -> RequiredContracts {
         self.0.required
+    }
+
+    pub fn constants(&self) -> &crate::ConstantPools {
+        &self.0.constants
     }
 
     pub const fn fragment(&self) -> &Fragment {
@@ -190,6 +214,7 @@ impl FragmentPackage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FragmentPackageError {
     Control(CompileControlError),
+    Constant(crate::ConstantReferenceError),
     Structure(ValidationErrors),
     ExpressionUses(RootUseBindingError),
     Calls(FrozenCallError),
@@ -201,6 +226,7 @@ impl fmt::Display for FragmentPackageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Control(error) => error.fmt(f),
+            Self::Constant(error) => error.fmt(f),
             Self::Structure(error) => error.fmt(f),
             Self::ExpressionUses(error) => error.fmt(f),
             Self::Calls(error) => error.fmt(f),
@@ -305,6 +331,14 @@ pub fn extract_fragment_packages(
     control
         .checkpoint(CompilePhase::Validate, 0)
         .map_err(FragmentPackageExtractionError::Control)?;
+    crate::constants::validate_plan_constants_observed(plan, control).map_err(
+        |error| match error {
+            crate::ConstantReferenceError::Control(error) => {
+                FragmentPackageExtractionError::Control(error)
+            }
+            error => FragmentPackageExtractionError::Local(FragmentPackageError::Constant(error)),
+        },
+    )?;
     let mut cuts =
         derive_fragment_cuts(plan).ok_or(FragmentPackageExtractionError::BoundaryDerivation)?;
     // Display/statistics annotations for the whole plan remain FE-owned. Index
@@ -381,8 +415,34 @@ pub fn extract_fragment_packages(
         }
         work.finish()
             .map_err(FragmentPackageExtractionError::Control)?;
+        let mut constant_work = CompileCheckpoints::try_new(control, CompilePhase::Validate)
+            .map_err(FragmentPackageExtractionError::Control)?;
+        let projected = plan.constants().project_optional_references_observed(
+            fragment
+                .expressions()
+                .iter()
+                .map(|(_, node)| match &node.kind {
+                    crate::ExprKind::Constant(reference) => Some((*reference, &node.ty)),
+                    _ => None,
+                }),
+            &mut constant_work,
+        );
+        let projected = match projected {
+            Err(crate::ConstantReferenceError::Control(error)) => {
+                return Err(FragmentPackageExtractionError::Control(error));
+            }
+            other => {
+                constant_work
+                    .finish()
+                    .map_err(FragmentPackageExtractionError::Control)?;
+                other.map_err(|error| {
+                    FragmentPackageExtractionError::Local(FragmentPackageError::Constant(error))
+                })?
+            }
+        };
         let package = FragmentPackage::try_new(
             FragmentPackageInput {
+                constants: projected,
                 version: plan.version(),
                 required: plan.required(),
                 fragment: fragment.clone(),

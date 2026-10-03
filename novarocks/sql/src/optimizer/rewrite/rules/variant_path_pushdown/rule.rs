@@ -242,7 +242,7 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
     factory: &mut ColumnRefFactory,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<ScalarId>, SqlCompileError> {
-    if let Some(request) = variant_request_scalar(arena, expr) {
+    if let Some(request) = variant_request_scalar(arena, expr, control)? {
         return bindings.column_ref_for(arena, &request, factory, control);
     }
 
@@ -548,9 +548,10 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
             |body| ScalarNode::Lambda { params, body },
             control,
         ),
-        ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {
-            Ok(None)
-        }
+        ScalarNode::ColumnRef(_)
+        | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_) => Ok(None),
     }
 }
 
@@ -665,7 +666,12 @@ fn rewrite_sort_keys<T: VariantBindings>(
     Ok((out, changed))
 }
 
-fn variant_request_scalar(arena: &ScalarArena, expr: ScalarId) -> Option<VariantRequest> {
+fn variant_request_scalar(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<VariantRequest>, SqlCompileError> {
+    use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
     let ScalarNode::FunctionCall {
         name,
         args,
@@ -674,50 +680,113 @@ fn variant_request_scalar(arena: &ScalarArena, expr: ScalarId) -> Option<Variant
         ..
     } = arena.node(expr)
     else {
-        return None;
+        return Ok(None);
     };
     if *distinct || args.len() != 3 {
-        return None;
+        return Ok(None);
     }
-
     let strict = if name.eq_ignore_ascii_case("variant_get") {
         true
     } else if name.eq_ignore_ascii_case("try_variant_get") {
         false
     } else {
-        return None;
+        return Ok(None);
     };
-
     let ScalarNode::ColumnRef(column_id) = arena.node(args[0]) else {
-        return None;
+        return Ok(None);
     };
     if *column_id == ColumnId::UNSET {
-        return None;
+        return Ok(None);
     }
-    let path = string_literal_value_scalar(arena, args[1])?;
-    let requested_type_literal = string_literal_value_scalar(arena, args[2])?.to_string();
-    let requested_type = requested_type_value_scalar(arena, args[2])?;
-    let canonical_path = canonical_object_path(path)?;
-
-    Some(VariantRequest {
-        source_column_id: *column_id,
-        canonical_path,
-        requested_type,
-        requested_type_literal,
-        strict,
-        binding: binding.clone(),
-    })
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+    let result = (|| {
+        let Some(path) = string_literal_value_scalar(arena, args[1], &mut work)? else {
+            return Ok(None);
+        };
+        let Some(type_literal) = string_literal_value_scalar(arena, args[2], &mut work)? else {
+            return Ok(None);
+        };
+        // The legacy type/path parsers and owned result strings remain opaque
+        // work. Observations bracket them; no internal quantum is claimed.
+        work.flush()?;
+        let requested_type_literal = type_literal.to_string();
+        let requested_type = requested_type_value(type_literal);
+        work.flush()?;
+        let Some(requested_type) = requested_type else {
+            return Ok(None);
+        };
+        let canonical_path = canonical_object_path(path);
+        work.flush()?;
+        let Some(canonical_path) = canonical_path else {
+            return Ok(None);
+        };
+        Ok(Some(VariantRequest {
+            source_column_id: *column_id,
+            canonical_path,
+            requested_type,
+            requested_type_literal,
+            strict,
+            binding: binding.clone(),
+        }))
+    })();
+    if matches!(
+        &result,
+        Err(SqlCompileError::Cancelled
+            | SqlCompileError::DeadlineExceeded
+            | SqlCompileError::ResourceExhausted)
+    ) {
+        return result;
+    }
+    work.finish()?;
+    result
 }
 
-fn string_literal_value_scalar(arena: &ScalarArena, expr: ScalarId) -> Option<&str> {
+fn string_literal_value_scalar<'a>(
+    arena: &'a ScalarArena,
+    expr: ScalarId,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<Option<&'a str>, SqlCompileError> {
+    use novarocks_type_contract::{CompilePhase, ValueLogicalType};
+    let source = arena.value_type(expr);
+    // A nominal JSON value is not a string path/type declaration. A carrier
+    // cannot authorize a logical domain that this consumer does not own.
+    if source.logical_type != ValueLogicalType::Physical
+        || !matches!(
+            source.data_type,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        )
+    {
+        return Ok(None);
+    }
     match arena.node(expr) {
-        ScalarNode::Literal(HashableLiteral(LiteralValue::String(value))) => Some(value),
-        _ => None,
+        ScalarNode::Literal(HashableLiteral(LiteralValue::String(value))) => Ok(Some(value)),
+        ScalarNode::Constant(value) => {
+            work.flush()?;
+            let same = source
+                .exactly_equals_observed::<novarocks_functions::ConstantError>(
+                    value.value_type(),
+                    || {
+                        work.step()
+                            .map_err(novarocks_functions::ConstantError::from)
+                    },
+                )
+                .map_err(SqlCompileError::from)?;
+            if !same {
+                return Err(SqlCompileError::InvalidRequest(
+                    "variant path constant source type differs".to_owned(),
+                ));
+            }
+            work.flush()?;
+            let selected = value
+                .try_utf8_borrowed_observed(CompilePhase::FunctionSpecialization, work.control())?;
+            work.flush()?;
+            Ok(selected)
+        }
+        _ => Ok(None),
     }
 }
 
-fn requested_type_value_scalar(arena: &ScalarArena, expr: ScalarId) -> Option<DataType> {
-    let value = string_literal_value_scalar(arena, expr)?;
+fn requested_type_value(value: &str) -> Option<DataType> {
     let data_type = variant_get_target_type(value).ok()?;
     match data_type {
         DataType::Boolean
@@ -780,10 +849,12 @@ fn find_or_create_slot(
             // its own (same condition as the pre-OptExpr implementation).
             let can_push = !request.strict
                 || scan.predicates.is_empty()
-                || scan
-                    .predicates
-                    .iter()
-                    .any(|pred_id| expr_contains_variant_request_scalar(arena, *pred_id, request));
+                || any_variant_request_scalar(
+                    arena,
+                    scan.predicates.iter().copied(),
+                    request,
+                    control,
+                )?;
             if can_push {
                 let Operator::LogicalScan(scan_mut) = &mut expr.op else {
                     return Ok(None);
@@ -798,7 +869,12 @@ fn find_or_create_slot(
             // contains the same variant_request — this preserves the pre-OptExpr
             // semantics that prevented spurious pushdown of unrelated projections.
             if !request.strict
-                || expr_contains_variant_request_scalar(arena, filter_op.predicate, request)
+                || expr_contains_variant_request_scalar(
+                    arena,
+                    filter_op.predicate,
+                    request,
+                    control,
+                )?
             {
                 let Some(input) = expr.children.get_mut(0) else {
                     return Ok(None);
@@ -812,86 +888,101 @@ fn find_or_create_slot(
     })
 }
 
+fn any_variant_request_scalar(
+    arena: &ScalarArena,
+    exprs: impl IntoIterator<Item = ScalarId>,
+    request: &VariantRequest,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<bool, SqlCompileError> {
+    for expr in exprs {
+        if expr_contains_variant_request_scalar(arena, expr, request, control)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn expr_contains_variant_request_scalar(
     arena: &ScalarArena,
     expr: ScalarId,
     request: &VariantRequest,
-) -> bool {
-    if variant_request_scalar(arena, expr).is_some_and(|candidate| candidate == *request) {
-        return true;
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<bool, SqlCompileError> {
+    if variant_request_scalar(arena, expr, control)?.is_some_and(|candidate| candidate == *request)
+    {
+        return Ok(true);
     }
-
+    // Preserve the original child order and first-true short circuit. Each
+    // selected Constant reader keeps the same originating request control.
     match arena.node(expr) {
         ScalarNode::BinaryOp { left, right, .. } => {
-            expr_contains_variant_request_scalar(arena, *left, request)
-                || expr_contains_variant_request_scalar(arena, *right, request)
+            any_variant_request_scalar(arena, [*left, *right], request, control)
         }
         ScalarNode::UnaryOp { child, .. }
         | ScalarNode::Cast { child, .. }
         | ScalarNode::IsNull { child, .. }
         | ScalarNode::IsTruthValue { child, .. }
-        | ScalarNode::Nested(child) => expr_contains_variant_request_scalar(arena, *child, request),
-        ScalarNode::FunctionCall { args, .. } => args
-            .iter()
-            .any(|arg| expr_contains_variant_request_scalar(arena, *arg, request)),
-        ScalarNode::AggregateCall { args, order_by, .. } => {
-            args.iter()
-                .any(|arg| expr_contains_variant_request_scalar(arena, *arg, request))
-                || order_by
-                    .iter()
-                    .any(|item| expr_contains_variant_request_scalar(arena, item.expr, request))
+        | ScalarNode::Nested(child) => {
+            expr_contains_variant_request_scalar(arena, *child, request, control)
         }
+        ScalarNode::FunctionCall { args, .. } => {
+            any_variant_request_scalar(arena, args.iter().copied(), request, control)
+        }
+        ScalarNode::AggregateCall { args, order_by, .. } => any_variant_request_scalar(
+            arena,
+            args.iter()
+                .copied()
+                .chain(order_by.iter().map(|item| item.expr)),
+            request,
+            control,
+        ),
         ScalarNode::WindowCall {
             args,
             partition_by,
             order_by,
             ..
-        } => {
+        } => any_variant_request_scalar(
+            arena,
             args.iter()
-                .any(|arg| expr_contains_variant_request_scalar(arena, *arg, request))
-                || partition_by
-                    .iter()
-                    .any(|expr| expr_contains_variant_request_scalar(arena, *expr, request))
-                || order_by
-                    .iter()
-                    .any(|item| expr_contains_variant_request_scalar(arena, item.expr, request))
-        }
+                .copied()
+                .chain(partition_by.iter().copied())
+                .chain(order_by.iter().map(|item| item.expr)),
+            request,
+            control,
+        ),
         ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
-            expr_contains_variant_request_scalar(arena, *body, request)
+            expr_contains_variant_request_scalar(arena, *body, request, control)
         }
-        ScalarNode::InList { child, list, .. } => {
-            expr_contains_variant_request_scalar(arena, *child, request)
-                || list
-                    .iter()
-                    .any(|item| expr_contains_variant_request_scalar(arena, *item, request))
-        }
+        ScalarNode::InList { child, list, .. } => any_variant_request_scalar(
+            arena,
+            std::iter::once(*child).chain(list.iter().copied()),
+            request,
+            control,
+        ),
         ScalarNode::Between {
             child, low, high, ..
-        } => {
-            expr_contains_variant_request_scalar(arena, *child, request)
-                || expr_contains_variant_request_scalar(arena, *low, request)
-                || expr_contains_variant_request_scalar(arena, *high, request)
-        }
+        } => any_variant_request_scalar(arena, [*child, *low, *high], request, control),
         ScalarNode::Like { child, pattern, .. } => {
-            expr_contains_variant_request_scalar(arena, *child, request)
-                || expr_contains_variant_request_scalar(arena, *pattern, request)
+            any_variant_request_scalar(arena, [*child, *pattern], request, control)
         }
         ScalarNode::Case {
             operand,
             when_then,
             else_expr,
-        } => {
-            operand.is_some_and(|expr| expr_contains_variant_request_scalar(arena, expr, request))
-                || when_then.iter().any(|(when, then)| {
-                    expr_contains_variant_request_scalar(arena, *when, request)
-                        || expr_contains_variant_request_scalar(arena, *then, request)
-                })
-                || else_expr
-                    .is_some_and(|expr| expr_contains_variant_request_scalar(arena, expr, request))
-        }
-        ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {
-            false
-        }
+        } => any_variant_request_scalar(
+            arena,
+            operand
+                .iter()
+                .copied()
+                .chain(when_then.iter().flat_map(|(when, then)| [*when, *then]))
+                .chain(else_expr.iter().copied()),
+            request,
+            control,
+        ),
+        ScalarNode::ColumnRef(_)
+        | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_) => Ok(false),
     }
 }
 
@@ -1093,8 +1184,13 @@ fn contains_variant_get_candidate_scalar(arena: &ScalarArena, expr: ScalarId) ->
                 })
                 || else_expr.is_some_and(|expr| contains_variant_get_candidate_scalar(arena, expr))
         }
-        ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {
-            false
-        }
+        ScalarNode::ColumnRef(_)
+        | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_) => false,
     }
 }
+
+#[cfg(test)]
+#[path = "constant_tests.rs"]
+mod constant_tests;

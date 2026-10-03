@@ -22,9 +22,9 @@ use crate::*;
 use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use novarocks_functions::{
-    CallEffectInput, EngineFunctionCatalogBuilder, EvaluatedArgument, FunctionArgument,
-    FunctionArgumentType, FunctionBindingRequest, FunctionId, FunctionKind, FunctionLiteral,
-    FunctionOverloadId, FunctionResultType, FunctionValueType, InstalledPureKernel,
+    CallEffectInput, ConstantPolicy, ConstantValue, EngineFunctionCatalogBuilder,
+    EvaluatedArgument, FunctionArgument, FunctionArgumentType, FunctionBindingRequest, FunctionId,
+    FunctionKind, FunctionOverloadId, FunctionResultType, FunctionValueType, InstalledPureKernel,
     KernelEvaluationControl, KernelFailure, PreparedPureKernel, PureCallPreparation,
     PureEngineFunctionCatalog, PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
     ScalarEvaluationInstance, ScopedExpressionEffects, Selection,
@@ -104,7 +104,28 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
     let seed_type = FunctionValueType::new(DataType::Int64, false);
     let arguments = [FunctionArgument::Value {
         value_type: seed_type.clone(),
-        constant: Some(FunctionLiteral::Int64(42)),
+        constant: Some(
+            ConstantValue::from_i64(
+                Arc::new(seed_type.try_to_field("fixture").unwrap()),
+                seed_type.clone(),
+                42,
+                ConstantPolicy {
+                    max_rows: 1,
+                    max_array_nodes: 1,
+                    max_logical_elements: 1,
+                    max_retained_buffer_bytes: 4096,
+                    max_type_depth: 1,
+                    max_type_nodes: 1,
+                    max_dictionary_depth: 0,
+                    max_metadata_bytes: 4096,
+                    max_library_validation_work: 65536,
+                    max_library_validation_bytes: 65536,
+                },
+                CompilePhase::FunctionSpecialization,
+                &control,
+            )
+            .unwrap(),
+        ),
     }];
     let request = FunctionBindingRequest {
         expected_result_type: None,

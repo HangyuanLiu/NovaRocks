@@ -30,7 +30,9 @@ mod tests;
 
 mod semantic_key;
 pub use semantic_key::ConstantSemanticKey;
+mod diagnostic;
 mod selected_scalar;
+mod selected_scalar_read;
 
 use arrow_array::{Array, ArrayRef, make_array};
 use arrow_data::ArrayData;
@@ -240,7 +242,16 @@ pub struct ConstantValue {
     ordinal: u32,
 }
 
+/// Opaque process-local retention identity while the backing is retained.
+/// It is neither a wire address nor selected-value equality.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ConstantBackingIdentity(usize);
+
 impl ConstantPool {
+    pub fn backing_identity(&self) -> ConstantBackingIdentity {
+        ConstantBackingIdentity(Arc::as_ptr(&self.0) as usize)
+    }
+
     /// Locked Rust Arc allocation request for this owner's actual backing.
     /// This is a layout input, not allocator usable size, RSS or a MEM grant.
     /// Rust 1.92 ArcInner is repr(C): two AtomicUsize counters then the payload.
@@ -352,6 +363,15 @@ impl ConstantPool {
     }
 }
 impl ConstantValue {
+    /// Selected-value diagnostics only. Text is never semantic identity or SQL source.
+    pub fn format_diagnostic_observed(
+        &self,
+        phase: CompilePhase,
+        control: &dyn PureCompileControl,
+    ) -> Result<String, ConstantError> {
+        diagnostic::format(self, phase, control)
+    }
+
     pub fn pool(&self) -> &ConstantPool {
         &self.pool
     }
@@ -1557,6 +1577,17 @@ impl ConstantValue {
             )),
         }
     }
+    /// Borrow the selected text from an exact Physical UTF8 carrier.
+    /// Only SQL NULL returns None; nominal/encoded/other carriers are errors.
+    /// The immutable pool already owns checked type, ordinal and UTF8 facts.
+    pub fn try_utf8_borrowed_observed(
+        &self,
+        phase: CompilePhase,
+        control: &dyn PureCompileControl,
+    ) -> Result<Option<&str>, ConstantError> {
+        selected_scalar_read::utf8(self, phase, control)
+    }
+
     pub fn try_utf8(&self) -> Result<Option<&str>, ConstantError> {
         let array = self.pool.array();
         let row = self.ordinal as usize;
@@ -1604,6 +1635,16 @@ impl ConstantValue {
             .ok_or(ConstantError::Invalid("constant is not a Boolean carrier"))?;
         let row = self.ordinal as usize;
         Ok(a.is_valid(row).then(|| a.value(row)))
+    }
+    pub fn try_f32_bits(&self) -> Result<Option<u32>, ConstantError> {
+        let a = self
+            .pool
+            .array()
+            .as_any()
+            .downcast_ref::<arrow_array::Float32Array>()
+            .ok_or(ConstantError::Invalid("constant is not a Float32 carrier"))?;
+        let row = self.ordinal as usize;
+        Ok(a.is_valid(row).then(|| a.value(row).to_bits()))
     }
     pub fn try_f64_bits(&self) -> Result<Option<u64>, ConstantError> {
         let a = self

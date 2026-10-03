@@ -445,6 +445,7 @@ fn compile_dml_change_stream_write(
         state.function_catalog().as_ref(),
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
+        state.constant_policy(),
         compile_control.clone(),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
@@ -527,8 +528,11 @@ fn compile_dml_change_stream_write(
     )?;
     let (plan, writer_routes) = finalized.into_parts();
     let candidate =
-        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)
-            .map_err(|error| error.to_string())?;
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(
+            plan,
+            &completion_control,
+        )
+        .map_err(|error| error.to_string())?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,
     )
@@ -3032,6 +3036,7 @@ fn execute_exact_cow_match_query(
         state.function_catalog().as_ref(),
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
+        state.constant_policy(),
         compile_control.clone(),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
@@ -3087,8 +3092,11 @@ fn execute_exact_cow_match_query(
         &completion_control,
     )?;
     let candidate =
-        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)
-            .map_err(|error| error.to_string())?;
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(
+            plan,
+            &completion_control,
+        )
+        .map_err(|error| error.to_string())?;
     let output = novarocks_query_application::preparation::OutputContract::from_completed_plan(
         novarocks_query_application::api::QueryExecutionKind::Read,
         candidate.plan(),
@@ -4589,6 +4597,7 @@ mod tests {
                         .expect("builtin function catalog"),
                 ),
                 Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
+                crate::application::test_constant_policy(),
             ),
             None,
             Arc::clone(&connector_control),

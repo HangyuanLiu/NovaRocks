@@ -182,7 +182,7 @@ pub(crate) fn encode_completed_plan(
         let scans = completed_plan_scan_facts(plan, &encodings)?;
         let provenance = mint_native_encoding_provenance();
         let topology = completed_plan_topology(plan)?;
-        let submission = completed_plan_submission_facts(plan, &encoded, &topology)?;
+        let submission = completed_plan_submission_facts(plan, &encoded, &topology, control)?;
         // A static plan is a property of the plan, not of an attempt: every
         // fragment is frozen here, once, and every attempt -- a recovery
         // included -- creates its tasks from these bytes.
@@ -247,7 +247,8 @@ pub(crate) fn completed_plan_submission_facts(
     plan: &PhysicalPlan,
     encoded: &plan::DistributedPlan,
     topology: &CompletedPlanTopology,
-) -> Result<SubmissionPlanFacts, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<SubmissionPlanFacts, novarocks_plan_codec::PhysicalEncodeError> {
     let mut stream_edge_sources = BTreeSet::new();
     for edge in plan.edges().values() {
         match edge.kind {
@@ -269,7 +270,7 @@ pub(crate) fn completed_plan_submission_facts(
                 return Err(format!(
                     "completed plan fragment {} has sink {other:?}, which this path does not submit",
                     fragment.id().get()
-                ));
+                ).into());
             }
         };
         fragments.push(SubmissionFragmentFacts::for_completed_plan(
@@ -286,7 +287,7 @@ pub(crate) fn completed_plan_submission_facts(
         ));
     }
     let mut cte_consumers = BTreeMap::<u32, Vec<CteMulticastConsumer>>::new();
-    for consumer in novarocks_plan_codec::physical_v1_cte_consumers(plan)? {
+    for consumer in novarocks_plan_codec::physical_v1_cte_consumers(plan, control)? {
         cte_consumers.entry(consumer.cte_id).or_default().push((
             consumer.target_fragment_id,
             consumer.target_exchange_node_id,
@@ -1172,6 +1173,7 @@ mod tests {
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
             noop_constant_evaluator(),
+            crate::application::test_constant_policy(),
             SqlCompileControl::unbounded(),
             PipelineDopDomain {
                 min: 1,

@@ -171,6 +171,7 @@ fn reject_quarantined_mv_targets(
 #[derive(Clone)]
 pub(crate) struct FrontendQueryCompiler {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    constant_policy: novarocks_functions::ConstantPolicy,
     query: QueryPreparationKernel,
     view: ViewExecutionKernel,
     system_tables: SystemTableQueryKernel,
@@ -263,9 +264,11 @@ impl FrontendQueryCompiler {
         mv_candidate_reader: MvCandidateReader,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         connector_blocking_io: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
+        constant_policy: novarocks_functions::ConstantPolicy,
     ) -> Self {
         Self {
             functions,
+            constant_policy,
             query,
             view,
             system_tables,
@@ -274,6 +277,10 @@ impl FrontendQueryCompiler {
             mv_storage_observation,
             connector_blocking_io,
         }
+    }
+
+    pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy
     }
 
     pub(crate) fn prepare_statement(
@@ -347,7 +354,7 @@ impl FrontendQueryCompiler {
                         self.mv_storage_observation.as_ref(),
                     )?)
                 };
-                let analyzed = SqlCompiler::analyze(self.analyze_request(
+                let request = self.analyze_request(
                     &query,
                     current_catalog,
                     current_database,
@@ -362,8 +369,10 @@ impl FrontendQueryCompiler {
                             analyze: false,
                         }
                     },
-                )?)
-                .map_err(FrontendQueryCompilerError::from_compile)?;
+                )?;
+                let explain_control = request.control().clone();
+                let analyzed = SqlCompiler::analyze(request)
+                    .map_err(FrontendQueryCompilerError::from_compile)?;
                 reject_quarantined_mv_targets(
                     materializer.query_table_bindings().as_ref(),
                     self.mv_readiness.as_ref(),
@@ -381,18 +390,13 @@ impl FrontendQueryCompiler {
                     SqlCompiler::optimize(SqlOptimizeRequest::new(
                         analyzed,
                         &statistics,
-                        SqlCompileControl::new(
-                            context.execution().deadline(),
-                            sql_cancellation_observation(
-                                context.execution().cancellation().clone(),
-                            ),
-                        ),
+                        explain_control.clone(),
                     ))
                     .map_err(FrontendQueryCompilerError::from_compile)?
                 };
                 Ok(PreparedQueryOperation::explain_lines(
                     output
-                        .into_explain_lines(level, force_logical_explain)
+                        .into_explain_lines(level, force_logical_explain, &explain_control)
                         .map_err(FrontendQueryCompilerError::from_compile)?,
                 )?)
             }
@@ -532,6 +536,7 @@ impl FrontendQueryCompiler {
             SqlPlanningEnvironment::Distributed,
             novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
             crate::query_execution::constant_eval::constant_evaluator(),
+            self.constant_policy(),
             SqlCompileControl::new(
                 execution.deadline(),
                 sql_cancellation_observation(execution.cancellation().clone()),
@@ -540,6 +545,7 @@ impl FrontendQueryCompiler {
             Self::scan_read_budget(query_options.as_ref()),
             novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
         );
+        let control = request.control().clone();
         let completed = self
             .connector_blocking_io
             .runtime()
@@ -547,8 +553,11 @@ impl FrontendQueryCompiler {
             .map_err(|failure| FrontendQueryCompilerError::from_completion(failure.error()))?;
         let lines = completed
             .candidate()
-            .render_explain_lines(novarocks_sql::compiler::ExplainRenderBudget::default())
-            .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?;
+            .render_explain_lines(
+                novarocks_sql::compiler::ExplainRenderBudget::default(),
+                &control,
+            )
+            .map_err(|error| FrontendQueryCompilerError::from_completion(&error))?;
         Ok(PreparedQueryOperation::explain_lines(lines)
             .map_err(FrontendQueryCompilerError::Engine)?)
     }
@@ -614,6 +623,7 @@ impl FrontendQueryCompiler {
             SqlPlanningEnvironment::Distributed,
             novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
             crate::query_execution::constant_eval::constant_evaluator(),
+            self.constant_policy(),
             SqlCompileControl::new(
                 execution.deadline(),
                 sql_cancellation_observation(execution.cancellation().clone()),
@@ -754,6 +764,7 @@ impl FrontendQueryCompiler {
             SqlPlanningEnvironment::Distributed,
             novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
             crate::query_execution::constant_eval::constant_evaluator(),
+            self.constant_policy(),
             SqlCompileControl::new(
                 execution.deadline(),
                 sql_cancellation_observation(execution.cancellation().clone()),
@@ -873,6 +884,7 @@ impl FrontendQueryCompiler {
             self.functions.as_ref(),
             crate::query_execution::constant_eval::constant_evaluator(),
             mv_definitions,
+            self.constant_policy(),
             SqlCompileControl::new(
                 execution.deadline(),
                 sql_cancellation_observation(execution.cancellation().clone()),

@@ -304,6 +304,7 @@ impl<'a> super::AnalyzerContext<'a> {
                                         l_q,
                                         r_q,
                                         self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                                        self.constant_policy,
                                         self.control,
                                     )
                                     .map_err(|error| error.at_type_mismatch(join.span))?;
@@ -730,8 +731,11 @@ impl<'a> super::AnalyzerContext<'a> {
         }
         let function_arguments = args
             .iter()
-            .map(crate::analysis::function_argument)
-            .collect::<Vec<_>>();
+            .map(|argument| {
+                crate::analysis::function_argument(argument, self.constant_policy, self.control)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(AnalyzeError::function_binding)?;
         let binding = self
             .function_catalog
             .resolve_table_binding("unnest", &function_arguments, self.control)

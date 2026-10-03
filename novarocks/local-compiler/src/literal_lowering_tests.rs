@@ -110,6 +110,7 @@ fn literal_package(ty: FunctionValueType, literal: LiteralValue) -> Arc<Fragment
             FragmentPackageInput {
                 version: PlanVersionId::try_new([63; 16]).unwrap(),
                 required: RequiredContracts::default(),
+                constants: novarocks_physical_plan::ConstantPools::empty(),
                 fragment,
                 expression_uses,
                 calls,

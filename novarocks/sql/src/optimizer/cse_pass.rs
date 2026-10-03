@@ -180,6 +180,7 @@ fn child_ids(scalars: &ScalarArena, id: ScalarId) -> Vec<ScalarId> {
         }
         ScalarNode::ColumnRef(_)
         | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_)
         | ScalarNode::LambdaParamRef { .. }
         | ScalarNode::WindowCall { .. }
         | ScalarNode::Lambda { .. }
@@ -220,6 +221,7 @@ fn eligible(scalars: &ScalarArena, id: ScalarId) -> bool {
     match scalars.node(id) {
         ScalarNode::ColumnRef(_)
         | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_)
         | ScalarNode::LambdaParamRef { .. }
         | ScalarNode::WindowCall { .. }
         | ScalarNode::Lambda { .. }
@@ -451,7 +453,7 @@ fn collect_column_refs_inner(
         ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
             collect_column_refs_inner(scalars, *body, seen, refs);
         }
-        ScalarNode::Literal(_) | ScalarNode::LambdaParamRef { .. } => {}
+        ScalarNode::Literal(_) | ScalarNode::Constant(_) | ScalarNode::LambdaParamRef { .. } => {}
     }
 }
 
@@ -602,6 +604,7 @@ fn substitute(
         }
         ScalarNode::ColumnRef(_)
         | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_)
         | ScalarNode::LambdaParamRef { .. }
         | ScalarNode::WindowCall { .. }
         | ScalarNode::Lambda { .. }

@@ -684,6 +684,7 @@ pub struct FrontendApplicationHost {
     mv_management_audit: Option<Arc<dyn novarocks_mv_application::management::ManagementAuditSink>>,
     mv_startup_isolation: Option<crate::mv::startup_isolation_file::StartupIsolationSource>,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
+    constant_policy: novarocks_functions::ConstantPolicy,
 }
 
 /// Matches the historical `[runtime] optimizer_query_mem_limit_bytes` default.
@@ -771,6 +772,7 @@ pub struct FrontendExecutionConfig {
     runtime_filter_worker_count: NonZeroUsize,
     native_compatibility_id: NativeCompatibilityId,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
+    constant_policy: novarocks_functions::ConstantPolicy,
     mv_scheduler: MvSchedulerConfig,
     mv_maintenance: MaintenanceCoordinatorConfig,
     mv_remote_effect_policy: novarocks_mv_application::management::RemoteEffectPolicy,
@@ -828,11 +830,13 @@ impl FrontendExecutionConfig {
         native_compatibility_id: NativeCompatibilityId,
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
         logical_runtime: FrontendLogicalExecutionRuntimeConfig,
+        constant_policy: novarocks_functions::ConstantPolicy,
     ) -> Self {
         Self {
             runtime_filter_worker_count,
             native_compatibility_id,
             function_catalog,
+            constant_policy,
             mv_scheduler: MvSchedulerConfig::default(),
             mv_maintenance: MaintenanceCoordinatorConfig::default(),
             mv_remote_effect_policy:
@@ -892,17 +896,23 @@ impl FrontendExecutionConfig {
         runtime_filter_worker_count: NonZeroUsize,
         native_compatibility_id: NativeCompatibilityId,
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
+        constant_policy: novarocks_functions::ConstantPolicy,
     ) -> Self {
         Self::new(
             runtime_filter_worker_count,
             native_compatibility_id,
             function_catalog,
             FrontendLogicalExecutionRuntimeConfig::for_test(),
+            constant_policy,
         )
     }
 
     pub(crate) fn function_catalog(&self) -> Arc<novarocks_functions::EngineFunctionCatalog> {
         Arc::clone(&self.function_catalog)
+    }
+
+    pub const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy
     }
 
     pub fn with_query_control_timeouts(mut self, timeouts: FrontendQueryControlTimeouts) -> Self {
@@ -1183,6 +1193,7 @@ impl FrontendApplicationHost {
             mv_management_audit: execution.mv_management_audit.clone(),
             mv_startup_isolation: execution.mv_startup_isolation.clone(),
             function_catalog: execution.function_catalog(),
+            constant_policy: execution.constant_policy,
         };
 
         if let Some(state_store) = state_store
@@ -1594,6 +1605,12 @@ impl FrontendApplicationHost {
         self.lake_publication_runtime_policy
     }
 
+    /// The immutable deployment profile used by every FE constant author.
+    /// This is an admission ceiling, not a memory allocation capability.
+    pub const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy
+    }
+
     pub fn function_catalog(&self) -> Arc<novarocks_functions::EngineFunctionCatalog> {
         Arc::clone(&self.function_catalog)
     }
@@ -1949,6 +1966,23 @@ impl FrontendApplicationHost {
     }
 }
 
+/// Finite constant admission used only by explicit Frontend unit fixtures.
+#[cfg(test)]
+pub(crate) fn test_constant_policy() -> novarocks_functions::ConstantPolicy {
+    novarocks_functions::ConstantPolicy {
+        max_rows: 1 << 20,
+        max_array_nodes: 1 << 20,
+        max_logical_elements: 1 << 24,
+        max_retained_buffer_bytes: 1 << 30,
+        max_type_depth: 64,
+        max_type_nodes: 4096,
+        max_dictionary_depth: 64,
+        max_metadata_bytes: 1 << 20,
+        max_library_validation_work: 1 << 30,
+        max_library_validation_bytes: 1 << 32,
+    }
+}
+
 #[cfg(test)]
 #[path = "application/tests_host.rs"]
 mod host_tests;
@@ -2226,6 +2260,7 @@ mod tests {
                     novarocks_sql::compiler::build_builtin_engine_function_catalog()
                         .expect("builtin function catalog"),
                 ),
+                crate::application::test_constant_policy(),
             ),
             backend,
             Vec::new(),

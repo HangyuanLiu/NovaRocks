@@ -47,7 +47,7 @@ fn random(
         author(
             functions,
             "rand",
-            vec![argument(integer, Some(FunctionLiteral::Int64(42)))],
+            vec![integer_argument(integer, 42)],
             ControlShape::Eager,
         ),
         vec![seed],
@@ -72,7 +72,7 @@ fn round_value(
                     FunctionValueType::new(DataType::Decimal128(38, 0), true),
                     None,
                 ),
-                argument(integer, Some(FunctionLiteral::Int64(-1))),
+                integer_argument(integer, -1),
             ],
             ControlShape::Eager,
         ),

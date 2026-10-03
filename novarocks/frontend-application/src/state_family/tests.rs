@@ -242,6 +242,7 @@ async fn open_application(input: StateStoreHostInput) -> FrontendApplicationHost
                 novarocks_sql::compiler::build_builtin_engine_function_catalog()
                     .expect("builtin function catalog"),
             ),
+            crate::application::test_constant_policy(),
         ),
         backend_config(),
         Vec::new(),

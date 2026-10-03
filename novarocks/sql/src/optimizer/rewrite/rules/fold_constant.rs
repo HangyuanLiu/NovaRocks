@@ -540,7 +540,10 @@ fn fold_scalar_uncached(
     // Post-order: children first, so a node only ever sees already-folded
     // children and "all children are literals" is decidable locally.
     match &mut node {
-        ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {}
+        ScalarNode::ColumnRef(_)
+        | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_) => {}
         ScalarNode::BinaryOp { left, right, .. } => {
             *left = fold_scalar_id(arena, *left, evaluator, memo, work)?;
             *right = fold_scalar_id(arena, *right, evaluator, memo, work)?;
@@ -692,14 +695,15 @@ fn try_fold_node(
     // `Nested` is a pure syntactic wrapper: when its inner expression is a
     // literal the wrapper collapses onto that literal, no evaluation needed.
     if let ScalarNode::Nested(inner) = &node {
-        let ScalarNode::Literal(literal) = arena.node(*inner).clone() else {
-            return Ok(None);
+        let literal = match arena.node(*inner) {
+            ScalarNode::Literal(_) | ScalarNode::Constant(_) => arena.node(*inner).clone(),
+            _ => return Ok(None),
         };
         if !is_wire_encodable_literal_type(&out_type) {
             return Ok(None);
         }
         return Ok(Some(arena.intern_observed(
-            ScalarNode::Literal(literal),
+            literal,
             arena.value_type(id).clone(),
             work.control(),
         )?));
@@ -753,11 +757,23 @@ fn try_fold_node(
     let mut args = Vec::with_capacity(children.len());
     for child in children {
         work.step()?;
-        let ScalarNode::Literal(HashableLiteral(value)) = arena.node(child) else {
-            return Ok(None);
+        let value = match arena.node(child) {
+            ScalarNode::Constant(value) => value.clone(),
+            ScalarNode::Literal(HashableLiteral(value)) => {
+                work.flush()?;
+                let value = crate::constant::admit_syntax_constant(
+                    value,
+                    arena.value_type(child),
+                    arena.constant_policy(),
+                    work.control(),
+                )?;
+                work.flush()?;
+                value
+            }
+            _ => return Ok(None),
         };
         args.push(FoldArg {
-            value: value.clone(),
+            value,
             value_type: arena.value_type(child).clone(),
         });
     }
@@ -766,6 +782,7 @@ fn try_fold_node(
         kind,
         args,
         result_type: arena.value_type(id).clone(),
+        constant_policy: arena.constant_policy(),
     };
 
     work.step()?;
@@ -774,6 +791,7 @@ fn try_fold_node(
         Ok(value) => Ok(value),
         Err(SqlConstantEvaluationError::Evaluation(error)) => Err(error),
         Err(SqlConstantEvaluationError::Control(error)) => return Err(error.into()),
+        Err(SqlConstantEvaluationError::Constant(error)) => return Err(error.into()),
         Err(SqlConstantEvaluationError::InvalidType(error)) => {
             return Err(SqlCompileError::InvalidRequest(error.to_string()));
         }
@@ -794,7 +812,7 @@ fn try_fold_node(
     work.step()?;
     Ok(match evaluated {
         Ok(Some(value)) => Some(arena.intern_observed(
-            ScalarNode::Literal(HashableLiteral(value)),
+            ScalarNode::Constant(value),
             arena.value_type(id).clone(),
             work.control(),
         )?),
@@ -805,6 +823,20 @@ fn try_fold_node(
         // this expression, so a failed fold must never become a planning error.
         Err(_) => None,
     })
+}
+
+#[cfg(test)]
+fn test_fold_value(
+    request: &FoldRequest,
+    value: crate::common::LiteralValue,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError> {
+    Ok(Some(crate::constant::admit_syntax_constant(
+        &value,
+        &request.result_type,
+        request.constant_policy,
+        control,
+    )?))
 }
 
 #[cfg(test)]
@@ -877,8 +909,9 @@ mod tests {
         fn eval_scalar(
             &self,
             request: &FoldRequest,
-            _control: &dyn novarocks_type_contract::PureCompileControl,
-        ) -> Result<Option<LiteralValue>, SqlConstantEvaluationError> {
+            control: &dyn novarocks_type_contract::PureCompileControl,
+        ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>
+        {
             self.calls.fetch_add(1, Ordering::SeqCst);
             match self.mode {
                 FakeMode::Decline => return Ok(None),
@@ -889,7 +922,11 @@ mod tests {
                 FoldNodeKind::BinaryOp(op @ (BinOp::Add | BinOp::Mul), _) => {
                     let mut values = Vec::new();
                     for arg in &request.args {
-                        let LiteralValue::Int(value) = arg.value else {
+                        let Some(value) = arg.value.signed_integer_observed(
+                            CompilePhase::FunctionSpecialization,
+                            control,
+                        )?
+                        else {
                             return Ok(None);
                         };
                         values.push(value);
@@ -901,9 +938,17 @@ mod tests {
                         BinOp::Add => values[0] + values[1],
                         _ => values[0] * values[1],
                     };
-                    Ok(Some(LiteralValue::Int(folded)))
+                    test_fold_value(request, LiteralValue::Int(folded), control)
                 }
-                FoldNodeKind::Function { .. } => Ok(Some(LiteralValue::Int(FUNCTION_MARKER))),
+                FoldNodeKind::Function { .. } => test_fold_value(
+                    request,
+                    if request.result_type.data_type == DataType::Utf8 {
+                        LiteralValue::String(FUNCTION_MARKER.to_string())
+                    } else {
+                        LiteralValue::Int(FUNCTION_MARKER)
+                    },
+                    control,
+                ),
                 _ => Ok(None),
             }
         }
@@ -1073,15 +1118,26 @@ mod tests {
 
     fn assert_int_literal(fixture: &Fixture, id: ScalarId, expected: i64) {
         match fixture.node(id) {
+            ScalarNode::Constant(value) => {
+                assert_eq!(
+                    value
+                        .signed_integer_observed(
+                            CompilePhase::Validate,
+                            crate::optimizer::test_optimizer_control()
+                        )
+                        .unwrap(),
+                    Some(expected)
+                );
+            }
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(value))) => {
                 assert_eq!(value, expected)
             }
-            other => panic!("expected Literal(Int({expected})), got {other:?}"),
+            other => panic!("expected checked integer value {expected}, got {other:?}"),
         }
     }
 
     struct FoldControl {
-        observations: std::sync::Mutex<Vec<u32>>,
+        observations: std::sync::Mutex<Vec<(CompilePhase, u32)>>,
         failure: Option<novarocks_type_contract::CompileControlError>,
         fail_at: usize,
     }
@@ -1091,9 +1147,14 @@ mod tests {
             phase: CompilePhase,
             units: u32,
         ) -> Result<(), novarocks_type_contract::CompileControlError> {
-            assert_eq!(phase, CompilePhase::Validate);
+            // The rule observes Validate; checked CV authors and selected
+            // readers observe FunctionSpecialization on the same request.
+            assert!(matches!(
+                phase,
+                CompilePhase::Validate | CompilePhase::FunctionSpecialization
+            ));
             let mut observations = self.observations.lock().unwrap();
-            observations.push(units);
+            observations.push((phase, units));
             if observations.len() == self.fail_at
                 && let Some(error) = self.failure
             {
@@ -1161,6 +1222,7 @@ mod tests {
                 failure: None,
                 fail_at: usize::MAX,
             };
+            let original_arena = fixture.arena.borrow().clone();
             let result = apply_with_control(&fixture, plan.clone(), &owner).unwrap();
             let rewritten = changed(result);
             let Operator::LogicalProject(project) = rewritten.op else {
@@ -1175,15 +1237,39 @@ mod tests {
             }
             assert_eq!(fixture.calls(), if shared { 1 } else { 320 });
             let observations = owner.observations.lock().unwrap().clone();
-            assert_eq!(observations[0], 0);
-            assert!(observations.iter().all(|units| *units <= 256));
-            assert!(observations.iter().sum::<u32>() >= 320);
+            assert_eq!(observations[0], (CompilePhase::Validate, 0));
+            assert_eq!(observations.last().unwrap().0, CompilePhase::Validate);
+            assert!(observations.iter().all(|(_, units)| *units <= 256));
+            assert!(observations.iter().map(|(_, units)| units).sum::<u32>() >= 320);
+            assert!(
+                observations
+                    .iter()
+                    .any(|(phase, _)| *phase == CompilePhase::FunctionSpecialization)
+            );
+            // Derive refusal locations from actual callbacks. In particular,
+            // CV entry/tail callbacks are not cached-edge Validate quanta.
+            let mut refusal_points = std::collections::BTreeSet::from([1, 2, observations.len()]);
+            for phase in [CompilePhase::Validate, CompilePhase::FunctionSpecialization] {
+                let first = observations.iter().position(|(p, _)| *p == phase).unwrap();
+                let last = observations.iter().rposition(|(p, _)| *p == phase).unwrap();
+                refusal_points.insert(first + 1);
+                refusal_points.insert(last + 1);
+            }
+            if let Some(quantum) = observations.iter().position(|(_, units)| *units == 256) {
+                refusal_points.insert(quantum + 1);
+            }
+            if shared {
+                // Cached edges stay in the rule's pending Validate scope;
+                // fresh CV authors instead flush that scope at each handoff.
+                assert!(observations.iter().any(|(_, units)| *units == 256));
+            }
             for failure in [
                 CompileControlError::Cancelled,
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
             ] {
-                for fail_at in [1, 2, observations.len()] {
+                for fail_at in refusal_points.iter().copied() {
+                    *fixture.arena.borrow_mut() = original_arena.clone();
                     let owner = FoldControl {
                         observations: Default::default(),
                         failure: Some(failure),
@@ -1192,7 +1278,7 @@ mod tests {
                     assert!(
                         matches!(apply_with_control(&fixture, plan.clone(), &owner), Err(error) if error == SqlCompileError::from(failure))
                     );
-                    assert_eq!(owner.observations.lock().unwrap().len(), fail_at);
+                    assert_eq!(*owner.observations.lock().unwrap(), observations[..fail_at]);
                     // A later successful observation cannot recover this result.
                     owner.checkpoint(CompilePhase::Validate, 0).unwrap();
                 }
@@ -1243,6 +1329,14 @@ mod tests {
         let weak = std::sync::Arc::downgrade(&owner);
         let rewritten =
             changed(apply_with_control(&fixture, project(sum), owner.as_ref()).unwrap());
+        assert!(
+            owner
+                .observations
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(phase, _)| *phase == CompilePhase::FunctionSpecialization)
+        );
         drop(owner);
         assert!(weak.upgrade().is_none());
         assert_int_literal(&fixture, project_expr(&rewritten), 2);
@@ -1257,25 +1351,28 @@ mod tests {
                 &self,
                 request: &FoldRequest,
                 control: &dyn PureCompileControl,
-            ) -> Result<Option<LiteralValue>, SqlConstantEvaluationError> {
+            ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>
+            {
                 let mut work =
                     CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
                 let mut sum = 0;
                 for argument in &request.args {
-                    work.step()?;
-                    let LiteralValue::Int(value) = argument.value else {
-                        panic!("expected the real integer fold arguments");
-                    };
+                    work.flush()?;
+                    let value = argument
+                        .value
+                        .signed_integer_observed(CompilePhase::FunctionSpecialization, control)?
+                        .expect("expected real integer fold arguments");
                     sum += value;
+                    work.step()?;
                 }
                 work.finish()?;
-                Ok(Some(LiteralValue::Int(sum)))
+                test_fold_value(request, LiteralValue::Int(sum), control)
             }
         }
         static EVALUATOR: ObservedEvaluator = ObservedEvaluator;
         struct Owner {
             checks: std::sync::Mutex<Vec<(CompilePhase, u32)>>,
-            failure: Option<(bool, CompileControlError)>,
+            failure: Option<(usize, CompileControlError)>,
         }
         impl PureCompileControl for Owner {
             fn checkpoint(
@@ -1283,10 +1380,11 @@ mod tests {
                 phase: CompilePhase,
                 units: u32,
             ) -> Result<(), CompileControlError> {
-                self.checks.lock().unwrap().push((phase, units));
-                if phase == CompilePhase::FunctionSpecialization
-                    && let Some((positive, error)) = self.failure
-                    && (units > 0) == positive
+                let mut checks = self.checks.lock().unwrap();
+                let index = checks.len();
+                checks.push((phase, units));
+                if let Some((fail_at, error)) = self.failure
+                    && index == fail_at
                 {
                     return Err(error);
                 }
@@ -1301,75 +1399,69 @@ mod tests {
             checks: Default::default(),
             failure: None,
         };
+        let original_arena = fixture.arena.borrow().clone();
         let rewritten = changed(
             apply_with_evaluator(&fixture, project(sum), Some(&EVALUATOR), &owner).unwrap(),
         );
         assert_int_literal(&fixture, project_expr(&rewritten), 3);
-        let checks = owner.checks.lock().unwrap();
-        let specialization = checks
-            .iter()
-            .filter(|(phase, _)| *phase == CompilePhase::FunctionSpecialization)
-            .copied()
-            .collect::<Vec<_>>();
-        assert_eq!(
-            specialization,
-            [
-                (CompilePhase::FunctionSpecialization, 0),
-                (CompilePhase::FunctionSpecialization, 2),
-            ]
-        );
-        let entry = checks
-            .iter()
-            .position(|check| *check == specialization[0])
-            .unwrap();
-        assert_eq!(checks[entry - 1].0, CompilePhase::Validate);
+        let checks = owner.checks.lock().unwrap().clone();
+        assert!(checks.iter().all(|(_, units)| *units <= 256));
         assert!(
-            checks[entry - 1].1 > 0,
-            "caller work must be flushed before the owner"
+            checks.iter().any(
+                |(phase, units)| *phase == CompilePhase::FunctionSpecialization && *units == 0
+            )
         );
-        drop(checks);
+        assert!(
+            checks
+                .iter()
+                .any(|(phase, units)| *phase == CompilePhase::FunctionSpecialization && *units > 0)
+        );
+        let first_owner = checks
+            .iter()
+            .position(|(phase, _)| *phase == CompilePhase::FunctionSpecialization)
+            .unwrap();
+        assert_eq!(checks[first_owner - 1].0, CompilePhase::Validate);
+        assert!(
+            checks[first_owner - 1].1 > 0,
+            "caller work must flush before the owner"
+        );
         for error in [
             CompileControlError::Cancelled,
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            for positive in [false, true] {
+            for fail_at in 0..checks.len() {
+                *fixture.arena.borrow_mut() = original_arena.clone();
                 let owner = Owner {
                     checks: Default::default(),
-                    failure: Some((positive, error)),
+                    failure: Some((fail_at, error)),
                 };
-                assert!(matches!(
-                    apply_with_evaluator(&fixture, project(sum), Some(&EVALUATOR), &owner),
-                    Err(actual) if actual == SqlCompileError::from(error)
-                ));
-                assert_eq!(
-                    owner.checks.lock().unwrap().last(),
-                    Some(&(
-                        CompilePhase::FunctionSpecialization,
-                        if positive { 2 } else { 0 }
-                    ))
+                assert!(
+                    matches!(apply_with_evaluator(&fixture,project(sum),Some(&EVALUATOR),&owner),
+                    Err(actual) if actual == SqlCompileError::from(error))
                 );
-                // A later successful observation cannot undo the returned failure.
-                owner.checkpoint(CompilePhase::Validate, 0).unwrap();
+                assert_eq!(*owner.checks.lock().unwrap(), checks[..=fail_at]);
             }
         }
     }
 
     #[test]
     fn legacy_evaluation_error_text_does_not_impersonate_typed_request_failure() {
-        struct LegacyError;
+        struct LegacyError(AtomicUsize);
         impl SqlConstantEvaluator for LegacyError {
             fn eval_scalar(
                 &self,
                 _: &FoldRequest,
                 _: &dyn novarocks_type_contract::PureCompileControl,
-            ) -> Result<Option<LiteralValue>, SqlConstantEvaluationError> {
+            ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>
+            {
+                self.0.fetch_add(1, Ordering::SeqCst);
                 Err(SqlConstantEvaluationError::Evaluation(
                     "pure compilation was cancelled".to_string(),
                 ))
             }
         }
-        static EVALUATOR: LegacyError = LegacyError;
+        static EVALUATOR: LegacyError = LegacyError(AtomicUsize::new(0));
         let fixture = Fixture::without_evaluator();
         let one = fixture.int_literal(1);
         let sum = fixture.binary(BinOp::Add, one, one);
@@ -1383,6 +1475,15 @@ mod tests {
             RewriteResult::Unchanged
         ));
         assert!(matches!(fixture.node(sum), ScalarNode::BinaryOp { .. }));
+        assert_eq!(EVALUATOR.0.load(Ordering::SeqCst), 1);
+        let observations = owner.observations.lock().unwrap();
+        assert_eq!(observations.first(), Some(&(CompilePhase::Validate, 0)));
+        assert_eq!(observations.last().unwrap().0, CompilePhase::Validate);
+        assert!(
+            observations
+                .iter()
+                .any(|(phase, _)| *phase == CompilePhase::FunctionSpecialization)
+        );
     }
 
     // -- tests -------------------------------------------------------------
@@ -1506,7 +1607,7 @@ mod tests {
         let roundtrip =
             fold_scalar_id(&mut arena, consumer, evaluator, &mut memo, &mut work).unwrap();
         work.finish().unwrap();
-        assert!(matches!(arena.node(standalone), ScalarNode::Literal(_)));
+        assert!(matches!(arena.node(standalone), ScalarNode::Constant(_)));
         let ScalarNode::FunctionCall { args, .. } = arena.node(roundtrip) else {
             panic!("roundtrip must not reuse the standalone folded literal");
         };
@@ -1975,13 +2076,14 @@ mod overflow_policy_tests {
         fn eval_scalar(
             &self,
             request: &FoldRequest,
-            _control: &dyn novarocks_type_contract::PureCompileControl,
-        ) -> Result<Option<LiteralValue>, SqlConstantEvaluationError> {
+            control: &dyn novarocks_type_contract::PureCompileControl,
+        ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>
+        {
             match request.kind {
                 FoldNodeKind::BinaryOp(BinOp::Add, ReportError)
                 | FoldNodeKind::Cast(ReportError) => Err("checked overflow".to_string().into()),
                 FoldNodeKind::BinaryOp(BinOp::Add, OutputNull) | FoldNodeKind::Cast(OutputNull) => {
-                    Ok(Some(LiteralValue::Null))
+                    test_fold_value(request, LiteralValue::Null, control)
                 }
                 _ => Ok(None),
             }
@@ -2029,12 +2131,28 @@ mod overflow_policy_tests {
             );
             let original = arena.node(throwing).clone();
             assert!(try_fold_test_node(&mut arena, throwing, &EVALUATOR).is_none());
-            assert_eq!(arena.node(throwing), &original);
+            assert_eq!(
+                arena
+                    .intern_observed(
+                        original,
+                        arena.value_type(throwing).clone(),
+                        crate::optimizer::test_optimizer_control()
+                    )
+                    .unwrap(),
+                throwing
+            );
             let folded = try_fold_test_node(&mut arena, nullable, &EVALUATOR).unwrap();
-            assert!(matches!(
-                arena.node(folded),
-                ScalarNode::Literal(HashableLiteral(LiteralValue::Null))
-            ));
+            let ScalarNode::Constant(value) = arena.node(folded) else {
+                panic!("checked NULL expected")
+            };
+            assert!(
+                value
+                    .is_null_observed(
+                        CompilePhase::Validate,
+                        crate::optimizer::test_optimizer_control()
+                    )
+                    .unwrap()
+            );
             assert!(try_fold_test_node(&mut arena, throwing, &EVALUATOR).is_none());
         }
     }
@@ -2046,11 +2164,14 @@ mod overflow_policy_tests {
             fn eval_scalar(
                 &self,
                 request: &FoldRequest,
-                _control: &dyn novarocks_type_contract::PureCompileControl,
-            ) -> Result<Option<LiteralValue>, SqlConstantEvaluationError> {
+                control: &dyn novarocks_type_contract::PureCompileControl,
+            ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>
+            {
                 match request.kind {
                     FoldNodeKind::BinaryOp(BinOp::Mul, OutputNull)
-                    | FoldNodeKind::Cast(OutputNull) => Ok(Some(LiteralValue::Null)),
+                    | FoldNodeKind::Cast(OutputNull) => {
+                        test_fold_value(request, LiteralValue::Null, control)
+                    }
                     _ => Ok(None),
                 }
             }
@@ -2092,15 +2213,31 @@ mod overflow_policy_tests {
             let guarded =
                 crate::compiler::constant_evaluator_for_legacy_mode(Some(&NULLABLE), true).unwrap();
             assert!(try_fold_test_node(&mut arena, id, guarded).is_none());
-            assert_eq!(arena.node(id), &original);
+            assert_eq!(
+                arena
+                    .intern_observed(
+                        original,
+                        arena.value_type(id).clone(),
+                        crate::optimizer::test_optimizer_control()
+                    )
+                    .unwrap(),
+                id
+            );
             let default =
                 crate::compiler::constant_evaluator_for_legacy_mode(Some(&NULLABLE), false)
                     .unwrap();
             let folded = try_fold_test_node(&mut arena, id, default).unwrap();
-            assert!(matches!(
-                arena.node(folded),
-                ScalarNode::Literal(HashableLiteral(LiteralValue::Null))
-            ));
+            let ScalarNode::Constant(value) = arena.node(folded) else {
+                panic!("checked NULL expected")
+            };
+            assert!(
+                value
+                    .is_null_observed(
+                        CompilePhase::Validate,
+                        crate::optimizer::test_optimizer_control()
+                    )
+                    .unwrap()
+            );
             let nested = arena.intern(
                 ScalarNode::Nested(literal),
                 novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(38, 0), false),
@@ -2127,7 +2264,8 @@ mod complete_fold_type_tests {
             &self,
             request: &FoldRequest,
             _: &dyn novarocks_type_contract::PureCompileControl,
-        ) -> Result<Option<LiteralValue>, SqlConstantEvaluationError> {
+        ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>
+        {
             self.0.lock().unwrap().push(request.clone());
             Ok(None)
         }
@@ -2190,7 +2328,15 @@ mod complete_fold_type_tests {
         for (request, expected) in requests.iter().zip(&root_types) {
             assert_eq!(&request.result_type, expected);
             assert_eq!(request.args.len(), 1);
-            assert_eq!(request.args[0].value, LiteralValue::Null);
+            assert!(
+                request.args[0]
+                    .value
+                    .is_null_observed(
+                        CompilePhase::Validate,
+                        crate::optimizer::test_optimizer_control()
+                    )
+                    .unwrap()
+            );
             assert_eq!(request.args[0].value_type, nested_type);
             let DataType::Struct(fields) = &request.args[0].value_type.data_type else {
                 panic!("the authored structure must survive the real request");
@@ -2207,7 +2353,8 @@ mod complete_fold_type_tests {
             &self,
             _: &FoldRequest,
             _: &dyn novarocks_type_contract::PureCompileControl,
-        ) -> Result<Option<LiteralValue>, SqlConstantEvaluationError> {
+        ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>
+        {
             Err(SqlConstantEvaluationError::Preparation(
                 self.0.lock().unwrap().as_ref().unwrap().clone(),
             ))
@@ -2296,7 +2443,8 @@ mod complete_fold_type_tests {
             &self,
             _: &FoldRequest,
             _: &dyn novarocks_type_contract::PureCompileControl,
-        ) -> Result<Option<LiteralValue>, SqlConstantEvaluationError> {
+        ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>
+        {
             Err(ValueTypeError::InvalidLogicalCarrier(ValueLogicalType::Json).into())
         }
     }
@@ -2328,3 +2476,7 @@ mod complete_fold_type_tests {
         assert!(matches!(arena.node(root), ScalarNode::Cast { .. }));
     }
 }
+
+#[cfg(test)]
+#[path = "fold_constant/cv_tests.rs"]
+mod cv_tests;

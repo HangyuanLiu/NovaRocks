@@ -22,6 +22,7 @@
 //! provider implementation, runtime object, or I/O capability.
 
 mod builder;
+mod constants;
 mod expression;
 mod expression_site;
 mod frozen_calls;
@@ -36,6 +37,7 @@ mod resource;
 mod validation;
 
 pub use builder::*;
+pub use constants::*;
 pub use expression::*;
 pub use expression_site::*;
 pub use frozen_calls::*;

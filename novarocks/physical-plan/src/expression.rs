@@ -201,6 +201,8 @@ pub enum ExprKind {
         ordinal: u32,
     },
     Literal(LiteralValue),
+    /// Exact address in the sole immutable plan/package checked pool table.
+    Constant(crate::ConstantReference),
     Unary {
         op: UnaryOperator,
         expr: ExprId,
@@ -324,7 +326,10 @@ impl ExprKind {
         mut visit: impl FnMut(ExprId) -> Result<(), E>,
     ) -> Result<(), E> {
         match self {
-            Self::Value(_) | Self::LambdaParameter { .. } | Self::Literal(_) => {}
+            Self::Value(_)
+            | Self::LambdaParameter { .. }
+            | Self::Literal(_)
+            | Self::Constant(_) => {}
             Self::Unary { expr, .. }
             | Self::Cast { expr, .. }
             | Self::IsNull { expr, .. }
@@ -475,6 +480,7 @@ pub fn expressions_are_replica_deterministic(
                 function.volatility == FunctionVolatility::Immutable
             }
             ExprKind::Literal(_)
+            | ExprKind::Constant(_)
             | ExprKind::LambdaParameter { .. }
             | ExprKind::Unary { .. }
             | ExprKind::Binary { .. }

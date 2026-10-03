@@ -368,6 +368,7 @@ impl ViewEngine for FrontendViewEngine {
             &provider,
             database,
             self.function_catalog(),
+            self.kernel.constant_policy(),
             &control,
         )
         .map_err(|error| error.to_string())?

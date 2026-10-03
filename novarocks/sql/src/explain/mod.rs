@@ -19,7 +19,9 @@
 
 pub(crate) mod completed;
 pub(crate) mod completed_tree;
-use std::fmt::Write;
+
+use crate::compiler::SqlCompileError;
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 
 use crate::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, ProjectItem, SortItem, TypedExpr, UnOp,
@@ -47,33 +49,136 @@ pub enum ExplainLevel {
     Contract,
 }
 
-/// Format a single LogicalPlanNode tree as EXPLAIN text lines.
-#[allow(dead_code)]
+/// Format one logical plan under the original compile control.
 pub(crate) fn explain_plan_checked(
     plan: &LogicalPlanNode,
     level: ExplainLevel,
-) -> Result<Vec<String>, String> {
-    Ok(explain_plan_unchecked(plan, level))
+    control: &dyn PureCompileControl,
+) -> Result<Vec<String>, SqlCompileError> {
+    format_checked(control, |work| {
+        let mut out = Vec::new();
+        format_node_with_work(plan, level, 0, &mut out, work)?;
+        Ok(out)
+    })
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn explain_plan(plan: &LogicalPlanNode, level: ExplainLevel) -> Vec<String> {
-    explain_plan_checked(plan, level).expect("invalid logical plan stage")
+    explain_plan_checked(
+        plan,
+        level,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .expect("invalid logical plan stage")
 }
 
-fn explain_plan_unchecked(plan: &LogicalPlanNode, level: ExplainLevel) -> Vec<String> {
-    let mut out = Vec::new();
-    format_node(plan, level, 0, &mut out);
-    out
+fn format_checked<T>(
+    control: &dyn PureCompileControl,
+    format: impl FnOnce(&mut CompileCheckpoints<'_>) -> Result<T, SqlCompileError>,
+) -> Result<T, SqlCompileError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let result = format(&mut work);
+    if matches!(
+        &result,
+        Err(SqlCompileError::Cancelled
+            | SqlCompileError::DeadlineExceeded
+            | SqlCompileError::ResourceExhausted)
+    ) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+
+// These helpers observe the work performed by this formatter. Standard library
+// formatting and external type diagnostics remain opaque library operations;
+// this diagnostic API is not an allocation grant or a semantic identity author.
+fn append_text(
+    out: &mut String,
+    text: &str,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), SqlCompileError> {
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = start.saturating_add(1024).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.push_str(&text[start..end]);
+        work.step()?;
+        start = end;
+    }
+    Ok(())
+}
+
+fn copy_text(text: &str, work: &mut CompileCheckpoints<'_>) -> Result<String, SqlCompileError> {
+    let mut out = String::new();
+    append_text(&mut out, text, work)?;
+    Ok(out)
+}
+
+fn join_text<T: AsRef<str>>(
+    items: &[T],
+    separator: &str,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<String, SqlCompileError> {
+    let mut out = String::new();
+    for (index, item) in items.iter().enumerate() {
+        if index != 0 {
+            append_text(&mut out, separator, work)?;
+        }
+        append_text(&mut out, item.as_ref(), work)?;
+        work.step()?;
+    }
+    Ok(out)
+}
+
+fn uppercase_text(
+    text: &str,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<String, SqlCompileError> {
+    let mut out = String::new();
+    for character in text.chars() {
+        for upper in character.to_uppercase() {
+            out.push(upper);
+        }
+        work.step()?;
+    }
+    Ok(out)
+}
+
+fn format_binary(
+    bytes: &[u8],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<String, SqlCompileError> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::from("X'");
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 15) as usize] as char);
+        work.step()?;
+    }
+    out.push('\'');
+    Ok(out)
 }
 
 #[allow(dead_code)]
-fn format_node(plan: &LogicalPlanNode, level: ExplainLevel, indent: usize, out: &mut Vec<String>) {
+fn format_node_with_work(
+    plan: &LogicalPlanNode,
+    level: ExplainLevel,
+    indent: usize,
+    out: &mut Vec<String>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), SqlCompileError> {
     let pad = "  ".repeat(indent);
     match &plan.kind {
         LogicalPlanKind::Scan(node) => {
-            let header = format_shared_plan_node_header(&plan.kind, PlanNodeExplainStage::Logical)
-                .expect("Scan is a shared explain node");
+            let header = format_shared_plan_node_header_with_work(
+                &plan.kind,
+                PlanNodeExplainStage::Logical,
+                work,
+            )?
+            .expect("Scan is a shared explain node");
             out.push(format!("{pad}0:{header}",));
             if let Some(ref cols) = node.required_columns
                 && matches!(
@@ -81,66 +186,108 @@ fn format_node(plan: &LogicalPlanNode, level: ExplainLevel, indent: usize, out: 
                     ExplainLevel::Verbose | ExplainLevel::Costs | ExplainLevel::Analyze
                 )
             {
-                let names = cols
-                    .iter()
-                    .map(|required| {
-                        node.columns
-                            .iter()
-                            .find(|column| column.column_id == *required)
-                            .map(|column| column.name.clone())
-                            .unwrap_or_else(|| format!("ColumnId({})", required.0))
-                    })
-                    .collect::<Vec<_>>();
-                out.push(format!("{pad}     columns: {}", names.join(", ")));
+                let mut names = Vec::new();
+                for required in cols {
+                    let mut found = None;
+                    for column in &node.columns {
+                        let matches = column.column_id == *required;
+                        work.step()?;
+                        if matches {
+                            found = Some(copy_text(&column.name, work)?);
+                            break;
+                        }
+                    }
+                    names.push(found.unwrap_or_else(|| format!("ColumnId({})", required.0)));
+                    work.step()?;
+                }
+                out.push(format!(
+                    "{pad}     columns: {}",
+                    join_text(&names, ", ", work)?
+                ));
             }
             if matches!(
                 level,
                 ExplainLevel::Verbose | ExplainLevel::Costs | ExplainLevel::Analyze
-            ) && let Some(source) = logical_scan_source_label(&node.table.source)
+            ) && let Some(source) =
+                logical_scan_source_label_with_work(&node.table.source, work)?
             {
                 out.push(format!("{pad}     source: {source}"));
             }
             if !node.predicates.is_empty() {
-                let preds: Vec<String> = node.predicates.iter().map(format_expr).collect();
-                out.push(format!("{pad}     predicates: {}", preds.join(" AND ")));
+                let preds: Vec<String> = node
+                    .predicates
+                    .iter()
+                    .map(|expr| format_expr_with_work(expr, work))
+                    .collect::<Result<_, SqlCompileError>>()?;
+                out.push(format!(
+                    "{pad}     predicates: {}",
+                    join_text(&preds, " AND ", work)?
+                ));
             }
         }
         LogicalPlanKind::Filter(_) => {
-            let header = format_shared_plan_node_header(&plan.kind, PlanNodeExplainStage::Logical)
-                .expect("Filter is a shared explain node");
+            let header = format_shared_plan_node_header_with_work(
+                &plan.kind,
+                PlanNodeExplainStage::Logical,
+                work,
+            )?
+            .expect("Filter is a shared explain node");
             out.push(format!("{pad}{header}"));
-            for line in
-                format_shared_plan_node_detail_lines(&plan.kind, PlanNodeExplainStage::Logical)
-            {
+            for line in format_shared_plan_node_detail_lines_with_work(
+                &plan.kind,
+                PlanNodeExplainStage::Logical,
+                work,
+            )? {
                 out.push(format!("{pad}  {line}"));
             }
-            format_node(plan.unary_input(), level, indent + 1, out);
+            format_node_with_work(plan.unary_input(), level, indent + 1, out, work)?;
         }
         LogicalPlanKind::Project(_) => {
-            let header = format_shared_plan_node_header(&plan.kind, PlanNodeExplainStage::Logical)
-                .expect("Project is a shared explain node");
+            let header = format_shared_plan_node_header_with_work(
+                &plan.kind,
+                PlanNodeExplainStage::Logical,
+                work,
+            )?
+            .expect("Project is a shared explain node");
             out.push(format!("{pad}{header}"));
-            format_node(plan.unary_input(), level, indent + 1, out);
+            format_node_with_work(plan.unary_input(), level, indent + 1, out, work)?;
         }
         LogicalPlanKind::Aggregate(node) => {
-            let groups: Vec<String> = node.group_by.iter().map(format_expr).collect();
+            let groups: Vec<String> = node
+                .group_by
+                .iter()
+                .map(|expr| format_expr_with_work(expr, work))
+                .collect::<Result<_, SqlCompileError>>()?;
             let aggs: Vec<String> = node
                 .aggregates
                 .iter()
                 .map(|a| {
-                    let args: Vec<String> = a.args.iter().map(format_expr).collect();
+                    let args: Vec<String> = a
+                        .args
+                        .iter()
+                        .map(|expr| format_expr_with_work(expr, work))
+                        .collect::<Result<_, SqlCompileError>>()?;
                     let distinct = if a.distinct { "DISTINCT " } else { "" };
-                    format!("{}({}{})", a.name, distinct, args.join(", "))
+                    let value =
+                        format!("{}({}{})", a.name, distinct, join_text(&args, ", ", work)?);
+                    work.step()?;
+                    Ok(value)
                 })
-                .collect();
+                .collect::<Result<_, SqlCompileError>>()?;
             out.push(format!("{pad}AGGREGATE"));
             if !groups.is_empty() {
-                out.push(format!("{pad}  group by: {}", groups.join(", ")));
+                out.push(format!(
+                    "{pad}  group by: {}",
+                    join_text(&groups, ", ", work)?
+                ));
             }
             if !aggs.is_empty() {
-                out.push(format!("{pad}  aggregations: {}", aggs.join(", ")));
+                out.push(format!(
+                    "{pad}  aggregations: {}",
+                    join_text(&aggs, ", ", work)?
+                ));
             }
-            format_node(plan.unary_input(), level, indent + 1, out);
+            format_node_with_work(plan.unary_input(), level, indent + 1, out, work)?;
         }
         LogicalPlanKind::Join(node) => {
             let join_str = match node.join_type {
@@ -157,16 +304,20 @@ fn format_node(plan: &LogicalPlanNode, level: ExplainLevel, indent: usize, out: 
             };
             out.push(format!("{pad}{join_str}"));
             if let Some(ref cond) = node.condition {
-                out.push(format!("{pad}  on: {}", format_expr(cond)));
+                out.push(format!("{pad}  on: {}", format_expr_with_work(cond, work)?));
             }
-            format_node(plan.left(), level, indent + 1, out);
-            format_node(plan.right(), level, indent + 1, out);
+            format_node_with_work(plan.left(), level, indent + 1, out, work)?;
+            format_node_with_work(plan.right(), level, indent + 1, out, work)?;
         }
         LogicalPlanKind::Sort(_) => {
-            let body = format_shared_plan_node_header(&plan.kind, PlanNodeExplainStage::Logical)
-                .expect("Sort is a shared explain node");
+            let body = format_shared_plan_node_header_with_work(
+                &plan.kind,
+                PlanNodeExplainStage::Logical,
+                work,
+            )?
+            .expect("Sort is a shared explain node");
             out.push(format!("{pad}{body}"));
-            format_node(plan.unary_input(), level, indent + 1, out);
+            format_node_with_work(plan.unary_input(), level, indent + 1, out, work)?;
         }
         LogicalPlanKind::Limit(node) => {
             let mut parts = Vec::new();
@@ -176,64 +327,84 @@ fn format_node(plan: &LogicalPlanNode, level: ExplainLevel, indent: usize, out: 
             if let Some(offset) = node.offset {
                 parts.push(format!("offset={offset}"));
             }
-            out.push(format!("{pad}LIMIT [{}]", parts.join(", ")));
-            format_node(plan.unary_input(), level, indent + 1, out);
+            out.push(format!("{pad}LIMIT [{}]", join_text(&parts, ", ", work)?));
+            format_node_with_work(plan.unary_input(), level, indent + 1, out, work)?;
         }
         LogicalPlanKind::Union(node) => {
             let kind = if node.all { "UNION ALL" } else { "UNION" };
             out.push(format!("{pad}{kind}"));
             for input in &plan.children {
-                format_node(input, level, indent + 1, out);
+                format_node_with_work(input, level, indent + 1, out, work)?;
             }
         }
         LogicalPlanKind::Intersect(_) => {
             out.push(format!("{pad}INTERSECT"));
             for input in &plan.children {
-                format_node(input, level, indent + 1, out);
+                format_node_with_work(input, level, indent + 1, out, work)?;
             }
         }
         LogicalPlanKind::Except(_) => {
             out.push(format!("{pad}EXCEPT"));
             for input in &plan.children {
-                format_node(input, level, indent + 1, out);
+                format_node_with_work(input, level, indent + 1, out, work)?;
             }
         }
         LogicalPlanKind::Window(_) => {
-            let header = format_shared_plan_node_header(&plan.kind, PlanNodeExplainStage::Logical)
-                .expect("Window is a shared explain node");
+            let header = format_shared_plan_node_header_with_work(
+                &plan.kind,
+                PlanNodeExplainStage::Logical,
+                work,
+            )?
+            .expect("Window is a shared explain node");
             out.push(format!("{pad}{header}"));
-            format_node(plan.unary_input(), level, indent + 1, out);
+            format_node_with_work(plan.unary_input(), level, indent + 1, out, work)?;
         }
         LogicalPlanKind::Values(_) => {
-            let body = format_shared_plan_node_header(&plan.kind, PlanNodeExplainStage::Logical)
-                .expect("Values is a shared explain node");
+            let body = format_shared_plan_node_header_with_work(
+                &plan.kind,
+                PlanNodeExplainStage::Logical,
+                work,
+            )?
+            .expect("Values is a shared explain node");
             out.push(format!("{pad}{body}"));
         }
         LogicalPlanKind::GenerateSeries(_) => {
-            let body = format_shared_plan_node_header(&plan.kind, PlanNodeExplainStage::Logical)
-                .expect("GenerateSeries is a shared explain node");
+            let body = format_shared_plan_node_header_with_work(
+                &plan.kind,
+                PlanNodeExplainStage::Logical,
+                work,
+            )?
+            .expect("GenerateSeries is a shared explain node");
             out.push(format!("{pad}{body}"));
         }
         LogicalPlanKind::TableFunction(_) => {
-            let body = format_shared_plan_node_header(&plan.kind, PlanNodeExplainStage::Logical)
-                .expect("TableFunction is a shared explain node");
+            let body = format_shared_plan_node_header_with_work(
+                &plan.kind,
+                PlanNodeExplainStage::Logical,
+                work,
+            )?
+            .expect("TableFunction is a shared explain node");
             out.push(format!("{pad}{body}"));
-            format_node(plan.unary_input(), level, indent + 1, out);
+            format_node_with_work(plan.unary_input(), level, indent + 1, out, work)?;
         }
         LogicalPlanKind::Repeat(_) => {
-            let body = format_shared_plan_node_header(&plan.kind, PlanNodeExplainStage::Logical)
-                .expect("Repeat is a shared explain node");
+            let body = format_shared_plan_node_header_with_work(
+                &plan.kind,
+                PlanNodeExplainStage::Logical,
+                work,
+            )?
+            .expect("Repeat is a shared explain node");
             out.push(format!("{pad}{body}"));
-            format_node(plan.unary_input(), level, indent + 1, out);
+            format_node_with_work(plan.unary_input(), level, indent + 1, out, work)?;
         }
         LogicalPlanKind::CTEAnchor(node) => {
             out.push(format!("{pad}CTE_ANCHOR(cte_id={})", node.cte_id));
-            format_node(plan.child(0), level, indent + 1, out);
-            format_node(plan.child(1), level, indent + 1, out);
+            format_node_with_work(plan.child(0), level, indent + 1, out, work)?;
+            format_node_with_work(plan.child(1), level, indent + 1, out, work)?;
         }
         LogicalPlanKind::CTEProduce(node) => {
             out.push(format!("{pad}CTE_PRODUCE(cte_id={})", node.cte_id));
-            format_node(plan.unary_input(), level, indent + 1, out);
+            format_node_with_work(plan.unary_input(), level, indent + 1, out, work)?;
         }
         LogicalPlanKind::CTEConsume(node) => {
             out.push(format!("{pad}CTE_CONSUME(cte_id={})", node.cte_id));
@@ -251,23 +422,33 @@ fn format_node(plan: &LogicalPlanNode, level: ExplainLevel, indent: usize, out: 
                 !node.correlation_column_ids.is_empty(),
                 node.use_semi_anti
             ));
-            format_node(plan.left(), level, indent + 1, out);
-            format_node(plan.right(), level, indent + 1, out);
+            format_node_with_work(plan.left(), level, indent + 1, out, work)?;
+            format_node_with_work(plan.right(), level, indent + 1, out, work)?;
         }
         LogicalPlanKind::AssertOneRow(_) => {
-            let body = format_shared_plan_node_header(&plan.kind, PlanNodeExplainStage::Logical)
-                .expect("AssertOneRow is a shared explain node");
+            let body = format_shared_plan_node_header_with_work(
+                &plan.kind,
+                PlanNodeExplainStage::Logical,
+                work,
+            )?
+            .expect("AssertOneRow is a shared explain node");
             out.push(format!("{pad}{body}"));
-            format_node(plan.unary_input(), level, indent + 1, out);
+            format_node_with_work(plan.unary_input(), level, indent + 1, out, work)?;
         }
         LogicalPlanKind::ImvDelta(_) | LogicalPlanKind::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
     }
+
+    work.step()?;
+    Ok(())
 }
 
-fn logical_scan_source_label(source: &ScanSource) -> Option<String> {
-    match source {
+fn logical_scan_source_label_with_work(
+    source: &ScanSource,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<String>, SqlCompileError> {
+    let value = match source {
         ScanSource::Sql(source) => match &source.kind {
             crate::planner::table::SqlScanKind::Delta {
                 from_snapshot_id,
@@ -289,8 +470,8 @@ fn logical_scan_source_label(source: &ScanSource) -> Option<String> {
                 source.table.catalog,
                 source.table.namespace,
                 source.table.table,
-                facts.group_key_names.join(","),
-                facts.aggregate_state_names.join(","),
+                join_text(&facts.group_key_names, ",", work)?,
+                join_text(&facts.aggregate_state_names, ",", work)?,
                 facts.constraint_summary()
             )),
             crate::planner::table::SqlScanKind::MvTargetLocator { facts } => Some(format!(
@@ -307,7 +488,9 @@ fn logical_scan_source_label(source: &ScanSource) -> Option<String> {
             )),
             _ => None,
         },
-    }
+    };
+    work.step()?;
+    Ok(value)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -316,11 +499,12 @@ pub(crate) enum PlanNodeExplainStage {
     Distributed,
 }
 
-pub(crate) fn format_shared_plan_node_header(
+fn format_shared_plan_node_header_with_work(
     kind: &LogicalPlanKind,
     stage: PlanNodeExplainStage,
-) -> Option<String> {
-    match kind {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<String>, SqlCompileError> {
+    let value = match kind {
         LogicalPlanKind::Scan(node) => {
             let alias = node
                 .alias
@@ -337,17 +521,17 @@ pub(crate) fn format_shared_plan_node_header(
             let items = node
                 .items
                 .iter()
-                .map(format_project_item)
-                .collect::<Vec<_>>();
-            Some(format!("PROJECT [{}]", items.join(", ")))
+                .map(|item| format_project_item_with_work(item, work))
+                .collect::<Result<Vec<_>, SqlCompileError>>()?;
+            Some(format!("PROJECT [{}]", join_text(&items, ", ", work)?))
         }
         LogicalPlanKind::Sort(node) => {
-            let items = format_sort_items(&node.items);
-            Some(format!("SORT BY [{}]", items.join(", ")))
+            let items = format_sort_items_with_work(&node.items, work)?;
+            Some(format!("SORT BY [{}]", join_text(&items, ", ", work)?))
         }
         LogicalPlanKind::Window(node) => {
-            let fns = format_window_exprs(&node.window_exprs, stage);
-            Some(format!("WINDOW [{}]", fns.join("; ")))
+            let fns = format_window_exprs_with_work(&node.window_exprs, stage, work)?;
+            Some(format!("WINDOW [{}]", join_text(&fns, "; ", work)?))
         }
         LogicalPlanKind::Values(node) => Some(format!("VALUES ({} rows)", node.rows.len())),
         LogicalPlanKind::Repeat(node) => Some(format!(
@@ -363,38 +547,54 @@ pub(crate) fn format_shared_plan_node_header(
             Some(format!(
                 "TABLE_FUNCTION [{} {}]",
                 join_type,
-                node.function_name.to_uppercase()
+                uppercase_text(&node.function_name, work)?
             ))
         }
-        LogicalPlanKind::AssertOneRow(node) => Some(format_assert_one_row_header(node, stage)),
+        LogicalPlanKind::AssertOneRow(node) => {
+            Some(format_assert_one_row_header_with_work(node, stage, work)?)
+        }
         _ => None,
-    }
+    };
+    work.step()?;
+    Ok(value)
 }
 
-pub(crate) fn format_assert_one_row_header(
+fn format_assert_one_row_header_with_work(
     node: &PlanAssertOneRowNode,
     stage: PlanNodeExplainStage,
-) -> String {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<String, SqlCompileError> {
     if matches!(stage, PlanNodeExplainStage::Logical) {
-        return "ASSERT ONE ROW".to_string();
+        work.step()?;
+        return Ok("ASSERT ONE ROW".to_string());
     }
     let relation = format_row_count_assertion(node.assertion);
     let desired = node.desired_num_rows.unwrap_or(1);
     if node.group_key_column_ids.is_empty() {
-        return format!("ASSERT NUM ROWS ({relation} {desired})");
+        work.step()?;
+        return Ok(format!("ASSERT NUM ROWS ({relation} {desired})"));
     }
     let labels = if node.group_key_labels.is_empty() {
         node.group_key_column_ids
             .iter()
-            .map(|column_id| format!("column_{}", column_id.0))
-            .collect::<Vec<_>>()
+            .map(|column_id| {
+                let label = format!("column_{}", column_id.0);
+                work.step()?;
+                Ok(label)
+            })
+            .collect::<Result<Vec<_>, SqlCompileError>>()?
     } else {
-        node.group_key_labels.clone()
+        node.group_key_labels
+            .iter()
+            .map(|label| copy_text(label, work))
+            .collect::<Result<Vec<_>, SqlCompileError>>()?
     };
-    format!(
+    let value = format!(
         "ASSERT NUM ROWS (PER KEY {relation} {desired} BY [{}])",
-        labels.join(", ")
-    )
+        join_text(&labels, ", ", work)?
+    );
+    work.step()?;
+    Ok(value)
 }
 
 fn format_row_count_assertion(assertion: PlanRowCountAssertion) -> &'static str {
@@ -408,19 +608,28 @@ fn format_row_count_assertion(assertion: PlanRowCountAssertion) -> &'static str 
     }
 }
 
-pub(crate) fn format_shared_plan_node_detail_lines(
+fn format_shared_plan_node_detail_lines_with_work(
     kind: &LogicalPlanKind,
     _stage: PlanNodeExplainStage,
-) -> Vec<String> {
-    match kind {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<String>, SqlCompileError> {
+    let value = match kind {
         LogicalPlanKind::Filter(node) => {
-            vec![format!("predicate: {}", format_expr(&node.predicate))]
+            vec![format!(
+                "predicate: {}",
+                format_expr_with_work(&node.predicate, work)?
+            )]
         }
         _ => vec![],
-    }
+    };
+    work.step()?;
+    Ok(value)
 }
 
-pub(crate) fn format_sort_items(items: &[SortItem]) -> Vec<String> {
+fn format_sort_items_with_work(
+    items: &[SortItem],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<String>, SqlCompileError> {
     items
         .iter()
         .map(|s| {
@@ -430,83 +639,126 @@ pub(crate) fn format_sort_items(items: &[SortItem]) -> Vec<String> {
             } else {
                 " NULLS LAST"
             };
-            format!("{} {dir}{nulls}", format_expr(&s.expr))
+            let value = format!("{} {dir}{nulls}", format_expr_with_work(&s.expr, work)?);
+            work.step()?;
+            Ok(value)
         })
-        .collect()
+        .collect::<Result<Vec<_>, SqlCompileError>>()
 }
 
-pub(crate) fn format_window_exprs(
+fn format_window_exprs_with_work(
     exprs: &[crate::planner::payload::WindowExpr],
     stage: PlanNodeExplainStage,
-) -> Vec<String> {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<String>, SqlCompileError> {
     exprs
         .iter()
         .map(|w| {
-            let args = w.args.iter().map(format_expr).collect::<Vec<_>>();
-            match stage {
+            let args = w
+                .args
+                .iter()
+                .map(|expr| format_expr_with_work(expr, work))
+                .collect::<Result<Vec<_>, SqlCompileError>>()?;
+            let value = match stage {
                 PlanNodeExplainStage::Logical => {
-                    let partition = w.partition_by.iter().map(format_expr).collect::<Vec<_>>();
+                    let partition = w
+                        .partition_by
+                        .iter()
+                        .map(|expr| format_expr_with_work(expr, work))
+                        .collect::<Result<Vec<_>, SqlCompileError>>()?;
                     let order = w
                         .order_by
                         .iter()
                         .map(|s| {
                             let dir = if s.asc { "ASC" } else { "DESC" };
-                            format!("{} {dir}", format_expr(&s.expr))
+                            let value = format!("{} {dir}", format_expr_with_work(&s.expr, work)?);
+                            work.step()?;
+                            Ok(value)
                         })
-                        .collect::<Vec<_>>();
+                        .collect::<Result<Vec<_>, SqlCompileError>>()?;
                     let mut over_parts = Vec::new();
                     if !partition.is_empty() {
-                        over_parts.push(format!("PARTITION BY {}", partition.join(", ")));
+                        over_parts.push(format!(
+                            "PARTITION BY {}",
+                            join_text(&partition, ", ", work)?
+                        ));
                     }
                     if !order.is_empty() {
-                        over_parts.push(format!("ORDER BY {}", order.join(", ")));
+                        over_parts.push(format!("ORDER BY {}", join_text(&order, ", ", work)?));
                     }
                     format!(
                         "{}({}) OVER ({})",
                         w.name,
-                        args.join(", "),
-                        over_parts.join(" ")
+                        join_text(&args, ", ", work)?,
+                        join_text(&over_parts, " ", work)?
                     )
                 }
                 PlanNodeExplainStage::Distributed => {
-                    format!("{}({})", w.name, args.join(", "))
+                    format!("{}({})", w.name, join_text(&args, ", ", work)?)
                 }
-            }
+            };
+            work.step()?;
+            Ok(value)
         })
-        .collect()
+        .collect::<Result<Vec<_>, SqlCompileError>>()
 }
 
-pub(crate) fn format_expr(expr: &TypedExpr) -> String {
-    format_expr_kind(&expr.kind)
+fn format_expr_with_work(
+    expr: &TypedExpr,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<String, SqlCompileError> {
+    format_expr_kind_with_work(&expr.kind, work)
 }
 
-pub(crate) fn format_project_item(item: &ProjectItem) -> String {
-    let expr_str = format_expr(&item.expr);
-    if item.output_name == expr_str {
+fn format_project_item_with_work(
+    item: &ProjectItem,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<String, SqlCompileError> {
+    let expr_str = format_expr_with_work(&item.expr, work)?;
+    let value = if item.output_name == expr_str {
         expr_str
     } else {
         format!("{expr_str} AS {}", item.output_name)
-    }
+    };
+    work.step()?;
+    Ok(value)
 }
 
-fn format_expr_kind(kind: &ExprKind) -> String {
-    match kind {
+fn format_expr_kind_with_work(
+    kind: &ExprKind,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<String, SqlCompileError> {
+    let value = match kind {
         ExprKind::ColumnRef {
             qualifier, column, ..
         } => match qualifier {
-            Some(q) => format!("{q}.{column}"),
-            None => column.clone(),
+            Some(q) => {
+                let mut text = copy_text(q, work)?;
+                text.push('.');
+                append_text(&mut text, column, work)?;
+                text
+            }
+            None => copy_text(column, work)?,
         },
-        ExprKind::LambdaParamRef { name, .. } => name.clone(),
+        ExprKind::LambdaParamRef { name, .. } => copy_text(name, work)?,
+        ExprKind::Constant(value) => {
+            work.flush()?;
+            crate::constant::format_constant_observed(value, work.control())?
+        }
         ExprKind::Literal(lit) => match lit {
             LiteralValue::Null => "NULL".to_string(),
             LiteralValue::Bool(b) => b.to_string(),
             LiteralValue::Int(n) => n.to_string(),
             LiteralValue::LargeInt(n) => n.to_string(),
             LiteralValue::Float(f) => f.to_string(),
-            LiteralValue::Decimal(d) => d.clone(),
-            LiteralValue::String(s) => format!("'{s}'"),
-            LiteralValue::Binary(bytes) => format!("X'{}'", hex::encode_upper(bytes)),
+            LiteralValue::Decimal(d) => copy_text(d, work)?,
+            LiteralValue::String(s) => {
+                let mut out = String::from("'");
+                append_text(&mut out, s, work)?;
+                out.push('\'');
+                out
+            }
+            LiteralValue::Binary(bytes) => format_binary(bytes, work)?,
         },
         ExprKind::BinaryOp {
             left, op, right, ..
@@ -528,7 +780,7 @@ fn format_expr_kind(kind: &ExprKind) -> String {
                 BinOp::Or => "OR",
             };
             let (display_left, display_right) = if matches!(op, BinOp::Eq | BinOp::EqForNull)
-                && matches!(left.kind, ExprKind::Literal(_))
+                && matches!(left.kind, ExprKind::Literal(_) | ExprKind::Constant(_))
                 && matches!(right.kind, ExprKind::ColumnRef { .. })
             {
                 (right.as_ref(), left.as_ref())
@@ -537,8 +789,8 @@ fn format_expr_kind(kind: &ExprKind) -> String {
             };
             format!(
                 "{} {op_str} {}",
-                format_expr(display_left),
-                format_expr(display_right)
+                format_expr_with_work(display_left, work)?,
+                format_expr_with_work(display_right, work)?
             )
         }
         ExprKind::UnaryOp { op, expr } => {
@@ -547,7 +799,7 @@ fn format_expr_kind(kind: &ExprKind) -> String {
                 UnOp::Negate => "-",
                 UnOp::BitwiseNot => "~",
             };
-            format!("{op_str} {}", format_expr(expr))
+            format!("{op_str} {}", format_expr_with_work(expr, work)?)
         }
         ExprKind::FunctionCall {
             name,
@@ -555,17 +807,24 @@ fn format_expr_kind(kind: &ExprKind) -> String {
             distinct,
             ..
         } => {
-            let args_str: Vec<String> = args.iter().map(format_expr).collect();
+            let args_str: Vec<String> = args
+                .iter()
+                .map(|expr| format_expr_with_work(expr, work))
+                .collect::<Result<_, SqlCompileError>>()?;
             let distinct_str = if *distinct { "DISTINCT " } else { "" };
-            format!("{name}({distinct_str}{})", args_str.join(", "))
+            format!(
+                "{name}({distinct_str}{})",
+                join_text(&args_str, ", ", work)?
+            )
         }
         ExprKind::LambdaFunction { params, body } => {
-            let params = params
-                .iter()
-                .map(|param| param.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("({params}) -> {}", format_expr(body))
+            let mut names = Vec::new();
+            for param in params {
+                names.push(param.name.as_str());
+                work.step()?;
+            }
+            let params = join_text(&names, ", ", work)?;
+            format!("({params}) -> {}", format_expr_with_work(body, work)?)
         }
         ExprKind::AggregateCall {
             name,
@@ -573,16 +832,22 @@ fn format_expr_kind(kind: &ExprKind) -> String {
             distinct,
             ..
         } => {
-            let args_str: Vec<String> = args.iter().map(format_expr).collect();
+            let args_str: Vec<String> = args
+                .iter()
+                .map(|expr| format_expr_with_work(expr, work))
+                .collect::<Result<_, SqlCompileError>>()?;
             let distinct_str = if *distinct { "DISTINCT " } else { "" };
-            format!("{name}({distinct_str}{})", args_str.join(", "))
+            format!(
+                "{name}({distinct_str}{})",
+                join_text(&args_str, ", ", work)?
+            )
         }
         ExprKind::Cast { expr, target, .. } => {
-            format!("CAST({} AS {target:?})", format_expr(expr))
+            format!("CAST({} AS {target:?})", format_expr_with_work(expr, work)?)
         }
         ExprKind::IsNull { expr, negated } => {
             let not = if *negated { " NOT" } else { "" };
-            format!("{} IS{not} NULL", format_expr(expr))
+            format!("{} IS{not} NULL", format_expr_with_work(expr, work)?)
         }
         ExprKind::InList {
             expr,
@@ -590,8 +855,15 @@ fn format_expr_kind(kind: &ExprKind) -> String {
             negated,
         } => {
             let not = if *negated { " NOT" } else { "" };
-            let items: Vec<String> = list.iter().map(format_expr).collect();
-            format!("{}{not} IN ({})", format_expr(expr), items.join(", "))
+            let items: Vec<String> = list
+                .iter()
+                .map(|expr| format_expr_with_work(expr, work))
+                .collect::<Result<_, SqlCompileError>>()?;
+            format!(
+                "{}{not} IN ({})",
+                format_expr_with_work(expr, work)?,
+                join_text(&items, ", ", work)?
+            )
         }
         ExprKind::Between {
             expr,
@@ -602,9 +874,9 @@ fn format_expr_kind(kind: &ExprKind) -> String {
             let not = if *negated { " NOT" } else { "" };
             format!(
                 "{}{not} BETWEEN {} AND {}",
-                format_expr(expr),
-                format_expr(low),
-                format_expr(high)
+                format_expr_with_work(expr, work)?,
+                format_expr_with_work(low, work)?,
+                format_expr_with_work(high, work)?
             )
         }
         ExprKind::Like {
@@ -613,7 +885,11 @@ fn format_expr_kind(kind: &ExprKind) -> String {
             negated,
         } => {
             let not = if *negated { " NOT" } else { "" };
-            format!("{}{not} LIKE {}", format_expr(expr), format_expr(pattern))
+            format!(
+                "{}{not} LIKE {}",
+                format_expr_with_work(expr, work)?,
+                format_expr_with_work(pattern, work)?
+            )
         }
         ExprKind::Case {
             operand,
@@ -622,15 +898,21 @@ fn format_expr_kind(kind: &ExprKind) -> String {
         } => {
             let mut s = String::from("CASE");
             if let Some(op) = operand {
-                let _ = write!(s, " {}", format_expr(op));
+                append_text(&mut s, " ", work)?;
+                append_text(&mut s, &format_expr_with_work(op, work)?, work)?;
             }
-            for (w, t) in when_then {
-                let _ = write!(s, " WHEN {} THEN {}", format_expr(w), format_expr(t));
+            for (when, then) in when_then {
+                append_text(&mut s, " WHEN ", work)?;
+                append_text(&mut s, &format_expr_with_work(when, work)?, work)?;
+                append_text(&mut s, " THEN ", work)?;
+                append_text(&mut s, &format_expr_with_work(then, work)?, work)?;
+                work.step()?;
             }
-            if let Some(e) = else_expr {
-                let _ = write!(s, " ELSE {}", format_expr(e));
+            if let Some(otherwise) = else_expr {
+                append_text(&mut s, " ELSE ", work)?;
+                append_text(&mut s, &format_expr_with_work(otherwise, work)?, work)?;
             }
-            s.push_str(" END");
+            append_text(&mut s, " END", work)?;
             s
         }
         ExprKind::IsTruthValue {
@@ -640,19 +922,89 @@ fn format_expr_kind(kind: &ExprKind) -> String {
         } => {
             let not = if *negated { " NOT" } else { "" };
             let val = if *value { "TRUE" } else { "FALSE" };
-            format!("{} IS{not} {val}", format_expr(expr))
+            format!("{} IS{not} {val}", format_expr_with_work(expr, work)?)
         }
-        ExprKind::Nested(inner) => format_expr(inner),
+        ExprKind::Nested(inner) => format_expr_with_work(inner, work)?,
         ExprKind::WindowCall { name, args, .. } => {
-            let args_str: Vec<String> = args.iter().map(format_expr).collect();
-            format!("{name}({})", args_str.join(", "))
+            let args_str: Vec<String> = args
+                .iter()
+                .map(|expr| format_expr_with_work(expr, work))
+                .collect::<Result<_, SqlCompileError>>()?;
+            format!("{name}({})", join_text(&args_str, ", ", work)?)
         }
         ExprKind::SubqueryPlaceholder { id, .. } => format!("<subquery_{id}>"),
         ExprKind::Lambda { params, body } => match params.as_slice() {
-            [single] => format!("{} -> {}", single, format_expr(body)),
-            many => format!("({}) -> {}", many.join(", "), format_expr(body)),
+            [single] => format!("{} -> {}", single, format_expr_with_work(body, work)?),
+            many => format!(
+                "({}) -> {}",
+                join_text(many, ", ", work)?,
+                format_expr_with_work(body, work)?
+            ),
         },
-    }
+    };
+    work.step()?;
+    Ok(value)
+}
+
+pub(crate) fn format_expr(
+    expr: &TypedExpr,
+    control: &dyn PureCompileControl,
+) -> Result<String, SqlCompileError> {
+    format_checked(control, |work| format_expr_with_work(expr, work))
+}
+
+pub(crate) fn format_project_item(
+    item: &ProjectItem,
+    control: &dyn PureCompileControl,
+) -> Result<String, SqlCompileError> {
+    format_checked(control, |work| format_project_item_with_work(item, work))
+}
+
+pub(crate) fn format_shared_plan_node_header(
+    kind: &LogicalPlanKind,
+    stage: PlanNodeExplainStage,
+    control: &dyn PureCompileControl,
+) -> Result<Option<String>, SqlCompileError> {
+    format_checked(control, |work| {
+        format_shared_plan_node_header_with_work(kind, stage, work)
+    })
+}
+
+pub(crate) fn format_shared_plan_node_detail_lines(
+    kind: &LogicalPlanKind,
+    stage: PlanNodeExplainStage,
+    control: &dyn PureCompileControl,
+) -> Result<Vec<String>, SqlCompileError> {
+    format_checked(control, |work| {
+        format_shared_plan_node_detail_lines_with_work(kind, stage, work)
+    })
+}
+
+pub(crate) fn format_sort_items(
+    items: &[SortItem],
+    control: &dyn PureCompileControl,
+) -> Result<Vec<String>, SqlCompileError> {
+    format_checked(control, |work| format_sort_items_with_work(items, work))
+}
+
+pub(crate) fn format_window_exprs(
+    exprs: &[crate::planner::payload::WindowExpr],
+    stage: PlanNodeExplainStage,
+    control: &dyn PureCompileControl,
+) -> Result<Vec<String>, SqlCompileError> {
+    format_checked(control, |work| {
+        format_window_exprs_with_work(exprs, stage, work)
+    })
+}
+
+pub(crate) fn format_assert_one_row_header(
+    node: &PlanAssertOneRowNode,
+    stage: PlanNodeExplainStage,
+    control: &dyn PureCompileControl,
+) -> Result<String, SqlCompileError> {
+    format_checked(control, |work| {
+        format_assert_one_row_header_with_work(node, stage, work)
+    })
 }
 
 #[cfg(test)]
@@ -926,19 +1278,39 @@ mod tests {
             LogicalPlanKind::AssertOneRow(PlanAssertOneRowNode::global_at_most_one("select 1"));
 
         assert_eq!(
-            format_shared_plan_node_header(&values, PlanNodeExplainStage::Logical),
+            format_shared_plan_node_header(
+                &values,
+                PlanNodeExplainStage::Logical,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap(),
             Some("VALUES (2 rows)".to_string())
         );
         assert_eq!(
-            format_shared_plan_node_header(&values, PlanNodeExplainStage::Distributed),
+            format_shared_plan_node_header(
+                &values,
+                PlanNodeExplainStage::Distributed,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap(),
             Some("VALUES (2 rows)".to_string())
         );
         assert_eq!(
-            format_shared_plan_node_header(&assert, PlanNodeExplainStage::Logical),
+            format_shared_plan_node_header(
+                &assert,
+                PlanNodeExplainStage::Logical,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap(),
             Some("ASSERT ONE ROW".to_string())
         );
         assert_eq!(
-            format_shared_plan_node_header(&assert, PlanNodeExplainStage::Distributed),
+            format_shared_plan_node_header(
+                &assert,
+                PlanNodeExplainStage::Distributed,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap(),
             Some("ASSERT NUM ROWS (<= 1)".to_string())
         );
 
@@ -949,7 +1321,12 @@ mod tests {
             "MOR UPDATE matched target row",
         ));
         assert_eq!(
-            format_shared_plan_node_header(&keyed, PlanNodeExplainStage::Distributed),
+            format_shared_plan_node_header(
+                &keyed,
+                PlanNodeExplainStage::Distributed,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap(),
             Some("ASSERT NUM ROWS (PER KEY <= 1 BY [_row_id])".to_string())
         );
     }
@@ -1033,7 +1410,12 @@ mod tests {
         );
 
         assert_eq!(
-            format_shared_plan_node_header(&window.kind, PlanNodeExplainStage::Logical),
+            format_shared_plan_node_header(
+                &window.kind,
+                PlanNodeExplainStage::Logical,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap(),
             Some("WINDOW [row_number() OVER (PARTITION BY k ORDER BY k ASC)]".to_string())
         );
         assert_eq!(
@@ -1076,7 +1458,10 @@ mod tests {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
 
-        assert_eq!(format_expr(&expr), "r.rk = 10");
+        assert_eq!(
+            format_expr(&expr, &crate::compiler::SqlCompileControl::unbounded()).unwrap(),
+            "r.rk = 10"
+        );
     }
 
     #[test]
@@ -1094,7 +1479,10 @@ mod tests {
             output_column_id: ColumnId(1),
         };
 
-        assert_eq!(format_project_item(&item), "a.k AS k");
+        assert_eq!(
+            format_project_item(&item, &crate::compiler::SqlCompileControl::unbounded()).unwrap(),
+            "a.k AS k"
+        );
     }
 
     #[test]
@@ -1112,6 +1500,13 @@ mod tests {
             output_column_id: ColumnId(1),
         };
 
-        assert_eq!(format_project_item(&item), "id AS alias_id");
+        assert_eq!(
+            format_project_item(&item, &crate::compiler::SqlCompileControl::unbounded()).unwrap(),
+            "id AS alias_id"
+        );
     }
 }
+
+#[cfg(test)]
+#[path = "cv_tests.rs"]
+mod cv_tests;

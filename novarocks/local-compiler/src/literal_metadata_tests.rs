@@ -62,24 +62,59 @@ fn policy() -> ConstantPolicy {
         max_library_validation_bytes: 1 << 20,
     }
 }
+fn source(ty: FunctionValueType, kind: ExprKind) -> ExprNode {
+    ExprNode {
+        id: ExprId::new(17),
+        owner: novarocks_physical_plan::NodeId::new(7),
+        lambda_scope: None,
+        ty,
+        kind,
+    }
+}
+fn project(
+    value: &ConstantValue,
+    source: &ExprNode,
+    control: &dyn PureCompileControl,
+) -> Result<Option<ConstantValue>, ExpressionLoweringError> {
+    let node = StaticExprNode::new(
+        StaticExprKind::Constant(value.clone()),
+        value.value_type().data_type.clone(),
+        None,
+    );
+    literal_argument(source, &node, control)
+}
+fn assert_shared(actual: &ConstantValue, original: &ConstantValue) {
+    assert_eq!(actual.ordinal(), original.ordinal());
+    assert_eq!(actual.value_type(), original.value_type());
+    assert!(Arc::ptr_eq(
+        actual.pool().field_ref(),
+        original.pool().field_ref()
+    ));
+    assert!(Arc::ptr_eq(actual.pool().array(), original.pool().array()));
+}
 #[test]
 fn scalar_metadata_keeps_actual_payloads_instead_of_nonconstant_markers() {
     macro_rules! check {
-        ($ty:expr, $factory:ident, $payload:expr, $source:expr, $expected:expr) => {{
+        ($ty:expr, $factory:ident, $payload:expr, $source:expr, $getter:ident, $expected:expr) => {{
             let ty = $ty;
             let value = ConstantValue::$factory(
                 Arc::new(ty.try_to_field("literal").unwrap()),
-                ty,
+                ty.clone(),
                 $payload,
                 policy(),
                 CompilePhase::Validate,
                 &Control::good(),
             )
             .unwrap();
-            assert_eq!(
-                checked_literal_metadata(&$source, &value, &Control::good()).unwrap(),
-                $expected
-            );
+            let actual = project(
+                &value,
+                &source(ty, ExprKind::Literal($source)),
+                &Control::good(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_shared(&actual, &value);
+            assert_eq!(actual.$getter().unwrap(), Some($expected));
         }};
     }
     check!(
@@ -87,7 +122,8 @@ fn scalar_metadata_keeps_actual_payloads_instead_of_nonconstant_markers() {
         from_u64,
         u64::MAX,
         LiteralValue::UInt64(u64::MAX),
-        FunctionLiteral::UInt64(u64::MAX)
+        try_u64,
+        u64::MAX
     );
     check!(
         FunctionValueType::try_with_logical_type(
@@ -99,35 +135,40 @@ fn scalar_metadata_keeps_actual_payloads_instead_of_nonconstant_markers() {
         from_largeint,
         i128::MIN,
         LiteralValue::LargeInt(i128::MIN),
-        FunctionLiteral::LargeInt(i128::MIN)
+        try_largeint,
+        i128::MIN
     );
     check!(
         FunctionValueType::new(DataType::Decimal128(38, -2), false),
         from_decimal128,
         -123,
         LiteralValue::Decimal128(-123),
-        FunctionLiteral::Decimal128(-123)
+        try_decimal128,
+        -123
     );
     check!(
         FunctionValueType::new(DataType::Decimal256(76, 9), false),
         from_decimal256_be,
         [255; 32],
         LiteralValue::Decimal256([255; 32]),
-        FunctionLiteral::Decimal256([255; 32])
+        try_decimal256_be,
+        [255; 32]
     );
     check!(
         FunctionValueType::new(DataType::Date32, false),
         from_date32,
         -11,
         LiteralValue::Date32(-11),
-        FunctionLiteral::Date32(-11)
+        try_date32,
+        -11
     );
     check!(
         FunctionValueType::new(DataType::Time64(TimeUnit::Nanosecond), false),
         from_time64,
         -99,
         LiteralValue::Time64(-99),
-        FunctionLiteral::Time64(-99)
+        try_time64,
+        -99
     );
     check!(
         FunctionValueType::new(
@@ -137,7 +178,8 @@ fn scalar_metadata_keeps_actual_payloads_instead_of_nonconstant_markers() {
         from_timestamp,
         -99,
         LiteralValue::Timestamp(-99),
-        FunctionLiteral::Timestamp(-99)
+        try_timestamp,
+        -99
     );
     check!(
         FunctionValueType::new(
@@ -151,11 +193,8 @@ fn scalar_metadata_keeps_actual_payloads_instead_of_nonconstant_markers() {
             days: i32::MAX,
             nanoseconds: i64::MIN
         },
-        FunctionLiteral::IntervalMonthDayNano {
-            months: i32::MIN,
-            days: i32::MAX,
-            nanoseconds: i64::MIN
-        }
+        try_interval_month_day_nano,
+        (i32::MIN, i32::MAX, i64::MIN)
     );
 }
 fn text_value(carrier: DataType, payload: &str) -> ConstantValue {
@@ -172,63 +211,163 @@ fn text_value(carrier: DataType, payload: &str) -> ConstantValue {
 }
 #[test]
 fn byte_metadata_compares_every_selected_byte_and_keeps_empty_constants() {
+    // Binding retains the admitted CV directly; byte validation belongs to its owner.
     for carrier in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
         for text in [String::new(), "µ\0雪".repeat(100)] {
             let value = text_value(carrier.clone(), &text);
-            let source = LiteralValue::Utf8(text.clone().into());
-            assert_eq!(
-                checked_literal_metadata(&source, &value, &Control::good()).unwrap(),
-                FunctionLiteral::Utf8(text.clone().into())
-            );
-            let mut different = text;
-            different.push('x');
-            assert!(matches!(
-                checked_literal_metadata(
-                    &LiteralValue::Utf8(different.into()),
-                    &value,
-                    &Control::good()
+            let actual = project(
+                &value,
+                &source(
+                    value.value_type().clone(),
+                    ExprKind::Literal(LiteralValue::Utf8(text.clone().into())),
                 ),
-                Err(ExpressionLoweringError::Invalid(_))
-            ));
+                &Control::good(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_shared(&actual, &value);
+            assert_eq!(actual.try_utf8().unwrap(), Some(text.as_str()));
         }
     }
     let ty = FunctionValueType::new(DataType::BinaryView, false);
     let value = ConstantValue::from_binary(
         Arc::new(ty.try_to_field("literal").unwrap()),
-        ty,
+        ty.clone(),
         &[0, 255, 128],
         policy(),
         CompilePhase::Validate,
         &Control::good(),
     )
     .unwrap();
-    assert_eq!(
-        checked_literal_metadata(
-            &LiteralValue::Binary(vec![0, 255, 128].into()),
-            &value,
+    let actual = project(
+        &value,
+        &source(
+            ty,
+            ExprKind::Literal(LiteralValue::Binary(vec![0, 255, 128].into())),
+        ),
+        &Control::good(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_shared(&actual, &value);
+    assert_eq!(actual.try_binary().unwrap(), Some(&[0, 255, 128][..]));
+}
+#[test]
+fn literal_metadata_preserves_nonzero_pool_ordinal_and_null_vs_nonconstant() {
+    use arrow_array::{Array, Int64Array};
+    let ty = FunctionValueType::new(DataType::Int64, true);
+    let field = Arc::new(ty.try_to_field("source").unwrap());
+    let mut pool_policy = policy();
+    pool_policy.max_rows = 3;
+    let pool = novarocks_functions::ConstantPool::try_new(
+        field.clone(),
+        ty.clone(),
+        Int64Array::from(vec![Some(99), Some(42), None]).to_data(),
+        pool_policy,
+        CompilePhase::Validate,
+        &Control::good(),
+    )
+    .unwrap();
+    let value = pool.value(1).unwrap();
+    let actual = project(
+        &value,
+        &source(ty.clone(), ExprKind::Literal(LiteralValue::Int64(42))),
+        &Control::good(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_shared(&actual, &value);
+    assert_eq!(actual.try_i64().unwrap(), Some(42));
+    let null = pool.value(2).unwrap();
+    let actual = project(
+        &null,
+        &source(ty.clone(), ExprKind::Literal(LiteralValue::Null)),
+        &Control::good(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_shared(&actual, &null);
+    assert_eq!(actual.try_i64().unwrap(), None);
+    let node = StaticExprNode::new(
+        StaticExprKind::SlotId(novarocks_types::SlotId::new(3)),
+        DataType::Int64,
+        None,
+    );
+    assert!(
+        literal_argument(
+            &source(
+                ty,
+                ExprKind::Value(novarocks_physical_plan::ValueId::new(91))
+            ),
+            &node,
             &Control::good()
         )
-        .unwrap(),
-        FunctionLiteral::Binary(vec![0, 255, 128].into())
+        .unwrap()
+        .is_none()
     );
-    assert!(matches!(
-        checked_literal_metadata(
-            &LiteralValue::Binary(vec![0, 255, 127].into()),
-            &value,
-            &Control::good()
-        ),
-        Err(ExpressionLoweringError::Invalid(_))
-    ));
 }
 #[test]
 fn long_literal_metadata_refusal_has_one_original_callback_prefix() {
-    let text = "ab\0µ雪".repeat(200);
-    let value = text_value(DataType::Utf8View, &text);
-    let source = LiteralValue::Utf8(text.into());
+    // Full nested metadata, not payload reconstruction, drives the observed traversal.
+    let mut metadata = std::collections::HashMap::new();
+    for n in 0..320 {
+        metadata.insert(format!("key{n}"), format!("value{n}"));
+    }
+    let carrier = DataType::Struct(
+        vec![Arc::new(
+            arrow_schema::Field::new("child", DataType::Int64, true).with_metadata(metadata),
+        )]
+        .into(),
+    );
+    let ty = FunctionValueType::new(carrier, true);
+    let mut p = policy();
+    p.max_type_depth = 64;
+    p.max_type_nodes = 4096;
+    let value = ConstantValue::null(
+        Arc::new(ty.try_to_field("literal").unwrap()),
+        ty.clone(),
+        p,
+        CompilePhase::Validate,
+        &Control::good(),
+    )
+    .unwrap();
+    let source = source(ty, ExprKind::Literal(LiteralValue::Null));
     let baseline = Control::good();
-    checked_literal_metadata(&source, &value, &baseline).unwrap();
+    project(&value, &source, &baseline).unwrap();
     let trace = baseline.trace.into_inner().unwrap();
-    assert!(trace.iter().filter(|(_, units)| *units > 0).count() >= 4);
+    assert!(trace.iter().any(|(_, units)| *units == 256));
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        // Wide input samples each real positive quantum plus the entry and tail.
+        for at in
+            (1..=trace.len()).filter(|at| *at == 1 || *at == trace.len() || trace[*at - 1].1 == 256)
+        {
+            let control = Control {
+                trace: Mutex::new(vec![]),
+                refusal: Some((at, cause)),
+            };
+            assert!(
+                matches!(project(&value,&source,&control),Err(ExpressionLoweringError::Control(actual)) if actual==cause)
+            );
+            assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
+        }
+    }
+}
+#[test]
+fn completed_mismatch_tail_observes_control_before_returning_data_error() {
+    let value = text_value(DataType::LargeUtf8, "abc");
+    let mut ty = value.value_type().clone();
+    ty.nullable = true;
+    let source = source(ty, ExprKind::Literal(LiteralValue::Utf8("abc".into())));
+    let baseline = Control::good();
+    assert!(matches!(
+        project(&value, &source, &baseline),
+        Err(ExpressionLoweringError::Invalid(_))
+    ));
+    let trace = baseline.trace.into_inner().unwrap();
     for cause in [
         CompileControlError::Cancelled,
         CompileControlError::DeadlineExceeded,
@@ -240,35 +379,9 @@ fn long_literal_metadata_refusal_has_one_original_callback_prefix() {
                 refusal: Some((at, cause)),
             };
             assert!(
-                matches!(checked_literal_metadata(&source, &value, &control), Err(ExpressionLoweringError::Control(actual)) if actual == cause)
+                matches!(project(&value,&source,&control),Err(ExpressionLoweringError::Control(actual)) if actual==cause)
             );
             assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
         }
-    }
-}
-#[test]
-fn completed_mismatch_tail_observes_control_before_returning_data_error() {
-    let value = text_value(DataType::LargeUtf8, "abc");
-    let source = LiteralValue::Utf8("abd".into());
-    let baseline = Control::good();
-    assert!(matches!(
-        checked_literal_metadata(&source, &value, &baseline),
-        Err(ExpressionLoweringError::Invalid(_))
-    ));
-    let trace = baseline.trace.into_inner().unwrap();
-    assert!(trace.last().unwrap().1 > 0);
-    for cause in [
-        CompileControlError::Cancelled,
-        CompileControlError::DeadlineExceeded,
-        CompileControlError::ResourceExhausted,
-    ] {
-        let control = Control {
-            trace: Mutex::new(vec![]),
-            refusal: Some((trace.len(), cause)),
-        };
-        assert!(
-            matches!(checked_literal_metadata(&source, &value, &control), Err(ExpressionLoweringError::Control(actual)) if actual == cause)
-        );
-        assert_eq!(*control.trace.lock().unwrap(), trace);
     }
 }

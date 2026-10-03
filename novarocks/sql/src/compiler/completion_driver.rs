@@ -68,6 +68,7 @@ pub struct SqlFinalPlanCompileRequest {
     environment: SqlPlanningEnvironment,
     functions: Arc<dyn SqlFunctionCatalog>,
     constant_evaluator: &'static dyn SqlConstantEvaluator,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: SqlCompileControl,
     dop_domain: PipelineDopDomain,
     scan_read_budget: ScanReadBudget,
@@ -103,6 +104,7 @@ impl SqlFinalPlanCompileRequest {
         environment: SqlPlanningEnvironment,
         functions: Arc<dyn SqlFunctionCatalog>,
         constant_evaluator: &'static dyn SqlConstantEvaluator,
+        constant_policy: novarocks_functions::ConstantPolicy,
         control: SqlCompileControl,
         dop_domain: PipelineDopDomain,
         scan_read_budget: ScanReadBudget,
@@ -116,6 +118,7 @@ impl SqlFinalPlanCompileRequest {
             environment,
             functions: functions.snapshot(),
             constant_evaluator,
+            constant_policy,
             control,
             dop_domain,
             scan_read_budget,
@@ -141,6 +144,7 @@ impl SqlFinalPlanCompileRequest {
             environment,
             functions,
             constant_evaluator,
+            constant_policy,
             control,
             dop_domain,
             scan_read_budget,
@@ -163,6 +167,7 @@ impl SqlFinalPlanCompileRequest {
             environment,
             functions,
             constant_evaluator,
+            constant_policy,
             dop_domain,
             scan_read_budget,
             display_intent,
@@ -286,6 +291,7 @@ struct FinalPlanCommon {
     environment: SqlPlanningEnvironment,
     functions: Arc<dyn SqlFunctionCatalog>,
     constant_evaluator: &'static dyn SqlConstantEvaluator,
+    constant_policy: novarocks_functions::ConstantPolicy,
     dop_domain: PipelineDopDomain,
     scan_read_budget: ScanReadBudget,
     display_intent: SqlDisplayIntent,
@@ -534,6 +540,7 @@ fn analyze_with_catalog(
         common.functions.as_ref(),
         common.constant_evaluator,
         mv_definitions,
+        common.constant_policy,
         control.clone(),
     );
     match SqlCompiler::analyze(request)? {
@@ -741,9 +748,11 @@ fn optimize_to_physical(
         mv_rewrite,
         function_catalog,
         constant_evaluator,
+        constant_policy,
     } = analyzed;
     control.check()?;
-    let mut scalar_arena = crate::optimizer::scalar::ScalarArena::new();
+    let mut scalar_arena =
+        crate::optimizer::scalar::ScalarArena::with_constant_policy(constant_policy);
     let mut optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical_plan,
         &mut scalar_arena,
@@ -760,7 +769,13 @@ fn optimize_to_physical(
     let super::mv_rewrite::SqlMvRewritePreparation {
         candidates,
         diagnostics: _,
+        constant_policy: mv_constant_policy,
     } = mv_rewrite;
+    if mv_constant_policy != constant_policy {
+        return Err(SqlCompileError::InvalidRequest(
+            "MV constant policy differs from its analyzed request".into(),
+        ));
+    }
     let root_distribution = match &intent {
         SqlCompileIntent::IcebergWrite { root_distribution } => {
             super::resolve_root_distribution_requirement(&logical_plan, root_distribution)?
@@ -841,6 +856,7 @@ fn provider_or_ready_step(
         common.dop_domain,
         common.functions.as_ref(),
         root_allow_throw_exception,
+        common.constant_policy,
         control,
     )
     .map_err(SqlCompileError::from)?;
@@ -1194,6 +1210,7 @@ pub(super) fn resume_provider_read(
             reads,
             state.common.functions.as_ref(),
             state.root_allow_throw_exception,
+            state.common.constant_policy,
             control,
         )
         .map_err(SqlCompileError::from)?;
@@ -1273,6 +1290,7 @@ mod tests {
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
             noop_constant_evaluator(),
+            crate::constant::test_constant_policy(),
             control,
             PipelineDopDomain {
                 min: 1,
@@ -1319,6 +1337,7 @@ mod tests {
                 input.functions.as_ref(),
                 input.constant_evaluator,
                 None,
+                crate::constant::test_constant_policy(),
                 input.control.clone(),
             ))
             .unwrap()
@@ -1863,7 +1882,8 @@ mod tests {
             .try_into_completion()
             .expect("completion seed");
 
-        let progress = SqlCompiler::start(seed).expect("completed values plan");
+        let progress = SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+            .expect("completed values plan");
 
         assert!(matches!(progress, SqlCompileProgress::Complete(_)));
     }
@@ -1878,7 +1898,11 @@ mod tests {
             .sql_semantics
             .clone()
             .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(session_mode));
-        let mut progress = SqlCompiler::start(input.try_into_completion().unwrap()).unwrap();
+        let mut progress = SqlCompiler::start(
+            input.try_into_completion().unwrap(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
         loop {
             match progress {
                 SqlCompileProgress::Complete(completed) => return completed,
@@ -2047,7 +2071,8 @@ mod tests {
         .expect("completion seed");
 
         let SqlCompileProgress::Complete(completed) =
-            SqlCompiler::start(seed).expect("completed explain plan")
+            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+                .expect("completed explain plan")
         else {
             panic!("values explain must not request external observations");
         };
@@ -2066,7 +2091,8 @@ mod tests {
             .try_into_completion()
             .expect("completion seed");
 
-        let progress = SqlCompiler::start(seed).expect("catalog need");
+        let progress = SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+            .expect("catalog need");
 
         assert!(matches!(
             &progress,
@@ -2098,7 +2124,8 @@ mod tests {
             weak.upgrade().is_none(),
             "the completion request must release its initial runtime control"
         );
-        let _ = SqlCompiler::start(seed).expect("the pure completion state remains usable");
+        let _ = SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+            .expect("the pure completion state remains usable");
     }
 
     #[test]
@@ -2106,7 +2133,10 @@ mod tests {
         let seed = request("select order_key from orders", SqlCompileIntent::Query)
             .try_into_completion()
             .expect("completion seed");
-        let compilation = incomplete(SqlCompiler::start(seed).expect("catalog need"));
+        let compilation = incomplete(
+            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+                .expect("catalog need"),
+        );
         let facts = catalog_facts(&compilation);
         let control = SqlCompileControl::new(
             None,
@@ -2124,7 +2154,10 @@ mod tests {
         let seed = request("select order_key from orders", SqlCompileIntent::Query)
             .try_into_completion()
             .expect("completion seed");
-        let compilation = incomplete(SqlCompiler::start(seed).expect("catalog need"));
+        let compilation = incomplete(
+            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+                .expect("catalog need"),
+        );
         let facts = catalog_facts(&compilation);
         let control = SqlCompileControl::new(
             Some(Instant::now() + Duration::from_millis(50)),
@@ -2201,7 +2234,8 @@ mod tests {
             let discovery_calls = AtomicUsize::new(0);
             let target_catalog_reads = AtomicUsize::new(0);
             complete_base_query_with_counters(
-                SqlCompiler::start(seed).expect("start base query"),
+                SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+                    .expect("start base query"),
                 &discovery_calls,
                 &target_catalog_reads,
             );
@@ -2228,7 +2262,9 @@ mod tests {
             .clone()
             .with_sql_mode(SqlMode::from_assignment("GROUP_CONCAT_LEGACY"));
         let seed = request.try_into_completion().unwrap();
-        let compilation = incomplete(SqlCompiler::start(seed).unwrap());
+        let compilation = incomplete(
+            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded()).unwrap(),
+        );
         assert!(matches!(
             compilation.needs(),
             SqlNeedBatch::MaterializedViews(_)
@@ -2248,7 +2284,9 @@ mod tests {
         )
         .try_into_completion()
         .unwrap();
-        let mv = incomplete(SqlCompiler::start(seed).unwrap());
+        let mv = incomplete(
+            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded()).unwrap(),
+        );
         let need = match mv.needs() {
             SqlNeedBatch::MaterializedViews(needs) => needs[0].clone(),
             other => panic!("modern query retains MV discovery, got {other:?}"),
@@ -2340,7 +2378,8 @@ mod tests {
             let discovery_calls = AtomicUsize::new(0);
             let target_catalog_reads = AtomicUsize::new(0);
             complete_base_query_with_counters(
-                SqlCompiler::start(seed).expect("start base query"),
+                SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+                    .expect("start base query"),
                 &discovery_calls,
                 &target_catalog_reads,
             );
@@ -2365,8 +2404,13 @@ mod tests {
                 .sql_semantics
                 .clone()
                 .with_decimal_overflow_to_double(true);
-            let compilation =
-                incomplete(SqlCompiler::start(request.try_into_completion().unwrap()).unwrap());
+            let compilation = incomplete(
+                SqlCompiler::start(
+                    request.try_into_completion().unwrap(),
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap(),
+            );
             assert!(matches!(
                 compilation.needs(),
                 SqlNeedBatch::MaterializedViews(_)
@@ -2387,7 +2431,9 @@ mod tests {
         )
         .try_into_completion()
         .unwrap();
-        let mv = incomplete(SqlCompiler::start(seed).unwrap());
+        let mv = incomplete(
+            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded()).unwrap(),
+        );
         let need = match mv.needs() {
             SqlNeedBatch::MaterializedViews(needs) => needs[0].clone(),
             other => panic!("modern query retains MV discovery, got {other:?}"),
@@ -2461,7 +2507,10 @@ mod tests {
         )
         .try_into_completion()
         .expect("completion seed");
-        let mv = incomplete(SqlCompiler::start(seed).expect("MV need"));
+        let mv = incomplete(
+            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+                .expect("MV need"),
+        );
         let mv_need = match mv.needs() {
             SqlNeedBatch::MaterializedViews(needs) if needs.len() == 1 => needs[0].clone(),
             other => panic!("expected one MV need, got {other:?}"),
@@ -2491,7 +2540,10 @@ mod tests {
         let seed = request("select order_key from orders", SqlCompileIntent::Query)
             .try_into_completion()
             .expect("completion seed");
-        let catalog = incomplete(SqlCompiler::start(seed).expect("catalog need"));
+        let catalog = incomplete(
+            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+                .expect("catalog need"),
+        );
         let statistics = incomplete(answer_catalog(catalog));
         let provider = incomplete(answer_statistics(statistics));
 
@@ -2508,7 +2560,10 @@ mod tests {
         )
         .try_into_completion()
         .expect("completion seed");
-        let catalog = incomplete(SqlCompiler::start(seed).expect("catalog need"));
+        let catalog = incomplete(
+            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+                .expect("catalog need"),
+        );
         let statistics = incomplete(answer_catalog(catalog));
         let provider = incomplete(answer_statistics(statistics));
         let provider_needs = match provider.needs() {
@@ -2568,7 +2623,10 @@ mod tests {
         let seed = request("select order_key from orders", SqlCompileIntent::Query)
             .try_into_completion()
             .expect("completion seed");
-        let catalog = incomplete(SqlCompiler::start(seed).expect("catalog need"));
+        let catalog = incomplete(
+            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+                .expect("catalog need"),
+        );
         let statistics = incomplete(answer_catalog(catalog));
         let provider = incomplete(answer_statistics(statistics));
         let original = match provider.needs() {
@@ -2748,6 +2806,7 @@ mod tests {
                 request(sql, intent)
                     .try_into_completion()
                     .expect("completion seed"),
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .expect("catalog need"),
         );
@@ -2809,6 +2868,7 @@ mod tests {
                 let costs = crate::explain::completed_tree::render_completed_plan_tree(
                     plan,
                     crate::explain::ExplainLevel::Costs,
+                    &SqlCompileControl::unbounded(),
                 )
                 .expect("costs text");
                 assert!(costs.iter().any(|line| line == &expected));
@@ -2824,6 +2884,7 @@ mod tests {
                 let normal = crate::explain::completed_tree::render_completed_plan_tree(
                     plan,
                     crate::explain::ExplainLevel::Normal,
+                    &SqlCompileControl::unbounded(),
                 )
                 .expect("normal text");
                 assert!(!normal.iter().any(|line| line.starts_with("TABLE STATS")));
@@ -2866,6 +2927,7 @@ mod tests {
                 request("select order_key from orders", SqlCompileIntent::Query)
                     .try_into_completion()
                     .expect("seed"),
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .expect("catalog"),
         );
@@ -2883,6 +2945,7 @@ mod tests {
             request("select 1", SqlCompileIntent::Query)
                 .try_into_completion()
                 .expect("seed"),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("values")
         .into_complete()
@@ -2947,6 +3010,7 @@ mod tests {
             functions,
             noop_constant_evaluator(),
             None,
+            crate::constant::test_constant_policy(),
             SqlCompileControl::unbounded(),
         ))
         .expect("analysis")
@@ -2992,7 +3056,8 @@ mod tests {
         assert!(
             crate::explain::completed_tree::render_completed_plan_tree(
                 &plan,
-                crate::explain::ExplainLevel::Costs
+                crate::explain::ExplainLevel::Costs,
+                &SqlCompileControl::unbounded(),
             )
             .expect("DML costs")
             .iter()
@@ -3015,8 +3080,11 @@ mod tests {
             .optimizer_settings
             .cbo_broadcast_node_mem_budget_bytes = Some(268435456.0);
         let catalog = incomplete(
-            SqlCompiler::start(compile_request.try_into_completion().expect("seed"))
-                .expect("catalog"),
+            SqlCompiler::start(
+                compile_request.try_into_completion().expect("seed"),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .expect("catalog"),
         );
         let statistics = incomplete(answer_catalog(catalog));
         let provider = incomplete(answer_exact_statistics(statistics, 10));
@@ -3077,8 +3145,11 @@ mod tests {
                 .optimizer_settings
                 .cbo_broadcast_node_mem_budget_bytes = Some(268435456.0);
             let catalog = incomplete(
-                SqlCompiler::start(compile_request.try_into_completion().expect("seed"))
-                    .expect("catalog"),
+                SqlCompiler::start(
+                    compile_request.try_into_completion().expect("seed"),
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .expect("catalog"),
             );
             let statistics = incomplete(answer_catalog(catalog));
             let provider = incomplete(answer_frozen_statistics(
@@ -3127,6 +3198,7 @@ mod tests {
             let text = crate::explain::completed_tree::render_completed_plan_tree(
                 completed.plan(),
                 crate::explain::ExplainLevel::Costs,
+                &SqlCompileControl::unbounded(),
             )
             .expect("completed costs");
             assert!(
@@ -3168,15 +3240,18 @@ mod tests {
                 .session
                 .optimizer_settings
                 .cbo_broadcast_node_mem_budget_bytes = Some(268435456.0);
-            let completed =
-                SqlCompiler::start(compile_request.try_into_completion().expect("seed"))
-                    .expect("source-free compilation")
-                    .into_complete()
-                    .expect("no catalog/statistics/provider needs");
+            let completed = SqlCompiler::start(
+                compile_request.try_into_completion().expect("seed"),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .expect("source-free compilation")
+            .into_complete()
+            .expect("no catalog/statistics/provider needs");
             assert!(frozen_table_statistics(completed.plan()).is_empty());
             let text = crate::explain::completed_tree::render_completed_plan_tree(
                 completed.plan(),
                 crate::explain::ExplainLevel::Costs,
+                &SqlCompileControl::unbounded(),
             )
             .expect("completed costs");
             if small_build {

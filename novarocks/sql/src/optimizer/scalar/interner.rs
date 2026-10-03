@@ -22,7 +22,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 
 use arrow::datatypes::DataType;
-use novarocks_functions::{FunctionArgumentType, FunctionResultType};
+use novarocks_functions::{ConstantError, ConstantValue, FunctionArgumentType, FunctionResultType};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl, ValueTypeError,
 };
@@ -39,6 +39,7 @@ use crate::compiler::SqlCompileError;
 enum InternerError {
     Control(CompileControlError),
     Type(ValueTypeError),
+    Constant(ConstantError),
 }
 impl From<CompileControlError> for InternerError {
     fn from(value: CompileControlError) -> Self {
@@ -50,11 +51,21 @@ impl From<ValueTypeError> for InternerError {
         Self::Type(value)
     }
 }
+impl From<ConstantError> for InternerError {
+    fn from(value: ConstantError) -> Self {
+        match value {
+            ConstantError::Control(cause) => Self::Control(cause),
+            other => Self::Constant(other),
+        }
+    }
+}
 impl From<InternerError> for SqlCompileError {
     fn from(value: InternerError) -> Self {
         match value {
             InternerError::Control(error) => error.into(),
             InternerError::Type(error) => Self::Compilation(error.to_string()),
+            InternerError::Constant(ConstantError::Limit(_)) => Self::ResourceExhausted,
+            InternerError::Constant(error) => Self::Compilation(error.to_string()),
         }
     }
 }
@@ -66,6 +77,7 @@ enum Token<'a> {
     Bytes(&'a [u8]),
     Type(&'a DataType),
     ValueType(&'a FunctionValueType),
+    Constant(&'a ConstantValue),
 }
 struct Fields<'a, 'w, 'c> {
     tokens: Vec<Token<'a>>,
@@ -261,6 +273,10 @@ fn node_fields<'a>(
             f.number(1)?;
             f.text(name)?;
             f.number(*slot_id as u128)?;
+        }
+        ScalarNode::Constant(value) => {
+            f.number(18)?;
+            f.push(Token::Constant(value))?;
         }
         ScalarNode::Literal(literal) => {
             f.number(2)?;
@@ -474,6 +490,9 @@ fn fingerprint(
                 hasher.write_u8(2);
                 hasher.write_u64(type_hash(v, work)?);
             }
+            // Pool layout, raw bytes and dictionary numbering are not value
+            // identity. The exact CV owner decides equality within this bucket.
+            Token::Constant(_) => hasher.write_u8(4),
             Token::ValueType(v) => {
                 hasher.write_u8(3);
                 hasher.write_u8(v.logical_type as u8);
@@ -518,6 +537,10 @@ fn tokens_equal(
                     work.step().map_err(InternerError::from)
                 })?
             }
+            (Token::Constant(a), Token::Constant(b)) => {
+                work.flush()?;
+                a.equals_observed(b, CompilePhase::Validate, work.control())?
+            }
             (Token::ValueType(a), Token::ValueType(b)) => {
                 a.exactly_equals_observed(b, || work.step().map_err(InternerError::from))?
             }
@@ -540,6 +563,16 @@ fn intern_inner(
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
     let node = ScalarArena::normalize(node);
     let result = (|| -> Result<(u64, Option<ScalarId>), InternerError> {
+        if let ScalarNode::Constant(value) = &node {
+            if !value_type.exactly_equals_observed(value.value_type(), || {
+                work.step().map_err(InternerError::from)
+            })? {
+                return Err(ConstantError::Invalid(
+                    "interner constant source differs from its frozen value type",
+                )
+                .into());
+            }
+        }
         let fields = node_fields(&node, &mut work)?;
         let actual = fingerprint(&fields, &value_type, &mut work)?;
         let fingerprint = forced_fingerprint.unwrap_or(actual);
@@ -561,6 +594,12 @@ fn intern_inner(
     })();
     if let Err(InternerError::Control(error)) = &result {
         return Err((*error).into());
+    }
+    if matches!(
+        &result,
+        Err(InternerError::Constant(ConstantError::Limit(_)))
+    ) {
+        return Err(SqlCompileError::ResourceExhausted);
     }
     work.finish()?;
     let (fingerprint, existing) = result.map_err(SqlCompileError::from)?;
@@ -593,3 +632,7 @@ pub(super) fn intern(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "constant_interner_tests.rs"]
+mod constant_interner_tests;

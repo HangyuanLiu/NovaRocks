@@ -412,6 +412,7 @@ fn package_input(fixture: &Fixture) -> FragmentPackageInput {
     FragmentPackageInput {
         version: PlanVersionId::try_new([113; 16]).unwrap(),
         required: RequiredContracts::default(),
+        constants: novarocks_physical_plan::ConstantPools::empty(),
         fragment: fixture.fragment.clone(),
         expression_uses,
         calls,

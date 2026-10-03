@@ -416,6 +416,7 @@ fn encode_decode_execute(plan: &PhysicalPlan) -> (Vec<Chunk>, Vec<SlotId>, ExecN
         plan,
         &catalog,
         &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
+        false,
         compile_control(),
     )
     .unwrap();
@@ -1128,6 +1129,7 @@ fn physical_plan_finish_encode_decode_preserves_transparent_duplicate_layout() {
         &physical,
         &catalog,
         &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
+        false,
         compile_control(),
     )
     .unwrap();
@@ -1217,6 +1219,7 @@ fn physical_plan_finish_encode_decode_preserves_set_op_fresh_output_layout() {
         &physical,
         &catalog,
         &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
+        false,
         compile_control(),
     )
     .unwrap();
@@ -1244,6 +1247,7 @@ fn physical_plan_finish_encode_decode_preserves_duplicate_router_occurrences() {
         &physical,
         &catalog,
         &facts,
+        false,
         compile_control(),
     )
     .expect("duplicate router occurrences have distinct v1 slots");

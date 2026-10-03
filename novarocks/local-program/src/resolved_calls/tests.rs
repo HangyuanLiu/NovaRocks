@@ -291,7 +291,20 @@ impl FunctionBindingResolver for Owner {
     ) -> Result<(), FunctionBindingError> {
         self.declaration.effect_declaration(&selected.overload)?;
         let expected = self.arguments(&selected.overload);
-        if request.arguments != expected
+        let mut arguments_equal = request.arguments.len() == expected.len();
+        if arguments_equal {
+            for (actual, expected) in request.arguments.iter().zip(&expected) {
+                if !actual.equals_observed(
+                    expected,
+                    novarocks_type_contract::CompilePhase::Validate,
+                    _control,
+                )? {
+                    arguments_equal = false;
+                    break;
+                }
+            }
+        }
+        if !arguments_equal
             || request.logical_argument_count != expected.len()
             || selected.argument_types
                 != expected

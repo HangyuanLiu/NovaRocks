@@ -697,7 +697,7 @@ fn actual_compiled_value_conversion_round_child_error_is_terminal_not_success_nu
                     "round",
                     vec![
                         argument(decimal.clone(), None),
-                        argument(scalar_integer, Some(FunctionLiteral::Int64(-1))),
+                        integer_argument(scalar_integer, -1),
                     ],
                     ControlShape::Eager,
                 ),

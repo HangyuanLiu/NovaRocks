@@ -99,6 +99,7 @@ pub(crate) fn analyze(
         catalog,
         current_database,
         crate::functions::builtin_sql_function_catalog(),
+        crate::constant::test_constant_policy(),
         &crate::compiler::SqlCompileControl::unbounded(),
     )
 }
@@ -110,6 +111,7 @@ pub(crate) fn analyze_with_function_catalog(
     catalog: &dyn PlannerTableProvider,
     current_database: &str,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
@@ -125,6 +127,7 @@ pub(crate) fn analyze_with_function_catalog(
         current_database,
         crate::column_id::ColumnRefFactory::new(),
         function_catalog,
+        constant_policy,
         control,
     )
 }
@@ -136,6 +139,7 @@ pub(crate) fn analyze_with_function_catalog_and_sql_semantics(
     current_database: &str,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     sql_semantics: &crate::sql_mode::SqlSemanticSettings,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
@@ -152,6 +156,7 @@ pub(crate) fn analyze_with_function_catalog_and_sql_semantics(
         crate::column_id::ColumnRefFactory::new(),
         function_catalog,
         sql_semantics,
+        constant_policy,
         control,
     )
 }
@@ -170,6 +175,7 @@ pub(crate) fn analyze_with_factory(
     catalog: &dyn PlannerTableProvider,
     current_database: &str,
     factory: crate::column_id::ColumnRefFactory,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
@@ -185,6 +191,7 @@ pub(crate) fn analyze_with_factory(
         current_database,
         factory,
         crate::functions::builtin_sql_function_catalog(),
+        constant_policy,
         control,
     )
 }
@@ -197,6 +204,7 @@ pub(crate) fn analyze_with_factory_and_function_catalog(
     current_database: &str,
     factory: crate::column_id::ColumnRefFactory,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
@@ -213,6 +221,7 @@ pub(crate) fn analyze_with_factory_and_function_catalog(
         factory,
         function_catalog,
         &crate::sql_mode::SqlSemanticSettings::default(),
+        constant_policy,
         control,
     )
 }
@@ -224,6 +233,7 @@ fn analyze_with_factory_and_function_catalog_inner(
     factory: crate::column_id::ColumnRefFactory,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     sql_semantics: &crate::sql_mode::SqlSemanticSettings,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
@@ -246,6 +256,7 @@ fn analyze_with_factory_and_function_catalog_inner(
         catalog,
         current_database,
         function_catalog,
+        constant_policy,
         control,
         sql_semantics: sql_semantics.clone(),
         factory: factory.clone(),
@@ -271,6 +282,7 @@ fn analyze_with_factory_and_function_catalog_inner(
 
 pub(super) struct AnalyzerContext<'a> {
     pub(super) control: &'a crate::compiler::SqlCompileControl,
+    pub(super) constant_policy: novarocks_functions::ConstantPolicy,
     pub(super) catalog: &'a dyn PlannerTableProvider,
     pub(super) current_database: &'a str,
     pub(super) function_catalog: &'a dyn crate::compiler::SqlFunctionCatalog,
@@ -314,6 +326,7 @@ impl<'a> AnalyzerContext<'a> {
         }
         let child = AnalyzerContext {
             control: self.control,
+            constant_policy: self.constant_policy,
             catalog: self.catalog,
             current_database: self.current_database,
             function_catalog: self.function_catalog,
@@ -388,6 +401,7 @@ impl<'a> AnalyzerContext<'a> {
 
         let mut child_ctx = AnalyzerContext {
             control: self.control,
+            constant_policy: self.constant_policy,
             catalog: self.catalog,
             current_database: self.current_database,
             function_catalog: self.function_catalog,
@@ -2574,9 +2588,10 @@ fn contains_subquery_placeholder(expr: &TypedExpr) -> bool {
                     .iter()
                     .any(|item| contains_subquery_placeholder(&item.expr))
         }
-        ExprKind::ColumnRef { .. } | ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) => {
-            false
-        }
+        ExprKind::ColumnRef { .. }
+        | ExprKind::LambdaParamRef { .. }
+        | ExprKind::Literal(_)
+        | ExprKind::Constant(_) => false,
     }
 }
 
@@ -3139,6 +3154,7 @@ fn replace_grouping_markers_in_typed_expr(
         ExprKind::ColumnRef { .. }
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
+        | ExprKind::Constant(_)
         | ExprKind::SubqueryPlaceholder { .. } => expr.clone(),
     }
 }
@@ -3255,6 +3271,7 @@ mod tests {
                 &TestCatalog,
                 "default",
                 crate::functions::builtin_sql_function_catalog(),
+                crate::constant::test_constant_policy(),
                 &control,
             )
             .unwrap();
@@ -3273,6 +3290,7 @@ mod tests {
                 &TestCatalog,
                 "default",
                 crate::functions::builtin_sql_function_catalog(),
+                crate::constant::test_constant_policy(),
                 &control,
             )
             .unwrap_err();
@@ -3304,6 +3322,7 @@ mod tests {
             &TestCatalog,
             "default",
             crate::functions::builtin_sql_function_catalog(),
+            crate::constant::test_constant_policy(),
             &control,
         )
         .unwrap();
@@ -3322,6 +3341,7 @@ mod tests {
             &TestCatalog,
             "default",
             crate::functions::builtin_sql_function_catalog(),
+            crate::constant::test_constant_policy(),
             &control,
         )
         .unwrap_err();
@@ -3389,6 +3409,7 @@ mod tests {
             &TestCatalog,
             "default",
             crate::functions::builtin_sql_function_catalog(),
+            crate::constant::test_constant_policy(),
             &control,
         )
         .unwrap();
@@ -5383,6 +5404,7 @@ mod tests {
             ExprKind::ColumnRef { .. }
             | ExprKind::LambdaParamRef { .. }
             | ExprKind::Literal(_)
+            | ExprKind::Constant(_)
             | ExprKind::SubqueryPlaceholder { .. } => None,
         }
     }
@@ -5457,6 +5479,7 @@ mod tests {
             }
             ExprKind::LambdaParamRef { .. }
             | ExprKind::Literal(_)
+            | ExprKind::Constant(_)
             | ExprKind::SubqueryPlaceholder { .. } => false,
         }
     }
@@ -5528,6 +5551,7 @@ mod tests {
             ExprKind::ColumnRef { .. }
             | ExprKind::LambdaParamRef { .. }
             | ExprKind::Literal(_)
+            | ExprKind::Constant(_)
             | ExprKind::SubqueryPlaceholder { .. } => false,
         }
     }
@@ -6618,6 +6642,7 @@ mod tests {
             &TestCatalog,
             "db",
             factory,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("analyze");

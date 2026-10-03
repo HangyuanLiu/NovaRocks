@@ -1459,6 +1459,12 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                 )
             }
             ExprKind::Literal(value) => format_literal(value).fmt(formatter),
+            ExprKind::Constant(reference) => write!(
+                formatter,
+                "constant-reference(pool={}, ordinal={})",
+                reference.pool.get(),
+                reference.ordinal,
+            ),
             ExprKind::Unary { op, expr: inner } => write!(
                 formatter,
                 "({}e{})",
@@ -3639,6 +3645,7 @@ mod tests {
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
             noop_constant_evaluator(),
+            crate::constant::test_constant_policy(),
             SqlCompileControl::unbounded(),
             PipelineDopDomain {
                 min: 1,
@@ -3662,7 +3669,8 @@ mod tests {
             .try_into_completion()
             .expect("completion request");
         let SqlCompileProgress::Complete(completed) =
-            SqlCompiler::start(request).expect("completed values plan")
+            SqlCompiler::start(request, &crate::compiler::SqlCompileControl::unbounded())
+                .expect("completed values plan")
         else {
             panic!("VALUES must not require external facts");
         };
@@ -3939,7 +3947,10 @@ mod tests {
         )
         .try_into_completion()
         .expect("completion request");
-        let catalog = incomplete(SqlCompiler::start(seed).expect("catalog need"));
+        let catalog = incomplete(
+            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+                .expect("catalog need"),
+        );
         let catalog_needs = match catalog.needs() {
             crate::compiler::SqlNeedBatch::CatalogRelations(needs) => needs,
             other => panic!("expected catalog needs, got {other:?}"),
@@ -4053,7 +4064,8 @@ mod tests {
         .expect("completion request");
 
         assert!(matches!(
-            SqlCompiler::start(request).expect("catalog need"),
+            SqlCompiler::start(request, &crate::compiler::SqlCompileControl::unbounded())
+                .expect("catalog need"),
             SqlCompileProgress::Incomplete(_)
         ));
     }

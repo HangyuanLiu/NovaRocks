@@ -742,6 +742,7 @@ mod tests {
                         .expect("builtin function catalog"),
                 ),
                 Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
+                crate::application::test_constant_policy(),
             ),
             None,
             Arc::clone(&connector_control),

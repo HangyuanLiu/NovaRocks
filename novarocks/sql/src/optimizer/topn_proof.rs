@@ -73,7 +73,7 @@ pub(crate) fn collect_column_ids(arena: &ScalarArena, expr: ScalarId) -> ColumnI
 fn collect_column_ids_inner(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<ColumnId>) {
     match arena.node(expr) {
         ScalarNode::ColumnRef(column_id) => out.push(*column_id),
-        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {}
+        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) | ScalarNode::Constant(_) => {}
         ScalarNode::BinaryOp { left, right, .. } => {
             collect_column_ids_inner(arena, *left, out);
             collect_column_ids_inner(arena, *right, out);

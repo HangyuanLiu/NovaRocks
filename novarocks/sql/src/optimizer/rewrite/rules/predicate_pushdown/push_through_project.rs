@@ -205,7 +205,9 @@ fn remap_scalar(
     let value_type = arena.value_type(expr).clone();
     Ok(match node {
         ScalarNode::ColumnRef(column_id) => bindings.get(&column_id).copied().flatten(),
-        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => Some(expr),
+        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) | ScalarNode::Constant(_) => {
+            Some(expr)
+        }
         ScalarNode::BinaryOp {
             op,
             left,

@@ -48,7 +48,7 @@ fn constant_rand(
         author(
             functions,
             "rand",
-            vec![argument(ty, Some(FunctionLiteral::Int64(42)))],
+            vec![integer_argument(ty, 42)],
             ControlShape::Eager,
         ),
         vec![seed],
@@ -72,10 +72,7 @@ fn rounded(
                     FunctionValueType::new(DataType::Decimal128(38, 0), true),
                     None,
                 ),
-                argument(
-                    FunctionValueType::new(DataType::Int64, false),
-                    Some(FunctionLiteral::Int64(-1)),
-                ),
+                integer_argument(FunctionValueType::new(DataType::Int64, false), -1),
             ],
             ControlShape::Eager,
         ),

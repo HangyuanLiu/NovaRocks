@@ -138,7 +138,7 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
                 "round",
                 vec![
                     argument(decimal, None),
-                    argument(integer.clone(), Some(FunctionLiteral::Int64(-1))),
+                    integer_argument(integer.clone(), -1),
                 ],
                 ControlShape::Eager,
             ),
@@ -179,7 +179,7 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
                     author(
                         &functions,
                         "rand",
-                        vec![argument(integer, Some(FunctionLiteral::Int64(42)))],
+                        vec![integer_argument(integer, 42)],
                         ControlShape::Eager,
                     ),
                     vec![seed],

@@ -156,6 +156,7 @@ trait IcebergMvRefreshSource:
 #[derive(Clone)]
 pub struct IcebergMvCorePorts {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    constant_policy: novarocks_functions::ConstantPolicy,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -179,9 +180,11 @@ impl IcebergMvCorePorts {
         connector_control: Arc<dyn ConnectorControlRegistry>,
         readiness: Arc<MvReadinessPort>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
+        constant_policy: novarocks_functions::ConstantPolicy,
     ) -> Self {
         Self {
             functions,
+            constant_policy,
             catalog_service,
             catalog_application,
             connector_control,
@@ -202,9 +205,11 @@ impl IcebergMvCorePorts {
         readiness: Arc<MvReadinessPort>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
         management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
+        constant_policy: novarocks_functions::ConstantPolicy,
     ) -> Self {
         Self {
             functions,
+            constant_policy,
             catalog_service,
             catalog_application,
             connector_control,
@@ -248,6 +253,10 @@ impl IcebergMvCorePorts {
             "document-managed MV CREATE requires the composed typed connector control host"
                 .to_string()
         })
+    }
+
+    pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy
     }
 
     pub(crate) fn function_catalog(&self) -> &Arc<novarocks_functions::EngineFunctionCatalog> {
@@ -945,17 +954,20 @@ fn prepare_iceberg_mv_create_with_ports(
         novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
         ports.catalog_application.as_deref(),
     );
+    let completion_control =
+        crate::query_execution::planning::sql_compile_control_from_connector_request(
+            connector_context,
+        );
     let analysis = crate::mv::domain::analysis_adapter::analyze_mv_select_with_provider(
         Some(current_catalog),
         &provider,
         current_database,
         &canonical_select_query,
         ports.function_catalog().as_ref(),
-        crate::query_execution::planning::sql_compile_control_from_connector_request(
-            connector_context,
-        ),
+        ports.constant_policy(),
+        completion_control.clone(),
     )?;
-    let refresh_contract = derive_imv_refresh_contract(&analysis)?;
+    let refresh_contract = derive_imv_refresh_contract(&analysis, &completion_control)?;
     let partition_fields = partition_fields_for_create(stmt.partition_by.as_ref());
     validate_mv_partition_columns(Some(&partition_fields), &analysis.output_columns)?;
     let created_at_ms = now_ms();
@@ -981,7 +993,7 @@ fn prepare_iceberg_mv_create_with_ports(
             target.catalog, target.namespace, target.table
         )
     })?;
-    let property = derive_fragment_property(&analysis)?;
+    let property = derive_fragment_property(&analysis, &completion_control)?;
     let create_persistence_facts = analysis.refresh_input.create_persistence_facts()?;
     let source_field_observations =
         crate::mv::domain::persistence::source_bindings::observe_mv_create_source_bindings(

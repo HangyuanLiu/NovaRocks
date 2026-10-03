@@ -787,9 +787,10 @@ fn scalar_complexity(arena: Option<&ScalarArena>, expr: ScalarId) -> f64 {
         return 1.0;
     };
     match arena.node(expr) {
-        ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {
-            0.1
-        }
+        ScalarNode::ColumnRef(_)
+        | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_) => 0.1,
         ScalarNode::Nested(child) | ScalarNode::Cast { child, .. } => {
             0.2 + scalar_complexity(Some(arena), *child)
         }

@@ -22,15 +22,14 @@ use std::hash::{Hash, Hasher};
 
 use novarocks_functions::{
     AggregateBindingSelection, EngineFunctionCatalog, FunctionArgument, FunctionBindingRequest,
-    FunctionBindingSelection, FunctionLiteral, FunctionResultType, FunctionSemantics,
-    ResolvedFunctionBinding,
+    FunctionBindingSelection, FunctionResultType, FunctionSemantics, ResolvedFunctionBinding,
 };
 use novarocks_physical_plan::{
     AggregateBinding, AggregatePhase, Distribution, Edge, EdgeId, EdgeKind, ExprId, ExprKind,
     Fragment, FragmentId, FragmentSink, FunctionArgumentType, JoinDistribution, JoinKind, JoinSide,
-    LiteralValue, NodeId, NodeKind, PhysicalNode, PhysicalPlan, ProviderColumnReference,
-    ProviderReadReference, ResultPort, RowCountAssertion, RowCountAssertionSpec, SetOperationKind,
-    SortMode, TopNPhase, UnpivotConstant, ValueId, ValueOrigin, ValueType,
+    NodeId, NodeKind, PhysicalNode, PhysicalPlan, ProviderColumnReference, ProviderReadReference,
+    ResultPort, RowCountAssertion, RowCountAssertionSpec, SetOperationKind, SortMode, TopNPhase,
+    UnpivotConstant, ValueId, ValueOrigin, ValueType,
 };
 use novarocks_proto_codec::{FieldPath, arrow_physical};
 use novarocks_proto_models::{common, expr, plan};
@@ -40,9 +39,9 @@ use prost::Message;
 use sha2::{Digest, Sha256};
 
 use crate::physical_expr::{
-    MAX_WIRE_LAMBDA_PARAMETERS, NATIVE_V1_MAX_WIRE_NESTING, ValueResolution,
-    WireExpressionPreflight, encode_exprs, encode_physical_expr, encode_sort_items,
-    encode_window_frame, wire_function_name,
+    ExpressionEncodingContext, MAX_WIRE_LAMBDA_PARAMETERS, NATIVE_V1_MAX_WIRE_NESTING,
+    ValueResolution, WireExpressionPreflight, encode_exprs, encode_physical_expr,
+    encode_sort_items, encode_window_frame, wire_function_name,
 };
 use crate::physical_type::{
     arrow_authoritative_wire_depths, encode_arrow_authoritative_compatibility_type,
@@ -230,8 +229,20 @@ pub fn encode_physical_plan_v1(
         control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
         // Recursive node, expression, and type trees are constructed only after
         // their complete nesting and expansion shape has passed preflight.
+        novarocks_physical_plan::validate_plan_observed(physical, control).map_err(|error| {
+            match error {
+                novarocks_physical_plan::PlanConstructionError::Constants(
+                    novarocks_physical_plan::ConstantReferenceError::Control(error),
+                ) => PhysicalEncodeError::Control(error),
+                error => PhysicalEncodeError::Invalid(error.to_string()),
+            }
+        })?;
         preflight_physical_plan_v1(physical).map_err(|error| error.to_string())?;
-        preflight_native_v1_wire_shape(physical)?;
+        let context = ExpressionEncodingContext {
+            constants: physical.constants(),
+            control,
+        };
+        preflight_native_v1_wire_shape(physical, context)?;
         preflight_encoder(
             physical,
             function_catalog,
@@ -266,9 +277,10 @@ pub fn encode_physical_plan_v1(
                     private_facts,
                     &runtime_filters,
                     &names,
+                    context,
                 )
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Result<Vec<_>, PhysicalEncodeError>>()?;
         let edges = physical
             .edges()
             .values()
@@ -327,46 +339,60 @@ pub struct PhysicalV1CteConsumer {
 /// Every CTE consumer of one completed plan, in edge order.
 pub fn physical_v1_cte_consumers(
     physical: &PhysicalPlan,
-) -> Result<Vec<PhysicalV1CteConsumer>, String> {
-    let mut consumers = Vec::new();
-    for edge in physical.edges().values() {
-        if edge.kind != EdgeKind::CteMulticast {
-            continue;
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<PhysicalV1CteConsumer>, PhysicalEncodeError> {
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        control,
+        novarocks_type_contract::CompilePhase::Encode,
+    )?;
+    let result = (|| -> Result<Vec<PhysicalV1CteConsumer>, PhysicalEncodeError> {
+        let mut consumers = Vec::new();
+        for edge in physical.edges().values() {
+            if edge.kind != EdgeKind::CteMulticast {
+                work.step()?;
+                continue;
+            }
+            let fragment = physical
+                .fragments()
+                .get(&edge.source.fragment)
+                .ok_or_else(|| {
+                    format!(
+                        "cte multicast edge {} names absent source fragment {}",
+                        edge.id.get(),
+                        edge.source.fragment.get()
+                    )
+                })?;
+            let layout = WireLayout::try_new(fragment).map_err(|error| error.to_string())?;
+            let output_slot_ids = layout
+                .project_output(fragment, fragment.root(), &edge.source.projection)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(WireSlotId::get)
+                .collect::<Vec<_>>();
+            consumers.push(PhysicalV1CteConsumer {
+                cte_id: edge.source.fragment.get(),
+                target_fragment_id: edge.destination.fragment.get(),
+                target_exchange_node_id: i32::try_from(edge.destination.node.get())
+                    .map_err(|_| "cte multicast destination node exceeds i32".to_string())?,
+                output_partition: encode_data_partition(
+                    fragment,
+                    &layout,
+                    &fragment.nodes()[&fragment.root()],
+                    &edge.partitioning.source,
+                    true,
+                )?,
+                receive_producer_column_ids: output_slot_ids_u32(&output_slot_ids)?,
+                output_slot_ids,
+            });
+            work.step()?;
         }
-        let fragment = physical
-            .fragments()
-            .get(&edge.source.fragment)
-            .ok_or_else(|| {
-                format!(
-                    "cte multicast edge {} names absent source fragment {}",
-                    edge.id.get(),
-                    edge.source.fragment.get()
-                )
-            })?;
-        let layout = WireLayout::try_new(fragment).map_err(|error| error.to_string())?;
-        let output_slot_ids = layout
-            .project_output(fragment, fragment.root(), &edge.source.projection)
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(WireSlotId::get)
-            .collect::<Vec<_>>();
-        consumers.push(PhysicalV1CteConsumer {
-            cte_id: edge.source.fragment.get(),
-            target_fragment_id: edge.destination.fragment.get(),
-            target_exchange_node_id: i32::try_from(edge.destination.node.get())
-                .map_err(|_| "cte multicast destination node exceeds i32".to_string())?,
-            output_partition: encode_data_partition(
-                fragment,
-                &layout,
-                &fragment.nodes()[&fragment.root()],
-                &edge.partitioning.source,
-                true,
-            )?,
-            receive_producer_column_ids: output_slot_ids_u32(&output_slot_ids)?,
-            output_slot_ids,
-        });
+        Ok(consumers)
+    })();
+    if matches!(&result, Err(PhysicalEncodeError::Control(_))) {
+        return result;
     }
-    Ok(consumers)
+    work.finish()?;
+    result
 }
 
 /// Which runtime-filter role one wire binding identity names.
@@ -948,11 +974,14 @@ const NATIVE_V1_WRITER_SQL_WRAPPER_DEPTH: usize = 4;
 /// own recursive messages below a node. These conservative fixed prefixes cover
 /// `DistributedPlan`, `PlanFragment`, the node payload, and the carrier-specific
 /// wrappers above the recursive expression or type.
-fn preflight_native_v1_wire_shape(physical: &PhysicalPlan) -> Result<(), String> {
+fn preflight_native_v1_wire_shape(
+    physical: &PhysicalPlan,
+    context: ExpressionEncodingContext<'_>,
+) -> Result<(), PhysicalEncodeError> {
     for fragment in physical.fragments().values() {
         let node_depths =
             native_v1_node_wire_depths(fragment).map_err(|error| error.to_string())?;
-        let mut expressions = WireExpressionPreflight::try_new(fragment)?;
+        let mut expressions = WireExpressionPreflight::try_new(fragment, context)?;
         for node in fragment.nodes().values() {
             let node_depth = node_depths.get(&node.id).copied().ok_or_else(|| {
                 format!(
@@ -1183,189 +1212,199 @@ fn preflight_encoder(
         control,
         novarocks_type_contract::CompilePhase::Validate,
     )?;
-    let Some(result) = physical.result_port() else {
-        return Err("native wire v1 requires one result port".into());
-    };
-    let result_fragment = &physical.fragments()[&result.fragment];
-    for field in &result.fields {
-        let writer_derived = result_fragment
-            .values()
-            .get(&field.value)
-            .is_some_and(|value| matches!(value.origin, ValueOrigin::WriterDerived { .. }));
-        if !writer_derived {
-            validate_v1_value_type(&field.ty)
-                .map_err(|reason| format!("result field `{}`: {reason}", field.name))?;
+    let result = (|| -> Result<(), PhysicalEncodeError> {
+        let Some(result) = physical.result_port() else {
+            return Err("native wire v1 requires one result port".into());
+        };
+        let result_fragment = &physical.fragments()[&result.fragment];
+        for field in &result.fields {
+            let writer_derived = result_fragment
+                .values()
+                .get(&field.value)
+                .is_some_and(|value| matches!(value.origin, ValueOrigin::WriterDerived { .. }));
+            if !writer_derived {
+                validate_v1_value_type(&field.ty)
+                    .map_err(|reason| format!("result field `{}`: {reason}", field.name))?;
+            }
         }
-    }
-    let scan_dynamic_filters = preflight_runtime_filters(physical)?;
-    for fragment in physical.fragments().values() {
-        work.step()?;
-        let writer_count = fragment
-            .nodes()
-            .values()
-            .filter(|node| matches!(node.kind, NodeKind::TableWriter { .. }))
-            .count();
-        if writer_count > 1 {
-            return Err(format!(
+        let scan_dynamic_filters = preflight_runtime_filters(physical)?;
+        for fragment in physical.fragments().values() {
+            work.step()?;
+            let writer_count = fragment
+                .nodes()
+                .values()
+                .filter(|node| matches!(node.kind, NodeKind::TableWriter { .. }))
+                .count();
+            if writer_count > 1 {
+                return Err(format!(
                 "native wire v1 fragment {} cannot assign exact writer ordinals to {writer_count} writers",
                 fragment.id().get()
             ).into());
-        }
-        for value in fragment.values().values() {
-            if !matches!(value.origin, ValueOrigin::WriterDerived { .. }) {
-                validate_v1_value_type(&value.ty).map_err(|reason| {
-                    format!(
-                        "fragment {} value {}: {reason}",
-                        fragment.id().get(),
-                        value.id.get()
-                    )
-                })?;
             }
-        }
-        for (id, expression) in fragment.expressions().iter() {
-            work.step()?;
-            let subject = |reason: String| {
-                format!(
-                    "fragment {} expression {}: {reason}",
-                    fragment.id().get(),
-                    id.get()
-                )
-            };
-            // v1 delivers this setting in statement QueryOptions, not in
-            // expression DTOs. Refuse any source that that projection loses.
-            for reference in expression.kind.intrinsic_parameter_references() {
-                let frozen = physical
-                    .parameters()
-                    .require(*reference)
-                    .map_err(|error| subject(error.to_string()))?;
-                if !matches!(frozen,
+            for value in fragment.values().values() {
+                if !matches!(value.origin, ValueOrigin::WriterDerived { .. }) {
+                    validate_v1_value_type(&value.ty).map_err(|reason| {
+                        format!(
+                            "fragment {} value {}: {reason}",
+                            fragment.id().get(),
+                            value.id.get()
+                        )
+                    })?;
+                }
+            }
+            for (id, expression) in fragment.expressions().iter() {
+                work.step()?;
+                let subject = |reason: String| {
+                    format!(
+                        "fragment {} expression {}: {reason}",
+                        fragment.id().get(),
+                        id.get()
+                    )
+                };
+                // v1 delivers this setting in statement QueryOptions, not in
+                // expression DTOs. Refuse any source that that projection loses.
+                for reference in expression.kind.intrinsic_parameter_references() {
+                    let frozen = physical
+                        .parameters()
+                        .require(*reference)
+                        .map_err(|error| subject(error.to_string()))?;
+                    if !matches!(frozen,
                     novarocks_type_contract::SemanticParameterValue::AllowThrowException(value)
                         if *value == root_allow_throw_exception)
-                {
-                    return Err(subject(
+                    {
+                        return Err(subject(
                         "intrinsic ALLOW_THROW_EXCEPTION differs from the admitted v1 statement setting".into()
                     ).into());
+                    }
                 }
-            }
-            validate_v1_value_type(&expression.ty).map_err(subject)?;
-            match &expression.kind {
-                ExprKind::Cast { target, .. } => {
-                    validate_physical_type(target).map_err(|reason| {
-                        format!(
-                            "fragment {} expression {} cast target: {reason}",
-                            fragment.id().get(),
-                            id.get()
-                        )
-                    })?
-                }
-                ExprKind::FunctionCall { function, args } => {
-                    work.flush()?;
-                    validate_scalar_binding(function_catalog, fragment, function, args, control)?
-                }
-                ExprKind::WindowCall {
-                    function,
-                    args,
-                    function_order_by,
-                    aggregate_binding,
-                    ..
-                } => {
-                    if let Some(binding) = aggregate_binding {
-                        let arguments = args
-                            .iter()
-                            .copied()
-                            .chain(function_order_by.iter().map(|item| item.expr))
-                            .collect::<Vec<_>>();
-                        work.flush()?;
-                        validate_aggregate_binding(
-                            function_catalog,
-                            fragment,
-                            binding,
-                            &arguments,
-                            control,
-                        )?;
-                    } else {
+                validate_v1_value_type(&expression.ty).map_err(subject)?;
+                match &expression.kind {
+                    ExprKind::Cast { target, .. } => {
+                        validate_physical_type(target).map_err(|reason| {
+                            format!(
+                                "fragment {} expression {} cast target: {reason}",
+                                fragment.id().get(),
+                                id.get()
+                            )
+                        })?
+                    }
+                    ExprKind::FunctionCall { function, args } => {
                         work.flush()?;
                         validate_scalar_binding(
                             function_catalog,
+                            physical.constants(),
                             fragment,
                             function,
                             args,
                             control,
-                        )?;
+                        )?
                     }
-                }
-                ExprKind::Lambda {
-                    parameter_types, ..
-                } => {
-                    // A lambda's parameters are addressed in the reserved
-                    // slot range, which is wide but not unbounded.
-                    if parameter_types.len() > MAX_WIRE_LAMBDA_PARAMETERS {
-                        return Err(format!(
+                    ExprKind::WindowCall {
+                        function,
+                        args,
+                        function_order_by,
+                        aggregate_binding,
+                        ..
+                    } => {
+                        if let Some(binding) = aggregate_binding {
+                            let arguments = args
+                                .iter()
+                                .copied()
+                                .chain(function_order_by.iter().map(|item| item.expr))
+                                .collect::<Vec<_>>();
+                            work.flush()?;
+                            validate_aggregate_binding(
+                                function_catalog,
+                                physical.constants(),
+                                fragment,
+                                binding,
+                                &arguments,
+                                control,
+                            )?;
+                        } else {
+                            work.flush()?;
+                            validate_scalar_binding(
+                                function_catalog,
+                                physical.constants(),
+                                fragment,
+                                function,
+                                args,
+                                control,
+                            )?;
+                        }
+                    }
+                    ExprKind::Lambda {
+                        parameter_types, ..
+                    } => {
+                        // A lambda's parameters are addressed in the reserved
+                        // slot range, which is wide but not unbounded.
+                        if parameter_types.len() > MAX_WIRE_LAMBDA_PARAMETERS {
+                            return Err(format!(
                             "fragment {} node {} lambda declares {} parameters; native wire v1 addresses at most {MAX_WIRE_LAMBDA_PARAMETERS}",
                             fragment.id().get(),
                             expression.owner.get(),
                             parameter_types.len()
                         ).into());
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-        for node in fragment.nodes().values() {
-            work.step()?;
-            match &node.kind {
-                NodeKind::Scan {
-                    occurrence,
-                    relation,
-                    read_budget,
-                    provider_outputs,
-                    derived_values,
-                    ..
-                } => {
-                    let fact =
-                        private_facts
-                            .scan_fact(fragment.id(), node.id)
-                            .ok_or_else(|| {
-                                format!(
-                                    "native wire v1 scan fact missing for fragment {} node {}",
-                                    fragment.id().get(),
-                                    node.id.get()
-                                )
-                            })?;
-                    if fact.occurrence != *occurrence {
-                        return Err(format!(
-                            "native wire v1 scan occurrence mismatch at fragment {} node {}",
-                            fragment.id().get(),
-                            node.id.get()
-                        )
-                        .into());
-                    }
-                    if &fact.read != relation.read() {
-                        return Err(format!(
-                            "native wire v1 scan fact relation mismatch at fragment {} node {}",
-                            fragment.id().get(),
-                            node.id.get()
-                        )
-                        .into());
-                    }
-                    let typed = typed_scan_source(&fact.table).ok_or_else(|| {
+            for node in fragment.nodes().values() {
+                work.step()?;
+                match &node.kind {
+                    NodeKind::Scan {
+                        occurrence,
+                        relation,
+                        read_budget,
+                        provider_outputs,
+                        derived_values,
+                        ..
+                    } => {
+                        let fact =
+                            private_facts
+                                .scan_fact(fragment.id(), node.id)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "native wire v1 scan fact missing for fragment {} node {}",
+                                        fragment.id().get(),
+                                        node.id.get()
+                                    )
+                                })?;
+                        if fact.occurrence != *occurrence {
+                            return Err(format!(
+                                "native wire v1 scan occurrence mismatch at fragment {} node {}",
+                                fragment.id().get(),
+                                node.id.get()
+                            )
+                            .into());
+                        }
+                        if &fact.read != relation.read() {
+                            return Err(format!(
+                                "native wire v1 scan fact relation mismatch at fragment {} node {}",
+                                fragment.id().get(),
+                                node.id.get()
+                            )
+                            .into());
+                        }
+                        let typed = typed_scan_source(&fact.table).ok_or_else(|| {
                         format!(
                             "native wire v1 scan fact has no typed source at fragment {} node {}",
                             fragment.id().get(),
                             node.id.get()
                         )
                     })?;
-                    if typed.max_batch_rows != read_budget.max_batch_rows
-                        || typed.max_batch_bytes != read_budget.max_batch_bytes
-                    {
-                        return Err(format!(
+                        if typed.max_batch_rows != read_budget.max_batch_rows
+                            || typed.max_batch_bytes != read_budget.max_batch_bytes
+                        {
+                            return Err(format!(
                             "native wire v1 scan fact read budget mismatch at fragment {} node {}",
                             fragment.id().get(),
                             node.id.get()
                         )
                         .into());
-                    }
-                    let expected_work_source = match relation.work_source() {
+                        }
+                        let expected_work_source = match relation.work_source() {
                         ConnectorReadWorkSource::RuntimeSplits => {
                             novarocks_proto_models::connector_read::ScanWorkSource::RuntimeSplits
                                 as i32
@@ -1375,267 +1414,289 @@ fn preflight_encoder(
                                 as i32
                         }
                     };
-                    if typed.work_source != expected_work_source {
-                        return Err(format!(
+                        if typed.work_source != expected_work_source {
+                            return Err(format!(
                             "native wire v1 scan fact work source mismatch at fragment {} node {}",
                             fragment.id().get(),
                             node.id.get()
                         )
                         .into());
+                        }
+                        preflight_scan_source_identity(relation, fact, typed)?;
+                        let scan_columns = preflight_scan_columns(
+                            fragment,
+                            node,
+                            relation.schema(),
+                            provider_outputs,
+                            fact,
+                            typed,
+                        )?;
+                        preflight_scan_dynamic_filters(
+                            fragment,
+                            node,
+                            &scan_columns,
+                            typed,
+                            scan_dynamic_filters
+                                .get(&(fragment.id(), node.id))
+                                .map(Vec::as_slice)
+                                .unwrap_or_default(),
+                        )?;
                     }
-                    preflight_scan_source_identity(relation, fact, typed)?;
-                    let scan_columns = preflight_scan_columns(
+                    NodeKind::Repeat {
+                        grouping_values, ..
+                    } if !v1_repeat_grouping_values_are_lossless(
                         fragment,
                         node,
-                        relation.schema(),
-                        provider_outputs,
-                        fact,
-                        typed,
-                    )?;
-                    preflight_scan_dynamic_filters(
-                        fragment,
-                        node,
-                        &scan_columns,
-                        typed,
-                        scan_dynamic_filters
-                            .get(&(fragment.id(), node.id))
-                            .map(Vec::as_slice)
-                            .unwrap_or_default(),
-                    )?;
-                }
-                NodeKind::Repeat {
-                    grouping_values, ..
-                } if !v1_repeat_grouping_values_are_lossless(fragment, node, grouping_values) => {
-                    return unsupported(
-                        fragment,
-                        node,
-                        "Repeat that moves a null-extended grouping column",
-                    )
-                    .map_err(PhysicalEncodeError::Invalid);
-                }
-                NodeKind::TableWriter { target } => {
-                    let fact = private_facts
-                        .write_fact(target.write_target_ordinal)
-                        .ok_or_else(|| {
-                            format!(
-                                "native wire v1 write fact missing for target {}",
-                                target.write_target_ordinal.get()
-                            )
-                        })?;
-                    let expected =
+                        grouping_values,
+                    ) =>
+                    {
+                        return unsupported(
+                            fragment,
+                            node,
+                            "Repeat that moves a null-extended grouping column",
+                        )
+                        .map_err(PhysicalEncodeError::Invalid);
+                    }
+                    NodeKind::TableWriter { target } => {
+                        let fact = private_facts
+                            .write_fact(target.write_target_ordinal)
+                            .ok_or_else(|| {
+                                format!(
+                                    "native wire v1 write fact missing for target {}",
+                                    target.write_target_ordinal.get()
+                                )
+                            })?;
+                        let expected =
                         novarocks_proto_codec::connector_common::encode_connector_payload_message(
                             &target.handle,
                         );
-                    let expected_handle =
-                        novarocks_proto_models::connector_write::ConnectorWriterHandle {
-                            provider_payload: Some(expected),
-                        };
-                    if fact.handle != expected_handle {
-                        return Err(format!(
+                        let expected_handle =
+                            novarocks_proto_models::connector_write::ConnectorWriterHandle {
+                                provider_payload: Some(expected),
+                            };
+                        if fact.handle != expected_handle {
+                            return Err(format!(
                             "native wire v1 writer handle payload or public header mismatch for target {}",
                             target.write_target_ordinal.get()
                         ).into());
+                        }
+                        for field in &target.target_fields {
+                            validate_v1_value_type(&field.ty)?;
+                        }
+                        validate_writer_schema(&target.output_schema)?;
+                        for call in &target.partial_aggregates {
+                            if !matches!(call.binding.phase, AggregatePhase::Partial { .. }) {
+                                return unsupported(
+                                    fragment,
+                                    node,
+                                    "writer aggregate whose phase is not Partial",
+                                )
+                                .map_err(PhysicalEncodeError::Invalid);
+                            }
+                            work.flush()?;
+                            validate_aggregate_binding_from_types(
+                                function_catalog,
+                                &call.binding,
+                                control,
+                            )?;
+                        }
                     }
-                    for field in &target.target_fields {
-                        validate_v1_value_type(&field.ty)?;
+                    NodeKind::TableFinish(spec) => {
+                        validate_writer_schema(&spec.input_schema)?;
+                        validate_writer_schema(&spec.output_schema)?;
+                        for call in &spec.final_aggregates {
+                            if !matches!(call.binding.phase, AggregatePhase::Final { .. }) {
+                                return unsupported(
+                                    fragment,
+                                    node,
+                                    "table-finish aggregate whose phase is not Final",
+                                )
+                                .map_err(PhysicalEncodeError::Invalid);
+                            }
+                            work.flush()?;
+                            validate_aggregate_binding_from_types(
+                                function_catalog,
+                                &call.binding,
+                                control,
+                            )?;
+                        }
                     }
-                    validate_writer_schema(&target.output_schema)?;
-                    for call in &target.partial_aggregates {
-                        if !matches!(call.binding.phase, AggregatePhase::Partial { .. }) {
+                    NodeKind::Aggregate { calls, .. } => {
+                        // Each call says for itself whether it reads values or a
+                        // state, and the wire carries that per call, so calls of
+                        // different phases in one node travel intact -- as long
+                        // as they agree on finalizing, which the wire states once
+                        // for the node.
+                        if !v1_aggregate_phases_are_lossless(calls) {
                             return unsupported(
                                 fragment,
                                 node,
-                                "writer aggregate whose phase is not Partial",
+                                "Aggregate whose calls disagree about finalizing",
                             )
                             .map_err(PhysicalEncodeError::Invalid);
                         }
-                        work.flush()?;
-                        validate_aggregate_binding_from_types(
-                            function_catalog,
-                            &call.binding,
-                            control,
-                        )?;
-                    }
-                }
-                NodeKind::TableFinish(spec) => {
-                    validate_writer_schema(&spec.input_schema)?;
-                    validate_writer_schema(&spec.output_schema)?;
-                    for call in &spec.final_aggregates {
-                        if !matches!(call.binding.phase, AggregatePhase::Final { .. }) {
-                            return unsupported(
+                        for call in calls {
+                            let arguments = call
+                                .arguments
+                                .iter()
+                                .copied()
+                                .chain(call.order_by.iter().map(|item| item.expr))
+                                .collect::<Vec<_>>();
+                            work.flush()?;
+                            validate_aggregate_binding(
+                                function_catalog,
+                                physical.constants(),
                                 fragment,
-                                node,
-                                "table-finish aggregate whose phase is not Final",
-                            )
-                            .map_err(PhysicalEncodeError::Invalid);
+                                &call.binding,
+                                &arguments,
+                                control,
+                            )?;
                         }
-                        work.flush()?;
-                        validate_aggregate_binding_from_types(
-                            function_catalog,
-                            &call.binding,
-                            control,
-                        )?;
                     }
-                }
-                NodeKind::Aggregate { calls, .. } => {
-                    // Each call says for itself whether it reads values or a
-                    // state, and the wire carries that per call, so calls of
-                    // different phases in one node travel intact -- as long
-                    // as they agree on finalizing, which the wire states once
-                    // for the node.
-                    if !v1_aggregate_phases_are_lossless(calls) {
-                        return unsupported(
-                            fragment,
-                            node,
-                            "Aggregate whose calls disagree about finalizing",
-                        )
-                        .map_err(PhysicalEncodeError::Invalid);
-                    }
-                    for call in calls {
-                        let arguments = call
-                            .arguments
-                            .iter()
-                            .copied()
-                            .chain(call.order_by.iter().map(|item| item.expr))
-                            .collect::<Vec<_>>();
-                        work.flush()?;
-                        validate_aggregate_binding(
-                            function_catalog,
-                            fragment,
-                            &call.binding,
-                            &arguments,
-                            control,
-                        )?;
-                    }
-                }
-                NodeKind::TableFunction {
-                    function,
-                    arguments,
-                    outputs,
-                    ..
-                } => {
-                    work.flush()?;
-                    validate_table_binding(
-                        function_catalog,
-                        fragment,
+                    NodeKind::TableFunction {
                         function,
                         arguments,
-                        control,
-                    )?;
-                    preflight_table_function_v1(fragment, node, function, outputs)?;
-                }
-                NodeKind::Sort {
-                    mode: SortMode::PartitionTopN { limit, .. },
-                    ..
-                } => {
-                    if !v1_partition_topn_limit_is_addressable(*limit) {
-                        return unsupported(
+                        outputs,
+                        ..
+                    } => {
+                        work.flush()?;
+                        validate_table_binding(
+                            function_catalog,
+                            physical.constants(),
                             fragment,
-                            node,
-                            "partition TopN with a zero or unaddressable limit",
-                        )
-                        .map_err(PhysicalEncodeError::Invalid);
+                            function,
+                            arguments,
+                            control,
+                        )?;
+                        preflight_table_function_v1(fragment, node, function, outputs)?;
                     }
-                }
-                NodeKind::TopN {
-                    limit,
-                    offset,
-                    phase,
-                    reduction,
-                    ..
-                } => {
-                    if !matches!(reduction, novarocks_physical_plan::TopNReduction::Rows) {
-                        return unsupported(
-                            fragment,
-                            node,
-                            "key-budgeted TopN state merging requires wire v2",
-                        )
-                        .map_err(PhysicalEncodeError::Invalid);
-                    }
-                    if !v1_topn_phase_is_lossless(*phase) {
-                        return unsupported(
-                            fragment,
-                            node,
-                            "split TopN sequence requiring ExchangeReceiver TopNSplit",
-                        )
-                        .map_err(PhysicalEncodeError::Invalid);
-                    }
-                    preflight_i64(*limit, fragment, node, "TopN limit")?;
-                    preflight_i64(*offset, fragment, node, "TopN offset")?;
-                }
-                NodeKind::Limit { limit, offset } => {
-                    if let Some(limit) = limit {
-                        preflight_i64(*limit, fragment, node, "Limit limit")?;
-                    }
-                    preflight_i64(*offset, fragment, node, "Limit offset")?;
-                }
-                NodeKind::AssertOneRow(RowCountAssertionSpec::Global { desired_rows, .. }) => {
-                    preflight_i64(*desired_rows, fragment, node, "assert desired row count")?;
-                }
-                NodeKind::HashJoin {
-                    kind, build_side, ..
-                } => {
-                    if !v1_hash_join_build_is_lossless(*kind, *build_side) {
-                        return unsupported(
-                            fragment,
-                            node,
-                            &format!("{build_side:?}-build {kind:?} HashJoin"),
-                        )
-                        .map_err(PhysicalEncodeError::Invalid);
-                    }
-                    if !v1_join_output_is_lossless(fragment, node, *kind) {
-                        return unsupported(fragment, node, "unrepresentable HashJoin output port")
+                    NodeKind::Sort {
+                        mode: SortMode::PartitionTopN { limit, .. },
+                        ..
+                    } => {
+                        if !v1_partition_topn_limit_is_addressable(*limit) {
+                            return unsupported(
+                                fragment,
+                                node,
+                                "partition TopN with a zero or unaddressable limit",
+                            )
                             .map_err(PhysicalEncodeError::Invalid);
+                        }
                     }
-                }
-                NodeKind::NestLoopJoin { kind, .. }
-                    if !v1_join_output_is_lossless(fragment, node, *kind) =>
-                {
-                    return unsupported(fragment, node, "unrepresentable NestLoopJoin output port")
-                        .map_err(PhysicalEncodeError::Invalid);
-                }
-                _ => {}
-            }
-        }
-        match fragment.sink() {
-            FragmentSink::Router { routes, .. } => {
-                wire_group_id(fragment.id()).map_err(|error| {
-                    format!(
-                        "fragment {} router group identity is not representable: {error}",
-                        fragment.id().get()
-                    )
-                })?;
-                let root = &fragment.nodes()[&fragment.root()];
-                for route in routes {
-                    let edge = physical
-                        .edges()
-                        .get(&route.edge)
-                        .ok_or_else(|| format!("router names absent edge {}", route.edge.get()))?;
-                    if edge.kind != EdgeKind::ChangeStreamRouter {
-                        return Err(format!(
-                            "router route edge {} is not a change-stream edge",
-                            edge.id.get()
+                    NodeKind::TopN {
+                        limit,
+                        offset,
+                        phase,
+                        reduction,
+                        ..
+                    } => {
+                        if !matches!(reduction, novarocks_physical_plan::TopNReduction::Rows) {
+                            return unsupported(
+                                fragment,
+                                node,
+                                "key-budgeted TopN state merging requires wire v2",
+                            )
+                            .map_err(PhysicalEncodeError::Invalid);
+                        }
+                        if !v1_topn_phase_is_lossless(*phase) {
+                            return unsupported(
+                                fragment,
+                                node,
+                                "split TopN sequence requiring ExchangeReceiver TopNSplit",
+                            )
+                            .map_err(PhysicalEncodeError::Invalid);
+                        }
+                        preflight_i64(*limit, fragment, node, "TopN limit")?;
+                        preflight_i64(*offset, fragment, node, "TopN offset")?;
+                    }
+                    NodeKind::Limit { limit, offset } => {
+                        if let Some(limit) = limit {
+                            preflight_i64(*limit, fragment, node, "Limit limit")?;
+                        }
+                        preflight_i64(*offset, fragment, node, "Limit offset")?;
+                    }
+                    NodeKind::AssertOneRow(RowCountAssertionSpec::Global {
+                        desired_rows, ..
+                    }) => {
+                        preflight_i64(*desired_rows, fragment, node, "assert desired row count")?;
+                    }
+                    NodeKind::HashJoin {
+                        kind, build_side, ..
+                    } => {
+                        if !v1_hash_join_build_is_lossless(*kind, *build_side) {
+                            return unsupported(
+                                fragment,
+                                node,
+                                &format!("{build_side:?}-build {kind:?} HashJoin"),
+                            )
+                            .map_err(PhysicalEncodeError::Invalid);
+                        }
+                        if !v1_join_output_is_lossless(fragment, node, *kind) {
+                            return unsupported(
+                                fragment,
+                                node,
+                                "unrepresentable HashJoin output port",
+                            )
+                            .map_err(PhysicalEncodeError::Invalid);
+                        }
+                    }
+                    NodeKind::NestLoopJoin { kind, .. }
+                        if !v1_join_output_is_lossless(fragment, node, *kind) =>
+                    {
+                        return unsupported(
+                            fragment,
+                            node,
+                            "unrepresentable NestLoopJoin output port",
                         )
-                        .into());
+                        .map_err(PhysicalEncodeError::Invalid);
                     }
-                    router_route_ordinals(root, route).map_err(|error| {
+                    _ => {}
+                }
+            }
+            match fragment.sink() {
+                FragmentSink::Router { routes, .. } => {
+                    wire_group_id(fragment.id()).map_err(|error| {
+                        format!(
+                            "fragment {} router group identity is not representable: {error}",
+                            fragment.id().get()
+                        )
+                    })?;
+                    let root = &fragment.nodes()[&fragment.root()];
+                    for route in routes {
+                        let edge = physical.edges().get(&route.edge).ok_or_else(|| {
+                            format!("router names absent edge {}", route.edge.get())
+                        })?;
+                        if edge.kind != EdgeKind::ChangeStreamRouter {
+                            return Err(format!(
+                                "router route edge {} is not a change-stream edge",
+                                edge.id.get()
+                            )
+                            .into());
+                        }
+                        router_route_ordinals(root, route).map_err(|error| {
                         format!(
                             "fragment {} router route {:?} occurrences are not representable: {error}",
                             fragment.id().get(),
                             route.route_id
                         )
                     })?;
+                    }
+                }
+                FragmentSink::Result
+                | FragmentSink::Stream { .. }
+                | FragmentSink::Multicast { .. } => {}
+                FragmentSink::Noop => {
+                    unreachable!("shared preflight rejects this sink")
                 }
             }
-            FragmentSink::Result | FragmentSink::Stream { .. } | FragmentSink::Multicast { .. } => {
-            }
-            FragmentSink::Noop => {
-                unreachable!("shared preflight rejects this sink")
-            }
         }
+        Ok(())
+    })();
+    if matches!(&result, Err(PhysicalEncodeError::Control(_))) {
+        return result;
     }
     work.finish()?;
-    Ok(())
+    result
 }
 
 fn preflight_runtime_filters(physical: &PhysicalPlan) -> Result<ScanRuntimeFilterBindings, String> {
@@ -1743,6 +1804,7 @@ fn preflight_runtime_filters(physical: &PhysicalPlan) -> Result<ScanRuntimeFilte
 
 fn validate_scalar_binding(
     catalog: &EngineFunctionCatalog,
+    constants: &novarocks_physical_plan::ConstantPools,
     fragment: &Fragment,
     function: &novarocks_physical_plan::BoundFunction,
     arguments: &[ExprId],
@@ -1750,7 +1812,7 @@ fn validate_scalar_binding(
 ) -> Result<(), PhysicalEncodeError> {
     let request_arguments = arguments
         .iter()
-        .map(|argument| physical_function_argument(fragment, *argument))
+        .map(|argument| physical_function_argument(constants, fragment, *argument, control))
         .collect::<Result<Vec<_>, _>>()?;
     validate_bound_function(
         catalog,
@@ -1765,6 +1827,7 @@ fn validate_scalar_binding(
 
 fn validate_table_binding(
     catalog: &EngineFunctionCatalog,
+    constants: &novarocks_physical_plan::ConstantPools,
     fragment: &Fragment,
     function: &novarocks_physical_plan::BoundTableFunction,
     arguments: &[ExprId],
@@ -1782,7 +1845,7 @@ fn validate_table_binding(
     }
     let request_arguments = arguments
         .iter()
-        .map(|argument| physical_function_argument(fragment, *argument))
+        .map(|argument| physical_function_argument(constants, fragment, *argument, control))
         .collect::<Result<Vec<_>, _>>()?;
     let bound = ResolvedFunctionBinding {
         function_id: function.function_id.clone(),
@@ -1824,6 +1887,7 @@ fn validate_table_binding(
 
 fn validate_aggregate_binding(
     catalog: &EngineFunctionCatalog,
+    constants: &novarocks_physical_plan::ConstantPools,
     fragment: &Fragment,
     binding: &AggregateBinding,
     arguments: &[ExprId],
@@ -1832,7 +1896,7 @@ fn validate_aggregate_binding(
     let request_arguments = if binding.phase.consumes_logical_arguments() {
         arguments
             .iter()
-            .map(|argument| physical_function_argument(fragment, *argument))
+            .map(|argument| physical_function_argument(constants, fragment, *argument, control))
             .collect::<Result<Vec<_>, _>>()?
     } else {
         binding
@@ -1973,31 +2037,57 @@ fn validate_function_argument_type(argument: &FunctionArgumentType) -> Result<()
 }
 
 fn physical_function_argument(
+    constants: &novarocks_physical_plan::ConstantPools,
     fragment: &Fragment,
     expression: ExprId,
-) -> Result<FunctionArgument, String> {
-    let expression = fragment.expressions().get(expression).ok_or_else(|| {
-        format!(
-            "function argument expression {} disappeared after physical validation",
-            expression.get()
-        )
-    })?;
-    Ok(match &expression.kind {
-        ExprKind::Lambda {
-            parameter_types, ..
-        } => FunctionArgument::Lambda {
-            parameter_types: parameter_types.clone(),
-            result_type: expression.ty.clone(),
-        },
-        ExprKind::Literal(literal) => FunctionArgument::Value {
-            value_type: expression.ty.clone(),
-            constant: physical_function_literal(literal),
-        },
-        _ => FunctionArgument::Value {
-            value_type: expression.ty.clone(),
-            constant: None,
-        },
-    })
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<FunctionArgument, PhysicalEncodeError> {
+    use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+    let result = (|| {
+        work.step()?;
+        let expression = fragment.expressions().get(expression).ok_or_else(|| {
+            PhysicalEncodeError::Invalid(format!(
+                "function argument expression {} disappeared after physical validation",
+                expression.get(),
+            ))
+        })?;
+        Ok(match &expression.kind {
+            ExprKind::Lambda {
+                parameter_types, ..
+            } => FunctionArgument::Lambda {
+                parameter_types: parameter_types.clone(),
+                result_type: expression.ty.clone(),
+            },
+            ExprKind::Constant(reference) => FunctionArgument::Value {
+                value_type: expression.ty.clone(),
+                constant: Some(
+                    constants
+                        .resolve_observed(*reference, &expression.ty, &mut work)
+                        .map_err(|error| match error {
+                            novarocks_physical_plan::ConstantReferenceError::Control(error) => {
+                                PhysicalEncodeError::Control(error)
+                            }
+                            error => PhysicalEncodeError::Invalid(error.to_string()),
+                        })?,
+                ),
+            },
+            ExprKind::Literal(_) => {
+                return Err(PhysicalEncodeError::Invalid(
+                    "literal function arguments require the checked constant source table".into(),
+                ));
+            }
+            _ => FunctionArgument::Value {
+                value_type: expression.ty.clone(),
+                constant: None,
+            },
+        })
+    })();
+    if matches!(result, Err(PhysicalEncodeError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
 }
 
 fn function_argument_from_type(argument: &FunctionArgumentType) -> FunctionArgument {
@@ -2013,33 +2103,6 @@ fn function_argument_from_type(argument: &FunctionArgumentType) -> FunctionArgum
             parameter_types: parameter_types.clone(),
             result_type: result_type.clone(),
         },
-    }
-}
-
-fn physical_function_literal(literal: &LiteralValue) -> Option<FunctionLiteral> {
-    match literal {
-        LiteralValue::Null => Some(FunctionLiteral::Null),
-        LiteralValue::Boolean(value) => Some(FunctionLiteral::Boolean(*value)),
-        LiteralValue::Int64(value) => Some(FunctionLiteral::Int64(*value)),
-        LiteralValue::UInt64(value) => Some(FunctionLiteral::UInt64(*value)),
-        LiteralValue::Float64Bits(value) => Some(FunctionLiteral::Float64Bits(*value)),
-        LiteralValue::LargeInt(value) => Some(FunctionLiteral::LargeInt(*value)),
-        LiteralValue::Decimal128(value) => Some(FunctionLiteral::Decimal128(*value)),
-        LiteralValue::Utf8(value) => Some(FunctionLiteral::Utf8(value.clone())),
-        LiteralValue::Binary(value) => Some(FunctionLiteral::Binary(value.clone())),
-        LiteralValue::Date32(value) => Some(FunctionLiteral::Date32(*value)),
-        LiteralValue::Time64(value) => Some(FunctionLiteral::Time64(*value)),
-        LiteralValue::Timestamp(value) => Some(FunctionLiteral::Timestamp(*value)),
-        LiteralValue::IntervalMonthDayNano {
-            months,
-            days,
-            nanoseconds,
-        } => Some(FunctionLiteral::IntervalMonthDayNano {
-            months: *months,
-            days: *days,
-            nanoseconds: *nanoseconds,
-        }),
-        LiteralValue::Decimal256(value) => Some(FunctionLiteral::Decimal256(*value)),
     }
 }
 
@@ -2473,6 +2536,7 @@ fn preflight_table_function_v1(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_fragment(
     physical: &PhysicalPlan,
     fragment: &Fragment,
@@ -2480,7 +2544,8 @@ fn encode_fragment(
     scan_facts: &impl PhysicalV1PrivateFacts,
     runtime_filters: &EncodedRuntimeFilters,
     names: &OutputValueNames,
-) -> Result<plan::PlanFragment, String> {
+    context: ExpressionEncodingContext<'_>,
+) -> Result<plan::PlanFragment, PhysicalEncodeError> {
     let root = encode_tree(
         physical,
         fragment,
@@ -2489,6 +2554,7 @@ fn encode_fragment(
         scan_facts,
         names,
         runtime_filters,
+        context,
     )?;
     let root_node = &fragment.nodes()[&fragment.root()];
     Ok(plan::PlanFragment {
@@ -2536,6 +2602,7 @@ fn compatibility_fragment_partition() -> plan::DataPartition {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_tree(
     physical: &PhysicalPlan,
     fragment: &Fragment,
@@ -2544,7 +2611,8 @@ fn encode_tree(
     scan_facts: &impl PhysicalV1PrivateFacts,
     names: &OutputValueNames,
     runtime_filters: &EncodedRuntimeFilters,
-) -> Result<plan::DistributedNode, String> {
+    context: ExpressionEncodingContext<'_>,
+) -> Result<plan::DistributedNode, PhysicalEncodeError> {
     let node = fragment.nodes().get(&node_id).ok_or_else(|| {
         format!(
             "fragment {} is missing node {}",
@@ -2564,10 +2632,12 @@ fn encode_tree(
                 scan_facts,
                 names,
                 runtime_filters,
+                context,
             )
         })
-        .collect::<Result<Vec<_>, String>>()?;
-    let payload = encode_node_payload(physical, fragment, layout, node, scan_facts, names)?;
+        .collect::<Result<Vec<_>, PhysicalEncodeError>>()?;
+    let payload =
+        encode_node_payload(physical, fragment, layout, node, scan_facts, names, context)?;
     Ok(plan::DistributedNode {
         node_id: i32::try_from(node.id.get())
             .map_err(|_| "native wire v1 node identity exceeds i32".to_string())?,
@@ -2585,6 +2655,7 @@ fn encode_tree(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_node_payload(
     physical: &PhysicalPlan,
     fragment: &Fragment,
@@ -2592,7 +2663,8 @@ fn encode_node_payload(
     node: &PhysicalNode,
     scan_facts: &impl PhysicalV1PrivateFacts,
     names: &OutputValueNames,
-) -> Result<plan::distributed_node::Payload, String> {
+    context: ExpressionEncodingContext<'_>,
+) -> Result<plan::distributed_node::Payload, PhysicalEncodeError> {
     use plan::distributed_node::Payload;
     use plan::plan_node::Kind;
 
@@ -2608,7 +2680,7 @@ fn encode_node_payload(
     }
     if let NodeKind::TableFinish(spec) = &node.kind {
         return Ok(Payload::TableFinish(encode_table_finish(
-            fragment, layout, node, spec,
+            fragment, layout, node, spec, context,
         )?));
     }
     let outputs = output_columns(names, fragment, layout, node)?;
@@ -2628,6 +2700,7 @@ fn encode_node_payload(
             derived_values,
             relation.schema(),
             scan_facts,
+            context,
         )?),
         NodeKind::Filter { predicates } => Kind::Filter(plan::FilterNode {
             predicate: Some(crate::physical_expr::encode_predicate_conjunction(
@@ -2636,6 +2709,7 @@ fn encode_node_payload(
                 node.id,
                 predicates,
                 ValueResolution::NodeInput,
+                context,
             )?),
         }),
         NodeKind::Project { expressions } => Kind::Project(plan::ProjectNode {
@@ -2663,12 +2737,13 @@ fn encode_node_payload(
                             node.id,
                             *expression,
                             ValueResolution::NodeInput,
+                            context,
                         )?),
                         output_name: output.name.clone(),
                         output_column_id: output.column_id,
                     })
                 })
-                .collect::<Result<Vec<_>, String>>()?,
+                .collect::<Result<Vec<_>, PhysicalEncodeError>>()?,
             output_qualifier: None,
         }),
         NodeKind::Values { rows } => Kind::Values(plan::ValuesNode {
@@ -2682,10 +2757,11 @@ fn encode_node_payload(
                             node.id,
                             row,
                             &ValueResolution::NodeInput,
+                            context,
                         )?,
                     })
                 })
-                .collect::<Result<Vec<_>, String>>()?,
+                .collect::<Result<Vec<_>, PhysicalEncodeError>>()?,
             columns: outputs.clone(),
         }),
         NodeKind::Limit { limit, offset } => Kind::Limit(plan::LimitNode {
@@ -2708,9 +2784,10 @@ fn encode_node_payload(
                         .chain(order_by.iter())
                         .cloned()
                         .collect::<Vec<_>>(),
+                    context,
                 )?,
                 SortMode::Global | SortMode::PartitionTopN { .. } => {
-                    encode_sort_items(fragment, layout, node.id, order_by)?
+                    encode_sort_items(fragment, layout, node.id, order_by, context)?
                 }
             },
             analytic_partition_by: match mode {
@@ -2725,9 +2802,10 @@ fn encode_node_payload(
                             node.id,
                             item.expr,
                             ValueResolution::NodeInput,
+                            context,
                         )
                     })
-                    .collect::<Result<Vec<_>, String>>()?,
+                    .collect::<Result<Vec<_>, PhysicalEncodeError>>()?,
             },
             output_columns: outputs.clone(),
             offset: None,
@@ -2747,7 +2825,7 @@ fn encode_node_payload(
             phase,
             ..
         } => Kind::Topn(plan::TopNNode {
-            items: encode_sort_items(fragment, layout, node.id, order_by)?,
+            items: encode_sort_items(fragment, layout, node.id, order_by, context)?,
             limit: Some(i64_from_u64(*limit)?),
             offset: Some(i64_from_u64(*offset)?),
             phase: match phase {
@@ -2781,6 +2859,7 @@ fn encode_node_payload(
                             node.id,
                             key.left,
                             ValueResolution::NodeInput,
+                            context,
                         )?),
                         right: Some(encode_physical_expr(
                             fragment,
@@ -2788,11 +2867,12 @@ fn encode_node_payload(
                             node.id,
                             key.right,
                             ValueResolution::NodeInput,
+                            context,
                         )?),
                         null_safe: key.null_safe,
                     })
                 })
-                .collect::<Result<Vec<_>, String>>()?,
+                .collect::<Result<Vec<_>, PhysicalEncodeError>>()?,
             other_condition: residual
                 .map(|expression| {
                     encode_physical_expr(
@@ -2801,6 +2881,7 @@ fn encode_node_payload(
                         node.id,
                         expression,
                         ValueResolution::NodeInput,
+                        context,
                     )
                 })
                 .transpose()?,
@@ -2819,6 +2900,7 @@ fn encode_node_payload(
                         node.id,
                         expression,
                         ValueResolution::NodeInput,
+                        context,
                     )
                 })
                 .transpose()?,
@@ -2854,7 +2936,8 @@ fn encode_node_payload(
                     fragment,
                     node,
                     "Aggregate whose calls disagree about finalizing",
-                );
+                )
+                .map_err(PhysicalEncodeError::from);
             }
             // The one thing the wire's reader takes from the mode is whether
             // this node finalizes.  The five names it may carry are the
@@ -2919,9 +3002,10 @@ fn encode_node_payload(
                             node.id,
                             *expression,
                             ValueResolution::NodeInput,
+                            context,
                         )
                     })
-                    .collect::<Result<Vec<_>, String>>()?,
+                    .collect::<Result<Vec<_>, PhysicalEncodeError>>()?,
                 aggregates: calls
                     .iter()
                     .enumerate()
@@ -2934,6 +3018,7 @@ fn encode_node_payload(
                                 node.id,
                                 &call.arguments,
                                 &ValueResolution::NodeInput,
+                                context,
                             )?,
                             distinct: call.distinct,
                             // The wire field is the aggregate's SQL result
@@ -2943,7 +3028,13 @@ fn encode_node_payload(
                             result_type: Some(encode_physical_type(
                                 &call.binding.function.result_type.data_type,
                             )?),
-                            order_by: encode_sort_items(fragment, layout, node.id, &call.order_by)?,
+                            order_by: encode_sort_items(
+                                fragment,
+                                layout,
+                                node.id,
+                                &call.order_by,
+                                context,
+                            )?,
                             output_column_id: output_slot_at(
                                 layout,
                                 node,
@@ -2954,7 +3045,7 @@ fn encode_node_payload(
                             resolved_signature: Some(encode_aggregate_signature(&call.binding)?),
                         })
                     })
-                    .collect::<Result<Vec<_>, String>>()?,
+                    .collect::<Result<Vec<_>, PhysicalEncodeError>>()?,
                 is_merge: calls
                     .iter()
                     .map(|call| !call.binding.phase.consumes_logical_arguments())
@@ -2992,7 +3083,8 @@ fn encode_node_payload(
                             "Window node {} expression {} is not a WindowCall",
                             node.id.get(),
                             window.expression.get()
-                        ));
+                        )
+                        .into());
                     };
                     Ok(plan::WindowExpr {
                         name: wire_function_name(&function.function_id)?.into(),
@@ -3002,6 +3094,7 @@ fn encode_node_payload(
                             node.id,
                             args,
                             &ValueResolution::NodeInput,
+                            context,
                         )?,
                         distinct: *distinct,
                         partition_by: spec
@@ -3014,13 +3107,20 @@ fn encode_node_payload(
                                     node.id,
                                     item.expr,
                                     ValueResolution::NodeInput,
+                                    context,
                                 )
                             })
-                            .collect::<Result<Vec<_>, String>>()?,
-                        order_by: encode_sort_items(fragment, layout, node.id, &spec.order_by)?,
+                            .collect::<Result<Vec<_>, PhysicalEncodeError>>()?,
+                        order_by: encode_sort_items(
+                            fragment,
+                            layout,
+                            node.id,
+                            &spec.order_by,
+                            context,
+                        )?,
                         window_frame: frame
                             .as_ref()
-                            .map(|frame| encode_window_frame(fragment, frame))
+                            .map(|frame| encode_window_frame(fragment, frame, context))
                             .transpose()?,
                         result_type: Some(encode_physical_type(&expression.ty.data_type)?),
                         output_name: value_name(window.output),
@@ -3032,6 +3132,7 @@ fn encode_node_payload(
                             layout,
                             node.id,
                             function_order_by,
+                            context,
                         )?,
                         aggregate_binding: aggregate_binding
                             .as_deref()
@@ -3039,7 +3140,7 @@ fn encode_node_payload(
                             .transpose()?,
                     })
                 })
-                .collect::<Result<Vec<_>, String>>()?,
+                .collect::<Result<Vec<_>, PhysicalEncodeError>>()?,
             output_columns: outputs.clone(),
         }),
         NodeKind::Unpivot { spec } => Kind::Unpivot(plan::UnpivotNode {
@@ -3076,22 +3177,24 @@ fn encode_node_payload(
                             .constants
                             .iter()
                             .map(|constant| {
-                                encode_unpivot_constant(fragment, layout, node.id, constant)
+                                encode_unpivot_constant(
+                                    fragment, layout, node.id, constant, context,
+                                )
                             })
-                            .collect::<Result<Vec<_>, String>>()?,
+                            .collect::<Result<Vec<_>, PhysicalEncodeError>>()?,
                     })
                 })
-                .collect::<Result<Vec<_>, String>>()?,
+                .collect::<Result<Vec<_>, PhysicalEncodeError>>()?,
             max_output_rows: spec.max_output_rows,
             max_output_bytes: spec.max_output_bytes,
             output_schema: Some(encode_unpivot_schema(fragment, layout, node)?),
         }),
         NodeKind::GenerateSeries { start, stop, step } => {
             Kind::GenerateSeries(plan::GenerateSeriesNode {
-                start: int64_literal(fragment, *start)?,
-                end: int64_literal(fragment, *stop)?,
+                start: int64_literal(fragment, *start, context)?,
+                end: int64_literal(fragment, *stop, context)?,
                 step: step
-                    .map(|value| int64_literal(fragment, value))
+                    .map(|value| int64_literal(fragment, value, context))
                     .transpose()?
                     .unwrap_or(1),
                 column_name: outputs
@@ -3120,6 +3223,7 @@ fn encode_node_payload(
                     node.id,
                     arguments,
                     &ValueResolution::NodeInput,
+                    context,
                 )?,
                 // The v1 decoder always prepends the complete child layout.
                 // This carrier therefore contains relation-result columns only.
@@ -3148,6 +3252,7 @@ fn encode_node_payload(
                                     node.id,
                                     expression,
                                     ValueResolution::NodeInput,
+                                    context,
                                 )
                             })
                             .transpose()?,
@@ -3166,16 +3271,17 @@ fn encode_node_payload(
                                                 node.id,
                                                 expression,
                                                 ValueResolution::NodeInput,
+                                                context,
                                             )
                                         })
                                         .transpose()?,
                                 })
                             })
-                            .collect::<Result<Vec<_>, String>>()?,
+                            .collect::<Result<Vec<_>, PhysicalEncodeError>>()?,
                         effect: encode_effect(event.effect),
                     })
                 })
-                .collect::<Result<Vec<_>, String>>()?,
+                .collect::<Result<Vec<_>, PhysicalEncodeError>>()?,
             output_columns: outputs.clone(),
             effect_column_id: output_slot_for_value(layout, node, *effect_output)?.get_u32(),
         }),
@@ -3195,7 +3301,8 @@ fn encode_node_payload(
         NodeKind::TableWriter { .. }
         | NodeKind::TableFinish(_)
         | NodeKind::ExchangeSource { .. } => {
-            return unsupported(fragment, node, node_kind_name(&node.kind));
+            return unsupported(fragment, node, node_kind_name(&node.kind))
+                .map_err(PhysicalEncodeError::from);
         }
     };
     let physical_output_columns = if matches!(&node.kind, NodeKind::Unpivot { .. }) {
@@ -3221,7 +3328,8 @@ fn encode_scan(
     derived_values: &[ValueId],
     relation_fields: &[novarocks_physical_plan::RelationField],
     scan_facts: &impl PhysicalV1PrivateFacts,
-) -> Result<plan::ScanNode, String> {
+    context: ExpressionEncodingContext<'_>,
+) -> Result<plan::ScanNode, PhysicalEncodeError> {
     let fact = scan_facts
         .scan_fact(fragment.id(), node.id)
         .ok_or_else(|| "scan fact disappeared after preflight".to_string())?;
@@ -3262,8 +3370,8 @@ fn encode_scan(
             .collect::<Result<Vec<_>, String>>()?;
     let variant_columns = derived_values
         .iter()
-        .map(|value| encode_scan_variant_column(fragment, &index, &exact_scope, *value))
-        .collect::<Result<Vec<_>, String>>()?;
+        .map(|value| encode_scan_variant_column(fragment, &index, &exact_scope, *value, context))
+        .collect::<Result<Vec<_>, PhysicalEncodeError>>()?;
     Ok(plan::ScanNode {
         database: fact.database.to_string(),
         table: Some(fact.table.clone()),
@@ -3278,9 +3386,10 @@ fn encode_scan(
                     node.id,
                     *expression,
                     ValueResolution::Exact(&exact_scope),
+                    context,
                 )
             })
-            .collect::<Result<Vec<_>, String>>()?,
+            .collect::<Result<Vec<_>, PhysicalEncodeError>>()?,
         // What the reader must produce: the provider columns this scan reads,
         // and the columns it derives from them, which are produced while it
         // reads and are not the provider's to name.
@@ -3319,19 +3428,20 @@ fn encode_scan_variant_column(
     index: &ScanColumnIndex<'_>,
     slots: &BTreeMap<ValueId, WireSlotId>,
     value: ValueId,
-) -> Result<plan::ScanVariantColumn, String> {
+    context: ExpressionEncodingContext<'_>,
+) -> Result<plan::ScanVariantColumn, PhysicalEncodeError> {
     let absent = || format!("scan derived value {} is not one variant path", value.get());
     let definition = fragment.values().get(&value).ok_or_else(absent)?;
     let novarocks_physical_plan::ValueOrigin::Expr { expr, .. } = definition.origin else {
-        return Err(absent());
+        return Err(absent().into());
     };
     let ExprKind::FunctionCall { function, args } =
         &fragment.expressions().get(expr).ok_or_else(absent)?.kind
     else {
-        return Err(absent());
+        return Err(absent().into());
     };
     let [source, path, requested] = args.as_ref() else {
-        return Err(absent());
+        return Err(absent().into());
     };
     let strict = match wire_function_name(&function.function_id)? {
         "variant_get" => true,
@@ -3340,12 +3450,13 @@ fn encode_scan_variant_column(
             return Err(format!(
                 "scan derived value {} is built by `{other}`, which is not a variant path",
                 value.get()
-            ));
+            )
+            .into());
         }
     };
     let source_value = match &fragment.expressions().get(*source).ok_or_else(absent)?.kind {
         ExprKind::Value(value) => *value,
-        _ => return Err(absent()),
+        _ => return Err(absent().into()),
     };
     let (_, source_column) = index.fact_column_for_value(source_value).ok_or_else(|| {
         format!(
@@ -3354,11 +3465,11 @@ fn encode_scan_variant_column(
             source_value.get()
         )
     })?;
-    let canonical_path = utf8_literal(fragment, *path).ok_or_else(absent)?;
+    let canonical_path = utf8_literal(fragment, *path, context)?.ok_or_else(absent)?;
     // The type literal the statement wrote is what the analyzer resolved this
     // column's type from; the wire carries the resolved type, which the reader
     // compares against the column it fills.
-    utf8_literal(fragment, *requested).ok_or_else(absent)?;
+    utf8_literal(fragment, *requested, context)?.ok_or_else(absent)?;
     Ok(plan::ScanVariantColumn {
         source_column_id: slots
             .get(&source_value)
@@ -3368,18 +3479,23 @@ fn encode_scan_variant_column(
         source_column: source_column.name.to_string(),
         synthetic_column_id: slots.get(&value).copied().ok_or_else(absent)?.get_u32(),
         synthetic_column: value_name(value),
-        canonical_path: canonical_path.to_string(),
+        canonical_path,
         requested_type: Some(encode_physical_type(&definition.ty.data_type)?),
         strict,
     })
 }
 
-/// The text one literal expression carries, when it is one.
-fn utf8_literal(fragment: &Fragment, expression: ExprId) -> Option<&str> {
-    match &fragment.expressions().get(expression)?.kind {
-        ExprKind::Literal(LiteralValue::Utf8(value)) => Some(value),
+/// Only the selected checked UTF8 scalar supplies a scan path.
+fn utf8_literal(
+    fragment: &Fragment,
+    expression: ExprId,
+    context: ExpressionEncodingContext<'_>,
+) -> Result<Option<String>, PhysicalEncodeError> {
+    let payload = crate::physical_expr::encode_constant_payload(fragment, expression, context)?;
+    Ok(match payload.and_then(|value| value.value) {
+        Some(common::literal_value::Value::StringValue(value)) => Some(value),
         _ => None,
-    }
+    })
 }
 
 fn encode_table_writer(
@@ -3527,7 +3643,8 @@ fn encode_unpivot_constant(
     layout: &WireLayout,
     owner: NodeId,
     constant: &UnpivotConstant,
-) -> Result<plan::UnpivotConstant, String> {
+    context: ExpressionEncodingContext<'_>,
+) -> Result<plan::UnpivotConstant, PhysicalEncodeError> {
     use plan::unpivot_constant::Value;
     let value = match constant {
         UnpivotConstant::Scalar(expression) => {
@@ -3536,9 +3653,11 @@ fn encode_unpivot_constant(
                     .expressions()
                     .get(*expression)
                     .map(|node| &node.kind),
-                Some(ExprKind::Literal(_))
+                Some(ExprKind::Constant(_))
             ) {
-                return Err("native wire v1 Unpivot scalar constant is not a literal".into());
+                return Err(
+                    "native wire v1 Unpivot scalar requires a checked constant reference".into(),
+                );
             }
             Value::ScalarLiteral(encode_physical_expr(
                 fragment,
@@ -3546,6 +3665,7 @@ fn encode_unpivot_constant(
                 owner,
                 *expression,
                 ValueResolution::NodeInput,
+                context,
             )?)
         }
         UnpivotConstant::Int32List(values) => Value::Int32List(plan::Int32List {
@@ -3609,7 +3729,8 @@ fn encode_table_finish(
     layout: &WireLayout,
     node: &PhysicalNode,
     spec: &novarocks_physical_plan::WriterFinishSpec,
-) -> Result<plan::TableFinishNode, String> {
+    context: ExpressionEncodingContext<'_>,
+) -> Result<plan::TableFinishNode, PhysicalEncodeError> {
     let input_node = fragment
         .nodes()
         .get(&node.inputs[0])
@@ -3651,7 +3772,9 @@ fn encode_table_finish(
                 .grouped_unpivot
                 .as_ref()
                 .map(|unpivot| {
-                    encode_writer_grouped_unpivot(fragment, layout, node, input_node, unpivot)
+                    encode_writer_grouped_unpivot(
+                        fragment, layout, node, input_node, unpivot, context,
+                    )
                 })
                 .transpose()?,
         }),
@@ -3664,7 +3787,8 @@ fn encode_writer_grouped_unpivot(
     node: &PhysicalNode,
     input_node: &PhysicalNode,
     unpivot: &novarocks_physical_plan::WriterGroupedUnpivotSpec,
-) -> Result<plan::WriterGroupedUnpivotPlan, String> {
+    context: ExpressionEncodingContext<'_>,
+) -> Result<plan::WriterGroupedUnpivotPlan, PhysicalEncodeError> {
     Ok(plan::WriterGroupedUnpivotPlan {
         grouping_input_slot_id: output_slot_for_value(layout, input_node, unpivot.grouping_input)?
             .get_u32(),
@@ -3697,12 +3821,12 @@ fn encode_writer_grouped_unpivot(
                         .constants
                         .iter()
                         .map(|constant| {
-                            encode_unpivot_constant(fragment, layout, node.id, constant)
+                            encode_unpivot_constant(fragment, layout, node.id, constant, context)
                         })
-                        .collect::<Result<Vec<_>, String>>()?,
+                        .collect::<Result<Vec<_>, PhysicalEncodeError>>()?,
                 })
             })
-            .collect::<Result<Vec<_>, String>>()?,
+            .collect::<Result<Vec<_>, PhysicalEncodeError>>()?,
         max_output_rows: unpivot.max_output_rows,
         max_output_bytes: unpivot.max_output_bytes,
     })
@@ -4835,14 +4959,25 @@ fn encode_repeat(
     })
 }
 
-fn int64_literal(fragment: &Fragment, expression: ExprId) -> Result<i64, String> {
-    match fragment
-        .expressions()
-        .get(expression)
-        .map(|node| &node.kind)
+fn int64_literal(
+    fragment: &Fragment,
+    expression: ExprId,
+    context: ExpressionEncodingContext<'_>,
+) -> Result<i64, PhysicalEncodeError> {
+    // Preserve the exact original Int64-only operator contract.
+    let node = fragment.expressions().get(expression).ok_or_else(|| {
+        PhysicalEncodeError::Invalid("GenerateSeries bound expression is absent".into())
+    })?;
+    if node.ty.logical_type != novarocks_type_contract::ValueLogicalType::Physical
+        || node.ty.data_type != arrow::datatypes::DataType::Int64
     {
-        Some(ExprKind::Literal(LiteralValue::Int64(value))) => Ok(*value),
-        _ => Err("native wire v1 GenerateSeries requires Int64 literal bounds".into()),
+        return Err("native wire v1 GenerateSeries requires Int64 constant bounds".into());
+    }
+    match crate::physical_expr::encode_constant_payload(fragment, expression, context)?
+        .and_then(|value| value.value)
+    {
+        Some(common::literal_value::Value::IntValue(value)) => Ok(value),
+        _ => Err("native wire v1 GenerateSeries requires non-NULL Int64 constant bounds".into()),
     }
 }
 
@@ -4892,36 +5027,337 @@ fn node_kind_name(kind: &NodeKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    fn codec_constant_policy() -> novarocks_constant_contract::ConstantPolicy {
+        novarocks_constant_contract::ConstantPolicy {
+            max_rows: 4096,
+            max_array_nodes: 4096,
+            max_logical_elements: 65536,
+            max_retained_buffer_bytes: 8 * 1024 * 1024,
+            max_type_depth: 64,
+            max_type_nodes: 4096,
+            max_dictionary_depth: 16,
+            max_metadata_bytes: 65536,
+            max_library_validation_work: 8 * 1024 * 1024,
+            max_library_validation_bytes: 32 * 1024 * 1024,
+        }
+    }
+
+    fn codec_i64_constant(value: i64) -> novarocks_constant_contract::ConstantValue {
+        let ty = FunctionValueType::new(DataType::Int64, false);
+        novarocks_constant_contract::ConstantValue::from_i64(
+            Arc::new(arrow::datatypes::Field::new(
+                "literal",
+                DataType::Int64,
+                false,
+            )),
+            ty,
+            value,
+            codec_constant_policy(),
+            novarocks_type_contract::CompilePhase::Encode,
+            &CodecTestControl,
+        )
+        .unwrap()
+    }
+
+    // Explicit scalar inputs shared by legacy plan fixtures. Pool rows remain
+    // source facts; referencing one row does not re-author its value or type.
+    fn fixture_i64_constants() -> novarocks_physical_plan::ConstantPools {
+        use arrow::array::{Array, Int64Array};
+        let pool = novarocks_constant_contract::ConstantPool::try_new(
+            Arc::new(arrow::datatypes::Field::new(
+                "source",
+                DataType::Int64,
+                false,
+            )),
+            FunctionValueType::new(DataType::Int64, false),
+            Int64Array::from(vec![1, 2, 7, 9]).to_data(),
+            codec_constant_policy(),
+            novarocks_type_contract::CompilePhase::Encode,
+            &CodecTestControl,
+        )
+        .unwrap();
+        let mut constants = novarocks_physical_plan::ConstantPools::empty();
+        constants
+            .insert(novarocks_physical_plan::ConstantPoolId::new(0), pool)
+            .unwrap();
+        constants
+    }
+
+    fn fixture_i64_reference(value: i64) -> ExprKind {
+        let ordinal = [1, 2, 7, 9]
+            .iter()
+            .position(|candidate| *candidate == value)
+            .expect("the fixture must explicitly author its source value");
+        ExprKind::Constant(novarocks_physical_plan::ConstantReference {
+            pool: novarocks_physical_plan::ConstantPoolId::new(0),
+            ordinal: u32::try_from(ordinal).unwrap(),
+        })
+    }
+
+    fn fragment_with_checked_constant(
+        value: &novarocks_constant_contract::ConstantValue,
+    ) -> (novarocks_physical_plan::ConstantPools, Fragment, ExprId) {
+        use novarocks_physical_plan::{ConstantPoolId, ConstantReference};
+        let mut constants = novarocks_physical_plan::ConstantPools::empty();
+        let pool = ConstantPoolId::new(u32::MAX);
+        constants.insert(pool, value.pool().clone()).unwrap();
+        let mut builder = FragmentBuilder::new(FragmentId::new(31));
+        let node = builder.reserve_node_id().unwrap();
+        let expression = builder
+            .add_expression(
+                node,
+                value.value_type().clone(),
+                ExprKind::Constant(ConstantReference {
+                    pool,
+                    ordinal: value.ordinal(),
+                }),
+            )
+            .unwrap();
+        let output = builder
+            .add_value(
+                value.value_type().clone(),
+                ValueOrigin::NodeOutput {
+                    node,
+                    output_ordinal: 0,
+                },
+            )
+            .unwrap();
+        builder
+            .insert_node_unchecked(PhysicalNode {
+                id: node,
+                inputs: Box::default(),
+                required_inputs: Box::default(),
+                output_properties: properties(),
+                output: OutputPort {
+                    node,
+                    columns: Box::from([output]),
+                },
+                kind: NodeKind::Values {
+                    rows: Box::from([Box::from([expression])]),
+                },
+            })
+            .unwrap();
+        let fragment = builder
+            .finish_definition(
+                node,
+                FragmentSink::Result,
+                PipelineDopDomain {
+                    min: 1,
+                    max: 1,
+                    requires_power_of_two: false,
+                },
+            )
+            .unwrap();
+        (constants, fragment, expression)
+    }
+
     #[test]
     fn physical_literal_binding_metadata_preserves_temporal_and_decimal256_constants() {
-        use super::physical_function_literal;
-        use novarocks_functions::FunctionLiteral;
-        use novarocks_physical_plan::LiteralValue;
-        for (source, expected) in [
-            (LiteralValue::Date32(-17), FunctionLiteral::Date32(-17)),
-            (LiteralValue::Time64(-99), FunctionLiteral::Time64(-99)),
-            (
-                LiteralValue::Timestamp(i64::MIN),
-                FunctionLiteral::Timestamp(i64::MIN),
+        use arrow::datatypes::{Field, IntervalUnit, TimeUnit};
+        use novarocks_constant_contract::ConstantValue;
+        macro_rules! value {
+            ($factory:ident, $carrier:expr, $payload:expr) => {{
+                let carrier = $carrier;
+                let ty = FunctionValueType::new(carrier.clone(), false);
+                let field = Arc::new(
+                    Field::new("source", carrier, false)
+                        .with_metadata(HashMap::from([("provider.field-id".into(), "27".into())])),
+                );
+                ConstantValue::$factory(
+                    field,
+                    ty,
+                    $payload,
+                    codec_constant_policy(),
+                    novarocks_type_contract::CompilePhase::Encode,
+                    &CodecTestControl,
+                )
+                .unwrap()
+            }};
+        }
+        let values = [
+            value!(from_date32, DataType::Date32, -17),
+            value!(from_time64, DataType::Time64(TimeUnit::Microsecond), -99),
+            value!(
+                from_timestamp,
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                i64::MIN
             ),
-            (
-                LiteralValue::Decimal256([255; 32]),
-                FunctionLiteral::Decimal256([255; 32]),
+            value!(from_decimal256_be, DataType::Decimal256(76, 0), [255; 32]),
+            value!(
+                from_interval_month_day_nano,
+                DataType::Interval(IntervalUnit::MonthDayNano),
+                (i32::MIN, i32::MAX, i64::MIN)
             ),
-            (
-                LiteralValue::IntervalMonthDayNano {
-                    months: i32::MIN,
-                    days: i32::MAX,
-                    nanoseconds: i64::MIN,
-                },
-                FunctionLiteral::IntervalMonthDayNano {
-                    months: i32::MIN,
-                    days: i32::MAX,
-                    nanoseconds: i64::MIN,
-                },
-            ),
+        ];
+        for (ordinal, source) in values.iter().enumerate() {
+            let (constants, fragment, expression) = fragment_with_checked_constant(source);
+            let actual =
+                physical_function_argument(&constants, &fragment, expression, &CodecTestControl)
+                    .unwrap();
+            let FunctionArgument::Value {
+                value_type,
+                constant: Some(actual),
+            } = actual
+            else {
+                panic!("missing checked constant");
+            };
+            assert_eq!(&value_type, source.value_type());
+            assert_eq!(
+                actual.pool().backing_identity(),
+                source.pool().backing_identity()
+            );
+            assert_eq!(actual.ordinal(), source.ordinal());
+            assert_eq!(actual.field().metadata(), source.field().metadata());
+            match ordinal {
+                0 => assert_eq!(actual.try_date32().unwrap(), Some(-17)),
+                1 => assert_eq!(actual.try_time64().unwrap(), Some(-99)),
+                2 => assert_eq!(actual.try_timestamp().unwrap(), Some(i64::MIN)),
+                3 => assert_eq!(actual.try_decimal256_be().unwrap(), Some([255; 32])),
+                4 => assert_eq!(
+                    actual.try_interval_month_day_nano().unwrap(),
+                    Some((i32::MIN, i32::MAX, i64::MIN))
+                ),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn physical_constant_reference_encodes_selected_pool_value_with_original_control() {
+        use arrow::array::{Array, Int64Array};
+        use novarocks_constant_contract::ConstantPool;
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        use std::sync::Mutex;
+        let ty = FunctionValueType::new(DataType::Int64, false);
+        let pool = ConstantPool::try_new(
+            Arc::new(arrow::datatypes::Field::new(
+                "source",
+                DataType::Int64,
+                false,
+            )),
+            ty.clone(),
+            Int64Array::from(vec![-999, 7, 999]).to_data(),
+            codec_constant_policy(),
+            CompilePhase::Encode,
+            &CodecTestControl,
+        )
+        .unwrap();
+        let selected = pool.value(1).unwrap();
+        let (constants, fragment, _) = fragment_with_checked_constant(&selected);
+        let root = fragment.root();
+        let output = fragment.nodes()[&root].output.clone();
+        let result_value = output.columns[0];
+        let mut builder = PlanBuilder::new(PlanVersionId::try_new([31; 16]).unwrap())
+            .with_constant_pools(constants);
+        builder.add_fragment(fragment).unwrap();
+        builder
+            .set_result_port(ResultPort {
+                fragment: FragmentId::new(31),
+                output,
+                fields: Box::from([ResultField {
+                    name: "value".into(),
+                    alias: None,
+                    value: result_value,
+                    ty,
+                }]),
+            })
+            .unwrap();
+        let physical = builder.finish_observed(&CodecTestControl).unwrap();
+        let (catalog, _) = exact_scalar_catalog();
+        #[derive(Default)]
+        struct TraceControl {
+            calls: Mutex<Vec<(CompilePhase, u32)>>,
+            refusal: Option<(usize, CompileControlError)>,
+        }
+        impl PureCompileControl for TraceControl {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push((phase, units));
+                if let Some((index, cause)) = self.refusal {
+                    if calls.len() - 1 == index {
+                        return Err(cause);
+                    }
+                }
+                Ok(())
+            }
+        }
+        let success = TraceControl::default();
+        let encoded = encode_physical_plan_v1(
+            &physical,
+            &catalog,
+            &NoPhysicalV1PrivateFacts,
+            false,
+            &success,
+        )
+        .unwrap();
+        let Some(plan::distributed_node::Payload::Physical(node)) =
+            &encoded.fragments[0].root.as_ref().unwrap().payload
+        else {
+            panic!("missing Values payload");
+        };
+        let Some(plan::plan_node::Kind::Values(values)) = &node.kind else {
+            panic!("wrong operator");
+        };
+        let Some(expr::expr::Kind::Literal(literal)) = &values.rows[0].values[0].kind else {
+            panic!("wrong expression");
+        };
+        assert_eq!(
+            literal.value.as_ref().unwrap().value,
+            Some(common::literal_value::Value::IntValue(7))
+        );
+        let trace = success.calls.into_inner().unwrap();
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
         ] {
-            assert_eq!(physical_function_literal(&source), Some(expected));
+            for index in 0..trace.len() {
+                let control = TraceControl {
+                    calls: Mutex::new(Vec::new()),
+                    refusal: Some((index, cause)),
+                };
+                assert_eq!(
+                    encode_physical_plan_v1(
+                        &physical,
+                        &catalog,
+                        &NoPhysicalV1PrivateFacts,
+                        false,
+                        &control
+                    ),
+                    Err(PhysicalEncodeError::Control(cause))
+                );
+                assert_eq!(*control.calls.lock().unwrap(), trace[..=index]);
+            }
+        }
+        // CTE projection uses the same mandatory original control even when no
+        // CTE edge exists; it has its own entry and completed ordinary tail.
+        let cte = TraceControl::default();
+        assert!(
+            physical_v1_cte_consumers(&physical, &cte)
+                .unwrap()
+                .is_empty()
+        );
+        let cte_trace = cte.calls.into_inner().unwrap();
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for index in 0..cte_trace.len() {
+                let control = TraceControl {
+                    calls: Mutex::new(Vec::new()),
+                    refusal: Some((index, cause)),
+                };
+                assert_eq!(
+                    physical_v1_cte_consumers(&physical, &control),
+                    Err(PhysicalEncodeError::Control(cause))
+                );
+                assert_eq!(*control.calls.lock().unwrap(), cte_trace[..=index]);
+            }
         }
     }
 
@@ -5048,7 +5484,7 @@ mod tests {
     ) -> Result<(), PhysicalEncodeError> {
         let arguments = [FunctionArgument::Value {
             value_type: FunctionValueType::new(DataType::Int64, false),
-            constant: Some(FunctionLiteral::Int64(7)),
+            constant: Some(codec_i64_constant(7)),
         }];
         validate_bound_function(
             catalog,
@@ -5076,6 +5512,7 @@ mod tests {
         encode_checkpoints: std::sync::atomic::AtomicUsize,
         validate_checkpoints: std::sync::atomic::AtomicUsize,
         tail_error: novarocks_type_contract::CompileControlError,
+        refuse_at: Option<usize>,
         earlier_error: Option<novarocks_type_contract::CompileControlError>,
     }
     impl EncodeTailControl {
@@ -5084,6 +5521,7 @@ mod tests {
                 encode_checkpoints: std::sync::atomic::AtomicUsize::new(0),
                 validate_checkpoints: std::sync::atomic::AtomicUsize::new(0),
                 tail_error: error,
+                refuse_at: Some(1),
                 earlier_error: None,
             }
         }
@@ -5097,7 +5535,7 @@ mod tests {
             use novarocks_type_contract::CompilePhase;
             use std::sync::atomic::Ordering;
             if phase == CompilePhase::Encode
-                && self.encode_checkpoints.fetch_add(1, Ordering::SeqCst) == 1
+                && Some(self.encode_checkpoints.fetch_add(1, Ordering::SeqCst)) == self.refuse_at
             {
                 return Err(self.tail_error);
             }
@@ -5117,21 +5555,25 @@ mod tests {
         use std::sync::atomic::Ordering;
         let (catalog, _) = exact_scalar_catalog();
         let physical = finish_limit_chain_plan(1);
+        let mut observed = EncodeTailControl::new(CompileControlError::Cancelled);
+        observed.refuse_at = None;
         let encoded = encode_physical_plan_v1(
             &physical,
             &catalog,
             &NoPhysicalV1PrivateFacts,
             false,
-            &CodecTestControl,
+            &observed,
         )
         .expect("the actual plan can be materialized before its tail is refused");
         assert!(!encoded.fragments.is_empty());
+        let actual_encode_callbacks = observed.encode_checkpoints.load(Ordering::SeqCst);
         for error in [
             CompileControlError::Cancelled,
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = EncodeTailControl::new(error);
+            let mut control = EncodeTailControl::new(error);
+            control.refuse_at = Some(actual_encode_callbacks - 1);
             assert_eq!(
                 encode_physical_plan_v1(
                     &physical,
@@ -5142,7 +5584,10 @@ mod tests {
                 ),
                 Err(PhysicalEncodeError::Control(error)),
             );
-            assert_eq!(control.encode_checkpoints.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                control.encode_checkpoints.load(Ordering::SeqCst),
+                actual_encode_callbacks
+            );
             assert!(control.validate_checkpoints.load(Ordering::SeqCst) > 1);
 
             let mut first_failure = EncodeTailControl::new(CompileControlError::ResourceExhausted);
@@ -5167,7 +5612,7 @@ mod tests {
         let (catalog, function) = exact_scalar_catalog();
         let arguments = [FunctionArgument::Value {
             value_type: FunctionValueType::new(DataType::Int64, false),
-            constant: Some(FunctionLiteral::Int64(7)),
+            constant: Some(codec_i64_constant(7)),
         }];
         let physical = finish_limit_chain_plan(1);
         for error in [
@@ -5640,7 +6085,7 @@ mod tests {
 
         let left = builder.reserve_node_id().unwrap();
         let left_literal = builder
-            .add_expression(left, ty.clone(), ExprKind::Literal(LiteralValue::Int64(1)))
+            .add_expression(left, ty.clone(), fixture_i64_reference(1))
             .unwrap();
         let left_value = builder
             .add_value(
@@ -5669,7 +6114,7 @@ mod tests {
 
         let right = builder.reserve_node_id().unwrap();
         let right_literal = builder
-            .add_expression(right, ty.clone(), ExprKind::Literal(LiteralValue::Int64(2)))
+            .add_expression(right, ty.clone(), fixture_i64_reference(2))
             .unwrap();
         let right_value = builder
             .add_value(
@@ -5738,7 +6183,8 @@ mod tests {
                 },
             )
             .unwrap();
-        let mut plan_builder = PlanBuilder::new(PlanVersionId::try_new([20; 16]).unwrap());
+        let mut plan_builder = PlanBuilder::new(PlanVersionId::try_new([20; 16]).unwrap())
+            .with_constant_pools(fixture_i64_constants());
         plan_builder.add_fragment(fragment).unwrap();
         plan_builder
             .set_result_port(ResultPort {
@@ -5755,7 +6201,7 @@ mod tests {
                 }]),
             })
             .unwrap();
-        let physical = plan_builder.finish().unwrap();
+        let physical = plan_builder.finish_observed(&CodecTestControl).unwrap();
 
         let encoded = encode_physical_plan_v1(
             &physical,
@@ -5817,7 +6263,8 @@ mod tests {
                 },
             )
             .unwrap();
-        let mut plan_builder = PlanBuilder::new(PlanVersionId::try_new([22; 16]).unwrap());
+        let mut plan_builder = PlanBuilder::new(PlanVersionId::try_new([22; 16]).unwrap())
+            .with_constant_pools(fixture_i64_constants());
         plan_builder.add_fragment(fragment).unwrap();
         plan_builder
             .set_result_port(ResultPort {
@@ -5834,7 +6281,7 @@ mod tests {
                 }]),
             })
             .unwrap();
-        let physical = plan_builder.finish().unwrap();
+        let physical = plan_builder.finish_observed(&CodecTestControl).unwrap();
         let encoded = encode_physical_plan_v1(
             &physical,
             &catalog,
@@ -5861,11 +6308,7 @@ mod tests {
         let ty = ValueType::new(DataType::Int64, false);
         let values = builder.reserve_node_id().unwrap();
         let literal = builder
-            .add_expression(
-                values,
-                ty.clone(),
-                ExprKind::Literal(LiteralValue::Int64(1)),
-            )
+            .add_expression(values, ty.clone(), fixture_i64_reference(1))
             .unwrap();
         let value = builder
             .add_value(
@@ -5924,7 +6367,8 @@ mod tests {
                 },
             )
             .unwrap();
-        let mut plan_builder = PlanBuilder::new(PlanVersionId::try_new([23; 16]).unwrap());
+        let mut plan_builder = PlanBuilder::new(PlanVersionId::try_new([23; 16]).unwrap())
+            .with_constant_pools(fixture_i64_constants());
         plan_builder.add_fragment(fragment).unwrap();
         plan_builder
             .set_result_port(ResultPort {
@@ -5941,7 +6385,7 @@ mod tests {
                 }]),
             })
             .unwrap();
-        plan_builder.finish().unwrap()
+        plan_builder.finish_observed(&CodecTestControl).unwrap()
     }
 
     fn finish_project_expression_plan(cast_depth: usize, diamond_depth: usize) -> PhysicalPlan {
@@ -5990,11 +6434,7 @@ mod tests {
         let ty = ValueType::new(DataType::Int64, false);
         let values = builder.reserve_node_id().unwrap();
         let literal = builder
-            .add_expression(
-                values,
-                ty.clone(),
-                ExprKind::Literal(LiteralValue::Int64(1)),
-            )
+            .add_expression(values, ty.clone(), fixture_i64_reference(1))
             .unwrap();
         let input = builder
             .add_value(
@@ -6089,7 +6529,8 @@ mod tests {
                 },
             )
             .unwrap();
-        let mut plan_builder = PlanBuilder::new(PlanVersionId::try_new([24; 16]).unwrap());
+        let mut plan_builder = PlanBuilder::new(PlanVersionId::try_new([24; 16]).unwrap())
+            .with_constant_pools(fixture_i64_constants());
         let mut parameters = Vec::new();
         if cast_depth != 0 {
             parameters.push((
@@ -6122,7 +6563,7 @@ mod tests {
                 }]),
             })
             .unwrap();
-        plan_builder.finish().unwrap()
+        plan_builder.finish_observed(&CodecTestControl).unwrap()
     }
 
     fn writer_schema_carrier(
@@ -6311,12 +6752,19 @@ mod tests {
         let fragment_id = FragmentId::new(26);
         let mut builder = FragmentBuilder::new(fragment_id);
         let ty = ValueType::new(DataType::Int64, false);
+        let constant = codec_i64_constant(1);
+        let pool_id = novarocks_physical_plan::ConstantPoolId::new(0);
+        let mut constants = novarocks_physical_plan::ConstantPools::empty();
+        constants.insert(pool_id, constant.pool().clone()).unwrap();
         let values = builder.reserve_node_id().unwrap();
         let literal = builder
             .add_expression(
                 values,
                 ty.clone(),
-                ExprKind::Literal(LiteralValue::Int64(1)),
+                ExprKind::Constant(novarocks_physical_plan::ConstantReference {
+                    pool: pool_id,
+                    ordinal: 0,
+                }),
             )
             .unwrap();
         let input = builder
@@ -6388,7 +6836,14 @@ mod tests {
                 },
             )
             .unwrap();
-        let mut preflight = WireExpressionPreflight::try_new(&fragment).unwrap();
+        let mut preflight = WireExpressionPreflight::try_new(
+            &fragment,
+            ExpressionEncodingContext {
+                constants: &constants,
+                control: &CodecTestControl,
+            },
+        )
+        .unwrap();
         for (expression, _) in expressions {
             preflight.charge(expression, 9).unwrap();
         }
@@ -6457,11 +6912,7 @@ mod tests {
         let node = builder.reserve_node_id().unwrap();
         let ty = ValueType::new(DataType::Int64, false);
         let literal = builder
-            .add_expression(
-                node,
-                ty.clone(),
-                ExprKind::Literal(LiteralValue::Int64(literal_value)),
-            )
+            .add_expression(node, ty.clone(), fixture_i64_reference(literal_value))
             .unwrap();
         let value = builder
             .add_value(
@@ -6745,7 +7196,8 @@ mod tests {
             )
             .unwrap();
 
-        let mut plan = PlanBuilder::new(PlanVersionId::try_new([30; 16]).unwrap());
+        let mut plan = PlanBuilder::new(PlanVersionId::try_new([30; 16]).unwrap())
+            .with_constant_pools(fixture_i64_constants());
         plan.add_fragment(source).unwrap();
         plan.add_fragment(partial).unwrap();
         plan.add_fragment(final_stage).unwrap();
@@ -6806,7 +7258,7 @@ mod tests {
             }]),
         })
         .unwrap();
-        plan.finish().unwrap()
+        plan.finish_observed(&CodecTestControl).unwrap()
     }
 
     fn test_runtime_filter_coverage(
@@ -7075,7 +7527,8 @@ mod tests {
             },
         };
 
-        let mut plan = PlanBuilder::new(PlanVersionId::try_new([40; 16]).unwrap());
+        let mut plan = PlanBuilder::new(PlanVersionId::try_new([40; 16]).unwrap())
+            .with_constant_pools(fixture_i64_constants());
         plan.add_fragment(left_source).unwrap();
         plan.add_fragment(right_source).unwrap();
         plan.add_fragment(join_stage).unwrap();
@@ -7154,7 +7607,7 @@ mod tests {
             ]),
         })
         .unwrap();
-        plan.finish().unwrap()
+        plan.finish_observed(&CodecTestControl).unwrap()
     }
 
     #[test]
@@ -7235,11 +7688,7 @@ mod tests {
         let values = fragment_builder.reserve_node_id().unwrap();
         let ty = ValueType::new(DataType::Int64, false);
         let literal = fragment_builder
-            .add_expression(
-                values,
-                ty.clone(),
-                ExprKind::Literal(LiteralValue::Int64(9)),
-            )
+            .add_expression(values, ty.clone(), fixture_i64_reference(9))
             .unwrap();
         let value = fragment_builder
             .add_value(
@@ -7295,7 +7744,8 @@ mod tests {
                 },
             )
             .unwrap();
-        let mut plan_builder = PlanBuilder::new(PlanVersionId::try_new([19; 16]).unwrap());
+        let mut plan_builder = PlanBuilder::new(PlanVersionId::try_new([19; 16]).unwrap())
+            .with_constant_pools(fixture_i64_constants());
         plan_builder.add_fragment(fragment).unwrap();
         plan_builder
             .set_result_port(ResultPort {
@@ -7320,7 +7770,7 @@ mod tests {
                 ]),
             })
             .unwrap();
-        let physical = plan_builder.finish().unwrap();
+        let physical = plan_builder.finish_observed(&CodecTestControl).unwrap();
         let encoded = encode_physical_plan_v1(
             &physical,
             &catalog,
@@ -7374,7 +7824,8 @@ mod tests {
             )
             .unwrap();
         let ty = ValueType::new(DataType::Int64, false);
-        let mut plan_builder = PlanBuilder::new(PlanVersionId::try_new([21; 16]).unwrap());
+        let mut plan_builder = PlanBuilder::new(PlanVersionId::try_new([21; 16]).unwrap())
+            .with_constant_pools(fixture_i64_constants());
         plan_builder.add_fragment(fragment).unwrap();
         plan_builder
             .set_result_port(ResultPort {
@@ -7391,22 +7842,31 @@ mod tests {
                 }]),
             })
             .unwrap();
-        let physical = plan_builder.finish().unwrap();
+        let physical = plan_builder.finish_observed(&CodecTestControl).unwrap();
 
+        let mut observed =
+            EncodeTailControl::new(novarocks_type_contract::CompileControlError::Cancelled);
+        observed.refuse_at = None;
         let error = encode_physical_plan_v1(
             &physical,
             &catalog,
             &NoPhysicalV1PrivateFacts,
             false,
-            &CodecTestControl,
+            &observed,
         )
         .expect_err("Limit overflow must fail in encoder preflight");
         assert!(
             error.to_string().contains("Limit limit exceeds i64"),
             "{error}"
         );
-        let control =
+        let mut control =
             EncodeTailControl::new(novarocks_type_contract::CompileControlError::Cancelled);
+        control.refuse_at = Some(
+            observed
+                .encode_checkpoints
+                .load(std::sync::atomic::Ordering::SeqCst)
+                - 1,
+        );
         assert_eq!(
             encode_physical_plan_v1(
                 &physical,
@@ -7434,18 +7894,10 @@ mod tests {
         let source = builder.reserve_node_id().unwrap();
         let ty = ValueType::new(DataType::Int64, false);
         let left_literal = builder
-            .add_expression(
-                source,
-                ty.clone(),
-                ExprKind::Literal(LiteralValue::Int64(1)),
-            )
+            .add_expression(source, ty.clone(), fixture_i64_reference(1))
             .unwrap();
         let right_literal = builder
-            .add_expression(
-                source,
-                ty.clone(),
-                ExprKind::Literal(LiteralValue::Int64(2)),
-            )
+            .add_expression(source, ty.clone(), fixture_i64_reference(2))
             .unwrap();
         let left = builder
             .add_value(
@@ -7586,7 +8038,8 @@ mod tests {
             layout.output_slot(repeat, 2).unwrap().get_u32()
         );
 
-        let mut plan_builder = PlanBuilder::new(PlanVersionId::try_new([18; 16]).unwrap());
+        let mut plan_builder = PlanBuilder::new(PlanVersionId::try_new([18; 16]).unwrap())
+            .with_constant_pools(fixture_i64_constants());
         plan_builder.add_fragment(fragment).unwrap();
         plan_builder
             .set_result_port(ResultPort {
@@ -7624,7 +8077,7 @@ mod tests {
             &physical_fragment.nodes()[&repeat],
             &grouping_values
         ));
-        let physical = plan_builder.finish().unwrap();
+        let physical = plan_builder.finish_observed(&CodecTestControl).unwrap();
         let (catalog, _) = exact_scalar_catalog();
         encode_physical_plan_v1(
             &physical,
@@ -7642,18 +8095,10 @@ mod tests {
         let source = builder.reserve_node_id().unwrap();
         let ty = ValueType::new(DataType::Int64, false);
         let first_literal = builder
-            .add_expression(
-                source,
-                ty.clone(),
-                ExprKind::Literal(LiteralValue::Int64(1)),
-            )
+            .add_expression(source, ty.clone(), fixture_i64_reference(1))
             .unwrap();
         let second_literal = builder
-            .add_expression(
-                source,
-                ty.clone(),
-                ExprKind::Literal(LiteralValue::Int64(2)),
-            )
+            .add_expression(source, ty.clone(), fixture_i64_reference(2))
             .unwrap();
         let key = builder
             .add_value(

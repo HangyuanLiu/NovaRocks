@@ -50,6 +50,10 @@ pub use mv_rewrite::{
     SqlMvRewriteSelectionFacts, SqlMvRewriteSourceOccurrenceFacts,
 };
 
+// The request profile has one owner; application test fixtures may author
+// their explicit ceiling without a second default or translation vocabulary.
+pub use novarocks_functions::ConstantPolicy;
+
 /// SQL's read-only observation of statement cancellation.
 ///
 /// The application owns cancellation reasons and sources.  Compiler phases
@@ -387,9 +391,9 @@ pub enum FoldNodeKind {
 }
 
 /// One already-folded argument of a fold request.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct FoldArg {
-    pub value: LiteralValue,
+    pub value: novarocks_functions::ConstantValue,
     /// The authored logical domain and exact Arrow field vocabulary travel
     /// together; a carrier alone cannot authorize a logical reinterpretation.
     pub value_type: novarocks_type_contract::FunctionValueType,
@@ -400,10 +404,12 @@ pub struct FoldArg {
 /// Every argument is already a literal: recursion, volatility gating and the
 /// foldable-shape policy stay on the SQL side, so an evaluator is a pure
 /// per-node calculator with no traversal knowledge.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct FoldRequest {
     pub kind: FoldNodeKind,
     pub args: Vec<FoldArg>,
+    /// Explicit host-admitted policy for the newly evaluated backing.
+    pub constant_policy: novarocks_functions::ConstantPolicy,
     pub result_type: novarocks_type_contract::FunctionValueType,
 }
 
@@ -432,7 +438,7 @@ pub trait SqlConstantEvaluator: Send + Sync {
         &self,
         request: &FoldRequest,
         control: &dyn novarocks_type_contract::PureCompileControl,
-    ) -> Result<Option<LiteralValue>, SqlConstantEvaluationError>;
+    ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>;
 }
 
 /// Request failures stay distinct from a failed optional legacy evaluation.
@@ -440,6 +446,7 @@ pub trait SqlConstantEvaluator: Send + Sync {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SqlConstantEvaluationError {
     Control(novarocks_type_contract::CompileControlError),
+    Constant(novarocks_functions::ConstantError),
     InvalidType(novarocks_type_contract::ValueTypeError),
     Preparation(novarocks_functions::KernelFailure),
     Evaluation(String),
@@ -448,6 +455,15 @@ pub enum SqlConstantEvaluationError {
 impl From<novarocks_type_contract::CompileControlError> for SqlConstantEvaluationError {
     fn from(error: novarocks_type_contract::CompileControlError) -> Self {
         Self::Control(error)
+    }
+}
+
+impl From<novarocks_functions::ConstantError> for SqlConstantEvaluationError {
+    fn from(error: novarocks_functions::ConstantError) -> Self {
+        match error {
+            novarocks_functions::ConstantError::Control(error) => Self::Control(error),
+            error => Self::Constant(error),
+        }
     }
 }
 
@@ -482,6 +498,7 @@ impl fmt::Display for SqlConstantEvaluationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Control(error) => error.fmt(f),
+            Self::Constant(error) => error.fmt(f),
             Self::InvalidType(error) => error.fmt(f),
             Self::Preparation(error) => error.fmt(f),
             Self::Evaluation(error) => f.write_str(error),
@@ -503,7 +520,7 @@ impl SqlConstantEvaluator for NoopConstantEvaluator {
         &self,
         _request: &FoldRequest,
         control: &dyn novarocks_type_contract::PureCompileControl,
-    ) -> Result<Option<LiteralValue>, SqlConstantEvaluationError> {
+    ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError> {
         let work = novarocks_type_contract::CompileCheckpoints::try_new(
             control,
             novarocks_type_contract::CompilePhase::FunctionSpecialization,
@@ -711,6 +728,7 @@ pub struct SqlAnalyzeRequest<'a> {
     pub(crate) functions: Option<&'a dyn SqlFunctionCatalog>,
     pub(crate) owned_functions: Option<Arc<dyn SqlFunctionCatalog>>,
     pub(crate) constant_evaluator: Option<&'static dyn SqlConstantEvaluator>,
+    pub(crate) constant_policy: novarocks_functions::ConstantPolicy,
     pub(crate) mv_rewrite: Option<&'a MvRewriteDefinitionIndex>,
     pub(crate) imv_rewrite: Option<&'a SqlImvPlanningInput>,
     pub(crate) control: SqlCompileControl,
@@ -727,6 +745,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
         functions: &'a dyn SqlFunctionCatalog,
         constant_evaluator: &'static dyn SqlConstantEvaluator,
         mv_rewrite: Option<&'a MvRewriteDefinitionIndex>,
+        constant_policy: novarocks_functions::ConstantPolicy,
         control: SqlCompileControl,
     ) -> Self {
         Self {
@@ -738,6 +757,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
             functions: Some(functions),
             owned_functions: None,
             constant_evaluator: Some(constant_evaluator),
+            constant_policy,
             mv_rewrite,
             imv_rewrite: None,
             control,
@@ -759,6 +779,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
         session: SqlSessionContext,
         environment: SqlPlanningEnvironment,
         constant_evaluator: Option<&'static dyn SqlConstantEvaluator>,
+        constant_policy: novarocks_functions::ConstantPolicy,
         control: SqlCompileControl,
     ) -> Self {
         Self {
@@ -770,6 +791,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
             functions: None,
             owned_functions: None,
             constant_evaluator,
+            constant_policy,
             mv_rewrite: None,
             imv_rewrite: None,
             control,
@@ -778,6 +800,11 @@ impl<'a> SqlAnalyzeRequest<'a> {
 
     pub(crate) fn check_control(&self) -> Result<(), SqlCompileError> {
         self.control.check()
+    }
+
+    /// Borrow the original request control for subsequent diagnostics.
+    pub fn control(&self) -> &SqlCompileControl {
+        &self.control
     }
 
     pub(crate) fn with_function_catalog(mut self, functions: Arc<dyn SqlFunctionCatalog>) -> Self {
@@ -813,9 +840,13 @@ pub struct SqlAnalyzedQuery {
     /// Carried from the analyze request because folding runs in the optimize
     /// phase, which outlives the analyze request borrow.
     constant_evaluator: Option<&'static dyn SqlConstantEvaluator>,
+    constant_policy: novarocks_functions::ConstantPolicy,
 }
 
 impl SqlAnalyzedQuery {
+    pub(crate) fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy
+    }
     pub(crate) fn root_allow_throw_exception(&self) -> bool {
         self.root_allow_throw_exception
     }
@@ -862,6 +893,10 @@ pub struct SqlOptimizeRequest<'a> {
 }
 
 impl<'a> SqlOptimizeRequest<'a> {
+    pub fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.analyzed.constant_policy
+    }
+
     pub fn root_allow_throw_exception(&self) -> bool {
         self.analyzed.root_allow_throw_exception()
     }
@@ -942,6 +977,7 @@ pub struct SqlImvRefreshExplainContext<'a> {
     pub catalog: &'a dyn SqlCatalogSnapshot,
     pub functions: &'a dyn SqlFunctionCatalog,
     pub constant_evaluator: &'static dyn SqlConstantEvaluator,
+    pub constant_policy: novarocks_functions::ConstantPolicy,
     pub control: SqlCompileControl,
     pub level: ExplainLevel,
 }
@@ -954,6 +990,7 @@ pub struct SqlMvRefreshAnalysisContext<'a> {
     pub current_database: String,
     pub catalog: &'a dyn SqlCatalogSnapshot,
     pub functions: &'a dyn SqlFunctionCatalog,
+    pub constant_policy: novarocks_functions::ConstantPolicy,
     pub control: SqlCompileControl,
 }
 
@@ -967,6 +1004,7 @@ pub fn analyze_mv_refresh_input(
         current_database,
         catalog,
         functions,
+        constant_policy,
         control,
     } = context;
     control.check()?;
@@ -983,6 +1021,7 @@ pub fn analyze_mv_refresh_input(
         catalog.planner_table_provider(),
         &current_database,
         functions,
+        constant_policy,
         &control,
     )
     .map_err(SqlCompileError::from)?;
@@ -1004,6 +1043,7 @@ pub fn compile_imv_refresh_explain_lines(
         catalog,
         functions,
         constant_evaluator,
+        constant_policy,
         control,
         level,
     } = context;
@@ -1019,10 +1059,12 @@ pub fn compile_imv_refresh_explain_lines(
         catalog,
         functions,
         constant_evaluator,
+        constant_policy,
         control,
     );
+    let explain_control = request.control().clone();
     let output = SqlCompiler::analyze(request)?.into_complete()?;
-    output.into_explain_lines(level, true)
+    output.into_explain_lines(level, true, &explain_control)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1036,6 +1078,7 @@ fn imv_refresh_explain_request<'a>(
     catalog: &'a dyn SqlCatalogSnapshot,
     functions: &'a dyn SqlFunctionCatalog,
     constant_evaluator: &'static dyn SqlConstantEvaluator,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: SqlCompileControl,
 ) -> SqlAnalyzeRequest<'a> {
     SqlAnalyzeRequest::new(
@@ -1052,6 +1095,7 @@ fn imv_refresh_explain_request<'a>(
         functions,
         constant_evaluator,
         None,
+        constant_policy,
         control,
     )
     .with_imv_rewrite(imv_rewrite)
@@ -1105,16 +1149,35 @@ impl SqlCompileOutput {
         self,
         level: ExplainLevel,
         logical: bool,
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<Vec<String>, SqlCompileError> {
-        match self.kind {
+        let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+            control,
+            novarocks_type_contract::CompilePhase::LowerProgram,
+        )?;
+        let result = match self.kind {
             SqlCompileOutputKind::Logical(output) if logical => {
-                crate::explain::explain_plan_checked(&output.logical_plan, level)
-                    .map_err(SqlCompileError::Compilation)
+                work.step()?;
+                work.flush()?;
+                crate::explain::explain_plan_checked(&output.logical_plan, level, control)
             }
-            _ => Err(SqlCompileError::InvalidRequest(
-                "EXPLAIN intent produced unexpected SQL facts".to_string(),
-            )),
+            _ => {
+                work.step()?;
+                Err(SqlCompileError::InvalidRequest(
+                    "EXPLAIN intent produced unexpected SQL facts".to_string(),
+                ))
+            }
+        };
+        if matches!(
+            &result,
+            Err(SqlCompileError::Cancelled
+                | SqlCompileError::DeadlineExceeded
+                | SqlCompileError::ResourceExhausted)
+        ) {
+            return result;
         }
+        work.finish()?;
+        result
     }
 }
 
@@ -1139,6 +1202,19 @@ impl From<novarocks_functions::FunctionBindingError> for SqlCompileError {
         match error {
             novarocks_functions::FunctionBindingError::Control(error) => error.into(),
             other => Self::Compilation(other.to_string()),
+        }
+    }
+}
+
+impl From<novarocks_functions::ConstantError> for SqlCompileError {
+    fn from(error: novarocks_functions::ConstantError) -> Self {
+        match error {
+            novarocks_functions::ConstantError::Control(error) => error.into(),
+            novarocks_functions::ConstantError::Limit(_) => Self::ResourceExhausted,
+            novarocks_functions::ConstantError::Type(error) => {
+                Self::InvalidRequest(error.to_string())
+            }
+            error => Self::Compilation(error.to_string()),
         }
     }
 }
@@ -1263,12 +1339,13 @@ impl SqlCompiler {
                         &request.session.current_database,
                         functions,
                         &request.session.sql_semantics,
+                        request.constant_policy,
                         &request.control,
                     )
                     .map_err(SqlCompileError::from)?;
                 request.check_control()?;
-                let logical_plan = crate::planner::plan_query(resolved, ctes, &mut factory)
-                    .map_err(SqlCompileError::Compilation)?;
+                let logical_plan =
+                    crate::planner::plan_query(resolved, ctes, &mut factory, &request.control)?;
                 let consumer_requires_semantic_snapshot =
                     crate::sql_mode::query_uses_group_concat_legacy(
                         &request.session.sql_semantics,
@@ -1358,6 +1435,7 @@ impl SqlCompiler {
                     snapshot: Arc::clone(input.snapshot()),
                     disabled_rules: settings.disabled_rules.clone(),
                     decimal_overflow_policy,
+                    constant_policy: request.constant_policy,
                     control: &request.control,
                     column_ref_factory: std::rc::Rc::clone(&factory_cell),
                     #[cfg(not(test))]
@@ -1414,11 +1492,12 @@ impl SqlCompiler {
                 &factory,
                 functions,
                 &settings,
+                request.constant_policy,
                 &request.control,
                 consumer_requires_semantic_snapshot,
             )?
         } else {
-            mv_rewrite::SqlMvRewriteAnalysis::empty()
+            mv_rewrite::SqlMvRewriteAnalysis::empty(request.constant_policy)
         };
         request.check_control()?;
         let function_catalog = request
@@ -1440,6 +1519,7 @@ impl SqlCompiler {
             change_stream,
             mv_rewrite,
             function_catalog,
+            constant_policy: request.constant_policy,
             constant_evaluator: constant_evaluator_for_legacy_mode(
                 request.constant_evaluator,
                 legacy_allow_throw_exception,
@@ -1459,10 +1539,12 @@ impl SqlCompiler {
             mv_rewrite,
             function_catalog,
             constant_evaluator,
+            constant_policy,
         } = request.analyzed;
         let control = request.control;
         control.check()?;
-        let mut scalar_arena = crate::optimizer::scalar::ScalarArena::new();
+        let mut scalar_arena =
+            crate::optimizer::scalar::ScalarArena::with_constant_policy(constant_policy);
         let mut optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
             &logical_plan,
             &mut scalar_arena,
@@ -1479,7 +1561,13 @@ impl SqlCompiler {
         let mv_rewrite::SqlMvRewritePreparation {
             candidates: mv_candidates,
             diagnostics: mv_rewrite_diagnostics,
+            constant_policy: mv_constant_policy,
         } = mv_rewrite;
+        if mv_constant_policy != constant_policy {
+            return Err(SqlCompileError::InvalidRequest(
+                "MV constant policy differs from its analyzed request".into(),
+            ));
+        }
         control.check()?;
         let root_distribution = match &intent {
             SqlCompileIntent::IcebergWrite { root_distribution } => {
@@ -1915,6 +2003,7 @@ mod tests {
             &FUNCTIONS,
             noop_constant_evaluator(),
             None,
+            crate::constant::test_constant_policy(),
             control,
         )
     }
@@ -1945,6 +2034,7 @@ mod tests {
             &FUNCTIONS,
             noop_constant_evaluator(),
             None,
+            crate::constant::test_constant_policy(),
             control,
         )
     }
@@ -2229,8 +2319,12 @@ mod tests {
         };
         let output = analyze_then_optimize(request).expect("compile ordinary EXPLAIN");
         assert!(output.is_optimized());
-        let _: fn(SqlCompileOutput, ExplainLevel, bool) -> Result<Vec<String>, SqlCompileError> =
-            SqlCompileOutput::into_explain_lines;
+        let _: fn(
+            SqlCompileOutput,
+            ExplainLevel,
+            bool,
+            &dyn novarocks_type_contract::PureCompileControl,
+        ) -> Result<Vec<String>, SqlCompileError> = SqlCompileOutput::into_explain_lines;
     }
 
     #[test]
@@ -2251,6 +2345,7 @@ mod tests {
             &CATALOG,
             &FUNCTIONS,
             noop_constant_evaluator(),
+            crate::constant::test_constant_policy(),
             control(None, &cancellation),
         );
 
@@ -2278,6 +2373,7 @@ mod tests {
         let catalog = SqlPlannerTableSnapshot::new(&catalog);
         let functions = crate::functions::build_builtin_engine_function_catalog().unwrap();
         let error = analyze_mv_refresh_input(SqlMvRefreshAnalysisContext {
+            constant_policy: crate::constant::test_constant_policy(),
             query: mv_analysis_query(
                 "SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ k FROM missing_table",
             ),
@@ -2325,6 +2421,7 @@ mod tests {
         let functions = crate::functions::build_builtin_engine_function_catalog()
             .expect("builtin function catalog");
         let input = analyze_mv_refresh_input(SqlMvRefreshAnalysisContext {
+            constant_policy: crate::constant::test_constant_policy(),
             query: mv_analysis_query("SELECT order_id FROM orders"),
             current_database: "db".to_string(),
             catalog: &catalog,
@@ -2353,6 +2450,7 @@ mod tests {
         let functions = crate::functions::build_builtin_engine_function_catalog()
             .expect("builtin function catalog");
         let error = analyze_mv_refresh_input(SqlMvRefreshAnalysisContext {
+            constant_policy: crate::constant::test_constant_policy(),
             query: mv_analysis_query("SELECT order_id FROM missing_orders"),
             current_database: "db".to_string(),
             catalog: &catalog,
@@ -2393,6 +2491,7 @@ mod tests {
                 crate::functions::builtin_sql_function_catalog(),
                 noop_constant_evaluator(),
                 None,
+                crate::constant::test_constant_policy(),
                 control(None, &cancellation),
             );
             let optimized = analyze_then_optimize(request)
@@ -2412,10 +2511,11 @@ mod tests {
                 },
                 crate::functions::builtin_sql_function_catalog(),
                 optimized.root_allow_throw_exception,
+                crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap()
-            .finish()
+            .finish_observed(&crate::compiler::SqlCompileControl::unbounded())
             .unwrap();
             let result = plan.result_port().unwrap();
             assert_eq!(result.fields.len(), 2);
@@ -2495,6 +2595,7 @@ mod tests {
             crate::functions::builtin_sql_function_catalog(),
             noop_constant_evaluator(),
             None,
+            crate::constant::test_constant_policy(),
             control(None, &cancellation),
         );
 
@@ -2524,6 +2625,7 @@ mod tests {
             crate::functions::builtin_sql_function_catalog(),
             noop_constant_evaluator(),
             None,
+            crate::constant::test_constant_policy(),
             control(None, &cancellation),
         );
 
@@ -2572,6 +2674,7 @@ mod tests {
             crate::functions::builtin_sql_function_catalog(),
             noop_constant_evaluator(),
             None,
+            crate::constant::test_constant_policy(),
             control(None, &cancellation),
         );
         assert!(matches!(
@@ -2601,6 +2704,7 @@ mod tests {
             crate::functions::builtin_sql_function_catalog(),
             noop_constant_evaluator(),
             None,
+            crate::constant::test_constant_policy(),
             control(None, &cancellation),
         );
         let optimized = analyze_then_optimize(request)
@@ -2789,6 +2893,7 @@ mod tests {
             crate::functions::builtin_sql_function_catalog(),
             noop_constant_evaluator(),
             None,
+            crate::constant::test_constant_policy(),
             SqlCompileControl::unbounded(),
         );
         let optimized = analyze_then_optimize(request)
@@ -2850,6 +2955,7 @@ mod tests {
                 crate::functions::builtin_sql_function_catalog(),
                 noop_constant_evaluator(),
                 None,
+                crate::constant::test_constant_policy(),
                 control(None, &cancellation),
             );
             let optimized = analyze_then_optimize(request)
@@ -2869,10 +2975,11 @@ mod tests {
                 },
                 crate::functions::builtin_sql_function_catalog(),
                 optimized.root_allow_throw_exception,
+                crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap()
-            .finish()
+            .finish_observed(&crate::compiler::SqlCompileControl::unbounded())
             .unwrap();
             let result = plan.result_port().unwrap();
             assert_eq!(result.fields.len(), 1);
@@ -2906,6 +3013,7 @@ mod tests {
             }
         }
         let request = FoldRequest {
+            constant_policy: crate::constant::test_constant_policy(),
             kind: FoldNodeKind::Function {
                 name: "fixture/no-op".into(),
             },
@@ -2919,9 +3027,11 @@ mod tests {
             checks: Default::default(),
             failure: None,
         };
-        assert_eq!(
-            noop_constant_evaluator().eval_scalar(&request, &owner),
-            Ok(None)
+        assert!(
+            noop_constant_evaluator()
+                .eval_scalar(&request, &owner)
+                .unwrap()
+                .is_none()
         );
         assert_eq!(*owner.checks.lock().unwrap(), [0, 0]);
         for error in [
@@ -2934,9 +3044,8 @@ mod tests {
                     checks: Default::default(),
                     failure: Some((at, error)),
                 };
-                assert_eq!(
-                    noop_constant_evaluator().eval_scalar(&request, &owner),
-                    Err(SqlConstantEvaluationError::Control(error))
+                assert!(
+                    matches!(noop_constant_evaluator().eval_scalar(&request, &owner), Err(SqlConstantEvaluationError::Control(actual)) if actual == error)
                 );
                 assert_eq!(owner.checks.lock().unwrap().len(), at);
             }
@@ -3087,10 +3196,16 @@ mod tests {
         impl SqlConstantEvaluator for NullableEvaluator {
             fn eval_scalar(
                 &self,
-                _: &FoldRequest,
-                _: &dyn novarocks_type_contract::PureCompileControl,
-            ) -> Result<Option<LiteralValue>, SqlConstantEvaluationError> {
-                Ok(Some(LiteralValue::Null))
+                request: &FoldRequest,
+                control: &dyn novarocks_type_contract::PureCompileControl,
+            ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>
+            {
+                Ok(Some(crate::constant::admit_syntax_constant(
+                    &LiteralValue::Null,
+                    &request.result_type,
+                    request.constant_policy,
+                    control,
+                )?))
             }
         }
         static EVALUATOR: NullableEvaluator = NullableEvaluator;
@@ -3129,6 +3244,7 @@ mod tests {
                 .unwrap()
                 .eval_scalar(
                     &FoldRequest {
+                        constant_policy: crate::constant::test_constant_policy(),
                         kind: FoldNodeKind::Cast(
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         ),

@@ -236,7 +236,7 @@ impl FunctionEffectOwner for Fixture {
             .into());
         }
         for (argument, expected) in input.request.arguments.iter().zip(&self.arguments) {
-            if argument != expected {
+            if !argument.equals_observed(expected, CompilePhase::FunctionSpecialization, control)? {
                 return Err(FunctionBindingError::InvalidBinding(
                     "fixture exact table argument differs".into(),
                 )
@@ -274,10 +274,14 @@ impl FunctionBindingResolver for Fixture {
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
-        _control: &dyn novarocks_type_contract::PureCompileControl,
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         if !std::ptr::eq(selected, self.selected.as_ref())
-            || request.arguments != self.arguments
+            || !crate::binding::arguments_equal_for_test(
+                request.arguments,
+                &self.arguments,
+                control,
+            )?
             || request.logical_argument_count != self.arguments.len()
         {
             return Err(FunctionBindingError::UnknownFunction);

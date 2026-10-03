@@ -18,8 +18,10 @@
 use crate::analysis::cte::CTERegistry;
 use crate::analysis::*;
 use crate::column_id::ColumnRefFactory;
+use crate::compiler::SqlCompileError;
 use crate::planner::logical::*;
 use crate::planner::payload::*;
+use novarocks_type_contract::PureCompileControl;
 
 use super::output::adapt_plan_output_with_qualifier;
 use super::query::plan_scoped_query;
@@ -32,7 +34,8 @@ pub(super) fn plan_relation_scoped(
     relation: Relation,
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
-) -> Result<LogicalPlanNode, String> {
+    control: &dyn PureCompileControl,
+) -> Result<LogicalPlanNode, SqlCompileError> {
     match relation {
         Relation::Scan(scan) => {
             // G1: reuse the ColumnIds the analyzer already minted for this
@@ -108,8 +111,9 @@ pub(super) fn plan_relation_scoped(
             alias,
             output_columns,
         } => {
-            let inner_plan = plan_scoped_query(*query, cte_registry, factory)?;
+            let inner_plan = plan_scoped_query(*query, cte_registry, factory, control)?;
             adapt_plan_output_with_qualifier(inner_plan, &output_columns, Some(&alias))
+                .map_err(SqlCompileError::Compilation)
         }
         Relation::Join(join_rel) => {
             let JoinRelation {
@@ -126,7 +130,8 @@ pub(super) fn plan_relation_scoped(
                         other => {
                             return Err(format!(
                                 "LATERAL UNNEST supports CROSS/INNER/LEFT joins, got {other:?}"
-                            ));
+                            )
+                            .into());
                         }
                     };
                     if !is_lateral_unnest_condition_supported(&condition) {
@@ -134,7 +139,7 @@ pub(super) fn plan_relation_scoped(
                             "LATERAL UNNEST currently requires no condition or ON TRUE".into()
                         );
                     }
-                    let left = plan_relation_scoped(left, cte_registry, factory)?;
+                    let left = plan_relation_scoped(left, cte_registry, factory, control)?;
                     Ok(LogicalPlanNode::new(
                         LogicalPlanKind::TableFunction(PlanTableFunctionNode {
                             function_name: "unnest".to_string(),
@@ -149,8 +154,8 @@ pub(super) fn plan_relation_scoped(
                     ))
                 }
                 right => {
-                    let left = plan_relation_scoped(left, cte_registry, factory)?;
-                    let right = plan_relation_scoped(right, cte_registry, factory)?;
+                    let left = plan_relation_scoped(left, cte_registry, factory, control)?;
+                    let right = plan_relation_scoped(right, cte_registry, factory, control)?;
                     Ok(LogicalPlanNode::new(
                         LogicalPlanKind::Join(LogicalJoinNode {
                             join_type,
@@ -190,8 +195,12 @@ pub(super) fn plan_relation_scoped(
             vec![],
             None,
         )),
-        Relation::IcebergMetadataScan(rel) => plan_iceberg_metadata_scan(rel, factory),
-        Relation::IcebergDeltaScan(rel) => plan_iceberg_delta_scan(rel, factory),
+        Relation::IcebergMetadataScan(rel) => {
+            plan_iceberg_metadata_scan(rel, factory).map_err(SqlCompileError::Compilation)
+        }
+        Relation::IcebergDeltaScan(rel) => {
+            plan_iceberg_delta_scan(rel, factory).map_err(SqlCompileError::Compilation)
+        }
     }
 }
 
@@ -405,7 +414,8 @@ pub(super) fn plan_set_operation_scoped(
     set_op: ResolvedSetOp,
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
-) -> Result<LogicalPlanNode, String> {
+    control: &dyn PureCompileControl,
+) -> Result<LogicalPlanNode, SqlCompileError> {
     // The parser associates a long set-operation chain to the left. Walk
     // that spine explicitly so an ordinary wide UNION ALL consumes bounded
     // planning stack while retaining every pairwise type-widening step.
@@ -467,9 +477,9 @@ pub(super) fn plan_set_operation_scoped(
             local_cte_ids,
         };
     };
-    let mut left = plan_scoped_query(base_left, cte_registry, factory)?;
+    let mut left = plan_scoped_query(base_left, cte_registry, factory, control)?;
     while let Some((kind, all, right, output_columns)) = operations.pop() {
-        let right = plan_scoped_query(*right, cte_registry, factory)?;
+        let right = plan_scoped_query(*right, cte_registry, factory, control)?;
         let payload = match kind {
             SetOpKind::Union => LogicalPlanKind::Union(LogicalUnionNode {
                 all,

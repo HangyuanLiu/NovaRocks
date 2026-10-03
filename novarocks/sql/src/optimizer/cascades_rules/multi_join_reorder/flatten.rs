@@ -272,7 +272,7 @@ fn collect_scalar_column_ids(arena: &ScalarArena, expr: ScalarId, out: &mut Hash
                 out.insert(*id);
             }
         }
-        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {}
+        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) | ScalarNode::Constant(_) => {}
         ScalarNode::BinaryOp { left, right, .. } => {
             collect_scalar_column_ids(arena, *left, out);
             collect_scalar_column_ids(arena, *right, out);

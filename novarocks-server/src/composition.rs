@@ -573,6 +573,11 @@ pub fn compose_frontend_role_config(
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<FrontendRoleConfig> {
     let runtime_config = &config.runtime;
+    let constant_policy = runtime_config
+        .frontend_constant_policy
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("runtime.frontend_constant_policy is required for FE"))?
+        .policy();
     let runtime_filter_worker_count = NonZeroUsize::new(runtime_config.actual_exec_threads())
         .ok_or_else(|| anyhow::anyhow!("frontend runtime-filter worker count must be nonzero"))?;
     let query_blocking_workers = NonZeroUsize::new(runtime_config.actual_query_blocking_workers())
@@ -624,6 +629,7 @@ pub fn compose_frontend_role_config(
         native_compatibility_id,
         function_catalog,
         logical_runtime,
+        constant_policy,
     )
     .with_catalog_desired_state_source(catalog_source)
     .try_with_catalog_prune_config(

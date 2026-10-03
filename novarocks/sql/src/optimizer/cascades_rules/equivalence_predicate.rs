@@ -22,7 +22,7 @@ use crate::common::{JoinKind, OutputColumn};
 use crate::optimizer::binder::Binding;
 use crate::optimizer::logical_props::{
     collect_literal_equalities, collect_strict_column_equalities, combine_with_and,
-    literal_signature, make_eq_literal_predicate,
+    literal_equal_observed, make_eq_literal_predicate,
 };
 use crate::optimizer::memo::{GroupId, LogicalProperties, MExpr, Memo};
 use crate::optimizer::operator::{FilterOp, LogicalJoinOp, Operator};
@@ -231,30 +231,68 @@ fn has_literal_equality_in_side(
     join_literals: &[(ColumnId, ScalarId)],
     column_id: ColumnId,
     literal: ScalarId,
-) -> bool {
-    let signature = literal_signature(&memo.scalars, literal);
-    if join_literals
-        .iter()
-        .any(|(existing_column, existing_literal)| {
-            *existing_column == column_id
-                && literal_signature(&memo.scalars, *existing_literal) == signature
-        })
-    {
-        return true;
-    }
-    let props = memo
-        .groups
-        .get(group_id)
-        .and_then(|group| group.logical_props.as_ref());
-    literal_equalities_from_group(memo, group_id)
-        .into_iter()
-        .any(|(existing_column, existing_literal)| {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<bool, crate::compiler::SqlCompileError> {
+    use crate::compiler::SqlCompileError;
+    use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+    let result = (|| {
+        // Preserve join-literal order and its first-match short circuit.
+        for (existing_column, existing_literal) in join_literals {
+            let same_column = *existing_column == column_id;
+            work.step()?;
+            if same_column {
+                work.flush()?;
+                if literal_equal_observed(
+                    &memo.scalars,
+                    *existing_literal,
+                    &memo.scalars,
+                    literal,
+                    work.control(),
+                )? {
+                    return Ok(true);
+                }
+            }
+        }
+        let props = memo
+            .groups
+            .get(group_id)
+            .and_then(|group| group.logical_props.as_ref());
+        // Existing memo/relationship collection is an opaque source walk.
+        work.flush()?;
+        let equalities = literal_equalities_from_group(memo, group_id);
+        work.flush()?;
+        for (existing_column, existing_literal) in equalities {
             let same_or_equivalent = existing_column == column_id
                 || props
                     .and_then(|props| props.equivalence_classes.class_containing(column_id))
                     .is_some_and(|class| class.contains(existing_column));
-            same_or_equivalent && literal_signature(&memo.scalars, existing_literal) == signature
-        })
+            work.step()?;
+            if same_or_equivalent {
+                work.flush()?;
+                if literal_equal_observed(
+                    &memo.scalars,
+                    existing_literal,
+                    &memo.scalars,
+                    literal,
+                    work.control(),
+                )? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    })();
+    if matches!(
+        &result,
+        Err(SqlCompileError::Cancelled
+            | SqlCompileError::DeadlineExceeded
+            | SqlCompileError::ResourceExhausted)
+    ) {
+        return result;
+    }
+    work.finish()?;
+    result
 }
 
 fn add_filter_group(
@@ -325,7 +363,14 @@ fn apply_inner(
         };
 
         if let Some(literal) = literal_by_column.get(&left_id).cloned()
-            && !has_literal_equality_in_side(memo, right_group, &join_literals, right_id, literal)
+            && !has_literal_equality_in_side(
+                memo,
+                right_group,
+                &join_literals,
+                right_id,
+                literal,
+                control,
+            )?
             && let Some(column) = right_columns.get(&right_id)
         {
             right_new.push(make_eq_literal_predicate(
@@ -336,7 +381,14 @@ fn apply_inner(
             )?);
         }
         if let Some(literal) = literal_by_column.get(&right_id).cloned()
-            && !has_literal_equality_in_side(memo, left_group, &join_literals, left_id, literal)
+            && !has_literal_equality_in_side(
+                memo,
+                left_group,
+                &join_literals,
+                left_id,
+                literal,
+                control,
+            )?
             && let Some(column) = left_columns.get(&left_id)
         {
             left_new.push(make_eq_literal_predicate(
@@ -721,5 +773,176 @@ mod tests {
                 .contains_key(&ColumnId::new_for_test(1)),
             "column_statistics must contain the child column 'a'"
         );
+    }
+
+    fn materialized_text(memo: &mut Memo, values: Vec<&str>, ordinal: u32) -> ScalarId {
+        use arrow::array::{Array, StringArray};
+        let ty = novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false);
+        let value = novarocks_functions::ConstantPool::try_new(
+            std::sync::Arc::new(arrow::datatypes::Field::new(
+                "selected",
+                DataType::Utf8,
+                false,
+            )),
+            ty.clone(),
+            StringArray::from(values).to_data(),
+            crate::constant::test_constant_policy(),
+            novarocks_type_contract::CompilePhase::Validate,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap()
+        .value(ordinal)
+        .unwrap();
+        memo.scalars
+            .intern_observed(
+                ScalarNode::Constant(value),
+                ty,
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap()
+    }
+
+    fn text_scan(memo: &mut Memo, id: u32, predicates: Vec<ScalarId>) -> GroupId {
+        let group = scan_group_with_predicates(memo, id, "key", predicates);
+        let mut column = output(id, "key");
+        column.value_type = novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false);
+        let Operator::LogicalScan(scan) = &mut memo.groups[group].logical_exprs[0].op else {
+            unreachable!()
+        };
+        scan.columns = vec![column.clone()];
+        memo.groups[group].logical_props = Some(LogicalProperties::new(vec![column], 10.0));
+        group
+    }
+
+    fn text_column(memo: &mut Memo, id: u32) -> ScalarId {
+        memo.scalars
+            .intern_observed(
+                ScalarNode::ColumnRef(ColumnId::new_for_test(id)),
+                novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn actual_equivalence_rule_deduplicates_selected_cv_and_keeps_first_match_before_syntax_leaf() {
+        let mut memo = Memo::new();
+        let value = materialized_text(&mut memo, vec!["unused", "same"], 1);
+        let second = materialized_text(&mut memo, vec!["same", "different"], 0);
+        let left_column = text_column(&mut memo, 1);
+        let right_column = text_column(&mut memo, 2);
+        let left_eq = eq(&mut memo, left_column, value);
+        let right_eq = eq(&mut memo, right_column, second);
+        let pair = eq(&mut memo, left_column, right_column);
+        let left = text_scan(&mut memo, 1, vec![left_eq]);
+        let right = text_scan(&mut memo, 2, vec![right_eq]);
+        let join = join_mexpr(&mut memo, JoinKind::Inner, pair, vec![left, right]);
+        let before = memo.scalars.node_count();
+        let groups = memo.groups.len();
+        assert!(
+            InnerJoinEquivalencePredicateRule
+                .apply(&join, &mut memo, crate::optimizer::test_optimizer_control())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(memo.scalars.node_count(), before);
+        assert_eq!(memo.groups.len(), groups);
+        // Ordered join matches take precedence over any side collection.
+        let syntax = memo.scalars.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::String("same".into()))),
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+        );
+        assert!(
+            !has_literal_equality_in_side(
+                &memo,
+                right,
+                &[(ColumnId::new_for_test(3), value)],
+                ColumnId::new_for_test(3),
+                syntax,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+        );
+        assert!(
+            !has_literal_equality_in_side(
+                &memo,
+                right,
+                &[(ColumnId::new_for_test(3), syntax)],
+                ColumnId::new_for_test(3),
+                value,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn actual_equivalence_cv_comparison_preserves_every_original_control_prefix_without_new_predicates()
+     {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        struct Control {
+            trace: std::sync::Mutex<Vec<(CompilePhase, u32)>>,
+            refuse: Option<usize>,
+            cause: CompileControlError,
+        }
+        impl PureCompileControl for Control {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                let mut trace = self.trace.lock().unwrap();
+                trace.push((phase, units));
+                if self.refuse == Some(trace.len() - 1) {
+                    return Err(self.cause);
+                }
+                Ok(())
+            }
+        }
+        let mut memo = Memo::new();
+        let payload = "x".repeat(320 * 1024);
+        let value = materialized_text(&mut memo, vec!["unused", &payload], 1);
+        let l = text_column(&mut memo, 1);
+        let r = text_column(&mut memo, 2);
+        let leq = eq(&mut memo, l, value);
+        let req = eq(&mut memo, r, value);
+        let pair = eq(&mut memo, l, r);
+        let left = text_scan(&mut memo, 1, vec![leq]);
+        let right = text_scan(&mut memo, 2, vec![req]);
+        let join = join_mexpr(&mut memo, JoinKind::Inner, pair, vec![left, right]);
+        let before = memo.scalars.node_count();
+        let groups = memo.groups.len();
+        let good = Control {
+            trace: Default::default(),
+            refuse: None,
+            cause: CompileControlError::Cancelled,
+        };
+        assert!(
+            InnerJoinEquivalencePredicateRule
+                .apply(&join, &mut memo, &good)
+                .unwrap()
+                .is_empty()
+        );
+        let trace = good.trace.into_inner().unwrap();
+        assert!(trace.iter().any(|(_, units)| *units == 256));
+        for index in 0..trace.len() {
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let control = Control {
+                    trace: Default::default(),
+                    refuse: Some(index),
+                    cause,
+                };
+                assert!(
+                    matches!(InnerJoinEquivalencePredicateRule.apply(&join, &mut memo, &control), Err(error) if error == crate::compiler::SqlCompileError::from(cause))
+                );
+                assert_eq!(*control.trace.lock().unwrap(), trace[..=index]);
+                assert_eq!(memo.scalars.node_count(), before);
+                assert_eq!(memo.groups.len(), groups);
+            }
+        }
     }
 }

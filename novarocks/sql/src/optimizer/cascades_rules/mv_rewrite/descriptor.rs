@@ -886,7 +886,10 @@ pub(crate) fn substitute_scalar(
     }
     let original = arena.node(expr).clone();
     let rewritten = match original {
-        ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {
+        ScalarNode::ColumnRef(_)
+        | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_) => {
             return Ok(expr);
         }
         ScalarNode::BinaryOp {
@@ -1066,7 +1069,10 @@ pub(crate) fn substitute_scalar(
 
 fn scalar_children(node: &ScalarNode) -> Vec<ScalarId> {
     match node {
-        ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {
+        ScalarNode::ColumnRef(_)
+        | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_) => {
             vec![]
         }
         ScalarNode::BinaryOp { left, right, .. } => vec![*left, *right],

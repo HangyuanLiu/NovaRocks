@@ -181,6 +181,7 @@ fn validate_nested_decimal_cast_policy(expr: &TypedExpr) -> Result<(), &'static 
         ExprKind::ColumnRef { .. }
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
+        | ExprKind::Constant(_)
         | ExprKind::SubqueryPlaceholder { .. } => Ok(()),
     }
 }
@@ -978,6 +979,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     vec![base, index_typed],
                     span,
                     self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    self.constant_policy,
                     self.control,
                 )?;
                 debug_assert_eq!(result.value_type.data_type, output_type);
@@ -1167,6 +1169,7 @@ impl<'a> super::AnalyzerContext<'a> {
             vec![base, field_name_expr],
             span,
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.constant_policy,
             self.control,
         )?;
         debug_assert_eq!(result.value_type.data_type, field_type);
@@ -1370,6 +1373,7 @@ impl<'a> super::AnalyzerContext<'a> {
             args,
             array.span,
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.constant_policy,
             self.control,
         )
     }
@@ -1392,6 +1396,7 @@ impl<'a> super::AnalyzerContext<'a> {
             args,
             right.span(),
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.constant_policy,
             self.control,
         )
     }
@@ -1648,6 +1653,7 @@ impl<'a> super::AnalyzerContext<'a> {
             &right_typed,
             left.span(),
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.constant_policy,
             self.control,
         )? {
             return Ok(date_shift);
@@ -2072,6 +2078,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         &args,
                         func.span,
                         self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                        self.constant_policy,
                         self.control,
                     )?,
                     args,
@@ -2350,6 +2357,7 @@ impl<'a> super::AnalyzerContext<'a> {
                             vec![arg],
                             func.span,
                             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                            self.constant_policy,
                             self.control,
                         )
                     }
@@ -2587,6 +2595,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     &func_order_by,
                     func.span,
                     self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    self.constant_policy,
                     self.control,
                 )?)
             };
@@ -2635,8 +2644,15 @@ impl<'a> super::AnalyzerContext<'a> {
             } else {
                 let arguments = args_typed
                     .iter()
-                    .map(crate::analysis::function_argument)
-                    .collect::<Vec<_>>();
+                    .map(|argument| {
+                        crate::analysis::function_argument(
+                            argument,
+                            self.constant_policy,
+                            self.control,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(AnalyzeError::function_binding)?;
                 self.function_catalog
                     .resolve_window_binding(&name, &arguments, self.control)
                     .map_err(|error| {
@@ -2829,6 +2845,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 &func_order_by,
                 func.span,
                 self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                self.constant_policy,
                 self.control,
             )?);
         } else if !aggregate_macro {
@@ -2891,6 +2908,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 &name,
                 args_typed,
                 self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                self.constant_policy,
                 self.control,
             )
             .map_err(|error| error.at_type_mismatch(func.span))?;
@@ -2910,6 +2928,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     "ds_hll_count_distinct_state",
                     args_typed,
                     self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    self.constant_policy,
                     self.control,
                 )
                 .map_err(|error| error.at_type_mismatch(func.span))?;
@@ -2935,6 +2954,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     std::slice::from_ref(&state_expr),
                     func.span,
                     self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    self.constant_policy,
                     self.control,
                 )?;
                 return Ok(TypedExpr {
@@ -2961,6 +2981,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     &args_typed,
                     func.span,
                     self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    self.constant_policy,
                     self.control,
                 )?;
                 return Ok(TypedExpr {
@@ -2987,6 +3008,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     &args_typed,
                     func.span,
                     self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    self.constant_policy,
                     self.control,
                 )?;
                 return Ok(TypedExpr {
@@ -3145,6 +3167,7 @@ impl<'a> super::AnalyzerContext<'a> {
             "map",
             args,
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.constant_policy,
             self.control,
         )
         .map_err(|error| error.at_invalid_argument(map.span))?;
@@ -3257,6 +3280,7 @@ impl<'a> super::AnalyzerContext<'a> {
             args,
             span,
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.constant_policy,
             self.control,
         )?;
         debug_assert_eq!(
@@ -3360,6 +3384,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 args,
                 span,
                 self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                self.constant_policy,
                 self.control,
             )
             .map(Some);
@@ -3434,6 +3459,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     args,
                     span,
                     self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    self.constant_policy,
                     self.control,
                 )
                 .map(Some)
@@ -3448,6 +3474,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     map_args,
                     span,
                     self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    self.constant_policy,
                     self.control,
                 )?;
                 let args = vec![mapped];
@@ -3457,6 +3484,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     args,
                     span,
                     self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    self.constant_policy,
                     self.control,
                 )
                 .map(Some)
@@ -3474,6 +3502,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     map_args,
                     span,
                     self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    self.constant_policy,
                     self.control,
                 )?;
                 let args = vec![source, filter];
@@ -3483,6 +3512,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     args,
                     span,
                     self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    self.constant_policy,
                     self.control,
                 )
                 .map(Some)
@@ -3732,6 +3762,7 @@ impl<'a> super::AnalyzerContext<'a> {
             args,
             span,
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.constant_policy,
             self.control,
         )?;
         let body_type = body_typed.value_type.data_type.clone();
@@ -4925,6 +4956,7 @@ fn date_day_arithmetic_expr(
     right: &TypedExpr,
     span: Span,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<TypedExpr>, AnalyzeError> {
     match op {
@@ -4936,6 +4968,7 @@ fn date_day_arithmetic_expr(
                 right.clone(),
                 span,
                 decimal_overflow_policy,
+                constant_policy,
                 control,
             )
         }
@@ -4947,6 +4980,7 @@ fn date_day_arithmetic_expr(
                 left.clone(),
                 span,
                 decimal_overflow_policy,
+                constant_policy,
                 control,
             )
         }
@@ -4958,6 +4992,7 @@ fn date_day_arithmetic_expr(
                 right.clone(),
                 span,
                 decimal_overflow_policy,
+                constant_policy,
                 control,
             )
         }
@@ -4972,6 +5007,7 @@ fn date_day_shift_expr(
     offset_expr: TypedExpr,
     span: Span,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<TypedExpr>, AnalyzeError> {
     if !is_integer_day_offset(&offset_expr.value_type.data_type) {
@@ -4992,6 +5028,7 @@ fn date_day_shift_expr(
         args,
         span,
         decimal_overflow_policy,
+        constant_policy,
         control,
     )
     .map(Some)
@@ -5118,6 +5155,7 @@ fn resolve_scalar_binding(
     name: &str,
     args: &[TypedExpr],
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
     crate::analysis::resolve_function_binding(
@@ -5125,6 +5163,7 @@ fn resolve_scalar_binding(
         name,
         args,
         decimal_overflow_policy,
+        constant_policy,
         control,
     )
     .map_err(AnalyzeError::function_binding)
@@ -5136,6 +5175,7 @@ pub(super) fn resolve_scalar_binding_at(
     args: &[TypedExpr],
     span: Span,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
     resolve_scalar_binding(
@@ -5143,6 +5183,7 @@ pub(super) fn resolve_scalar_binding_at(
         name,
         args,
         decimal_overflow_policy,
+        constant_policy,
         control,
     )
     .map_err(|error| error.at_type_mismatch(span))
@@ -5154,6 +5195,7 @@ pub(super) fn resolved_scalar_call_at(
     args: Vec<TypedExpr>,
     span: Span,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<TypedExpr, AnalyzeError> {
     let binding = resolve_scalar_binding_at(
@@ -5162,6 +5204,7 @@ pub(super) fn resolved_scalar_call_at(
         &args,
         span,
         decimal_overflow_policy,
+        constant_policy,
         control,
     )?;
     let args = args
@@ -5192,6 +5235,7 @@ pub(super) fn resolved_scalar_call_at(
                         argument,
                         super::helpers::with_nullability(target.clone(), nullable),
                         decimal_overflow_policy,
+                        constant_policy,
                         control,
                     )
                 } else {
@@ -5208,6 +5252,7 @@ pub(super) fn resolved_scalar_call_at(
         &args,
         span,
         decimal_overflow_policy,
+        constant_policy,
         control,
     )?;
     if exact.function_id != binding.function_id
@@ -5323,6 +5368,7 @@ fn coerce_selected_function_argument(
     expr: TypedExpr,
     target: &novarocks_type_contract::FunctionValueType,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<TypedExpr, AnalyzeError> {
     if expr.value_type.same_value_domain(target) {
@@ -5342,7 +5388,7 @@ fn coerce_selected_function_argument(
                 DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
             ));
     let value_type = super::helpers::with_nullability(target.clone(), nullable);
-    if matches!(expr.kind, ExprKind::Literal(LiteralValue::Null))
+    if super::value_conversion::constant_is_null(&expr, constant_policy, control)?
         || expr.value_type.logical_type != target.logical_type
         || !novarocks_type_contract::preserves_nested_logical_identity(
             &expr.value_type.data_type,
@@ -5354,6 +5400,7 @@ fn coerce_selected_function_argument(
             expr,
             value_type,
             decimal_overflow_policy,
+            constant_policy,
             control,
         );
     }
@@ -5389,6 +5436,7 @@ fn bind_scalar_function_call(
         name,
         args,
         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        crate::constant::test_constant_policy(),
         &crate::compiler::SqlCompileControl::unbounded(),
     )
 }
@@ -5506,6 +5554,7 @@ pub(super) fn bind_scalar_function_call_with_catalog(
     name: &str,
     mut args: Vec<TypedExpr>,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<BoundScalarCall, AnalyzeError> {
     apply_implicit_string_function_casts(name, &mut args);
@@ -5523,6 +5572,7 @@ pub(super) fn bind_scalar_function_call_with_catalog(
         name,
         &args,
         decimal_overflow_policy,
+        constant_policy,
         control,
     ) {
         Ok(binding) => {
@@ -5536,6 +5586,7 @@ pub(super) fn bind_scalar_function_call_with_catalog(
                             arg,
                             value,
                             decimal_overflow_policy,
+                            constant_policy,
                             control,
                         )
                     }
@@ -5557,6 +5608,7 @@ pub(super) fn bind_scalar_function_call_with_catalog(
                 name,
                 &args,
                 decimal_overflow_policy,
+                constant_policy,
                 control,
             )?;
             if exact.function_id != binding.function_id
@@ -5584,6 +5636,7 @@ pub(super) fn resolve_aggregate_function_call(
     args: &[TypedExpr],
     span: Span,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
     resolve_aggregate_function_call_with_order(
@@ -5593,6 +5646,7 @@ pub(super) fn resolve_aggregate_function_call(
         &[],
         span,
         decimal_overflow_policy,
+        constant_policy,
         control,
     )
 }
@@ -5604,6 +5658,7 @@ fn resolve_aggregate_function_call_with_order(
     function_order_by: &[SortItem],
     span: Span,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
     let arg_types = args
@@ -5616,6 +5671,7 @@ fn resolve_aggregate_function_call_with_order(
         args,
         function_order_by,
         false,
+        constant_policy,
         control,
     )
     .map(|binding| crate::binding::SqlFunctionBinding::new(binding, decimal_overflow_policy))
@@ -5991,7 +6047,7 @@ fn is_lead_lag_default_arg_acceptable(default_arg: &TypedExpr, value_type: &Data
 
 fn is_signed_literal(expr: &TypedExpr) -> bool {
     match &expr.kind {
-        ExprKind::Literal(_) => true,
+        ExprKind::Literal(_) | ExprKind::Constant(_) => true,
         ExprKind::Nested(inner) => is_signed_literal(inner),
         ExprKind::UnaryOp { expr: inner, .. } => is_signed_literal(inner),
         ExprKind::Cast { expr: inner, .. } => is_signed_literal(inner),
@@ -6001,7 +6057,7 @@ fn is_signed_literal(expr: &TypedExpr) -> bool {
 
 fn is_constant_default_expression(expr: &TypedExpr) -> bool {
     match &expr.kind {
-        ExprKind::Literal(_) => true,
+        ExprKind::Literal(_) | ExprKind::Constant(_) => true,
         ExprKind::Cast { expr, .. } | ExprKind::Nested(expr) => {
             is_constant_default_expression(expr)
         }
@@ -7044,6 +7100,7 @@ mod tests {
             catalog,
             "default",
             function_catalog,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .map_err(|error| error.to_string())?;
@@ -8034,6 +8091,7 @@ mod tests {
             current_database: "default",
             function_catalog: crate::functions::builtin_sql_function_catalog(),
             control: &control,
+            constant_policy: crate::constant::test_constant_policy(),
             sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
             factory,
             ctes: HashMap::new(),
@@ -9080,6 +9138,7 @@ mod tests {
                 crate::functions::builtin_sql_function_catalog(),
                 &crate::sql_mode::SqlSemanticSettings::default()
                     .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(mode)),
+                crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .map(|(query, _, _)| query)
@@ -9372,6 +9431,7 @@ mod tests {
                 crate::functions::builtin_sql_function_catalog(),
                 &crate::sql_mode::SqlSemanticSettings::default()
                     .with_decimal_overflow_to_double(enabled),
+                crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded(),
             )?;
             let QueryBody::Select(select) = query.body else {
@@ -9483,6 +9543,7 @@ mod tests {
                     "default",
                     crate::functions::builtin_sql_function_catalog(),
                     &crate::sql_mode::SqlSemanticSettings::default(),
+                    crate::constant::test_constant_policy(),
                     &crate::compiler::SqlCompileControl::unbounded(),
                 )
                 .unwrap();
@@ -9630,6 +9691,7 @@ mod tests {
                     "default",
                     crate::functions::builtin_sql_function_catalog(),
                     &crate::sql_mode::SqlSemanticSettings::default(),
+                    crate::constant::test_constant_policy(),
                     &crate::compiler::SqlCompileControl::unbounded(),
                 )
                 .unwrap();
@@ -9729,6 +9791,7 @@ mod tests {
                 "default",
                 crate::functions::builtin_sql_function_catalog(),
                 &crate::sql_mode::SqlSemanticSettings::default(),
+                crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap_err();
@@ -9977,6 +10040,7 @@ mod tests {
             "default",
             crate::functions::builtin_sql_function_catalog(),
             &crate::sql_mode::SqlSemanticSettings::default(),
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap_or_else(|error| panic!("{sql}: {error}"))

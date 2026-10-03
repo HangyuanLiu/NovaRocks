@@ -448,6 +448,7 @@ fn expr_contains_function(expr: &TypedExpr, name: &str) -> bool {
         ExprKind::ColumnRef { .. }
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
+        | ExprKind::Constant(_)
         | ExprKind::SubqueryPlaceholder { .. } => false,
     }
 }

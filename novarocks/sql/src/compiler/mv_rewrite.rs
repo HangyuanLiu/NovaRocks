@@ -2399,6 +2399,7 @@ pub(crate) struct SqlMvRewriteDiagnostic {
 }
 
 pub(crate) struct SqlMvRewritePreparation {
+    pub(crate) constant_policy: novarocks_functions::ConstantPolicy,
     pub(crate) candidates: Vec<MvRewriteCandidate>,
     pub(crate) diagnostics: Vec<SqlMvRewriteDiagnostic>,
 }
@@ -3033,12 +3034,14 @@ enum SqlMvRewriteAnalysisEntry {
 }
 
 pub(crate) struct SqlMvRewriteAnalysis {
+    constant_policy: novarocks_functions::ConstantPolicy,
     entries: Vec<SqlMvRewriteAnalysisEntry>,
 }
 
 impl SqlMvRewriteAnalysis {
-    pub(crate) fn empty() -> Self {
+    pub(crate) fn empty(constant_policy: novarocks_functions::ConstantPolicy) -> Self {
         Self {
+            constant_policy,
             entries: Vec::new(),
         }
     }
@@ -3078,17 +3081,18 @@ pub(crate) fn analyze_candidates(
     factory: &ColumnRefFactory,
     functions: &dyn SqlFunctionCatalog,
     optimizer_settings: &crate::optimizer::options::SessionOptimizerSettings,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
     consumer_requires_semantic_snapshot: bool,
 ) -> Result<SqlMvRewriteAnalysis, crate::compiler::SqlCompileError> {
     if !optimizer_settings.mv_rewrite_enabled() {
-        return Ok(SqlMvRewriteAnalysis::empty());
+        return Ok(SqlMvRewriteAnalysis::empty(constant_policy));
     }
 
     let mut query_fqns = Vec::new();
     collect_iceberg_fqns(logical, &mut query_fqns);
     if query_fqns.is_empty() {
-        return Ok(SqlMvRewriteAnalysis::empty());
+        return Ok(SqlMvRewriteAnalysis::empty(constant_policy));
     }
 
     let mut entries = Vec::with_capacity(definitions.definitions().len());
@@ -3158,6 +3162,7 @@ pub(crate) fn analyze_candidates(
             definition,
             &candidate_factory,
             functions,
+            constant_policy,
             control,
         ) {
             Ok(Some(candidate)) => {
@@ -3181,7 +3186,10 @@ pub(crate) fn analyze_candidates(
         control.check()?;
     }
 
-    Ok(SqlMvRewriteAnalysis { entries })
+    Ok(SqlMvRewriteAnalysis {
+        constant_policy,
+        entries,
+    })
 }
 
 pub(crate) fn attach_candidate_statistics(
@@ -3218,6 +3226,7 @@ pub(crate) fn attach_candidate_statistics(
     }
     Ok((
         SqlMvRewritePreparation {
+            constant_policy: analysis.constant_policy,
             candidates,
             diagnostics,
         },
@@ -3231,6 +3240,7 @@ fn build_candidate(
     definition: &MvRewriteDefinition,
     factory: &ColumnRefFactory,
     functions: &dyn SqlFunctionCatalog,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<Option<AnalyzedMvRewriteCandidate>, crate::compiler::SqlCompileError> {
     use crate::compiler::SqlCompileError;
@@ -3248,15 +3258,16 @@ fn build_candidate(
         &definition.resolution.default_namespace,
         factory.clone(),
         functions,
+        constant_policy,
         control,
     )
     .map_err(SqlCompileError::from)?;
     let mut returned = returned;
-    let mv_logical = crate::planner::plan_query(resolved, ctes, &mut returned)
-        .map_err(SqlCompileError::Compilation)?;
+    let mv_logical = crate::planner::plan_query(resolved, ctes, &mut returned, control)?;
     validate_definition_sources(&mv_logical, &definition.sources)
         .map_err(SqlCompileError::Compilation)?;
-    let mut mv_scalars = crate::optimizer::scalar::ScalarArena::new();
+    let mut mv_scalars =
+        crate::optimizer::scalar::ScalarArena::with_constant_policy(constant_policy);
     let mv_opt_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &mv_logical,
         &mut mv_scalars,
@@ -3462,6 +3473,7 @@ mod tests {
             &factory,
             crate::functions::builtin_sql_function_catalog(),
             &crate::optimizer::options::SessionOptimizerSettings::default(),
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
             true,
         )
@@ -3496,6 +3508,7 @@ mod tests {
             &factory,
             crate::functions::builtin_sql_function_catalog(),
             &crate::optimizer::options::SessionOptimizerSettings::default(),
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
             false,
         )
@@ -3523,6 +3536,7 @@ mod tests {
             &factory,
             crate::functions::builtin_sql_function_catalog(),
             &crate::optimizer::options::SessionOptimizerSettings::default(),
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
             false,
         )
@@ -3679,11 +3693,17 @@ mod tests {
             catalog,
             "db",
             crate::functions::builtin_sql_function_catalog(),
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("analyze main query");
-        let logical =
-            crate::planner::plan_query(resolved, ctes, &mut factory).expect("plan main query");
+        let logical = crate::planner::plan_query(
+            resolved,
+            ctes,
+            &mut factory,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .expect("plan main query");
         (logical, factory)
     }
 
@@ -3880,6 +3900,7 @@ mod tests {
                 &definition,
                 &ColumnRefFactory::new(),
                 crate::functions::builtin_sql_function_catalog(),
+                crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap()
@@ -3968,6 +3989,8 @@ mod tests {
     fn phase_one_materializes_mv_base_and_target_before_statistics_attachment() {
         let catalog = CandidateCatalog::new();
         let (logical, factory) = main_candidate_query(&catalog);
+        let mut constant_policy = crate::constant::test_constant_policy();
+        constant_policy.max_rows = 37;
         let analysis = analyze_candidates(
             &candidate_index(),
             &catalog,
@@ -3976,10 +3999,16 @@ mod tests {
             &factory,
             crate::functions::builtin_sql_function_catalog(),
             &crate::optimizer::options::SessionOptimizerSettings::default(),
+            constant_policy,
             &crate::compiler::SqlCompileControl::unbounded(),
             false,
         )
         .expect("analyze candidate before statistics freeze");
+        assert_eq!(analysis.constant_policy, constant_policy);
+        assert!(analysis.entries.iter().any(|entry| {
+            matches!(entry, SqlMvRewriteAnalysisEntry::Candidate(candidate)
+                if candidate.mv_scalars.constant_policy() == constant_policy)
+        }));
         assert_eq!(
             catalog.resolutions.load(Ordering::Acquire),
             3,
@@ -4006,6 +4035,11 @@ mod tests {
         )
         .expect("typed Missing target statistics remain conservative");
         assert_eq!(prepared.candidates.len(), 1);
+        assert_eq!(prepared.constant_policy, constant_policy);
+        assert_eq!(
+            prepared.candidates[0].mv_scalars.constant_policy(),
+            constant_policy
+        );
         assert_eq!(catalog.resolutions.load(Ordering::Acquire), 3);
 
         let analysis = analyze_candidates(
@@ -4016,6 +4050,7 @@ mod tests {
             &factory,
             crate::functions::builtin_sql_function_catalog(),
             &crate::optimizer::options::SessionOptimizerSettings::default(),
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
             false,
         )
@@ -4062,6 +4097,7 @@ mod tests {
             &factory,
             crate::functions::builtin_sql_function_catalog(),
             &crate::optimizer::options::SessionOptimizerSettings::default(),
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
             false,
         )

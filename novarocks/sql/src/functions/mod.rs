@@ -365,6 +365,7 @@ pub(crate) fn resolve_sql_aggregate_binding(
     args: &[crate::analysis::TypedExpr],
     order_by: &[crate::analysis::SortItem],
     trusted: bool,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
     let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
@@ -380,7 +381,13 @@ pub(crate) fn resolve_sql_aggregate_binding(
         let mut arguments = Vec::with_capacity(count);
         for argument in args.iter().chain(order_by.iter().map(|item| &item.expr)) {
             work.step()?;
-            arguments.push(crate::analysis::function_argument(argument));
+            work.flush()?;
+            arguments.push(crate::analysis::function_argument(
+                argument,
+                constant_policy,
+                work.control(),
+            )?);
+            work.flush()?;
         }
         work.flush()?;
         if trusted {
@@ -602,7 +609,7 @@ mod tests {
     fn value_argument(
         data_type: DataType,
         nullable: bool,
-        constant: Option<novarocks_functions::FunctionLiteral>,
+        constant: Option<novarocks_functions::ConstantValue>,
     ) -> FunctionArgument {
         FunctionArgument::Value {
             value_type: FunctionValueType::new(data_type, nullable),

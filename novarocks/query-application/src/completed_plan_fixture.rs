@@ -110,8 +110,11 @@ pub(crate) fn completed_noop_plan(version: [u8; 16]) -> CompletedPlanWithAccess<
         .expect("no-op fragment");
     let mut builder = PlanBuilder::new(PlanVersionId::try_new(version).expect("plan version"));
     builder.add_fragment(fragment).expect("one fragment");
-    let candidate = CompletedPhysicalPlanCandidate::for_program(builder.finish().expect("plan"))
-        .expect("validated program");
+    let candidate = CompletedPhysicalPlanCandidate::for_program(
+        builder.finish().expect("plan"),
+        &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+    )
+    .expect("validated program");
     CompletedPlanWithAccess::try_pair(candidate, FinalPlanRuntimeAccess::default())
         .expect("no provider reads")
 }
@@ -209,8 +212,11 @@ pub(crate) fn completed_scan_candidate(version: [u8; 16]) -> CompletedPhysicalPl
         .expect("scan fragment");
     let mut builder = PlanBuilder::new(PlanVersionId::try_new(version).expect("plan version"));
     builder.add_fragment(fragment).expect("one fragment");
-    CompletedPhysicalPlanCandidate::for_program(builder.finish().expect("scan plan"))
-        .expect("validated scan candidate")
+    CompletedPhysicalPlanCandidate::for_program(
+        builder.finish().expect("scan plan"),
+        &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+    )
+    .expect("validated scan candidate")
 }
 
 fn query_scope() -> (RootWork, WorkScope) {
@@ -231,6 +237,21 @@ fn query_scope() -> (RootWork, WorkScope) {
     (root, scope)
 }
 
+pub(crate) fn test_constant_policy() -> novarocks_sql::compiler::ConstantPolicy {
+    novarocks_sql::compiler::ConstantPolicy {
+        max_rows: 1 << 20,
+        max_array_nodes: 1 << 20,
+        max_logical_elements: 1 << 24,
+        max_retained_buffer_bytes: 1 << 30,
+        max_type_depth: 64,
+        max_type_nodes: 4096,
+        max_dictionary_depth: 64,
+        max_metadata_bytes: 1 << 20,
+        max_library_validation_work: 1 << 30,
+        max_library_validation_bytes: 1 << 32,
+    }
+}
+
 fn values_request(version: [u8; 16]) -> SqlFinalPlanCompileRequest {
     SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new(version).expect("plan version"),
@@ -245,6 +266,7 @@ fn values_request(version: [u8; 16]) -> SqlFinalPlanCompileRequest {
         SqlPlanningEnvironment::Distributed,
         builtin_sql_function_catalog().snapshot(),
         noop_constant_evaluator(),
+        test_constant_policy(),
         SqlCompileControl::unbounded(),
         PipelineDopDomain {
             min: 1,

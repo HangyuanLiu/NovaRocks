@@ -795,7 +795,32 @@ mod tests {
         );
         let other_args = [FunctionArgument::Value {
             value_type: FunctionValueType::new(arrow_schema::DataType::Int64, true),
-            constant: Some(crate::FunctionLiteral::Int64(1)),
+            constant: Some(
+                crate::ConstantValue::from_i64(
+                    std::sync::Arc::new(arrow_schema::Field::new(
+                        "fixture",
+                        arrow_schema::DataType::Int64,
+                        true,
+                    )),
+                    FunctionValueType::new(arrow_schema::DataType::Int64, true),
+                    1,
+                    crate::ConstantPolicy {
+                        max_rows: 1,
+                        max_array_nodes: 1,
+                        max_logical_elements: 1,
+                        max_retained_buffer_bytes: 4096,
+                        max_type_depth: 1,
+                        max_type_nodes: 1,
+                        max_dictionary_depth: 0,
+                        max_metadata_bytes: 4096,
+                        max_library_validation_work: 65536,
+                        max_library_validation_bytes: 65536,
+                    },
+                    CompilePhase::FunctionSpecialization,
+                    &Control(false),
+                )
+                .unwrap(),
+            ),
         }];
         assert_eq!(
             result.compose_for_use(

@@ -269,7 +269,10 @@ fn canonical_expr_key(arena: &ScalarArena, expr: ScalarId) -> String {
         ScalarNode::Lambda { params, body } => {
             format!("Lambda({params:?},{})", canonical_expr_key(arena, *body))
         }
-        ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {
+        ScalarNode::ColumnRef(_)
+        | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_) => {
             format!("{:?}", arena.node(expr))
         }
     }

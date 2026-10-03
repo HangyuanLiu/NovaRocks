@@ -33,7 +33,7 @@ use crate::{
     CallEffectInput, FunctionArgument, FunctionBindingDeclaration, FunctionBindingError,
     FunctionBindingRequest, FunctionBindingResolver, FunctionBindingSelection,
     FunctionCatalogError, FunctionDefinition, FunctionEffectOwner, FunctionEffectOwnerError,
-    FunctionFailureBehavior, FunctionId, FunctionIntrinsicRowError, FunctionKind, FunctionLiteral,
+    FunctionFailureBehavior, FunctionId, FunctionIntrinsicRowError, FunctionKind,
     FunctionVisibility, FunctionVolatility, KernelFailure, PreparedScalarKernel,
     PureFunctionMetadataOwner, PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
     PureScalarImplementation, ScalarCallContract, ScalarKernelInstance,
@@ -135,37 +135,37 @@ impl RandOwner {
 
 /// Only the exact bound compile-time facts select a recipe. Runtime array
 /// shape or broadcasting category never promotes a nonconstant seed.
-fn seed_recipe(request: FunctionBindingRequest<'_>) -> Result<SeedRecipe, FunctionBindingError> {
+fn seed_recipe(
+    request: FunctionBindingRequest<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<SeedRecipe, FunctionBindingError> {
     match (request.logical_argument_count, request.arguments) {
         (0, []) => Ok(SeedRecipe::Unseeded),
-        (
-            1,
-            [
-                FunctionArgument::Value {
-                    value_type,
-                    constant,
-                },
-            ],
-        ) => match constant {
-            None => Ok(SeedRecipe::PerRow),
-            Some(FunctionLiteral::Int64(seed))
-                if value_type.logical_type == ValueLogicalType::Physical
-                    && value_type.data_type == DataType::Int64 =>
+        (1, [argument @ FunctionArgument::Value { value_type, .. }]) => {
+            let Some(value) = super::catalogue::constant_source(Some(argument), work)? else {
+                return Ok(SeedRecipe::PerRow);
+            };
+            if value_type.logical_type != ValueLogicalType::Physical
+                || value_type.data_type != DataType::Int64
             {
-                Ok(SeedRecipe::Constant(*seed as u64))
+                return Err(FunctionBindingError::InvalidBinding(
+                    "RAND/RANDOM constant seed differs from its exact signed BIGINT source".into(),
+                ));
             }
-            Some(FunctionLiteral::Null)
-                if value_type.logical_type == ValueLogicalType::Physical
-                    && value_type.nullable
-                    && value_type.data_type == DataType::Int64 =>
-            {
-                Ok(SeedRecipe::Constant(0))
+            work.flush()?;
+            if value.is_null_observed(CompilePhase::FunctionSpecialization, work.control())? {
+                return Ok(SeedRecipe::Constant(0));
             }
-            _ => Err(FunctionBindingError::InvalidBinding(
-                "RAND/RANDOM constant seed differs from its exact signed BIGINT or NULL source"
-                    .into(),
-            )),
-        },
+            work.flush()?;
+            let seed = value
+                .int64_observed(CompilePhase::FunctionSpecialization, work.control())?
+                .ok_or_else(|| {
+                    FunctionBindingError::InvalidBinding(
+                        "RAND/RANDOM non-NULL constant seed is not exact BIGINT".into(),
+                    )
+                })?;
+            Ok(SeedRecipe::Constant(seed as u64))
+        }
         _ => Err(FunctionBindingError::InvalidBinding(
             "RAND/RANDOM requires its exact zero-argument or one-value signature".into(),
         )),
@@ -238,7 +238,7 @@ impl FunctionEffectOwner for RandOwner {
                 other => FunctionEffectOwnerError::Owner(other),
             })?;
         work.step().map_err(FunctionEffectOwnerError::Control)?;
-        let recipe = seed_recipe(input.request)?;
+        let recipe = seed_recipe(input.request, &mut work)?;
         let result = self.call_effects(recipe, input.proof_scope);
         work.finish().map_err(FunctionEffectOwnerError::Control)?;
         Ok(result)
@@ -273,8 +273,14 @@ impl PureScalarImplementation for RandOwner {
                 _ => invalid("RAND/RANDOM preparation has a stale selected binding"),
             })?;
         work.step().map_err(compile_failure)?;
-        let recipe = seed_recipe(input.request)
-            .map_err(|_| invalid("RAND/RANDOM preparation has stale constant seed facts"))?;
+        work.flush().map_err(compile_failure)?;
+        let recipe = seed_recipe(input.request, &mut work).map_err(|error| {
+            if let Some(cause) = error.control_error() {
+                compile_failure(cause)
+            } else {
+                invalid("RAND/RANDOM preparation has stale constant seed facts")
+            }
+        })?;
         if contract.effects() != &self.call_effects(recipe, input.proof_scope) {
             return Err(invalid(
                 "RAND/RANDOM preparation has different exact recipe effects",
@@ -320,7 +326,7 @@ fn test_owner(name: &str) -> Result<RandOwner, FunctionCatalogError> {
 pub(super) fn prepared_for_test(
     name: &str,
     source: Option<crate::FunctionValueType>,
-    constant: Option<FunctionLiteral>,
+    constant: Option<crate::ConstantValue>,
 ) -> Result<Arc<dyn PreparedScalarKernel>, crate::FunctionSpecializationFailure> {
     let owner = test_owner(name).expect("actual RAND/RANDOM owner registration");
     let arguments = source
@@ -375,7 +381,9 @@ fn test_context() -> novarocks_type_contract::ExpressionEffectContext {
 
 #[cfg(test)]
 mod tests {
+    use super::super::catalogue::constant_binding_tests as cv;
     use super::*;
+    use crate::ConstantValue;
     use crate::{
         FunctionArgumentType, FunctionResultType, FunctionSpecializationFailure, FunctionValueType,
         ScopedExpressionEffects, specialize_frozen_scalar, specialize_scalar,
@@ -385,7 +393,7 @@ mod tests {
         SemanticParameterKey, SemanticParameterRef, SemanticParameters,
     };
 
-    fn args(constant: Option<FunctionLiteral>, nullable: bool) -> [FunctionArgument; 1] {
+    fn args(constant: Option<ConstantValue>, nullable: bool) -> [FunctionArgument; 1] {
         [FunctionArgument::Value {
             value_type: FunctionValueType::new(DataType::Int64, nullable),
             constant,
@@ -459,11 +467,11 @@ mod tests {
             for (arguments, expected) in [
                 (Vec::new(), SeedRecipe::Unseeded),
                 (
-                    args(Some(FunctionLiteral::Int64(-1)), false).to_vec(),
+                    args(Some(cv::i64(-1, false)), false).to_vec(),
                     SeedRecipe::Constant(u64::MAX),
                 ),
                 (
-                    args(Some(FunctionLiteral::Null), true).to_vec(),
+                    args(Some(cv::null(DataType::Int64)), true).to_vec(),
                     SeedRecipe::Constant(0),
                 ),
                 (args(None, true).to_vec(), SeedRecipe::PerRow),
@@ -477,7 +485,15 @@ mod tests {
                 let parameters = SemanticParameters::try_new([]).unwrap();
                 let uses = vec![Some(ExpressionUseId::new(2)); arguments.len()];
                 let input = input(&owner, &selected, &arguments, &parameters, &uses);
-                assert_eq!(seed_recipe(input.request).unwrap(), expected);
+                let mut recipe_work = CompileCheckpoints::try_new(
+                    crate::binding_test_control(),
+                    CompilePhase::FunctionSpecialization,
+                )
+                .unwrap();
+                assert_eq!(
+                    seed_recipe(input.request, &mut recipe_work).unwrap(),
+                    expected
+                );
                 let fresh = specialize_scalar(
                     &owner,
                     input,
@@ -554,7 +570,7 @@ mod tests {
             let prepared = prepared_for_test(
                 "rand",
                 Some(FunctionValueType::new(DataType::Int64, false)),
-                Some(FunctionLiteral::Int64(seed)),
+                Some(cv::i64(seed, false)),
             )
             .unwrap();
             assert_eq!(
@@ -581,7 +597,7 @@ mod tests {
     #[test]
     fn wrong_frozen_recipe_state_and_stale_result_fail_before_a_runtime_instance() {
         let owner = test_owner("rand").unwrap();
-        let arguments = args(Some(FunctionLiteral::Int64(7)), false);
+        let arguments = args(Some(cv::i64(7, false)), false);
         let selected = Arc::new(
             owner
                 .resolve(request(&arguments), crate::binding_test_control())
@@ -617,10 +633,10 @@ mod tests {
     #[test]
     fn wrong_typed_constant_seed_and_nullability_are_explicit_refusals() {
         for constant in [
-            FunctionLiteral::Boolean(true),
-            FunctionLiteral::UInt64(7),
-            FunctionLiteral::Float64Bits(1.0f64.to_bits()),
-            FunctionLiteral::Utf8("7".into()),
+            cv::boolean(true),
+            cv::u64(7),
+            cv::f64(1.0),
+            cv::utf8("7", false),
         ] {
             assert!(matches!(
                 prepared_for_test(
@@ -637,7 +653,7 @@ mod tests {
             prepared_for_test(
                 "rand",
                 Some(FunctionValueType::new(DataType::Int64, false)),
-                Some(FunctionLiteral::Null)
+                Some(cv::null(DataType::Int64))
             ),
             Err(FunctionSpecializationFailure::Binding(
                 FunctionBindingError::InvalidBinding(_)
@@ -665,7 +681,7 @@ mod tests {
         let owner = test_owner("rand").unwrap();
         let narrow = [FunctionArgument::Value {
             value_type: FunctionValueType::new(DataType::Int32, false),
-            constant: Some(FunctionLiteral::Int64(7)),
+            constant: Some(cv::i32(7, false)),
         }];
         let selected = Arc::new(
             owner
@@ -694,7 +710,7 @@ mod tests {
                 "call value argument differs from its already-coerced selected domain"
             ))
         ));
-        let coerced = args(Some(FunctionLiteral::Int64(7)), false);
+        let coerced = args(Some(cv::i64(7, false)), false);
         owner
             .validate_selected(&selected, request(&coerced), crate::binding_test_control())
             .unwrap();

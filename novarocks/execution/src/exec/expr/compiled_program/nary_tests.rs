@@ -394,6 +394,7 @@ fn package_with_calls(
             FragmentPackageInput {
                 version: PlanVersionId::try_new([91; 16]).unwrap(),
                 required: RequiredContracts::default(),
+                constants: novarocks_physical_plan::ConstantPools::empty(),
                 fragment: fixture.fragment,
                 expression_uses,
                 calls,

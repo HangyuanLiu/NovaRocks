@@ -23,11 +23,11 @@ use arrow::{
 };
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_functions::{
-    CallEffectInput, ConstantPolicy, EngineFunctionCatalogBuilder, FunctionArgument,
-    FunctionBindingRequest, FunctionId, FunctionKind, FunctionLiteral, FunctionOverloadId,
-    FunctionResultType, InstalledPureKernel, KernelEvaluationControl, KernelFailure,
-    PureCallPreparation, PureEngineFunctionCatalog, PureImplementationDeclaration,
-    PureImplementationId, PureKernelAbi, ScopedExpressionEffects, SelectedValues, Selection,
+    CallEffectInput, ConstantPolicy, ConstantValue, EngineFunctionCatalogBuilder, FunctionArgument,
+    FunctionBindingRequest, FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType,
+    InstalledPureKernel, KernelEvaluationControl, KernelFailure, PureCallPreparation,
+    PureEngineFunctionCatalog, PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
+    ScopedExpressionEffects, SelectedValues, Selection,
 };
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
@@ -176,7 +176,17 @@ fn package_with_dictionary(
     let arguments = [FunctionArgument::Value {
         value_type: seed_type.clone(),
         constant: if matches!(mode, SeedMode::DirectConstant) {
-            Some(FunctionLiteral::Int64(42))
+            Some(
+                ConstantValue::from_i64(
+                    Arc::new(seed_type.try_to_field("fixture").unwrap()),
+                    seed_type.clone(),
+                    42,
+                    options(1).constants,
+                    CompilePhase::FunctionSpecialization,
+                    &FixtureControl,
+                )
+                .unwrap(),
+            )
         } else {
             None
         },
@@ -490,6 +500,7 @@ fn package_with_dictionary(
             FragmentPackageInput {
                 version: PlanVersionId::try_new([72; 16]).unwrap(),
                 required: RequiredContracts::default(),
+                constants: novarocks_physical_plan::ConstantPools::empty(),
                 pruning: FrozenFragmentPruning::try_new(fragment_id, vec![], &FixtureControl)
                     .unwrap(),
                 fragment,

@@ -324,6 +324,7 @@ pub fn analyze_mv_select_with_provider(
     current_database: &str,
     query: &novarocks_parser::ast::Query,
     functions: &dyn novarocks_sql::compiler::SqlFunctionCatalog,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: novarocks_sql::compiler::SqlCompileControl,
 ) -> Result<MvAnalysis, novarocks_sql::compiler::SqlCompileError> {
     let prepared =
@@ -335,6 +336,7 @@ pub fn analyze_mv_select_with_provider(
             current_database: current_database.to_string(),
             catalog: &catalog,
             functions,
+            constant_policy,
             control,
         },
     )?;
@@ -735,6 +737,7 @@ mod compile_control_tests {
                 "default_db",
                 &query,
                 novarocks_sql::compiler::builtin_sql_function_catalog(),
+                crate::application::test_constant_policy(),
                 control,
             );
             assert!(matches!(

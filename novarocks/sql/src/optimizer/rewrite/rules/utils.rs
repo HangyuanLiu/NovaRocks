@@ -52,7 +52,7 @@ fn collect_scalar_column_id_refs_strict_inner(
             }
             out.insert(*column_id);
         }
-        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {}
+        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) | ScalarNode::Constant(_) => {}
         ScalarNode::BinaryOp { left, right, .. } => {
             collect_scalar_column_id_refs_strict_inner(arena, *left, out)?;
             collect_scalar_column_id_refs_strict_inner(arena, *right, out)?;
@@ -548,7 +548,7 @@ mod typed_legacy {
                     out.insert(*column_id);
                 }
             }
-            ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) => {}
+            ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) | ExprKind::Constant(_) => {}
             ExprKind::BinaryOp { left, right, .. } => {
                 collect_column_id_refs_inner(left, out);
                 collect_column_id_refs_inner(right, out);

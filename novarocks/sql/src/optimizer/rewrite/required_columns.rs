@@ -198,7 +198,7 @@ fn collect_scalar_column_id_refs_inner(
                 out.insert(*column_id);
             }
         }
-        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {}
+        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) | ScalarNode::Constant(_) => {}
         ScalarNode::BinaryOp { left, right, .. } => {
             collect_scalar_column_id_refs_inner(arena, *left, out);
             collect_scalar_column_id_refs_inner(arena, *right, out);

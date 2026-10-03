@@ -423,7 +423,7 @@ fn verify_expr(expr: &TypedExpr, input: &HashSet<ColumnId>, context: &str) -> Re
             }
             verify_input_id(*column_id, input, &format!("{context} `{column}`"))
         }
-        ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) => Ok(()),
+        ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) | ExprKind::Constant(_) => Ok(()),
         ExprKind::BinaryOp { left, right, .. } => {
             verify_expr(left, input, context)?;
             verify_expr(right, input, context)

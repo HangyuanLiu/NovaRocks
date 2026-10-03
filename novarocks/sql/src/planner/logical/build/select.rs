@@ -18,8 +18,10 @@
 use crate::analysis::cte::CTERegistry;
 use crate::analysis::*;
 use crate::column_id::{ColumnId, ColumnRefFactory};
+use crate::compiler::SqlCompileError;
 use crate::planner::logical::*;
 use crate::planner::payload::*;
+use novarocks_type_contract::PureCompileControl;
 
 use super::aggregate::{
     collect_non_agg_column_refs, dedup_group_by_exprs, expr_column_id, prepare_repeat_input,
@@ -37,8 +39,9 @@ pub(super) fn plan_select_scoped(
     select: ResolvedSelect,
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
-) -> Result<LogicalPlanNode, String> {
-    plan_select_scoped_with_source(select, None, cte_registry, factory)
+    control: &dyn PureCompileControl,
+) -> Result<LogicalPlanNode, SqlCompileError> {
+    plan_select_scoped_with_source(select, None, cte_registry, factory, control)
 }
 
 pub(super) fn plan_select_scoped_with_source(
@@ -46,7 +49,8 @@ pub(super) fn plan_select_scoped_with_source(
     source: Option<LogicalPlanNode>,
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
-) -> Result<LogicalPlanNode, String> {
+    control: &dyn PureCompileControl,
+) -> Result<LogicalPlanNode, SqlCompileError> {
     const REPEAT_GROUP_QUALIFIER: &str = "__repeat_group";
 
     // Take ownership of all apply specs up-front. The wrap points below consume
@@ -57,7 +61,7 @@ pub(super) fn plan_select_scoped_with_source(
     let mut current = match source {
         Some(source) => source,
         None => match select.from.take() {
-            Some(relation) => plan_relation_scoped(relation, cte_registry, factory)?,
+            Some(relation) => plan_relation_scoped(relation, cte_registry, factory, control)?,
             None => LogicalPlanNode::new(
                 LogicalPlanKind::Values(PlanValuesNode {
                     rows: vec![vec![]],
@@ -78,6 +82,7 @@ pub(super) fn plan_select_scoped_with_source(
         ApplyClause::Where,
         cte_registry,
         factory,
+        control,
     )?;
     current = wrap_predicate_applies(
         current,
@@ -85,6 +90,7 @@ pub(super) fn plan_select_scoped_with_source(
         ApplyClause::Where,
         cte_registry,
         factory,
+        control,
     )?;
 
     if let Some(predicate) = select.filter.take() {
@@ -104,6 +110,7 @@ pub(super) fn plan_select_scoped_with_source(
         ApplyClause::AggregateInput,
         cte_registry,
         factory,
+        control,
     )?;
 
     if let Some(mut repeat_info) = select.repeat.take() {
@@ -113,7 +120,8 @@ pub(super) fn plan_select_scoped_with_source(
             &mut repeat_info,
             REPEAT_GROUP_QUALIFIER,
             factory,
-        );
+            control,
+        )?;
         current = LogicalPlanNode::new(
             LogicalPlanKind::Repeat(PlanRepeatNode {
                 repeat_column_ref_list: repeat_info.repeat_column_ref_list,
@@ -150,7 +158,7 @@ pub(super) fn plan_select_scoped_with_source(
                     .map(|s| s.output_column.column_id),
             );
             let mut extra_gb = Vec::new();
-            collect_non_agg_column_refs(having_expr, &select.group_by, &mut extra_gb);
+            collect_non_agg_column_refs(having_expr, &select.group_by, &mut extra_gb, control)?;
             for col in extra_gb {
                 // Skip output columns of HAVING apply specs — they are
                 // provided by the Apply node above the Aggregate, not below.
@@ -163,14 +171,15 @@ pub(super) fn plan_select_scoped_with_source(
             }
         }
 
-        let aggregate_group_by = dedup_group_by_exprs(&select.group_by);
+        let aggregate_group_by = dedup_group_by_exprs(&select.group_by, control)?;
         let (project_items, agg_calls, output_columns, rewritten_having) =
             split_projection_for_aggregate(
                 &select.projection,
                 &aggregate_group_by,
                 select.having.as_ref(),
                 factory,
-            );
+                control,
+            )?;
         current = LogicalPlanNode::new(
             LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by: aggregate_group_by,
@@ -190,6 +199,7 @@ pub(super) fn plan_select_scoped_with_source(
             ApplyClause::Having,
             cte_registry,
             factory,
+            control,
         )?;
         current = wrap_predicate_applies(
             current,
@@ -197,6 +207,7 @@ pub(super) fn plan_select_scoped_with_source(
             ApplyClause::Having,
             cte_registry,
             factory,
+            control,
         )?;
 
         if let Some(having) = rewritten_having {
@@ -216,6 +227,7 @@ pub(super) fn plan_select_scoped_with_source(
             ApplyClause::Projection,
             cte_registry,
             factory,
+            control,
         )?;
 
         current = build_window_and_project(current, project_items, factory)?;
@@ -227,6 +239,7 @@ pub(super) fn plan_select_scoped_with_source(
             ApplyClause::Projection,
             cte_registry,
             factory,
+            control,
         )?;
 
         current = build_window_and_project(current, select.projection.clone(), factory)?;

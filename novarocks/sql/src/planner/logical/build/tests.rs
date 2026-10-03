@@ -225,7 +225,13 @@ impl PlannerTableProvider for TestCatalog {
 
 fn parse_analyze_and_plan(sql: &str) -> Result<LogicalPlanNode, String> {
     let (resolved, cte_registry, mut factory) = parse_analyze_query(sql)?;
-    plan_query(resolved, cte_registry, &mut factory)
+    plan_query(
+        resolved,
+        cte_registry,
+        &mut factory,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn parse_analyze_query(
@@ -247,7 +253,13 @@ fn parse_analyze_query_apply(
 /// Analyze and plan `sql` with the Apply subquery framework.
 fn parse_analyze_and_plan_apply(sql: &str) -> Result<LogicalPlanNode, String> {
     let (resolved, cte_registry, mut factory) = parse_analyze_query_apply(sql)?;
-    plan_query(resolved, cte_registry, &mut factory)
+    plan_query(
+        resolved,
+        cte_registry,
+        &mut factory,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn plan_test_query(sql: &str) -> LogicalPlanNode {
@@ -396,7 +408,11 @@ fn planner_group_by_targets_ignore_aggregate_public_output_order() {
         already_pushed: false,
     };
 
-    let targets = planner_aggregate_group_by_targets(&aggregate);
+    let targets = planner_aggregate_group_by_targets(
+        &aggregate,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .unwrap();
 
     assert_eq!(
         targets
@@ -1198,8 +1214,13 @@ fn p3_cube_without_grouping_survives_optimizer_id_binding() {
                    SELECT a, b FROM t GROUP BY CUBE(a, b) ORDER BY a, b";
     let (resolved, cte_registry, mut factory) =
         parse_analyze_query(sql).expect("analyzer should succeed");
-    let logical_plan =
-        plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
+    let logical_plan = plan_query(
+        resolved,
+        cte_registry,
+        &mut factory,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .expect("planner should succeed");
     let mut scalar_arena = crate::optimizer::scalar::ScalarArena::new();
     let optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical_plan,
@@ -1227,8 +1248,13 @@ fn p3_rollup_order_by_only_key_survives_optimizer_id_binding() {
                    FROM t GROUP BY ROLLUP(a) ORDER BY a";
     let (resolved, cte_registry, mut factory) =
         parse_analyze_query(sql).expect("analyzer should succeed");
-    let logical_plan =
-        plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
+    let logical_plan = plan_query(
+        resolved,
+        cte_registry,
+        &mut factory,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .expect("planner should succeed");
     let mut scalar_arena = crate::optimizer::scalar::ScalarArena::new();
     let optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical_plan,
@@ -1269,8 +1295,13 @@ fn p3_rollup_window_order_by_alias_extra_survives_optimizer_id_binding() {
                    LIMIT 10";
     let (resolved, cte_registry, mut factory) =
         parse_analyze_query(sql).expect("analyzer should succeed");
-    let logical_plan =
-        plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
+    let logical_plan = plan_query(
+        resolved,
+        cte_registry,
+        &mut factory,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .expect("planner should succeed");
     let mut scalar_arena = crate::optimizer::scalar::ScalarArena::new();
     let optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical_plan,
@@ -1301,8 +1332,13 @@ fn p3_aggregate_order_by_alias_topn_survives_optimizer_id_binding() {
                    LIMIT 10";
     let (resolved, cte_registry, mut factory) =
         parse_analyze_query(sql).expect("analyzer should succeed");
-    let logical_plan =
-        plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
+    let logical_plan = plan_query(
+        resolved,
+        cte_registry,
+        &mut factory,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .expect("planner should succeed");
     let mut scalar_arena = crate::optimizer::scalar::ScalarArena::new();
     let optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical_plan,
@@ -2165,7 +2201,13 @@ fn p2_values_output_uses_single_column_id() {
     let (resolved, cte_registry, mut factory) =
         parse_analyze_query("VALUES (1, 2), (3, 4)").expect("analyzer should succeed");
     let analyzer_output_columns = resolved.output_columns.clone();
-    let plan = plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
+    let plan = plan_query(
+        resolved,
+        cte_registry,
+        &mut factory,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .expect("planner should succeed");
     let LogicalPlanKind::Values(values) = &plan.kind else {
         panic!("expected Values root");
     };
@@ -2486,12 +2528,26 @@ fn grouping_input_quoted_column_name_cannot_replace_an_entire_aggregate() {
     };
     let source_id = column_ref_id(&args[0]);
     assert_eq!(
-        crate::analysis::expr_display::typed_expr_display_name(&select.group_by[0]),
-        crate::analysis::expr_display::typed_expr_display_name(&select.projection[1].expr),
+        crate::analysis::expr_display::typed_expr_display_name(
+            &select.group_by[0],
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap(),
+        crate::analysis::expr_display::typed_expr_display_name(
+            &select.projection[1].expr,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap(),
         "the quoted grouping key and real aggregate intentionally share a display name"
     );
 
-    let plan = plan_query(resolved, registry, &mut factory).expect("collision must preserve SUM");
+    let plan = plan_query(
+        resolved,
+        registry,
+        &mut factory,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .expect("collision must preserve SUM");
     let (_, repeat) = first_repeat_node(&plan);
     let key_id = repeat.all_rollup_column_ids[0];
     let (project, aggregate) = root_project_over_aggregate(&plan);
@@ -2942,8 +2998,13 @@ fn plan_with_single_predicate_apply_spec(
         "test query must record exactly one predicate apply spec"
     );
     let spec = select.predicate_apply_specs[0].clone();
-    let plan = plan_query(resolved, cte_registry, &mut factory)
-        .expect("planner must consume predicate apply spec");
+    let plan = plan_query(
+        resolved,
+        cte_registry,
+        &mut factory,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .expect("planner must consume predicate apply spec");
     (plan, spec)
 }
 

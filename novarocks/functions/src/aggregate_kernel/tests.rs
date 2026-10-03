@@ -273,11 +273,15 @@ impl FunctionBindingResolver for Owner {
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
-        _control: &dyn novarocks_type_contract::PureCompileControl,
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         if !std::ptr::eq(selected, self.selected.as_ref())
             || request.logical_argument_count != self.logical
-            || request.arguments != self.arguments
+            || !crate::binding::arguments_equal_for_test(
+                request.arguments,
+                &self.arguments,
+                control,
+            )?
         {
             return Err(FunctionBindingError::UnknownFunction);
         }

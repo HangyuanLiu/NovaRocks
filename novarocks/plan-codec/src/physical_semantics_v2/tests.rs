@@ -98,6 +98,7 @@ fn input() -> FragmentPackageInput {
         cuts: FragmentCuts::default(),
         result: None,
         parameters: SemanticParameters::default(),
+        constants: novarocks_physical_plan::ConstantPools::empty(),
         scans: BTreeMap::new(),
         writes: BTreeMap::new(),
         annotations: Box::default(),
@@ -130,7 +131,19 @@ fn public_semantics_projection_preserves_explicit_empty_components_and_same_pack
         &Control::default(),
     )
     .unwrap();
-    assert_eq!(reconstructed, package);
+    assert_eq!(reconstructed.version(), package.version());
+    assert_eq!(reconstructed.required(), package.required());
+    assert_eq!(reconstructed.fragment(), package.fragment());
+    assert_eq!(reconstructed.expression_uses(), package.expression_uses());
+    assert_eq!(reconstructed.parameters(), package.parameters());
+    assert_eq!(reconstructed.cuts(), package.cuts());
+    assert_eq!(reconstructed.result(), package.result());
+    assert!(reconstructed.calls().entries().is_empty());
+    assert!(reconstructed.pruning().witnesses().is_empty());
+    assert!(reconstructed.constants().entries().is_empty());
+    assert!(reconstructed.scans().is_empty());
+    assert!(reconstructed.writes().is_empty());
+    assert!(reconstructed.annotations().is_empty());
 }
 
 #[test]
@@ -154,7 +167,7 @@ fn decoded_semantic_parts_require_actual_package_parameter_closure() {
         parameters.get(SemanticParameterId::new(u32::MAX)),
         Some(&SemanticParameterValue::AllowThrowException(false))
     );
-    assert_eq!(
+    assert!(matches!(
         FragmentPackage::try_new(
             FragmentPackageInput {
                 parameters,
@@ -165,7 +178,7 @@ fn decoded_semantic_parts_require_actual_package_parameter_closure() {
             &Control::default()
         ),
         Err(FragmentPackageError::UnusedParameters)
-    );
+    ));
 }
 
 #[test]

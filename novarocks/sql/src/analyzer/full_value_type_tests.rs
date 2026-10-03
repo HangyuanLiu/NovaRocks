@@ -639,6 +639,7 @@ fn same_spelling_custom_round_result_is_not_reauthored_by_analyzer() {
         &SourceCatalog,
         "default",
         &catalog,
+        crate::constant::test_constant_policy(),
         &crate::compiler::SqlCompileControl::unbounded(),
     )
     .unwrap()
@@ -831,6 +832,7 @@ fn actual_request_catalog_missing_conversion_port_has_no_fallback() {
         &SourceCatalog,
         "default",
         &MissingConversionPort,
+        crate::constant::test_constant_policy(),
         &crate::compiler::SqlCompileControl::unbounded(),
     )
     .unwrap_err();
@@ -922,6 +924,7 @@ fn function_binding_adapters_preserve_control_at_entry_and_inside_actual_argumen
                 "coalesce",
                 &arguments,
                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                crate::constant::test_constant_policy(),
                 &control,
             )
             .unwrap_err();
@@ -933,6 +936,7 @@ fn function_binding_adapters_preserve_control_at_entry_and_inside_actual_argumen
                 "coalesce",
                 arguments.clone(),
                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                crate::constant::test_constant_policy(),
                 &control,
             ) {
                 Ok(_) => panic!("stopped argument binding must fail"),
@@ -952,6 +956,7 @@ fn function_binding_adapters_preserve_control_at_entry_and_inside_actual_argumen
         "coalesce",
         &arguments,
         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        crate::constant::test_constant_policy(),
         &crate::compiler::SqlCompileControl::unbounded(),
     )
     .unwrap();
@@ -1042,6 +1047,7 @@ fn aggregate_and_value_conversion_adapters_preserve_binding_control() {
             &control_binding_arguments(1),
             novarocks_parser::Span::new(2, 8),
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &control,
         )
         .unwrap_err();
@@ -1051,6 +1057,7 @@ fn aggregate_and_value_conversion_adapters_preserve_binding_control() {
             source.clone(),
             FunctionValueType::new(DataType::Utf8, true),
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &control,
         )
         .unwrap_err();

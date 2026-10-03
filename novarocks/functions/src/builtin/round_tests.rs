@@ -17,8 +17,8 @@
 
 use super::*;
 use crate::{
-    ConstantPolicy, ConstantPool, EvaluatedArgument, FunctionLiteral, FunctionValueType,
-    ScalarEvaluationInstance, Selection,
+    ConstantPolicy, ConstantPool, EvaluatedArgument, FunctionValueType, ScalarEvaluationInstance,
+    Selection,
 };
 use arrow_array::{types::*, *};
 use novarocks_type_contract::CompilePhase;
@@ -278,7 +278,7 @@ fn decimal_final_scale_adjustment_rounds_real_wrapped_constant_digits_twice() {
     ];
     let prepared = super::super::round_owner::prepared_for_test(
         &types,
-        &[None, Some(FunctionLiteral::Int64(257))],
+        &[None, Some(cv::i64(257, true))],
         DecimalOverflowPolicy::OutputNull,
     )
     .unwrap();
@@ -948,3 +948,5 @@ fn long_selected_text_is_observed_mid_parse_and_control_failure_never_replays() 
         }
     }
 }
+
+use super::super::catalogue::constant_binding_tests as cv;

@@ -757,7 +757,10 @@ fn is_column_ref(arena: &ScalarArena, expr: ScalarId) -> bool {
 }
 
 fn is_literal(arena: &ScalarArena, expr: ScalarId) -> bool {
-    matches!(arena.node(expr), ScalarNode::Literal(_))
+    matches!(
+        arena.node(expr),
+        ScalarNode::Literal(_) | ScalarNode::Constant(_)
+    )
 }
 
 fn binary_bool(

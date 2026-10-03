@@ -381,6 +381,7 @@ fn bind_incremental_write_dataflow(
                     catalog: &catalog,
                     functions: query_kernel.function_catalog().as_ref(),
                     constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
+                    constant_policy: query_kernel.constant_policy(),
                     control: compile_control.clone(),
                 },
             )?;
@@ -482,6 +483,7 @@ fn bind_incremental_write_dataflow(
                     catalog: &catalog,
                     functions: query_kernel.function_catalog().as_ref(),
                     constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
+                    constant_policy: query_kernel.constant_policy(),
                     control: compile_control.clone(),
                 },
             )?;

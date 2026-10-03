@@ -794,6 +794,7 @@ mod tests {
             ExprKind::ColumnRef { .. }
             | ExprKind::LambdaParamRef { .. }
             | ExprKind::Literal(_)
+            | ExprKind::Constant(_)
             | ExprKind::SubqueryPlaceholder { .. } => false,
         }
     }

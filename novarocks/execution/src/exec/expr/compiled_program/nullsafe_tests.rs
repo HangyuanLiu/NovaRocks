@@ -124,6 +124,7 @@ fn checked_package(
             FragmentPackageInput {
                 version: PlanVersionId::try_new([193; 16]).unwrap(),
                 required: RequiredContracts::default(),
+                constants: novarocks_physical_plan::ConstantPools::empty(),
                 fragment,
                 expression_uses: uses,
                 calls,
@@ -205,7 +206,7 @@ fn nullsafe_fixture(
                 author(
                     &functions,
                     "rand",
-                    vec![argument(integer, Some(FunctionLiteral::Int64(42)))],
+                    vec![integer_argument(integer, 42)],
                     ControlShape::Eager,
                 ),
                 vec![seed],
@@ -223,10 +224,7 @@ fn nullsafe_fixture(
                 author(
                     &functions,
                     "round",
-                    vec![
-                        argument(ty.clone(), None),
-                        argument(integer, Some(FunctionLiteral::Int64(-1))),
-                    ],
+                    vec![argument(ty.clone(), None), integer_argument(integer, -1)],
                     ControlShape::Eager,
                 ),
                 vec![source, digits],

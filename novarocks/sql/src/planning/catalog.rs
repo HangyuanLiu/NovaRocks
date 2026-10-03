@@ -752,10 +752,16 @@ pub fn analyze_view_query(
     provider: &dyn PlannerTableProvider,
     database: &str,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<Vec<ViewOutputColumn>, crate::compiler::SqlCompileError> {
     let (resolved, _ctes, _factory) = crate::analyzer::analyze_with_function_catalog(
-        query, provider, database, functions, control,
+        query,
+        provider,
+        database,
+        functions,
+        constant_policy,
+        control,
     )
     .map_err(crate::compiler::SqlCompileError::from)?;
     Ok(resolved

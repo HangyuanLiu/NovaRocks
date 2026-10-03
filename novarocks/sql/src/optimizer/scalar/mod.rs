@@ -86,7 +86,7 @@ pub(crate) struct SortKey {
 /// One scalar node. Children are referenced by `ScalarId` (never inlined), so a
 /// node is cheap to hash/compare. Type metadata is part of `ScalarKey`; semantic
 /// operation details that are not implied by children still belong in the node.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum ScalarNode {
     ColumnRef(ColumnId),
     LambdaParamRef {
@@ -94,6 +94,8 @@ pub(crate) enum ScalarNode {
         slot_id: i32,
     },
     Literal(HashableLiteral),
+    /// A materialized value retains its checked owner; syntax is never rebuilt.
+    Constant(novarocks_functions::ConstantValue),
     BinaryOp {
         op: BinOp,
         left: ScalarId,
@@ -209,6 +211,7 @@ struct StoredColumnDisplay {
 /// Owns all scalar nodes for one optimize() call; interns (hash-conses) on push.
 #[derive(Clone, Debug)]
 pub(crate) struct ScalarArena {
+    constant_policy: novarocks_functions::ConstantPolicy,
     nodes: Vec<ScalarNode>,
     value_types: Vec<FunctionValueType>,
     /// Function semantics resolved at scalar interning time.  It is kept
@@ -220,14 +223,31 @@ pub(crate) struct ScalarArena {
 }
 
 impl ScalarArena {
+    #[cfg(test)]
+    pub(crate) fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new() -> Self {
+        Self::with_constant_policy(crate::constant::test_constant_policy())
+    }
+
+    pub(crate) fn with_constant_policy(
+        constant_policy: novarocks_functions::ConstantPolicy,
+    ) -> Self {
         Self {
+            constant_policy,
             nodes: Vec::new(),
             value_types: Vec::new(),
             function_volatility: Vec::new(),
             intern: HashMap::new(),
             column_displays: HashMap::new(),
         }
+    }
+
+    pub(crate) fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy
     }
 
     /// Intern a typed node with the original request control. Bucket keys are
@@ -418,18 +438,22 @@ pub(crate) fn resolve_function_binding(
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
     let arguments = args
         .iter()
-        .map(|arg| function_argument(arena, *arg))
-        .collect::<Vec<_>>();
+        .map(|arg| function_argument(arena, *arg, control))
+        .collect::<Result<Vec<_>, _>>()?;
     catalog
         .resolve_scalar_binding(name, &arguments, control)
         .map(|resolved| crate::binding::SqlFunctionBinding::new(resolved, policy))
         .map_err(crate::compiler::SqlCompileError::from)
 }
 
-fn function_argument(arena: &ScalarArena, arg: ScalarId) -> novarocks_functions::FunctionArgument {
-    use novarocks_functions::{FunctionArgument, FunctionLiteral};
-
-    match arena.node(arg) {
+fn function_argument(
+    arena: &ScalarArena,
+    arg: ScalarId,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<novarocks_functions::FunctionArgument, crate::compiler::SqlCompileError> {
+    use novarocks_functions::FunctionArgument;
+    let value_type = arena.value_type(arg);
+    Ok(match arena.node(arg) {
         ScalarNode::LambdaFunction { params, body } => FunctionArgument::Lambda {
             parameter_types: params
                 .iter()
@@ -437,43 +461,27 @@ fn function_argument(arena: &ScalarArena, arg: ScalarId) -> novarocks_functions:
                 .collect(),
             result_type: arena.value_type(*body).clone(),
         },
-        ScalarNode::Literal(HashableLiteral(value)) => {
-            let constant = match value {
-                LiteralValue::Null => Some(FunctionLiteral::Null),
-                LiteralValue::Bool(value) => Some(FunctionLiteral::Boolean(*value)),
-                LiteralValue::Int(value) => Some(FunctionLiteral::Int64(*value)),
-                LiteralValue::LargeInt(value) => Some(FunctionLiteral::LargeInt(*value)),
-                LiteralValue::Float(value) => {
-                    Some(FunctionLiteral::Float64Bits(value.to_bits()))
-                }
-                LiteralValue::Decimal(value) => match arena.data_type(arg) {
-                    DataType::Decimal128(_, scale) => Some(FunctionLiteral::Decimal128(
-                        crate::analysis::decimal128_literal_unscaled(value, *scale)
-                            .unwrap_or_else(|message| {
-                                panic!(
-                                    "interned Decimal128 literal must have an exact value: {message}"
-                                )
-                            }),
-                    )),
-                    _ => None,
-                },
-                LiteralValue::String(value) => {
-                    Some(FunctionLiteral::Utf8(value.clone().into_boxed_str()))
-                }
-                LiteralValue::Binary(value) => {
-                    Some(FunctionLiteral::Binary(value.clone().into_boxed_slice()))
-                }
-            };
-            FunctionArgument::Value {
-                value_type: arena.value_type(arg).clone(),
-                constant,
-            }
-        }
+        ScalarNode::Literal(HashableLiteral(value)) => FunctionArgument::Value {
+            value_type: value_type.clone(),
+            constant: Some(
+                crate::constant::admit_syntax_constant(
+                    value,
+                    value_type,
+                    arena.constant_policy,
+                    control,
+                )
+                .map_err(crate::compiler::SqlCompileError::from)?,
+            ),
+        },
+        ScalarNode::Constant(value) => FunctionArgument::Value {
+            value_type: value_type.clone(),
+            constant: Some(value.clone()),
+        },
         _ => FunctionArgument::Value {
-            value_type: arena.value_type(arg).clone(),
+            value_type: value_type.clone(),
             constant: None,
         },
-    }
+    })
 }
 
 pub(crate) fn resolve_aggregate_binding(
@@ -491,8 +499,8 @@ pub(crate) fn resolve_aggregate_binding(
         .iter()
         .copied()
         .chain(order_by.iter().map(|item| item.expr))
-        .map(|argument| function_argument(arena, argument))
-        .collect::<Vec<_>>();
+        .map(|argument| function_argument(arena, argument, control))
+        .collect::<Result<Vec<_>, _>>()?;
     let exact = if trusted {
         catalog.resolve_aggregate_binding_trusted(name, args.len(), &arguments, control)
     } else {
@@ -1287,7 +1295,12 @@ mod bridge_tests {
         let FunctionArgument::Value {
             value_type,
             constant,
-        } = function_argument(&arena, body)
+        } = function_argument(
+            &arena,
+            body,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap()
         else {
             panic!("ordinary argument must remain a value");
         };
@@ -1296,7 +1309,12 @@ mod bridge_tests {
         let FunctionArgument::Lambda {
             parameter_types,
             result_type,
-        } = function_argument(&arena, lambda)
+        } = function_argument(
+            &arena,
+            lambda,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap()
         else {
             panic!("lambda argument must retain its signature");
         };

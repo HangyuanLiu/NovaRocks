@@ -23,10 +23,10 @@ use arrow::{
 };
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_functions::{
-    CallEffectInput, ConstantPolicy, EngineFunctionCatalogBuilder, FunctionArgument,
-    FunctionBindingRequest, FunctionBindingSelection, FunctionId, FunctionKind, FunctionLiteral,
-    FunctionOverloadId, FunctionResultType, InstalledPureKernel, KernelEvaluationControl,
-    KernelFailure, PureCallPreparation, PureEngineFunctionCatalog, PureImplementationDeclaration,
+    CallEffectInput, ConstantPolicy, ConstantValue, EngineFunctionCatalogBuilder, FunctionArgument,
+    FunctionBindingRequest, FunctionBindingSelection, FunctionId, FunctionKind, FunctionOverloadId,
+    FunctionResultType, InstalledPureKernel, KernelEvaluationControl, KernelFailure,
+    PureCallPreparation, PureEngineFunctionCatalog, PureImplementationDeclaration,
     PureImplementationId, PureKernelAbi, ScopedExpressionEffects, Selection,
 };
 use novarocks_local_compiler::{
@@ -167,7 +167,33 @@ fn author(
         arguments,
     }
 }
-fn argument(ty: FunctionValueType, constant: Option<FunctionLiteral>) -> FunctionArgument {
+fn integer_constant(ty: &FunctionValueType, value: i64) -> ConstantValue {
+    ConstantValue::from_i64(
+        Arc::new(ty.try_to_field("fixture").unwrap()),
+        ty.clone(),
+        value,
+        ConstantPolicy {
+            max_rows: 16,
+            max_array_nodes: 128,
+            max_logical_elements: 1024,
+            max_retained_buffer_bytes: 1 << 20,
+            max_type_depth: 64,
+            max_type_nodes: 4096,
+            max_dictionary_depth: 64,
+            max_metadata_bytes: 1 << 20,
+            max_library_validation_work: 1 << 20,
+            max_library_validation_bytes: 1 << 20,
+        },
+        CompilePhase::FunctionSpecialization,
+        &Control,
+    )
+    .unwrap()
+}
+fn integer_argument(ty: FunctionValueType, value: i64) -> FunctionArgument {
+    let constant = integer_constant(&ty, value);
+    argument(ty, Some(constant))
+}
+fn argument(ty: FunctionValueType, constant: Option<ConstantValue>) -> FunctionArgument {
     FunctionArgument::Value {
         value_type: ty,
         constant,
@@ -282,11 +308,7 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
             &mut builder,
             output,
             &mut authors,
-            author(
-                &functions,
-                "rand",
-                vec![argument(ty, Some(FunctionLiteral::Int64(42)))],
-            ),
+            author(&functions, "rand", vec![integer_argument(ty, 42)]),
             vec![seed],
         )
     } else {
@@ -324,7 +346,7 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
                     if matches!(shape, Shape::ObservableSibling) {
                         None
                     } else {
-                        Some(FunctionLiteral::Int64(-1))
+                        Some(integer_constant(&integer, -1))
                     },
                 ),
             ],
@@ -347,10 +369,7 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
             author(
                 &functions,
                 "round",
-                vec![
-                    argument(ty, None),
-                    argument(integer, Some(FunctionLiteral::Int64(0))),
-                ],
+                vec![argument(ty, None), integer_argument(integer, 0)],
             ),
             vec![first_round, zero],
         )
@@ -490,6 +509,7 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
             FragmentPackageInput {
                 version: PlanVersionId::try_new([93; 16]).unwrap(),
                 required: RequiredContracts::default(),
+                constants: novarocks_physical_plan::ConstantPools::empty(),
                 pruning: FrozenFragmentPruning::try_new(fragment_id, vec![], &Control).unwrap(),
                 fragment,
                 expression_uses: uses,

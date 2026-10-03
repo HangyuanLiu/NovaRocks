@@ -412,6 +412,7 @@ fn package(builder: FragmentBuilder, root: NodeId, scan: NodeId) -> FragmentPack
         FrozenFragmentPruning::try_new(fragment.id(), Vec::new(), &Control::default()).unwrap();
     FragmentPackage::try_new(
         FragmentPackageInput {
+            constants: crate::ConstantPools::empty(),
             version,
             required: RequiredContracts::default(),
             cuts: cuts.remove(&fragment.id()).unwrap(),

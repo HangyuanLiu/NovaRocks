@@ -194,7 +194,11 @@ impl FunctionEffectOwner for Owner {
         if input.function_id != &self.id
             || input.kind != FunctionKind::Scalar
             || !std::ptr::eq(input.selected, self.selected.as_ref())
-            || input.request.arguments != self.arguments
+            || !crate::binding::arguments_equal_for_test(
+                input.request.arguments,
+                &self.arguments,
+                control,
+            )?
             || input.request.logical_argument_count != self.arguments.len()
             || !input.environment.is_empty()
             || !std::ptr::eq(input.parameters, &self.parameters)

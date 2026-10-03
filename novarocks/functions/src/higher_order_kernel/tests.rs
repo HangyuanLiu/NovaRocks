@@ -243,7 +243,11 @@ impl FunctionEffectOwner for Owner {
         if input.function_id != &self.id
             || input.kind != FunctionKind::Scalar
             || !std::ptr::eq(input.selected, self.selected.as_ref())
-            || input.request.arguments != self.arguments
+            || !crate::binding::arguments_equal_for_test(
+                input.request.arguments,
+                &self.arguments,
+                control,
+            )?
             || input.request.logical_argument_count != self.arguments.len()
             || !input.environment.is_empty()
             || !std::ptr::eq(input.parameters, &self.parameters)
@@ -282,10 +286,14 @@ impl FunctionBindingResolver for Owner {
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
-        _control: &dyn novarocks_type_contract::PureCompileControl,
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         if !std::ptr::eq(selected, self.selected.as_ref())
-            || request.arguments != self.arguments
+            || !crate::binding::arguments_equal_for_test(
+                request.arguments,
+                &self.arguments,
+                control,
+            )?
             || request.logical_argument_count != self.arguments.len()
         {
             Err(FunctionBindingError::UnknownFunction)

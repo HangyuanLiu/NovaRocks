@@ -579,7 +579,10 @@ where
             params,
             body: candidate_or_none!(rewrite(arena, body)?),
         },
-        ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {
+        ScalarNode::ColumnRef(_)
+        | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_) => {
             return Ok(Some(expr));
         }
     };

@@ -719,6 +719,7 @@ fn replace_source_fragment(
     let mut fragments = plan.fragments().clone();
     fragments.insert(source_id, Fragment::from(parts));
     PhysicalPlan::from(crate::PhysicalPlanParts {
+        constants: crate::ConstantPools::empty(),
         parameters: novarocks_type_contract::SemanticParameters::default(),
         version: plan.version(),
         fragments,

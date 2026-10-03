@@ -52,6 +52,7 @@ use novarocks_spi::connector::{
 /// version, and schema columns are attempt-local facts.
 #[derive(Clone)]
 pub(crate) struct StatisticsAttemptExecutionPorts {
+    constant_policy: novarocks_functions::ConstantPolicy,
     execution_role: novarocks_types::ClusterRole,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     /// The composition root's single typed control registry. A collection is
@@ -75,8 +76,10 @@ impl StatisticsAttemptExecutionPorts {
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
         attempt_timeout: Duration,
         runtime: tokio::runtime::Handle,
+        constant_policy: novarocks_functions::ConstantPolicy,
     ) -> Self {
         Self {
+            constant_policy,
             execution_role,
             connector_control,
             typed_connector_control,
@@ -446,6 +449,7 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
                     crate::query_execution::statistics::CompletedStatisticsPlanningServices::new(
                         &self.ports.typed_connector_control,
                         self.ports.function_catalog.as_ref(),
+                        self.ports.constant_policy,
                     ),
                     &execution,
                     context,

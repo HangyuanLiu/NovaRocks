@@ -3785,6 +3785,7 @@ version = "0.1.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
+ "arrow-cast",
  "arrow-data",
  "arrow-schema",
  "novarocks-type-contract",
@@ -4176,6 +4177,7 @@ dependencies = [
 name = "novarocks-physical-plan"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
  "arrow-schema",
  "novarocks-connector-contract",
  "novarocks-constant-contract",

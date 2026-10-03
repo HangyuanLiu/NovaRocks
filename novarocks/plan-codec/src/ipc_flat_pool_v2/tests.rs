@@ -32,7 +32,9 @@ use arrow::{
     },
     record_batch::RecordBatch,
 };
-use arrow_buffer::{BooleanBuffer, Buffer, IntervalMonthDayNano, NullBuffer, ScalarBuffer, i256};
+use arrow_buffer::{
+    BooleanBuffer, Buffer, IntervalDayTime, IntervalMonthDayNano, NullBuffer, ScalarBuffer, i256,
+};
 use novarocks_arrow_ipc_frame::VerifierOptions;
 use novarocks_constant_contract::{ConstantPolicy, ConstantPool};
 use novarocks_type_contract::{
@@ -369,6 +371,11 @@ fn actual_flat_writer_fixed_bits_and_interval_match_independent_standard_reader(
             Some(i32::MAX),
             None,
         ])),
+        Arc::new(IntervalDayTimeArray::from(vec![
+            Some(IntervalDayTime::new(i32::MIN, i32::MAX)),
+            Some(IntervalDayTime::new(i32::MAX, i32::MIN)),
+            None,
+        ])),
         Arc::new(
             Decimal32Array::from(vec![Some(-123), Some(999), None])
                 .with_precision_and_scale(3, -128)
@@ -447,6 +454,20 @@ fn actual_flat_writer_fixed_bits_and_interval_match_independent_standard_reader(
         if let Some(a) = batch
             .column(0)
             .as_any()
+            .downcast_ref::<IntervalDayTimeArray>()
+        {
+            assert_eq!(
+                (a.value(0).days, a.value(0).milliseconds),
+                (i32::MIN, i32::MAX)
+            );
+            assert_eq!(
+                (a.value(1).days, a.value(1).milliseconds),
+                (i32::MAX, i32::MIN)
+            );
+        }
+        if let Some(a) = batch
+            .column(0)
+            .as_any()
             .downcast_ref::<IntervalMonthDayNanoArray>()
         {
             assert_eq!(
@@ -462,6 +483,84 @@ fn actual_flat_writer_fixed_bits_and_interval_match_independent_standard_reader(
             assert_eq!(a.value(1), u64::MAX);
         }
     }
+}
+
+#[test]
+fn actual_flat_writer_day_time_slice_preserves_components_null_and_selected_ordinal() {
+    // Arrow's native DayTime is a repr(C) pair of signed i32 components.
+    // The source slice intentionally excludes both non-NULL sentinel rows.
+    let source = IntervalDayTimeArray::from(vec![
+        Some(IntervalDayTime::new(71, 72)),
+        Some(IntervalDayTime::new(-7, -86400001)),
+        Some(IntervalDayTime::new(i32::MIN, i32::MAX)),
+        None,
+        Some(IntervalDayTime::new(i32::MAX, i32::MIN)),
+        Some(IntervalDayTime::new(73, 74)),
+    ])
+    .slice(1, 4);
+    let field = Arc::new(
+        Field::new("day_time_source", source.data_type().clone(), true).with_metadata(
+            HashMap::from([("provider.field_id".into(), "2147483647".into())]),
+        ),
+    );
+    let ty = FunctionValueType::new(source.data_type().clone(), true);
+    let original = pool_with(Arc::new(source), Arc::clone(&field), ty.clone());
+    let selected = original.value(1).unwrap();
+    assert_eq!(selected.ordinal(), 1);
+    assert_eq!(original.resource_facts().rows, 4);
+    let source_invoice = invoice(&original);
+    let facts = preflight_flat_pool_write(
+        &original,
+        source_invoice,
+        limits(),
+        &Control::good(CompilePhase::Encode),
+    )
+    .unwrap();
+    assert_eq!(facts.rows, 4);
+    assert_eq!(facts.buffer_descriptors, 2);
+    let mut exact = limits();
+    exact.max_rows = facts.rows;
+    exact.max_body_bytes = facts.body_bytes;
+    let control = Control::good(CompilePhase::Encode);
+    let bytes = encode_flat_pool(&original, source_invoice, exact, &control).unwrap();
+    compare_standard_batch(&bytes, &standard(&original), field.data_type());
+    let standard_batch = standard_read(&bytes);
+    let decoded = materialize(&bytes, &original);
+    assert_eq!(decoded.resource_facts().rows, 4);
+    assert_eq!(decoded.value(1).unwrap().ordinal(), 1);
+    assert_eq!(decoded.value_type(), &ty);
+    assert!(Arc::ptr_eq(decoded.field_ref(), &field));
+    assert_eq!(decoded.field().metadata(), field.metadata());
+    let expected = [
+        Some((-7, -86400001)),
+        Some((i32::MIN, i32::MAX)),
+        None,
+        Some((i32::MAX, i32::MIN)),
+    ];
+    for array in [standard_batch.column(0), decoded.array(), original.array()] {
+        let values = array
+            .as_any()
+            .downcast_ref::<IntervalDayTimeArray>()
+            .unwrap();
+        assert_eq!(values.len(), expected.len());
+        for (row, expected) in expected.iter().enumerate() {
+            let actual = (!values.is_null(row)).then(|| {
+                let value = values.value(row);
+                (value.days, value.milliseconds)
+            });
+            assert_eq!(actual, *expected);
+        }
+    }
+    let trace = control.trace();
+    assert_prefixes(&original, source_invoice, exact, &trace, 0..trace.len());
+    exact.max_rows -= 1;
+    let rejected = Control::good(CompilePhase::Encode);
+    assert!(matches!(
+        encode_flat_pool(&original, source_invoice, exact, &rejected),
+        Err(TypeCodecError::InvalidShape(_))
+    ));
+    let trace = rejected.trace();
+    assert_prefixes(&original, source_invoice, exact, &trace, 0..trace.len());
 }
 
 #[test]

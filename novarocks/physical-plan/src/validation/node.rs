@@ -2824,8 +2824,10 @@ pub(crate) fn validate_unpivot_constant(
         crate::UnpivotConstant::Scalar(expression) => match fragment.expressions().get(*expression)
         {
             Some(expression) => (
-                matches!(expression.kind, ExprKind::Literal(_))
-                    && expression.ty.same_value_domain(output_type),
+                matches!(
+                    expression.kind,
+                    ExprKind::Literal(_) | ExprKind::Constant(_)
+                ) && expression.ty.same_value_domain(output_type),
                 expression.ty.nullable,
             ),
             None => {

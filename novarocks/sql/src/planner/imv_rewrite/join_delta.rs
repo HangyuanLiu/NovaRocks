@@ -342,6 +342,7 @@ fn inject_join_apply_key(
             evidence,
             &join_apply_key_column,
             ctx.decimal_overflow_policy(),
+            ctx.scalar_arena().borrow().constant_policy(),
             &ctx.control_view(),
         )?;
         prune_raw_join_row_id_output_from_branch(branch, evidence)?;
@@ -425,6 +426,7 @@ fn inject_join_apply_key_into_branch(
     evidence: &JoinDeltaBranchEvidence,
     join_apply_key_column: &OutputColumn,
     policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<(), crate::compiler::SqlCompileError> {
     let LogicalPlanKind::Project(project) = &mut branch.kind else {
@@ -441,7 +443,7 @@ fn inject_join_apply_key_into_branch(
         return Ok(());
     }
     project.items.push(ProjectItem {
-        expr: join_row_key_expr(function_catalog, evidence, policy, control)?,
+        expr: join_row_key_expr(function_catalog, evidence, policy, constant_policy, control)?,
         output_name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
         output_column_id: join_apply_key_column.column_id,
     });
@@ -470,6 +472,7 @@ fn join_row_key_expr(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     evidence: &JoinDeltaBranchEvidence,
     policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
     let args = vec![
@@ -483,6 +486,7 @@ fn join_row_key_expr(
         "join_row_key",
         &args,
         policy,
+        constant_policy,
         control,
     )?;
     let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
@@ -1686,6 +1690,7 @@ mod tests {
             crate::functions::builtin_sql_function_catalog(),
             &evidence,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("join-row-key binding");

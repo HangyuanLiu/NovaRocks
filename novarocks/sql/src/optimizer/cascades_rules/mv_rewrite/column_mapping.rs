@@ -306,7 +306,7 @@ impl MvColumnMap {
         // means the MV does not materialize this column -> fail.
         match arena.node(expr).clone() {
             ScalarNode::ColumnRef(_) => Ok(None),
-            ScalarNode::Literal(_) => Ok(Some(expr)),
+            ScalarNode::Literal(_) | ScalarNode::Constant(_) => Ok(Some(expr)),
             node => rewrite_children(
                 arena,
                 expr,
@@ -470,6 +470,7 @@ fn rewrite_children(
         ScalarNode::ColumnRef(_)
         | ScalarNode::LambdaParamRef { .. }
         | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_)
         | ScalarNode::WindowCall { .. }
         | ScalarNode::LambdaFunction { .. }
         | ScalarNode::Lambda { .. }
@@ -860,7 +861,9 @@ mod tests {
                 }
                 // The source definition remains the actual input, rather than
                 // a partially published successful mapping result.
-                assert_eq!(arena.node(leaf), &ScalarNode::ColumnRef(input.column_id));
+                assert!(
+                    matches!(arena.node(leaf), ScalarNode::ColumnRef(actual) if *actual == input.column_id)
+                );
             }
         }
     }
@@ -927,6 +930,7 @@ mod tests {
             "abs",
             &args,
             policy,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap();
@@ -959,6 +963,7 @@ mod tests {
             &args,
             &order_by,
             false,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap();

@@ -19,7 +19,6 @@ use crate::compiler::SqlCompileError;
 use arrow::datatypes::DataType;
 use std::collections::HashSet;
 
-use crate::analysis::expr_display::typed_expr_display_name;
 use crate::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr, UnOp,
 };
@@ -164,7 +163,7 @@ pub(crate) fn build_aggregate_state_merge(
         .snapshot
         .aggregate_shape_and_layout_for_execution()
         .map_err(SqlCompileError::from)?;
-    let group_key_names = group_key_names(&aggregate).map_err(SqlCompileError::from)?;
+    let group_key_names = group_key_names(&aggregate, &ctx.control_view())?;
     let aggregate_state_names =
         aggregate_state_names(ext, &aggregate, &aggregate_layout).map_err(SqlCompileError::from)?;
     let row_id_column_name = aggregate_row_id_column_name(ext).map_err(SqlCompileError::from)?;
@@ -545,6 +544,7 @@ fn build_relational_aggregate_change_stream(
         "state_all_zero",
         &state_all_zero_args,
         ctx.decimal_overflow_policy(),
+        ctx.scalar_arena().borrow().constant_policy(),
         &ctx.control_view(),
     )?;
     let insert_predicate = bool_and(
@@ -698,6 +698,7 @@ fn delta_state_with_row_id(
         "mv_group_row_id",
         &row_id_args,
         ctx.decimal_overflow_policy(),
+        ctx.scalar_arena().borrow().constant_policy(),
         &ctx.control_view(),
     )?;
     items.push(ProjectItem {
@@ -754,6 +755,7 @@ fn merged_state_expr(
                 name,
                 &args,
                 ctx.decimal_overflow_policy(),
+                ctx.scalar_arena().borrow().constant_policy(),
                 &ctx.control_view(),
             )?;
             Ok(TypedExpr {
@@ -986,6 +988,7 @@ fn aggregate_insert_expr_for_output(
             name,
             &args,
             ctx.decimal_overflow_policy(),
+            ctx.scalar_arena().borrow().constant_policy(),
             &ctx.control_view(),
         )?;
         let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
@@ -1514,48 +1517,98 @@ fn is_unpartitioned_target_contract(
         .is_none_or(|partition| partition.fields.is_empty())
 }
 
-fn group_key_names(aggregate: &LogicalAggregateNode) -> Result<Vec<String>, String> {
-    aggregate
-        .group_by
-        .iter()
-        .map(|expr| group_key_output_name(expr, &aggregate.output_columns))
-        .collect()
-}
-
-fn group_key_output_name(
-    expr: &TypedExpr,
-    output_columns: &[crate::analysis::OutputColumn],
-) -> Result<String, String> {
-    if let ExprKind::ColumnRef { column_id, .. } = &expr.kind {
-        let matches = output_columns
-            .iter()
-            .filter(|column| column.column_id == *column_id)
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [column] => return Ok(column.name.clone()),
-            [] => {}
-            _ => {
-                return Err(format!(
-                    "Iceberg IMV aggregate rewrite found ambiguous GROUP BY output column id {column_id:?}"
+fn group_key_names(
+    aggregate: &LogicalAggregateNode,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<String>, SqlCompileError> {
+    use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+    let result = (|| {
+        let mut aggregate_ids = HashSet::new();
+        for call in &aggregate.aggregates {
+            aggregate_ids.insert(call.output_column_id);
+            work.step()?;
+        }
+        // The logical aggregate builder publishes group outputs in group_by
+        // order, independently of their names, then appends aggregate outputs.
+        // Filtering aggregate IDs also preserves that association when only
+        // aggregate outputs have been moved ahead of the group outputs.
+        let mut group_outputs = Vec::new();
+        for column in &aggregate.output_columns {
+            if !aggregate_ids.contains(&column.column_id) {
+                group_outputs.push(column);
+            }
+            work.step()?;
+        }
+        if group_outputs.len() != aggregate.group_by.len() {
+            return Err(SqlCompileError::Compilation(
+                "Iceberg IMV aggregate rewrite GROUP BY/output association has inconsistent cardinality"
+                    .to_string(),
+            ));
+        }
+        let mut names = Vec::new();
+        let mut selected_outputs = HashSet::new();
+        for (index, expr) in aggregate.group_by.iter().enumerate() {
+            let output_index = if let ExprKind::ColumnRef { column_id, .. } = &expr.kind {
+                let mut matched = None;
+                for (candidate_index, column) in group_outputs.iter().enumerate() {
+                    let same = column.column_id == *column_id;
+                    work.step()?;
+                    if same {
+                        if matched.replace(candidate_index).is_some() {
+                            return Err(SqlCompileError::Compilation(
+                                "Iceberg IMV aggregate rewrite found ambiguous GROUP BY output column id"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+                // A rewritten input reference may have a different ID from
+                // its published group output. The original ordinal binding
+                // remains authoritative when no exact output ID exists.
+                matched.unwrap_or(index)
+            } else {
+                index
+            };
+            let output = group_outputs[output_index];
+            if !selected_outputs.insert(output_index) {
+                return Err(SqlCompileError::Compilation(
+                    "Iceberg IMV aggregate rewrite GROUP BY output associations overlap"
+                        .to_string(),
                 ));
             }
+            let same_type = expr
+                .value_type
+                .exactly_equals_observed::<novarocks_functions::ConstantError>(
+                    &output.value_type,
+                    || work.step().map_err(Into::into),
+                )
+                .map_err(SqlCompileError::from)?;
+            if !same_type {
+                return Err(SqlCompileError::Compilation(
+                    "Iceberg IMV aggregate rewrite GROUP BY output type differs from its expression"
+                        .to_string(),
+                ));
+            }
+            work.step()?;
+            // String cloning remains an opaque library operation. The name is
+            // the published output fact, never evidence of expression identity.
+            work.flush()?;
+            names.push(output.name.clone());
+            work.flush()?;
         }
+        Ok(names)
+    })();
+    if matches!(
+        &result,
+        Err(SqlCompileError::Cancelled
+            | SqlCompileError::DeadlineExceeded
+            | SqlCompileError::ResourceExhausted)
+    ) {
+        return result;
     }
-
-    let display_name = typed_expr_display_name(expr);
-    let matches = output_columns
-        .iter()
-        .filter(|column| column.name.eq_ignore_ascii_case(&display_name))
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [column] => Ok(column.name.clone()),
-        [] => Err(format!(
-            "Iceberg IMV aggregate rewrite cannot map GROUP BY expression {display_name} to aggregate output column"
-        )),
-        _ => Err(format!(
-            "Iceberg IMV aggregate rewrite found ambiguous GROUP BY output column name {display_name}"
-        )),
-    }
+    work.finish()?;
+    result
 }
 
 fn aggregate_state_names(
@@ -1743,7 +1796,8 @@ fn signed_aggregate(
                 )
             })?;
             let call = align_aggregate_call_inputs_to_child(call, &input_columns)?;
-            signed_aggregate_call(&call, state_column, action_column, ctx.function_catalog(), &ctx.control_view())
+            signed_aggregate_call(&call, state_column, action_column, ctx.function_catalog(), ctx.scalar_arena().borrow().constant_policy(),
+        &ctx.control_view())
         })
         .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?;
     let hidden_retraction_call = layout.state_columns.iter().any(|column| {
@@ -1754,6 +1808,7 @@ fn signed_aggregate(
             action_column,
             ctx.function_catalog(),
             ctx.decimal_overflow_policy(),
+            ctx.scalar_arena().borrow().constant_policy(),
             &ctx.control_view(),
         )?);
     }
@@ -1977,6 +2032,7 @@ fn align_expr_column_refs_to_child(
         }
         ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
+        | ExprKind::Constant(_)
         | ExprKind::SubqueryPlaceholder { .. } => Ok(()),
     }
 }
@@ -2307,6 +2363,7 @@ fn retraction_count_aggregate_call(
     action_column: ColumnId,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<AggregateCall, crate::compiler::SqlCompileError> {
     let args = vec![TypedExpr {
@@ -2323,6 +2380,7 @@ fn retraction_count_aggregate_call(
         &args,
         &[],
         true,
+        constant_policy,
         control,
     )
     .map_err(|error| match error {
@@ -2352,6 +2410,7 @@ fn signed_aggregate_call(
     state_column: &crate::compiler::mv_rewrite::SqlImvAggregateStateColumn,
     action_column: ColumnId,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<AggregateCall, crate::compiler::SqlCompileError> {
     let signed_name = match state_column.state_role {
@@ -2371,6 +2430,7 @@ fn signed_aggregate_call(
         action_column,
         function_catalog,
         call.resolved.decimal_overflow_policy(),
+        constant_policy,
         control,
     )?;
     let resolved = crate::functions::resolve_sql_aggregate_binding(
@@ -2379,6 +2439,7 @@ fn signed_aggregate_call(
         std::slice::from_ref(&input),
         &call.order_by,
         true,
+        constant_policy,
         control,
     )
     .map_err(|error| match error {
@@ -2429,6 +2490,7 @@ fn signed_state_input(
     action_column: ColumnId,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
     let args = vec![
@@ -2449,6 +2511,7 @@ fn signed_state_input(
         "named_struct",
         &args,
         policy,
+        constant_policy,
         control,
     )?;
     let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
@@ -3822,6 +3885,7 @@ mod tests {
             ExprKind::ColumnRef { .. }
             | ExprKind::LambdaParamRef { .. }
             | ExprKind::Literal(_)
+            | ExprKind::Constant(_)
             | ExprKind::SubqueryPlaceholder { .. } => false,
         }
     }
@@ -4158,5 +4222,176 @@ mod tests {
                 .contains("requires a retraction-count or COUNT(*) state column"),
             "unexpected error: {err}"
         );
+    }
+
+    fn materialized_group_key(value: i64) -> TypedExpr {
+        let value_type = novarocks_type_contract::FunctionValueType::new(DataType::Int64, false);
+        let value = novarocks_functions::ConstantValue::from_i64(
+            std::sync::Arc::new(arrow::datatypes::Field::new(
+                "literal",
+                DataType::Int64,
+                false,
+            )),
+            value_type.clone(),
+            value,
+            crate::constant::test_constant_policy(),
+            novarocks_type_contract::CompilePhase::Validate,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        TypedExpr {
+            kind: ExprKind::Constant(value),
+            value_type,
+        }
+    }
+
+    #[test]
+    fn materialized_group_key_mapping_uses_authored_order_and_published_aliases_not_payload_names()
+    {
+        let mut plan = aggregate_over(leaf_scan());
+        let LogicalPlanKind::Aggregate(aggregate) = &mut plan.kind else {
+            unreachable!()
+        };
+        aggregate.group_by = vec![materialized_group_key(7), materialized_group_key(9)];
+        let ty = aggregate.group_by[0].value_type.clone();
+        // Aggregate output has a misleading literal-looking name and comes
+        // first; group aliases deliberately resemble the opposite key value.
+        aggregate.output_columns = vec![
+            OutputColumn {
+                name: "7".into(),
+                ..aggregate.output_columns[1].clone()
+            },
+            OutputColumn {
+                column_id: ColumnId::new_for_test(10),
+                name: "9".into(),
+                value_type: ty.clone(),
+                is_internal: false,
+            },
+            OutputColumn {
+                column_id: ColumnId::new_for_test(11),
+                name: "7".into(),
+                value_type: ty,
+                is_internal: false,
+            },
+        ];
+        assert_eq!(
+            group_key_names(aggregate, crate::optimizer::test_optimizer_control()).unwrap(),
+            vec!["9", "7"]
+        );
+        aggregate.output_columns[1].value_type.nullable = true;
+        assert!(matches!(
+            group_key_names(aggregate, crate::optimizer::test_optimizer_control()),
+            Err(SqlCompileError::Compilation(_))
+        ));
+        aggregate.output_columns.pop();
+        assert!(matches!(
+            group_key_names(aggregate, crate::optimizer::test_optimizer_control()),
+            Err(SqlCompileError::Compilation(_))
+        ));
+    }
+
+    #[test]
+    fn rewrite_aggregate_state_accepts_non_column_cv_group_key_with_published_target_alias() {
+        let mut ctx = build_ctx();
+        let mut aggregate_plan = aggregate_first_output_over(leaf_scan());
+        let LogicalPlanKind::Aggregate(aggregate) = &mut aggregate_plan.kind else {
+            unreachable!()
+        };
+        aggregate.group_by[0] = materialized_group_key(7);
+        // This is the actual target's published alias, unrelated to rendering
+        // the selected materialized value or its pool.
+        aggregate.output_columns[1].name = "k".into();
+        let arena = ctx.scalar_arena();
+        let expr = to_optimizer_expr(&delta(aggregate_plan), &mut arena.borrow_mut());
+        let result = RewriteAggregateStateRule.apply(expr, &mut ctx).unwrap();
+        let changed = expect_changed_merge(result, &arena.borrow());
+        let old_scan = find_target_state_scan(&changed);
+        let target_state = sql_mv_target_state_scan(&old_scan.table.source).unwrap();
+        assert_eq!(target_state.group_key_names, vec!["k"]);
+        let signed = find_signed_delta_project(&changed).unary_input();
+        let LogicalPlanKind::Aggregate(aggregate) = &signed.kind else {
+            unreachable!()
+        };
+        assert!(
+            matches!(&aggregate.group_by[0].kind, ExprKind::Constant(value) if value.try_i64().unwrap() == Some(7))
+        );
+    }
+
+    #[test]
+    fn materialized_group_output_mapping_observes_real_loops_and_all_typed_failure_tails() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        struct Control {
+            trace: std::sync::Mutex<Vec<(CompilePhase, u32)>>,
+            refuse: Option<usize>,
+            cause: CompileControlError,
+        }
+        impl PureCompileControl for Control {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                let mut trace = self.trace.lock().unwrap();
+                trace.push((phase, units));
+                if self.refuse == Some(trace.len() - 1) {
+                    Err(self.cause)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let mut plan = aggregate_over(leaf_scan());
+        let LogicalPlanKind::Aggregate(aggregate) = &mut plan.kind else {
+            unreachable!()
+        };
+        let key = materialized_group_key(7);
+        aggregate.group_by = vec![key.clone(); 320];
+        aggregate.output_columns = (0..320)
+            .map(|index| OutputColumn {
+                column_id: ColumnId::new_for_test(1000 + index),
+                name: format!("published_{index}"),
+                value_type: key.value_type.clone(),
+                is_internal: false,
+            })
+            .chain([aggregate.output_columns[1].clone()])
+            .collect();
+        for ordinary in [false, true] {
+            if ordinary {
+                aggregate.output_columns.last_mut().unwrap().column_id =
+                    ColumnId::new_for_test(9999);
+            }
+            let good = Control {
+                trace: Default::default(),
+                refuse: None,
+                cause: CompileControlError::Cancelled,
+            };
+            let result = group_key_names(aggregate, &good);
+            if ordinary {
+                assert!(matches!(result, Err(SqlCompileError::Compilation(_))));
+            } else {
+                assert_eq!(result.unwrap().len(), 320);
+            }
+            let trace = good.trace.into_inner().unwrap();
+            assert_eq!(trace.first(), Some(&(CompilePhase::Validate, 0)));
+            assert!(trace.iter().any(|(_, units)| *units == 256));
+            assert!(trace.iter().all(|(_, units)| *units <= 256));
+            for index in 0..trace.len() {
+                for cause in [
+                    CompileControlError::Cancelled,
+                    CompileControlError::DeadlineExceeded,
+                    CompileControlError::ResourceExhausted,
+                ] {
+                    let control = Control {
+                        trace: Default::default(),
+                        refuse: Some(index),
+                        cause,
+                    };
+                    assert!(
+                        matches!(group_key_names(aggregate, &control), Err(error) if error == SqlCompileError::from(cause))
+                    );
+                    assert_eq!(*control.trace.lock().unwrap(), trace[..=index]);
+                }
+            }
+        }
     }
 }

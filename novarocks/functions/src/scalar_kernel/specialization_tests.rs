@@ -255,7 +255,7 @@ impl FunctionEffectOwner for Owner {
             return Err(FunctionBindingError::UnknownFunction.into());
         }
         for (argument, expected) in input.request.arguments.iter().zip(&self.arguments) {
-            if argument != expected {
+            if !argument.equals_observed(expected, CompilePhase::FunctionSpecialization, control)? {
                 return Err(FunctionBindingError::UnknownFunction.into());
             }
             work.step().map_err(FunctionEffectOwnerError::Control)?;

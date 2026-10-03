@@ -341,6 +341,7 @@ fn package_with_case(
             FragmentPackageInput {
                 version: PlanVersionId::try_new([27; 16]).unwrap(),
                 required: RequiredContracts::default(),
+                constants: novarocks_physical_plan::ConstantPools::empty(),
                 pruning: FrozenFragmentPruning::try_new(fragment_id, vec![], &FixtureControl)
                     .unwrap(),
                 fragment,

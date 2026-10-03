@@ -140,6 +140,7 @@ struct FrontendRoleProducts {
     unified_statistics: Arc<crate::connector::UnifiedStatisticsResolver>,
     catalog_application: Arc<dyn novarocks_catalog_application::CatalogApplicationPort>,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
+    constant_policy: novarocks_functions::ConstantPolicy,
     connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
     typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
     query_control: novarocks_query_application::session_control::QueryControlService,
@@ -190,6 +191,7 @@ impl FrontendRoleProducts {
                     self.mv_product_service
                         .management_entrance()
                         .expect("serving MV product owns document-management authority"),
+                    self.constant_policy,
                 ),
                 Arc::clone(&self.maintenance_engine),
             ))
@@ -368,6 +370,7 @@ async fn build_frontend_role_products(
             mv_product_service
                 .management_entrance()
                 .expect("serving MV product owns document-management authority"),
+            host.constant_policy(),
         ),
     );
     let mv_service = Arc::new(
@@ -424,6 +427,7 @@ async fn build_frontend_role_products(
         query_execution.clone(),
         Arc::clone(&maintenance_service),
         Handle::current(),
+        host.constant_policy(),
     );
     let maintenance_engine = core_capabilities::background_maintenance_engine(
         maintenance_ports.clone(),
@@ -463,6 +467,7 @@ async fn build_frontend_role_products(
                     host.lake_publication_runtime_policy()
                         .max_attempt_duration(),
                     Handle::current(),
+                    host.constant_policy(),
                 ),
             ),
             Handle::current(),
@@ -479,6 +484,7 @@ async fn build_frontend_role_products(
         unified_statistics,
         catalog_application,
         function_catalog,
+        constant_policy: host.constant_policy(),
         connector_control,
         typed_connector_control,
         query_control,
@@ -547,6 +553,7 @@ fn build_frontend_query_session_factory_from_role_products(
             mv_candidate_reader,
             Arc::clone(&mv_storage_observation),
             host.connector_blocking_io_supervisor(),
+            host.constant_policy(),
         ));
     let session_catalog_resolver =
         core_capabilities::session_catalog_resolver(core_capabilities::SessionCatalogPorts::new(
@@ -575,6 +582,7 @@ fn build_frontend_query_session_factory_from_role_products(
             Some(Arc::clone(&catalog_application)),
             Arc::clone(&connector_control),
             Arc::clone(&products.view_service),
+            host.constant_policy(),
         ));
     let iceberg_ref_command_executor = core_capabilities::iceberg_ref_command_executor(
         core_capabilities::IcebergRefCommandPorts::new(
@@ -597,6 +605,7 @@ fn build_frontend_query_session_factory_from_role_products(
                 .expect("serving MV product owns document-management authority"),
             products.mv_product_service.management_continuation(),
             host.mv_management_audit_sink(),
+            host.constant_policy(),
         ));
     let mv_command_consumer: Arc<
         dyn novarocks_query_application::api::MaterializedViewCommandConsumer,
@@ -627,6 +636,7 @@ fn build_frontend_query_session_factory_from_role_products(
         query_execution.clone(),
         Handle::current(),
         host.lake_publication_runtime_policy(),
+        host.constant_policy(),
     ));
     let query_service = Arc::new(crate::query::FrontendQueryService::new(
         session_catalog_resolver,
@@ -1412,6 +1422,7 @@ mod tests {
                 std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
                 builtin_function_catalog(),
+                crate::application::test_constant_policy(),
             )
             .with_catalog_desired_state_source(CatalogDesiredStateSourceInput::DynamicStateStore),
             frontend_backend_open_config(),
@@ -1526,6 +1537,7 @@ mod tests {
                 std::num::NonZeroUsize::new(1).unwrap(),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
                 builtin_function_catalog(),
+                crate::application::test_constant_policy(),
             ),
             frontend_backend_open_config(),
             Vec::new(),
@@ -1574,6 +1586,7 @@ mod tests {
                 std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
                 builtin_function_catalog(),
+                crate::application::test_constant_policy(),
             ),
             frontend_backend_open_config(),
             Vec::new(),
@@ -1628,6 +1641,7 @@ mod tests {
                 std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
                 builtin_function_catalog(),
+                crate::application::test_constant_policy(),
             ),
             frontend_backend_open_config(),
             Vec::new(),
@@ -1738,6 +1752,7 @@ mod tests {
                 NonZeroUsize::new(1).unwrap(),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
                 builtin_function_catalog(),
+                crate::application::test_constant_policy(),
             ),
             frontend_backend_open_config(),
             Vec::new(),
@@ -1786,6 +1801,7 @@ mod tests {
                 NonZeroUsize::new(1).unwrap(),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
                 builtin_function_catalog(),
+                crate::application::test_constant_policy(),
             ),
             frontend_backend_open_config(),
             Vec::new(),

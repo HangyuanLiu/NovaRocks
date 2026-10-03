@@ -21,6 +21,10 @@
 //! Memo operators (`MExpr`) and reads child statistics from group logical
 //! properties instead of recursing the `LogicalPlanNode` tree.
 
+#[cfg(test)]
+#[path = "stats/values_constant_tests.rs"]
+mod values_constant_tests;
+
 use crate::compiler::SqlCompileError;
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 use std::collections::HashMap;
@@ -702,7 +706,8 @@ pub(crate) fn derive_opt_expr_statistics(
     control: &dyn PureCompileControl,
 ) -> Result<Statistics, SqlCompileError> {
     control.checkpoint(CompilePhase::Validate, 0)?;
-    let mut memo = Memo::new();
+    let mut memo =
+        Memo::with_scalar_arena(ScalarArena::with_constant_policy(arena.constant_policy()));
     // The arena clone remains opaque; this is observation around the existing
     // operation, not a claim of cooperative work inside its allocations.
     memo.scalars = arena.clone();
@@ -1505,8 +1510,9 @@ fn values_column_statistics_scalar(
             match cell {
                 Some(expr) if scalar_is_null_literal(arena, *expr) => nulls += 1,
                 Some(expr) => match values_literal_f64_observed(arena, *expr, control, work)? {
-                    Some(v) => values.push(v),
-                    None => {
+                    ValuesLiteral::Number(v) => values.push(v),
+                    ValuesLiteral::Null => nulls += 1,
+                    ValuesLiteral::Unsupported => {
                         all_numeric_or_null = false;
                         break;
                     }
@@ -1582,12 +1588,18 @@ fn values_column_statistics_scalar(
 
 // Follow the same literal/Cast/Nested path as scalar_literal_f64 without
 // retaining a recursive frame or skipping its actual scalar traversal.
+enum ValuesLiteral {
+    Number(f64),
+    Null,
+    Unsupported,
+}
+
 fn values_literal_f64_observed(
     arena: &ScalarArena,
     mut expr: ScalarId,
     control: &dyn PureCompileControl,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Option<f64>, SqlCompileError> {
+) -> Result<ValuesLiteral, SqlCompileError> {
     loop {
         work.step()?;
         match arena.node(expr) {
@@ -1604,12 +1616,72 @@ fn values_literal_f64_observed(
                         value
                     }
                     _ => None,
-                });
+                }
+                .map_or(ValuesLiteral::Unsupported, ValuesLiteral::Number));
+            }
+            ScalarNode::Constant(value) => {
+                return values_constant_f64_observed(arena, expr, value, control, work);
             }
             ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => expr = *child,
-            _ => return Ok(None),
+            _ => return Ok(ValuesLiteral::Unsupported),
         }
     }
+}
+
+fn values_constant_f64_observed(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    value: &novarocks_functions::ConstantValue,
+    control: &dyn PureCompileControl,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ValuesLiteral, SqlCompileError> {
+    use arrow::datatypes::DataType;
+    use novarocks_functions::ConstantError;
+    use novarocks_type_contract::ValueLogicalType;
+    if !arena
+        .value_type(expr)
+        .exactly_equals_observed(value.value_type(), || {
+            work.step().map_err(ConstantError::from)
+        })?
+    {
+        return Err(SqlCompileError::InvalidRequest(
+            "VALUES constant source differs from its frozen scalar type".into(),
+        ));
+    }
+    // Flush completed parent work before borrowing the sole logical-NULL
+    // author. This observes only the checked selected value, not other rows.
+    work.flush()?;
+    if value.is_null_observed(CompilePhase::Validate, control)? {
+        return Ok(ValuesLiteral::Null);
+    }
+    let ty = value.value_type();
+    let number = match (&ty.logical_type, &ty.data_type) {
+        (
+            ValueLogicalType::Physical,
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64,
+        ) => value.try_i64()?.map(|v| v as f64),
+        (
+            ValueLogicalType::Physical,
+            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64,
+        ) => value.try_u64()?.map(|v| v as f64),
+        (ValueLogicalType::Physical, DataType::Float32) => {
+            value.try_f32_bits()?.map(|v| f32::from_bits(v) as f64)
+        }
+        (ValueLogicalType::Physical, DataType::Float64) => {
+            value.try_f64_bits()?.map(f64::from_bits)
+        }
+        (ValueLogicalType::Physical, DataType::Decimal128(_, scale)) => value
+            .try_decimal128()?
+            .map(|v| (v as f64) * 10f64.powi(-i32::from(*scale))),
+        (ValueLogicalType::LargeInt, DataType::FixedSizeBinary(16)) => {
+            value.try_largeint()?.map(|v| v as f64)
+        }
+        _ => None,
+    };
+    work.step()?;
+    // f64 is the existing statistics representation, not constant equality.
+    // Read integers with their actual signedness before that approximation.
+    Ok(number.map_or(ValuesLiteral::Unsupported, ValuesLiteral::Number))
 }
 
 fn scalar_is_null_literal(arena: &ScalarArena, expr: ScalarId) -> bool {
@@ -2331,7 +2403,7 @@ fn is_unknown_column_literal_eq_scalar(
 
 fn scalar_is_literal_like(arena: &ScalarArena, expr: ScalarId) -> bool {
     match arena.node(expr) {
-        ScalarNode::Literal(_) => true,
+        ScalarNode::Literal(_) | ScalarNode::Constant(_) => true,
         ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => {
             scalar_is_literal_like(arena, *child)
         }

@@ -878,8 +878,11 @@ mod tests {
                 .unwrap(),
             );
         builder.add_fragment(fragment).unwrap();
-        let candidate =
-            CompletedPhysicalPlanCandidate::for_program(builder.finish().unwrap()).unwrap();
+        let candidate = CompletedPhysicalPlanCandidate::for_program(
+            builder.finish().unwrap(),
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
         FrozenExecutionDescription::for_completed_plan(
             novarocks_query_application::api::QueryExecutionKind::Write,
             candidate,

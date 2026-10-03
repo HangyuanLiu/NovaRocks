@@ -769,6 +769,7 @@ fn validate_definition_correspondence(
             ExprKind::Value(_)
             | ExprKind::LambdaParameter { .. }
             | ExprKind::Literal(_)
+            | ExprKind::Constant(_)
             | ExprKind::Unary { .. }
             | ExprKind::Binary { .. }
             | ExprKind::Cast { .. }

@@ -25,12 +25,11 @@ use arrow::{
 };
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_functions::{
-    CallEffectInput, ConstantPolicy, EngineFunctionCatalogBuilder, FunctionArgument,
-    FunctionBindingRequest, FunctionBindingSelection, FunctionId, FunctionKind, FunctionLiteral,
-    FunctionOverloadId, FunctionResultType, InstalledPureKernel, KernelDiagnostic,
-    KernelEvaluationControl, KernelFailure, PureCallPreparation, PureEngineFunctionCatalog,
-    PureImplementationDeclaration, PureImplementationId, PureKernelAbi, ScopedExpressionEffects,
-    Selection,
+    CallEffectInput, ConstantPolicy, ConstantValue, EngineFunctionCatalogBuilder, FunctionArgument,
+    FunctionBindingRequest, FunctionBindingSelection, FunctionId, FunctionKind, FunctionOverloadId,
+    FunctionResultType, InstalledPureKernel, KernelDiagnostic, KernelEvaluationControl,
+    KernelFailure, PureCallPreparation, PureEngineFunctionCatalog, PureImplementationDeclaration,
+    PureImplementationId, PureKernelAbi, ScopedExpressionEffects, Selection,
 };
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
@@ -176,7 +175,22 @@ impl Author {
         result.clone()
     }
 }
-fn argument(ty: FunctionValueType, constant: Option<FunctionLiteral>) -> FunctionArgument {
+fn integer_constant(ty: &FunctionValueType, value: i64) -> ConstantValue {
+    ConstantValue::from_i64(
+        Arc::new(ty.try_to_field("fixture").unwrap()),
+        ty.clone(),
+        value,
+        options().constants,
+        CompilePhase::FunctionSpecialization,
+        &Control,
+    )
+    .unwrap()
+}
+fn integer_argument(ty: FunctionValueType, value: i64) -> FunctionArgument {
+    let constant = integer_constant(&ty, value);
+    argument(ty, Some(constant))
+}
+fn argument(ty: FunctionValueType, constant: Option<ConstantValue>) -> FunctionArgument {
     FunctionArgument::Value {
         value_type: ty,
         constant,
@@ -482,7 +496,7 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
             author(
                 &functions,
                 "rand",
-                vec![argument(scalar_integer, Some(FunctionLiteral::Int64(42)))],
+                vec![integer_argument(scalar_integer, 42)],
                 ControlShape::Eager,
             ),
             vec![literal_seed],
@@ -520,7 +534,7 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
                 "round",
                 vec![
                     argument(decimal.clone(), None),
-                    argument(scalar_integer, Some(FunctionLiteral::Int64(-1))),
+                    integer_argument(scalar_integer, -1),
                 ],
                 ControlShape::Eager,
             ),
@@ -701,6 +715,7 @@ fn compile_checked_fragment(
             FragmentPackageInput {
                 version: PlanVersionId::try_new([193; 16]).unwrap(),
                 required: RequiredContracts::default(),
+                constants: novarocks_physical_plan::ConstantPools::empty(),
                 fragment,
                 expression_uses: uses,
                 calls,

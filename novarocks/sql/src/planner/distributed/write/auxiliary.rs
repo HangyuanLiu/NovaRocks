@@ -269,6 +269,7 @@ pub fn plan_writer_statistics(
     targets: &[WriterStatisticsTargetInput<'_>],
     functions: &dyn SqlFunctionCatalog,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<WriterAuxiliaryPlan, crate::compiler::SqlCompileError> {
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
@@ -353,6 +354,7 @@ pub fn plan_writer_statistics(
                 std::slice::from_ref(&input_expr),
                 &[],
                 true,
+                constant_policy,
                 control,
             )
             .map_err(|error| match error {
@@ -665,6 +667,7 @@ mod tests {
             }],
             &build_builtin_engine_function_catalog().expect("builtin function catalog"),
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("count does not produce a binary artifact body");
@@ -684,6 +687,7 @@ mod tests {
             }],
             &binary_catalog(),
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap();
@@ -732,6 +736,7 @@ mod tests {
             ],
             &binary_catalog(),
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("plan");
@@ -765,6 +770,7 @@ mod tests {
             }],
             &binary_catalog(),
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("plan");
@@ -793,6 +799,7 @@ mod tests {
             ],
             &binary_catalog(),
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("plan");
@@ -836,6 +843,7 @@ mod tests {
             ],
             &binary_catalog(),
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("unordered targets");
@@ -859,6 +867,7 @@ mod tests {
                 }],
                 &binary_catalog(),
                 policy,
+                crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap();

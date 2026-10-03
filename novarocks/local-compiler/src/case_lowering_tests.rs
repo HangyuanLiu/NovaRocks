@@ -18,11 +18,11 @@
 use super::*;
 use arrow_schema::DataType;
 use novarocks_functions::{
-    CallEffectInput, ConstantPolicy, EngineFunctionCatalogBuilder, FunctionArgument,
+    CallEffectInput, ConstantPolicy, ConstantValue, EngineFunctionCatalogBuilder, FunctionArgument,
     FunctionArgumentType, FunctionBindingRequest, FunctionBindingSelection, FunctionId,
-    FunctionKind, FunctionLiteral, FunctionOverloadId, FunctionResultType, InstalledPureKernel,
-    PureCallPreparation, PureEngineFunctionCatalog, PureImplementationDeclaration,
-    PureImplementationId, PureKernelAbi, ScopedExpressionEffects,
+    FunctionKind, FunctionOverloadId, FunctionResultType, InstalledPureKernel, PureCallPreparation,
+    PureEngineFunctionCatalog, PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
+    ScopedExpressionEffects,
 };
 use novarocks_local_program::{
     KernelAbiVersion, ProgramExpressionArena, ProgramExpressionRootSite, ProgramNodeExpressionRole,
@@ -139,7 +139,22 @@ impl Author {
         result.clone()
     }
 }
-fn argument(ty: FunctionValueType, constant: Option<FunctionLiteral>) -> FunctionArgument {
+fn integer_constant(ty: &FunctionValueType, value: i64) -> ConstantValue {
+    ConstantValue::from_i64(
+        Arc::new(ty.try_to_field("fixture").unwrap()),
+        ty.clone(),
+        value,
+        options().constants,
+        CompilePhase::FunctionSpecialization,
+        &Control,
+    )
+    .unwrap()
+}
+fn integer_argument(ty: FunctionValueType, value: i64) -> FunctionArgument {
+    let constant = integer_constant(&ty, value);
+    argument(ty, Some(constant))
+}
+fn argument(ty: FunctionValueType, constant: Option<ConstantValue>) -> FunctionArgument {
     FunctionArgument::Value {
         value_type: ty,
         constant,
@@ -416,7 +431,7 @@ fn fixture(
                 "round",
                 vec![
                     argument(decimal.clone(), None),
-                    argument(integer, Some(FunctionLiteral::Int64(-1))),
+                    integer_argument(integer, -1),
                 ],
                 ControlShape::Eager,
             );
@@ -768,6 +783,7 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
             FragmentPackageInput {
                 version: PlanVersionId::try_new([97; 16]).unwrap(),
                 required: RequiredContracts::default(),
+                constants: novarocks_physical_plan::ConstantPools::empty(),
                 fragment: fixture.fragment,
                 expression_uses,
                 calls,

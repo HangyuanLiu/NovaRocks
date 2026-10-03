@@ -249,6 +249,7 @@ impl StatisticsRelationIdentity {
 /// through the provider-read protocol: the control that read is frozen
 /// through, and the catalog the collection's aggregates are bound in.
 pub struct CompletedStatisticsPlanningServices<'a> {
+    constant_policy: novarocks_functions::ConstantPolicy,
     typed_connector_control: &'a Arc<novarocks_catalog_application::ConnectorControlHost>,
     functions: &'a novarocks_functions::EngineFunctionCatalog,
 }
@@ -257,8 +258,10 @@ impl<'a> CompletedStatisticsPlanningServices<'a> {
     pub const fn new(
         typed_connector_control: &'a Arc<novarocks_catalog_application::ConnectorControlHost>,
         functions: &'a novarocks_functions::EngineFunctionCatalog,
+        constant_policy: novarocks_functions::ConstantPolicy,
     ) -> Self {
         Self {
+            constant_policy,
             typed_connector_control,
             functions,
         }
@@ -293,6 +296,7 @@ pub fn prepare_completed_statistics_collection(
     let CompletedStatisticsPlanningServices {
         typed_connector_control,
         functions,
+        constant_policy,
     } = services;
     let live = execution.topology().targets().len();
     if live == 0 {
@@ -372,11 +376,12 @@ pub fn prepare_completed_statistics_collection(
             .sql_mode()
             .decimal_overflow_policy(),
         execution.sql_semantics().sql_mode().allow_throw_exception(),
+        constant_policy,
         &completion_control,
     )
     .map_err(DistributedQueryError::from_compile)?;
     let version = plan.version();
-    let candidate = CompletedPhysicalPlanCandidate::for_program(plan)
+    let candidate = CompletedPhysicalPlanCandidate::for_program(plan, &completion_control)
         .map_err(|error| contract_violation(error.to_string()))?;
     let output = novarocks_query_application::preparation::OutputContract::from_completed_plan(
         novarocks_query_application::api::QueryExecutionKind::Statistics,

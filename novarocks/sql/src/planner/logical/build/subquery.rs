@@ -19,7 +19,9 @@ use crate::analysis::cte::CTERegistry;
 use crate::analysis::*;
 use crate::column_id::ColumnRefFactory;
 use crate::common::ApplyKind;
+use crate::compiler::SqlCompileError;
 use crate::planner::logical::*;
+use novarocks_type_contract::PureCompileControl;
 
 use super::output::plan_output_columns;
 use super::query::plan_scoped_query;
@@ -38,7 +40,8 @@ pub(super) fn wrap_scalar_applies(
     clause: ApplyClause,
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
-) -> Result<LogicalPlanNode, String> {
+    control: &dyn PureCompileControl,
+) -> Result<LogicalPlanNode, SqlCompileError> {
     let mut current = input;
     let mut remaining = Vec::new();
     for spec in specs.drain(..) {
@@ -46,7 +49,7 @@ pub(super) fn wrap_scalar_applies(
             remaining.push(spec);
             continue;
         }
-        let right = plan_scoped_query(spec.inner, cte_registry, factory)?;
+        let right = plan_scoped_query(spec.inner, cte_registry, factory, control)?;
         // Capture the inner's single scalar output column id before right is
         // moved into the LogicalApplyNode. This id is stable across M1b pushdown rules
         // (which may add group-by keys), so it is the reliable way to find the
@@ -99,7 +102,8 @@ pub(super) fn wrap_predicate_applies(
     clause: ApplyClause,
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
-) -> Result<LogicalPlanNode, String> {
+    control: &dyn PureCompileControl,
+) -> Result<LogicalPlanNode, SqlCompileError> {
     use crate::analysis::SubqueryKind;
 
     let mut current = input;
@@ -109,7 +113,7 @@ pub(super) fn wrap_predicate_applies(
             remaining.push(spec);
             continue;
         }
-        let right = plan_scoped_query(spec.inner, cte_registry, factory)?;
+        let right = plan_scoped_query(spec.inner, cte_registry, factory, control)?;
         let inner_output_column_id = plan_output_columns(&right)?
             .first()
             .map(|c| c.column_id)
@@ -119,14 +123,18 @@ pub(super) fn wrap_predicate_applies(
             SubqueryKind::Exists { negated } => ApplyKind::Exists { negated },
             SubqueryKind::InSubquery { negated } => ApplyKind::In { negated },
             SubqueryKind::Scalar => {
-                return Err("scalar spec routed to wrap_predicate_applies".to_string());
+                return Err(SqlCompileError::Compilation(
+                    "scalar spec routed to wrap_predicate_applies".to_string(),
+                ));
             }
         };
 
         let subquery_expr = match (&kind, spec.in_lhs.clone()) {
             (ApplyKind::In { .. }, Some(lhs)) => lhs,
             (ApplyKind::In { .. }, None) => {
-                return Err("IN spec missing analyzed LHS".to_string());
+                return Err(SqlCompileError::Compilation(
+                    "IN spec missing analyzed LHS".to_string(),
+                ));
             }
             _ => TypedExpr {
                 kind: ExprKind::ColumnRef {

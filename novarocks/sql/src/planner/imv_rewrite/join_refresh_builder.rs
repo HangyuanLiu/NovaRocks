@@ -50,6 +50,7 @@ pub(crate) fn build_join_apply_key_project(
     apply_key_column_id: u32,
     action_column_id: u32,
     policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     build_join_apply_key_project_with_action(
@@ -64,6 +65,7 @@ pub(crate) fn build_join_apply_key_project(
             action: JoinApplyActionProjection::InputColumn,
         },
         policy,
+        constant_policy,
         control,
     )
 }
@@ -81,6 +83,7 @@ pub(crate) fn build_join_apply_key_project_with_constant_insert_action(
     apply_key_column_id: u32,
     action_column_id: u32,
     policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     build_join_apply_key_project_with_action(
@@ -95,6 +98,7 @@ pub(crate) fn build_join_apply_key_project_with_constant_insert_action(
             action: JoinApplyActionProjection::ConstantInsert,
         },
         policy,
+        constant_policy,
         control,
     )
 }
@@ -113,6 +117,7 @@ pub(crate) fn build_join_apply_key_append_project(
     right_object_id: &ConnectorTableObjectId,
     apply_key_column_id: u32,
     policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     desc.validate()?;
@@ -140,6 +145,7 @@ pub(crate) fn build_join_apply_key_append_project(
                 right_object_id,
                 JoinApplyActionProjection::InputColumn,
                 policy,
+                constant_policy,
                 control,
             )
         })
@@ -178,6 +184,7 @@ fn build_join_apply_key_project_with_action(
     input: LogicalPlanNode,
     projection: JoinApplyKeyProjection<'_>,
     policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let JoinApplyKeyProjection {
@@ -207,6 +214,7 @@ fn build_join_apply_key_project_with_action(
                 right_object_id,
                 action,
                 policy,
+                constant_policy,
                 control,
             )
         })
@@ -267,6 +275,7 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
     locator_last_updated_seq_column_id: u32,
     #[cfg(not(test))] function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     #[cfg(test)]
@@ -361,6 +370,7 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         &net_column,
         function_catalog,
         policy,
+        constant_policy,
         control,
     )?;
     let payload_checked = build_payload_coalesce_assert_filter(
@@ -368,6 +378,7 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         &net_column,
         function_catalog,
         policy,
+        constant_policy,
         control,
     )?;
     let key_shape_checked = build_key_shape_assert_join(
@@ -379,6 +390,7 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         &pending_delete_count,
         function_catalog,
         policy,
+        constant_policy,
         control,
     )?;
     let locator_join = build_locator_join_shell(
@@ -400,6 +412,7 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         ColumnId(locator_pos_column_id),
         function_catalog,
         policy,
+        constant_policy,
         control,
     )?;
     build_final_coalesce_project(
@@ -425,6 +438,7 @@ fn build_payload_coalesce_aggregate(
     net_column: &OutputColumn,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let aggregate_args = vec![column_ref(action_input)];
@@ -434,6 +448,7 @@ fn build_payload_coalesce_aggregate(
         &aggregate_args,
         &[],
         true,
+        constant_policy,
         control,
     )
     .map_err(|error| match error {
@@ -531,6 +546,7 @@ fn build_payload_coalesce_assert_filter(
     net_column: &OutputColumn,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let net_ne_zero = binary(
@@ -544,6 +560,7 @@ fn build_payload_coalesce_assert_filter(
         "abs",
         &abs_args,
         policy,
+        constant_policy,
         control,
     )?;
     let novarocks_functions::FunctionResultType::Scalar(abs_result) =
@@ -568,6 +585,7 @@ fn build_payload_coalesce_assert_filter(
         abs_net_le_one,
         "join delta per-payload net change exceeds 1",
         policy,
+        constant_policy,
         control,
     )?;
     Ok(LogicalPlanNode::new(
@@ -588,6 +606,7 @@ fn build_key_shape_assert_join(
     pending_delete_count: &OutputColumn,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let insert_args = vec![pending_count_expr(net_column, BinOp::Gt)];
@@ -598,6 +617,7 @@ fn build_key_shape_assert_join(
         &insert_args,
         &[],
         true,
+        constant_policy,
         control,
     )
     .map_err(|error| match error {
@@ -658,6 +678,7 @@ fn build_key_shape_assert_join(
         ),
         "join delta multiple pending payloads for key",
         policy,
+        constant_policy,
         control,
     )?;
     let checked_key_shape = LogicalPlanNode::new(
@@ -872,6 +893,7 @@ fn build_locator_assert_filter(
     locator_pos_column_id: ColumnId,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let insert_or_noop = binary(
@@ -897,6 +919,7 @@ fn build_locator_assert_filter(
         binary(insert_or_noop, BinOp::Or, locator_present),
         "join delta DELETE row missing target locator",
         policy,
+        constant_policy,
         control,
     )?;
     Ok(LogicalPlanNode::new(
@@ -1151,6 +1174,7 @@ fn assert_true_call(
     predicate: TypedExpr,
     message: &str,
     policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
     let args = vec![predicate, string_literal(message)];
@@ -1159,6 +1183,7 @@ fn assert_true_call(
         "assert_true",
         &args,
         policy,
+        constant_policy,
         control,
     )?;
     Ok(TypedExpr {
@@ -1249,6 +1274,7 @@ fn project_item_for_mapping(
     right_object_id: &ConnectorTableObjectId,
     action_projection: JoinApplyActionProjection,
     policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<ProjectItem, crate::compiler::SqlCompileError> {
     let expr = match mapping.source {
@@ -1317,6 +1343,7 @@ fn project_item_for_mapping(
                 left_object_id,
                 right_object_id,
                 policy,
+                constant_policy,
                 control,
             )?
         }
@@ -1386,6 +1413,7 @@ fn join_row_key_expr(
     left_object_id: &ConnectorTableObjectId,
     right_object_id: &ConnectorTableObjectId,
     policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
     let args = vec![
@@ -1399,6 +1427,7 @@ fn join_row_key_expr(
         "join_row_key",
         &args,
         policy,
+        constant_policy,
         control,
     )?;
     let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
@@ -1505,6 +1534,7 @@ mod tests {
             90,
             91,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("apply-key project");
@@ -1550,6 +1580,7 @@ mod tests {
             90,
             91,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("missing right row-id should fail closed");
@@ -1576,6 +1607,7 @@ mod tests {
             900,
             91,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("apply-key id mismatch should fail closed");
@@ -1618,6 +1650,7 @@ mod tests {
             90,
             91,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("apply-key project with constant insert action");
@@ -1754,6 +1787,7 @@ mod tests {
             103,
             104,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("coalesce plan");
@@ -1785,6 +1819,7 @@ mod tests {
             103,
             104,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("coalesce plan");
@@ -1820,6 +1855,7 @@ mod tests {
             103,
             104,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("coalesce plan");
@@ -1846,6 +1882,7 @@ mod tests {
             103,
             104,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("coalesce plan");
@@ -1883,6 +1920,7 @@ mod tests {
             103,
             104,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("coalesce requires locator");
@@ -1908,6 +1946,7 @@ mod tests {
             103,
             104,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("net id collision should fail closed");
@@ -1933,6 +1972,7 @@ mod tests {
             103,
             104,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("duplicate generated ids should fail closed");
@@ -1961,6 +2001,7 @@ mod tests {
                 103,
                 104,
                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .expect_err("reserved locator payload output should fail closed");
@@ -2302,6 +2343,7 @@ mod tests {
             ExprKind::IsTruthValue { expr, .. } => collect_column_refs(expr, refs),
             ExprKind::LambdaParamRef { .. }
             | ExprKind::Literal(_)
+            | ExprKind::Constant(_)
             | ExprKind::SubqueryPlaceholder { .. } => {}
         }
     }
@@ -2621,6 +2663,7 @@ mod tests {
                 90,
                 91,
                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                crate::constant::test_constant_policy(),
                 &Stop(error),
             );
             assert!(

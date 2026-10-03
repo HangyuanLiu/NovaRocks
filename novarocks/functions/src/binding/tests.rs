@@ -36,11 +36,48 @@ fn argument(data_type: DataType, nullable: bool) -> FunctionArgument {
     }
 }
 
-fn literal_argument(constant: FunctionLiteral) -> FunctionArgument {
+fn literal_argument(constant: crate::ConstantValue) -> FunctionArgument {
     FunctionArgument::Value {
-        value_type: value_type(DataType::Utf8, false),
+        value_type: constant.value_type().clone(),
         constant: Some(constant),
     }
+}
+
+fn constant_policy() -> crate::ConstantPolicy {
+    crate::ConstantPolicy {
+        max_rows: 4096,
+        max_array_nodes: 64,
+        max_logical_elements: 16384,
+        max_retained_buffer_bytes: 1 << 20,
+        max_type_depth: 64,
+        max_type_nodes: 64,
+        max_dictionary_depth: 8,
+        max_metadata_bytes: 65536,
+        max_library_validation_work: 4 << 20,
+        max_library_validation_bytes: 4 << 20,
+    }
+}
+fn text_constant(text: Option<&str>) -> crate::ConstantValue {
+    let ty = value_type(DataType::Utf8, text.is_none());
+    let field = Arc::new(ty.try_to_field("fixture").unwrap());
+    match text {
+        Some(text) => crate::ConstantValue::from_utf8(
+            field,
+            ty,
+            text,
+            constant_policy(),
+            CompilePhase::FunctionSpecialization,
+            crate::binding_test_control(),
+        ),
+        None => crate::ConstantValue::null(
+            field,
+            ty,
+            constant_policy(),
+            CompilePhase::FunctionSpecialization,
+            crate::binding_test_control(),
+        ),
+    }
+    .unwrap()
 }
 
 fn request(arguments: &[FunctionArgument]) -> FunctionBindingRequest<'_> {
@@ -276,6 +313,7 @@ struct NamedStructResolver;
 impl NamedStructResolver {
     fn selection(
         request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         let [
             name,
@@ -288,17 +326,16 @@ impl NamedStructResolver {
             return Err(FunctionBindingError::NoMatchingOverload);
         };
         let FunctionArgument::Value {
-            constant: Some(FunctionLiteral::Utf8(name)),
+            constant: Some(value),
             ..
         } = name
         else {
             return Err(invalid("field name must be a compile-time string"));
         };
-        let field = Field::new(
-            name.as_ref(),
-            field_type.data_type.clone(),
-            field_type.nullable,
-        );
+        let Some(name) = value.utf8_observed(CompilePhase::FunctionSpecialization, control)? else {
+            return Err(invalid("field name must be a compile-time string"));
+        };
+        let field = Field::new(name, field_type.data_type.clone(), field_type.nullable);
         Ok(FunctionBindingSelection {
             overload: identity("test/named-struct/T/v1"),
             argument_types: request
@@ -319,18 +356,18 @@ impl FunctionBindingResolver for NamedStructResolver {
     fn resolve(
         &self,
         request: FunctionBindingRequest<'_>,
-        _control: &dyn novarocks_type_contract::PureCompileControl,
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
-        Self::selection(request)
+        Self::selection(request, control)
     }
 
     fn validate_selected(
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
-        _control: &dyn novarocks_type_contract::PureCompileControl,
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
-        if selected != &Self::selection(request)? {
+        if selected != &Self::selection(request, control)? {
             return Err(invalid(
                 "selected field schema differs from its literal argument",
             ));
@@ -362,7 +399,7 @@ fn literal_dependent_binding_distinguishes_constant_null_nonconstant_and_changed
             )
             .is_err()
     );
-    args[0] = literal_argument(FunctionLiteral::Null);
+    args[0] = literal_argument(text_constant(None));
     assert!(
         catalog
             .resolve_bound_user(
@@ -373,7 +410,7 @@ fn literal_dependent_binding_distinguishes_constant_null_nonconstant_and_changed
             )
             .is_err()
     );
-    args[0] = literal_argument(FunctionLiteral::Utf8("field_a".into()));
+    args[0] = literal_argument(text_constant(Some("field_a")));
     let bound = catalog
         .resolve_bound_user(
             "echo",
@@ -385,7 +422,7 @@ fn literal_dependent_binding_distinguishes_constant_null_nonconstant_and_changed
     catalog
         .validate_bound(&bound, request(&args), crate::binding_test_control())
         .unwrap();
-    args[0] = literal_argument(FunctionLiteral::Utf8("field_b".into()));
+    args[0] = literal_argument(text_constant(Some("field_b")));
     assert!(
         catalog
             .validate_bound(&bound, request(&args), crate::binding_test_control())
@@ -1351,4 +1388,192 @@ fn resolver_control_failure_survives_later_wrapper_observation() {
         );
         assert_eq!(control.0.lock().unwrap().last(), Some(&7));
     }
+}
+
+struct ConstantTraceControl {
+    trace: std::sync::Mutex<Vec<(CompilePhase, u32)>>,
+    stop: Option<(usize, CompileControlError)>,
+}
+impl ConstantTraceControl {
+    fn new(stop: Option<(usize, CompileControlError)>) -> Self {
+        Self {
+            trace: Default::default(),
+            stop,
+        }
+    }
+}
+impl PureCompileControl for ConstantTraceControl {
+    fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+        let mut trace = self.trace.lock().unwrap();
+        if let Some((at, _)) = self.stop {
+            assert!(trace.len() < at, "no callback after primary refusal");
+        }
+        trace.push((phase, units));
+        match self.stop {
+            Some((at, error)) if trace.len() == at => Err(error),
+            _ => Ok(()),
+        }
+    }
+}
+fn check_constant_prefixes(
+    call: impl Fn(&dyn PureCompileControl) -> Result<bool, FunctionBindingError>,
+    expected: bool,
+) {
+    let baseline = ConstantTraceControl::new(None);
+    assert_eq!(call(&baseline).unwrap(), expected);
+    let trace = baseline.trace.into_inner().unwrap();
+    assert_eq!(trace.first().unwrap().1, 0);
+    for error in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        for at in 1..=trace.len() {
+            let control = ConstantTraceControl::new(Some((at, error)));
+            assert_eq!(call(&control), Err(FunctionBindingError::Control(error)));
+            assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
+        }
+    }
+}
+fn pooled_integer(rows: Vec<Option<i64>>, ordinal: u32) -> FunctionArgument {
+    use arrow_array::{Array, Int64Array};
+    let ty = value_type(DataType::Int64, true);
+    let pool = crate::ConstantPool::try_new(
+        Arc::new(ty.try_to_field("source").unwrap()),
+        ty,
+        Int64Array::from(rows).to_data(),
+        constant_policy(),
+        CompilePhase::FunctionSpecialization,
+        crate::binding_test_control(),
+    )
+    .unwrap();
+    literal_argument(pool.value(ordinal).unwrap())
+}
+#[test]
+fn constant_arguments_compare_selected_values_without_pool_or_ordinal_identity() {
+    let left = pooled_integer(vec![Some(-99), Some(42), None], 1);
+    let right = pooled_integer(vec![Some(42), Some(7), Some(8)], 0);
+    check_constant_prefixes(
+        |control| left.equals_observed(&right, CompilePhase::FunctionSpecialization, control),
+        true,
+    );
+    let changed = pooled_integer(vec![Some(99), Some(43)], 1);
+    check_constant_prefixes(
+        |control| left.equals_observed(&changed, CompilePhase::FunctionSpecialization, control),
+        false,
+    );
+    let null = pooled_integer(vec![Some(42), None], 1);
+    let second_null = pooled_integer(vec![None, Some(-9)], 0);
+    check_constant_prefixes(
+        |control| null.equals_observed(&second_null, CompilePhase::FunctionSpecialization, control),
+        true,
+    );
+    let nonconstant = argument(DataType::Int64, true);
+    check_constant_prefixes(
+        |control| null.equals_observed(&nonconstant, CompilePhase::FunctionSpecialization, control),
+        false,
+    );
+    check_constant_prefixes(
+        |control| {
+            nonconstant.equals_observed(&nonconstant, CompilePhase::FunctionSpecialization, control)
+        },
+        true,
+    );
+}
+#[test]
+fn constant_argument_request_type_mismatch_refuses_before_resolver_and_observes_tail() {
+    let constant = match pooled_integer(vec![Some(42)], 0) {
+        FunctionArgument::Value {
+            constant: Some(value),
+            ..
+        } => value,
+        _ => unreachable!(),
+    };
+    for ty in [
+        value_type(DataType::Int64, false),
+        value_type(DataType::Float64, true),
+    ] {
+        let arguments = [FunctionArgument::Value {
+            value_type: ty,
+            constant: Some(constant.clone()),
+        }];
+        let resolver = Arc::new(EchoResolver::default());
+        let catalog = catalog(
+            resolver.clone(),
+            declaration(FunctionKind::Scalar, vec![overload("test/echo/T/v1", "T")]),
+        );
+        let call = |control: &dyn PureCompileControl| {
+            catalog.resolve_bound_user("echo", FunctionKind::Scalar, request(&arguments), control)
+        };
+        let baseline = ConstantTraceControl::new(None);
+        assert!(matches!(
+            call(&baseline),
+            Err(FunctionBindingError::InvalidBinding(_))
+        ));
+        assert_eq!(resolver.resolutions.load(Ordering::Relaxed), 0);
+        let trace = baseline.trace.into_inner().unwrap();
+        assert!(trace.len() >= 2, "ordinary refusal must observe completion");
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for at in 1..=trace.len() {
+                let control = ConstantTraceControl::new(Some((at, error)));
+                assert_eq!(call(&control), Err(FunctionBindingError::Control(error)));
+                assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
+                assert_eq!(resolver.resolutions.load(Ordering::Relaxed), 0);
+            }
+        }
+    }
+}
+#[test]
+fn argument_observed_comparison_keeps_full_lambda_and_nominal_types() {
+    let physical = value_type(DataType::FixedSizeBinary(16), true);
+    let largeint = FunctionValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        true,
+        novarocks_type_contract::ValueLogicalType::LargeInt,
+    )
+    .unwrap();
+    let lambda = |ty: FunctionValueType| FunctionArgument::Lambda {
+        parameter_types: vec![ty.clone()].into_boxed_slice(),
+        result_type: ty,
+    };
+    let left = lambda(largeint.clone());
+    let same = lambda(largeint);
+    let changed = lambda(physical);
+    check_constant_prefixes(
+        |control| left.equals_observed(&same, CompilePhase::FunctionSpecialization, control),
+        true,
+    );
+    check_constant_prefixes(
+        |control| left.equals_observed(&changed, CompilePhase::FunctionSpecialization, control),
+        false,
+    );
+    let field = |metadata: &str| {
+        value_type(
+            DataType::Struct(
+                vec![Arc::new(
+                    Field::new("child", DataType::Int64, true).with_metadata(
+                        [("provider".to_owned(), metadata.to_owned())]
+                            .into_iter()
+                            .collect(),
+                    ),
+                )]
+                .into(),
+            ),
+            true,
+        )
+    };
+    check_constant_prefixes(
+        |control| {
+            lambda(field("original")).equals_observed(
+                &lambda(field("changed")),
+                CompilePhase::FunctionSpecialization,
+                control,
+            )
+        },
+        false,
+    );
 }

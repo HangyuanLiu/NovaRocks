@@ -38,6 +38,7 @@ numeric_id!(FragmentId);
 numeric_id!(NodeId);
 numeric_id!(ValueId);
 numeric_id!(ExprId);
+numeric_id!(ConstantPoolId);
 numeric_id!(AggregateCallId);
 numeric_id!(AggregateSequenceId);
 numeric_id!(EdgeId);

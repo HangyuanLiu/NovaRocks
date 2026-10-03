@@ -339,16 +339,17 @@ fn specialization_failure(error: FunctionSpecializationFailure) -> KernelFailure
 #[cfg(test)]
 pub(super) fn prepared_for_test(
     sources: &[crate::FunctionValueType],
-    literals: &[Option<crate::FunctionLiteral>],
+    literals: &[Option<crate::ConstantValue>],
     policy: DecimalOverflowPolicy,
 ) -> Result<Arc<dyn PreparedScalarKernel>, crate::FunctionSpecializationFailure> {
     tests::prepared_for_test(sources, literals, policy)
 }
 #[cfg(test)]
 mod tests {
+    use super::super::catalogue::constant_binding_tests as cv;
     use super::*;
     use crate::{
-        FunctionArgument, FunctionArgumentType, FunctionLiteral, FunctionResultType,
+        ConstantValue, FunctionArgument, FunctionArgumentType, FunctionResultType,
         FunctionSpecializationFailure, FunctionValueType, ScopedExpressionEffects,
         specialize_frozen_scalar, specialize_scalar,
     };
@@ -428,7 +429,7 @@ mod tests {
     }
     pub(super) fn prepared_for_test(
         sources: &[FunctionValueType],
-        literals: &[Option<FunctionLiteral>],
+        literals: &[Option<ConstantValue>],
         policy: DecimalOverflowPolicy,
     ) -> Result<Arc<dyn PreparedScalarKernel>, FunctionSpecializationFailure> {
         if sources.len() != literals.len() {
@@ -583,7 +584,7 @@ mod tests {
                 argument(FunctionValueType::new(DataType::Decimal128(12, 5), false)),
                 FunctionArgument::Value {
                     value_type: FunctionValueType::new(DataType::Int64, false),
-                    constant: Some(FunctionLiteral::Int64(digits)),
+                    constant: Some(cv::i64(digits, false)),
                 },
             ];
             let selected = owner
@@ -618,7 +619,7 @@ mod tests {
                     FunctionValueType::new(DataType::Decimal128(12, 5), false),
                     FunctionValueType::new(DataType::Int64, false),
                 ],
-                &[None, Some(FunctionLiteral::Int64(digits))],
+                &[None, Some(cv::i64(digits, false))],
                 DecimalOverflowPolicy::OutputNull,
             )
             .unwrap();

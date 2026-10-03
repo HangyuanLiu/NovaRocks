@@ -41,12 +41,16 @@ pub(crate) fn validate_fragment_parameter_resource_usage(
 pub(crate) fn validate_package(
     input: &FragmentPackageInput,
     semantic_items: usize,
-) -> Result<(), ValidationErrors> {
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<(), crate::FragmentPackageError> {
     let mut errors = ValidationContext::new();
     let fragment = &input.fragment;
     let mut usage = CutResourcePreflight::new();
     usage.add_fragment(fragment, &mut errors);
     usage.add_cuts(fragment, &input.cuts, &mut errors);
+    usage
+        .add_constants_observed(&input.constants, work)
+        .map_err(crate::FragmentPackageError::Control)?;
     // Count the immutable control representation in the same package dynamic
     // item bound. These counts are not a decoded-allocation or peak-byte model.
     let control = &input.expression_uses;
@@ -86,7 +90,9 @@ pub(crate) fn validate_package(
     }
     usage.validate("package.resources", &mut errors);
     if !errors.is_empty() {
-        return Err(ValidationErrors::from_collector(errors));
+        return Err(crate::FragmentPackageError::Structure(
+            ValidationErrors::from_collector(errors),
+        ));
     }
     if input.required.plan_contract_revision != PLAN_CONTRACT_REVISION {
         errors.push(ValidationError::new(
@@ -96,7 +102,9 @@ pub(crate) fn validate_package(
     }
     validate_fragment_structure_into(fragment, &mut errors);
     if !errors.is_empty() {
-        return Err(ValidationErrors::from_collector(errors));
+        return Err(crate::FragmentPackageError::Structure(
+            ValidationErrors::from_collector(errors),
+        ));
     }
     validate_fragment_cuts_into(fragment, &input.cuts, &mut errors);
     validate_fragment_partition_identities(fragment, &input.cuts, &mut errors);
@@ -133,7 +141,9 @@ pub(crate) fn validate_package(
     if errors.is_empty() {
         Ok(())
     } else {
-        Err(ValidationErrors::from_collector(errors))
+        Err(crate::FragmentPackageError::Structure(
+            ValidationErrors::from_collector(errors),
+        ))
     }
 }
 

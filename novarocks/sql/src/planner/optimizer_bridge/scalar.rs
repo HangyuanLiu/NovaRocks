@@ -870,6 +870,7 @@ pub(crate) fn intern_typed(
             slot_id: *slot_id,
         },
         ExprKind::Literal(v) => ScalarNode::Literal(HashableLiteral(v.clone())),
+        ExprKind::Constant(value) => ScalarNode::Constant(value.clone()),
         ExprKind::BinaryOp {
             left,
             op,
@@ -1073,6 +1074,7 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
             slot_id: *slot_id,
         },
         ScalarNode::Literal(HashableLiteral(v)) => ExprKind::Literal(v.clone()),
+        ScalarNode::Constant(value) => ExprKind::Constant(value.clone()),
         ScalarNode::BinaryOp {
             op,
             left,

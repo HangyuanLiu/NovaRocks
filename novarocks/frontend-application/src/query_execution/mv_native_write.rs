@@ -208,8 +208,10 @@ pub(crate) fn prepare_completed_mv_write(
         ))?;
     let plan = finish(version, dop_domain, reads, targets)?;
     let candidate =
-        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)
-            .map_err(|error| error.to_string())?;
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(
+            plan, control,
+        )
+        .map_err(|error| error.to_string())?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,
     )

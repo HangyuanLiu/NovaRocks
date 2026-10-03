@@ -250,38 +250,14 @@ fn validate_pattern(pattern: &str) -> Result<(), FunctionBindingError> {
     Ok(())
 }
 
-/// Compile-time scalar values required by literal-dependent binders. The
-/// argument's exact Arrow type specifies widths, decimal scales and time units.
-/// `None` on FunctionArgument::Value means nonconstant; `Some(Null)` is a
-/// constant NULL. Lambdas cannot carry a scalar constant.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum FunctionLiteral {
-    Null,
-    Boolean(bool),
-    Int64(i64),
-    LargeInt(i128),
-    UInt64(u64),
-    Float64Bits(u64),
-    Decimal128(i128),
-    /// Big-endian two's-complement unscaled value; precision/scale stay in the type.
-    Decimal256([u8; 32]),
-    Date32(i32),
-    Time64(i64),
-    Timestamp(i64),
-    IntervalMonthDayNano {
-        months: i32,
-        days: i32,
-        nanoseconds: i64,
-    },
-    Utf8(Box<str>),
-    Binary(Box<[u8]>),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Exact checked constants required by value-dependent binders. `None` is a
+/// nonconstant expression; `Some(value)` retains typed NULL, selected ordinal,
+/// original Field and shared backing. Lambdas cannot carry a scalar constant.
+#[derive(Clone, Debug)]
 pub enum FunctionArgument {
     Value {
         value_type: FunctionValueType,
-        constant: Option<FunctionLiteral>,
+        constant: Option<crate::ConstantValue>,
     },
     Lambda {
         parameter_types: Box<[FunctionValueType]>,
@@ -290,6 +266,71 @@ pub enum FunctionArgument {
 }
 
 impl FunctionArgument {
+    /// Compare actual checked values and complete argument types. Pool IDs,
+    /// unused rows and backing addresses are not semantic value equality.
+    pub fn equals_observed(
+        &self,
+        other: &Self,
+        phase: CompilePhase,
+        control: &dyn PureCompileControl,
+    ) -> Result<bool, FunctionBindingError> {
+        let mut work = CompileCheckpoints::try_new(control, phase)?;
+        let result = (|| match (self, other) {
+            (
+                Self::Value {
+                    value_type: left,
+                    constant: left_constant,
+                },
+                Self::Value {
+                    value_type: right,
+                    constant: right_constant,
+                },
+            ) => {
+                if !left.exactly_equals_observed(right, || {
+                    work.step().map_err(FunctionBindingError::from)
+                })? {
+                    return Ok(false);
+                }
+                match (left_constant, right_constant) {
+                    (None, None) => Ok(true),
+                    (Some(left), Some(right)) => {
+                        work.flush()?;
+                        let equal = left.equals_observed(right, phase, work.control())?;
+                        work.flush()?;
+                        Ok(equal)
+                    }
+                    _ => Ok(false),
+                }
+            }
+            (
+                Self::Lambda {
+                    parameter_types: left,
+                    result_type: left_result,
+                },
+                Self::Lambda {
+                    parameter_types: right,
+                    result_type: right_result,
+                },
+            ) => {
+                if left.len() != right.len() {
+                    return Ok(false);
+                }
+                for (left, right) in left.iter().zip(right) {
+                    if !left.exactly_equals_observed(right, || {
+                        work.step().map_err(FunctionBindingError::from)
+                    })? {
+                        return Ok(false);
+                    }
+                }
+                left_result.exactly_equals_observed(right_result, || {
+                    work.step().map_err(FunctionBindingError::from)
+                })
+            }
+            _ => Ok(false),
+        })();
+        finish_binding_work(result, work)
+    }
+
     pub fn argument_type(&self) -> FunctionArgumentType {
         match self {
             Self::Value { value_type, .. } => FunctionArgumentType::Value(value_type.clone()),
@@ -905,7 +946,21 @@ fn validate_request(
     for argument in request.arguments {
         work.step()?;
         match argument {
-            FunctionArgument::Value { value_type, .. } => validate_value_type(value_type, work)?,
+            FunctionArgument::Value {
+                value_type,
+                constant,
+            } => {
+                validate_value_type(value_type, work)?;
+                if let Some(constant) = constant
+                    && !value_type.exactly_equals_observed(constant.value_type(), || {
+                        work.step().map_err(FunctionBindingError::from)
+                    })?
+                {
+                    return Err(invalid(
+                        "constant source type differs from its argument type",
+                    ));
+                }
+            }
             FunctionArgument::Lambda {
                 parameter_types,
                 result_type,
@@ -1213,4 +1268,39 @@ impl From<crate::FunctionResolutionError> for FunctionBindingError {
             other => invalid(&other.to_string()),
         }
     }
+}
+
+impl From<crate::ConstantError> for FunctionBindingError {
+    fn from(error: crate::ConstantError) -> Self {
+        match error {
+            crate::ConstantError::Control(error) => Self::Control(error),
+            crate::ConstantError::Limit(_) => Self::Control(CompileControlError::ResourceExhausted),
+            error => invalid(&error.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn arguments_equal_for_test(
+    actual: &[FunctionArgument],
+    expected: &[FunctionArgument],
+    control: &dyn PureCompileControl,
+) -> Result<bool, FunctionBindingError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+    let result = (|| {
+        work.step()?;
+        if actual.len() != expected.len() {
+            return Ok(false);
+        }
+        for (actual, expected) in actual.iter().zip(expected) {
+            work.step()?;
+            work.flush()?;
+            if !actual.equals_observed(expected, CompilePhase::FunctionSpecialization, control)? {
+                return Ok(false);
+            }
+            work.flush()?;
+        }
+        Ok(true)
+    })();
+    finish_binding_work(result, work)
 }

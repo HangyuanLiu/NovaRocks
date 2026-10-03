@@ -99,10 +99,7 @@ fn byte_program(carrier: DataType, required_error: bool) -> Arc<LocalProgram> {
                 "round",
                 vec![
                     argument(decimal, None),
-                    argument(
-                        FunctionValueType::new(DataType::Int64, false),
-                        Some(FunctionLiteral::Int64(-1)),
-                    ),
+                    integer_argument(FunctionValueType::new(DataType::Int64, false), -1),
                 ],
                 ControlShape::Eager,
             ),

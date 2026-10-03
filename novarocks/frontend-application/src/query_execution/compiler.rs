@@ -108,6 +108,7 @@ pub(crate) trait DmlQueryExecutionKernel:
     + crate::query_execution::planning::statistics::QueryStatisticsResolver
 {
     fn function_catalog(&self) -> &novarocks_functions::EngineFunctionCatalog;
+    fn constant_policy(&self) -> novarocks_functions::ConstantPolicy;
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver;
     /// The statement's typed connector control registry, supplied once when
     /// the kernel was composed.
@@ -126,6 +127,10 @@ pub(crate) trait DmlQueryExecutionKernel:
 impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
     fn function_catalog(&self) -> &novarocks_functions::EngineFunctionCatalog {
         self.function_catalog().as_ref()
+    }
+
+    fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy()
     }
 
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver {
@@ -162,6 +167,10 @@ impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
 impl DmlQueryExecutionKernel for domain::QueryPreparationKernel {
     fn function_catalog(&self) -> &novarocks_functions::EngineFunctionCatalog {
         self.function_catalog().as_ref()
+    }
+
+    fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy()
     }
 
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver {
@@ -1414,6 +1423,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         DmlQueryExecutionKernel::function_catalog(state),
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
+        DmlQueryExecutionKernel::constant_policy(state),
         compile_control.clone(),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(analyze_request)
@@ -1515,8 +1525,11 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     )?;
     let version = plan.version();
     let candidate =
-        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)
-            .map_err(|error| error.to_string())?;
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(
+            plan,
+            &completion_control,
+        )
+        .map_err(|error| error.to_string())?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,
     )

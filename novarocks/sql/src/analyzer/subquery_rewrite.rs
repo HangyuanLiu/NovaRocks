@@ -581,6 +581,7 @@ impl<'a> AnalyzerContext<'a> {
             std::slice::from_ref(&marker_argument),
             novarocks_parser::Span::new(0, 0),
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.constant_policy,
             self.control,
         )?;
         let marker_query = match null_source_col {
@@ -2244,6 +2245,7 @@ impl<'a> AnalyzerContext<'a> {
             std::slice::from_ref(&argument),
             span,
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.constant_policy,
             self.control,
         )?;
         let FunctionResultType::Scalar(result) = &resolved.selected.result_type else {
@@ -2338,6 +2340,7 @@ impl<'a> AnalyzerContext<'a> {
             vec![values.clone()],
             span,
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.constant_policy,
             self.control,
         )?;
         let probes = resolved_scalar_call_at(
@@ -2346,6 +2349,7 @@ impl<'a> AnalyzerContext<'a> {
             vec![lhs, length],
             span,
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.constant_policy,
             self.control,
         )?;
         let mapped = resolved_scalar_call_at(
@@ -2354,6 +2358,7 @@ impl<'a> AnalyzerContext<'a> {
             vec![lambda, probes, values],
             span,
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.constant_policy,
             self.control,
         )?;
         // ARRAY_AGG emits a non-null empty list for zero input rows;
@@ -2364,6 +2369,7 @@ impl<'a> AnalyzerContext<'a> {
             vec![mapped],
             span,
             self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.constant_policy,
             self.control,
         )?;
         if negated {
@@ -2517,6 +2523,7 @@ impl<'a> AnalyzerContext<'a> {
                         &args,
                         subquery_span,
                         self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                        self.constant_policy,
                         self.control,
                     )?;
                     Ok(TypedExpr {
@@ -2755,6 +2762,7 @@ impl<'a> AnalyzerContext<'a> {
     ) -> Result<(ResolvedQuery, AnalyzerScope), AnalyzeError> {
         let child_ctx = AnalyzerContext {
             control: self.control,
+            constant_policy: self.constant_policy,
             catalog: self.catalog,
             current_database: self.current_database,
             function_catalog: self.function_catalog,
@@ -3611,6 +3619,10 @@ fn qualify_inner_shadowing_column_refs(
                 )),
             },
         },
+        ExprKind::Constant(value) => TypedExpr {
+            value_type: expr.value_type,
+            kind: ExprKind::Constant(value),
+        },
         kind @ (ExprKind::ColumnRef { .. }
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
@@ -3753,6 +3765,7 @@ fn collect_outer_ref_column_ids(
             }
         }
         ExprKind::Literal(_)
+        | ExprKind::Constant(_)
         | ExprKind::SubqueryPlaceholder { .. }
         | ExprKind::LambdaParamRef { .. } => {}
     }
@@ -4506,6 +4519,7 @@ fn placeholder_is_aggregate_input(expr: &TypedExpr, placeholder_id: usize) -> bo
         ExprKind::ColumnRef { .. }
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
+        | ExprKind::Constant(_)
         | ExprKind::SubqueryPlaceholder { .. } => false,
     }
 }
@@ -5561,6 +5575,7 @@ mod tests {
             &catalog,
             "default",
             crate::functions::builtin_sql_function_catalog(),
+            crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap();
@@ -5621,6 +5636,7 @@ mod tests {
                 &catalog,
                 "default",
                 crate::functions::builtin_sql_function_catalog(),
+                crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap();

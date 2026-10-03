@@ -565,8 +565,11 @@ mod tests {
         let mut builder = PlanBuilder::new(PlanVersionId::try_new([73; 16]).unwrap())
             .with_semantic_parameters(parameters);
         builder.add_fragment(fragment).unwrap();
-        let candidate =
-            CompletedPhysicalPlanCandidate::for_program(builder.finish().unwrap()).unwrap();
+        let candidate = CompletedPhysicalPlanCandidate::for_program(
+            builder.finish().unwrap(),
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
         FrozenExecutionDescription::for_completed_plan(
             QueryExecutionKind::Write,
             candidate,

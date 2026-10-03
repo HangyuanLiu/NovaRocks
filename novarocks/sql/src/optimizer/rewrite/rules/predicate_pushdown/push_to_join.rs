@@ -728,10 +728,14 @@ fn factor_common_eq_from_or(
         }
     }
 
-    let or_remaining = if new_branches
-        .iter()
-        .all(|branch| scalar_expr::is_true_literal(arena, *branch))
-    {
+    let mut all_true = true;
+    for branch in &new_branches {
+        if !scalar_expr::is_true_literal(arena, *branch, control)? {
+            all_true = false;
+            break;
+        }
+    }
+    let or_remaining = if all_true {
         None
     } else {
         scalar_expr::combine_disjuncts(arena, new_branches, control)?
@@ -1044,5 +1048,90 @@ mod tests {
                 policy == ReportError
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod selected_boolean_factor_tests {
+    use super::*;
+    use arrow::array::{Array, BooleanArray};
+    use arrow::datatypes::DataType;
+    use novarocks_functions::ConstantPool;
+    use novarocks_type_contract::{CompilePhase, FunctionValueType};
+    use std::sync::Arc;
+
+    #[test]
+    fn factor_common_join_equality_removes_actual_selected_true_constant_residuals() {
+        let control = crate::optimizer::test_optimizer_control();
+        let mut arena = ScalarArena::new();
+        let source_type = FunctionValueType::new(DataType::Boolean, false);
+        let pool = ConstantPool::try_new(
+            Arc::new(source_type.try_to_field("source.bool").unwrap()),
+            source_type.clone(),
+            BooleanArray::from(vec![false, true]).to_data(),
+            crate::constant::test_constant_policy(),
+            CompilePhase::Validate,
+            control,
+        )
+        .unwrap();
+        let selected_true = arena
+            .intern_observed(
+                ScalarNode::Constant(pool.value(1).unwrap()),
+                source_type.clone(),
+                control,
+            )
+            .unwrap();
+        let left_column = ColumnId::new_for_test(701);
+        let right_column = ColumnId::new_for_test(702);
+        let left = arena
+            .intern_observed(
+                ScalarNode::ColumnRef(left_column),
+                FunctionValueType::new(DataType::Int64, false),
+                control,
+            )
+            .unwrap();
+        let right = arena
+            .intern_observed(
+                ScalarNode::ColumnRef(right_column),
+                FunctionValueType::new(DataType::Int64, false),
+                control,
+            )
+            .unwrap();
+        let mut binary = |op, left, right| {
+            arena
+                .intern_observed(
+                    ScalarNode::BinaryOp {
+                        op,
+                        left,
+                        right,
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    },
+                    source_type.clone(),
+                    control,
+                )
+                .unwrap()
+        };
+        let equality = binary(BinOp::Eq, left, right);
+        let first = binary(BinOp::And, equality, selected_true);
+        let second = binary(BinOp::And, selected_true, equality);
+        let disjunction = binary(BinOp::Or, first, second);
+        let node_count = arena.node_count();
+        let (common, residual) = factor_common_eq_from_or(
+            &mut arena,
+            disjunction,
+            &HashSet::from([left_column]),
+            &HashSet::from([right_column]),
+            control,
+        )
+        .unwrap();
+        assert_eq!(common, vec![equality]);
+        assert_eq!(residual, None);
+        assert_eq!(arena.node_count(), node_count);
+        let ScalarNode::Constant(actual) = arena.node(selected_true) else {
+            panic!("expected original constant");
+        };
+        assert_eq!(actual.ordinal(), 1);
+        assert_eq!(actual.try_boolean().unwrap(), Some(true));
     }
 }

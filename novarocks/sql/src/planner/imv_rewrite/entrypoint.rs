@@ -42,6 +42,7 @@ pub(crate) struct ImvRewriteInput<'a> {
     pub snapshot: Arc<SqlImvRewriteSnapshot>,
     pub disabled_rules: Vec<String>,
     pub decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    pub constant_policy: novarocks_functions::ConstantPolicy,
     pub control: &'a dyn PureCompileControl,
     pub column_ref_factory: Rc<RefCell<ColumnRefFactory>>,
     #[cfg(not(test))]
@@ -63,6 +64,7 @@ pub(crate) fn run_imv_rewrite(
         snapshot,
         disabled_rules,
         decimal_overflow_policy,
+        constant_policy,
         control,
         column_ref_factory,
         #[cfg(not(test))]
@@ -101,7 +103,9 @@ pub(crate) fn run_imv_rewrite(
     // hands this entrypoint a LogicalPlanNode, while the optimizer rewrite
     // pipeline operates on OptExpr. This is not a production rewrite
     // round-trip inside the optimizer.
-    let scalars = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
+    let scalars = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::with_constant_policy(
+        constant_policy,
+    )));
     let opt_in = try_to_optimizer_expr(&plan, &mut scalars.borrow_mut(), control)?;
     work.step()
         .map_err(crate::compiler::SqlCompileError::from)?;
@@ -527,6 +531,7 @@ fn collect_expr_column_ids(expr: &TypedExpr, max_id: &mut u32) {
         }
         ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
+        | ExprKind::Constant(_)
         | ExprKind::SubqueryPlaceholder { .. } => {}
     }
 }
@@ -1178,6 +1183,8 @@ pub(crate) mod tests {
             snapshot: repeated_source_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -1244,6 +1251,8 @@ pub(crate) mod tests {
             snapshot: Arc::new(snapshot),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -1864,6 +1873,8 @@ pub(crate) mod tests {
             snapshot: dummy_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: std::rc::Rc::clone(&factory),
         })
@@ -1883,6 +1894,8 @@ pub(crate) mod tests {
             snapshot: empty_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -1908,6 +1921,8 @@ pub(crate) mod tests {
             snapshot: dummy_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2030,6 +2045,8 @@ pub(crate) mod tests {
             snapshot: empty_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["NoSuchRule".to_string(), "WrapRootInImvDelta".to_string()],
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2141,6 +2158,8 @@ pub(crate) mod tests {
             snapshot: empty_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2164,6 +2183,8 @@ pub(crate) mod tests {
             snapshot: empty_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2185,6 +2206,8 @@ pub(crate) mod tests {
             snapshot: empty_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2201,6 +2224,8 @@ pub(crate) mod tests {
             snapshot: empty_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2244,6 +2269,8 @@ pub(crate) mod tests {
                 "InjectApplyKeyProject".to_string(),
                 "ActionColumnValidation".to_string(),
             ],
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2285,6 +2312,8 @@ pub(crate) mod tests {
             snapshot: dummy_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2322,6 +2351,8 @@ pub(crate) mod tests {
             snapshot: dummy_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2354,6 +2385,8 @@ pub(crate) mod tests {
                 "InjectApplyKeyProject".to_string(),
                 "ActionColumnValidation".to_string(),
             ],
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2408,6 +2441,8 @@ pub(crate) mod tests {
             snapshot: dummy_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2466,6 +2501,8 @@ pub(crate) mod tests {
             snapshot: dummy_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory_reserved_until(100),
         })
@@ -2548,6 +2585,8 @@ pub(crate) mod tests {
             snapshot: dummy_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory_reserved_until(100),
         })
@@ -2567,6 +2606,8 @@ pub(crate) mod tests {
             snapshot: repeated_source_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2644,6 +2685,8 @@ pub(crate) mod tests {
             snapshot: partitioned_aggregate_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2678,6 +2721,8 @@ pub(crate) mod tests {
             snapshot: aggregate_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2711,6 +2756,8 @@ pub(crate) mod tests {
             snapshot: ctx,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2747,6 +2794,8 @@ pub(crate) mod tests {
             snapshot: dummy_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2761,6 +2810,8 @@ pub(crate) mod tests {
             snapshot: aggregate_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2818,6 +2869,8 @@ pub(crate) mod tests {
             snapshot: join_aggregate_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2861,6 +2914,8 @@ pub(crate) mod tests {
             snapshot: join_aggregate_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -2877,6 +2932,8 @@ pub(crate) mod tests {
             snapshot: join_projection_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory_reserved_until(30),
         })
@@ -2951,6 +3008,8 @@ pub(crate) mod tests {
             snapshot: join_projection_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory_reserved_until(30),
         })
@@ -2989,6 +3048,8 @@ pub(crate) mod tests {
             snapshot: join_projection_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: Rc::clone(&factory_cell),
         })
@@ -3016,7 +3077,8 @@ pub(crate) mod tests {
                 203,
                 204,
              novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-&crate::compiler::SqlCompileControl::unbounded())
+crate::constant::test_constant_policy(),
+        &crate::compiler::SqlCompileControl::unbounded())
         }
         .expect("join projection coalesce plan");
 
@@ -3035,7 +3097,8 @@ pub(crate) mod tests {
                     snapshot: join_projection_mv_ctx(),
                     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
-                    control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+
+            constant_policy: crate::constant::test_constant_policy(),                    control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
                     column_ref_factory: Rc::clone(&factory_cell),
                 })
                 .expect("join projection IMV pipeline must rewrite and validate");
@@ -3062,7 +3125,8 @@ pub(crate) mod tests {
                         203,
                         204,
                      novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-&crate::compiler::SqlCompileControl::unbounded())
+crate::constant::test_constant_policy(),
+        &crate::compiler::SqlCompileControl::unbounded())
                 }
                 .expect("join projection coalesce plan");
                 let optimized_tree = optimize_logical_for_test(coalesce);
@@ -3086,7 +3150,8 @@ pub(crate) mod tests {
                     snapshot: join_projection_mv_ctx(),
                     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
-                    control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+
+            constant_policy: crate::constant::test_constant_policy(),                    control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
                     column_ref_factory: Rc::clone(&factory_cell),
                 })
                 .expect("join projection/filter IMV pipeline must rewrite and validate");
@@ -3113,7 +3178,8 @@ pub(crate) mod tests {
                         203,
                         204,
                      novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-&crate::compiler::SqlCompileControl::unbounded())
+crate::constant::test_constant_policy(),
+        &crate::compiler::SqlCompileControl::unbounded())
                 }
                 .expect("join projection/filter coalesce plan");
                 let optimized_tree = optimize_logical_for_test(coalesce);
@@ -3141,7 +3207,8 @@ pub(crate) mod tests {
                     snapshot: join_projection_mv_ctx(),
                     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
-                    control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+
+            constant_policy: crate::constant::test_constant_policy(),                    control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
                     column_ref_factory: Rc::clone(&factory_cell),
                 })
                 .expect("join projection side-filter IMV pipeline must rewrite and validate");
@@ -3168,7 +3235,8 @@ pub(crate) mod tests {
                         203,
                         204,
                      novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-&crate::compiler::SqlCompileControl::unbounded())
+crate::constant::test_constant_policy(),
+        &crate::compiler::SqlCompileControl::unbounded())
                 }
                 .expect("join side-filter coalesce plan");
                 let optimized_tree = optimize_logical_for_test(coalesce);
@@ -3226,6 +3294,8 @@ pub(crate) mod tests {
                 snapshot: Arc::clone(&snapshot),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
+
+                constant_policy: crate::constant::test_constant_policy(),
                 control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
                 column_ref_factory: Rc::clone(&factory_cell),
                 #[cfg(not(test))]
@@ -3253,7 +3323,8 @@ pub(crate) mod tests {
                     #[cfg(not(test))]
                     crate::functions::builtin_sql_function_catalog(),
                  novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-&crate::compiler::SqlCompileControl::unbounded())
+crate::constant::test_constant_policy(),
+        &crate::compiler::SqlCompileControl::unbounded())
             }
             .expect("join projection coalesce plan");
             optimize_logical_for_test(coalesce)
@@ -3310,6 +3381,8 @@ pub(crate) mod tests {
             snapshot: ctx,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -3335,6 +3408,8 @@ pub(crate) mod tests {
             snapshot: ctx,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -3410,6 +3485,8 @@ pub(crate) mod tests {
             snapshot: join_aggregate_mv_ctx(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             disabled_rules: Vec::new(),
+
+            constant_policy: crate::constant::test_constant_policy(),
             control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             column_ref_factory: test_column_ref_factory(),
         })
@@ -3693,6 +3770,7 @@ pub(crate) mod tests {
             }
             ExprKind::LambdaParamRef { .. }
             | ExprKind::Literal(_)
+            | ExprKind::Constant(_)
             | ExprKind::SubqueryPlaceholder { .. } => {}
         }
     }
@@ -3936,6 +4014,8 @@ pub(crate) mod tests {
                 snapshot: empty_mv_ctx(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 disabled_rules: vec![],
+
+                constant_policy: crate::constant::test_constant_policy(),
                 control: &control,
                 column_ref_factory: test_column_ref_factory(),
             })

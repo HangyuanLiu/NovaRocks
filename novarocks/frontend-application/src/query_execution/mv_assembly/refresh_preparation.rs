@@ -269,6 +269,7 @@ fn build_aggregate_layout_for_refresh_select_sql(
         current_database,
         &visible_query,
         ports.function_catalog().as_ref(),
+        ports.constant_policy(),
         crate::query_execution::planning::sql_compile_control_from_connector_request(
             connector_context,
         ),
@@ -594,18 +595,23 @@ fn prepare_managed_repartition_transition(
         novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
         source.catalog_application(),
     );
+    let completion_control =
+        crate::query_execution::planning::sql_compile_control_from_connector_request(
+            connector_context,
+        );
     let analysis = crate::mv::domain::analysis_adapter::analyze_mv_select_with_provider(
         current_catalog,
         &provider,
         current_database,
         &query,
         source.function_catalog().as_ref(),
-        crate::query_execution::planning::sql_compile_control_from_connector_request(
-            connector_context,
-        ),
+        source.constant_policy(),
+        completion_control.clone(),
     )?;
     validate_mv_partition_columns(Some(fields), &analysis.output_columns)?;
-    if derive_fragment_property(&analysis)?.is_composed_aggregate_schema_contract_fallback() {
+    if derive_fragment_property(&analysis, &completion_control)?
+        .is_composed_aggregate_schema_contract_fallback()
+    {
         return Err("partitioned composed aggregate Iceberg MV is not supported"
             .to_string()
             .into());

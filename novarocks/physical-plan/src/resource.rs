@@ -21,6 +21,8 @@ use arrow_schema::{
     DataType, Field, TimeUnit,
 };
 use novarocks_connector_contract::ConnectorEncodedPayload;
+use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
+use std::collections::BTreeSet;
 
 use crate::validation::ValidationContext;
 use crate::{
@@ -92,6 +94,16 @@ impl CutResourcePreflight {
         errors: &mut ValidationContext,
     ) {
         self.usage.merge(fragment_cut_usage(fragment, cuts, errors));
+    }
+
+    /// Count sparse addresses individually and immutable backings once in the
+    /// same package envelope. These are source facts, not allocation grants.
+    pub(crate) fn add_constants_observed(
+        &mut self,
+        pools: &crate::ConstantPools,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), CompileControlError> {
+        add_constant_pool_usage(pools, &mut self.usage, work)
     }
 
     pub(crate) fn add_items(&mut self, count: usize) {
@@ -335,6 +347,36 @@ fn add_writer_result_cut_usage(
 }
 
 pub(crate) fn validate_plan_resources(plan: &PhysicalPlan, errors: &mut ValidationContext) {
+    let usage = plan_usage(plan, errors);
+    validate_usage(
+        "resources",
+        usage,
+        MAX_PLAN_DYNAMIC_ITEMS,
+        MAX_PLAN_DYNAMIC_BYTES,
+        errors,
+    );
+}
+
+/// The caller owns entry/completion and keeps the original control. The old
+/// structure collector is shared; only this explicit port admits pool facts.
+pub(crate) fn validate_plan_resources_observed(
+    plan: &PhysicalPlan,
+    errors: &mut ValidationContext,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), CompileControlError> {
+    let mut usage = plan_usage(plan, errors);
+    add_constant_pool_usage(plan.constants(), &mut usage, work)?;
+    validate_usage(
+        "resources",
+        usage,
+        MAX_PLAN_DYNAMIC_ITEMS,
+        MAX_PLAN_DYNAMIC_BYTES,
+        errors,
+    );
+    Ok(())
+}
+
+fn plan_usage(plan: &PhysicalPlan, errors: &mut ValidationContext) -> ResourceUsage {
     let mut usage = ResourceUsage::limited(MAX_PLAN_DYNAMIC_ITEMS, MAX_PLAN_DYNAMIC_BYTES);
     usage.add_item_counts([
         plan.fragments().len(),
@@ -391,13 +433,53 @@ pub(crate) fn validate_plan_resources(plan: &PhysicalPlan, errors: &mut Validati
         }
         usage.add_byte_counts([annotation.key.len(), annotation.value.len()]);
     }
-    validate_usage(
-        "resources",
-        usage,
-        MAX_PLAN_DYNAMIC_ITEMS,
-        MAX_PLAN_DYNAMIC_BYTES,
-        errors,
-    );
+    usage
+}
+
+fn add_constant_pool_usage(
+    pools: &crate::ConstantPools,
+    usage: &mut ResourceUsage,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), CompileControlError> {
+    // This O(1) count occurs before any deduplication scratch allocation. It
+    // shares the existing plan/package item limit with all earlier facts.
+    usage.add_items(pools.entries().len());
+    work.step()?;
+    if usage.exhausted() {
+        return Ok(());
+    }
+    let mut retained = BTreeSet::new();
+    for pool in pools.entries().values() {
+        let first = retained.insert(pool.backing_identity());
+        work.step()?;
+        if first {
+            let facts = pool.resource_facts();
+            // Rows describe addressable source items; nodes and descriptors
+            // describe backing structure. The expanded validation work bound
+            // is not retained data and is not charged as another item table.
+            usage.add_item_counts([
+                resource_count(facts.rows),
+                resource_count(facts.array_nodes),
+                resource_count(facts.buffer_count),
+            ]);
+            usage.add_byte_counts([
+                resource_count(facts.retained_buffer_capacity_bytes),
+                resource_count(facts.metadata_bytes),
+            ]);
+            work.step()?;
+        }
+        if usage.exhausted() {
+            break;
+        }
+    }
+    // The scratch tree is bounded by the admitted sparse table and stores
+    // opaque owner retention identities, never max-ID-indexed slots or CV Eq.
+    // Its allocation is not a MEM-accounted grant/free protocol.
+    Ok(())
+}
+
+fn resource_count(count: u64) -> usize {
+    usize::try_from(count).unwrap_or(usize::MAX)
 }
 
 fn validate_usage(
@@ -504,11 +586,9 @@ fn add_expression_usage(
         return;
     }
     match kind {
-        ExprKind::Literal(crate::LiteralValue::Utf8(value)) => usage.add_bytes(value.len()),
-        ExprKind::Literal(crate::LiteralValue::Binary(value)) => usage.add_bytes(value.len()),
-        ExprKind::Literal(crate::LiteralValue::LargeInt(_)) => {
-            usage.add_bytes(std::mem::size_of::<i128>())
-        }
+        // The sparse reference is a leaf. Its selected payload is retained
+        // by the enclosing constant table, where backing aliases are deduped.
+        ExprKind::Constant(_) => {}
         ExprKind::FunctionCall { function, args } => {
             usage.add_items(args.len());
             add_function_usage(function, &format!("{path}.function"), usage, errors);
@@ -1544,5 +1624,217 @@ mod tests {
         assert_eq!(errors.len(), 2);
         assert!(errors[0].message().contains("dynamic items"));
         assert!(errors[1].message().contains("dynamic bytes"));
+    }
+}
+
+#[cfg(test)]
+mod constant_resource_tests {
+    use super::*;
+    use arrow_array::{Array, Int64Array};
+    use novarocks_constant_contract::{ConstantPolicy, ConstantPool};
+    use novarocks_type_contract::{CompilePhase, FunctionValueType, PureCompileControl};
+    use std::sync::{Arc, Mutex};
+
+    struct Control {
+        refusal: Option<(usize, CompileControlError)>,
+        calls: Mutex<Vec<(CompilePhase, u32)>>,
+    }
+    impl Control {
+        fn good() -> Self {
+            Self {
+                refusal: None,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+        fn trace(&self) -> Vec<(CompilePhase, u32)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            let mut calls = self.calls.lock().unwrap();
+            let position = calls.len();
+            calls.push((phase, units));
+            match self.refusal {
+                Some((at, cause)) if at == position => Err(cause),
+                _ => Ok(()),
+            }
+        }
+    }
+    fn pool() -> ConstantPool {
+        let array = Int64Array::from(vec![11, 42, 71]);
+        let field = Field::new("actual_source", DataType::Int64, false)
+            .with_metadata([("provider.id".to_owned(), "source-42".to_owned())].into());
+        let policy = ConstantPolicy {
+            max_rows: 1024,
+            max_array_nodes: 4096,
+            max_logical_elements: 4096,
+            max_retained_buffer_bytes: 1024 * 1024,
+            max_type_depth: 64,
+            max_type_nodes: 4096,
+            max_dictionary_depth: 16,
+            max_metadata_bytes: 1024 * 1024,
+            max_library_validation_work: 1024 * 1024,
+            max_library_validation_bytes: 1024 * 1024,
+        };
+        ConstantPool::try_new(
+            Arc::new(field),
+            FunctionValueType::new(DataType::Int64, false),
+            array.to_data(),
+            policy,
+            CompilePhase::Validate,
+            &Control::good(),
+        )
+        .unwrap()
+    }
+    fn measured(
+        pools: &crate::ConstantPools,
+        control: &dyn PureCompileControl,
+    ) -> Result<CutResourceUsage, CompileControlError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+        let mut usage = CutResourcePreflight::new();
+        usage.add_constants_observed(pools, &mut work)?;
+        work.finish()?;
+        Ok(CutResourceUsage {
+            items: usage.usage.items,
+            bytes: usage.usage.bytes,
+        })
+    }
+
+    #[test]
+    fn constant_backing_aliases_charge_sparse_entries_and_one_actual_owner() {
+        let original = pool();
+        let facts = original.resource_facts();
+        let mut aliases = crate::ConstantPools::empty();
+        aliases
+            .insert(crate::ConstantPoolId::new(0), original.clone())
+            .unwrap();
+        aliases
+            .insert(crate::ConstantPoolId::new(u32::MAX), original.clone())
+            .unwrap();
+        let usage = measured(&aliases, &Control::good()).unwrap();
+        let owner_items = facts.rows + facts.array_nodes + facts.buffer_count;
+        let owner_bytes = facts.retained_buffer_capacity_bytes + facts.metadata_bytes;
+        assert_eq!(usage.items, 2 + usize::try_from(owner_items).unwrap());
+        assert_eq!(usage.bytes, usize::try_from(owner_bytes).unwrap());
+        let separate = pool();
+        assert_ne!(original.backing_identity(), separate.backing_identity());
+        assert!(
+            original
+                .value(1)
+                .unwrap()
+                .equals_observed(
+                    &separate.value(1).unwrap(),
+                    CompilePhase::Validate,
+                    &Control::good()
+                )
+                .unwrap()
+        );
+        aliases
+            .insert(crate::ConstantPoolId::new(7), separate)
+            .unwrap();
+        let usage = measured(&aliases, &Control::good()).unwrap();
+        assert_eq!(usage.items, 3 + 2 * usize::try_from(owner_items).unwrap());
+        assert_eq!(usage.bytes, 2 * usize::try_from(owner_bytes).unwrap());
+    }
+
+    #[test]
+    fn constant_resources_share_existing_fragment_items_and_bytes_exact_boundary() {
+        let p = pool();
+        let mut pools = crate::ConstantPools::empty();
+        pools.insert(crate::ConstantPoolId::new(0), p).unwrap();
+        let facts = measured(&pools, &Control::good()).unwrap();
+        // Each axis reaches/refuses its own envelope. The first refusal is
+        // allowed to stop accounting the other axis before visiting backings.
+        for item_axis in [true, false] {
+            for extra in [0, 1] {
+                let control = Control::good();
+                let mut work =
+                    CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+                let mut usage = CutResourcePreflight::new();
+                if item_axis {
+                    usage.add_items(MAX_FRAGMENT_DYNAMIC_ITEMS - facts.items + extra);
+                } else {
+                    usage.add_bytes(MAX_FRAGMENT_DYNAMIC_BYTES - facts.bytes + extra);
+                }
+                usage.add_constants_observed(&pools, &mut work).unwrap();
+                let mut errors = ValidationContext::new();
+                let counted = usage.validate("package.resources", &mut errors);
+                work.finish().unwrap();
+                if item_axis {
+                    assert_eq!(counted.items, MAX_FRAGMENT_DYNAMIC_ITEMS + extra);
+                } else {
+                    assert_eq!(counted.bytes, MAX_FRAGMENT_DYNAMIC_BYTES + extra);
+                }
+                assert_eq!(errors.len(), extra);
+                if extra == 1 {
+                    assert!(errors[0].message().contains(if item_axis {
+                        "dynamic items"
+                    } else {
+                        "dynamic bytes"
+                    }));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn constant_table_count_refuses_before_backing_deduplication_scratch() {
+        let original = pool();
+        let mut pools = crate::ConstantPools::empty();
+        pools
+            .insert(crate::ConstantPoolId::new(0), original.clone())
+            .unwrap();
+        pools
+            .insert(crate::ConstantPoolId::new(u32::MAX), original)
+            .unwrap();
+        let control = Control::good();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        let mut usage = ResourceUsage::limited(MAX_PLAN_DYNAMIC_ITEMS, MAX_PLAN_DYNAMIC_BYTES);
+        usage.add_items(MAX_PLAN_DYNAMIC_ITEMS - 1);
+        add_constant_pool_usage(&pools, &mut usage, &mut work).unwrap();
+        work.finish().unwrap();
+        assert_eq!(usage.items, MAX_PLAN_DYNAMIC_ITEMS + 1);
+        assert_eq!(usage.bytes, 0);
+        // Only the completed O(1) table-length addition was performed. No
+        // backing deduplication visit (and therefore no tree insertion) ran.
+        assert_eq!(
+            control.trace(),
+            vec![(CompilePhase::Validate, 0), (CompilePhase::Validate, 1)]
+        );
+    }
+
+    #[test]
+    fn constant_resource_deduplication_preserves_original_quantum_and_three_causes() {
+        let original = pool();
+        let mut pools = crate::ConstantPools::empty();
+        for id in 0..320 {
+            pools
+                .insert(crate::ConstantPoolId::new(id), original.clone())
+                .unwrap();
+        }
+        let baseline = Control::good();
+        let usage = measured(&pools, &baseline).unwrap();
+        let facts = original.resource_facts();
+        assert_eq!(
+            usage.items,
+            320 + usize::try_from(facts.rows + facts.array_nodes + facts.buffer_count).unwrap()
+        );
+        let trace = baseline.trace();
+        assert!(trace.iter().any(|(_, units)| *units == 256));
+        for at in 0..trace.len() {
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let control = Control {
+                    refusal: Some((at, cause)),
+                    calls: Mutex::new(Vec::new()),
+                };
+                assert!(matches!(measured(&pools, &control), Err(actual) if actual == cause));
+                assert_eq!(control.trace(), trace[..=at]);
+            }
+        }
     }
 }

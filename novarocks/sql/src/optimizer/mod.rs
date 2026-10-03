@@ -323,10 +323,9 @@ fn optimize_with_root_property(
         )
         .into_inner();
     control.checkpoint(CompilePhase::Validate, 0)?;
-    let mut memo = Memo::new();
+    let mut memo = Memo::with_scalar_arena(arena.borrow().clone());
     memo.function_catalog = Some(function_catalog);
     memo.factory = factory;
-    memo.scalars = arena.borrow().clone();
     let root_group = memo_copy::opt_expr_to_memo(&rewritten_expr, &mut memo, control)?;
 
     // 6. Derive initial statistics.
@@ -1722,8 +1721,13 @@ mod is_known_rule_name_tests {
         };
         let (resolved, cte_registry, mut factory) =
             crate::analyzer::analyze(query, &MinimalCatalog, "default").expect("analyze");
-        let logical =
-            crate::planner::plan_query(resolved, cte_registry, &mut factory).expect("plan query");
+        let logical = crate::planner::plan_query(
+            resolved,
+            cte_registry,
+            &mut factory,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .expect("plan query");
         let hash_col = match &logical.kind {
             LogicalPlanKind::Project(project) => match &project.items[0].expr.kind {
                 ExprKind::ColumnRef { column_id, .. } => *column_id,
@@ -1858,8 +1862,13 @@ mod is_known_rule_name_tests {
         };
         let (resolved, cte_registry, mut factory) =
             crate::analyzer::analyze(query, &RankingCatalog, "default").expect("analyze");
-        let logical =
-            crate::planner::plan_query(resolved, cte_registry, &mut factory).expect("plan query");
+        let logical = crate::planner::plan_query(
+            resolved,
+            cte_registry,
+            &mut factory,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .expect("plan query");
         let mut scalars = crate::optimizer::scalar::ScalarArena::new();
         let opt_plan = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
             &logical,
@@ -1972,8 +1981,13 @@ mod is_known_rule_name_tests {
                 .expect("analyze with apply framework must succeed");
 
         // plan_query: turns the ApplyScalarSpec into LogicalPlanKind::Apply.
-        let plan = crate::planner::plan_query(resolved, cte_registry, &mut factory)
-            .expect("plan_query with apply framework must succeed");
+        let plan = crate::planner::plan_query(
+            resolved,
+            cte_registry,
+            &mut factory,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .expect("plan_query with apply framework must succeed");
 
         // optimize: M1b's decorrelation rules must rewrite the Apply to a
         // join; no ApplyException error, no residual Apply.

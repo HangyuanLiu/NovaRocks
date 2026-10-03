@@ -123,6 +123,7 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
             catalog: &catalog,
             functions: ports.function_catalog().as_ref(),
             constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
+            constant_policy: ports.constant_policy(),
             control: crate::query_execution::planning::sql_compile_control_from_connector_request(
                 connector_context,
             ),

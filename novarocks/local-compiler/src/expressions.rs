@@ -28,16 +28,17 @@ use std::{
 
 use novarocks_functions::{
     CallEffectInput, ConstantError, ConstantPolicy, ConstantValue, FunctionArgument,
-    FunctionBindingError, FunctionBindingRequest, FunctionBindingSelection, FunctionLiteral,
-    FunctionResultType, FunctionSpecializationFailure, KernelFailure, PureCallPreparation,
-    PureCallSpecialization, PureEngineFunctionCatalog, ScopedExpressionEffects,
+    FunctionBindingError, FunctionBindingRequest, FunctionBindingSelection, FunctionResultType,
+    FunctionSpecializationFailure, KernelFailure, PureCallPreparation, PureCallSpecialization,
+    PureEngineFunctionCatalog, ScopedExpressionEffects,
 };
 use novarocks_local_program::{
     ExpressionsCompileError, ImmutableExpressions, ProgramCallSite, ProgramExprId,
     ProgramExpressionArena, ProgramUseRef, StaticExprKind, StaticExprNode,
 };
 use novarocks_physical_plan::{
-    ExprId, ExprKind, ExprNode, FragmentPackage, LiteralValue, PhysicalCallSite,
+    ConstantReferenceError, ExprId, ExprKind, ExprNode, FragmentPackage, LiteralValue,
+    PhysicalCallSite,
 };
 use novarocks_type_contract::{
     ArgumentControl, CompileCheckpoints, CompileControlError, CompilePhase, ControlShape,
@@ -57,6 +58,7 @@ pub(crate) struct LoweredExpressions {
 pub(crate) enum ExpressionLoweringError {
     Control(CompileControlError),
     Constant(ConstantError),
+    Reference(ConstantReferenceError),
     Binding(FunctionBindingError),
     Type(ValueTypeError),
     Expressions(ExpressionsCompileError),
@@ -74,6 +76,7 @@ impl fmt::Display for ExpressionLoweringError {
         match self {
             Self::Control(e) => e.fmt(f),
             Self::Constant(e) => e.fmt(f),
+            Self::Reference(e) => e.fmt(f),
             Self::Binding(e) => e.fmt(f),
             Self::Type(e) => e.fmt(f),
             Self::Expressions(e) => e.fmt(f),
@@ -95,6 +98,7 @@ impl Error for ExpressionLoweringError {
         match self {
             Self::Control(e) => Some(e),
             Self::Constant(e) => Some(e),
+            Self::Reference(e) => Some(e),
             Self::Binding(e) => Some(e),
             Self::Type(e) => Some(e),
             Self::Expressions(e) => Some(e),
@@ -144,6 +148,20 @@ impl From<ConstantError> for ExpressionLoweringError {
         match e {
             ConstantError::Control(e) => Self::Control(e),
             other => Self::Constant(other),
+        }
+    }
+}
+impl From<ConstantReferenceError> for ExpressionLoweringError {
+    fn from(error: ConstantReferenceError) -> Self {
+        match error {
+            ConstantReferenceError::Control(cause)
+            | ConstantReferenceError::Constant(ConstantError::Control(cause)) => {
+                Self::Control(cause)
+            }
+            ConstantReferenceError::Constant(ConstantError::Limit(_)) => {
+                Self::Control(CompileControlError::ResourceExhausted)
+            }
+            other => Self::Reference(other),
         }
     }
 }
@@ -296,7 +314,7 @@ fn lower_core(
                 ));
             }
             let child = match &node.kind {
-                ExprKind::Literal(_) | ExprKind::Value(_) => None,
+                ExprKind::Literal(_) | ExprKind::Constant(_) | ExprKind::Value(_) => None,
                 ExprKind::FunctionCall { args, .. }
                 | ExprKind::Conjunction { args }
                 | ExprKind::Disjunction { args } => args.get(next).copied(),
@@ -362,6 +380,11 @@ fn lower_core(
                     ))?;
                     StaticExprKind::SlotId(input.slot)
                 }
+                ExprKind::Constant(reference) => StaticExprKind::Constant(
+                    package
+                        .constants()
+                        .resolve_observed(*reference, &node.ty, work)?,
+                ),
                 ExprKind::Literal(literal) => {
                     // The original CV owner performs type/resource preflight
                     // before Arrow construction. Field creation/type clones
@@ -765,6 +788,42 @@ fn prepare_core(
                 "lowered full type differs from source",
             ));
         }
+        if let ExprKind::Constant(reference) = &definition.kind {
+            let node = lowered
+                .arena
+                .node(local_id)
+                .ok_or(ExpressionLoweringError::Invalid(
+                    "missing lowered constant definition",
+                ))?;
+            let StaticExprKind::Constant(value) = node.kind() else {
+                return Err(ExpressionLoweringError::Invalid(
+                    "constant reference lost its checked source",
+                ));
+            };
+            let source = package
+                .constants()
+                .resolve_observed(*reference, &definition.ty, work)?;
+            work.flush()?;
+            let same_type = definition
+                .ty
+                .exactly_equals_observed::<ExpressionLoweringError>(value.value_type(), || {
+                    control
+                        .checkpoint(CompilePhase::FunctionSpecialization, 0)
+                        .map_err(ExpressionLoweringError::Control)
+                })?;
+            work.flush()?;
+            // This is exact source retention, not semantic selected-value
+            // equality: a private mapping cannot substitute another backing.
+            if !same_type
+                || value.pool().backing_identity() != source.pool().backing_identity()
+                || value.ordinal() != source.ordinal()
+            {
+                return Err(ConstantReferenceError::InvalidConsumer(
+                    "lowered constant reference differs from its checked source",
+                )
+                .into());
+            }
+        }
         work.step()?;
     }
     // Static validation covers every declared call, including dead definitions
@@ -944,7 +1003,7 @@ fn prepare_core(
                     }
                     ScopedExpressionEffects::pure_value(invocation.context)
                 }
-                (ExprKind::Literal(_), StaticExprKind::Constant(_)) => {
+                (ExprKind::Literal(_) | ExprKind::Constant(_), StaticExprKind::Constant(_)) => {
                     if invocation.control != ControlShape::Eager || !invocation.arguments.is_empty()
                     {
                         return Err(ExpressionLoweringError::Invalid(
@@ -1455,173 +1514,72 @@ fn prepare_core(
     Ok(result)
 }
 
-// Metadata remains an actual constant for every lowered source kind. Validation
-// reads the checked CV owner, never an unchecked Arrow payload or an inferred
-// logical domain. Variable bytes share one bounded observation cursor.
-fn checked_literal_metadata(
-    literal: &LiteralValue,
-    value: &ConstantValue,
-    control: &dyn PureCompileControl,
-) -> Result<FunctionLiteral, ExpressionLoweringError> {
-    let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
-    let result = (|| {
-        macro_rules! scalar {
-            ($getter:ident, $variant:ident, $expected:expr) => {{
-                if value.$getter()? != Some(*$expected) {
-                    return Err(ExpressionLoweringError::Invalid(
-                        "lowered literal differs from source",
-                    ));
-                }
-                FunctionLiteral::$variant(*$expected)
-            }};
-        }
-        let metadata = match literal {
-            LiteralValue::Null => {
-                if !value.is_null_observed(CompilePhase::FunctionSpecialization, control)? {
-                    return Err(ExpressionLoweringError::Invalid(
-                        "lowered NULL differs from source",
-                    ));
-                }
-                FunctionLiteral::Null
-            }
-            LiteralValue::Boolean(expected) => scalar!(try_boolean, Boolean, expected),
-            LiteralValue::Int64(expected) => scalar!(try_i64, Int64, expected),
-            LiteralValue::UInt64(expected) => scalar!(try_u64, UInt64, expected),
-            LiteralValue::Float64Bits(expected) => scalar!(try_f64_bits, Float64Bits, expected),
-            LiteralValue::LargeInt(expected) => scalar!(try_largeint, LargeInt, expected),
-            LiteralValue::Decimal128(expected) => scalar!(try_decimal128, Decimal128, expected),
-            LiteralValue::Decimal256(expected) => scalar!(try_decimal256_be, Decimal256, expected),
-            LiteralValue::Date32(expected) => scalar!(try_date32, Date32, expected),
-            LiteralValue::Time64(expected) => scalar!(try_time64, Time64, expected),
-            LiteralValue::Timestamp(expected) => scalar!(try_timestamp, Timestamp, expected),
-            LiteralValue::Utf8(expected) => {
-                if !literal_bytes_equal(
-                    value.try_utf8()?.map(str::as_bytes),
-                    expected.as_bytes(),
-                    &mut work,
-                )? {
-                    return Err(ExpressionLoweringError::Invalid(
-                        "lowered UTF8 differs from source",
-                    ));
-                }
-                work.flush()?;
-                let metadata = FunctionLiteral::Utf8(expected.clone());
-                work.flush()?;
-                metadata
-            }
-            LiteralValue::Binary(expected) => {
-                if !literal_bytes_equal(value.try_binary()?, expected, &mut work)? {
-                    return Err(ExpressionLoweringError::Invalid(
-                        "lowered Binary differs from source",
-                    ));
-                }
-                work.flush()?;
-                let metadata = FunctionLiteral::Binary(expected.clone());
-                work.flush()?;
-                metadata
-            }
-            LiteralValue::IntervalMonthDayNano {
-                months,
-                days,
-                nanoseconds,
-            } => {
-                if value.try_interval_month_day_nano()? != Some((*months, *days, *nanoseconds)) {
-                    return Err(ExpressionLoweringError::Invalid(
-                        "lowered interval differs from source",
-                    ));
-                }
-                FunctionLiteral::IntervalMonthDayNano {
-                    months: *months,
-                    days: *days,
-                    nanoseconds: *nanoseconds,
-                }
-            }
-        };
-        work.step()?;
-        Ok(metadata)
-    })();
-    finish(result, &mut work)
-}
-
-fn literal_bytes_equal(
-    actual: Option<&[u8]>,
-    expected: &[u8],
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<bool, ExpressionLoweringError> {
-    work.step()?;
-    let Some(actual) = actual.filter(|actual| actual.len() == expected.len()) else {
-        return Ok(false);
-    };
-    for (actual, expected) in actual.iter().zip(expected) {
-        work.step()?;
-        if actual != expected {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
+// Static constants retain the actual checked source owner through binding;
+// no scalar metadata enum is reconstructed from an Arrow value.
 fn literal_argument(
     source: &ExprNode,
     node: &StaticExprNode,
     control: &dyn PureCompileControl,
-) -> Result<Option<FunctionLiteral>, ExpressionLoweringError> {
-    if let StaticExprKind::Constant(value) = node.kind()
-        && !source
-            .ty
-            .exactly_equals_observed::<ExpressionLoweringError>(value.value_type(), || {
-                control
-                    .checkpoint(CompilePhase::FunctionSpecialization, 0)
-                    .map_err(ExpressionLoweringError::Control)
-            })?
-    {
-        return Err(ExpressionLoweringError::Invalid(
-            "constant full type differs from source",
-        ));
-    }
-    match (&source.kind, node.kind()) {
-        (ExprKind::Literal(literal), StaticExprKind::Constant(value)) => {
-            checked_literal_metadata(literal, value, control).map(Some)
-        }
-        // A resolved input is not a constant, even if this particular runtime
-        // batch happens to broadcast one scalar value (notably RAND seeds).
-        (ExprKind::Value(_), StaticExprKind::SlotId(_)) => Ok(None),
-        (ExprKind::FunctionCall { .. }, StaticExprKind::BoundCall { .. }) => Ok(None),
-        (ExprKind::Conjunction { .. }, StaticExprKind::NaryAnd { .. })
-        | (ExprKind::Disjunction { .. }, StaticExprKind::NaryOr { .. }) => Ok(None),
-        (
-            ExprKind::Unary {
-                op: novarocks_physical_plan::UnaryOperator::Not,
-                ..
-            },
-            StaticExprKind::Not(_),
-        )
-        | (ExprKind::IsNull { negated: false, .. }, StaticExprKind::IsNull(_))
-        | (ExprKind::IsNull { negated: true, .. }, StaticExprKind::IsNotNull(_)) => Ok(None),
-        (ExprKind::Case { .. }, StaticExprKind::Case { .. }) => Ok(None),
-        (ExprKind::Cast { .. }, StaticExprKind::PreparedCast { .. }) => Ok(None),
-        (ExprKind::Binary { op, .. }, StaticExprKind::PreparedArithmetic { operator, .. })
-            if arithmetic_operator(*op) == Some(*operator) =>
+) -> Result<Option<ConstantValue>, ExpressionLoweringError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+    let result = (|| {
+        if let StaticExprKind::Constant(value) = node.kind()
+            && !source
+                .ty
+                .exactly_equals_observed::<ExpressionLoweringError>(value.value_type(), || {
+                    work.step().map_err(ExpressionLoweringError::Control)
+                })?
         {
-            Ok(None)
+            return Err(ExpressionLoweringError::Invalid(
+                "constant full type differs from source",
+            ));
         }
-        (
-            ExprKind::Binary {
-                op: novarocks_physical_plan::BinaryOperator::EqForNull,
-                ..
-            },
-            StaticExprKind::PreparedNullSafeComparison { .. },
-        ) => Ok(None),
-        (ExprKind::Binary { op, .. }, kind)
-            if kind.ordinary_comparison().is_some()
-                && comparison_operator(*op) == kind.ordinary_comparison().map(|parts| parts.0) =>
-        {
-            Ok(None)
+        match (&source.kind, node.kind()) {
+            (ExprKind::Literal(_) | ExprKind::Constant(_), StaticExprKind::Constant(value)) => {
+                Ok(Some(value.clone()))
+            }
+            // A resolved input is not a constant, even if this particular runtime
+            // batch happens to broadcast one scalar value (notably RAND seeds).
+            (ExprKind::Value(_), StaticExprKind::SlotId(_)) => Ok(None),
+            (ExprKind::FunctionCall { .. }, StaticExprKind::BoundCall { .. }) => Ok(None),
+            (ExprKind::Conjunction { .. }, StaticExprKind::NaryAnd { .. })
+            | (ExprKind::Disjunction { .. }, StaticExprKind::NaryOr { .. }) => Ok(None),
+            (
+                ExprKind::Unary {
+                    op: novarocks_physical_plan::UnaryOperator::Not,
+                    ..
+                },
+                StaticExprKind::Not(_),
+            )
+            | (ExprKind::IsNull { negated: false, .. }, StaticExprKind::IsNull(_))
+            | (ExprKind::IsNull { negated: true, .. }, StaticExprKind::IsNotNull(_)) => Ok(None),
+            (ExprKind::Case { .. }, StaticExprKind::Case { .. }) => Ok(None),
+            (ExprKind::Cast { .. }, StaticExprKind::PreparedCast { .. }) => Ok(None),
+            (ExprKind::Binary { op, .. }, StaticExprKind::PreparedArithmetic { operator, .. })
+                if arithmetic_operator(*op) == Some(*operator) =>
+            {
+                Ok(None)
+            }
+            (
+                ExprKind::Binary {
+                    op: novarocks_physical_plan::BinaryOperator::EqForNull,
+                    ..
+                },
+                StaticExprKind::PreparedNullSafeComparison { .. },
+            ) => Ok(None),
+            (ExprKind::Binary { op, .. }, kind)
+                if kind.ordinary_comparison().is_some()
+                    && comparison_operator(*op)
+                        == kind.ordinary_comparison().map(|parts| parts.0) =>
+            {
+                Ok(None)
+            }
+            _ => Err(ExpressionLoweringError::Invalid(
+                "unsupported call argument projection",
+            )),
         }
-        _ => Err(ExpressionLoweringError::Invalid(
-            "unsupported call argument projection",
-        )),
-    }
+    })();
+    finish(result, &mut work)
 }
 
 fn comparison_operator(
@@ -1658,3 +1616,7 @@ fn arithmetic_operator(
         _ => return None,
     })
 }
+
+#[cfg(test)]
+#[path = "checked_reference_tests.rs"]
+mod checked_reference_tests;
