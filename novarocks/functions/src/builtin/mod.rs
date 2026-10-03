@@ -67,6 +67,8 @@ mod string_concat;
 mod string_concat_owner;
 mod string_left_right;
 mod string_left_right_owner;
+mod string_locate;
+mod string_locate_owner;
 mod string_measure;
 mod string_measure_owner;
 mod string_repeat;

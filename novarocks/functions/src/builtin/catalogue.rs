@@ -2387,6 +2387,9 @@ pub(super) fn scalar_definition_parts(
                     name if super::string_repeat_owner::operation(name).is_some() => {
                         Some(super::string_repeat_owner::effects())
                     }
+                    name if super::string_locate_owner::operation(name).is_some() => {
+                        Some(super::string_locate_owner::effects())
+                    }
                     name if super::string_reverse_owner::operation(name).is_some() => {
                         Some(super::string_reverse_owner::effects())
                     }
@@ -2564,6 +2567,9 @@ pub fn contribute_builtin_functions(
             }
             name if super::string_repeat_owner::operation(name).is_some() => {
                 super::string_repeat_owner::definition(name, declaration, resolver)?
+            }
+            name if super::string_locate_owner::operation(name).is_some() => {
+                super::string_locate_owner::definition(name, declaration, resolver)?
             }
             name if super::string_reverse_owner::operation(name).is_some() => {
                 super::string_reverse_owner::definition(name, declaration, resolver)?
