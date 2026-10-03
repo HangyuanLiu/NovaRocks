@@ -175,8 +175,12 @@ fn request_model() -> Result<(), Error> {
     Ok(())
 }
 pub(crate) fn arc_str_bytes(n: usize) -> Result<usize, Error> {
+    arc_u8_slice_bytes(n)
+}
+pub(crate) fn arc_u8_slice_bytes(n: usize) -> Result<usize, Error> {
     // Rust 1.92 alloc/sync.rs ArcInner is repr(C): two AtomicUsize counters
-    // followed by str bytes. From<&str> allocates once, without a String.
+    // followed by byte-aligned str/[u8] data. From<&str>/From<&[u8]>
+    // allocate once, without an intermediate String or Vec.
     let data = Layout::array::<u8>(n).map_err(|_| invalid("connector identity layout overflow"))?;
     Layout::new::<[AtomicUsize; 2]>()
         .extend(data)

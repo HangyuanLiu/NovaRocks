@@ -29,12 +29,16 @@ pub const MAX_READ_PROPERTY_KEYS: usize = 1024;
 pub struct ConnectorReadInputVersion(Arc<[u8]>);
 
 impl ConnectorReadInputVersion {
+    /// The same diagnostic source permits projection owners to admit its
+    /// String request before invoking the sole checked constructor.
+    pub const fn invalid_length_diagnostic() -> &'static str {
+        "connector read input version must be non-empty and bounded"
+    }
+
     pub fn try_new(bytes: impl Into<Arc<[u8]>>) -> Result<Self, ConnectorError> {
         let bytes = bytes.into();
         if bytes.is_empty() || bytes.len() > MAX_READ_INPUT_VERSION_BYTES {
-            return Err(invalid(
-                "connector read input version must be non-empty and bounded",
-            ));
+            return Err(invalid(Self::invalid_length_diagnostic()));
         }
         Ok(Self(bytes))
     }
