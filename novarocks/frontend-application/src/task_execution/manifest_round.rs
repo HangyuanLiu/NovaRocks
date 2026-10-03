@@ -131,7 +131,7 @@ pub(crate) fn assemble_manifest_round(
                 backend.process_id()
             )));
         }
-        backends.push((backend.process_id(), backend.endpoint().clone()));
+        backends.push(backend.target().descriptor().clone());
         preparing_positions.insert(
             backend.process_id(),
             backend.target().descriptor().preparing_positions(),

@@ -985,6 +985,7 @@ impl FrontendReportServerHandle {
             native_trust,
             native_transport.incoming_adapter(),
             "frontend report endpoint",
+            novarocks_proto_codec::native_rpc::NativeEndpointDomain::FrontendMembership,
             "frontend-report-grpc",
             || {},
             || crate::metrics::observe_native_trust_transport_rejection("report_listener"),

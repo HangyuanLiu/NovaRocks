@@ -1360,6 +1360,8 @@ mod tests {
         let descriptor = BackendProcessDescriptor::try_new(
             process,
             RuntimeEndpoint::new("127.0.0.1", i32::from(port)).expect("valid endpoint"),
+            RuntimeEndpoint::new(format!("control-{ordinal}.test.invalid"), 19061)
+                .expect("valid control endpoint"),
             "test-deployment",
             "test-build",
             NativeCompatibilityId::new([0x71; 32]),

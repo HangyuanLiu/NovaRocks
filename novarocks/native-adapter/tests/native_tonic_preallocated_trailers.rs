@@ -192,7 +192,7 @@ impl Funded {
         let (fields, calls, requested) = measure(1, || {
             HeaderFieldAllocationPool::new(capacity, positions, maximum, field_owner).unwrap()
         });
-        assert_eq!(calls, 3);
+        assert_eq!(calls, 3 + usize::from(cfg!(target_os = "macos")));
         assert!(requested <= field_bound);
         let map_owner = owner(&budget, map_bound + carrier(), 2);
         let (maps, calls, requested) = measure(2, || {

@@ -27,6 +27,7 @@ use hyper::http::{HeaderValue, Request, Response, Uri};
 use hyper_util::rt::TokioIo;
 use novarocks_execution::runtime::fragment::io::ResultWriteAdmission;
 use novarocks_native_trust::NativeIncomingAdapter;
+use novarocks_proto_codec::native_rpc::NativeRpcMethod;
 use novarocks_types::NativeEndpoint;
 use novarocks_worker::result_buffer::ResultRetainedBudget;
 use std::convert::Infallible;
@@ -157,6 +158,7 @@ impl Service<Request<axum::body::Body>> for HeldService {
 struct Listener {
     address: std::net::SocketAddr,
     service: HeldService,
+    method: NativeRpcMethod,
     shutdown: watch::Sender<bool>,
     task: tokio::task::JoinHandle<Result<(), String>>,
 }
@@ -178,6 +180,10 @@ impl Listener {
         Self {
             address,
             service,
+            method: match class {
+                TransportClass::Data => NativeRpcMethod::ApplyTaskOperations,
+                TransportClass::Control => NativeRpcMethod::Heartbeat,
+            },
             shutdown,
             task,
         }
@@ -226,7 +232,10 @@ async fn application(listener: &Listener) -> LiveRequest {
         .send_request(
             Request::builder()
                 .method("POST")
-                .uri("http://localhost/original")
+                .uri(format!(
+                    "http://localhost{}",
+                    listener.method.contract().path
+                ))
                 .header("x-native-original", ORIGINAL)
                 .body(())
                 .unwrap(),

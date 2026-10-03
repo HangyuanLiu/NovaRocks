@@ -19,7 +19,7 @@ under the License.
 
 # 分布式部署
 
-分布式部署使用 NovaRocks native 角色能力，将协调节点和计算节点拆分为不同进程。FE 角色提供 MySQL 入口、SQL 解析、优化和 fragment 调度；BE 角色提供 NovaRocks gRPC 后端服务并执行 fragment。
+分布式部署使用 NovaRocks native 角色能力，将协调节点和计算节点拆分为不同进程。FE 角色提供 MySQL 入口、SQL 解析、优化和 fragment 调度；BE 角色通过独立的 Native Data 与 Control gRPC listener 执行 fragment 和处理控制请求。
 
 该模式不依赖 StarRocks FE。当前 Server 只封装 Iceberg 与 Paimon provider；StarRocks 已废弃，没有 active read capability，旧 `[connector.starrocks]` 配置会在启动解析阶段明确失败。
 
@@ -42,13 +42,13 @@ NovaRocks role=be  +  NovaRocks role=be  +  ...
 | 角色 | 作用 | 对外端口 |
 | --- | --- | --- |
 | `fe` | 接收 MySQL 连接，解析 SQL，优化计划，调度 fragment 到后端 | MySQL：`[standalone_server].mysql_port`；Native coordinator-report gRPC：`[server].grpc_port`；FE management HTTP：`[server].http_port` |
-| `be` | 执行 FE 下发的 fragment，处理 exchange 和结果回传 | Native fragment/exchange gRPC：`[server].grpc_port`；BE management HTTP：`[server].http_port` |
+| `be` | 执行 FE 下发的 fragment，处理 exchange、结果回传和 lifecycle control | Native Data gRPC：`[server].grpc_port`；Native Control gRPC：`[server].control_grpc_port`；BE management HTTP：`[server].http_port` |
 
 ## 前提条件
 
 - FE 节点和所有 BE 节点使用同一版本的 NovaRocks。
-- FE 节点可以访问每个 BE 的 `grpc_port`。
-- BE 节点可以访问 FE 的 `grpc_port`，用于向 coordinator 上报执行状态。
+- FE 节点可以访问每个 BE 的 advertised Data 与 Control endpoint；BE 之间可以访问对方的 advertised Data endpoint。
+- BE 节点可以访问 FE 原有的 `grpc_port`，用于 announce 与 coordinator report；FE 不为这些请求新增 BE Control listener。
 - 所有 FE/BE 配置必须有完全相同的 `[native_trust].deployment_id`、shared
   secret 与 transport mode；Native JWT 是 mandatory，TLS 只是在其上增加的可选层。
 - 所有 BE 节点都能访问相同的数据源、对象存储和 catalog。
@@ -79,11 +79,18 @@ cargo build
 
 ## 配置 BE 节点
 
-BE 节点使用 `server.grpc_port` 提供 Native NovaRocksGrpc 服务，使用独立的
-`server.http_port` 提供 BE-scoped management metrics。Native listener 不提供任何
-management route，management listener 也不提供 Native gRPC service。不同机器上的
-BE 可以都使用默认端口；同一 address family 内不能让任意 Native/management
-listener 复用相同端口，wildcard bind 也会与同端口具体地址冲突。
+BE 必须显式配置非零的 `[server].control_grpc_port`，并使它与 Data 的
+`[server].grpc_port`、management 的 `[server].http_port` 不同。Control 端口不会由
+Data 端口加一或缺省值推导。两条 Native listener 不提供 management route，management
+listener 也不提供 Native gRPC service。同一 address family 内不能让任意 listener
+复用相同 bind endpoint，wildcard bind 也会与同端口具体地址冲突。
+
+Data 与 Control 共用准确的 advertised reference host，并使用独立端口。
+`[cluster].advertise_port` 指定 Data 的外部端口；可选的
+`[cluster].advertise_control_port` 指定 Control 的外部端口，未配置时使用显式的
+`[server].control_grpc_port`。若部署使用 NAT 或端口映射，两个外部端口都必须映射到
+各自 listener，且 advertised Data 与 Control endpoint 必须不同。TLS 身份及防火墙规则
+必须同时覆盖这两条连接路径。
 
 示例 `be-1.toml`：
 
@@ -93,6 +100,7 @@ log_level = "info"
 [server]
 host = "0.0.0.0"
 grpc_port = 9080
+control_grpc_port = 9081
 http_port = 8040
 # Keep this aligned with terminationGracePeriodSeconds: 360 below.
 frontend_drain_timeout_ms = 300000
@@ -104,7 +112,11 @@ shared_secret = "${ENV:NOVAROCKS_NATIVE_SHARED_SECRET}"
 
 [cluster]
 role = "be"
+frontend_endpoint = "fe.native.example:9080"
 advertise_host = "10.0.0.11"
+# For NAT, set the exact externally reachable ports separately.
+# advertise_port = 29080
+# advertise_control_port = 29081
 
 [runtime.native_ingress]
 worker_threads = 8
@@ -127,8 +139,21 @@ enable_path_style_access = true
 ```
 
 `[runtime.native_ingress]` 的 BE 容量按 listener 生效，不是 FE 整集群查询配额。
-`ApplyTaskOperations` 使用 ordinary 运行/等待资格与普通消息界；
-`ApplyTaskControlOperations` 使用独立 control 资格、小请求界和有界控制执行器。
+Data listener 使用 `worker_threads` 与 ordinary 运行/等待资格；Control listener 有自己的
+线程、Tokio runtime、`control_worker_threads` 与 control 运行/等待资格。后者的小请求界
+和控制执行器不会排进 Data listener 的运行队列。
+
+RPC endpoint 由唯一的 Native method manifest 决定，认证后在读取 request body 和调用
+handler 前拒绝错误域，不转发到另一条 listener：
+
+| BE endpoint | 接受的方法 |
+| --- | --- |
+| Data | `ApplyTaskOperations`、`SubscribeTaskStatus`、`FetchTaskResult`、`FetchTaskDynamicFilters`、`GetFinalTaskInfo`、`PruneCatalogs`、`ExchangeUnary`、`TransmitRuntimeFilterEnvelope` |
+| Control | `ApplyTaskControlOperations`、`Heartbeat` |
+
+`AnnounceBackend` 发到 FE 原有 Native endpoint；已退役的 `FetchResult` 和 `Exchange`
+不因换一个端口而恢复。FE 每个已准入 attempt 冻结完整 BE descriptor，再按具体 RPC method
+选择其中的 Data 或 Control endpoint，不重新查询 membership，也不在 Control 缺失时拨 Data。
 消息尺寸门位于 protobuf 对象构造之前，Worker 的 Context reservation 仍是另一道
 独立门。等待资格可以设为零；`ordinary_running` 不得超过
 `max_blocking_threads`，`control_running` 不得超过 `control_worker_threads`，
@@ -146,10 +171,12 @@ NO_PROXY=127.0.0.1,localhost \
 启动成功后会输出：
 
 ```text
-NOVAROCKS_READY role=be grpc_port=9080 advertise_host=10.0.0.11 pid=<pid>
+NOVAROCKS_READY role=be grpc_port=9080 control_grpc_port=9081 advertise_host=10.0.0.11 pid=<pid>
 ```
 
-`role=be` 不提供 MySQL 端口，`--port` 参数对 BE 无效。
+BE readiness marker 在两条 advertised endpoint 的启动就绪检查成功后发布；其中两个
+`*_grpc_port` 是本地 bind 端口，不能替代 NAT 后的 advertised port。`role=be` 不提供
+MySQL 端口，`--port` 参数对 BE 无效。
 
 `[connector.object_store]` 是 native connector 读取 Iceberg 或 Paimon/S3 数据时使用的
 role-local 静态启动配置。静态绑定须使 FE metadata 用途和 BE execution 用途分别获得
@@ -242,6 +269,28 @@ NOVAROCKS_READY mysql_port=9030 pid=<pid>
 
 当前 MySQL 入口绑定在 `127.0.0.1`。如果需要远程访问，请在 FE 节点上使用 SSH tunnel、反向代理或本机客户端连接。
 
+## Native 握手资格与文件描述符基线
+
+BE 进程的 Native acquisition 资格按 Data 32、Control 8 独立计数，同类的实际
+accepted/dial 路径使用同一资格来源，两个类别不互借。listener 在应用 clone、connection
+任务和 TLS/H2 I/O 前取得资格；不足时关闭刚 accepted 的连接，不排一个无界握手队列。
+从 accept 开始的 2 秒绝对期限覆盖 TLS、preface 和初始 SETTINGS。只有 peer SETTINGS
+已成功校验并应用、初始本地 SETTINGS 与 ACK 已实际 flush 后才归还握手资格；失败或取消
+等待实际握手 owner 退出。成功后正常应用 stream 不再受这条握手期限约束。
+
+独立 listener/runtime 与 Control 8 个位置，使 Data 半开连接耗尽其 32 个握手位置时不会
+占用 Control 握手资格。这不是所有 CPU、socket、TLS、stream、缓存及外部 Connector
+owner 的完整资源隔离证明，也不代表已经发布 bounded-root/V1 支持。
+
+启动在 bind 前只通过 `getrlimit(RLIMIT_NOFILE)` 查询 soft/hard limit：BE 的 soft limit
+至少 1024，FE 至少 2048。不满足时启动失败；NovaRocks 不调用 `setrlimit` 自动提高限制。
+部署者应在进程启动环境或服务管理器中设置符合基线的限制。
+
+当前 BE Native 物理 stock 算术是 Data 518 + Control 20 + 2 listener + 2 accepted refusal
+transient，共 542 个 socket positions；1024 基线留下 482 的算术余量。查询和比较本身不
+预留这些 FD，也不证明 Connector、普通文件、OS scheduler 或其他进程内使用者已取得
+独立 FD headroom。FE 的 2048 是本角色 operational baseline，不由 BE 的 542 推导。
+
 ## Native 入口容量与观测
 
 BE management HTTP 的 `/metrics` 或 `/metrics?type=json` 提供当前 Native 门的具名读数。
@@ -256,6 +305,11 @@ BE management HTTP 的 `/metrics` 或 `/metrics?type=json` 提供当前 Native �
 `novarocks_backend_native_control_queue_wait_seconds` 和
 `novarocks_backend_worker_registry_lock_observation` 分别帮助区分 async 首次调度、
 普通 blocking 排队、控制执行器排队与 Worker registry 锁等待/持有。
+`novarocks_backend_task_preparation_snapshot_available` 为 1 时，本次 scrape 含有
+准确 preparation ledger；Worker registry 正忙或没有采样 owner 时为 0，本次响应
+省略 preparation 数值，不能将它解释成零占用或沿用上次读数。采样不等待 registry
+锁，因此持锁期间仍能观察真实 Control 执行器进展；registry poison 明确使 scrape
+失败。其他 owner 的采样仍有各自的同步边界。
 `novarocks_backend_saturation_source_available` 对尚未接入此读数面的 Exchange slot
 与内存账本报告 unavailable（值为零），不能把它解释成这些资源空闲。
 
@@ -289,7 +343,7 @@ mysql -h 127.0.0.1 -P 9030 -uroot
 SHOW BACKENDS;
 ```
 
-期望看到每个 BE 的 `Host`、`GrpcPort`、`State`、`Alive` 等字段。至少应有一个 BE 处于可用状态后再执行查询。
+检查每个 BE 的 `ProcessId`、`Endpoint`、`IdentityVerified` 与 `Eligible` 等字段。`Endpoint` 展示 Data endpoint；至少应有一个 BE `Eligible=true` 后再执行查询。
 
 执行最小查询：
 
@@ -312,7 +366,15 @@ backend_announce_initial_backoff_ms = 100
 backend_announce_max_backoff_ms = 2000
 ```
 
-BE 启动后创建新的 process identity，立即通过同一受 NWT-3 保护的 Native listener announce；FE 随后反向 heartbeat 该 endpoint，二者 descriptor 精确一致才调度新查询。`SHOW BACKENDS` 只读展示 `ProcessId`、lease、identity verification、reported state、compatibility 和 derived `Eligible`。`ADD BACKEND`、`DROP BACKEND`、`[cluster].backends` 均不是产品接口。
+BE 每次启动生成新的 UUIDv7 process identity，并向 `[cluster].frontend_endpoint` 指定的
+FE 原有 Native gRPC listener announce。不可变 descriptor 同时携带准确 Data endpoint、
+mandatory Control endpoint、deployment/build/compatibility 与 preparation positions；
+BE advertised Control 不依赖可选的 bounded-root 支持字段。
+
+FE 按该 descriptor 的 Control endpoint 反向 `Heartbeat`，并比较完整 descriptor。
+Data 或 Control endpoint 漂移都不能通过 exact heartbeat verification；同一 process
+identity 的不同 descriptor announce 也会拒绝。二者完全一致才调度新查询。
+`SHOW BACKENDS` 只读展示 `ProcessId`、lease、identity verification、reported state、compatibility 和 derived `Eligible`。`ADD BACKEND`、`DROP BACKEND`、`[cluster].backends` 均不是产品接口。
 
 ## 启停顺序
 
@@ -338,11 +400,12 @@ BE 启动后创建新的 process identity，立即通过同一受 NWT-3 保护�
 | 现象 | 处理方式 |
 | --- | --- |
 | `SHOW BACKENDS` 为空 | 确认 BE 已启动、`frontend_endpoint` 指向 FE Native listener，且所有 role 的 Native trust 配置一致。 |
-| BE 一直不 Eligible | 确认 FE 能访问 BE 的 advertised endpoint，并检查 announce、heartbeat、process identity 和 build diagnostics。 |
+| BE 一直不 Eligible | 确认 FE 能访问 BE 的两个 advertised endpoint，特别是 Heartbeat 的 Control 端口；检查 announce 与完整 heartbeat descriptor、process identity 和 build diagnostics。 |
 | `Unauthenticated` 或 native trust startup failure | 检查每个 FE/BE 的 `deployment_id`、environment-resolved secret 与 transport mode 完全一致；不要为恢复连接而删除 `[native_trust]`。 |
 | TLS handshake / certificate failure | 所有 role 必须使用同一 TLS mode；检查 advertised IP/DNS reference 与 certificate SAN，PEM mode 还要检查显式 trust roots。 |
 | 查询报 `role=fe: no live backend available` | 当前 FE 没有可调度的 live BE；先恢复或注册 BE。 |
 | FE 启动时提示缺少 catalog source | StaticFile mode 必须提供可读、完整的 snapshot file；DynamicStateStore mode 必须配置 `[state_store]`。不要使用 core metadata 或内存 registry 作为 fallback。 |
-| BE 启动时配置校验失败 | `role=be` 必须配置 `[cluster].frontend_endpoint`，且不能配置 FE heartbeat 或 lease 设置。 |
-| Native 或 management endpoint 冲突 | 让 FE MySQL、FE Native gRPC、FE management HTTP、BE Native gRPC、BE management HTTP 使用不重叠的 bind endpoint；同时检查 wildcard bind。 |
+| BE 启动时配置校验失败 | `role=be` 必须配置 `[cluster].frontend_endpoint` 和非零独立 `[server].control_grpc_port`，且不能配置 FE heartbeat 或 lease 设置。 |
+| Native 或 management endpoint 冲突 | 让 FE MySQL、FE Native gRPC、FE management HTTP、BE Data gRPC、BE Control gRPC、BE management HTTP 使用不重叠的 bind endpoint；同时检查 wildcard bind。 |
+| 启动拒绝 Native descriptor baseline | 检查 BE soft `RLIMIT_NOFILE` 至少 1024、FE 至少 2048；在启动环境设置，不依赖 Server 自动提高。 |
 | `/metrics` 在 gRPC port 不可用 | 改访问对应 role 的 `[server].http_port`；metrics 使用 role-local registry，不会跨 FE/BE 混合。 |

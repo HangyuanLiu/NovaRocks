@@ -1004,6 +1004,8 @@ mod tests {
             BackendProcessDescriptor::try_new(
                 BackendProcessId::new_v7(),
                 RuntimeEndpoint::new("127.0.0.1", 19040).expect("valid endpoint"),
+                RuntimeEndpoint::new("control-0.test.invalid", 19061)
+                    .expect("valid control endpoint"),
                 "test-deployment",
                 "different-build",
                 novarocks_types::NativeCompatibilityId::new([0x72; 32]),

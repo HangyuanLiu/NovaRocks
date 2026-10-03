@@ -38,12 +38,12 @@ import fixture_runtime as runtime
 
 HERE = Path(__file__).resolve().parent
 FILES = runtime.ENTRY_FILES
-LOCAL_RANGES = {"mysql": 9030, "fe_grpc": 9080, "be_grpc": 9280, "fe_http": 8240, "be_http": 8440}
+LOCAL_RANGES = {"mysql": 9030, "fe_grpc": 9080, "be_grpc": 9280, "be_control_grpc": 9480, "fe_http": 8240, "be_http": 8440}
 MANAGED = """NOVA_ENV_CONFIG_FILE NOVA_ENV_ID NOVA_ENV_SHARED_DOCKER NOVA_ENV_COMPOSE_PROJECT
 NOVA_ENV_RUNTIME_DIR NOVA_ENV_CURRENT_DIR NOVA_ENV_REST_ENV_FILE NOVA_ENV_MANIFEST NOVA_ENV_README
 NOVA_ENV_COMPOSE_FILE NOVA_ENV_COMPOSE_ENV NOVA_ENV_MINIO_PORT NOVA_ENV_MINIO_CONSOLE_PORT
 NOVA_ENV_REST_PORT NOVA_ENV_SPARK_UI_PORT NOVA_ENV_MYSQL_PORT NOVA_ENV_FE_GRPC_PORT
-NOVA_ENV_FE_HTTP_PORT NOVA_ENV_BE_GRPC_PORT NOVA_ENV_BE_HTTP_PORT NOVAROCKS_NATIVE_SHARED_SECRET
+NOVA_ENV_FE_HTTP_PORT NOVA_ENV_BE_GRPC_PORT NOVA_ENV_BE_CONTROL_GRPC_PORT NOVA_ENV_BE_HTTP_PORT NOVAROCKS_NATIVE_SHARED_SECRET
 AWS_S3_ENDPOINT AWS_S3_ACCESS_KEY_ID AWS_S3_SECRET_ACCESS_KEY MINIO_ROOT_USER MINIO_ROOT_PASSWORD
 iceberg_object_store_credential_name iceberg_object_store_credential_generation CATALOG_WAREHOUSE_URI
 NOVAROCKS_ICEBERG_TEST_WAREHOUSE NOVAROCKS_ICEBERG_REST_URI NOVA_ENV_REST_SERVER_WAREHOUSE_URI
@@ -189,6 +189,7 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
 
 def render_role_configs(staging: Path, stable: Path, env_id: str, ports: dict, trust: dict) -> None:
     for role in ("fe", "be"):
+        control = f'control_grpc_port = {ports["be_control_grpc"]}\n' if role == "be" else ""
         value = f'''[native_trust]
 deployment_id = {json_string(trust["deployment_id"])}
 shared_secret = "${{ENV:NOVAROCKS_NATIVE_SHARED_SECRET}}"
@@ -197,7 +198,7 @@ shared_secret = "${{ENV:NOVAROCKS_NATIVE_SHARED_SECRET}}"
 host = "127.0.0.1"
 http_port = {ports[role + "_http"]}
 grpc_port = {ports[role + "_grpc"]}
-
+{control}
 [cluster]
 role = "{role}"
 '''
@@ -356,13 +357,14 @@ def port_available(port: int) -> bool:
             return False
 
 
-def choose_ports(names: dict[str, int], offset: int, ranges: dict[str, int] | None = None) -> dict[str, int]:
+def choose_ports(names: dict[str, int], offset: int, ranges: dict[str, int] | None = None, *, reserved: set[int] | None = None) -> dict[str, int]:
     result = {}
+    reserved = reserved or set()
     for name, base in names.items():
         count = (ranges or {}).get(name, 199) + 1
         for index in range(count):
             port = base + (offset + index) % count
-            if port not in result.values() and port_available(port):
+            if port not in result.values() and port not in reserved and port_available(port):
                 result[name] = port
                 break
         else:
@@ -377,7 +379,10 @@ def request_config(workspace: Path, settings: dict, config_file: Path, entry: Pa
     offset = int(hashlib.sha1(str(workspace).encode()).hexdigest()[:8], 16)
     starts = {name: int(settings.get('NOVA_ENV_' + name.upper() + '_PORT_START', base)) for name, base in LOCAL_RANGES.items()}
     ranges = {name: int(settings.get('NOVA_ENV_' + name.upper() + '_PORT_RANGE', '199')) for name in LOCAL_RANGES}
-    ports = old_config.get('local_ports') or choose_ports(starts, offset, ranges)
+    ports = dict(old_config.get('local_ports') or {})
+    missing = {name: base for name, base in starts.items() if name not in ports}
+    if missing:
+        ports.update(choose_ports(missing, offset, ranges, reserved=set(ports.values())))
     benchmark_root = settings.get('NOVA_ENV_SHARED_BENCHMARK_ROOT', 's3://novarocks/shared/benchmarks')
     if not re.fullmatch(r's3://[^/\s]+/[^\s]+', benchmark_root):
         raise runtime.RuntimeFailure('InvalidConfiguration', 'benchmark root requires s3://bucket/prefix')

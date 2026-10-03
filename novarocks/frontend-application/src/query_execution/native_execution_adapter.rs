@@ -617,12 +617,10 @@ async fn acquire_replacement_admissions(
             .targets
             .get(&context.backend_process_id())
             .ok_or(ReplacementQualificationFailure::InvalidReservation)?;
-        backends.push((
-            context.backend_process_id(),
-            target
-                .endpoint()
-                .map_err(|_| ReplacementQualificationFailure::InvalidReservation)?,
-        ));
+        if target.descriptor().process_id() != context.backend_process_id() {
+            return Err(ReplacementQualificationFailure::InvalidReservation);
+        }
+        backends.push(target.descriptor().clone());
     }
     let notify = Arc::new(tokio::sync::Notify::new());
     let wake = Arc::new(NotifyWake::new(Arc::clone(&notify))) as Arc<dyn StatusIntakeWake>;
@@ -1331,12 +1329,7 @@ impl ProductionManifestAttemptProjection {
         let backends = manifest
             .contexts()
             .iter()
-            .map(|context| {
-                (
-                    context.backend().process_id(),
-                    context.backend().endpoint().clone(),
-                )
-            })
+            .map(|context| context.backend().target().descriptor().clone())
             .collect::<Vec<_>>();
         let mut round = crate::task_execution::manifest_round::assemble_manifest_round(
             manifest,
@@ -2207,6 +2200,7 @@ mod tests {
                 BackendProcessDescriptor::try_new(
                     process,
                     RuntimeEndpoint::new("127.0.0.1", 19100 + index as i32).unwrap(),
+                    RuntimeEndpoint::new(format!("control-{index}.test.invalid"), 19061).unwrap(),
                     "test-deployment",
                     "test-build",
                     NativeCompatibilityId::new([0x71; 32]),
@@ -2322,6 +2316,8 @@ mod tests {
                 let descriptor = BackendProcessDescriptor::try_new(
                     *process,
                     RuntimeEndpoint::new("127.0.0.1", 19050 + index as i32).expect("test endpoint"),
+                    RuntimeEndpoint::new(format!("control-{index}.test.invalid"), 19061)
+                        .expect("test control endpoint"),
                     "test-deployment",
                     "test-build",
                     NativeCompatibilityId::new([0x71; 32]),

@@ -171,6 +171,8 @@ pub struct ClusterConfig {
     pub frontend_endpoint: Option<String>,
     pub advertise_host: String,
     pub advertise_port: u16,
+    /// Explicit external Control port; absent means the explicit Control bind port.
+    pub advertise_control_port: Option<u16>,
     pub heartbeat_interval_ms: Option<u64>,
     pub heartbeat_timeout_retries: Option<u32>,
     pub backend_announce_lease_ttl_ms: Option<u64>,
@@ -210,6 +212,7 @@ impl Default for ClusterConfig {
             frontend_endpoint: None,
             advertise_host: String::new(),
             advertise_port: 0,
+            advertise_control_port: None,
             heartbeat_interval_ms: None,
             heartbeat_timeout_retries: None,
             backend_announce_lease_ttl_ms: None,
@@ -223,6 +226,9 @@ impl Default for ClusterConfig {
 impl ClusterConfig {
     /// Validate cluster config consistency. Called at startup after parsing.
     pub fn validate(&self) -> Result<(), String> {
+        if self.advertise_control_port == Some(0) {
+            return Err("[cluster].advertise_control_port must be nonzero".to_string());
+        }
         match self.role {
             ClusterRole::Fe if self.frontend_endpoint.is_some() => {
                 return Err("role=fe must not configure [cluster].frontend_endpoint".to_string());
@@ -579,6 +585,10 @@ impl NovaRocksConfig {
             .validate()
             .map_err(anyhow::Error::msg)
             .with_context(|| format!("validate [cluster]: {}", path.display()))?;
+        cfg.server
+            .validate_for_role(cfg.cluster.role)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("validate [server]: {}", path.display()))?;
         if cfg.native_trust.is_none() {
             bail!(
                 "config {}: missing required [native_trust] table",
@@ -806,6 +816,9 @@ pub struct ServerConfig {
     pub http_port: u16,
     #[serde(default = "default_grpc_port")]
     pub grpc_port: u16,
+    /// Required explicit BE Control listener port. No port is inferred from Data.
+    #[serde(default)]
+    pub control_grpc_port: Option<u16>,
     #[serde(default = "default_frontend_drain_timeout_ms")]
     pub frontend_drain_timeout_ms: u64,
     #[serde(default = "default_frontend_cleanup_timeout_ms")]
@@ -835,9 +848,33 @@ impl Default for ServerConfig {
             priority_networks: String::new(),
             http_port: default_http_port(),
             grpc_port: default_grpc_port(),
+            control_grpc_port: None,
             frontend_drain_timeout_ms: default_frontend_drain_timeout_ms(),
             frontend_cleanup_timeout_ms: default_frontend_cleanup_timeout_ms(),
         }
+    }
+}
+
+impl ServerConfig {
+    pub fn validate_for_role(&self, role: ClusterRole) -> std::result::Result<(), String> {
+        if self.grpc_port == self.http_port {
+            return Err("server.grpc_port and server.http_port must differ".to_string());
+        }
+        let control_port = match self.control_grpc_port {
+            Some(0) => return Err("[server].control_grpc_port must be nonzero".to_string()),
+            Some(port) => port,
+            None if role == ClusterRole::Be => {
+                return Err("role=be requires explicit [server].control_grpc_port".to_string());
+            }
+            None => return Ok(()),
+        };
+        if control_port == self.grpc_port || control_port == self.http_port {
+            return Err(
+                "server.control_grpc_port must differ from server.grpc_port and server.http_port"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -4007,6 +4044,39 @@ grpc_port = 19080
         )
         .expect("parse config");
         assert_eq!(cfg.server.grpc_port, 19080);
+    }
+
+    #[test]
+    fn control_listener_requires_an_explicit_disjoint_be_port() {
+        let mut server = super::ServerConfig::default();
+        assert_eq!(server.control_grpc_port, None);
+        assert!(server.validate_for_role(ClusterRole::Fe).is_ok());
+        assert!(server.validate_for_role(ClusterRole::Be).is_err());
+        for port in [0, server.grpc_port, server.http_port] {
+            server.control_grpc_port = Some(port);
+            assert!(server.validate_for_role(ClusterRole::Be).is_err());
+        }
+        server.control_grpc_port = Some(19082);
+        assert!(server.validate_for_role(ClusterRole::Be).is_ok());
+        let parsed: NovaRocksConfig = toml::from_str(
+            "[server]\ncontrol_grpc_port = 19082\n[cluster]\nadvertise_control_port = 29082\n",
+        )
+        .expect("parse explicit Control ports");
+        assert_eq!(parsed.server.control_grpc_port, Some(19082));
+        assert_eq!(parsed.cluster.advertise_control_port, Some(29082));
+    }
+
+    #[test]
+    fn control_advertise_port_rejects_zero_instead_of_inferring_a_port() {
+        let mut cluster = super::ClusterConfig::default();
+        assert_eq!(cluster.advertise_control_port, None);
+        cluster.advertise_control_port = Some(0);
+        assert!(
+            cluster
+                .validate()
+                .unwrap_err()
+                .contains("advertise_control_port")
+        );
     }
 
     #[test]

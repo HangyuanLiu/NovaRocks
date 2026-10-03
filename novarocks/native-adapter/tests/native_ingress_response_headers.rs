@@ -27,6 +27,7 @@ use hyper::http::{HeaderMap, HeaderValue, Request, Response};
 use novarocks_execution::runtime::fragment::io::{ResultWriteAdmission, ResultWriteCredit};
 use novarocks_native_adapter::native_ingress::NativeIngressService;
 use novarocks_native_adapter::native_server::NativeIngressConfig;
+use novarocks_proto_codec::native_rpc::{NativeEndpointDomain, NativeRpcMethod};
 use novarocks_worker::result_buffer::ResultRetainedBudget;
 use std::convert::Infallible;
 use std::future::{Future, Ready, ready};
@@ -108,7 +109,7 @@ impl Funded {
     }
     fn request(&self, body: Body) -> Request<Body> {
         let mut request = Request::builder()
-            .uri("/Test/FetchTaskResult")
+            .uri(NativeRpcMethod::FetchTaskResult.contract().path)
             .body(body)
             .unwrap();
         *request.headers_mut() = HeaderMap::try_from_allocation_pool(&self.maps).unwrap();
@@ -321,7 +322,13 @@ async fn spare_error_map_is_claimed_before_gate_wait_and_cancellation_physically
     let (body, polls, drops) = body(None);
     let request = funded.request(body);
     let (inner, calls, _) = inner(Mode::Ready);
-    let mut ingress = NativeIngressService::new(inner, config(0, 1), "Test", true);
+    let mut ingress = NativeIngressService::new(
+        inner,
+        config(0, 1),
+        "Ignored",
+        true,
+        NativeEndpointDomain::BackendData,
+    );
     let mut future = ingress.call(request);
     assert_eq!(
         funded.maps.available_maps(),
@@ -364,7 +371,13 @@ async fn invalid_deadline_and_content_length_keep_original_response_family_witho
                 .unwrap();
         }
         let (inner, calls, _) = inner(Mode::Ready);
-        let mut ingress = NativeIngressService::new(inner, config(1, 0), "Test", true);
+        let mut ingress = NativeIngressService::new(
+            inner,
+            config(1, 0),
+            "Ignored",
+            true,
+            NativeEndpointDomain::BackendData,
+        );
         let response = ingress.call(request).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(polls.load(Ordering::SeqCst), 0);
@@ -410,7 +423,13 @@ async fn timeout_after_inner_owns_request_uses_preclaimed_map_and_original_trans
         )
         .unwrap();
     let (inner, calls, future_exits) = inner(Mode::Pending);
-    let mut ingress = NativeIngressService::new(inner, config(1, 0), "Test", true);
+    let mut ingress = NativeIngressService::new(
+        inner,
+        config(1, 0),
+        "Ignored",
+        true,
+        NativeEndpointDomain::BackendData,
+    );
     let mut future = ingress.call(request);
     assert!(poll(future.as_mut()).is_pending());
     assert_eq!(
@@ -462,7 +481,13 @@ async fn preparation_shortage_reuses_cleared_input_without_service_or_body_poll(
         )
         .unwrap();
     let (inner, calls, _) = inner(Mode::Ready);
-    let mut ingress = NativeIngressService::new(inner, config(1, 0), "Test", true);
+    let mut ingress = NativeIngressService::new(
+        inner,
+        config(1, 0),
+        "Ignored",
+        true,
+        NativeEndpointDomain::BackendData,
+    );
     let future = ingress.call(request);
     assert_eq!(
         drops.load(Ordering::SeqCst),
@@ -493,7 +518,13 @@ async fn cancellation_after_request_moves_into_inner_retires_both_maps_on_future
     let (body, polls, drops) = body(None);
     let request = funded.request(body);
     let (inner, calls, future_exits) = inner(Mode::Pending);
-    let mut ingress = NativeIngressService::new(inner, config(1, 0), "Test", true);
+    let mut ingress = NativeIngressService::new(
+        inner,
+        config(1, 0),
+        "Ignored",
+        true,
+        NativeEndpointDomain::BackendData,
+    );
     let mut future = ingress.call(request);
     assert!(poll(future.as_mut()).is_pending());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -521,7 +552,13 @@ async fn fields_none_and_frontend_bypass_keep_their_existing_response_paths() {
         )
         .unwrap();
     let (delegate, calls, _) = inner(Mode::Ready);
-    let mut ingress = NativeIngressService::new(delegate, config(1, 0), "Test", true);
+    let mut ingress = NativeIngressService::new(
+        delegate,
+        config(1, 0),
+        "Ignored",
+        true,
+        NativeEndpointDomain::BackendData,
+    );
     let response = ingress.call(request).await.unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -542,7 +579,18 @@ async fn fields_none_and_frontend_bypass_keep_their_existing_response_paths() {
         )
         .unwrap();
     let (delegate, calls, _) = inner(Mode::Ready);
-    let mut ingress = NativeIngressService::new(delegate, config(0, 0), "Test", false);
+    *request.uri_mut() = NativeRpcMethod::AnnounceBackend
+        .contract()
+        .path
+        .parse()
+        .unwrap();
+    let mut ingress = NativeIngressService::new(
+        delegate,
+        config(0, 0),
+        "Ignored",
+        false,
+        NativeEndpointDomain::FrontendMembership,
+    );
     let response = ingress.call(request).await.unwrap();
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -573,7 +621,13 @@ async fn actual_ingress_and_tonic_chain_needs_four_live_maps_before_decode() {
         )
         .unwrap();
     let (inner, calls, _) = inner(Mode::Tonic);
-    let mut ingress = NativeIngressService::new(inner, config(1, 0), "Test", true);
+    let mut ingress = NativeIngressService::new(
+        inner,
+        config(1, 0),
+        "Ignored",
+        true,
+        NativeEndpointDomain::BackendData,
+    );
     let mut response = ingress.call(request).await.unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(drops.load(Ordering::SeqCst), 1);

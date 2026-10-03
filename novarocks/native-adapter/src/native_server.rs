@@ -37,11 +37,16 @@ mod initial_settings_tests;
 #[path = "native_acquisition_tests.rs"]
 mod acquisition_tests;
 
+#[cfg(test)]
+#[path = "native_control_listener_tests.rs"]
+mod control_listener_tests;
+
 use axum::Router;
 use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use novarocks_native_trust::{NativeIncomingAdapter, NativeServerAdmission, NativeTrust};
+use novarocks_proto_codec::native_rpc::NativeEndpointDomain;
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 use tonic::body::boxed;
@@ -140,6 +145,7 @@ impl NativeRpcServerHandle {
         native_trust: Arc<NativeTrust>,
         incoming_adapter: NativeIncomingAdapter,
         role_label: &'static str,
+        domain: NativeEndpointDomain,
         thread_name: &'static str,
         on_authentication_failure: F,
         on_transport_handshake_failure: H,
@@ -157,6 +163,7 @@ impl NativeRpcServerHandle {
             native_trust,
             incoming_adapter,
             role_label,
+            domain,
             thread_name,
             on_authentication_failure,
             on_transport_handshake_failure,
@@ -176,6 +183,7 @@ impl NativeRpcServerHandle {
         native_trust: Arc<NativeTrust>,
         incoming_adapter: NativeIncomingAdapter,
         role_label: &'static str,
+        domain: NativeEndpointDomain,
         thread_name: &'static str,
         on_authentication_failure: F,
         on_transport_handshake_failure: H,
@@ -195,6 +203,7 @@ impl NativeRpcServerHandle {
             native_trust,
             incoming_adapter,
             role_label,
+            domain,
             thread_name,
             on_authentication_failure,
             on_transport_handshake_failure,
@@ -214,6 +223,7 @@ impl NativeRpcServerHandle {
         native_trust: Arc<NativeTrust>,
         incoming_adapter: NativeIncomingAdapter,
         role_label: &'static str,
+        domain: NativeEndpointDomain,
         thread_name: &'static str,
         on_authentication_failure: F,
         on_transport_handshake_failure: H,
@@ -225,6 +235,29 @@ impl NativeRpcServerHandle {
         F: Fn() + Send + Sync + 'static,
         H: Fn() + Send + Sync + 'static,
     {
+        if let Some((_, class)) = transport_capacity.as_ref() {
+            let compatible = matches!(
+                (domain, class),
+                (NativeEndpointDomain::BackendData, TransportClass::Data)
+                    | (
+                        NativeEndpointDomain::BackendControl,
+                        TransportClass::Control
+                    )
+            );
+            if !compatible {
+                return Err("native endpoint domain and transport capacity class disagree".into());
+            }
+        }
+        let descriptor_capacity =
+            crate::native_fd_capacity::verify_native_file_descriptor_capacity(domain).map_err(
+                |error| format!("verify native {role_label} descriptor capacity: {error}"),
+            )?;
+        tracing::info!(
+            role = role_label,
+            endpoint_domain = ?domain,
+            descriptor_capacity = ?descriptor_capacity,
+            "native listener descriptor baseline verified"
+        );
         let address = (host, port)
             .to_socket_addrs()
             .map_err(|error| {
@@ -254,7 +287,10 @@ impl NativeRpcServerHandle {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let runtime = tokio::runtime::Builder::new_multi_thread()
                         .enable_all()
-                        .worker_threads(ingress_config.worker_threads)
+                        .worker_threads(match domain {
+                            NativeEndpointDomain::BackendControl => ingress_config.control_worker_threads,
+                            _ => ingress_config.worker_threads,
+                        })
                         .max_blocking_threads(ingress_config.max_blocking_threads)
                         .thread_stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)
                         .build()
@@ -265,26 +301,26 @@ impl NativeRpcServerHandle {
                         let listener = TokioTcpListener::from_std(listener).map_err(|error| {
                             format!("create Tokio native {role_label} gRPC listener: {error}")
                         })?;
-                        // FE consumes listener runtime sizing only. Its report
-                        // service keeps the native baseline message limits;
-                        // BE method limits belong solely to task ingress.
-                        let (ordinary_request_limit, ordinary_response_limit, control_request_limit, control_response_limit) =
-                            if role_label == "backend" {
-                                (
-                                    ingress_config.ordinary_request_max_bytes,
-                                    ingress_config.ordinary_response_max_bytes,
-                                    ingress_config.control_request_max_bytes,
-                                    ingress_config.control_response_max_bytes,
-                                )
-                            } else {
-                                (GRPC_MAX_MESSAGE_BYTES, GRPC_MAX_MESSAGE_BYTES, GRPC_MAX_MESSAGE_BYTES, GRPC_MAX_MESSAGE_BYTES)
-                            };
+                        // The explicit endpoint domain owns runtime admission
+                        // and generated-service limits. Labels are diagnostic.
+                        let (request_limit, response_limit) = match domain {
+                            NativeEndpointDomain::BackendData => (
+                                ingress_config.ordinary_request_max_bytes,
+                                ingress_config.ordinary_response_max_bytes,
+                            ),
+                            NativeEndpointDomain::BackendControl => (
+                                ingress_config.control_request_max_bytes,
+                                ingress_config.control_response_max_bytes,
+                            ),
+                            NativeEndpointDomain::FrontendMembership =>
+                                (GRPC_MAX_MESSAGE_BYTES, GRPC_MAX_MESSAGE_BYTES),
+                        };
                         let ordinary_service = NovaRocksGrpcServer::new(service.clone())
-                            .max_decoding_message_size(ordinary_request_limit)
-                            .max_encoding_message_size(ordinary_response_limit);
+                            .max_decoding_message_size(request_limit)
+                            .max_encoding_message_size(response_limit);
                         let control_service = NovaRocksGrpcServer::new(service)
-                            .max_decoding_message_size(control_request_limit)
-                            .max_encoding_message_size(control_response_limit);
+                            .max_decoding_message_size(request_limit)
+                            .max_encoding_message_size(response_limit);
                         let grpc_path = format!(
                             "/{}/*rest",
                             <NovaRocksGrpcServer<S> as NamedService>::NAME
@@ -304,7 +340,8 @@ impl NativeRpcServerHandle {
                             app,
                             ingress_config,
                             <NovaRocksGrpcServer<S> as NamedService>::NAME,
-                            role_label == "backend",
+                            domain != NativeEndpointDomain::FrontendMembership,
+                            domain,
                         );
                         let app = NativeListenerAuthService::new(
                             app,
@@ -366,11 +403,17 @@ impl NativeRpcServerHandle {
         }
     }
 
-    pub fn stop(&mut self) -> Result<(), String> {
+    /// Close this listener's admission before waiting for its runtime to exit.
+    /// Multiple independently owned listeners can all begin stopping first.
+    pub fn begin_stop(&mut self) {
         self.stop_requested.store(true, Ordering::Release);
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(true);
         }
+    }
+
+    pub fn stop(&mut self) -> Result<(), String> {
+        self.begin_stop();
         if let Some(join_handle) = self.join_handle.take() {
             join_handle
                 .join()

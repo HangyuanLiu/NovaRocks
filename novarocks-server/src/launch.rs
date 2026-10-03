@@ -224,6 +224,17 @@ fn load_role_config(mode: ServerLaunchMode, path: PathBuf) -> Result<RoleConfig>
     }
     let endpoints = role_bind_endpoints(expected, &config, &path)?;
     ensure_no_endpoint_overlap(&endpoints, &[])?;
+    // Observe the operational limit before any logging/runtime/listener startup.
+    // This check neither reserves descriptors nor advertises result support.
+    novarocks_native_adapter::native_fd_capacity::verify_native_file_descriptor_capacity_for_role(
+        expected,
+    )
+    .with_context(|| {
+        format!(
+            "verify {mode:?} Native descriptor baseline: {}",
+            path.display()
+        )
+    })?;
     let native_trust = build_role_native_trust_snapshot(expected, &config)
         .with_context(|| format!("construct {mode:?} native trust {}", path.display()))?;
     Ok(RoleConfig {
@@ -290,14 +301,17 @@ fn role_bind_endpoints(
     config: &NovaRocksConfig,
     path: &Path,
 ) -> Result<Vec<BindEndpoint>> {
-    if config.server.grpc_port == config.server.http_port {
-        bail!(
-            "{} config {}: server.grpc_port and server.http_port must differ (both {})",
-            role_name(role),
-            path.display(),
-            config.server.grpc_port
-        );
-    }
+    config
+        .server
+        .validate_for_role(role)
+        .map_err(anyhow::Error::msg)
+        .with_context(|| {
+            format!(
+                "{} config {}: invalid bind ports",
+                role_name(role),
+                path.display()
+            )
+        })?;
     let mut endpoints = vec![
         resolve_endpoint(
             role,
@@ -314,6 +328,18 @@ fn role_bind_endpoints(
             path,
         )?,
     ];
+    if role == ClusterRole::Be {
+        let control_port = config.server.control_grpc_port.ok_or_else(|| {
+            anyhow::anyhow!("role=be requires explicit [server].control_grpc_port")
+        })?;
+        endpoints.push(resolve_endpoint(
+            role,
+            "native control gRPC",
+            &config.server.host,
+            control_port,
+            path,
+        )?);
+    }
     if role == ClusterRole::Fe {
         let mysql_port = config
             .standalone_server
@@ -419,6 +445,11 @@ mod tests {
         let frontend_endpoint = (role == "be")
             .then_some("frontend_endpoint = \"127.0.0.1:19080\"\n")
             .unwrap_or_default();
+        let control_port = if role == "be" {
+            "control_grpc_port = 19082\n"
+        } else {
+            ""
+        };
         let catalog_source = if role == "fe" {
             let catalogs = path.with_extension("catalogs.toml");
             std::fs::write(&catalogs, "format_version = 3\ncatalogs = []\n")
@@ -433,7 +464,7 @@ mod tests {
         } else {
             String::new()
         };
-        std::fs::write(path, format!("{extra}\n[native_trust]\ndeployment_id = \"test-deployment\"\nshared_secret = \"0123456789abcdef0123456789abcdef\"\n\n[server]\nhost = \"{host}\"\ngrpc_port = {grpc}\nhttp_port = {http}\n\n[cluster]\nrole = \"{role}\"\n{frontend_endpoint}{mysql}{catalog_source}")).expect("write config");
+        std::fs::write(path, format!("{extra}\n[native_trust]\ndeployment_id = \"test-deployment\"\nshared_secret = \"0123456789abcdef0123456789abcdef\"\n\n[server]\nhost = \"{host}\"\ngrpc_port = {grpc}\n{control_port}http_port = {http}\n\n[cluster]\nrole = \"{role}\"\n{frontend_endpoint}{mysql}{catalog_source}")).expect("write config");
     }
 
     fn args(values: &[&str]) -> Vec<String> {
@@ -639,5 +670,69 @@ mod tests {
             resolve_server_launch(parsed).expect("resolve"),
             ResolvedServerLaunch::AllInOne { .. }
         ));
+    }
+
+    #[test]
+    fn be_control_port_preflight_rejects_missing_zero_and_local_conflicts() {
+        let fixture = tempfile::tempdir().unwrap();
+        let be = fixture.path().join("be.toml");
+        for control_line in [
+            "",
+            "control_grpc_port = 0\n",
+            "control_grpc_port = 19081\n",
+            "control_grpc_port = 18041\n",
+        ] {
+            write_config(&be, "be", "127.0.0.1", 19081, 18041, None, "");
+            let source = std::fs::read_to_string(&be).unwrap();
+            std::fs::write(
+                &be,
+                source.replace("control_grpc_port = 19082\n", control_line),
+            )
+            .unwrap();
+            let parsed = parse_standalone_launch_args(&args(&[
+                "--role",
+                "be",
+                "--config",
+                be.to_str().unwrap(),
+            ]))
+            .unwrap()
+            .unwrap();
+            assert!(launch_error(parsed).contains("control_grpc_port"));
+        }
+    }
+
+    #[test]
+    fn control_bind_participates_in_cross_role_conflict_preflight() {
+        let fixture = tempfile::tempdir().unwrap();
+        let fe = fixture.path().join("fe.toml");
+        let be = fixture.path().join("be.toml");
+        write_config(&fe, "fe", "0.0.0.0", 19080, 18040, Some(19030), "");
+        for port in [19080, 18040, 19030] {
+            write_config(&be, "be", "127.0.0.1", 19081, 18041, None, "");
+            let source = std::fs::read_to_string(&be).unwrap();
+            std::fs::write(
+                &be,
+                source.replace(
+                    "control_grpc_port = 19082",
+                    &format!("control_grpc_port = {port}"),
+                ),
+            )
+            .unwrap();
+            let parsed = parse_standalone_launch_args(&args(&[
+                "--role",
+                "all-in-one",
+                "--fe-config",
+                fe.to_str().unwrap(),
+                "--be-config",
+                be.to_str().unwrap(),
+            ]))
+            .unwrap()
+            .unwrap();
+            let error = launch_error(parsed);
+            assert!(
+                error.contains("bind endpoint conflict") && error.contains("native control gRPC"),
+                "{error}"
+            );
+        }
     }
 }

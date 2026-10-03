@@ -4,7 +4,7 @@ use bytes::Bytes;
 use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const QUANTUM: usize = 64;
 
@@ -13,7 +13,7 @@ const QUANTUM: usize = 64;
 pub enum HeaderFieldFillError<E> {
     /// The requested field exceeds the fixed per-field maximum.
     TooLarge,
-    /// No position, contiguous extent or nonwaiting checkout gate is available.
+    /// No position or contiguous extent is available.
     Exhausted,
     /// The callback failed; its original error is preserved unchanged.
     Fill(E),
@@ -26,7 +26,7 @@ struct Core {
     base: *mut u8,
     used: Vec<AtomicBool>,
     live: AtomicUsize,
-    checkout: AtomicBool,
+    checkout: Mutex<()>,
     bound: AtomicBool,
     capacity: usize,
     positions: usize,
@@ -34,7 +34,7 @@ struct Core {
     // The final Arc allocation, arena and bitmap exit before original credit.
     _ownership: Bytes,
 }
-// SAFETY: A nonwaiting checkout gate serializes disjoint extent claims. A claimed extent stays
+// SAFETY: A short checkout lock serializes disjoint extent claims and retirement. A claimed extent stays
 // immutable after publication until its final Bytes wrapper physically exits.
 // The arena never moves/grows and final Core destruction requires all owners.
 unsafe impl Send for Core {}
@@ -45,7 +45,9 @@ unsafe impl Sync for Core {}
 /// Obtain the complete allocation bound before construction, including every
 /// possible live Bytes owner wrapper. Fields occupy rounded 64-byte extents,
 /// rather than one maximum-sized buffer per field. Exhaustion or fragmentation
-/// refuses decoding without waiting or a heap fallback. All aliases retain the
+/// refuses decoding without a heap fallback. Extent claims serialize only the
+/// finite bitmap scan; fill callbacks execute outside that lock. This does not
+/// bound the operating system's mutex scheduling time. All aliases retain the
 /// original owner; a position is reusable only after its wrapper physically
 /// exits. This does not cover HeaderMap/table/pseudo-header metadata.
 pub struct HeaderFieldAllocationPool {
@@ -61,10 +63,12 @@ impl HeaderFieldAllocationPool {
         max_field: usize,
     ) -> io::Result<usize> {
         validate(capacity, positions, max_field)?;
+        let platform = mutex_backing_bytes()?;
         std::mem::size_of::<Core>()
             .checked_add(3 * std::mem::size_of::<usize>())
             .and_then(|n| n.checked_add(std::mem::align_of::<Core>()))
             .and_then(|n| n.checked_add(capacity))
+            .and_then(|n| n.checked_add(platform))
             .and_then(|n| n.checked_add((capacity / QUANTUM) * std::mem::size_of::<AtomicBool>()))
             .and_then(|n| {
                 Bytes::owner_with_exit_guard_metadata_size::<PoolField, FieldExit>()
@@ -89,20 +93,27 @@ impl HeaderFieldAllocationPool {
             .collect::<Vec<_>>();
         assert_eq!(arena.capacity(), capacity);
         assert_eq!(used.capacity(), capacity / QUANTUM);
-        Ok(Self {
-            core: Some(Arc::new(Core {
-                _arena: arena,
-                base,
-                used,
-                live: AtomicUsize::new(0),
-                checkout: AtomicBool::new(false),
-                bound: AtomicBool::new(false),
-                capacity,
-                positions,
-                max_field,
-                _ownership: ownership,
-            })),
-        })
+        let core = Arc::new(Core {
+            _arena: arena,
+            base,
+            used,
+            live: AtomicUsize::new(0),
+            checkout: Mutex::new(()),
+            bound: AtomicBool::new(false),
+            capacity,
+            positions,
+            max_field,
+            _ownership: ownership,
+        });
+        // Initialize the pinned std's lazy Darwin PAL allocation while the
+        // final Core is unpublished. Concurrent first lockers could otherwise
+        // allocate multiple temporary PAL Boxes despite one retained mutex.
+        drop(
+            core.checkout
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        Ok(Self { core: Some(core) })
     }
 
     /// Actual fixed arena capacity, including extent rounding and fragmentation.
@@ -153,11 +164,11 @@ impl HeaderFieldAllocationPool {
             return Ok(Bytes::new());
         }
         let blocks = len.div_ceil(QUANTUM);
-        self.core()
+        let checkout = self
+            .core()
             .checkout
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .map_err(|_| HeaderFieldFillError::Exhausted)?;
-        let _checkout = Checkout(&self.core().checkout);
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if self.core().live.load(Ordering::Acquire) == self.field_positions() {
             return Err(HeaderFieldFillError::Exhausted);
         }
@@ -179,6 +190,10 @@ impl HeaderFieldAllocationPool {
             used.store(true, Ordering::Relaxed);
         }
         self.core().live.fetch_add(1, Ordering::AcqRel);
+        // Only the fixed scan and claim execute under this lock. User fill,
+        // owner construction, publication and all payload destruction are
+        // outside it, permitting concurrent and reentrant disjoint fills.
+        drop(checkout);
         // This guard exists before callback/owner construction, so errors and
         // unwinding release the claim. No callback runs under a blocking lock.
         let exit = FieldExit {
@@ -186,7 +201,7 @@ impl HeaderFieldAllocationPool {
             start,
             blocks,
         };
-        // SAFETY: the exclusive checkout gate granted this exact disjoint extent. No
+        // SAFETY: the exclusive checkout lock granted this exact disjoint extent. No
         // whole-arena reference is formed, including while other fields live.
         let output =
             unsafe { std::slice::from_raw_parts_mut(self.core().base.add(start * QUANTUM), len) };
@@ -247,18 +262,39 @@ struct FieldExit {
 }
 impl Drop for FieldExit {
     fn drop(&mut self) {
+        let checkout = self
+            .pool
+            .core()
+            .checkout
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         for used in &self.pool.core().used[self.start..self.start + self.blocks] {
             used.store(false, Ordering::Release);
         }
         self.pool.core().live.fetch_sub(1, Ordering::AcqRel);
+        drop(checkout);
     }
 }
-// A bounded claim scan/callback never blocks a decoder on an alias destructor.
-// Concurrent or reentrant checkout refuses rather than waiting for this gate.
-struct Checkout<'a>(&'a AtomicBool);
-impl Drop for Checkout<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+fn mutex_backing_bytes() -> io::Result<usize> {
+    // Source-audited pinned Rust 1.92 std sys/sync/mutex/pthread.rs uses one
+    // Box<pal::Mutex>, whose sole field is UnsafeCell<pthread_mutex_t>.
+    // On supported 64-bit Darwin, that type is a signature plus 56 bytes.
+    // Linux's supported atomic-32 futex implementation has no heap backing.
+    // Revalidate this receipt when changing the pinned std/platform ABI.
+    #[cfg(all(target_os = "macos", target_pointer_width = "64"))]
+    {
+        Ok(std::alloc::Layout::new::<(isize, [u8; 56])>().size())
+    }
+    #[cfg(all(target_os = "linux", target_has_atomic = "32"))]
+    {
+        Ok(0)
+    }
+    #[cfg(not(any(
+        all(target_os = "macos", target_pointer_width = "64"),
+        all(target_os = "linux", target_has_atomic = "32")
+    )))]
+    {
+        Err(io::ErrorKind::Unsupported.into())
     }
 }
 fn invalid(message: &'static str) -> io::Error {

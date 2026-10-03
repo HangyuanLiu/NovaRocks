@@ -50,6 +50,8 @@ impl FrontendBackendSnapshot {
                 let descriptor = BackendProcessDescriptor::try_new(
                     BackendProcessId::new_v7(),
                     endpoint,
+                    RuntimeEndpoint::new(format!("control-{backend_idx}.test.invalid"), 19061)
+                        .map_err(|error| contract_error(error.to_string()))?,
                     "scheduler-test",
                     "scheduler-test",
                     novarocks_types::NativeCompatibilityId::new([0x71; 32]),

@@ -43,6 +43,7 @@ pub enum BackendReportedState {
 pub struct BackendProcessDescriptor {
     process_id: BackendProcessId,
     endpoint: RuntimeEndpoint,
+    control_endpoint: RuntimeEndpoint,
     deployment_id: String,
     build_identity: String,
     native_compatibility_id: NativeCompatibilityId,
@@ -54,11 +55,15 @@ impl BackendProcessDescriptor {
     pub fn try_new(
         process_id: BackendProcessId,
         endpoint: RuntimeEndpoint,
+        control_endpoint: RuntimeEndpoint,
         deployment_id: impl Into<String>,
         build_identity: impl Into<String>,
         native_compatibility_id: NativeCompatibilityId,
         preparing_positions: usize,
     ) -> Result<Self, BackendProcessDescriptorError> {
+        if endpoint == control_endpoint {
+            return Err(BackendProcessDescriptorError::IndependentEndpoints);
+        }
         if preparing_positions == 0 {
             return Err(BackendProcessDescriptorError::PreparingPositions);
         }
@@ -77,6 +82,7 @@ impl BackendProcessDescriptor {
         Ok(Self {
             process_id,
             endpoint,
+            control_endpoint,
             deployment_id,
             build_identity,
             native_compatibility_id,
@@ -85,14 +91,14 @@ impl BackendProcessDescriptor {
         })
     }
 
-    /// An independently configured control endpoint; it is never inferred
-    /// from the data endpoint or from the all-in-one topology.
+    /// Optional root support must use this process's already-frozen control
+    /// endpoint. Configuring independent endpoints does not advertise support.
     pub fn with_bounded_root_support(
         mut self,
         support: BoundedRootSupport,
     ) -> Result<Self, BackendProcessDescriptorError> {
-        if support.control_endpoint() == &self.endpoint {
-            return Err(BackendProcessDescriptorError::IndependentEndpoints);
+        if support.control_endpoint() != &self.control_endpoint {
+            return Err(BackendProcessDescriptorError::ConflictingControlEndpoint);
         }
         if self
             .bounded_root_support
@@ -122,6 +128,10 @@ impl BackendProcessDescriptor {
         &self.endpoint
     }
 
+    pub fn control_endpoint(&self) -> &RuntimeEndpoint {
+        &self.control_endpoint
+    }
+
     pub fn deployment_id(&self) -> &str {
         &self.deployment_id
     }
@@ -144,6 +154,7 @@ impl BackendProcessDescriptor {
 pub enum BackendProcessDescriptorError {
     PreparingPositions,
     IndependentEndpoints,
+    ConflictingControlEndpoint,
     ConflictingRootSupport,
     MissingRootSupport,
     DeploymentId,
@@ -154,8 +165,10 @@ impl fmt::Display for BackendProcessDescriptorError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::IndependentEndpoints => {
-                formatter.write_str("root control and data endpoints must be distinct")
+                formatter.write_str("backend control and data endpoints must be distinct")
             }
+            Self::ConflictingControlEndpoint => formatter
+                .write_str("bounded root support must use the frozen backend control endpoint"),
             Self::ConflictingRootSupport => {
                 formatter.write_str("backend root support is immutable")
             }
@@ -201,6 +214,7 @@ mod tests {
             BackendProcessDescriptor::try_new(
                 BackendProcessId::new_v7(),
                 endpoint.clone(),
+                RuntimeEndpoint::new("be-0.internal", 9061).unwrap(),
                 "",
                 "build",
                 NativeCompatibilityId::new([7; 32]),
@@ -212,6 +226,7 @@ mod tests {
             BackendProcessDescriptor::try_new(
                 BackendProcessId::new_v7(),
                 endpoint,
+                RuntimeEndpoint::new("be-0.internal", 9061).unwrap(),
                 "deployment",
                 "b".repeat(257),
                 NativeCompatibilityId::new([7; 32]),
@@ -228,6 +243,7 @@ mod tests {
         let base = BackendProcessDescriptor::try_new(
             BackendProcessId::new_v7(),
             RuntimeEndpoint::new("be", 9060).unwrap(),
+            RuntimeEndpoint::new("be", 9061).unwrap(),
             "deployment",
             "build",
             NativeCompatibilityId::new([7; 32]),
@@ -237,6 +253,10 @@ mod tests {
         assert_eq!(
             base.require_bounded_root_support(),
             Err(BackendProcessDescriptorError::MissingRootSupport)
+        );
+        assert_eq!(
+            base.control_endpoint(),
+            &RuntimeEndpoint::new("be", 9061).unwrap()
         );
         assert!(
             base.clone()
@@ -258,7 +278,50 @@ mod tests {
                 RuntimeEndpoint::new("be", 9062).unwrap(),
                 RootProfileId::V1,
             )),
-            Err(BackendProcessDescriptorError::ConflictingRootSupport)
+            Err(BackendProcessDescriptorError::ConflictingControlEndpoint)
+        );
+    }
+
+    #[test]
+    fn mandatory_control_endpoint_is_distinct_and_part_of_exact_process_facts() {
+        let process = BackendProcessId::new_v7();
+        let data = RuntimeEndpoint::new("be", 9060).unwrap();
+        assert_eq!(
+            BackendProcessDescriptor::try_new(
+                process,
+                data.clone(),
+                data.clone(),
+                "deployment",
+                "build",
+                NativeCompatibilityId::new([7; 32]),
+                4096,
+            ),
+            Err(BackendProcessDescriptorError::IndependentEndpoints),
+        );
+        let descriptor = |port| {
+            BackendProcessDescriptor::try_new(
+                process,
+                data.clone(),
+                RuntimeEndpoint::new("be", port).unwrap(),
+                "deployment",
+                "build",
+                NativeCompatibilityId::new([7; 32]),
+                4096,
+            )
+            .unwrap()
+        };
+        let first = descriptor(9061);
+        let replacement = descriptor(9062);
+        assert_eq!(first.process_id(), replacement.process_id());
+        assert_eq!(first.endpoint(), replacement.endpoint());
+        assert_ne!(first, replacement);
+        assert!(first.bounded_root_support().is_none());
+        assert_eq!(
+            first.with_bounded_root_support(crate::native_result_support::BoundedRootSupport::new(
+                RuntimeEndpoint::new("be", 9062).unwrap(),
+                novarocks_result_contract::RootProfileId::V1,
+            )),
+            Err(BackendProcessDescriptorError::ConflictingControlEndpoint),
         );
     }
 }

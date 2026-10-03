@@ -41,7 +41,9 @@ use novarocks_execution::task_execution::{
     FinalTaskInfo, MaxWait, OperationOutcome, ResultByteLimit, ResultPacketSequence, TaskIdentity,
     TaskOperationId,
 };
+use novarocks_execution_contract::BackendProcessDescriptor;
 use novarocks_proto_codec::FieldPath;
+use novarocks_proto_codec::native_rpc::NativeRpcMethod;
 use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
 use novarocks_query_application::{
     api::{QueryExecutionError, QueryExecutionErrorKind},
@@ -397,7 +399,7 @@ impl fmt::Debug for NativeTaskResultTransport {
 )]
 impl NativeTaskResultTransport {
     pub(crate) fn new(
-        backends: &[(BackendProcessId, RuntimeEndpoint)],
+        backends: &[BackendProcessDescriptor],
         data_runtime: FrontendDataRuntime,
         grace: TaskReadGrace,
     ) -> Result<Self, String> {
@@ -406,12 +408,13 @@ impl NativeTaskResultTransport {
         }
         let mut clients = BTreeMap::new();
         let mut endpoints = BTreeMap::new();
-        for (process_id, endpoint) in backends {
-            let client = Client::new(endpoint.native_endpoint().clone(), data_runtime.clone());
-            if clients.insert(*process_id, client).is_some() {
+        for descriptor in backends {
+            let process_id = descriptor.process_id();
+            let client = Client::for_backend(descriptor.clone(), data_runtime.clone());
+            if clients.insert(process_id, client).is_some() {
                 return Err(format!("duplicate backend process {process_id}"));
             }
-            endpoints.insert(*process_id, endpoint.clone());
+            endpoints.insert(process_id, descriptor.endpoint().clone());
         }
         Ok(Self {
             clients,
@@ -463,15 +466,18 @@ impl NativeTaskResultTransport {
             let wait = max_wait.get();
             let deadline = grace.deadline_for(wait);
             let expires_at = tokio::time::Instant::now() + deadline;
-            let mut grpc = tokio::time::timeout_at(expires_at, client.grpc_with_channel_error())
-                .await
-                .map_err(|_| {
-                    NativeRootResultFetchError::infrastructure(format!(
-                        "{address}: root result poll for task {root_task} could not acquire a \
+            let mut grpc = tokio::time::timeout_at(
+                expires_at,
+                client.grpc_with_channel_error(NativeRpcMethod::FetchTaskResult),
+            )
+            .await
+            .map_err(|_| {
+                NativeRootResultFetchError::infrastructure(format!(
+                    "{address}: root result poll for task {root_task} could not acquire a \
                          channel within {deadline:?}"
-                    ))
-                })?
-                .map_err(|error| NativeRootResultFetchError::infrastructure(error.to_string()))?;
+                ))
+            })?
+            .map_err(|error| NativeRootResultFetchError::infrastructure(error.to_string()))?;
             let response = tokio::time::timeout_at(expires_at, grpc.fetch_task_result(request))
                 .await
                 .map_err(|_| {
@@ -666,15 +672,18 @@ impl TaskResultTransport for NativeTaskResultTransport {
         let deadline = self.grace.deadline_for(std::time::Duration::ZERO);
         let response = self.data_runtime.block_on(async {
             let expires_at = tokio::time::Instant::now() + deadline;
-            let mut grpc = tokio::time::timeout_at(expires_at, client.grpc_with_channel_error())
-                .await
-                .map_err(|_| {
-                    format!(
-                        "{address}: final info read for task {identity} could not acquire a \
+            let mut grpc = tokio::time::timeout_at(
+                expires_at,
+                client.grpc_with_channel_error(NativeRpcMethod::GetFinalTaskInfo),
+            )
+            .await
+            .map_err(|_| {
+                format!(
+                    "{address}: final info read for task {identity} could not acquire a \
                          channel within {deadline:?}"
-                    )
-                })?
-                .map_err(|error| error.to_string())?;
+                )
+            })?
+            .map_err(|error| error.to_string())?;
             tokio::time::timeout_at(expires_at, grpc.get_final_task_info(request))
                 .await
                 .map_err(|_| {
@@ -723,15 +732,17 @@ impl TaskResultTransport for NativeTaskResultTransport {
             .data_runtime
             .block_on(async {
                 let expires_at = tokio::time::Instant::now() + DYNAMIC_FILTER_READ_TIMEOUT;
-                let mut grpc =
-                    tokio::time::timeout_at(expires_at, client.grpc_with_channel_error())
-                        .await
-                        .map_err(|_| {
-                            DynamicFilterReadError::Unavailable(format!(
-                                "{address}: dynamic filter read could not acquire a channel in time"
-                            ))
-                        })?
-                        .map_err(|error| DynamicFilterReadError::Unavailable(error.to_string()))?;
+                let mut grpc = tokio::time::timeout_at(
+                    expires_at,
+                    client.grpc_with_channel_error(NativeRpcMethod::FetchTaskDynamicFilters),
+                )
+                .await
+                .map_err(|_| {
+                    DynamicFilterReadError::Unavailable(format!(
+                        "{address}: dynamic filter read could not acquire a channel in time"
+                    ))
+                })?
+                .map_err(|error| DynamicFilterReadError::Unavailable(error.to_string()))?;
                 tokio::time::timeout_at(expires_at, grpc.fetch_task_dynamic_filters(request))
                     .await
                     .map_err(|_| {

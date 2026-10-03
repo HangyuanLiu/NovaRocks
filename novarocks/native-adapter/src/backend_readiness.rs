@@ -31,14 +31,11 @@ use crate::BackendDataRuntime;
 pub fn wait_for_backend_native_endpoint_ready(
     runtime: &BackendDataRuntime,
     endpoint: NativeEndpoint,
+    class: crate::native_transport_capacity::TransportClass,
     timeout: Duration,
 ) -> Result<(), String> {
     let connector = runtime.native_transport().connector_for(endpoint.clone())?;
-    let channel_endpoint = crate::native_client::capacity_endpoint(
-        runtime,
-        &endpoint,
-        crate::native_transport_capacity::TransportClass::Data,
-    )?;
+    let channel_endpoint = crate::native_client::capacity_endpoint(runtime, &endpoint, class)?;
     let connector = tower::service_fn(move |_| {
         let connector = connector.clone();
         async move {

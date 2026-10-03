@@ -8,6 +8,7 @@ use tonic::transport::Channel;
 
 use crate::metrics::observe_backend_heartbeat_rtt;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
+use novarocks_execution_contract::BackendProcessDescriptor as FrozenBackendDescriptor;
 use novarocks_native_trust::NativeClientAuthInterceptor;
 use novarocks_proto_codec::catalog::{
     PruneCatalogsOutcome, PruneCatalogsRequest, PruneCatalogsResponse,
@@ -15,6 +16,7 @@ use novarocks_proto_codec::catalog::{
 use novarocks_proto_codec::membership::{
     BackendProcessDescriptor, BackendProcessId as ProtocolBackendProcessId, parse_reported_state,
 };
+use novarocks_proto_codec::native_rpc::{NativeEndpointDomain, NativeRpcMethod};
 use novarocks_query_application::api::HeartbeatOutcome;
 use novarocks_types::{BackendProcessId, NativeEndpoint};
 
@@ -40,10 +42,14 @@ pub(crate) fn prune_catalogs(
     request: &PruneCatalogsRequest,
     timeout: Duration,
 ) -> Result<CatalogPruneDispatchOutcome, String> {
-    let client = Client::new(endpoint.native_endpoint().clone(), data_runtime.clone());
+    let client = Client::for_endpoint(
+        endpoint.native_endpoint().clone(),
+        NativeEndpointDomain::BackendData,
+        data_runtime.clone(),
+    );
     let response = data_runtime.block_on(async {
         tokio::time::timeout(timeout, async {
-            let mut grpc = client.grpc().await?;
+            let mut grpc = client.grpc(NativeRpcMethod::PruneCatalogs).await?;
             grpc.prune_catalogs(Request::new(request.as_proto().clone()))
                 .await
                 .map(|response| response.into_inner())
@@ -97,38 +103,96 @@ impl std::fmt::Display for ChannelAcquisitionError {
 impl std::error::Error for ChannelAcquisitionError {}
 
 #[derive(Clone)]
+enum FrozenClientEndpoints {
+    Backend(FrozenBackendDescriptor),
+    Single {
+        endpoint: NativeEndpoint,
+        domain: NativeEndpointDomain,
+    },
+}
+
+#[derive(Clone)]
 pub(super) struct Client {
-    endpoint: NativeEndpoint,
+    endpoints: FrozenClientEndpoints,
     data_runtime: FrontendDataRuntime,
 }
 
 impl Client {
-    pub(super) fn new(endpoint: NativeEndpoint, data_runtime: FrontendDataRuntime) -> Self {
+    pub(super) fn for_backend(
+        descriptor: FrozenBackendDescriptor,
+        data_runtime: FrontendDataRuntime,
+    ) -> Self {
         Self {
-            endpoint,
+            endpoints: FrozenClientEndpoints::Backend(descriptor),
             data_runtime,
         }
     }
 
-    async fn grpc(&self) -> Result<AuthenticatedNovaRocksGrpcClient, String> {
-        self.grpc_with_channel_error()
+    pub(super) fn for_endpoint(
+        endpoint: NativeEndpoint,
+        domain: NativeEndpointDomain,
+        data_runtime: FrontendDataRuntime,
+    ) -> Self {
+        Self {
+            endpoints: FrozenClientEndpoints::Single { endpoint, domain },
+            data_runtime,
+        }
+    }
+
+    fn endpoint_for(
+        &self,
+        method: NativeRpcMethod,
+    ) -> Result<&NativeEndpoint, ChannelAcquisitionError> {
+        let domain = method.contract().endpoint;
+        if !method.is_allowed_at(domain) {
+            return Err(ChannelAcquisitionError::fatal(
+                "retired Native method cannot acquire a channel",
+            ));
+        }
+        match &self.endpoints {
+            FrozenClientEndpoints::Backend(descriptor) => match domain {
+                NativeEndpointDomain::BackendData => Ok(descriptor.endpoint().native_endpoint()),
+                NativeEndpointDomain::BackendControl => {
+                    Ok(descriptor.control_endpoint().native_endpoint())
+                }
+                NativeEndpointDomain::FrontendMembership => Err(ChannelAcquisitionError::fatal(
+                    "backend descriptor cannot address frontend membership",
+                )),
+            },
+            FrozenClientEndpoints::Single {
+                endpoint,
+                domain: frozen_domain,
+            } if *frozen_domain == domain => Ok(endpoint),
+            FrozenClientEndpoints::Single { .. } => Err(ChannelAcquisitionError::fatal(
+                "Native method conflicts with the frozen endpoint domain",
+            )),
+        }
+    }
+
+    async fn grpc(
+        &self,
+        method: NativeRpcMethod,
+    ) -> Result<AuthenticatedNovaRocksGrpcClient, String> {
+        self.grpc_with_channel_error(method)
             .await
             .map_err(|error| error.to_string())
     }
 
     pub(super) async fn grpc_with_channel_error(
         &self,
+        method: NativeRpcMethod,
     ) -> Result<AuthenticatedNovaRocksGrpcClient, ChannelAcquisitionError> {
-        self.grpc_with_channel_identity()
+        self.grpc_with_channel_identity(method)
             .await
             .map(|(grpc, _)| grpc)
     }
 
     pub(super) async fn grpc_with_channel_identity(
         &self,
+        method: NativeRpcMethod,
     ) -> Result<(AuthenticatedNovaRocksGrpcClient, CachedNativeChannel), ChannelAcquisitionError>
     {
-        let acquired = channel(&self.data_runtime, self.endpoint.clone()).await?;
+        let acquired = channel(&self.data_runtime, self.endpoint_for(method)?.clone()).await?;
         let grpc = NovaRocksGrpcClient::with_interceptor(
             acquired.channel.clone(),
             NativeClientAuthInterceptor::new(self.data_runtime.native_trust().as_ref().clone()),
@@ -138,9 +202,15 @@ impl Client {
         Ok((grpc, acquired))
     }
 
-    pub(super) fn invalidate_channel_if_current(&self, acquired: &CachedNativeChannel) -> bool {
-        self.data_runtime
-            .invalidate_channel_if_current(&self.endpoint, acquired)
+    pub(super) fn invalidate_channel_if_current(
+        &self,
+        method: NativeRpcMethod,
+        acquired: &CachedNativeChannel,
+    ) -> bool {
+        self.endpoint_for(method).is_ok_and(|endpoint| {
+            self.data_runtime
+                .invalidate_channel_if_current(endpoint, acquired)
+        })
     }
 }
 
@@ -193,10 +263,14 @@ pub(crate) fn heartbeat(
 ) -> HeartbeatOutcome {
     let started = Instant::now();
     let outcome = (|| -> Result<_, String> {
-        let client = Client::new(endpoint.native_endpoint().clone(), data_runtime.clone());
+        let client = Client::for_endpoint(
+            endpoint.native_endpoint().clone(),
+            NativeEndpointDomain::BackendControl,
+            data_runtime.clone(),
+        );
         data_runtime.block_on(async {
             tokio::time::timeout(timeout, async {
-                let mut grpc = client.grpc().await?;
+                let mut grpc = client.grpc(NativeRpcMethod::Heartbeat).await?;
                 grpc.heartbeat(Request::new(
                     novarocks_proto_models::novarocks::HeartbeatRequest {
                         expected_process_id: Some(
@@ -262,4 +336,68 @@ fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_millis().try_into().unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn frozen_method_manifest_selects_exact_endpoints_and_refuses_other_domains() {
+        let descriptor = FrozenBackendDescriptor::try_new(
+            BackendProcessId::new_v7(),
+            RuntimeEndpoint::new("data.test.invalid", 19060).unwrap(),
+            RuntimeEndpoint::new("control.test.invalid", 19061).unwrap(),
+            "routing-test",
+            "routing-test",
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+            4096,
+        )
+        .unwrap();
+        let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        let client = Client::for_backend(descriptor.clone(), runtime.clone());
+        for method in [
+            NativeRpcMethod::ApplyTaskOperations,
+            NativeRpcMethod::FetchTaskResult,
+            NativeRpcMethod::SubscribeTaskStatus,
+            NativeRpcMethod::FetchTaskDynamicFilters,
+            NativeRpcMethod::GetFinalTaskInfo,
+            NativeRpcMethod::PruneCatalogs,
+        ] {
+            assert_eq!(
+                client.endpoint_for(method).unwrap(),
+                descriptor.endpoint().native_endpoint()
+            );
+        }
+        for method in [
+            NativeRpcMethod::ApplyTaskControlOperations,
+            NativeRpcMethod::Heartbeat,
+        ] {
+            assert_eq!(
+                client.endpoint_for(method).unwrap(),
+                descriptor.control_endpoint().native_endpoint()
+            );
+        }
+        for method in [
+            NativeRpcMethod::AnnounceBackend,
+            NativeRpcMethod::RetiredFetchResult,
+            NativeRpcMethod::RetiredExchange,
+        ] {
+            assert!(matches!(
+                client.endpoint_for(method),
+                Err(ChannelAcquisitionError::Fatal(_))
+            ));
+        }
+        let only_data = Client::for_endpoint(
+            descriptor.endpoint().native_endpoint().clone(),
+            NativeEndpointDomain::BackendData,
+            runtime,
+        );
+        assert!(matches!(
+            only_data
+                .grpc_with_channel_error(NativeRpcMethod::Heartbeat)
+                .await,
+            Err(ChannelAcquisitionError::Fatal(_))
+        ));
+    }
 }

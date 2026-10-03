@@ -300,6 +300,8 @@ mod tests {
                             9030 + i32::try_from(backend_idx).expect("fixture backend index"),
                         )
                         .expect("valid loopback endpoint"),
+                        RuntimeEndpoint::new(format!("control-{backend_idx}.test.invalid"), 19061)
+                            .expect("valid control endpoint"),
                         "test-deployment",
                         "test-build",
                         novarocks_types::NativeCompatibilityId::new([0x71; 32]),
@@ -326,6 +328,8 @@ mod tests {
                 BackendProcessDescriptor::try_new(
                     BackendProcessId::new_v7(),
                     RuntimeEndpoint::new("127.0.0.1", 9030).expect("valid loopback endpoint"),
+                    RuntimeEndpoint::new("control.test.invalid", 19061)
+                        .expect("valid control endpoint"),
                     "test-deployment",
                     "test-build",
                     novarocks_types::NativeCompatibilityId::new([0x71; 32]),

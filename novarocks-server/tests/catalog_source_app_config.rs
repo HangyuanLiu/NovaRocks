@@ -131,6 +131,9 @@ mode = "managed-controller"
         &config,
         format!(
             r#"
+[server]
+control_grpc_port = 9480
+
 [cluster]
 role = "be"
 frontend_endpoint = "127.0.0.1:9000"

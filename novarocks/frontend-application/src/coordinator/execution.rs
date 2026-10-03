@@ -819,10 +819,12 @@ impl FrontendDistributedQueryCoordinator {
                 // reach a process this attempt never placed a task on.
                 continue;
             };
-            let endpoint = target
-                .endpoint()
-                .map_err(|error| failed(error.to_string()))?;
-            backends.push((process_id, endpoint));
+            if target.descriptor().process_id() != process_id {
+                return Err(failed(
+                    "scheduled backend process differs from its frozen descriptor",
+                ));
+            }
+            backends.push(target.descriptor().clone());
             admission_epochs.insert(process_id, target.admission_epoch_capability());
             preparing_positions.insert(process_id, target.descriptor().preparing_positions());
         }
@@ -2880,6 +2882,8 @@ mod tests {
             process_id,
             RuntimeEndpoint::new(endpoint.ip().to_string(), i32::from(endpoint.port()))
                 .expect("test endpoint"),
+            RuntimeEndpoint::new(format!("control-{process_id}.test.invalid"), 19061)
+                .expect("test control endpoint"),
             "test-deployment",
             native_build_identity(),
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),

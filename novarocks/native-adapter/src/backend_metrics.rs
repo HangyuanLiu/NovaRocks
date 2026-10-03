@@ -42,6 +42,7 @@ pub struct BackendMetricsRegistry {
     process_memory: Option<(ProcessMemoryObservation, ProcessMemoryGauges)>,
     task_preparation: Option<std::sync::Arc<novarocks_worker::TaskExecutionRegistry>>,
     task_preparation_gauges: IntGaugeVec,
+    preparation_snapshot_available: IntGauge,
     scrape_lock: std::sync::Mutex<()>,
 }
 
@@ -88,6 +89,14 @@ impl BackendMetricsRegistry {
         registry
             .register(Box::new(task_preparation_gauges.clone()))
             .map_err(|error| format!("register task preparation metrics: {error}"))?;
+        let preparation_snapshot_available = IntGauge::with_opts(Opts::new(
+            "novarocks_backend_task_preparation_snapshot_available",
+            "Whether this scrape obtained the exact Worker preparation charge ledger.",
+        ))
+        .map_err(|error| format!("construct preparation snapshot availability: {error}"))?;
+        registry
+            .register(Box::new(preparation_snapshot_available.clone()))
+            .map_err(|error| format!("register preparation snapshot availability: {error}"))?;
         let collectors = [
             Box::new(Lazy::force(&BACKEND_QUERY_EXECUTION_RESOURCES).clone())
                 as Box<dyn prometheus::core::Collector>,
@@ -145,6 +154,7 @@ impl BackendMetricsRegistry {
             process_memory: None,
             task_preparation: None,
             task_preparation_gauges,
+            preparation_snapshot_available,
             scrape_lock: std::sync::Mutex::new(()),
         })
     }
@@ -258,11 +268,19 @@ impl BackendMetricsRegistry {
         self
     }
 
-    fn gather(&self) -> Vec<prometheus::proto::MetricFamily> {
+    fn gather(&self) -> Result<Vec<prometheus::proto::MetricFamily>, String> {
         // Keep owner sampling, gauge projection and collection in one scrape order.
         let _scrape = self.scrape_lock.lock().expect("backend metric scrape lock");
-        if let Some(owner) = &self.task_preparation {
-            let snapshot = owner.preparation_snapshot();
+        let preparation = self
+            .task_preparation
+            .as_ref()
+            .map(|owner| owner.try_preparation_snapshot())
+            .transpose()
+            .map_err(|error| format!("sample Worker preparation charge ledger: {error}"))?
+            .flatten();
+        self.preparation_snapshot_available
+            .set(i64::from(preparation.is_some()));
+        if let Some(snapshot) = preparation {
             for (resource, used, limit) in [
                 ("positions", snapshot.positions, snapshot.position_limit),
                 (
@@ -323,7 +341,13 @@ impl BackendMetricsRegistry {
         if let Some(observation) = &self.worker_registry_lock {
             publish_worker_registry_lock(observation.snapshot());
         }
-        self.registry.gather()
+        let mut families = self.registry.gather();
+        if preparation.is_none() {
+            // This scrape has no exact ledger. Previously sampled values must
+            // not appear as current values, and unavailable is not zero usage.
+            families.retain(|family| family.get_name() != "novarocks_backend_task_preparation");
+        }
+        Ok(families)
     }
 }
 
@@ -931,7 +955,7 @@ pub(crate) fn render_metrics(metrics: &BackendMetricsRegistry) -> Result<String,
     let encoder = TextEncoder::new();
     let mut buf = Vec::new();
     encoder
-        .encode(&metrics.gather(), &mut buf)
+        .encode(&metrics.gather()?, &mut buf)
         .map_err(|e| format!("encode prometheus metrics failed: {e}"))?;
     String::from_utf8(buf).map_err(|e| format!("prometheus metrics were not utf-8: {e}"))
 }
@@ -940,7 +964,7 @@ pub(crate) fn render_metrics(metrics: &BackendMetricsRegistry) -> Result<String,
 pub(crate) fn render_metrics_json(metrics: &BackendMetricsRegistry) -> Result<String, String> {
     refresh_backend_gauges();
     let mut rows = Vec::new();
-    for family in metrics.gather() {
+    for family in metrics.gather()? {
         for metric in family.get_metric() {
             let mut tags = serde_json::Map::new();
             tags.insert(
@@ -1041,6 +1065,274 @@ mod tests {
     use prometheus::{IntGauge, Opts, Registry};
 
     use super::*;
+
+    struct UnusedPreparationHost;
+
+    impl novarocks_worker::QueryContextHost for UnusedPreparationHost {
+        fn materialize(
+            &self,
+            _: novarocks_worker::SharedFactsRequest<'_>,
+        ) -> Result<(), novarocks_worker::HostRejection> {
+            panic!("metrics fixture must not materialize a context")
+        }
+        fn release(
+            &self,
+            _: novarocks_execution_contract::QueryContextRef,
+        ) -> novarocks_worker::ReleasedContextEvidence {
+            panic!("metrics fixture must not release a context")
+        }
+        fn advance_shared_domain(
+            &self,
+            _: novarocks_execution_contract::QueryContextRef,
+            _: &novarocks_execution_contract::task_execution::operation::QueryContextDomainUpdate,
+        ) -> Result<(), novarocks_worker::HostRejection> {
+            panic!("metrics fixture must not advance a context")
+        }
+    }
+
+    impl novarocks_worker::TaskExecutionHost for UnusedPreparationHost {
+        fn close_context_admission(&self, _: novarocks_execution_contract::QueryContextRef) {}
+        fn retire_context_execution(&self, _: novarocks_execution_contract::QueryContextRef) {}
+        fn forget_context_admission(&self, _: novarocks_execution_contract::QueryContextRef) {}
+        fn install_receiver(
+            &self,
+            _: &novarocks_execution_contract::task_execution::descriptor::TaskDescriptor,
+            _: novarocks_execution_contract::task_execution::creation::TaskCreationInput,
+        ) -> Result<novarocks_worker::PreparedTaskInstallation, novarocks_worker::HostRejection>
+        {
+            panic!("metrics fixture must not install a task")
+        }
+        fn remove_receiver(
+            &self,
+            _: &novarocks_execution_contract::task_execution::descriptor::TaskDescriptor,
+        ) {
+        }
+        fn install_inbound_capability(
+            &self,
+            _: &novarocks_execution_contract::task_execution::descriptor::TaskDescriptor,
+        ) -> Result<(), novarocks_worker::HostRejection> {
+            panic!("metrics fixture must not install an inbound capability")
+        }
+        fn remove_inbound_capability(
+            &self,
+            _: &novarocks_execution_contract::task_execution::descriptor::TaskDescriptor,
+        ) {
+        }
+        fn submit_runnable(
+            &self,
+            _: &novarocks_execution_contract::task_execution::descriptor::TaskDescriptor,
+            _: novarocks_worker::TaskStatusReporter,
+        ) -> Result<Arc<dyn novarocks_worker::RunnableTask>, novarocks_worker::HostRejection>
+        {
+            panic!("metrics fixture must not submit a task")
+        }
+        fn apply_task_domain(
+            &self,
+            _: &novarocks_execution_contract::task_execution::descriptor::TaskDescriptor,
+            _: &novarocks_execution_contract::task_execution::operation::TaskDomainUpdate,
+        ) -> Result<Option<u64>, novarocks_worker::HostRejection> {
+            panic!("metrics fixture must not advance a task")
+        }
+    }
+
+    fn preparation_owner() -> Arc<novarocks_worker::TaskExecutionRegistry> {
+        novarocks_worker::TaskExecutionRegistry::new(
+            novarocks_worker::TaskExecutionRegistryConfig::for_process(
+                novarocks_types::BackendProcessId::new_v7(),
+                17,
+                29,
+            ),
+            Arc::new(novarocks_worker::ManualClock::new()),
+            Arc::new(UnusedPreparationHost),
+            Arc::new(UnusedPreparationHost),
+            crate::task_execution_observation::backend_task_execution_ports(),
+        )
+    }
+
+    fn assert_preparation_unavailable(prometheus: &str, json: &str) {
+        assert!(prometheus.contains("novarocks_backend_task_preparation_snapshot_available 0"));
+        assert!(
+            !prometheus.contains("novarocks_backend_task_preparation{"),
+            "{prometheus}"
+        );
+        let rows: serde_json::Value = serde_json::from_str(json).expect("metrics JSON");
+        let rows = rows.as_array().expect("metric rows");
+        assert!(rows.iter().any(|row| row["tags"]["metric"]
+            == "novarocks_backend_task_preparation_snapshot_available"
+            && row["value"].as_f64() == Some(0.0)));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row["tags"]["metric"] == "novarocks_backend_task_preparation")
+        );
+    }
+
+    #[test]
+    fn preparation_without_owner_is_unavailable_in_both_formats() {
+        let backend = BackendMetricsRegistry::new().expect("Backend metrics");
+        backend
+            .task_preparation_gauges
+            .with_label_values(&["positions", "used"])
+            .set(123);
+        assert_preparation_unavailable(
+            &render_metrics(&backend).unwrap(),
+            &render_metrics_json(&backend).unwrap(),
+        );
+    }
+
+    #[test]
+    fn preparation_projects_exact_owner_ledger_in_both_formats() {
+        let owner = preparation_owner();
+        let snapshot = owner.preparation_snapshot();
+        let backend = BackendMetricsRegistry::new()
+            .expect("Backend metrics")
+            .with_task_preparation(owner);
+        backend
+            .task_preparation_gauges
+            .with_label_values(&["positions", "used"])
+            .set(123);
+        let prometheus = render_metrics(&backend).expect("exact preparation scrape");
+        let json = render_metrics_json(&backend).expect("exact preparation JSON");
+        assert!(prometheus.contains("novarocks_backend_task_preparation_snapshot_available 1"));
+        let rows: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let rows = rows.as_array().unwrap();
+        assert!(rows.iter().any(|row| row["tags"]["metric"]
+            == "novarocks_backend_task_preparation_snapshot_available"
+            && row["value"].as_f64() == Some(1.0)));
+        for (resource, used, limit) in [
+            ("positions", snapshot.positions, snapshot.position_limit),
+            (
+                "context_positions",
+                snapshot.context_positions,
+                snapshot.context_position_limit,
+            ),
+            (
+                "queued_positions",
+                snapshot.queued_positions,
+                snapshot.position_limit,
+            ),
+            ("workers", snapshot.workers, snapshot.worker_limit),
+            ("bytes", snapshot.bytes, snapshot.byte_limit),
+        ] {
+            for (dimension, value) in [("used", used), ("limit", limit)] {
+                assert!(prometheus.contains(&format!("novarocks_backend_task_preparation{{dimension=\"{dimension}\",resource=\"{resource}\"}} {value}")), "{prometheus}");
+                assert!(
+                    rows.iter().any(|row| row["tags"]["metric"]
+                        == "novarocks_backend_task_preparation"
+                        && row["tags"]["resource"] == resource
+                        && row["tags"]["dimension"] == dimension
+                        && row["value"].as_f64() == Some(value as f64)),
+                    "{json}"
+                );
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn preparation_busy_scrape_omits_stale_values_without_blocking_control_metrics() {
+        let owner = preparation_owner();
+        let backend = Arc::new(
+            BackendMetricsRegistry::new()
+                .unwrap()
+                .with_task_preparation(Arc::clone(&owner))
+                .with_worker_registry_lock(owner.registry_lock_observation()),
+        );
+        assert!(
+            render_metrics(&backend)
+                .unwrap()
+                .contains("novarocks_backend_task_preparation_snapshot_available 1")
+        );
+        backend
+            .task_preparation_gauges
+            .with_label_values(&["positions", "used"])
+            .set(123);
+        let _ = BACKEND_NATIVE_INGRESS_SLOTS.with_label_values(&["control", "running", "used"]);
+        native_control_queue_wait("started", std::time::Duration::from_millis(2));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            owner.with_registry_lock_for_test(|| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("actual registry lock acquired");
+        let metrics = Arc::clone(&backend);
+        let (rendered_tx, rendered_rx) = std::sync::mpsc::channel();
+        let scrape = std::thread::spawn(move || {
+            rendered_tx
+                .send((render_metrics(&metrics), render_metrics_json(&metrics)))
+                .unwrap();
+        });
+        let rendered = rendered_rx.recv_timeout(std::time::Duration::from_secs(5));
+        // Always release the real lock before asserting the nonblocking oracle.
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        scrape.join().unwrap();
+        let (prometheus, json) =
+            rendered.expect("both metrics formats must finish while the registry lock is held");
+        let prometheus = prometheus.unwrap();
+        let json = json.unwrap();
+        assert_preparation_unavailable(&prometheus, &json);
+        assert!(prometheus.contains("novarocks_backend_native_ingress_slots{class=\"control\",dimension=\"used\",phase=\"running\"}"));
+        assert!(prometheus.contains(
+            "novarocks_backend_native_control_queue_wait_seconds_count{outcome=\"started\"}"
+        ));
+        assert!(prometheus.contains("novarocks_backend_worker_registry_lock_observation"));
+        let rows: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let rows = rows.as_array().unwrap();
+        for name in [
+            "novarocks_backend_native_ingress_slots",
+            "novarocks_backend_native_control_queue_wait_seconds_count",
+            "novarocks_backend_worker_registry_lock_observation",
+        ] {
+            assert!(
+                rows.iter().any(|row| row["tags"]["metric"] == name),
+                "{json}"
+            );
+        }
+        assert!(
+            render_metrics(&backend)
+                .unwrap()
+                .contains("novarocks_backend_task_preparation_snapshot_available 1")
+        );
+        assert!(
+            render_metrics_json(&backend)
+                .unwrap()
+                .contains("novarocks_backend_task_preparation\"")
+        );
+        assert_eq!(
+            backend
+                .task_preparation_gauges
+                .with_label_values(&["positions", "used"])
+                .get(),
+            0
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn preparation_poison_is_an_error_in_both_formats() {
+        let owner = preparation_owner();
+        let backend = BackendMetricsRegistry::new()
+            .unwrap()
+            .with_task_preparation(Arc::clone(&owner));
+        let poison = std::thread::spawn(move || {
+            owner.with_registry_lock_for_test(|| panic!("poison actual registry mutex"))
+        });
+        assert!(poison.join().is_err());
+        for result in [render_metrics(&backend), render_metrics_json(&backend)] {
+            let error = result.expect_err("poison must not become busy or zero usage");
+            assert!(
+                error.contains("sample Worker preparation charge ledger"),
+                "{error}"
+            );
+            assert!(error.to_ascii_lowercase().contains("poison"), "{error}");
+        }
+    }
 
     #[test]
     fn query_resource_scrape_replaces_stale_gauge() {

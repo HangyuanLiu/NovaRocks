@@ -77,9 +77,11 @@ const TASK_DEADLINE_TICK_INTERVAL: Duration = Duration::from_millis(100);
 pub struct BackendServerConfig {
     pub bind_host: String,
     pub grpc_port: u16,
+    pub control_grpc_port: u16,
     pub metrics_http_port: u16,
     pub native_ingress: crate::native_server::NativeIngressConfig,
     pub advertise_endpoint: AdvertiseEndpoint,
+    pub advertise_control_endpoint: AdvertiseEndpoint,
     /// Server-resolved Native caller authentication and transport material.
     /// Backend receives this immutable capability and never reads trust source
     /// configuration or credentials itself.
@@ -171,6 +173,7 @@ impl std::error::Error for BackendApplicationError {}
 pub struct BackendApplicationHost {
     ready_marker: String,
     grpc_server: NativeRpcServerHandle,
+    control_grpc_server: NativeRpcServerHandle,
     execution_runtime: Arc<ExecutionRuntime>,
     root_producer_pool: Arc<RootProducerPool>,
     task_completion_supervisor: Arc<novarocks_worker::TaskCompletionSupervisor>,
@@ -511,7 +514,14 @@ impl BackendApplicationHost {
     /// can dial.  A wildcard bind remains a listener concern; composition must
     /// use loopback rather than attempting to connect to `0.0.0.0` or `::`.
     pub fn connectable_native_endpoint(&self) -> SocketAddr {
-        let bound = self.grpc_server.bound_addr();
+        Self::connectable_bound_address(self.grpc_server.bound_addr())
+    }
+
+    pub fn connectable_control_native_endpoint(&self) -> SocketAddr {
+        Self::connectable_bound_address(self.control_grpc_server.bound_addr())
+    }
+
+    fn connectable_bound_address(bound: SocketAddr) -> SocketAddr {
         let ip = if bound.ip().is_unspecified() {
             match bound.ip() {
                 std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
@@ -541,6 +551,10 @@ impl BackendApplicationHost {
     ) -> Result<Option<BackendApplicationError>, BackendApplicationError> {
         for (component, failure) in [
             ("grpc_listener", self.grpc_server.poll_failure()),
+            (
+                "control_grpc_listener",
+                self.control_grpc_server.poll_failure(),
+            ),
             ("metrics_http", self.metrics_http_server.poll_failure()),
             (
                 "task_deadline_tick",
@@ -577,7 +591,10 @@ impl BackendApplicationHost {
         self.task_deadline_tick.stop();
         // Close ingress before draining drivers, so no CreateTask can
         // install a new completion slot behind the shutdown boundary.
-        let listener_shutdown = self.grpc_server.stop();
+        self.grpc_server.begin_stop();
+        self.control_grpc_server.begin_stop();
+        let listener_shutdown =
+            combine_shutdown_results(self.grpc_server.stop(), self.control_grpc_server.stop());
         // Cancel and join root producers before driver pending_finish waits.
         // Completion of this join does not free pool backings; their owner is
         // still retained here until Host destruction.
@@ -608,9 +625,11 @@ impl BackendApplicationHost {
         let BackendServerConfig {
             bind_host,
             grpc_port,
+            control_grpc_port,
             metrics_http_port,
             native_ingress,
             advertise_endpoint,
+            advertise_control_endpoint,
             native_trust,
             native_compatibility_id,
             function_set,
@@ -632,6 +651,15 @@ impl BackendApplicationHost {
             execution_role_binding_factories,
             process_memory,
         } = config;
+        if control_grpc_port == 0
+            || control_grpc_port == grpc_port
+            || control_grpc_port == metrics_http_port
+        {
+            return Err(BackendApplicationError::new(
+                BackendApplicationErrorKind::Configuration,
+                "backend Native control port must be nonzero and distinct from data and management ports",
+            ));
+        }
         let readiness_endpoint = novarocks_types::NativeEndpoint::from_host_port(
             &advertise_endpoint.host,
             advertise_endpoint.port,
@@ -640,6 +668,31 @@ impl BackendApplicationHost {
             BackendApplicationError::new(
                 BackendApplicationErrorKind::Configuration,
                 format!("invalid advertised Native readiness endpoint: {error}"),
+            )
+        })?;
+        let control_readiness_endpoint = NativeEndpoint::from_host_port(
+            &advertise_control_endpoint.host,
+            advertise_control_endpoint.port,
+        )
+        .map_err(|error| {
+            BackendApplicationError::new(
+                BackendApplicationErrorKind::Configuration,
+                format!("invalid advertised Native control readiness endpoint: {error}"),
+            )
+        })?;
+        if readiness_endpoint == control_readiness_endpoint {
+            return Err(BackendApplicationError::new(
+                BackendApplicationErrorKind::Configuration,
+                "backend advertised Native control and data endpoints must be distinct",
+            ));
+        }
+        crate::native_fd_capacity::verify_native_file_descriptor_capacity(
+            novarocks_proto_codec::native_rpc::NativeEndpointDomain::BackendData,
+        )
+        .map_err(|error| {
+            BackendApplicationError::new(
+                BackendApplicationErrorKind::Configuration,
+                format!("verify backend Native file descriptor baseline: {error}"),
             )
         })?;
         // Reserve Native connection stock before any root producer can grow.
@@ -706,6 +759,16 @@ impl BackendApplicationHost {
                 BackendApplicationError::new(
                     BackendApplicationErrorKind::Configuration,
                     format!("resolve backend process endpoint: {error}"),
+                )
+            })?,
+            RuntimeEndpoint::new(
+                advertise_control_endpoint.host.clone(),
+                i32::from(advertise_control_endpoint.port),
+            )
+            .map_err(|error| {
+                BackendApplicationError::new(
+                    BackendApplicationErrorKind::Configuration,
+                    format!("resolve backend process control endpoint: {error}"),
                 )
             })?,
             native_trust.deployment_id().as_str(),
@@ -781,31 +844,35 @@ impl BackendApplicationHost {
             control_queue_capacity,
         )
         .map_err(|error| BackendApplicationError::new(BackendApplicationErrorKind::Start, error))?;
+        let service = BackendRpcService::new(
+            Arc::clone(&services.task_execution_ingress),
+            Arc::clone(&services.query_context_host)
+                as Arc<
+                    dyn novarocks_native_adapter::catalog_prune_rpc::CatalogReachabilityAuthority,
+                >,
+            runtime_filter_ingress,
+            Arc::clone(&services.exchange_receiver_port),
+            Arc::clone(&services.task_inbound_capabilities),
+            BackendHeartbeatResponder::new(
+                process_descriptor.clone(),
+                Arc::clone(&services.drain),
+                admission_epoch,
+            ),
+            control_executor,
+        );
         let mut grpc_server = match NativeRpcServerHandle::start_with_transport_capacity(
             &bind_host,
             grpc_port,
-            BackendRpcService::new(
-                Arc::clone(&services.task_execution_ingress),
-                Arc::clone(&services.query_context_host)
-                    as Arc<dyn novarocks_native_adapter::catalog_prune_rpc::CatalogReachabilityAuthority>,
-                runtime_filter_ingress,
-                Arc::clone(&services.exchange_receiver_port),
-                Arc::clone(&services.task_inbound_capabilities),
-                BackendHeartbeatResponder::new(
-                    process_descriptor.clone(),
-                    Arc::clone(&services.drain),
-                    admission_epoch,
-                ),
-                control_executor,
-            ),
-            native_trust,
+            service.clone(),
+            Arc::clone(&native_trust),
             native_transport.incoming_adapter(),
             "backend",
+            novarocks_proto_codec::native_rpc::NativeEndpointDomain::BackendData,
             "native-backend-grpc",
             novarocks_native_adapter::backend_metrics::record_backend_native_authentication_failure,
             novarocks_native_adapter::backend_metrics::record_backend_native_tls_handshake_failure,
             native_ingress,
-            transport_capacity,
+            transport_capacity.clone(),
             crate::native_transport_capacity::TransportClass::Data,
         ) {
             Ok(server) => server,
@@ -822,21 +889,67 @@ impl BackendApplicationHost {
             }
         };
 
-        if let Err(error) = wait_for_backend_native_endpoint_ready(
-            &readiness_runtime,
-            readiness_endpoint,
-            readiness_timeout,
+        let mut control_grpc_server = match NativeRpcServerHandle::start_with_transport_capacity(
+            &bind_host,
+            control_grpc_port,
+            service,
+            native_trust,
+            native_transport.incoming_adapter(),
+            "backend-control",
+            novarocks_proto_codec::native_rpc::NativeEndpointDomain::BackendControl,
+            "native-backend-control-grpc",
+            novarocks_native_adapter::backend_metrics::record_backend_native_authentication_failure,
+            novarocks_native_adapter::backend_metrics::record_backend_native_tls_handshake_failure,
+            native_ingress,
+            transport_capacity,
+            crate::native_transport_capacity::TransportClass::Control,
         ) {
-            let listener_result = grpc_server.stop();
-            let metrics_result = metrics_http_server.stop();
-            let primary = BackendApplicationError::new(
-                BackendApplicationErrorKind::Readiness,
-                format!("advertised endpoint readiness failed: {error}"),
-            );
-            return Err(append_cleanup_results(
-                primary,
-                [listener_result, metrics_result],
-            ));
+            Ok(server) => server,
+            Err(error) => {
+                grpc_server.begin_stop();
+                let primary = BackendApplicationError::new(
+                    BackendApplicationErrorKind::Start,
+                    format!(
+                        "start native backend control gRPC server on {bind_host}:{control_grpc_port}: {error}"
+                    ),
+                );
+                return Err(append_cleanup_results(
+                    primary,
+                    [grpc_server.stop(), metrics_http_server.stop()],
+                ));
+            }
+        };
+
+        for (endpoint, class) in [
+            (
+                readiness_endpoint,
+                crate::native_transport_capacity::TransportClass::Data,
+            ),
+            (
+                control_readiness_endpoint,
+                crate::native_transport_capacity::TransportClass::Control,
+            ),
+        ] {
+            if let Err(error) = wait_for_backend_native_endpoint_ready(
+                &readiness_runtime,
+                endpoint,
+                class,
+                readiness_timeout,
+            ) {
+                grpc_server.begin_stop();
+                control_grpc_server.begin_stop();
+                let listener_result = grpc_server.stop();
+                let control_listener_result = control_grpc_server.stop();
+                let metrics_result = metrics_http_server.stop();
+                let primary = BackendApplicationError::new(
+                    BackendApplicationErrorKind::Readiness,
+                    format!("advertised endpoint readiness failed: {error}"),
+                );
+                return Err(append_cleanup_results(
+                    primary,
+                    [listener_result, control_listener_result, metrics_result],
+                ));
+            }
         }
 
         let announce_task = BackendAnnounceSupervisor::start(
@@ -851,11 +964,12 @@ impl BackendApplicationHost {
 
         Ok(Self {
             ready_marker: format!(
-                "NOVAROCKS_READY role=be grpc_port={grpc_port} advertise_host={} pid={}",
+                "NOVAROCKS_READY role=be grpc_port={grpc_port} control_grpc_port={control_grpc_port} advertise_host={} pid={}",
                 advertise_endpoint.host,
                 std::process::id()
             ),
             grpc_server,
+            control_grpc_server,
             execution_runtime: services.execution_runtime,
             root_producer_pool: services.root_producer_pool,
             task_completion_supervisor: services.task_completion_supervisor,
@@ -1061,16 +1175,22 @@ mod tests {
     }
 
     fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
+        let control_grpc_port = unused_port();
         BackendServerConfig {
             memory_authority: novarocks_native_adapter::backend_test_support::test_memory_authority(
             ),
             bind_host: "127.0.0.1".to_string(),
             grpc_port,
+            control_grpc_port,
             metrics_http_port: unused_port(),
             native_ingress: crate::native_server::NativeIngressConfig::default(),
             advertise_endpoint: AdvertiseEndpoint {
                 host: "127.0.0.1".to_string(),
                 port: advertise_port,
+            },
+            advertise_control_endpoint: AdvertiseEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: control_grpc_port,
             },
             native_trust: novarocks_native_adapter::backend_test_support::test_backend_native_trust(
             ),
@@ -1312,10 +1432,85 @@ mod tests {
     }
 
     #[test]
+    fn control_port_validation_precedes_native_budget_and_all_listener_binds() {
+        let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
+        for collision in [0, 1, 2] {
+            let data_port = unused_port();
+            let mut config = backend_config(data_port, data_port);
+            let metrics_port = config.metrics_http_port;
+            config.control_grpc_port = match collision {
+                0 => 0,
+                1 => data_port,
+                _ => metrics_port,
+            };
+            // If validation moves behind stock construction, this different
+            // original-budget error wins and the oracle fails.
+            config.result_retained_limits =
+                WorkerResultRetainedLimits::try_new(16 * 1024 * 1024, 32 * 1024 * 1024).unwrap();
+            let error = BackendApplicationHost::open(config, test_data_runtime()).unwrap_err();
+            assert_eq!(error.kind(), BackendApplicationErrorKind::Configuration);
+            assert!(
+                error
+                    .to_string()
+                    .contains("control port must be nonzero and distinct")
+            );
+            let _data = TcpListener::bind(("127.0.0.1", data_port)).unwrap();
+            let _metrics = TcpListener::bind(("127.0.0.1", metrics_port)).unwrap();
+        }
+    }
+
+    #[test]
+    fn second_control_listener_bind_failure_joins_data_and_management_listeners() {
+        let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let control_port = occupied.local_addr().unwrap().port();
+        let data_port = unused_port();
+        let mut config = backend_config(data_port, data_port);
+        let metrics_port = config.metrics_http_port;
+        config.control_grpc_port = control_port;
+        config.advertise_control_endpoint.port = control_port;
+        let error = BackendApplicationHost::open(config, test_data_runtime()).unwrap_err();
+        assert_eq!(error.kind(), BackendApplicationErrorKind::Start);
+        assert!(
+            error
+                .to_string()
+                .contains("start native backend control gRPC server")
+        );
+        let _data = TcpListener::bind(("127.0.0.1", data_port)).unwrap();
+        let _metrics = TcpListener::bind(("127.0.0.1", metrics_port)).unwrap();
+        // The failed second bind never owns the other process's descriptor.
+        assert_eq!(occupied.local_addr().unwrap().port(), control_port);
+        drop(occupied);
+        let _control = TcpListener::bind(("127.0.0.1", control_port)).unwrap();
+    }
+
+    #[test]
+    fn control_readiness_failure_joins_both_native_and_management_listeners() {
+        let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
+        let data_port = unused_port();
+        let mut config = backend_config(data_port, data_port);
+        let control_port = config.control_grpc_port;
+        let metrics_port = config.metrics_http_port;
+        config.advertise_control_endpoint.host = "127.0.0.2".to_string();
+        let error = BackendApplicationHost::open_with_readiness_timeout(
+            config,
+            test_data_runtime(),
+            Duration::from_millis(25),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), BackendApplicationErrorKind::Readiness);
+        let _data = TcpListener::bind(("127.0.0.1", data_port)).unwrap();
+        let _control = TcpListener::bind(("127.0.0.1", control_port)).unwrap();
+        let _metrics = TcpListener::bind(("127.0.0.1", metrics_port)).unwrap();
+    }
+
+    #[test]
     fn readiness_failure_stops_and_joins_started_listener() {
         let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
         let grpc_port = unused_port();
         let mut config = backend_config(grpc_port, grpc_port);
+        let control_port = config.control_grpc_port;
+        let metrics_port = config.metrics_http_port;
         config.advertise_endpoint.host = "127.0.0.2".to_string();
         let error = BackendApplicationHost::open_with_readiness_timeout(
             config,
@@ -1327,6 +1522,8 @@ mod tests {
         assert_eq!(error.kind(), BackendApplicationErrorKind::Readiness);
         TcpListener::bind(("127.0.0.1", grpc_port))
             .expect("readiness cleanup must release the started listener");
+        let _control = TcpListener::bind(("127.0.0.1", control_port)).unwrap();
+        let _metrics = TcpListener::bind(("127.0.0.1", metrics_port)).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1358,13 +1555,31 @@ mod tests {
             .expect_err("Native RPC without JWT must fail before domain validation");
         assert_eq!(error.code(), tonic::Code::Unauthenticated);
         assert_eq!(error.message(), "native caller authentication failed");
+        let mut wrong_data_domain = NovaRocksGrpcClient::with_interceptor(
+            connect_live_channel(grpc_port).await,
+            test_backend_native_trust().client_interceptor(),
+        );
+        let error = wrong_data_domain
+            .heartbeat(HeartbeatRequest::default())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
+        let mut wrong_control_domain = NovaRocksGrpcClient::with_interceptor(
+            connect_live_channel(host.connectable_control_native_endpoint().port()).await,
+            test_backend_native_trust().client_interceptor(),
+        );
+        let error = wrong_control_domain
+            .apply_task_operations(protocol::ApplyTaskOperationsRequest::default())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
         let metrics = http_get(metrics_port, "/metrics").expect("read backend metrics");
         assert!(metrics.contains(
             "novarocks_native_authentication_failures_total{reason=\"authentication\"} 1"
         ));
 
         let mut authenticated = NovaRocksGrpcClient::with_interceptor(
-            connect_live_channel(grpc_port).await,
+            connect_live_channel(host.connectable_control_native_endpoint().port()).await,
             test_backend_native_trust().client_interceptor(),
         );
         let heartbeat = authenticated

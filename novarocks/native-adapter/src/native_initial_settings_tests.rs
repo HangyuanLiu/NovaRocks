@@ -27,6 +27,7 @@ use hyper::http::{Request, Response, Uri};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use novarocks_execution::runtime::fragment::io::ResultWriteAdmission;
 use novarocks_native_trust::NativeIncomingAdapter;
+use novarocks_proto_codec::native_rpc::NativeRpcMethod;
 use novarocks_types::NativeEndpoint;
 use novarocks_worker::result_buffer::ResultRetainedBudget;
 use std::convert::Infallible;
@@ -350,7 +351,10 @@ async fn completed_native_bootstrap_does_not_expire_a_long_application_stream() 
     let driver = tokio::spawn(async move { connection.await });
     let request = Request::builder()
         .method("POST")
-        .uri("http://localhost/long-stream")
+        .uri(format!(
+            "http://localhost{}",
+            NativeRpcMethod::SubscribeTaskStatus.contract().path
+        ))
         .body(())
         .unwrap();
     let (response, body) = sender.send_request(request, true).unwrap();

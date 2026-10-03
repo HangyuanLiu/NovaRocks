@@ -1739,6 +1739,8 @@ mod tests {
             process_id,
             RuntimeEndpoint::new("127.0.0.1", 19000 + ordinal as i32)
                 .expect("query control endpoint"),
+            RuntimeEndpoint::new(format!("control-{ordinal}.test.invalid"), 19061)
+                .expect("independent control endpoint"),
             "test-deployment",
             "test-build",
             NativeCompatibilityId::new([0x71; 32]),

@@ -381,6 +381,7 @@ pub enum ClusterProcessRole {
 pub struct BePorts {
     pub http: u16,
     pub grpc: u16,
+    pub control_grpc: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -763,7 +764,7 @@ pub struct CrossProcessClusterOptions {
 }
 
 /// Opt-in Native TCP proxies. An empty map leaves every BE endpoint unchanged.
-/// Each value bounds the forwarding buffers retained by that BE's proxy.
+/// Each value bounds the combined forwarding buffers retained by that BE's Data and Control proxies.
 #[derive(Debug, Clone, Default)]
 pub struct CrossProcessNativeFaultProxyConfig {
     pub backend_retained_byte_limits: BTreeMap<usize, u64>,
@@ -772,6 +773,7 @@ pub struct CrossProcessNativeFaultProxyConfig {
 #[derive(Default)]
 struct BackendNativeFaultProxies {
     proxies: BTreeMap<usize, NativeFaultProxy>,
+    control_proxies: BTreeMap<usize, NativeFaultProxy>,
 }
 
 impl BackendNativeFaultProxies {
@@ -792,9 +794,13 @@ impl BackendNativeFaultProxies {
         let mut result = Self::default();
         for (index, limit) in config.backend_retained_byte_limits {
             let upstream = ([127, 0, 0, 1], runtime.be[index].grpc).into();
-            let proxy = NativeFaultProxy::start(upstream, limit)
-                .with_context(|| format!("start Native fault proxy for BE[{index}]"))?;
+            let control_upstream = ([127, 0, 0, 1], runtime.be[index].control_grpc).into();
+            let (proxy, control_proxy) =
+                NativeFaultProxy::start_pair(upstream, control_upstream, limit).with_context(
+                    || format!("start Native Data and Control fault proxies for BE[{index}]"),
+                )?;
             result.proxies.insert(index, proxy);
+            result.control_proxies.insert(index, control_proxy);
         }
         Ok(result)
     }
@@ -812,20 +818,45 @@ impl BackendNativeFaultProxies {
             .collect()
     }
 
+    fn advertised_control_port(&self, index: usize) -> Option<u16> {
+        self.control_proxies
+            .get(&index)
+            .map(|proxy| proxy.address().port())
+    }
+
+    fn advertised_control_ports(&self, runtime: &CrossProcessRuntime) -> Vec<u16> {
+        runtime
+            .be
+            .iter()
+            .enumerate()
+            .map(|(index, ports)| {
+                self.advertised_control_port(index)
+                    .unwrap_or(ports.control_grpc)
+            })
+            .collect()
+    }
+
     fn disconnect_backend(&self, index: usize) {
         if let Some(proxy) = self.proxies.get(&index) {
+            proxy.control().disconnect_all();
+        }
+        if let Some(proxy) = self.control_proxies.get(&index) {
             proxy.control().disconnect_all();
         }
     }
 
     fn disconnect_all(&self) {
-        for proxy in self.proxies.values() {
+        for proxy in self.proxies.values().chain(self.control_proxies.values()) {
             proxy.control().disconnect_all();
         }
     }
 
     fn stop(&mut self) {
-        for proxy in self.proxies.values_mut() {
+        for proxy in self
+            .proxies
+            .values_mut()
+            .chain(self.control_proxies.values_mut())
+        {
             proxy.stop();
         }
     }
@@ -2560,6 +2591,7 @@ pub fn render_cross_process_config(
     server.insert("host".to_string(), Value::String("127.0.0.1".to_string()));
     match role {
         ClusterProcessRole::Fe => {
+            server.remove("control_grpc_port");
             server.insert(
                 "http_port".to_string(),
                 Value::Integer(i64::from(runtime.fe_http_port)),
@@ -2573,6 +2605,10 @@ pub fn render_cross_process_config(
             let be = &runtime.be[be_index];
             server.insert("http_port".to_string(), Value::Integer(i64::from(be.http)));
             server.insert("grpc_port".to_string(), Value::Integer(i64::from(be.grpc)));
+            server.insert(
+                "control_grpc_port".to_string(),
+                Value::Integer(i64::from(be.control_grpc)),
+            );
         }
     }
 
@@ -2611,9 +2647,13 @@ pub fn render_cross_process_config(
             cluster.insert("heartbeat_timeout_retries".to_string(), Value::Integer(2));
             cluster.remove("backends");
             cluster.remove("frontend_endpoint");
+            cluster.remove("advertise_control_port");
+            cluster.remove("advertise_port");
         }
         ClusterProcessRole::Be => {
             cluster.insert("role".to_string(), Value::String("be".to_string()));
+            cluster.remove("advertise_port");
+            cluster.remove("advertise_control_port");
             cluster.remove("backends");
             cluster.insert(
                 "frontend_endpoint".to_string(),
@@ -2673,6 +2713,7 @@ struct CrossProcessLaunchConfig<'a> {
     be_index: usize,
     runtime: &'a CrossProcessRuntime,
     be_advertised_grpc_port: Option<u16>,
+    be_advertised_control_grpc_port: Option<u16>,
     runtime_dir: &'a Path,
     query_lifecycle_faults_enabled: bool,
     cleanup_faults_enabled: bool,
@@ -2688,12 +2729,17 @@ fn render_cross_process_launch_config(config: CrossProcessLaunchConfig<'_>) -> R
         be_index,
         runtime,
         be_advertised_grpc_port,
+        be_advertised_control_grpc_port,
         runtime_dir,
         query_lifecycle_faults_enabled,
         cleanup_faults_enabled,
         overlays,
         native_trust_fixture,
     } = config;
+    ensure!(
+        be_advertised_grpc_port.is_some() == be_advertised_control_grpc_port.is_some(),
+        "Native fault proxies require both Data and Control advertised endpoints"
+    );
     let rendered = render_cross_process_config(base_config, role, be_index, runtime)?;
     let mut value = rendered
         .parse::<Value>()
@@ -2718,6 +2764,16 @@ fn render_cross_process_launch_config(config: CrossProcessLaunchConfig<'_>) -> R
         );
         cluster.insert(
             "advertise_port".to_string(),
+            Value::Integer(i64::from(port)),
+        );
+    }
+    if let Some(port) = be_advertised_control_grpc_port {
+        ensure!(
+            role == ClusterProcessRole::Be && port != 0,
+            "a Native Control proxy advertised port requires a BE and a nonzero port"
+        );
+        cluster.insert(
+            "advertise_control_port".to_string(),
             Value::Integer(i64::from(port)),
         );
     }
@@ -3026,6 +3082,7 @@ pub struct CrossProcessServerHandle {
     mysql_user: String,
     // FE-visible endpoints; runtime.be retains the real process listen ports.
     be_grpc_ports: Vec<u16>,
+    be_control_grpc_ports: Vec<u16>,
     native_fault_proxies: BackendNativeFaultProxies,
     fragment_failure_trigger_paths: Vec<PathBuf>,
     fragment_failure_tokens: Vec<Option<String>>,
@@ -3216,6 +3273,7 @@ impl CrossProcessServerHandle {
                 .map(|bp| BePorts {
                     http: bp.http.port(),
                     grpc: bp.grpc.port(),
+                    control_grpc: bp.control_grpc.port(),
                 })
                 .collect(),
             fe_http_port: reserved.fe_http_port.port(),
@@ -3225,6 +3283,7 @@ impl CrossProcessServerHandle {
         let native_proxy_config = proxy_config.clone();
         let native_fault_proxies = BackendNativeFaultProxies::start(&runtime, proxy_config)?;
         let be_grpc_ports = native_fault_proxies.advertised_ports(&runtime);
+        let be_control_grpc_ports = native_fault_proxies.advertised_control_ports(&runtime);
 
         validate_be_config_overrides(&config_overlay.be_by_index, cluster_size)?;
 
@@ -3255,6 +3314,9 @@ impl CrossProcessServerHandle {
                 runtime: &runtime,
                 be_advertised_grpc_port: (role == ClusterProcessRole::Be)
                     .then(|| native_fault_proxies.advertised_port(be_index))
+                    .flatten(),
+                be_advertised_control_grpc_port: (role == ClusterProcessRole::Be)
+                    .then(|| native_fault_proxies.advertised_control_port(be_index))
                     .flatten(),
                 runtime_dir: runtime_dir.path(),
                 query_lifecycle_faults_enabled,
@@ -3316,6 +3378,7 @@ impl CrossProcessServerHandle {
                     backend_environments: &be_environments,
                     native_proxy_config: &native_proxy_config,
                     advertised_backend_grpc_ports: &be_grpc_ports,
+                    advertised_backend_control_grpc_ports: &be_control_grpc_ports,
                 },
             )?;
 
@@ -3356,8 +3419,10 @@ impl CrossProcessServerHandle {
             .enumerate()
         {
             let grpc_port = reserved_be.grpc.port();
+            let control_grpc_port = reserved_be.control_grpc.port();
             let _ = reserved_be.http.release();
             let _ = reserved_be.grpc.release();
+            let _ = reserved_be.control_grpc.release();
             let identity_role = format!("be-{i}");
             let (be_process, be_launch_identity) = spawn_novarocks_process(ProcessLaunch {
                 binary: &be_binaries[i],
@@ -3375,9 +3440,10 @@ impl CrossProcessServerHandle {
                 launch_profile,
             })?;
             println!(
-                "started cross-process BE[{i}] pid={} grpc_port={} config={}",
+                "started cross-process BE[{i}] pid={} grpc_port={} control_grpc_port={} config={}",
                 be_process.pid(),
                 grpc_port,
+                control_grpc_port,
                 be_config_path.display()
             );
             be_processes.push(be_process);
@@ -3406,6 +3472,7 @@ impl CrossProcessServerHandle {
             target_port: runtime.fe_mysql_port,
             mysql_user,
             be_grpc_ports,
+            be_control_grpc_ports,
             native_fault_proxies,
             fragment_failure_trigger_paths,
             fragment_failure_tokens: vec![None; cluster_size],
@@ -3572,16 +3639,50 @@ impl CrossProcessServerHandle {
             .context("construct harness Native BE endpoint")
     }
 
+    /// Build the exact separately advertised BE Control endpoint.
+    pub fn native_be_control_endpoint(&self, index: usize) -> Result<NativeEndpoint> {
+        let port = self
+            .be_control_grpc_ports
+            .get(index)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("native BE index {index} is out of bounds"))?;
+        NativeEndpoint::from_host_port(self.native_trust_fixture.fixture.advertise_host(), port)
+            .map_err(anyhow::Error::msg)
+            .context("construct harness Native BE Control endpoint")
+    }
+
     /// Control a selected BE's proxy without transferring its lifecycle owner.
     /// The control remains valid across BE/FE restarts; resume paused directions
     /// before using restart methods that wait for a live topology barrier.
     pub fn native_fault_proxy(&self, index: usize) -> Result<NativeFaultProxyControl> {
         self.ensure_be_index(index)?;
+        let data = self.native_data_fault_proxy(index)?;
+        let control = self.native_control_fault_proxy(index)?;
+        Ok(data.paired_with(control))
+    }
+
+    /// Control only the actual Data proxy for domain-isolation scenarios.
+    pub fn native_data_fault_proxy(&self, index: usize) -> Result<NativeFaultProxyControl> {
+        self.ensure_be_index(index)?;
         self.native_fault_proxies
             .proxies
             .get(&index)
             .map(NativeFaultProxy::control)
-            .ok_or_else(|| anyhow::anyhow!("Native fault proxy is not enabled for BE[{index}]"))
+            .ok_or_else(|| {
+                anyhow::anyhow!("Native Data fault proxy is not enabled for BE[{index}]")
+            })
+    }
+
+    /// Control only the independent Control proxy for lifecycle faults.
+    pub fn native_control_fault_proxy(&self, index: usize) -> Result<NativeFaultProxyControl> {
+        self.ensure_be_index(index)?;
+        self.native_fault_proxies
+            .control_proxies
+            .get(&index)
+            .map(NativeFaultProxy::control)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Native Control fault proxy is not enabled for BE[{index}]")
+            })
     }
 
     /// Construct an authenticated test caller with the same deployment key as
@@ -5211,6 +5312,7 @@ pub fn startup_timeout_from_env(raw: Option<&str>) -> Duration {
 struct ReservedBePorts {
     http: ReservedTcpPort,
     grpc: ReservedTcpPort,
+    control_grpc: ReservedTcpPort,
 }
 
 struct ReservedRuntimePorts {
@@ -5228,6 +5330,7 @@ impl ReservedRuntimePorts {
             be_ports.push(ReservedBePorts {
                 http: ReservedTcpPort::new()?,
                 grpc: ReservedTcpPort::new()?,
+                control_grpc: ReservedTcpPort::new()?,
             });
         }
         Ok(Self {
@@ -6368,6 +6471,7 @@ mod tests {
             be: vec![BePorts {
                 http: 18080,
                 grpc: 19070,
+                control_grpc: 19170,
             }],
             fe_http_port: 28080,
             fe_grpc_port: 29070,
@@ -6381,10 +6485,12 @@ mod tests {
                 BePorts {
                     http: 18080,
                     grpc: 19070,
+                    control_grpc: 19170,
                 },
                 BePorts {
                     http: 18081,
                     grpc: 19071,
+                    control_grpc: 19171,
                 },
             ],
             fe_http_port: 28080,
@@ -6404,6 +6510,11 @@ mod tests {
         assert!(proxies.proxies.is_empty());
         assert_eq!(proxies.advertised_ports(&runtime), vec![19070, 19071]);
         assert_eq!(proxies.advertised_port(0), None);
+        assert_eq!(
+            proxies.advertised_control_ports(&runtime),
+            vec![19170, 19171]
+        );
+        assert_eq!(proxies.advertised_control_port(0), None);
         let fixture = rendered_native_trust_fixture();
         let rendered = render_cross_process_launch_config(CrossProcessLaunchConfig {
             base_config: BASE_CONFIG,
@@ -6412,6 +6523,7 @@ mod tests {
             be_index: 0,
             runtime: &runtime,
             be_advertised_grpc_port: proxies.advertised_port(0),
+            be_advertised_control_grpc_port: proxies.advertised_control_port(0),
             runtime_dir: Path::new("/tmp/novarocks-no-native-proxy"),
             query_lifecycle_faults_enabled: false,
             cleanup_faults_enabled: false,
@@ -6421,7 +6533,12 @@ mod tests {
         .unwrap();
         let config: Value = rendered.parse().unwrap();
         assert_eq!(config["server"]["grpc_port"].as_integer(), Some(19070));
+        assert_eq!(
+            config["server"]["control_grpc_port"].as_integer(),
+            Some(19170)
+        );
         assert!(config["cluster"].get("advertise_port").is_none());
+        assert!(config["cluster"].get("advertise_control_port").is_none());
     }
 
     #[test]
@@ -6437,6 +6554,10 @@ mod tests {
         let advertised = proxies.advertised_ports(&runtime);
         assert_eq!(advertised[0], runtime.be[0].grpc);
         assert_ne!(advertised[1], runtime.be[1].grpc);
+        let advertised_control = proxies.advertised_control_ports(&runtime);
+        assert_eq!(advertised_control[0], runtime.be[0].control_grpc);
+        assert_ne!(advertised_control[1], runtime.be[1].control_grpc);
+        assert_ne!(advertised_control[1], advertised[1]);
         let mut fixture = rendered_native_trust_fixture();
         fixture.fixture = NativeTrustFixture::automatic_dns();
         let rendered = render_cross_process_launch_config(CrossProcessLaunchConfig {
@@ -6446,6 +6567,7 @@ mod tests {
             be_index: 1,
             runtime: &runtime,
             be_advertised_grpc_port: proxies.advertised_port(1),
+            be_advertised_control_grpc_port: proxies.advertised_control_port(1),
             runtime_dir: Path::new("/tmp/novarocks-native-proxy-config"),
             query_lifecycle_faults_enabled: false,
             cleanup_faults_enabled: false,
@@ -6455,6 +6577,14 @@ mod tests {
         .unwrap();
         let config: Value = rendered.parse().unwrap();
         assert_eq!(config["server"]["grpc_port"].as_integer(), Some(19071));
+        assert_eq!(
+            config["server"]["control_grpc_port"].as_integer(),
+            Some(19171)
+        );
+        assert_eq!(
+            config["cluster"]["advertise_control_port"].as_integer(),
+            Some(i64::from(advertised_control[1]))
+        );
         assert_eq!(
             config["cluster"]["advertise_port"].as_integer(),
             Some(i64::from(advertised[1]))
@@ -6474,10 +6604,15 @@ mod tests {
         validate_live_backend_topology(&advertised, 2, &rows).unwrap();
         assert!(validate_live_backend_topology(&[19070, 19071], 2, &rows).is_err());
         let control = proxies.proxies[&1].control();
+        let lifecycle_control = proxies.control_proxies[&1].control();
         proxies.stop();
         assert!(control.is_stopped());
+        assert!(lifecycle_control.is_stopped());
         let listener =
             std::net::TcpListener::bind(control.address()).expect("release advertised port");
+        drop(listener);
+        let listener = std::net::TcpListener::bind(lifecycle_control.address())
+            .expect("release advertised Control port");
         drop(listener);
     }
 
@@ -6544,6 +6679,16 @@ mod tests {
         )?;
         let control = cluster.native_fault_proxy(1)?;
         let endpoint = cluster.native_be_endpoint(1)?;
+        let control_endpoint = cluster.native_be_control_endpoint(1)?;
+        assert_eq!(
+            control_endpoint.port(),
+            cluster.native_control_fault_proxy(1)?.address().port()
+        );
+        assert_ne!(
+            control_endpoint.port(),
+            cluster.runtime().be[1].control_grpc
+        );
+        assert_ne!(control_endpoint, endpoint);
         assert_eq!(endpoint.port(), control.address().port());
         assert_ne!(endpoint.port(), cluster.runtime().be[1].grpc);
         assert_eq!(
@@ -6573,9 +6718,11 @@ mod tests {
         ServerHandle::restart_be(&mut cluster, 1)?;
         assert_ne!(cluster.process_ids().backends[1], before.backends[1]);
         assert_eq!(cluster.native_be_endpoint(1)?, endpoint);
+        assert_eq!(cluster.native_be_control_endpoint(1)?, control_endpoint);
         ServerHandle::restart_fe(&mut cluster)?;
         assert_ne!(cluster.process_ids().frontend, before.frontend);
         assert_eq!(cluster.native_be_endpoint(1)?, endpoint);
+        assert_eq!(cluster.native_be_control_endpoint(1)?, control_endpoint);
         let mut connection = MysqlConn::new(
             OptsBuilder::new()
                 .ip_or_hostname(Some("127.0.0.1"))
@@ -6804,6 +6951,7 @@ access_key_secret = "admin123"
             be_index: 0,
             runtime: &runtime,
             be_advertised_grpc_port: None,
+            be_advertised_control_grpc_port: None,
             runtime_dir: Path::new("/tmp/novarocks-native-trust-reference"),
             query_lifecycle_faults_enabled: false,
             cleanup_faults_enabled: false,
@@ -6885,6 +7033,7 @@ access_key_secret = "admin123"
             be_index: 0,
             runtime: &runtime,
             be_advertised_grpc_port: None,
+            be_advertised_control_grpc_port: None,
             runtime_dir: first_runtime,
             query_lifecycle_faults_enabled: false,
             cleanup_faults_enabled: false,
@@ -6901,6 +7050,7 @@ access_key_secret = "admin123"
             be_index: 0,
             runtime: &runtime,
             be_advertised_grpc_port: None,
+            be_advertised_control_grpc_port: None,
             runtime_dir: second_runtime,
             query_lifecycle_faults_enabled: false,
             cleanup_faults_enabled: false,
@@ -6967,6 +7117,7 @@ static_file_path = "catalogs.toml"
             be_index: 0,
             runtime: &runtime,
             be_advertised_grpc_port: None,
+            be_advertised_control_grpc_port: None,
             runtime_dir: &output,
             query_lifecycle_faults_enabled: false,
             cleanup_faults_enabled: false,
@@ -7098,15 +7249,17 @@ static_file_path = "catalogs.toml"
     }
 
     #[test]
-    fn reserved_runtime_ports_new_2_yields_two_distinct_be_port_pairs() {
-        let reserved = ReservedRuntimePorts::new(2).expect("reserve 2 BE port pairs");
+    fn reserved_runtime_ports_new_2_yields_distinct_data_control_and_http_ports() {
+        let reserved = ReservedRuntimePorts::new(2).expect("reserve 2 BE port triples");
         assert_eq!(reserved.be_ports.len(), 2);
         let http0 = reserved.be_ports[0].http.port();
         let grpc0 = reserved.be_ports[0].grpc.port();
         let http1 = reserved.be_ports[1].http.port();
         let grpc1 = reserved.be_ports[1].grpc.port();
-        // All four ports must be distinct.
-        let ports = [http0, grpc0, http1, grpc1];
+        // Every reserved Data, Control, and HTTP port must be distinct.
+        let control0 = reserved.be_ports[0].control_grpc.port();
+        let control1 = reserved.be_ports[1].control_grpc.port();
+        let ports = [http0, grpc0, control0, http1, grpc1, control1];
         for i in 0..ports.len() {
             for j in (i + 1)..ports.len() {
                 assert_ne!(
@@ -7417,6 +7570,7 @@ static_file_path = "catalogs.toml"
             be_index: 0,
             runtime: &runtime,
             be_advertised_grpc_port: None,
+            be_advertised_control_grpc_port: None,
             runtime_dir: Path::new("/tmp/novarocks-be-config-overlay"),
             query_lifecycle_faults_enabled: false,
             cleanup_faults_enabled: false,
@@ -7445,6 +7599,7 @@ static_file_path = "catalogs.toml"
             be_index: 0,
             runtime: &runtime,
             be_advertised_grpc_port: None,
+            be_advertised_control_grpc_port: None,
             runtime_dir: Path::new("/tmp/novarocks-be-config-overlay-guard"),
             query_lifecycle_faults_enabled: false,
             cleanup_faults_enabled: false,
@@ -7485,6 +7640,7 @@ static_file_path = "catalogs.toml"
         );
         assert!(merge_safe_config_overlay(root, "[cluster]\nrole = 'be'\n").is_err());
         assert!(merge_safe_config_overlay(root, "[server]\ngrpc_port = 1\n").is_err());
+        assert!(merge_safe_config_overlay(root, "[server]\ncontrol_grpc_port = 1\n").is_err());
         merge_safe_config_overlay(
             root,
             "[server]\nfrontend_drain_timeout_ms = 500\nfrontend_cleanup_timeout_ms = 2000\n",

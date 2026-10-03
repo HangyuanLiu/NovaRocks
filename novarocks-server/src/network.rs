@@ -98,6 +98,26 @@ pub fn standalone_native_advertise_endpoint(
     Ok(endpoint)
 }
 
+/// Resolve Control independently, preserving the same Native reference-host rules.
+pub fn standalone_native_control_advertise_endpoint(
+    bind_host: &str,
+    priority_networks: &str,
+    configured_advertise_host: &str,
+    configured_advertise_port: Option<u16>,
+    control_grpc_port: u16,
+) -> Result<NativeEndpoint, String> {
+    if control_grpc_port == 0 || configured_advertise_port == Some(0) {
+        return Err("native Control bind and advertised ports must be nonzero".to_string());
+    }
+    standalone_native_advertise_endpoint(
+        bind_host,
+        priority_networks,
+        configured_advertise_host,
+        configured_advertise_port.unwrap_or(control_grpc_port),
+        control_grpc_port,
+    )
+}
+
 fn choose_advertise_host(
     configured_host: &str,
     priority_networks: &str,
@@ -282,7 +302,7 @@ fn mask_v6(addr: Ipv6Addr, prefix_len: u8) -> u128 {
 mod tests {
     use super::{
         LocalAddress, choose_advertise_host, standalone_advertise_endpoint,
-        standalone_native_advertise_endpoint,
+        standalone_native_advertise_endpoint, standalone_native_control_advertise_endpoint,
     };
     use std::net::IpAddr;
 
@@ -394,5 +414,50 @@ mod tests {
                 "{host}"
             );
         }
+    }
+
+    #[test]
+    fn control_endpoint_uses_only_explicit_control_ports_and_keeps_reference_host() {
+        let bound = standalone_native_control_advertise_endpoint(
+            "0.0.0.0",
+            "",
+            "BE.Example.Internal",
+            None,
+            19082,
+        )
+        .expect("resolve Control bind port");
+        let external = standalone_native_control_advertise_endpoint(
+            "0.0.0.0",
+            "",
+            "BE.Example.Internal",
+            Some(29082),
+            19082,
+        )
+        .expect("resolve Control NAT port");
+        assert_eq!(bound.as_host_port(), "be.example.internal:19082");
+        assert_eq!(external.as_host_port(), "be.example.internal:29082");
+        assert_eq!(bound.reference_host(), external.reference_host());
+        for (advertised, bind) in [(Some(0), 19082), (None, 0)] {
+            assert!(
+                standalone_native_control_advertise_endpoint(
+                    "127.0.0.1",
+                    "",
+                    "be.example.internal",
+                    advertised,
+                    bind,
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            standalone_native_control_advertise_endpoint(
+                "0.0.0.0",
+                "",
+                " be.example.internal",
+                None,
+                19082,
+            )
+            .is_err()
+        );
     }
 }

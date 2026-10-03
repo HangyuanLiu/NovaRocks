@@ -197,7 +197,11 @@ impl Funded {
         let (fields, calls, bytes) = measure(1, || {
             HeaderFieldAllocationPool::new(capacity, positions, max_field, field_owner).unwrap()
         });
-        assert_eq!(calls, 3, "arena, extent bitmap and Core Arc");
+        assert_eq!(
+            calls,
+            3 + usize::from(cfg!(target_os = "macos")),
+            "arena, extent bitmap, Core Arc and prewarmed PAL"
+        );
         assert!(bytes <= field_bound);
         let map_owner = owner(&budget, map_grant, 2);
         let (maps, calls, bytes) = measure(2, || {

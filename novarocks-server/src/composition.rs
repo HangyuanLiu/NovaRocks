@@ -439,6 +439,21 @@ pub fn compose_backend_server_config(
     runtime: tokio::runtime::Handle,
     scan_io: &ScanIoServices,
 ) -> anyhow::Result<BackendServerConfig> {
+    config
+        .server
+        .validate_for_role(novarocks_types::ClusterRole::Be)
+        .map_err(anyhow::Error::msg)?;
+    let control_grpc_port = config
+        .server
+        .control_grpc_port
+        .ok_or_else(|| anyhow!("role=be requires explicit [server].control_grpc_port"))?;
+    let control_endpoint = native_trust.control_advertised_endpoint().ok_or_else(|| {
+        anyhow!("BE native trust snapshot requires a Control advertised endpoint")
+    })?;
+    let advertise_control_endpoint = novarocks_types::AdvertiseEndpoint {
+        host: control_endpoint.host().to_string(),
+        port: control_endpoint.port(),
+    };
     let runtime_config = &config.runtime;
     let frame_envelope = runtime_config.native_ingress.validate()?;
     tracing::info!(
@@ -461,8 +476,10 @@ pub fn compose_backend_server_config(
     Ok(BackendServerConfig {
         bind_host: config.server.host.clone(),
         grpc_port: config.server.grpc_port,
+        control_grpc_port,
         metrics_http_port: config.server.http_port,
         advertise_endpoint,
+        advertise_control_endpoint,
         native_trust: std::sync::Arc::clone(native_trust.trust()),
         native_compatibility_id,
         function_set,

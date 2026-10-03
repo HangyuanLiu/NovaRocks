@@ -65,6 +65,7 @@ mod native_channel_cache;
 mod native_channel_identity;
 pub mod native_client;
 mod native_connection_key_capacity;
+pub mod native_fd_capacity;
 mod root_producer_pool;
 pub mod root_result_reader;
 pub mod root_result_session;

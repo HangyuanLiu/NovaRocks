@@ -30,6 +30,7 @@ use axum::body::Body;
 use axum::http::{Request, Response, header};
 use bytes::Bytes;
 use hyper::body::Frame;
+use novarocks_proto_codec::native_rpc::{NativeBodyKind, NativeEndpointDomain, NativeRpcMethod};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::codegen::Body as HttpBody;
 use tonic::{Code, Status};
@@ -309,65 +310,66 @@ pub struct NativeIngressService<S> {
     ordinary: Gate,
     control: Gate,
     config: NativeIngressConfig,
-    service_prefix: String,
+    domain: NativeEndpointDomain,
     backend_metrics: bool,
 }
 
 impl<S> NativeIngressService<S> {
+    /// Install one explicit endpoint domain. The service name is diagnostic;
+    /// only exact frozen manifest paths admit requests. Metrics never select
+    /// admission behavior or the frontend bypass.
     pub fn new(
         inner: S,
         config: NativeIngressConfig,
-        service_name: &str,
+        _service_name: &str,
         backend_metrics: bool,
+        domain: NativeEndpointDomain,
     ) -> Self {
-        let prefix = format!("/{service_name}/");
         Self {
             inner,
             ordinary: Gate::new(
-                config.ordinary_running,
-                config.ordinary_waiting,
+                if domain == NativeEndpointDomain::BackendData {
+                    config.ordinary_running
+                } else {
+                    0
+                },
+                if domain == NativeEndpointDomain::BackendData {
+                    config.ordinary_waiting
+                } else {
+                    0
+                },
                 "ordinary",
-                backend_metrics,
+                backend_metrics && domain == NativeEndpointDomain::BackendData,
                 config.ordinary_request_max_bytes,
             ),
             control: Gate::new(
-                config.control_running,
-                config.control_waiting,
+                if domain == NativeEndpointDomain::BackendControl {
+                    config.control_running
+                } else {
+                    0
+                },
+                if domain == NativeEndpointDomain::BackendControl {
+                    config.control_waiting
+                } else {
+                    0
+                },
                 "control",
-                backend_metrics,
+                backend_metrics && domain == NativeEndpointDomain::BackendControl,
                 config.control_request_max_bytes,
             ),
             config,
-            service_prefix: prefix,
+            domain,
             backend_metrics,
         }
     }
 
-    fn classify(&self, path: &str) -> MethodClass {
-        use novarocks_proto_codec::native_rpc::{
-            FrontendNativeLane, NATIVE_METHODS, NativeBodyKind, NativeTrafficClass,
-        };
-        let method = path.strip_prefix(&self.service_prefix).and_then(|name| {
-            NATIVE_METHODS
-                .iter()
-                .find(|entry| entry.path.rsplit('/').next() == Some(name))
-        });
-        match method {
-            Some(method)
-                if method.traffic
-                    == NativeTrafficClass::Frontend(FrontendNativeLane::LifecycleControl) =>
-            {
-                MethodClass::Control
-            }
-            Some(method)
-                if matches!(
-                    method.body,
-                    NativeBodyKind::ServerStream | NativeBodyKind::RetiredStream
-                ) =>
-            {
-                MethodClass::Stream
-            }
-            _ => MethodClass::Ordinary,
+    fn classify(&self, method: NativeRpcMethod) -> MethodClass {
+        if self.domain == NativeEndpointDomain::BackendControl {
+            MethodClass::Control
+        } else if method.contract().body == NativeBodyKind::ServerStream {
+            MethodClass::Stream
+        } else {
+            MethodClass::Ordinary
         }
     }
 }
@@ -389,9 +391,23 @@ where
     }
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
-        if !self.backend_metrics {
-            // Frontend Native RPCs share the listener runtime sizing, but
-            // BE-local task admission must not govern FE control traffic.
+        // Exact endpoint admission precedes every clone, gate, decoder, and
+        // response-position claim. Authentication wraps this service.
+        let Some(method) = NativeRpcMethod::from_path(request.uri().path())
+            .filter(|method| method.is_allowed_at(self.domain))
+        else {
+            let response = respond_from_request(
+                request,
+                Status::from_static(
+                    Code::Unimplemented,
+                    "native RPC method is unavailable on this endpoint",
+                ),
+            );
+            return Box::pin(async move { Ok(response) });
+        };
+        if self.domain == NativeEndpointDomain::FrontendMembership {
+            // FE membership keeps the baseline service path and does not
+            // consume BE-local task admission.
             let mut inner = self.inner.clone();
             return Box::pin(async move { inner.ready().await?.call(request).await });
         }
@@ -408,7 +424,7 @@ where
                 return Box::pin(async move { Ok(response) });
             }
         };
-        let class = self.classify(request.uri().path());
+        let class = self.classify(method);
         let gate = match class {
             MethodClass::Control => self.control.clone(),
             MethodClass::Ordinary | MethodClass::Stream => self.ordinary.clone(),
@@ -775,27 +791,37 @@ mod tests {
 
     #[test]
     fn method_manifest_is_the_only_ingress_classification_source() {
-        let ingress = NativeIngressService::new((), NativeIngressConfig::default(), "Test", false);
-        for name in ["Heartbeat", "ApplyTaskControlOperations"] {
-            assert!(matches!(
-                ingress.classify(&format!("/Test/{name}")),
-                MethodClass::Control
-            ));
+        let data = NativeIngressService::new(
+            (),
+            NativeIngressConfig::default(),
+            "Ignored",
+            false,
+            NativeEndpointDomain::BackendData,
+        );
+        let control = NativeIngressService::new(
+            (),
+            NativeIngressConfig::default(),
+            "Ignored",
+            false,
+            NativeEndpointDomain::BackendControl,
+        );
+        for method in [
+            NativeRpcMethod::Heartbeat,
+            NativeRpcMethod::ApplyTaskControlOperations,
+        ] {
+            assert!(matches!(control.classify(method), MethodClass::Control));
         }
-        for name in ["ApplyTaskOperations", "FetchTaskResult", "Unknown"] {
-            assert!(matches!(
-                ingress.classify(&format!("/Test/{name}")),
-                MethodClass::Ordinary
-            ));
+        for method in [
+            NativeRpcMethod::ApplyTaskOperations,
+            NativeRpcMethod::FetchTaskResult,
+        ] {
+            assert!(matches!(data.classify(method), MethodClass::Ordinary));
         }
         assert!(matches!(
-            ingress.classify("/Test/SubscribeTaskStatus"),
+            data.classify(NativeRpcMethod::SubscribeTaskStatus),
             MethodClass::Stream
         ));
-        assert!(matches!(
-            ingress.classify("/Other/Heartbeat"),
-            MethodClass::Ordinary
-        ));
+        assert_eq!(NativeRpcMethod::from_path("/Other/Heartbeat"), None);
     }
 
     #[test]
@@ -912,10 +938,21 @@ mod tests {
             control_running: 0,
             ..NativeIngressConfig::default()
         };
-        let response = NativeIngressService::new(service, config, "Test", false)
-            .oneshot(Request::new(Body::empty()))
-            .await
-            .unwrap();
+        let response = NativeIngressService::new(
+            service,
+            config,
+            "Ignored",
+            false,
+            NativeEndpointDomain::FrontendMembership,
+        )
+        .oneshot(
+            Request::builder()
+                .uri(NativeRpcMethod::AnnounceBackend.contract().path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
@@ -935,11 +972,21 @@ mod tests {
         });
         let config = NativeIngressConfig::default();
         let mut request = Request::new(Body::new(PendingBody));
-        *request.uri_mut() = "/Test/ApplyTaskOperations".parse().unwrap();
+        *request.uri_mut() = NativeRpcMethod::ApplyTaskOperations
+            .contract()
+            .path
+            .parse()
+            .unwrap();
         request
             .headers_mut()
             .insert("grpc-timeout", "10m".parse().unwrap());
-        let mut ingress = NativeIngressService::new(service, config, "Test", true);
+        let mut ingress = NativeIngressService::new(
+            service,
+            config,
+            "Ignored",
+            true,
+            NativeEndpointDomain::BackendData,
+        );
         let future = ingress.call(request);
         tokio::time::sleep(Duration::from_millis(20)).await;
         let response = tokio::time::timeout(Duration::from_millis(200), future)
@@ -968,3 +1015,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "native_endpoint_domain_tests.rs"]
+mod endpoint_domain_tests;

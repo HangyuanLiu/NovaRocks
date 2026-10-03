@@ -180,8 +180,9 @@ impl Funded {
             HeaderFieldAllocationPool::new(capacity, positions, max, original).unwrap()
         });
         assert_eq!(
-            calls, 3,
-            "exact arena, bitmap, Core Arc constructor allocations"
+            calls,
+            3 + usize::from(cfg!(target_os = "macos")),
+            "exact arena, bitmap, Core Arc and prewarmed PAL constructor allocations"
         );
         assert!(requested <= bound);
         Self {

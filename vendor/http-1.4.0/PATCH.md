@@ -17,3 +17,12 @@ backing and physical-exit credit survive every alias. This constructor does not
 acquire funding and cannot make a reusable raw workspace safe to retain.
 HeaderMap storage/clones/iterators, Status/message/details, Method/Scheme and
 the complete Native connection envelope remain separate ownership obligations.
+
+The opt-in `HeaderFieldAllocationPool` serializes its fixed extent claims and
+retirement with an originally funded mutex. It prewarms the pinned Darwin PAL
+before publication; its allocation bound includes that backing. Fill callbacks,
+Bytes publication and owner destruction run outside the lock. Concurrent fills
+with available extents do not confuse a temporary checkout collision with real
+capacity exhaustion. Position, fragmentation and per-field limits still refuse
+without a heap fallback. Mutex scheduling time and the outer IO/task graph remain
+separate obligations. Generic HTTP paths without this pool are unchanged.

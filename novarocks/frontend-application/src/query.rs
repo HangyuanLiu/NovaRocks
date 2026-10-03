@@ -3211,6 +3211,7 @@ mod tests {
         let descriptor = BackendProcessDescriptor::try_new(
             novarocks_types::BackendProcessId::new_v7(),
             RuntimeEndpoint::new("127.0.0.1", 9030).expect("test endpoint"),
+            RuntimeEndpoint::new("control-0.test.invalid", 19061).expect("test control endpoint"),
             "test-deployment",
             "test-build",
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),

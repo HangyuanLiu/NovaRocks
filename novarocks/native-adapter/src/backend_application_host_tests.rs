@@ -45,15 +45,21 @@ fn test_execution_function_set()
 }
 
 fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
+    let control_grpc_port = unused_port();
     BackendServerConfig {
         memory_authority: novarocks_native_adapter::backend_test_support::test_memory_authority(),
         bind_host: "127.0.0.1".to_string(),
         grpc_port,
+        control_grpc_port,
         metrics_http_port: unused_port(),
         native_ingress: crate::native_server::NativeIngressConfig::default(),
         advertise_endpoint: AdvertiseEndpoint {
             host: "127.0.0.1".to_string(),
             port: advertise_port,
+        },
+        advertise_control_endpoint: AdvertiseEndpoint {
+            host: "127.0.0.1".to_string(),
+            port: control_grpc_port,
         },
         native_trust: test_native_trust(),
         native_compatibility_id: novarocks_types::NativeCompatibilityId::new([0x71; 32]),

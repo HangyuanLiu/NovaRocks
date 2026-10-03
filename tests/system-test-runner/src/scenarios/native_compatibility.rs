@@ -137,10 +137,14 @@ impl Scenario for RawEstablishCompatibilityAdmission {
         let endpoint = context.handle().native_be_endpoint(0)?;
         let mode = context.handle().native_trust_mode();
         let connector = context.handle().native_probe_connector(endpoint, mode)?;
+        let control_endpoint = context.handle().native_be_control_endpoint(0)?;
+        let control_connector = context
+            .handle()
+            .native_probe_connector(control_endpoint, mode)?;
         let trust = context.handle().native_probe_trust()?;
         let authorization = authorization_header(&trust)?;
         let heartbeat: proto::HeartbeatResponse = raw_unary(
-            connector.clone(),
+            control_connector,
             HEARTBEAT_PATH,
             &authorization,
             proto::HeartbeatRequest {
@@ -615,6 +619,10 @@ fn assert_other_island_admission_cut(
     let endpoint = context.handle().native_be_endpoint(2)?;
     let mode = context.handle().native_trust_mode();
     let connector = context.handle().native_probe_connector(endpoint, mode)?;
+    let control_endpoint = context.handle().native_be_control_endpoint(2)?;
+    let control_connector = context
+        .handle()
+        .native_probe_connector(control_endpoint, mode)?;
     let trust = context.handle().native_probe_trust()?;
     let authorization = authorization_header(&trust)?;
     let rows = context.handle().frontend_backend_topology()?;
@@ -625,7 +633,7 @@ fn assert_other_island_admission_cut(
         .context("SHOW BACKENDS omitted OtherIsland admission target")?;
     let backend = target.process_id.parse::<BackendProcessId>()?;
     let heartbeat: proto::HeartbeatResponse = raw_unary(
-        connector.clone(),
+        control_connector,
         HEARTBEAT_PATH,
         &authorization,
         proto::HeartbeatRequest {

@@ -161,7 +161,7 @@ pub use task_execution_ports::{
 pub use task_protocol_event::{RuntimeFilterReleaseObservation, TaskProtocolEvent};
 pub use task_registry::{
     DeadlineSweep, RegistryCounters, RegistryLockObservation, RegistryLockSnapshot,
-    TaskExecutionRegistry, TaskPreparationSnapshot,
+    TaskExecutionRegistry, TaskPreparationSnapshot, TaskPreparationSnapshotError,
 };
 pub use task_registry_config::{TaskExecutionRegistryConfig, TaskPreparationLimits};
 pub use typed_preparation_flow::ScanPreparationTimer;

@@ -26,6 +26,7 @@ use hyper::http::{HeaderValue, Request, Response, Uri};
 use hyper_util::rt::TokioIo;
 use novarocks_execution::runtime::fragment::io::ResultWriteAdmission;
 use novarocks_native_trust::NativeIncomingAdapter;
+use novarocks_proto_codec::native_rpc::NativeRpcMethod;
 use novarocks_types::NativeEndpoint;
 use novarocks_worker::result_buffer::ResultRetainedBudget;
 use std::collections::VecDeque;
@@ -161,7 +162,10 @@ async fn listener_request(
     });
     let request = Request::builder()
         .method("POST")
-        .uri("http://localhost/original")
+        .uri(format!(
+            "http://localhost{}",
+            NativeRpcMethod::ApplyTaskOperations.contract().path
+        ))
         .header("x-native-original", ORIGINAL_VALUE)
         .body(())
         .unwrap();
@@ -312,7 +316,10 @@ fn endpoint_peer(
     let task = tokio::spawn(async move {
         let mut connection = h2::server::handshake(peer).await.unwrap();
         let (request, mut sender) = connection.accept().await.unwrap().unwrap();
-        assert_eq!(request.uri().path(), "/capacity-endpoint");
+        assert_eq!(
+            request.uri().path(),
+            NativeRpcMethod::Heartbeat.contract().path
+        );
         drop(request);
         let response = Response::builder()
             .header("x-peer-original", value)
@@ -385,7 +392,10 @@ async fn actual_capacity_endpoint_clones_install_two_fresh_original_configuratio
     let first_response = bounded(
         first.clone().oneshot(
             Request::builder()
-                .uri("http://localhost/capacity-endpoint")
+                .uri(format!(
+                    "http://localhost{}",
+                    NativeRpcMethod::Heartbeat.contract().path
+                ))
                 .body(boxed(axum::body::Body::empty()))
                 .unwrap(),
         ),
@@ -395,7 +405,10 @@ async fn actual_capacity_endpoint_clones_install_two_fresh_original_configuratio
     let second_response = bounded(
         second.clone().oneshot(
             Request::builder()
-                .uri("http://localhost/capacity-endpoint")
+                .uri(format!(
+                    "http://localhost{}",
+                    NativeRpcMethod::Heartbeat.contract().path
+                ))
                 .body(boxed(axum::body::Body::empty()))
                 .unwrap(),
         ),

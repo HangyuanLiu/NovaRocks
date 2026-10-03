@@ -104,12 +104,18 @@ impl Scenario for NativeTrustPositive {
             context.handle().native_trust_mode() == self.fixture.mode(),
             "Native trust harness launched a different transport profile"
         );
-        let endpoint = context.handle().native_be_endpoint(0)?;
+        let data_endpoint = context.handle().native_be_endpoint(0)?;
+        let control_endpoint = context.handle().native_be_control_endpoint(0)?;
         let trust = context.handle().native_probe_trust()?;
 
-        assert_authentication_order(context, &endpoint, &trust, self.fixture.mode())?;
+        for (endpoint, path) in [
+            (&data_endpoint, APPLY_TASK_OPERATIONS_PATH),
+            (&control_endpoint, HEARTBEAT_PATH),
+        ] {
+            assert_authentication_order(context, endpoint, &trust, self.fixture.mode(), path)?;
+        }
         context.action(
-            "proved listener-wide missing/invalid/valid JWT ordering on a real Native BE listener",
+            "proved missing/invalid/valid JWT ordering on both real Native BE Data and Control listeners",
         );
 
         let mut connection = mysql_actor::connect(
@@ -525,6 +531,7 @@ fn assert_authentication_order(
     endpoint: &NativeEndpoint,
     trust: &NativeTrust,
     mode: NativeTrustFixtureMode,
+    representative_path: &str,
 ) -> Result<()> {
     let missing = raw_grpc_probe(
         context
@@ -563,17 +570,18 @@ fn assert_authentication_order(
         valid_unknown.http_status == 200 && valid_unknown.grpc_status == Some(GRPC_UNIMPLEMENTED),
         "valid JWT must reach the Native unknown-path fallback, got {valid_unknown:?}"
     );
-    let valid_heartbeat = raw_grpc_probe(
+    let valid_rpc = raw_grpc_probe(
         context
             .handle()
             .native_probe_connector(endpoint.clone(), mode)?,
-        HEARTBEAT_PATH,
+        representative_path,
         Some(&authorization),
-        Some(&[0, 0, 0, 0, 2, 0x08, 0x01]),
+        // An unterminated protobuf varint is invalid for either request schema.
+        Some(&[0, 0, 0, 0, 1, 0xff]),
     )?;
     ensure!(
-        valid_heartbeat.grpc_status != Some(GRPC_UNAUTHENTICATED),
-        "valid JWT must reach representative Native RPC dispatch, got {valid_heartbeat:?}"
+        valid_rpc.grpc_status == Some(tonic::Code::Internal as u16),
+        "valid JWT must reach representative Native RPC protobuf decode on its exact endpoint, got {valid_rpc:?}"
     );
     Ok(())
 }

@@ -973,6 +973,8 @@ fn test_request_context_with_role(
                     BackendProcessDescriptor::try_new(
                         BackendProcessId::new_v7(),
                         RuntimeEndpoint::new("127.0.0.1", 9030).expect("valid loopback endpoint"),
+                        RuntimeEndpoint::new("control-0.test.invalid", 19061)
+                            .expect("valid control endpoint"),
                         "test-deployment",
                         "test-build",
                         novarocks_types::NativeCompatibilityId::new([0x71; 32]),

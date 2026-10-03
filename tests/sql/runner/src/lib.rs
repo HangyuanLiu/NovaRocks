@@ -6991,6 +6991,7 @@ mod tests {
             be: vec![BePorts {
                 http: 18080,
                 grpc: 19070,
+                control_grpc: 19071,
             }],
             fe_http_port: 28080,
             fe_grpc_port: 29070,

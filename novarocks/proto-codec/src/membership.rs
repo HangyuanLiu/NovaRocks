@@ -58,6 +58,7 @@ impl BackendProcessDescriptor {
     pub fn new(
         process_id: DomainBackendProcessId,
         endpoint: QueryControlEndpoint,
+        control_endpoint: QueryControlEndpoint,
         deployment_id: impl Into<String>,
         build_identity: impl Into<String>,
         native_compatibility_id: NativeCompatibilityId,
@@ -70,9 +71,18 @@ impl BackendProcessDescriptor {
                     format!("backend process endpoint is invalid: {error}"),
                 )
             })?;
+        let control_endpoint =
+            RuntimeEndpoint::new(control_endpoint.host(), i32::from(control_endpoint.port()))
+                .map_err(|error| {
+                    invalid(
+                        FieldPath::root("backend_process_descriptor").field("control_endpoint"),
+                        format!("backend control endpoint is invalid: {error}"),
+                    )
+                })?;
         ContractBackendProcessDescriptor::try_new(
             process_id,
             endpoint,
+            control_endpoint,
             deployment_id,
             build_identity,
             native_compatibility_id,
@@ -108,6 +118,26 @@ impl BackendProcessDescriptor {
             &raw.native_compatibility_id,
             FieldPath::root("backend_process_descriptor").field("native_compatibility_id"),
         )?;
+        let control_endpoint = raw.control_endpoint.clone().ok_or_else(|| {
+            missing(
+                FieldPath::root("backend_process_descriptor").field("control_endpoint"),
+                "backend control endpoint is required",
+            )
+        })?;
+        let control_endpoint = QueryControlEndpoint::parse(control_endpoint).map_err(|error| {
+            prefix_path(
+                FieldPath::root("backend_process_descriptor").field("control_endpoint"),
+                error,
+            )
+        })?;
+        let control_endpoint =
+            RuntimeEndpoint::new(control_endpoint.host(), i32::from(control_endpoint.port()))
+                .map_err(|error| {
+                    invalid(
+                        FieldPath::root("backend_process_descriptor").field("control_endpoint"),
+                        format!("backend control endpoint is invalid: {error}"),
+                    )
+                })?;
         let endpoint =
             RuntimeEndpoint::new(endpoint.host(), i32::from(endpoint.port())).map_err(|error| {
                 invalid(
@@ -134,6 +164,7 @@ impl BackendProcessDescriptor {
         let descriptor = ContractBackendProcessDescriptor::try_new(
             process_id,
             endpoint,
+            control_endpoint,
             raw.deployment_id,
             raw.build_identity,
             native_compatibility_id,
@@ -173,6 +204,15 @@ impl BackendProcessDescriptor {
                     .clone(),
                 ),
                 preparing_positions: descriptor.preparing_positions() as u64,
+                control_endpoint: Some(
+                    QueryControlEndpoint::new(
+                        descriptor.control_endpoint().host(),
+                        descriptor.control_endpoint().port() as u16,
+                    )
+                    .expect("contract control endpoint retains a valid u16 port")
+                    .as_proto()
+                    .clone(),
+                ),
                 bounded_root_support: descriptor
                     .bounded_root_support()
                     .map(encode_bounded_root_support),
@@ -188,10 +228,13 @@ impl BackendProcessDescriptor {
     pub fn to_contract(&self) -> Result<ContractBackendProcessDescriptor, ProtocolError> {
         let validated = Self::parse(self.raw.clone())?;
         let endpoint = validated.endpoint()?;
+        let control_endpoint = validated.control_endpoint()?;
         let descriptor = ContractBackendProcessDescriptor::try_new(
             validated.process_id()?,
             RuntimeEndpoint::new(endpoint.host(), i32::from(endpoint.port()))
                 .expect("validated endpoint retains host/port"),
+            RuntimeEndpoint::new(control_endpoint.host(), i32::from(control_endpoint.port()))
+                .expect("validated control endpoint retains host/port"),
             validated.deployment_id(),
             validated.build_identity(),
             validated.native_compatibility_id()?,
@@ -231,6 +274,16 @@ impl BackendProcessDescriptor {
             missing(
                 FieldPath::root("backend_process_descriptor").field("endpoint"),
                 "backend process endpoint is required",
+            )
+        })?;
+        QueryControlEndpoint::parse(endpoint)
+    }
+
+    pub fn control_endpoint(&self) -> Result<QueryControlEndpoint, ProtocolError> {
+        let endpoint = self.raw.control_endpoint.clone().ok_or_else(|| {
+            missing(
+                FieldPath::root("backend_process_descriptor").field("control_endpoint"),
+                "backend control endpoint is required",
             )
         })?;
         QueryControlEndpoint::parse(endpoint)
@@ -700,6 +753,7 @@ mod tests {
         BackendProcessDescriptor::new(
             DomainBackendProcessId::new_v7(),
             QueryControlEndpoint::new("be-0.internal", 9090).expect("endpoint"),
+            QueryControlEndpoint::new("be-0.internal", 9091).expect("control endpoint"),
             "warehouse-a",
             "build-identity",
             NativeCompatibilityId::new([7; 32]),
@@ -798,6 +852,87 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_requires_valid_independent_control_even_without_root_support() {
+        let original = descriptor();
+        assert!(original.as_proto().bounded_root_support.is_none());
+        let mut missing = original.as_proto().clone();
+        missing.control_endpoint = None;
+        let error = BackendProcessDescriptor::parse(missing).unwrap_err();
+        assert_eq!(error.kind(), crate::ProtocolErrorKind::MissingField);
+        assert_eq!(
+            error.path().to_string(),
+            "backend_process_descriptor.control_endpoint"
+        );
+        for (endpoint, expected_kind) in [
+            (
+                novarocks::QueryControlEndpoint {
+                    host: "be-0.internal".into(),
+                    port: 0,
+                },
+                crate::ProtocolErrorKind::InvalidValue,
+            ),
+            (
+                novarocks::QueryControlEndpoint {
+                    host: "be-0.internal".into(),
+                    port: 65536,
+                },
+                crate::ProtocolErrorKind::OutOfRange,
+            ),
+            (
+                novarocks::QueryControlEndpoint {
+                    host: String::new(),
+                    port: 9091,
+                },
+                crate::ProtocolErrorKind::InvalidValue,
+            ),
+        ] {
+            let mut malformed = original.as_proto().clone();
+            malformed.control_endpoint = Some(endpoint);
+            let error = BackendProcessDescriptor::parse(malformed).unwrap_err();
+            assert_eq!(error.kind(), expected_kind);
+            assert!(
+                error
+                    .path()
+                    .to_string()
+                    .starts_with("backend_process_descriptor.control_endpoint")
+            );
+        }
+        let mut shared_endpoint = original.as_proto().clone();
+        shared_endpoint.control_endpoint = shared_endpoint.endpoint.clone();
+        assert!(BackendProcessDescriptor::parse(shared_endpoint).is_err());
+    }
+
+    #[test]
+    fn control_endpoint_roundtrip_and_change_are_exact_membership_facts() {
+        let original = descriptor();
+        let contract = original.to_contract().unwrap();
+        assert_eq!(contract.control_endpoint().port(), 9091);
+        assert!(contract.bounded_root_support().is_none());
+        assert_eq!(
+            BackendProcessDescriptor::from_contract(contract.clone()),
+            original
+        );
+        let mut raw = original.as_proto().clone();
+        raw.control_endpoint = Some(
+            QueryControlEndpoint::new("be-0.internal", 9092)
+                .unwrap()
+                .as_proto()
+                .clone(),
+        );
+        let changed = BackendProcessDescriptor::parse(raw).unwrap();
+        let changed_contract = changed.to_contract().unwrap();
+        assert_eq!(contract.process_id(), changed_contract.process_id());
+        assert_eq!(contract.endpoint(), changed_contract.endpoint());
+        assert_ne!(contract, changed_contract);
+        assert_ne!(original, changed);
+        let announce = BackendAnnounceRequest::new(changed, BackendReportedState::Running).unwrap();
+        assert_eq!(
+            announce.descriptor().unwrap().to_contract().unwrap(),
+            changed_contract
+        );
+    }
+
+    #[test]
     fn bounded_root_support_is_preserved_in_membership_and_requires_exact_geometry() {
         use novarocks_execution_contract::{
             RuntimeEndpoint, native_result_support::BoundedRootSupport,
@@ -834,6 +969,31 @@ mod tests {
             .unwrap()
             .control_endpoint = None;
         assert!(BackendProcessDescriptor::parse(missing_control).is_err());
+        let mut missing_mandatory_control = encoded.as_proto().clone();
+        missing_mandatory_control.control_endpoint = None;
+        let error = BackendProcessDescriptor::parse(missing_mandatory_control).unwrap_err();
+        assert_eq!(error.kind(), crate::ProtocolErrorKind::MissingField);
+        assert_eq!(
+            error.path().to_string(),
+            "backend_process_descriptor.control_endpoint"
+        );
+        let mut drifting_support = encoded.as_proto().clone();
+        drifting_support
+            .bounded_root_support
+            .as_mut()
+            .unwrap()
+            .control_endpoint = Some(
+            QueryControlEndpoint::new("be-0.internal", 9092)
+                .unwrap()
+                .as_proto()
+                .clone(),
+        );
+        let error = BackendProcessDescriptor::parse(drifting_support).unwrap_err();
+        assert_eq!(error.kind(), crate::ProtocolErrorKind::InvalidValue);
+        assert_eq!(
+            error.path().to_string(),
+            "backend_process_descriptor.bounded_root_support"
+        );
         let mut same_endpoint = encoded.as_proto().clone();
         same_endpoint
             .bounded_root_support

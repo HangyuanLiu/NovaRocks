@@ -208,6 +208,8 @@ message BackendProcessDescriptor {
   uint64 preparing_positions = 6;
   // Absence declares no bounded-root capability; it never implies a default.
   BoundedRootSupport bounded_root_support = 7;
+  // Mandatory independent lifecycle/control endpoint, even without root support.
+  QueryControlEndpoint control_endpoint = 8;
 }
 
 message AnnounceBackendRequest {
