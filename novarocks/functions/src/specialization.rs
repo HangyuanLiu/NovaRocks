@@ -76,6 +76,12 @@ pub(crate) fn refine_once_for_specialization<
     Ok((receipt, effects))
 }
 
+impl From<CompileControlError> for FunctionSpecializationFailure {
+    fn from(error: CompileControlError) -> Self {
+        Self::Control(error)
+    }
+}
+
 impl From<FunctionBindingError> for FunctionSpecializationFailure {
     fn from(error: FunctionBindingError) -> Self {
         match error {

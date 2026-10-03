@@ -21,8 +21,8 @@
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use novarocks_type_contract::{
-    ArgumentControl, CallEffects, CompilePhase, FunctionEffectDeclaration, FunctionInstanceState,
-    FunctionNullBehavior, ObservableEffects, PureCompileControl,
+    ArgumentControl, CallEffects, CompileCheckpoints, CompilePhase, FunctionEffectDeclaration,
+    FunctionInstanceState, FunctionNullBehavior, ObservableEffects, PureCompileControl,
 };
 use sha2::{Digest, Sha256};
 
@@ -1105,44 +1105,93 @@ impl PureEngineFunctionCatalog {
         options: PureCallPreparation,
         control: &dyn PureCompileControl,
     ) -> Result<PureCallSpecialization, FunctionSpecializationFailure> {
-        control
-            .checkpoint(CompilePhase::FunctionSpecialization, 0)
-            .map_err(FunctionSpecializationFailure::Control)?;
-        let definition = self.catalog.definition_by_id(input.function_id).ok_or(
-            FunctionSpecializationFailure::Binding(FunctionBindingError::UnknownFunction),
-        )?;
-        let binding = definition
-            .binding
-            .as_ref()
-            .expect("pure seal checked every binding");
-        if binding.declaration.kind() != input.kind
-            || !std::ptr::eq(input.selected, selected.as_ref())
-        {
+        prepare_selected(&self.catalog, input, selected, frozen, options, control)
+    }
+}
+
+impl EngineFunctionCatalog {
+    /// Prepare one exact selected implementation from this catalogue's
+    /// original installed attachment. This grants no whole-catalogue seal and
+    /// never resolves a SQL name or manufactures missing implementation facts.
+    pub fn prepare_fresh_selected(
+        &self,
+        input: CallEffectInput<'_>,
+        selected: Arc<FunctionBindingSelection>,
+        options: PureCallPreparation,
+        control: &dyn PureCompileControl,
+    ) -> Result<PureCallSpecialization, FunctionSpecializationFailure> {
+        prepare_selected(self, input, selected, None, options, control)
+    }
+}
+
+fn prepare_selected(
+    catalog: &EngineFunctionCatalog,
+    input: CallEffectInput<'_>,
+    selected: Arc<FunctionBindingSelection>,
+    frozen: Option<&CallEffects>,
+    options: PureCallPreparation,
+    control: &dyn PureCompileControl,
+) -> Result<PureCallSpecialization, FunctionSpecializationFailure> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+    let result = (|| {
+        let definition = catalog.definition_by_id(input.function_id);
+        work.step()?;
+        let definition = definition.ok_or(FunctionSpecializationFailure::Binding(
+            FunctionBindingError::UnknownFunction,
+        ))?;
+        let binding = definition.binding.as_ref();
+        work.step()?;
+        let binding = binding.ok_or(FunctionSpecializationFailure::Binding(
+            FunctionBindingError::MissingBindingDeclaration,
+        ))?;
+        let exact_owner = binding.declaration.kind() == input.kind
+            && std::ptr::eq(input.selected, selected.as_ref());
+        work.step()?;
+        if !exact_owner {
             return Err(FunctionSpecializationFailure::InvalidInput(
                 "pure preparation has a different exact kind or selected owner",
             ));
         }
-        binding
-            .declaration
-            .effect_declaration(&selected.overload)
-            .map_err(FunctionSpecializationFailure::from)?;
-        let attachment = binding
-            .pure
-            .as_ref()
-            .expect("pure seal checked every installed owner");
+        // Use the same complete selected-signature author as frozen metadata
+        // consumers. Owner refinement below still validates its own facts.
+        work.flush()?;
+        catalog.validate_frozen_selection(
+            input.function_id,
+            input.kind,
+            selected.as_ref(),
+            input.request,
+            control,
+        )?;
+        work.flush()?;
+        let attachment = binding.pure.as_ref();
+        work.step()?;
+        let attachment = attachment.ok_or(FunctionSpecializationFailure::InvalidInput(
+            "selected function has no installed pure implementation",
+        ))?;
+        let declaration = binding.declaration.effect_declaration(&selected.overload);
+        work.step()?;
+        declaration?;
         let index = attachment
             .implementations
-            .binary_search_by(|record| record.overload.cmp(&selected.overload))
-            .expect("atomic registration closed every exact overload");
-        if !attachment.implementations[index]
+            .binary_search_by(|record| record.overload.cmp(&selected.overload));
+        work.step()?;
+        let index = index.map_err(|_| {
+            FunctionSpecializationFailure::Binding(FunctionBindingError::UnknownOverload(
+                selected.overload.clone(),
+            ))
+        })?;
+        let accepts = attachment.implementations[index]
             .abi
-            .accepts_preparation(&options)
-        {
+            .accepts_preparation(&options);
+        work.step()?;
+        if !accepts {
             return Err(wrong_options());
         }
+        work.flush()?;
         let draft = attachment
             .owner
             .prepare(input, selected, frozen, options, control)?;
+        work.flush()?;
         Ok(PureCallSpecialization {
             prepared: draft.prepared,
             effects: draft.effects,
@@ -1154,7 +1203,22 @@ impl PureEngineFunctionCatalog {
                 PurePreparationSource::Fresh
             },
         })
+    })();
+    // Preparation may forward an original compile refusal through the kernel
+    // boundary. Both typed representations remain primary without a callback.
+    if matches!(
+        result,
+        Err(FunctionSpecializationFailure::Control(_))
+            | Err(FunctionSpecializationFailure::Kernel(
+                KernelFailure::Cancelled
+                    | KernelFailure::DeadlineExceeded
+                    | KernelFailure::ResourceExhausted
+            ))
+    ) {
+        return result;
     }
+    work.finish()?;
+    result
 }
 
 pub(crate) fn digest_pure_attachment(
@@ -1179,3 +1243,7 @@ mod tests;
 
 #[cfg(test)]
 mod typed_tests;
+
+#[cfg(test)]
+#[path = "pure_catalogue/selected_fresh_tests.rs"]
+mod selected_fresh_tests;

@@ -2363,6 +2363,9 @@ pub(super) fn scalar_definition_parts(
                     name if super::string_measure_owner::operation(name).is_some() => {
                         Some(super::string_measure_owner::effects())
                     }
+                    name if super::string_case_owner::operation(name).is_some() => {
+                        Some(super::string_case_owner::effects())
+                    }
                     "dround" => Some(super::dround_owner::effects()),
                     name if super::bit_shift_owner::operation(name).is_some() => {
                         Some(super::bit_shift_owner::effects())
@@ -2513,6 +2516,9 @@ pub fn contribute_builtin_functions(
             "crc32" => super::crc32_owner::definition(declaration, resolver)?,
             name if super::string_measure_owner::operation(name).is_some() => {
                 super::string_measure_owner::definition(name, declaration, resolver)?
+            }
+            name if super::string_case_owner::operation(name).is_some() => {
+                super::string_case_owner::definition(name, declaration, resolver)?
             }
             "dround" => super::dround_owner::definition(declaration, resolver)?,
             name if super::bit_shift_owner::operation(name).is_some() => {
