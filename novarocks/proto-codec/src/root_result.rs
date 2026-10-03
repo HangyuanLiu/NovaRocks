@@ -834,6 +834,12 @@ pub fn encode_root_contract(value: &RootOutputContract) -> wire::RootOutputContr
     wire::RootOutputContract {
         profile_id: value.profile().get(),
         output_kind: Some(encode_kind(value.kind())),
+        scalar_schema: match value.output() {
+            FrozenRootOutput::ScalarValue(schema) => {
+                Some(crate::scalar_result::encode_scalar_schema(schema))
+            }
+            _ => None,
+        },
         client_schema: match value.output() {
             FrozenRootOutput::ClientRows(schema) => Some(encode_client_schema(schema)),
             _ => None,
@@ -853,12 +859,29 @@ pub fn decode_root_contract(
             .ok_or_else(|| invalid(path.clone(), "root output purpose is required"))?,
         path.clone().field("output_kind"),
     )?;
-    let output = match (kind, value.client_schema.as_ref()) {
-        (RootOutputKind::ClientRows, Some(schema)) => FrozenRootOutput::ClientRows(
+    let output = match (
+        kind,
+        value.client_schema.as_ref(),
+        value.scalar_schema.as_ref(),
+    ) {
+        (RootOutputKind::ClientRows, Some(schema), None) => FrozenRootOutput::ClientRows(
             decode_client_schema(schema, input_columns, path.clone().field("client_schema"))?,
         ),
-        (RootOutputKind::InternalFacts(domain), None) => FrozenRootOutput::InternalFacts(domain),
-        (RootOutputKind::CountOnly, None) => FrozenRootOutput::CountOnly,
+        (
+            RootOutputKind::InternalFacts(InternalResultDomain::ScalarValueV1),
+            None,
+            Some(schema),
+        ) => FrozenRootOutput::ScalarValue(crate::scalar_result::decode_scalar_schema(
+            schema,
+            input_columns,
+            path.clone().field("scalar_schema"),
+        )?),
+        (RootOutputKind::InternalFacts(domain), None, None)
+            if domain != InternalResultDomain::ScalarValueV1 =>
+        {
+            FrozenRootOutput::InternalFacts(domain)
+        }
+        (RootOutputKind::CountOnly, None, None) => FrozenRootOutput::CountOnly,
         _ => {
             return Err(invalid(
                 path,

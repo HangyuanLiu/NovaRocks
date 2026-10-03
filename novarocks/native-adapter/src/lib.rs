@@ -72,6 +72,7 @@ mod root_producer_pool;
 pub mod root_result_reader;
 pub mod root_result_session;
 pub mod root_result_unary;
+pub mod root_scalar_leaf_codec;
 pub mod root_statistics_codec;
 pub use native_client::NativeRpcClient;
 pub mod native_codec;

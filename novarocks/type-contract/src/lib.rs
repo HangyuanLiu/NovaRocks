@@ -48,3 +48,4 @@ pub use partition::{
 };
 
 pub mod result_render_type;
+pub mod result_scalar_type;

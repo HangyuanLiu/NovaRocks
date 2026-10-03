@@ -80,6 +80,24 @@ pub fn decode_fragment_sink_program(
                     )
                 })?;
             }
+            if let novarocks_result_contract::FrozenRootOutput::ScalarValue(schema) =
+                contract.output()
+            {
+                let [slot] = layout.order() else {
+                    return Err(NativeFragmentDecodeError::invalid_value(
+                        path.clone().field("root_result").field("scalar_schema"),
+                        "scalar root requires exactly one source slot",
+                    ));
+                };
+                schema
+                    .validate_native_slots(&[slot.as_u32()])
+                    .map_err(|error| {
+                        NativeFragmentDecodeError::invalid_value(
+                            path.clone().field("root_result").field("scalar_schema"),
+                            error,
+                        )
+                    })?;
+            }
             Ok(FragmentSinkProgram::RootResult(std::sync::Arc::new(
                 contract,
             )))

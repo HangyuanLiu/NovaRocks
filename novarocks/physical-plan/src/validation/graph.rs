@@ -72,6 +72,11 @@ pub(crate) fn validate_fragment_graph(plan: &PhysicalPlan, errors: &mut Validati
 
 pub(crate) fn validate_fragment_sink(fragment: &Fragment, errors: &mut ValidationContext) {
     let path = format!("fragments[{}].sink", fragment.id().get());
+    if let FragmentSink::RootResult(contract) = fragment.sink()
+        && let Err(error) = contract.validate_purpose()
+    {
+        errors.push(ValidationError::new(&path, error.to_string()));
+    }
     let root_output = fragment
         .nodes()
         .get(&fragment.root())
@@ -978,6 +983,19 @@ pub(crate) fn validate_result(plan: &PhysicalPlan, errors: &mut ValidationContex
                             format!("render occurrence differs at ordinal {ordinal}"),
                         ));
                     }
+                }
+            }
+            if let FragmentSink::RootResult(contract) = fragment.sink()
+                && let novarocks_result_contract::FrozenRootOutput::ScalarValue(schema) =
+                    contract.output()
+            {
+                match result.fields.as_ref() {
+                    [field] if novarocks_type_contract::result_scalar_type::scalar_field_matches_storage(
+                        schema.field(), &field.ty.data_type, field.ty.nullable
+                    ) => {}
+                    _ => errors.push(ValidationError::new(
+                        "result_port.scalar_schema", "scalar schema differs from the sole ordered root occurrence"
+                    )),
                 }
             }
             if result.fields.len() != result.output.columns.len() {

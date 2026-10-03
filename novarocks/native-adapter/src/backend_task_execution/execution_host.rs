@@ -5297,8 +5297,16 @@ mod tests {
         let root = identity(91_004, 1, 1);
         let descriptor = consistent_descriptor(root, UniqueId::new(91_004, 1));
         let body = Body::bounded_root(
-            novarocks_result_contract::FrozenRootOutput::InternalFacts(
-                novarocks_result_contract::InternalResultDomain::ScalarValueV1,
+            novarocks_result_contract::FrozenRootOutput::ScalarValue(
+                novarocks_result_contract::ScalarSchema::try_new(
+                    novarocks_result_contract::ScalarField {
+                        nullable: false,
+                        value_type: novarocks_result_contract::ScalarValueType::SignedInteger(64),
+                    },
+                )
+                .unwrap()
+                .bind_native_slots(&[10])
+                .unwrap(),
             ),
             &[],
         );
@@ -5306,6 +5314,10 @@ mod tests {
             .install_receiver(&descriptor, body.input(&descriptor))
             .unwrap_err();
         assert_eq!(rejected.category(), TaskFailureCategory::Protocol);
+        assert_eq!(
+            rejected.detail().as_str(),
+            "explicit internal root codec is not installed"
+        );
         assert!(host.task_runtime(root).is_none());
         host.root_producer_pool.shutdown().unwrap();
     }

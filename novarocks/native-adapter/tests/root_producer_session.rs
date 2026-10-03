@@ -867,3 +867,46 @@ async fn statistics_record_can_cross_segments_and_cancel_releases_its_original_b
     ));
     shutdown(&fixture.pool).await;
 }
+
+#[tokio::test]
+async fn typed_scalar_session_stays_closed_until_the_complete_domain_producer_is_installed() {
+    use novarocks_result_contract::{ScalarField, ScalarSchema, ScalarValueType};
+    let limits = WorkerResultRetainedLimits::try_new(256 << 20, 512 << 20).unwrap();
+    let budget = ResultRetainedBudget::new(limits.per_process());
+    let pool = RootProducerPool::try_new(
+        NonZeroUsize::new(1).unwrap(),
+        NonZeroUsize::new(8).unwrap(),
+        1 << 20,
+        Arc::clone(&budget),
+    )
+    .unwrap();
+    let schema = ScalarSchema::try_new(ScalarField {
+        nullable: false,
+        value_type: ScalarValueType::SignedInteger(64),
+    })
+    .unwrap()
+    .bind_native_slots(&[7])
+    .unwrap();
+    let channel = RootResultChannel::try_open(
+        RootResultWriteSpec {
+            task: task(),
+            contract: Arc::new(RootOutputContract::new(
+                RootProfileId::V1,
+                FrozenRootOutput::ScalarValue(schema),
+            )),
+        },
+        Arc::clone(&budget),
+        limits,
+    )
+    .unwrap();
+    channel.mark_context_owned().unwrap();
+    let rejected = NativeRootResultSession::try_open(Arc::clone(&channel), &pool);
+    assert!(
+        matches!(rejected, Err(ref error) if error.to_string().contains("explicit internal root codec is not installed"))
+    );
+    assert_eq!(channel.snapshot().produced_through, 0);
+    assert_eq!(channel.snapshot().consumed_through, 0);
+    assert!(channel.physical_idle());
+    channel.close(RootRetentionClose::ContextReleased);
+    shutdown(&pool).await;
+}

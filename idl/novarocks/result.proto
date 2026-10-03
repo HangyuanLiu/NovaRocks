@@ -113,11 +113,66 @@ message RootOutputKind {
     bool count_only = 3;
   }
 }
+// ScalarValueV1 owns this semantic schema, independent of MySQL presentation.
+// Type nodes form one tree; cycles, sharing and unreachable nodes are refused.
+enum ScalarTypeKind {
+  SCALAR_TYPE_KIND_UNSPECIFIED = 0;
+  SCALAR_NULL = 1;
+  SCALAR_BOOLEAN = 2;
+  SCALAR_SIGNED_INTEGER = 3;
+  SCALAR_LARGE_INT = 4;
+  SCALAR_FLOAT32 = 5;
+  SCALAR_FLOAT64 = 6;
+  SCALAR_DECIMAL = 7;
+  SCALAR_STRING = 8;
+  SCALAR_BINARY = 9;
+  SCALAR_DATE = 10;
+  SCALAR_TIME_MICROS = 11;
+  SCALAR_TIMESTAMP = 12;
+  SCALAR_JSON = 13;
+  SCALAR_VARIANT = 14;
+  SCALAR_OPAQUE = 15;
+  SCALAR_LIST = 16;
+  SCALAR_MAP = 17;
+  SCALAR_STRUCT = 18;
+}
+enum ScalarTimestampUnit {
+  SCALAR_TIMESTAMP_UNIT_UNSPECIFIED = 0;
+  SCALAR_MICROSECOND = 1;
+  SCALAR_NANOSECOND = 2;
+}
+message NamedScalarField {
+  string name = 1;
+  uint32 field_node_id = 2;
+}
+message ScalarValueType {
+  ScalarTypeKind kind = 1;
+  uint32 bits = 2;
+  uint32 precision = 3;
+  uint32 scale = 4;
+  ScalarTimestampUnit timestamp_unit = 5;
+  optional string time_zone = 6;
+  OpaqueKind opaque_kind = 7;
+  // List: item. Map: key then value. Struct: exact ordered names.
+  repeated NamedScalarField children = 8;
+}
+message ScalarField {
+  bool nullable = 1;
+  ScalarValueType value_type = 2;
+}
+message ScalarSchema {
+  // A native root must bind exactly one source slot, at ordinal zero.
+  optional uint32 source_slot = 1;
+  uint32 root_field_node_id = 2;
+  repeated ScalarField field_nodes = 3;
+}
 message RootOutputContract {
   uint32 profile_id = 1;
   RootOutputKind output_kind = 2;
   // Required exactly for ClientRows. Domains own their private codec schema.
   ClientRenderSchema client_schema = 3;
+  // Required exactly for InternalFacts(ScalarValueV1).
+  ScalarSchema scalar_schema = 4;
 }
 // Sequence starts at one. End is a separate logical item even when sent with
 // Data. The body is one flat bounded allocation; no row-piece/repeated index.

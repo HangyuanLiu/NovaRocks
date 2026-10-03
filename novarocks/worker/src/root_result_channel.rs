@@ -315,10 +315,16 @@ impl RootResultChannel {
         budget: Arc<ResultRetainedBudget>,
         limits: WorkerResultRetainedLimits,
     ) -> Result<Arc<Self>, RootChannelError> {
+        spec.contract
+            .validate_purpose()
+            .map_err(|_| RootChannelError::Payload)?;
         let fixed =
             NativeResultSupportGeometry::V1.root_fixed_schema_cursor_driver_capacity_bytes as usize;
         let schema_bytes = match spec.contract.output() {
             novarocks_result_contract::FrozenRootOutput::ClientRows(schema) => {
+                schema.backing_bytes()
+            }
+            novarocks_result_contract::FrozenRootOutput::ScalarValue(schema) => {
                 schema.backing_bytes()
             }
             _ => 0,

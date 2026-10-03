@@ -32,6 +32,18 @@ pub use root::{
     RootProfileId, RootProfileV1,
 };
 
+mod scalar;
+pub use scalar::{
+    NamedScalarField, ScalarField, ScalarOpaqueType, ScalarProfileV1, ScalarSchema,
+    ScalarTimestampUnit, ScalarValueType,
+};
+
+mod scalar_leaf;
+pub use scalar_leaf::{
+    BorrowedScalarLeaf, SCALAR_LEAF_HEADER_BYTES, ScalarLeafCursor, ScalarLeafError,
+    ScalarLeafHeader, ScalarLeafTurn,
+};
+
 mod render_schema;
 pub use render_schema::{
     ClientRenderSchema, NamedRenderField, NativeRenderType, OpaqueRenderType, RenderColumn,

@@ -118,6 +118,7 @@ mod tests {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FrozenRootOutput {
     ClientRows(crate::ClientRenderSchema),
+    ScalarValue(crate::ScalarSchema),
     InternalFacts(InternalResultDomain),
     CountOnly,
 }
@@ -125,6 +126,9 @@ impl FrozenRootOutput {
     pub const fn kind(&self) -> RootOutputKind {
         match self {
             Self::ClientRows(_) => RootOutputKind::ClientRows,
+            Self::ScalarValue(_) => {
+                RootOutputKind::InternalFacts(InternalResultDomain::ScalarValueV1)
+            }
             Self::InternalFacts(domain) => RootOutputKind::InternalFacts(*domain),
             Self::CountOnly => RootOutputKind::CountOnly,
         }
@@ -140,9 +144,13 @@ impl RootOutputContract {
         Self { profile, output }
     }
     pub fn bind_native_slots(self, slots: &[u32]) -> Result<Self, RootContractError> {
+        self.validate_purpose()?;
         let output = match self.output {
             FrozenRootOutput::ClientRows(schema) => {
                 FrozenRootOutput::ClientRows(schema.bind_native_slots(slots)?)
+            }
+            FrozenRootOutput::ScalarValue(schema) => {
+                FrozenRootOutput::ScalarValue(schema.bind_native_slots(slots)?)
             }
             other => other,
         };
@@ -150,6 +158,16 @@ impl RootOutputContract {
             profile: self.profile,
             output,
         })
+    }
+    /// A scalar domain identity alone cannot authorize an untyped producer.
+    pub fn validate_purpose(&self) -> Result<(), RootContractError> {
+        if matches!(
+            self.output,
+            FrozenRootOutput::InternalFacts(InternalResultDomain::ScalarValueV1)
+        ) {
+            return Err(RootContractError::InvalidSchema);
+        }
+        Ok(())
     }
     pub const fn profile(&self) -> RootProfileId {
         self.profile

@@ -154,6 +154,8 @@ struct RenderSchemaScan {
     nodes: usize,
     wire_bytes: usize,
     root_wire_bytes: usize,
+    scalar_initialized: bool,
+    scalar_nodes: usize,
     expansion: RenderExpansion,
 }
 impl RenderSchemaScan {
@@ -163,6 +165,8 @@ impl RenderSchemaScan {
             nodes: 0,
             wire_bytes: 0,
             root_wire_bytes: 0,
+            scalar_initialized: false,
+            scalar_nodes: 0,
             expansion: RenderExpansion {
                 backing: size_of::<novarocks_proto_models::result::ClientRenderSchema>(),
                 growth_old: 0,
@@ -224,6 +228,44 @@ impl RenderSchemaScan {
             Ok(())
         })
     }
+    fn scan_scalar(&mut self, raw: &[u8]) -> ScanResult {
+        use novarocks_proto_models::result as wire;
+        use novarocks_result_contract::RootProfileV1;
+        self.wire_bytes = self
+            .wire_bytes
+            .checked_add(raw.len())
+            .ok_or_else(|| limit("scalar schema size overflow"))?;
+        if self.wire_bytes > RootProfileV1::SCHEMA_WIRE_BYTES {
+            return Err(limit("scalar schema exceeds wire profile"));
+        }
+        if !self.scalar_initialized {
+            self.expansion.backing = self
+                .expansion
+                .backing
+                .checked_add(size_of::<wire::ScalarSchema>())
+                .ok_or_else(|| limit("scalar schema expansion overflow"))?;
+            self.scalar_initialized = true;
+        }
+        self.expansion.backing = self
+            .expansion
+            .backing
+            .checked_add(raw.len())
+            .ok_or_else(|| limit("scalar schema expansion overflow"))?;
+        self.expansion.check()?;
+        for_fields(raw, |field, value| {
+            if let (3, Value::Bytes(node)) = (field, value) {
+                checked_increment(
+                    &mut self.scalar_nodes,
+                    RootProfileV1::SCHEMA_TYPE_NODES,
+                    "scalar schema exceeds decoded node profile",
+                )?;
+                self.expansion
+                    .grow_vec(self.scalar_nodes, size_of::<wire::ScalarField>())?;
+                scan_scalar_field(node, &mut self.expansion)?;
+            }
+            Ok(())
+        })
+    }
     fn scan_root(&mut self, raw: &[u8]) -> ScanResult {
         use novarocks_result_contract::RootProfileV1;
         self.root_wire_bytes = self
@@ -234,8 +276,10 @@ impl RenderSchemaScan {
             return Err(limit("root output contract exceeds its profile"));
         }
         for_fields(raw, |field, value| {
-            if let (3, Value::Bytes(schema)) = (field, value) {
-                self.scan(schema)?;
+            match (field, value) {
+                (3, Value::Bytes(schema)) => self.scan(schema)?,
+                (4, Value::Bytes(schema)) => self.scan_scalar(schema)?,
+                _ => {}
             }
             Ok(())
         })
@@ -333,6 +377,53 @@ fn scan_render_field(raw: &[u8], expansion: &mut RenderExpansion) -> ScanResult 
                             if let (1, Value::Bytes(name)) = (field, value) {
                                 if name.len() > RootProfileV1::MAX_NAME_BYTES {
                                     return Err(limit("render child name exceeds profile"));
+                                }
+                                expansion.string(name.len())?;
+                            }
+                            Ok(())
+                        })?;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    })
+}
+
+/// Allocation preflight only, before prost builds the private scalar schema.
+/// Business validation (sole slot, exact type, tree reachability) is separate.
+pub fn check_scalar_schema(raw: &[u8]) -> Result<(), ResourcePreflightError> {
+    finish(RenderSchemaScan::new().scan_scalar(raw))
+}
+fn scan_scalar_field(raw: &[u8], expansion: &mut RenderExpansion) -> ScanResult {
+    use novarocks_proto_models::result as wire;
+    use novarocks_result_contract::RootProfileV1;
+    let mut children = 0usize;
+    // All occurrences of singular nested messages merge into the same Vec;
+    // never reset its count at a duplicate value_type declaration.
+    for_fields(raw, |field, value| {
+        if let (2, Value::Bytes(ty)) = (field, value) {
+            for_fields(ty, |field, value| {
+                match (field, value) {
+                    (6, Value::Bytes(zone)) => {
+                        if zone.len() > RootProfileV1::MAX_NAME_BYTES {
+                            return Err(limit("scalar timezone exceeds profile"));
+                        }
+                        expansion.string(zone.len())?;
+                    }
+                    (8, Value::Bytes(child)) => {
+                        checked_increment(
+                            &mut children,
+                            RootProfileV1::MAX_COLUMNS,
+                            "scalar type exceeds child profile",
+                        )?;
+                        expansion.grow_vec(children, size_of::<wire::NamedScalarField>())?;
+                        for_fields(child, |field, value| {
+                            if let (1, Value::Bytes(name)) = (field, value) {
+                                if name.len() > RootProfileV1::MAX_NAME_BYTES {
+                                    return Err(limit("scalar child name exceeds profile"));
                                 }
                                 expansion.string(name.len())?;
                             }
@@ -1399,5 +1490,77 @@ mod root_preflight_tests {
         schema.clear();
         bytes_field(&mut schema, 2, &field);
         assert!(check_client_render_schema(&schema).is_err());
+    }
+    #[test]
+    fn scalar_schema_raw_expansion_preflight_counts_nodes_names_and_empty_children() {
+        let mut schema = Vec::new();
+        bytes_field(&mut schema, 3, &[]);
+        assert!(check_scalar_schema(&schema).is_ok());
+        for _ in 0..RootProfileV1::SCHEMA_TYPE_NODES {
+            bytes_field(&mut schema, 3, &[]);
+        }
+        assert!(schema.len() < RootProfileV1::SCHEMA_WIRE_BYTES);
+        assert!(check_scalar_schema(&schema).is_err());
+        let mut ty = Vec::new();
+        bytes_field(&mut ty, 6, &vec![b'x'; RootProfileV1::MAX_NAME_BYTES + 1]);
+        let mut field = Vec::new();
+        bytes_field(&mut field, 2, &ty);
+        schema.clear();
+        bytes_field(&mut schema, 3, &field);
+        assert!(check_scalar_schema(&schema).is_err());
+        ty.clear();
+        for _ in 0..=RootProfileV1::MAX_COLUMNS {
+            bytes_field(&mut ty, 8, &[]);
+        }
+        field.clear();
+        bytes_field(&mut field, 2, &ty);
+        schema.clear();
+        bytes_field(&mut schema, 3, &field);
+        assert!(check_scalar_schema(&schema).is_err());
+    }
+    #[test]
+    fn scalar_schema_raw_preflight_tracks_singular_type_merges_before_prost() {
+        let mut half = Vec::new();
+        for _ in 0..2049 {
+            bytes_field(&mut half, 8, &[]);
+        }
+        let mut field = Vec::new();
+        bytes_field(&mut field, 2, &half);
+        bytes_field(&mut field, 2, &half);
+        let mut schema = Vec::new();
+        bytes_field(&mut schema, 3, &field);
+        assert!(schema.len() < RootProfileV1::SCHEMA_WIRE_BYTES);
+        assert!(check_scalar_schema(&schema).is_err());
+    }
+    #[test]
+    fn scalar_schema_raw_preflight_follows_every_actual_frozen_root_wrapper() {
+        let mut schema = Vec::new();
+        for _ in 0..=RootProfileV1::SCHEMA_TYPE_NODES {
+            bytes_field(&mut schema, 3, &[]);
+        }
+        let mut root = Vec::new();
+        bytes_field(&mut root, 4, &schema);
+        let mut sink = Vec::new();
+        bytes_field(&mut sink, 9, &root);
+        let mut plan = Vec::new();
+        bytes_field(&mut plan, 5, &sink);
+        let mut frozen = Vec::new();
+        bytes_field(&mut frozen, 5, &plan);
+        assert!(check_frozen_fragment(&frozen).is_err());
+        // Duplicate singular schema messages merge their field-node Vec.
+        // Counts must survive the wrapper boundary as well as one scan call.
+        schema.clear();
+        for _ in 0..2048 {
+            bytes_field(&mut schema, 3, &[]);
+        }
+        root.clear();
+        bytes_field(&mut root, 4, &schema);
+        let mut state = RenderSchemaScan::new();
+        for _ in 0..4 {
+            if state.scan_root(&root).is_err() {
+                return;
+            }
+        }
+        assert!(state.scan_root(&root).is_err());
     }
 }

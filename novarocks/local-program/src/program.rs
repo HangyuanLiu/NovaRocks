@@ -915,6 +915,11 @@ impl LocalProgram {
                 }
                 _ => {}
             }
+            if let StaticSinkProgram::RootResult(contract) = sink {
+                contract
+                    .validate_purpose()
+                    .map_err(|_| LocalProgramError::InvalidSink)?;
+            }
             if let StaticSinkProgram::RootResult(contract) = sink
                 && let novarocks_result_contract::FrozenRootOutput::ClientRows(schema) =
                     contract.output()
@@ -940,6 +945,28 @@ impl LocalProgram {
                     ) {
                         return Err(LocalProgramError::InvalidSink);
                     }
+                }
+            }
+            if let StaticSinkProgram::RootResult(contract) = sink
+                && let novarocks_result_contract::FrozenRootOutput::ScalarValue(schema) =
+                    contract.output()
+            {
+                let layout = &nodes[root.index()].output_layout;
+                let [slot] = layout.slots() else {
+                    return Err(LocalProgramError::InvalidSink);
+                };
+                schema
+                    .validate_native_slots(&[slot.as_u32()])
+                    .map_err(|_| LocalProgramError::InvalidSink)?;
+                let [field] = layout.schema().fields().as_ref() else {
+                    return Err(LocalProgramError::InvalidSink);
+                };
+                if !novarocks_type_contract::result_scalar_type::scalar_field_matches_storage(
+                    schema.field(),
+                    field.data_type(),
+                    field.is_nullable(),
+                ) {
+                    return Err(LocalProgramError::InvalidSink);
                 }
             }
             for requirement in requirements.entries() {
