@@ -19,6 +19,7 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
 use chrono::{Datelike, NaiveDateTime, Timelike};
+use novarocks_functions::calendar_period_numeric::{months_diff_starrocks, years_diff_starrocks};
 use std::sync::Arc;
 
 #[derive(Clone, Copy)]
@@ -47,31 +48,6 @@ fn parse_diff_unit(unit: &str) -> Option<DiffUnit> {
         "millisecond" => Some(DiffUnit::Milliseconds),
         _ => None,
     }
-}
-
-fn datetime_tail_value(dt: NaiveDateTime) -> i64 {
-    dt.day() as i64 * 1_000_000_000_000
-        + dt.hour() as i64 * 10_000_000_000
-        + dt.minute() as i64 * 100_000_000
-        + dt.second() as i64 * 1_000_000
-        + (dt.nanosecond() / 1_000) as i64
-}
-
-fn months_diff_starrocks(lhs: NaiveDateTime, rhs: NaiveDateTime) -> i64 {
-    let mut month =
-        (lhs.year() - rhs.year()) as i64 * 12 + (lhs.month() as i64 - rhs.month() as i64);
-    let lhs_tail = datetime_tail_value(lhs);
-    let rhs_tail = datetime_tail_value(rhs);
-
-    if month >= 0 {
-        if lhs_tail < rhs_tail {
-            month -= 1;
-        }
-    } else if lhs_tail > rhs_tail {
-        month += 1;
-    }
-
-    month
 }
 
 #[inline]
@@ -185,20 +161,7 @@ fn eval_diff_value(lhs: NaiveDateTime, rhs: NaiveDateTime, unit: DiffUnit) -> i6
         DiffUnit::Days => diff.num_days(),
         DiffUnit::Weeks => diff.num_weeks(),
         DiffUnit::Months => months_diff_starrocks(lhs, rhs),
-        DiffUnit::Years => {
-            let (sign, start, end) = if lhs >= rhs {
-                (1_i64, rhs, lhs)
-            } else {
-                (-1_i64, lhs, rhs)
-            };
-            let mut years = (end.year() - start.year()) as i64;
-            let end_tuple = (end.month(), end.day(), end.time());
-            let start_tuple = (start.month(), start.day(), start.time());
-            if end_tuple < start_tuple {
-                years -= 1;
-            }
-            years * sign
-        }
+        DiffUnit::Years => years_diff_starrocks(lhs, rhs),
         DiffUnit::Quarters => months_diff_starrocks(lhs, rhs) / 3,
     }
 }

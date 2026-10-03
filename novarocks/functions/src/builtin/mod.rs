@@ -46,6 +46,8 @@ mod calendar_diff;
 mod calendar_diff_owner;
 mod calendar_parts;
 mod calendar_parts_owner;
+mod calendar_period_diff;
+mod calendar_period_diff_owner;
 mod control_owner;
 mod crc32;
 mod crc32_owner;
