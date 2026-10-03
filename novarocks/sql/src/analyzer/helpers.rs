@@ -79,9 +79,16 @@ pub(super) fn column_value_type(
             ColumnProjectionError::Source(error) => {
                 AnalyzeError::internal(format!("invalid catalog column `{}`: {error}", column.name))
             }
-        })?;
+        });
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.control_error().is_some())
+    {
+        return result;
+    }
     work.finish().map_err(AnalyzeError::control)?;
-    Ok(result)
+    result
 }
 
 pub(super) fn validate_value_type(
@@ -92,8 +99,8 @@ pub(super) fn validate_value_type(
     use novarocks_type_contract::{CompileCheckpoints, CompileControlError, CompilePhase};
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)
         .map_err(AnalyzeError::control)?;
-    novarocks_functions::validate_function_value_type_observed(ty, &mut work).map_err(|error| {
-        match error {
+    let result = novarocks_functions::validate_function_value_type_observed(ty, &mut work).map_err(
+        |error| match error {
             KernelFailure::Cancelled => AnalyzeError::control(CompileControlError::Cancelled),
             KernelFailure::DeadlineExceeded => {
                 AnalyzeError::control(CompileControlError::DeadlineExceeded)
@@ -102,9 +109,17 @@ pub(super) fn validate_value_type(
                 AnalyzeError::control(CompileControlError::ResourceExhausted)
             }
             error => AnalyzeError::internal(error.to_string()),
-        }
-    })?;
-    work.finish().map_err(AnalyzeError::control)
+        },
+    );
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.control_error().is_some())
+    {
+        return result;
+    }
+    work.finish().map_err(AnalyzeError::control)?;
+    result
 }
 
 pub(super) fn field_value_type(
