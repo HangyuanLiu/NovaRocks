@@ -93,6 +93,11 @@ impl From<TypeCodecError> for PhysicalConstantCodecError {
         }
     }
 }
+impl From<novarocks_type_contract::ValueTypeError> for PhysicalConstantCodecError {
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::Type(TypeCodecError::ValueType(error))
+    }
+}
 impl From<FlatReaderError> for PhysicalConstantCodecError {
     fn from(error: FlatReaderError) -> Self {
         match error {
@@ -337,10 +342,16 @@ pub fn prepare_constant_record_write<'pool, 'control>(
     finish(work, result)
 }
 
+mod binding_resources;
 mod namespace;
+mod write_namespace;
 pub use namespace::{
     ConstantNamespaceProjectionLimits, ConstantNamespaceResourceFacts, PreparedConstantNamespace,
     decode_constant_namespace, prepare_constant_namespace,
+};
+pub use write_namespace::{
+    ConstantNamespaceWriteFacts, ConstantRecordTypeIds, PreparedConstantNamespaceWrite,
+    encode_constant_namespace, prepare_constant_namespace_write,
 };
 
 #[cfg(test)]

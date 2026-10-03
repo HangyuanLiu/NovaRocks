@@ -110,14 +110,114 @@ fn finish<T>(
     result
 }
 
+/// The original source roots and their immutable wire projection from one
+/// successful emission. Root IDs occupy separate sparse namespaces; borrowing
+/// this proof does not reconstruct source Fields or types from the wire DTO.
+pub struct EncodedTypeTable<'source> {
+    table: wire::TypeTable,
+    values: &'source [(u32, FunctionValueType)],
+    fields: &'source [(u32, Arc<Field>)],
+}
+impl<'source> EncodedTypeTable<'source> {
+    pub fn as_wire(&self) -> &wire::TypeTable {
+        &self.table
+    }
+    pub fn into_wire(self) -> wire::TypeTable {
+        self.table
+    }
+    /// Counts for caller admission of repeated root lookups. No index, source
+    /// copy or maximum-ID-indexed storage is created by this owner.
+    pub(crate) fn source_counts(&self) -> (usize, usize) {
+        (self.values.len(), self.fields.len())
+    }
+    /// The caller owns entry/ordinary/success tails on the original meter.
+    /// Only completed ID comparisons are charged here, including a miss.
+    pub(crate) fn value_type_observed(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'source FunctionValueType>, TypeCodecError> {
+        self.root_value_binding_observed(id, work)
+            .map(|binding| binding.map(|(_, value)| value))
+    }
+    /// Bind an authored value root to the carrier occurrence assigned by the
+    /// same emission. This is not a lookup of arbitrary nested carriers, and
+    /// the carrier ID does not replace the complete source value type.
+    /// The caller admits repeated linear lookups using `source_counts` and
+    /// owns entry/ordinary/success tails on the original meter.
+    pub(crate) fn root_value_binding_observed(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<(u32, &'source FunctionValueType)>, TypeCodecError> {
+        for (position, (candidate, value)) in self.values.iter().enumerate() {
+            let matches = *candidate == id;
+            work.step()?;
+            if matches {
+                // Root value definitions are emitted one-for-one in source
+                // order. These constant-time defensive checks neither build
+                // an index nor reconstruct a source type from the DTO.
+                let emitted =
+                    self.table
+                        .value_types
+                        .get(position)
+                        .ok_or(TypeCodecError::InvalidShape(
+                            "encoded root value definition is absent",
+                        ))?;
+                if emitted.id != *candidate {
+                    return Err(TypeCodecError::InvalidShape(
+                        "encoded root value definition differs from its source",
+                    ));
+                }
+                let carrier = emitted.carrier_type_id.ok_or(TypeCodecError::InvalidShape(
+                    "encoded root value carrier is absent",
+                ))?;
+                return Ok(Some((carrier, value)));
+            }
+        }
+        Ok(None)
+    }
+    pub(crate) fn field_observed(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'source Arc<Field>>, TypeCodecError> {
+        for (candidate, field) in self.fields {
+            let matches = *candidate == id;
+            work.step()?;
+            if matches {
+                return Ok(Some(field));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Project source roots once and retain their original borrowed identity for
+/// later namespace binding. The same emission and resource gates author both
+/// this token and the existing DTO-only public APIs.
+pub fn encode_type_table_sources<'source>(
+    values: &'source [(u32, FunctionValueType)],
+    fields: &'source [(u32, Arc<Field>)],
+    limits: TypeProjectionLimits,
+    control: &dyn PureCompileControl,
+) -> Result<EncodedTypeTable<'source>, TypeCodecError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
+    let table = encode::encode_with_fields(values, fields, limits, &mut work);
+    let table = finish(work, table)?;
+    Ok(EncodedTypeTable {
+        table,
+        values,
+        fields,
+    })
+}
+
 pub fn encode_type_table(
     values: &[(u32, FunctionValueType)],
     limits: TypeProjectionLimits,
     control: &dyn PureCompileControl,
 ) -> Result<wire::TypeTable, TypeCodecError> {
-    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
-    let result = encode::encode(values, limits, &mut work);
-    finish(work, result)
+    encode_type_table_sources(values, &[], limits, control).map(EncodedTypeTable::into_wire)
 }
 
 /// Project explicit complete root fields as well as value types. Authored
@@ -130,9 +230,7 @@ pub fn encode_type_table_with_fields(
     limits: TypeProjectionLimits,
     control: &dyn PureCompileControl,
 ) -> Result<wire::TypeTable, TypeCodecError> {
-    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
-    let result = encode::encode_with_fields(values, fields, limits, &mut work);
-    finish(work, result)
+    encode_type_table_sources(values, fields, limits, control).map(EncodedTypeTable::into_wire)
 }
 
 pub fn decode_type_table(
@@ -291,3 +389,6 @@ mod tests;
 
 #[cfg(test)]
 mod fields_tests;
+
+#[cfg(test)]
+mod sources_tests;

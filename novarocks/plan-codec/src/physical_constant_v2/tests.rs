@@ -922,3 +922,9 @@ fn record_prepared_writer_uses_same_original_control_source_and_admitted_request
         }
     }
 }
+
+mod write_namespace_tests {
+    use super::*;
+    use crate::physical_type_v2::encode_type_table_sources;
+    include!("write_namespace_tests.rs");
+}

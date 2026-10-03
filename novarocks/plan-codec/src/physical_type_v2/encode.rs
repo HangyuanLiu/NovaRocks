@@ -400,14 +400,6 @@ fn emit_type(
     Ok(id)
 }
 
-pub(super) fn encode(
-    values: &[(u32, FunctionValueType)],
-    limits: TypeProjectionLimits,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<wire::TypeTable, Error> {
-    encode_with_fields(values, &[], limits, work)
-}
-
 pub(super) fn encode_with_fields(
     values: &[(u32, FunctionValueType)],
     fields: &[(u32, Arc<Field>)],
