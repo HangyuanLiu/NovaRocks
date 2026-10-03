@@ -53,24 +53,63 @@ pub fn naive_to_timestamp_micros(dt: NaiveDateTime) -> i64 {
     dt.and_utc().timestamp_micros()
 }
 
-pub fn parse_date(s: &str) -> Option<NaiveDate> {
-    NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        .or_else(|_| NaiveDate::parse_from_str(s, "%Y%m%d"))
-        .ok()
+/// Actual completed parser work and boundaries of opaque standard/library calls.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DateParseObservation {
+    Step,
+    OpaqueBoundary,
 }
 
-fn parse_datetime_flexible(raw: &str) -> Option<NaiveDateTime> {
+fn unobserved<T>(result: Result<T, std::convert::Infallible>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(never) => match never {},
+    }
+}
+
+pub fn parse_date(s: &str) -> Option<NaiveDate> {
+    unobserved(parse_date_observed(s, |_| Ok(())))
+}
+
+pub(crate) fn parse_date_observed<E>(
+    s: &str,
+    mut observe: impl FnMut(DateParseObservation) -> Result<(), E>,
+) -> Result<Option<NaiveDate>, E> {
+    for format in ["%Y-%m-%d", "%Y%m%d"] {
+        observe(DateParseObservation::OpaqueBoundary)?;
+        let parsed = NaiveDate::parse_from_str(s, format);
+        observe(DateParseObservation::OpaqueBoundary)?;
+        if let Ok(date) = parsed {
+            return Ok(Some(date));
+        }
+    }
+    Ok(None)
+}
+
+fn parse_datetime_flexible<E>(
+    raw: &str,
+    observe: &mut impl FnMut(DateParseObservation) -> Result<(), E>,
+) -> Result<Option<NaiveDateTime>, E> {
+    observe(DateParseObservation::OpaqueBoundary)?;
     let text = raw.trim();
+    observe(DateParseObservation::OpaqueBoundary)?;
     let bytes = text.as_bytes();
-    if bytes.is_empty() || !bytes[0].is_ascii_digit() {
-        return None;
+    let invalid_start = bytes.is_empty() || !bytes[0].is_ascii_digit();
+    observe(DateParseObservation::Step)?;
+    if invalid_start {
+        return Ok(None);
     }
 
     let mut pos = 0usize;
     while pos < bytes.len() && (bytes[pos].is_ascii_digit() || bytes[pos] == b'T') {
         pos += 1;
+        observe(DateParseObservation::Step)?;
     }
-    let compact_digits = bytes[..pos].iter().filter(|b| b.is_ascii_digit()).count();
+    let mut compact_digits = 0usize;
+    for byte in &bytes[..pos] {
+        compact_digits += usize::from(byte.is_ascii_digit());
+        observe(DateParseObservation::Step)?;
+    }
     let is_compact = pos == bytes.len() || bytes.get(pos) == Some(&b'.');
     let mut field_len = if is_compact {
         if compact_digits == 4 || compact_digits == 8 || compact_digits >= 14 {
@@ -91,9 +130,14 @@ fn parse_datetime_flexible(raw: &str) -> Option<NaiveDateTime> {
         let mut value = 0u32;
         let scan_to_delim = !is_compact && field_idx != 6;
         while ptr < bytes.len() && bytes[ptr].is_ascii_digit() && (scan_to_delim || field_len > 0) {
-            value = value
-                .checked_mul(10)?
-                .checked_add((bytes[ptr] - b'0') as u32)?;
+            let next = value
+                .checked_mul(10)
+                .and_then(|v| v.checked_add((bytes[ptr] - b'0') as u32));
+            observe(DateParseObservation::Step)?;
+            let Some(next) = next else {
+                return Ok(None);
+            };
+            value = next;
             ptr += 1;
             if !scan_to_delim {
                 field_len -= 1;
@@ -102,6 +146,7 @@ fn parse_datetime_flexible(raw: &str) -> Option<NaiveDateTime> {
         values[field_idx] = value;
         lengths[field_idx] = ptr - start;
         field_len = 2;
+        observe(DateParseObservation::Step)?;
 
         if ptr == bytes.len() {
             field_idx += 1;
@@ -110,12 +155,14 @@ fn parse_datetime_flexible(raw: &str) -> Option<NaiveDateTime> {
         if field_idx == 2 && bytes[ptr] == b'T' {
             ptr += 1;
             field_idx += 1;
+            observe(DateParseObservation::Step)?;
             continue;
         }
         if field_idx == 5 {
             if bytes[ptr] == b'.' {
                 ptr += 1;
                 field_len = 6;
+                observe(DateParseObservation::Step)?;
             } else if bytes[ptr].is_ascii_digit() {
                 field_idx += 1;
                 break;
@@ -127,13 +174,14 @@ fn parse_datetime_flexible(raw: &str) -> Option<NaiveDateTime> {
             && (bytes[ptr].is_ascii_punctuation() || bytes[ptr].is_ascii_whitespace())
         {
             ptr += 1;
+            observe(DateParseObservation::Step)?;
         }
         field_idx += 1;
     }
 
     let parsed_fields = field_idx;
     if parsed_fields < 3 {
-        return None;
+        return Ok(None);
     }
 
     let mut year = values[0] as i32;
@@ -145,37 +193,68 @@ fn parse_datetime_flexible(raw: &str) -> Option<NaiveDateTime> {
     let mut microsecond = values[6];
 
     if lengths[6] > 0 && lengths[6] < 6 {
-        microsecond = microsecond.checked_mul(10u32.pow((6 - lengths[6]) as u32))?;
+        let next = microsecond.checked_mul(10u32.pow((6 - lengths[6]) as u32));
+        observe(DateParseObservation::Step)?;
+        let Some(next) = next else {
+            return Ok(None);
+        };
+        microsecond = next;
     }
 
     if lengths[0] == 2 {
         year = if year < 70 { year + 2000 } else { year + 1900 };
     }
 
-    if !(1..=12).contains(&month)
+    let invalid = !(1..=12).contains(&month)
         || day == 0
         || hour > 23
         || minute > 59
         || second > 59
-        || microsecond >= 1_000_000
-    {
-        return None;
+        || microsecond >= 1_000_000;
+    observe(DateParseObservation::Step)?;
+    if invalid {
+        return Ok(None);
     }
 
-    let date = NaiveDate::from_ymd_opt(year, month, day)?;
-    date.and_hms_micro_opt(hour, minute, second, microsecond)
+    let date = NaiveDate::from_ymd_opt(year, month, day);
+    observe(DateParseObservation::Step)?;
+    let Some(date) = date else {
+        return Ok(None);
+    };
+    let result = date.and_hms_micro_opt(hour, minute, second, microsecond);
+    observe(DateParseObservation::Step)?;
+    Ok(result)
 }
 
 pub fn parse_datetime(s: &str) -> Option<NaiveDateTime> {
-    // chrono's %S accepts 60 (leap second) and normalizes it to the next minute;
-    // reject that to match StarRocks behavior (second=60 is invalid).
-    let from_chrono = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
-        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f"))
-        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
-        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f"))
-        .ok()
-        .filter(|dt| dt.nanosecond() < 1_000_000_000);
-    from_chrono.or_else(|| parse_datetime_flexible(s))
+    unobserved(parse_datetime_observed(s, |_| Ok(())))
+}
+
+pub(crate) fn parse_datetime_observed<E>(
+    s: &str,
+    mut observe: impl FnMut(DateParseObservation) -> Result<(), E>,
+) -> Result<Option<NaiveDateTime>, E> {
+    // Preserve first successful Chrono format, then reject leap seconds before
+    // the original flexible fallback. Refusal never tries another parser.
+    let mut from_chrono = None;
+    for format in [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%.f",
+    ] {
+        observe(DateParseObservation::OpaqueBoundary)?;
+        let parsed = NaiveDateTime::parse_from_str(s, format);
+        observe(DateParseObservation::OpaqueBoundary)?;
+        if let Ok(date) = parsed {
+            from_chrono = Some(date);
+            break;
+        }
+    }
+    if let Some(date) = from_chrono.filter(|dt| dt.nanosecond() < 1_000_000_000) {
+        return Ok(Some(date));
+    }
+    parse_datetime_flexible(s, &mut observe)
 }
 
 #[cfg(test)]
@@ -300,6 +379,116 @@ mod tests {
             "20161231235960",
         ] {
             assert_eq!(parse_datetime(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn observed_date_parsers_keep_independent_values_and_real_scan_work() {
+        for text in ["2024-02-29", "20240229", "2023-02-29", "nonsense"] {
+            let mut events = Vec::new();
+            let parsed = parse_date_observed(text, |event| {
+                events.push(event);
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+            let expected = if text == "2024-02-29" || text == "20240229" {
+                Some(date(2024, 2, 29))
+            } else {
+                None
+            };
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed, parse_date(text));
+            assert!(
+                events
+                    .iter()
+                    .all(|event| *event == DateParseObservation::OpaqueBoundary)
+            );
+        }
+        let text = format!("2024-02-29{}12:34:56", ".".repeat(320));
+        let mut steps = 0usize;
+        let parsed = parse_datetime_observed(&text, |event| {
+            if event == DateParseObservation::Step {
+                steps += 1;
+            }
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        assert_eq!(parsed, date(2024, 2, 29).and_hms_opt(12, 34, 56));
+        assert_eq!(parsed, parse_datetime(&text));
+        assert!(
+            steps >= 320,
+            "the original delimiter loop must report its own completed work"
+        );
+        let invalid = format!("2{}", "T".repeat(320));
+        steps = 0;
+        assert_eq!(
+            parse_datetime_observed(&invalid, |event| {
+                if event == DateParseObservation::Step {
+                    steps += 1;
+                }
+                Ok::<(), ()>(())
+            })
+            .unwrap(),
+            None
+        );
+        assert!(
+            steps >= 642,
+            "both original prefix and compact-digit scans must complete"
+        );
+    }
+
+    #[test]
+    fn observed_date_parser_refusal_preserves_every_actual_prefix_without_fallback() {
+        for text in [
+            "2024-02-29 12:34:56",
+            "2024-02-29...12:34:56",
+            "2016-12-31 23:59:60",
+            "nonsense",
+        ] {
+            let mut events = Vec::new();
+            parse_datetime_observed(text, |event| {
+                events.push(event);
+                Ok::<(), usize>(())
+            })
+            .unwrap();
+            for stop in 0..events.len() {
+                let mut observed = Vec::new();
+                let result = parse_datetime_observed(text, |event| {
+                    assert!(observed.len() <= stop, "callback or fallback after refusal");
+                    observed.push(event);
+                    if observed.len() == stop + 1 {
+                        Err(stop)
+                    } else {
+                        Ok(())
+                    }
+                });
+                assert_eq!(result, Err(stop));
+                assert_eq!(observed, events[..=stop]);
+            }
+        }
+        for text in ["2024-02-29", "20240229", "nonsense"] {
+            let mut events = Vec::new();
+            parse_date_observed(text, |event| {
+                events.push(event);
+                Ok::<(), usize>(())
+            })
+            .unwrap();
+            for stop in 0..events.len() {
+                let mut observed = Vec::new();
+                assert_eq!(
+                    parse_date_observed(text, |event| {
+                        assert!(observed.len() <= stop);
+                        observed.push(event);
+                        if observed.len() == stop + 1 {
+                            Err(stop)
+                        } else {
+                            Ok(())
+                        }
+                    }),
+                    Err(stop)
+                );
+                assert_eq!(observed, events[..=stop]);
+            }
         }
     }
 }
