@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[path = "source_reference_tests.rs"]
+mod source_reference_tests;
 use novarocks_connector_contract::ConnectorCodecCategory;
 use std::sync::Mutex;
 const SOURCE: usize = 1024 * 1024;

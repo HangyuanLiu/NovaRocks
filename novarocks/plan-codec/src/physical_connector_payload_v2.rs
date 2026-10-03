@@ -174,7 +174,7 @@ fn request_model() -> Result<(), Error> {
     }
     Ok(())
 }
-fn arc_str_bytes(n: usize) -> Result<usize, Error> {
+pub(crate) fn arc_str_bytes(n: usize) -> Result<usize, Error> {
     // Rust 1.92 alloc/sync.rs ArcInner is repr(C): two AtomicUsize counters
     // followed by str bytes. From<&str> allocates once, without a String.
     let data = Layout::array::<u8>(n).map_err(|_| invalid("connector identity layout overflow"))?;
@@ -183,7 +183,7 @@ fn arc_str_bytes(n: usize) -> Result<usize, Error> {
         .map(|(layout, _)| layout.pad_to_align().size())
         .map_err(|_| invalid("connector identity Arc layout overflow"))
 }
-fn bytes_shared_upper() -> Result<usize, Error> {
+pub(crate) fn bytes_shared_upper() -> Result<usize, Error> {
     // bytes 1.11.0 bytes.rs From<Vec> reuses the payload allocation. If
     // allocator capacity exceeds length it additionally boxes Shared. Shared
     // is repr(Rust), so field sizes plus per-field padding are an UPPER bound,
@@ -306,8 +306,65 @@ pub struct EncodedConnectorPayloads<'source, 'control> {
     indices: BindingIndex,
     facts: ConnectorPayloadProjectionFacts,
     control: &'control dyn PureCompileControl,
+    original_source_bytes: usize,
 }
-impl<'source> EncodedConnectorPayloads<'source, '_> {
+impl<'source, 'control> EncodedConnectorPayloads<'source, 'control> {
+    pub(crate) fn original_control(&self) -> &'control dyn PureCompileControl {
+        self.control
+    }
+
+    /// This lower floor counts the original invoice once and current owned
+    /// backing. It is not an allocator-capacity upper bound or a host grant.
+    pub(crate) fn retained_floor_observed(
+        &self,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<usize, Error> {
+        let mut floor = add(self.original_source_bytes, size_of::<Self>())?;
+        floor = add(floor, self.indices.backing_bytes()?)?;
+        floor = add(
+            floor,
+            bytes::<wire::ConnectorPayloadDefinition>(self.wire.capacity())?,
+        )?;
+        work.step()?;
+        for definition in &self.wire {
+            let payload = definition
+                .payload
+                .as_ref()
+                .ok_or_else(|| invalid("sealed connector payload source is absent"))?;
+            let (header, catalog) = raw_header(payload, work)?;
+            for n in [
+                payload.payload.capacity(),
+                header.provider_id.capacity(),
+                catalog.catalog_name.capacity(),
+                catalog.version.capacity(),
+            ] {
+                floor = add(floor, n)?;
+            }
+            work.step()?;
+        }
+        Ok(floor)
+    }
+
+    /// Resolve the exact original owner. An alias emitted under multiple IDs
+    /// requires a later explicit sealed-reference author, never a first match.
+    pub(crate) fn source_id_observed(
+        &self,
+        source: &ConnectorEncodedPayload,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<u32, Error> {
+        let mut found = None;
+        for (id, payload) in self.inputs {
+            let same = std::ptr::eq(*payload, source);
+            work.step()?;
+            if same {
+                if found.is_some() {
+                    return Err(invalid("connector payload source association is ambiguous"));
+                }
+                found = Some(*id);
+            }
+        }
+        found.ok_or_else(|| invalid("connector payload source owner is not in this namespace"))
+    }
     pub fn as_wire(&self) -> &[wire::ConnectorPayloadDefinition] {
         &self.wire
     }
@@ -342,8 +399,40 @@ pub struct DecodedConnectorPayloads<'wire, 'control> {
     indices: BindingIndex,
     facts: ConnectorPayloadProjectionFacts,
     control: &'control dyn PureCompileControl,
+    original_source_bytes: usize,
 }
-impl<'wire> DecodedConnectorPayloads<'wire, '_> {
+impl<'wire, 'control> DecodedConnectorPayloads<'wire, 'control> {
+    pub(crate) fn original_control(&self) -> &'control dyn PureCompileControl {
+        self.control
+    }
+    pub fn source_count(&self) -> usize {
+        self.wire.len()
+    }
+    pub(crate) fn retained_floor_observed(
+        &self,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<usize, Error> {
+        let mut floor = add(self.original_source_bytes, size_of::<Self>())?;
+        floor = add(floor, self.indices.backing_bytes()?)?;
+        floor = add(
+            floor,
+            bytes::<ConnectorEncodedPayload>(self.payloads.capacity())?,
+        )?;
+        work.step()?;
+        for payload in &self.payloads {
+            let header = payload.header();
+            floor = add(floor, arc_str_bytes(header.provider_id().as_str().len())?)?;
+            floor = add(
+                floor,
+                arc_str_bytes(header.catalog().catalog_name().as_str().len())?,
+            )?;
+            // Bytes' logical length is independently visible; opaque allocator
+            // capacity and Shared backing remain in the host's complete invoice.
+            floor = add(floor, payload.payload().len())?;
+            work.step()?;
+        }
+        Ok(floor)
+    }
     pub fn as_wire(&self) -> &'wire [wire::ConnectorPayloadDefinition] {
         self.wire
     }
@@ -457,6 +546,7 @@ fn encode_core<'source, 'control>(
         indices,
         facts,
         control,
+        original_source_bytes: source,
     })
 }
 pub fn decode_connector_payloads<'wire, 'control>(
@@ -579,6 +669,7 @@ fn decode_core<'wire, 'control>(
         indices,
         facts,
         control,
+        original_source_bytes: source,
     })
 }
 
