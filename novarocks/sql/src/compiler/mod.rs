@@ -784,13 +784,14 @@ pub fn analyze_mv_refresh_input(
     )?;
     crate::planning::mv::validate_imv_aggregate_star_arguments(&query)
         .map_err(|error| error.to_string())?;
-    let (resolved, _, _) = crate::analyzer::analyze_with_function_catalog(
+    let (resolved, _, factory) = crate::analyzer::analyze_with_function_catalog(
         &query,
         catalog.planner_table_provider(),
         &current_database,
         functions,
     )
     .map_err(|error| error.to_string())?;
+    crate::planning::mv::validate_persistable_output(&resolved, &factory)?;
     Ok(crate::planning::mv::SqlResolvedMvRefreshInput::from_analysis(resolved))
 }
 

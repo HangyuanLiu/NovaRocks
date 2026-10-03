@@ -1,0 +1,5 @@
+{
+  "target/debug/novarocks": "69879f6a9c8d2410e86594124f903778038b556119dcd5ee5d1ad04ad2d5a429",
+  "target/debug/novarocks-sql-test": "4f4d25fcac5f5c8334cbb8feefb02e2ab2b99afaf3b848a44cde493746587b2e",
+  "target/debug/novarocks-system-tests": "8853fbed25c985c7f6fb482623b95a4457782c5315ac5f73fc28e6d3390350bc"
+}

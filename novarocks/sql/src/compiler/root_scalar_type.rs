@@ -149,6 +149,8 @@ fn sql_domain(logical: &T) -> Option<L> {
         T::Json => Some(L::Json),
         T::Hll => Some(L::Hll),
         T::Bitmap => Some(L::Bitmap),
+        T::Object => Some(L::Object),
+        T::Percentile => Some(L::Percentile),
         _ => None,
     }
 }
@@ -163,7 +165,7 @@ fn sql_storage_matches(logical: &T, data_type: &D) -> bool {
         | (T::Float, D::Float32)
         | (T::Double, D::Float64)
         | (T::String | T::Json, D::Utf8)
-        | (T::Binary | T::Hll | T::Bitmap, D::Binary)
+        | (T::Binary | T::Hll | T::Bitmap | T::Object | T::Percentile, D::Binary)
         | (T::Boolean, D::Boolean)
         | (T::Date, D::Date32)
         | (T::DateTime, D::Timestamp(TimeUnit::Microsecond, _))
@@ -539,6 +541,8 @@ mod tests {
             (D::Utf8, T::Json, S::Json),
             (D::Binary, T::Hll, S::Opaque(O::Hll)),
             (D::Binary, T::Bitmap, S::Opaque(O::Bitmap)),
+            (D::Binary, T::Object, S::Opaque(O::Object)),
+            (D::Binary, T::Percentile, S::Opaque(O::Percentile)),
             (D::LargeBinary, T::Variant, S::Variant),
         ] {
             let actual = scalar_field(&storage, false, Some(&logical)).unwrap();

@@ -1879,7 +1879,9 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             };
-            let node = body.frozen.plan.as_mut().unwrap().root.as_mut().unwrap();
+            let fragment = body.frozen.plan.as_mut().unwrap();
+            fragment.output_columns = vec![column.clone()];
+            let node = fragment.root.as_mut().unwrap();
             let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_mut()
             else {
                 unreachable!()

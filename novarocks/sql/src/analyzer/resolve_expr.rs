@@ -174,6 +174,9 @@ impl<'a> super::AnalyzerContext<'a> {
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
         let resolved = self.analyze_expr_impl(expr, scope)?;
+        // Project trusted wrapper facts through an explicit output adapter;
+        // the implementation expression and its selected binding stay exact.
+        let resolved = self.adapt_bound_output_domains(resolved, Some(expr), scope, expr.span())?;
         if self.sql_semantics.sql_mode().decimal_overflow_policy()
             == novarocks_type_contract::DecimalOverflowPolicy::ReportError
         {
@@ -6559,13 +6562,21 @@ mod tests {
             .ok_or_else(|| "expected projection".to_string())
     }
 
-    fn assert_json_list_scalar_adapter(expression: &crate::analysis::TypedExpr, expected_id: &str) {
+    fn assert_json_list_scalar_adapter(
+        expression: &crate::analysis::TypedExpr,
+        expected_id: &str,
+        sql: &str,
+    ) {
         use novarocks_types::logical::{LogicalType, logical_type_of_field};
         let DataType::List(item) = &expression.data_type else {
             panic!("expected List");
         };
         assert_eq!(item.data_type(), &DataType::Utf8);
-        assert_eq!(logical_type_of_field(item), Some(LogicalType::Json));
+        assert_eq!(
+            logical_type_of_field(item),
+            Some(LogicalType::Json),
+            "{sql}"
+        );
         let ExprKind::Cast {
             expr: physical,
             target,
@@ -6611,7 +6622,7 @@ mod tests {
             "select array<json>[null]",
         ] {
             let expression = analyze_projection_expr(sql).unwrap();
-            assert_json_list_scalar_adapter(&expression, "builtin.scalar/__array_literal/v1");
+            assert_json_list_scalar_adapter(&expression, "builtin.scalar/__array_literal/v1", sql);
         }
         for sql in [
             "select array_sortby([json_object('k',1), json_object('k',2)], [2,1])",
@@ -6625,7 +6636,7 @@ mod tests {
         ] {
             let expression =
                 analyze_projection_expr(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
-            assert_json_list_scalar_adapter(&expression, "builtin.scalar/array_sortby/v1");
+            assert_json_list_scalar_adapter(&expression, "builtin.scalar/array_sortby/v1", sql);
         }
         for sql in [
             "select ['{\"k\":1}', '{\"k\":2}']",
@@ -6841,7 +6852,7 @@ mod tests {
                 &JsonCatalog,
                 crate::functions::builtin_sql_function_catalog(),
             )
-            .unwrap();
+            .unwrap_or_else(|error| panic!("{sql}: {error}"));
             assert_array_agg_json_adapter(&expression);
         }
         for sql in [
@@ -6854,8 +6865,8 @@ mod tests {
                 &JsonCatalog,
                 crate::functions::builtin_sql_function_catalog(),
             )
-            .unwrap();
-            assert_json_list_scalar_adapter(&expression, "builtin.scalar/array_sortby/v1");
+            .unwrap_or_else(|error| panic!("{sql}: {error}"));
+            assert_json_list_scalar_adapter(&expression, "builtin.scalar/array_sortby/v1", sql);
         }
     }
 

@@ -28,6 +28,7 @@ use crate::common::OutputColumn;
 pub(crate) struct RootOutputSemantics {
     occurrences: Box<[(ColumnId, ResultValueDomain)]>,
     scalar_field: Option<ScalarField>,
+    private_persistence_domain: bool,
 }
 
 impl RootOutputSemantics {
@@ -50,8 +51,18 @@ impl RootOutputSemantics {
             .ok(),
             _ => None,
         };
+        let private_persistence_domain =
+            columns
+                .iter()
+                .filter(|column| !column.is_internal)
+                .any(|column| {
+                    factory
+                        .borrowed_logical_type(column.column_id)
+                        .is_some_and(private_persistence_domain)
+                });
         Ok(Self {
             scalar_field,
+            private_persistence_domain,
             occurrences: columns
                 .iter()
                 .map(|column| {
@@ -60,12 +71,20 @@ impl RootOutputSemantics {
                         Some(SqlType::Variant) => ResultValueDomain::Variant,
                         Some(SqlType::Hll) => ResultValueDomain::Hll,
                         Some(SqlType::Bitmap) => ResultValueDomain::Bitmap,
+                        Some(SqlType::Object) => ResultValueDomain::Object,
+                        Some(SqlType::Percentile) => ResultValueDomain::Percentile,
                         _ => ResultValueDomain::Plain,
                     };
                     (column.column_id, domain)
                 })
                 .collect(),
         })
+    }
+
+    /// Retain a complete declared private-domain refusal independently of the
+    /// scalar schema. Multi-column and unsupported scalar shapes still carry it.
+    pub(crate) fn has_private_persistence_domain(&self) -> bool {
+        self.private_persistence_domain
     }
 
     /// Optimizer aliases may repeat one value. They may not reorder or replace
@@ -112,6 +131,20 @@ impl RootOutputSemantics {
             return None;
         }
         ScalarSchema::try_new(field).ok()
+    }
+}
+
+fn private_persistence_domain(logical: &SqlType) -> bool {
+    match logical {
+        SqlType::Object | SqlType::Percentile => true,
+        SqlType::Array(item) => private_persistence_domain(item),
+        SqlType::Map(key, value) => {
+            private_persistence_domain(key) || private_persistence_domain(value)
+        }
+        SqlType::Struct(fields) => fields
+            .iter()
+            .any(|(_, field)| private_persistence_domain(field)),
+        _ => false,
     }
 }
 

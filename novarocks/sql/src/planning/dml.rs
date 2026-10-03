@@ -844,6 +844,8 @@ impl DmlReadCompletion {
 /// stable capture fingerprint, and sealed write plan derived from it.
 #[derive(Clone, Debug)]
 pub struct DmlCtasSourcePlan {
+    private_output_domain: bool,
+    output_domains: Box<[novarocks_physical_plan::ResultValueDomain]>,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     optimized: crate::optimizer::OptimizedOperatorNode,
     function_catalog: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
@@ -852,17 +854,25 @@ pub struct DmlCtasSourcePlan {
 /// One source output field exposed to CTAS target admission.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DmlSourceColumn {
+    pub domain: novarocks_physical_plan::ResultValueDomain,
     pub name: String,
     pub data_type: arrow::datatypes::DataType,
     pub nullable: bool,
 }
 
 impl DmlCtasSourcePlan {
+    /// Complete declared private domains survive even when Arrow fields omit markers.
+    pub fn has_private_output_domain(&self) -> bool {
+        self.private_output_domain
+    }
+
     pub fn output_columns(&self) -> Vec<DmlSourceColumn> {
         self.optimized
             .output_columns
             .iter()
-            .map(|column| DmlSourceColumn {
+            .zip(self.output_domains.iter().copied())
+            .map(|(column, domain)| DmlSourceColumn {
+                domain,
                 name: column.name.clone(),
                 data_type: column.data_type.clone(),
                 nullable: column.nullable,
@@ -875,7 +885,10 @@ impl DmlCtasSourcePlan {
     pub fn capture_fingerprint(&self) -> [u8; 32] {
         use sha2::{Digest, Sha256};
 
-        let material = format!("{:#?}", self.optimized);
+        let material = format!(
+            "{:#?}\n{:#?}\n{}",
+            self.optimized, self.output_domains, self.private_output_domain
+        );
         let mut digest = Sha256::new();
         for part in [
             b"novarocks.ctas-optimized-capture.v1".as_slice(),
@@ -898,7 +911,14 @@ pub fn compile_ctas_source(
         .map_err(|error| error.to_string())?
         .into_optimized_output()
         .map_err(|_| "CTAS source did not produce optimized SQL facts".to_string())?;
+    let output_domains = compiled
+        .root_semantics
+        .domains(&compiled.optimized_tree.output_columns)?
+        .into_boxed_slice();
+    let private_output_domain = compiled.root_semantics.has_private_persistence_domain();
     Ok(DmlCtasSourcePlan {
+        private_output_domain,
+        output_domains,
         query_statistics: compiled.statistics.snapshot,
         optimized: compiled.optimized_tree,
         function_catalog: compiled.function_catalog,
@@ -2526,6 +2546,129 @@ mod tests {
         StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue,
         StatisticsNumericNature, StatisticsRowCoverage,
     };
+
+    #[test]
+    fn m07_ctas_source_keeps_exact_producer_domains_until_target_admission() {
+        use crate::compiler::*;
+        use novarocks_physical_plan::ResultValueDomain as Domain;
+        for (sql, expected) in [
+            (
+                "select percentile_hash(cast(1 as double)) as v",
+                Domain::Percentile,
+            ),
+            ("select to_bitmap(1) as v", Domain::Bitmap),
+            ("select bitmap_to_binary(to_bitmap(1)) as v", Domain::Plain),
+        ] {
+            let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+            let snapshot = SqlPlannerTableSnapshot::new(&catalog);
+            let control = SqlCompileControl::unbounded();
+            let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
+                SqlStatementInput::sql(sql),
+                SqlCompileIntent::IcebergWrite {
+                    root_distribution: RootDistributionRequirement::Any,
+                },
+                SqlSessionContext {
+                    sql_semantics: Default::default(),
+                    current_catalog: None,
+                    current_database: "default".into(),
+                    optimizer_settings: Default::default(),
+                },
+                SqlPlanningEnvironment::Distributed,
+                &snapshot,
+                builtin_sql_function_catalog(),
+                noop_constant_evaluator(),
+                None,
+                control.clone(),
+            ))
+            .unwrap()
+            .into_pending()
+            .unwrap();
+            let source = super::compile_ctas_source(SqlOptimizeRequest::new(
+                analyzed,
+                &DmlStatisticsSnapshot::empty(),
+                control,
+            ))
+            .unwrap();
+            let columns = source.output_columns();
+            assert_eq!(columns.len(), 1, "{sql}");
+            assert_eq!(columns[0].domain, expected, "{sql}");
+            assert_eq!(
+                source.has_private_output_domain(),
+                expected == Domain::Percentile
+            );
+            if expected != Domain::Plain {
+                let mut erased = source.clone();
+                erased.output_domains[0] = Domain::Plain;
+                assert_ne!(source.capture_fingerprint(), erased.capture_fingerprint());
+            }
+        }
+    }
+
+    #[test]
+    fn m07_ctas_complete_private_declaration_survives_unmarked_multi_column_source() {
+        use crate::compiler::*;
+        use arrow::datatypes::{DataType as D, Field};
+        use novarocks_types::schema::{ColumnDef, SqlType as T};
+        use std::sync::Arc;
+        for logical in [T::Object, T::Percentile] {
+            let mut catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+            crate::planning::catalog::register_test_connector_read_table(
+                &mut catalog,
+                "default",
+                "t",
+                vec![ColumnDef {
+                    name: "state".into(),
+                    data_type: D::List(Arc::new(Field::new("item", D::Binary, true))),
+                    nullable: true,
+                    write_default: None,
+                    logical_type: Some(T::Array(Box::new(logical))),
+                }],
+            )
+            .unwrap();
+            let snapshot = SqlPlannerTableSnapshot::new(&catalog);
+            let control = SqlCompileControl::unbounded();
+            let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
+                SqlStatementInput::sql("select state, 1 as plain from t"),
+                SqlCompileIntent::IcebergWrite {
+                    root_distribution: RootDistributionRequirement::Any,
+                },
+                SqlSessionContext {
+                    sql_semantics: Default::default(),
+                    current_catalog: None,
+                    current_database: "default".into(),
+                    optimizer_settings: Default::default(),
+                },
+                SqlPlanningEnvironment::Distributed,
+                &snapshot,
+                builtin_sql_function_catalog(),
+                noop_constant_evaluator(),
+                None,
+                control.clone(),
+            ))
+            .unwrap()
+            .into_pending()
+            .unwrap();
+            let source = super::compile_ctas_source(SqlOptimizeRequest::new(
+                analyzed,
+                &DmlStatisticsSnapshot::from_evidence([super::DmlStatisticsEvidence::Missing {
+                    binding: crate::binding::SqlTableBindingId::new_for_test(1),
+                    label: "test_catalog.test_db.test_table".into(),
+                    reason: "fixture has no published statistics".into(),
+                }]),
+                control,
+            ))
+            .unwrap();
+            assert_eq!(source.output_columns().len(), 2);
+            assert_eq!(
+                source.output_columns()[0].domain,
+                novarocks_physical_plan::ResultValueDomain::Plain
+            );
+            assert!(source.has_private_output_domain());
+            let mut erased = source.clone();
+            erased.private_output_domain = false;
+            assert_ne!(source.capture_fingerprint(), erased.capture_fingerprint());
+        }
+    }
 
     fn statistics_final_context() -> super::DmlFinalPlanContext {
         use novarocks_physical_plan::{

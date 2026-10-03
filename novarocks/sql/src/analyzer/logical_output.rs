@@ -26,6 +26,9 @@ use super::{AnalyzerContext, scope::AnalyzerScope};
 use crate::analysis::{ExprKind, TypedExpr};
 use crate::analyze_error::AnalyzeError;
 
+#[path = "logical_container.rs"]
+mod container;
+
 impl AnalyzerContext<'_> {
     pub(super) fn logical_output_type(
         &self,
@@ -33,6 +36,15 @@ impl AnalyzerContext<'_> {
         expression: &TypedExpr,
         scope: &AnalyzerScope,
     ) -> Option<SqlType> {
+        // The existing independent source witness also covers explicitly typed
+        // empty/all-null JSON literals and catalog JSON-list columns. A physical
+        // List<Utf8> or an output CAST alone does not establish this witness.
+        if self.json_list_provenance(source, expression, scope)
+            && matches!(&expression.data_type, DataType::List(item)
+                if item.data_type() == &DataType::Utf8)
+        {
+            return Some(SqlType::Array(Box::new(SqlType::Json)));
+        }
         // A public JSON CAST does not prove arbitrary string contents. Only
         // its already-proven Json operand preserves the existing domain. All
         // other explicit CASTs retain their current owner semantics, including
@@ -109,12 +121,42 @@ impl AnalyzerContext<'_> {
                         "builtin.scalar/nullif/v1" if args.len() == 2 => {
                             self.logical_output_type(source_arg(0), &args[0], scope)
                         }
-                        _ => None,
+                        _ => self.container_output_type(source, expression, scope),
                     }
                 } else {
                     None
                 }
             }
+            ExprKind::AggregateCall { resolved, args, .. } => {
+                crate::functions::aggregate_output_logical_type(resolved).or_else(|| {
+                    if resolved.kind == novarocks_functions::FunctionKind::Aggregate
+                        && resolved.function_id.as_str() == "builtin.aggregate/any_value/v1"
+                        && args.len() == 1
+                    {
+                        self.logical_output_type(
+                            container::argument_source(source, 0),
+                            &args[0],
+                            scope,
+                        )
+                    } else {
+                        self.container_output_type(source, expression, scope)
+                    }
+                })
+            }
+            ExprKind::WindowCall {
+                aggregate_binding: Some(binding),
+                args,
+                ..
+            } => crate::functions::aggregate_output_logical_type(binding).or_else(|| {
+                if binding.kind == novarocks_functions::FunctionKind::Aggregate
+                    && binding.function_id.as_str() == "builtin.aggregate/any_value/v1"
+                    && args.len() == 1
+                {
+                    self.logical_output_type(container::argument_source(source, 0), &args[0], scope)
+                } else {
+                    self.container_output_type(source, expression, scope)
+                }
+            }),
             ExprKind::Case {
                 when_then,
                 else_expr,
@@ -415,7 +457,11 @@ fn logical_carrier_matches(domain: &SqlType, carrier: &DataType) -> bool {
     match (domain, carrier) {
         (SqlType::String | SqlType::Json, DataType::Utf8 | DataType::LargeUtf8)
         | (
-            SqlType::Binary | SqlType::Hll | SqlType::Bitmap,
+            SqlType::Binary
+            | SqlType::Hll
+            | SqlType::Bitmap
+            | SqlType::Object
+            | SqlType::Percentile,
             DataType::Binary | DataType::LargeBinary,
         )
         | (SqlType::Variant, DataType::LargeBinary)
@@ -515,6 +561,8 @@ mod scalar_domain_tests {
                     declared("b", DataType::Binary, SqlType::Bitmap),
                     declared("s", DataType::Utf8, SqlType::String),
                     declared("v", DataType::LargeBinary, SqlType::Variant),
+                    declared("o", DataType::Binary, SqlType::Object),
+                    declared("p", DataType::Binary, SqlType::Percentile),
                     declared(
                         "a",
                         DataType::List(Arc::new(json_item)),
@@ -594,6 +642,125 @@ mod scalar_domain_tests {
             next_lambda_slot_id: Cell::new(0),
             collected_subqueries: RefCell::new(Vec::new()),
             cte_registry: RefCell::new(Default::default()),
+        }
+    }
+
+    #[test]
+    fn m07_json_list_explicit_literal_target_keeps_its_source_decision() {
+        assert_eq!(
+            output_domains("select array<json>[],array<json>[null]"),
+            vec![Some(SqlType::Array(Box::new(SqlType::Json))); 2],
+        );
+        assert_eq!(
+            output_domains(
+                "with q as (select array<json>[] as j) select array_sortby(j,[1]) from q"
+            ),
+            vec![Some(SqlType::Array(Box::new(SqlType::Json)))],
+        );
+        assert_eq!(
+            output_domains("select array<varchar>[json_object('k',1)],array<json>['plain']"),
+            vec![Some(SqlType::Array(Box::new(SqlType::String))); 2],
+        );
+        assert_eq!(
+            output_domains("select cast(['plain'] as array<json>)"),
+            vec![None],
+        );
+    }
+
+    #[test]
+    fn m07_json_list_missing_marker_requires_its_independent_source_witness() {
+        for (marker, witness, accepted) in [
+            (None, false, false),
+            (None, true, true),
+            (Some("json"), false, true),
+            (Some("json"), true, true),
+            (Some("unknown"), true, false),
+            (Some("hll"), true, false),
+        ] {
+            let item = Field::new("item", DataType::Utf8, true);
+            let item = match marker {
+                Some(value) => item.with_metadata(
+                    [(
+                        novarocks_types::logical::NR_LOGICAL_TYPE_KEY.to_owned(),
+                        value.to_owned(),
+                    )]
+                    .into(),
+                ),
+                None => item,
+            };
+            let carrier = DataType::List(Arc::new(item));
+            let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
+            let id = factory
+                .borrow_mut()
+                .create(None, "source".into(), carrier.clone(), true);
+            factory
+                .borrow_mut()
+                .set_logical_type(id, Some(SqlType::Array(Box::new(SqlType::Json))));
+            factory.borrow_mut().set_json_list_provenance(id, witness);
+            let scope = AnalyzerScope::new(factory.clone());
+            let context = context(factory);
+            let source = TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: id,
+                    qualifier: None,
+                    column: "source".into(),
+                },
+                data_type: carrier,
+                nullable: true,
+            };
+            if witness && !accepted {
+                // A binding coercion must not hide the original conflicting
+                // item marker behind an ordinary List<Utf8> argument.
+                let target = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+                let coerced = TypedExpr {
+                    kind: ExprKind::Cast {
+                        expr: Box::new(source.clone()),
+                        target: target.clone(),
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    },
+                    data_type: target,
+                    nullable: true,
+                };
+                let bound = super::super::resolve_expr::resolved_scalar_call_at(
+                    context.function_catalog,
+                    "row",
+                    vec![coerced],
+                    Span::new(0, 0),
+                )
+                .unwrap();
+                assert!(
+                    context
+                        .adapt_bound_output_domains(bound, None, &scope, Span::new(0, 0))
+                        .is_err()
+                );
+            }
+            let bound = super::super::resolve_expr::resolved_scalar_call_at(
+                context.function_catalog,
+                "row",
+                vec![source],
+                Span::new(0, 0),
+            )
+            .unwrap();
+            let result = context.adapt_bound_output_domains(bound, None, &scope, Span::new(0, 0));
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "marker={marker:?} witness={witness}: {result:?}"
+            );
+            if accepted {
+                let result = result.unwrap();
+                let DataType::Struct(fields) = result.data_type else {
+                    panic!("row result");
+                };
+                let DataType::List(item) = fields[0].data_type() else {
+                    panic!("list result");
+                };
+                assert_eq!(
+                    novarocks_types::logical::logical_type_of_field(item),
+                    Some(LogicalType::Json)
+                );
+            }
         }
     }
 
@@ -777,5 +944,204 @@ mod scalar_domain_tests {
             context.logical_output_type(None, &cast(DataType::Utf8), &scope),
             Some(SqlType::Json)
         );
+    }
+
+    fn output_expressions(sql: &str) -> Vec<TypedExpr> {
+        let (query, _, _) = super::super::analyze(&query(sql), &Catalog, "db").unwrap();
+        let crate::analysis::QueryBody::Select(select) = query.body else {
+            panic!("expected select")
+        };
+        select
+            .projection
+            .into_iter()
+            .map(|item| item.expr)
+            .collect()
+    }
+
+    #[test]
+    fn m07_scalar_exact_aggregate_and_window_producers_forward_domains() {
+        assert_eq!(
+            output_domains(
+                "select bitmap_union(to_bitmap(1)),hll_union(hll_hash('x')),percentile_union(percentile_hash(1.0)),any_value(to_bitmap(1))"
+            ),
+            vec![
+                Some(SqlType::Bitmap),
+                Some(SqlType::Hll),
+                Some(SqlType::Percentile),
+                Some(SqlType::Bitmap)
+            ]
+        );
+        assert_eq!(
+            output_domains("select bitmap_union(to_bitmap(1)) over ()"),
+            vec![Some(SqlType::Bitmap)]
+        );
+        assert_eq!(
+            output_domains(
+                "select array_agg(to_bitmap(1)),map_agg(cast(1 as bigint),hll_hash('x'))"
+            ),
+            vec![
+                Some(SqlType::Array(Box::new(SqlType::Bitmap))),
+                Some(SqlType::Map(
+                    Box::new(SqlType::BigInt),
+                    Box::new(SqlType::Hll)
+                ))
+            ]
+        );
+    }
+
+    #[test]
+    fn m07_scalar_nested_wrappers_and_selectors_keep_exact_value_origins() {
+        assert_eq!(
+            output_domains(
+                "select element_at([to_bitmap(1),null],1),element_at(map(1,hll_hash('x')),1),element_at(map_values(map(1,percentile_hash(1.0))),1),named_struct('value',to_bitmap(1)).value"
+            ),
+            vec![
+                Some(SqlType::Bitmap),
+                Some(SqlType::Hll),
+                Some(SqlType::Percentile),
+                Some(SqlType::Bitmap)
+            ]
+        );
+        assert_eq!(
+            output_domains(
+                "select element_at(array_slice([hll_hash('x')],1),1),element_at(array_sortby([to_bitmap(1)],[1]),1),element_at(map_from_arrays([cast(1 as bigint)],[percentile_hash(1.0)]),1)"
+            ),
+            vec![
+                Some(SqlType::Hll),
+                Some(SqlType::Bitmap),
+                Some(SqlType::Percentile)
+            ]
+        );
+        assert_eq!(
+            output_domains("select element_at([o],1),element_at([p],1),element_at([v],1) from t"),
+            vec![
+                Some(SqlType::Object),
+                Some(SqlType::Percentile),
+                Some(SqlType::Variant)
+            ]
+        );
+    }
+
+    #[test]
+    fn m07_scalar_null_companion_retains_actual_null_and_independent_marker() {
+        let expressions = output_expressions(
+            "select row(null,to_bitmap(1)),named_struct('missing',null,'value',percentile_hash(1.0))",
+        );
+        for (expression, marker, names) in [
+            (&expressions[0], LogicalType::Bitmap, ["col1", "col2"]),
+            (
+                &expressions[1],
+                LogicalType::Percentile,
+                ["missing", "value"],
+            ),
+        ] {
+            let DataType::Struct(fields) = &expression.data_type else {
+                panic!("expected struct")
+            };
+            assert_eq!(fields[0].data_type(), &DataType::Null);
+            assert_eq!(fields[0].name(), names[0]);
+            assert_eq!(fields[1].name(), names[1]);
+            assert_eq!(
+                novarocks_types::logical::logical_type_of_field(&fields[1]),
+                Some(marker)
+            );
+        }
+        // SqlType has no Null member. The exact actual fields carry this proof,
+        // rather than a fabricated all-members SqlType or a plain opaque value.
+        assert_eq!(output_domains("select row(null,to_bitmap(1))"), vec![None]);
+        assert_eq!(
+            output_domains(
+                "select named_struct('missing',null,'value',percentile_hash(1.0)).value"
+            ),
+            vec![Some(SqlType::Percentile)]
+        );
+    }
+
+    #[test]
+    fn m07_scalar_wrapper_output_adapter_preserves_selected_overload_and_shape() {
+        let expression = output_expressions("select [to_bitmap(1),null]").remove(0);
+        let ExprKind::Cast { expr, target, .. } = &expression.kind else {
+            panic!("expected explicit output adapter")
+        };
+        let ExprKind::FunctionCall { binding, .. } = &expr.kind else {
+            panic!("expected original bound function")
+        };
+        assert_eq!(
+            binding.function_id.as_str(),
+            "builtin.scalar/__array_literal/v1"
+        );
+        let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
+        else {
+            panic!("expected scalar result")
+        };
+        assert_eq!(result.data_type, expr.data_type);
+        let (DataType::List(actual), DataType::List(adapted)) = (&expr.data_type, target) else {
+            panic!("expected lists")
+        };
+        assert_eq!(actual.name(), adapted.name());
+        assert_eq!(actual.is_nullable(), adapted.is_nullable());
+        assert_eq!(actual.data_type(), adapted.data_type());
+        assert_eq!(
+            novarocks_types::logical::logical_type_of_field(actual),
+            None
+        );
+        assert_eq!(
+            novarocks_types::logical::logical_type_of_field(adapted),
+            Some(LogicalType::Bitmap)
+        );
+    }
+
+    #[test]
+    fn m07_scalar_wrapper_mixed_domains_clear_and_missing_source_markers_refuse() {
+        assert_eq!(
+            output_domains(
+                "select element_at([to_bitmap(1),hll_hash('x')],1),element_at([parse_json('{}'),'plain'],1)"
+            ),
+            vec![Some(SqlType::Binary), Some(SqlType::String)]
+        );
+        // These trusted catalog facts deliberately lack their declared nested
+        // marker in Catalog. A wrapper must not launder them by adding a marker.
+        for sql in ["select map_values(m) from t", "select row(r) from t"] {
+            let error = super::super::analyze(&query(sql), &Catalog, "db").unwrap_err();
+            assert!(
+                error.to_string().contains("logical identity differs"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            output_domains("select cast(element_at([to_bitmap(1)],1) as varbinary)"),
+            vec![None]
+        );
+    }
+
+    #[test]
+    fn m07_scalar_shadowed_wrapper_binding_cannot_project_child_domain() {
+        let (resolved, _, factory) =
+            super::super::analyze(&query("select [to_bitmap(1)]"), &Catalog, "db").unwrap();
+        let crate::analysis::QueryBody::Select(select) = resolved.body else {
+            panic!("expected select")
+        };
+        let ExprKind::Cast { expr, .. } = select.projection[0].expr.clone().kind else {
+            panic!("expected adapter")
+        };
+        let mut original = *expr;
+        let ExprKind::FunctionCall { binding, .. } = &mut original.kind else {
+            panic!("expected original binding")
+        };
+        let mut shadowed = binding.resolved().clone();
+        shadowed.function_id =
+            novarocks_functions::FunctionId::try_new("test.shadow/__array_literal/v1").unwrap();
+        *binding = shadowed.into();
+        let factory = Rc::new(RefCell::new(factory));
+        let scope = AnalyzerScope::new(factory.clone());
+        let context = context(factory);
+        let adapted = context
+            .adapt_bound_output_domains(original, None, &scope, Span::new(0, 0))
+            .unwrap();
+        let DataType::List(field) = &adapted.data_type else {
+            panic!("expected list")
+        };
+        assert_eq!(novarocks_types::logical::logical_type_of_field(field), None);
+        assert_eq!(context.logical_output_type(None, &adapted, &scope), None);
     }
 }

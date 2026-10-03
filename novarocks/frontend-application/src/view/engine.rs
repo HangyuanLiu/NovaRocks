@@ -451,8 +451,8 @@ fn view_type_name(data_type: &arrow::datatypes::DataType) -> Result<TypeName, St
         })
     }
 
-    fn convert(data_type: SqlType) -> TypeName {
-        match data_type {
+    fn convert(data_type: SqlType) -> Result<TypeName, String> {
+        Ok(match data_type {
             SqlType::TinyInt => type_name("TINYINT", vec![]),
             SqlType::SmallInt => type_name("SMALLINT", vec![]),
             SqlType::Int => type_name("INT", vec![]),
@@ -469,19 +469,24 @@ fn view_type_name(data_type: &arrow::datatypes::DataType) -> Result<TypeName, St
             SqlType::Binary => type_name("VARBINARY", vec![]),
             SqlType::Bitmap => type_name("BITMAP", vec![]),
             SqlType::Hll => type_name("HLL", vec![]),
+            SqlType::Object | SqlType::Percentile => {
+                return Err(
+                    "internal opaque value domains have no public view SQL type name".into(),
+                );
+            }
             SqlType::Boolean => type_name("BOOLEAN", vec![]),
             SqlType::Date => type_name("DATE", vec![]),
             SqlType::DateTime => type_name("DATETIME", vec![]),
             SqlType::DateTimeNs => type_name("DATETIME_NS", vec![]),
             SqlType::Time => type_name("TIME", vec![]),
             SqlType::Array(element) => {
-                type_name("ARRAY", vec![TypeNameArgument::Type(convert(*element))])
+                type_name("ARRAY", vec![TypeNameArgument::Type(convert(*element)?)])
             }
             SqlType::Map(key, value) => type_name(
                 "MAP",
                 vec![
-                    TypeNameArgument::Type(convert(*key)),
-                    TypeNameArgument::Type(convert(*value)),
+                    TypeNameArgument::Type(convert(*key)?),
+                    TypeNameArgument::Type(convert(*value)?),
                 ],
             ),
             SqlType::Struct(fields) => type_name(
@@ -489,19 +494,19 @@ fn view_type_name(data_type: &arrow::datatypes::DataType) -> Result<TypeName, St
                 fields
                     .into_iter()
                     .map(|(name, field_type)| {
-                        TypeNameArgument::Field(StructField {
+                        Ok(TypeNameArgument::Field(StructField {
                             name: ident(name),
-                            data_type: convert(field_type),
+                            data_type: convert(field_type)?,
                             span: span(),
-                        })
+                        }))
                     })
-                    .collect(),
+                    .collect::<Result<Vec<_>, String>>()?,
             ),
             SqlType::Variant => type_name("VARIANT", vec![]),
-        }
+        })
     }
 
-    Ok(convert(arrow_data_type_to_sql_type(data_type)?))
+    convert(arrow_data_type_to_sql_type(data_type)?)
 }
 
 #[cfg(test)]

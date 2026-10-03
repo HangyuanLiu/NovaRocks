@@ -1463,6 +1463,7 @@ fn build_pipeline_for_program_node(
         lp::ProgramNodeKind::Project {
             input,
             is_subordinate,
+            validate_final_result_input,
             exprs,
             expr_slot_ids,
             expr_slot_schemas,
@@ -1495,10 +1496,8 @@ fn build_pipeline_for_program_node(
                         .collect::<Result<Vec<_>, _>>()
                 })
                 .transpose()?;
-            build
-                .pipeline
-                .factories
-                .push(Box::new(ProjectProcessorFactory::new(
+            build.pipeline.factories.push(Box::new(
+                ProjectProcessorFactory::new(
                     node_id,
                     *is_subordinate,
                     Arc::clone(&ctx.arena),
@@ -1507,7 +1506,9 @@ fn build_pipeline_for_program_node(
                     schemas,
                     output_indices.clone(),
                     ChunkSchema::from_static_layout(node.output_layout())?,
-                )));
+                )
+                .with_final_result_input_validation(*validate_final_result_input),
+            ));
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
         }
@@ -2173,6 +2174,7 @@ mod tests {
                 input: Box::new(filter),
                 node_id: 3,
                 is_subordinate: false,
+                validate_final_result_input: false,
                 exprs: vec![value_expr],
                 expr_slot_ids: vec![slot],
                 expr_slot_schemas: None,

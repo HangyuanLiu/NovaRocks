@@ -3080,3 +3080,214 @@ fn array_agg_json_project_retains_semantics_above_exact_aggregate_slots() {
         assert_eq!(output.data_type, call.result_type);
     }
 }
+
+fn assert_m07_planned_domains(sql: &str, expected: Vec<Option<novarocks_types::schema::SqlType>>) {
+    use novarocks_physical_plan::ResultValueDomain as D;
+    use novarocks_types::schema::SqlType as S;
+    let (resolved, registry, mut factory) =
+        parse_analyze_query(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+    let original_ids: Vec<_> = resolved
+        .output_columns
+        .iter()
+        .map(|column| column.column_id)
+        .collect();
+    assert_eq!(
+        original_ids
+            .iter()
+            .map(|id| factory.logical_type(*id))
+            .collect::<Vec<_>>(),
+        expected,
+        "analyzer: {sql}"
+    );
+    let witnesses: Vec<_> = original_ids
+        .iter()
+        .map(|id| factory.has_json_list_provenance(*id))
+        .collect();
+    let plan = plan_query(resolved, registry, &mut factory)
+        .unwrap_or_else(|error| panic!("{sql}: {error}"));
+    let columns = plan_output_columns(&plan).unwrap();
+    assert_eq!(
+        columns
+            .iter()
+            .map(|column| factory.logical_type(column.column_id))
+            .collect::<Vec<_>>(),
+        expected,
+        "logical planner: {sql}"
+    );
+    assert_eq!(
+        columns
+            .iter()
+            .map(|column| factory.has_json_list_provenance(column.column_id))
+            .collect::<Vec<_>>(),
+        witnesses,
+        "JSON source witness: {sql}"
+    );
+    let frozen =
+        crate::compiler::root_output::RootOutputSemantics::capture(&columns, &factory).unwrap();
+    let domains: Vec<_> = expected
+        .iter()
+        .map(|logical| match logical {
+            Some(S::Json) => D::Json,
+            Some(S::Hll) => D::Hll,
+            Some(S::Bitmap) => D::Bitmap,
+            Some(S::Object) => D::Object,
+            Some(S::Percentile) => D::Percentile,
+            Some(S::Variant) => D::Variant,
+            _ => D::Plain,
+        })
+        .collect();
+    assert_eq!(
+        frozen.domains(&columns).unwrap(),
+        domains,
+        "compiler capture: {sql}"
+    );
+}
+
+#[test]
+fn m07_aggregate_symbol_rewrites_keep_original_output_domains() {
+    use novarocks_types::schema::SqlType as S;
+    for (sql, domain) in [
+        (
+            "select hll_union(hll_hash(cast(o_orderkey as varchar))) from orders",
+            S::Hll,
+        ),
+        ("select hll_raw_agg(hll_hash('x')) from orders", S::Hll),
+        (
+            "select bitmap_union(to_bitmap(o_orderkey)) from orders",
+            S::Bitmap,
+        ),
+        (
+            "select percentile_union(percentile_hash(cast(o_orderkey as double))) from orders",
+            S::Percentile,
+        ),
+    ] {
+        assert_m07_planned_domains(sql, vec![Some(domain)]);
+    }
+    assert_m07_planned_domains(
+        "select o_custkey,hll_union(hll_hash('x')) as h,bitmap_union(to_bitmap(o_orderkey)) as b,percentile_union(percentile_hash(1.0)) as p from orders group by o_custkey",
+        vec![None, Some(S::Hll), Some(S::Bitmap), Some(S::Percentile)],
+    );
+    assert_m07_planned_domains(
+        "select hll_union(hll_hash('x')) as x,hll_union(hll_hash('x')) as y from orders",
+        vec![Some(S::Hll); 2],
+    );
+    assert_m07_planned_domains(
+        "select count(*),sum(o_orderkey),cast(hll_union(hll_hash('x')) as varbinary) from orders",
+        vec![None; 3],
+    );
+    for (sql, expected) in [
+        (
+            "select hll_union(hll_hash('x')) as h,cast(hll_union(hll_hash('x')) as varbinary) as raw from orders",
+            vec![Some(S::Hll), None],
+        ),
+        (
+            "select cast(hll_union(hll_hash('x')) as varbinary) as raw,hll_union(hll_hash('x')) as h from orders",
+            vec![None, Some(S::Hll)],
+        ),
+    ] {
+        assert_m07_planned_domains(sql, expected);
+        let (resolved, registry, mut factory) = parse_analyze_query(sql).unwrap();
+        let plan = plan_query(resolved, registry, &mut factory).unwrap();
+        let columns = plan_output_columns(&plan).unwrap();
+        assert_ne!(
+            columns[0].column_id, columns[1].column_id,
+            "explicit same-carrier CAST must retain an independent output occurrence: {sql}"
+        );
+    }
+}
+
+#[test]
+fn m07_duplicate_and_window_projections_keep_complete_source_witnesses() {
+    use novarocks_types::schema::SqlType as S;
+    assert_m07_planned_domains(
+        "select hll_hash('x') as x,hll_hash('x') as y",
+        vec![Some(S::Hll); 2],
+    );
+    assert_m07_planned_domains(
+        "select count(*) over () as x,count(*) over () as y from orders",
+        vec![None; 2],
+    );
+    assert_m07_planned_domains(
+        "select array_agg(parse_json('{}')) as x,array_agg(parse_json('{}')) as y from orders",
+        vec![Some(S::Array(Box::new(S::Json))); 2],
+    );
+    assert_m07_planned_domains(
+        "select array_sortby(array<json>[],[1]) as x,array_sortby(array<json>[],[1]) as y",
+        vec![Some(S::Array(Box::new(S::Json))); 2],
+    );
+    // Exercise the duplicate-ID builder path with an actual analyzer-owned
+    // HLL expression; no window producer domain is inferred by this fixture.
+    let (resolved, _, mut factory) =
+        parse_analyze_query("select hll_hash('x') as x,hll_hash('x') as y").unwrap();
+    let QueryBody::Select(mut select) = resolved.body else {
+        panic!("expected select");
+    };
+    let original = select.projection[0].output_column_id;
+    select.projection[1].output_column_id = original;
+    let input = LogicalPlanNode::new(
+        LogicalPlanKind::Values(PlanValuesNode {
+            rows: vec![vec![]],
+            columns: vec![],
+        }),
+        vec![],
+        None,
+    );
+    let plan =
+        super::window::build_window_and_project(input, select.projection, &mut factory).unwrap();
+    let columns = plan_output_columns(&plan).unwrap();
+    assert_eq!(columns[0].column_id, original);
+    assert_ne!(columns[1].column_id, original);
+    for column in columns {
+        assert_eq!(factory.logical_type(column.column_id), Some(S::Hll));
+    }
+}
+
+#[test]
+fn m07_shared_aggregate_symbol_refuses_conflicting_occurrence_facts() {
+    use novarocks_types::schema::SqlType;
+    let sql = "select hll_union(hll_hash('x')) as x,hll_union(hll_hash('x')) as y from orders";
+    for conflict in [None, Some(SqlType::Bitmap)] {
+        for ordinal in [0, 1] {
+            let (resolved, registry, mut factory) = parse_analyze_query(sql).unwrap();
+            factory.set_logical_type(resolved.output_columns[ordinal].column_id, conflict.clone());
+            let error = plan_query(resolved, registry, &mut factory).unwrap_err();
+            assert!(
+                error.contains("merged conflicting source domains"),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn m07_same_value_transfer_checks_carrier_nullability_and_existing_facts() {
+    use novarocks_types::schema::SqlType;
+    let mut factory = ColumnRefFactory::new();
+    let source = factory.create(None, "source".into(), DataType::Binary, true);
+    factory.set_logical_type(source, Some(SqlType::Hll));
+    let wrong_type = factory.create(None, "wrong".into(), DataType::Utf8, true);
+    assert!(
+        factory
+            .transfer_value_provenance(source, wrong_type)
+            .unwrap_err()
+            .contains("carrier")
+    );
+    let narrowed = factory.create(None, "narrowed".into(), DataType::Binary, false);
+    assert!(
+        factory
+            .transfer_value_provenance(source, narrowed)
+            .unwrap_err()
+            .contains("nullability")
+    );
+    let conflict = factory.create(None, "conflict".into(), DataType::Binary, true);
+    factory.set_logical_type(conflict, Some(SqlType::Bitmap));
+    assert!(
+        factory
+            .transfer_value_provenance(source, conflict)
+            .unwrap_err()
+            .contains("logical domains")
+    );
+    let target = factory.create(None, "target".into(), DataType::Binary, true);
+    factory.transfer_value_provenance(source, target).unwrap();
+    assert_eq!(factory.logical_type(target), Some(SqlType::Hll));
+}

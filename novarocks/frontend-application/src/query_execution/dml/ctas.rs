@@ -1574,6 +1574,11 @@ impl CtasEngine for DmlExecutionKernel {
             &request.execution,
             &connector_context,
         )?;
+        if planned.source.has_private_output_domain() {
+            return Err(internal_failure(
+                "CTAS source contains an unsupported internal opaque value domain",
+            ));
+        }
         let source_columns = planned.source.output_columns();
         if source_columns.is_empty() {
             return Err(CtasFailure {
@@ -1582,6 +1587,8 @@ impl CtasEngine for DmlExecutionKernel {
                 user_error: None,
             });
         }
+        crate::query_execution::dml::iceberg_ctas::validate_source_domains(&source_columns)
+            .map_err(internal_failure)?;
         let output_schema = Arc::new(arrow::datatypes::Schema::new(
             source_columns
                 .iter()

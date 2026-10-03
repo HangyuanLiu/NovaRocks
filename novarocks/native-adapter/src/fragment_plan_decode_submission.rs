@@ -133,6 +133,33 @@ pub(crate) fn decode_fragment_submission(
             error,
         )
     })?;
+    let carries_result_fields = match &static_sink {
+        StaticSinkProgram::Result => {
+            crate::final_result_layout::legacy_result_uses_declared_fields(
+                &decoded_root,
+                &fragment.output_columns,
+            )?
+        }
+        StaticSinkProgram::RootResult(contract) => matches!(
+            contract.output(),
+            novarocks_result_contract::FrozenRootOutput::ClientRows(_)
+                | novarocks_result_contract::FrozenRootOutput::ScalarValue(_)
+        ),
+        _ => false,
+    };
+    // The final occurrence layout is independent of every function's carrier
+    // signature. Apply its owned fields to the real output before LocalProgram
+    // freezes the graph and before either result carrier observes the schema.
+    let decoded_root = if carries_result_fields {
+        crate::final_result_layout::apply_final_root_output_layout(
+            decoded_root,
+            &fragment.output_columns,
+            &mut arena,
+            root.node_id,
+        )?
+    } else {
+        decoded_root
+    };
     let sink_requirements = match &static_sink {
         StaticSinkProgram::Result | StaticSinkProgram::RootResult(_) => {
             vec![ExternalSinkRequirement::Result]

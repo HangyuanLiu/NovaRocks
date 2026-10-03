@@ -787,7 +787,7 @@ fn normalize_set_op_inputs(
             let data_type = NativeFragmentDecodeError::map_invalid(child_path.clone().index(col_idx).field("type"), decode_type(data_type))?;
             Ok(arena.push_typed(ExprNode::SlotId(slot), data_type))
         }).collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
-        Ok(ExecNode { kind: ExecNodeKind::Project(ProjectNode { input: Box::new(child.node), node_id, is_subordinate: true, exprs, expr_slot_ids: output_slots.clone(), expr_slot_schemas: Some(output_slot_schemas.clone()), output_indices: None, output_chunk_schema: output_schema.clone() }) })
+        Ok(ExecNode { kind: ExecNodeKind::Project(ProjectNode { input: Box::new(child.node), node_id, is_subordinate: true, validate_final_result_input: false, exprs, expr_slot_ids: output_slots.clone(), expr_slot_schemas: Some(output_slot_schemas.clone()), output_indices: None, output_chunk_schema: output_schema.clone() }) })
     }).collect()
 }
 
@@ -815,7 +815,7 @@ fn normalize_set_op_inputs_by_position(
             let data_type = child.output_schema.slot(slot).ok_or_else(|| NativeFragmentDecodeError::inconsistent(path.clone().field("child_output_columns").index(idx), format!("SetOpNode child {idx} slot {} missing from child output schema", slot)))?.data_type().clone();
             Ok(arena.push_typed(ExprNode::SlotId(slot), data_type))
         }).collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
-        Ok(ExecNode { kind: ExecNodeKind::Project(ProjectNode { input: Box::new(child.node), node_id, is_subordinate: true, exprs, expr_slot_ids: output_slots.clone(), expr_slot_schemas: Some(output_slot_schemas.clone()), output_indices: None, output_chunk_schema: output_schema.clone() }) })
+        Ok(ExecNode { kind: ExecNodeKind::Project(ProjectNode { input: Box::new(child.node), node_id, is_subordinate: true, validate_final_result_input: false, exprs, expr_slot_ids: output_slots.clone(), expr_slot_schemas: Some(output_slot_schemas.clone()), output_indices: None, output_chunk_schema: output_schema.clone() }) })
     }).collect()
 }
 
@@ -986,6 +986,7 @@ pub fn build_slot_projection(
                 input: Box::new(input.node),
                 node_id,
                 is_subordinate: true,
+                validate_final_result_input: false,
                 exprs,
                 expr_slot_ids: layout.order().to_vec(),
                 expr_slot_schemas: Some(expr_slot_schemas),
@@ -1171,6 +1172,7 @@ fn project_join_scope_to_declared_output(
                 input: Box::new(joined.node),
                 node_id,
                 is_subordinate: true,
+                validate_final_result_input: false,
                 exprs,
                 expr_slot_ids: layout.order().to_vec(),
                 expr_slot_schemas: Some(declared.slot_schemas().to_vec()),
@@ -1832,6 +1834,7 @@ pub fn lower_table_function_node(
                         input: Box::new(child.node),
                         node_id: node.node_id,
                         is_subordinate: true,
+                        validate_final_result_input: false,
                         exprs: project_exprs,
                         expr_slot_ids: project_slot_ids,
                         expr_slot_schemas: Some(project_output_schema.slots().to_vec()),
@@ -2182,6 +2185,7 @@ pub fn lower_project_node(
                 input: Box::new(child.node),
                 node_id: node.node_id,
                 is_subordinate: false,
+                validate_final_result_input: false,
                 exprs,
                 expr_slot_ids,
                 expr_slot_schemas: Some(expr_slot_schemas),

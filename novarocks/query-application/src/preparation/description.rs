@@ -50,20 +50,49 @@ impl OutputContract {
             return Ok(Self::CompletionOnly);
         }
         match plan.result_port() {
-            Some(result) if !result.fields.is_empty() => Ok(Self::Rows(
-                result
+            Some(result) if !result.fields.is_empty() => {
+                if result
                     .fields
                     .iter()
-                    .map(|field| {
-                        crate::api::ResultField::new(
-                            field.alias.as_deref().unwrap_or(&field.name).to_string(),
-                            field.ty.data_type.clone(),
-                            field.ty.nullable,
-                            None,
-                        )
-                    })
-                    .collect(),
-            )),
+                    .any(|field| !field.domain.matches_storage(&field.ty.data_type))
+                {
+                    return Err("completed result domain differs from its physical carrier".into());
+                }
+                Ok(Self::Rows(
+                    result
+                        .fields
+                        .iter()
+                        .map(|field| {
+                            crate::api::ResultField::new(
+                                field.alias.as_deref().unwrap_or(&field.name).to_string(),
+                                field.ty.data_type.clone(),
+                                field.ty.nullable,
+                                match field.domain {
+                                    novarocks_physical_plan::ResultValueDomain::Plain => None,
+                                    novarocks_physical_plan::ResultValueDomain::Json => {
+                                        Some(novarocks_types::schema::SqlType::Json)
+                                    }
+                                    novarocks_physical_plan::ResultValueDomain::Variant => {
+                                        Some(novarocks_types::schema::SqlType::Variant)
+                                    }
+                                    novarocks_physical_plan::ResultValueDomain::Hll => {
+                                        Some(novarocks_types::schema::SqlType::Hll)
+                                    }
+                                    novarocks_physical_plan::ResultValueDomain::Bitmap => {
+                                        Some(novarocks_types::schema::SqlType::Bitmap)
+                                    }
+                                    novarocks_physical_plan::ResultValueDomain::Object => {
+                                        Some(novarocks_types::schema::SqlType::Object)
+                                    }
+                                    novarocks_physical_plan::ResultValueDomain::Percentile => {
+                                        Some(novarocks_types::schema::SqlType::Percentile)
+                                    }
+                                },
+                            )
+                        })
+                        .collect(),
+                ))
+            }
             _ if kind == QueryExecutionKind::Read => {
                 Err("completed read plan has no row output contract".to_string())
             }
@@ -379,6 +408,33 @@ fn validate_effect_recovery(effect: ExecutionEffect, recovery: RecoveryMode) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn m07_completed_output_preserves_exact_producer_domains() {
+        use novarocks_types::schema::SqlType as T;
+        for (sql, domain) in [
+            ("select json_object('k', 1) as value", Some(T::Json)),
+            ("select to_bitmap(1) as value", Some(T::Bitmap)),
+            ("select hll_hash(cast(1 as bigint)) as value", Some(T::Hll)),
+            (
+                "select percentile_hash(cast(1 as double)) as value",
+                Some(T::Percentile),
+            ),
+            ("select bitmap_to_binary(to_bitmap(1)) as value", None),
+            ("select cast(json_object('k', 1) as varchar) as value", None),
+        ] {
+            let completed =
+                crate::completed_plan_fixture::completed_literal_query([41; 16], sql).await;
+            let output = OutputContract::from_completed_plan(
+                QueryExecutionKind::Read,
+                completed.candidate().plan(),
+            )
+            .unwrap();
+            assert_eq!(output.fields().len(), 1, "{sql}");
+            assert_eq!(output.fields()[0].name(), "value", "{sql}");
+            assert_eq!(output.fields()[0].logical_type(), domain.as_ref(), "{sql}");
+        }
+    }
 
     #[tokio::test]
     async fn completed_description_rejects_a_substituted_output_or_scan() {

@@ -49,6 +49,14 @@ pub(super) fn plan_select_scoped_with_source(
 ) -> Result<LogicalPlanNode, String> {
     const REPEAT_GROUP_QUALIFIER: &str = "__repeat_group";
 
+    // Keep the analyzer-owned occurrence identities before Repeat/Aggregate
+    // substitute their same-value runtime symbols.
+    let analyzed_projection_ids: Vec<_> = select
+        .projection
+        .iter()
+        .map(|item| item.output_column_id)
+        .collect();
+
     // Take ownership of all apply specs up-front. The wrap points below consume
     // them clause by clause.
     let mut apply_specs = std::mem::take(&mut select.apply_specs);
@@ -218,6 +226,7 @@ pub(super) fn plan_select_scoped_with_source(
             factory,
         )?;
 
+        transfer_projection_provenance(&analyzed_projection_ids, &project_items, factory)?;
         current = build_window_and_project(current, project_items, factory)?;
     } else {
         // Projection placement (non-aggregated branch).
@@ -248,6 +257,49 @@ pub(super) fn plan_select_scoped_with_source(
     }
 
     Ok(current)
+}
+
+/// The rewrite functions preserve each complete projected value and ordinal.
+/// Carry its analyzed facts to the replacement symbol before duplicate output
+/// IDs are separated. Repeated symbols must agree even when one fact is None.
+fn transfer_projection_provenance(
+    analyzed_ids: &[ColumnId],
+    rewritten: &[ProjectItem],
+    factory: &mut ColumnRefFactory,
+) -> Result<(), String> {
+    if analyzed_ids.len() != rewritten.len() {
+        return Err("same-value projection rewrite changed its occurrence count".into());
+    }
+    let mut sources_by_target = std::collections::HashMap::new();
+    for (&source, item) in analyzed_ids.iter().zip(rewritten) {
+        if source == ColumnId::UNSET || item.output_column_id == ColumnId::UNSET {
+            // Legacy construction tests may omit analyzer IDs; there is no
+            // source fact to transfer from an unset identity.
+            continue;
+        }
+        let original = factory.get(source);
+        if original.data_type != item.expr.data_type {
+            return Err("same-value projection rewrite changed its declared carrier".into());
+        }
+        if original.nullable && !item.expr.nullable {
+            return Err("same-value projection rewrite narrowed its declared nullability".into());
+        }
+        if let Some(previous) = sources_by_target.insert(item.output_column_id, source)
+            && (factory.borrowed_logical_type(previous) != factory.borrowed_logical_type(source)
+                || factory.has_json_list_provenance(previous)
+                    != factory.has_json_list_provenance(source))
+        {
+            return Err("same-value projection rewrite merged conflicting source domains".into());
+        }
+    }
+    for (&source, item) in analyzed_ids.iter().zip(rewritten) {
+        if source != ColumnId::UNSET && item.output_column_id != ColumnId::UNSET {
+            factory
+                .transfer_value_provenance(source, item.output_column_id)
+                .map_err(str::to_owned)?;
+        }
+    }
+    Ok(())
 }
 
 /// Build a deduplication Aggregate for SELECT DISTINCT.

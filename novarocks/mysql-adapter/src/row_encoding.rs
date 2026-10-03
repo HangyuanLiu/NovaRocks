@@ -18,14 +18,14 @@
 //! Arrow result batches to MySQL scalar-row adaptation.
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
-    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
-    LargeStringArray, StringArray, Time32MillisecondArray, Time32SecondArray,
-    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, DictionaryArray,
+    FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, LargeBinaryArray, LargeStringArray, StringArray, Time32MillisecondArray,
+    Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::{DataType, Int32Type, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{Duration, NaiveDate, NaiveDateTime, Utc};
 use novarocks_query_application::api::ResultField;
@@ -100,16 +100,6 @@ pub fn array_value_to_mysql_value(
         return Ok(MysqlResultValue::Null);
     }
 
-    let name_lower = declared.name().to_lowercase();
-    if matches!(column.data_type(), DataType::Binary | DataType::LargeBinary)
-        && (name_lower.starts_with("bitmap_agg(")
-            || name_lower.starts_with("bitmap_union(")
-            || name_lower.starts_with("hll_union(")
-            || name_lower.starts_with("hll_raw_agg("))
-    {
-        return Ok(MysqlResultValue::Null);
-    }
-
     match column.data_type() {
         DataType::Boolean => downcast_array::<BooleanArray>(column, "BooleanArray")
             .map(|arr| MysqlResultValue::Int(if arr.value(row_idx) { 1 } else { 0 })),
@@ -144,6 +134,37 @@ pub fn array_value_to_mysql_value(
             .map(|arr| MysqlResultValue::Bytes(arr.value(row_idx).as_bytes().to_vec())),
         DataType::LargeUtf8 => downcast_array::<LargeStringArray>(column, "LargeStringArray")
             .map(|arr| MysqlResultValue::Bytes(arr.value(row_idx).as_bytes().to_vec())),
+        DataType::Dictionary(key, value)
+            if key.as_ref() == &DataType::Int32
+                && matches!(value.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
+        {
+            if !matches!(declared.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
+                return Err("mysql string dictionary differs from its declared result type".into());
+            }
+            let dictionary =
+                downcast_array::<DictionaryArray<Int32Type>>(column, "StringDictionary")?;
+            let key = usize::try_from(dictionary.keys().value(row_idx))
+                .map_err(|_| "mysql string dictionary key is invalid")?;
+            let values = dictionary.values();
+            if key >= values.len() {
+                return Err("mysql string dictionary key is out of bounds".into());
+            }
+            if values.is_null(key) {
+                return Ok(MysqlResultValue::Null);
+            }
+            // Only the selected cell is materialized for the legacy row API.
+            // The dictionary and all unselected values retain their original backing.
+            match value.as_ref() {
+                DataType::Utf8 => downcast_array::<StringArray>(values, "StringArray")
+                    .map(|arr| MysqlResultValue::Bytes(arr.value(key).as_bytes().to_vec())),
+                DataType::LargeUtf8 => {
+                    downcast_array::<LargeStringArray>(values, "LargeStringArray")
+                        .map(|arr| MysqlResultValue::Bytes(arr.value(key).as_bytes().to_vec()))
+                }
+                _ => unreachable!("string dictionary carrier was checked"),
+            }
+        }
+        DataType::Dictionary(_, _) => Err("mysql result dictionary carrier is unsupported".into()),
         DataType::Binary => downcast_array::<BinaryArray>(column, "BinaryArray")
             .map(|arr| MysqlResultValue::Bytes(arr.value(row_idx).to_vec())),
         DataType::LargeBinary => downcast_array::<LargeBinaryArray>(column, "LargeBinaryArray")
@@ -435,5 +456,101 @@ mod tests {
         let row = build_mysql_row(&batch, &fields, 0).expect("mysql row");
 
         assert_eq!(row, vec![MysqlResultValue::Int(7)]);
+    }
+
+    #[test]
+    fn m07_legacy_dictionary_rows_select_keys_and_both_null_sources() {
+        use arrow::array::{DictionaryArray, Int32Array, LargeStringArray, StringArray};
+        use arrow::datatypes::Int32Type;
+        for values in [
+            Arc::new(StringArray::from(vec![Some("{}"), None, Some("[]")])) as ArrayRef,
+            Arc::new(LargeStringArray::from(vec![Some("{}"), None, Some("[]")])) as ArrayRef,
+        ] {
+            let column = Arc::new(
+                DictionaryArray::<Int32Type>::try_new(
+                    Int32Array::from(vec![Some(2), None, Some(1), Some(0)]),
+                    values,
+                )
+                .unwrap(),
+            ) as ArrayRef;
+            let batch = arrow::record_batch::RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "json_alias",
+                    column.data_type().clone(),
+                    true,
+                )])),
+                vec![column],
+            )
+            .unwrap();
+            let fields = [ResultField::new(
+                "json_alias",
+                DataType::Utf8,
+                true,
+                Some(novarocks_types::schema::SqlType::Json),
+            )];
+            for (row, expected) in [
+                MysqlResultValue::Bytes(b"[]".to_vec()),
+                MysqlResultValue::Null,
+                MysqlResultValue::Null,
+                MysqlResultValue::Bytes(b"{}".to_vec()),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert_eq!(
+                    build_mysql_row(&batch, &fields, row).unwrap(),
+                    vec![expected]
+                );
+            }
+            let wrong = [ResultField::new("binary", DataType::Binary, true, None)];
+            assert!(
+                build_mysql_row(&batch, &wrong, 0)
+                    .unwrap_err()
+                    .contains("declared result type")
+            );
+        }
+    }
+
+    #[test]
+    fn m07_plain_binary_names_do_not_establish_opaque_domains() {
+        use arrow::array::BinaryArray;
+        use novarocks_types::logical::{LogicalType, field_with_logical_type};
+        for name in [
+            "bitmap_agg(ordinary)",
+            "bitmap_union(ordinary)",
+            "hll_union(ordinary)",
+            "hll_raw_agg(ordinary)",
+        ] {
+            let values =
+                Arc::new(BinaryArray::from(vec![b"external state".as_slice()])) as ArrayRef;
+            let field = ResultField::new(name, DataType::Binary, false, None);
+            let plain = arrow::record_batch::RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(name, DataType::Binary, false)])),
+                vec![Arc::clone(&values)],
+            )
+            .unwrap();
+            assert_eq!(
+                build_mysql_row(&plain, &[field], 0).unwrap(),
+                vec![MysqlResultValue::Bytes(b"external state".to_vec())]
+            );
+            let opaque = arrow::record_batch::RecordBatch::try_new(
+                Arc::new(Schema::new(vec![field_with_logical_type(
+                    Field::new("independent alias", DataType::Binary, false),
+                    LogicalType::Hll,
+                )])),
+                vec![values],
+            )
+            .unwrap();
+            let field = ResultField::new(
+                "independent alias",
+                DataType::Binary,
+                false,
+                Some(novarocks_types::schema::SqlType::Hll),
+            );
+            assert_eq!(
+                build_mysql_row(&opaque, &[field], 0).unwrap(),
+                vec![MysqlResultValue::Null]
+            );
+        }
     }
 }

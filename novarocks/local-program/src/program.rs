@@ -365,6 +365,8 @@ pub enum ProgramNodeKind {
     Project {
         input: ProgramNodeId,
         is_subordinate: bool,
+        /// Check runtime identity input domains at the final result boundary.
+        validate_final_result_input: bool,
         exprs: Vec<ProgramExprId>,
         expr_slot_ids: Vec<SlotId>,
         expr_slot_schemas: Option<Vec<ProjectExpressionSlot>>,

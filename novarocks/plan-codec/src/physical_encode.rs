@@ -4140,7 +4140,15 @@ fn output_columns(
                 fragment.values()[value].origin,
                 ValueOrigin::WriterDerived { .. }
             );
-            output_column(slot, name, ty, internal)
+            output_column_with_domain(
+                slot,
+                name,
+                ty,
+                internal,
+                result_field.map_or(novarocks_physical_plan::ResultValueDomain::Plain, |field| {
+                    field.domain
+                }),
+            )
         })
         .collect()
 }
@@ -4174,14 +4182,73 @@ fn output_column(
     ty: &ValueType,
     internal: bool,
 ) -> Result<common::OutputColumn, String> {
+    output_column_with_domain(
+        slot,
+        name,
+        ty,
+        internal,
+        novarocks_physical_plan::ResultValueDomain::Plain,
+    )
+}
+
+/// Only the exact root occurrence supplies a top-level logical domain. Names,
+/// aliases, other values and intermediate outputs never establish this fact.
+fn output_column_with_domain(
+    slot: WireSlotId,
+    name: &str,
+    ty: &ValueType,
+    internal: bool,
+    domain: novarocks_physical_plan::ResultValueDomain,
+) -> Result<common::OutputColumn, String> {
+    use novarocks_physical_plan::ResultValueDomain as D;
+    if !domain.matches_storage(&ty.data_type) {
+        return Err("native root output domain differs from its exact storage".into());
+    }
+    if internal && domain != D::Plain {
+        return Err("native internal writer output cannot own a scalar root domain".into());
+    }
     let wire_type = if internal {
         // Writer relation values are paired with the mandatory exact
         // ArrowPhysicalSchema on TableWriter/TableFinish. That schema owns
         // execution type identity; this legacy descriptor is only its SQL
         // compatibility projection.
         encode_arrow_authoritative_compatibility_type(&ty.data_type)?
-    } else {
+    } else if domain == D::Plain {
         encode_physical_type(&ty.data_type)?
+    } else {
+        // The ordinary exact-carrier check still rejects offset adaptation,
+        // dictionaries and unsupported primitives before constructing a DTO.
+        validate_physical_type(&ty.data_type)?;
+        let exact = match domain {
+            D::Json => matches!(ty.data_type, arrow::datatypes::DataType::Utf8),
+            D::Variant => matches!(ty.data_type, arrow::datatypes::DataType::LargeBinary),
+            D::Hll | D::Bitmap | D::Object | D::Percentile => {
+                matches!(ty.data_type, arrow::datatypes::DataType::Binary)
+            }
+            D::Plain => unreachable!("plain output used the ordinary encoder"),
+        };
+        if !exact {
+            return Err("native root output domain cannot preserve its exact carrier".into());
+        }
+        let primitive = match domain {
+            D::Json => common::PrimitiveType::Json,
+            D::Variant => common::PrimitiveType::Variant,
+            D::Hll => common::PrimitiveType::Hll,
+            D::Bitmap => common::PrimitiveType::Bitmap,
+            D::Object => common::PrimitiveType::Object,
+            D::Percentile => common::PrimitiveType::Percentile,
+            D::Plain => unreachable!("plain output used the ordinary encoder"),
+        };
+        common::TypeDesc {
+            kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
+                r#type: primitive as i32,
+                len: None,
+                precision: None,
+                scale: None,
+                time_unit: None,
+                time_zone: None,
+            })),
+        }
     };
     Ok(common::OutputColumn {
         column_id: slot.get_u32(),
@@ -4303,11 +4370,20 @@ fn output_column_at(
     expected: ValueId,
     names: &OutputValueNames<'_>,
 ) -> Result<common::OutputColumn, String> {
-    output_column(
+    let domain = names
+        .result
+        .filter(|result| result.fragment == fragment.id() && result.output.node == node.id)
+        .and_then(|result| result.fields.get(ordinal))
+        .filter(|field| field.value == expected)
+        .map_or(novarocks_physical_plan::ResultValueDomain::Plain, |field| {
+            field.domain
+        });
+    output_column_with_domain(
         output_slot_at(layout, node, ordinal, expected)?,
         &names.output_name(fragment.id(), expected),
         &fragment.values()[&expected].ty,
         false,
+        domain,
     )
 }
 

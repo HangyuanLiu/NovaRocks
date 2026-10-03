@@ -365,6 +365,11 @@ pub(crate) fn connector_data_type(data_type: &SqlType) -> Result<ConnectorDataTy
         SqlType::Binary => ConnectorDataType::Binary,
         SqlType::Bitmap => ConnectorDataType::Bitmap,
         SqlType::Hll => ConnectorDataType::Hll,
+        SqlType::Object | SqlType::Percentile => {
+            return Err(
+                "internal opaque value domains are not supported connector column types".into(),
+            );
+        }
         SqlType::Date => ConnectorDataType::Date,
         SqlType::DateTime => ConnectorDataType::DateTime,
         SqlType::DateTimeNs => ConnectorDataType::DateTimeNs,
@@ -1628,6 +1633,21 @@ mod drop_table_if_exists_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn m07_internal_opaque_domains_are_refused_before_connector_schema_admission() {
+        use novarocks_types::schema::SqlType as T;
+        for domain in [T::Object, T::Percentile] {
+            for ty in [
+                domain.clone(),
+                T::Array(Box::new(domain.clone())),
+                T::Map(Box::new(T::String), Box::new(domain.clone())),
+                T::Struct(vec![("value".into(), domain)]),
+            ] {
+                assert!(super::connector_data_type(&ty).is_err());
+            }
+        }
+        assert!(super::connector_data_type(&T::Binary).is_ok());
+    }
     #[test]
     fn semantic_create_table_lowering_materializes_catalog_request() {
         let sql = "CREATE TABLE IF NOT EXISTS ice.db.orders (id BIGINT DEFAULT 3, amount DECIMAL(10,2) DEFAULT '12.30', payload BINARY DEFAULT X'CAFE') DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 8 PARTITION BY (month(id)) PROPERTIES ('format-version' = '2') COMMENT 'orders'";

@@ -388,6 +388,7 @@ impl Lowering<'_> {
                     P::Project {
                         input,
                         is_subordinate: n.is_subordinate,
+                        validate_final_result_input: n.validate_final_result_input,
                         exprs: n.exprs.into_iter().map(expr).collect(),
                         expr_slot_ids: n.expr_slot_ids,
                         expr_slot_schemas,
