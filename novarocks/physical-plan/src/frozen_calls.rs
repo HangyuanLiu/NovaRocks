@@ -105,6 +105,9 @@ pub enum FrozenCallError {
     WrongProofScope,
     WrongControl,
     InvalidEffects(EffectContractError),
+    /// A claimed broadcast output repeats an invocation whose complete
+    /// occurrence facts do not establish replica equivalence.
+    ReplicaEquivalence(PhysicalCallSite),
 }
 impl fmt::Display for FrozenCallError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -538,3 +541,5 @@ fn ordinal(value: usize) -> Result<u32, FrozenCallError> {
 
 #[cfg(test)]
 mod tests;
+
+mod replica;

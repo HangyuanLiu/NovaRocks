@@ -27,6 +27,9 @@ use novarocks_type_contract::{
 };
 use std::sync::Mutex;
 
+#[path = "replica_tests.rs"]
+mod replica_tests;
+
 #[derive(Default)]
 struct Control {
     stop: Option<CompileControlError>,

@@ -118,7 +118,7 @@ impl FragmentPackage {
         resource_result?;
         input
             .calls
-            .validate_fragment(&input.fragment, &input.expression_uses, control)
+            .validate_replica_equivalence(&input.fragment, &input.expression_uses, control)
             .map_err(|error| match error {
                 FrozenCallError::Control(error) => FragmentPackageError::Control(error),
                 FrozenCallError::Roots(error) => FragmentPackageError::ExpressionUses(error),
