@@ -31,10 +31,10 @@ use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
 };
 use std::alloc::Layout;
-mod allocations;
-mod body;
-mod geometry;
-mod header;
+pub(crate) mod allocations;
+pub(crate) mod body;
+pub(crate) mod geometry;
+pub(crate) mod header;
 use geometry::{Geometry, add, aligned, mul};
 
 #[derive(Clone, Copy, Debug)]
@@ -77,7 +77,7 @@ fn cap(actual: usize, maximum: usize, message: &'static str) -> Result<(), TypeC
         Ok(())
     }
 }
-fn source_work(source: usize, entries: usize) -> Result<usize, TypeCodecError> {
+pub(crate) fn source_work(source: usize, entries: usize) -> Result<usize, TypeCodecError> {
     // Two preflight passes each scan metadata twice; emission scans once;
     // verification can scan original metadata once for each emitted entry.
     // Two logical-tag lookups also probe the original raw table. Its whole
@@ -87,7 +87,7 @@ fn source_work(source: usize, entries: usize) -> Result<usize, TypeCodecError> {
         mul(2, novarocks_type_contract::NR_LOGICAL_TYPE_KEY.len())?,
     )
 }
-fn metadata_capacity(bytes: usize) -> Result<usize, TypeCodecError> {
+pub(crate) fn metadata_capacity(bytes: usize) -> Result<usize, TypeCodecError> {
     let padded = aligned(bytes)?;
     if padded > i32::MAX as usize || bytes >= (1usize << 31) {
         return Err(shape(
@@ -250,7 +250,10 @@ pub fn preflight_flat_pool_write(
     work.finish()?;
     result
 }
-fn reserve(capacity: usize, work: &mut CompileCheckpoints<'_>) -> Result<Vec<u8>, TypeCodecError> {
+pub(crate) fn reserve(
+    capacity: usize,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<u8>, TypeCodecError> {
     work.flush()?;
     let mut result = Vec::new();
     result
@@ -259,7 +262,7 @@ fn reserve(capacity: usize, work: &mut CompileCheckpoints<'_>) -> Result<Vec<u8>
     work.flush()?;
     Ok(result)
 }
-fn initialize_to(
+pub(crate) fn initialize_to(
     output: &mut Vec<u8>,
     length: usize,
     work: &mut CompileCheckpoints<'_>,
@@ -276,7 +279,7 @@ fn initialize_to(
     }
     Ok(())
 }
-fn append(
+pub(crate) fn append(
     output: &mut Vec<u8>,
     bytes: &[u8],
     work: &mut CompileCheckpoints<'_>,
@@ -290,7 +293,7 @@ fn append(
     }
     Ok(())
 }
-fn frame(
+pub(crate) fn frame(
     output: &mut Vec<u8>,
     metadata: &[u8],
     work: &mut CompileCheckpoints<'_>,

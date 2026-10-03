@@ -107,7 +107,7 @@ fn require(
         Err(TypeCodecError::InvalidShape(message))
     }
 }
-fn buffer<'a>(
+pub(crate) fn buffer<'a>(
     batch: arrow::ipc::RecordBatch<'_>,
     body: &'a [u8],
     index: usize,
@@ -305,16 +305,61 @@ fn preflight_message(
         "IPC batch descriptor count differs from carrier",
         work,
     )?;
+    inspect_leaf_at(
+        batch,
+        body,
+        layout,
+        rows,
+        null_count,
+        0,
+        variadic_buffers,
+        limits,
+        work,
+    )
+}
+
+/// Inspect one already paired leaf occurrence in a larger recursive batch.
+/// Shared layout and buffer rules remain the flat owner's sole author.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Borrowed raw geometry keeps independently checked wire extents explicit."
+)]
+pub(crate) fn inspect_leaf_at(
+    batch: arrow::ipc::RecordBatch<'_>,
+    body: &[u8],
+    layout: Layout,
+    rows: usize,
+    null_count: usize,
+    buffer_start: usize,
+    variadic_buffers: usize,
+    limits: FlatBatchProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FlatBatchGeometry, TypeCodecError> {
+    let count = match layout {
+        Layout::Null => 0,
+        Layout::Bits | Layout::Fixed(_) => 2,
+        Layout::Offsets(_) => 3,
+        Layout::Views => add(2, variadic_buffers)?,
+    };
+    let buffers = batch.buffers().ok_or(TypeCodecError::InvalidShape(
+        "IPC batch buffer descriptors are missing",
+    ))?;
+    require(
+        add(buffer_start, count)? <= buffers.len(),
+        "IPC leaf descriptor range exceeds batch",
+        work,
+    )?;
+    let leaf_buffer = |index| buffer(batch, body, add(buffer_start, index)?);
     let mut described_buffer_bytes = 0;
-    for index in 0..buffers.len() {
-        let bytes = buffer(batch, body, index)?;
+    for index in 0..count {
+        let bytes = leaf_buffer(index)?;
         described_buffer_bytes = add(described_buffer_bytes, bytes.len())?;
         work.step()?;
     }
     let bitmap_bytes = add(rows / 8, usize::from(rows % 8 != 0))?;
     if !matches!(layout, Layout::Null) && null_count != 0 {
         require(
-            buffer(batch, body, 0)?.len() >= bitmap_bytes,
+            leaf_buffer(0)?.len() >= bitmap_bytes,
             "IPC batch validity bitmap is too short",
             work,
         )?;
@@ -327,17 +372,17 @@ fn preflight_message(
             work,
         )?,
         Layout::Bits => require(
-            buffer(batch, body, 1)?.len() >= bitmap_bytes,
+            leaf_buffer(1)?.len() >= bitmap_bytes,
             "IPC Boolean values are too short",
             work,
         )?,
         Layout::Fixed(width) => require(
-            buffer(batch, body, 1)?.len() >= mul(rows, width)?,
+            leaf_buffer(1)?.len() >= mul(rows, width)?,
             "IPC fixed-width values are too short",
             work,
         )?,
         Layout::Offsets(width) => {
-            let offsets = buffer(batch, body, 1)?;
+            let offsets = leaf_buffer(1)?;
             // Arrow's typed_offsets converts the entire descriptor before
             // selecting N+1 entries. A partial trailing element would panic
             // in Buffer::typed_data even when the useful prefix is complete.
@@ -360,7 +405,7 @@ fn preflight_message(
             )?;
         }
         Layout::Views => {
-            let views = buffer(batch, body, 1)?;
+            let views = leaf_buffer(1)?;
             // The same whole-buffer typed conversion is used for u128 views.
             // Extra complete records are allowed; a partial one is unsafe.
             require(
@@ -401,7 +446,7 @@ fn preflight_message(
                         "IPC view references an invalid buffer",
                         work,
                     )?;
-                    let payload = buffer(batch, body, add(index, 2)?)?;
+                    let payload = leaf_buffer(add(index, 2)?)?;
                     let start = usize::try_from(read(12)).map_err(|_| {
                         TypeCodecError::InvalidShape("IPC view offset is unrepresentable")
                     })?;
@@ -416,7 +461,7 @@ fn preflight_message(
     Ok(FlatBatchGeometry {
         rows,
         null_count,
-        buffer_descriptors: buffers.len(),
+        buffer_descriptors: count,
         variadic_buffers,
         body_bytes: body.len(),
         described_buffer_bytes,

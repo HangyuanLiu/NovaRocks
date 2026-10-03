@@ -48,11 +48,24 @@ pub struct IpcSchemaProjectionLimits {
     pub max_flatbuffer_bytes: usize,
 }
 
+mod writer_resources;
+pub(crate) use writer_resources::{
+    preflight_schema_writer_resources, schema_writer_prefix_resources,
+};
+
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct SchemaPreflight {
     pub backing: usize,
     pub tables: usize,
     pub metadata_entries: usize,
     pub string_bytes: usize,
+    pub field_occurrences: usize,
+    pub type_occurrences: usize,
+    pub metadata_nonempty_fields: usize,
+    pub child_offset_items: usize,
+    pub child_offset_requests: usize,
+    pub union_id_items: usize,
+    pub union_id_requests: usize,
 }
 
 #[derive(Default)]
@@ -62,6 +75,11 @@ struct Counts {
     metadata_entries: usize,
     string_count: usize,
     string_bytes: usize,
+    metadata_nonempty_fields: usize,
+    child_offset_items: usize,
+    child_offset_requests: usize,
+    union_id_items: usize,
+    union_id_requests: usize,
 }
 
 fn checked_add(a: usize, b: usize) -> Result<usize, TypeCodecError> {
@@ -101,6 +119,9 @@ impl Counts {
             ));
         }
         self.string(field.name().len(), limits)?;
+        if !field.metadata().is_empty() {
+            self.metadata_nonempty_fields = checked_add(self.metadata_nonempty_fields, 1)?;
+        }
         for (key, value) in field.metadata() {
             work.step()?;
             self.metadata_entries = checked_add(self.metadata_entries, 1)?;
@@ -158,6 +179,31 @@ fn preflight_source(
                         "IPC schema type envelope exceeded",
                     ));
                 }
+                // These counters describe allocations of the existing emit_type
+                // branches. They neither add carriers nor define another schema.
+                let children = match ty {
+                    DataType::List(_)
+                    | DataType::LargeList(_)
+                    | DataType::ListView(_)
+                    | DataType::LargeListView(_)
+                    | DataType::FixedSizeList(_, _)
+                    | DataType::Map(_, _) => 1,
+                    DataType::Struct(fields) => fields.len(),
+                    DataType::Union(fields, _) => {
+                        if !fields.is_empty() {
+                            counts.union_id_items =
+                                checked_add(counts.union_id_items, fields.len())?;
+                            counts.union_id_requests = checked_add(counts.union_id_requests, 1)?;
+                        }
+                        fields.len()
+                    }
+                    DataType::RunEndEncoded(_, _) => 2,
+                    _ => 0,
+                };
+                if children != 0 {
+                    counts.child_offset_items = checked_add(counts.child_offset_items, children)?;
+                    counts.child_offset_requests = checked_add(counts.child_offset_requests, 1)?;
+                }
                 match ty {
                     DataType::Timestamp(_, Some(zone)) => counts.string(zone.len(), limits)?,
                     DataType::Dictionary(_, value)
@@ -199,6 +245,13 @@ pub(crate) fn preflight_writer(
         tables,
         metadata_entries: counts.metadata_entries,
         string_bytes: counts.string_bytes,
+        field_occurrences: counts.fields,
+        type_occurrences: counts.types,
+        metadata_nonempty_fields: counts.metadata_nonempty_fields,
+        child_offset_items: counts.child_offset_items,
+        child_offset_requests: counts.child_offset_requests,
+        union_id_items: counts.union_id_items,
+        union_id_requests: counts.union_id_requests,
     })
 }
 

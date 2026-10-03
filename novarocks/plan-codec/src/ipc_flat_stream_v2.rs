@@ -39,8 +39,8 @@ use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileContr
 mod pool_resources;
 pub use pool_resources::{FlatPoolResourceError, FlatPoolResourceProjection};
 mod reader;
-mod reader_allocations;
-mod reader_diagnostics;
+pub(crate) mod reader_allocations;
+pub(crate) mod reader_diagnostics;
 mod reader_work;
 pub use reader::{FlatReaderError, FlatReaderProjectionLimits, FlatReaderResourceFacts};
 
@@ -90,7 +90,7 @@ impl<'a, 'f> FlatConstantStream<'a, 'f> {
     }
 }
 
-fn require(
+pub(crate) fn require(
     condition: bool,
     message: &'static str,
     work: &mut CompileCheckpoints<'_>,
@@ -103,7 +103,7 @@ fn require(
     }
 }
 
-fn metadata<'a>(
+pub(crate) fn metadata<'a>(
     input: &'a [u8],
     offset: usize,
     limit: usize,

@@ -24,6 +24,7 @@ use crate::{
     ipc_flat_batch_v2::{Layout, layout},
     physical_type_v2::TypeCodecError,
 };
+use arrow::array::ArrayData;
 use novarocks_constant_contract::ConstantPool;
 use novarocks_type_contract::CompileCheckpoints;
 
@@ -53,7 +54,7 @@ impl Destination<'_> {
     }
 }
 
-fn copy(
+pub(crate) fn copy(
     source: &[u8],
     target: &mut [u8],
     work: &mut CompileCheckpoints<'_>,
@@ -69,7 +70,7 @@ fn copy(
     Ok(())
 }
 
-fn bitmap(
+pub(crate) fn bitmap(
     source: &[u8],
     offset: usize,
     rows: usize,
@@ -119,9 +120,22 @@ pub(super) fn emit(
     output: &mut [u8],
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), TypeCodecError> {
-    let data = pool.data();
+    emit_span(pool.data(), 0, geometry, output, work)
+}
+
+pub(crate) fn emit_span(
+    data: &ArrayData,
+    start: usize,
+    geometry: &Geometry,
+    output: &mut [u8],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), TypeCodecError> {
+    if add(start, geometry.rows)? > data.len() {
+        return Err(invalid());
+    }
+    let offset = add(data.offset(), start)?;
     let kind = layout(data.data_type())?;
-    if geometry.rows != data.len() || output.len() != geometry.body_bytes {
+    if output.len() != geometry.body_bytes {
         return Err(invalid());
     }
     let variadic = if matches!(kind, Layout::Views) {
@@ -141,26 +155,7 @@ pub(super) fn emit(
     };
     if !matches!(kind, Layout::Null) {
         let validity = destination.segment(bit_bytes(geometry.rows)?)?;
-        if let Some(nulls) = data.nulls() {
-            // ArrayData's offset does not apply to its independently sliced
-            // NullBuffer (Arrow 58.2 ArrayData::nulls contract).
-            if nulls.len() != geometry.rows {
-                return Err(invalid());
-            }
-            bitmap(
-                nulls.inner().values(),
-                nulls.offset(),
-                geometry.rows,
-                validity,
-                work,
-            )?;
-        } else {
-            work.step()?;
-            for chunk in validity.chunks_mut(1024) {
-                chunk.fill(0xff);
-                work.step()?;
-            }
-        }
+        emit_validity_span(data, start, geometry.rows, validity, work)?;
     }
     match kind {
         Layout::Null => (),
@@ -170,7 +165,7 @@ pub(super) fn emit(
             }
             bitmap(
                 data.buffers().first().ok_or_else(invalid)?.as_slice(),
-                data.offset(),
+                offset,
                 geometry.rows,
                 destination.segment(geometry.values_bytes)?,
                 work,
@@ -182,7 +177,7 @@ pub(super) fn emit(
                 Layout::Views => 16,
                 _ => return Err(invalid()),
             };
-            if geometry.values_start != mul(data.offset(), width)?
+            if geometry.values_start != mul(offset, width)?
                 || geometry.values_bytes != mul(geometry.rows, width)?
             {
                 return Err(invalid());
@@ -203,39 +198,21 @@ pub(super) fn emit(
             }
         }
         Layout::Offsets(width) => {
-            let source = data.buffers().first().ok_or_else(invalid)?.as_slice();
             let values = data.buffers().get(1).ok_or_else(invalid)?.as_slice();
             if geometry.values_start != geometry.offset_base {
                 return Err(invalid());
             }
             let offsets = destination.segment(mul(add(geometry.rows, 1)?, width)?)?;
-            for (row, target) in offsets.chunks_exact_mut(width).enumerate() {
-                let rebased = if geometry.rows == 0 {
-                    if geometry.offset_base != 0 || geometry.values_bytes != 0 {
-                        return Err(invalid());
-                    }
-                    0
-                } else {
-                    native_offset(source, add(data.offset(), row)?, width)?
-                        .checked_sub(geometry.offset_base)
-                        .ok_or_else(invalid)?
-                };
-                if (row == 0 && rebased != 0)
-                    || (row == geometry.rows && rebased != geometry.values_bytes)
-                {
-                    return Err(invalid());
-                }
-                match width {
-                    4 => target.copy_from_slice(
-                        &i32::try_from(rebased).map_err(|_| invalid())?.to_le_bytes(),
-                    ),
-                    8 => target.copy_from_slice(
-                        &i64::try_from(rebased).map_err(|_| invalid())?.to_le_bytes(),
-                    ),
-                    _ => return Err(invalid()),
-                }
-                work.step()?;
-            }
+            emit_offsets_span(
+                data,
+                start,
+                geometry.rows,
+                width,
+                geometry.offset_base,
+                geometry.values_bytes,
+                offsets,
+                work,
+            )?;
             copy(
                 selected_bytes(values, geometry.values_start, geometry.values_bytes)?,
                 destination.segment(geometry.values_bytes)?,
@@ -251,5 +228,79 @@ pub(super) fn emit(
     }
     work.step()?;
     // The parent retains this same meter and performs its success/error tail.
+    Ok(())
+}
+
+/// Projects the independently sliced validity owner, including hidden payload rows.
+pub(crate) fn emit_validity_span(
+    data: &ArrayData,
+    start: usize,
+    rows: usize,
+    validity: &mut [u8],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), TypeCodecError> {
+    if add(start, rows)? > data.len() || validity.len() != bit_bytes(rows)? {
+        return Err(invalid());
+    }
+    if let Some(nulls) = data.nulls() {
+        if add(start, rows)? > nulls.len() {
+            return Err(invalid());
+        }
+        bitmap(
+            nulls.inner().values(),
+            add(nulls.offset(), start)?,
+            rows,
+            validity,
+            work,
+        )?;
+    } else {
+        work.step()?;
+        for chunk in validity.chunks_mut(1024) {
+            chunk.fill(0xff);
+            work.step()?;
+        }
+    }
+    Ok(())
+}
+
+/// Shared offset rebase for bytes and recursive List/Map child spans.
+pub(crate) fn emit_offsets_span(
+    data: &ArrayData,
+    start: usize,
+    rows: usize,
+    width: usize,
+    base: usize,
+    extent: usize,
+    offsets: &mut [u8],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), TypeCodecError> {
+    if add(start, rows)? > data.len() || offsets.len() != mul(add(rows, 1)?, width)? {
+        return Err(invalid());
+    }
+    let source = data.buffers().first().ok_or_else(invalid)?.as_slice();
+    let offset = add(data.offset(), start)?;
+    for (row, target) in offsets.chunks_exact_mut(width).enumerate() {
+        let rebased = if rows == 0 {
+            if base != 0 || extent != 0 {
+                return Err(invalid());
+            }
+            0
+        } else {
+            native_offset(source, add(offset, row)?, width)?
+                .checked_sub(base)
+                .ok_or_else(invalid)?
+        };
+        if (row == 0 && rebased != 0) || (row == rows && rebased != extent) {
+            return Err(invalid());
+        }
+        match width {
+            4 => target
+                .copy_from_slice(&i32::try_from(rebased).map_err(|_| invalid())?.to_le_bytes()),
+            8 => target
+                .copy_from_slice(&i64::try_from(rebased).map_err(|_| invalid())?.to_le_bytes()),
+            _ => return Err(invalid()),
+        }
+        work.step()?;
+    }
     Ok(())
 }

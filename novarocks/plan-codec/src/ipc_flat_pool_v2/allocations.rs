@@ -28,7 +28,7 @@ use novarocks_type_contract::CompileCheckpoints;
 use std::alloc::Layout;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct Requests {
+pub(crate) struct Requests {
     pub bytes: usize,
     pub count: usize,
 }
@@ -40,6 +40,11 @@ pub(super) struct Requests {
 struct FieldLocation {
     offset: u32,
     slot: u16,
+}
+
+/// Layout of the sole locked FlatBuffers private FieldLoc source mirror.
+pub(crate) fn field_location_layout() -> Layout {
+    Layout::new::<FieldLocation>()
 }
 
 type TypeWalkerEntry<'a> = (&'a DataType, usize);
@@ -188,6 +193,13 @@ mod tests {
             tables: entries + 4,
             metadata_entries: entries,
             string_bytes: 0,
+            field_occurrences: 1,
+            type_occurrences: 1,
+            metadata_nonempty_fields: usize::from(entries != 0),
+            child_offset_items: 0,
+            child_offset_requests: 0,
+            union_id_items: 0,
+            union_id_requests: 0,
         }
     }
 
@@ -286,4 +298,27 @@ mod tests {
             assert_eq!(*control.calls.lock().unwrap(), first);
         }
     }
+}
+
+/// Batch/output requests shared by flat and recursive writers. Schema requests
+/// belong to their sole schema allocation author and are not counted here.
+pub(crate) fn batch_and_stream_requests(
+    batch_backing: usize,
+    stream_capacity: usize,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Requests, TypeCodecError> {
+    let field_location = Layout::new::<FieldLocation>();
+    let matches_source = field_location.size() == 8 && field_location.align() == 4;
+    work.step()?;
+    if !matches_source {
+        return Err(TypeCodecError::InvalidShape(
+            "flat writer FieldLoc allocation source layout changed",
+        ));
+    }
+    let mut requests = Requests { bytes: 0, count: 0 };
+    requests.request::<u8>(batch_backing, work)?;
+    requests.request::<FieldLocation>(4, work)?;
+    requests.request::<u32>(4, work)?;
+    requests.request::<u8>(stream_capacity, work)?;
+    Ok(requests)
 }

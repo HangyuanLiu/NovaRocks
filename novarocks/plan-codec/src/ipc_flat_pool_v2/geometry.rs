@@ -23,10 +23,11 @@ use crate::{
     ipc_flat_batch_v2::{Layout, layout},
     physical_type_v2::TypeCodecError,
 };
+use arrow::array::ArrayData;
 use novarocks_constant_contract::ConstantPool;
 use novarocks_type_contract::CompileCheckpoints;
 
-pub(super) struct Geometry {
+pub(crate) struct Geometry {
     pub rows: usize,
     pub buffers: usize,
     pub variadic: usize,
@@ -40,19 +41,19 @@ pub(super) struct Geometry {
 fn invalid() -> TypeCodecError {
     TypeCodecError::InvalidShape("flat pool writer extent is not representable")
 }
-pub(super) fn add(a: usize, b: usize) -> Result<usize, TypeCodecError> {
+pub(crate) fn add(a: usize, b: usize) -> Result<usize, TypeCodecError> {
     a.checked_add(b).ok_or_else(invalid)
 }
-pub(super) fn mul(a: usize, b: usize) -> Result<usize, TypeCodecError> {
+pub(crate) fn mul(a: usize, b: usize) -> Result<usize, TypeCodecError> {
     a.checked_mul(b).ok_or_else(invalid)
 }
-pub(super) fn aligned(n: usize) -> Result<usize, TypeCodecError> {
+pub(crate) fn aligned(n: usize) -> Result<usize, TypeCodecError> {
     Ok(add(n, 7)? & !7)
 }
-pub(super) fn bit_bytes(n: usize) -> Result<usize, TypeCodecError> {
+pub(crate) fn bit_bytes(n: usize) -> Result<usize, TypeCodecError> {
     Ok(add(n, 7)? / 8)
 }
-pub(super) fn native_offset(
+pub(crate) fn native_offset(
     bytes: &[u8],
     at: usize,
     width: usize,
@@ -67,16 +68,37 @@ pub(super) fn native_offset(
     usize::try_from(signed).map_err(|_| invalid())
 }
 
-pub(super) fn inspect(
+pub(crate) fn inspect(
     pool: &ConstantPool,
     max_rows: usize,
     max_buffers: usize,
     max_body_bytes: usize,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Geometry, TypeCodecError> {
-    // No Array::to_data or Field metadata clone precedes this inspection.
-    let data = pool.data();
-    let rows = data.len();
+    inspect_span(
+        pool.data(),
+        0,
+        pool.data().len(),
+        max_rows,
+        max_buffers,
+        max_body_bytes,
+        work,
+    )
+}
+
+pub(crate) fn inspect_span(
+    data: &ArrayData,
+    start: usize,
+    rows: usize,
+    max_rows: usize,
+    max_buffers: usize,
+    max_body_bytes: usize,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Geometry, TypeCodecError> {
+    if add(start, rows)? > data.len() {
+        return Err(invalid());
+    }
+    let offset = add(data.offset(), start)?;
     if rows > max_rows || i64::try_from(rows).is_err() {
         return Err(TypeCodecError::InvalidShape(
             "flat pool writer row envelope exceeded",
@@ -131,7 +153,7 @@ pub(super) fn inspect(
             let bytes = bit_bytes(rows)?;
             // The canonical source was already validated, but retain checked
             // range arithmetic so this projection never assumes a wrapping sum.
-            let last = add(data.offset(), rows)?;
+            let last = add(offset, rows)?;
             if bit_bytes(last)? > data.buffers()[0].len() {
                 return Err(invalid());
             }
@@ -139,7 +161,7 @@ pub(super) fn inspect(
             result.values_bytes = bytes;
         }
         Layout::Fixed(width) => {
-            let start = mul(data.offset(), width)?;
+            let start = mul(offset, width)?;
             let bytes = mul(rows, width)?;
             if add(start, bytes)? > data.buffers()[0].len() {
                 return Err(invalid());
@@ -155,8 +177,8 @@ pub(super) fn inspect(
             } else {
                 let source = data.buffers()[0].as_slice();
                 (
-                    native_offset(source, data.offset(), width)?,
-                    native_offset(source, add(data.offset(), rows)?, width)?,
+                    native_offset(source, offset, width)?,
+                    native_offset(source, add(offset, rows)?, width)?,
                 )
             };
             let bytes = end.checked_sub(base).ok_or_else(invalid)?;
@@ -170,7 +192,7 @@ pub(super) fn inspect(
             result.values_bytes = bytes;
         }
         Layout::Views => {
-            let start = mul(data.offset(), 16)?;
+            let start = mul(offset, 16)?;
             let bytes = mul(rows, 16)?;
             if add(start, bytes)? > data.buffers()[0].len() {
                 return Err(invalid());

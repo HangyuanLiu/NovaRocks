@@ -23,12 +23,12 @@
 
 use super::{FlatConstantStream, FlatPoolResourceError};
 use crate::physical_type_v2::TypeCodecError;
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field};
 use novarocks_type_contract::CompileCheckpoints;
 use std::alloc::Layout;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct ReaderDiagnosticRequests {
+pub(crate) struct ReaderDiagnosticRequests {
     pub request_bytes_upper_bound: usize,
     pub allocation_requests_upper_bound: usize,
 }
@@ -48,7 +48,7 @@ fn byte_layout(bytes: usize) -> Result<(), FlatPoolResourceError> {
         .map_err(|_| invalid())
 }
 impl ReaderDiagnosticRequests {
-    fn plus(self, other: Self) -> Result<Self, FlatPoolResourceError> {
+    pub(crate) fn plus(self, other: Self) -> Result<Self, FlatPoolResourceError> {
         Ok(Self {
             request_bytes_upper_bound: add(
                 self.request_bytes_upper_bound,
@@ -60,7 +60,7 @@ impl ReaderDiagnosticRequests {
             )?,
         })
     }
-    fn maximum(self, other: Self) -> Self {
+    pub(crate) fn maximum(self, other: Self) -> Self {
         // Different branches can maximize different quantities; a componentwise
         // maximum remains an upper bound for the one first failing branch.
         Self {
@@ -79,7 +79,7 @@ impl ReaderDiagnosticRequests {
 /// length <= L, cumulative requests are <= 8+4L. Check a possible individual
 /// capacity separately from the cumulative sum. Aggregate requests need not
 /// themselves describe one allocation Layout.
-fn string_requests(
+pub(crate) fn string_requests(
     length: usize,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ReaderDiagnosticRequests, FlatPoolResourceError> {
@@ -119,7 +119,7 @@ fn length(
     }
     Ok(result)
 }
-fn arrow_error(
+pub(crate) fn arrow_error(
     description: usize,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ReaderDiagnosticRequests, FlatPoolResourceError> {
@@ -140,7 +140,7 @@ fn candidate(
     work.step()?;
     Ok(())
 }
-fn decimal_digits(
+pub(crate) fn decimal_digits(
     mut value: usize,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<usize, FlatPoolResourceError> {
@@ -248,7 +248,15 @@ pub(super) fn preflight(
     stream: &FlatConstantStream<'_, '_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ReaderDiagnosticRequests, FlatPoolResourceError> {
-    let ty = stream.field().data_type();
+    preflight_field(stream.field(), work)
+}
+
+/// Shared per-field leaf diagnostic author; container wrapping is additional.
+pub(crate) fn preflight_field(
+    field: &Field,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ReaderDiagnosticRequests, FlatPoolResourceError> {
+    let ty = field.data_type();
     let digits = decimal_digits(usize::MAX, work)?;
     let mut largest = ReaderDiagnosticRequests::default();
     if !matches!(ty, DataType::Null) {
@@ -258,11 +266,11 @@ pub(super) fn preflight(
             &[digits, digits],
             work,
         )?;
-        if !stream.field().is_nullable() {
+        if !field.is_nullable() {
             candidate(
                 &mut largest,
                 "Column '' is declared as non-nullable but contains null values",
-                &[stream.field().name().len()],
+                &[field.name().len()],
                 work,
             )?;
         }

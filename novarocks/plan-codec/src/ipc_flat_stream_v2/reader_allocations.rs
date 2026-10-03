@@ -58,7 +58,7 @@ fn array_layout<T>(count: usize) -> Result<Layout, FlatPoolResourceError> {
     Layout::array::<T>(count)
         .map_err(|_| invalid("flat reader container layout is not representable"))
 }
-fn arc_layout(payload: Layout) -> Result<Layout, FlatPoolResourceError> {
+pub(crate) fn arc_layout(payload: Layout) -> Result<Layout, FlatPoolResourceError> {
     // Rust 1.92 alloc/sync.rs: ArcInner is repr(C, align(2)), with exactly
     // strong/weak AtomicUsize counters followed by the actual payload.
     let counters = Layout::new::<[AtomicUsize; 2]>();
@@ -97,7 +97,9 @@ fn bytes_layout() -> Layout {
     argument_layout(Buffer::from_bytes)
 }
 
-fn environment(work: &mut CompileCheckpoints<'_>) -> Result<Layout, FlatPoolResourceError> {
+pub(crate) fn environment(
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Layout, FlatPoolResourceError> {
     let bytes = bytes_layout();
     let supported = LOCKED_FAMILY
         && LOCKED_TOOLCHAIN
@@ -117,12 +119,12 @@ fn environment(work: &mut CompileCheckpoints<'_>) -> Result<Layout, FlatPoolReso
 }
 
 #[derive(Default)]
-struct Requests {
-    bytes: usize,
-    count: usize,
+pub(crate) struct Requests {
+    pub(crate) bytes: usize,
+    pub(crate) count: usize,
 }
 impl Requests {
-    fn record(
+    pub(crate) fn record(
         &mut self,
         layout: Layout,
         copies: usize,
@@ -136,7 +138,7 @@ impl Requests {
         work.step()?;
         result
     }
-    fn exact_vec<T>(
+    pub(crate) fn exact_vec<T>(
         &mut self,
         count: usize,
         copies: usize,
@@ -149,7 +151,7 @@ impl Requests {
         let layout = array_layout::<T>(count)?;
         self.record(layout, copies, work)
     }
-    fn arc(
+    pub(crate) fn arc(
         &mut self,
         payload: Layout,
         copies: usize,
@@ -157,7 +159,7 @@ impl Requests {
     ) -> Result<(), FlatPoolResourceError> {
         self.record(arc_layout(payload)?, copies, work)
     }
-    fn growing_vec<T>(
+    pub(crate) fn growing_vec<T>(
         &mut self,
         count: usize,
         work: &mut CompileCheckpoints<'_>,
@@ -194,7 +196,7 @@ impl Requests {
         work.step()?;
         result
     }
-    fn view_to_data(
+    pub(crate) fn view_to_data(
         &mut self,
         variadic: usize,
         work: &mut CompileCheckpoints<'_>,
@@ -207,7 +209,7 @@ impl Requests {
     }
 }
 
-fn concrete_array_layout(ty: &DataType) -> Result<Layout, FlatPoolResourceError> {
+pub(crate) fn concrete_array_layout(ty: &DataType) -> Result<Layout, FlatPoolResourceError> {
     // Exactly the locked make_array concrete object dispatch. Closedness is
     // decided by the shared raw geometry layout, not this allocation mapping.
     macro_rules! object {
@@ -216,6 +218,10 @@ fn concrete_array_layout(ty: &DataType) -> Result<Layout, FlatPoolResourceError>
         };
     }
     Ok(match ty {
+        DataType::Struct(_) => object!(StructArray),
+        DataType::List(_) => object!(ListArray),
+        DataType::LargeList(_) => object!(LargeListArray),
+        DataType::Map(_, _) => object!(MapArray),
         DataType::Null => object!(NullArray),
         DataType::Boolean => object!(BooleanArray),
         DataType::Int8 => object!(Int8Array),

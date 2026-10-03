@@ -22,6 +22,7 @@ use crate::{
     ipc_flat_batch_v2::{Layout, layout},
     physical_type_v2::TypeCodecError,
 };
+use arrow::array::ArrayData;
 use arrow::ipc;
 use flatbuffers::FlatBufferBuilder;
 use novarocks_constant_contract::ConstantPool;
@@ -31,16 +32,35 @@ fn invalid() -> TypeCodecError {
     TypeCodecError::InvalidShape("flat pool batch metadata differs from checked geometry")
 }
 pub(super) fn backing(geometry: &Geometry) -> Result<usize, TypeCodecError> {
-    // Two five-slot tables: 64 + 54; node vector 27; descriptors 16C+11;
-    // root/alignment 11; optional one i64 variadic vector 19.
-    let value = add(
-        add(167, mul(16, geometry.buffers)?)?,
-        if geometry.views { 19 } else { 0 },
-    )?;
-    Ok(value)
+    backing_counts(1, geometry.buffers, usize::from(geometry.views))
+}
+
+pub(crate) fn backing_counts(
+    nodes: usize,
+    buffers: usize,
+    view_fields: usize,
+) -> Result<usize, TypeCodecError> {
+    // Two five-slot tables 64+54, node vector 16N+11,
+    // descriptors 16C+11, root/alignment 11, optional i64 vector 8V+11.
+    add(
+        add(151, mul(16, add(nodes, buffers)?)?)?,
+        if view_fields == 0 {
+            0
+        } else {
+            add(11, mul(8, view_fields)?)?
+        },
+    )
 }
 pub(super) fn descriptor_bytes(
     pool: &ConstantPool,
+    geometry: &Geometry,
+    index: usize,
+) -> Result<usize, TypeCodecError> {
+    descriptor_bytes_span(pool.data(), geometry, index)
+}
+
+pub(crate) fn descriptor_bytes_span(
+    data: &ArrayData,
     geometry: &Geometry,
     index: usize,
 ) -> Result<usize, TypeCodecError> {
@@ -50,7 +70,7 @@ pub(super) fn descriptor_bytes(
     if index == 0 {
         return bit_bytes(geometry.rows);
     }
-    match layout(pool.data().data_type())? {
+    match layout(data.data_type())? {
         Layout::Bits | Layout::Fixed(_) => Ok(geometry.values_bytes),
         Layout::Offsets(width) => {
             if index == 1 {
@@ -63,8 +83,7 @@ pub(super) fn descriptor_bytes(
             if index == 1 {
                 Ok(geometry.values_bytes)
             } else {
-                pool.data()
-                    .buffers()
+                data.buffers()
                     .get(index - 1)
                     .map(|b| b.len())
                     .ok_or_else(invalid)
