@@ -25,6 +25,8 @@ mod canonical_call_tests;
 #[cfg(test)]
 mod column_type_control_tests;
 #[cfg(test)]
+mod window_canonical_tests;
+#[cfg(test)]
 mod element_at_control_tests;
 #[cfg(test)]
 mod extract_binding_tests;

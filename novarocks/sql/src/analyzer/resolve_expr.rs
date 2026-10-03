@@ -2647,33 +2647,17 @@ impl<'a> super::AnalyzerContext<'a> {
             let binding = if let Some(aggregate) = &aggregate_binding {
                 aggregate.clone()
             } else {
-                let arguments = args_typed
-                    .iter()
-                    .map(|argument| {
-                        crate::analysis::function_argument(
-                            argument,
-                            self.constant_policy,
-                            self.control,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(AnalyzeError::function_binding)?;
-                self.function_catalog
-                    .resolve_window_binding(&name, &arguments, self.control)
-                    .map_err(|error| {
-                        if let novarocks_functions::FunctionBindingError::Control(error) = error { return AnalyzeError::control(error); }
-                        AnalyzeError::type_mismatch(
-                            format!(
-                                "cannot bind window function `{name}` for argument types {:?}: {error}",
-                                args_typed
-                                    .iter()
-                                    .map(|argument| argument.value_type.data_type.clone())
-                                    .collect::<Vec<_>>()
-                            ),
-                            func.span,
-                        )
-                    })
-                    .map(|binding| crate::binding::SqlFunctionBinding::new(binding, self.sql_semantics.sql_mode().decimal_overflow_policy()))?
+                let (coerced, binding) = bind_window_function_call_with_catalog(
+                    self.function_catalog,
+                    &name,
+                    args_typed,
+                    func.span,
+                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    self.constant_policy,
+                    self.control,
+                )?;
+                args_typed = coerced;
+                binding
             };
             let result = match &binding.selected.result_type {
                 novarocks_functions::FunctionResultType::Scalar(result) => result.clone(),
@@ -5552,6 +5536,128 @@ fn normalize_field_arguments(
             Ok(cast)
         })
         .collect()
+}
+
+/// Window-only selected arguments use the same carrier/domain conversion
+/// author as ordinary calls, then retain the exact window selection.
+pub(super) fn bind_window_function_call_with_catalog(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    name: &str,
+    args: Vec<TypedExpr>,
+    span: Span,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(Vec<TypedExpr>, crate::binding::SqlFunctionBinding), AnalyzeError> {
+    let resolve = |args: &[TypedExpr]| {
+        let arguments = args
+            .iter()
+            .map(|argument| crate::analysis::function_argument(argument, constant_policy, control))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(AnalyzeError::function_binding)?;
+        function_catalog
+            .resolve_window_binding(name, &arguments, control)
+            .map_err(|error| {
+                if let novarocks_functions::FunctionBindingError::Control(error) = error {
+                    return AnalyzeError::control(error);
+                }
+                AnalyzeError::type_mismatch(
+                    format!(
+                        "cannot bind window function `{name}` for argument types {:?}: {error}",
+                        args.iter()
+                            .map(|argument| argument.value_type.data_type.clone())
+                            .collect::<Vec<_>>()
+                    ),
+                    span,
+                )
+            })
+    };
+    let binding = resolve(&args)?;
+    if binding.kind != novarocks_functions::FunctionKind::Window
+        || binding.selected.argument_types.len() != args.len()
+        || !matches!(
+            binding.selected.result_type,
+            novarocks_functions::FunctionResultType::Scalar(_)
+        )
+    {
+        return Err(AnalyzeError::type_mismatch(
+            format!("window function `{name}` selected an invalid call shape"),
+            span,
+        ));
+    }
+    let args = args
+        .into_iter()
+        .zip(binding.selected.argument_types.iter())
+        .map(|(arg, target)| match target {
+            novarocks_functions::FunctionArgumentType::Value(value) => {
+                coerce_selected_function_argument(
+                    function_catalog,
+                    arg,
+                    value,
+                    decimal_overflow_policy,
+                    constant_policy,
+                    control,
+                )
+            }
+            novarocks_functions::FunctionArgumentType::Lambda { .. } => {
+                Err(AnalyzeError::type_mismatch(
+                    format!(
+                        "window function `{name}` selected a lambda target for a value argument"
+                    ),
+                    span,
+                ))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let exact = resolve(&args)?;
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        control,
+        novarocks_type_contract::CompilePhase::FunctionSpecialization,
+    )
+    .map_err(AnalyzeError::control)?;
+    let matches = (|| -> Result<bool, novarocks_functions::FunctionBindingError> {
+        work.step()?;
+        if exact.function_id != binding.function_id
+            || exact.selected.overload != binding.selected.overload
+            || exact.kind != binding.kind
+            || exact.selected.argument_types.len() != args.len()
+            || !matches!(
+                exact.selected.result_type,
+                novarocks_functions::FunctionResultType::Scalar(_)
+            )
+        {
+            return Ok(false);
+        }
+        for (target, arg) in exact.selected.argument_types.iter().zip(args.iter()) {
+            work.step()?;
+            let novarocks_functions::FunctionArgumentType::Value(value) = target else {
+                return Ok(false);
+            };
+            if !value.exactly_equals_observed::<novarocks_functions::FunctionBindingError>(
+                &arg.value_type,
+                || work.step().map_err(Into::into),
+            )? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    })();
+    if let Err(error) = &matches
+        && let Some(cause) = error.control_error()
+    {
+        return Err(AnalyzeError::control(cause));
+    }
+    work.finish().map_err(AnalyzeError::control)?;
+    if !matches!(matches, Ok(true)) {
+        return Err(AnalyzeError::type_mismatch(
+            format!("window function `{name}` changed selected identity after argument coercion"),
+            span,
+        ));
+    }
+    Ok((
+        args,
+        crate::binding::SqlFunctionBinding::new(exact, decimal_overflow_policy),
+    ))
 }
 
 pub(super) fn bind_scalar_function_call_with_catalog(
