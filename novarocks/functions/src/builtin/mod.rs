@@ -69,6 +69,8 @@ mod round_cast_float_text;
 mod round_cast_text;
 mod round_owner;
 mod rounding_binding;
+mod string_append_trailing;
+mod string_append_trailing_owner;
 mod string_case;
 mod string_case_owner;
 mod string_concat;
