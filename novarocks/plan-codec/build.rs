@@ -16,11 +16,19 @@
 // under the License.
 
 use std::{env, process::Command};
+#[path = "src/byte_request_model_profile.rs"]
+mod byte_request_model_profile;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=RUSTC");
     println!("cargo:rerun-if-changed=../../rust-toolchain.toml");
     println!("cargo:rerun-if-changed=../../Cargo.lock");
+    println!("cargo:rerun-if-changed=src/byte_request_model_profile.rs");
+    assert!(
+        byte_request_model_profile::locked_bytes_matches(include_bytes!("../../Cargo.lock")),
+        "plan-codec bytes request model requires re-audit after a locked source change"
+    );
+    println!("cargo:rustc-env=NOVAROCKS_PLAN_CODEC_RESOURCE_BYTES=1.11.0");
     let compiler = env::var_os("RUSTC").expect("Cargo must provide RUSTC");
     let result = Command::new(compiler)
         .arg("--version")

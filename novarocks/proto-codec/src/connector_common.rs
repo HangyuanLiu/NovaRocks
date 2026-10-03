@@ -47,7 +47,7 @@ pub fn encode_connector_payload_message(
                 catalog_name: header.catalog().catalog_name().as_str().to_owned(),
                 version: header.catalog().version().as_bytes().to_vec(),
             }),
-            category: encode_category(header.category()),
+            category: encode_connector_category(header.category()),
             codec_revision: header.codec_revision().get(),
         }),
         payload: value.payload().to_vec(),
@@ -191,7 +191,9 @@ fn connector_error(path: FieldPath, error: ConnectorCodecError) -> ProtocolError
     ProtocolError::new(path, kind, error.to_string())
 }
 
-fn encode_category(category: ConnectorCodecCategory) -> i32 {
+/// Project the sole neutral category vocabulary without a private codec or
+/// runtime capability. Carrier codecs share this exhaustive conversion.
+pub fn encode_connector_category(category: ConnectorCodecCategory) -> i32 {
     match category {
         ConnectorCodecCategory::ReadTable => dto::ConnectorPayloadCategory::ReadTable as i32,
         ConnectorCodecCategory::ReadView => dto::ConnectorPayloadCategory::ReadView as i32,
@@ -208,20 +210,28 @@ fn decode_category(
     value: i32,
     path: ConnectorFieldPath,
 ) -> Result<ConnectorCodecCategory, ConnectorCodecError> {
-    match dto::ConnectorPayloadCategory::try_from(value) {
-        Ok(dto::ConnectorPayloadCategory::ReadTable) => Ok(ConnectorCodecCategory::ReadTable),
-        Ok(dto::ConnectorPayloadCategory::ReadView) => Ok(ConnectorCodecCategory::ReadView),
-        Ok(dto::ConnectorPayloadCategory::ReadColumn) => Ok(ConnectorCodecCategory::ReadColumn),
-        Ok(dto::ConnectorPayloadCategory::ReadSplit) => Ok(ConnectorCodecCategory::ReadSplit),
-        Ok(dto::ConnectorPayloadCategory::WriteHandle) => Ok(ConnectorCodecCategory::WriteHandle),
-        Ok(dto::ConnectorPayloadCategory::CommitFragment) => {
-            Ok(ConnectorCodecCategory::CommitFragment)
-        }
-        Ok(dto::ConnectorPayloadCategory::Unspecified) | Err(_) => Err(ConnectorCodecError::new(
+    decode_connector_category(value).ok_or_else(|| {
+        ConnectorCodecError::new(
             path,
             ConnectorCodecErrorKind::InvalidEnum,
             "connector payload category is unknown or unspecified",
-        )),
+        )
+    })
+}
+
+/// Reject unspecified and unknown categories before any provider lookup.
+/// This checks the neutral envelope grammar and grants no private authority.
+pub fn decode_connector_category(value: i32) -> Option<ConnectorCodecCategory> {
+    match dto::ConnectorPayloadCategory::try_from(value) {
+        Ok(dto::ConnectorPayloadCategory::ReadTable) => Some(ConnectorCodecCategory::ReadTable),
+        Ok(dto::ConnectorPayloadCategory::ReadView) => Some(ConnectorCodecCategory::ReadView),
+        Ok(dto::ConnectorPayloadCategory::ReadColumn) => Some(ConnectorCodecCategory::ReadColumn),
+        Ok(dto::ConnectorPayloadCategory::ReadSplit) => Some(ConnectorCodecCategory::ReadSplit),
+        Ok(dto::ConnectorPayloadCategory::WriteHandle) => Some(ConnectorCodecCategory::WriteHandle),
+        Ok(dto::ConnectorPayloadCategory::CommitFragment) => {
+            Some(ConnectorCodecCategory::CommitFragment)
+        }
+        Ok(dto::ConnectorPayloadCategory::Unspecified) | Err(_) => None,
     }
 }
 
