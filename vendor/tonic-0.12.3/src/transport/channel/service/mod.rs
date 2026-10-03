@@ -26,3 +26,6 @@ pub(super) use self::executor::{Executor, SharedExec};
 mod tls;
 #[cfg(feature = "tls")]
 pub(super) use self::tls::TlsConnector;
+
+mod attempt_connector;
+pub(crate) use self::attempt_connector::AttemptTimeoutConnector;

@@ -1,0 +1,881 @@
+{
+  "parent": "f55dce9d8f2d6e0f4fdc87e026d502475ec04978",
+  "status": "P04 executing; P05-P10 open; V1 not advertised",
+  "geometry": {
+    "std-mutex-native-only": {
+      "connection_bytes": 6454133,
+      "process_stock_bytes": 3472543834,
+      "registration_bytes": 448
+    },
+    "parking_lot-workspace": {
+      "connection_bytes": 6453949,
+      "process_stock_bytes": 3472444458,
+      "registration_bytes": 256
+    }
+  },
+  "focused_tests": {
+    "native_lib": 673,
+    "native_trust_lib": 9,
+    "protocol_unique": 75,
+    "registration_feature_matrix": "4 same tests in each of two actual feature combinations; do not double-count unique tests",
+    "elapsed_payload_oracle": "final nine typed tests pass in full CI; initial source() oracle invalid"
+  },
+  "cargo_only_ci": {
+    "artifact": "logs/ci-full/20261003-171218",
+    "status": "PASS",
+    "duration_seconds": 555,
+    "passed": 11942,
+    "failed": 0,
+    "ignored": 7,
+    "profile": "dev",
+    "environment": {
+      "CARGO_BUILD_JOBS": "4",
+      "CARGO_INCREMENTAL": "0"
+    }
+  },
+  "initial_failed_ci": {
+    "artifact": "logs/ci-full/20261003-164010",
+    "cause": "actual Tokio parking_lot feature selects inline mutex, old typed bound incorrectly added 64 B PAL; four exact registration layout assertions failed",
+    "classification": "real source omission; fixed and both features reverified"
+  },
+  "source_negative_unique_cases": 3,
+  "source_negative_scope": "two actual Tokio Arc/PAL regressions plus original Tonic Elapsed payload loss; wrong source() oracle failures are invalid and excluded",
+  "public_tonic_tls": {
+    "tests_passed": 2,
+    "private_tests_executed": false,
+    "original_funding_claim": false,
+    "toolchain": "1.92.0"
+  },
+  "system": [
+    {
+      "scenario": "native-ingress/blocking-saturation-control",
+      "outcome": "passed",
+      "exit_code": 0,
+      "cluster_size": 3,
+      "platform": {
+        "os": "macos",
+        "architecture": "aarch64",
+        "logical_cpu_count": 10
+      },
+      "source_revision": "f55dce9d8f2d6e0f4fdc87e026d502475ec04978",
+      "source_dirty": true,
+      "source_tree_sha256": "3cd252bdf38a8f2ecece533551c36c728c037588f08849f96b42a0c58bec646d",
+      "cargo_lock_sha256": "baf88915862f746dae9f6b6312f515becfadd1a7751839cf311c49ef6a250337",
+      "runner_native_build_identity": "f55dce9d8f2d6e0f4fdc87e026d502475ec04978",
+      "started_unix_millis": 1791019344299,
+      "ended_unix_millis": 1791019344548,
+      "artifact": "logs/mem-1-m07/p04-original-socket-system-fixed/native-ingress-blocking-saturation-control/scenario-evidence.json",
+      "artifact_sha256": "34a08cc4278694bd97a7ac589e6d14f44f8d82bbb41eb0aab1ff2be4e1328c22"
+    },
+    {
+      "scenario": "native-ingress/outer-preflight-rejection",
+      "outcome": "passed",
+      "exit_code": 0,
+      "cluster_size": 3,
+      "platform": {
+        "os": "macos",
+        "architecture": "aarch64",
+        "logical_cpu_count": 10
+      },
+      "source_revision": "f55dce9d8f2d6e0f4fdc87e026d502475ec04978",
+      "source_dirty": true,
+      "source_tree_sha256": "3cd252bdf38a8f2ecece533551c36c728c037588f08849f96b42a0c58bec646d",
+      "cargo_lock_sha256": "baf88915862f746dae9f6b6312f515becfadd1a7751839cf311c49ef6a250337",
+      "runner_native_build_identity": "f55dce9d8f2d6e0f4fdc87e026d502475ec04978",
+      "started_unix_millis": 1791019343841,
+      "ended_unix_millis": 1791019344056,
+      "artifact": "logs/mem-1-m07/p04-original-socket-system-fixed/native-ingress-outer-preflight-rejection/scenario-evidence.json",
+      "artifact_sha256": "54b173f809b7f051a13af9fe03a3edf76339921c08bca7892eabdb097a135775"
+    },
+    {
+      "scenario": "native-ingress/partial-body-deadline",
+      "outcome": "passed",
+      "exit_code": 0,
+      "cluster_size": 3,
+      "platform": {
+        "os": "macos",
+        "architecture": "aarch64",
+        "logical_cpu_count": 10
+      },
+      "source_revision": "f55dce9d8f2d6e0f4fdc87e026d502475ec04978",
+      "source_dirty": true,
+      "source_tree_sha256": "3cd252bdf38a8f2ecece533551c36c728c037588f08849f96b42a0c58bec646d",
+      "cargo_lock_sha256": "baf88915862f746dae9f6b6312f515becfadd1a7751839cf311c49ef6a250337",
+      "runner_native_build_identity": "f55dce9d8f2d6e0f4fdc87e026d502475ec04978",
+      "started_unix_millis": 1791019344895,
+      "ended_unix_millis": 1791019345226,
+      "artifact": "logs/mem-1-m07/p04-original-socket-system-fixed/native-ingress-partial-body-deadline/scenario-evidence.json",
+      "artifact_sha256": "4ba354ac05a11f6461cd7016e99372464b475de392669f61791c3aae94f25d9a"
+    },
+    {
+      "scenario": "native-ingress/registry-contention-control",
+      "outcome": "passed",
+      "exit_code": 0,
+      "cluster_size": 3,
+      "platform": {
+        "os": "macos",
+        "architecture": "aarch64",
+        "logical_cpu_count": 10
+      },
+      "source_revision": "f55dce9d8f2d6e0f4fdc87e026d502475ec04978",
+      "source_dirty": true,
+      "source_tree_sha256": "3cd252bdf38a8f2ecece533551c36c728c037588f08849f96b42a0c58bec646d",
+      "cargo_lock_sha256": "baf88915862f746dae9f6b6312f515becfadd1a7751839cf311c49ef6a250337",
+      "runner_native_build_identity": "f55dce9d8f2d6e0f4fdc87e026d502475ec04978",
+      "started_unix_millis": 1791019345479,
+      "ended_unix_millis": 1791019345704,
+      "artifact": "logs/mem-1-m07/p04-original-socket-system-fixed/native-ingress-registry-contention-control/scenario-evidence.json",
+      "artifact_sha256": "add3dad8c3e15be73b6aec63776aba5c0b42500d298e7671839b92d78fa7d872"
+    },
+    {
+      "scenario": "native-trust/automatic-dns",
+      "outcome": "passed",
+      "exit_code": 0,
+      "cluster_size": 3,
+      "platform": {
+        "os": "macos",
+        "architecture": "aarch64",
+        "logical_cpu_count": 10
+      },
+      "source_revision": "f55dce9d8f2d6e0f4fdc87e026d502475ec04978",
+      "source_dirty": true,
+      "source_tree_sha256": "3cd252bdf38a8f2ecece533551c36c728c037588f08849f96b42a0c58bec646d",
+      "cargo_lock_sha256": "baf88915862f746dae9f6b6312f515becfadd1a7751839cf311c49ef6a250337",
+      "runner_native_build_identity": "f55dce9d8f2d6e0f4fdc87e026d502475ec04978",
+      "started_unix_millis": 1791019342357,
+      "ended_unix_millis": 1791019342790,
+      "artifact": "logs/mem-1-m07/p04-original-socket-system-fixed/native-trust-automatic-dns/scenario-evidence.json",
+      "artifact_sha256": "99d1e392215a8ae8000bd25855ce7bd9a4bd5248ec8c17f438f45f04e0e4897e"
+    },
+    {
+      "scenario": "native-trust/pem-ip",
+      "outcome": "passed",
+      "exit_code": 0,
+      "cluster_size": 3,
+      "platform": {
+        "os": "macos",
+        "architecture": "aarch64",
+        "logical_cpu_count": 10
+      },
+      "source_revision": "f55dce9d8f2d6e0f4fdc87e026d502475ec04978",
+      "source_dirty": true,
+      "source_tree_sha256": "3cd252bdf38a8f2ecece533551c36c728c037588f08849f96b42a0c58bec646d",
+      "cargo_lock_sha256": "baf88915862f746dae9f6b6312f515becfadd1a7751839cf311c49ef6a250337",
+      "runner_native_build_identity": "f55dce9d8f2d6e0f4fdc87e026d502475ec04978",
+      "started_unix_millis": 1791019343159,
+      "ended_unix_millis": 1791019343589,
+      "artifact": "logs/mem-1-m07/p04-original-socket-system-fixed/native-trust-pem-ip/scenario-evidence.json",
+      "artifact_sha256": "d01ed08ec8e75fa9f1d2e1203d9724e86a63a4c11886f38a7fb4d80a63087bc5"
+    },
+    {
+      "scenario": "native-trust/plaintext-ip",
+      "outcome": "passed",
+      "exit_code": 0,
+      "cluster_size": 3,
+      "platform": {
+        "os": "macos",
+        "architecture": "aarch64",
+        "logical_cpu_count": 10
+      },
+      "source_revision": "f55dce9d8f2d6e0f4fdc87e026d502475ec04978",
+      "source_dirty": true,
+      "source_tree_sha256": "3cd252bdf38a8f2ecece533551c36c728c037588f08849f96b42a0c58bec646d",
+      "cargo_lock_sha256": "baf88915862f746dae9f6b6312f515becfadd1a7751839cf311c49ef6a250337",
+      "runner_native_build_identity": "f55dce9d8f2d6e0f4fdc87e026d502475ec04978",
+      "started_unix_millis": 1791019341670,
+      "ended_unix_millis": 1791019342082,
+      "artifact": "logs/mem-1-m07/p04-original-socket-system-fixed/native-trust-plaintext-ip/scenario-evidence.json",
+      "artifact_sha256": "17b0557302177ca755a9a10f1b8bcc0e229668d1218b98d2656025e84c26ceab"
+    }
+  ],
+  "logs": {
+    "m07-original-socket-cargo-only.log": {
+      "locator": "/tmp/m07-original-socket-cargo-only.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    "m07-original-socket-clean.log": {
+      "locator": "/tmp/m07-original-socket-clean.log",
+      "sha256": "6d21963a8599f13fac852fc79454b4766724d16d9c8791e4219fb501aa76bbc9",
+      "bytes": 42
+    },
+    "m07-original-socket-first-tests.log": {
+      "locator": "/tmp/m07-original-socket-first-tests.log",
+      "sha256": "b830c05b796efbb114abe0baabdba00f7ff105f3b5cd57ce07290ad6e6ebffae",
+      "bytes": 56164
+    },
+    "m07-original-socket-fmt-first.log": {
+      "locator": "/tmp/m07-original-socket-fmt-first.log",
+      "sha256": "aa04f2850fc03e6c8330a599407510389138054ac1102d7455f435c507d61750",
+      "bytes": 6622
+    },
+    "m07-original-socket-geometry.log": {
+      "locator": "/tmp/m07-original-socket-geometry.log",
+      "sha256": "5a83612bca764177c3643f69bd3438bad41834c14feaa79e5ce4614d5303a26c",
+      "bytes": 44508
+    },
+    "m07-original-socket-libs.log": {
+      "locator": "/tmp/m07-original-socket-libs.log",
+      "sha256": "dad6448105bd904a3c1a1d916da71fbd091407074dd4a7ba84dc2987ba0dd29e",
+      "bytes": 117071
+    },
+    "m07-original-socket-native-first-check.log": {
+      "locator": "/tmp/m07-original-socket-native-first-check.log",
+      "sha256": "5d54097253b0b6cd7bf6af19a9eb2440ea7de38e5bb18047daf7eb602f64546b",
+      "bytes": 56639
+    },
+    "m07-original-socket-negatives.log": {
+      "locator": "/tmp/m07-original-socket-negatives.log",
+      "sha256": "dc767b6d518aaf36c364bc5425fad143b0a198440309d2e91d886b6524ef31b6",
+      "bytes": 445
+    },
+    "m07-original-socket-protocol.log": {
+      "locator": "/tmp/m07-original-socket-protocol.log",
+      "sha256": "53a2b9de32cbf648f7855fd450f768cabce9b5eac8a8326f3e7ee10dc8d1fd44",
+      "bytes": 52284
+    },
+    "m07-original-socket-restored-tests.log": {
+      "locator": "/tmp/m07-original-socket-restored-tests.log",
+      "sha256": "4aac1ffbc8864b5e05e170d06351e1a6c6c8e401209567aeeefa2c91eab204a3",
+      "bytes": 45602
+    },
+    "m07-original-socket-server-build.log": {
+      "locator": "/tmp/m07-original-socket-server-build.log",
+      "sha256": "dad44344e61c124f3888599d3a606e78bd470a3cecba4f2d13b04b525d3766e3",
+      "bytes": 192970
+    },
+    "m07-original-socket-system-final.log": {
+      "locator": "/tmp/m07-original-socket-system-final.log",
+      "sha256": "c26795f66f8123af653fc8f3bec3ed65be8807090a8dcfb0ab3105afb8a357e7",
+      "bytes": 17651
+    },
+    "m07-original-socket-system-fixed.log": {
+      "locator": "/tmp/m07-original-socket-system-fixed.log",
+      "sha256": "021444692487ff48578c3cd55175dd89d947fccd712c4661618d4215d4fc5bfc",
+      "bytes": 92
+    },
+    "m07-original-socket-system.log": {
+      "locator": "/tmp/m07-original-socket-system.log",
+      "sha256": "e46ab21fa147ef876bda721c08eb6b294b462a8698086aa9ba642b779474deee",
+      "bytes": 86
+    },
+    "m07-original-socket-tokio-check.log": {
+      "locator": "/tmp/m07-original-socket-tokio-check.log",
+      "sha256": "e8c74c292da46d86b44d95b73fac95647da1107e762747ee31e48661204daa5e",
+      "bytes": 1762
+    },
+    "m07-original-socket-tokio-first-check.log": {
+      "locator": "/tmp/m07-original-socket-tokio-first-check.log",
+      "sha256": "e8ba25ea0890bf6630709e9f811ccb71944e489015181c521f81c609f9040c2a",
+      "bytes": 65
+    },
+    "m07-socket-final-fmt.log": {
+      "locator": "/tmp/m07-socket-final-fmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    "m07-socket-final-focused-after-timeout.log": {
+      "locator": "/tmp/m07-socket-final-focused-after-timeout.log",
+      "sha256": "4b34b7924388d42afefab6f7993841ba2499d24667618fd6cba25a1832d5f772",
+      "bytes": 42
+    },
+    "m07-socket-final-focused.log": {
+      "locator": "/tmp/m07-socket-final-focused.log",
+      "sha256": "ab4af75ba9996a401c0168f4faa1f3c4a8c7cbdc1f27f9339ac6afc178ccf6fb",
+      "bytes": 153
+    },
+    "m07-socket-final-geometry-std.log": {
+      "locator": "/tmp/m07-socket-final-geometry-std.log",
+      "sha256": "b08110ba7bdffe06650d855a52086357c9c917767b66783998ad43dd59460da8",
+      "bytes": 44827
+    },
+    "m07-socket-final-geometry-workspace.log": {
+      "locator": "/tmp/m07-socket-final-geometry-workspace.log",
+      "sha256": "f45d3ae4cd2839dfd9d7c3e8f41191231808f25d7996654631addcb7ded1cb2e",
+      "bytes": 228869
+    },
+    "m07-socket-final-public-tls.log": {
+      "locator": "/tmp/m07-socket-final-public-tls.log",
+      "sha256": "34348c5a7e681e3480db4357d899982b164e35b14af106bd8d7e4ecd4b56e9fd",
+      "bytes": 822
+    },
+    "m07-socket-fixed-cargo-only.log": {
+      "locator": "/tmp/m07-socket-fixed-cargo-only.log",
+      "sha256": "374efacb0aded11f6d6fee0c9f3dbbb47c82c416edb963a9f10637895e151657",
+      "bytes": 92
+    },
+    "m07-socket-fixed-negatives.log": {
+      "locator": "/tmp/m07-socket-fixed-negatives.log",
+      "sha256": "8c215adf708400ba651b8ba1faa9d03af5ee37e6449b1cad7bfc7412ddfc919d",
+      "bytes": 445
+    },
+    "m07-socket-fixed-system.log": {
+      "locator": "/tmp/m07-socket-fixed-system.log",
+      "sha256": "f0bbe066370b30ff776db922701809fcae3d72253b1d62cc2c5f708ad84c2ff2",
+      "bytes": 18029
+    },
+    "m07-socket-followup-checks.log": {
+      "locator": "/tmp/m07-socket-followup-checks.log",
+      "sha256": "c00aa096c4cfa6f19af9d2740436c288976d61c1cebb5fbed3d37e9a157fa559",
+      "bytes": 49
+    },
+    "m07-socket-public-replay-final.log": {
+      "locator": "/tmp/m07-socket-public-replay-final.log",
+      "sha256": "d4c01ec7116446936194aeb19546ec5d6a4d371311d544f16f755181d8e580b5",
+      "bytes": 457
+    },
+    "m07-socket-std-feature.log": {
+      "locator": "/tmp/m07-socket-std-feature.log",
+      "sha256": "21a70b760f5df05e07c2325a4652e9aebfaa1af00d300c00e360e1822dbb8ba7",
+      "bytes": 45706
+    },
+    "m07-socket-timeout-payload-negative.log": {
+      "locator": "/tmp/m07-socket-timeout-payload-negative.log",
+      "sha256": "e86b48185c29fa51a84c8d933973ec334fc007f920771febccdb0d506d9106be",
+      "bytes": 165
+    },
+    "m07-socket-timeout-source-fixed.log": {
+      "locator": "/tmp/m07-socket-timeout-source-fixed.log",
+      "sha256": "988e774aa04de7d93c3892c17aea657cd3550382efe7f0b2b4fb135f545ea464",
+      "bytes": 45852
+    },
+    "m07-socket-timeout-source-negative.log": {
+      "locator": "/tmp/m07-socket-timeout-source-negative.log",
+      "sha256": "10767165ec6ce1286279a8391e0dbd15566fbccdfb30641b92eab01287199c0f",
+      "bytes": 45068
+    },
+    "m07-socket-tonic-public-tls.log": {
+      "locator": "/tmp/m07-socket-tonic-public-tls.log",
+      "sha256": "af1e08e00ce924363d40fe1c74907bc33ec7633a09ae4de6c993785a77864876",
+      "bytes": 2221
+    },
+    "m07-socket-workspace-feature.log": {
+      "locator": "/tmp/m07-socket-workspace-feature.log",
+      "sha256": "37a136980f6c85a70547e6cb1339865ea035be087fa995db6c999cd3e966a893",
+      "bytes": 51020
+    },
+    "ci-20261003-164010-application-domain-dependency-boundary-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/application-domain-dependency-boundary-test.log",
+      "sha256": "7e1f93ebf3d1d9a814a3c61155b1e0a200ee2e6f90229d2c0eb5b43628921b00",
+      "bytes": 159
+    },
+    "ci-20261003-164010-application-domain-dependency-boundary.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/application-domain-dependency-boundary.log",
+      "sha256": "ca81667ce52af5b5f9b8613a652355d8ba757eb31c2c90b61f26117f4b766d4b",
+      "bytes": 104
+    },
+    "ci-20261003-164010-cargo-build.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/cargo-build.log",
+      "sha256": "5c748c40291ff11bd66a75f3c274069ab90ac1f9a291659fd2f2347c34e79792",
+      "bytes": 183605
+    },
+    "ci-20261003-164010-cargo-check-all-targets.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/cargo-check-all-targets.log",
+      "sha256": "21bb08fd646e09c78a9f4decff63310b52fbbd25964ad7ab95895aec17685959",
+      "bytes": 232449
+    },
+    "ci-20261003-164010-cargo-check-server-system-allocator.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/cargo-check-server-system-allocator.log",
+      "sha256": "9c4d31713edacea70f01d3246df796254c8ab1147fc0ff003043bfa2b71e2f86",
+      "bytes": 182281
+    },
+    "ci-20261003-164010-cargo-clippy.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/cargo-clippy.log",
+      "sha256": "b7f68635f28a30900a667bf3cb0e865abd5fe07546d9f5f62d4e408fe293d5e0",
+      "bytes": 536509
+    },
+    "ci-20261003-164010-cargo-deny.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/cargo-deny.log",
+      "sha256": "27c3bc20f1e5f2017989973ebd4c82e6c8abc983a78af8e4a6412ca01f08df1f",
+      "bytes": 109
+    },
+    "ci-20261003-164010-cargo-fmt.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/cargo-fmt.log",
+      "sha256": "25293c8809a4971b7ad97551d7900c3289770c2e95b4372b44fe03db1359093a",
+      "bytes": 20
+    },
+    "ci-20261003-164010-cargo-metadata.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/cargo-metadata.log",
+      "sha256": "c87155cd0e55bfb5359d9b09ff38d5852d158095c6add77589109321aa7e9f55",
+      "bytes": 248131
+    },
+    "ci-20261003-164010-cargo-test-component.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/cargo-test-component.log",
+      "sha256": "6857d6ec450195c85f18e56f0fb636c80825ce6285e5fb6b613bbd961de2de63",
+      "bytes": 886344
+    },
+    "ci-20261003-164010-connector-role-binding-boundary-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/connector-role-binding-boundary-test.log",
+      "sha256": "c4a85d5ea6058bda3dd76731973593eaaa3752a2a7552f5fc5083b4fa99d8c8a",
+      "bytes": 138
+    },
+    "ci-20261003-164010-connector-role-binding-boundary.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/connector-role-binding-boundary.log",
+      "sha256": "048e8e08d57aff46ecf298be6177a2dc535d88718bc0892eff8be90c74dff749",
+      "bytes": 90
+    },
+    "ci-20261003-164010-datasketches-source-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/datasketches-source-test.log",
+      "sha256": "0986d4b1602aa389a50a669a7bb291e0d84d720bc4dc5005104770c6998315e5",
+      "bytes": 76
+    },
+    "ci-20261003-164010-datasketches-source.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/datasketches-source.log",
+      "sha256": "8118501ffb6fd327ab4ce9c13bc60804360552646120b48ff2dd76beeb879ffb",
+      "bytes": 202
+    },
+    "ci-20261003-164010-error-manifest-check.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/error-manifest-check.log",
+      "sha256": "086329a3bc285c93d79bb3913dc84dc2eaff4b7beedf8bcc0b8678740145874e",
+      "bytes": 50148
+    },
+    "ci-20261003-164010-generated-artifact-hygiene.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/generated-artifact-hygiene.log",
+      "sha256": "ab4ae276af81cd6a4f1ce4bff4d6b3a6532242e692ad715e37f4b7c7a6a97f33",
+      "bytes": 83
+    },
+    "ci-20261003-164010-isolated-fixture-current-link.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/isolated-fixture-current-link.log",
+      "sha256": "058e0f97608affb1d78c5af813fe98d87e3c2ac2277d8805b871c541ec856695",
+      "bytes": 838
+    },
+    "ci-20261003-164010-legacy-branding-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/legacy-branding-test.log",
+      "sha256": "9689a9cc4e2ada9cef5b690109f044ad56315d64eb4275c1ee22b1ba908ede09",
+      "bytes": 68
+    },
+    "ci-20261003-164010-legacy-branding.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/legacy-branding.log",
+      "sha256": "8073cfe9f0f5606237c7b9276449e5ad0fdd6c552d93b2dadc214f4b94b3fa23",
+      "bytes": 58
+    },
+    "ci-20261003-164010-local-program-dependency-boundary-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/local-program-dependency-boundary-test.log",
+      "sha256": "1827f8e7d488e0a668898edef456743fd2c1619df954f8764362f667eaab9348",
+      "bytes": 184
+    },
+    "ci-20261003-164010-local-program-dependency-boundary.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/local-program-dependency-boundary.log",
+      "sha256": "25f001b325e31dc2f99a8948c179800aa271e81f64dc5c70eba2300ebb5c0835",
+      "bytes": 155
+    },
+    "ci-20261003-164010-memory-dependency-boundary-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/memory-dependency-boundary-test.log",
+      "sha256": "6531f455590a0167913a5ddad2f0f20940dedf924a2a7989f260205a697c74a3",
+      "bytes": 1557
+    },
+    "ci-20261003-164010-memory-dependency-boundary.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/memory-dependency-boundary.log",
+      "sha256": "34eb2544fa14892099b7f284bd95823384f877855aa61e8e9c978ca27e5fd90f",
+      "bytes": 921
+    },
+    "ci-20261003-164010-native-trust-dependency-boundary-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/native-trust-dependency-boundary-test.log",
+      "sha256": "b0646c129ac077cddb2744fe4138b6481182fbe09c997c0e957975c86ee24aa0",
+      "bytes": 141
+    },
+    "ci-20261003-164010-native-trust-dependency-boundary.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/native-trust-dependency-boundary.log",
+      "sha256": "86ab6b328e65a3b3d721ac2457d55c8816a691c79ac22cc8afa83bf8f011305d",
+      "bytes": 92
+    },
+    "ci-20261003-164010-native-wire-dependency-boundary-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/native-wire-dependency-boundary-test.log",
+      "sha256": "432116548d78562baed81388fb7e143da65801aaacf86e9f163493efebd2e2a3",
+      "bytes": 138
+    },
+    "ci-20261003-164010-native-wire-dependency-boundary.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/native-wire-dependency-boundary.log",
+      "sha256": "49206e456a02a375f0f07f7e311c1a452d3ea4ae41491d3611c91b6ea2892a76",
+      "bytes": 90
+    },
+    "ci-20261003-164010-ncp8-statistics-boundary-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/ncp8-statistics-boundary-test.log",
+      "sha256": "b9e7c475f341dec57a4ecb0c7332e7164b34f037c4efba43f63316e1a2622148",
+      "bytes": 118
+    },
+    "ci-20261003-164010-ncp8-statistics-boundary.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/ncp8-statistics-boundary.log",
+      "sha256": "416f80f5d8cb6ddb21988728ff589dd22535f5dae88c50c11b7cc3f1a4f9b2b5",
+      "bytes": 77
+    },
+    "ci-20261003-164010-physical-plan-dependency-boundary-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/physical-plan-dependency-boundary-test.log",
+      "sha256": "34fbffee3ca1de3e9afdfac07c956a86c661447291b98af1e2c26f5f26a820ec",
+      "bytes": 104
+    },
+    "ci-20261003-164010-physical-plan-dependency-boundary.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/physical-plan-dependency-boundary.log",
+      "sha256": "72b4953a0519ee0760d34ef381c8da2d9c13c29277ff1dcc34354ef27cc823d7",
+      "bytes": 458
+    },
+    "ci-20261003-164010-shared-benchmark-environment.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/shared-benchmark-environment.log",
+      "sha256": "5af34e86af3e9756a022f29f0d5e2768a55431b4b57b1e94802f4d7eb03002aa",
+      "bytes": 706
+    },
+    "ci-20261003-164010-shared-benchmark-fixture-contract.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/shared-benchmark-fixture-contract.log",
+      "sha256": "84ee141f6f42fe10ac9ee4490b389a1aff8ee768cd78dcb7901c931a056b5ce9",
+      "bytes": 176
+    },
+    "ci-20261003-164010-shared-benchmark-fixture-lifecycle.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/shared-benchmark-fixture-lifecycle.log",
+      "sha256": "cffd5c4d288be06d9d38eb8c84ed44dca5fcab977835d6d769e502b0ff565f64",
+      "bytes": 201
+    },
+    "ci-20261003-164010-spi-dependency-boundary-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/spi-dependency-boundary-test.log",
+      "sha256": "78080eb31c0cc02a1cb80ef1c47c860f1548bb43d7d691f8a05de1205947ab71",
+      "bytes": 84
+    },
+    "ci-20261003-164010-spi-dependency-boundary.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/spi-dependency-boundary.log",
+      "sha256": "e7a45113da2d557f9d582a95e41a67298b1aabb0b5ca9d2043c97965958dbb3d",
+      "bytes": 238
+    },
+    "ci-20261003-164010-sql-helper-env-file.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/sql-helper-env-file.log",
+      "sha256": "fe5d1dd82fa81d4876cbd120bbca8b693a7267305e81ddd9d5cf06d643150707",
+      "bytes": 324
+    },
+    "ci-20261003-164010-state-store-dependency-boundary-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/state-store-dependency-boundary-test.log",
+      "sha256": "8bd19b5f371ad4cbaff9700759e42bf38198fe2fbdfac5ddf51eea2c20e9ea15",
+      "bytes": 100
+    },
+    "ci-20261003-164010-state-store-dependency-boundary.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/state-store-dependency-boundary.log",
+      "sha256": "fc74536e0d6e210ace130f7806d36314dcc74909dc60a3c3b981ee296efa4655",
+      "bytes": 2053
+    },
+    "ci-20261003-164010-system-scenarios-stage-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/system-scenarios-stage-test.log",
+      "sha256": "2cfa94d698d66eae7eadcec39ad74eb09714e275d258a89f5c4cd98effc14900",
+      "bytes": 86
+    },
+    "ci-20261003-164010-summary.md": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-164010/summary.md",
+      "sha256": "f229411babf4937a990af0c3ba22c8dc105464d67190fb4e612b06f3f5f87194",
+      "bytes": 6282
+    },
+    "ci-20261003-171218-application-domain-dependency-boundary-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/application-domain-dependency-boundary-test.log",
+      "sha256": "7e1f93ebf3d1d9a814a3c61155b1e0a200ee2e6f90229d2c0eb5b43628921b00",
+      "bytes": 159
+    },
+    "ci-20261003-171218-application-domain-dependency-boundary.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/application-domain-dependency-boundary.log",
+      "sha256": "ca81667ce52af5b5f9b8613a652355d8ba757eb31c2c90b61f26117f4b766d4b",
+      "bytes": 104
+    },
+    "ci-20261003-171218-cargo-build.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/cargo-build.log",
+      "sha256": "adef7fcc7176e9335cb51d10fdd097b524c02b483a6425e473060920a632b2ca",
+      "bytes": 180819
+    },
+    "ci-20261003-171218-cargo-check-all-targets.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/cargo-check-all-targets.log",
+      "sha256": "41666750106b2d11bf827da5213d67f54f41d8e4cb5234e426892621fc8c365f",
+      "bytes": 219389
+    },
+    "ci-20261003-171218-cargo-check-server-system-allocator.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/cargo-check-server-system-allocator.log",
+      "sha256": "94e19080d248c3604b33480cf832ff2b0af27cc68001de04d83572c3fcccc70e",
+      "bytes": 179720
+    },
+    "ci-20261003-171218-cargo-clippy.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/cargo-clippy.log",
+      "sha256": "c128cfcd1f18d46253e30d427e1d94a1846fa3cca5145e43fd64caf67345355b",
+      "bytes": 534823
+    },
+    "ci-20261003-171218-cargo-deny.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/cargo-deny.log",
+      "sha256": "27c3bc20f1e5f2017989973ebd4c82e6c8abc983a78af8e4a6412ca01f08df1f",
+      "bytes": 109
+    },
+    "ci-20261003-171218-cargo-fmt.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/cargo-fmt.log",
+      "sha256": "25293c8809a4971b7ad97551d7900c3289770c2e95b4372b44fe03db1359093a",
+      "bytes": 20
+    },
+    "ci-20261003-171218-cargo-metadata.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/cargo-metadata.log",
+      "sha256": "c87155cd0e55bfb5359d9b09ff38d5852d158095c6add77589109321aa7e9f55",
+      "bytes": 248131
+    },
+    "ci-20261003-171218-cargo-test-component.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/cargo-test-component.log",
+      "sha256": "6e65b61596847b8b8b244ac8e16ae30a58e67e37ce226df66b5be1066bc62ac1",
+      "bytes": 1397950
+    },
+    "ci-20261003-171218-cargo-test-server-owner.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/cargo-test-server-owner.log",
+      "sha256": "c49b66771f66c5f4665f8fbd2857d2b74e71778c19db1637087f60267c5cff29",
+      "bytes": 194015
+    },
+    "ci-20261003-171218-cargo-test-server-smoke.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/cargo-test-server-smoke.log",
+      "sha256": "54198dc06976c3093a9b6e9481aa441b91dcc77d3dc55792f1964b3016671daa",
+      "bytes": 176711
+    },
+    "ci-20261003-171218-connector-role-binding-boundary-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/connector-role-binding-boundary-test.log",
+      "sha256": "c4a85d5ea6058bda3dd76731973593eaaa3752a2a7552f5fc5083b4fa99d8c8a",
+      "bytes": 138
+    },
+    "ci-20261003-171218-connector-role-binding-boundary.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/connector-role-binding-boundary.log",
+      "sha256": "048e8e08d57aff46ecf298be6177a2dc535d88718bc0892eff8be90c74dff749",
+      "bytes": 90
+    },
+    "ci-20261003-171218-datasketches-source-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/datasketches-source-test.log",
+      "sha256": "0986d4b1602aa389a50a669a7bb291e0d84d720bc4dc5005104770c6998315e5",
+      "bytes": 76
+    },
+    "ci-20261003-171218-datasketches-source.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/datasketches-source.log",
+      "sha256": "8118501ffb6fd327ab4ce9c13bc60804360552646120b48ff2dd76beeb879ffb",
+      "bytes": 202
+    },
+    "ci-20261003-171218-error-manifest-check.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/error-manifest-check.log",
+      "sha256": "086329a3bc285c93d79bb3913dc84dc2eaff4b7beedf8bcc0b8678740145874e",
+      "bytes": 50148
+    },
+    "ci-20261003-171218-generated-artifact-hygiene.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/generated-artifact-hygiene.log",
+      "sha256": "ab4ae276af81cd6a4f1ce4bff4d6b3a6532242e692ad715e37f4b7c7a6a97f33",
+      "bytes": 83
+    },
+    "ci-20261003-171218-isolated-fixture-current-link.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/isolated-fixture-current-link.log",
+      "sha256": "058e0f97608affb1d78c5af813fe98d87e3c2ac2277d8805b871c541ec856695",
+      "bytes": 838
+    },
+    "ci-20261003-171218-legacy-branding-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/legacy-branding-test.log",
+      "sha256": "9689a9cc4e2ada9cef5b690109f044ad56315d64eb4275c1ee22b1ba908ede09",
+      "bytes": 68
+    },
+    "ci-20261003-171218-legacy-branding.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/legacy-branding.log",
+      "sha256": "8073cfe9f0f5606237c7b9276449e5ad0fdd6c552d93b2dadc214f4b94b3fa23",
+      "bytes": 58
+    },
+    "ci-20261003-171218-local-program-dependency-boundary-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/local-program-dependency-boundary-test.log",
+      "sha256": "115fac195ad0a0351294510f1efc68464e67642599dd1e4aa5df5d2b9bc57c49",
+      "bytes": 184
+    },
+    "ci-20261003-171218-local-program-dependency-boundary.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/local-program-dependency-boundary.log",
+      "sha256": "25f001b325e31dc2f99a8948c179800aa271e81f64dc5c70eba2300ebb5c0835",
+      "bytes": 155
+    },
+    "ci-20261003-171218-memory-dependency-boundary-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/memory-dependency-boundary-test.log",
+      "sha256": "6531f455590a0167913a5ddad2f0f20940dedf924a2a7989f260205a697c74a3",
+      "bytes": 1557
+    },
+    "ci-20261003-171218-memory-dependency-boundary.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/memory-dependency-boundary.log",
+      "sha256": "34eb2544fa14892099b7f284bd95823384f877855aa61e8e9c978ca27e5fd90f",
+      "bytes": 921
+    },
+    "ci-20261003-171218-native-trust-dependency-boundary-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/native-trust-dependency-boundary-test.log",
+      "sha256": "b0646c129ac077cddb2744fe4138b6481182fbe09c997c0e957975c86ee24aa0",
+      "bytes": 141
+    },
+    "ci-20261003-171218-native-trust-dependency-boundary.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/native-trust-dependency-boundary.log",
+      "sha256": "86ab6b328e65a3b3d721ac2457d55c8816a691c79ac22cc8afa83bf8f011305d",
+      "bytes": 92
+    },
+    "ci-20261003-171218-native-wire-dependency-boundary-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/native-wire-dependency-boundary-test.log",
+      "sha256": "432116548d78562baed81388fb7e143da65801aaacf86e9f163493efebd2e2a3",
+      "bytes": 138
+    },
+    "ci-20261003-171218-native-wire-dependency-boundary.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/native-wire-dependency-boundary.log",
+      "sha256": "49206e456a02a375f0f07f7e311c1a452d3ea4ae41491d3611c91b6ea2892a76",
+      "bytes": 90
+    },
+    "ci-20261003-171218-ncp8-statistics-boundary-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/ncp8-statistics-boundary-test.log",
+      "sha256": "b9e7c475f341dec57a4ecb0c7332e7164b34f037c4efba43f63316e1a2622148",
+      "bytes": 118
+    },
+    "ci-20261003-171218-ncp8-statistics-boundary.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/ncp8-statistics-boundary.log",
+      "sha256": "416f80f5d8cb6ddb21988728ff589dd22535f5dae88c50c11b7cc3f1a4f9b2b5",
+      "bytes": 77
+    },
+    "ci-20261003-171218-physical-plan-dependency-boundary-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/physical-plan-dependency-boundary-test.log",
+      "sha256": "34fbffee3ca1de3e9afdfac07c956a86c661447291b98af1e2c26f5f26a820ec",
+      "bytes": 104
+    },
+    "ci-20261003-171218-physical-plan-dependency-boundary.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/physical-plan-dependency-boundary.log",
+      "sha256": "72b4953a0519ee0760d34ef381c8da2d9c13c29277ff1dcc34354ef27cc823d7",
+      "bytes": 458
+    },
+    "ci-20261003-171218-shared-benchmark-environment.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/shared-benchmark-environment.log",
+      "sha256": "c8b6d69de05b702eacdb6d42183bafc95e71135ba974ab8627dc52f8b2d2e900",
+      "bytes": 706
+    },
+    "ci-20261003-171218-shared-benchmark-fixture-contract.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/shared-benchmark-fixture-contract.log",
+      "sha256": "84ee141f6f42fe10ac9ee4490b389a1aff8ee768cd78dcb7901c931a056b5ce9",
+      "bytes": 176
+    },
+    "ci-20261003-171218-shared-benchmark-fixture-lifecycle.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/shared-benchmark-fixture-lifecycle.log",
+      "sha256": "fbf4e9e3b25f0aa9301b48aeef33b96b4c0e09778b50134cecef89d82bd93411",
+      "bytes": 201
+    },
+    "ci-20261003-171218-spi-dependency-boundary-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/spi-dependency-boundary-test.log",
+      "sha256": "78080eb31c0cc02a1cb80ef1c47c860f1548bb43d7d691f8a05de1205947ab71",
+      "bytes": 84
+    },
+    "ci-20261003-171218-spi-dependency-boundary.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/spi-dependency-boundary.log",
+      "sha256": "e7a45113da2d557f9d582a95e41a67298b1aabb0b5ca9d2043c97965958dbb3d",
+      "bytes": 238
+    },
+    "ci-20261003-171218-sql-helper-env-file.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/sql-helper-env-file.log",
+      "sha256": "05198f5240d5ab80f12841fa43b8877b966bc4968193225195c499309816bc87",
+      "bytes": 324
+    },
+    "ci-20261003-171218-state-store-dependency-boundary-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/state-store-dependency-boundary-test.log",
+      "sha256": "8bd19b5f371ad4cbaff9700759e42bf38198fe2fbdfac5ddf51eea2c20e9ea15",
+      "bytes": 100
+    },
+    "ci-20261003-171218-state-store-dependency-boundary.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/state-store-dependency-boundary.log",
+      "sha256": "fc74536e0d6e210ace130f7806d36314dcc74909dc60a3c3b981ee296efa4655",
+      "bytes": 2053
+    },
+    "ci-20261003-171218-system-scenarios-stage-test.log": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/system-scenarios-stage-test.log",
+      "sha256": "2cfa94d698d66eae7eadcec39ad74eb09714e275d258a89f5c4cd98effc14900",
+      "bytes": 86
+    },
+    "ci-20261003-171218-summary.md": {
+      "locator": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/ci-full/20261003-171218/summary.md",
+      "sha256": "b2c6efce1feca295dca1b60d5e948c3d97af3d234d05eeb4ffe3fde7a6f6fb52",
+      "bytes": 4051
+    },
+    "m07-original-socket-verify-7_gws6bd-diff.log": {
+      "locator": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-socket-verify-7_gws6bd/diff.log",
+      "sha256": "7ad819196304115b746c2e33f05573c91a12f4411edbe56ba068b0f0bede65fe",
+      "bytes": 26
+    },
+    "m07-original-socket-verify-7_gws6bd-fmt.log": {
+      "locator": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-socket-verify-7_gws6bd/fmt.log",
+      "sha256": "310d968c9dde5e337aabaf6933225a0709b7a790e75c38d534ec693e5e9cc817",
+      "bytes": 36
+    },
+    "m07-original-socket-verify-7_gws6bd-libs.log": {
+      "locator": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-socket-verify-7_gws6bd/libs.log",
+      "sha256": "a417d8adf95f9175ea008c6ca0ee0cd1e965a6a1f150ab22ead9a4cf81c9b1ea",
+      "bytes": 118016
+    },
+    "m07-original-socket-verify-7_gws6bd-protocol.log": {
+      "locator": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-socket-verify-7_gws6bd/protocol.log",
+      "sha256": "82afb66ba0a70528c8d4d4a45a15e3d16151cb7007cafd46bcb0d35fd7d569bd",
+      "bytes": 52608
+    },
+    "m07-original-socket-verify-7_gws6bd-workspace-mutex.log": {
+      "locator": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-socket-verify-7_gws6bd/workspace-mutex.log",
+      "sha256": "6002ea3b12fa3ffa18cdda66306cca4c246762e2d268a0ac92ac0b8d85f30799",
+      "bytes": 50497
+    },
+    "m07-original-socket-verify-8k1kw8q1-fmt.log": {
+      "locator": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-socket-verify-8k1kw8q1/fmt.log",
+      "sha256": "c88ea56eb0152bd1782550c7ec598228bad35a86af337f93eec5cd93a5ee8f35",
+      "bytes": 2997
+    },
+    "m07-original-socket-verify-8k1kw8q1-libs.log": {
+      "locator": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-socket-verify-8k1kw8q1/libs.log",
+      "sha256": "5fc7608a6515fb76dd330dbf76f5a83d2f613f876ed736f257803193d9dde3fa",
+      "bytes": 117285
+    },
+    "m07-original-socket-verify-8k1kw8q1-protocol.log": {
+      "locator": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-socket-verify-8k1kw8q1/protocol.log",
+      "sha256": "9ed19e90aefcd25d03b7ee99831769192fad39dbccd04d9e663232c8f7adc7d3",
+      "bytes": 52608
+    },
+    "m07-original-socket-verify-8k1kw8q1-workspace-mutex.log": {
+      "locator": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-socket-verify-8k1kw8q1/workspace-mutex.log",
+      "sha256": "e8ce33d252aa35c52b2f937aa1743730b9c165e8d5e2b99f18df4df76684abd0",
+      "bytes": 49736
+    },
+    "m07-original-socket-registration-negatives-qcg6j7ik-missing-pal-prewarm.diff": {
+      "locator": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-socket-registration-negatives-qcg6j7ik/missing-pal-prewarm.diff",
+      "sha256": "7a25c0ea4c341297eb722c2b04f19d9749432fbcd1c0883163837c8dfeba888a",
+      "bytes": 484
+    },
+    "m07-original-socket-registration-negatives-qcg6j7ik-missing-pal-prewarm.log": {
+      "locator": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-socket-registration-negatives-qcg6j7ik/missing-pal-prewarm.log",
+      "sha256": "f0e1ec311e96150c3e4a51e0756dff30d255a782dcafc723474a79776759eb11",
+      "bytes": 46305
+    },
+    "m07-original-socket-registration-negatives-qcg6j7ik-ordinary-arc-retirement.diff": {
+      "locator": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-socket-registration-negatives-qcg6j7ik/ordinary-arc-retirement.diff",
+      "sha256": "7070a365f5088a5968288832afbd5f575630b463bae314135bdb179bb462ada8",
+      "bytes": 918
+    },
+    "m07-original-socket-registration-negatives-qcg6j7ik-ordinary-arc-retirement.log": {
+      "locator": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-socket-registration-negatives-qcg6j7ik/ordinary-arc-retirement.log",
+      "sha256": "719c9977f546e5a3142c11ea077c03c61d7976028db88115b788200a87bee4b5",
+      "bytes": 46342
+    },
+    "m07-original-socket-registration-negatives-c4f2tdcn-missing-pal-prewarm.diff": {
+      "locator": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-socket-registration-negatives-c4f2tdcn/missing-pal-prewarm.diff",
+      "sha256": "7a25c0ea4c341297eb722c2b04f19d9749432fbcd1c0883163837c8dfeba888a",
+      "bytes": 484
+    },
+    "m07-original-socket-registration-negatives-c4f2tdcn-missing-pal-prewarm.log": {
+      "locator": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-socket-registration-negatives-c4f2tdcn/missing-pal-prewarm.log",
+      "sha256": "29b302b49b0fd99de527599bbd46f648dc918c3db66fb4a1d791b4726a3290d1",
+      "bytes": 46305
+    },
+    "m07-original-socket-registration-negatives-c4f2tdcn-ordinary-arc-retirement.diff": {
+      "locator": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-socket-registration-negatives-c4f2tdcn/ordinary-arc-retirement.diff",
+      "sha256": "7070a365f5088a5968288832afbd5f575630b463bae314135bdb179bb462ada8",
+      "bytes": 918
+    },
+    "m07-original-socket-registration-negatives-c4f2tdcn-ordinary-arc-retirement.log": {
+      "locator": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-socket-registration-negatives-c4f2tdcn/ordinary-arc-retirement.log",
+      "sha256": "b52b0e29d07621dc711829364b565fd31fd4f06437ce39d507bc4fe691fb6ede",
+      "bytes": 46238
+    },
+    "m07-tonic-timeout-payload-negative-zd7l9tbu-negative.log": {
+      "locator": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-tonic-timeout-payload-negative-zd7l9tbu/negative.log",
+      "sha256": "2d84d094ae76cbbd027e0ab74000fd88b2fcab4bd73c05f01034f3c89cdcf2ee",
+      "bytes": 45284
+    },
+    "public-tls-final-metadata.log": {
+      "locator": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-public-tonic-tls-8fhqw8co/metadata.log",
+      "sha256": "6e1af71d1de801eaa08a0bac2d86e2a8c39b10c729af3a88847703fc9b8e9870",
+      "bytes": 523807
+    },
+    "public-tls-final-public-parity.log": {
+      "locator": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-public-tonic-tls-8fhqw8co/public-parity.log",
+      "sha256": "d1d8d766b7b2e40b7201298ec08e94634056ccb56b54452608ad832104e016c9",
+      "bytes": 438
+    }
+  },
+  "linux": "User runs manually; not executed",
+  "scope": "original inbound socket registration and typed connector seam; Native outgoing cutover/DNS, TaskCell/futures, whole shared runtime/TLS/body/auth and complete connection graph remain open",
+  "push_pr_archive": "not authorized; not performed"
+}

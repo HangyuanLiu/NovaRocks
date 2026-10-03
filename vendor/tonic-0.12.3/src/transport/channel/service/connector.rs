@@ -1,9 +1,8 @@
-use super::BoxedIo;
 #[cfg(feature = "tls")]
 use super::TlsConnector;
+use super::{attempt_connector::RequestUri, BoxedIo};
 use crate::transport::channel::BoxFuture;
 use crate::ConnectError;
-use http::Uri;
 #[cfg(feature = "tls")]
 use std::fmt;
 use std::task::{Context, Poll};
@@ -30,9 +29,10 @@ impl<C> Connector<C> {
     }
 }
 
-impl<C> Service<Uri> for Connector<C>
+impl<C, R> Service<R> for Connector<C>
 where
-    C: Service<Uri>,
+    C: Service<R>,
+    R: RequestUri,
     C::Response: rt::Read + rt::Write + Unpin + Send + 'static,
     C::Future: Send + 'static,
     crate::Error: From<C::Error> + Send + 'static,
@@ -47,13 +47,14 @@ where
             .map_err(|err| ConnectError(From::from(err)))
     }
 
-    fn call(&mut self, uri: Uri) -> Self::Future {
+    fn call(&mut self, request: R) -> Self::Future {
         #[cfg(feature = "tls")]
         let tls = self.tls.clone();
 
+        let _scheme = request.uri().scheme_str();
         #[cfg(feature = "tls")]
-        let is_https = uri.scheme_str() == Some("https");
-        let connect = self.inner.call(uri);
+        let is_https = _scheme == Some("https");
+        let connect = self.inner.call(request);
 
         Box::pin(async move {
             async {
@@ -92,3 +93,52 @@ impl fmt::Display for HttpsUriWithoutTlsSupport {
 // std::error::Error only requires a type to impl Debug and Display
 #[cfg(feature = "tls")]
 impl std::error::Error for HttpsUriWithoutTlsSupport {}
+
+#[cfg(all(test, feature = "tls"))]
+mod attempt_tls_tests {
+    use super::*;
+    use crate::transport::channel::http2_connection::Http2ConnectionAttempt;
+    use http::Uri;
+
+    #[tokio::test]
+    async fn typed_https_without_config_matches_uri_connector_tls_refusal() {
+        let legacy = tower::service_fn(|_: Uri| async {
+            let (io, _) = tokio::io::duplex(64);
+            Ok::<_, std::io::Error>(TokioIo::new(io))
+        });
+        let typed = tower::service_fn(|attempt: Http2ConnectionAttempt| async {
+            assert_eq!(attempt.uri().scheme_str(), Some("https"));
+            let (io, _) = tokio::io::duplex(64);
+            Ok::<_, std::io::Error>(TokioIo::new(io))
+        });
+        let uri = Uri::from_static("https://example.test");
+        let legacy = Connector::new(legacy, None).call(uri.clone()).await;
+        let typed = Connector::new(typed, None)
+            .call(Http2ConnectionAttempt::new(uri, None))
+            .await;
+        assert!(
+            matches!(legacy, Err(ConnectError(error)) if error.is::<HttpsUriWithoutTlsSupport>())
+        );
+        assert!(
+            matches!(typed, Err(ConnectError(error)) if error.is::<HttpsUriWithoutTlsSupport>())
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_http_preserves_original_owner_without_tonic_tls() {
+        let typed = tower::service_fn(|attempt: Http2ConnectionAttempt| async {
+            let (uri, owner) = attempt.into_parts();
+            assert_eq!(uri.scheme_str(), Some("http"));
+            assert_eq!(owner.unwrap().as_ref(), b"original owner");
+            let (io, _) = tokio::io::duplex(64);
+            Ok::<_, std::io::Error>(TokioIo::new(io))
+        });
+        let result = Connector::new(typed, None)
+            .call(Http2ConnectionAttempt::new(
+                Uri::from_static("http://example.test"),
+                Some(bytes::Bytes::from_static(b"original owner")),
+            ))
+            .await;
+        assert!(result.is_ok());
+    }
+}

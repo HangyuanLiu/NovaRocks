@@ -18,6 +18,7 @@
 //! Native inbound RPC listener over a Server-resolved transport capability.
 
 use std::future::Future;
+use std::io;
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
@@ -298,7 +299,15 @@ impl NativeRpcServerHandle {
                             format!("build native {role_label} gRPC runtime: {error}")
                         })?;
                     let outcome = runtime.block_on(async move {
-                        let listener = TokioTcpListener::from_std(listener).map_err(|error| {
+                        let listener = match &transport_capacity {
+                            Some((factory, class)) => {
+                                let owner = factory.try_listener_registration_owner(*class).map_err(|error| {
+                                    format!("claim native {role_label} listener registration: {error}")
+                                })?;
+                                TokioTcpListener::from_std_with_registration_owner(listener, owner)
+                            }
+                            None => TokioTcpListener::from_std(listener),
+                        }.map_err(|error| {
                             format!("create Tokio native {role_label} gRPC listener: {error}")
                         })?;
                         // The explicit endpoint domain owns runtime admission
@@ -473,9 +482,41 @@ where
                     break;
                 }
             }
-            accepted = listener.accept() => {
-                let (stream, peer) = match accepted {
-                    Err(error) => {
+            accepted = async {
+                match &transport_capacity {
+                    Some((factory, class)) => {
+                        let mut capacity_refused = false;
+                        let accepted = listener.accept_with_registration_owner(|| {
+                            // The OS has accepted this socket, but Tokio has
+                            // not allocated its reactor registration yet.
+                            let accepted_at = std::time::Instant::now();
+                            let config = factory.try_config(*class).map_err(|error| {
+                                capacity_refused = true;
+                                error
+                            })?;
+                            let owner = config.io_owner.clone().ok_or_else(|| {
+                                capacity_refused = true;
+                                io::Error::from(io::ErrorKind::InvalidInput)
+                            })?;
+                            Ok((owner, (config, accepted_at)))
+                        }).await;
+                        accepted
+                            .map(|(stream, peer, (config, accepted_at))| (stream, peer, accepted_at, Some(config)))
+                            .map_err(|error| (error, capacity_refused))
+                    }
+                    None => listener.accept().await
+                        .map(|(stream, peer)| (stream, peer, std::time::Instant::now(), None))
+                        .map_err(|error| (error, false)),
+                }
+            } => {
+                let (stream, peer, accepted_at, mut capacity) = match accepted {
+                    Err((_, true)) => {
+                        // The accepted, unregistered socket was closed by
+                        // Tokio. Capacity refusal creates no registration or
+                        // pending queue and is not a broken listener.
+                        continue;
+                    }
+                    Err((error, false)) => {
                         // One refused connection is not a broken listener. The
                         // previous behaviour returned here, which dropped this
                         // thread's runtime and cancelled every other live
@@ -502,7 +543,6 @@ where
                     }
                     Ok(accepted) => accepted,
                 };
-                let accepted_at = std::time::Instant::now();
                 consecutive_accept_errors = 0;
                 let mut builder = http2::Builder::new(TokioExecutor::new());
                 let initial_settings_deadline = transport_capacity.as_ref().map(|_| {
@@ -512,24 +552,13 @@ where
                 });
                 // Claim the shared process acquisition position before cloning
                 // application owners, creating tasks or performing TLS/H2 IO.
-                let mut capacity = match &transport_capacity {
-                    Some((factory, class)) => match factory.try_config(*class) {
-                        Ok(config) => {
-                            if configure_server(&mut builder, &config).is_err() {
-                                drop(stream);
-                                continue;
-                            }
-                            builder.initial_settings_deadline(initial_settings_deadline.expect("funded listener has an absolute bootstrap deadline"));
-                            Some(config)
-                        }
-                        Err(_) => {
-                            // Refusal has no pending queue and no protocol IO.
-                            drop(stream);
-                            continue;
-                        }
-                    },
-                    None => None,
-                };
+                if let Some(config) = &capacity {
+                    if configure_server(&mut builder, config).is_err() {
+                        drop(stream);
+                        continue;
+                    }
+                    builder.initial_settings_deadline(initial_settings_deadline.expect("funded listener has an absolute bootstrap deadline"));
+                }
                 let acquisition_owner = capacity.as_mut().and_then(|config| config.acquisition_owner.take());
                 let io_owner = capacity.as_mut().and_then(|config| config.io_owner.take());
                 let io_owner_for_stream = io_owner.clone();

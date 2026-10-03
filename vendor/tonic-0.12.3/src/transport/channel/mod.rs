@@ -7,7 +7,7 @@ pub(crate) mod service;
 mod tls;
 
 pub use endpoint::Endpoint;
-pub use http2_connection::Http2ConnectionConfig;
+pub use http2_connection::{Http2ConnectionAttempt, Http2ConnectionConfig};
 #[cfg(feature = "tls")]
 pub use tls::ClientTlsConfig;
 
@@ -180,6 +180,41 @@ impl Channel {
         let (svc, worker) = Buffer::pair(Either::A(svc), buffer_size);
         executor.execute(worker);
 
+        Ok(Channel { svc })
+    }
+
+    pub(crate) fn new_attempt<C>(connector: C, endpoint: Endpoint) -> Self
+    where
+        C: Service<Http2ConnectionAttempt> + Send + 'static,
+        C::Error: Into<crate::Error> + Send,
+        C::Future: Send,
+        C::Response: rt::Read + rt::Write + HyperConnection + Unpin + Send + 'static,
+    {
+        let buffer_size = endpoint.buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE);
+        let executor = endpoint.executor.clone();
+        let svc = Connection::lazy_attempt(connector, endpoint);
+        let (svc, worker) = Buffer::pair(Either::A(svc), buffer_size);
+        executor.execute(worker);
+        Channel { svc }
+    }
+
+    pub(crate) async fn connect_attempt<C>(
+        connector: C,
+        endpoint: Endpoint,
+    ) -> Result<Self, super::Error>
+    where
+        C: Service<Http2ConnectionAttempt> + Send + 'static,
+        C::Error: Into<crate::Error> + Send,
+        C::Future: Unpin + Send,
+        C::Response: rt::Read + rt::Write + HyperConnection + Unpin + Send + 'static,
+    {
+        let buffer_size = endpoint.buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE);
+        let executor = endpoint.executor.clone();
+        let svc = Connection::connect_attempt(connector, endpoint)
+            .await
+            .map_err(super::Error::from_source)?;
+        let (svc, worker) = Buffer::pair(Either::A(svc), buffer_size);
+        executor.execute(worker);
         Ok(Channel { svc })
     }
 

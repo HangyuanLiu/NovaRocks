@@ -75,6 +75,33 @@ pub struct Http2ConnectionConfig {
     pub receive_goaway_buffer_pool: Option<h2::ReceiveBufferPool>,
 }
 
+/// Typed facts for one actual connector invocation, created after its factory
+/// verdict and before TCP/TLS IO. A reconnect receives a fresh attempt.
+/// The capability is the same original IO owner; it is not a new wallet.
+#[derive(Debug)]
+pub struct Http2ConnectionAttempt {
+    uri: http::Uri,
+    io_owner: Option<bytes::Bytes>,
+}
+
+impl Http2ConnectionAttempt {
+    pub(crate) fn new(uri: http::Uri, io_owner: Option<bytes::Bytes>) -> Self {
+        Self { uri, io_owner }
+    }
+
+    /// The original endpoint URI, including the scheme used by Tonic TLS.
+    pub fn uri(&self) -> &http::Uri {
+        &self.uri
+    }
+
+    /// Consume this attempt and carry its original owner into socket setup.
+    /// Retaining it does not prove a socket registration allocation bound;
+    /// the connector must install it before that actual allocation happens.
+    pub fn into_parts(self) -> (http::Uri, Option<bytes::Bytes>) {
+        (self.uri, self.io_owner)
+    }
+}
+
 impl Http2ConnectionConfig {
     pub(crate) fn apply<E: Clone>(
         self,

@@ -1,4 +1,6 @@
-use super::http2_connection::{Http2ConnectionConfig, Http2ConnectionFactory};
+use super::http2_connection::{
+    Http2ConnectionAttempt, Http2ConnectionConfig, Http2ConnectionFactory,
+};
 #[cfg(feature = "tls")]
 use super::service::TlsConnector;
 use super::service::{self, Executor, SharedExec};
@@ -421,6 +423,51 @@ impl Endpoint {
             Channel::new(connector, self.clone())
         } else {
             Channel::new(connector, self.clone())
+        }
+    }
+
+    /// Connect with a typed per-attempt connector. Each factory verdict precedes
+    /// the call and supplies the same original IO capability to the connector.
+    /// The URI scheme retains normal Tonic TLS semantics when TLS is enabled;
+    /// a connector doing its own TLS uses `http` to avoid a second TLS layer.
+    /// The endpoint connect timeout still applies; no IO timeout is introduced.
+    pub async fn connect_with_attempt_connector<C>(&self, connector: C) -> Result<Channel, Error>
+    where
+        C: Service<Http2ConnectionAttempt> + Send + 'static,
+        C::Response: rt::Read + rt::Write + Send + Unpin,
+        C::Future: Send,
+        crate::Error: From<C::Error> + Send,
+    {
+        let connector = self.connector(connector);
+        if let Some(timeout) = self.connect_timeout {
+            Channel::connect_attempt(
+                service::AttemptTimeoutConnector::new(connector, timeout),
+                self.clone(),
+            )
+            .await
+        } else {
+            Channel::connect_attempt(connector, self.clone()).await
+        }
+    }
+
+    /// Create a lazy channel using the typed per-attempt connector. No factory
+    /// or connector is invoked until use; each reconnect gets a fresh attempt.
+    /// TLS and connect_timeout are the same as the eager typed method.
+    pub fn connect_with_attempt_connector_lazy<C>(&self, connector: C) -> Channel
+    where
+        C: Service<Http2ConnectionAttempt> + Send + 'static,
+        C::Response: rt::Read + rt::Write + Send + Unpin,
+        C::Future: Send,
+        crate::Error: From<C::Error> + Send,
+    {
+        let connector = self.connector(connector);
+        if let Some(timeout) = self.connect_timeout {
+            Channel::new_attempt(
+                service::AttemptTimeoutConnector::new(connector, timeout),
+                self.clone(),
+            )
+        } else {
+            Channel::new_attempt(connector, self.clone())
         }
     }
 

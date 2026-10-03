@@ -101,7 +101,7 @@ mod tls;
 
 #[doc(inline)]
 #[cfg(feature = "channel")]
-pub use self::channel::{Channel, Endpoint, Http2ConnectionConfig};
+pub use self::channel::{Channel, Endpoint, Http2ConnectionAttempt, Http2ConnectionConfig};
 pub use self::error::Error;
 #[doc(inline)]
 #[cfg(feature = "server")]

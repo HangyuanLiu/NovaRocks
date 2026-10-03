@@ -188,6 +188,8 @@ h2 = { path = "vendor/h2-0.4.12" }
 hyper = { path = "vendor/hyper-1.8.1" }
 # Fresh HTTP/2 configuration for every actual physical connection attempt.
 tonic = { path = "vendor/tonic-0.12.3" }
+# Original-funded socket registrations retain capacity through reactor retirement.
+tokio = { path = "vendor/tokio-1.52.3" }
 # Borrowed allocation-capacity introspection for bounded root input owners.
 # Existing Arrow data/encoding/capacity semantics stay unchanged; Custom
 # buffers require a source-owner proof rather than a declared-length guess.

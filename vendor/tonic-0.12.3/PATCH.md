@@ -47,3 +47,37 @@ Defaults are None, and the outbound table ceiling remains independent.
 `Http2ConnectionConfig.connection_lifecycle` requires a positive initial SETTINGS timeout and forwards the original capability. Final acquisition publication follows the actual Hyper handshake and the same absolute deadline's late-Ready check; callback work is followed by another check against that deadline. An inline attempt guard permanently retires refused, timed-out or canceled attempts even while factory aliases remain, and disarms only after final success. The existing ordered acquisition owner wrapper still retains its original position through actual inner-future exit. These additions do not fund the outer boxed future, Channel/executor task, socket or TLS backings.
 
 A supplied lifecycle also retains the original acquisition owner before dialing. This closes the failed-final-verdict window where Hyper has already spawned its independent protocol task: returning an error and dropping SendRequest do not prove that task/IO exited. Successful post-deadline verdict explicitly releases the extra alias; failure keeps it in the actual H2 bound lease until IO exits, while the original wrapper covers future exit.
+
+## Typed original-owner connector attempts
+
+`Endpoint::connect_with_attempt_connector` and its lazy counterpart accept
+`Service<Http2ConnectionAttempt>`. After obtaining and validating each fresh
+factory configuration, the actual make-service call passes the original URI
+and a strong alias of the same `io_owner` before invoking the connector. The
+private attempt constructor prevents callers from fabricating a Tonic attempt;
+`uri()` and `into_parts()` expose the exact facts needed for socket setup. Legacy
+`Service<Uri>` APIs remain on their existing path. A connector's readiness,
+allocation and escaping aliases still require its own original-owner proof.
+
+The typed connect-only timeout awaits the existing connector, including Tonic
+TLS when enabled, and returns its original IO response type. It does not create
+a `TimeoutStream` IO-response box or introduce read/write timeouts. Expiration
+preserves `io::ErrorKind::TimedOut` and its original Tokio `Elapsed` error payload,
+matching the legacy timeout's error cause. URI scheme handling remains in the
+shared actual Connector: HTTPS uses configured Tonic TLS when enabled; a
+connector providing its own TLS uses HTTP to avoid a second TLS layer.
+
+The ordered acquisition wrapper retains the original owner through refused,
+failed, canceled and never-polled inner attempts. Success transfers it to the
+inline final IO wrapper, whose concrete IO destruction and box deallocation
+precede the original capability's release, including destructor unwind. Actual
+public Channel tests exercise the typed handoff, eager cancellation, pending
+connect deadline and cause, factory refusal before connector call, None owner,
+lazy reconnect, and successful boxing with and without a connect timeout.
+
+These additions prepare the typed connector boundary; they do not install it
+in Native outbound clients or close outgoing DNS, socket registration, private
+TLS buffers, enclosing futures/tasks, or the whole Native connection envelope.
+The optional private `cfg(tls)` parity tests and separate public TLS parity
+probe have distinct execution receipts and are not implied by the Native
+transport-only target's results.

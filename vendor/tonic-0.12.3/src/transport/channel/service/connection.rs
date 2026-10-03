@@ -1,6 +1,6 @@
 use super::io::OwnedConnectionIo;
 use super::{AddOrigin, Reconnect, SharedExec, UserAgent};
-use crate::transport::channel::http2_connection::Http2ConnectionFactory;
+use crate::transport::channel::http2_connection::{Http2ConnectionAttempt, Http2ConnectionFactory};
 use crate::{
     body::{boxed, BoxBody},
     transport::{channel::BoxFuture, service::GrpcTimeout, ConnectionAcquisition, Endpoint},
@@ -51,9 +51,15 @@ impl Drop for AcquisitionLifecycle {
 }
 
 impl Connection {
-    fn new<C>(connector: C, endpoint: Endpoint, is_lazy: bool) -> Self
+    fn new<C, R>(
+        connector: C,
+        endpoint: Endpoint,
+        is_lazy: bool,
+        request: fn(Uri, Option<bytes::Bytes>) -> R,
+    ) -> Self
     where
-        C: Service<Uri> + Send + 'static,
+        R: Send + 'static,
+        C: Service<R> + Send + 'static,
         C::Error: Into<crate::Error> + Send,
         C::Future: Send,
         C::Response: rt::Read + rt::Write + Unpin + Send + 'static,
@@ -99,6 +105,7 @@ impl Connection {
             settings,
             endpoint.http2_connection_factory.clone(),
             endpoint.http2_max_header_list_size,
+            request,
         );
 
         let conn = Reconnect::new(make_service, endpoint.uri.clone(), is_lazy);
@@ -115,7 +122,9 @@ impl Connection {
         C::Future: Unpin + Send,
         C::Response: rt::Read + rt::Write + Unpin + Send + 'static,
     {
-        Self::new(connector, endpoint, false).ready_oneshot().await
+        Self::new(connector, endpoint, false, |uri, _| uri)
+            .ready_oneshot()
+            .await
     }
 
     pub(crate) fn lazy<C>(connector: C, endpoint: Endpoint) -> Self
@@ -125,7 +134,32 @@ impl Connection {
         C::Future: Send,
         C::Response: rt::Read + rt::Write + Unpin + Send + 'static,
     {
-        Self::new(connector, endpoint, true)
+        Self::new(connector, endpoint, true, |uri, _| uri)
+    }
+
+    pub(crate) async fn connect_attempt<C>(
+        connector: C,
+        endpoint: Endpoint,
+    ) -> Result<Self, crate::Error>
+    where
+        C: Service<Http2ConnectionAttempt> + Send + 'static,
+        C::Error: Into<crate::Error> + Send,
+        C::Future: Unpin + Send,
+        C::Response: rt::Read + rt::Write + Unpin + Send + 'static,
+    {
+        Self::new(connector, endpoint, false, Http2ConnectionAttempt::new)
+            .ready_oneshot()
+            .await
+    }
+
+    pub(crate) fn lazy_attempt<C>(connector: C, endpoint: Endpoint) -> Self
+    where
+        C: Service<Http2ConnectionAttempt> + Send + 'static,
+        C::Error: Into<crate::Error> + Send,
+        C::Future: Send,
+        C::Response: rt::Read + rt::Write + Unpin + Send + 'static,
+    {
+        Self::new(connector, endpoint, true, Http2ConnectionAttempt::new)
     }
 }
 
@@ -183,21 +217,23 @@ impl tower::Service<Request<BoxBody>> for SendRequest {
     }
 }
 
-struct MakeSendRequestService<C> {
+struct MakeSendRequestService<C, R> {
     connector: C,
     executor: SharedExec,
     settings: Builder<SharedExec>,
     factory: Option<Http2ConnectionFactory>,
     inherited_max_header_list_size: Option<u32>,
+    request: fn(Uri, Option<bytes::Bytes>) -> R,
 }
 
-impl<C> MakeSendRequestService<C> {
+impl<C, R> MakeSendRequestService<C, R> {
     fn new(
         connector: C,
         executor: SharedExec,
         settings: Builder<SharedExec>,
         factory: Option<Http2ConnectionFactory>,
         inherited_max_header_list_size: Option<u32>,
+        request: fn(Uri, Option<bytes::Bytes>) -> R,
     ) -> Self {
         Self {
             connector,
@@ -205,13 +241,15 @@ impl<C> MakeSendRequestService<C> {
             settings,
             factory,
             inherited_max_header_list_size,
+            request,
         }
     }
 }
 
-impl<C> tower::Service<Uri> for MakeSendRequestService<C>
+impl<C, R> tower::Service<Uri> for MakeSendRequestService<C, R>
 where
-    C: Service<Uri> + Send + 'static,
+    R: Send + 'static,
+    C: Service<R> + Send + 'static,
     C::Error: Into<crate::Error> + Send,
     C::Future: Send,
     C::Response: rt::Read + rt::Write + Unpin + Send,
@@ -286,7 +324,8 @@ where
                 acquisition_owner,
             ));
         }
-        let fut = self.connector.call(req);
+        let request = (self.request)(req, io_owner.clone());
+        let fut = self.connector.call(request);
         let executor = self.executor.clone();
 
         // Construct the ordered owner wrapper before returning the queued

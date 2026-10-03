@@ -88,6 +88,7 @@ struct StockCore {
     slots: Vec<ConnectionRecord>,
     dimensions: Dimensions,
     acquisitions: [AtomicUsize; 2],
+    listener_registrations: [AtomicBool; 2],
     channel_cache_claimed: AtomicBool,
     connection_keys: NativeConnectionKeyCapacity,
     credit: ResultWriteCredit,
@@ -227,6 +228,21 @@ impl Drop for NativeLifecycleObserver {
 struct AcquisitionExit {
     factory: NativeTransportCapacityFactory,
     class: TransportClass,
+}
+
+struct ListenerRegistrationExit {
+    factory: NativeTransportCapacityFactory,
+    class: TransportClass,
+}
+
+impl Drop for ListenerRegistrationExit {
+    fn drop(&mut self) {
+        assert!(
+            self.factory.core().listener_registrations[class_index(self.class)]
+                .swap(false, Ordering::AcqRel),
+            "original listener registration exits once"
+        );
+    }
 }
 
 impl Drop for AcquisitionExit {
@@ -450,6 +466,11 @@ impl Dimensions {
             bound,
             Layout::new::<hyper_util::rt::TokioIo<novarocks_native_trust::BoxedNativeIo>>().size(),
         )?;
+        // A socket's reactor registration outlives TcpStream Drop. Its private
+        // strong-only handle retains this same carrier until actual Arc/PAL
+        // deallocation at the reactor's safe retirement point.
+        let registration = tokio::net::TcpStream::registration_allocation_capacity_bound()?;
+        bound = add(bound, registration)?;
         let stream_extra = add(
             add(
                 value(g.transport_stream_bookkeeping_bytes)?,
@@ -471,6 +492,18 @@ impl Dimensions {
             .size();
         let mut stock = add(mul(bound, positions)?, arc_bytes::<StockCore>()?)?;
         stock = add(stock, slots)?;
+        // Data and Control each have one independent listener registration,
+        // including its original carrier. They do not borrow connection slots.
+        stock = add(
+            stock,
+            mul(
+                2,
+                add(
+                    registration,
+                    Bytes::owner_with_exit_guard_metadata_size::<Bytes, ListenerRegistrationExit>(),
+                )?,
+            )?,
+        )?;
         stock = add(
             stock,
             NativeConnectionKeyCapacity::additional_backing_bytes()?,
@@ -541,6 +574,7 @@ impl NativeTransportCapacityFactory {
                 slots,
                 dimensions,
                 acquisitions: [AtomicUsize::new(0), AtomicUsize::new(0)],
+                listener_registrations: [AtomicBool::new(false), AtomicBool::new(false)],
                 channel_cache_claimed: AtomicBool::new(false),
                 connection_keys: NativeConnectionKeyCapacity::new()?,
                 credit,
@@ -552,6 +586,25 @@ impl NativeTransportCapacityFactory {
     /// Startup bytes kept reserved through the final actual pool/carrier exit.
     pub fn reserved_bytes(&self) -> usize {
         self.core().credit.bytes()
+    }
+
+    /// Claim the already funded registration for this class's one listener.
+    /// Must run before Tokio registers the listener. The registration keeps
+    /// this capability through reactor retirement and its final physical exit.
+    pub(crate) fn try_listener_registration_owner(
+        &self,
+        class: TransportClass,
+    ) -> io::Result<Bytes> {
+        self.core().listener_registrations[class_index(class)]
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+        Ok(Bytes::from_owner_with_exit_guard(
+            Bytes::new(),
+            ListenerRegistrationExit {
+                factory: self.clone(),
+                class,
+            },
+        ))
     }
 
     pub(crate) fn claim_channel_cache(&self) -> io::Result<()> {
@@ -1207,6 +1260,41 @@ mod tests {
             .unwrap();
         drop(second);
         drop(factory);
+        released(&budget, bytes);
+    }
+
+    #[test]
+    fn independent_listener_registration_aliases_keep_the_original_startup_stock() {
+        let (factory, budget, bytes) = factory();
+        let data = factory
+            .try_listener_registration_owner(TransportClass::Data)
+            .unwrap();
+        let control = factory
+            .try_listener_registration_owner(TransportClass::Control)
+            .unwrap();
+        assert_eq!(
+            factory
+                .try_listener_registration_owner(TransportClass::Data)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let alias = data.clone();
+        drop(data);
+        assert!(
+            factory
+                .try_listener_registration_owner(TransportClass::Data)
+                .is_err()
+        );
+        drop(alias);
+        let data = factory
+            .try_listener_registration_owner(TransportClass::Data)
+            .unwrap();
+        drop(factory);
+        held(&budget, bytes);
+        drop(control);
+        held(&budget, bytes);
+        drop(data);
         released(&budget, bytes);
     }
 
