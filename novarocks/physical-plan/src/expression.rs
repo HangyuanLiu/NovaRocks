@@ -55,6 +55,18 @@ pub struct BoundFunction {
     pub semantic_parameters: Box<[novarocks_type_contract::SemanticParameterRef]>,
 }
 
+impl BoundFunction {
+    /// Structural correspondence of the selected signature. Occurrence
+    /// effects and environments are independent and require their own proof.
+    pub(crate) fn signature_matches(&self, other: &Self) -> bool {
+        self.function_id == other.function_id
+            && self.overload == other.overload
+            && self.kind == other.kind
+            && self.argument_types == other.argument_types
+            && self.result_type == other.result_type
+    }
+}
+
 /// Exact binding for a function whose result is a relation rather than a
 /// scalar value. Keeping this separate prevents outer-input pass-through
 /// columns from being mistaken for function result columns.

@@ -30,8 +30,17 @@ use crate::{
     validate_fragment_definition, validate_plan,
 };
 
-/// Mutable construction state. It cannot be encoded, scheduled or viewed as a
-/// complete plan; `finish` consumes it and publishes only validated output.
+mod structure;
+pub use structure::FragmentStructureError;
+
+#[cfg(test)]
+#[path = "builder/structure_tests.rs"]
+mod structure_tests;
+
+/// Mutable construction state. It cannot be encoded or scheduled as a complete
+/// plan. A structural definition still requires actual call/property proofs
+/// and final package publication; finishing a construction stage is not that
+/// publication.
 pub struct FragmentBuilder {
     id: FragmentId,
     next_value: u32,
@@ -1000,7 +1009,20 @@ impl FragmentBuilder {
         sink: FragmentSink,
         dop_domain: PipelineDopDomain,
     ) -> Result<Fragment, ValidationErrors> {
-        let fragment = Fragment::from(FragmentParts {
+        let (mut parts, runtime_filters) = self.into_fragment_parts(root, sink, dop_domain);
+        parts.runtime_filters = runtime_filters.into_iter().collect();
+        let fragment = Fragment::from(parts);
+        validate_fragment_definition(&fragment)?;
+        Ok(fragment)
+    }
+
+    fn into_fragment_parts(
+        self,
+        root: NodeId,
+        sink: FragmentSink,
+        dop_domain: PipelineDopDomain,
+    ) -> (FragmentParts, BTreeSet<RuntimeFilterId>) {
+        let parts = FragmentParts {
             id: self.id,
             root,
             values: self.values,
@@ -1008,10 +1030,11 @@ impl FragmentBuilder {
             nodes: self.nodes,
             sink,
             dop_domain,
-            runtime_filters: self.runtime_filters.into_iter().collect(),
-        });
-        validate_fragment_definition(&fragment)?;
-        Ok(fragment)
+            // The author installs the exact ordered references before this
+            // unpublished construction input reaches any validator.
+            runtime_filters: Box::default(),
+        };
+        (parts, self.runtime_filters)
     }
 }
 

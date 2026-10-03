@@ -146,6 +146,7 @@ pub(crate) struct ValidationContext {
     pub(crate) errors: Vec<ValidationError>,
     pub(crate) truncated: bool,
     pub(crate) limits: PlanLimits,
+    construction_only: bool,
 }
 
 impl ValidationContext {
@@ -158,7 +159,21 @@ impl ValidationContext {
             errors: Vec::new(),
             truncated: false,
             limits,
+            construction_only: false,
         }
+    }
+
+    /// The unpublished definition still has to prove every structural fact.
+    /// Invocation effects and output-property derivation are separate, later
+    /// obligations of the same fragment before package publication.
+    pub(crate) const fn for_construction(limits: PlanLimits) -> Self {
+        let mut context = Self::with_limits(limits);
+        context.construction_only = true;
+        context
+    }
+
+    pub(crate) const fn checks_output_and_effect_proofs(&self) -> bool {
+        !self.construction_only
     }
 
     pub(crate) const fn limits(&self) -> &PlanLimits {

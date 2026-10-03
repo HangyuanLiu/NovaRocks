@@ -98,6 +98,23 @@ pub(crate) fn validate_fragment_definition(fragment: &Fragment) -> Result<(), Va
     }
 }
 
+/// The sole caller admits this same owned source and its exact pending
+/// runtime-filter count before creating the reference array. Do not repeat
+/// that resource walk after the array has been installed.
+pub(crate) fn validate_fragment_construction_after_admission(
+    fragment: &Fragment,
+    limits: PlanLimits,
+) -> Result<(), ValidationErrors> {
+    let mut errors = ValidationContext::for_construction(limits);
+    validate_fragment_structure_into(fragment, &mut errors);
+    validate_fragment_partition_identities(fragment, &FragmentCuts::default(), &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ValidationErrors::from_collector(errors))
+    }
+}
+
 pub fn validate_plan(plan: &PhysicalPlan) -> Result<(), ValidationErrors> {
     validate_plan_with_limits(plan, PlanLimits::FROZEN)
 }

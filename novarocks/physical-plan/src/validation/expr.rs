@@ -388,7 +388,7 @@ pub(crate) fn validate_expression(
                 }
                 FunctionKind::Aggregate => match aggregate_binding {
                     Some(binding)
-                        if binding.function == *function
+                        if binding.function.signature_matches(function)
                             && binding.phase == AggregatePhase::Single =>
                     {
                         validate_aggregate_arguments(
@@ -1065,9 +1065,10 @@ pub(crate) fn validate_function_call(
     path: &str,
     errors: &mut ValidationContext,
 ) {
-    if !function
-        .intrinsic_row_error
-        .is_valid_for_kind(function.kind)
+    if errors.checks_output_and_effect_proofs()
+        && !function
+            .intrinsic_row_error
+            .is_valid_for_kind(function.kind)
     {
         errors.push(ValidationError::new(
             path,
@@ -1282,10 +1283,11 @@ pub(crate) fn validate_aggregate_arguments(
     path: &str,
     errors: &mut ValidationContext,
 ) {
-    if !binding
-        .function
-        .intrinsic_row_error
-        .is_valid_for_kind(binding.function.kind)
+    if errors.checks_output_and_effect_proofs()
+        && !binding
+            .function
+            .intrinsic_row_error
+            .is_valid_for_kind(binding.function.kind)
     {
         errors.push(ValidationError::new(
             path,

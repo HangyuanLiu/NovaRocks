@@ -189,7 +189,7 @@ pub(crate) fn aggregate_bindings_match(
     expected: &crate::AggregateBinding,
     actual: &crate::AggregateBinding,
 ) -> bool {
-    expected.function == actual.function
+    expected.function.signature_matches(&actual.function)
         && expected.logical_argument_count == actual.logical_argument_count
         && expected.intermediate_type == actual.intermediate_type
         && expected.state_format == actual.state_format

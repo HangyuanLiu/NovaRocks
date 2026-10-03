@@ -312,7 +312,9 @@ pub(crate) fn validate_node(
             errors,
         );
     }
-    validate_node_output_properties(fragment, node, &path, errors);
+    if errors.checks_output_and_effect_proofs() {
+        validate_node_output_properties(fragment, node, &path, errors);
+    }
     let mut expressions = Vec::new();
     node.kind.expression_references(&mut expressions);
     for expression in expressions {
@@ -1025,8 +1027,7 @@ pub(crate) fn validate_node_semantics(
                 require_boolean_expression(fragment, *predicate, path, errors);
             }
             validate_null_extended(fragment, node.id, null_extended, path, errors);
-            if nest_loop_join_output_distribution(fragment, node, *kind, *distribution, *predicate)
-                .is_none()
+            if nest_loop_join_placement_distribution(fragment, node, *kind, *distribution).is_none()
             {
                 errors.push(ValidationError::new(
                     path,
@@ -1502,9 +1503,10 @@ pub(crate) fn validate_node_semantics(
             outputs,
             left_outer,
         } => {
-            if !function
-                .intrinsic_row_error
-                .is_valid_for_kind(crate::FunctionKind::Table)
+            if errors.checks_output_and_effect_proofs()
+                && !function
+                    .intrinsic_row_error
+                    .is_valid_for_kind(crate::FunctionKind::Table)
             {
                 errors.push(ValidationError::new(
                     path,
@@ -2985,11 +2987,13 @@ pub(crate) fn validate_scan_predicate_contract(
                 "relation predicate guarantee is not owned by its scan",
             ));
         }
-        if !fragment_expressions_are_replica_deterministic(
-            fragment,
-            std::iter::once(guarantee.predicate),
-            true,
-        ) {
+        if errors.checks_output_and_effect_proofs()
+            && !fragment_expressions_are_replica_deterministic(
+                fragment,
+                std::iter::once(guarantee.predicate),
+                true,
+            )
+        {
             errors.push(ValidationError::new(
                 path,
                 "relation predicate guarantee must be replica deterministic",

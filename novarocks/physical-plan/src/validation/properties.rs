@@ -320,14 +320,36 @@ pub(crate) fn nest_loop_join_output_distribution(
     distribution: crate::NestLoopJoinDistribution,
     predicate: Option<ExprId>,
 ) -> Option<Distribution> {
-    let inputs = node
-        .inputs
-        .iter()
-        .map(|input| fragment.nodes().get(input))
-        .collect::<Option<Vec<_>>>()?;
-    if inputs.len() != 2 || node.required_inputs.len() != 2 {
+    let mut output = nest_loop_join_placement_distribution(fragment, node, kind, distribution)?;
+    if output == Distribution::Broadcast
+        && predicate.is_some_and(|predicate| {
+            !fragment_expressions_are_replica_deterministic(
+                fragment,
+                std::iter::once(predicate),
+                true,
+            )
+        })
+    {
+        output = Distribution::Unconstrained;
+    }
+    Some(output)
+}
+
+/// Placement is a structural prerequisite, independently of predicate effects
+/// that may relinquish an otherwise provided output distribution.
+pub(crate) fn nest_loop_join_placement_distribution(
+    fragment: &Fragment,
+    node: &PhysicalNode,
+    kind: crate::JoinKind,
+    distribution: crate::NestLoopJoinDistribution,
+) -> Option<Distribution> {
+    let [left, right] = node.inputs.as_ref() else {
+        return None;
+    };
+    if node.required_inputs.len() != 2 {
         return None;
     }
+    let inputs = [fragment.nodes().get(left)?, fragment.nodes().get(right)?];
     match distribution {
         crate::NestLoopJoinDistribution::Singleton => {
             let complete = inputs
@@ -360,19 +382,7 @@ pub(crate) fn nest_loop_join_output_distribution(
             {
                 return None;
             }
-            let mut output = inputs[0].output_properties.distribution.clone();
-            if output == Distribution::Broadcast
-                && predicate.is_some_and(|predicate| {
-                    !fragment_expressions_are_replica_deterministic(
-                        fragment,
-                        std::iter::once(predicate),
-                        true,
-                    )
-                })
-            {
-                output = Distribution::Unconstrained;
-            }
-            Some(output)
+            Some(inputs[0].output_properties.distribution.clone())
         }
     }
 }

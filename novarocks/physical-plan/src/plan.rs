@@ -1018,6 +1018,19 @@ pub struct Fragment {
 }
 
 impl Fragment {
+    pub(crate) fn into_parts(self) -> FragmentParts {
+        FragmentParts {
+            id: self.id,
+            root: self.root,
+            values: self.values,
+            expressions: self.expressions,
+            nodes: self.nodes,
+            sink: self.sink,
+            dop_domain: self.dop_domain,
+            runtime_filters: self.runtime_filters,
+        }
+    }
+
     pub const fn id(&self) -> FragmentId {
         self.id
     }
