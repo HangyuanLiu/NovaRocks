@@ -33,8 +33,8 @@ pub use adapter::{
 };
 pub use auth::{
     AuthenticatedNativeCaller, ManualClock, NativeCallerSubject, NativeClientAuthInterceptor,
-    NativeListenerAuthLayer, NativeListenerAuthService, NativeServerAdmission, NativeTrust,
-    NativeTrustClock, SystemClock, TOKEN_LIFETIME_SECONDS,
+    NativeListenerAuthLayer, NativeListenerAuthService, NativeProcessIdentity,
+    NativeServerAdmission, NativeTrust, NativeTrustClock, SystemClock, TOKEN_LIFETIME_SECONDS,
 };
 pub use deployment::{DeploymentId, ValidatedSharedSecret};
 pub use error::NativeTrustFailureKind;

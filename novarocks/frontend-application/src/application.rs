@@ -44,7 +44,7 @@ use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use novarocks_catalog_application::CatalogAttachmentRepository;
 use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
 use novarocks_mv_application::scheduler::MvSchedulerConfig;
-use novarocks_native_trust::NativeTrust;
+use novarocks_native_trust::{NativeProcessIdentity, NativeTrust};
 use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
 use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
 use novarocks_state_store_api::{StateStore, StateStoreProviderId};
@@ -277,6 +277,7 @@ struct FrontendQueryRuntimeConfig {
 impl FrontendExecutionRuntimeOwner {
     fn try_new(
         runtime: Handle,
+        frontend_process_id: FrontendProcessId,
         supervisor_config: LogicalExecutionSupervisorConfig,
         workload_config: WorkloadConfig,
         resource_config: ResourceConfig,
@@ -313,7 +314,6 @@ impl FrontendExecutionRuntimeOwner {
                     )
                 })?;
         let decode_runtime = decode.runtime();
-        let frontend_process_id = FrontendProcessId::new_v7();
         let process_bytes = frontend_process_id.to_bytes();
         let namespace = QueryProcessNamespace::new(
             u64::from_be_bytes(process_bytes[..8].try_into().expect("UUID high half"))
@@ -1132,6 +1132,14 @@ impl FrontendApplicationHost {
                 error,
             ));
         }
+        // The role composition root mints one identity for both signed Native
+        // calls and logical execution. Transport subjects remain diagnostic.
+        let frontend_process_id = FrontendProcessId::new_v7();
+        native_trust
+            .bind_process_identity(NativeProcessIdentity::Frontend(frontend_process_id))
+            .map_err(|error| {
+                FrontendApplicationError::new(FrontendApplicationErrorKind::CoordinatorOpen, error)
+            })?;
         let query_runtime = data_runtime.clone();
         let data_runtime = FrontendDataRuntime::new_with_native_trust(
             data_runtime,
@@ -1144,6 +1152,7 @@ impl FrontendApplicationHost {
         })?;
         let execution_runtime_owner = FrontendExecutionRuntimeOwner::try_new(
             query_runtime,
+            frontend_process_id,
             execution.logical_execution_supervisor,
             execution.workload.clone(),
             execution.workload_resources.clone(),
@@ -1995,6 +2004,7 @@ mod tests {
     async fn execution_runtime_shutdown_deadline_retains_the_same_workload_owner_for_retry() {
         let mut runtime = FrontendExecutionRuntimeOwner::try_new(
             tokio::runtime::Handle::current(),
+            novarocks_types::FrontendProcessId::new_v7(),
             LogicalExecutionSupervisorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
@@ -2046,6 +2056,7 @@ mod tests {
     async fn execution_runtime_supervises_admitted_statement_deadlines() {
         let mut runtime = FrontendExecutionRuntimeOwner::try_new(
             tokio::runtime::Handle::current(),
+            novarocks_types::FrontendProcessId::new_v7(),
             LogicalExecutionSupervisorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
@@ -2107,6 +2118,7 @@ mod tests {
     async fn execution_runtime_shutdown_consumes_terminal_control_notifications() {
         let mut runtime = FrontendExecutionRuntimeOwner::try_new(
             tokio::runtime::Handle::current(),
+            novarocks_types::FrontendProcessId::new_v7(),
             LogicalExecutionSupervisorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),

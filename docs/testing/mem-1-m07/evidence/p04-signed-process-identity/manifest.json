@@ -1,0 +1,28 @@
+{
+  "parent": "741254c8dd69756a21368838526fd571d1afcddc",
+  "evidence_state": "dirty candidate before checkpoint, not final M07 SHA",
+  "sources": {
+    "novarocks/native-trust/src/auth.rs": "1dbedb397e889d91fc1f3b663fdcbbe0097eb06a2801f4f511807a9af2e67f48",
+    "novarocks/native-trust/src/error.rs": "899e77b50970a572c65a9adfd57cf1cfc9fcb709e6e9abedf5f6c4e69fbcc19a",
+    "novarocks/native-trust/src/lib.rs": "781d2f500b26451140bd117dc9144e4a79720fb5fc591ec473a98e4562812cfe",
+    "novarocks/frontend-application/src/application.rs": "857cece0b2b7e73b6c7e83a76c4976809da07de86bbdf3e2b41ec878f3f3aa5a",
+    "novarocks/native-adapter/src/backend_application.rs": "1d76fe478d425e1dfddb90e6495cd933e46bd2c567db26076d519e3cb7d782e3",
+    "novarocks/native-adapter/src/backend_test_support.rs": "6e149cab5408ea9e3940948a07454027ce577c62ed650a346c93550f7516bd34",
+    "novarocks/version/src/lib.rs": "4cf62a60ba799e3bb8c3a193f4cac3863078d434e9336a38880bd8ffbcc50866",
+    "Cargo.lock": "baf88915862f746dae9f6b6312f515becfadd1a7751839cf311c49ef6a250337"
+  },
+  "logs": [
+    {
+      "name": "m07-signed-process-libs.log.gz",
+      "original_sha256": "f2704647323adfb0e08be0695e37085d8b2e3cdab045d47311cdbd89780ec22f"
+    },
+    {
+      "name": "m07-signed-process-alternate-epoch.log.gz",
+      "original_sha256": "757814b3313d0bf372af8060f38cf4f30944b7e95efdf117ae915eafac438243"
+    },
+    {
+      "name": "m07-signed-process-fmt.log.gz",
+      "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ]
+}

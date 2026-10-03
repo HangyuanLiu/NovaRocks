@@ -14,7 +14,8 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use http::HeaderMap;
-use serde::Deserialize;
+use novarocks_types::{BackendProcessId, FrontendProcessId};
+use serde::{Deserialize, Deserializer};
 use sha2::Sha256;
 use tonic::{Request, Status, service::Interceptor};
 use tower::{Layer, Service};
@@ -115,16 +116,34 @@ impl fmt::Display for NativeCallerSubject {
     }
 }
 
-/// Successful deployment authentication. This cannot be promoted into role or
-/// membership authority by the trust layer.
+/// An exact process identity supplied by the role's composition owner.
+///
+/// This is a signed caller assertion, not topology membership, health, or
+/// permission to operate on a query context. It neither mints an identity nor
+/// derives a role from the diagnostic subject.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum NativeProcessIdentity {
+    Frontend(FrontendProcessId),
+    Backend(BackendProcessId),
+}
+
+/// Successful deployment authentication and its optional signed process claim.
+/// Membership and operation authorization remain with their application owners.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthenticatedNativeCaller {
     subject: NativeCallerSubject,
+    process_identity: Option<NativeProcessIdentity>,
 }
 
 impl AuthenticatedNativeCaller {
     pub fn subject(&self) -> &NativeCallerSubject {
         &self.subject
+    }
+
+    /// Legacy unbound tokens carry no process assertion. A consumer requiring
+    /// exact process admission must reject `None`, never interpret the subject.
+    pub const fn process_identity(&self) -> Option<NativeProcessIdentity> {
+        self.process_identity
     }
 }
 
@@ -140,7 +159,12 @@ struct NativeTrustInner {
     automatic_ed25519_seed: [u8; 32],
     transport_mode: NativeTransportMode,
     clock: Arc<dyn NativeTrustClock>,
-    cache: Mutex<Option<CachedToken>>,
+    authentication: Mutex<AuthenticationState>,
+}
+
+struct AuthenticationState {
+    process_identity: Option<NativeProcessIdentity>,
+    cache: Option<CachedToken>,
 }
 
 struct CachedToken {
@@ -203,7 +227,10 @@ impl NativeTrust {
                 automatic_ed25519_seed: hkdf_expand_32(&prk, AUTOMATIC_TLS_KEY_INFO),
                 transport_mode,
                 clock,
-                cache: Mutex::new(None),
+                authentication: Mutex::new(AuthenticationState {
+                    process_identity: None,
+                    cache: None,
+                }),
             }),
         }
     }
@@ -214,6 +241,41 @@ impl NativeTrust {
 
     pub fn local_subject(&self) -> &NativeCallerSubject {
         &self.inner.local_subject
+    }
+
+    /// Bind the existing role-owned process identity exactly once.
+    ///
+    /// All trust clones share this binding. The first binding atomically clears
+    /// any cached legacy token under the same lock used for token issuance.
+    /// Repeating the exact identity is idempotent; another role or process is a
+    /// conflict and leaves both the original identity and token cache unchanged.
+    pub fn bind_process_identity(
+        &self,
+        identity: NativeProcessIdentity,
+    ) -> Result<(), NativeTrustFailureKind> {
+        let mut authentication = self
+            .inner
+            .authentication
+            .lock()
+            .expect("native trust authentication state mutex poisoned");
+        match authentication.process_identity {
+            Some(existing) if existing == identity => Ok(()),
+            Some(_) => Err(NativeTrustFailureKind::ProcessIdentityConflict),
+            None => {
+                authentication.cache = None;
+                authentication.process_identity = Some(identity);
+                Ok(())
+            }
+        }
+    }
+
+    /// The shared local binding, independent of a remote token's signed claim.
+    pub fn local_process_identity(&self) -> Option<NativeProcessIdentity> {
+        self.inner
+            .authentication
+            .lock()
+            .expect("native trust authentication state mutex poisoned")
+            .process_identity
     }
 
     pub fn transport_mode(&self) -> NativeTransportMode {
@@ -290,12 +352,12 @@ impl NativeTrust {
 
     fn current_token(&self) -> Result<String, NativeTrustFailureKind> {
         let now = self.inner.clock.unix_seconds();
-        let mut cache = self
+        let mut authentication = self
             .inner
-            .cache
+            .authentication
             .lock()
-            .expect("native trust token cache mutex poisoned");
-        if let Some(cached) = cache.as_ref()
+            .expect("native trust authentication state mutex poisoned");
+        if let Some(cached) = authentication.cache.as_ref()
             && now < cached.expires_at - TOKEN_REFRESH_THRESHOLD_SECONDS
         {
             return Ok(cached.value.clone());
@@ -303,8 +365,8 @@ impl NativeTrust {
         let expires_at = now
             .checked_add(TOKEN_LIFETIME_SECONDS)
             .ok_or(NativeTrustFailureKind::InvalidTokenTime)?;
-        let token = self.encode_token(now, expires_at)?;
-        *cache = Some(CachedToken {
+        let token = self.encode_token(now, expires_at, authentication.process_identity)?;
+        authentication.cache = Some(CachedToken {
             value: token.clone(),
             expires_at,
         });
@@ -315,15 +377,34 @@ impl NativeTrust {
         &self,
         issued_at: i64,
         expires_at: i64,
+        identity: Option<NativeProcessIdentity>,
     ) -> Result<String, NativeTrustFailureKind> {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
-        let claims = format!(
-            r#"{{"aud":"{}","sub":"{}","iat":{},"exp":{}}}"#,
-            self.inner.deployment_id.as_str(),
-            self.inner.local_subject.as_str(),
-            issued_at,
-            expires_at
-        );
+        let claims = match identity {
+            None => format!(
+                r#"{{"aud":"{}","sub":"{}","iat":{},"exp":{}}}"#,
+                self.inner.deployment_id.as_str(),
+                self.inner.local_subject.as_str(),
+                issued_at,
+                expires_at
+            ),
+            Some(NativeProcessIdentity::Frontend(process)) => format!(
+                r#"{{"aud":"{}","sub":"{}","iat":{},"exp":{},"role":"frontend","process_id":"{}"}}"#,
+                self.inner.deployment_id.as_str(),
+                self.inner.local_subject.as_str(),
+                issued_at,
+                expires_at,
+                process
+            ),
+            Some(NativeProcessIdentity::Backend(process)) => format!(
+                r#"{{"aud":"{}","sub":"{}","iat":{},"exp":{},"role":"backend","process_id":"{}"}}"#,
+                self.inner.deployment_id.as_str(),
+                self.inner.local_subject.as_str(),
+                issued_at,
+                expires_at,
+                process
+            ),
+        };
         let encoded_claims = URL_SAFE_NO_PAD.encode(claims.as_bytes());
         let signing_input = format!("{header}.{encoded_claims}");
         let signature = hmac_sha256(&self.inner.jwt_hmac_key, signing_input.as_bytes());
@@ -376,6 +457,7 @@ impl NativeTrust {
         let claims_bytes = decode_base64url(claims_segment)?;
         let claims: JwtClaims = serde_json::from_slice(&claims_bytes)
             .map_err(|_| NativeTrustFailureKind::InvalidClaims)?;
+        let process_identity = claims.process_identity()?;
         let subject = NativeCallerSubject::parse(claims.sub)
             .map_err(|_| NativeTrustFailureKind::InvalidClaims)?;
         if claims.aud != self.inner.deployment_id.as_str() {
@@ -404,7 +486,10 @@ impl NativeTrust {
         if now >= claims.exp {
             return Err(NativeTrustFailureKind::ExpiredToken);
         }
-        Ok(AuthenticatedNativeCaller { subject })
+        Ok(AuthenticatedNativeCaller {
+            subject,
+            process_identity,
+        })
     }
 
     #[cfg(test)]
@@ -548,6 +633,51 @@ struct JwtClaims {
     sub: String,
     iat: i64,
     exp: i64,
+    #[serde(default)]
+    role: ProcessStringClaim,
+    #[serde(default)]
+    process_id: ProcessStringClaim,
+}
+
+// A default applies only to a missing object field. Explicit null and other
+// non-string values invoke String::deserialize and are rejected, rather than
+// silently being treated as a legacy absent claim by Option<String>.
+#[derive(Default)]
+enum ProcessStringClaim {
+    #[default]
+    Missing,
+    Present(String),
+}
+
+impl<'de> Deserialize<'de> for ProcessStringClaim {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Self::Present)
+    }
+}
+
+impl JwtClaims {
+    fn process_identity(&self) -> Result<Option<NativeProcessIdentity>, NativeTrustFailureKind> {
+        match (&self.role, &self.process_id) {
+            (ProcessStringClaim::Missing, ProcessStringClaim::Missing) => Ok(None),
+            (ProcessStringClaim::Present(role), ProcessStringClaim::Present(process)) => {
+                let identity = match role.as_str() {
+                    "frontend" => NativeProcessIdentity::Frontend(
+                        process
+                            .parse()
+                            .map_err(|_| NativeTrustFailureKind::InvalidClaims)?,
+                    ),
+                    "backend" => NativeProcessIdentity::Backend(
+                        process
+                            .parse()
+                            .map_err(|_| NativeTrustFailureKind::InvalidClaims)?,
+                    ),
+                    _ => return Err(NativeTrustFailureKind::InvalidClaims),
+                };
+                Ok(Some(identity))
+            }
+            _ => Err(NativeTrustFailureKind::InvalidClaims),
+        }
+    }
 }
 
 fn decode_base64url(value: &str) -> Result<Vec<u8>, NativeTrustFailureKind> {
@@ -587,8 +717,8 @@ mod tests {
     use novarocks_secret::SecretValue;
 
     use super::{
-        DeploymentId, ManualClock, NativeCallerSubject, NativeTransportMode, NativeTrust,
-        NativeTrustFailureKind, TOKEN_LIFETIME_SECONDS, ValidatedSharedSecret,
+        DeploymentId, ManualClock, NativeCallerSubject, NativeProcessIdentity, NativeTransportMode,
+        NativeTrust, NativeTrustFailureKind, TOKEN_LIFETIME_SECONDS, ValidatedSharedSecret,
     };
 
     const REFERENCE_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhbmFseXRpY3MtcHJvZCIsInN1YiI6ImZlQDEyNy4wLjAuMTo5MDgwIiwiaWF0IjoxNzAwMDAwMDAwLCJleHAiOjE3MDAwMDAzNjB9.PFzl2xOOm_UE6NWzXZCdz8-OuujaqQY1CeC5B5K-1YM";
@@ -611,6 +741,234 @@ mod tests {
             HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
         );
         headers
+    }
+
+    fn frontend_identity() -> NativeProcessIdentity {
+        NativeProcessIdentity::Frontend(
+            "018bcfe5-6800-7000-8000-000000000001"
+                .parse()
+                .expect("explicit UUIDv7 frontend fixture"),
+        )
+    }
+
+    fn backend_identity() -> NativeProcessIdentity {
+        NativeProcessIdentity::Backend(
+            "018bcfe5-6800-7000-8000-000000000002"
+                .parse()
+                .expect("explicit UUIDv7 backend fixture"),
+        )
+    }
+
+    fn signed_claims(trust: &NativeTrust, claims: &str) -> String {
+        let header = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
+        let claims = URL_SAFE_NO_PAD.encode(claims.as_bytes());
+        let signing_input = format!("{header}.{claims}");
+        let signature =
+            super::hmac_sha256(&trust.jwt_hmac_key_for_vector(), signing_input.as_bytes());
+        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
+    }
+
+    #[test]
+    fn process_binding_clears_legacy_cache_is_shared_and_conflicts_without_mutation() {
+        let trust = trust(Arc::new(ManualClock::new(1_700_000_000)));
+        let clone = trust.clone();
+        let legacy = trust.current_token().unwrap();
+        assert_eq!(legacy, REFERENCE_TOKEN);
+        assert_eq!(trust.local_process_identity(), None);
+        assert_eq!(
+            trust
+                .verify_headers(&authorization(&legacy))
+                .unwrap()
+                .process_identity(),
+            None
+        );
+
+        clone.bind_process_identity(frontend_identity()).unwrap();
+        let bound = trust.current_token().unwrap();
+        assert_ne!(bound, legacy);
+        assert_eq!(trust.local_process_identity(), Some(frontend_identity()));
+        let authenticated = clone.verify_headers(&authorization(&bound)).unwrap();
+        assert_eq!(authenticated.process_identity(), Some(frontend_identity()));
+        assert_eq!(authenticated.subject().as_str(), "fe@127.0.0.1:9080");
+        let payload = URL_SAFE_NO_PAD
+            .decode(bound.split('.').nth(1).unwrap())
+            .unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(claims["role"], "frontend");
+        assert_eq!(claims["process_id"], "018bcfe5-6800-7000-8000-000000000001");
+
+        clone.bind_process_identity(frontend_identity()).unwrap();
+        assert_eq!(clone.current_token().unwrap(), bound);
+        assert_eq!(
+            clone.bind_process_identity(backend_identity()),
+            Err(NativeTrustFailureKind::ProcessIdentityConflict)
+        );
+        let another_frontend = NativeProcessIdentity::Frontend(
+            "018bcfe5-6800-7000-8000-000000000003".parse().unwrap(),
+        );
+        assert_eq!(
+            trust.bind_process_identity(another_frontend),
+            Err(NativeTrustFailureKind::ProcessIdentityConflict)
+        );
+        assert_eq!(clone.local_process_identity(), Some(frontend_identity()));
+        assert_eq!(trust.current_token().unwrap(), bound);
+    }
+
+    #[test]
+    fn bound_token_refresh_preserves_exact_identity_and_signature() {
+        let clock = Arc::new(ManualClock::new(1_700_000_000));
+        let issuer = trust(clock.clone());
+        issuer.bind_process_identity(backend_identity()).unwrap();
+        let verifier = trust(clock.clone());
+        verifier.bind_process_identity(frontend_identity()).unwrap();
+        let first = issuer.current_token().unwrap();
+        assert_eq!(
+            verifier
+                .verify_headers(&authorization(&first))
+                .unwrap()
+                .process_identity(),
+            Some(backend_identity())
+        );
+        clock.set_unix_seconds(1_700_000_059);
+        assert_eq!(issuer.current_token().unwrap(), first);
+        clock.set_unix_seconds(1_700_000_060);
+        let renewed = issuer.clone().current_token().unwrap();
+        assert_ne!(renewed, first);
+        let authenticated = verifier.verify_headers(&authorization(&renewed)).unwrap();
+        assert_eq!(authenticated.process_identity(), Some(backend_identity()));
+        // The fixture subject says "fe"; it remains diagnostic and does not
+        // override the signed, composition-supplied Backend identity.
+        assert_eq!(authenticated.subject().as_str(), "fe@127.0.0.1:9080");
+        clock.set_unix_seconds(1_700_000_000 + TOKEN_LIFETIME_SECONDS);
+        assert_eq!(
+            verifier.verify_headers(&authorization(&first)),
+            Err(NativeTrustFailureKind::ExpiredToken)
+        );
+        assert_eq!(
+            verifier
+                .verify_headers(&authorization(&renewed))
+                .unwrap()
+                .process_identity(),
+            Some(backend_identity())
+        );
+    }
+
+    #[test]
+    fn actual_signed_process_claims_reject_partial_null_duplicate_and_invalid_identity() {
+        let trust = trust(Arc::new(ManualClock::new(1_700_000_001)));
+        let malformed = [
+            r#", "role":"frontend""#,
+            r#", "process_id":"018bcfe5-6800-7000-8000-000000000001""#,
+            r#", "role":null, "process_id":null"#,
+            r#", "role":null"#,
+            r#", "process_id":null"#,
+            r#", "role":"frontend", "process_id":null"#,
+            r#", "role":0, "process_id":"018bcfe5-6800-7000-8000-000000000001""#,
+            r#", "role":"frontend", "process_id":[]"#,
+            r#", "role":"fe", "process_id":"018bcfe5-6800-7000-8000-000000000001""#,
+            r#", "role":"unknown", "process_id":"018bcfe5-6800-7000-8000-000000000001""#,
+            r#", "role":"frontend", "process_id":"00000000-0000-0000-0000-000000000000""#,
+            r#", "role":"backend", "process_id":"018bcfe5-6800-4000-8000-000000000001""#,
+            r#", "role":"backend", "process_id":"not-a-uuid""#,
+            r#", "role":"frontend", "process_id":"""#,
+            r#", "role":"frontend", "role":"backend", "process_id":"018bcfe5-6800-7000-8000-000000000001""#,
+            r#", "role":"frontend", "process_id":"018bcfe5-6800-7000-8000-000000000001", "process_id":"018bcfe5-6800-7000-8000-000000000002""#,
+            r#", "role":"frontend", "process_id":"018bcfe5-6800-7000-8000-000000000001", "extra":true"#,
+        ];
+        for extra in malformed {
+            let claims = format!(
+                r#"{{"aud":"analytics-prod","sub":"fe@127.0.0.1:9080","iat":1700000000,"exp":1700000360{extra}}}"#
+            );
+            let token = signed_claims(&trust, &claims);
+            assert_eq!(
+                trust.verify_headers(&authorization(&token)),
+                Err(NativeTrustFailureKind::InvalidClaims),
+                "signed malformed claim suffix: {extra}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_process_claim_substitution_requires_a_new_signature() {
+        let trust = trust(Arc::new(ManualClock::new(1_700_000_001)));
+        trust.bind_process_identity(frontend_identity()).unwrap();
+        let token = trust.current_token().unwrap();
+        let parts: Vec<_> = token.split('.').collect();
+        let payload = String::from_utf8(URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+        let changed = payload.replace(
+            "018bcfe5-6800-7000-8000-000000000001",
+            "018bcfe5-6800-7000-8000-000000000003",
+        );
+        let tampered = format!(
+            "{}.{}.{}",
+            parts[0],
+            URL_SAFE_NO_PAD.encode(changed.as_bytes()),
+            parts[2]
+        );
+        assert_eq!(
+            trust.verify_headers(&authorization(&tampered)),
+            Err(NativeTrustFailureKind::InvalidSignature)
+        );
+        let signed = signed_claims(&trust, &changed);
+        assert_eq!(
+            trust
+                .verify_headers(&authorization(&signed))
+                .unwrap()
+                .process_identity(),
+            Some(NativeProcessIdentity::Frontend(
+                "018bcfe5-6800-7000-8000-000000000003".parse().unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn competing_clone_bindings_choose_one_identity_and_all_later_tokens_use_it() {
+        let trust = trust(Arc::new(ManualClock::new(1_700_000_000)));
+        trust.current_token().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut threads = Vec::new();
+        for identity in [frontend_identity(), backend_identity()] {
+            let clone = trust.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                (identity, clone.bind_process_identity(identity))
+            }));
+        }
+        barrier.wait();
+        let outcomes: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(
+            outcomes.iter().filter(|(_, result)| result.is_ok()).count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(
+                    |(_, result)| *result == Err(NativeTrustFailureKind::ProcessIdentityConflict)
+                )
+                .count(),
+            1
+        );
+        let winner = outcomes
+            .iter()
+            .find(|(_, result)| result.is_ok())
+            .unwrap()
+            .0;
+        assert_eq!(trust.local_process_identity(), Some(winner));
+        for clone in [trust.clone(), trust.clone()] {
+            let token = clone.current_token().unwrap();
+            assert_eq!(
+                trust
+                    .verify_headers(&authorization(&token))
+                    .unwrap()
+                    .process_identity(),
+                Some(winner)
+            );
+        }
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::time::Duration;
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
 use novarocks_memory::MemoryAuthority;
-use novarocks_native_trust::NativeTrust;
+use novarocks_native_trust::{NativeProcessIdentity, NativeTrust};
 use novarocks_spi::connector::ConnectorExecutionRoleBindingFactory;
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
 use novarocks_worker::sink_commit::ConfiguredWorkerSinkCommitPort;
@@ -345,6 +345,7 @@ impl BackendExecutionRuntimeInput {
 )]
 fn compose_backend_application_services(
     data_runtime: BackendDataRuntime,
+    backend_process_id: BackendProcessId,
     execution: BackendExecutionRuntimeInput,
     native_compatibility_id: NativeCompatibilityId,
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
@@ -372,11 +373,6 @@ fn compose_backend_application_services(
             BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
         })?,
     );
-    // One process identity, minted here. It is what the announce carries,
-    // what a heartbeat is checked against, and what both execution owners
-    // stamp their work with, so it is minted by the composition root rather
-    // than by whichever owner happens to be constructed first.
-    let backend_process_id = BackendProcessId::new_v7();
     let drain = Arc::new(WorkerDrainState::new());
     let exchange_receiver_port: Arc<dyn ExchangeReceiverPort> = Arc::new(
         ExecutionRuntimeExchangeReceiverPort::new(Arc::clone(&execution_runtime)),
@@ -722,6 +718,22 @@ impl BackendApplicationHost {
                 .available_positions(crate::native_transport_capacity::TransportClass::Control),
             "Prepaid original Native HTTP/2 pool stock"
         );
+        // The same process identity signs Native calls and appears in the
+        // announce, heartbeat and local execution owners. Bind before channels
+        // or role workers can issue an outbound RPC.
+        let backend_process_id = BackendProcessId::new_v7();
+        let native_identity = NativeProcessIdentity::Backend(backend_process_id);
+        native_trust
+            .bind_process_identity(native_identity)
+            .map_err(|error| {
+                BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
+            })?;
+        data_runtime
+            .native_trust()
+            .bind_process_identity(native_identity)
+            .map_err(|error| {
+                BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
+            })?;
         let data_runtime = data_runtime
             .with_transport_capacity(transport_capacity.clone())
             .map_err(|error| {
@@ -733,6 +745,7 @@ impl BackendApplicationHost {
         let readiness_runtime = data_runtime.clone();
         let services = compose_backend_application_services(
             data_runtime,
+            backend_process_id,
             BackendExecutionRuntimeInput::new(
                 execution_runtime_config,
                 function_set,
@@ -1327,6 +1340,7 @@ mod tests {
 
         let services = compose_backend_application_services(
             test_data_runtime(),
+            BackendProcessId::new_v7(),
             BackendExecutionRuntimeInput::new(
                 execution_runtime_config(),
                 test_execution_function_set(),
