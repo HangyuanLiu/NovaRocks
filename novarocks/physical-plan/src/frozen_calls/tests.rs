@@ -16,6 +16,10 @@
 // under the License.
 
 use super::*;
+#[path = "property_formula_tests.rs"]
+mod property_formula_tests;
+#[path = "property_proof_tests.rs"]
+mod property_proof_tests;
 use crate::*;
 use arrow_schema::DataType;
 use novarocks_type_contract::{

@@ -563,4 +563,7 @@ fn ordinal(value: usize) -> Result<u32, FrozenCallError> {
 #[cfg(test)]
 mod tests;
 
+mod property_proof;
 mod replica;
+pub(crate) use property_proof::OccurrencePropertyProof;
+pub use property_proof::{PropertyProofProjectionFacts, PropertyProofProjectionLimits};

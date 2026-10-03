@@ -19,6 +19,15 @@ use super::*;
 use crate::Distribution;
 use novarocks_type_contract::{FunctionInstanceState, FunctionVolatility};
 
+// One criterion for both claimed-broadcast validation and the private
+// occurrence property proof. Relational lifecycle state is not scalar state;
+// row errors do not authorize movement and do not invalidate identical replay.
+pub(super) fn call_is_replica_equivalent(kind: FunctionKind, effects: &CallEffects) -> bool {
+    effects.value_stability == FunctionVolatility::Immutable
+        && (kind != FunctionKind::Scalar || effects.instance_state == FunctionInstanceState::None)
+        && effects.observable_effects.is_empty()
+}
+
 impl FrozenFragmentCalls {
     /// Check the complete occurrence prerequisite for claimed broadcast
     /// equivalence, retaining each invocation's own control domain.
@@ -78,11 +87,7 @@ impl FrozenFragmentCalls {
             // iteration. Its exact kind was checked above; it does not by
             // itself mean the scalar-instance state that forbids replication.
             // Existing relational property proofs remain mandatory.
-            if call.effects.value_stability != FunctionVolatility::Immutable
-                || (binding.kind() == FunctionKind::Scalar
-                    && call.effects.instance_state != FunctionInstanceState::None)
-                || !call.effects.observable_effects.is_empty()
-            {
+            if !call_is_replica_equivalent(binding.kind(), &call.effects) {
                 return Err(FrozenCallError::ReplicaEquivalence(site));
             }
             Ok(())

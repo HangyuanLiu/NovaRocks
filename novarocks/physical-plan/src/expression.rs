@@ -580,6 +580,25 @@ pub fn expressions_are_replica_deterministic(
     expressions: impl IntoIterator<Item = ExprId>,
     allow_values: bool,
 ) -> bool {
+    check_definition_properties(arena, expressions, allow_values, true)
+}
+
+/// Check the existing closed-definition prerequisite independently of runtime
+/// effect claims. This does not establish replica equivalence: exact actual
+/// occurrences must separately provide their complete frozen call facts.
+pub(crate) fn expressions_have_closed_value_scope(
+    arena: &ExprArena,
+    expressions: impl IntoIterator<Item = ExprId>,
+) -> bool {
+    check_definition_properties(arena, expressions, false, false)
+}
+
+fn check_definition_properties(
+    arena: &ExprArena,
+    expressions: impl IntoIterator<Item = ExprId>,
+    allow_values: bool,
+    check_legacy_stability: bool,
+) -> bool {
     let mut pending = expressions.into_iter().collect::<Vec<_>>();
     let mut visited = BTreeSet::new();
     while let Some(expression) = pending.pop() {
@@ -592,7 +611,7 @@ pub fn expressions_are_replica_deterministic(
         let immutable = match &expression.kind {
             ExprKind::Value(_) => allow_values,
             ExprKind::FunctionCall { function, .. } | ExprKind::WindowCall { function, .. } => {
-                function.volatility == FunctionVolatility::Immutable
+                !check_legacy_stability || function.volatility == FunctionVolatility::Immutable
             }
             ExprKind::Literal(_)
             | ExprKind::Constant(_)

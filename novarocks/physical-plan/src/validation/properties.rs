@@ -19,10 +19,183 @@ use super::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::FrozenCallError;
+use crate::frozen_calls::OccurrencePropertyProof;
 use crate::{
-    Distribution, ExprId, Fragment, FragmentCuts, NodeKind, PhysicalNode, PhysicalPlan,
+    Distribution, ExprId, Fragment, FragmentCuts, NodeId, NodeKind, PhysicalNode, PhysicalPlan,
     RowMultiplicity, ValueId,
 };
+use novarocks_type_contract::CompileCheckpoints;
+
+/// Only old standalone definition validation consults migration-era binding
+/// bits. The frozen package route supplies a checked proof of the same source
+/// and its original meter; it cannot fall back to legacy expression facts.
+pub(crate) enum PropertyEffectSource<'proof, 'work, 'control> {
+    Legacy,
+    Frozen {
+        proof: &'proof OccurrencePropertyProof<'proof>,
+        work: &'work mut CompileCheckpoints<'control>,
+    },
+}
+impl PropertyEffectSource<'_, '_, '_> {
+    fn expressions_safe(
+        &mut self,
+        fragment: &Fragment,
+        node: NodeId,
+        expressions: impl IntoIterator<Item = ExprId>,
+        allow_values: bool,
+    ) -> Result<bool, FrozenCallError> {
+        match self {
+            Self::Legacy => Ok(fragment_expressions_are_replica_deterministic(
+                fragment,
+                expressions,
+                allow_values,
+            )),
+            Self::Frozen { proof, work } => {
+                proof.require_fragment(fragment, work)?;
+                if !allow_values {
+                    // Preserve the original static closed-value prerequisite
+                    // separately from actual occurrence effect authority.
+                    // The original graph walker allocates opaque scratch;
+                    // this boundary does not claim its internal cooperation.
+                    work.flush()?;
+                    let closed = crate::expression::expressions_have_closed_value_scope(
+                        fragment.expressions(),
+                        expressions,
+                    );
+                    work.step()?;
+                    work.flush()?;
+                    if !closed {
+                        return Ok(false);
+                    }
+                }
+                proof.replica_safe(node, work)
+            }
+        }
+    }
+
+    fn table_safe(
+        &mut self,
+        fragment: &Fragment,
+        node: NodeId,
+        function: &crate::BoundTableFunction,
+        arguments: &[ExprId],
+    ) -> Result<bool, FrozenCallError> {
+        match self {
+            Self::Legacy => Ok(function.volatility == crate::FunctionVolatility::Immutable
+                && fragment_expressions_are_replica_deterministic(
+                    fragment,
+                    arguments.iter().copied(),
+                    true,
+                )),
+            Self::Frozen { proof, work } => {
+                proof.require_fragment(fragment, work)?;
+                proof.replica_safe(node, work)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum FragmentPropertyError {
+    Control(novarocks_type_contract::CompileControlError),
+    Calls(FrozenCallError),
+    Structure(ValidationErrors),
+}
+impl From<FrozenCallError> for FragmentPropertyError {
+    fn from(error: FrozenCallError) -> Self {
+        match error {
+            FrozenCallError::Control(cause) => Self::Control(cause),
+            error => Self::Calls(error),
+        }
+    }
+}
+impl From<novarocks_type_contract::CompileControlError> for FragmentPropertyError {
+    fn from(cause: novarocks_type_contract::CompileControlError) -> Self {
+        Self::Control(cause)
+    }
+}
+impl std::fmt::Display for FragmentPropertyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Control(cause) => cause.fmt(f),
+            Self::Calls(cause) => cause.fmt(f),
+            Self::Structure(cause) => cause.fmt(f),
+        }
+    }
+}
+impl std::error::Error for FragmentPropertyError {}
+
+/// Validate the sole output-property formulas against this fragment's exact
+/// invocation claims. This stage neither derives/replans required inputs nor
+/// authenticates an installed kernel. The final package must still validate
+/// cuts, constants, parameters, pruning and all other application-owned facts.
+///
+/// The explicit projection ceilings admit the occurrence index. Existing
+/// structural validators and property formulas retain opaque scratch work;
+/// this API does not claim a complete first-allocation model or host MEM grant.
+pub fn validate_fragment_output_properties_observed(
+    fragment: &Fragment,
+    uses: &crate::PhysicalRootUses,
+    calls: &crate::FrozenFragmentCalls,
+    limits: PlanLimits,
+    source_retained_bytes: usize,
+    projection_limits: crate::PropertyProofProjectionLimits,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::PropertyProofProjectionFacts, FragmentPropertyError> {
+    let mut work =
+        CompileCheckpoints::try_new(control, novarocks_type_contract::CompilePhase::Validate)?;
+    let result = (|| {
+        work.flush()?;
+        let proof = calls.property_proof(
+            fragment,
+            uses,
+            &limits,
+            source_retained_bytes,
+            projection_limits,
+            control,
+        )?;
+        work.flush()?;
+        let structure = super::validate_fragment_construction_after_admission(fragment, limits);
+        work.step()?;
+        work.flush()?;
+        structure.map_err(FragmentPropertyError::Structure)?;
+        proof.require_declared_broadcast_equivalence(&mut work)?;
+        let mut errors = ValidationContext::with_limits(limits);
+        for node in fragment.nodes().values() {
+            // Original formula scratch/clone/format operations are opaque.
+            // Own sparse lookups inside them use this exact same meter.
+            work.flush()?;
+            validate_node_output_properties_from(
+                fragment,
+                node,
+                "fragment.output_properties",
+                &mut errors,
+                &mut PropertyEffectSource::Frozen {
+                    proof: &proof,
+                    work: &mut work,
+                },
+            )?;
+            work.step()?;
+            work.flush()?;
+            if errors.is_saturated() {
+                errors.mark_truncated();
+                break;
+            }
+        }
+        if !errors.is_empty() {
+            return Err(FragmentPropertyError::Structure(
+                ValidationErrors::from_collector(errors),
+            ));
+        }
+        Ok(proof.facts())
+    })();
+    if matches!(&result, Err(FragmentPropertyError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
 
 pub(crate) fn validate_fragment_partition_identities(
     fragment: &Fragment,
@@ -319,20 +492,20 @@ pub(crate) fn nest_loop_join_output_distribution(
     kind: crate::JoinKind,
     distribution: crate::NestLoopJoinDistribution,
     predicate: Option<ExprId>,
-) -> Option<Distribution> {
-    let mut output = nest_loop_join_placement_distribution(fragment, node, kind, distribution)?;
+    source: &mut PropertyEffectSource<'_, '_, '_>,
+) -> Result<Option<Distribution>, FrozenCallError> {
+    let Some(mut output) =
+        nest_loop_join_placement_distribution(fragment, node, kind, distribution)
+    else {
+        return Ok(None);
+    };
     if output == Distribution::Broadcast
-        && predicate.is_some_and(|predicate| {
-            !fragment_expressions_are_replica_deterministic(
-                fragment,
-                std::iter::once(predicate),
-                true,
-            )
-        })
+        && let Some(predicate) = predicate
+        && !source.expressions_safe(fragment, node.id, std::iter::once(predicate), true)?
     {
         output = Distribution::Unconstrained;
     }
-    Some(output)
+    Ok(Some(output))
 }
 
 /// Placement is a structural prerequisite, independently of predicate effects
@@ -544,6 +717,26 @@ pub(crate) fn validate_node_output_properties(
     path: &str,
     errors: &mut ValidationContext,
 ) {
+    if let Err(error) = validate_node_output_properties_from(
+        fragment,
+        node,
+        path,
+        errors,
+        &mut PropertyEffectSource::Legacy,
+    ) {
+        // Legacy mode has no compile owner and cannot produce Control; any
+        // new invariant failure must still prevent standalone publication.
+        errors.push(ValidationError::new(path, error.to_string()));
+    }
+}
+
+pub(crate) fn validate_node_output_properties_from(
+    fragment: &Fragment,
+    node: &PhysicalNode,
+    path: &str,
+    errors: &mut ValidationContext,
+    source: &mut PropertyEffectSource<'_, '_, '_>,
+) -> Result<(), FrozenCallError> {
     let empty = crate::PhysicalProperties {
         distribution: Distribution::Unconstrained,
         row_multiplicity: RowMultiplicity::SingleCopy,
@@ -567,15 +760,11 @@ pub(crate) fn validate_node_output_properties(
                 .first()
                 .and_then(|input| fragment.nodes().get(input))
             else {
-                return;
+                return Ok(());
             };
             let expected = crate::derive_filter_output_properties(
                 &input.output_properties,
-                fragment_expressions_are_replica_deterministic(
-                    fragment,
-                    predicates.iter().copied(),
-                    true,
-                ),
+                source.expressions_safe(fragment, node.id, predicates.iter().copied(), true)?,
             );
             if node.output_properties != expected {
                 errors.push(ValidationError::new(
@@ -583,7 +772,7 @@ pub(crate) fn validate_node_output_properties(
                     "filter output properties exceed its deterministic predicate proof",
                 ));
             }
-            return;
+            return Ok(());
         }
         NodeKind::Limit { .. } => {
             let Some(input) = node
@@ -591,7 +780,7 @@ pub(crate) fn validate_node_output_properties(
                 .first()
                 .and_then(|input| fragment.nodes().get(input))
             else {
-                return;
+                return Ok(());
             };
             if input.output_properties.row_multiplicity != RowMultiplicity::SingleCopy
                 || node.output_properties
@@ -606,7 +795,7 @@ pub(crate) fn validate_node_output_properties(
                     "limit output properties exceed its replica-equivalence proof",
                 ));
             }
-            return;
+            return Ok(());
         }
         NodeKind::Project { expressions } => {
             let Some(input) = node
@@ -614,16 +803,17 @@ pub(crate) fn validate_node_output_properties(
                 .first()
                 .and_then(|input| fragment.nodes().get(input))
             else {
-                return;
+                return Ok(());
             };
             let expected = crate::derive_project_output_properties(
                 &input.output_properties,
                 &node.output.columns,
-                fragment_expressions_are_replica_deterministic(
+                source.expressions_safe(
                     fragment,
+                    node.id,
                     expressions.iter().map(|(expression, _)| *expression),
                     true,
-                ),
+                )?,
             );
             if node.output_properties != expected {
                 errors.push(ValidationError::new(
@@ -631,7 +821,7 @@ pub(crate) fn validate_node_output_properties(
                     "project output properties differ from the guarantees preserved by its output",
                 ));
             }
-            return;
+            return Ok(());
         }
         NodeKind::Sort { order_by, mode } => {
             let Some(input) = node
@@ -639,7 +829,7 @@ pub(crate) fn validate_node_output_properties(
                 .first()
                 .and_then(|input| fragment.nodes().get(input))
             else {
-                return;
+                return Ok(());
             };
             let required = node.required_inputs.first();
             let partition_by = match mode {
@@ -704,7 +894,7 @@ pub(crate) fn validate_node_output_properties(
                     "sort output ordering differs from its exact partition and order keys",
                 ));
             }
-            return;
+            return Ok(());
         }
         NodeKind::TopN {
             order_by, phase, ..
@@ -714,7 +904,7 @@ pub(crate) fn validate_node_output_properties(
                 .first()
                 .and_then(|input| fragment.nodes().get(input))
             else {
-                return;
+                return Ok(());
             };
             let required = node.required_inputs.first();
             let distribution_valid = match phase {
@@ -761,15 +951,15 @@ pub(crate) fn validate_node_output_properties(
                     "TopN output ordering differs from its exact order keys",
                 ));
             }
-            return;
+            return Ok(());
         }
         NodeKind::Window(spec) => {
             validate_window_properties(fragment, node, spec, path, errors);
-            return;
+            return Ok(());
         }
         NodeKind::AssertOneRow(spec) => {
             validate_assertion_properties(fragment, node, spec, path, errors);
-            return;
+            return Ok(());
         }
         NodeKind::TableFunction {
             function,
@@ -778,11 +968,16 @@ pub(crate) fn validate_node_output_properties(
             ..
         } => {
             validate_table_function_properties(
-                fragment, node, function, arguments, outputs, path, errors,
-            );
-            return;
+                fragment,
+                node,
+                (function, arguments, outputs),
+                path,
+                errors,
+                source,
+            )?;
+            return Ok(());
         }
-        NodeKind::ExchangeSource { .. } => return,
+        NodeKind::ExchangeSource { .. } => return Ok(()),
         NodeKind::Values { .. } => {
             let NodeKind::Values { rows } = &node.kind else {
                 unreachable!();
@@ -794,11 +989,12 @@ pub(crate) fn validate_node_output_properties(
                     }
                     (Distribution::Broadcast, _) => {
                         node.output_properties.row_multiplicity == RowMultiplicity::Replicated
-                            && fragment_expressions_are_replica_deterministic(
+                            && source.expressions_safe(
                                 fragment,
+                                node.id,
                                 rows.iter().flat_map(|row| row.iter().copied()),
                                 false,
-                            )
+                            )?
                     }
                     (
                         Distribution::Unconstrained
@@ -814,7 +1010,7 @@ pub(crate) fn validate_node_output_properties(
                     "VALUES distribution and row multiplicity lack an exact placement proof",
                 ));
             }
-            return;
+            return Ok(());
         }
         NodeKind::Aggregate {
             group_by, grouping, ..
@@ -884,7 +1080,7 @@ pub(crate) fn validate_node_output_properties(
                     "aggregate output properties differ from its proven input distribution",
                 ));
             }
-            return;
+            return Ok(());
         }
         NodeKind::HashJoin {
             kind,
@@ -900,7 +1096,7 @@ pub(crate) fn validate_node_output_properties(
                 .filter_map(|input| fragment.nodes().get(input))
                 .collect::<Vec<_>>();
             if inputs.len() != 2 {
-                return;
+                return Ok(());
             }
             let mut output_distribution = match (kind, distribution, build_side) {
                 (_, crate::JoinDistribution::Singleton, _) => Distribution::Singleton,
@@ -931,13 +1127,14 @@ pub(crate) fn validate_node_output_properties(
                 && (inputs
                     .iter()
                     .any(|input| input.output_properties.distribution != Distribution::Broadcast)
-                    || !fragment_expressions_are_replica_deterministic(
+                    || !source.expressions_safe(
                         fragment,
+                        node.id,
                         keys.iter()
                             .flat_map(|key| [key.left, key.right])
                             .chain(residual.iter().copied()),
                         true,
-                    ))
+                    )?)
             {
                 output_distribution = Distribution::Unconstrained;
             }
@@ -953,7 +1150,7 @@ pub(crate) fn validate_node_output_properties(
                     "hash join output properties differ from its preserved partition side",
                 ));
             }
-            return;
+            return Ok(());
         }
         NodeKind::NestLoopJoin {
             kind,
@@ -967,8 +1164,10 @@ pub(crate) fn validate_node_output_properties(
                 *kind,
                 *distribution,
                 *predicate,
-            ) else {
-                return;
+                source,
+            )?
+            else {
+                return Ok(());
             };
             if node.output_properties
                 != (crate::PhysicalProperties {
@@ -982,12 +1181,12 @@ pub(crate) fn validate_node_output_properties(
                     "nested-loop join output properties differ from its execution placement",
                 ));
             }
-            return;
+            return Ok(());
         }
         NodeKind::SetOp { kind, .. } => {
             let Some(distribution) = set_operation_output_distribution(fragment, node, *kind)
             else {
-                return;
+                return Ok(());
             };
             if node.output_properties
                 != (crate::PhysicalProperties {
@@ -1001,7 +1200,7 @@ pub(crate) fn validate_node_output_properties(
                     "set operation output properties differ from its equality co-location proof",
                 ));
             }
-            return;
+            return Ok(());
         }
         NodeKind::Repeat { .. } | NodeKind::Unpivot { .. } => {
             let Some(input) = node
@@ -1009,7 +1208,7 @@ pub(crate) fn validate_node_output_properties(
                 .first()
                 .and_then(|input| fragment.nodes().get(input))
             else {
-                return;
+                return Ok(());
             };
             let value_mapping = match &node.kind {
                 NodeKind::Unpivot { spec } => {
@@ -1033,7 +1232,7 @@ pub(crate) fn validate_node_output_properties(
                     "row-expanding operator output properties differ from its exact passthrough mapping",
                 ));
             }
-            return;
+            return Ok(());
         }
         NodeKind::ChangeEventExpand { .. } => {
             let Some(input) = node
@@ -1041,7 +1240,7 @@ pub(crate) fn validate_node_output_properties(
                 .first()
                 .and_then(|input| fragment.nodes().get(input))
             else {
-                return;
+                return Ok(());
             };
             if node.output_properties
                 != (crate::PhysicalProperties {
@@ -1055,7 +1254,7 @@ pub(crate) fn validate_node_output_properties(
                     "change-event expansion must declare unconstrained output properties",
                 ));
             }
-            return;
+            return Ok(());
         }
         NodeKind::GenerateSeries { .. } => {
             if node.output_properties
@@ -1070,7 +1269,7 @@ pub(crate) fn validate_node_output_properties(
                     "generate-series requires singleton placement with single-copy row ownership",
                 ));
             }
-            return;
+            return Ok(());
         }
         NodeKind::TableWriter { .. } => Some(&empty),
         NodeKind::TableFinish(_) => {
@@ -1085,7 +1284,7 @@ pub(crate) fn validate_node_output_properties(
                     "table finish output requires singleton placement with single-copy ownership",
                 ));
             }
-            return;
+            return Ok(());
         }
     };
     if expected.is_some_and(|expected| expected != &node.output_properties) {
@@ -1094,6 +1293,7 @@ pub(crate) fn validate_node_output_properties(
             "node output properties are not proven by its operator semantics",
         ));
     }
+    Ok(())
 }
 
 /// Fragment-scoped wrapper over the arena-level check in `expression`.
@@ -1247,12 +1447,16 @@ pub(crate) fn validate_assertion_properties(
 pub(crate) fn validate_table_function_properties(
     fragment: &Fragment,
     node: &PhysicalNode,
-    function: &crate::BoundTableFunction,
-    arguments: &[ExprId],
-    outputs: &[crate::TableFunctionOutput],
+    table: (
+        &crate::BoundTableFunction,
+        &[ExprId],
+        &[crate::TableFunctionOutput],
+    ),
     path: &str,
     errors: &mut ValidationContext,
-) {
+    source: &mut PropertyEffectSource<'_, '_, '_>,
+) -> Result<(), FrozenCallError> {
+    let (function, arguments, outputs) = table;
     let Some(input) = node
         .inputs
         .first()
@@ -1270,7 +1474,7 @@ pub(crate) fn validate_table_function_properties(
                 "standalone table function requires singleton placement with single-copy ownership",
             ));
         }
-        return;
+        return Ok(());
     };
     let passthrough = outputs
         .iter()
@@ -1289,12 +1493,7 @@ pub(crate) fn validate_table_function_properties(
             Distribution::Unconstrained
         }
         Distribution::Broadcast
-            if function.volatility != crate::FunctionVolatility::Immutable
-                || !fragment_expressions_are_replica_deterministic(
-                    fragment,
-                    arguments.iter().copied(),
-                    true,
-                ) =>
+            if !source.table_safe(fragment, node.id, function, arguments)? =>
         {
             Distribution::Unconstrained
         }
@@ -1319,6 +1518,7 @@ pub(crate) fn validate_table_function_properties(
             "table function output properties differ from its explicit passthrough guarantees",
         ));
     }
+    Ok(())
 }
 
 pub(crate) fn validate_property_keys_on_port(
