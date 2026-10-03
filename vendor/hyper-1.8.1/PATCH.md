@@ -63,3 +63,7 @@ adds header_table_size(u32) to advertise the incoming ceiling, matching the
 existing client API. h2 applies it only on SETTINGS ACK and retains the
 initial 4096-byte table before that ACK. Default buffer and server setting
 remain None; table backing and field payload owners remain independent.
+
+## Original connection lifecycle forwarding
+
+Both HTTP/2 builders forward an optional h2 lifecycle capability into the real protocol connection. A configured server yields once immediately after initial SETTINGS completion, before dispatching any application stream, so its acquisition owner can perform the final deadline verdict. The caller must perform that verdict before polling service again; this is not a persistent application dispatch gate. None retains the existing loop. Client initial completion does not itself publish final acquisition. Outer executor/task/socket funding is separate.

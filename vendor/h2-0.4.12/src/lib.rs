@@ -180,3 +180,8 @@ pub use self::send_header_block::SendHeaderBlockPool;
 
 mod send_frame_buffer;
 pub use self::send_frame_buffer::SendFrameBuffer;
+
+mod connection_lifecycle;
+pub use self::connection_lifecycle::{
+    BoundConnectionLifecycle, ConnectionLifecycle, ConnectionLifecycleObserver,
+};

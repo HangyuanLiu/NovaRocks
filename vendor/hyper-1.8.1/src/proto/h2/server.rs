@@ -80,6 +80,7 @@ fn try_set_date_header_if_missing(headers: &mut http::HeaderMap) -> crate::Resul
 pub(crate) struct Config {
     pub(crate) initial_settings_deadline: Option<Instant>,
     pub(crate) stream_store_buffer: Option<h2::StreamStoreBuffer>,
+    pub(crate) connection_lifecycle: Option<h2::ConnectionLifecycle>,
     pub(crate) adaptive_window: bool,
     pub(crate) initial_conn_window_size: u32,
     pub(crate) initial_stream_window_size: u32,
@@ -114,6 +115,7 @@ impl Default for Config {
         Config {
             initial_settings_deadline: None,
             stream_store_buffer: None,
+            connection_lifecycle: None,
             adaptive_window: false,
             initial_conn_window_size: DEFAULT_CONN_WINDOW,
             initial_stream_window_size: DEFAULT_STREAM_WINDOW,
@@ -156,6 +158,7 @@ pin_project! {
         service: S,
         state: State<T, B>,
         date_header: bool,
+        yield_after_initial_settings: bool,
         close_pending: bool
     }
 }
@@ -234,6 +237,9 @@ where
         if let Some(buffer) = &config.stream_store_buffer {
             builder.stream_store_buffer(buffer.clone());
         }
+        if let Some(lifecycle) = &config.connection_lifecycle {
+            builder.connection_lifecycle(lifecycle.clone());
+        }
         if let Some(pool) = &config.receive_header_map_pool {
             builder.receive_header_map_pool(pool.clone());
         }
@@ -291,6 +297,7 @@ where
             },
             service,
             date_header: config.date_header,
+            yield_after_initial_settings: config.connection_lifecycle.is_some(),
             close_pending: false,
         }
     }
@@ -327,6 +334,7 @@ where
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = &mut *self;
         loop {
+            let was_initial_settings = matches!(me.state, State::InitialSettings { .. });
             let next = match me.state {
                 State::Handshaking {
                     ref mut hs,
@@ -389,6 +397,13 @@ where
                 }
             };
             me.state = next;
+            if was_initial_settings && me.yield_after_initial_settings {
+                // Let the acquisition owner check its final deadline and
+                // lifecycle verdict before dispatching an application stream.
+                me.yield_after_initial_settings = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
         }
     }
 }

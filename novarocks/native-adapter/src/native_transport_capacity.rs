@@ -31,7 +31,7 @@ use novarocks_worker::result_buffer::ResultRetainedBudget;
 use std::alloc::Layout;
 use std::fmt;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use tonic::transport::Http2ConnectionConfig;
 
@@ -67,9 +67,21 @@ struct Dimensions {
     stock_bound: usize,
 }
 
+const VACANT: u8 = 0;
+const ACQUIRING: u8 = 1;
+const INITIAL_COMPLETE: u8 = 2;
+const LIVE: u8 = 3;
+const RETIRING: u8 = 4;
+
+struct ConnectionRecord {
+    claimed: AtomicBool,
+    generation: AtomicU64,
+    phase: AtomicU8,
+}
+
 struct StockCore {
     // Backings precede credit in declaration order. No Weak StockCore escapes.
-    slots: Vec<AtomicBool>,
+    slots: Vec<ConnectionRecord>,
     dimensions: Dimensions,
     acquisitions: [AtomicUsize; 2],
     credit: ResultWriteCredit,
@@ -113,6 +125,7 @@ impl fmt::Debug for NativeTransportCapacityFactory {
 struct SlotExit {
     factory: NativeTransportCapacityFactory,
     index: usize,
+    generation: u64,
 }
 
 impl Drop for SlotExit {
@@ -120,7 +133,69 @@ impl Drop for SlotExit {
         // Bytes first drops its owner and frees its complete wrapper allocation.
         // No callbacks or waits occur here. Acquire in the next claim observes
         // all preceding physical retirement before constructing fresh pools.
-        self.factory.core().slots[self.index].store(false, Ordering::Release);
+        let record = &self.factory.core().slots[self.index];
+        assert_eq!(
+            record.generation.load(Ordering::Acquire),
+            self.generation,
+            "exact physical connection generation"
+        );
+        record.phase.store(VACANT, Ordering::Release);
+        record.claimed.store(false, Ordering::Release);
+    }
+}
+
+/// Original records contain no Channel, task, socket or observer alias.
+/// The observer and ten pools retain the same carrier until actual exit.
+struct NativeLifecycleObserver {
+    factory: NativeTransportCapacityFactory,
+    index: usize,
+    generation: u64,
+}
+
+impl NativeLifecycleObserver {
+    fn record(&self) -> io::Result<&ConnectionRecord> {
+        let record = &self.factory.core().slots[self.index];
+        if !record.claimed.load(Ordering::Acquire)
+            || record.generation.load(Ordering::Acquire) != self.generation
+        {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        Ok(record)
+    }
+}
+
+impl h2::ConnectionLifecycleObserver for NativeLifecycleObserver {
+    fn on_initial_settings_complete(&self) -> io::Result<()> {
+        self.record()?
+            .phase
+            .compare_exchange(
+                ACQUIRING,
+                INITIAL_COMPLETE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|_| io::ErrorKind::ConnectionAborted.into())
+    }
+
+    fn on_acquisition_complete(&self) -> io::Result<()> {
+        self.record()?
+            .phase
+            .compare_exchange(INITIAL_COMPLETE, LIVE, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| io::ErrorKind::ConnectionAborted.into())
+    }
+
+    fn on_retiring(&self) -> io::Result<()> {
+        self.record()?.phase.store(RETIRING, Ordering::Release);
+        Ok(())
+    }
+}
+
+impl Drop for NativeLifecycleObserver {
+    fn drop(&mut self) {
+        // Includes unpolled attempts that never obtained a bound IO lease.
+        let _ = h2::ConnectionLifecycleObserver::on_retiring(self);
     }
 }
 
@@ -313,6 +388,10 @@ impl Dimensions {
             bound,
             h2::StreamStoreBuffer::allocation_capacity_bound(streams, streams)?,
         )?;
+        bound = add(
+            bound,
+            h2::ConnectionLifecycle::allocation_capacity_bound::<NativeLifecycleObserver>()?,
+        )?;
         let stream_extra = add(
             add(
                 value(g.transport_stream_bookkeeping_bytes)?,
@@ -329,7 +408,7 @@ impl Dimensions {
         }
         dimensions.connection_bound = bound;
         let positions = add(data_positions, control_positions)?;
-        let slots = Layout::array::<AtomicBool>(positions)
+        let slots = Layout::array::<ConnectionRecord>(positions)
             .map_err(|_| invalid())?
             .size();
         let mut stock = add(mul(bound, positions)?, arc_bytes::<StockCore>()?)?;
@@ -386,7 +465,11 @@ impl NativeTransportCapacityFactory {
         slots
             .try_reserve_exact(positions)
             .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
-        slots.resize_with(positions, || AtomicBool::new(false));
+        slots.resize_with(positions, || ConnectionRecord {
+            claimed: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            phase: AtomicU8::new(VACANT),
+        });
         Ok(Self {
             core: Some(Arc::new(StockCore {
                 slots,
@@ -424,7 +507,10 @@ impl NativeTransportCapacityFactory {
     /// A concurrent snapshot of physically returned positions, not a grant.
     pub fn available_positions(&self, class: TransportClass) -> usize {
         self.range(class)
-            .filter(|&index| !self.core().slots[index].load(Ordering::Acquire))
+            .filter(|&index| {
+                !self.core().slots[index].claimed.load(Ordering::Acquire)
+                    && self.core().slots[index].generation.load(Ordering::Acquire) != u64::MAX
+            })
             .count()
     }
 
@@ -461,18 +547,38 @@ impl NativeTransportCapacityFactory {
         ))
     }
 
-    fn claim(&self, class: TransportClass) -> io::Result<Bytes> {
+    fn claim(&self, class: TransportClass) -> io::Result<(Bytes, usize, u64)> {
         for index in self.range(class) {
-            if self.core().slots[index]
+            let record = &self.core().slots[index];
+            if record
+                .claimed
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return Ok(Bytes::from_owner_with_exit_guard(
-                    Bytes::new(),
-                    SlotExit {
-                        factory: self.clone(),
-                        index,
-                    },
+                let generation = match record.generation.fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |generation| generation.checked_add(1),
+                ) {
+                    Ok(previous) => previous + 1,
+                    Err(_) => {
+                        // An exhausted generation never wraps into an old family.
+                        record.claimed.store(false, Ordering::Release);
+                        continue;
+                    }
+                };
+                record.phase.store(ACQUIRING, Ordering::Release);
+                return Ok((
+                    Bytes::from_owner_with_exit_guard(
+                        Bytes::new(),
+                        SlotExit {
+                            factory: self.clone(),
+                            index,
+                            generation,
+                        },
+                    ),
+                    index,
+                    generation,
                 ));
             }
         }
@@ -486,9 +592,18 @@ impl NativeTransportCapacityFactory {
     pub fn try_config(&self, class: TransportClass) -> io::Result<Http2ConnectionConfig> {
         let d = self.core().dimensions;
         let acquisition_owner = self.claim_acquisition(class)?;
-        let owner = self.claim(class)?;
+        let (owner, index, generation) = self.claim(class)?;
+        let connection_lifecycle = h2::ConnectionLifecycle::new(
+            NativeLifecycleObserver {
+                factory: self.clone(),
+                index,
+                generation,
+            },
+            owner.clone(),
+        )?;
         Ok(Http2ConnectionConfig {
             acquisition_owner: Some(acquisition_owner),
+            connection_lifecycle: Some(connection_lifecycle),
             stream_store_buffer: Some(h2::StreamStoreBuffer::new(
                 d.streams,
                 d.streams,
@@ -551,7 +666,8 @@ pub fn configure_server<E>(
 ) -> io::Result<()> {
     let d = Dimensions::frozen()?;
     let g = NativeResultSupportGeometry::V1;
-    if config.acquisition_owner.is_none()
+    if config.connection_lifecycle.is_none()
+        || config.acquisition_owner.is_none()
         || config.max_frame_size != Some(d.frame as u32)
         || config.initial_settings_timeout
             != Some(std::time::Duration::from_millis(
@@ -602,6 +718,11 @@ pub fn configure_server<E>(
     {
         return Err(invalid());
     }
+    config
+        .connection_lifecycle
+        .as_ref()
+        .unwrap()
+        .retain_acquisition_owner(config.acquisition_owner.as_ref().unwrap().clone())?;
     builder
         .initial_stream_window_size(g.transport_h2_stream_receive_window_bytes as u32)
         .initial_connection_window_size(g.transport_h2_connection_receive_window_bytes as u32)
@@ -617,6 +738,7 @@ pub fn configure_server<E>(
         .max_receive_buffered_events(d.events)
         .max_send_buf_size(d.writer)
         .retain_data_payloads(true);
+    builder.connection_lifecycle(config.connection_lifecycle.as_ref().unwrap().clone());
     builder.stream_store_buffer(config.stream_store_buffer.as_ref().unwrap().clone());
     builder.receive_frame_buffer(config.receive_frame_buffer.as_ref().unwrap().clone());
     builder
@@ -666,6 +788,97 @@ mod tests {
             panic!("original stock must be physically returned");
         };
         drop(credit);
+    }
+
+    #[test]
+    fn actual_lifecycle_phases_hold_position_until_final_original_alias_exit() {
+        let (factory, budget, bytes) = factory();
+        let index = factory.range(TransportClass::Data).start;
+        let record = &factory.core().slots[index];
+        let config = factory.try_config(TransportClass::Data).unwrap();
+        let lifecycle = config.connection_lifecycle.as_ref().unwrap().clone();
+        let lease = lifecycle.bind().unwrap();
+        assert_eq!(record.generation.load(Ordering::Acquire), 1);
+        assert_eq!(record.phase.load(Ordering::Acquire), ACQUIRING);
+        assert!(lifecycle.on_acquisition_complete().is_err());
+        lease.on_initial_settings_complete().unwrap();
+        assert_eq!(record.phase.load(Ordering::Acquire), INITIAL_COMPLETE);
+        lifecycle.on_acquisition_complete().unwrap();
+        assert_eq!(record.phase.load(Ordering::Acquire), LIVE);
+        let pool_alias = config.receive_frame_buffer.as_ref().unwrap().clone();
+        drop(config);
+        drop(lease);
+        assert_eq!(record.phase.load(Ordering::Acquire), RETIRING);
+        assert!(lifecycle.on_acquisition_complete().is_err());
+        drop(lifecycle);
+        assert_eq!(factory.available_positions(TransportClass::Data), 517);
+        assert_eq!(record.phase.load(Ordering::Acquire), RETIRING);
+        drop(pool_alias);
+        assert_eq!(record.phase.load(Ordering::Acquire), VACANT);
+        assert_eq!(factory.available_positions(TransportClass::Data), 518);
+        drop(factory);
+        released(&budget, bytes);
+    }
+
+    #[test]
+    fn returned_position_changes_generation_and_refuses_old_observer_events() {
+        use h2::ConnectionLifecycleObserver;
+        let (factory, budget, bytes) = factory();
+        let index = factory.range(TransportClass::Control).start;
+        let first = factory.try_config(TransportClass::Control).unwrap();
+        let stale = NativeLifecycleObserver {
+            factory: factory.clone(),
+            index,
+            generation: 1,
+        };
+        drop(first);
+        let second = factory.try_config(TransportClass::Control).unwrap();
+        let record = &factory.core().slots[index];
+        assert_eq!(record.generation.load(Ordering::Acquire), 2);
+        assert_eq!(record.phase.load(Ordering::Acquire), ACQUIRING);
+        assert_eq!(
+            stale.on_initial_settings_complete().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            stale.on_acquisition_complete().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            stale.on_retiring().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        drop(stale);
+        assert_eq!(record.phase.load(Ordering::Acquire), ACQUIRING);
+        drop(second);
+        drop(factory);
+        released(&budget, bytes);
+    }
+
+    #[test]
+    fn exhausted_physical_generation_never_wraps_and_rolls_back_acquisition() {
+        let (factory, budget, bytes) = factory();
+        for index in factory.range(TransportClass::Data) {
+            factory.core().slots[index]
+                .generation
+                .store(u64::MAX, Ordering::Release);
+        }
+        assert_eq!(factory.available_positions(TransportClass::Data), 0);
+        assert_eq!(
+            factory.try_config(TransportClass::Data).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(factory.available_acquisitions(TransportClass::Data), 32);
+        for index in factory.range(TransportClass::Data) {
+            let record = &factory.core().slots[index];
+            assert!(!record.claimed.load(Ordering::Acquire));
+            assert_eq!(record.generation.load(Ordering::Acquire), u64::MAX);
+            assert_eq!(record.phase.load(Ordering::Acquire), VACANT);
+        }
+        let control = factory.try_config(TransportClass::Control).unwrap();
+        drop(control);
+        drop(factory);
+        released(&budget, bytes);
     }
 
     #[test]

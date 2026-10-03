@@ -25,6 +25,30 @@ pub(crate) struct Connection {
     inner: BoxService<Request<BoxBody>, Response<BoxBody>, crate::Error>,
 }
 
+// An attempt may be canceled before binding IO while factory aliases remain.
+// Retirement is a logical verdict; its original owner remains with every alias.
+struct AcquisitionLifecycle {
+    lifecycle: Option<h2::ConnectionLifecycle>,
+    completed: bool,
+}
+
+impl AcquisitionLifecycle {
+    fn complete(mut self) {
+        self.completed = true;
+        drop(self);
+    }
+}
+
+impl Drop for AcquisitionLifecycle {
+    fn drop(&mut self) {
+        if !self.completed {
+            if let Some(lifecycle) = &self.lifecycle {
+                let _ = lifecycle.retire();
+            }
+        }
+    }
+}
+
 impl Connection {
     fn new<C>(connector: C, endpoint: Endpoint, is_lazy: bool) -> Self
     where
@@ -203,6 +227,10 @@ where
         let started = std::time::Instant::now();
         let mut initial_settings_deadline = None;
         let mut acquisition_owner = None;
+        let mut connection_lifecycle = AcquisitionLifecycle {
+            lifecycle: None,
+            completed: false,
+        };
         let mut builder = self.settings.clone();
         if let Some(factory) = &self.factory {
             let configured = factory().and_then(|mut config| {
@@ -210,10 +238,16 @@ where
                 // any builder capabilities. Even rejected attempts retain it
                 // in the returned future until that future actually exits.
                 acquisition_owner = config.acquisition_owner.take();
-                if acquisition_owner.is_some()
+                connection_lifecycle.lifecycle = config.connection_lifecycle.clone();
+                if (acquisition_owner.is_some() || connection_lifecycle.lifecycle.is_some())
                     && config.initial_settings_timeout.is_none_or(|d| d.is_zero())
                 {
                     return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput).into());
+                }
+                if let (Some(lifecycle), Some(owner)) =
+                    (&connection_lifecycle.lifecycle, &acquisition_owner)
+                {
+                    lifecycle.retain_acquisition_owner(owner.clone())?;
                 }
                 if let Some(timeout) = config.initial_settings_timeout {
                     if timeout.is_zero() {
@@ -280,13 +314,31 @@ where
                     None => connecting.await,
                 }?;
                 if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                    // A late Ready may contain a live IO/connection. It exits
-                    // inside this verdict future, before the acquisition owner.
+                    // Drop the late sender/output here. Hyper's independent
+                    // protocol task retains the original acquisition alias
+                    // through its actual IO exit on this failed verdict.
                     drop(result);
                     return Err(crate::Error::from(std::io::Error::from(
                         std::io::ErrorKind::TimedOut,
                     )));
                 }
+                if let Some(lifecycle) = &connection_lifecycle.lifecycle {
+                    if let Err(error) = lifecycle.on_acquisition_complete() {
+                        drop(result);
+                        return Err(crate::Error::from(error));
+                    }
+                    // A callback is finite work but may cross the same absolute
+                    // D. No late-success output can escape final validation.
+                    if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                        let _ = lifecycle.retire();
+                        drop(result);
+                        return Err(crate::Error::from(std::io::Error::from(
+                            std::io::ErrorKind::TimedOut,
+                        )));
+                    }
+                    lifecycle.release_acquisition_owner()?;
+                }
+                connection_lifecycle.complete();
                 Ok(result)
             },
             acquisition_owner,

@@ -541,6 +541,20 @@ where
                             drop(capacity);
                             return Err("Native acquisition deadline elapsed at initial settings completion".to_owned());
                         }
+                        if let Some(lifecycle) = capacity.as_ref().and_then(|config| config.connection_lifecycle.as_ref()) {
+                            if let Err(error) = lifecycle.on_acquisition_complete() {
+                                drop(connection);
+                                drop(capacity);
+                                return Err(format!("Native acquisition lifecycle refused completion: {error}"));
+                            }
+                            if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                                let _ = lifecycle.retire();
+                                drop(connection);
+                                drop(capacity);
+                                return Err("Native acquisition deadline elapsed during completion verdict".to_owned());
+                            }
+                            lifecycle.release_acquisition_owner().map_err(|error| format!("Native acquisition owner refused release: {error}"))?;
+                        }
                         Ok(AcquiredConnection::Installed(connection, capacity))
                     };
                     match initial_settings_deadline {

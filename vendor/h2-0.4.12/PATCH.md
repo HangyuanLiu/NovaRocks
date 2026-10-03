@@ -188,3 +188,9 @@ receipts. The default None paths preserve upstream behavior; those receipts
 do not establish a general upstream advisory fix. Original registry provenance
 remains in UPSTREAM.json. A passing registry policy check does not discharge
 local vendor source audit responsibility.
+
+## Original connection lifecycle capability
+
+`ConnectionLifecycle` funds its strong-only Core/observer allocations through the caller's original Bytes carrier. Checked Layout includes the concrete observer, Arc metadata and one optional retained-acquisition Bytes Box; last-strong exit frees those backings before the carrier. A non-cloneable bound lease binds once before IO, stays in the actual protocol Connection after codec/stream fields, and permanently retires on terminal poll, GOAWAY, phase failure or Drop. Initial completion follows actual peer SETTINGS application and ACK/local flush; final acquisition is a separate caller deadline verdict. Transient CAS states prevent unfinished callbacks from publishing success. No callback runs under an internal lifecycle mutex. Refusals allocate no error backing. Default None is unchanged. Outer future/task/socket/TLS allocations and independent handshake cancellation ordering require separate evidence.
+
+The optional acquisition carrier installs once through an atomic INSTALLING phase before binding. A single prepaid Box is published without a Darwin lazy Mutex allocation. The actual bound lease keeps this carrier on failed final verdicts until codec/IO exit; a successful caller releases it only after its last absolute-deadline check. Atomic swap ownership exposes no pointer/reference escape, and panic-safe final cleanup frees retention metadata before the common original carrier. The outer ordered attempt separately retains the same acquisition carrier through future exit.

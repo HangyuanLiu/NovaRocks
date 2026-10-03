@@ -24,6 +24,10 @@ pub struct Http2ConnectionConfig {
     /// success releases it before spawning the live connection task. This
     /// carrier does not fund the enclosing future, TLS or socket allocations.
     pub acquisition_owner: Option<bytes::Bytes>,
+    /// Original physical lifecycle shared with the real h2 connection. Initial
+    /// SETTINGS and the caller's final acquisition verdict are separate events.
+    /// Requires a positive acquisition timeout. None preserves legacy behavior.
+    pub connection_lifecycle: Option<h2::ConnectionLifecycle>,
     /// Original fixed resident stream and readiness storage for this attempt.
     pub stream_store_buffer: Option<h2::StreamStoreBuffer>,
     /// Local maximum inbound frame payload. This is not an outbound ceiling.
@@ -71,7 +75,7 @@ impl Http2ConnectionConfig {
         builder: &mut Builder<E>,
         inherited_max_header_list_size: Option<u32>,
     ) -> io::Result<()> {
-        if self.acquisition_owner.is_some()
+        if (self.acquisition_owner.is_some() || self.connection_lifecycle.is_some())
             && self.initial_settings_timeout.is_none_or(|d| d.is_zero())
         {
             return Err(invalid(
@@ -177,6 +181,9 @@ impl Http2ConnectionConfig {
         }
         // Validate every scalar/geometry before changing the builder or calling
         // the connector. Reuse is checked by h2 bind before its handshake I/O.
+        if let Some(lifecycle) = self.connection_lifecycle {
+            builder.connection_lifecycle(lifecycle);
+        }
         if let Some(buffer) = self.stream_store_buffer {
             builder.stream_store_buffer(buffer);
         }

@@ -82,6 +82,7 @@ const DEFAULT_INITIAL_MAX_SEND_STREAMS: usize = 100;
 pub(crate) struct Config {
     pub(crate) initial_settings_deadline: Option<Instant>,
     pub(crate) stream_store_buffer: Option<h2::StreamStoreBuffer>,
+    pub(crate) connection_lifecycle: Option<h2::ConnectionLifecycle>,
     pub(crate) adaptive_window: bool,
     pub(crate) initial_conn_window_size: u32,
     pub(crate) initial_stream_window_size: u32,
@@ -116,6 +117,7 @@ impl Default for Config {
         Config {
             initial_settings_deadline: None,
             stream_store_buffer: None,
+            connection_lifecycle: None,
             adaptive_window: false,
             initial_conn_window_size: DEFAULT_CONN_WINDOW,
             initial_stream_window_size: DEFAULT_STREAM_WINDOW,
@@ -180,6 +182,9 @@ fn new_builder(config: &Config) -> Builder {
     }
     if let Some(buffer) = &config.stream_store_buffer {
         builder.stream_store_buffer(buffer.clone());
+    }
+    if let Some(lifecycle) = &config.connection_lifecycle {
+        builder.connection_lifecycle(lifecycle.clone());
     }
     if let Some(pool) = &config.receive_header_map_pool {
         builder.receive_header_map_pool(pool.clone());

@@ -41,3 +41,9 @@ advertised ceiling (4096 by default); the constructor separately requires
 capacity for the initial 4096-byte protocol table. Both options move into the
 actual Hyper attempt. Endpoint has no incoming table-size API to inherit.
 Defaults are None, and the outbound table ceiling remains independent.
+
+## Per-attempt original lifecycle verdict
+
+`Http2ConnectionConfig.connection_lifecycle` requires a positive initial SETTINGS timeout and forwards the original capability. Final acquisition publication follows the actual Hyper handshake and the same absolute deadline's late-Ready check; callback work is followed by another check against that deadline. An inline attempt guard permanently retires refused, timed-out or canceled attempts even while factory aliases remain, and disarms only after final success. The existing ordered acquisition owner wrapper still retains its original position through actual inner-future exit. These additions do not fund the outer boxed future, Channel/executor task, socket or TLS backings.
+
+A supplied lifecycle also retains the original acquisition owner before dialing. This closes the failed-final-verdict window where Hyper has already spawned its independent protocol task: returning an error and dropping SendRequest do not prove that task/IO exited. Successful post-deadline verdict explicitly releases the extra alias; failure keeps it in the actual H2 bound lease until IO exits, while the original wrapper covers future exit.

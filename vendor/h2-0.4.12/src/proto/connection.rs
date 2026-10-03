@@ -27,6 +27,8 @@ where
 
     initial_settings_deadline: Option<Instant>,
     initial_settings_failed: bool,
+    // Codec/IO and stream fields physically exit before this bound lease.
+    connection_lifecycle: Option<crate::BoundConnectionLifecycle>,
 }
 
 // Extracted part of `Connection` which does not depend on `T`. Reduces the amount of duplicated
@@ -79,6 +81,7 @@ struct DynConnection<'a, B: Buf = Bytes> {
 #[derive(Debug)]
 pub(crate) struct Config {
     pub stream_store: Option<streams::FixedStreamStore>,
+    pub connection_lifecycle: Option<crate::BoundConnectionLifecycle>,
     pub next_stream_id: StreamId,
     pub initial_max_send_streams: usize,
     pub max_send_buffer_size: usize,
@@ -140,6 +143,7 @@ where
             codec,
             initial_settings_deadline: config.initial_settings_deadline,
             initial_settings_failed: false,
+            connection_lifecycle: config.connection_lifecycle.take(),
             inner: ConnectionInner {
                 state: State::Open,
                 error: None,
@@ -272,6 +276,20 @@ where
 
     /// Advances the internal state of the connection.
     pub fn poll(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
+        let result = self.poll_inner(cx);
+        if result.is_ready()
+            || !matches!(self.inner.state, State::Open)
+            || self.inner.error.is_some()
+            || self.inner.go_away.is_going_away()
+        {
+            if let Some(lifecycle) = &self.connection_lifecycle {
+                let _ = lifecycle.retire();
+            }
+        }
+        result
+    }
+
+    fn poll_inner(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
         if self.initial_settings_deadline.is_some() || self.initial_settings_failed {
             ready!(self.poll_initial_settings(cx))?;
         }
@@ -347,6 +365,9 @@ where
             // poll_flush. Keep an inline terminal latch, not a cloned error
             // payload or an additional callback allocation.
             self.initial_settings_failed = true;
+            if let Some(lifecycle) = &self.connection_lifecycle {
+                let _ = lifecycle.retire();
+            }
         }
         result
     }
@@ -381,6 +402,12 @@ where
                 // This flush covers both the buffered initial local SETTINGS
                 // and the ACK for the fully applied initial remote SETTINGS.
                 // Local::WaitingAck alone never establishes physical flush.
+                if let Some(lifecycle) = &self.connection_lifecycle {
+                    lifecycle
+                        .on_initial_settings_complete()
+                        .map_err(Error::from)?;
+                }
+                self.check_initial_settings_phase()?;
                 self.codec.set_initial_settings_deadline(None);
                 self.initial_settings_deadline = None;
                 return Poll::Ready(Ok(()));
@@ -737,6 +764,9 @@ where
     B: Buf,
 {
     fn drop(&mut self) {
+        if let Some(lifecycle) = &self.connection_lifecycle {
+            let _ = lifecycle.retire();
+        }
         // Ignore errors as this indicates that the mutex is poisoned.
         let _ = self.inner.streams.recv_eof(true);
     }

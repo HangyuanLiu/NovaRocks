@@ -151,6 +151,7 @@ pub struct Handshake<T, B: Buf = Bytes> {
     builder: Builder,
     /// The current state of the handshake.
     state: Handshaking<T, B>,
+    connection_lifecycle: Option<crate::BoundConnectionLifecycle>,
     /// Span tracking the handshake
     span: tracing::Span,
 }
@@ -237,6 +238,7 @@ pub struct Connection<T, B: Buf> {
 pub struct Builder {
     initial_settings_deadline: Option<Instant>,
     stream_store_buffer: Option<crate::StreamStoreBuffer>,
+    connection_lifecycle: Option<crate::ConnectionLifecycle>,
     /// Time to keep locally reset streams around before reaping.
     reset_stream_duration: Duration,
 
@@ -403,6 +405,7 @@ where
             drop(entered);
             return Handshake {
                 stream_store: None,
+                connection_lifecycle: None,
                 builder,
                 state: Handshaking::Failed(Some(error)),
                 span,
@@ -414,6 +417,7 @@ where
             drop(entered);
             return Handshake {
                 stream_store: None,
+                connection_lifecycle: None,
                 builder,
                 state: Handshaking::Failed(Some(crate::Error::from_io(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -428,7 +432,7 @@ where
                     < builder.settings.header_table_size().unwrap_or(4096) as usize
             {
                 drop(entered);
-                return Handshake { stream_store: None, builder, state: Handshaking::Failed(Some(crate::Error::from_io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "header table buffer requires a field pool and capacity covering the initial and advertised incoming table")))), span };
+                return Handshake { stream_store: None, connection_lifecycle: None, builder, state: Handshaking::Failed(Some(crate::Error::from_io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "header table buffer requires a field pool and capacity covering the initial and advertised incoming table")))), span };
             }
         }
         if let Some(pool) = &builder.receive_header_field_pool {
@@ -439,7 +443,7 @@ where
                     .is_none_or(|max| max < 32 || pool.max_field_bytes() < max as usize - 32)
             {
                 drop(entered);
-                return Handshake { stream_store: None, builder, state: Handshaking::Failed(Some(crate::Error::from_io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "header field pool requires fixed encoded input and an explicit fitting header-list maximum")))), span };
+                return Handshake { stream_store: None, connection_lifecycle: None, builder, state: Handshaking::Failed(Some(crate::Error::from_io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "header field pool requires fixed encoded input and an explicit fitting header-list maximum")))), span };
             }
         }
         if let Some(buffer) = &builder.receive_header_block_buffer {
@@ -448,7 +452,7 @@ where
                 || max.is_none_or(|max| max == 0 || max > buffer.max_encoded_bytes())
             {
                 drop(entered);
-                return Handshake { stream_store: None, builder, state: Handshaking::Failed(Some(crate::Error::from_io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "encoded header buffer requires fixed raw input and a valid explicit block maximum")))), span };
+                return Handshake { stream_store: None, connection_lifecycle: None, builder, state: Handshaking::Failed(Some(crate::Error::from_io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "encoded header buffer requires fixed raw input and a valid explicit block maximum")))), span };
             }
         }
         if builder.send_header_block_pool.is_some() && builder.max_send_header_table_size != Some(0)
@@ -456,6 +460,7 @@ where
             drop(entered);
             return Handshake {
                 stream_store: None,
+                connection_lifecycle: None,
                 builder,
                 state: Handshaking::Failed(Some(crate::Error::from_io(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -468,6 +473,7 @@ where
             drop(entered);
             return Handshake {
                 stream_store: None,
+                connection_lifecycle: None,
                 builder,
                 state: Handshaking::Failed(Some(crate::Error::from_io(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -502,6 +508,7 @@ where
             drop(entered);
             return Handshake {
                 stream_store: None,
+                connection_lifecycle: None,
                 builder,
                 state: Handshaking::Failed(Some(crate::Error::from_io(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -522,6 +529,7 @@ where
                 drop(entered);
                 return Handshake {
                     stream_store: None,
+                    connection_lifecycle: None,
                     builder,
                     state: Handshaking::Failed(Some(crate::Error::from_io(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
@@ -542,6 +550,7 @@ where
                 drop(entered);
                 return Handshake {
                     stream_store: None,
+                    connection_lifecycle: None,
                     builder,
                     state: Handshaking::Failed(Some(crate::Error::from_io(error))),
                     span,
@@ -565,6 +574,7 @@ where
                 drop(entered);
                 return Handshake {
                     stream_store: None,
+                    connection_lifecycle: None,
                     builder,
                     state: Handshaking::Failed(Some(crate::Error::from_io(error))),
                     span,
@@ -582,6 +592,7 @@ where
                 drop(entered);
                 return Handshake {
                     stream_store: None,
+                    connection_lifecycle: None,
                     builder,
                     state: Handshaking::Failed(Some(crate::Error::from_io(error))),
                     span,
@@ -599,6 +610,7 @@ where
                 drop(entered);
                 return Handshake {
                     stream_store: None,
+                    connection_lifecycle: None,
                     builder,
                     state: Handshaking::Failed(Some(crate::Error::from_io(error))),
                     span,
@@ -616,6 +628,7 @@ where
                 drop(entered);
                 return Handshake {
                     stream_store: None,
+                    connection_lifecycle: None,
                     builder,
                     state: Handshaking::Failed(Some(crate::Error::from_io(error))),
                     span,
@@ -633,6 +646,7 @@ where
                 drop(entered);
                 return Handshake {
                     stream_store: None,
+                    connection_lifecycle: None,
                     builder,
                     state: Handshaking::Failed(Some(crate::Error::from_io(error))),
                     span,
@@ -650,6 +664,7 @@ where
                 drop(entered);
                 return Handshake {
                     stream_store: None,
+                    connection_lifecycle: None,
                     builder,
                     state: Handshaking::Failed(Some(crate::Error::from_io(error))),
                     span,
@@ -667,6 +682,7 @@ where
                 drop(entered);
                 return Handshake {
                     stream_store: None,
+                    connection_lifecycle: None,
                     builder,
                     state: Handshaking::Failed(Some(crate::Error::from_io(error))),
                     span,
@@ -685,6 +701,32 @@ where
                 drop(entered);
                 return Handshake {
                     stream_store: None,
+                    connection_lifecycle: None,
+                    builder,
+                    state: Handshaking::Failed(Some(crate::Error::from_io(error))),
+                    span,
+                };
+            }
+        };
+
+        let lifecycle = if builder.connection_lifecycle.is_some()
+            && builder.initial_settings_deadline.is_none()
+        {
+            Err(io::Error::from(io::ErrorKind::InvalidInput))
+        } else {
+            builder
+                .connection_lifecycle
+                .as_ref()
+                .map(crate::ConnectionLifecycle::bind)
+                .transpose()
+        };
+        let connection_lifecycle = match lifecycle {
+            Ok(lifecycle) => lifecycle,
+            Err(error) => {
+                drop(entered);
+                return Handshake {
+                    stream_store: None,
+                    connection_lifecycle: None,
                     builder,
                     state: Handshaking::Failed(Some(crate::Error::from_io(error))),
                     span,
@@ -751,6 +793,7 @@ where
 
         Handshake {
             stream_store,
+            connection_lifecycle,
             builder,
             state,
             span,
@@ -1015,6 +1058,7 @@ impl Builder {
         Builder {
             initial_settings_deadline: None,
             stream_store_buffer: None,
+            connection_lifecycle: None,
             reset_stream_duration: Duration::from_secs(proto::DEFAULT_RESET_STREAM_SECS),
             reset_stream_max: proto::DEFAULT_RESET_STREAM_MAX,
             pending_accept_reset_stream_max: proto::DEFAULT_REMOTE_RESET_STREAM_MAX,
@@ -1037,6 +1081,13 @@ impl Builder {
 
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
         }
+    }
+
+    /// Install an original once-bound physical lifecycle capability.
+    /// Requires the actual finite initial SETTINGS phase before acquisition.
+    pub fn connection_lifecycle(&mut self, lifecycle: crate::ConnectionLifecycle) -> &mut Self {
+        self.connection_lifecycle = Some(lifecycle);
+        self
     }
 
     /// Install original fixed resident storage, independent of peer SETTINGS.
@@ -1955,6 +2006,7 @@ where
                         codec,
                         Config {
                             stream_store: self.stream_store.take(),
+                            connection_lifecycle: self.connection_lifecycle.take(),
                             next_stream_id: 2.into(),
                             // Server does not need to locally initiate any streams
                             initial_max_send_streams: 0,

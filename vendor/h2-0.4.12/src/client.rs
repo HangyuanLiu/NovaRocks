@@ -310,6 +310,7 @@ pub struct PushPromises {
 pub struct Builder {
     initial_settings_deadline: Option<Instant>,
     stream_store_buffer: Option<crate::StreamStoreBuffer>,
+    connection_lifecycle: Option<crate::ConnectionLifecycle>,
     /// Time to keep locally reset streams around before reaping.
     reset_stream_duration: Duration,
 
@@ -684,6 +685,7 @@ impl Builder {
         Builder {
             initial_settings_deadline: None,
             stream_store_buffer: None,
+            connection_lifecycle: None,
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
             retain_data_payloads: false,
             send_frame_buffer: None,
@@ -707,6 +709,13 @@ impl Builder {
             stream_id: 1.into(),
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
         }
+    }
+
+    /// Install an original once-bound physical lifecycle capability.
+    /// Requires the actual finite initial SETTINGS phase before acquisition.
+    pub fn connection_lifecycle(&mut self, lifecycle: crate::ConnectionLifecycle) -> &mut Self {
+        self.connection_lifecycle = Some(lifecycle);
+        self
     }
 
     /// Install original fixed resident storage, independent of peer SETTINGS.
@@ -1712,6 +1721,17 @@ where
             .map(crate::StreamStoreBuffer::bind)
             .transpose()
             .map_err(crate::Error::from_io)?;
+        if builder.connection_lifecycle.is_some() && builder.initial_settings_deadline.is_none() {
+            return Err(crate::Error::from_io(
+                std::io::ErrorKind::InvalidInput.into(),
+            ));
+        }
+        let connection_lifecycle = builder
+            .connection_lifecycle
+            .as_ref()
+            .map(crate::ConnectionLifecycle::bind)
+            .transpose()
+            .map_err(crate::Error::from_io)?;
         bind_connection(&mut io, builder.initial_settings_deadline).await?;
         check_initial_settings_deadline(builder.initial_settings_deadline)?;
 
@@ -1769,6 +1789,7 @@ where
             codec,
             proto::Config {
                 stream_store,
+                connection_lifecycle,
                 next_stream_id: builder.stream_id,
                 initial_max_send_streams: builder.initial_max_send_streams,
                 max_send_buffer_size: builder.max_send_buffer_size,

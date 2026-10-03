@@ -129,6 +129,12 @@ impl<E> Builder<E> {
         }
     }
 
+    /// Install an original once-bound physical connection lifecycle.
+    pub fn connection_lifecycle(&mut self, lifecycle: h2::ConnectionLifecycle) -> &mut Self {
+        self.h2_builder.connection_lifecycle = Some(lifecycle);
+        self
+    }
+
     /// Install originally funded resident stream storage and bounded waiters.
     /// Its persistent local limit is independent of peer SETTINGS.
     pub fn stream_store_buffer(&mut self, buffer: h2::StreamStoreBuffer) -> &mut Self {
