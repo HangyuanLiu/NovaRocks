@@ -37,6 +37,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[path = "prepared_tests.rs"]
+mod prepared_tests;
+
 const CAUSES: [CompileControlError; 3] = [
     CompileControlError::Cancelled,
     CompileControlError::DeadlineExceeded,

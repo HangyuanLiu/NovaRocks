@@ -862,3 +862,63 @@ fn record_every_success_and_ordinary_failure_callback_preserves_original_three_c
         false,
     );
 }
+
+mod namespace_tests {
+    use super::*;
+    use crate::physical_constant_v2::namespace::*;
+    include!("namespace/tests.rs");
+}
+
+#[test]
+fn record_prepared_writer_uses_same_original_control_source_and_admitted_requests() {
+    let mut arrays = nested_arrays();
+    arrays.push(Arc::new(Float32Array::from(vec![
+        Some(f32::from_bits(0x7fc0_1234)),
+        None,
+        Some(-0.0),
+    ])));
+    for array in arrays {
+        let original = pool(array);
+        let identity = original.backing_identity();
+        let control = Control::good(CompilePhase::Encode);
+        let prepared = prepare_constant_record_write(
+            ConstantPoolId::new(u32::MAX),
+            0,
+            u32::MAX,
+            &original,
+            SOURCE,
+            write_limits(),
+            &control,
+        )
+        .unwrap();
+        let facts = *prepared.facts();
+        assert_eq!(facts.source_retained_bytes, SOURCE);
+        assert!(facts.new_allocation_request_bytes_upper_bound > 0);
+        let before_emission = control.trace().len();
+        let record = prepared.emit().unwrap();
+        assert!(control.trace().len() > before_emission);
+        assert!(record.arrow_ipc.capacity() <= facts.encoded_stream_bytes_upper_bound);
+        assert_eq!(original.backing_identity(), identity);
+        let types = types(
+            Arc::clone(original.field_ref()),
+            original.value_type().clone(),
+            0,
+            u32::MAX,
+        );
+        let (id, decoded) = decode(&record, &types);
+        assert_eq!(id, ConstantPoolId::new(u32::MAX));
+        for ordinal in 0..original.array().len() as u32 {
+            assert!(
+                original
+                    .value(ordinal)
+                    .unwrap()
+                    .equals_observed(
+                        &decoded.value(ordinal).unwrap(),
+                        CompilePhase::Decode,
+                        &Control::good(CompilePhase::Decode)
+                    )
+                    .unwrap()
+            );
+        }
+    }
+}

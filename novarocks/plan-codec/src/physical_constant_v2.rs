@@ -20,25 +20,29 @@
 //! These explicit component envelopes are not formal MEM allocation grants.
 
 use crate::{
-    ipc_flat_pool_v2::{FlatPoolWriteLimits, encode_flat_pool},
+    ipc_flat_pool_v2::{
+        FlatPoolWriteFacts, FlatPoolWriteLimits, PreparedFlatPoolWriter, prepare_flat_pool_write,
+    },
     ipc_flat_stream_v2::{
         FlatPoolResourceError, FlatReaderError, FlatReaderProjectionLimits,
         FlatStreamProjectionLimits, preflight_flat_constant_stream,
     },
-    ipc_recursive_pool_v2::{RecursivePoolWriteLimits, encode_recursive_pool},
+    ipc_recursive_pool_v2::{
+        PreparedRecursivePoolWriter, RecursivePoolWriteLimits, prepare_recursive_pool_write,
+    },
     ipc_recursive_stream_v2::{
         RecursiveReaderProjectionLimits, RecursiveStreamProjectionLimits,
         preflight_recursive_constant_stream,
     },
     physical_type_v2::{DecodedTypeTable, TypeCodecError},
 };
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field};
 use novarocks_arrow_ipc_frame::VerifierOptions;
 use novarocks_constant_contract::{ConstantPolicy, ConstantPool};
 use novarocks_physical_plan::ConstantPoolId;
 use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+    CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
 };
 use std::{fmt, sync::Arc};
 
@@ -62,6 +66,7 @@ pub enum PhysicalConstantCodecError {
     Control(CompileControlError),
     Type(TypeCodecError),
     Reader(FlatReaderError),
+    Reference(novarocks_physical_plan::ConstantReferenceError),
 }
 impl fmt::Display for PhysicalConstantCodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -70,6 +75,7 @@ impl fmt::Display for PhysicalConstantCodecError {
             Self::Control(error) => error.fmt(f),
             Self::Type(error) => error.fmt(f),
             Self::Reader(error) => error.fmt(f),
+            Self::Reference(error) => error.fmt(f),
         }
     }
 }
@@ -122,6 +128,49 @@ fn required(
     value.ok_or(PhysicalConstantCodecError::InvalidShape(message))
 }
 
+fn record_sources<'t>(
+    record: &wire::IpcConstantPool,
+    types: &'t DecodedTypeTable,
+    source_retained_bytes: usize,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(&'t FunctionValueType, &'t Arc<Field>), PhysicalConstantCodecError> {
+    work.step()?;
+    if record.compression != wire::IpcCompression::Uncompressed as i32 {
+        return Err(PhysicalConstantCodecError::InvalidShape(
+            "constant record requires uncompressed IPC",
+        ));
+    }
+    let type_id = required(
+        record.value_type_id,
+        "constant record is missing its value type ID",
+        work,
+    )?;
+    let field_id = required(
+        record.field_id,
+        "constant record is missing its Field ID",
+        work,
+    )?;
+    let value_type = types.value_type(type_id);
+    work.step()?;
+    let value_type = value_type.ok_or(PhysicalConstantCodecError::InvalidShape(
+        "constant record references an unknown value type",
+    ))?;
+    let field = types.field(field_id);
+    work.step()?;
+    let field = field.ok_or(PhysicalConstantCodecError::InvalidShape(
+        "constant record references an unknown Field",
+    ))?;
+    let source_covers_ipc = source_retained_bytes >= record.arrow_ipc.capacity();
+    work.step()?;
+    if !source_covers_ipc {
+        return Err(PhysicalConstantCodecError::InvalidShape(
+            "constant record source invoice omits original IPC backing",
+        ));
+    }
+    work.flush()?;
+    Ok((value_type, field))
+}
+
 /// The invoice covers every still-live DTO/input and type-table owner, including
 /// original Field/FVT names, metadata, spare capacity and removed hash buckets.
 /// Never substitute IPC visible length for that trusted source invoice.
@@ -138,40 +187,7 @@ pub fn decode_constant_record(
 ) -> Result<(ConstantPoolId, ConstantPool), PhysicalConstantCodecError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
     let result = (|| {
-        work.step()?;
-        if record.compression != wire::IpcCompression::Uncompressed as i32 {
-            return Err(PhysicalConstantCodecError::InvalidShape(
-                "constant record requires uncompressed IPC",
-            ));
-        }
-        let type_id = required(
-            record.value_type_id,
-            "constant record is missing its value type ID",
-            &mut work,
-        )?;
-        let field_id = required(
-            record.field_id,
-            "constant record is missing its Field ID",
-            &mut work,
-        )?;
-        let value_type = types.value_type(type_id);
-        work.step()?;
-        let value_type = value_type.ok_or(PhysicalConstantCodecError::InvalidShape(
-            "constant record references an unknown value type",
-        ))?;
-        let field = types.field(field_id);
-        work.step()?;
-        let field = field.ok_or(PhysicalConstantCodecError::InvalidShape(
-            "constant record references an unknown Field",
-        ))?;
-        let source_covers_ipc = source_retained_bytes >= record.arrow_ipc.capacity();
-        work.step()?;
-        if !source_covers_ipc {
-            return Err(PhysicalConstantCodecError::InvalidShape(
-                "constant record source invoice omits original IPC backing",
-            ));
-        }
-        work.flush()?;
+        let (value_type, field) = record_sources(record, types, source_retained_bytes, &mut work)?;
         let pool = if recursive(field.data_type()) {
             let stream = preflight_recursive_constant_stream(
                 &record.arrow_ipc,
@@ -226,30 +242,106 @@ pub fn encode_constant_record(
     limits: ConstantWriteProjectionLimits,
     control: &dyn PureCompileControl,
 ) -> Result<wire::IpcConstantPool, PhysicalConstantCodecError> {
+    prepare_constant_record_write(
+        id,
+        value_type_id,
+        field_id,
+        pool,
+        source_retained_bytes,
+        limits,
+        control,
+    )?
+    .emit()
+}
+
+enum PreparedWriter<'pool> {
+    Flat(PreparedFlatPoolWriter<'pool>),
+    Recursive(PreparedRecursivePoolWriter<'pool>),
+}
+/// One original checked pool and its sealed writer model. Table-ID binding
+/// still belongs to the sole whole-package type author, as for record encode.
+pub struct PreparedConstantRecordWrite<'pool, 'control> {
+    id: ConstantPoolId,
+    value_type_id: u32,
+    field_id: u32,
+    writer: PreparedWriter<'pool>,
+    control: &'control dyn PureCompileControl,
+}
+impl PreparedConstantRecordWrite<'_, '_> {
+    /// The common full request/work envelope. Recursive geometry is included
+    /// by its original writer author; it is not re-counted by this wrapper.
+    pub fn facts(&self) -> &FlatPoolWriteFacts {
+        match &self.writer {
+            PreparedWriter::Flat(writer) => writer.facts(),
+            PreparedWriter::Recursive(writer) => &writer.facts().flat,
+        }
+    }
+    pub fn emit(self) -> Result<wire::IpcConstantPool, PhysicalConstantCodecError> {
+        let mut work = CompileCheckpoints::try_new(self.control, CompilePhase::Encode)?;
+        let result = (|| {
+            work.flush()?;
+            let arrow_ipc = match self.writer {
+                PreparedWriter::Flat(writer) => writer.emit(work.control())?,
+                PreparedWriter::Recursive(writer) => writer.emit(work.control())?,
+            };
+            work.step()?;
+            Ok(wire::IpcConstantPool {
+                id: self.id.get(),
+                value_type_id: Some(self.value_type_id),
+                field_id: Some(self.field_id),
+                compression: wire::IpcCompression::Uncompressed as i32,
+                arrow_ipc,
+            })
+        })();
+        finish(work, result)
+    }
+}
+
+/// Admit the exact original writer snapshot once. The caller may accumulate
+/// receiving/output requests before consuming it; no output stream exists yet.
+pub fn prepare_constant_record_write<'pool, 'control>(
+    id: ConstantPoolId,
+    value_type_id: u32,
+    field_id: u32,
+    pool: &'pool ConstantPool,
+    source_retained_bytes: usize,
+    limits: ConstantWriteProjectionLimits,
+    control: &'control dyn PureCompileControl,
+) -> Result<PreparedConstantRecordWrite<'pool, 'control>, PhysicalConstantCodecError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
     let result = (|| {
         work.flush()?;
-        let arrow_ipc = if recursive(pool.field().data_type()) {
-            encode_recursive_pool(
+        let writer = if recursive(pool.field().data_type()) {
+            PreparedWriter::Recursive(prepare_recursive_pool_write(
                 pool,
                 source_retained_bytes,
                 limits.recursive,
                 work.control(),
-            )?
+            )?)
         } else {
-            encode_flat_pool(pool, source_retained_bytes, limits.flat, work.control())?
+            PreparedWriter::Flat(prepare_flat_pool_write(
+                pool,
+                source_retained_bytes,
+                limits.flat,
+                work.control(),
+            )?)
         };
-        work.step()?;
-        Ok(wire::IpcConstantPool {
-            id: id.get(),
-            value_type_id: Some(value_type_id),
-            field_id: Some(field_id),
-            compression: wire::IpcCompression::Uncompressed as i32,
-            arrow_ipc,
+        Ok(PreparedConstantRecordWrite {
+            id,
+            value_type_id,
+            field_id,
+            writer,
+            control,
         })
     })();
     finish(work, result)
 }
+
+mod namespace;
+pub use namespace::{
+    ConstantNamespaceProjectionLimits, ConstantNamespaceResourceFacts, PreparedConstantNamespace,
+    decode_constant_namespace, prepare_constant_namespace,
+};
 
 #[cfg(test)]
 mod tests;

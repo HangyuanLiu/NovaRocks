@@ -233,6 +233,51 @@ fn prepare(
     Ok(Prepared { geometry, facts })
 }
 
+/// Sealed geometry/model preparation bound to the original checked pool.
+/// The preparation scratch and host authorization remain earlier obligations.
+pub(crate) struct PreparedFlatPoolWriter<'p> {
+    pool: &'p ConstantPool,
+    limits: FlatPoolWriteLimits,
+    prepared: Prepared,
+}
+impl PreparedFlatPoolWriter<'_> {
+    pub(crate) fn facts(&self) -> &FlatPoolWriteFacts {
+        &self.prepared.facts
+    }
+    pub(crate) fn emit(self, control: &dyn PureCompileControl) -> Result<Vec<u8>, TypeCodecError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
+        let result = emit_prepared(self.pool, self.prepared, self.limits, &mut work);
+        finish_writer(work, result)
+    }
+}
+fn finish_writer<T>(
+    work: CompileCheckpoints<'_>,
+    result: Result<T, TypeCodecError>,
+) -> Result<T, TypeCodecError> {
+    if matches!(&result, Err(TypeCodecError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+/// Keep the same immutable snapshot through later namespace admission. No
+/// output is allocated here and emission does not repeat numerical preparation.
+pub(crate) fn prepare_flat_pool_write<'p>(
+    pool: &'p ConstantPool,
+    source_retained_bytes: usize,
+    limits: FlatPoolWriteLimits,
+    control: &dyn PureCompileControl,
+) -> Result<PreparedFlatPoolWriter<'p>, TypeCodecError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
+    let prepared = prepare(pool, source_retained_bytes, limits, &mut work);
+    let prepared = finish_writer(work, prepared)?;
+    Ok(PreparedFlatPoolWriter {
+        pool,
+        limits,
+        prepared,
+    })
+}
+
 /// The mandatory trusted invoice includes all retained original pool, Field,
 /// type, buffer and raw HashMap backing, including spare/deleted buckets.
 /// This projection cannot establish that host fact or create a memory wallet.
@@ -317,50 +362,55 @@ pub fn encode_flat_pool(
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
     let result = (|| {
         let prepared = prepare(pool, source_retained_bytes, limits, &mut work)?;
-        work.flush()?;
-        let schema =
-            ipc_schema_v2::encode_single_field_schema(pool.field(), limits.schema, work.control())?;
-        work.flush()?;
-        let mut batch = reserve(prepared.facts.batch_backing_bytes_upper_bound, &mut work)?;
-        initialize_to(
-            &mut batch,
-            prepared.facts.batch_backing_bytes_upper_bound,
-            &mut work,
-        )?;
-        work.flush()?;
-        let mut builder = FlatBufferBuilder::from_vec(batch);
-        work.flush()?;
-        header::emit(pool, &prepared.geometry, &mut builder, &mut work)?;
-        // Witness the complete primary backing, not just the finished message.
-        let backing = builder.mut_finished_buffer().0.len();
-        if backing != prepared.facts.batch_backing_bytes_upper_bound {
-            return Err(shape(
-                "flat pool batch builder grew beyond its admitted backing",
-            ));
-        }
-        let mut output = reserve(prepared.facts.encoded_stream_bytes_upper_bound, &mut work)?;
-        frame(&mut output, &schema, &mut work)?;
-        frame(&mut output, builder.finished_data(), &mut work)?;
-        let body_start = output.len();
-        let body_end = add(body_start, prepared.geometry.body_bytes)?;
-        initialize_to(&mut output, body_end, &mut work)?;
-        body::emit(
-            pool,
-            &prepared.geometry,
-            &mut output[body_start..body_end],
-            &mut work,
-        )?;
-        append(&mut output, &[255, 255, 255, 255, 0, 0, 0, 0], &mut work)?;
-        if output.len() > prepared.facts.encoded_stream_bytes_upper_bound {
-            return Err(shape("flat pool encoded result exceeds admitted capacity"));
-        }
-        Ok(output)
+        emit_prepared(pool, prepared, limits, &mut work)
     })();
-    if matches!(&result, Err(TypeCodecError::Control(_))) {
-        return result;
+    finish_writer(work, result)
+}
+
+fn emit_prepared(
+    pool: &ConstantPool,
+    prepared: Prepared,
+    limits: FlatPoolWriteLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<u8>, TypeCodecError> {
+    work.flush()?;
+    let schema =
+        ipc_schema_v2::encode_single_field_schema(pool.field(), limits.schema, work.control())?;
+    work.flush()?;
+    let mut batch = reserve(prepared.facts.batch_backing_bytes_upper_bound, work)?;
+    initialize_to(
+        &mut batch,
+        prepared.facts.batch_backing_bytes_upper_bound,
+        work,
+    )?;
+    work.flush()?;
+    let mut builder = FlatBufferBuilder::from_vec(batch);
+    work.flush()?;
+    header::emit(pool, &prepared.geometry, &mut builder, work)?;
+    // Witness the complete primary backing, not just the finished message.
+    let backing = builder.mut_finished_buffer().0.len();
+    if backing != prepared.facts.batch_backing_bytes_upper_bound {
+        return Err(shape(
+            "flat pool batch builder grew beyond its admitted backing",
+        ));
     }
-    work.finish()?;
-    result
+    let mut output = reserve(prepared.facts.encoded_stream_bytes_upper_bound, work)?;
+    frame(&mut output, &schema, work)?;
+    frame(&mut output, builder.finished_data(), work)?;
+    let body_start = output.len();
+    let body_end = add(body_start, prepared.geometry.body_bytes)?;
+    initialize_to(&mut output, body_end, work)?;
+    body::emit(
+        pool,
+        &prepared.geometry,
+        &mut output[body_start..body_end],
+        work,
+    )?;
+    append(&mut output, &[255, 255, 255, 255, 0, 0, 0, 0], work)?;
+    if output.len() > prepared.facts.encoded_stream_bytes_upper_bound {
+        return Err(shape("flat pool encoded result exceeds admitted capacity"));
+    }
+    Ok(output)
 }
 
 #[cfg(test)]

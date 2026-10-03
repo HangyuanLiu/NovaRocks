@@ -67,6 +67,53 @@ pub struct RecursiveConstantStream<'a, 'f> {
     checked: CheckedRecursiveBatch<'f>,
 }
 
+struct PreparedRecursiveParts<'v> {
+    field: Arc<Field>,
+    value_type: Cow<'v, FunctionValueType>,
+    policy: ConstantPolicy,
+    facts: RecursiveReaderResourceFacts,
+}
+/// Owns the original checked stream and its already admitted geometry scratch.
+/// No caller can construct a receipt detached from that immutable snapshot.
+pub(crate) struct PreparedRecursiveReader<'a, 'f, 'v> {
+    stream: RecursiveConstantStream<'a, 'f>,
+    parts: PreparedRecursiveParts<'v>,
+}
+impl PreparedRecursiveReader<'_, '_, '_> {
+    pub(crate) fn facts(&self) -> &RecursiveReaderResourceFacts {
+        &self.parts.facts
+    }
+    pub(crate) fn geometry_scratch_request_bytes(&self) -> usize {
+        self.stream.checked.scratch_request_bytes
+    }
+    pub(crate) fn geometry_scratch_request_count(&self) -> usize {
+        self.stream.checked.scratch_request_count
+    }
+    pub(crate) fn materialize(
+        self,
+        control: &dyn PureCompileControl,
+    ) -> Result<ConstantPool, RecursiveReaderError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+        let result = self.stream.materialize_parts(self.parts, &mut work);
+        finish_prepared_reader(work, result)
+    }
+}
+fn finish_prepared_reader<T>(
+    work: CompileCheckpoints<'_>,
+    result: Result<T, RecursiveReaderError>,
+) -> Result<T, RecursiveReaderError> {
+    if matches!(
+        &result,
+        Err(RecursiveReaderError::Projection(
+            FlatPoolResourceError::Control(_)
+        ))
+    ) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+
 pub fn preflight_recursive_constant_stream<'a, 'f>(
     input: &'a [u8],
     expected: &'f Field,
@@ -147,7 +194,7 @@ fn preflight<'a, 'f>(
     })
 }
 
-impl RecursiveConstantStream<'_, '_> {
+impl<'a, 'f> RecursiveConstantStream<'a, 'f> {
     fn reader_input(&self) -> reader_resources::ReaderInput<'_, '_> {
         reader_resources::ReaderInput {
             field: self.field,
@@ -258,58 +305,115 @@ impl RecursiveConstantStream<'_, '_> {
     ) -> Result<ConstantPool, RecursiveReaderError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
         let result = (|| {
-            require(
-                std::ptr::eq(self.field, field.as_ref()),
-                "recursive reader requires the original source Field Arc",
-                &mut work,
-            )
-            .map_err(FlatPoolResourceError::from)?;
-            self.reader_resources(
-                value_type.as_ref(),
+            let parts = self.prepare_parts(
+                field,
+                value_type,
                 source_retained_bytes,
                 policy,
                 limits,
                 &mut work,
             )?;
-            work.flush()?;
-            let schema = Arc::new(Schema::new([Arc::clone(&field)]));
-            work.flush()?;
-            let body = Buffer::from_slice_ref(self.body);
-            work.flush()?;
-            let decoded = read_record_batch(
-                &body,
-                self.batch,
-                schema,
-                &HashMap::new(),
-                None,
-                &self.version,
-            )
-            .map_err(|error| RecursiveReaderError::Arrow(error.to_string()));
-            work.flush()?;
-            let decoded = decoded?;
-            let data = decoded.column(0).to_data();
-            work.flush()?;
-            let pool = ConstantPool::try_new(
-                field,
-                value_type.into_owned(),
-                data,
-                policy,
-                CompilePhase::Decode,
-                work.control(),
-            )
-            .map_err(FlatPoolResourceError::from)?;
-            Ok(pool)
+            self.materialize_parts(parts, &mut work)
         })();
-        if matches!(
-            &result,
-            Err(RecursiveReaderError::Projection(
-                FlatPoolResourceError::Control(_)
-            ))
-        ) {
-            return result;
-        }
-        work.finish()?;
-        result
+        finish_prepared_reader(work, result)
+    }
+
+    /// Freeze the single numerical/model pass while retaining the original
+    /// geometry. A later namespace gate cannot retro-authorize its allocation.
+    pub(crate) fn prepare_pool_borrowed<'v>(
+        self,
+        field: Arc<Field>,
+        value_type: &'v FunctionValueType,
+        source_retained_bytes: usize,
+        policy: ConstantPolicy,
+        limits: RecursiveReaderProjectionLimits,
+        control: &dyn PureCompileControl,
+    ) -> Result<PreparedRecursiveReader<'a, 'f, 'v>, RecursiveReaderError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+        let parts = self.prepare_parts(
+            field,
+            Cow::Borrowed(value_type),
+            source_retained_bytes,
+            policy,
+            limits,
+            &mut work,
+        );
+        let parts = finish_prepared_reader(work, parts)?;
+        Ok(PreparedRecursiveReader {
+            stream: self,
+            parts,
+        })
+    }
+
+    fn prepare_parts<'v>(
+        &self,
+        field: Arc<Field>,
+        value_type: Cow<'v, FunctionValueType>,
+        source_retained_bytes: usize,
+        policy: ConstantPolicy,
+        limits: RecursiveReaderProjectionLimits,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<PreparedRecursiveParts<'v>, RecursiveReaderError> {
+        require(
+            std::ptr::eq(self.field, field.as_ref()),
+            "recursive reader requires the original source Field Arc",
+            work,
+        )
+        .map_err(FlatPoolResourceError::from)?;
+        let facts = self.reader_resources(
+            value_type.as_ref(),
+            source_retained_bytes,
+            policy,
+            limits,
+            work,
+        )?;
+        Ok(PreparedRecursiveParts {
+            field,
+            value_type,
+            policy,
+            facts,
+        })
+    }
+
+    fn materialize_parts(
+        &self,
+        parts: PreparedRecursiveParts<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<ConstantPool, RecursiveReaderError> {
+        let PreparedRecursiveParts {
+            field,
+            value_type,
+            policy,
+            facts: _,
+        } = parts;
+        work.flush()?;
+        let schema = Arc::new(Schema::new([Arc::clone(&field)]));
+        work.flush()?;
+        let body = Buffer::from_slice_ref(self.body);
+        work.flush()?;
+        let decoded = read_record_batch(
+            &body,
+            self.batch,
+            schema,
+            &HashMap::new(),
+            None,
+            &self.version,
+        )
+        .map_err(|error| RecursiveReaderError::Arrow(error.to_string()));
+        work.flush()?;
+        let decoded = decoded?;
+        let data = decoded.column(0).to_data();
+        work.flush()?;
+        let pool = ConstantPool::try_new(
+            field,
+            value_type.into_owned(),
+            data,
+            policy,
+            CompilePhase::Decode,
+            work.control(),
+        )
+        .map_err(FlatPoolResourceError::from)?;
+        Ok(pool)
     }
 }
 

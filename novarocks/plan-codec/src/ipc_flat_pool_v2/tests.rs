@@ -1053,3 +1053,6 @@ fn actual_flat_writer_original_control_and_unsupported_tails_never_publish_parti
         assert_prefixes(&wide, invoice(&wide), limits(), &trace, positions);
     }
 }
+
+#[path = "prepared_tests.rs"]
+mod prepared_tests;

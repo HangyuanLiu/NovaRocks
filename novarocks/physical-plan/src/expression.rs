@@ -15,13 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+use std::fmt;
 
 use arrow_schema::DataType;
 
 use novarocks_type_contract::{
-    AggregateStateFormatId, FunctionArgumentEvaluation, FunctionFailureBehavior, FunctionId,
-    FunctionKind, FunctionOverloadId, FunctionVolatility, SemanticParameterRef,
+    AggregateStateFormatId, CompileCheckpoints, CompileControlError, CompilePhase,
+    FunctionArgumentEvaluation, FunctionFailureBehavior, FunctionId, FunctionKind,
+    FunctionOverloadId, FunctionVolatility, PureCompileControl, SemanticParameterRef,
 };
 
 use crate::{ExprId, FunctionArgumentType, ValueId, ValueType};
@@ -424,7 +426,108 @@ pub struct ExprArena {
     nodes: BTreeMap<ExprId, ExprNode>,
 }
 
+/// Failures of sparse definition ownership, before fragment semantics are checked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExprArenaConstructionError {
+    Control(CompileControlError),
+    TooManyDefinitions,
+    DefinitionCountMismatch { declared: usize, actual: usize },
+    DuplicateDefinition(ExprId),
+}
+impl From<CompileControlError> for ExprArenaConstructionError {
+    fn from(error: CompileControlError) -> Self {
+        Self::Control(error)
+    }
+}
+impl fmt::Display for ExprArenaConstructionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Control(error) => error.fmt(formatter),
+            Self::TooManyDefinitions => {
+                formatter.write_str("expression definition count exceeds its fragment limit")
+            }
+            Self::DefinitionCountMismatch { declared, actual } => {
+                write!(
+                    formatter,
+                    "expression iterator declared {declared} definitions but yielded {actual}"
+                )
+            }
+            Self::DuplicateDefinition(id) => {
+                write!(formatter, "duplicate expression definition {}", id.get())
+            }
+        }
+    }
+}
+impl std::error::Error for ExprArenaConstructionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 impl ExprArena {
+    /// Own already-authored definitions while preserving every sparse ID.
+    /// Zero and MAX are ordinary sparse keys; no next-ID allocator is involved.
+    ///
+    /// This checks definition count and duplicates only. The original fragment
+    /// validators still own types, references, lexical scopes and graph shape.
+    /// The caller must admit iterator production/clones and arena allocations
+    /// before calling; this constructor is not a resource grant or preflight.
+    /// The declared length is checked against actual pulls before inserting an
+    /// excess entry, and short iterators are rejected before publication.
+    pub fn try_from_definitions_observed(
+        mut definitions: impl ExactSizeIterator<Item = ExprNode>,
+        limits: &crate::PlanLimits,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ExprArenaConstructionError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+        let result = (|| {
+            let count = definitions.len();
+            work.step()?;
+            if count > limits.fragment_expressions {
+                return Err(ExprArenaConstructionError::TooManyDefinitions);
+            }
+            let mut nodes = BTreeMap::new();
+            let mut actual_count = 0usize;
+            for definition in &mut definitions {
+                let next_count = actual_count.checked_add(1);
+                // The source iterator has completed its pull. Count it even
+                // when the actual count check is about to reject the source.
+                work.step()?;
+                actual_count = next_count.ok_or(ExprArenaConstructionError::TooManyDefinitions)?;
+                if actual_count > count {
+                    return Err(ExprArenaConstructionError::DefinitionCountMismatch {
+                        declared: count,
+                        actual: actual_count,
+                    });
+                }
+                let id = definition.id;
+                let inserted = match nodes.entry(id) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(definition);
+                        Ok(())
+                    }
+                    Entry::Occupied(_) => Err(ExprArenaConstructionError::DuplicateDefinition(id)),
+                };
+                work.step()?;
+                inserted?;
+            }
+            if actual_count != count {
+                return Err(ExprArenaConstructionError::DefinitionCountMismatch {
+                    declared: count,
+                    actual: actual_count,
+                });
+            }
+            Ok(Self { nodes })
+        })();
+        if matches!(&result, Err(ExprArenaConstructionError::Control(_))) {
+            return result;
+        }
+        work.finish()?;
+        result
+    }
     pub fn get(&self, id: ExprId) -> Option<&ExprNode> {
         self.nodes.get(&id)
     }
@@ -582,3 +685,7 @@ pub fn ordering_keys(
         })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "expression_arena_tests.rs"]
+mod arena_construction_tests;

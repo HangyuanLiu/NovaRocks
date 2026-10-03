@@ -97,7 +97,56 @@ fn cap(actual: usize, limit: usize, message: &'static str) -> Result<(), FlatPoo
     }
 }
 
-impl FlatConstantStream<'_, '_> {
+struct PreparedParts<'v> {
+    field: Arc<Field>,
+    value_type: Cow<'v, FunctionValueType>,
+    policy: ConstantPolicy,
+    facts: FlatReaderResourceFacts,
+}
+
+/// Sealed preparation of the same checked stream. Geometry/source admission
+/// precedes this owner; its facts do not authorize host memory or later work.
+pub(crate) struct PreparedFlatReader<'a, 'f, 'v> {
+    stream: FlatConstantStream<'a, 'f>,
+    parts: PreparedParts<'v>,
+}
+impl PreparedFlatReader<'_, '_, '_> {
+    pub(crate) fn facts(&self) -> &FlatReaderResourceFacts {
+        &self.parts.facts
+    }
+    pub(crate) fn geometry_scratch_request_bytes(&self) -> usize {
+        0
+    }
+    pub(crate) fn geometry_scratch_request_count(&self) -> usize {
+        0
+    }
+
+    pub(crate) fn materialize(
+        self,
+        control: &dyn PureCompileControl,
+    ) -> Result<ConstantPool, FlatReaderError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+        let result = self.stream.materialize_parts(self.parts, &mut work);
+        finish_reader(work, result)
+    }
+}
+fn finish_reader<T>(
+    work: CompileCheckpoints<'_>,
+    result: Result<T, FlatReaderError>,
+) -> Result<T, FlatReaderError> {
+    if matches!(
+        &result,
+        Err(FlatReaderError::Projection(FlatPoolResourceError::Control(
+            _
+        )))
+    ) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+
+impl<'a, 'f> FlatConstantStream<'a, 'f> {
     /// The caller supplies actual retained source backing, including any larger
     /// allocation kept by a slice and retained Field/type owners, including all
     /// HashMap bucket/control backing even after removals. Visible input
@@ -256,57 +305,114 @@ impl FlatConstantStream<'_, '_> {
     ) -> Result<ConstantPool, FlatReaderError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
         let result = (|| {
-            if !std::ptr::eq(self.field(), field.as_ref()) {
-                return Err(shape("flat reader requires the original source Field Arc").into());
-            }
-            work.step()?;
-            let _facts = self.reader_resources(
-                value_type.as_ref(),
+            let parts = self.prepare_parts(
+                field,
+                value_type,
                 source_retained_bytes,
                 policy,
                 limits,
                 &mut work,
             )?;
-            work.flush()?;
-            let schema = Arc::new(Schema::new([Arc::clone(&field)]));
-            work.flush()?;
-            let body = Buffer::from_slice_ref(self.batch_body());
-            work.flush()?;
-            let read = read_record_batch(
-                &body,
-                self.record_batch(),
-                schema,
-                &HashMap::new(),
-                None,
-                &self.metadata_version(),
-            );
-            // Formatting the ordinary Arrow error is part of the already checked
-            // diagnostic envelope. Observe the same original control afterwards.
-            let read = read.map_err(|e| FlatReaderError::Arrow(e.to_string()));
-            work.flush()?;
-            let decoded = read?;
-            let data = decoded.column(0).to_data();
-            work.flush()?;
-            let pool = ConstantPool::try_new(
-                field,
-                value_type.into_owned(),
-                data,
-                policy,
-                CompilePhase::Decode,
-                work.control(),
-            )
-            .map_err(FlatPoolResourceError::from)?;
-            Ok(pool)
+            self.materialize_parts(parts, &mut work)
         })();
-        if matches!(
-            &result,
-            Err(FlatReaderError::Projection(FlatPoolResourceError::Control(
-                _
-            )))
-        ) {
-            return result;
+        finish_reader(work, result)
+    }
+
+    /// Consume the original checked stream without cloning geometry or source.
+    /// Namespace callers may aggregate these facts before consuming this owner.
+    pub(crate) fn prepare_pool_borrowed<'v>(
+        self,
+        field: Arc<Field>,
+        value_type: &'v FunctionValueType,
+        source_retained_bytes: usize,
+        policy: ConstantPolicy,
+        limits: FlatReaderProjectionLimits,
+        control: &dyn PureCompileControl,
+    ) -> Result<PreparedFlatReader<'a, 'f, 'v>, FlatReaderError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+        let parts = self.prepare_parts(
+            field,
+            Cow::Borrowed(value_type),
+            source_retained_bytes,
+            policy,
+            limits,
+            &mut work,
+        );
+        let parts = finish_reader(work, parts)?;
+        Ok(PreparedFlatReader {
+            stream: self,
+            parts,
+        })
+    }
+
+    fn prepare_parts<'v>(
+        &self,
+        field: Arc<Field>,
+        value_type: Cow<'v, FunctionValueType>,
+        source_retained_bytes: usize,
+        policy: ConstantPolicy,
+        limits: FlatReaderProjectionLimits,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<PreparedParts<'v>, FlatReaderError> {
+        if !std::ptr::eq(self.field(), field.as_ref()) {
+            return Err(shape("flat reader requires the original source Field Arc").into());
         }
-        work.finish()?;
-        result
+        work.step()?;
+        let facts = self.reader_resources(
+            value_type.as_ref(),
+            source_retained_bytes,
+            policy,
+            limits,
+            work,
+        )?;
+        Ok(PreparedParts {
+            field,
+            value_type,
+            policy,
+            facts,
+        })
+    }
+
+    fn materialize_parts(
+        &self,
+        parts: PreparedParts<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<ConstantPool, FlatReaderError> {
+        let PreparedParts {
+            field,
+            value_type,
+            policy,
+            facts: _,
+        } = parts;
+        work.flush()?;
+        let schema = Arc::new(Schema::new([Arc::clone(&field)]));
+        work.flush()?;
+        let body = Buffer::from_slice_ref(self.batch_body());
+        work.flush()?;
+        let read = read_record_batch(
+            &body,
+            self.record_batch(),
+            schema,
+            &HashMap::new(),
+            None,
+            &self.metadata_version(),
+        );
+        // Formatting the ordinary Arrow error is part of the already checked
+        // diagnostic envelope. Observe the same original control afterwards.
+        let read = read.map_err(|e| FlatReaderError::Arrow(e.to_string()));
+        work.flush()?;
+        let decoded = read?;
+        let data = decoded.column(0).to_data();
+        work.flush()?;
+        let pool = ConstantPool::try_new(
+            field,
+            value_type.into_owned(),
+            data,
+            policy,
+            CompilePhase::Decode,
+            work.control(),
+        )
+        .map_err(FlatPoolResourceError::from)?;
+        Ok(pool)
     }
 }

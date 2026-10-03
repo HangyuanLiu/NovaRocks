@@ -42,6 +42,7 @@ mod reader;
 pub(crate) mod reader_allocations;
 pub(crate) mod reader_diagnostics;
 mod reader_work;
+pub(crate) use reader::PreparedFlatReader;
 pub use reader::{FlatReaderError, FlatReaderProjectionLimits, FlatReaderResourceFacts};
 
 /// All limits originate with the admitted caller, not the stream or defaults.

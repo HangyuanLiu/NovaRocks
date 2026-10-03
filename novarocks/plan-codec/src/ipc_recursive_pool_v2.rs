@@ -58,6 +58,36 @@ struct Prepared {
     geometry: geometry::Geometry,
     facts: RecursivePoolWriteFacts,
 }
+
+/// One immutable checked pool paired with the admitted geometry and limits.
+/// Consumption emits that snapshot without repeating resource preparation.
+pub(crate) struct PreparedRecursivePoolWriter<'pool> {
+    pool: &'pool ConstantPool,
+    limits: RecursivePoolWriteLimits,
+    prepared: Prepared,
+}
+impl PreparedRecursivePoolWriter<'_> {
+    pub(crate) const fn facts(&self) -> &RecursivePoolWriteFacts {
+        &self.prepared.facts
+    }
+
+    pub(crate) fn emit(self, control: &dyn PureCompileControl) -> Result<Vec<u8>, TypeCodecError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
+        let result = emit_prepared(self.pool, &self.prepared, self.limits, &mut work);
+        finish(work, result)
+    }
+}
+
+fn finish<T>(
+    work: CompileCheckpoints<'_>,
+    result: Result<T, TypeCodecError>,
+) -> Result<T, TypeCodecError> {
+    if matches!(&result, Err(TypeCodecError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
 fn shape(message: &'static str) -> TypeCodecError {
     TypeCodecError::InvalidShape(message)
 }
@@ -198,11 +228,24 @@ pub fn preflight_recursive_pool_write(
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
     let result =
         prepare(pool, source_retained_bytes, limits, &mut work).map(|prepared| prepared.facts);
-    if matches!(&result, Err(TypeCodecError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    finish(work, result)
+}
+
+pub(crate) fn prepare_recursive_pool_write<'pool>(
+    pool: &'pool ConstantPool,
+    source_retained_bytes: usize,
+    limits: RecursivePoolWriteLimits,
+    control: &dyn PureCompileControl,
+) -> Result<PreparedRecursivePoolWriter<'pool>, TypeCodecError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
+    let result = prepare(pool, source_retained_bytes, limits, &mut work).map(|prepared| {
+        PreparedRecursivePoolWriter {
+            pool,
+            limits,
+            prepared,
+        }
+    });
+    finish(work, result)
 }
 
 /// Preserves the complete original pool and ordinals. Only the final original
@@ -214,63 +257,61 @@ pub fn encode_recursive_pool(
     control: &dyn PureCompileControl,
 ) -> Result<Vec<u8>, TypeCodecError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
-    let result = (|| {
-        let prepared = prepare(pool, source_retained_bytes, limits, &mut work)?;
-        work.flush()?;
-        let schema = ipc_schema_v2::encode_single_field_schema(
-            pool.field(),
-            limits.flat.schema,
-            work.control(),
-        )?;
-        work.flush()?;
-        let mut batch = ipc_flat_pool_v2::reserve(
-            prepared.facts.flat.batch_backing_bytes_upper_bound,
-            &mut work,
-        )?;
-        ipc_flat_pool_v2::initialize_to(
-            &mut batch,
-            prepared.facts.flat.batch_backing_bytes_upper_bound,
-            &mut work,
-        )?;
-        work.flush()?;
-        let mut builder = FlatBufferBuilder::from_vec(batch);
-        work.flush()?;
-        header::emit(pool.data(), &prepared.geometry, &mut builder, &mut work)?;
-        if builder.mut_finished_buffer().0.len()
-            != prepared.facts.flat.batch_backing_bytes_upper_bound
-        {
-            return Err(shape(
-                "recursive batch builder grew beyond admitted backing",
-            ));
-        }
-        let mut output = ipc_flat_pool_v2::reserve(
-            prepared.facts.flat.encoded_stream_bytes_upper_bound,
-            &mut work,
-        )?;
-        ipc_flat_pool_v2::frame(&mut output, &schema, &mut work)?;
-        ipc_flat_pool_v2::frame(&mut output, builder.finished_data(), &mut work)?;
-        let body_start = output.len();
-        let body_end = add(body_start, prepared.geometry.body_bytes)?;
-        ipc_flat_pool_v2::initialize_to(&mut output, body_end, &mut work)?;
-        body::emit(
-            pool.data(),
-            &prepared.geometry,
-            &mut output[body_start..body_end],
-            &mut work,
-        )?;
-        ipc_flat_pool_v2::append(&mut output, &[255, 255, 255, 255, 0, 0, 0, 0], &mut work)?;
-        if output.len() > prepared.facts.flat.encoded_stream_bytes_upper_bound {
-            return Err(shape(
-                "recursive writer result exceeds admitted stream capacity",
-            ));
-        }
-        Ok(output)
-    })();
-    if matches!(&result, Err(TypeCodecError::Control(_))) {
-        return result;
+    let result = prepare(pool, source_retained_bytes, limits, &mut work)
+        .and_then(|prepared| emit_prepared(pool, &prepared, limits, &mut work));
+    finish(work, result)
+}
+
+fn emit_prepared(
+    pool: &ConstantPool,
+    prepared: &Prepared,
+    limits: RecursivePoolWriteLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<u8>, TypeCodecError> {
+    work.flush()?;
+    let schema = ipc_schema_v2::encode_single_field_schema(
+        pool.field(),
+        limits.flat.schema,
+        work.control(),
+    )?;
+    work.flush()?;
+    let mut batch =
+        ipc_flat_pool_v2::reserve(prepared.facts.flat.batch_backing_bytes_upper_bound, work)?;
+    ipc_flat_pool_v2::initialize_to(
+        &mut batch,
+        prepared.facts.flat.batch_backing_bytes_upper_bound,
+        work,
+    )?;
+    work.flush()?;
+    let mut builder = FlatBufferBuilder::from_vec(batch);
+    work.flush()?;
+    header::emit(pool.data(), &prepared.geometry, &mut builder, work)?;
+    if builder.mut_finished_buffer().0.len() != prepared.facts.flat.batch_backing_bytes_upper_bound
+    {
+        return Err(shape(
+            "recursive batch builder grew beyond admitted backing",
+        ));
     }
-    work.finish()?;
-    result
+    let mut output =
+        ipc_flat_pool_v2::reserve(prepared.facts.flat.encoded_stream_bytes_upper_bound, work)?;
+    ipc_flat_pool_v2::frame(&mut output, &schema, work)?;
+    ipc_flat_pool_v2::frame(&mut output, builder.finished_data(), work)?;
+    let body_start = output.len();
+    let body_end = add(body_start, prepared.geometry.body_bytes)?;
+    ipc_flat_pool_v2::initialize_to(&mut output, body_end, work)?;
+    body::emit(
+        pool.data(),
+        &prepared.geometry,
+        &mut output[body_start..body_end],
+        work,
+    )?;
+    ipc_flat_pool_v2::append(&mut output, &[255, 255, 255, 255, 0, 0, 0, 0], work)?;
+    if output.len() > prepared.facts.flat.encoded_stream_bytes_upper_bound {
+        return Err(shape(
+            "recursive writer result exceeds admitted stream capacity",
+        ));
+    }
+    Ok(output)
 }
 
 #[cfg(test)]

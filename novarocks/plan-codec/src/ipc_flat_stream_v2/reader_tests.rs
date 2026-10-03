@@ -963,3 +963,6 @@ fn actual_reader_deleted_metadata_keeps_original_backing_invoice_work_authority(
 mod borrowed_tests {
     include!("reader_tests/borrowed_tests.rs");
 }
+
+#[path = "prepared_tests.rs"]
+mod prepared_tests;
