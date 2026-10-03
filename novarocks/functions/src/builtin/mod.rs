@@ -69,6 +69,8 @@ mod string_left_right;
 mod string_left_right_owner;
 mod string_measure;
 mod string_measure_owner;
+mod string_repeat;
+mod string_repeat_owner;
 mod string_reverse;
 mod string_reverse_owner;
 mod string_substring;
