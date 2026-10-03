@@ -26,8 +26,16 @@ macro_rules! stable_identity {
         pub struct $name(Box<str>);
 
         impl $name {
+            /// Validate a borrowed identity with the constructor's exact grammar.
+            /// This performs no allocation and does not retain the input.
+            pub fn validate_str(value: &str) -> Result<(), FunctionIdentityError> {
+                validate_identity($kind, value)
+            }
+
             pub fn try_new(value: impl AsRef<str>) -> Result<Self, FunctionIdentityError> {
-                validate_identity($kind, value.as_ref()).map(|()| Self(value.as_ref().into()))
+                let value = value.as_ref();
+                Self::validate_str(value)?;
+                Ok(Self(value.into()))
             }
 
             pub fn as_str(&self) -> &str {
@@ -47,8 +55,9 @@ stable_identity!(FunctionOverloadId, "function overload");
 pub struct AggregateStateFormatId(Box<str>);
 
 impl AggregateStateFormatId {
-    pub fn try_new(value: impl AsRef<str>) -> Result<Self, FunctionIdentityError> {
-        let value = value.as_ref();
+    /// Validate a borrowed state identity with the constructor's exact grammar.
+    /// This performs no allocation and does not retain the input.
+    pub fn validate_str(value: &str) -> Result<(), FunctionIdentityError> {
         validate_identity("aggregate state format", value)?;
         if !value
             .bytes()
@@ -58,6 +67,12 @@ impl AggregateStateFormatId {
                 kind: "aggregate state format",
             });
         }
+        Ok(())
+    }
+
+    pub fn try_new(value: impl AsRef<str>) -> Result<Self, FunctionIdentityError> {
+        let value = value.as_ref();
+        Self::validate_str(value)?;
         Ok(Self(value.into()))
     }
 
@@ -611,3 +626,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "function/identity_tests.rs"]
+mod identity_tests;

@@ -28,6 +28,8 @@ use novarocks_type_contract::{
 use std::fmt;
 
 mod encode;
+mod read;
+pub use read::{PreparedFunctionBindingHeaders, prepare_function_binding_headers};
 
 #[derive(Debug)]
 pub enum BindingCodecError {
