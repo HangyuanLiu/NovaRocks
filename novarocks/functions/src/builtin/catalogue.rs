@@ -2411,6 +2411,12 @@ pub(super) fn scalar_definition_parts(
                     name if super::string_split_part_owner::operation(name).is_some() => {
                         Some(super::string_split_part_owner::effects())
                     }
+                    name if super::calendar_day_number_owner::operation(name).is_some() => {
+                        Some(super::calendar_day_number_owner::effects())
+                    }
+                    name if super::calendar_diff_owner::operation(name).is_some() => {
+                        Some(super::calendar_diff_owner::effects())
+                    }
                     name if super::calendar_parts_owner::operation(name).is_some() => {
                         Some(super::calendar_parts_owner::effects())
                     }
@@ -2618,6 +2624,12 @@ pub fn contribute_builtin_functions(
             }
             name if super::string_split_part_owner::operation(name).is_some() => {
                 super::string_split_part_owner::definition(name, declaration, resolver)?
+            }
+            name if super::calendar_day_number_owner::operation(name).is_some() => {
+                super::calendar_day_number_owner::definition(name, declaration, resolver)?
+            }
+            name if super::calendar_diff_owner::operation(name).is_some() => {
+                super::calendar_diff_owner::definition(name, declaration, resolver)?
             }
             name if super::calendar_parts_owner::operation(name).is_some() => {
                 super::calendar_parts_owner::definition(name, declaration, resolver)?

@@ -26,12 +26,11 @@ use novarocks_types::largeint;
 
 use novarocks_functions::calendar_numeric::numeric_datetime_literal_to_naive;
 
+pub use novarocks_functions::calendar_julian::{BC_EPOCH_JULIAN, julian_from_date};
 pub use novarocks_functions::datetime_value::{
     UNIX_EPOCH_DAY_OFFSET, date32_to_naive, naive_to_timestamp_micros, parse_date, parse_datetime,
     timestamp_to_naive,
 };
-
-pub const BC_EPOCH_JULIAN: i32 = 1721060; // from StarRocks time_types.h
 
 pub fn naive_to_date32(date: NaiveDate) -> i32 {
     date.num_days_from_ce() - UNIX_EPOCH_DAY_OFFSET
@@ -386,17 +385,6 @@ pub fn time_from_local_now() -> NaiveTime {
 
 pub fn time_from_utc_now() -> NaiveTime {
     chrono::Utc::now().naive_utc().time()
-}
-
-pub fn julian_from_date(date: NaiveDate) -> i32 {
-    // Julian day number for proleptic Gregorian calendar
-    let y = date.year();
-    let m = date.month() as i32;
-    let d = date.day() as i32;
-    let a = (14 - m) / 12;
-    let y = y + 4800 - a;
-    let m = m + 12 * a - 3;
-    d + ((153 * m + 2) / 5) + 365 * y + y / 4 - y / 100 + y / 400 - 32045
 }
 
 pub fn date_from_julian(julian: i32) -> Option<NaiveDate> {

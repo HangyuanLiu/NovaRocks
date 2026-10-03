@@ -37,6 +37,7 @@ pub mod aggregate_types;
 mod arithmetic;
 mod binding;
 pub mod builtin;
+pub mod calendar_julian;
 pub mod calendar_numeric;
 mod call_contract;
 #[cfg(test)]
