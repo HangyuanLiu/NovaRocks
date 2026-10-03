@@ -490,6 +490,48 @@ impl Handle {
         handle
     }
 
+    /// Spawn using the original task allocation capability.
+    #[cfg(all(
+        feature = "io-util",
+        not(any(
+            loom,
+            all(tokio_unstable, feature = "tracing"),
+            all(
+                tokio_unstable,
+                feature = "taskdump",
+                feature = "rt",
+                target_os = "linux",
+                any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+            )
+        ))
+    ))]
+    #[track_caller]
+    pub(crate) fn spawn_with_task_owner<F>(
+        me: &Arc<Self>,
+        future: F,
+        id: crate::runtime::task::Id,
+        spawned_at: SpawnLocation,
+        owner: bytes::Bytes,
+    ) -> JoinHandle<F::Output>
+    where
+        F: crate::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let (handle, notified) =
+            me.shared
+                .owned
+                .bind_with_owner(future, me.clone(), id, spawned_at, owner);
+        me.task_hooks.spawn(&TaskMeta {
+            id,
+            spawned_at,
+            _phantom: Default::default(),
+        });
+        if let Some(notified) = notified {
+            me.schedule(notified);
+        }
+        handle
+    }
+
     /// Spawn a task which isn't safe to send across thread boundaries onto the runtime.
     ///
     /// # Safety

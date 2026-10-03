@@ -17,8 +17,8 @@
 
 //! Startup-prepaid original HTTP/2 backing stock for a BE process.
 //!
-//! These explicit workspace caps do not advertise V1 support. Socket registration/TLS internals,
-//! stream/task/queue scaffolds, the caller's enclosing factory closure, and
+//! These explicit workspace caps do not advertise V1 support. TLS internals,
+//! other stream/task/queue scaffolds, the caller's enclosing factory closure, and
 //! independent request/body/message owners still require composition proofs.
 //! A slot is returned by the final carrier's physical exit, never by a deadline,
 //! connection completion, configuration replacement, or logical cancellation.
@@ -67,6 +67,7 @@ struct Dimensions {
     map_keys: usize,
     map_extras: usize,
     table_bytes: usize,
+    server_task_bound: usize,
     connection_bound: usize,
     stock_bound: usize,
 }
@@ -380,6 +381,7 @@ impl Dimensions {
             map_extras: 16,
             // Required pre-ACK incoming HPACK capacity even when advertising 0.
             table_bytes: 4096,
+            server_task_bound: 0,
             connection_bound: 0,
             stock_bound: 0,
         };
@@ -471,6 +473,11 @@ impl Dimensions {
         // deallocation at the reactor's safe retirement point.
         let registration = tokio::net::TcpStream::registration_allocation_capacity_bound()?;
         bound = add(bound, registration)?;
+        // This is the actual production constructor's return type, including
+        // Tokio's existing large-future Box branch and complete TaskCell Layout.
+        dimensions.server_task_bound =
+            crate::native_server::native_server_task_allocation_capacity_bound()?;
+        bound = add(bound, dimensions.server_task_bound)?;
         let stream_extra = add(
             add(
                 value(g.transport_stream_bookkeeping_bytes)?,
@@ -605,6 +612,13 @@ impl NativeTransportCapacityFactory {
                 class,
             },
         ))
+    }
+
+    pub(crate) fn validate_server_task_capacity(&self, actual_bound: usize) -> io::Result<()> {
+        if actual_bound > self.core().dimensions.server_task_bound {
+            return Err(invalid());
+        }
+        Ok(())
     }
 
     pub(crate) fn claim_channel_cache(&self) -> io::Result<()> {
@@ -1074,8 +1088,12 @@ mod tests {
     fn checked_stock_receipt_fits_frozen_process_and_connection_envelopes() {
         let d = Dimensions::frozen().unwrap();
         eprintln!(
-            "Checked original stock: connection_pool_bytes={} process_stock_bytes={} data_positions={} control_positions={}",
-            d.connection_bound, d.stock_bound, d.data_positions, d.control_positions
+            "Checked original stock: connection_pool_bytes={} process_stock_bytes={} data_positions={} control_positions={} server_task_backings_bytes={}",
+            d.connection_bound,
+            d.stock_bound,
+            d.data_positions,
+            d.control_positions,
+            d.server_task_bound
         );
         assert_eq!((d.data_positions, d.control_positions), (518, 20));
         assert_eq!(

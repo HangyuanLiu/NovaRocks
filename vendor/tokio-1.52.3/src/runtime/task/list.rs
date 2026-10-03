@@ -103,6 +103,39 @@ impl<S: 'static> OwnedTasks<S> {
         (join, notified)
     }
 
+    #[cfg(all(
+        feature = "io-util",
+        not(any(
+            loom,
+            all(tokio_unstable, feature = "tracing"),
+            all(
+                tokio_unstable,
+                feature = "taskdump",
+                feature = "rt",
+                target_os = "linux",
+                any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+            )
+        ))
+    ))]
+    pub(crate) fn bind_with_owner<T>(
+        &self,
+        task: T,
+        scheduler: S,
+        id: super::Id,
+        spawned_at: SpawnLocation,
+        owner: bytes::Bytes,
+    ) -> (JoinHandle<T::Output>, Option<Notified<S>>)
+    where
+        S: Schedule,
+        T: Future + Send + 'static,
+        T::Output: Send + 'static,
+    {
+        let (task, notified, join) =
+            super::new_task_with_owner(task, scheduler, id, spawned_at, owner);
+        let notified = unsafe { self.bind_inner(task, notified) };
+        (join, notified)
+    }
+
     /// Bind a task that isn't safe to transfer across thread boundaries.
     ///
     /// # Safety

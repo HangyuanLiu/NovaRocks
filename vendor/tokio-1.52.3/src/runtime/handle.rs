@@ -207,6 +207,139 @@ impl Handle {
         }
     }
 
+    /// Complete requested backing bound for one originally owned task Cell
+    /// and the ordinary spawn policy's optional automatic Future Box.
+    ///
+    /// The bound takes the maximum actual Cell Layout of the supported
+    /// current-thread and multi-thread schedulers, including Future/Output
+    /// stage, task metadata and the original capability field. Obtain this
+    /// capacity before calling [`Handle::spawn_with_task_owner`]. The Bytes
+    /// owner wrapper, future/output external heap, shared scheduler queues,
+    /// hooks, runtime, Wakers and instrumentation are separate.
+    ///
+    /// Loom, enabled taskdump and unstable tracing instrumentation are refused
+    /// because their additional backing is outside this allocation receipt.
+    #[cfg(feature = "io-util")]
+    pub fn task_allocation_capacity_bound<F>() -> std::io::Result<usize>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        #[cfg(any(
+            loom,
+            all(tokio_unstable, feature = "tracing"),
+            all(
+                tokio_unstable,
+                feature = "taskdump",
+                feature = "rt",
+                target_os = "linux",
+                any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+            )
+        ))]
+        {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+        #[cfg(not(any(
+            loom,
+            all(tokio_unstable, feature = "tracing"),
+            all(
+                tokio_unstable,
+                feature = "taskdump",
+                feature = "rt",
+                target_os = "linux",
+                any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+            )
+        )))]
+        {
+            let future = mem::size_of::<F>();
+            if future > BOX_FUTURE_THRESHOLD {
+                scheduler::Handle::task_cell_allocation_capacity::<std::pin::Pin<Box<F>>>()
+                    .checked_add(std::alloc::Layout::new::<F>().size())
+                    .ok_or_else(|| std::io::ErrorKind::InvalidInput.into())
+            } else {
+                Ok(scheduler::Handle::task_cell_allocation_capacity::<F>())
+            }
+        }
+    }
+
+    /// Spawn using a previously obtained original task allocation capability.
+    ///
+    /// This follows the ordinary spawn policy for automatic Future boxing and
+    /// closed runtimes. A completed future or dropped JoinHandle does not
+    /// release the capability: it remains in the Cell through the last actual
+    /// task/Waker/AbortHandle alias and exits only after Cell deallocation.
+    /// The caller must pregrant [`Handle::task_allocation_capacity_bound`] and
+    /// separately cover the owner wrapper and external/shared backing. Bytes
+    /// alone does not prove funding; this method creates no capacity authority.
+    /// Unsupported model/instrumentation configurations are rejected before
+    /// Future Box or Cell allocation. The supplied future is dropped first.
+    #[cfg(feature = "io-util")]
+    #[track_caller]
+    pub fn spawn_with_task_owner<F>(
+        &self,
+        future: F,
+        owner: bytes::Bytes,
+    ) -> std::io::Result<JoinHandle<F::Output>>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        // Keep this same original capability outside the construction chain.
+        // Cell::new may unwind after Box allocation and before RawTask exists,
+        // and spawn hooks may unwind after publication. Declaration order
+        // also destroys an unsubmitted future before the capability on refusal.
+        let original = owner;
+        let future = future;
+        #[cfg(any(
+            loom,
+            all(tokio_unstable, feature = "tracing"),
+            all(
+                tokio_unstable,
+                feature = "taskdump",
+                feature = "rt",
+                target_os = "linux",
+                any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+            )
+        ))]
+        {
+            // Unsupported builds must not type-check uninstrumented Future
+            // calls against Tokio's InstrumentedFuture scheduler interface.
+            drop(future);
+            drop(original);
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+        #[cfg(not(any(
+            loom,
+            all(tokio_unstable, feature = "tracing"),
+            all(
+                tokio_unstable,
+                feature = "taskdump",
+                feature = "rt",
+                target_os = "linux",
+                any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+            )
+        )))]
+        {
+            Self::task_allocation_capacity_bound::<F>()?;
+            let future_size = mem::size_of::<F>();
+            let meta = SpawnMeta::new_unnamed(future_size);
+            let id = crate::runtime::task::Id::next();
+            let join = if future_size > BOX_FUTURE_THRESHOLD {
+                self.inner.spawn_with_task_owner(
+                    Box::pin(future),
+                    id,
+                    meta.spawned_at,
+                    original.clone(),
+                )
+            } else {
+                self.inner
+                    .spawn_with_task_owner(future, id, meta.spawned_at, original.clone())
+            };
+            drop(original);
+            Ok(join)
+        }
+    }
+
     /// Runs the provided function on an executor dedicated to blocking
     /// operations.
     ///

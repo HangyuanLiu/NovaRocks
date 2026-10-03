@@ -206,6 +206,10 @@ pub(super) struct Trailer {
     /// Optional hooks needed in the harness.
     #[cfg_attr(not(tokio_unstable), allow(dead_code))] //TODO: remove when hooks are stabilized
     pub(super) hooks: TaskHarnessScheduleHooks,
+    /// Original capability retained past future completion and all task aliases.
+    /// Only the zero-reference deallocator may take it after publication.
+    #[cfg(feature = "io-util")]
+    pub(super) task_owner: Option<bytes::Bytes>,
 }
 
 generate_addr_of_methods! {
@@ -233,6 +237,7 @@ impl<T: Future, S: Schedule> Cell<T, S> {
         state: State,
         task_id: Id,
         #[cfg(tokio_unstable)] spawned_at: &'static Location<'static>,
+        #[cfg(feature = "io-util")] task_owner: Option<bytes::Bytes>,
     ) -> Box<Cell<T, S>> {
         // Separated into a non-generic function to reduce LLVM codegen
         fn new_header(
@@ -254,7 +259,11 @@ impl<T: Future, S: Schedule> Cell<T, S> {
         let tracing_id = future.id();
         let vtable = raw::vtable::<T, S>();
         let result = Box::new(Cell {
-            trailer: Trailer::new(scheduler.hooks()),
+            trailer: Trailer::new(
+                scheduler.hooks(),
+                #[cfg(feature = "io-util")]
+                task_owner,
+            ),
             header: new_header(
                 state,
                 vtable,
@@ -537,11 +546,16 @@ impl Header {
 }
 
 impl Trailer {
-    fn new(hooks: TaskHarnessScheduleHooks) -> Self {
+    fn new(
+        hooks: TaskHarnessScheduleHooks,
+        #[cfg(feature = "io-util")] task_owner: Option<bytes::Bytes>,
+    ) -> Self {
         Trailer {
             waker: UnsafeCell::new(None),
             owned: linked_list::Pointers::new(),
             hooks,
+            #[cfg(feature = "io-util")]
+            task_owner,
         }
     }
 

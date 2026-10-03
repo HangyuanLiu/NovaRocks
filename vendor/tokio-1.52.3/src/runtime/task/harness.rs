@@ -270,6 +270,18 @@ where
         // As explained in the documentation for `UnsafeCell`, such references
         // are allowed to be dangling after their last use, even if the
         // reference has not yet gone out of scope.
+        #[cfg(feature = "io-util")]
+        unsafe {
+            let mut cell = Box::from_raw(self.cell.as_ptr());
+            // The zero-reference transition grants unique ownership of the
+            // entire Cell. Do not leave the capability in a field: field Drop
+            // precedes Box deallocation. The local also covers destructor
+            // unwind, after Box's allocation cleanup has completed.
+            let original = cell.trailer.task_owner.take();
+            drop(cell);
+            drop(original);
+        }
+        #[cfg(not(feature = "io-util"))]
         unsafe {
             drop(Box::from_raw(self.cell.as_ptr()));
         }

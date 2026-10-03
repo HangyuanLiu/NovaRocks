@@ -218,6 +218,55 @@ impl RawTask {
         T: Future,
         S: Schedule,
     {
+        Self::new_inner(
+            task,
+            scheduler,
+            id,
+            _spawned_at,
+            #[cfg(feature = "io-util")]
+            None,
+        )
+    }
+
+    #[cfg(all(
+        feature = "io-util",
+        not(any(
+            loom,
+            all(tokio_unstable, feature = "tracing"),
+            all(
+                tokio_unstable,
+                feature = "taskdump",
+                feature = "rt",
+                target_os = "linux",
+                any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+            )
+        ))
+    ))]
+    pub(super) fn new_with_owner<T, S>(
+        task: T,
+        scheduler: S,
+        id: Id,
+        spawned_at: super::SpawnLocation,
+        owner: bytes::Bytes,
+    ) -> RawTask
+    where
+        T: Future,
+        S: Schedule,
+    {
+        Self::new_inner(task, scheduler, id, spawned_at, Some(owner))
+    }
+
+    fn new_inner<T, S>(
+        task: T,
+        scheduler: S,
+        id: Id,
+        _spawned_at: super::SpawnLocation,
+        #[cfg(feature = "io-util")] owner: Option<bytes::Bytes>,
+    ) -> RawTask
+    where
+        T: Future,
+        S: Schedule,
+    {
         let ptr = Box::into_raw(Cell::<_, S>::new(
             task,
             scheduler,
@@ -225,6 +274,8 @@ impl RawTask {
             id,
             #[cfg(tokio_unstable)]
             _spawned_at.0,
+            #[cfg(feature = "io-util")]
+            owner,
         ));
         let ptr = unsafe { NonNull::new_unchecked(ptr.cast()) };
 

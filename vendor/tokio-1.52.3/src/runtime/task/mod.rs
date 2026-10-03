@@ -337,6 +337,42 @@ cfg_rt! {
             id,
             spawned_at,
         );
+        task_handles::<T, S>(raw)
+    }
+
+    #[cfg(all(feature = "io-util", not(any(
+    loom,
+    all(tokio_unstable, feature = "tracing"),
+    all(
+        tokio_unstable,
+        feature = "taskdump",
+        feature = "rt",
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+    )
+))))]
+    fn new_task_with_owner<T, S>(
+        task: T,
+        scheduler: S,
+        id: Id,
+        spawned_at: SpawnLocation,
+        owner: bytes::Bytes,
+    ) -> (Task<S>, Notified<S>, JoinHandle<T::Output>)
+    where
+        S: Schedule,
+        T: Future + 'static,
+        T::Output: 'static,
+    {
+        let raw = RawTask::new_with_owner::<T, S>(task, scheduler, id, spawned_at, owner);
+        task_handles::<T, S>(raw)
+    }
+
+    fn task_handles<T, S>(raw: RawTask) -> (Task<S>, Notified<S>, JoinHandle<T::Output>)
+    where
+        S: Schedule,
+        T: Future + 'static,
+        T::Output: 'static,
+    {
         let task = Task {
             raw,
             _p: PhantomData,
@@ -348,6 +384,25 @@ cfg_rt! {
         let join = JoinHandle::new(raw);
 
         (task, notified, join)
+    }
+
+    #[cfg(all(feature = "io-util", not(any(
+    loom,
+    all(tokio_unstable, feature = "tracing"),
+    all(
+        tokio_unstable,
+        feature = "taskdump",
+        feature = "rt",
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+    )
+))))]
+    pub(crate) fn cell_allocation_capacity<T, S>() -> usize
+    where
+        T: Future,
+        S: Schedule,
+    {
+        std::alloc::Layout::new::<Cell<T, S>>().size()
     }
 
     /// Creates a new task with an associated join handle. This method is used

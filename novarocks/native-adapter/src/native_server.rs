@@ -343,7 +343,7 @@ impl NativeRpcServerHandle {
                                 .route_service(&control_path, AxumGrpcService::new(control_service))
                                 .route_service(&grpc_path, AxumGrpcService::new(ordinary_service))
                                 .fallback(grpc_unimplemented_fallback),
-                            |response: axum::http::Response<axum::body::Body>| response.map(boxed),
+                            box_native_response as NativeResponseMapper,
                         );
                         let app = NativeIngressService::new(
                             app,
@@ -352,7 +352,7 @@ impl NativeRpcServerHandle {
                             domain != NativeEndpointDomain::FrontendMembership,
                             domain,
                         );
-                        let app = NativeListenerAuthService::new(
+                        let app: NativeServerApp = NativeListenerAuthService::new(
                             app,
                             native_trust.server_admission(),
                             authentication_failure,
@@ -447,6 +447,241 @@ enum AcquiredConnection<C> {
     Finished(Result<(), hyper::Error>, bool),
 }
 
+type NativeResponseMapper =
+    fn(axum::http::Response<axum::body::Body>) -> axum::http::Response<tonic::body::BoxBody>;
+type NativeServerApp = NativeListenerAuthService<
+    NativeIngressService<tower::util::MapResponse<Router, NativeResponseMapper>>,
+>;
+
+fn box_native_response(
+    response: axum::http::Response<axum::body::Body>,
+) -> axum::http::Response<tonic::body::BoxBody> {
+    response.map(boxed)
+}
+
+struct NativeConnectionTaskInputs<S> {
+    stream: tokio::net::TcpStream,
+    app: S,
+    incoming: NativeIncomingAdapter,
+    builder: http2::Builder<TokioExecutor>,
+    capacity: Option<tonic::transport::Http2ConnectionConfig>,
+    initial_settings_deadline: Option<std::time::Instant>,
+    acquisition_owner: Option<bytes::Bytes>,
+    io_owner: Option<bytes::Bytes>,
+    served: ServedConnection,
+    drain: watch::Receiver<()>,
+    on_transport_handshake_failure: Arc<dyn Fn() + Send + Sync>,
+}
+
+// This ordinary constructor establishes ordered capture scopes before the
+// returned future can be queued or canceled without being polled. Its exact
+// return type is both the startup Layout subject and the actual spawned task.
+fn native_connection_task<S>(
+    inputs: NativeConnectionTaskInputs<S>,
+) -> impl Future<Output = ()> + Send + 'static
+where
+    S: Service<
+            axum::http::Request<axum::body::Body>,
+            Response = axum::http::Response<tonic::body::BoxBody>,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    let NativeConnectionTaskInputs {
+        stream,
+        app,
+        incoming,
+        builder,
+        capacity,
+        initial_settings_deadline,
+        acquisition_owner,
+        io_owner,
+        mut served,
+        mut drain,
+        on_transport_handshake_failure,
+    } = inputs;
+    let io_owner_for_stream = io_owner.clone();
+    // Construct the ordered scope before spawn: an unpolled task
+    // cancellation must drop its captured socket/future before
+    // returning the original acquisition position too.
+    let acquisition = tonic::transport::ConnectionAcquisition::new(
+        async move {
+            // Retain the original IO grant outside the captured future:
+            // even cancellation before first poll destroys the socket
+            // and any concrete IO Box before returning that grant.
+            let bootstrap = tonic::transport::ConnectionAcquisition::new(
+                async move {
+                    if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                        return Err(
+                            "Native acquisition deadline elapsed before first poll".to_owned()
+                        );
+                    }
+                    let stream = incoming
+                        .accept(stream)
+                        .await
+                        .map_err(|error| format!("{error:?}"))?;
+                    let stream =
+                        novarocks_native_trust::OwnedNativeIo::new(stream, io_owner_for_stream);
+                    if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                        drop(stream);
+                        return Err("Native acquisition deadline elapsed during TLS".to_owned());
+                    }
+                    let service =
+                        service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                            let app = app.clone();
+                            async move {
+                                let response = app
+                                    .oneshot(request.map(axum::body::Body::new))
+                                    .await
+                                    .expect("Native route service is infallible");
+                                Ok::<_, std::convert::Infallible>(response)
+                            }
+                        });
+                    let mut connection = builder.serve_connection(TokioIo::new(stream), service);
+                    if initial_settings_deadline.is_none() {
+                        return Ok(AcquiredConnection::Installed(connection, capacity));
+                    }
+                    let terminal = std::future::poll_fn(|cx| {
+                        let outcome = std::pin::Pin::new(&mut connection).poll(cx);
+                        let complete = connection.initial_settings_complete();
+                        match outcome {
+                            Poll::Ready(outcome) => Poll::Ready(Some((outcome, complete))),
+                            Poll::Pending if complete => Poll::Ready(None),
+                            Poll::Pending => Poll::Pending,
+                        }
+                    })
+                    .await;
+                    if let Some((outcome, complete)) = terminal {
+                        // Failure/EOF cannot return a still-live IO as an
+                        // output while releasing the acquisition capability.
+                        drop(connection);
+                        drop(capacity);
+                        return Ok(AcquiredConnection::Finished(outcome, complete));
+                    }
+                    if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                        drop(connection);
+                        drop(capacity);
+                        return Err(
+                            "Native acquisition deadline elapsed at initial settings completion"
+                                .to_owned(),
+                        );
+                    }
+                    if let Some(lifecycle) = capacity
+                        .as_ref()
+                        .and_then(|config| config.connection_lifecycle.as_ref())
+                    {
+                        if let Err(error) = lifecycle.on_acquisition_complete() {
+                            drop(connection);
+                            drop(capacity);
+                            return Err(format!(
+                                "Native acquisition lifecycle refused completion: {error}"
+                            ));
+                        }
+                        if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d)
+                        {
+                            let _ = lifecycle.retire();
+                            drop(connection);
+                            drop(capacity);
+                            return Err(
+                                "Native acquisition deadline elapsed during completion verdict"
+                                    .to_owned(),
+                            );
+                        }
+                        lifecycle.release_acquisition_owner().map_err(|error| {
+                            format!("Native acquisition owner refused release: {error}")
+                        })?;
+                    }
+                    Ok(AcquiredConnection::Installed(connection, capacity))
+                },
+                io_owner,
+            );
+            match initial_settings_deadline {
+                Some(deadline) => {
+                    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), bootstrap)
+                        .await
+                        .map_err(|_| {
+                            "Native TCP/TLS/HTTP2 initial settings deadline elapsed".to_owned()
+                        })?
+                }
+                None => bootstrap.await,
+            }
+        },
+        acquisition_owner,
+    );
+    async move {
+        let (connection, capacity) = match acquisition.await {
+            Ok(AcquiredConnection::Installed(connection, capacity)) => (connection, capacity),
+            Ok(AcquiredConnection::Finished(outcome, complete)) => {
+                if outcome.is_err() && !complete && initial_settings_deadline.is_some() {
+                    on_transport_handshake_failure();
+                }
+                served.close(
+                    "http2",
+                    &match outcome {
+                        Ok(()) => "ok".to_owned(),
+                        Err(error) => format!("{error:?}"),
+                    },
+                );
+                return;
+            }
+            Err(error) => {
+                served.close("transport_handshake", &error);
+                on_transport_handshake_failure();
+                return;
+            }
+        };
+        // The acquisition scope has exited. Application streams
+        // retain independent pool/IO owners without the 2s timer.
+        let mut connection = std::pin::pin!(connection);
+        let mut winding_down = false;
+        let outcome = loop {
+            tokio::select! {
+                outcome = &mut connection => break outcome,
+                _ = drain.changed(), if !winding_down => {
+                    winding_down = true;
+                    connection.as_mut().graceful_shutdown();
+                }
+            }
+        };
+        drop(capacity);
+        served.close(
+            "http2",
+            &match outcome {
+                Ok(()) => "ok".to_owned(),
+                Err(error) => format!("{error:?}"),
+            },
+        );
+    }
+}
+
+fn task_capacity_from_constructor<P, F>(_: fn(P) -> F) -> io::Result<usize>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    // Infer F without constructing a temporary task, socket, app or capability.
+    tokio::runtime::Handle::task_allocation_capacity_bound::<F>()
+}
+
+fn native_connection_task_capacity_bound<S>() -> io::Result<usize>
+where
+    S: Service<
+            axum::http::Request<axum::body::Body>,
+            Response = axum::http::Response<tonic::body::BoxBody>,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    task_capacity_from_constructor(native_connection_task::<S>)
+}
+
+pub(crate) fn native_server_task_allocation_capacity_bound() -> io::Result<usize> {
+    native_connection_task_capacity_bound::<NativeServerApp>()
+}
+
 async fn serve_native_listener<S>(
     listener: TokioTcpListener,
     app: S,
@@ -466,6 +701,16 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
+    if let Some((factory, _)) = &transport_capacity {
+        // Generic test/application services must also fit the startup-funded
+        // production constructor; reject before accepting or cloning an app.
+        let bound = native_connection_task_capacity_bound::<S>().map_err(|error| {
+            format!("calculate actual native connection task capacity: {error}")
+        })?;
+        factory
+            .validate_server_task_capacity(bound)
+            .map_err(|error| format!("validate actual native connection task capacity: {error}"))?;
+    }
     // Per listener rather than per process: one all-in-one process hosts both
     // role listeners, and a shared counter would report the other one's work.
     let live_connections = Arc::new(AtomicU64::new(0));
@@ -561,124 +806,30 @@ where
                 }
                 let acquisition_owner = capacity.as_mut().and_then(|config| config.acquisition_owner.take());
                 let io_owner = capacity.as_mut().and_then(|config| config.io_owner.take());
-                let io_owner_for_stream = io_owner.clone();
                 let app = app.clone();
                 let incoming = incoming.clone();
                 let on_transport_handshake_failure = Arc::clone(&on_transport_handshake_failure);
-                let mut served = ServedConnection::open(
+                let served = ServedConnection::open(
                     role_label, peer, &next_connection_id, &live_connections,
                 );
-                let mut drain = drain_rx.clone();
-                // Construct the ordered scope before spawn: an unpolled task
-                // cancellation must drop its captured socket/future before
-                // returning the original acquisition position too.
-                let acquisition = tonic::transport::ConnectionAcquisition::new(async move {
-                    // Retain the original IO grant outside the captured future:
-                    // even cancellation before first poll destroys the socket
-                    // and any concrete IO Box before returning that grant.
-                    let bootstrap = tonic::transport::ConnectionAcquisition::new(async move {
-                        if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                            return Err("Native acquisition deadline elapsed before first poll".to_owned());
-                        }
-                        let stream = incoming.accept(stream).await.map_err(|error| format!("{error:?}"))?;
-                        let stream = novarocks_native_trust::OwnedNativeIo::new(stream, io_owner_for_stream);
-                        if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                            drop(stream);
-                            return Err("Native acquisition deadline elapsed during TLS".to_owned());
-                        }
-                        let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
-                            let app = app.clone();
-                            async move {
-                                let response = app.oneshot(request.map(axum::body::Body::new)).await
-                                    .expect("Native route service is infallible");
-                                Ok::<_, std::convert::Infallible>(response)
-                            }
-                        });
-                        let mut connection = builder.serve_connection(TokioIo::new(stream), service);
-                        if initial_settings_deadline.is_none() {
-                            return Ok(AcquiredConnection::Installed(connection, capacity));
-                        }
-                        let terminal = std::future::poll_fn(|cx| {
-                            let outcome = std::pin::Pin::new(&mut connection).poll(cx);
-                            let complete = connection.initial_settings_complete();
-                            match outcome {
-                                Poll::Ready(outcome) => Poll::Ready(Some((outcome, complete))),
-                                Poll::Pending if complete => Poll::Ready(None),
-                                Poll::Pending => Poll::Pending,
-                            }
-                        }).await;
-                        if let Some((outcome, complete)) = terminal {
-                            // Failure/EOF cannot return a still-live IO as an
-                            // output while releasing the acquisition capability.
-                            drop(connection);
-                            drop(capacity);
-                            return Ok(AcquiredConnection::Finished(outcome, complete));
-                        }
-                        if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                            drop(connection);
-                            drop(capacity);
-                            return Err("Native acquisition deadline elapsed at initial settings completion".to_owned());
-                        }
-                        if let Some(lifecycle) = capacity.as_ref().and_then(|config| config.connection_lifecycle.as_ref()) {
-                            if let Err(error) = lifecycle.on_acquisition_complete() {
-                                drop(connection);
-                                drop(capacity);
-                                return Err(format!("Native acquisition lifecycle refused completion: {error}"));
-                            }
-                            if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                                let _ = lifecycle.retire();
-                                drop(connection);
-                                drop(capacity);
-                                return Err("Native acquisition deadline elapsed during completion verdict".to_owned());
-                            }
-                            lifecycle.release_acquisition_owner().map_err(|error| format!("Native acquisition owner refused release: {error}"))?;
-                        }
-                        Ok(AcquiredConnection::Installed(connection, capacity))
-                    }, io_owner);
-                    match initial_settings_deadline {
-                        Some(deadline) => tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), bootstrap)
-                            .await.map_err(|_| "Native TCP/TLS/HTTP2 initial settings deadline elapsed".to_owned())?,
-                        None => bootstrap.await,
-                    }
-                }, acquisition_owner);
-                tokio::spawn(async move {
-                    let (connection, capacity) = match acquisition.await {
-                        Ok(AcquiredConnection::Installed(connection, capacity)) => (connection, capacity),
-                        Ok(AcquiredConnection::Finished(outcome, complete)) => {
-                            if outcome.is_err() && !complete && initial_settings_deadline.is_some() {
-                                on_transport_handshake_failure();
-                            }
-                            served.close("http2", &match outcome {
-                                Ok(()) => "ok".to_owned(),
-                                Err(error) => format!("{error:?}"),
-                            });
-                            return;
-                        }
-                        Err(error) => {
-                            served.close("transport_handshake", &error);
-                            on_transport_handshake_failure();
-                            return;
-                        }
-                    };
-                    // The acquisition scope has exited. Application streams
-                    // retain independent pool/IO owners without the 2s timer.
-                    let mut connection = std::pin::pin!(connection);
-                    let mut winding_down = false;
-                    let outcome = loop {
-                        tokio::select! {
-                            outcome = &mut connection => break outcome,
-                            _ = drain.changed(), if !winding_down => {
-                                winding_down = true;
-                                connection.as_mut().graceful_shutdown();
-                            }
-                        }
-                    };
-                    drop(capacity);
-                    served.close("http2", &match outcome {
-                        Ok(()) => "ok".to_owned(),
-                        Err(error) => format!("{error:?}"),
-                    });
+                let drain = drain_rx.clone();
+                let task_owner = io_owner.clone();
+                let task = native_connection_task(NativeConnectionTaskInputs {
+                    stream, app, incoming, builder, capacity, initial_settings_deadline,
+                    acquisition_owner, io_owner, served, drain,
+                    on_transport_handshake_failure,
                 });
+                match task_owner {
+                    Some(owner) => {
+                        // The same original slot funds the actual TaskCell and
+                        // any existing automatic large-future Box. Last Waker
+                        // or Abort/Join aliases retain it past logical completion.
+                        tokio::runtime::Handle::current()
+                            .spawn_with_task_owner(task, owner)
+                            .map_err(|error| format!("spawn original native connection task: {error}"))?;
+                    }
+                    None => { tokio::spawn(task); }
+                }
             }
         }
     }

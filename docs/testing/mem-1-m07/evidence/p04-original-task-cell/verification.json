@@ -1,0 +1,765 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1 M07 P04",
+  "slice": "original Tokio task Cell and automatic Future Box",
+  "status": "local_TaskCell_slice_verified_P04_executing_P05_P10_open_V1_not_advertised",
+  "toolchain": "1.92.0",
+  "source_pins": {
+    "status": "published",
+    "final_source_sha256": "source-sha256.json",
+    "count": 567,
+    "modified_upstream_files": "modified-upstream-files.json",
+    "original_tokio_file_count": 555,
+    "modified_tokio_file_count": 17
+  },
+  "initial_checks": {
+    "native_adapter_check": {
+      "status": "finished",
+      "exit": null,
+      "exit_record": "not recorded in supplied log",
+      "log_key": "first-check"
+    },
+    "checked_geometry": {
+      "status": "passed",
+      "tests_passed": 1,
+      "tests_failed": 0,
+      "log_key": "first-geometry",
+      "observed_values": {
+        "connection_pool_bytes": 6463605,
+        "process_stock_bytes": 3477639778,
+        "data_positions": 518,
+        "control_positions": 20,
+        "server_task_backings_bytes": 9472
+      },
+      "whole_native_connection_proof": false
+    },
+    "system_allocator_target": {
+      "status": "passed_initial_run",
+      "tests_passed": 5,
+      "tests_failed": 0,
+      "log_key": "first-tests"
+    },
+    "library_regressions": {
+      "status": "passed_initial_run",
+      "native_adapter_tests_passed": 673,
+      "native_trust_tests_passed": 9,
+      "log_key": "libs"
+    }
+  },
+  "feature_configuration": {
+    "first_tracing_compile": {
+      "status": "failed_compile",
+      "error": "E0277",
+      "error_count": 4,
+      "log_key": "first-trace-check",
+      "runtime_negative": false,
+      "cause": "cfg! refusal still type-checked uninstrumented generic calls against InstrumentedFuture scheduler bounds"
+    },
+    "fixed_tracing_compile": {
+      "status": "finished",
+      "exit": null,
+      "exit_record": "not recorded in supplied log",
+      "log_key": "fixed-trace-check"
+    },
+    "matrix": [
+      {
+        "label": "A-current-owner",
+        "features": "owner",
+        "environment_overrides": {
+          "CARGO_TARGET_DIR": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/target",
+          "CARGO_BUILD_JOBS": "4",
+          "CARGO_INCREMENTAL": "0",
+          "CARGO_NET_OFFLINE": "true",
+          "RUSTUP_TOOLCHAIN": "1.92.0",
+          "RUSTFLAGS": ""
+        },
+        "removed_environment_keys": [],
+        "commands": [
+          {
+            "argv": [
+              "cargo",
+              "metadata",
+              "--offline",
+              "--format-version",
+              "1",
+              "--manifest-path",
+              "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-task-cell-feature-probe-3ekurnlu/Cargo.toml",
+              "--no-default-features",
+              "--features",
+              "owner"
+            ],
+            "exit": 0,
+            "log": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-task-cell-feature-probe-3ekurnlu/A-current-owner-metadata.log"
+          },
+          {
+            "argv": [
+              "cargo",
+              "test",
+              "--offline",
+              "--locked",
+              "--manifest-path",
+              "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-task-cell-feature-probe-3ekurnlu/Cargo.toml",
+              "--no-default-features",
+              "--features",
+              "owner",
+              "--test",
+              "features",
+              "--",
+              "--test-threads=1",
+              "--nocapture"
+            ],
+            "exit": 0,
+            "log": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-task-cell-feature-probe-3ekurnlu/A-current-owner-tests.log"
+          }
+        ],
+        "production_package_identities": 6,
+        "source_identity_unchanged": true,
+        "status": "passed",
+        "tests_passed": 2,
+        "privateScopeFactsNoFunding": true,
+        "logs": [
+          {
+            "source_path": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-task-cell-feature-probe-3ekurnlu/A-current-owner-metadata.log",
+            "sha256": "de1ca07f2b8c99df2869e6db0684e1fc6bea2c2732cbb7c005fdbfb250875802",
+            "bytes": 61161,
+            "published_path": null,
+            "publication_status": "pending"
+          },
+          {
+            "source_path": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-task-cell-feature-probe-3ekurnlu/A-current-owner-tests.log",
+            "sha256": "6a7e34bcf1d59cd9c7f5c2db5603080c7e5c044d5ca88496bf00323b19c2767e",
+            "bytes": 663,
+            "published_path": null,
+            "publication_status": "pending"
+          }
+        ]
+      },
+      {
+        "label": "B-multi-owner",
+        "features": "owner,multi",
+        "environment_overrides": {
+          "CARGO_TARGET_DIR": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/target",
+          "CARGO_BUILD_JOBS": "4",
+          "CARGO_INCREMENTAL": "0",
+          "CARGO_NET_OFFLINE": "true",
+          "RUSTUP_TOOLCHAIN": "1.92.0",
+          "RUSTFLAGS": ""
+        },
+        "removed_environment_keys": [],
+        "commands": [
+          {
+            "argv": [
+              "cargo",
+              "metadata",
+              "--offline",
+              "--format-version",
+              "1",
+              "--manifest-path",
+              "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-task-cell-feature-probe-3ekurnlu/Cargo.toml",
+              "--no-default-features",
+              "--features",
+              "owner,multi"
+            ],
+            "exit": 0,
+            "log": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-task-cell-feature-probe-3ekurnlu/B-multi-owner-metadata.log"
+          },
+          {
+            "argv": [
+              "cargo",
+              "test",
+              "--offline",
+              "--locked",
+              "--manifest-path",
+              "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-task-cell-feature-probe-3ekurnlu/Cargo.toml",
+              "--no-default-features",
+              "--features",
+              "owner,multi",
+              "--test",
+              "features",
+              "--",
+              "--test-threads=1",
+              "--nocapture"
+            ],
+            "exit": 0,
+            "log": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-task-cell-feature-probe-3ekurnlu/B-multi-owner-tests.log"
+          }
+        ],
+        "production_package_identities": 6,
+        "source_identity_unchanged": true,
+        "status": "passed",
+        "tests_passed": 2,
+        "privateScopeFactsNoFunding": true,
+        "logs": [
+          {
+            "source_path": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-task-cell-feature-probe-3ekurnlu/B-multi-owner-metadata.log",
+            "sha256": "37f7cf98aceca0eaf1bd04999bc710306aaa009712d3a84ac851d4551d47212a",
+            "bytes": 61187,
+            "published_path": null,
+            "publication_status": "pending"
+          },
+          {
+            "source_path": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-task-cell-feature-probe-3ekurnlu/B-multi-owner-tests.log",
+            "sha256": "8ce6408ed32172426cfda786b45637d41292e1c8289dbd3ffd5988752d73b7cc",
+            "bytes": 663,
+            "published_path": null,
+            "publication_status": "pending"
+          }
+        ]
+      },
+      {
+        "label": "C-unstable-tracing-refusal",
+        "features": "owner,trace",
+        "environment_overrides": {
+          "CARGO_TARGET_DIR": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/target",
+          "CARGO_BUILD_JOBS": "4",
+          "CARGO_INCREMENTAL": "0",
+          "CARGO_NET_OFFLINE": "true",
+          "RUSTUP_TOOLCHAIN": "1.92.0",
+          "RUSTFLAGS": "--cfg tokio_unstable"
+        },
+        "removed_environment_keys": [],
+        "commands": [
+          {
+            "argv": [
+              "cargo",
+              "metadata",
+              "--offline",
+              "--format-version",
+              "1",
+              "--manifest-path",
+              "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-task-cell-feature-probe-3ekurnlu/Cargo.toml",
+              "--no-default-features",
+              "--features",
+              "owner,trace"
+            ],
+            "exit": 0,
+            "log": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-task-cell-feature-probe-3ekurnlu/C-unstable-tracing-refusal-metadata.log"
+          },
+          {
+            "argv": [
+              "cargo",
+              "test",
+              "--offline",
+              "--locked",
+              "--manifest-path",
+              "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-task-cell-feature-probe-3ekurnlu/Cargo.toml",
+              "--no-default-features",
+              "--features",
+              "owner,trace",
+              "--test",
+              "features",
+              "--",
+              "--test-threads=1",
+              "--nocapture"
+            ],
+            "exit": 0,
+            "log": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-task-cell-feature-probe-3ekurnlu/C-unstable-tracing-refusal-tests.log"
+          }
+        ],
+        "production_package_identities": 6,
+        "source_identity_unchanged": true,
+        "status": "passed",
+        "tests_passed": 2,
+        "privateScopeFactsNoFunding": true,
+        "logs": [
+          {
+            "source_path": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-task-cell-feature-probe-3ekurnlu/C-unstable-tracing-refusal-metadata.log",
+            "sha256": "70511a5d211c3fcda02d66375c738806c624cf30b07024f8285dc89a001ba089",
+            "bytes": 80571,
+            "published_path": null,
+            "publication_status": "pending"
+          },
+          {
+            "source_path": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-task-cell-feature-probe-3ekurnlu/C-unstable-tracing-refusal-tests.log",
+            "sha256": "44ab6842fc7d3157d62117bf7e9fcc4b7d081694cbc738347753f8ad256f0942",
+            "bytes": 909,
+            "published_path": null,
+            "publication_status": "pending"
+          }
+        ]
+      }
+    ],
+    "privateScopeFactsNoFunding": true,
+    "source_identity_unchanged": true,
+    "summary_log_key": "matrix"
+  },
+  "source_regressions": {
+    "valid_runtime_negatives": 3,
+    "constructor_positive_controls": 1,
+    "cases": [
+      {
+        "name": "owner-before-cell-deallocation",
+        "command": [
+          "cargo",
+          "test",
+          "--offline",
+          "--locked",
+          "-p",
+          "novarocks-native-adapter",
+          "--test",
+          "native_original_task_cell",
+          "current_thread_small_future_large_output_and_overaligned_cell_keep_original_credit",
+          "--",
+          "--exact",
+          "--test-threads=1"
+        ],
+        "expected": "exact compiled runtime FAILED",
+        "mutations": {
+          "vendor/tokio-1.52.3/src/runtime/task/harness.rs": "c768511b75694736826c655a620acb9e57679b6d444a1b1ffb8db518d7d43377"
+        },
+        "exit": 101,
+        "verdict": "expected exact runtime outcome and physical oracle",
+        "log_sha256": "3caebdc8ab67b0304f388ce0a1197ce9066476a145105dd65bcdbaf0d28a6578",
+        "exact_restoration": true,
+        "log": {
+          "source_path": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-task-negatives-lxc1k67h/owner-before-cell-deallocation.log",
+          "sha256": "3caebdc8ab67b0304f388ce0a1197ce9066476a145105dd65bcdbaf0d28a6578",
+          "bytes": 46071,
+          "published_path": null,
+          "publication_status": "pending"
+        },
+        "valid_runtime_negative": true,
+        "classification": "runtime_negative"
+      },
+      {
+        "name": "future-completion-owner",
+        "command": [
+          "cargo",
+          "test",
+          "--offline",
+          "--locked",
+          "-p",
+          "novarocks-native-adapter",
+          "--test",
+          "native_original_task_cell",
+          "current_thread_small_future_large_output_and_overaligned_cell_keep_original_credit",
+          "--",
+          "--exact",
+          "--test-threads=1"
+        ],
+        "expected": "exact compiled runtime FAILED",
+        "mutations": {
+          "vendor/tokio-1.52.3/src/runtime/task/raw.rs": "ca0ccd0ccc35e060db174e2a75f8120d9b8180148a1bd53b80c5fc4e19f30666"
+        },
+        "exit": 101,
+        "verdict": "expected exact runtime outcome and physical oracle",
+        "log_sha256": "cf4176f409131699dd1b9590ec4e448103ab30f9279dc21afc9fb0bb1ca7fad4",
+        "exact_restoration": true,
+        "log": {
+          "source_path": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-task-negatives-lxc1k67h/future-completion-owner.log",
+          "sha256": "cf4176f409131699dd1b9590ec4e448103ab30f9279dc21afc9fb0bb1ca7fad4",
+          "bytes": 45962,
+          "published_path": null,
+          "publication_status": "pending"
+        },
+        "valid_runtime_negative": true,
+        "classification": "runtime_negative"
+      },
+      {
+        "name": "post-box-constructor-positive",
+        "command": [
+          "cargo",
+          "test",
+          "--offline",
+          "--locked",
+          "--manifest-path",
+          "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-task-negatives-jal6iimb/constructor/Cargo.toml",
+          "--test",
+          "probe",
+          "post_box_constructor_unwind_exits_actual_backings_before_original_credit",
+          "--",
+          "--exact",
+          "--test-threads=1"
+        ],
+        "expected": "exact compiled runtime PASS",
+        "mutations": {
+          "vendor/tokio-1.52.3/src/runtime/task/core.rs": "9642b509d70734c2b6f0ef1b450aeea90c13cf5847ca62c86f2152683079e64f"
+        },
+        "exit": 0,
+        "verdict": "expected exact runtime outcome and physical oracle",
+        "log_sha256": "d80578a62176cb714a447d03dd23c226f8a45f5c7e1ad849d312fef73c25e180",
+        "exact_restoration": true,
+        "log": {
+          "source_path": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-task-negatives-jal6iimb/post-box-constructor-positive.log",
+          "sha256": "d80578a62176cb714a447d03dd23c226f8a45f5c7e1ad849d312fef73c25e180",
+          "bytes": 4807,
+          "published_path": null,
+          "publication_status": "pending"
+        },
+        "valid_runtime_negative": false,
+        "classification": "constructor_positive_control"
+      },
+      {
+        "name": "post-box-constructor-missing-outer-clone",
+        "command": [
+          "cargo",
+          "test",
+          "--offline",
+          "--locked",
+          "--manifest-path",
+          "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-task-negatives-jal6iimb/constructor/Cargo.toml",
+          "--test",
+          "probe",
+          "post_box_constructor_unwind_exits_actual_backings_before_original_credit",
+          "--",
+          "--exact",
+          "--test-threads=1"
+        ],
+        "expected": "exact compiled runtime FAILED",
+        "mutations": {
+          "vendor/tokio-1.52.3/src/runtime/task/core.rs": "9642b509d70734c2b6f0ef1b450aeea90c13cf5847ca62c86f2152683079e64f",
+          "vendor/tokio-1.52.3/src/runtime/handle.rs": "c17908f890091f2afdce27fbcc40323722f353621f648011f7390017ca6ebea8"
+        },
+        "exit": 101,
+        "verdict": "expected exact runtime outcome and physical oracle",
+        "log_sha256": "698f5238a1676f7250150efa66a4797351facaf90fe1d23081b37082e351bafb",
+        "exact_restoration": true,
+        "log": {
+          "source_path": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-task-negatives-jal6iimb/post-box-constructor-missing-outer-clone.log",
+          "sha256": "698f5238a1676f7250150efa66a4797351facaf90fe1d23081b37082e351bafb",
+          "bytes": 2904,
+          "published_path": null,
+          "publication_status": "pending"
+        },
+        "valid_runtime_negative": true,
+        "classification": "runtime_negative"
+      }
+    ],
+    "first_batch_scratch": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-task-negatives-lxc1k67h",
+    "constructor_final_scratch": "/var/folders/_n/bq14zlm14v9d3lftd01lw1f00000gn/T/m07-original-task-negatives-jal6iimb",
+    "exact_restoration": true,
+    "mutation_baseline_sha256": {
+      "vendor/tokio-1.52.3/src/runtime/task/harness.rs": "7a91cc3e7001b5f22fd972be46d749d9e2fa990751e0fb59b9241c63b89dbe75",
+      "vendor/tokio-1.52.3/src/runtime/task/raw.rs": "f3ee1696c6dcd2ab9e1b417d23fb0afb9faa0b48d68699fbf1080b846492e17b",
+      "vendor/tokio-1.52.3/src/runtime/task/core.rs": "382b3edf81843782ba2f3a9f819834c26ecc5017c81cd944dbba7a1ed8875cd0",
+      "vendor/tokio-1.52.3/src/runtime/handle.rs": "b9c009021f8baa4a6cfb02e06887990322f47309dd3a58aced69c4aafa2683ca"
+    },
+    "constructor_probe": {
+      "actual_test_source_sha256": "d4d3b5cb8fd04a8a783e0008d1a0d71bb3fb8514f0f135f5c8238b465d5f09d7",
+      "compound_probe_source_sha256": "c050fedb6debbf35d50d4e45b3dc9ee020b50260952d77296c8f72a5936af660",
+      "production_package_identities": 238,
+      "funding": "same production Worker ResultRetainedBudget; copied downstream allocator test code, no model Cell"
+    },
+    "invalid_constructor_attempt": {
+      "status": "rejected_at_metadata_identity_check",
+      "runtime_test_executed": false,
+      "preserved": true,
+      "log_key": "negatives",
+      "cause": "partial patch manifest resolved registry Arrow packages absent from production package identities",
+      "unexpected_packages": [
+        {
+          "name": "arrow-buffer",
+          "version": "58.4.0",
+          "source": "registry"
+        },
+        {
+          "name": "arrow-schema",
+          "version": "58.4.0",
+          "source": "registry"
+        },
+        {
+          "name": "arrow-array",
+          "version": "58.2.0",
+          "source": "registry"
+        }
+      ],
+      "invalidates_prior_two_runtime_negatives": false
+    }
+  },
+  "artifacts": {
+    "first-check": {
+      "source_path": "/tmp/m07-task-cell-first-check.log",
+      "sha256": "59e482fec50986c3f373ebd43254ae942bf02d79da188aac09214b471f383213",
+      "bytes": 45103,
+      "published_path": "logs/m07-task-cell-first-check.log.gz",
+      "publication_status": "published_lossless_gzip"
+    },
+    "first-geometry": {
+      "source_path": "/tmp/m07-task-cell-first-geometry.log",
+      "sha256": "d72786e4c43580922349f33a3832ba5c198385e23b4d4191b10bc9b96ff0db29",
+      "bytes": 45585,
+      "published_path": "logs/m07-task-cell-first-geometry.log.gz",
+      "publication_status": "published_lossless_gzip"
+    },
+    "first-tests": {
+      "source_path": "/tmp/m07-task-cell-first-tests.log",
+      "sha256": "778fd65ebd9c1e71f268f73df1cc22e387fb25c9ebaf009fdc6690dd623b7336",
+      "bytes": 44837,
+      "published_path": "logs/m07-task-cell-first-tests.log.gz",
+      "publication_status": "published_lossless_gzip"
+    },
+    "libs": {
+      "source_path": "/tmp/m07-task-cell-libs.log",
+      "sha256": "74bc0adf9be7849eb516bb683e1b5ea5828ad33631957ef3272067e3f96af2e4",
+      "bytes": 117897,
+      "published_path": "logs/m07-task-cell-libs.log.gz",
+      "publication_status": "published_lossless_gzip"
+    },
+    "negatives": {
+      "source_path": "/tmp/m07-task-cell-negatives.log",
+      "sha256": "38e1d8bc418aaa1feab1bfb2d1ee824a07a355366a11893ed6de5c52a0161191",
+      "bytes": 1301,
+      "published_path": "logs/m07-task-cell-negatives.log.gz",
+      "publication_status": "published_lossless_gzip"
+    },
+    "constructor-regressions": {
+      "source_path": "/tmp/m07-task-cell-constructor-regressions.log",
+      "sha256": "174a10ab67b698f31010113ae4918419aa592969b08ac1558d4d043ef3fb9728",
+      "bytes": 359,
+      "published_path": "logs/m07-task-cell-constructor-regressions.log.gz",
+      "publication_status": "published_lossless_gzip"
+    },
+    "first-trace-check": {
+      "source_path": "/tmp/m07-task-feature-first-trace-check.log",
+      "sha256": "3e0f3e6c925ee9ea2786fb9cc28df31a454df5d0b51698bd9341660263bcc5f8",
+      "bytes": 5177,
+      "published_path": "logs/m07-task-feature-first-trace-check.log.gz",
+      "publication_status": "published_lossless_gzip"
+    },
+    "fixed-trace-check": {
+      "source_path": "/tmp/m07-task-feature-fixed-trace-check.log",
+      "sha256": "034afc991e56129f6579972bd7feadb94dac025e01dd38e312b479de60db68de",
+      "bytes": 293,
+      "published_path": "logs/m07-task-feature-fixed-trace-check.log.gz",
+      "publication_status": "published_lossless_gzip"
+    },
+    "matrix": {
+      "source_path": "/tmp/m07-task-feature-matrix.log",
+      "sha256": "14747b67cddd76d349aa21966fc789152b84bb7d06e51512b3dcf24bb2426b82",
+      "bytes": 1167,
+      "published_path": "logs/m07-task-feature-matrix.log.gz",
+      "publication_status": "published_lossless_gzip"
+    }
+  },
+  "pending": {
+    "final_source_pins": false,
+    "log_publication_and_manifest": false,
+    "final_system_allocator_target": {
+      "status": "PASS",
+      "tests": 5
+    },
+    "final_focused_regressions": {
+      "status": "PASS",
+      "tests": 743
+    },
+    "full_ci": {
+      "status": "PASS"
+    },
+    "miri": {
+      "status": "not_claimed"
+    },
+    "linux_manual_acceptance": {
+      "status": "user_deferred"
+    },
+    "native_1fe_3be_product_acceptance": {
+      "status": "seven_slice_scenarios_PASS",
+      "whole_M07_acceptance": false
+    }
+  },
+  "scope_limits": [
+    "Task Cell backing, automatic Future Box and original Bytes carrier only in the allocator target",
+    "feature matrix markers establish API and lifetime facts, not allocation authority or funding",
+    "Future/Output external heaps, scheduler queues, runtime, task hooks and instrumentation remain separate",
+    "complete Native task graph and per-connection 2MiB envelope are not proven",
+    "initial focused logs do not substitute final same-source checks or full CI"
+  ],
+  "parent": "6794993ced49e36beda350cff8a2044e1dce7881",
+  "final_focused": {
+    "native_lib": 673,
+    "native_trust_lib": 9,
+    "protocol_targets": 8,
+    "protocol_tests": 61,
+    "unique_total": 743,
+    "source_negative_runtime_cases": 3,
+    "constructor_positive_control": 1,
+    "final_task_allocator_tests": 5,
+    "profile": "dev",
+    "log": "logs/m07-task-cell-final-tests-corrected.log.gz"
+  },
+  "format": {
+    "workspace": "PASS",
+    "modified_tokio_files": "PASS",
+    "edition_tokio": "2021",
+    "toolchain": "1.92.0"
+  },
+  "strict_clippy_attempts": {
+    "status": "FAILED_existing_baseline",
+    "dependencies": "11 SPI lint errors",
+    "native_no_deps": "35 lib errors, 39 lib test errors",
+    "final_strategy": "repository warning-only full Cargo CI; review changed-source diagnostics separately"
+  },
+  "geometry": {
+    "std_mutex_native_only": {
+      "connection_pool_bytes": 6463605,
+      "process_stock_bytes": 3477639778,
+      "data_positions": 518,
+      "control_positions": 20,
+      "server_task_backings_bytes": 9472
+    },
+    "parking_lot_workspace": {
+      "connection_pool_bytes": 6463421,
+      "process_stock_bytes": 3477540402,
+      "server_task_backings_bytes": 9472,
+      "data_positions": 518,
+      "control_positions": 20
+    }
+  },
+  "cargo_only_ci": {
+    "status": "PASS",
+    "artifact": "logs/ci-full/20261003-180547",
+    "duration_seconds": 646,
+    "component_passed": 11770,
+    "server_owner_passed": 173,
+    "server_smoke_passed": 4,
+    "passed": 11947,
+    "ignored": 7,
+    "profile": "dev",
+    "CARGO_BUILD_JOBS": "4",
+    "CARGO_INCREMENTAL": "0",
+    "source_identity": "parent 6794993ced49e36beda350cff8a2044e1dce7881 dirty candidate; source-sha256.json, not eventual checkpoint SHA"
+  },
+  "system": [
+    {
+      "scenario": "native-ingress/blocking-saturation-control",
+      "outcome": "passed",
+      "exit_code": 0,
+      "cluster_size": 3,
+      "platform": {
+        "os": "macos",
+        "architecture": "aarch64",
+        "logical_cpu_count": 10
+      },
+      "source_revision": "6794993ced49e36beda350cff8a2044e1dce7881",
+      "source_dirty": true,
+      "source_tree_sha256": "c303b70ff74e95e1123eb99e1de73cbd88145ccc7692ec9fe9544c1ca0aeb3fd",
+      "cargo_lock_sha256": "baf88915862f746dae9f6b6312f515becfadd1a7751839cf311c49ef6a250337",
+      "runner_native_build_identity": "6794993ced49e36beda350cff8a2044e1dce7881",
+      "started_unix_millis": 1791022643562,
+      "ended_unix_millis": 1791022643814,
+      "artifact": "logs/mem-1-m07/p04-original-task-system/native-ingress-blocking-saturation-control/scenario-evidence.json",
+      "artifact_sha256": "388e7246a6dd9fa4e9a11d79f5b9247e32b40f765283367dbe0e054ab53a31fd"
+    },
+    {
+      "scenario": "native-ingress/outer-preflight-rejection",
+      "outcome": "passed",
+      "exit_code": 0,
+      "cluster_size": 3,
+      "platform": {
+        "os": "macos",
+        "architecture": "aarch64",
+        "logical_cpu_count": 10
+      },
+      "source_revision": "6794993ced49e36beda350cff8a2044e1dce7881",
+      "source_dirty": true,
+      "source_tree_sha256": "c303b70ff74e95e1123eb99e1de73cbd88145ccc7692ec9fe9544c1ca0aeb3fd",
+      "cargo_lock_sha256": "baf88915862f746dae9f6b6312f515becfadd1a7751839cf311c49ef6a250337",
+      "runner_native_build_identity": "6794993ced49e36beda350cff8a2044e1dce7881",
+      "started_unix_millis": 1791022642980,
+      "ended_unix_millis": 1791022643201,
+      "artifact": "logs/mem-1-m07/p04-original-task-system/native-ingress-outer-preflight-rejection/scenario-evidence.json",
+      "artifact_sha256": "2dda934c671f1d0c282c3da8aca5eb40ec50f50657b219b0303b22116e1f6246"
+    },
+    {
+      "scenario": "native-ingress/partial-body-deadline",
+      "outcome": "passed",
+      "exit_code": 0,
+      "cluster_size": 3,
+      "platform": {
+        "os": "macos",
+        "architecture": "aarch64",
+        "logical_cpu_count": 10
+      },
+      "source_revision": "6794993ced49e36beda350cff8a2044e1dce7881",
+      "source_dirty": true,
+      "source_tree_sha256": "c303b70ff74e95e1123eb99e1de73cbd88145ccc7692ec9fe9544c1ca0aeb3fd",
+      "cargo_lock_sha256": "baf88915862f746dae9f6b6312f515becfadd1a7751839cf311c49ef6a250337",
+      "runner_native_build_identity": "6794993ced49e36beda350cff8a2044e1dce7881",
+      "started_unix_millis": 1791022644078,
+      "ended_unix_millis": 1791022644405,
+      "artifact": "logs/mem-1-m07/p04-original-task-system/native-ingress-partial-body-deadline/scenario-evidence.json",
+      "artifact_sha256": "afa1f7adf66574301b100953e9f9503feecf71e561235c9c5d5f633463bac76e"
+    },
+    {
+      "scenario": "native-ingress/registry-contention-control",
+      "outcome": "passed",
+      "exit_code": 0,
+      "cluster_size": 3,
+      "platform": {
+        "os": "macos",
+        "architecture": "aarch64",
+        "logical_cpu_count": 10
+      },
+      "source_revision": "6794993ced49e36beda350cff8a2044e1dce7881",
+      "source_dirty": true,
+      "source_tree_sha256": "c303b70ff74e95e1123eb99e1de73cbd88145ccc7692ec9fe9544c1ca0aeb3fd",
+      "cargo_lock_sha256": "baf88915862f746dae9f6b6312f515becfadd1a7751839cf311c49ef6a250337",
+      "runner_native_build_identity": "6794993ced49e36beda350cff8a2044e1dce7881",
+      "started_unix_millis": 1791022644764,
+      "ended_unix_millis": 1791022644990,
+      "artifact": "logs/mem-1-m07/p04-original-task-system/native-ingress-registry-contention-control/scenario-evidence.json",
+      "artifact_sha256": "f4b64d726af05181b9bddb6a0f66bbace734d9e465ca3169fbf02101126da59f"
+    },
+    {
+      "scenario": "native-trust/automatic-dns",
+      "outcome": "passed",
+      "exit_code": 0,
+      "cluster_size": 3,
+      "platform": {
+        "os": "macos",
+        "architecture": "aarch64",
+        "logical_cpu_count": 10
+      },
+      "source_revision": "6794993ced49e36beda350cff8a2044e1dce7881",
+      "source_dirty": true,
+      "source_tree_sha256": "c303b70ff74e95e1123eb99e1de73cbd88145ccc7692ec9fe9544c1ca0aeb3fd",
+      "cargo_lock_sha256": "baf88915862f746dae9f6b6312f515becfadd1a7751839cf311c49ef6a250337",
+      "runner_native_build_identity": "6794993ced49e36beda350cff8a2044e1dce7881",
+      "started_unix_millis": 1791022641491,
+      "ended_unix_millis": 1791022641926,
+      "artifact": "logs/mem-1-m07/p04-original-task-system/native-trust-automatic-dns/scenario-evidence.json",
+      "artifact_sha256": "37492f9bbcab0be491c7863423a175613e2034b35611cd31f8e0626890cfaafa"
+    },
+    {
+      "scenario": "native-trust/pem-ip",
+      "outcome": "passed",
+      "exit_code": 0,
+      "cluster_size": 3,
+      "platform": {
+        "os": "macos",
+        "architecture": "aarch64",
+        "logical_cpu_count": 10
+      },
+      "source_revision": "6794993ced49e36beda350cff8a2044e1dce7881",
+      "source_dirty": true,
+      "source_tree_sha256": "c303b70ff74e95e1123eb99e1de73cbd88145ccc7692ec9fe9544c1ca0aeb3fd",
+      "cargo_lock_sha256": "baf88915862f746dae9f6b6312f515becfadd1a7751839cf311c49ef6a250337",
+      "runner_native_build_identity": "6794993ced49e36beda350cff8a2044e1dce7881",
+      "started_unix_millis": 1791022642286,
+      "ended_unix_millis": 1791022642718,
+      "artifact": "logs/mem-1-m07/p04-original-task-system/native-trust-pem-ip/scenario-evidence.json",
+      "artifact_sha256": "e396fc57a0e146dc040ab2a64440cdb1db1c4396b5c0d4d4cd8907a22c436800"
+    },
+    {
+      "scenario": "native-trust/plaintext-ip",
+      "outcome": "passed",
+      "exit_code": 0,
+      "cluster_size": 3,
+      "platform": {
+        "os": "macos",
+        "architecture": "aarch64",
+        "logical_cpu_count": 10
+      },
+      "source_revision": "6794993ced49e36beda350cff8a2044e1dce7881",
+      "source_dirty": true,
+      "source_tree_sha256": "c303b70ff74e95e1123eb99e1de73cbd88145ccc7692ec9fe9544c1ca0aeb3fd",
+      "cargo_lock_sha256": "baf88915862f746dae9f6b6312f515becfadd1a7751839cf311c49ef6a250337",
+      "runner_native_build_identity": "6794993ced49e36beda350cff8a2044e1dce7881",
+      "started_unix_millis": 1791022640666,
+      "ended_unix_millis": 1791022641106,
+      "artifact": "logs/mem-1-m07/p04-original-task-system/native-trust-plaintext-ip/scenario-evidence.json",
+      "artifact_sha256": "c8ae1af53ef4706de2ea9afec8cf10ff7b64311e141b6ba0532007b07e0a333e"
+    }
+  ],
+  "push_pr_archive": false,
+  "published_gzip_artifacts": 83
+}

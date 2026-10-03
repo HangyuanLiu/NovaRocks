@@ -71,6 +71,18 @@ cfg_rt! {
     use crate::future::Future;
     use crate::loom::sync::Arc;
     use crate::runtime::{blocking, task::{Id, SpawnLocation}};
+    #[cfg(all(feature = "io-util", not(any(
+    loom,
+    all(tokio_unstable, feature = "tracing"),
+    all(
+        tokio_unstable,
+        feature = "taskdump",
+        feature = "rt",
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+    )
+))))]
+    use crate::runtime::task;
     use crate::runtime::context;
     use crate::task::JoinHandle;
     use crate::util::RngSeedGenerator;
@@ -171,6 +183,57 @@ cfg_rt! {
 
                 #[cfg(feature = "rt-multi-thread")]
                 Handle::MultiThread(h) => multi_thread::Handle::spawn(h, future, id, spawned_at),
+            }
+        }
+
+        /// Spawn using the original task allocation capability.
+        #[cfg(all(feature = "io-util", not(any(
+    loom,
+    all(tokio_unstable, feature = "tracing"),
+    all(
+        tokio_unstable,
+        feature = "taskdump",
+        feature = "rt",
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+    )
+))))]
+        pub(crate) fn spawn_with_task_owner<F>(&self, future: F, id: Id, spawned_at: SpawnLocation, owner: bytes::Bytes) -> JoinHandle<F::Output>
+        where
+            F: Future + Send + 'static,
+            F::Output: Send + 'static,
+        {
+            match self {
+                Handle::CurrentThread(h) => current_thread::Handle::spawn_with_task_owner(h, future, id, spawned_at, owner),
+                #[cfg(feature = "rt-multi-thread")]
+                Handle::MultiThread(h) => multi_thread::Handle::spawn_with_task_owner(h, future, id, spawned_at, owner),
+            }
+        }
+
+        #[cfg(all(feature = "io-util", not(any(
+    loom,
+    all(tokio_unstable, feature = "tracing"),
+    all(
+        tokio_unstable,
+        feature = "taskdump",
+        feature = "rt",
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+    )
+))))]
+        pub(crate) fn task_cell_allocation_capacity<F>() -> usize
+        where
+            F: Future + Send + 'static,
+            F::Output: Send + 'static,
+        {
+            let current = task::cell_allocation_capacity::<F, Arc<current_thread::Handle>>();
+            #[cfg(feature = "rt-multi-thread")]
+            {
+                current.max(task::cell_allocation_capacity::<F, Arc<multi_thread::Handle>>())
+            }
+            #[cfg(not(feature = "rt-multi-thread"))]
+            {
+                current
             }
         }
 

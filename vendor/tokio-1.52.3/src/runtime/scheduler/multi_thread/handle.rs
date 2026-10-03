@@ -71,6 +71,44 @@ impl Handle {
             .load(crate::loom::sync::atomic::Ordering::SeqCst)
     }
 
+    #[cfg(all(
+        feature = "io-util",
+        not(any(
+            loom,
+            all(tokio_unstable, feature = "tracing"),
+            all(
+                tokio_unstable,
+                feature = "taskdump",
+                feature = "rt",
+                target_os = "linux",
+                any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+            )
+        ))
+    ))]
+    pub(crate) fn spawn_with_task_owner<F>(
+        me: &Arc<Self>,
+        future: F,
+        id: task::Id,
+        spawned_at: SpawnLocation,
+        owner: bytes::Bytes,
+    ) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let (handle, notified) =
+            me.shared
+                .owned
+                .bind_with_owner(future, me.clone(), id, spawned_at, owner);
+        me.task_hooks.spawn(&TaskMeta {
+            id,
+            spawned_at,
+            _phantom: Default::default(),
+        });
+        me.schedule_option_task_without_yield(notified);
+        handle
+    }
+
     pub(crate) fn shutdown(&self) {
         self.close();
         #[cfg(all(tokio_unstable, feature = "time"))]
