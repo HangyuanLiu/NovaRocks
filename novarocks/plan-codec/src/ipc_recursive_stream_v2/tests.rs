@@ -381,9 +381,226 @@ fn recursive_source_retention_and_checked_arithmetic_fail_before_hidden_work() {
     assert!(mul(usize::MAX, 2).is_err());
     assert!(capacity(usize::MAX).is_err());
     let control = Control::default();
-    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
-    assert!(reader_work::source_metadata_work(usize::MAX, 1024, &mut work).is_err());
+    let work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    assert!(reader_work::metadata_comparison_work(usize::MAX, 1024).is_err());
     work.finish().unwrap();
+}
+
+fn metadata_struct(entries: usize, sparse: bool) -> (ArrayRef, Field) {
+    let mut metadata = if sparse {
+        let mut metadata = HashMap::with_capacity(8192);
+        for index in 0..4096 {
+            metadata.insert(format!("removed-{index}"), "removed".to_owned());
+        }
+        for index in 0..4096 {
+            metadata.remove(&format!("removed-{index}"));
+        }
+        metadata
+    } else {
+        HashMap::new()
+    };
+    for index in 0..entries {
+        // Legal maximum-length keys with a long common prefix force actual
+        // exact-key chunks; neither the model nor Constant assumes this cap.
+        metadata.insert(format!("{}{:04}", "k".repeat(1020), index), "value".into());
+    }
+    if sparse {
+        assert!(metadata.capacity() > entries * 100);
+    }
+    let child = Arc::new(Field::new("child", DataType::Int32, true).with_metadata(metadata));
+    let array: ArrayRef = Arc::new(StructArray::new(
+        vec![child].into(),
+        vec![Arc::new(Int32Array::from(vec![Some(7), None]))],
+        None,
+    ));
+    let field =
+        Field::new("root", array.data_type().clone(), true).with_metadata(HashMap::from([(
+            "root-only".into(),
+            "not-a-type-field".into(),
+        )]));
+    (array, field)
+}
+
+#[test]
+fn recursive_metadata_bound_counts_three_type_passes_and_excludes_root_field_map() {
+    // Hand-calculated candidate/table/byte upper bound for K=3, B=4096:
+    // B*(1+K+2K+2) + (K+K²+K²+K+2).
+    assert_eq!(
+        reader_work::metadata_comparison_work(3, 4096).unwrap(),
+        49_178
+    );
+    assert_eq!(reader_work::metadata_comparison_work(0, 4096).unwrap(), 0);
+    assert!(reader_work::metadata_comparison_work(257, 4096).is_ok());
+    assert!(reader_work::metadata_comparison_work(1, usize::MAX).is_err());
+    let (array, field) = metadata_struct(3, false);
+    let (metadata, body) = encoded(array, &field);
+    let checked = geometry(&metadata, &body, &field);
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let actual = reader_work::source_metadata_work(&checked.nodes, 4096, &mut work).unwrap();
+    work.finish().unwrap();
+    assert_eq!(actual.one_comparison, 49_178);
+    assert_eq!(actual.native_comparisons, 0);
+    assert_eq!(
+        actual.total,
+        4096 * (6 * 2 + 2)
+            + 4 * 2 * novarocks_type_contract::NR_LOGICAL_TYPE_KEY.len()
+            + 3 * 49_178
+            + std::mem::size_of::<[usize; novarocks_type_contract::MAX_VALUE_TYPE_NODES]>()
+            + 4 // Base calculation, metadata scan, index insertion, linear group item.
+    );
+    // The map on the root Field is still covered by the original source
+    // walks/probes. It does not add a fourth metadata exact-comparison pass.
+    assert_eq!(checked.nodes[0].field.metadata().len(), 1);
+    let DataType::Struct(fields) = field.data_type() else {
+        panic!("actual Struct fixture");
+    };
+    let child = Arc::clone(&fields[0]);
+    let duplicate: ArrayRef = Arc::new(StructArray::new(
+        vec![Arc::clone(&child), child].into(),
+        vec![
+            Arc::new(Int32Array::from(vec![7])),
+            Arc::new(Int32Array::from(vec![8])),
+        ],
+        None,
+    ));
+    let repeated = Field::new("root", duplicate.data_type().clone(), true);
+    let (metadata, body) = encoded(duplicate, &repeated);
+    let checked = geometry(&metadata, &body, &repeated);
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let actual = reader_work::source_metadata_work(&checked.nodes, 4096, &mut work).unwrap();
+    work.finish().unwrap();
+    // One shared map is visited twice; independent per-name deduplication
+    // would incorrectly charge it only once. Its group weight must be 24.
+    assert_eq!(actual.one_comparison, 4096 * 24 + 2 * 26);
+    assert_eq!(actual.native_comparisons, 0);
+    let z = Arc::new(fields[0].as_ref().clone().with_name("z"));
+    let aa = Arc::new(fields[0].as_ref().clone().with_name("aa"));
+    let unordered: ArrayRef = Arc::new(StructArray::new(
+        vec![Arc::clone(&z), aa, z].into(),
+        (0..3)
+            .map(|index| Arc::new(Int32Array::from(vec![index])) as ArrayRef)
+            .collect(),
+        None,
+    ));
+    let unordered_field = Field::new("root", unordered.data_type().clone(), true);
+    let (metadata, body) = encoded(unordered, &unordered_field);
+    let checked = geometry(&metadata, &body, &unordered_field);
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let actual = reader_work::source_metadata_work(&checked.nodes, 4096, &mut work).unwrap();
+    work.finish().unwrap();
+    // Sort by actual bytes (aa before z); the two separated z occurrences
+    // must form one weighted group, with all three candidate counts retained.
+    assert_eq!(actual.one_comparison, 4096 * 24 + 3 * 26);
+    assert_eq!(actual.native_comparisons, 0);
+    let array = nested();
+    let field = Field::new("root", array.data_type().clone(), true);
+    let (metadata, body) = encoded(array, &field);
+    let checked = geometry(&metadata, &body, &field);
+    assert_eq!(checked.nodes[2].depth, 3);
+    assert_eq!(checked.nodes[2].list_map_ancestors, 1);
+    assert_eq!(
+        reader_work::native_metadata_frequency(&checked.nodes[2]).unwrap(),
+        8
+    ); // (4+1)*sum(1) + (2+1)*1, not a global T-squared multiplier.
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let actual = reader_work::source_metadata_work(&checked.nodes, 4096, &mut work).unwrap();
+    work.finish().unwrap();
+    assert_eq!(actual.one_comparison, 4096 * 6 + 6);
+    assert_eq!(actual.native_comparisons, 8 * (4096 * 6 + 6));
+    let child = Arc::new(Field::new("child", DataType::Int32, true));
+    let array: ArrayRef = Arc::new(StructArray::new(
+        vec![child].into(),
+        vec![Arc::new(Int32Array::from(vec![7]))],
+        None,
+    ));
+    let field = Field::new("root", array.data_type().clone(), true);
+    let (metadata, body) = encoded(array, &field);
+    let checked = geometry(&metadata, &body, &field);
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let actual = reader_work::source_metadata_work(&checked.nodes, 4096, &mut work).unwrap();
+    work.finish().unwrap();
+    assert_eq!(actual.one_comparison, 0);
+    assert_eq!(actual.native_comparisons, 0);
+    assert_eq!(
+        actual.total,
+        4096 * 14 + 8 * novarocks_type_contract::NR_LOGICAL_TYPE_KEY.len() + 2
+    ); // Base and one length scan, without fixed-stack initialization work.
+    assert_eq!(
+        control.trace(),
+        [(CompilePhase::Decode, 0), (CompilePhase::Decode, 2)]
+    );
+}
+
+#[test]
+fn recursive_sparse_metadata_invoice_and_k_work_refuse_before_constant_preflight() {
+    let (array, field) = metadata_struct(20, true);
+    let (metadata, body) = encoded(array, &field);
+    let checked = geometry(&metadata, &body, &field);
+    let input = input(&field, &metadata, &body, &checked);
+    // Explicit fixture invoices include both Field/FVT owners and all original
+    // HashMap table control backing, not its current public capacity/length.
+    let sparse_invoice = 1 << 20;
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let sparse =
+        reader_work::source_metadata_work(&checked.nodes, sparse_invoice, &mut work).unwrap();
+    let compact = reader_work::source_metadata_work(&checked.nodes, 1 << 16, &mut work).unwrap();
+    work.finish().unwrap();
+    assert!(sparse.one_comparison > compact.one_comparison);
+    let facts = admitted(&input, sparse_invoice, reader_limits(), &Control::default()).unwrap();
+    assert!(facts.cumulative_library_work_upper_bound > sparse.total);
+    let mut limits = reader_limits();
+    limits.max_cumulative_library_work = sparse.total - 1;
+    let control = Control::default();
+    assert!(matches!(
+        admitted(&input, sparse_invoice, limits, &control),
+        Err(FlatPoolResourceError::Shape(
+            crate::physical_type_v2::TypeCodecError::InvalidShape(
+                "recursive reader source metadata work envelope exceeded"
+            )
+        ))
+    ));
+    // Compare with the actual source-only owner trace, including its scratch
+    // boundaries and tail. Numerical Constant was not entered after this gate.
+    let source_only = Control::default();
+    let mut work = CompileCheckpoints::try_new(&source_only, CompilePhase::Decode).unwrap();
+    reader_work::source_metadata_work(&checked.nodes, sparse_invoice, &mut work).unwrap();
+    work.finish().unwrap();
+    assert_eq!(control.trace(), source_only.trace());
+    assert!(source_only.trace().last().unwrap().1 > 0);
+    for at in 0..control.trace().len() {
+        for cause in CAUSES {
+            let refuse = Control::refusing(at, cause);
+            assert!(matches!(admitted(&input, sparse_invoice, limits, &refuse),
+                Err(FlatPoolResourceError::Control(actual)) if actual == cause));
+            assert_eq!(refuse.trace(), control.trace()[..=at]);
+        }
+    }
+}
+
+#[test]
+fn recursive_long_metadata_key_comparisons_preserve_every_original_control_prefix() {
+    let (array, field) = metadata_struct(20, false);
+    let (metadata, body) = encoded(array, &field);
+    let checked = geometry(&metadata, &body, &field);
+    let input = input(&field, &metadata, &body, &checked);
+    let good = Control::default();
+    admitted(&input, 1 << 20, reader_limits(), &good).unwrap();
+    let trace = good.trace();
+    assert!(trace.iter().any(|(_, units)| *units == 256));
+    for at in 0..trace.len() {
+        for cause in CAUSES {
+            let refuse = Control::refusing(at, cause);
+            assert!(
+                matches!(admitted(&input, 1 << 20, reader_limits(), &refuse),
+                Err(FlatPoolResourceError::Control(actual)) if actual == cause),
+                "callback {at}, cause {cause:?}"
+            );
+            assert_eq!(refuse.trace(), trace[..=at]);
+        }
+    }
 }
 
 #[test]

@@ -206,10 +206,9 @@ pub(crate) fn preflight(
         source_retained_bytes,
         "recursive reader source retention below body",
     )?;
-    let source_work =
-        reader_work::source_metadata_work(input.nodes.len(), source_retained_bytes, work)?;
+    let source_work = reader_work::source_metadata_work(input.nodes, source_retained_bytes, work)?;
     cap(
-        source_work,
+        source_work.total,
         limits.max_cumulative_library_work,
         "recursive reader source metadata work envelope exceeded",
     )?;
@@ -276,11 +275,11 @@ pub(crate) fn preflight(
     let coexisting = add(source_retained_bytes, requested)?;
     let cumulative = reader_work::preflight(
         input,
-        source_retained_bytes,
         &payload,
         &pool,
         &structures,
         &diagnostics,
+        &source_work,
         work,
     )?;
     cap(

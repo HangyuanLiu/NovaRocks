@@ -22,6 +22,8 @@
 //! including retained capacity, and are not allocation authorization.
 
 #[cfg(test)]
+mod borrowed_comparison_tests;
+#[cfg(test)]
 mod flat_resource_tests;
 #[cfg(test)]
 mod scalar_factory_tests;
@@ -43,6 +45,7 @@ use arrow_schema::{DataType, Field, UnionMode};
 use novarocks_type_contract::{
     CarrierParameterError, CompileCheckpoints, CompileControlError, CompilePhase,
     FunctionValueType, PureCompileControl, ValueLogicalType, ValueTypeError, ValueTypeVisit,
+    arrow_data_types_exact_borrowed_observed, arrow_fields_exact_borrowed_observed,
     validate_arrow_carrier_parameters_observed,
 };
 use std::{collections::BTreeSet, fmt, sync::Arc};
@@ -282,7 +285,7 @@ impl ConstantPool {
         let mut work = CompileCheckpoints::try_new(control, phase)?;
         let checked = (|| {
             let metadata_bytes = validate_type(&field, &value_type, policy, &mut work)?;
-            if !novarocks_type_contract::arrow_data_types_exact_observed::<ConstantError>(
+            if !arrow_data_types_exact_borrowed_observed::<ConstantError>(
                 field.data_type(),
                 data.data_type(),
                 || {
@@ -394,14 +397,10 @@ impl ConstantValue {
     ) -> Result<bool, ConstantError> {
         let mut work = CompileCheckpoints::try_new(control, phase)?;
         let type_equal = self.value_type().logical_type == other.value_type().logical_type
-            && novarocks_type_contract::arrow_fields_exact_observed(
-                self.field(),
-                other.field(),
-                || {
-                    work.step()?;
-                    Ok::<_, ConstantError>(())
-                },
-            )?;
+            && arrow_fields_exact_borrowed_observed(self.field(), other.field(), || {
+                work.step()?;
+                Ok::<_, ConstantError>(())
+            })?;
         if !type_equal {
             work.finish()?;
             return Ok(false);
@@ -524,7 +523,7 @@ fn validate_type(
             "constant root logical label differs from exact value identity",
         ));
     }
-    if !novarocks_type_contract::arrow_data_types_exact_observed::<ConstantError>(
+    if !arrow_data_types_exact_borrowed_observed::<ConstantError>(
         field.data_type(),
         &ty.data_type,
         || {

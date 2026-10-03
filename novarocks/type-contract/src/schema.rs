@@ -80,6 +80,52 @@ pub fn arrow_data_types_exact_observed<E: From<crate::ValueTypeError>>(
     })
 }
 
+/// Compare exact types with the same traversal and bounds as the observed
+/// exact port, borrowing metadata instead of allocating fingerprint buckets.
+/// Callers must admit quadratic metadata candidate work and retained map
+/// iteration capacity. Long names, keys, and values retain chunk observation;
+/// this port introduces no additional metadata admission limit.
+pub fn arrow_data_types_exact_borrowed_observed<E: From<crate::ValueTypeError>>(
+    left: &DataType,
+    right: &DataType,
+    mut observe: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    Walk {
+        observe: &mut observe,
+        validate: &mut |depth, nodes| {
+            if depth > crate::MAX_VALUE_TYPE_DEPTH {
+                Err(crate::ValueTypeError::TooDeep.into())
+            } else if nodes > crate::MAX_VALUE_TYPE_NODES {
+                Err(crate::ValueTypeError::TooManyNodes.into())
+            } else {
+                Ok(())
+            }
+        },
+        nodes: 0,
+        mode: FieldMode::Exact,
+        metadata_mode: MetadataMode::BorrowedLinear,
+    }
+    .ty(left, right, 1)
+}
+
+/// Exact Field comparison using borrowed metadata and the sole type traversal.
+/// Like the existing observed Field port, this relies on caller-owned schema
+/// bounds and does not introduce a new depth, node, or metadata limit.
+pub fn arrow_fields_exact_borrowed_observed<E>(
+    left: &Field,
+    right: &Field,
+    mut observe: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    Walk {
+        observe: &mut observe,
+        validate: &mut |_, _| Ok(()),
+        nodes: 0,
+        mode: FieldMode::Exact,
+        metadata_mode: MetadataMode::BorrowedLinear,
+    }
+    .field(left, right, 1)
+}
+
 /// Observe Arrow schema compatibility equality. Unlike the frozen exact
 /// comparison, this deliberately ignores Field dictionary ids/order exactly
 /// as Arrow's PartialEq does; all other attributes use the same comparison
@@ -120,6 +166,7 @@ pub fn arrow_fields_exact_observed<E>(
         validate: &mut |_, _| Ok(()),
         nodes: 0,
         mode: FieldMode::Exact,
+        metadata_mode: MetadataMode::Bucketed,
     }
     .field(left, right, 1)
 }
@@ -136,8 +183,15 @@ fn compare_types<E>(
         validate: &mut validate,
         nodes: 0,
         mode,
+        metadata_mode: MetadataMode::Bucketed,
     }
     .ty(left, right, 1)
+}
+
+#[derive(Clone, Copy)]
+enum MetadataMode {
+    Bucketed,
+    BorrowedLinear,
 }
 
 #[derive(Clone, Copy)]
@@ -151,6 +205,7 @@ struct Walk<'a, F, B> {
     validate: &'a mut B,
     nodes: usize,
     mode: FieldMode,
+    metadata_mode: MetadataMode,
 }
 impl<E, F: FnMut() -> Result<(), E>, B: FnMut(usize, usize) -> Result<(), E>> Walk<'_, F, B> {
     fn bytes(&mut self, left: &[u8], right: &[u8]) -> Result<bool, E> {
@@ -176,7 +231,37 @@ impl<E, F: FnMut() -> Result<(), E>, B: FnMut(usize, usize) -> Result<(), E>> Wa
         Ok(hash.finish())
     }
     fn metadata(&mut self, left: &Field, right: &Field) -> Result<bool, E> {
-        self.metadata_with_key_hash(left, right, Self::key_hash)
+        match self.metadata_mode {
+            MetadataMode::Bucketed => self.metadata_with_key_hash(left, right, Self::key_hash),
+            MetadataMode::BorrowedLinear => self.metadata_borrowed(left, right),
+        }
+    }
+    fn metadata_borrowed(&mut self, left: &Field, right: &Field) -> Result<bool, E> {
+        if left.metadata().len() != right.metadata().len() {
+            return Ok(false);
+        }
+        // Borrow the original maps and compare candidate bytes cooperatively.
+        // No hash computation, bucket table, or copied key is required. A caller
+        // must admit the K right-map scans and K^2 candidates, including opaque
+        // iteration over retained hash-table capacity, before entering here.
+        for (key, value) in left.metadata() {
+            (self.observe)()?;
+            let mut matched = false;
+            for (other_key, other_value) in right.metadata() {
+                (self.observe)()?;
+                if self.bytes(key.as_bytes(), other_key.as_bytes())? {
+                    if !self.bytes(value.as_bytes(), other_value.as_bytes())? {
+                        return Ok(false);
+                    }
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
     fn metadata_with_key_hash(
         &mut self,
@@ -550,6 +635,7 @@ mod tests {
                 validate: &mut |_, _| Ok(()),
                 nodes: 0,
                 mode: FieldMode::Exact,
+                metadata_mode: MetadataMode::Bucketed,
             }
             .metadata(&empty, &empty),
             Ok(true)
@@ -582,6 +668,7 @@ mod tests {
                 validate: &mut |_, _| Ok(()),
                 nodes: 0,
                 mode: FieldMode::Exact,
+                metadata_mode: MetadataMode::Bucketed,
             }
             .metadata_with_key_hash(&left, right, |walk, _| {
                 (walk.observe)()?;

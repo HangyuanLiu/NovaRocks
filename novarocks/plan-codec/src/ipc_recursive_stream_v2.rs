@@ -182,8 +182,11 @@ impl RecursiveConstantStream<'_, '_> {
         )
     }
     /// Source retention includes the complete input allocation, original Field
-    /// and all type/metadata backing, including HashMap removed-entry capacity.
+    /// and both original Field and supplied value-type backing, including
+    /// their names/metadata and HashMap removed-entry capacity.
     /// Earlier framing and geometry retain their separate admission boundary.
+    /// Numerical grouping uses fixed stack indices under the admitted type-node
+    /// bound; stack-scratch admission remains the caller's separate obligation.
     pub fn preflight_reader_resources(
         &self,
         value_type: &FunctionValueType,
