@@ -2067,24 +2067,25 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
             };
             let argument = self.analyze_expr(arg_exprs[1], scope)?;
-            let args = vec![argument];
+            let bound = bind_scalar_function_call_with_catalog(
+                self.function_catalog,
+                function_name,
+                vec![argument],
+                self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                self.constant_policy,
+                self.control,
+            )
+            .map_err(|error| error.at_type_mismatch(func.span))?;
+            let value_type = bound.value_type().clone();
             return Ok(TypedExpr {
                 kind: ExprKind::FunctionCall {
                     volatility: self.function_catalog.volatility(function_name),
                     name: function_name.to_string(),
-                    binding: resolve_scalar_binding_at(
-                        self.function_catalog,
-                        function_name,
-                        &args,
-                        func.span,
-                        self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                        self.constant_policy,
-                        self.control,
-                    )?,
-                    args,
+                    binding: bound.binding,
+                    args: bound.args,
                     distinct: false,
                 },
-                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
+                value_type,
             });
         }
 

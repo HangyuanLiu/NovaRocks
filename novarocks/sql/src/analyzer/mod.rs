@@ -21,6 +21,8 @@
 //! without producing any physical plan concepts (tuple_id, slot_id, etc.).
 
 #[cfg(test)]
+mod extract_binding_tests;
+#[cfg(test)]
 mod full_value_type_tests;
 pub(crate) mod functions;
 mod helpers;
