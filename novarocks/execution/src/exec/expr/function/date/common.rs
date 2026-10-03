@@ -24,73 +24,14 @@ use arrow::datatypes::{DataType, TimeUnit};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
 use novarocks_types::largeint;
 
+use novarocks_functions::calendar_numeric::numeric_datetime_literal_to_naive;
+
 pub use novarocks_functions::datetime_value::{
     UNIX_EPOCH_DAY_OFFSET, date32_to_naive, naive_to_timestamp_micros, parse_date, parse_datetime,
     timestamp_to_naive,
 };
 
 pub const BC_EPOCH_JULIAN: i32 = 1721060; // from StarRocks time_types.h
-
-fn standardize_numeric_datetime_literal(value: i64) -> Option<i64> {
-    const YY_PART_YEAR: i64 = 70;
-    if value <= 0 {
-        return None;
-    }
-    if value >= 10000101000000 {
-        if value > 99999999999999 {
-            return None;
-        }
-        return Some(value);
-    }
-    if value < 101 {
-        return None;
-    }
-    if value <= (YY_PART_YEAR - 1) * 10000 + 1231 {
-        return Some((value + 20000000) * 1000000);
-    }
-    if value < YY_PART_YEAR * 10000 + 101 {
-        return None;
-    }
-    if value <= 991231 {
-        return Some((value + 19000000) * 1000000);
-    }
-    if value < 10000101 {
-        return None;
-    }
-    if value <= 99991231 {
-        return Some(value * 1000000);
-    }
-    if value < 101000000 {
-        return None;
-    }
-    if value <= (YY_PART_YEAR - 1) * 10000000000 + 1231235959 {
-        return Some(value + 20000000000000);
-    }
-    if value < YY_PART_YEAR * 10000000000 + 101000000 {
-        return None;
-    }
-    if value <= 991231235959 {
-        return Some(value + 19000000000000);
-    }
-    Some(value)
-}
-
-fn numeric_datetime_literal_to_naive(value: i64) -> Option<NaiveDateTime> {
-    let standardized = standardize_numeric_datetime_literal(value)?;
-    let date_part = standardized / 1_000_000;
-    let time_part = standardized % 1_000_000;
-
-    let year = (date_part / 10_000) as i32;
-    let month = ((date_part / 100) % 100) as u32;
-    let day = (date_part % 100) as u32;
-    let hour = (time_part / 10_000) as u32;
-    let minute = ((time_part / 100) % 100) as u32;
-    let second = (time_part % 100) as u32;
-
-    let date = NaiveDate::from_ymd_opt(year, month, day)?;
-    let time = NaiveTime::from_hms_opt(hour, minute, second)?;
-    Some(date.and_time(time))
-}
 
 pub fn naive_to_date32(date: NaiveDate) -> i32 {
     date.num_days_from_ce() - UNIX_EPOCH_DAY_OFFSET

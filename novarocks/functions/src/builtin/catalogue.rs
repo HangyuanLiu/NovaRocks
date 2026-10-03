@@ -2411,6 +2411,9 @@ pub(super) fn scalar_definition_parts(
                     name if super::string_split_part_owner::operation(name).is_some() => {
                         Some(super::string_split_part_owner::effects())
                     }
+                    name if super::calendar_parts_owner::operation(name).is_some() => {
+                        Some(super::calendar_parts_owner::effects())
+                    }
                     name if super::date_owner::operation(name).is_some() => {
                         Some(super::date_owner::effects())
                     }
@@ -2615,6 +2618,9 @@ pub fn contribute_builtin_functions(
             }
             name if super::string_split_part_owner::operation(name).is_some() => {
                 super::string_split_part_owner::definition(name, declaration, resolver)?
+            }
+            name if super::calendar_parts_owner::operation(name).is_some() => {
+                super::calendar_parts_owner::definition(name, declaration, resolver)?
             }
             name if super::date_owner::operation(name).is_some() => {
                 super::date_owner::definition(name, declaration, resolver)?
