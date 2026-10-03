@@ -17,6 +17,7 @@
 
 //! Native inbound RPC listener over a Server-resolved transport capability.
 
+use std::future::Future;
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
@@ -31,6 +32,10 @@ mod capacity_tests;
 #[cfg(test)]
 #[path = "native_initial_settings_tests.rs"]
 mod initial_settings_tests;
+
+#[cfg(test)]
+#[path = "native_acquisition_tests.rs"]
+mod acquisition_tests;
 
 use axum::Router;
 use hyper::server::conn::http2;
@@ -176,6 +181,7 @@ impl NativeRpcServerHandle {
         on_transport_handshake_failure: H,
         ingress_config: NativeIngressConfig,
         transport_capacity: NativeTransportCapacityFactory,
+        transport_class: TransportClass,
     ) -> Result<Self, String>
     where
         S: NovaRocksGrpc + Clone + Send + Sync + 'static,
@@ -193,7 +199,7 @@ impl NativeRpcServerHandle {
             on_authentication_failure,
             on_transport_handshake_failure,
             ingress_config,
-            Some(transport_capacity),
+            Some((transport_capacity, transport_class)),
         )
     }
 
@@ -212,7 +218,7 @@ impl NativeRpcServerHandle {
         on_authentication_failure: F,
         on_transport_handshake_failure: H,
         ingress_config: NativeIngressConfig,
-        transport_capacity: Option<NativeTransportCapacityFactory>,
+        transport_capacity: Option<(NativeTransportCapacityFactory, TransportClass)>,
     ) -> Result<Self, String>
     where
         S: NovaRocksGrpc + Clone + Send + Sync + 'static,
@@ -380,6 +386,15 @@ impl Drop for NativeRpcServerHandle {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The existing connection task retains acquisition output inline without another backing allocation."
+)]
+enum AcquiredConnection<C> {
+    Installed(C, Option<tonic::transport::Http2ConnectionConfig>),
+    Finished(Result<(), hyper::Error>, bool),
+}
+
 async fn serve_native_listener<S>(
     listener: TokioTcpListener,
     app: S,
@@ -387,7 +402,7 @@ async fn serve_native_listener<S>(
     mut shutdown_rx: watch::Receiver<bool>,
     on_transport_handshake_failure: Arc<dyn Fn() + Send + Sync>,
     role_label: &'static str,
-    transport_capacity: Option<NativeTransportCapacityFactory>,
+    transport_capacity: Option<(NativeTransportCapacityFactory, TransportClass)>,
 ) -> Result<(), String>
 where
     S: Service<
@@ -446,130 +461,131 @@ where
                 };
                 let accepted_at = std::time::Instant::now();
                 consecutive_accept_errors = 0;
-                let app = app.clone();
-                let incoming = incoming.clone();
-                let on_transport_handshake_failure = Arc::clone(&on_transport_handshake_failure);
-                let served = ServedConnection::open(
-                    role_label,
-                    peer,
-                    &next_connection_id,
-                    &live_connections,
-                );
-                // Actual pool grants and geometry precede the first TLS I/O.
-                // Binding remains the subsequent Hyper/H2 connection's owner.
-                let mut served = served;
                 let mut builder = http2::Builder::new(TokioExecutor::new());
                 let initial_settings_deadline = transport_capacity.as_ref().map(|_| {
                     accepted_at + Duration::from_millis(
                         novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1.transport_handshake_deadline_ms,
                     )
                 });
-                let capacity = match &transport_capacity {
-                    Some(factory) => match factory.try_config(TransportClass::Data) {
+                // Claim the shared process acquisition position before cloning
+                // application owners, creating tasks or performing TLS/H2 IO.
+                let mut capacity = match &transport_capacity {
+                    Some((factory, class)) => match factory.try_config(*class) {
                         Ok(config) => {
-                            if let Err(error) = configure_server(&mut builder, &config) {
-                                served.close("transport_geometry", &error.to_string());
+                            if configure_server(&mut builder, &config).is_err() {
+                                drop(stream);
                                 continue;
                             }
                             builder.initial_settings_deadline(initial_settings_deadline.expect("funded listener has an absolute bootstrap deadline"));
                             Some(config)
                         }
-                        Err(error) => {
-                            served.close("transport_capacity", &error.to_string());
+                        Err(_) => {
+                            // Refusal has no pending queue and no protocol IO.
+                            drop(stream);
                             continue;
                         }
                     },
                     None => None,
                 };
+                let acquisition_owner = capacity.as_mut().and_then(|config| config.acquisition_owner.take());
+                let app = app.clone();
+                let incoming = incoming.clone();
+                let on_transport_handshake_failure = Arc::clone(&on_transport_handshake_failure);
+                let mut served = ServedConnection::open(
+                    role_label, peer, &next_connection_id, &live_connections,
+                );
                 let mut drain = drain_rx.clone();
-                tokio::spawn(async move {
-                    if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                        served.close("transport_handshake", "Native acquisition deadline elapsed before first poll");
-                        on_transport_handshake_failure();
-                        return;
-                    }
-                    let handshake = incoming.accept(stream);
-                    let accepted = if let Some(deadline) = initial_settings_deadline {
-                        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), handshake).await {
-                            Ok(result) => result,
-                            Err(_) => {
-                                served.close("transport_handshake", "Native TLS handshake deadline elapsed");
-                                on_transport_handshake_failure();
-                                return;
-                            }
+                // Construct the ordered scope before spawn: an unpolled task
+                // cancellation must drop its captured socket/future before
+                // returning the original acquisition position too.
+                let acquisition = tonic::transport::ConnectionAcquisition::new(async move {
+                    let bootstrap = async move {
+                        if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                            return Err("Native acquisition deadline elapsed before first poll".to_owned());
                         }
-                    } else {
-                        handshake.await
+                        let stream = incoming.accept(stream).await.map_err(|error| format!("{error:?}"))?;
+                        if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                            drop(stream);
+                            return Err("Native acquisition deadline elapsed during TLS".to_owned());
+                        }
+                        let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                            let app = app.clone();
+                            async move {
+                                let response = app.oneshot(request.map(axum::body::Body::new)).await
+                                    .expect("Native route service is infallible");
+                                Ok::<_, std::convert::Infallible>(response)
+                            }
+                        });
+                        let mut connection = builder.serve_connection(TokioIo::new(stream), service);
+                        if initial_settings_deadline.is_none() {
+                            return Ok(AcquiredConnection::Installed(connection, capacity));
+                        }
+                        let terminal = std::future::poll_fn(|cx| {
+                            let outcome = std::pin::Pin::new(&mut connection).poll(cx);
+                            let complete = connection.initial_settings_complete();
+                            match outcome {
+                                Poll::Ready(outcome) => Poll::Ready(Some((outcome, complete))),
+                                Poll::Pending if complete => Poll::Ready(None),
+                                Poll::Pending => Poll::Pending,
+                            }
+                        }).await;
+                        if let Some((outcome, complete)) = terminal {
+                            // Failure/EOF cannot return a still-live IO as an
+                            // output while releasing the acquisition capability.
+                            drop(connection);
+                            drop(capacity);
+                            return Ok(AcquiredConnection::Finished(outcome, complete));
+                        }
+                        if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                            drop(connection);
+                            drop(capacity);
+                            return Err("Native acquisition deadline elapsed at initial settings completion".to_owned());
+                        }
+                        Ok(AcquiredConnection::Installed(connection, capacity))
                     };
-                    if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                        served.close("transport_handshake", "Native acquisition deadline elapsed during TLS");
-                        on_transport_handshake_failure();
-                        return;
+                    match initial_settings_deadline {
+                        Some(deadline) => tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), bootstrap)
+                            .await.map_err(|_| "Native TCP/TLS/HTTP2 initial settings deadline elapsed".to_owned())?,
+                        None => bootstrap.await,
                     }
-                    let stream = match accepted {
-                        Ok(stream) => stream,
+                }, acquisition_owner);
+                tokio::spawn(async move {
+                    let (connection, capacity) = match acquisition.await {
+                        Ok(AcquiredConnection::Installed(connection, capacity)) => (connection, capacity),
+                        Ok(AcquiredConnection::Finished(outcome, complete)) => {
+                            if outcome.is_err() && !complete && initial_settings_deadline.is_some() {
+                                on_transport_handshake_failure();
+                            }
+                            served.close("http2", &match outcome {
+                                Ok(()) => "ok".to_owned(),
+                                Err(error) => format!("{error:?}"),
+                            });
+                            return;
+                        }
                         Err(error) => {
-                            served.close("transport_handshake", &format!("{error:?}"));
+                            served.close("transport_handshake", &error);
                             on_transport_handshake_failure();
                             return;
                         }
                     };
-                    let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
-                        let app = app.clone();
-                        async move {
-                            let response = app
-                                .oneshot(request.map(axum::body::Body::new))
-                                .await
-                                .expect("Native route service is infallible");
-                            Ok::<_, std::convert::Infallible>(response)
-                        }
-                    });
-                    let mut connection = std::pin::pin!(
-                        builder.serve_connection(TokioIo::new(stream), service)
-                    );
+                    // The acquisition scope has exited. Application streams
+                    // retain independent pool/IO owners without the 2s timer.
+                    let mut connection = std::pin::pin!(connection);
                     let mut winding_down = false;
-                    let mut waiting_initial_settings = initial_settings_deadline.is_some();
-                    // A completed bootstrap disarms only this acquisition
-                    // deadline. Application streams keep their own lifetime.
-                    let deadline = initial_settings_deadline.unwrap_or(accepted_at);
-                    let deadline = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
-                    tokio::pin!(deadline);
                     let outcome = loop {
                         tokio::select! {
-                            _ = &mut deadline, if waiting_initial_settings => {
-                                if connection.as_ref().get_ref().initial_settings_complete() {
-                                    waiting_initial_settings = false;
-                                } else {
-                                    served.close("transport_handshake", "Native HTTP/2 initial settings deadline elapsed");
-                                    on_transport_handshake_failure();
-                                    return;
-                                }
-                            }
                             outcome = &mut connection => break outcome,
-                            // A closed channel means the listener is gone, which
-                            // asks for the same thing as an explicit signal.
                             _ = drain.changed(), if !winding_down => {
                                 winding_down = true;
-                                // GOAWAY, then let the streams already in flight
-                                // finish. This is what makes a stopping backend
-                                // answer its caller instead of vanishing.
                                 connection.as_mut().graceful_shutdown();
                             }
                         }
                     };
-                    if outcome.is_err() && !connection.as_ref().get_ref().initial_settings_complete() && initial_settings_deadline.is_some() {
-                        on_transport_handshake_failure();
-                    }
-                    // The serving future still holds the actual transport;
-                    // these construction handles may retire independently.
                     drop(capacity);
-                    served.close(
-                        "http2",
-                        &match outcome {
-                            Ok(()) => "ok".to_string(),
-                            Err(error) => format!("{error:?}"),
-                        },
-                    );
+                    served.close("http2", &match outcome {
+                        Ok(()) => "ok".to_owned(),
+                        Err(error) => format!("{error:?}"),
+                    });
                 });
             }
         }

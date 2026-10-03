@@ -192,7 +192,7 @@ async fn installed_tcp_listener_decoded_alias_survives_actual_connection_exit() 
         shutting_down,
         Arc::new(|| {}),
         "capacity-test",
-        Some(factory.clone()),
+        Some((factory.clone(), TransportClass::Data)),
     ));
     let (sender, response, driver) = listener_request(address).await;
     bounded(entered.notified()).await;

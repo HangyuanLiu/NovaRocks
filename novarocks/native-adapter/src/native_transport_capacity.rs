@@ -48,6 +48,8 @@ pub enum TransportClass {
 struct Dimensions {
     data_positions: usize,
     control_positions: usize,
+    data_acquisitions: usize,
+    control_acquisitions: usize,
     frame: usize,
     header: usize,
     writer: usize,
@@ -69,6 +71,7 @@ struct StockCore {
     // Backings precede credit in declaration order. No Weak StockCore escapes.
     slots: Vec<AtomicBool>,
     dimensions: Dimensions,
+    acquisitions: [AtomicUsize; 2],
     credit: ResultWriteCredit,
     // Keep the existing issuer alive through the credit's release callback.
     _budget: Arc<ResultRetainedBudget>,
@@ -118,6 +121,28 @@ impl Drop for SlotExit {
         // No callbacks or waits occur here. Acquire in the next claim observes
         // all preceding physical retirement before constructing fresh pools.
         self.factory.core().slots[self.index].store(false, Ordering::Release);
+    }
+}
+
+struct AcquisitionExit {
+    factory: NativeTransportCapacityFactory,
+    class: TransportClass,
+}
+
+impl Drop for AcquisitionExit {
+    fn drop(&mut self) {
+        // The owned Bytes wrapper has physically exited before this callback.
+        // Incoming and every outgoing attempt use these same process counters.
+        let previous = self.factory.core().acquisitions[class_index(self.class)]
+            .fetch_sub(1, Ordering::AcqRel);
+        assert!(previous > 0, "live acquisition position");
+    }
+}
+
+fn class_index(class: TransportClass) -> usize {
+    match class {
+        TransportClass::Data => 0,
+        TransportClass::Control => 1,
     }
 }
 
@@ -216,6 +241,8 @@ impl Dimensions {
         let mut dimensions = Self {
             data_positions,
             control_positions,
+            data_acquisitions: value(g.transport_data_handshake_positions)?,
+            control_acquisitions: value(g.transport_control_handshake_positions)?,
             frame,
             header,
             writer: value(g.transport_h2_send_buffer_bytes)?,
@@ -307,6 +334,16 @@ impl Dimensions {
             .size();
         let mut stock = add(mul(bound, positions)?, arc_bytes::<StockCore>()?)?;
         stock = add(stock, slots)?;
+        stock = add(
+            stock,
+            mul(
+                add(
+                    dimensions.data_acquisitions,
+                    dimensions.control_acquisitions,
+                )?,
+                Bytes::owner_with_exit_guard_metadata_size::<Bytes, AcquisitionExit>(),
+            )?,
+        )?;
         // Exact process-credit callback capture at the existing issuer seam.
         // Callback retirement/observer backing belongs to that existing issuer;
         // this receipt does not claim the issuer's whole allocation graph.
@@ -354,6 +391,7 @@ impl NativeTransportCapacityFactory {
             core: Some(Arc::new(StockCore {
                 slots,
                 dimensions,
+                acquisitions: [AtomicUsize::new(0), AtomicUsize::new(0)],
                 credit,
                 _budget: budget,
             })),
@@ -390,6 +428,39 @@ impl NativeTransportCapacityFactory {
             .count()
     }
 
+    /// Shared incoming/outgoing acquisition positions, distinct from live pool
+    /// stock. A snapshot does not itself authorize connector or listener I/O.
+    #[cfg(test)]
+    pub fn available_acquisitions(&self, class: TransportClass) -> usize {
+        let capacity = self.acquisition_positions(class);
+        let used = self.core().acquisitions[class_index(class)].load(Ordering::Acquire);
+        capacity - used
+    }
+
+    pub fn acquisition_positions(&self, class: TransportClass) -> usize {
+        let d = self.core().dimensions;
+        match class {
+            TransportClass::Data => d.data_acquisitions,
+            TransportClass::Control => d.control_acquisitions,
+        }
+    }
+
+    fn claim_acquisition(&self, class: TransportClass) -> io::Result<Bytes> {
+        let capacity = self.acquisition_positions(class);
+        self.core().acquisitions[class_index(class)]
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(1).filter(|&next| next <= capacity)
+            })
+            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+        Ok(Bytes::from_owner_with_exit_guard(
+            Bytes::new(),
+            AcquisitionExit {
+                factory: self.clone(),
+                class,
+            },
+        ))
+    }
+
     fn claim(&self, class: TransportClass) -> io::Result<Bytes> {
         for index in self.range(class) {
             if self.core().slots[index]
@@ -414,8 +485,10 @@ impl NativeTransportCapacityFactory {
     /// Endpoint windows/adaptive mode/pending queue must be set by its caller.
     pub fn try_config(&self, class: TransportClass) -> io::Result<Http2ConnectionConfig> {
         let d = self.core().dimensions;
+        let acquisition_owner = self.claim_acquisition(class)?;
         let owner = self.claim(class)?;
         Ok(Http2ConnectionConfig {
+            acquisition_owner: Some(acquisition_owner),
             stream_store_buffer: Some(h2::StreamStoreBuffer::new(
                 d.streams,
                 d.streams,
@@ -478,7 +551,8 @@ pub fn configure_server<E>(
 ) -> io::Result<()> {
     let d = Dimensions::frozen()?;
     let g = NativeResultSupportGeometry::V1;
-    if config.max_frame_size != Some(d.frame as u32)
+    if config.acquisition_owner.is_none()
+        || config.max_frame_size != Some(d.frame as u32)
         || config.initial_settings_timeout
             != Some(std::time::Duration::from_millis(
                 g.transport_handshake_deadline_ms,
@@ -647,6 +721,11 @@ mod tests {
         assert_eq!(
             factory.try_config(TransportClass::Data).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            factory.available_acquisitions(TransportClass::Data),
+            32,
+            "stock refusal must roll back its preceding acquisition claim"
         );
         assert_eq!(factory.available_positions(TransportClass::Control), 20);
         let control = factory.try_config(TransportClass::Control).unwrap();

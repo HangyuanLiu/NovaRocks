@@ -121,3 +121,64 @@ pub use self::channel::ClientTlsConfig;
 pub use self::server::ServerTlsConfig;
 #[cfg(feature = "tls")]
 pub use self::tls::Identity;
+
+/// Inline owner for one connection acquisition future.
+///
+/// The future is destroyed before the original owner on cancellation, error or
+/// completion. No extra backing is allocated by this wrapper. The enclosing
+/// future, IO/TLS, task, stack and output-owned aliases remain caller scopes.
+/// Put every success validation, including an absolute deadline's late-Ready
+/// check, inside the future before returning its live connection output.
+#[pin_project::pin_project(PinnedDrop)]
+pub struct ConnectionAcquisition<F> {
+    #[pin]
+    future: Option<F>,
+    owner: Option<bytes::Bytes>,
+}
+impl<F> std::fmt::Debug for ConnectionAcquisition<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionAcquisition")
+            .field("active", &self.future.is_some())
+            .field("has_owner", &self.owner.is_some())
+            .finish_non_exhaustive()
+    }
+}
+impl<F> ConnectionAcquisition<F> {
+    /// Hold an original acquisition capability until the actual future exits.
+    /// A successful output can retain independently funded connection owners.
+    pub fn new(future: F, owner: Option<bytes::Bytes>) -> Self {
+        Self {
+            future: Some(future),
+            owner,
+        }
+    }
+}
+impl<F: std::future::Future> std::future::Future for ConnectionAcquisition<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let mut this = self.project();
+        let result = this
+            .future
+            .as_mut()
+            .as_pin_mut()
+            .expect("live acquisition future")
+            .poll(cx);
+        if result.is_ready() {
+            this.future.set(None);
+            drop(this.owner.take());
+        }
+        result
+    }
+}
+#[pin_project::pinned_drop]
+impl<F> PinnedDrop for ConnectionAcquisition<F> {
+    fn drop(self: std::pin::Pin<&mut Self>) {
+        let mut this = self.project();
+        this.future.set(None);
+        drop(this.owner.take());
+    }
+}

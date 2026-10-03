@@ -176,7 +176,7 @@ async fn actual_listener_partial_bootstraps_expire_without_dispatch_and_return_o
                 observed.fetch_add(1, Ordering::AcqRel);
             }),
             "initial-settings-test",
-            Some(factory.clone()),
+            Some((factory.clone(), TransportClass::Data)),
         ));
         let started = Instant::now();
         let mut peer = bounded(tokio::net::TcpStream::connect(address))
@@ -340,7 +340,7 @@ async fn completed_native_bootstrap_does_not_expire_a_long_application_stream() 
             observed.fetch_add(1, Ordering::AcqRel);
         }),
         "long-initial-settings-test",
-        Some(factory.clone()),
+        Some((factory.clone(), TransportClass::Data)),
     ));
     let stream = bounded(tokio::net::TcpStream::connect(address))
         .await

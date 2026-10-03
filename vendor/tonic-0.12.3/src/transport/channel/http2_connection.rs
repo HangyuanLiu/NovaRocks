@@ -18,6 +18,12 @@ pub struct Http2ConnectionConfig {
     /// TCP/TLS, preface, applied peer initial SETTINGS and actual initial flush.
     /// None preserves legacy acquisition. This never times application streams.
     pub initial_settings_timeout: Option<std::time::Duration>,
+    /// Original per-attempt acquisition position, held through the complete
+    /// TCP/TLS and initial SETTINGS phase. Requires a positive timeout. The
+    /// connector/handshake future exits before this owner on error or cancel;
+    /// success releases it before spawning the live connection task. This
+    /// carrier does not fund the enclosing future, TLS or socket allocations.
+    pub acquisition_owner: Option<bytes::Bytes>,
     /// Original fixed resident stream and readiness storage for this attempt.
     pub stream_store_buffer: Option<h2::StreamStoreBuffer>,
     /// Local maximum inbound frame payload. This is not an outbound ceiling.
@@ -65,6 +71,13 @@ impl Http2ConnectionConfig {
         builder: &mut Builder<E>,
         inherited_max_header_list_size: Option<u32>,
     ) -> io::Result<()> {
+        if self.acquisition_owner.is_some()
+            && self.initial_settings_timeout.is_none_or(|d| d.is_zero())
+        {
+            return Err(invalid(
+                "acquisition owner requires a positive initial settings timeout",
+            ));
+        }
         if self.initial_settings_timeout.is_some_and(|d| d.is_zero()) {
             return Err(invalid(
                 "initial settings acquisition timeout must be positive",

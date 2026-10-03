@@ -799,6 +799,7 @@ impl BackendApplicationHost {
             novarocks_native_adapter::backend_metrics::record_backend_native_tls_handshake_failure,
             native_ingress,
             transport_capacity,
+            crate::native_transport_capacity::TransportClass::Data,
         ) {
             Ok(server) => server,
             Err(error) => {

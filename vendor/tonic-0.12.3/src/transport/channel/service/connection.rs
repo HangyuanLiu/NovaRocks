@@ -2,7 +2,7 @@ use super::{AddOrigin, Reconnect, SharedExec, UserAgent};
 use crate::transport::channel::http2_connection::Http2ConnectionFactory;
 use crate::{
     body::{boxed, BoxBody},
-    transport::{channel::BoxFuture, service::GrpcTimeout, Endpoint},
+    transport::{channel::BoxFuture, service::GrpcTimeout, ConnectionAcquisition, Endpoint},
 };
 use http::{Request, Response, Uri};
 use hyper::rt;
@@ -202,9 +202,19 @@ where
     fn call(&mut self, req: Uri) -> Self::Future {
         let started = std::time::Instant::now();
         let mut initial_settings_deadline = None;
+        let mut acquisition_owner = None;
         let mut builder = self.settings.clone();
         if let Some(factory) = &self.factory {
-            let configured = factory().and_then(|config| {
+            let configured = factory().and_then(|mut config| {
+                // Extract the original position before validation or moving
+                // any builder capabilities. Even rejected attempts retain it
+                // in the returned future until that future actually exits.
+                acquisition_owner = config.acquisition_owner.take();
+                if acquisition_owner.is_some()
+                    && config.initial_settings_timeout.is_none_or(|d| d.is_zero())
+                {
+                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput).into());
+                }
                 if let Some(timeout) = config.initial_settings_timeout {
                     if timeout.is_zero() {
                         return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput).into());
@@ -224,47 +234,68 @@ where
             });
             if let Err(error) = configured {
                 // No dial future or handshake is created on factory refusal.
-                return Box::pin(async move { Err(error) });
+                return Box::pin(ConnectionAcquisition::new(
+                    async move { Err(error) },
+                    acquisition_owner,
+                ));
             }
         }
         if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-            return Box::pin(async {
-                Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into())
-            });
+            return Box::pin(ConnectionAcquisition::new(
+                async { Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into()) },
+                acquisition_owner,
+            ));
         }
         let fut = self.connector.call(req);
         let executor = self.executor.clone();
 
-        Box::pin(async move {
-            let acquisition = async move {
-                // A queued first poll cannot perform connector I/O after D.
+        // Construct the ordered owner wrapper before returning the queued
+        // future. Cancellation before its first poll must also retire the
+        // captured connector future before returning the acquisition position.
+        let acquisition = ConnectionAcquisition::new(
+            async move {
+                let connecting = async move {
+                    if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                        return Err(crate::Error::from(std::io::Error::from(
+                            std::io::ErrorKind::TimedOut,
+                        )));
+                    }
+                    let io = fut
+                        .await
+                        .map_err(|error| -> crate::Error { error.into() })?;
+                    builder
+                        .handshake(io)
+                        .await
+                        .map_err(|error| -> crate::Error { error.into() })
+                };
+                let result = match initial_settings_deadline {
+                    Some(deadline) => tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(deadline),
+                        connecting,
+                    )
+                    .await
+                    .map_err(|_| {
+                        crate::Error::from(std::io::Error::from(std::io::ErrorKind::TimedOut))
+                    })?,
+                    None => connecting.await,
+                }?;
                 if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                    // A late Ready may contain a live IO/connection. It exits
+                    // inside this verdict future, before the acquisition owner.
+                    drop(result);
                     return Err(crate::Error::from(std::io::Error::from(
                         std::io::ErrorKind::TimedOut,
                     )));
                 }
-                let io = fut
-                    .await
-                    .map_err(|error| -> crate::Error { error.into() })?;
-                builder
-                    .handshake(io)
-                    .await
-                    .map_err(|error| -> crate::Error { error.into() })
-            };
-            let (send_request, conn) = match initial_settings_deadline {
-                Some(deadline) => {
-                    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), acquisition)
-                        .await
-                        .map_err(|_| {
-                            crate::Error::from(std::io::Error::from(std::io::ErrorKind::TimedOut))
-                        })??
-                }
-                None => acquisition.await?,
-            };
-            if initial_settings_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
-            }
+                Ok(result)
+            },
+            acquisition_owner,
+        );
 
+        Box::pin(async move {
+            let (send_request, conn) = acquisition.await?;
+            // The ordered acquisition future has now exited and released its
+            // position. The live connection retains its independent pools.
             Executor::<BoxFuture<'static, ()>>::execute(
                 &executor,
                 Box::pin(async move {
@@ -273,7 +304,6 @@ where
                     }
                 }) as _,
             );
-
             Ok(SendRequest::from(send_request))
         })
     }
