@@ -4866,6 +4866,57 @@ mod tests {
     // IV3-7 Task 12: nanosecond timestamp cast semantics
 
     #[test]
+    fn cast_seconds_and_milliseconds_to_micros_keep_checked_overflow_nulls() {
+        for (source, factor) in [
+            (TimeUnit::Second, 1_000_000_i64),
+            (TimeUnit::Millisecond, 1_000),
+        ] {
+            for zone in [None, Some(Arc::<str>::from("UTC"))] {
+                let boundary = i64::MAX / factor;
+                let values = vec![
+                    Some(1),
+                    Some(-1),
+                    Some(boundary),
+                    Some(boundary + 1),
+                    Some(i64::MAX),
+                    Some(i64::MIN),
+                    None,
+                ];
+                let array: ArrayRef = match source {
+                    TimeUnit::Second => {
+                        Arc::new(TimestampSecondArray::from(values).with_timezone_opt(zone))
+                    }
+                    TimeUnit::Millisecond => {
+                        Arc::new(TimestampMillisecondArray::from(values).with_timezone_opt(zone))
+                    }
+                    _ => unreachable!(),
+                };
+                let out = cast_with_special_rules(
+                    &array,
+                    &DataType::Timestamp(TimeUnit::Microsecond, None),
+                )
+                .unwrap();
+                let out = out
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap();
+                assert_eq!(
+                    out.iter().collect::<Vec<_>>(),
+                    [
+                        Some(factor),
+                        Some(-factor),
+                        Some(boundary * factor),
+                        None,
+                        None,
+                        None,
+                        None
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn cast_same_unit_timestamp_retags_timezone_metadata() {
         let src = Arc::new(TimestampMicrosecondArray::from(vec![Some(1_000_i64)])) as ArrayRef;
         let target = DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()));

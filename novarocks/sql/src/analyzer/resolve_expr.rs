@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_parser::Span;
 use novarocks_parser::ast;
 use novarocks_parser::printer::{print_expr, print_object_name, print_type_name};
@@ -5213,35 +5213,14 @@ pub(super) fn resolved_scalar_call_at(
         .zip(binding.selected.argument_types.iter())
         .map(|(argument, target)| match target {
             novarocks_functions::FunctionArgumentType::Value(target) => {
-                if argument.value_type.logical_type != target.logical_type
-                    || !novarocks_type_contract::preserves_nested_logical_identity(
-                        &argument.value_type.data_type,
-                        &target.data_type,
-                    )
-                {
-                    let nullable = argument.value_type.nullable
-                        || (argument.value_type.logical_type
-                            == novarocks_type_contract::ValueLogicalType::LargeInt
-                            && target.logical_type
-                                == novarocks_type_contract::ValueLogicalType::Physical
-                            && matches!(
-                                target.data_type,
-                                DataType::Int8
-                                    | DataType::Int16
-                                    | DataType::Int32
-                                    | DataType::Int64
-                            ));
-                    super::value_conversion::convert_value_domain_with_catalog(
-                        function_catalog,
-                        argument,
-                        super::helpers::with_nullability(target.clone(), nullable),
-                        decimal_overflow_policy,
-                        constant_policy,
-                        control,
-                    )
-                } else {
-                    Ok(argument)
-                }
+                coerce_selected_function_argument(
+                    function_catalog,
+                    argument,
+                    target,
+                    decimal_overflow_policy,
+                    constant_policy,
+                    control,
+                )
             }
             novarocks_functions::FunctionArgumentType::Lambda { .. } => Ok(argument),
         })
@@ -5352,7 +5331,8 @@ fn coerce_function_argument(
         });
     }
     let nullable = expr.value_type.nullable
-        || narrowing_integer_cast_can_return_null(&expr.value_type.data_type, target);
+        || narrowing_integer_cast_can_return_null(&expr.value_type.data_type, target)
+        || timestamp_unit_cast_can_return_null(&expr.value_type.data_type, target);
     Ok(TypedExpr {
         kind: ExprKind::Cast {
             expr: Box::new(expr),
@@ -5382,6 +5362,7 @@ fn coerce_selected_function_argument(
     }
     let nullable = expr.value_type.nullable
         || narrowing_integer_cast_can_return_null(&expr.value_type.data_type, &target.data_type)
+        || timestamp_unit_cast_can_return_null(&expr.value_type.data_type, &target.data_type)
         || (expr.value_type.logical_type == novarocks_type_contract::ValueLogicalType::LargeInt
             && target.logical_type == novarocks_type_contract::ValueLogicalType::Physical
             && matches!(
@@ -5413,6 +5394,25 @@ fn coerce_selected_function_argument(
     coerced.value_type =
         super::helpers::with_nullability(target.clone(), coerced.value_type.nullable);
     Ok(coerced)
+}
+
+// These unit expansions use the existing safe Arrow cast, whose checked
+// multiplication can produce NULL. Microsecond -> nanosecond is excluded:
+// the installed cast owner reports overflow as an error for that pair.
+fn timestamp_unit_cast_can_return_null(source: &DataType, target: &DataType) -> bool {
+    matches!(
+        (source, target),
+        (
+            DataType::Timestamp(TimeUnit::Second, _),
+            DataType::Timestamp(
+                TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond,
+                _
+            )
+        ) | (
+            DataType::Timestamp(TimeUnit::Millisecond, _),
+            DataType::Timestamp(TimeUnit::Microsecond | TimeUnit::Nanosecond, _)
+        )
+    )
 }
 
 fn narrowing_integer_cast_can_return_null(source: &DataType, target: &DataType) -> bool {

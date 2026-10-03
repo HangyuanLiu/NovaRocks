@@ -193,7 +193,14 @@ fn extract_binding_all_six_units_preserve_canonical_targets_and_original_catalog
                 )
                 .unwrap()
             } else {
-                FunctionValueType::new(target_carrier, nullable)
+                FunctionValueType::new(
+                    target_carrier,
+                    nullable
+                        || matches!(
+                            carrier,
+                            DataType::Timestamp(TimeUnit::Second | TimeUnit::Millisecond, _)
+                        ),
+                )
             };
             for name in ["year", "month", "day", "hour", "minute", "second"] {
                 let sql = format!("SELECT EXTRACT({name} FROM x), {name}(x) FROM temporal_source");
