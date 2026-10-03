@@ -2420,6 +2420,9 @@ pub(super) fn scalar_definition_parts(
                     name if super::string_md5_owner::operation(name).is_some() => {
                         Some(super::string_md5_owner::effects())
                     }
+                    name if super::string_sm3_owner::operation(name).is_some() => {
+                        Some(super::string_sm3_owner::effects())
+                    }
                     name if super::calendar_day_number_owner::operation(name).is_some() => {
                         Some(super::calendar_day_number_owner::effects())
                     }
@@ -2645,6 +2648,9 @@ pub fn contribute_builtin_functions(
             }
             name if super::string_md5_owner::operation(name).is_some() => {
                 super::string_md5_owner::definition(name, declaration, resolver)?
+            }
+            name if super::string_sm3_owner::operation(name).is_some() => {
+                super::string_sm3_owner::definition(name, declaration, resolver)?
             }
             name if super::calendar_day_number_owner::operation(name).is_some() => {
                 super::calendar_day_number_owner::definition(name, declaration, resolver)?

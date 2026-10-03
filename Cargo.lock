@@ -3999,6 +3999,7 @@ dependencies = [
  "num-traits",
  "rand 0.8.5",
  "sha2",
+ "sm3",
 ]
 
 [[package]]

@@ -41,6 +41,7 @@ novarocks-constant-contract.workspace = true
 num-traits.workspace = true
 rand.workspace = true
 sha2.workspace = true
+sm3 = "0.4"
 
 [dev-dependencies]
 arrow-ord = "58.2.0"
