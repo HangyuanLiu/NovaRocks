@@ -39,7 +39,7 @@ use novarocks_constant_contract::{ConstantPolicy, ConstantPool};
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, FunctionValueType, PureCompileControl,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 mod reader_allocations;
 mod reader_diagnostics;
@@ -215,6 +215,47 @@ impl RecursiveConstantStream<'_, '_> {
         limits: RecursiveReaderProjectionLimits,
         control: &dyn PureCompileControl,
     ) -> Result<ConstantPool, RecursiveReaderError> {
+        self.materialize_pool_core(
+            field,
+            Cow::Owned(value_type),
+            source_retained_bytes,
+            policy,
+            limits,
+            control,
+        )
+    }
+
+    /// Borrow the admitted type-table value until the original complete gate
+    /// and reader succeed. The permitted carrier profile clones only Arc
+    /// owners or inline parameters; no recursive Field or metadata is copied.
+    pub fn materialize_pool_borrowed(
+        &self,
+        field: Arc<Field>,
+        value_type: &FunctionValueType,
+        source_retained_bytes: usize,
+        policy: ConstantPolicy,
+        limits: RecursiveReaderProjectionLimits,
+        control: &dyn PureCompileControl,
+    ) -> Result<ConstantPool, RecursiveReaderError> {
+        self.materialize_pool_core(
+            field,
+            Cow::Borrowed(value_type),
+            source_retained_bytes,
+            policy,
+            limits,
+            control,
+        )
+    }
+
+    fn materialize_pool_core(
+        &self,
+        field: Arc<Field>,
+        value_type: Cow<'_, FunctionValueType>,
+        source_retained_bytes: usize,
+        policy: ConstantPolicy,
+        limits: RecursiveReaderProjectionLimits,
+        control: &dyn PureCompileControl,
+    ) -> Result<ConstantPool, RecursiveReaderError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
         let result = (|| {
             require(
@@ -224,7 +265,7 @@ impl RecursiveConstantStream<'_, '_> {
             )
             .map_err(FlatPoolResourceError::from)?;
             self.reader_resources(
-                &value_type,
+                value_type.as_ref(),
                 source_retained_bytes,
                 policy,
                 limits,
@@ -250,7 +291,7 @@ impl RecursiveConstantStream<'_, '_> {
             work.flush()?;
             let pool = ConstantPool::try_new(
                 field,
-                value_type,
+                value_type.into_owned(),
                 data,
                 policy,
                 CompilePhase::Decode,

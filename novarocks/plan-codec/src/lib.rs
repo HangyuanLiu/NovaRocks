@@ -28,6 +28,7 @@ pub mod ipc_recursive_stream_v2;
 pub mod ipc_schema_v2;
 pub mod native_type;
 mod native_type_encode;
+pub mod physical_constant_v2;
 pub mod physical_control_v2;
 mod physical_encode;
 mod physical_expr;

@@ -406,3 +406,7 @@ fn recursive_framing_every_original_callback_and_ordinary_tail_preserves_primary
         }
     }
 }
+
+mod borrowed_tests {
+    include!("ipc_recursive_stream_v2/borrowed_reader_tests.rs");
+}

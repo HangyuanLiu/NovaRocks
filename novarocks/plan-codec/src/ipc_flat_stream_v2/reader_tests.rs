@@ -959,3 +959,7 @@ fn actual_reader_deleted_metadata_keeps_original_backing_invoice_work_authority(
     );
     assert_eq!(pool.value(0).unwrap().try_i64().unwrap(), Some(71));
 }
+
+mod borrowed_tests {
+    include!("reader_tests/borrowed_tests.rs");
+}

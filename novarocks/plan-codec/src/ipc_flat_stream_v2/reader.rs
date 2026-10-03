@@ -33,7 +33,7 @@ use novarocks_constant_contract::{ConstantPolicy, ConstantPool};
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, FunctionValueType, PureCompileControl,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 /// Explicit admitted host envelopes. They do not create a separate wallet.
 #[derive(Clone, Copy, Debug)]
@@ -213,6 +213,47 @@ impl FlatConstantStream<'_, '_> {
         limits: FlatReaderProjectionLimits,
         control: &dyn PureCompileControl,
     ) -> Result<ConstantPool, FlatReaderError> {
+        self.materialize_pool_core(
+            field,
+            Cow::Owned(value_type),
+            source_retained_bytes,
+            policy,
+            limits,
+            control,
+        )
+    }
+
+    /// Borrow the admitted type-table value until the original complete gate
+    /// and reader succeed. The permitted carrier profile clones only Arc
+    /// owners or inline parameters; no recursive Field or metadata is copied.
+    pub fn materialize_pool_borrowed(
+        &self,
+        field: Arc<Field>,
+        value_type: &FunctionValueType,
+        source_retained_bytes: usize,
+        policy: ConstantPolicy,
+        limits: FlatReaderProjectionLimits,
+        control: &dyn PureCompileControl,
+    ) -> Result<ConstantPool, FlatReaderError> {
+        self.materialize_pool_core(
+            field,
+            Cow::Borrowed(value_type),
+            source_retained_bytes,
+            policy,
+            limits,
+            control,
+        )
+    }
+
+    fn materialize_pool_core(
+        &self,
+        field: Arc<Field>,
+        value_type: Cow<'_, FunctionValueType>,
+        source_retained_bytes: usize,
+        policy: ConstantPolicy,
+        limits: FlatReaderProjectionLimits,
+        control: &dyn PureCompileControl,
+    ) -> Result<ConstantPool, FlatReaderError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
         let result = (|| {
             if !std::ptr::eq(self.field(), field.as_ref()) {
@@ -220,7 +261,7 @@ impl FlatConstantStream<'_, '_> {
             }
             work.step()?;
             let _facts = self.reader_resources(
-                &value_type,
+                value_type.as_ref(),
                 source_retained_bytes,
                 policy,
                 limits,
@@ -248,7 +289,7 @@ impl FlatConstantStream<'_, '_> {
             work.flush()?;
             let pool = ConstantPool::try_new(
                 field,
-                value_type,
+                value_type.into_owned(),
                 data,
                 policy,
                 CompilePhase::Decode,
