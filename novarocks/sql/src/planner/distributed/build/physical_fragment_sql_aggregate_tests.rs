@@ -147,7 +147,7 @@ fn genuine_sql_partial_final_composer_covers_every_actual_call_from_original_jou
     let owner = crate::compiler::compile_authored_aggregate_for_test(
         "SELECT COUNT(*), COUNT(7), MIN(order_key), MAX(order_key) FROM orders",
     );
-    let catalog = crate::functions::builtin_sql_function_catalog();
+    let catalog = owner.function_catalog().as_ref();
     let mut update = 0;
     let mut merge = 0;
     for fragment in aggregate_fragments(&owner) {
@@ -165,7 +165,6 @@ fn genuine_sql_partial_final_composer_covers_every_actual_call_from_original_jou
                 &scopes,
                 &expressions,
             ),
-            catalog,
             &Control::default(),
         )
         .unwrap();
@@ -208,7 +207,7 @@ fn genuine_sql_partial_final_composer_covers_every_actual_call_from_original_jou
 #[test]
 fn genuine_sql_composer_success_and_original_policy_refusal_observe_all_real_prefixes() {
     let owner = crate::compiler::compile_authored_aggregate_for_test("SELECT COUNT(*) FROM orders");
-    let catalog = crate::functions::builtin_sql_function_catalog();
+    let catalog = owner.function_catalog().as_ref();
     for fragment in aggregate_fragments(&owner) {
         let occurrences =
             author_physical_occurrences_observed(fragment, catalog, &Control::default()).unwrap();
@@ -226,7 +225,6 @@ fn genuine_sql_composer_success_and_original_policy_refusal_observe_all_real_pre
                         &scopes,
                         &expressions,
                     ),
-                    catalog,
                     control,
                 )
             },
@@ -248,7 +246,6 @@ fn genuine_sql_composer_success_and_original_policy_refusal_observe_all_real_pre
                 &scopes,
                 &expressions,
             ),
-            catalog,
             &Control::default(),
         );
         assert!(matches!(
@@ -269,7 +266,6 @@ fn genuine_sql_composer_success_and_original_policy_refusal_observe_all_real_pre
                         &scopes,
                         &expressions,
                     ),
-                    catalog,
                     control,
                 )
             },
@@ -284,7 +280,7 @@ fn genuine_sql_composer_refuses_foreign_equal_owner_pool_parameters_and_extra_mi
     let foreign =
         crate::compiler::compile_authored_aggregate_for_test("SELECT COUNT(*) FROM orders");
     let cloned = owner.clone();
-    let catalog = crate::functions::builtin_sql_function_catalog();
+    let catalog = owner.function_catalog().as_ref();
     for fragment in aggregate_fragments(&owner) {
         let occurrences =
             author_physical_occurrences_observed(fragment, catalog, &Control::default()).unwrap();
@@ -301,7 +297,6 @@ fn genuine_sql_composer_refuses_foreign_equal_owner_pool_parameters_and_extra_mi
                     &scopes,
                     &expressions
                 ),
-                catalog,
                 &Control::default()
             )
             .is_ok()
@@ -318,7 +313,6 @@ fn genuine_sql_composer_refuses_foreign_equal_owner_pool_parameters_and_extra_mi
                         &scopes,
                         &expressions,
                     ),
-                    catalog,
                     control,
                 )
             },
@@ -340,14 +334,14 @@ fn genuine_sql_composer_refuses_foreign_equal_owner_pool_parameters_and_extra_mi
                     } else {
                         source.parameters = foreign.plan().parameters();
                     }
-                    author_sql_aggregate_fragment_effects_observed(&owner, source, catalog, control)
+                    author_sql_aggregate_fragment_effects_observed(&owner, source, control)
                 },
                 false,
             );
         }
         let (site, scope) = scopes.pop_first().unwrap();
         assert!(
-            matches!(author_sql_aggregate_fragment_effects_observed(&owner, input(&owner, fragment, &occurrences, policy, &scopes, &expressions), catalog, &Control::default()), Err(PhysicalFragmentEffectsError::MissingScope(actual)) if actual == site)
+            matches!(author_sql_aggregate_fragment_effects_observed(&owner, input(&owner, fragment, &occurrences, policy, &scopes, &expressions), &Control::default()), Err(PhysicalFragmentEffectsError::MissingScope(actual)) if actual == site)
         );
         prefixes(
             |control| {
@@ -361,7 +355,6 @@ fn genuine_sql_composer_refuses_foreign_equal_owner_pool_parameters_and_extra_mi
                         &scopes,
                         &expressions,
                     ),
-                    catalog,
                     control,
                 )
             },
@@ -397,7 +390,6 @@ fn genuine_sql_composer_refuses_foreign_equal_owner_pool_parameters_and_extra_mi
                         &scopes,
                         &expressions,
                     ),
-                    catalog,
                     control,
                 )
             },
@@ -409,7 +401,7 @@ fn genuine_sql_composer_refuses_foreign_equal_owner_pool_parameters_and_extra_mi
 #[test]
 fn genuine_sql_composer_refuses_captured_constant_policy_change_and_direct_merge_reconstruction() {
     let owner = crate::compiler::compile_authored_aggregate_for_test("SELECT COUNT(*) FROM orders");
-    let catalog = crate::functions::builtin_sql_function_catalog();
+    let catalog = owner.function_catalog().as_ref();
     let mut final_seen = false;
     for fragment in aggregate_fragments(&owner) {
         let occurrences =
@@ -430,7 +422,6 @@ fn genuine_sql_composer_refuses_captured_constant_policy_change_and_direct_merge
                         &scopes,
                         &expressions,
                     ),
-                    catalog,
                     control,
                 )
             },

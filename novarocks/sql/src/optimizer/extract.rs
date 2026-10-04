@@ -1455,7 +1455,7 @@ mod tests {
                     max: 8,
                     requires_power_of_two: true,
                 },
-                crate::functions::builtin_sql_function_catalog(),
+                crate::functions::builtin_sql_function_catalog().snapshot(),
                 false,
                 crate::constant::test_constant_policy(), // This test authors a statement with throwing disabled.
                 &control,

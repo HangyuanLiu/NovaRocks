@@ -607,7 +607,7 @@ pub fn build_final_frozen_connector_write_plan(
     sink: DmlWritePlanInput,
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
-    functions: &dyn crate::compiler::SqlFunctionCatalog,
+    functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     settings: &crate::compiler::SessionOptimizerSettings,
     final_write: DmlFinalWritePlanContext,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
@@ -634,7 +634,7 @@ pub fn build_final_frozen_connector_write_plan(
                 requirements: statistics,
             },
         ],
-        functions,
+        functions.as_ref(),
         decimal_overflow_policy,
         constant_policy,
         control,
@@ -754,7 +754,7 @@ impl DmlWriteCompletion {
                 auxiliary: &self.auxiliary,
                 targets: targets.0,
             },
-            self.functions.as_ref(),
+            self.functions,
             self.root_allow_throw_exception,
             self.constant_policy,
             control,
@@ -806,7 +806,7 @@ pub fn compile_final_connector_write_plan(
         &auxiliary,
         settings,
         final_write,
-        compiled.function_catalog.as_ref(),
+        compiled.function_catalog,
         compiled.root_allow_throw_exception,
         constant_policy,
         &control,
@@ -822,7 +822,7 @@ fn complete_connector_write_plan(
     auxiliary: &crate::planner::distributed::write::auxiliary::WriterAuxiliaryPlan,
     settings: &crate::compiler::SessionOptimizerSettings,
     final_write: DmlFinalWritePlanContext,
-    functions: &dyn crate::compiler::SqlFunctionCatalog,
+    functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     root_allow_throw_exception: bool,
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
@@ -916,7 +916,7 @@ impl DmlReadCompletion {
                     version,
                     dop_domain,
                     reads,
-                    self.functions.as_ref(),
+                    self.functions,
                     self.root_allow_throw_exception,
                     self.constant_policy,
                     control,
@@ -926,7 +926,7 @@ impl DmlReadCompletion {
                 &self.physical,
                 version,
                 dop_domain,
-                self.functions.as_ref(),
+                self.functions,
                 self.root_allow_throw_exception,
                 self.constant_policy,
                 control,
@@ -1222,7 +1222,7 @@ impl DmlChangeStreamCompletion {
                 auxiliary: &self.auxiliary,
                 targets: finalized_targets.0,
             },
-            self.functions.as_ref(),
+            self.functions,
             self.root_allow_throw_exception,
             self.constant_policy,
             control,
@@ -1452,7 +1452,7 @@ pub fn compile_final_dml_change_stream(
         compiled.statistics.snapshot,
         request.routes,
         request.statistics_targets,
-        compiled.function_catalog.as_ref(),
+        compiled.function_catalog,
         DmlFinalChangeStreamSealContext {
             pre_expand_keyed_assert: request.pre_expand_keyed_assert,
             shape: request.shape,
@@ -1474,7 +1474,7 @@ pub(crate) fn seal_final_change_stream_producer(
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     routes: Vec<DmlChangeStreamRoute>,
     statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
-    functions: &dyn crate::compiler::SqlFunctionCatalog,
+    functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     context: DmlFinalChangeStreamSealContext,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     root_allow_throw_exception: bool,
@@ -1523,7 +1523,7 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
     routes: Vec<DmlChangeStreamRoute>,
     statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
     effect_output_ordinal: usize,
-    functions: &dyn crate::compiler::SqlFunctionCatalog,
+    functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     context: DmlFinalChangeStreamSealContext,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     root_allow_throw_exception: bool,
@@ -1550,7 +1550,7 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
     let auxiliary = plan_change_stream_writer_statistics(
         &routes,
         statistics_targets,
-        functions,
+        functions.as_ref(),
         decimal_overflow_policy,
         constant_policy,
         control,
@@ -2338,6 +2338,11 @@ pub fn build_final_statistics_connector_plan(
                 .into(),
         );
     }
+    // This generated source has no preceding analyzed catalog owner. Capture
+    // once before authoring its first binding, and retain that same owner.
+    control.check()?;
+    let functions = functions.snapshot();
+    control.check()?;
     let (version, dop_domain, reads) = final_context.into_parts();
     let reads = reads.ok_or_else(|| {
         "ANALYZE final planning requires exactly one finalized provider read".to_string()
@@ -2348,7 +2353,7 @@ pub fn build_final_statistics_connector_plan(
     let mut physical = build_statistics_connector_physical(
         scan,
         required,
-        functions,
+        functions.as_ref(),
         scan_occurrence,
         decimal_overflow_policy,
         constant_policy,
@@ -2807,6 +2812,11 @@ fn build_statistics_connector_physical(
 }
 
 #[cfg(test)]
+pub(crate) fn statistics_final_context_for_test() -> DmlFinalPlanContext {
+    tests::statistics_final_context()
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         DmlChangeStreamRoute, DmlChangeStreamStatisticsTarget, DmlStatisticsSnapshot,
@@ -2943,7 +2953,7 @@ mod tests {
         );
     }
 
-    fn statistics_final_context() -> super::DmlFinalPlanContext {
+    pub(super) fn statistics_final_context() -> super::DmlFinalPlanContext {
         use novarocks_physical_plan::{
             ExactInputVersion, PipelineDopDomain, PlanVersionId, ProviderColumnReference,
             ProviderReadReference, ScanReadBudget, ValueType,

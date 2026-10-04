@@ -1166,7 +1166,7 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         prepare_frozen_rewrite_cohort_with_ports(
             self.kernel.connector_control().as_ref(),
             self.kernel.typed_connector_control(),
-            self.kernel.function_catalog().as_ref(),
+            Arc::clone(self.kernel.function_catalog()),
             self.kernel.query_execution(),
             session.session(),
             cohort_id,
@@ -1486,7 +1486,7 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
 fn prepare_frozen_rewrite_cohort_with_ports(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
-    function_catalog: &novarocks_functions::EngineFunctionCatalog,
+    function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     query_execution: &crate::query_execution::service::QueryExecutionService,
     session: &crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession,
     cohort_id: ConnectorWriteCohortId,
@@ -1652,7 +1652,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
         sink,
         write_target.ordinal(),
         write_target.statistics().requirements(),
-        function_catalog,
+        function_catalog.clone(),
         &optimizer_settings,
         novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
             novarocks_sql::planning::dml::DmlFinalPlanContext::new(
@@ -1692,7 +1692,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
     .map_err(|(error, _returned)| error.to_string())?;
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
-        function_catalog,
+        function_catalog.as_ref(),
         Some(&write_target_facts),
         execution.sql_semantics().sql_mode().allow_throw_exception(),
         control,

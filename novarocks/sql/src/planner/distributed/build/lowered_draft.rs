@@ -34,12 +34,29 @@ use crate::binding::CapturedAggregateLogicalRequest;
 /// statement or DML result transfers this entire owner, including its original
 /// logical-source journal. This is not certification of fresh kernel coverage,
 /// a neutral wire source, a FragmentPackage, or a runtime allocation grant.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SqlAuthoredPhysicalPlan {
     plan: Arc<PhysicalPlan>,
     aggregate_sources: Arc<AggregateLogicalSourceJournal>,
+    functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
+}
+impl std::fmt::Debug for SqlAuthoredPhysicalPlan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SqlAuthoredPhysicalPlan")
+            .field("plan", &self.plan)
+            .field("aggregate_sources", &self.aggregate_sources)
+            .field("functions", &"retained immutable catalogue")
+            .finish()
+    }
 }
 impl SqlAuthoredPhysicalPlan {
+    /// The original completion snapshot moves with this source owner. Fresh
+    /// preparation borrows it directly; it must never capture a second one.
+    pub(crate) const fn function_catalog(&self) -> &Arc<dyn crate::compiler::SqlFunctionCatalog> {
+        &self.functions
+    }
+
     pub fn plan(&self) -> &PhysicalPlan {
         &self.plan
     }
@@ -235,15 +252,18 @@ pub(super) struct AggregateLogicalSourceJournal {
 pub(crate) struct LoweredSqlPhysicalDraft {
     builder: PlanBuilder,
     aggregate_sources: AggregateLogicalSourceJournal,
+    functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
 }
 impl LoweredSqlPhysicalDraft {
     pub(super) fn from_lowering(
         builder: PlanBuilder,
         aggregate_sources: AggregateLogicalSourceJournal,
+        functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     ) -> Self {
         Self {
             builder,
             aggregate_sources,
+            functions,
         }
     }
     pub(crate) fn add_annotation(&mut self, annotation: PlanAnnotation) {
@@ -274,6 +294,7 @@ impl LoweredSqlPhysicalDraft {
             Ok(SqlAuthoredPhysicalPlan {
                 plan,
                 aggregate_sources,
+                functions: self.functions,
             })
         })();
         if matches!(

@@ -686,7 +686,7 @@ pub fn compile_final_join_incremental_refresh_change_stream(
         analyzed.routes,
         statistics_targets,
         effect_output_ordinal,
-        function_catalog.as_ref(),
+        function_catalog,
         crate::planning::dml::DmlFinalChangeStreamSealContext {
             pre_expand_keyed_assert: None,
             shape,
@@ -856,7 +856,7 @@ pub fn compile_final_mv_incremental_refresh_change_stream(
         analyzed.routes,
         statistics_targets,
         effect_output_ordinal,
-        function_catalog.as_ref(),
+        function_catalog,
         crate::planning::dml::DmlFinalChangeStreamSealContext {
             pre_expand_keyed_assert: None,
             shape,

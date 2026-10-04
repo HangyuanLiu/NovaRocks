@@ -727,6 +727,7 @@ fn optimize_and_prepare_provider(
 /// The optimizer result and the immutable base-table facts it consumed travel
 /// together until final-plan completion. Provider negotiation cannot replace them.
 struct OptimizedPhysicalPlan {
+    functions: Arc<dyn SqlFunctionCatalog>,
     root_allow_throw_exception: bool,
     physical: PhysicalPlanNode,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
@@ -811,6 +812,7 @@ fn optimize_to_physical(
     let physical = crate::planner::optimizer_bridge::to_physical_plan(&optimized)
         .map_err(SqlCompileError::Compilation)?;
     Ok(OptimizedPhysicalPlan {
+        functions: function_catalog,
         root_allow_throw_exception,
         physical,
         query_statistics: statistics.snapshot,
@@ -818,16 +820,20 @@ fn optimize_to_physical(
 }
 
 fn provider_or_ready_step(
-    common: FinalPlanCommon,
+    mut common: FinalPlanCommon,
     optimized: OptimizedPhysicalPlan,
     next_need_ordinal: u32,
     control: &SqlCompileControl,
 ) -> Result<CompilerStep, SqlCompileError> {
     let OptimizedPhysicalPlan {
+        functions,
         root_allow_throw_exception,
         mut physical,
         query_statistics,
     } = optimized;
+    // Retain the exact catalogue snapshot that authored optimizer bindings,
+    // rather than the earlier request snapshot whose outer owner may differ.
+    common.functions = functions;
     crate::planner::physical::runtime_filter_placement::place_runtime_filters(
         &mut physical,
         &common.session.optimizer_settings,
@@ -854,7 +860,7 @@ fn provider_or_ready_step(
         &physical,
         common.version,
         common.dop_domain,
-        common.functions.as_ref(),
+        common.functions,
         root_allow_throw_exception,
         common.constant_policy,
         control,
@@ -1208,7 +1214,7 @@ pub(super) fn resume_provider_read(
             state.common.version,
             state.common.dop_domain,
             reads,
-            state.common.functions.as_ref(),
+            state.common.functions,
             state.root_allow_throw_exception,
             state.common.constant_policy,
             control,
@@ -1255,7 +1261,7 @@ mod tests {
     };
     use crate::planning::dml::DmlStatisticsEvidence;
 
-    fn request(sql: &str, intent: SqlCompileIntent) -> SqlFinalPlanCompileRequest {
+    pub(super) fn request(sql: &str, intent: SqlCompileIntent) -> SqlFinalPlanCompileRequest {
         request_with_mv(sql, intent, false)
     }
 
@@ -1682,7 +1688,7 @@ mod tests {
         }
     }
 
-    fn incomplete(progress: SqlCompileProgress) -> SqlCompilation {
+    pub(super) fn incomplete(progress: SqlCompileProgress) -> SqlCompilation {
         match progress {
             SqlCompileProgress::Incomplete(compilation) => {
                 assert_eq!(
@@ -1757,7 +1763,7 @@ mod tests {
         )
     }
 
-    fn provider_contract(need: &ProviderReadNeed) -> ProviderReadStaticContract {
+    pub(super) fn provider_contract(need: &ProviderReadNeed) -> ProviderReadStaticContract {
         let binding = connector_binding();
         ProviderReadStaticContract {
             sql_binding: need.binding(),
@@ -1822,7 +1828,7 @@ mod tests {
         SqlFactBatch::CatalogRelations(facts.into_boxed_slice())
     }
 
-    fn answer_catalog(compilation: SqlCompilation) -> SqlCompileProgress {
+    pub(super) fn answer_catalog(compilation: SqlCompilation) -> SqlCompileProgress {
         let facts = catalog_facts(&compilation);
         SqlCompiler::finish(compilation, facts, &SqlCompileControl::unbounded())
             .expect("catalog round")
@@ -1856,7 +1862,7 @@ mod tests {
         .expect("statistics round")
     }
 
-    fn answer_provider(compilation: SqlCompilation) -> SqlCompileProgress {
+    pub(super) fn answer_provider(compilation: SqlCompilation) -> SqlCompileProgress {
         let needs = match compilation.needs() {
             SqlNeedBatch::ProviderReads(needs) => needs.to_vec(),
             other => panic!("expected provider needs, got {other:?}"),
@@ -2662,7 +2668,7 @@ mod tests {
         ));
     }
 
-    fn available_statistics_evidence(rows: u64) -> DmlStatisticsEvidence {
+    pub(super) fn available_statistics_evidence(rows: u64) -> DmlStatisticsEvidence {
         available_statistics_evidence_with_average_size(rows, None)
     }
 
@@ -2723,7 +2729,10 @@ mod tests {
         }
     }
 
-    fn answer_exact_statistics(compilation: SqlCompilation, rows: u64) -> SqlCompileProgress {
+    pub(super) fn answer_exact_statistics(
+        compilation: SqlCompilation,
+        rows: u64,
+    ) -> SqlCompileProgress {
         answer_frozen_statistics(compilation, available_statistics_evidence(rows))
     }
 
@@ -2955,7 +2964,7 @@ mod tests {
         assert!(frozen_table_statistics(values.plan()).is_empty());
     }
 
-    struct FrozenOrdersCatalog;
+    pub(super) struct FrozenOrdersCatalog;
 
     impl crate::catalog::PlannerTableProvider for FrozenOrdersCatalog {
         fn resolve_table_for_analysis(
@@ -3312,3 +3321,7 @@ pub(crate) fn compile_authored_aggregate_for_test(sql: &str) -> super::SqlAuthor
 #[cfg(test)]
 #[path = "owned_plan_movement_tests.rs"]
 mod owned_plan_movement_tests;
+
+#[cfg(test)]
+#[path = "catalogue_retention_tests.rs"]
+mod catalogue_retention_tests;

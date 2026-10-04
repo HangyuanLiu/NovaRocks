@@ -143,18 +143,18 @@ pub(crate) fn author_physical_fragment_effects_observed(
 /// including updates. Captured constants and true nonconstants are borrowed
 /// from the original request, independently of physical expression folding.
 /// The supplied fragment, constants and parameters must loan this exact plan.
-/// Other source scopes and the immutable Functions snapshot remain caller
-/// obligations; this component is not full SQL source or Package publication.
+/// Fresh preparation borrows the retained original immutable Functions Arc.
+/// Other source scopes remain caller obligations; this component is not full
+/// SQL source or Package publication.
 pub(crate) fn author_sql_aggregate_fragment_effects_observed(
     owner: &SqlAuthoredPhysicalPlan,
     input: PhysicalFragmentEffectsInput<'_>,
-    functions: &dyn SqlFunctionCatalog,
     control: &dyn PureCompileControl,
 ) -> Result<AuthoredPhysicalFragmentEffects, PhysicalFragmentEffectsError> {
     compose_fragment_effects_observed(
         input,
         AggregateSources::SqlJournal(owner),
-        functions,
+        owner.function_catalog().as_ref(),
         control,
     )
 }
