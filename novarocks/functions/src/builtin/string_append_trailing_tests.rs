@@ -604,7 +604,7 @@ fn string_append_trailing_owner_preserves_exact_fresh_frozen_arc_effects_and_rej
         let params = SemanticParameters::try_new([]).unwrap();
         let input = crate::CallEffectInput {
             context,
-            argument_uses: &uses,
+            argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
             function_id: owner.binding_declaration().function_id(),
             kind: crate::FunctionKind::Scalar,
             selected: &selected,
@@ -858,7 +858,7 @@ fn string_append_trailing_constant_null_and_invalid_suffix_are_deferred_until_se
         let params = SemanticParameters::try_new([]).unwrap();
         let input = crate::CallEffectInput {
             context,
-            argument_uses: &uses,
+            argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
             function_id: owner.binding_declaration().function_id(),
             kind: crate::FunctionKind::Scalar,
             selected: &selected,

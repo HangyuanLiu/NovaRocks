@@ -275,7 +275,7 @@ fn package_with_case(
                 .prepare_fresh(
                     CallEffectInput {
                         context,
-                        argument_uses: &[],
+                        argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&[]),
                         function_id: &bound.function_id,
                         kind: bound.kind,
                         selected: selected.as_ref(),

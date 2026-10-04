@@ -1434,7 +1434,9 @@ fn prepare_core(
                     }
                     let input = CallEffectInput {
                         context: frozen.context,
-                        argument_uses: &argument_uses,
+                        argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(
+                            &argument_uses,
+                        ),
                         function_id: &function.function_id,
                         kind: function.kind,
                         selected: selection.as_ref(),

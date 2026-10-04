@@ -216,7 +216,7 @@ pub(crate) fn prepare_physical_table_occurrence_observed(
     }
     let call = CallEffectInput {
         context,
-        argument_uses: &argument_uses,
+        argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&argument_uses),
         function_id: &function.function_id,
         kind: FunctionKind::Table,
         selected: input.request.selected().as_ref(),

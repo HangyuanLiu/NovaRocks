@@ -184,6 +184,72 @@ fn specialize_aggregate_once<O: PureAggregateImplementation + ?Sized>(
     options: AggregatePreparationOptions,
     control: &dyn PureCompileControl,
 ) -> Result<AggregateSpecialization<O::Kernel>, FunctionSpecializationFailure> {
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        control,
+        CompilePhase::FunctionSpecialization,
+    )
+    .map_err(FunctionSpecializationFailure::Control)?;
+    let aligned = (|| {
+        let phase = options.phase;
+        let correct = match input.argument_uses {
+            crate::CallArgumentUses::SelectedChannels(_) => {
+                phase.consumes_logical_arguments() && options.state_input_type.is_none()
+            }
+            crate::CallArgumentUses::AggregateMerge { phase: actual, .. } => {
+                !phase.consumes_logical_arguments()
+                    && actual == phase
+                    && options.state_input_type.is_some()
+            }
+        };
+        work.step()
+            .map_err(crate::kernel_control::compile_failure)?;
+        if !correct {
+            return Err(invalid(
+                "aggregate runtime demand differs from its exact preparation phase",
+            ));
+        }
+        match input.argument_uses {
+            crate::CallArgumentUses::SelectedChannels(_) => Ok(None),
+            crate::CallArgumentUses::AggregateMerge {
+                state_input_type, ..
+            } => {
+                let Some(owned) = options.state_input_type else {
+                    return Err(invalid("aggregate merge options have no state input type"));
+                };
+                crate::aggregate_call::align_aggregate_merge_state_observed(
+                    state_input_type,
+                    owned,
+                    &mut work,
+                )
+                .map(Some)
+            }
+        }
+    })();
+    let aligned = match aligned {
+        Err(
+            error @ (KernelFailure::Cancelled
+            | KernelFailure::DeadlineExceeded
+            | KernelFailure::ResourceExhausted),
+        ) => {
+            return Err(match error {
+                KernelFailure::Cancelled => FunctionSpecializationFailure::Control(
+                    novarocks_type_contract::CompileControlError::Cancelled,
+                ),
+                KernelFailure::DeadlineExceeded => FunctionSpecializationFailure::Control(
+                    novarocks_type_contract::CompileControlError::DeadlineExceeded,
+                ),
+                KernelFailure::ResourceExhausted => FunctionSpecializationFailure::Control(
+                    novarocks_type_contract::CompileControlError::ResourceExhausted,
+                ),
+                other => FunctionSpecializationFailure::Kernel(other),
+            });
+        }
+        result => {
+            work.finish()
+                .map_err(FunctionSpecializationFailure::Control)?;
+            result.map_err(FunctionSpecializationFailure::Kernel)?
+        }
+    };
     let (receipt, effects) = crate::specialization::refine_once_for_specialization(
         owner, input, frozen, arguments, control,
     )?;
@@ -192,12 +258,13 @@ fn specialize_aggregate_once<O: PureAggregateImplementation + ?Sized>(
             .map_err(FunctionSpecializationFailure::Kernel)?,
     );
     let contract = Arc::new(
-        AggregateCallContract::try_new(
+        AggregateCallContract::try_new_refined(
             call,
             options.phase,
             options.distinct,
             options.order_keys,
-            options.state_input_type,
+            aligned,
+            receipt.aggregate_merge_state(),
             control,
         )
         .map_err(FunctionSpecializationFailure::Kernel)?,

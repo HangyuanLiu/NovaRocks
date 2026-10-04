@@ -573,7 +573,7 @@ fn string_find_in_set_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects
         let params = SemanticParameters::try_new([]).unwrap();
         let input = crate::CallEffectInput {
             context,
-            argument_uses: &uses,
+            argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
             function_id: owner.binding_declaration().function_id(),
             kind: crate::FunctionKind::Scalar,
             selected: &selected,
@@ -828,7 +828,7 @@ fn string_find_in_set_constant_null_is_deferred_and_empty_selection_keeps_source
     let params = SemanticParameters::try_new([]).unwrap();
     let input = crate::CallEffectInput {
         context,
-        argument_uses: &uses,
+        argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
         function_id: owner.binding_declaration().function_id(),
         kind: crate::FunctionKind::Scalar,
         selected: &selected,

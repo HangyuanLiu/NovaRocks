@@ -406,7 +406,7 @@ fn call_input<'a>(
 ) -> CallEffectInput<'a> {
     CallEffectInput {
         context: context(),
-        argument_uses: uses,
+        argument_uses: crate::CallArgumentUses::SelectedChannels(uses),
         function_id: function,
         kind: FunctionKind::Scalar,
         selected,

@@ -461,7 +461,9 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
             .prepare_fresh(
                 CallEffectInput {
                     context,
-                    argument_uses: &argument_uses,
+                    argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(
+                        &argument_uses,
+                    ),
                     function_id: &author.function.function_id,
                     kind: author.function.kind,
                     selected: author.selected.as_ref(),

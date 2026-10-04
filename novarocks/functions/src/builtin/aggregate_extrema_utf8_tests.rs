@@ -85,6 +85,7 @@ struct Fixture {
     uses: Vec<Option<ExpressionUseId>>,
     parameters: SemanticParameters,
     policy: DecimalOverflowPolicy,
+    state_input_type: FunctionValueType,
 }
 impl Fixture {
     fn new(name: &str, source: FunctionValueType, policy: DecimalOverflowPolicy) -> Self {
@@ -142,6 +143,10 @@ impl Fixture {
                 &CompileControl::default(),
             )
             .unwrap();
+        let state_input_type = match &bound.selected.result_type {
+            FunctionResultType::Scalar(ty) => ty.clone(),
+            _ => panic!("actual scalar extrema state source"),
+        };
         Self {
             catalog,
             id: bound.function_id,
@@ -152,6 +157,7 @@ impl Fixture {
             args,
             parameters: SemanticParameters::try_new([]).unwrap(),
             policy,
+            state_input_type,
         }
     }
     fn input(&self) -> CallEffectInput<'_> {
@@ -164,13 +170,30 @@ impl Fixture {
                 logical_argument_count: self.args.len(),
                 expected_result_type: None,
             },
-            argument_uses: &self.uses,
+            argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             context: context(),
             parameters: &self.parameters,
             environment: &[],
             decimal_overflow_policy: self.policy,
             proof_scope: CallProofScope::Domain(context().domain),
         }
+    }
+    fn input_for_phase(&self, phase: AggregateKernelPhase) -> CallEffectInput<'_> {
+        let mut input = self.input();
+        if !phase.consumes_logical_arguments() {
+            // This fixture owns the actual nullable state carrier separately
+            // from the selected logical signature. No production flow is inferred.
+            input.argument_uses = crate::CallArgumentUses::AggregateMerge {
+                phase,
+                state_context: ExpressionEffectContext {
+                    use_id: ExpressionUseId::new(u32::MAX),
+                    domain: EvaluationDomainId::new(u32::MAX - 1),
+                    demand: EvaluationDemand::Value,
+                },
+                state_input_type: &self.state_input_type,
+            };
+        }
+        input
     }
     fn options(&self, phase: AggregateKernelPhase) -> PureCallPreparation {
         PureCallPreparation::Aggregate {
@@ -179,12 +202,8 @@ impl Fixture {
                 phase,
                 distinct: false,
                 order_keys: Arc::from([]),
-                state_input_type: (!phase.consumes_logical_arguments()).then(|| {
-                    let FunctionResultType::Scalar(ty) = &self.selected.result_type else {
-                        panic!()
-                    };
-                    ty.clone()
-                }),
+                state_input_type: (!phase.consumes_logical_arguments())
+                    .then(|| self.state_input_type.clone()),
             },
         }
     }
@@ -194,7 +213,7 @@ impl Fixture {
         control: &dyn PureCompileControl,
     ) -> Result<PureCallSpecialization, FunctionSpecializationFailure> {
         self.catalog.prepare_fresh(
-            self.input(),
+            self.input_for_phase(phase),
             self.selected.clone(),
             self.options(phase),
             control,
@@ -282,7 +301,7 @@ fn frozen(fixture: &Fixture, phase: AggregateKernelPhase) -> PureCallSpecializat
     fixture
         .catalog
         .prepare_frozen(
-            fixture.input(),
+            fixture.input_for_phase(phase),
             fixture.selected.clone(),
             fresh.call_contract().effects(),
             fixture.options(phase),

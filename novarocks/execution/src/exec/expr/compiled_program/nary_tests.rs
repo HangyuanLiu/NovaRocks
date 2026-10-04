@@ -900,7 +900,7 @@ fn dual_demand_program() -> Arc<LocalProgram> {
         .prepare_fresh(
             CallEffectInput {
                 context,
-                argument_uses: &child_uses,
+                argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&child_uses),
                 function_id: &bound.function_id,
                 kind: bound.kind,
                 selected: selected.as_ref(),

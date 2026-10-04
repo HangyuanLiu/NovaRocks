@@ -210,7 +210,7 @@ impl Owner {
                 domain: EvaluationDomainId::new(9),
                 demand: EvaluationDemand::Value,
             },
-            argument_uses: &self.uses,
+            argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.id,
             kind: FunctionKind::Aggregate,
             selected: &self.selected,
@@ -224,6 +224,21 @@ impl Owner {
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
             proof_scope: CallProofScope::Unconditional,
         }
+    }
+    fn input_for_phase(&self, phase: AggregateKernelPhase) -> CallEffectInput<'_> {
+        let mut input = self.input();
+        if !phase.consumes_logical_arguments() {
+            input.argument_uses = crate::CallArgumentUses::AggregateMerge {
+                phase,
+                state_context: ExpressionEffectContext {
+                    use_id: ExpressionUseId::new(u32::MAX),
+                    domain: EvaluationDomainId::new(8),
+                    demand: EvaluationDemand::Value,
+                },
+                state_input_type: &self.selected.aggregate.as_ref().unwrap().intermediate_type,
+            };
+        }
+        input
     }
     fn frozen(&self) -> CallEffects {
         CallEffects {
@@ -266,7 +281,7 @@ impl Owner {
         }
     }
     fn specialize(&self, phase: AggregateKernelPhase) -> AggregateSpecialization<Kernel> {
-        let input = self.input();
+        let input = self.input_for_phase(phase);
         specialize_aggregate(
             self,
             input,

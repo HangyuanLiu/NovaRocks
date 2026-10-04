@@ -136,7 +136,7 @@ impl Fixture {
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
             context: context(),
-            argument_uses: &ARGUMENT_USES,
+            argument_uses: crate::CallArgumentUses::SelectedChannels(&ARGUMENT_USES),
             function_id: &self.function,
             kind: FunctionKind::Window,
             selected: &self.selected,

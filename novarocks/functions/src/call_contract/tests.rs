@@ -133,7 +133,7 @@ impl Fixture {
                 domain: EvaluationDomainId::new(0),
                 demand: EvaluationDemand::Value,
             },
-            argument_uses: &self.uses,
+            argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.function,
             kind: FunctionKind::Scalar,
             selected: self.selected.as_ref(),

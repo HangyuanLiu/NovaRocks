@@ -71,8 +71,12 @@ impl HigherOrderCallContract {
         };
         let call = FunctionCallContract::from_refined(input, receipt, selected, control)?;
         let body_ordinal = body_ordinal as usize;
-        let body_edge_use = input
-            .argument_uses
+        let crate::CallArgumentUses::SelectedChannels(argument_uses) = input.argument_uses else {
+            return Err(invalid(
+                "higher-order calls require selected argument channels",
+            ));
+        };
+        let body_edge_use = argument_uses
             .get(body_ordinal)
             .copied()
             .flatten()

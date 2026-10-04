@@ -340,7 +340,7 @@ impl<'owner> Call<'owner> {
                 domain: EvaluationDomainId::new(1),
                 demand: EvaluationDemand::Value,
             },
-            argument_uses: &self.uses,
+            argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: self.owner.declaration.function_id(),
             kind: self.owner.declaration.kind(),
             selected: &self.selected,

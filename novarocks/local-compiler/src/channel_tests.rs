@@ -412,7 +412,9 @@ fn package_with_outputs(
             .prepare_fresh(
                 CallEffectInput {
                     context,
-                    argument_uses: &argument_uses,
+                    argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(
+                        &argument_uses,
+                    ),
                     function_id: &bound.function_id,
                     kind: bound.kind,
                     selected: selected.as_ref(),

@@ -350,7 +350,7 @@ pub(super) fn prepared_for_test(
         .collect::<Vec<_>>();
     let input = CallEffectInput {
         context,
-        argument_uses: &uses,
+        argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
         function_id: owner.declaration.function_id(),
         kind: FunctionKind::Scalar,
         selected: &selected,
@@ -415,7 +415,7 @@ mod tests {
     ) -> CallEffectInput<'a> {
         CallEffectInput {
             context: test_context(),
-            argument_uses: uses,
+            argument_uses: crate::CallArgumentUses::SelectedChannels(uses),
             function_id: owner.declaration.function_id(),
             kind: FunctionKind::Scalar,
             selected,

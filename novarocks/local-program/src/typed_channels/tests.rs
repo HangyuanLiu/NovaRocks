@@ -1047,7 +1047,7 @@ fn independent_order_tail_has_its_actual_complete_type_and_is_materialized_as_a_
     };
     let input = CallEffectInput {
         context,
-        argument_uses: &uses,
+        argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&uses),
         function_id: owner.declaration.function_id(),
         kind: FunctionKind::Aggregate,
         selected: &owner.selected,

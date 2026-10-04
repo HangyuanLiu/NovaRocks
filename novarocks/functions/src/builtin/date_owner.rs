@@ -349,7 +349,7 @@ pub(super) fn prepared_for_test_with_control(
     let uses = [Some(ExpressionUseId::new(42))];
     let input = CallEffectInput {
         context,
-        argument_uses: &uses,
+        argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
         function_id: owner.declaration.function_id(),
         kind: FunctionKind::Scalar,
         selected: &selected,

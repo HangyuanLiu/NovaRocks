@@ -151,7 +151,7 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
     let uses = [Some(ExpressionUseId::new(u32::MAX))];
     let input = CallEffectInput {
         context,
-        argument_uses: &uses,
+        argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&uses),
         function_id: &bound.function_id,
         kind: FunctionKind::Scalar,
         selected: &selected,

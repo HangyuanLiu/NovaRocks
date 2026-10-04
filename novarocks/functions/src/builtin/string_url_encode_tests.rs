@@ -498,7 +498,7 @@ fn string_url_encode_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_
         let params = SemanticParameters::try_new([]).unwrap();
         let input = crate::CallEffectInput {
             context,
-            argument_uses: &uses,
+            argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
             function_id: owner.binding_declaration().function_id(),
             kind: crate::FunctionKind::Scalar,
             selected: &selected,

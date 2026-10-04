@@ -631,7 +631,7 @@ fn string_substring_index_owner_preserves_exact_fresh_frozen_arc_effects_and_rej
         let params = SemanticParameters::try_new([]).unwrap();
         let input = crate::CallEffectInput {
             context,
-            argument_uses: &uses,
+            argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
             function_id: owner.binding_declaration().function_id(),
             kind: crate::FunctionKind::Scalar,
             selected: &selected,
@@ -931,7 +931,7 @@ fn string_substring_index_constant_null_is_deferred_and_no_unrelated_string_size
     let params = SemanticParameters::try_new([]).unwrap();
     let input = crate::CallEffectInput {
         context,
-        argument_uses: &uses,
+        argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
         function_id: owner.binding_declaration().function_id(),
         kind: crate::FunctionKind::Scalar,
         selected: &selected,

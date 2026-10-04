@@ -392,7 +392,7 @@ fn package(
         .prepare_fresh(
             CallEffectInput {
                 context: rng_context,
-                argument_uses: &[],
+                argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&[]),
                 function_id: &rng.function_id,
                 kind: rng.kind,
                 selected: rng_selected.as_ref(),
@@ -425,7 +425,7 @@ fn package(
         .prepare_fresh(
             CallEffectInput {
                 context: parent_context,
-                argument_uses: &child_uses,
+                argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&child_uses),
                 function_id: &bound.function_id,
                 kind: bound.kind,
                 selected: selected.as_ref(),

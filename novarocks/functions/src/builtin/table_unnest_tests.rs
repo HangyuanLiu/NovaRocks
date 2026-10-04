@@ -174,7 +174,7 @@ impl Fixture {
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
             context: context(),
-            argument_uses: &self.uses,
+            argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.function,
             kind: FunctionKind::Table,
             selected: self.selected.as_ref(),

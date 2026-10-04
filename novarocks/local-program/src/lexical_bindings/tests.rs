@@ -531,7 +531,7 @@ fn build_project(
             .collect::<Vec<_>>();
         let input = CallEffectInput {
             context: invocation.context,
-            argument_uses: &uses,
+            argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&uses),
             function_id: &function,
             kind: FunctionKind::Scalar,
             selected: &selected,

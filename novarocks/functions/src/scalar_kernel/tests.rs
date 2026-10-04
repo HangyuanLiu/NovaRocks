@@ -140,7 +140,7 @@ fn contract_with_argument_nullability(
             domain: EvaluationDomainId::new(9),
             demand: EvaluationDemand::Value,
         },
-        argument_uses: &uses,
+        argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
         function_id: &function_id,
         kind: FunctionKind::Scalar,
         selected: selected.as_ref(),
@@ -675,7 +675,7 @@ fn specialization_uses_one_exact_owner_and_preserves_checked_signature_backing()
     let argument_uses = [Some(ExpressionUseId::new(10))];
     let input = CallEffectInput {
         context: frozen.context(),
-        argument_uses: &argument_uses,
+        argument_uses: crate::CallArgumentUses::SelectedChannels(&argument_uses),
         function_id: frozen.function_id(),
         kind: FunctionKind::Scalar,
         selected: frozen.selected(),

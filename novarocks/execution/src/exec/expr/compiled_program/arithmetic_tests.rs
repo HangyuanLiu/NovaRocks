@@ -140,7 +140,9 @@ fn compile_arithmetic(
                 .prepare_fresh(
                     CallEffectInput {
                         context,
-                        argument_uses: &argument_uses,
+                        argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(
+                            &argument_uses,
+                        ),
                         function_id: &owner.function.function_id,
                         kind: FunctionKind::Scalar,
                         selected: owner.selected.as_ref(),

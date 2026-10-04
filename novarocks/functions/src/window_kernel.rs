@@ -316,6 +316,10 @@ fn specialize_aggregate_window_once<O: PureAggregateWindowImplementation + ?Size
         .map_err(FunctionSpecializationFailure::Control)?;
     if aggregate_options.phase != crate::AggregateKernelPhase::Single
         || aggregate_options.state_input_type.is_some()
+        || !matches!(
+            input.argument_uses,
+            crate::CallArgumentUses::SelectedChannels(_)
+        )
     {
         return Err(FunctionSpecializationFailure::Kernel(invalid(
             "aggregate window specialization requires Single logical input",

@@ -238,7 +238,7 @@ fn calendar_parts_all_48_actual_records_preserve_fresh_frozen_selected_identity_
             let uses = [Some(ExpressionUseId::new(42))];
             let input = crate::CallEffectInput {
                 context,
-                argument_uses: &uses,
+                argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
                 function_id: owner.binding_declaration().function_id(),
                 kind: crate::FunctionKind::Scalar,
                 selected: &selected,

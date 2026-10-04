@@ -163,7 +163,7 @@ impl Owner {
                 domain: EvaluationDomainId::new(11),
                 demand: EvaluationDemand::Value,
             },
-            argument_uses: &self.uses,
+            argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.id,
             kind: FunctionKind::Scalar,
             selected: self.selected.as_ref(),
@@ -360,7 +360,12 @@ fn exact_owner_is_refined_and_prepared_once_without_reselection_or_instance_crea
 fn argument_summary(input: CallEffectInput<'_>) -> ScopedExpressionEffects {
     let child = ScopedExpressionEffects::primitive(
         ExpressionEffectContext {
-            use_id: input.argument_uses[0].unwrap(),
+            use_id: match input.argument_uses {
+                crate::CallArgumentUses::SelectedChannels(uses) => uses[0].unwrap(),
+                crate::CallArgumentUses::AggregateMerge { .. } => {
+                    panic!("scalar fixture has aggregate merge channels")
+                }
+            },
             ..input.context
         },
         ExpressionEffects {
@@ -657,7 +662,10 @@ fn frozen_validation_returns_one_borrowed_receipt_for_composition_and_contract_c
 fn type_only_retains_static_signature_without_runtime_argument_uses_or_expression_lookup() {
     let owner = Owner::new(1, ArgumentControl::TypeOnly);
     let input = owner.input();
-    assert_eq!(input.argument_uses, [None]);
+    assert!(matches!(
+        input.argument_uses,
+        crate::CallArgumentUses::SelectedChannels([None])
+    ));
     let result = specialize_frozen_scalar(
         &owner,
         input,

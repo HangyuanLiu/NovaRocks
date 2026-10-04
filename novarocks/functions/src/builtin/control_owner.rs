@@ -203,8 +203,12 @@ impl FunctionEffectOwner for ControlOwner {
                 return Err(CompileControlError::ResourceExhausted.into());
             }
             let arity = input.request.arguments.len();
+            let crate::CallArgumentUses::SelectedChannels(argument_uses) = input.argument_uses
+            else {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            };
             if input.request.logical_argument_count != arity
-                || input.argument_uses.len() != arity
+                || argument_uses.len() != arity
                 || input.selected.argument_types.len() != arity
                 || match self.operation {
                     ControlOperation::If => arity != 3,
@@ -213,7 +217,7 @@ impl FunctionEffectOwner for ControlOwner {
             {
                 return Err(FunctionBindingError::NoMatchingOverload);
             }
-            for (argument, use_id) in input.request.arguments.iter().zip(input.argument_uses) {
+            for (argument, use_id) in input.request.arguments.iter().zip(argument_uses) {
                 if !matches!(argument, FunctionArgument::Value { .. }) || use_id.is_none() {
                     return Err(FunctionBindingError::NoMatchingOverload);
                 }

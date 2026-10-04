@@ -178,7 +178,7 @@ pub(crate) fn prepare_physical_window_occurrence_observed(
     }
     let call = CallEffectInput {
         context: invocation.context,
-        argument_uses: &argument_uses,
+        argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&argument_uses),
         function_id: &function.function_id,
         kind: function.kind,
         selected: input.request.selected().as_ref(),

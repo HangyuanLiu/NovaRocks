@@ -160,7 +160,7 @@ impl Fixture {
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
             context: self.context(),
-            argument_uses: &self.uses,
+            argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.function,
             kind: FunctionKind::Scalar,
             selected: &self.selected,

@@ -86,7 +86,7 @@ impl Default for Behavior {
 #[derive(Default)]
 struct CompileControl {
     failure: Option<CompileControlError>,
-    positive: bool,
+    quantum_only: bool,
     seen: Mutex<Vec<u32>>,
 }
 impl PureCompileControl for CompileControl {
@@ -94,7 +94,7 @@ impl PureCompileControl for CompileControl {
         assert_eq!(phase, CompilePhase::FunctionSpecialization);
         assert!(work <= 256);
         self.seen.lock().unwrap().push(work);
-        if !self.positive || work > 0 {
+        if !self.quantum_only || work == 256 {
             self.failure.map_or(Ok(()), Err)
         } else {
             Ok(())
@@ -193,7 +193,7 @@ impl Owner {
                 domain: EvaluationDomainId::new(9),
                 demand: EvaluationDemand::Value,
             },
-            argument_uses: &self.uses,
+            argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.id,
             kind: FunctionKind::Aggregate,
             selected: &self.selected,
@@ -207,6 +207,21 @@ impl Owner {
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
             proof_scope: CallProofScope::Unconditional,
         }
+    }
+    fn input_for_phase(&self, phase: AggregateKernelPhase) -> CallEffectInput<'_> {
+        let mut input = self.input();
+        if !phase.consumes_logical_arguments() {
+            input.argument_uses = crate::CallArgumentUses::AggregateMerge {
+                phase,
+                state_context: ExpressionEffectContext {
+                    use_id: ExpressionUseId::new(u32::MAX),
+                    domain: EvaluationDomainId::new(8),
+                    demand: EvaluationDemand::Value,
+                },
+                state_input_type: &self.selected.aggregate.as_ref().unwrap().intermediate_type,
+            };
+        }
+        input
     }
     fn frozen(&self) -> CallEffects {
         CallEffects {
@@ -249,7 +264,7 @@ impl Owner {
         }
     }
     fn specialize(&self, phase: AggregateKernelPhase) -> AggregateSpecialization<Kernel> {
-        let input = self.input();
+        let input = self.input_for_phase(phase);
         specialize_aggregate(
             self,
             input,
@@ -579,7 +594,7 @@ fn fresh_and_frozen_prepare_once_without_state_and_preserve_exact_phase_channels
         for frozen in [false, true] {
             owner.counts.refine.store(0, Ordering::Relaxed);
             owner.counts.prepare.store(0, Ordering::Relaxed);
-            let input = owner.input();
+            let input = owner.input_for_phase(phase);
             let child = ScopedExpressionEffects::pure_value(input.context);
             let prepared = if frozen {
                 specialize_frozen_aggregate(
@@ -1092,7 +1107,7 @@ fn compile_entry_and_positive_quantum_controls_remain_typed_before_preparation()
             let input = owner.input();
             let control = CompileControl {
                 failure: Some(failure),
-                positive,
+                quantum_only: positive,
                 ..CompileControl::default()
             };
             for frozen in [false, true] {

@@ -124,7 +124,7 @@ impl Owner {
                 domain: EvaluationDomainId::new(7),
                 demand: EvaluationDemand::Value,
             },
-            argument_uses: &self.uses,
+            argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.id,
             kind: FunctionKind::Aggregate,
             selected: &self.selected,

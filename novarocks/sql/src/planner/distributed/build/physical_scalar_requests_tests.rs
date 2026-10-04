@@ -182,7 +182,7 @@ fn prepare(
         .collect();
     let input = CallEffectInput {
         context: context(),
-        argument_uses: &uses,
+        argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&uses),
         function_id: &authored.function.function_id,
         kind: authored.function.kind,
         selected: authored.selected.as_ref(),

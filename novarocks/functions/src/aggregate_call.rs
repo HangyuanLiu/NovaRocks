@@ -48,6 +48,56 @@ impl AggregateKernelPhase {
     }
 }
 
+/// The sole state-domain check borrows its exact immutable inputs. This proof
+/// is local preparation evidence, not a graph or wire identity.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ValidatedAggregateMergeState<'a> {
+    input: &'a FunctionValueType,
+    intermediate: &'a FunctionValueType,
+}
+
+/// The options own the same full type that was borrowed by the runtime demand.
+/// Only the observed exact comparison below can construct this token.
+pub(crate) struct AlignedAggregateMergeState<'a> {
+    input: &'a FunctionValueType,
+    owned: FunctionValueType,
+}
+
+pub(crate) fn align_aggregate_merge_state_observed<'a>(
+    input: &'a FunctionValueType,
+    owned: FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<AlignedAggregateMergeState<'a>, KernelFailure> {
+    if !input
+        .exactly_equals_observed::<KernelFailure>(&owned, || work.step().map_err(compile_failure))?
+    {
+        return Err(invalid(
+            "aggregate options differ from the actual merge state type",
+        ));
+    }
+    Ok(AlignedAggregateMergeState { input, owned })
+}
+
+pub(crate) fn validate_aggregate_merge_state_observed<'a>(
+    input: &'a FunctionValueType,
+    intermediate: &'a FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ValidatedAggregateMergeState<'a>, KernelFailure> {
+    validate_type_observed(input, work)?;
+    if !input.same_value_domain_observed::<KernelFailure>(intermediate, || {
+        work.step().map_err(compile_failure)
+    })? || (intermediate.nullable && !input.nullable)
+    {
+        return Err(invalid(
+            "aggregate merge state layout differs from its selected intermediate domain",
+        ));
+    }
+    Ok(ValidatedAggregateMergeState {
+        input,
+        intermediate,
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AggregateCallContract {
     call: Arc<FunctionCallContract>,
@@ -69,60 +119,143 @@ impl AggregateCallContract {
         state_input_type: Option<FunctionValueType>,
         control: &dyn PureCompileControl,
     ) -> Result<Self, KernelFailure> {
+        Self::try_new_impl(
+            call,
+            crate::AggregatePreparationOptions {
+                phase,
+                distinct,
+                order_keys,
+                state_input_type,
+            },
+            None,
+            control,
+        )
+    }
+
+    pub(crate) fn try_new_refined(
+        call: Arc<FunctionCallContract>,
+        phase: AggregateKernelPhase,
+        distinct: bool,
+        order_keys: Arc<[AggregateOrderKey]>,
+        state: Option<AlignedAggregateMergeState<'_>>,
+        proof: Option<ValidatedAggregateMergeState<'_>>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, KernelFailure> {
+        let validated = match (state, proof) {
+            (None, None) => None,
+            (Some(state), Some(proof)) if std::ptr::eq(state.input, proof.input) => {
+                Some((state.owned, proof))
+            }
+            _ => {
+                return Err(invalid(
+                    "aggregate merge receipt differs from its actual state options",
+                ));
+            }
+        };
+        let (state_input_type, proof) = match validated {
+            Some((state, proof)) => (Some(state), Some(proof)),
+            None => (None, None),
+        };
+        Self::try_new_impl(
+            call,
+            crate::AggregatePreparationOptions {
+                phase,
+                distinct,
+                order_keys,
+                state_input_type,
+            },
+            proof,
+            control,
+        )
+    }
+
+    fn try_new_impl(
+        call: Arc<FunctionCallContract>,
+        options: crate::AggregatePreparationOptions,
+        proof: Option<ValidatedAggregateMergeState<'_>>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, KernelFailure> {
+        let crate::AggregatePreparationOptions {
+            phase,
+            distinct,
+            order_keys,
+            state_input_type,
+        } = options;
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
             .map_err(compile_failure)?;
-        if call.kind() != FunctionKind::Aggregate
-            || call.effects().argument_control != ArgumentControl::Aggregate
-        {
-            return Err(invalid(
-                "aggregate preparation requires its exact aggregate control",
-            ));
-        }
-        let Some(state) = &call.selected().aggregate else {
-            return Err(invalid("aggregate binding has no state contract"));
-        };
-        if !matches!(call.selected().result_type, FunctionResultType::Scalar(_)) {
-            return Err(invalid("aggregate binding requires a scalar final result"));
-        }
-        let channels = &call.selected().argument_types;
-        let logical = call.logical_argument_count();
-        if logical > channels.len() || order_keys.len() > crate::MAX_CALL_EFFECT_ARGUMENTS {
-            return Err(invalid("aggregate logical/order channel shape differs"));
-        }
-        for channel in channels {
-            if !matches!(channel, FunctionArgumentType::Value(_)) {
-                return Err(invalid("aggregate channel cannot be a lambda"));
-            }
-            work.step().map_err(compile_failure)?;
-        }
-        if phase.consumes_logical_arguments() {
-            if state_input_type.is_some() || order_keys.len() != channels.len() - logical {
-                return Err(invalid(
-                    "aggregate update channels differ from its selected logical/order signature",
-                ));
-            }
-        } else {
-            if distinct || !order_keys.is_empty() {
-                return Err(invalid(
-                    "aggregate merge cannot repeat DISTINCT or function ORDER BY",
-                ));
-            }
-            let Some(input) = &state_input_type else {
-                return Err(invalid("aggregate merge has no exact state input layout"));
-            };
-            validate_type_observed(input, &mut work)?;
-            if !input
-                .same_value_domain_observed::<KernelFailure>(&state.intermediate_type, || {
-                    work.step().map_err(compile_failure)
-                })?
-                || (state.intermediate_type.nullable && !input.nullable)
+        let result = (|| {
+            if call.kind() != FunctionKind::Aggregate
+                || call.effects().argument_control != ArgumentControl::Aggregate
             {
                 return Err(invalid(
-                    "aggregate merge state layout differs from its selected intermediate domain",
+                    "aggregate preparation requires its exact aggregate control",
                 ));
             }
+            let Some(state) = &call.selected().aggregate else {
+                return Err(invalid("aggregate binding has no state contract"));
+            };
+            if !matches!(call.selected().result_type, FunctionResultType::Scalar(_)) {
+                return Err(invalid("aggregate binding requires a scalar final result"));
+            }
+            let channels = &call.selected().argument_types;
+            let logical = call.logical_argument_count();
+            if logical > channels.len() || order_keys.len() > crate::MAX_CALL_EFFECT_ARGUMENTS {
+                return Err(invalid("aggregate logical/order channel shape differs"));
+            }
+            for channel in channels {
+                if !matches!(channel, FunctionArgumentType::Value(_)) {
+                    return Err(invalid("aggregate channel cannot be a lambda"));
+                }
+                work.step().map_err(compile_failure)?;
+            }
+            if phase.consumes_logical_arguments() {
+                if state_input_type.is_some() || order_keys.len() != channels.len() - logical {
+                    return Err(invalid(
+                        "aggregate update channels differ from its selected logical/order signature",
+                    ));
+                }
+            } else {
+                if distinct || !order_keys.is_empty() {
+                    return Err(invalid(
+                        "aggregate merge cannot repeat DISTINCT or function ORDER BY",
+                    ));
+                }
+                let Some(input) = &state_input_type else {
+                    return Err(invalid("aggregate merge has no exact state input layout"));
+                };
+                match proof {
+                    Some(proof) if std::ptr::eq(proof.intermediate, &state.intermediate_type) => {
+                        // The exact runtime source was checked once by refinement;
+                        // its owned options were aligned before that refinement.
+                        work.step().map_err(compile_failure)?;
+                    }
+                    Some(_) => {
+                        return Err(invalid(
+                            "aggregate state receipt has a different selected owner",
+                        ));
+                    }
+                    None => {
+                        validate_aggregate_merge_state_observed(
+                            input,
+                            &state.intermediate_type,
+                            &mut work,
+                        )?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        match result {
+            Err(
+                error @ (KernelFailure::Cancelled
+                | KernelFailure::DeadlineExceeded
+                | KernelFailure::ResourceExhausted),
+            ) => return Err(error),
+            result => {
+                work.finish().map_err(compile_failure)?;
+                result?;
+            }
         }
-        work.finish().map_err(compile_failure)?;
         Ok(Self {
             call,
             phase,

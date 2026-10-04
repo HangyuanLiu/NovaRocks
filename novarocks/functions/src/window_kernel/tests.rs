@@ -205,7 +205,7 @@ impl Fixture {
                 domain: EvaluationDomainId::new(9),
                 demand: EvaluationDemand::Value,
             },
-            argument_uses: &self.argument_uses,
+            argument_uses: crate::CallArgumentUses::SelectedChannels(&self.argument_uses),
             function_id: &self.id,
             kind: self.kind,
             selected: self.selected.as_ref(),

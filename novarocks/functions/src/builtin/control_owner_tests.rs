@@ -120,7 +120,7 @@ fn input<'a>(
 ) -> CallEffectInput<'a> {
     CallEffectInput {
         context: context(),
-        argument_uses: uses,
+        argument_uses: crate::CallArgumentUses::SelectedChannels(uses),
         function_id: owner.declaration.function_id(),
         kind: FunctionKind::Scalar,
         selected,
@@ -433,7 +433,7 @@ fn actual_arity_lambda_and_full_domain_forgery_are_rejected() {
         None,
         Some(ExpressionUseId::new(102)),
     ];
-    exact.argument_uses = &missing_uses;
+    exact.argument_uses = crate::CallArgumentUses::SelectedChannels(&missing_uses);
     assert!(
         owner
             .validate_and_refine(exact, crate::binding_test_control())

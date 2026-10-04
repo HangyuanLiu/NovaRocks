@@ -573,7 +573,7 @@ fn a_frozen_function_call_cannot_be_attached_to_a_physical_nary_intrinsic() {
         .prepare_fresh(
             CallEffectInput {
                 context: invocation.context,
-                argument_uses: &[],
+                argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&[]),
                 function_id: &bound.function_id,
                 kind: bound.kind,
                 selected: selected.as_ref(),

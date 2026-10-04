@@ -315,6 +315,7 @@ pub(crate) struct Call<'owner> {
     uses: [Option<ExpressionUseId>; 1],
     parameters: SemanticParameters,
     pub(crate) context_id: u32,
+    state_input_type: FunctionValueType,
 }
 impl<'owner> Call<'owner> {
     pub(crate) fn new(owner: &'owner Owner, ordinal: usize) -> Self {
@@ -337,6 +338,7 @@ impl<'owner> Call<'owner> {
             uses: [Some(ExpressionUseId::new(1))],
             parameters: SemanticParameters::default(),
             context_id: u32::MAX,
+            state_input_type: value_type(DataType::Int64),
         }
     }
     pub(crate) fn input(&self) -> CallEffectInput<'_> {
@@ -346,7 +348,7 @@ impl<'owner> Call<'owner> {
                 domain: EvaluationDomainId::new(1),
                 demand: EvaluationDemand::Value,
             },
-            argument_uses: &self.uses,
+            argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: self.owner.declaration.function_id(),
             kind: self.owner.declaration.kind(),
             selected: &self.selected,
@@ -360,6 +362,21 @@ impl<'owner> Call<'owner> {
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
             proof_scope: CallProofScope::Unconditional,
         }
+    }
+    pub(crate) fn input_for_phase(&self, phase: AggregateKernelPhase) -> CallEffectInput<'_> {
+        let mut input = self.input();
+        if !phase.consumes_logical_arguments() {
+            input.argument_uses = novarocks_functions::CallArgumentUses::AggregateMerge {
+                phase,
+                state_context: ExpressionEffectContext {
+                    use_id: ExpressionUseId::new(0),
+                    domain: EvaluationDomainId::new(2),
+                    demand: EvaluationDemand::Value,
+                },
+                state_input_type: &self.state_input_type,
+            };
+        }
+        input
     }
     pub(crate) fn children(&self) -> ScopedExpressionEffects {
         ScopedExpressionEffects::pure_value(self.input().context)
@@ -965,11 +982,11 @@ pub(crate) fn prepare_aggregate_token(
 ) -> PureCallSpecialization {
     let mut options = aggregate_options(phase);
     if !phase.consumes_logical_arguments() {
-        options.state_input_type = Some(value_type(DataType::Int64));
+        options.state_input_type = Some(call.state_input_type.clone());
     }
     catalog
         .prepare_frozen(
-            call.input(),
+            call.input_for_phase(phase),
             call.selected.clone(),
             &call.owner.frozen(&call.selected),
             PureCallPreparation::Aggregate {

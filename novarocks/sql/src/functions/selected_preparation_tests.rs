@@ -98,7 +98,7 @@ fn input<'a>(
 ) -> CallEffectInput<'a> {
     CallEffectInput {
         context: context(),
-        argument_uses: uses,
+        argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(uses),
         function_id: &bound.function_id,
         kind: bound.kind,
         selected,

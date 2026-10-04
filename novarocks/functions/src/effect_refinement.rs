@@ -27,10 +27,48 @@ use std::{collections::BTreeSet, error::Error, fmt};
 
 pub const MAX_CALL_EFFECT_ARGUMENTS: usize = 4096;
 
+/// Actual runtime demand is separate from the immutable selected signature.
+/// A merge reads one state occurrence; it never re-evaluates logical inputs.
+#[derive(Clone, Copy, Debug)]
+pub enum CallArgumentUses<'a> {
+    SelectedChannels(&'a [Option<novarocks_type_contract::ExpressionUseId>]),
+    AggregateMerge {
+        phase: crate::AggregateKernelPhase,
+        state_context: novarocks_type_contract::ExpressionEffectContext,
+        state_input_type: &'a novarocks_type_contract::FunctionValueType,
+    },
+}
+impl CallArgumentUses<'_> {
+    fn same_borrow(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::SelectedChannels(left), Self::SelectedChannels(right)) => {
+                std::ptr::eq(left, right)
+            }
+            (
+                Self::AggregateMerge {
+                    phase: left_phase,
+                    state_context: left_context,
+                    state_input_type: left_type,
+                },
+                Self::AggregateMerge {
+                    phase: right_phase,
+                    state_context: right_context,
+                    state_input_type: right_type,
+                },
+            ) => {
+                left_phase == right_phase
+                    && left_context == right_context
+                    && std::ptr::eq(left_type, right_type)
+            }
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct CallEffectInput<'a> {
     pub context: novarocks_type_contract::ExpressionEffectContext,
-    pub argument_uses: &'a [Option<novarocks_type_contract::ExpressionUseId>],
+    pub argument_uses: CallArgumentUses<'a>,
     pub function_id: &'a FunctionId,
     pub kind: FunctionKind,
     pub selected: &'a FunctionBindingSelection,
@@ -106,145 +144,215 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
 ) -> Result<RefinedCallEffects<'a>, CallEffectRefinementError<O::Error>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
         .map_err(CallEffectRefinementError::Control)?;
-    if input.environment.len() > novarocks_type_contract::MAX_SEMANTIC_PARAMETERS {
-        return Err(CallEffectRefinementError::Control(
-            CompileControlError::ResourceExhausted,
-        ));
-    }
-    if input.request.arguments.len() > MAX_CALL_EFFECT_ARGUMENTS
-        || input.selected.argument_types.len() > MAX_CALL_EFFECT_ARGUMENTS
-    {
-        return Err(CallEffectRefinementError::Control(
-            CompileControlError::ResourceExhausted,
-        ));
-    }
-    if input.argument_uses.len() != input.request.arguments.len()
-        || input.request.arguments.len() != input.selected.argument_types.len()
-        || input.request.logical_argument_count > input.request.arguments.len()
-        || (input.kind != FunctionKind::Aggregate
-            && input.request.logical_argument_count != input.request.arguments.len())
-    {
-        return Err(CallEffectRefinementError::InvalidInput(
-            "call effect input differs from selected argument shape",
-        ));
-    }
-    if input.proof_scope != CallProofScope::Unconditional
-        && input.proof_scope != CallProofScope::Domain(input.context.domain)
-    {
-        return Err(CallEffectRefinementError::Contract(
-            EffectContractError::ProofScopeMismatch,
-        ));
-    }
-    // Specialization consumes already-coerced arguments. Check their complete
-    // types before any owner operation; this does not resolve FE coercions or
-    // infer a legacy literal payload's type.
-    validate_input_types(input, &mut work)?;
-    work.finish().map_err(CallEffectRefinementError::Control)?;
-    let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-        .map_err(CallEffectRefinementError::Control)?;
-    let declaration = owner
-        .declaration(input.function_id, input.selected)
-        .map_err(CallEffectRefinementError::Owner)?;
-    declaration
-        .validate(input.kind)
-        .map_err(CallEffectRefinementError::Contract)?;
-    // Body demand is an exact owner fact, never inferred from a name or the
-    // function result type. This ABI has one lambda body argument; another
-    // lambda-bearing protocol must add its own closed declaration.
-    if let novarocks_type_contract::ArgumentControl::HigherOrder {
-        body_ordinal,
-        body_demand,
-    } = declaration.argument_control
-    {
-        let Some(crate::FunctionArgumentType::Lambda { result_type, .. }) =
-            input.selected.argument_types.get(body_ordinal as usize)
-        else {
-            return Err(CallEffectRefinementError::InvalidInput(
-                "higher-order body ordinal does not identify the selected lambda argument",
+    let result = (|| {
+        if input.environment.len() > novarocks_type_contract::MAX_SEMANTIC_PARAMETERS {
+            return Err(CallEffectRefinementError::Control(
+                CompileControlError::ResourceExhausted,
             ));
+        }
+        if input.request.arguments.len() > MAX_CALL_EFFECT_ARGUMENTS
+            || input.selected.argument_types.len() > MAX_CALL_EFFECT_ARGUMENTS
+        {
+            return Err(CallEffectRefinementError::Control(
+                CompileControlError::ResourceExhausted,
+            ));
+        }
+        let selected_shape = match input.argument_uses {
+            CallArgumentUses::SelectedChannels(uses) => uses.len() == input.request.arguments.len(),
+            CallArgumentUses::AggregateMerge {
+                phase,
+                state_context,
+                ..
+            } => {
+                input.kind == FunctionKind::Aggregate
+                    && !phase.consumes_logical_arguments()
+                    && state_context.demand == novarocks_type_contract::EvaluationDemand::Value
+                    && state_context.use_id != input.context.use_id
+                    && state_context.domain != input.context.domain
+                    && input.selected.aggregate.is_some()
+                    && matches!(
+                        input.selected.result_type,
+                        crate::FunctionResultType::Scalar(_)
+                    )
+            }
         };
-        if body_demand == novarocks_type_contract::EvaluationDemand::TruthOnly
-            && (result_type.data_type != arrow_schema::DataType::Boolean
-                || result_type.logical_type != novarocks_type_contract::ValueLogicalType::Physical)
+        if !selected_shape
+            || input.request.arguments.len() != input.selected.argument_types.len()
+            || input.request.logical_argument_count > input.request.arguments.len()
+            || (input.kind != FunctionKind::Aggregate
+                && input.request.logical_argument_count != input.request.arguments.len())
         {
             return Err(CallEffectRefinementError::InvalidInput(
-                "higher-order TruthOnly body requires an exact Boolean result type",
+                "call effect input differs from selected argument shape",
             ));
         }
-        for (ordinal, argument) in input.selected.argument_types.iter().enumerate() {
-            if matches!(argument, crate::FunctionArgumentType::Lambda { .. })
-                != (ordinal == body_ordinal as usize)
+        if input.proof_scope != CallProofScope::Unconditional
+            && input.proof_scope != CallProofScope::Domain(input.context.domain)
+        {
+            return Err(CallEffectRefinementError::Contract(
+                EffectContractError::ProofScopeMismatch,
+            ));
+        }
+        // Specialization consumes already-coerced arguments. Check their complete
+        // types before any owner operation; this does not resolve FE coercions or
+        // infer a legacy literal payload's type.
+        validate_input_types(input, &mut work)?;
+        let merge_state = match input.argument_uses {
+            CallArgumentUses::SelectedChannels(_) => None,
+            CallArgumentUses::AggregateMerge {
+                state_input_type, ..
+            } => {
+                let Some(state) = &input.selected.aggregate else {
+                    return Err(CallEffectRefinementError::InvalidInput(
+                        "aggregate merge has no selected state contract",
+                    ));
+                };
+                Some(
+                    crate::aggregate_call::validate_aggregate_merge_state_observed(
+                        state_input_type,
+                        &state.intermediate_type,
+                        &mut work,
+                    )
+                    .map_err(input_type_failure::<O::Error>)?,
+                )
+            }
+        };
+        work.flush().map_err(CallEffectRefinementError::Control)?;
+        work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(CallEffectRefinementError::Control)?;
+        let declaration = owner
+            .declaration(input.function_id, input.selected)
+            .map_err(CallEffectRefinementError::Owner)?;
+        declaration
+            .validate(input.kind)
+            .map_err(CallEffectRefinementError::Contract)?;
+        // Body demand is an exact owner fact, never inferred from a name or the
+        // function result type. This ABI has one lambda body argument; another
+        // lambda-bearing protocol must add its own closed declaration.
+        if let novarocks_type_contract::ArgumentControl::HigherOrder {
+            body_ordinal,
+            body_demand,
+        } = declaration.argument_control
+        {
+            let Some(crate::FunctionArgumentType::Lambda { result_type, .. }) =
+                input.selected.argument_types.get(body_ordinal as usize)
+            else {
+                return Err(CallEffectRefinementError::InvalidInput(
+                    "higher-order body ordinal does not identify the selected lambda argument",
+                ));
+            };
+            if body_demand == novarocks_type_contract::EvaluationDemand::TruthOnly
+                && (result_type.data_type != arrow_schema::DataType::Boolean
+                    || result_type.logical_type
+                        != novarocks_type_contract::ValueLogicalType::Physical)
             {
                 return Err(CallEffectRefinementError::InvalidInput(
-                    "higher-order body declaration differs from selected lambda channels",
+                    "higher-order TruthOnly body requires an exact Boolean result type",
+                ));
+            }
+            for (ordinal, argument) in input.selected.argument_types.iter().enumerate() {
+                if matches!(argument, crate::FunctionArgumentType::Lambda { .. })
+                    != (ordinal == body_ordinal as usize)
+                {
+                    return Err(CallEffectRefinementError::InvalidInput(
+                        "higher-order body declaration differs from selected lambda channels",
+                    ));
+                }
+                work.step().map_err(CallEffectRefinementError::Control)?;
+            }
+        } else {
+            for argument in &input.selected.argument_types {
+                if declaration.argument_control
+                    != novarocks_type_contract::ArgumentControl::TypeOnly
+                    && matches!(argument, crate::FunctionArgumentType::Lambda { .. })
+                {
+                    return Err(CallEffectRefinementError::InvalidInput(
+                        "lambda value arguments require an exact higher-order control declaration",
+                    ));
+                }
+                work.step().map_err(CallEffectRefinementError::Control)?;
+            }
+        }
+        match input.argument_uses {
+            CallArgumentUses::SelectedChannels(uses) => {
+                for use_id in uses {
+                    if use_id.is_none()
+                        != (declaration.argument_control
+                            == novarocks_type_contract::ArgumentControl::TypeOnly)
+                    {
+                        return Err(CallEffectRefinementError::InvalidInput(
+                            "call argument demand differs from its exact owner control",
+                        ));
+                    }
+                    work.step().map_err(CallEffectRefinementError::Control)?;
+                }
+            }
+            CallArgumentUses::AggregateMerge { .. } => {
+                if declaration.argument_control
+                    != novarocks_type_contract::ArgumentControl::Aggregate
+                {
+                    return Err(CallEffectRefinementError::InvalidInput(
+                        "aggregate merge requires its exact aggregate owner control",
+                    ));
+                }
+                work.step().map_err(CallEffectRefinementError::Control)?;
+            }
+        }
+        work.step().map_err(CallEffectRefinementError::Control)?;
+        let mut refs = BTreeSet::new();
+        // One active lexical setting per key in one call. Different call scopes may
+        // still use different refs of the same key in the package's sparse table.
+        let mut keys = BTreeSet::new();
+        for reference in input.environment {
+            if !declaration
+                .environment_dependencies
+                .contains(&reference.expected_key)
+                || !refs.insert(*reference)
+                || !keys.insert(reference.expected_key)
+                || input.parameters.require(*reference).is_err()
+            {
+                return Err(CallEffectRefinementError::InvalidInput(
+                    "call effect environment is not an exact frozen declared dependency",
                 ));
             }
             work.step().map_err(CallEffectRefinementError::Control)?;
         }
-    } else {
-        for argument in &input.selected.argument_types {
-            if declaration.argument_control != novarocks_type_contract::ArgumentControl::TypeOnly
-                && matches!(argument, crate::FunctionArgumentType::Lambda { .. })
-            {
+        // Flush wrapper work before entering the implementation owner's scope.
+        work.flush().map_err(CallEffectRefinementError::Control)?;
+        let effects = owner
+            .validate_and_refine(input, control)
+            .map_err(|error| match error {
+                FunctionEffectOwnerError::Control(error) => {
+                    CallEffectRefinementError::Control(error)
+                }
+                FunctionEffectOwnerError::Owner(error) => CallEffectRefinementError::Owner(error),
+            })?;
+        work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(CallEffectRefinementError::Control)?;
+        effects
+            .validate_refinement(declaration, input.proof_scope)
+            .map_err(CallEffectRefinementError::Contract)?;
+        for reference in &effects.environment {
+            if !refs.contains(reference) {
                 return Err(CallEffectRefinementError::InvalidInput(
-                    "lambda value arguments require an exact higher-order control declaration",
+                    "refiner introduced an unfrozen semantic dependency",
                 ));
             }
             work.step().map_err(CallEffectRefinementError::Control)?;
         }
+        work.flush().map_err(CallEffectRefinementError::Control)?;
+        Ok(RefinedCallEffects {
+            input,
+            effects,
+            merge_state,
+        })
+    })();
+    // Ordinary failures report the pending completed work. An original control
+    // refusal is primary and must never invoke its control again.
+    if result.is_err() && !matches!(&result, Err(CallEffectRefinementError::Control(_))) {
+        work.finish().map_err(CallEffectRefinementError::Control)?;
     }
-    for use_id in input.argument_uses {
-        if use_id.is_none()
-            != (declaration.argument_control == novarocks_type_contract::ArgumentControl::TypeOnly)
-        {
-            return Err(CallEffectRefinementError::InvalidInput(
-                "call argument demand differs from its exact owner control",
-            ));
-        }
-        work.step().map_err(CallEffectRefinementError::Control)?;
-    }
-    work.step().map_err(CallEffectRefinementError::Control)?;
-    let mut refs = BTreeSet::new();
-    // One active lexical setting per key in one call. Different call scopes may
-    // still use different refs of the same key in the package's sparse table.
-    let mut keys = BTreeSet::new();
-    for reference in input.environment {
-        if !declaration
-            .environment_dependencies
-            .contains(&reference.expected_key)
-            || !refs.insert(*reference)
-            || !keys.insert(reference.expected_key)
-            || input.parameters.require(*reference).is_err()
-        {
-            return Err(CallEffectRefinementError::InvalidInput(
-                "call effect environment is not an exact frozen declared dependency",
-            ));
-        }
-        work.step().map_err(CallEffectRefinementError::Control)?;
-    }
-    // Flush wrapper work before entering the implementation owner's scope.
-    work.finish().map_err(CallEffectRefinementError::Control)?;
-    let effects = owner
-        .validate_and_refine(input, control)
-        .map_err(|error| match error {
-            FunctionEffectOwnerError::Control(error) => CallEffectRefinementError::Control(error),
-            FunctionEffectOwnerError::Owner(error) => CallEffectRefinementError::Owner(error),
-        })?;
-    let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-        .map_err(CallEffectRefinementError::Control)?;
-    effects
-        .validate_refinement(declaration, input.proof_scope)
-        .map_err(CallEffectRefinementError::Contract)?;
-    for reference in &effects.environment {
-        if !refs.contains(reference) {
-            return Err(CallEffectRefinementError::InvalidInput(
-                "refiner introduced an unfrozen semantic dependency",
-            ));
-        }
-        work.step().map_err(CallEffectRefinementError::Control)?;
-    }
-    work.finish().map_err(CallEffectRefinementError::Control)?;
-    Ok(RefinedCallEffects { input, effects })
+    result
 }
 
 fn input_type_failure<E: Error>(error: crate::KernelFailure) -> CallEffectRefinementError<E> {
@@ -393,8 +501,14 @@ mod input_types_tests;
 pub struct RefinedCallEffects<'a> {
     input: CallEffectInput<'a>,
     effects: CallEffects,
+    merge_state: Option<crate::aggregate_call::ValidatedAggregateMergeState<'a>>,
 }
 impl RefinedCallEffects<'_> {
+    pub(crate) fn aggregate_merge_state(
+        &self,
+    ) -> Option<crate::aggregate_call::ValidatedAggregateMergeState<'_>> {
+        self.merge_state
+    }
     pub const fn facts(&self) -> &CallEffects {
         &self.effects
     }
@@ -457,12 +571,20 @@ impl RefinedCallEffects<'_> {
         // repeatedly comparing/copying recursive schemas and constant backing.
         // These local addresses are never a wire, plan or profile identity.
         if original.context != input.context
-            || !std::ptr::eq(original.argument_uses, input.argument_uses)
+            || !original.argument_uses.same_borrow(input.argument_uses)
             || !std::ptr::eq(original.function_id, input.function_id)
             || original.kind != input.kind
             || !std::ptr::eq(original.selected, input.selected)
             || !std::ptr::eq(original.request.arguments, input.request.arguments)
             || original.request.logical_argument_count != input.request.logical_argument_count
+            || !match (
+                original.request.expected_result_type,
+                input.request.expected_result_type,
+            ) {
+                (None, None) => true,
+                (Some(original), Some(actual)) => std::ptr::eq(original, actual),
+                _ => false,
+            }
             || !std::ptr::eq(original.environment, input.environment)
             || !std::ptr::eq(original.parameters, input.parameters)
             || original.decimal_overflow_policy != input.decimal_overflow_policy
@@ -739,7 +861,7 @@ mod tests {
         };
         let input = CallEffectInput {
             context,
-            argument_uses: &argument_uses,
+            argument_uses: CallArgumentUses::SelectedChannels(&argument_uses),
             function_id: &id,
             kind: FunctionKind::Scalar,
             selected: &selected,
@@ -775,7 +897,7 @@ mod tests {
         assert_eq!(
             result.compose_for_use(
                 CallEffectInput {
-                    argument_uses: &other_arguments,
+                    argument_uses: CallArgumentUses::SelectedChannels(&other_arguments),
                     ..input
                 },
                 arguments
@@ -998,7 +1120,7 @@ mod tests {
         };
         let input = CallEffectInput {
             context,
-            argument_uses: &argument_uses,
+            argument_uses: CallArgumentUses::SelectedChannels(&argument_uses),
             function_id: &id,
             kind: FunctionKind::Scalar,
             selected: &selected,
@@ -1019,3 +1141,7 @@ mod tests {
 
 #[cfg(test)]
 mod control_join_tests;
+
+#[cfg(test)]
+#[path = "effect_refinement/aggregate_merge_tests.rs"]
+mod aggregate_merge_tests;
