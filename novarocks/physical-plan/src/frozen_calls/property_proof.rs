@@ -307,7 +307,7 @@ impl FrozenFragmentCalls {
                 work.step()?;
             }
             let mut first_broadcast_unsafe = None;
-            visit_calls(fragment, uses, &mut work, |site, binding, work| {
+            visit_calls::<FrozenCallError>(fragment, uses, &mut work, |site, binding, work| {
                 let owner = match site {
                     PhysicalCallSite::Expression(id) => {
                         let invocation = uses.flow().uses().get(&id);

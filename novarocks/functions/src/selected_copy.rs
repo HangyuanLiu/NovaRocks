@@ -766,7 +766,7 @@ pub fn guarded_interleave_extent(ty: &DataType, rows: usize) -> Result<(), CopyE
     interleave_bitmap_extent(rows)
 }
 
-fn byte_interleave_payload_extent(total: usize, large: bool) -> Result<(), CopyError> {
+pub(crate) fn byte_interleave_payload_extent(total: usize, large: bool) -> Result<(), CopyError> {
     limit(total, offset_max(large))?;
     buffer_extent(total, 1)
 }

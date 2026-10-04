@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::super::aggregate_extrema_dispatch::ExtremaState as InstalledExtremaState;
 use super::*;
 use arrow_schema::{DataType, Field};
 use novarocks_type_contract::{
@@ -891,7 +892,7 @@ fn aggregate_extrema_split_phases_distinct_idempotence_and_unsupported_options()
         );
         let text = Fixture::new(
             name,
-            FunctionValueType::new(DataType::Utf8, true),
+            FunctionValueType::new(DataType::LargeUtf8, true),
             DecimalOverflowPolicy::ReportError,
         );
         assert!(matches!(
@@ -903,7 +904,7 @@ fn aggregate_extrema_split_phases_distinct_idempotence_and_unsupported_options()
     }
 }
 #[repr(align(32))]
-struct Storage([MaybeUninit<u8>; size_of::<Option<ExtremaValue>>()]);
+struct Storage([MaybeUninit<u8>; size_of::<InstalledExtremaState>()]);
 
 #[test]
 fn aggregate_extrema_actual_erased_group_mapping_and_all_emission_first_causes() {
@@ -915,10 +916,13 @@ fn aggregate_extrema_actual_erased_group_mapping_and_all_emission_first_causes()
         let PreparedPureKernel::Aggregate(handle) = prepared.prepared() else {
             panic!()
         };
-        assert_eq!(handle.state_layout(), Layout::new::<Option<ExtremaValue>>());
+        assert_eq!(
+            handle.state_layout(),
+            Layout::new::<InstalledExtremaState>()
+        );
         let setup = RuntimeControl::default();
-        let mut first = Storage([MaybeUninit::uninit(); size_of::<Option<ExtremaValue>>()]);
-        let mut second = Storage([MaybeUninit::uninit(); size_of::<Option<ExtremaValue>>()]);
+        let mut first = Storage([MaybeUninit::uninit(); size_of::<InstalledExtremaState>()]);
+        let mut second = Storage([MaybeUninit::uninit(); size_of::<InstalledExtremaState>()]);
         let mut states = [
             handle.initialize_in(&mut first.0, &setup).unwrap(),
             handle.initialize_in(&mut second.0, &setup).unwrap(),
@@ -962,7 +966,7 @@ fn aggregate_extrema_actual_erased_group_mapping_and_all_emission_first_causes()
             AggregateStateMemoryPolicy::FixedZero
         );
         let mut merged_storage =
-            Storage([MaybeUninit::uninit(); size_of::<Option<ExtremaValue>>()]);
+            Storage([MaybeUninit::uninit(); size_of::<InstalledExtremaState>()]);
         let mut merged = [final_handle
             .initialize_in(&mut merged_storage.0, &setup)
             .unwrap()];
@@ -1003,9 +1007,9 @@ fn aggregate_extrema_actual_erased_group_mapping_and_all_emission_first_causes()
                 let action = |ctrl: &RuntimeControl| {
                     let setup = RuntimeControl::default();
                     let mut first =
-                        Storage([MaybeUninit::uninit(); size_of::<Option<ExtremaValue>>()]);
+                        Storage([MaybeUninit::uninit(); size_of::<InstalledExtremaState>()]);
                     let mut second =
-                        Storage([MaybeUninit::uninit(); size_of::<Option<ExtremaValue>>()]);
+                        Storage([MaybeUninit::uninit(); size_of::<InstalledExtremaState>()]);
                     let states = [
                         handle.initialize_in(&mut first.0, &setup).unwrap(),
                         handle.initialize_in(&mut second.0, &setup).unwrap(),
@@ -1153,7 +1157,7 @@ fn aggregate_extrema_complete_source_binding_stale_domains_and_metadata_refuse()
 fn aggregate_extrema_compile_every_actual_callback_success_and_ordinary_refusal() {
     for (source, good) in [
         (ty(true), true),
-        (FunctionValueType::new(DataType::Utf8, true), false),
+        (FunctionValueType::new(DataType::LargeUtf8, true), false),
     ] {
         let fixture = Fixture::new("min", source, DecimalOverflowPolicy::ReportError);
         let action = |ctrl: &CompileControl| fixture.prepare(AggregateKernelPhase::Single, ctrl);
@@ -1338,5 +1342,173 @@ fn aggregate_extrema_layout_and_dishonest_iterator_refuse_before_growth() {
             },
             false,
         );
+    }
+}
+
+#[test]
+fn installed_extrema_dispatch_borrowed_output_keeps_actual_prefix_and_typed_iterator_failures() {
+    use crate::builtin::aggregate_extrema_dispatch::{ExtremaState, PreparedExtrema};
+    let fixture = Fixture::new("min", ty(true), DecimalOverflowPolicy::OutputNull);
+    let kernel = PreparedExtrema::Fixed(fixture.kernel(AggregateKernelPhase::Single));
+    let states = [
+        ExtremaState::Fixed(None),
+        ExtremaState::Fixed(Some(ExtremaValue::I64(7))),
+    ];
+    let baseline = RuntimeControl::default();
+    let output = kernel.build_final(states.iter(), &baseline).unwrap();
+    assert_eq!(
+        output
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![None, Some(7)]
+    );
+    let trace = baseline.trace.lock().unwrap().clone();
+    for at in 0..trace.len() {
+        for cause in causes() {
+            let control = RuntimeControl {
+                trace: Mutex::default(),
+                refusal: Some((at, cause.clone())),
+            };
+            assert!(
+                matches!(kernel.build_final(states.iter(), &control), Err(actual) if actual == cause)
+            );
+            assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+        }
+    }
+    struct Declared<'a> {
+        states: std::slice::Iter<'a, ExtremaState>,
+        count: usize,
+    }
+    impl<'a> Iterator for Declared<'a> {
+        type Item = &'a ExtremaState;
+        fn next(&mut self) -> Option<Self::Item> {
+            self.states.next()
+        }
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            (self.count, Some(self.count))
+        }
+    }
+    impl ExactSizeIterator for Declared<'_> {
+        fn len(&self) -> usize {
+            self.count
+        }
+    }
+    for count in [0, 3] {
+        let baseline = RuntimeControl::default();
+        assert!(matches!(
+            kernel.build_final(
+                Declared {
+                    states: states.iter(),
+                    count
+                },
+                &baseline
+            ),
+            Err(KernelFailure::Internal(_))
+        ));
+        let trace = baseline.trace.lock().unwrap().clone();
+        for at in 0..trace.len() {
+            for cause in causes() {
+                let control = RuntimeControl {
+                    trace: Mutex::default(),
+                    refusal: Some((at, cause.clone())),
+                };
+                assert!(
+                    matches!(kernel.build_final(Declared { states: states.iter(), count }, &control), Err(actual) if actual == cause)
+                );
+                assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+            }
+        }
+    }
+    let control = RuntimeControl::default();
+    assert!(matches!(
+        kernel.build_final(
+            Declared {
+                states: states.iter(),
+                count: usize::MAX
+            },
+            &control
+        ),
+        Err(KernelFailure::ResourceExhausted)
+    ));
+    assert_eq!(*control.trace.lock().unwrap(), vec![0]);
+}
+
+#[test]
+fn installed_extrema_dispatch_counts_actual_heap_and_refuses_a_foreign_private_state() {
+    use crate::builtin::aggregate_extrema_dispatch::{ExtremaState, PreparedExtrema};
+    use crate::builtin::aggregate_extrema_utf8::Utf8ExtremaKernel;
+    let fixed = Fixture::new("min", ty(true), DecimalOverflowPolicy::ReportError);
+    let kernel = PreparedExtrema::Fixed(fixed.kernel(AggregateKernelPhase::Single));
+    let text = Fixture::new(
+        "min",
+        FunctionValueType::new(DataType::Utf8, true),
+        DecimalOverflowPolicy::ReportError,
+    );
+    let leaf = Utf8ExtremaKernel {
+        contract: text.kernel(AggregateKernelPhase::Single).contract,
+        operation: ExtremaOperation::Min,
+    };
+    let wrong = ExtremaState::Utf8(leaf.create_state(&RuntimeControl::default()).unwrap());
+    assert_eq!(
+        kernel.retained_bytes(&wrong),
+        0,
+        "actual empty state heap, not a diagnostic sentinel"
+    );
+    let baseline = RuntimeControl::default();
+    assert!(matches!(
+        kernel.build_final([&wrong].into_iter(), &baseline),
+        Err(KernelFailure::InvalidProgram(_))
+    ));
+    let trace = baseline.trace.lock().unwrap().clone();
+    for at in 0..trace.len() {
+        for cause in causes() {
+            let control = RuntimeControl {
+                trace: Mutex::default(),
+                refusal: Some((at, cause.clone())),
+            };
+            assert!(
+                matches!(kernel.build_final([&wrong].into_iter(), &control), Err(actual) if actual == cause)
+            );
+            assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+        }
+    }
+    let values: ArrayRef = Arc::new(Int64Array::from(vec![9]));
+    let args = [EvaluatedArgument::Column(&values)];
+    let input = SelectedAggregateUpdateInput::try_new(
+        kernel.contract(),
+        Selection::all(1),
+        &args,
+        &[],
+        &RuntimeControl::default(),
+    )
+    .unwrap();
+    let prepared = kernel
+        .prepare_update(input, &RuntimeControl::default())
+        .unwrap();
+    let baseline = RuntimeControl::default();
+    let mut state = ExtremaState::Utf8(leaf.create_state(&RuntimeControl::default()).unwrap());
+    assert!(matches!(
+        kernel.update_row(&mut state, &prepared, 0, &baseline),
+        Err(KernelFailure::InvalidProgram(_))
+    ));
+    let trace = baseline.trace.lock().unwrap().clone();
+    for at in 0..trace.len() {
+        for cause in causes() {
+            let mut state =
+                ExtremaState::Utf8(leaf.create_state(&RuntimeControl::default()).unwrap());
+            let control = RuntimeControl {
+                trace: Mutex::default(),
+                refusal: Some((at, cause.clone())),
+            };
+            assert_eq!(
+                kernel.update_row(&mut state, &prepared, 0, &control),
+                Err(cause)
+            );
+            assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+            assert_eq!(kernel.retained_bytes(&state), 0);
+        }
     }
 }

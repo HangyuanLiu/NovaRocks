@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Exact fixed-width MIN/MAX owners; Utf8 state and aggregate OVER remain separate obligations.
+//! Exact MIN/MAX fixed-width and UTF-8 owners; aggregate OVER remains separate.
 
+use super::aggregate_extrema_dispatch::PreparedExtrema;
+use super::aggregate_extrema_utf8::Utf8ExtremaKernel;
 use super::{
     aggregate_extrema::{ExtremaKernel, ExtremaOperation, supported_type},
     catalogue::BuiltinAggregateResolver,
@@ -237,13 +239,13 @@ impl FunctionEffectOwner for ExtremaOwner {
     }
 }
 impl PureAggregateImplementation for ExtremaOwner {
-    type Kernel = ExtremaKernel;
+    type Kernel = PreparedExtrema;
     fn prepare_aggregate(
         &self,
         input: CallEffectInput<'_>,
         contract: Arc<AggregateCallContract>,
         control: &dyn PureCompileControl,
-    ) -> Result<Arc<ExtremaKernel>, KernelFailure> {
+    ) -> Result<Arc<PreparedExtrema>, KernelFailure> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
             .map_err(compile_failure)?;
         let result = (|| {
@@ -270,7 +272,7 @@ impl PureAggregateImplementation for ExtremaOwner {
             work.step().map_err(compile_failure)?;
             if !supported {
                 return Err(invalid(
-                    "MIN/MAX fixed-width lifecycle requires one value and no function ORDER BY",
+                    "MIN/MAX lifecycle requires one value and no function ORDER BY",
                 ));
             }
             work.flush().map_err(compile_failure)?;
@@ -307,16 +309,20 @@ impl PureAggregateImplementation for ExtremaOwner {
             else {
                 return Err(invalid("MIN/MAX requires its selected value channel"));
             };
-            let supported = supported_type(&source.data_type)
+            let supported = (supported_type(&source.data_type)
+                || source.data_type == DataType::Utf8)
                 && match source.logical_type {
                     ValueLogicalType::LargeInt => source.data_type == DataType::FixedSizeBinary(16),
                     ValueLogicalType::Physical => source.data_type != DataType::FixedSizeBinary(16),
+                    // The installed resolver and original extrema kernel keep
+                    // this nominal tag while comparing the original UTF-8 bytes.
+                    ValueLogicalType::Json => source.data_type == DataType::Utf8,
                     _ => false,
                 };
             work.step().map_err(compile_failure)?;
             if !supported {
                 return Err(invalid(
-                    "MIN/MAX pure owner does not implement this input carrier (Utf8 and non-LargeInt FSB16 remain separate)",
+                    "MIN/MAX pure owner does not implement this input carrier",
                 ));
             }
             let final_type = contract.final_type();
@@ -348,10 +354,18 @@ impl PureAggregateImplementation for ExtremaOwner {
                 ));
             }
             work.flush().map_err(compile_failure)?;
-            let prepared = Arc::new(ExtremaKernel {
-                contract,
-                operation: self.operation,
-            });
+            let prepared = if source.data_type == DataType::Utf8 {
+                PreparedExtrema::Utf8(Utf8ExtremaKernel {
+                    contract,
+                    operation: self.operation,
+                })
+            } else {
+                PreparedExtrema::Fixed(ExtremaKernel {
+                    contract,
+                    operation: self.operation,
+                })
+            };
+            let prepared = Arc::new(prepared);
             work.flush().map_err(compile_failure)?;
             Ok(prepared)
         })();

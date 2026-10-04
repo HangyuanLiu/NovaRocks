@@ -417,7 +417,46 @@ fn validate_public_effect_shape(
         .map_err(FrozenCallError::InvalidEffects)
 }
 
-fn visit_calls<'a>(
+/// Visit each actual call occurrence using the caller's original work scope.
+///
+/// Root-use correspondence is rechecked against this fragment before any call
+/// is exposed. Bindings are borrowed from that fragment, in the same order as
+/// the frozen-call validator. This port does not infer effects or create call
+/// facts, and root-use correspondence is not a content-identity proof.
+///
+/// The caller admits source, delegated root-validation scratch and callback
+/// allocations, owns entry and finish, and propagates a typed control refusal
+/// immediately without a later finish.
+/// Delegated root validation retains the same control; no budget is reset.
+pub fn visit_physical_calls_observed<'a, E: From<FrozenCallError>>(
+    fragment: &'a Fragment,
+    uses: &PhysicalRootUses,
+    work: &mut CompileCheckpoints<'_>,
+    visit: impl FnMut(
+        PhysicalCallSite,
+        PhysicalCallBinding<'a>,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<(), E>,
+) -> Result<(), E> {
+    if uses.roots().fragment() != fragment.id() {
+        return Err(FrozenCallError::Roots(RootUseBindingError::WrongFragment).into());
+    }
+    work.flush().map_err(FrozenCallError::Control)?;
+    let checked = uses
+        .validate_fragment(fragment, work.control())
+        .map_err(|error| match error {
+            RootUseBindingError::Control(error) => FrozenCallError::Control(error),
+            error => FrozenCallError::Roots(error),
+        });
+    if let Err(FrozenCallError::Control(error)) = checked {
+        return Err(FrozenCallError::Control(error).into());
+    }
+    work.flush().map_err(FrozenCallError::Control)?;
+    checked?;
+    visit_calls(fragment, uses, work, visit)
+}
+
+fn visit_calls<'a, E: From<FrozenCallError>>(
     fragment: &'a Fragment,
     uses: &PhysicalRootUses,
     work: &mut CompileCheckpoints<'_>,
@@ -425,8 +464,8 @@ fn visit_calls<'a>(
         PhysicalCallSite,
         PhysicalCallBinding<'a>,
         &mut CompileCheckpoints<'_>,
-    ) -> Result<(), FrozenCallError>,
-) -> Result<(), FrozenCallError> {
+    ) -> Result<(), E>,
+) -> Result<(), E> {
     for (id, invocation) in uses.flow().uses() {
         let expression = fragment
             .expressions()
@@ -467,7 +506,7 @@ fn visit_calls<'a>(
             | ExprKind::Case { .. }
             | ExprKind::IsTruthValue { .. } => {}
         }
-        work.step()?;
+        work.step().map_err(FrozenCallError::Control)?;
     }
     for node in fragment.nodes().values() {
         match &node.kind {
@@ -481,7 +520,7 @@ fn visit_calls<'a>(
                         PhysicalCallBinding::Aggregate(&item.binding),
                         work,
                     )?;
-                    work.step()?;
+                    work.step().map_err(FrozenCallError::Control)?;
                 }
             }
             NodeKind::TopN {
@@ -497,7 +536,7 @@ fn visit_calls<'a>(
                         PhysicalCallBinding::Aggregate(&item.binding),
                         work,
                     )?;
-                    work.step()?;
+                    work.step().map_err(FrozenCallError::Control)?;
                 }
             }
             NodeKind::TableWriter { target } => {
@@ -510,7 +549,7 @@ fn visit_calls<'a>(
                         PhysicalCallBinding::Aggregate(&item.binding),
                         work,
                     )?;
-                    work.step()?;
+                    work.step().map_err(FrozenCallError::Control)?;
                 }
             }
             NodeKind::TableFinish(finish) => {
@@ -523,7 +562,7 @@ fn visit_calls<'a>(
                         PhysicalCallBinding::Aggregate(&item.binding),
                         work,
                     )?;
-                    work.step()?;
+                    work.step().map_err(FrozenCallError::Control)?;
                 }
             }
             NodeKind::TableFunction { function, .. } => visit(
@@ -552,7 +591,7 @@ fn visit_calls<'a>(
             | NodeKind::ChangeEventExpand { .. }
             | NodeKind::ExchangeSource { .. } => {}
         }
-        work.step()?;
+        work.step().map_err(FrozenCallError::Control)?;
     }
     Ok(())
 }
