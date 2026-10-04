@@ -64,17 +64,48 @@ pub struct FragmentPackageInput {
     pub annotations: Box<[PlanAnnotation]>,
 }
 
+/// Explicit host-authored admission for this exact coexisting source.
+/// PlanLimits are structural counts; the independent property ceilings admit
+/// its occurrence projection. This is not a complete validator scratch model
+/// or a MEM grant. Source bytes must cover all original retained backing.
+#[derive(Clone, Copy, Debug)]
+pub struct FragmentPackageAdmission {
+    pub plan_limits: crate::PlanLimits,
+    pub source_retained_bytes: usize,
+    pub property_projection_limits: crate::PropertyProofProjectionLimits,
+}
+
 #[derive(Clone, Debug)]
 pub struct FragmentPackage(FragmentPackageInput);
 
 impl FragmentPackage {
     pub fn try_new(
         input: FragmentPackageInput,
+        admission: FragmentPackageAdmission,
         control: &dyn PureCompileControl,
     ) -> Result<Self, FragmentPackageError> {
         control
             .checkpoint(CompilePhase::Validate, 0)
             .map_err(FragmentPackageError::Control)?;
+        crate::validate_fragment_output_properties_observed(
+            &input.fragment,
+            &input.expression_uses,
+            &input.calls,
+            admission.plan_limits,
+            admission.source_retained_bytes,
+            admission.property_projection_limits,
+            control,
+        )
+        .map_err(|error| match error {
+            crate::FragmentPropertyError::Control(cause) => FragmentPackageError::Control(cause),
+            crate::FragmentPropertyError::Calls(FrozenCallError::Roots(cause)) => {
+                FragmentPackageError::ExpressionUses(cause)
+            }
+            crate::FragmentPropertyError::Calls(cause) => FragmentPackageError::Calls(cause),
+            crate::FragmentPropertyError::Structure(cause) => {
+                FragmentPackageError::Structure(cause)
+            }
+        })?;
         crate::constants::validate_fragment_constants_observed(
             &input.fragment,
             &input.constants,
@@ -104,6 +135,7 @@ impl FragmentPackage {
             .map_err(FragmentPackageError::Control)?;
         let resource_result = crate::validation::validate_package(
             &input,
+            admission.plan_limits,
             call_items
                 .saturating_add(pruning_items)
                 .saturating_add(counts.intrinsic),
@@ -116,14 +148,6 @@ impl FragmentPackage {
             .finish()
             .map_err(FragmentPackageError::Control)?;
         resource_result?;
-        input
-            .calls
-            .validate_replica_equivalence(&input.fragment, &input.expression_uses, control)
-            .map_err(|error| match error {
-                FrozenCallError::Control(error) => FragmentPackageError::Control(error),
-                FrozenCallError::Roots(error) => FragmentPackageError::ExpressionUses(error),
-                error => FragmentPackageError::Calls(error),
-            })?;
         // The exact package profile must admit the complete source before
         // materializing any repeated semantic-parameter references.
         let references = fragment_parameter_references(&input.fragment, &input.calls, control)
@@ -326,11 +350,38 @@ pub fn extract_fragment_packages(
     expression_uses: &BTreeMap<FragmentId, PhysicalRootUses>,
     calls: &BTreeMap<FragmentId, FrozenFragmentCalls>,
     pruning: &BTreeMap<FragmentId, FrozenFragmentPruning>,
+    admissions: &BTreeMap<FragmentId, FragmentPackageAdmission>,
     control: &dyn PureCompileControl,
 ) -> Result<BTreeMap<FragmentId, FragmentPackage>, FragmentPackageExtractionError> {
     control
         .checkpoint(CompilePhase::Validate, 0)
         .map_err(FragmentPackageExtractionError::Control)?;
+    let mut admission_work = CompileCheckpoints::try_new(control, CompilePhase::Validate)
+        .map_err(FragmentPackageExtractionError::Control)?;
+    for fragment in plan.fragments().values() {
+        let present = admissions.contains_key(&fragment.id());
+        admission_work
+            .step()
+            .map_err(FragmentPackageExtractionError::Control)?;
+        if !present {
+            admission_work
+                .finish()
+                .map_err(FragmentPackageExtractionError::Control)?;
+            return Err(FragmentPackageExtractionError::MissingAdmission(
+                fragment.id(),
+            ));
+        }
+    }
+    let exact_count = admissions.len() == plan.fragments().len();
+    admission_work
+        .step()
+        .map_err(FragmentPackageExtractionError::Control)?;
+    admission_work
+        .finish()
+        .map_err(FragmentPackageExtractionError::Control)?;
+    if !exact_count {
+        return Err(FragmentPackageExtractionError::UnusedAdmission);
+    }
     crate::constants::validate_plan_constants_observed(plan, control).map_err(
         |error| match error {
             crate::ConstantReferenceError::Control(error) => {
@@ -361,6 +412,9 @@ pub fn extract_fragment_packages(
     let mut consumed_writes = std::collections::BTreeSet::new();
     let mut consumed_parameters = std::collections::BTreeSet::new();
     for fragment in plan.fragments().values() {
+        let admission = *admissions.get(&fragment.id()).ok_or(
+            FragmentPackageExtractionError::MissingAdmission(fragment.id()),
+        )?;
         let mut local_scans = BTreeMap::new();
         let mut local_writes = BTreeMap::new();
         for node in fragment.nodes().values() {
@@ -395,6 +449,7 @@ pub fn extract_fragment_packages(
         // before copying its potentially repeated environment references.
         crate::validation::validate_fragment_parameter_resource_usage(
             fragment,
+            admission.plan_limits,
             local_calls.entries().len().saturating_add(counts.total),
         )
         .map_err(|error| {
@@ -474,6 +529,7 @@ pub fn extract_fragment_packages(
                 writes: local_writes,
                 annotations,
             },
+            admission,
             control,
         )
         .map_err(|error| match error {
@@ -521,6 +577,8 @@ pub enum FragmentPackageExtractionError {
     UnusedCalls,
     MissingPruning(FragmentId),
     UnusedPruning,
+    MissingAdmission(FragmentId),
+    UnusedAdmission,
     UnusedParameters,
 }
 
@@ -559,6 +617,10 @@ impl fmt::Display for FragmentPackageExtractionError {
             Self::UnusedPruning => {
                 f.write_str("frozen pruning declarations name an unused fragment")
             }
+            Self::MissingAdmission(id) => {
+                write!(f, "resource admission is missing for fragment {}", id.get())
+            }
+            Self::UnusedAdmission => f.write_str("resource admission names an unused fragment"),
             Self::UnusedParameters => {
                 f.write_str("complete plan contains unused semantic parameters")
             }

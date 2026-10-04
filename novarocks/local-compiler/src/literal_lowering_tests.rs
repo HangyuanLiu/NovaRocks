@@ -122,6 +122,7 @@ fn literal_package(ty: FunctionValueType, literal: LiteralValue) -> Arc<Fragment
                 annotations: Box::default(),
                 pruning,
             },
+            package_admission(),
             &FixtureControl,
         )
         .unwrap(),
@@ -394,4 +395,18 @@ fn explicit_interval_components_reach_the_actual_project_root_without_packed_int
     let invocation = &snapshot.flows()[&ProgramExpressionArena::Main].uses()[root_use];
     assert_eq!(invocation.definition, root.definition);
     assert!(invocation.arguments.is_empty());
+}
+
+// Conservative retained-source invoice and independent projection ceilings for
+// these small fixtures only; this is not a production default or a MEM grant.
+fn package_admission() -> novarocks_physical_plan::FragmentPackageAdmission {
+    novarocks_physical_plan::FragmentPackageAdmission {
+        plan_limits: novarocks_physical_plan::PlanLimits::FROZEN,
+        source_retained_bytes: 64 * 1024 * 1024,
+        property_projection_limits: novarocks_physical_plan::PropertyProofProjectionLimits {
+            max_request_bytes: 16 * 1024 * 1024,
+            max_coexisting_bytes: 256 * 1024 * 1024,
+            max_projection_work: 16 * 1024 * 1024,
+        },
+    }
 }

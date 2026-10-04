@@ -426,7 +426,9 @@ fn package_input(fixture: &Fixture) -> FragmentPackageInput {
     }
 }
 fn package(fixture: &Fixture) -> Arc<FragmentPackage> {
-    Arc::new(FragmentPackage::try_new(package_input(fixture), &Control).unwrap())
+    Arc::new(
+        FragmentPackage::try_new(package_input(fixture), package_admission(), &Control).unwrap(),
+    )
 }
 fn compile(
     source: Arc<FragmentPackage>,
@@ -772,7 +774,7 @@ fn checked_arithmetic_package_refuses_missing_or_wrong_parameter_authority() {
     let mut input = package_input(&fixture);
     input.parameters = SemanticParameters::default();
     assert_eq!(
-        FragmentPackage::try_new(input, &Control).unwrap_err(),
+        FragmentPackage::try_new(input, package_admission(), &Control).unwrap_err(),
         FragmentPackageError::Parameter(SemanticParameterError::MissingId(
             SemanticParameterId::new(u32::MAX)
         ))
@@ -784,7 +786,7 @@ fn checked_arithmetic_package_refuses_missing_or_wrong_parameter_authority() {
     )])
     .unwrap();
     assert_eq!(
-        FragmentPackage::try_new(input, &Control).unwrap_err(),
+        FragmentPackage::try_new(input, package_admission(), &Control).unwrap_err(),
         FragmentPackageError::Parameter(SemanticParameterError::KeyMismatch(reference(u32::MAX)))
     );
 }
@@ -860,5 +862,19 @@ fn mandatory_arithmetic_compilation_preserves_every_control_prefix_and_ordinary_
                 assert_eq!(*control.trace.lock().unwrap(), trace[..stop_at]);
             }
         }
+    }
+}
+
+// Conservative retained-source invoice and independent projection ceilings for
+// these small fixtures only; this is not a production default or a MEM grant.
+fn package_admission() -> novarocks_physical_plan::FragmentPackageAdmission {
+    novarocks_physical_plan::FragmentPackageAdmission {
+        plan_limits: novarocks_physical_plan::PlanLimits::FROZEN,
+        source_retained_bytes: 64 * 1024 * 1024,
+        property_projection_limits: novarocks_physical_plan::PropertyProofProjectionLimits {
+            max_request_bytes: 16 * 1024 * 1024,
+            max_coexisting_bytes: 256 * 1024 * 1024,
+            max_projection_work: 16 * 1024 * 1024,
+        },
     }
 }

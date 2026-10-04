@@ -30,6 +30,7 @@ mod contract_regressions;
 mod definition_control_contract;
 mod exchange_occurrence_contract;
 mod expression_site_contract;
+mod guarantee_admission;
 mod ordering_window_assertion_contract;
 mod package_contract;
 mod partition_scan_contract;

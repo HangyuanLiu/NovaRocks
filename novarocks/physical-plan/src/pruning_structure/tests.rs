@@ -426,6 +426,7 @@ fn package(builder: FragmentBuilder, root: NodeId, scan: NodeId) -> FragmentPack
             writes: BTreeMap::new(),
             annotations: Box::default(),
         },
+        package_admission(),
         &Control::default(),
     )
     .unwrap()
@@ -1134,7 +1135,8 @@ fn mandatory_package_pruning_preserves_actual_witnesses_and_full_source_claims()
     let expected = pruning_table(&package, vec![witness.clone()]);
     let mut input = package.into_input();
     input.pruning = expected.clone();
-    let package = FragmentPackage::try_new(input, &Control::default()).unwrap();
+    let package =
+        FragmentPackage::try_new(input, package_admission(), &Control::default()).unwrap();
     assert_eq!(package.pruning(), &expected);
     assert_eq!(package.pruning().fragment(), package.fragment().id());
     assert_eq!(
@@ -1182,7 +1184,7 @@ fn mandatory_package_pruning_rejects_invalid_target_paths_and_occurrence_claims(
         // The table constructor checks the bounded declaration shape only.
         input.pruning = pruning_table(&package, vec![witness]);
         assert_eq!(
-            FragmentPackage::try_new(input, &Control::default()).unwrap_err(),
+            FragmentPackage::try_new(input, package_admission(), &Control::default()).unwrap_err(),
             FragmentPackageError::Pruning(FrozenPruningError::Structure(error))
         );
     }
@@ -1193,7 +1195,7 @@ fn mandatory_package_pruning_rejects_invalid_target_paths_and_occurrence_claims(
         FrozenFragmentPruning::try_new(foreign.target.fragment, vec![foreign], &Control::default())
             .unwrap();
     assert_eq!(
-        FragmentPackage::try_new(input, &Control::default()).unwrap_err(),
+        FragmentPackage::try_new(input, package_admission(), &Control::default()).unwrap_err(),
         FragmentPackageError::Pruning(FrozenPruningError::WrongFragment)
     );
 }
@@ -1266,7 +1268,7 @@ fn frozen_pruning_reference_limit_is_combined_across_distinct_targets() {
 }
 
 #[test]
-fn frozen_pruning_and_mandatory_package_preserve_typed_entry_and_256_work_failures() {
+fn frozen_pruning_and_mandatory_package_preserve_typed_entry_and_first_positive_work_failures() {
     let (package, witness) = fixture(false, 300);
     let table = pruning_table(&package, vec![witness.clone()]);
     for failure in [
@@ -1314,12 +1316,21 @@ fn frozen_pruning_and_mandatory_package_preserve_typed_entry_and_256_work_failur
             let mut input = package.clone().into_input();
             input.pruning = table.clone();
             assert_eq!(
-                FragmentPackage::try_new(input, &control).unwrap_err(),
+                FragmentPackage::try_new(input, package_admission(), &control).unwrap_err(),
                 FragmentPackageError::Control(failure)
             );
             let work = control.work.lock().unwrap();
             assert_eq!(work.first(), Some(&0));
-            assert_eq!(work.last(), Some(&if positive_only { 256 } else { 0 }));
+            if positive_only {
+                // Package admission now observes a short preflight before the
+                // pruning walk. A first-positive refusal must stop there;
+                // the two direct pruning ports above still exercise real256.
+                let last = *work.last().unwrap();
+                assert!((1..=256).contains(&last));
+                assert!(work[..work.len() - 1].iter().all(|units| *units == 0));
+            } else {
+                assert_eq!(work.as_slice(), &[0]);
+            }
         }
     }
 }
@@ -1351,7 +1362,8 @@ fn two_real_domain_targets_share_one_actual_consumer_index() {
     );
     let mut input = package.into_input();
     input.pruning = both.clone();
-    let installed = FragmentPackage::try_new(input, &Control::default()).unwrap();
+    let installed =
+        FragmentPackage::try_new(input, package_admission(), &Control::default()).unwrap();
     assert_eq!(installed.pruning(), &both);
 }
 
@@ -1368,4 +1380,18 @@ fn consumer_index_cannot_be_reused_for_a_different_package_with_the_same_fragmen
             .unwrap_err(),
         PruningStructureError::WrongSnapshot,
     );
+}
+
+// Explicit small-fixture source invoice and independent property projection
+// ceilings. These are test inputs, not a production default or MEM grant.
+fn package_admission() -> crate::FragmentPackageAdmission {
+    crate::FragmentPackageAdmission {
+        plan_limits: crate::PlanLimits::FROZEN,
+        source_retained_bytes: 64 * 1024 * 1024,
+        property_projection_limits: crate::PropertyProofProjectionLimits {
+            max_request_bytes: 16 * 1024 * 1024,
+            max_coexisting_bytes: 256 * 1024 * 1024,
+            max_projection_work: 16 * 1024 * 1024,
+        },
+    }
 }

@@ -137,6 +137,7 @@ fn literal_program(cases: &[(FunctionValueType, LiteralValue)]) -> Arc<LocalProg
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
             },
+            package_admission(),
             &FixtureControl,
         )
         .unwrap(),
@@ -428,4 +429,18 @@ fn actual_compiled_literal_offset_view_and_nominal_bytes_keep_payload_and_typed_
         LiteralValue::Binary(vec![0, 0xff, 0x32, 0x80].into_boxed_slice()),
     ));
     check_literal_roots(with_typed_nulls(cases));
+}
+
+// Conservative retained-source invoice and independent projection ceilings for
+// these small fixtures only; this is not a production default or a MEM grant.
+fn package_admission() -> novarocks_physical_plan::FragmentPackageAdmission {
+    novarocks_physical_plan::FragmentPackageAdmission {
+        plan_limits: novarocks_physical_plan::PlanLimits::FROZEN,
+        source_retained_bytes: 64 * 1024 * 1024,
+        property_projection_limits: novarocks_physical_plan::PropertyProofProjectionLimits {
+            max_request_bytes: 16 * 1024 * 1024,
+            max_coexisting_bytes: 256 * 1024 * 1024,
+            max_projection_work: 16 * 1024 * 1024,
+        },
+    }
 }

@@ -161,6 +161,13 @@ pub fn validate_fragment_output_properties_observed(
         work.flush()?;
         structure.map_err(FragmentPropertyError::Structure)?;
         proof.require_declared_broadcast_equivalence(&mut work)?;
+        let facts = super::guarantee::validate_guarantees_observed(
+            fragment,
+            proof.facts(),
+            limits,
+            projection_limits,
+            &mut work,
+        )?;
         let mut errors = ValidationContext::with_limits(limits);
         for node in fragment.nodes().values() {
             // Original formula scratch/clone/format operations are opaque.
@@ -188,7 +195,7 @@ pub fn validate_fragment_output_properties_observed(
                 ValidationErrors::from_collector(errors),
             ));
         }
-        Ok(proof.facts())
+        Ok(facts)
     })();
     if matches!(&result, Err(FragmentPropertyError::Control(_))) {
         return result;

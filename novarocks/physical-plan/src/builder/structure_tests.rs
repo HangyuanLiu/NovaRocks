@@ -332,7 +332,7 @@ fn structure_stage_defers_property_derivation_but_definition_and_package_still_r
         writes: BTreeMap::new(),
         annotations: Box::default(),
     };
-    assert!(FragmentPackage::try_new(input, &Control::default()).is_err());
+    assert!(FragmentPackage::try_new(input, package_admission(), &Control::default()).is_err());
 }
 
 #[test]
@@ -649,5 +649,19 @@ fn structure_signature_correspondence_ignores_only_legacy_effects_and_keeps_full
             !nested.signature_matches(&changed),
             "full nested type dimension {change}"
         );
+    }
+}
+
+// Explicit small-fixture source invoice and independent property projection
+// ceilings. These are test inputs, not a production default or MEM grant.
+fn package_admission() -> crate::FragmentPackageAdmission {
+    crate::FragmentPackageAdmission {
+        plan_limits: crate::PlanLimits::FROZEN,
+        source_retained_bytes: 64 * 1024 * 1024,
+        property_projection_limits: crate::PropertyProofProjectionLimits {
+            max_request_bytes: 16 * 1024 * 1024,
+            max_coexisting_bytes: 256 * 1024 * 1024,
+            max_projection_work: 16 * 1024 * 1024,
+        },
     }
 }

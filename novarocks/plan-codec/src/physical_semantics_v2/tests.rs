@@ -108,7 +108,9 @@ fn input() -> FragmentPackageInput {
 #[test]
 fn public_semantics_projection_preserves_explicit_empty_components_and_same_package() {
     let original = input();
-    let package = FragmentPackage::try_new(original.clone(), &Control::default()).unwrap();
+    let package =
+        FragmentPackage::try_new(original.clone(), package_admission(), &Control::default())
+            .unwrap();
     let encoded = encode_fragment_semantics(&package, &Control::default()).unwrap();
     assert!(encoded.parameters.entries.is_empty());
     assert!(encoded.calls.entries.is_empty());
@@ -128,6 +130,7 @@ fn public_semantics_projection_preserves_explicit_empty_components_and_same_pack
             pruning,
             ..original
         },
+        package_admission(),
         &Control::default(),
     )
     .unwrap();
@@ -149,7 +152,9 @@ fn public_semantics_projection_preserves_explicit_empty_components_and_same_pack
 #[test]
 fn decoded_semantic_parts_require_actual_package_parameter_closure() {
     let original = input();
-    let package = FragmentPackage::try_new(original.clone(), &Control::default()).unwrap();
+    let package =
+        FragmentPackage::try_new(original.clone(), package_admission(), &Control::default())
+            .unwrap();
     let mut encoded = encode_fragment_semantics(&package, &Control::default()).unwrap();
     encoded.parameters.entries.push(wire::SemanticParameter {
         id: u32::MAX,
@@ -175,6 +180,7 @@ fn decoded_semantic_parts_require_actual_package_parameter_closure() {
                 pruning,
                 ..original
             },
+            package_admission(),
             &Control::default()
         ),
         Err(FragmentPackageError::UnusedParameters)
@@ -183,7 +189,8 @@ fn decoded_semantic_parts_require_actual_package_parameter_closure() {
 
 #[test]
 fn public_semantics_control_refusal_precedes_result_publication_in_both_directions() {
-    let package = FragmentPackage::try_new(input(), &Control::default()).unwrap();
+    let package =
+        FragmentPackage::try_new(input(), package_admission(), &Control::default()).unwrap();
     let encoded = encode_fragment_semantics(&package, &Control::default()).unwrap();
     for error in [
         CompileControlError::Cancelled,
@@ -235,7 +242,8 @@ fn ordinary_decode_failure_observes_completed_tail_and_preserves_control_categor
             }
         }
     }
-    let package = FragmentPackage::try_new(input(), &Control::default()).unwrap();
+    let package =
+        FragmentPackage::try_new(input(), package_admission(), &Control::default()).unwrap();
     let encoded = encode_fragment_semantics(&package, &Control::default()).unwrap();
     for malformed_parameters in [false, true] {
         let mut bad = encoded.clone();
@@ -292,5 +300,19 @@ fn nested_owner_control_failures_keep_the_original_semantics_codec_category() {
         ] {
             assert_eq!(projected, SemanticsCodecError::Control(error));
         }
+    }
+}
+
+// Explicit small-fixture source invoice and independent property projection
+// ceilings. These are test inputs, not a production default or MEM grant.
+fn package_admission() -> novarocks_physical_plan::FragmentPackageAdmission {
+    novarocks_physical_plan::FragmentPackageAdmission {
+        plan_limits: novarocks_physical_plan::PlanLimits::FROZEN,
+        source_retained_bytes: 64 * 1024 * 1024,
+        property_projection_limits: novarocks_physical_plan::PropertyProofProjectionLimits {
+            max_request_bytes: 16 * 1024 * 1024,
+            max_coexisting_bytes: 256 * 1024 * 1024,
+            max_projection_work: 16 * 1024 * 1024,
+        },
     }
 }

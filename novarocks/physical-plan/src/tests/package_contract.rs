@@ -209,6 +209,7 @@ fn extract(
         &controls,
         &calls,
         &fixture_pruning_tables(plan),
+        &package_admissions(&fixture_plan_parameters(plan, parameters.clone())),
         &Control,
     )
 }
@@ -219,7 +220,7 @@ fn package_input(fragment: Fragment) -> FragmentPackageInput {
     package_input_with_controls(fragment, expression_uses, calls)
 }
 
-fn package_input_with_controls(
+pub(super) fn package_input_with_controls(
     fragment: Fragment,
     expression_uses: PhysicalRootUses,
     calls: FrozenFragmentCalls,
@@ -273,6 +274,7 @@ fn extraction_requires_exact_expression_control_fragment_coverage() {
             controls,
             &calls,
             &fixture_pruning_tables(&plan),
+            &package_admissions(&fixture_plan_parameters(&plan, parameters.clone())),
             &Control,
         )
     };
@@ -315,6 +317,7 @@ fn extraction_requires_explicit_pruning_table_for_every_fragment() {
             &controls,
             &calls,
             pruning,
+            &package_admissions(&fixture_plan_parameters(&plan, parameters.clone())),
             &Control,
         )
     };
@@ -346,7 +349,7 @@ fn package_and_extraction_reject_pruning_table_fragment_identity_mismatch() {
     let mut input = package_input(fragment.clone());
     input.pruning = wrong.clone();
     assert_eq!(
-        FragmentPackage::try_new(input, &Control).unwrap_err(),
+        FragmentPackage::try_new(input, package_admission(), &Control).unwrap_err(),
         FragmentPackageError::Pruning(FrozenPruningError::WrongFragment)
     );
     let mut builder = PlanBuilder::new(version());
@@ -363,6 +366,10 @@ fn package_and_extraction_reject_pruning_table_fragment_identity_mismatch() {
             &controls,
             &calls,
             &BTreeMap::from([(fragment.id(), wrong)]),
+            &package_admissions(&fixture_plan_parameters(
+                &plan,
+                SemanticParameters::default().clone()
+            )),
             &Control,
         )
         .unwrap_err(),
@@ -496,6 +503,7 @@ fn package_rechecks_ordered_children_intrinsic_control_and_roots_with_reused_ids
     let calls = fixture_calls(&original, &uses);
     FragmentPackage::try_new(
         package_input_with_controls(original.clone(), uses.clone(), calls.clone()),
+        package_admission(),
         &Control,
     )
     .unwrap();
@@ -560,6 +568,7 @@ fn package_rechecks_ordered_children_intrinsic_control_and_roots_with_reused_ids
         assert_eq!(
             FragmentPackage::try_new(
                 package_input_with_controls(changed, uses.clone(), calls.clone()),
+                package_admission(),
                 &Control,
             )
             .unwrap_err(),
@@ -606,7 +615,7 @@ fn package_and_extraction_keep_typed_control_failures_before_and_during_validati
                 work: std::sync::Mutex::default(),
             };
             assert_eq!(
-                FragmentPackage::try_new(input.clone(), &control).unwrap_err(),
+                FragmentPackage::try_new(input.clone(), package_admission(), &control).unwrap_err(),
                 FragmentPackageError::Control(failure)
             );
             if positive_only {
@@ -626,6 +635,10 @@ fn package_and_extraction_keep_typed_control_failures_before_and_during_validati
                     &controls,
                     &calls,
                     &fixture_pruning_tables(&plan),
+                    &package_admissions(&fixture_plan_parameters(
+                        &plan,
+                        SemanticParameters::default().clone()
+                    )),
                     &control
                 )
                 .unwrap_err(),
@@ -667,6 +680,7 @@ fn package_control_checks_correspondence_without_claiming_literal_content_identi
     validate_fragment_definition(&changed).unwrap();
     let package = FragmentPackage::try_new(
         package_input_with_controls(changed.clone(), checked.clone(), calls.clone()),
+        package_admission(),
         &Control,
     )
     .unwrap();
@@ -675,8 +689,12 @@ fn package_control_checks_correspondence_without_claiming_literal_content_identi
 
     let (other, _) = literal_fragment(FragmentId::new(85), FragmentSink::Noop, false);
     assert_eq!(
-        FragmentPackage::try_new(package_input_with_controls(other, checked, calls), &Control)
-            .unwrap_err(),
+        FragmentPackage::try_new(
+            package_input_with_controls(other, checked, calls),
+            package_admission(),
+            &Control
+        )
+        .unwrap_err(),
         FragmentPackageError::ExpressionUses(RootUseBindingError::WrongFragment)
     );
 }
@@ -819,6 +837,7 @@ fn package_preserves_actual_case_branch_guards_and_root_occurrences() {
     let calls = fixture_calls(&fragment, &uses);
     let package = FragmentPackage::try_new(
         package_input_with_controls(fragment, uses.clone(), calls),
+        package_admission(),
         &Control,
     )
     .unwrap();
@@ -840,7 +859,7 @@ fn package_preserves_actual_case_branch_guards_and_root_occurrences() {
     );
 }
 
-fn frozen_scan(fragment: &Fragment) -> FrozenConnectorRead {
+pub(super) fn frozen_scan(fragment: &Fragment) -> FrozenConnectorRead {
     let NodeKind::Scan {
         relation,
         read_budget,
@@ -1040,7 +1059,7 @@ fn explicit_empty_pruning_table_keeps_actual_scan_and_provider_domains() {
     let uses = input.expression_uses.clone();
     assert!(input.pruning.witnesses().is_empty());
     input.scans.insert(fragment.root(), read.clone());
-    let package = FragmentPackage::try_new(input, &Control).unwrap();
+    let package = FragmentPackage::try_new(input, package_admission(), &Control).unwrap();
     assert!(package.pruning().witnesses().is_empty());
     assert_eq!(package.fragment(), &fragment);
     assert_eq!(package.expression_uses(), &uses);
@@ -1088,18 +1107,18 @@ fn package_refuses_missing_or_wrong_scan_node_facts() {
     let fragment = finish_scan_relation(metadata_relation(&binding, column)).unwrap();
     let mut input = package_input(fragment.clone());
     assert!(
-        FragmentPackage::try_new(input.clone(), &Control)
+        FragmentPackage::try_new(input.clone(), package_admission(), &Control)
             .unwrap_err()
             .to_string()
             .contains("no complete frozen public facts")
     );
     input.scans.insert(fragment.root(), frozen_scan(&fragment));
-    FragmentPackage::try_new(input.clone(), &Control).unwrap();
+    FragmentPackage::try_new(input.clone(), package_admission(), &Control).unwrap();
     input
         .scans
         .insert(NodeId::new(u32::MAX), frozen_scan(&fragment));
     assert!(
-        FragmentPackage::try_new(input, &Control)
+        FragmentPackage::try_new(input, package_admission(), &Control)
             .unwrap_err()
             .to_string()
             .contains("missing or non-scan node")
@@ -1185,7 +1204,7 @@ fn package_refuses_complete_public_source_drift() {
         let mut input = package_input(fragment.clone());
         input.scans.insert(fragment.root(), scan);
         assert!(
-            FragmentPackage::try_new(input, &Control).is_err(),
+            FragmentPackage::try_new(input, package_admission(), &Control).is_err(),
             "accepted public source drift {mutation}"
         );
     }
@@ -1247,7 +1266,7 @@ fn package_refuses_exact_relation_and_batch_contract_drift() {
         let mut input = package_input(fragment.clone());
         input.scans.insert(fragment.root(), malformed.unwrap());
         assert!(
-            FragmentPackage::try_new(input, &Control).is_err(),
+            FragmentPackage::try_new(input, package_admission(), &Control).is_err(),
             "mutation {mutation}"
         );
     }
@@ -1264,17 +1283,17 @@ fn result_and_annotation_facts_are_checked_at_the_local_boundary() {
         ty: fragment.values()[&value].ty.clone(),
     };
     let mut input = package_input(fragment.clone());
-    assert!(FragmentPackage::try_new(input.clone(), &Control).is_err());
+    assert!(FragmentPackage::try_new(input.clone(), package_admission(), &Control).is_err());
     input.result = Some(ResultPort {
         fragment: id,
         output: fragment.nodes()[&fragment.root()].output.clone(),
         fields: Box::from([field]),
     });
-    FragmentPackage::try_new(input.clone(), &Control).unwrap();
+    FragmentPackage::try_new(input.clone(), package_admission(), &Control).unwrap();
     let mut wrong_result = input.clone();
     wrong_result.result.as_mut().unwrap().fields[0].ty.nullable = true;
     assert!(
-        FragmentPackage::try_new(wrong_result, &Control)
+        FragmentPackage::try_new(wrong_result, package_admission(), &Control)
             .unwrap_err()
             .to_string()
             .contains("result type differs")
@@ -1285,7 +1304,7 @@ fn result_and_annotation_facts_are_checked_at_the_local_boundary() {
         value: "17".into(),
     }]);
     assert!(
-        FragmentPackage::try_new(input, &Control)
+        FragmentPackage::try_new(input, package_admission(), &Control)
             .unwrap_err()
             .to_string()
             .contains("subject this plan does not have")
@@ -1424,7 +1443,7 @@ fn duplicate_scan_payloads_keep_runtime_filter_assignment_occurrences() {
         input
             .scans
             .insert(scan_id, public_read(&fragment, scan_id, scan).unwrap());
-        let result = FragmentPackage::try_new(input.clone(), &Control);
+        let result = FragmentPackage::try_new(input.clone(), package_admission(), &Control);
         assert_eq!(result.is_ok(), accepted, "{variable}: {result:?}");
     }
 }
@@ -1509,6 +1528,7 @@ fn extraction_requires_frozen_call_table_for_every_fragment_even_without_calls()
             &controls,
             calls,
             &fixture_pruning_tables(&plan),
+            &package_admissions(&fixture_plan_parameters(&plan, parameters.clone())),
             &Control,
         )
     };
@@ -1545,6 +1565,7 @@ fn package_empty_noncall_table_cannot_substitute_for_an_actual_call_occurrence()
     let empty_calls = fixture_calls(&literal, &literal_uses);
     let empty = FragmentPackage::try_new(
         package_input_with_controls(literal, literal_uses, empty_calls.clone()),
+        package_admission(),
         &Control,
     )
     .unwrap();
@@ -1552,6 +1573,7 @@ fn package_empty_noncall_table_cannot_substitute_for_an_actual_call_occurrence()
     assert_eq!(
         FragmentPackage::try_new(
             package_input_with_controls(fragment, uses, empty_calls),
+            package_admission(),
             &Control
         )
         .unwrap_err(),
@@ -1623,7 +1645,7 @@ fn package_preserves_same_key_different_lexical_references_for_shared_definition
         ),
     ])
     .unwrap();
-    let checked = FragmentPackage::try_new(input.clone(), &Control).unwrap();
+    let checked = FragmentPackage::try_new(input.clone(), package_admission(), &Control).unwrap();
     assert_eq!(checked.parameters().entries().len(), 2);
     for (id, reference) in [first, second].into_iter().enumerate() {
         assert_eq!(
@@ -1645,6 +1667,7 @@ fn package_preserves_same_key_different_lexical_references_for_shared_definition
         &BTreeMap::from([(FragmentId::new(81), uses)]),
         &BTreeMap::from([(FragmentId::new(81), calls)]),
         &fixture_pruning_tables(&plan),
+        &package_admissions(&fixture_plan_parameters(&plan, input.parameters.clone())),
         &Control,
     )
     .unwrap();
@@ -1658,7 +1681,7 @@ fn package_preserves_same_key_different_lexical_references_for_shared_definition
         SemanticParameters::try_new([(first.id, SemanticParameterValue::TimeZone("UTC".into()))])
             .unwrap();
     assert!(
-        FragmentPackage::try_new(missing, &Control)
+        FragmentPackage::try_new(missing, package_admission(), &Control)
             .unwrap_err()
             .to_string()
             .contains("missing semantic parameter ID")
@@ -1670,7 +1693,7 @@ fn package_preserves_same_key_different_lexical_references_for_shared_definition
     ])
     .unwrap();
     assert!(
-        FragmentPackage::try_new(wrong_key, &Control)
+        FragmentPackage::try_new(wrong_key, package_admission(), &Control)
             .unwrap_err()
             .to_string()
             .contains("expected key")
@@ -1688,7 +1711,7 @@ fn package_preserves_same_key_different_lexical_references_for_shared_definition
     ])
     .unwrap();
     assert!(
-        FragmentPackage::try_new(input, &Control)
+        FragmentPackage::try_new(input, package_admission(), &Control)
             .unwrap_err()
             .to_string()
             .contains("unused definitions")
@@ -1714,7 +1737,7 @@ fn frozen_call_environment_is_the_only_package_dependency_authority() {
         SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
     )])
     .unwrap();
-    let checked = FragmentPackage::try_new(input.clone(), &Control).unwrap();
+    let checked = FragmentPackage::try_new(input.clone(), package_admission(), &Control).unwrap();
     assert!(checked.parameters().entries().get(&legacy.id).is_none());
     let definition = &checked
         .fragment()
@@ -1751,6 +1774,7 @@ fn frozen_call_environment_is_the_only_package_dependency_authority() {
         &controls,
         &tables,
         &fixture_pruning_tables(&plan),
+        &package_admissions(&fixture_plan_parameters(&plan, snapshot.clone())),
         &Control,
     )
     .unwrap();
@@ -1762,7 +1786,7 @@ fn frozen_call_environment_is_the_only_package_dependency_authority() {
         SemanticParameters::try_new([(legacy.id, SemanticParameterValue::TimeZone("UTC".into()))])
             .unwrap();
     assert!(
-        FragmentPackage::try_new(input.clone(), &Control)
+        FragmentPackage::try_new(input.clone(), package_admission(), &Control)
             .unwrap_err()
             .to_string()
             .contains("missing semantic parameter ID")
@@ -1775,6 +1799,7 @@ fn frozen_call_environment_is_the_only_package_dependency_authority() {
             &controls,
             &tables,
             &fixture_pruning_tables(&plan),
+            &package_admissions(&fixture_plan_parameters(&plan, input.parameters.clone())),
             &Control
         ),
         Err(FragmentPackageExtractionError::Parameter(_))
@@ -1820,12 +1845,12 @@ fn package_parameters_are_the_exact_call_dependency_closure() {
         Err(FragmentPackageExtractionError::UnusedParameters)
     ));
     assert_eq!(
-        FragmentPackage::try_new(input.clone(), &Control).unwrap_err(),
+        FragmentPackage::try_new(input.clone(), package_admission(), &Control).unwrap_err(),
         FragmentPackageError::UnusedParameters
     );
     input.parameters = SemanticParameters::default();
     assert!(
-        FragmentPackage::try_new(input.clone(), &Control)
+        FragmentPackage::try_new(input.clone(), package_admission(), &Control)
             .unwrap_err()
             .to_string()
             .contains("missing semantic parameter ID")
@@ -1836,7 +1861,7 @@ fn package_parameters_are_the_exact_call_dependency_closure() {
     )])
     .unwrap();
     assert!(
-        FragmentPackage::try_new(input, &Control)
+        FragmentPackage::try_new(input, package_admission(), &Control)
             .unwrap_err()
             .to_string()
             .contains("expected key")
@@ -1852,7 +1877,7 @@ fn package_cannot_carry_whole_plan_display_annotations() {
         key: "optimizer.table_statistics".into(),
         value: "peer facts".into(),
     }]);
-    assert!(FragmentPackage::try_new(input, &Control).is_err());
+    assert!(FragmentPackage::try_new(input, package_admission(), &Control).is_err());
 }
 
 #[test]
@@ -1900,17 +1925,17 @@ fn writer_package_requires_the_exact_public_input_recipe() {
     let mut input = package_input(fragment.clone());
     input.cuts = fragment_cuts(&plan, fragment.id()).unwrap();
     assert!(
-        FragmentPackage::try_new(input.clone(), &Control)
+        FragmentPackage::try_new(input.clone(), package_admission(), &Control)
             .unwrap_err()
             .to_string()
             .contains("no complete frozen public facts")
     );
     input.writes.insert(writer_id, write.clone());
-    FragmentPackage::try_new(input.clone(), &Control).unwrap();
+    FragmentPackage::try_new(input.clone(), package_admission(), &Control).unwrap();
     let mut wrong_node = input.clone();
     wrong_node.writes.insert(NodeId::new(u32::MAX), write);
     assert!(
-        FragmentPackage::try_new(wrong_node, &Control)
+        FragmentPackage::try_new(wrong_node, package_admission(), &Control)
             .unwrap_err()
             .to_string()
             .contains("missing or non-writer node")
@@ -1941,7 +1966,7 @@ fn writer_package_requires_the_exact_public_input_recipe() {
         .unwrap();
         input.writes.insert(writer_id, write);
         assert!(
-            FragmentPackage::try_new(input.clone(), &Control)
+            FragmentPackage::try_new(input.clone(), package_admission(), &Control)
                 .unwrap_err()
                 .to_string()
                 .contains("input field occurrence")
@@ -2029,7 +2054,7 @@ fn writer_package_preserves_nested_dictionary_field_identity() {
         )
         .unwrap();
         input.writes.insert(original.root(), recipe);
-        let result = FragmentPackage::try_new(input.clone(), &Control);
+        let result = FragmentPackage::try_new(input.clone(), package_admission(), &Control);
         if id == 1 {
             result.unwrap();
         } else {
@@ -2065,11 +2090,11 @@ fn extraction_preserves_per_occurrence_decimal_policy_and_package_receipt_identi
     .unwrap();
     let mut input = package_input_with_controls(fragment.clone(), uses.clone(), calls.clone());
     input.parameters = parameters.clone();
-    let checked = FragmentPackage::try_new(input.clone(), &Control).unwrap();
+    let checked = FragmentPackage::try_new(input.clone(), package_admission(), &Control).unwrap();
     assert_eq!(checked.calls(), &calls);
     let mut changed = input;
     changed.calls = original;
-    let changed = FragmentPackage::try_new(changed, &Control).unwrap();
+    let changed = FragmentPackage::try_new(changed, package_admission(), &Control).unwrap();
     assert_ne!(checked.calls(), changed.calls());
     let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment.clone()).unwrap();
@@ -2081,6 +2106,7 @@ fn extraction_preserves_per_occurrence_decimal_policy_and_package_receipt_identi
         &BTreeMap::from([(fragment.id(), uses)]),
         &BTreeMap::from([(fragment.id(), calls.clone())]),
         &fixture_pruning_tables(&plan),
+        &package_admissions(&fixture_plan_parameters(&plan, parameters.clone())),
         &Control,
     )
     .unwrap();
@@ -2218,7 +2244,7 @@ fn intrinsic_package_fixture() -> FragmentPackageInput {
 #[test]
 fn intrinsic_arithmetic_and_cast_use_the_only_plan_table_with_sparse_false_true_scopes() {
     let input = intrinsic_package_fixture();
-    let checked = FragmentPackage::try_new(input.clone(), &Control).unwrap();
+    let checked = FragmentPackage::try_new(input.clone(), package_admission(), &Control).unwrap();
     assert_eq!(
         checked
             .parameters()
@@ -2244,6 +2270,7 @@ fn intrinsic_arithmetic_and_cast_use_the_only_plan_table_with_sparse_false_true_
         &BTreeMap::from([(checked.fragment().id(), input.expression_uses)]),
         &BTreeMap::from([(checked.fragment().id(), input.calls)]),
         &fixture_pruning_tables(&plan),
+        &package_admissions(&plan),
         &Control,
     )
     .unwrap();
@@ -2256,7 +2283,7 @@ fn intrinsic_reference_closure_rejects_missing_wrong_key_and_unconsumed_values()
     let mut missing = input.clone();
     missing.parameters = SemanticParameters::default();
     assert_eq!(
-        FragmentPackage::try_new(missing, &Control).unwrap_err(),
+        FragmentPackage::try_new(missing, package_admission(), &Control).unwrap_err(),
         FragmentPackageError::Parameter(
             novarocks_type_contract::SemanticParameterError::MissingId(SemanticParameterId::new(0))
         )
@@ -2274,7 +2301,7 @@ fn intrinsic_reference_closure_rejects_missing_wrong_key_and_unconsumed_values()
     ])
     .unwrap();
     assert_eq!(
-        FragmentPackage::try_new(wrong, &Control).unwrap_err(),
+        FragmentPackage::try_new(wrong, package_admission(), &Control).unwrap_err(),
         FragmentPackageError::Parameter(
             novarocks_type_contract::SemanticParameterError::KeyMismatch(intrinsic_reference(
                 u32::MAX
@@ -2295,7 +2322,7 @@ fn intrinsic_reference_closure_rejects_missing_wrong_key_and_unconsumed_values()
     )
     .unwrap();
     assert_eq!(
-        FragmentPackage::try_new(extra.clone(), &Control).unwrap_err(),
+        FragmentPackage::try_new(extra.clone(), package_admission(), &Control).unwrap_err(),
         FragmentPackageError::UnusedParameters
     );
     let mut builder = PlanBuilder::new(version()).with_semantic_parameters(extra.parameters);
@@ -2309,6 +2336,7 @@ fn intrinsic_reference_closure_rejects_missing_wrong_key_and_unconsumed_values()
             &BTreeMap::from([(input.fragment.id(), input.expression_uses)]),
             &BTreeMap::from([(input.fragment.id(), input.calls)]),
             &fixture_pruning_tables(&plan),
+            &package_admissions(&plan),
             &Control
         )
         .unwrap_err(),
@@ -2457,7 +2485,7 @@ fn parameter_free_actual_definitions_keep_original_control_at_every_package_boun
         calls: Default::default(),
         refusal: None,
     };
-    FragmentPackage::try_new(input.clone(), &good).unwrap();
+    FragmentPackage::try_new(input.clone(), package_admission(), &good).unwrap();
     let trace = good.calls.into_inner().unwrap();
     // The original entry is observed before the constant/resource and call
     // passes. Those independently observed passes may add earlier callbacks;
@@ -2485,7 +2513,7 @@ fn parameter_free_actual_definitions_keep_original_control_at_every_package_boun
                 refusal: Some((index, error)),
             };
             assert_eq!(
-                FragmentPackage::try_new(input.clone(), &control).unwrap_err(),
+                FragmentPackage::try_new(input.clone(), package_admission(), &control).unwrap_err(),
                 FragmentPackageError::Control(error)
             );
             assert_eq!(*control.calls.lock().unwrap(), trace[..=index]);
@@ -2507,13 +2535,44 @@ fn extraction_reference_preallocation_uses_the_existing_fragment_profile_boundar
     let remaining = crate::MAX_FRAGMENT_DYNAMIC_ITEMS - actual.items;
     // Counts come from the allocation-free observed walk. Test the real
     // preallocation gate without allocating millions of repeated references.
-    crate::validation::validate_fragment_parameter_resource_usage(&fragment, remaining).unwrap();
+    crate::validation::validate_fragment_parameter_resource_usage(
+        &fragment,
+        PlanLimits::FROZEN,
+        remaining,
+    )
+    .unwrap();
     for count in [remaining + 1, usize::MAX] {
-        let errors =
-            crate::validation::validate_fragment_parameter_resource_usage(&fragment, count)
-                .unwrap_err();
+        let errors = crate::validation::validate_fragment_parameter_resource_usage(
+            &fragment,
+            PlanLimits::FROZEN,
+            count,
+        )
+        .unwrap_err();
         assert!(errors.errors().iter().any(|error| {
             error.path() == "package.resources" && error.message().contains("dynamic items")
         }));
     }
+}
+
+// Explicit small-fixture source invoice and independent property projection
+// ceilings. These are test inputs, not a production default or MEM grant.
+fn package_admission() -> crate::FragmentPackageAdmission {
+    crate::FragmentPackageAdmission {
+        plan_limits: crate::PlanLimits::FROZEN,
+        source_retained_bytes: 64 * 1024 * 1024,
+        property_projection_limits: crate::PropertyProofProjectionLimits {
+            max_request_bytes: 16 * 1024 * 1024,
+            max_coexisting_bytes: 256 * 1024 * 1024,
+            max_projection_work: 16 * 1024 * 1024,
+        },
+    }
+}
+
+fn package_admissions(
+    plan: &crate::PhysicalPlan,
+) -> std::collections::BTreeMap<crate::FragmentId, crate::FragmentPackageAdmission> {
+    plan.fragments()
+        .keys()
+        .map(|id| (*id, package_admission()))
+        .collect()
 }

@@ -20,6 +20,7 @@ mod cuts;
 mod error;
 mod expr;
 mod graph;
+mod guarantee;
 mod index;
 mod limits;
 mod node;

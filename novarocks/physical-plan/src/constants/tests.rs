@@ -653,6 +653,7 @@ fn actual_plan_and_package_publication_require_sparse_checked_closed_sources() {
     assert_eq!(plan.constants().entries().len(), 2);
     let package = crate::FragmentPackage::try_new(
         package_input(fragment.clone(), table.clone()),
+        package_admission(),
         &Control::good(),
     )
     .unwrap();
@@ -685,7 +686,11 @@ fn actual_plan_and_package_publication_require_sparse_checked_closed_sources() {
         ))
     ));
     assert!(matches!(
-        crate::FragmentPackage::try_new(package_input(fragment, table), &Control::good()),
+        crate::FragmentPackage::try_new(
+            package_input(fragment, table),
+            package_admission(),
+            &Control::good()
+        ),
         Err(crate::FragmentPackageError::Constant(
             ConstantReferenceError::UnusedPools
         ))
@@ -716,6 +721,7 @@ fn actual_plan_and_package_publication_refuse_missing_ordinal_and_full_type_mism
         };
         let package_error = crate::FragmentPackage::try_new(
             package_input(fragment, table.clone()),
+            package_admission(),
             &Control::good(),
         )
         .unwrap_err();
@@ -784,6 +790,7 @@ fn actual_peer_fragments_project_their_own_constants_without_global_local_charge
     assert!(matches!(
         crate::FragmentPackage::try_new(
             package_input(fragments[0].clone(), table),
+            package_admission(),
             &Control::good()
         ),
         Err(crate::FragmentPackageError::Constant(
@@ -818,6 +825,7 @@ fn actual_peer_fragments_project_their_own_constants_without_global_local_charge
         &uses,
         &calls,
         &pruning,
+        &package_admissions(&plan),
         &Control::good(),
     )
     .unwrap();
@@ -868,7 +876,7 @@ fn actual_publication_keeps_primary_control_every_callback_and_ordinary_tail() {
     assert!(plan_trace.iter().any(|(_, units)| *units == 256));
     let input = package_input(fragment.clone(), table.clone());
     let baseline = Control::good();
-    crate::FragmentPackage::try_new(input.clone(), &baseline).unwrap();
+    crate::FragmentPackage::try_new(input.clone(), package_admission(), &baseline).unwrap();
     let package_trace = baseline.trace();
     assert!(package_trace.iter().any(|(_, units)| *units == 256));
     for cause in [
@@ -887,7 +895,7 @@ fn actual_publication_keeps_primary_control_every_callback_and_ordinary_tail() {
         for at in 0..package_trace.len() {
             let control = Control::at(Some((at, cause)));
             assert!(
-                matches!(crate::FragmentPackage::try_new(input.clone(), &control),
+                matches!(crate::FragmentPackage::try_new(input.clone(), package_admission(),  &control),
                 Err(crate::FragmentPackageError::Control(actual)) if actual == cause)
             );
             assert_eq!(control.trace(), package_trace[..=at]);
@@ -905,7 +913,7 @@ fn actual_publication_keeps_primary_control_every_callback_and_ordinary_tail() {
     let input = package_input(missing, ConstantPools::empty());
     let baseline = Control::good();
     assert!(matches!(
-        crate::FragmentPackage::try_new(input.clone(), &baseline),
+        crate::FragmentPackage::try_new(input.clone(), package_admission(), &baseline),
         Err(crate::FragmentPackageError::Constant(
             ConstantReferenceError::MissingPool(_)
         ))
@@ -919,7 +927,7 @@ fn actual_publication_keeps_primary_control_every_callback_and_ordinary_tail() {
         for at in 0..trace.len() {
             let control = Control::at(Some((at, cause)));
             assert!(
-                matches!(crate::FragmentPackage::try_new(input.clone(), &control),
+                matches!(crate::FragmentPackage::try_new(input.clone(), package_admission(),  &control),
                 Err(crate::FragmentPackageError::Control(actual)) if actual == cause)
             );
             assert_eq!(control.trace(), trace[..=at]);
@@ -1042,4 +1050,27 @@ fn optional_constant_projection_observes_nonconstant_prefixes_and_definition_gap
             }
         }
     }
+}
+
+// Explicit small-fixture source invoice and independent property projection
+// ceilings. These are test inputs, not a production default or MEM grant.
+fn package_admission() -> crate::FragmentPackageAdmission {
+    crate::FragmentPackageAdmission {
+        plan_limits: crate::PlanLimits::FROZEN,
+        source_retained_bytes: 64 * 1024 * 1024,
+        property_projection_limits: crate::PropertyProofProjectionLimits {
+            max_request_bytes: 16 * 1024 * 1024,
+            max_coexisting_bytes: 256 * 1024 * 1024,
+            max_projection_work: 16 * 1024 * 1024,
+        },
+    }
+}
+
+fn package_admissions(
+    plan: &crate::PhysicalPlan,
+) -> std::collections::BTreeMap<crate::FragmentId, crate::FragmentPackageAdmission> {
+    plan.fragments()
+        .keys()
+        .map(|id| (*id, package_admission()))
+        .collect()
 }

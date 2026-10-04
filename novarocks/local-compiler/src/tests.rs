@@ -507,6 +507,7 @@ fn checked_package(
                 writes,
                 annotations: Box::default(),
             },
+            package_admission(),
             &FixtureControl,
         )
         .unwrap(),
@@ -996,4 +997,18 @@ fn ordinary_node_error_observes_stage_tail_and_tail_control_stays_fatal() {
     }
     assert_eq!(port.reads.load(Ordering::Relaxed), 0);
     assert_eq!(port.writes.load(Ordering::Relaxed), 0);
+}
+
+// Conservative retained-source invoice and independent projection ceilings for
+// these small fixtures only; this is not a production default or a MEM grant.
+fn package_admission() -> novarocks_physical_plan::FragmentPackageAdmission {
+    novarocks_physical_plan::FragmentPackageAdmission {
+        plan_limits: novarocks_physical_plan::PlanLimits::FROZEN,
+        source_retained_bytes: 64 * 1024 * 1024,
+        property_projection_limits: novarocks_physical_plan::PropertyProofProjectionLimits {
+            max_request_bytes: 16 * 1024 * 1024,
+            max_coexisting_bytes: 256 * 1024 * 1024,
+            max_projection_work: 16 * 1024 * 1024,
+        },
+    }
 }

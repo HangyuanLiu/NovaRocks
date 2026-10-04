@@ -24,9 +24,10 @@ use crate::{FragmentPackageInput, FragmentSink, RuntimeFilterApplyPoint};
 // the final package constructor still checks cuts and all other owned facts.
 pub(crate) fn validate_fragment_parameter_resource_usage(
     fragment: &Fragment,
+    limits: PlanLimits,
     semantic_items: usize,
 ) -> Result<(), ValidationErrors> {
-    let mut errors = ValidationContext::new();
+    let mut errors = ValidationContext::for_construction(limits);
     let mut usage = CutResourcePreflight::new();
     usage.add_fragment(fragment, &mut errors);
     usage.add_items(semantic_items);
@@ -40,10 +41,11 @@ pub(crate) fn validate_fragment_parameter_resource_usage(
 
 pub(crate) fn validate_package(
     input: &FragmentPackageInput,
+    limits: PlanLimits,
     semantic_items: usize,
     work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
 ) -> Result<(), crate::FragmentPackageError> {
-    let mut errors = ValidationContext::new();
+    let mut errors = ValidationContext::for_construction(limits);
     let fragment = &input.fragment;
     let mut usage = CutResourcePreflight::new();
     usage.add_fragment(fragment, &mut errors);

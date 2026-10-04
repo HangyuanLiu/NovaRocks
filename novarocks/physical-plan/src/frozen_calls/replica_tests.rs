@@ -635,19 +635,133 @@ fn replica_equivalence_package_rejects_one_unsafe_shared_scalar_occurrence() {
         fixture.uses.flow().uses()[&ExpressionUseId::new(0)].definition,
         fixture.uses.flow().uses()[&ExpressionUseId::new(u32::MAX)].definition
     );
-    FragmentPackage::try_new(scalar_package_input(&fixture), &ReplicaControl::default()).unwrap();
+    FragmentPackage::try_new(
+        scalar_package_input(&fixture),
+        package_admission(),
+        &ReplicaControl::default(),
+    )
+    .unwrap();
     let site = fixture.calls[1].site;
     fixture.calls[1].effects.instance_state = FunctionInstanceState::ScalarInstance;
     assert!(matches!(
-        FragmentPackage::try_new(scalar_package_input(&fixture), &ReplicaControl::default()),
+        FragmentPackage::try_new(scalar_package_input(&fixture), package_admission(),  &ReplicaControl::default()),
         Err(FragmentPackageError::Calls(FrozenCallError::ReplicaEquivalence(actual)))
             if actual == site
     ));
     fixture.calls[1].effects.instance_state = FunctionInstanceState::None;
     fixture.calls[1].effects.observable_effects.warnings = true;
     assert!(matches!(
-        FragmentPackage::try_new(scalar_package_input(&fixture), &ReplicaControl::default()),
+        FragmentPackage::try_new(scalar_package_input(&fixture), package_admission(),  &ReplicaControl::default()),
         Err(FragmentPackageError::Calls(FrozenCallError::ReplicaEquivalence(actual)))
             if actual == site
     ));
+}
+
+// Explicit small-fixture source invoice and independent property projection
+// ceilings. These are test inputs, not a production default or MEM grant.
+fn package_admission() -> crate::FragmentPackageAdmission {
+    crate::FragmentPackageAdmission {
+        plan_limits: crate::PlanLimits::FROZEN,
+        source_retained_bytes: 64 * 1024 * 1024,
+        property_projection_limits: crate::PropertyProofProjectionLimits {
+            max_request_bytes: 16 * 1024 * 1024,
+            max_coexisting_bytes: 256 * 1024 * 1024,
+            max_projection_work: 16 * 1024 * 1024,
+        },
+    }
+}
+
+#[test]
+fn package_property_author_uses_complete_occurrence_facts_and_ignores_legacy_volatility() {
+    let mut fixture = scalar_fixture(2, 809);
+    broadcast(&mut fixture);
+    fixture.fragment = edit_fragment(&fixture.fragment, |parts| {
+        let definitions = parts
+            .expressions
+            .iter()
+            .map(|(_, node)| {
+                let mut node = node.clone();
+                if let ExprKind::FunctionCall { function, .. } = &mut node.kind {
+                    function.volatility = FunctionVolatility::Volatile;
+                }
+                node
+            })
+            .collect::<Vec<_>>();
+        parts.expressions = ExprArena::try_from_definitions_observed(
+            definitions.into_iter(),
+            &PlanLimits::FROZEN,
+            &Control::default(),
+        )
+        .unwrap();
+    });
+    // Full immutable occurrence facts are the package authority. Row data
+    // errors remain replica-equivalent; mutable/observable success does not.
+    fixture.calls[0].effects.own_row_error = FunctionIntrinsicRowError::MayRaise;
+    let input = scalar_package_input(&fixture);
+    FragmentPackage::try_new(input, package_admission(), &ReplicaControl::default()).unwrap();
+    fixture.calls[1].effects.observable_effects.rng_sampling = true;
+    assert!(
+        matches!(FragmentPackage::try_new(scalar_package_input(&fixture), package_admission(), &ReplicaControl::default()),
+        Err(FragmentPackageError::Calls(FrozenCallError::ReplicaEquivalence(site))) if site==fixture.calls[1].site)
+    );
+}
+
+#[test]
+fn package_property_projection_requires_each_explicit_ceiling_and_original_source_invoice() {
+    let fixture = scalar_fixture(2, 810);
+    let input = scalar_package_input(&fixture);
+    let base = package_admission();
+    let facts = validate_fragment_output_properties_observed(
+        &input.fragment,
+        &input.expression_uses,
+        &input.calls,
+        base.plan_limits,
+        base.source_retained_bytes,
+        base.property_projection_limits,
+        &ReplicaControl::default(),
+    )
+    .unwrap();
+    for variant in 0..5 {
+        let mut admission = base;
+        match variant {
+            0 => admission.source_retained_bytes = 0,
+            1 => admission.property_projection_limits.max_request_bytes = facts.request_bytes - 1,
+            2 => {
+                admission.property_projection_limits.max_coexisting_bytes =
+                    facts.coexisting_bytes - 1
+            }
+            3 => {
+                admission.property_projection_limits.max_projection_work = facts.projection_work - 1
+            }
+            4 => admission.plan_limits.fragment_nodes = 0,
+            _ => unreachable!(),
+        }
+        let rejected =
+            FragmentPackage::try_new(input.clone(), admission, &ReplicaControl::default());
+        if variant == 3 {
+            // The complete projection includes the guarantee source walk.
+            // This one-under still admits the earlier occurrence-only index.
+            let Err(FragmentPackageError::Structure(errors)) = rejected else {
+                panic!("expected the combined guarantee-work envelope rejection");
+            };
+            assert!(errors.errors().iter().any(|error| {
+                error.category() == ValidationErrorCategory::ResourceLimit
+                    && error.path() == "fragment.guarantees.resources"
+            }));
+        } else {
+            assert!(matches!(
+                rejected,
+                Err(FragmentPackageError::Calls(FrozenCallError::TooManyItems))
+            ));
+        }
+    }
+    let exact = FragmentPackageAdmission {
+        property_projection_limits: PropertyProofProjectionLimits {
+            max_request_bytes: facts.request_bytes,
+            max_coexisting_bytes: facts.coexisting_bytes,
+            max_projection_work: facts.projection_work,
+        },
+        ..base
+    };
+    FragmentPackage::try_new(input, exact, &ReplicaControl::default()).unwrap();
 }

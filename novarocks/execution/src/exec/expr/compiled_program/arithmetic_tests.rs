@@ -219,6 +219,7 @@ fn compile_arithmetic(
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
             },
+            package_admission(),
             &Control,
         )
         .unwrap(),
@@ -816,3 +817,17 @@ mod cast_tests;
 
 #[path = "nullsafe_tests.rs"]
 mod nullsafe_tests;
+
+// Conservative retained-source invoice and independent projection ceilings for
+// these small fixtures only; this is not a production default or a MEM grant.
+fn package_admission() -> novarocks_physical_plan::FragmentPackageAdmission {
+    novarocks_physical_plan::FragmentPackageAdmission {
+        plan_limits: novarocks_physical_plan::PlanLimits::FROZEN,
+        source_retained_bytes: 64 * 1024 * 1024,
+        property_projection_limits: novarocks_physical_plan::PropertyProofProjectionLimits {
+            max_request_bytes: 16 * 1024 * 1024,
+            max_coexisting_bytes: 256 * 1024 * 1024,
+            max_projection_work: 16 * 1024 * 1024,
+        },
+    }
+}
