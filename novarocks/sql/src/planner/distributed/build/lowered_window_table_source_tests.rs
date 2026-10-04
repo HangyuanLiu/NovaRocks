@@ -21,7 +21,8 @@ use crate::analysis::{SortItem, WindowBound, WindowFrame, WindowFrameType};
 use crate::binding::SqlFunctionBinding;
 use crate::compiler::SqlAuthoredPhysicalPlan;
 use crate::planner::distributed::build::lowered_draft::{
-    CheckedExpressionLogicalSourceEntry, CheckedTableLogicalSourceEntry, SqlSourceJournalError,
+    CheckedExpressionLogicalSourceEntry, CheckedTableLogicalSourceEntry,
+    SqlOperationalProjectionError, SqlSourceJournalError,
 };
 use crate::planner::payload::{PlanTableFunctionNode, PlanWindowNode, WindowExpr};
 use arrow::array::{Array, Int64Array, ListArray};
@@ -58,6 +59,20 @@ impl PureCompileControl for Control {
 }
 fn policy() -> novarocks_functions::ConstantPolicy {
     crate::constant::test_constant_policy()
+}
+fn project(
+    control: &dyn PureCompileControl,
+    projection: impl FnOnce(
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<Box<[FunctionArgument]>, SqlOperationalProjectionError>,
+) -> Result<Box<[FunctionArgument]>, SqlOperationalProjectionError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+    let result = projection(&mut work);
+    if matches!(&result, Err(SqlOperationalProjectionError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
 }
 fn integer(value: i64) -> TypedExpr {
     TypedExpr {
@@ -454,8 +469,19 @@ fn window_journal_orders_only_logical_and_function_order_channels_with_original_
     assert_eq!(receipt.arguments(), &[args[0], function_order_by[0].expr]);
     assert_eq!(function_order_by[0].direction, SortDirection::Descending);
     assert_eq!(function_order_by[0].null_ordering, NullOrdering::First);
+    let projected = project(&Control::default(), |work| {
+        receipt.operational_arguments_observed(owner.plan().constants(), work)
+    })
+    .unwrap();
+    assert_eq!(projected.len(), 2);
     for (index, ordinal) in [1, 2].into_iter().enumerate() {
         let captured = constant(&request.arguments[index]).unwrap();
+        let operational = constant(&projected[index]).unwrap();
+        assert_eq!(operational.ordinal(), ordinal);
+        assert_eq!(
+            operational.pool().backing_identity(),
+            captured.pool().backing_identity()
+        );
         let actual = emitted(&owner, fragment, receipt.arguments()[index]);
         assert_eq!(actual.ordinal(), ordinal);
         assert!(Arc::ptr_eq(captured.pool().array(), pool.array()));
@@ -514,8 +540,20 @@ fn table_journal_selected_list_ordinal_and_left_whole_relation_keep_full_source(
     assert!(*left_outer);
     assert_eq!(results.len(), 2);
     assert_eq!(function.result_types.as_ref(), results.as_ref());
+    let projected = project(&Control::default(), |work| {
+        receipt.operational_arguments_observed(owner.plan().constants(), work)
+    })
+    .unwrap();
+    assert_eq!(projected.len(), 2);
     for (index, ordinal) in [1, 2].into_iter().enumerate() {
         let captured = constant(&request.arguments[index]).unwrap();
+        let operational = constant(&projected[index]).unwrap();
+        assert_eq!(operational.ordinal(), ordinal);
+        assert_eq!(
+            operational.pool().backing_identity(),
+            captured.pool().backing_identity()
+        );
+        assert_eq!(operational.value_type(), captured.value_type());
         let actual = emitted(&owner, fragment, receipt.arguments()[index]);
         assert_eq!(actual.ordinal(), ordinal);
         assert!(Arc::ptr_eq(actual.pool().array(), captured.pool().array()));

@@ -114,6 +114,10 @@ pub(super) fn definition_parts()
 
 pub(super) struct ValueConversionResolver;
 
+#[cfg(test)]
+#[path = "value_conversion_exact_tests.rs"]
+mod exact_tests;
+
 /// Check an assignment through this exact implementation-owner binder. The
 /// returned selection still needs the registered function identity, FE
 /// materialization and installed kernel coverage before execution.
@@ -533,6 +537,28 @@ fn json_carriers(source: &DataType, target: &DataType) -> Option<bool> {
     }
 }
 
+fn input_pair_observed<'a>(
+    request: FunctionBindingRequest<'a>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(&'a FunctionValueType, &'a FunctionValueType), FunctionBindingError> {
+    binding_control::request_types(request, work)?;
+    input_shape(request)
+}
+
+fn require_selected_pair_observed(
+    overload: &FunctionOverloadId,
+    source: &FunctionValueType,
+    target: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), FunctionBindingError> {
+    if !pair_matches_observed(overload.as_str(), source, target, work)? {
+        return Err(invalid(
+            "frozen value-domain conversion differs from its exact source, target or overload",
+        ));
+    }
+    Ok(())
+}
+
 impl FunctionBindingResolver for ValueConversionResolver {
     fn resolve(
         &self,
@@ -557,6 +583,19 @@ impl FunctionBindingResolver for ValueConversionResolver {
             Err(FunctionBindingError::NoMatchingOverload)
         })
     }
+    fn select_at_overload_observed(
+        &self,
+        overload: &FunctionOverloadId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        binding_control::scope(control, |work| {
+            let (source, target) = input_pair_observed(request, work)?;
+            require_selected_pair_observed(overload, source, target, work)?;
+            selection(overload.as_str(), source, target)
+        })
+    }
+
     fn validate_selected(
         &self,
         selected: &FunctionBindingSelection,
@@ -564,8 +603,7 @@ impl FunctionBindingResolver for ValueConversionResolver {
         control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         binding_control::scope(control, |work| {
-            binding_control::request_types(request, work)?;
-            let (source, target) = input_shape(request)?;
+            let (source, target) = input_pair_observed(request, work)?;
             let arguments_match = match selected.argument_types.as_ref() {
                 [FunctionArgumentType::Value(actual)] => {
                     binding_control::exact_type(actual, source, work)?
@@ -578,16 +616,12 @@ impl FunctionBindingResolver for ValueConversionResolver {
                 }
                 _ => false,
             };
-            if selected.aggregate.is_some()
-                || !arguments_match
-                || !result_matches
-                || !pair_matches_observed(selected.overload.as_str(), source, target, work)?
-            {
+            if selected.aggregate.is_some() || !arguments_match || !result_matches {
                 return Err(invalid(
                     "frozen value-domain conversion differs from its exact source, target or overload",
                 ));
             }
-            Ok(())
+            require_selected_pair_observed(&selected.overload, source, target, work)
         })
     }
 }

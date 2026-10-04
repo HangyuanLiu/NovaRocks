@@ -20,7 +20,7 @@ use super::*;
 use crate::binding::SqlFunctionBinding;
 use crate::compiler::SqlAuthoredPhysicalPlan;
 use crate::planner::distributed::build::lowered_draft::{
-    CheckedExpressionLogicalSourceEntry, SqlSourceJournalError,
+    CheckedExpressionLogicalSourceEntry, SqlOperationalProjectionError, SqlSourceJournalError,
 };
 use crate::planner::payload::PlanProjectNode;
 use arrow::array::{Array, StringArray};
@@ -28,6 +28,12 @@ use novarocks_constant_contract::ConstantPool;
 use novarocks_functions::{FunctionArgument, FunctionResultType};
 use novarocks_type_contract::DecimalOverflowPolicy;
 use std::sync::Mutex;
+
+#[path = "lowered_operational_channel_tests.rs"]
+mod operational_tests;
+
+#[path = "lowered_operational_lambda_tests.rs"]
+mod lowered_operational_lambda_tests;
 
 #[derive(Default)]
 struct Control {
@@ -160,6 +166,20 @@ fn constant(argument: &FunctionArgument) -> Option<&novarocks_functions::Constan
     };
     constant.as_ref()
 }
+
+fn operational_arguments(
+    owner: &SqlAuthoredPhysicalPlan,
+    receipt: &CheckedExpressionLogicalSourceEntry<'_>,
+    control: &dyn PureCompileControl,
+) -> Result<Box<[FunctionArgument]>, SqlOperationalProjectionError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+    let result = receipt.operational_arguments_observed(owner.plan().constants(), &mut work);
+    if matches!(&result, Err(SqlOperationalProjectionError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
 fn physical_constant(
     owner: &SqlAuthoredPhysicalPlan,
     fragment: &Fragment,
@@ -253,6 +273,18 @@ fn scalar_journal_literal_and_selected_cv_emit_the_same_original_backing_once() 
         assert_eq!(receipt.captured().constant_policy(), policy());
         let request = receipt.captured().request();
         let captured = constant(&request.arguments[0]).unwrap();
+        let operational = operational_arguments(&owner, &receipt, &Control::default()).unwrap();
+        let projected = constant(&operational[0]).unwrap();
+        assert_eq!(projected.value_type(), captured.value_type());
+        assert_eq!(projected.ordinal(), captured.ordinal());
+        assert_eq!(
+            projected.pool().backing_identity(),
+            captured.pool().backing_identity()
+        );
+        assert!(Arc::ptr_eq(
+            projected.pool().field_ref(),
+            captured.pool().field_ref()
+        ));
         let emitted = physical_constant(&owner, fragment, receipt.arguments()[0]);
         assert_eq!(emitted.ordinal(), captured.ordinal());
         assert!(Arc::ptr_eq(emitted.pool().array(), captured.pool().array()));
@@ -290,6 +322,8 @@ fn scalar_journal_original_cast_and_nested_none_survive_constant_emission() {
         let (fragment, source) = scalar_source(&owner);
         let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
         assert!(constant(&receipt.captured().request().arguments[0]).is_none());
+        let operational = operational_arguments(&owner, &receipt, &Control::default()).unwrap();
+        assert!(constant(&operational[0]).is_none());
         assert_eq!(
             physical_constant(&owner, fragment, receipt.arguments()[0])
                 .try_utf8()
@@ -439,6 +473,17 @@ fn scalar_journal_bare_null_and_cast_null_keep_distinct_original_request_sources
     let emitted = physical_constant(&owner, fragment, receipt.arguments()[0]);
     assert_eq!(emitted.value_type(), &ValueType::new(DataType::Utf8, true));
     assert_eq!(emitted.try_utf8().unwrap(), None);
+    let operational = operational_arguments(&owner, &receipt, &Control::default()).unwrap();
+    let projected = constant(&operational[0]).unwrap();
+    assert_eq!(projected.value_type(), emitted.value_type());
+    assert_eq!(
+        projected.pool().backing_identity(),
+        emitted.pool().backing_identity()
+    );
+    assert_ne!(
+        projected.pool().backing_identity(),
+        captured.pool().backing_identity()
+    );
     // Conversion authors a new typed NULL; the retained Null source is neither
     // retyped nor presented as the resulting UTF8 constant's backing.
     assert!(!Arc::ptr_eq(

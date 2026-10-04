@@ -30,6 +30,10 @@ use novarocks_type_contract::{
 
 use crate::binding::{CapturedAggregateLogicalRequest, CapturedLogicalCallArguments};
 
+mod operational_channels;
+pub(crate) use operational_channels::SqlOperationalProjectionError;
+pub(super) use operational_channels::{LoweredOperationalChannel, SqlOperationalChannelRole};
+
 /// A completed SQL source owner. Its physical view is read-only; consuming a
 /// statement or DML result transfers this entire owner, including its original
 /// logical-source journal. This is not certification of fresh kernel coverage,
@@ -384,6 +388,7 @@ pub(super) fn validate_expression_source_entry_observed(
         .ok_or(CompileControlError::ResourceExhausted)?;
     let request = entry.captured.request();
     let same_count = count == entry.arguments.len()
+        && count == entry.channels.len()
         && count == request.arguments.len()
         && args.len() == request.logical_argument_count;
     work.step()?;
@@ -392,13 +397,14 @@ pub(super) fn validate_expression_source_entry_observed(
             "expression journal scope or channel count differs from its emission",
         ));
     }
-    for (actual, original) in args
+    for ((actual, original), channel) in args
         .iter()
         .copied()
         .chain(order.iter().map(|key| key.expr))
         .zip(entry.arguments.iter().copied())
+        .zip(entry.channels.iter())
     {
-        let same_argument = actual == original;
+        let same_argument = actual == original && actual == channel.expression;
         work.step()?;
         if !same_argument {
             return Err(SqlSourceJournalError::InvalidSource(
@@ -442,6 +448,7 @@ pub(super) fn validate_table_source_entry_observed(
     };
     let request = entry.captured.request();
     let same_count = arguments.len() == entry.arguments.len()
+        && arguments.len() == entry.channels.len()
         && arguments.len() == request.arguments.len()
         && arguments.len() == request.logical_argument_count;
     work.step()?;
@@ -450,8 +457,12 @@ pub(super) fn validate_table_source_entry_observed(
             "table journal channel count differs from its emission",
         ));
     }
-    for (actual, original) in arguments.iter().zip(entry.arguments.iter()) {
-        let same_argument = actual == original;
+    for ((actual, original), channel) in arguments
+        .iter()
+        .zip(entry.arguments.iter())
+        .zip(entry.channels.iter())
+    {
+        let same_argument = actual == original && *actual == channel.expression;
         work.step()?;
         if !same_argument {
             return Err(SqlSourceJournalError::InvalidSource(
@@ -555,6 +566,7 @@ pub(super) enum SqlExpressionCallKind {
 pub(super) struct LoweredTableSourceEntry {
     pub(super) captured: CapturedLogicalCallArguments,
     pub(super) arguments: Box<[ExprId]>,
+    pub(super) channels: Box<[LoweredOperationalChannel]>,
 }
 pub(super) enum LoweredExpressionLogicalSource {
     Owned(CapturedLogicalCallArguments),
@@ -586,6 +598,7 @@ pub(super) struct LoweredExpressionSourceEntry {
     pub(super) owner: novarocks_physical_plan::NodeId,
     pub(super) lambda_scope: Option<ExprId>,
     pub(super) arguments: Box<[ExprId]>,
+    pub(super) channels: Box<[LoweredOperationalChannel]>,
 }
 #[derive(Debug)]
 pub(super) struct SqlLogicalSourceJournal {

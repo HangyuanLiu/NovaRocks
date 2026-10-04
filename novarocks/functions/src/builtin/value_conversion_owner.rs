@@ -30,10 +30,11 @@ use crate::kernel_control::{compile_failure, invalid};
 use crate::{
     CallEffectInput, FunctionBindingDeclaration, FunctionBindingError, FunctionBindingRequest,
     FunctionBindingResolver, FunctionBindingSelection, FunctionCatalogError, FunctionDefinition,
-    FunctionEffectOwner, FunctionEffectOwnerError, FunctionId, FunctionKind, FunctionVisibility,
-    KernelEvaluationControl, KernelFailure, PreparedScalarKernel, PureFunctionMetadataOwner,
-    PureImplementationDeclaration, PureImplementationId, PureKernelAbi, PureScalarImplementation,
-    ScalarCallContract, ScalarCallInput, ScalarKernelInstance, SelectedValues,
+    FunctionEffectOwner, FunctionEffectOwnerError, FunctionId, FunctionKind, FunctionOverloadId,
+    FunctionVisibility, KernelEvaluationControl, KernelFailure, PreparedScalarKernel,
+    PureFunctionMetadataOwner, PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
+    PureScalarImplementation, ScalarCallContract, ScalarCallInput, ScalarKernelInstance,
+    SelectedValues,
 };
 
 fn implementation_pairs() -> [(&'static str, &'static str); 5] {
@@ -154,6 +155,16 @@ impl FunctionBindingResolver for ValueConversionOwner {
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         self.resolver.resolve(request, control)
     }
+    fn select_at_overload_observed(
+        &self,
+        overload: &FunctionOverloadId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        self.resolver
+            .select_at_overload_observed(overload, request, control)
+    }
+
     fn validate_selected(
         &self,
         selected: &FunctionBindingSelection,

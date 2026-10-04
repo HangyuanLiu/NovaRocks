@@ -76,9 +76,9 @@ use sha2::{Digest, Sha256};
 use super::lowered_draft::{
     AggregateRuntimeDemand, AggregateSourceTarget, LoweredAggregateLogicalSource,
     LoweredAggregateSourceEntry, LoweredExpressionLogicalSource, LoweredExpressionSourceEntry,
-    LoweredSqlPhysicalDraft, LoweredTableSourceEntry, SqlExpressionCallKind,
-    SqlLogicalSourceJournal, validate_expression_source_entry_observed,
-    validate_table_source_entry_observed,
+    LoweredOperationalChannel, LoweredSqlPhysicalDraft, LoweredTableSourceEntry,
+    SqlExpressionCallKind, SqlLogicalSourceJournal, SqlOperationalChannelRole,
+    validate_expression_source_entry_observed, validate_table_source_entry_observed,
 };
 use crate::analysis::cte::CteId;
 use crate::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr, UnOp};
@@ -2716,6 +2716,25 @@ impl<'a> ContractLoweringVisitor<'a> {
                     args: Box::from([source_expression, path_expression, type_expression]),
                 },
             )?;
+            let mut channels = self.reserve_call_channels(3)?;
+            channels.push(LoweredOperationalChannel {
+                expression: source_expression,
+                role: SqlOperationalChannelRole::ValueWithoutConstant,
+            });
+            self.work.step()?;
+            channels.push(LoweredOperationalChannel {
+                expression: path_expression,
+                role: SqlOperationalChannelRole::DerivedVariantPath,
+            });
+            self.work.step()?;
+            channels.push(LoweredOperationalChannel {
+                expression: type_expression,
+                role: SqlOperationalChannelRole::DerivedVariantTypeLiteral,
+            });
+            self.work.step()?;
+            self.work.flush()?;
+            let channels = channels.into_boxed_slice();
+            self.work.step()?;
             self.work.flush()?;
             let source = Arc::clone(descriptor.source());
             self.work.step()?;
@@ -2725,6 +2744,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 expression,
                 LoweredExpressionLogicalSource::DerivedVariant(source),
                 SqlExpressionCallKind::DerivedVariant,
+                channels,
             )?;
             let value = self.fragment_mut().add_value(
                 expected_result,
@@ -6922,14 +6942,18 @@ impl<'a> ContractLoweringVisitor<'a> {
             .map_err(|_| CompileControlError::ResourceExhausted)?;
         self.work.step()?;
         self.work.flush()?;
+        let mut channels = self.reserve_call_channels(captured.request().arguments.len())?;
         for (ordinal, argument) in table_function.args.iter().enumerate() {
-            arguments.push(self.lower_captured_unbound_argument(
+            let channel = self.lower_captured_unbound_argument(
                 node,
                 argument,
                 ordinal,
                 &captured,
                 &child.columns,
-            )?);
+            )?;
+            arguments.push(channel.expression);
+            self.work.step()?;
+            channels.push(channel);
             self.work.step()?;
         }
         self.work.flush()?;
@@ -7053,7 +7077,10 @@ impl<'a> ContractLoweringVisitor<'a> {
                 left_outer: table_function.is_left_join,
             },
         )?;
-        self.record_table_source(node, captured, retained_arguments)?;
+        self.work.flush()?;
+        let channels = channels.into_boxed_slice();
+        self.work.step()?;
+        self.record_table_source(node, captured, retained_arguments, channels)?;
         let properties = self
             .fragment_mut()
             .node_output_properties(node)
@@ -7403,15 +7430,19 @@ impl<'a> ContractLoweringVisitor<'a> {
             .map_err(|_| CompileControlError::ResourceExhausted)?;
         self.work.step()?;
         self.work.flush()?;
+        let mut channels = self.reserve_call_channels(captured.request().arguments.len())?;
         for (ordinal, (argument, expected)) in window
             .args
             .iter()
             .zip(function.argument_types.iter())
             .enumerate()
         {
-            args.push(self.lower_captured_scalar_argument(
+            let channel = self.lower_captured_scalar_argument(
                 owner, argument, ordinal, &captured, visible, expected,
-            )?);
+            )?;
+            args.push(channel.expression);
+            self.work.step()?;
+            channels.push(channel);
             self.work.step()?;
         }
         self.work.flush()?;
@@ -7425,7 +7456,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         self.work.step()?;
         self.work.flush()?;
         for (ordinal, key) in window.function_order_by.iter().enumerate() {
-            let expr = self.lower_captured_unbound_argument(
+            let channel = self.lower_captured_unbound_argument(
                 owner,
                 &key.expr,
                 window.args.len() + ordinal,
@@ -7433,7 +7464,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 visible,
             )?;
             function_order_by.push(SortExpr {
-                expr,
+                expr: channel.expression,
                 direction: if key.asc {
                     SortDirection::Ascending
                 } else {
@@ -7445,6 +7476,8 @@ impl<'a> ContractLoweringVisitor<'a> {
                     NullOrdering::Last
                 },
             });
+            self.work.step()?;
+            channels.push(channel);
             self.work.step()?;
         }
         self.work.flush()?;
@@ -7469,7 +7502,16 @@ impl<'a> ContractLoweringVisitor<'a> {
                 aggregate_binding: aggregate_binding.map(Box::new),
             },
         )?;
-        self.record_expression_source(owner, emitted, captured, SqlExpressionCallKind::Window)?;
+        self.work.flush()?;
+        let channels = channels.into_boxed_slice();
+        self.work.step()?;
+        self.record_expression_source(
+            owner,
+            emitted,
+            captured,
+            SqlExpressionCallKind::Window,
+            channels,
+        )?;
         Ok(emitted)
     }
 
@@ -8096,20 +8138,27 @@ impl<'a> ContractLoweringVisitor<'a> {
                     .map_err(|_| CompileControlError::ResourceExhausted)?;
                 self.work.step()?;
                 self.work.flush()?;
+                let mut channels =
+                    self.reserve_call_channels(captured.request().arguments.len())?;
                 for (ordinal, (argument, expected)) in
                     args.iter().zip(argument_types.iter()).enumerate()
                 {
                     let lowered = self.lower_captured_scalar_argument(
                         owner, argument, ordinal, &captured, visible, expected,
                     )?;
-                    lowered_args.push(lowered);
+                    lowered_args.push(lowered.expression);
+                    self.work.step()?;
+                    channels.push(lowered);
                     self.work.step()?;
                 }
                 self.work.flush()?;
                 let lowered_args = lowered_args.into_boxed_slice();
                 self.work.step()?;
                 self.work.flush()?;
-                captured_call = Some(captured);
+                self.work.flush()?;
+                let channels = channels.into_boxed_slice();
+                self.work.step()?;
+                captured_call = Some((captured, channels));
                 ContractExprKind::FunctionCall {
                     function: BoundFunction {
                         semantic_parameters: Box::default(),
@@ -8247,25 +8296,34 @@ impl<'a> ContractLoweringVisitor<'a> {
             }
         }
         let emitted = self.add_scoped_expression(owner, ty, kind)?;
-        if let Some(captured) = captured_call {
-            self.record_expression_source(owner, emitted, captured, SqlExpressionCallKind::Scalar)?;
+        if let Some((captured, channels)) = captured_call {
+            self.record_expression_source(
+                owner,
+                emitted,
+                captured,
+                SqlExpressionCallKind::Scalar,
+                channels,
+            )?;
         }
         Ok(emitted)
     }
 
     /// Retain the original ordered emission association alongside its request.
+    /// Source roles are authored by the original emission branch, not here.
     fn record_expression_source(
         &mut self,
         owner: NodeId,
         emitted: ExprId,
         captured: CapturedLogicalCallArguments,
         kind: SqlExpressionCallKind,
+        channels: Box<[LoweredOperationalChannel]>,
     ) -> Result<(), ContractLoweringError> {
         self.record_expression_source_with_data(
             owner,
             emitted,
             LoweredExpressionLogicalSource::Owned(captured),
             kind,
+            channels,
         )
     }
 
@@ -8275,6 +8333,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         emitted: ExprId,
         captured: LoweredExpressionLogicalSource,
         kind: SqlExpressionCallKind,
+        channels: Box<[LoweredOperationalChannel]>,
     ) -> Result<(), ContractLoweringError> {
         self.work.flush()?;
         let mut arguments = Vec::new();
@@ -8309,7 +8368,29 @@ impl<'a> ContractLoweringVisitor<'a> {
                 });
             }
         };
-        for argument in args.iter().copied().chain(order.iter().map(|key| key.expr)) {
+        let count = args
+            .len()
+            .checked_add(order.len())
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        self.work.step()?;
+        if count != channels.len() || count != captured.request().arguments.len() {
+            return Err(ContractLoweringError::InvalidFunctionBinding {
+                detail: "recorded call channel count differs from its original emission".into(),
+            });
+        }
+        for (argument, channel) in args
+            .iter()
+            .copied()
+            .chain(order.iter().map(|key| key.expr))
+            .zip(channels.iter())
+        {
+            let same = argument == channel.expression;
+            self.work.step()?;
+            if !same {
+                return Err(ContractLoweringError::InvalidFunctionBinding {
+                    detail: "recorded call channel differs from its original expression".into(),
+                });
+            }
             arguments.push(argument);
             self.work.step()?;
         }
@@ -8335,6 +8416,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 owner,
                 lambda_scope,
                 arguments,
+                channels,
             },
         );
         self.work.step()?;
@@ -8349,13 +8431,27 @@ impl<'a> ContractLoweringVisitor<'a> {
         captured: &CapturedLogicalCallArguments,
         visible: &BTreeMap<ColumnId, ValueId>,
         expected: &FunctionArgumentType,
-    ) -> Result<ExprId, ContractLoweringError> {
+    ) -> Result<LoweredOperationalChannel, ContractLoweringError> {
         // Preserve the original binding's canonical bare-NULL conversion.
         // The retained original request still says what analysis authored.
-        if matches!(expected, FunctionArgumentType::Value(value) if value.data_type != DataType::Null)
+        if let FunctionArgumentType::Value(expected) = expected
+            && expected.data_type != DataType::Null
             && argument.value_type.data_type == DataType::Null
         {
-            return self.lower_bound_argument(owner, argument, visible, expected);
+            let (expression, value) = self.author_literal_expression_with_source(
+                owner,
+                &LiteralValue::Null,
+                ValueType {
+                    nullable: true,
+                    ..expected.clone()
+                },
+            )?;
+            let channel = LoweredOperationalChannel {
+                expression,
+                role: SqlOperationalChannelRole::CanonicalNull { value },
+            };
+            self.work.step()?;
+            return Ok(channel);
         }
         if matches!(argument.kind, ExprKind::Literal(_) | ExprKind::Constant(_)) {
             self.work.step()?;
@@ -8368,9 +8464,12 @@ impl<'a> ContractLoweringVisitor<'a> {
                     detail: "literal scalar argument has no captured constant source".into(),
                 });
             };
-            return self.lower_constant_expression(owner, value, expression_type(argument));
+            let expression =
+                self.lower_constant_expression(owner, value, expression_type(argument))?;
+            return self.original_emission_channel(expression, ordinal, captured);
         }
-        self.lower_bound_argument(owner, argument, visible, expected)
+        let expression = self.lower_bound_argument(owner, argument, visible, expected)?;
+        self.original_emission_channel(expression, ordinal, captured)
     }
 
     fn lower_captured_unbound_argument(
@@ -8380,7 +8479,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         ordinal: usize,
         captured: &CapturedLogicalCallArguments,
         visible: &BTreeMap<ColumnId, ValueId>,
-    ) -> Result<ExprId, ContractLoweringError> {
+    ) -> Result<LoweredOperationalChannel, ContractLoweringError> {
         if matches!(
             expression.kind,
             ExprKind::Literal(_) | ExprKind::Constant(_)
@@ -8396,9 +8495,64 @@ impl<'a> ContractLoweringVisitor<'a> {
                     detail: "literal call channel has no captured constant source".into(),
                 });
             };
-            return self.lower_constant_expression(owner, value, expression_type(expression));
+            let emitted =
+                self.lower_constant_expression(owner, value, expression_type(expression))?;
+            return self.original_emission_channel(emitted, ordinal, captured);
         }
-        self.lower_expression(owner, expression, visible)
+        let emitted = self.lower_expression(owner, expression, visible)?;
+        self.original_emission_channel(emitted, ordinal, captured)
+    }
+
+    /// The original captured request decides presence, even when a Cast or
+    /// Nested expression emits a constant. This does not inspect frozen shape.
+    fn original_emission_channel(
+        &mut self,
+        expression: ExprId,
+        ordinal: usize,
+        captured: &CapturedLogicalCallArguments,
+    ) -> Result<LoweredOperationalChannel, ContractLoweringError> {
+        let argument = captured.request().arguments.get(ordinal);
+        self.work.step()?;
+        let role = match argument {
+            Some(novarocks_functions::FunctionArgument::Value { constant: None, .. }) => {
+                SqlOperationalChannelRole::ValueWithoutConstant
+            }
+            Some(novarocks_functions::FunctionArgument::Value {
+                constant: Some(_), ..
+            }) => SqlOperationalChannelRole::CapturedConstant,
+            Some(novarocks_functions::FunctionArgument::Lambda { .. }) => {
+                SqlOperationalChannelRole::Lambda
+            }
+            None => {
+                return Err(ContractLoweringError::InvalidFunctionBinding {
+                    detail: "emitted call channel has no original request occurrence".into(),
+                });
+            }
+        };
+        self.work.step()?;
+        Ok(LoweredOperationalChannel { expression, role })
+    }
+
+    /// Admission includes the existing payload and retained request/role
+    /// buffers together. This bounded reservation is not a separate wallet.
+    fn reserve_call_channels(
+        &mut self,
+        count: usize,
+    ) -> Result<Vec<LoweredOperationalChannel>, ContractLoweringError> {
+        if count > novarocks_functions::MAX_CALL_EFFECT_ARGUMENTS {
+            return Err(CompileControlError::ResourceExhausted.into());
+        }
+        std::alloc::Layout::array::<LoweredOperationalChannel>(count)
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        self.work.step()?;
+        self.work.flush()?;
+        let mut channels = Vec::new();
+        channels
+            .try_reserve_exact(count)
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        self.work.step()?;
+        self.work.flush()?;
+        Ok(channels)
     }
 
     fn record_table_source(
@@ -8406,8 +8560,26 @@ impl<'a> ContractLoweringVisitor<'a> {
         emitted: NodeId,
         captured: CapturedLogicalCallArguments,
         arguments: Box<[ExprId]>,
+        channels: Box<[LoweredOperationalChannel]>,
     ) -> Result<(), ContractLoweringError> {
         self.work.flush()?;
+        let same_count = arguments.len() == channels.len()
+            && arguments.len() == captured.request().arguments.len();
+        self.work.step()?;
+        if !same_count {
+            return Err(ContractLoweringError::InvalidTableFunction {
+                detail: "recorded table channels differ from its original request".into(),
+            });
+        }
+        for (argument, channel) in arguments.iter().zip(channels.iter()) {
+            let same = *argument == channel.expression;
+            self.work.step()?;
+            if !same {
+                return Err(ContractLoweringError::InvalidTableFunction {
+                    detail: "recorded table channel differs from its original expression".into(),
+                });
+            }
+        }
         let key = (self.current_fragment, emitted);
         let duplicate = self.call_sources.table_entries.contains_key(&key);
         self.work.step()?;
@@ -8421,6 +8593,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             LoweredTableSourceEntry {
                 captured,
                 arguments,
+                channels,
             },
         );
         self.work.step()?;
@@ -8633,11 +8806,21 @@ impl<'a> ContractLoweringVisitor<'a> {
                 args: Box::from([expression]),
             };
             let emitted = self.add_scoped_expression(owner, result.clone(), kind)?;
+            let mut channels = self.reserve_call_channels(1)?;
+            channels.push(LoweredOperationalChannel {
+                expression,
+                role: SqlOperationalChannelRole::ValueWithoutConstant,
+            });
+            self.work.step()?;
+            self.work.flush()?;
+            let channels = channels.into_boxed_slice();
+            self.work.step()?;
             self.record_expression_source(
                 owner,
                 emitted,
                 captured,
                 SqlExpressionCallKind::ValueConversion,
+                channels,
             )?;
             emitted
         } else {
@@ -8818,6 +9001,18 @@ impl<'a> ContractLoweringVisitor<'a> {
         literal: &LiteralValue,
         ty: ValueType,
     ) -> Result<ExprId, ContractLoweringError> {
+        self.author_literal_expression_with_source(owner, literal, ty)
+            .map(|(expression, _)| expression)
+    }
+
+    /// The same original factory result can be retained by a canonical call
+    /// emitter. It is never recreated from a later constant expression.
+    fn author_literal_expression_with_source(
+        &mut self,
+        owner: NodeId,
+        literal: &LiteralValue,
+        ty: ValueType,
+    ) -> Result<(ExprId, novarocks_constant_contract::ConstantValue), ContractLoweringError> {
         self.work.flush()?;
         let value = crate::constant::admit_syntax_constant(
             literal,
@@ -8826,7 +9021,8 @@ impl<'a> ContractLoweringVisitor<'a> {
             self.control,
         )?;
         self.work.flush()?;
-        self.lower_constant_expression(owner, &value, ty)
+        let expression = self.lower_constant_expression(owner, &value, ty)?;
+        Ok((expression, value))
     }
 
     fn lower_literal_expression(
@@ -13197,6 +13393,35 @@ mod tests {
             &checked.captured().request().arguments[0],
             novarocks_functions::FunctionArgument::Value { constant: None, .. }
         ));
+        let mut projection_work =
+            CompileCheckpoints::try_new(&loan_control, CompilePhase::FunctionSpecialization)
+                .unwrap();
+        let projected = checked
+            .operational_arguments_observed(final_plan.constants(), &mut projection_work)
+            .unwrap();
+        projection_work.finish().unwrap();
+        assert!(matches!(
+            &projected[0],
+            novarocks_functions::FunctionArgument::Value { constant: None, .. }
+        ));
+        for (argument, original_value) in projected[1..]
+            .iter()
+            .zip([original.canonical_path(), original.type_literal()])
+        {
+            let novarocks_functions::FunctionArgument::Value {
+                constant: Some(value),
+                ..
+            } = argument
+            else {
+                panic!("actual canonical descriptor request");
+            };
+            assert_eq!(value.value_type(), original_value.value_type());
+            assert_eq!(value.ordinal(), original_value.ordinal());
+            assert_eq!(
+                value.pool().backing_identity(),
+                original_value.pool().backing_identity()
+            );
+        }
         for (argument, original_value) in checked.arguments()[1..]
             .iter()
             .zip([original.canonical_path(), original.type_literal()])

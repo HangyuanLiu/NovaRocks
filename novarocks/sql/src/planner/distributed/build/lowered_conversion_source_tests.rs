@@ -202,6 +202,18 @@ fn conversion_journal_constant_input_preserves_original_none_and_full_binding_lo
     };
     assert_eq!(value_type, &json(false));
     assert!(constant.is_none());
+    let projection_control = Control::default();
+    let mut projection_work =
+        CompileCheckpoints::try_new(&projection_control, CompilePhase::FunctionSpecialization)
+            .unwrap();
+    let projected = receipt
+        .operational_arguments_observed(owner.plan().constants(), &mut projection_work)
+        .unwrap();
+    projection_work.finish().unwrap();
+    assert!(
+        matches!(&projected[0], FunctionArgument::Value { value_type, constant: None }
+        if value_type == &json(false))
+    );
     let actual = source_constant(&owner, fragment, receipt.arguments()[0]);
     assert_eq!(actual.ordinal(), 1);
     assert!(Arc::ptr_eq(actual.pool().array(), original.pool().array()));
