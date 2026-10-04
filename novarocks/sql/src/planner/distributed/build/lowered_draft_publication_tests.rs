@@ -95,7 +95,7 @@ fn actual_source_owner_publication_observes_arc_completion_at_every_control_pref
     let owner = values_draft().finish_observed(&control).unwrap();
     assert_eq!(owner.plan().fragments().len(), 1);
     assert!(
-        owner.aggregate_sources.entries.is_empty(),
+        owner.call_sources.entries.is_empty(),
         "only the actual visitor may produce a lawful empty journal"
     );
     let baseline = control.trace.into_inner().unwrap();

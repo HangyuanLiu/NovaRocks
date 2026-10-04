@@ -23,6 +23,11 @@
 //! layers and are copied into the final physical-plan contract only at its
 //! lowering boundary.
 
+mod call_arguments;
+pub(crate) use call_arguments::{
+    CapturedLogicalCallArguments, LogicalCallArgumentCaptureError, capture_logical_call_arguments,
+};
+
 mod aggregate_request;
 mod aggregate_source;
 pub(crate) use aggregate_request::{

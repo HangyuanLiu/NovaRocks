@@ -28,7 +28,7 @@ use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
 };
 
-use crate::binding::CapturedAggregateLogicalRequest;
+use crate::binding::{CapturedAggregateLogicalRequest, CapturedLogicalCallArguments};
 
 /// A completed SQL source owner. Its physical view is read-only; consuming a
 /// statement or DML result transfers this entire owner, including its original
@@ -37,7 +37,7 @@ use crate::binding::CapturedAggregateLogicalRequest;
 #[derive(Clone)]
 pub struct SqlAuthoredPhysicalPlan {
     plan: Arc<PhysicalPlan>,
-    aggregate_sources: Arc<AggregateLogicalSourceJournal>,
+    call_sources: Arc<SqlLogicalSourceJournal>,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
 }
 impl std::fmt::Debug for SqlAuthoredPhysicalPlan {
@@ -45,7 +45,7 @@ impl std::fmt::Debug for SqlAuthoredPhysicalPlan {
         formatter
             .debug_struct("SqlAuthoredPhysicalPlan")
             .field("plan", &self.plan)
-            .field("aggregate_sources", &self.aggregate_sources)
+            .field("call_sources", &self.call_sources)
             .field("functions", &"retained immutable catalogue")
             .finish()
     }
@@ -62,6 +62,47 @@ impl SqlAuthoredPhysicalPlan {
     }
     pub const fn plan_arc(&self) -> &Arc<PhysicalPlan> {
         &self.plan
+    }
+
+    /// Loan an ordinary SQL call's original request from its exact emission.
+    /// A physical expression's constant shape does not reconstruct presence.
+    /// This does not provide late typed projection, use/domain scope or effects.
+    pub(crate) fn checked_scalar_source_observed<'a>(
+        &'a self,
+        fragment: &'a Fragment,
+        source: &'a novarocks_physical_plan::ExprNode,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<CheckedScalarLogicalSourceEntry<'a>, AggregateSourceJournalError> {
+        work.flush()?;
+        let same_fragment = self
+            .plan
+            .fragments()
+            .get(&fragment.id())
+            .is_some_and(|original| std::ptr::eq(original, fragment));
+        work.step()?;
+        let same_expression = fragment
+            .expressions()
+            .get(source.id)
+            .is_some_and(|original| std::ptr::eq(original, source));
+        work.step()?;
+        if !same_fragment || !same_expression {
+            return Err(AggregateSourceJournalError::InvalidSource(
+                "scalar journal loans a foreign plan or expression",
+            ));
+        }
+        let entry = self
+            .call_sources
+            .scalar_entries
+            .get(&(fragment.id(), source.id));
+        work.step()?;
+        let entry = entry.ok_or(AggregateSourceJournalError::MissingEntry)?;
+        validate_scalar_source_entry_observed(entry, source, work)?;
+        work.flush()?;
+        Ok(CheckedScalarLogicalSourceEntry {
+            entry,
+            fragment,
+            source,
+        })
     }
 
     /// Only an entry sealed by the actual lowering producer can loan an
@@ -110,7 +151,7 @@ impl SqlAuthoredPhysicalPlan {
                 "aggregate journal call differs from its original site",
             ));
         }
-        let entry = self.aggregate_sources.entries.get(&(fragment.id(), site));
+        let entry = self.call_sources.entries.get(&(fragment.id(), site));
         work.step()?;
         let entry = entry.ok_or(AggregateSourceJournalError::MissingEntry)?;
         let same_phase = entry.phase == source.binding.phase;
@@ -158,6 +199,59 @@ impl SqlAuthoredPhysicalPlan {
             source,
         })
     }
+}
+
+/// Only the source owner can create this original emission loan. There is no
+/// conversion from a binding, a selected signature or captured data alone.
+pub(crate) struct CheckedScalarLogicalSourceEntry<'a> {
+    entry: &'a LoweredScalarSourceEntry,
+    fragment: &'a Fragment,
+    source: &'a novarocks_physical_plan::ExprNode,
+}
+impl<'a> CheckedScalarLogicalSourceEntry<'a> {
+    pub(crate) const fn captured(&self) -> &'a CapturedLogicalCallArguments {
+        &self.entry.captured
+    }
+    pub(crate) const fn fragment(&self) -> &'a Fragment {
+        self.fragment
+    }
+    pub(crate) const fn source(&self) -> &'a novarocks_physical_plan::ExprNode {
+        self.source
+    }
+    pub(crate) fn arguments(&self) -> &'a [ExprId] {
+        &self.entry.arguments
+    }
+}
+
+pub(super) fn validate_scalar_source_entry_observed(
+    entry: &LoweredScalarSourceEntry,
+    source: &novarocks_physical_plan::ExprNode,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), AggregateSourceJournalError> {
+    let same_scope = source.owner == entry.owner && source.lambda_scope == entry.lambda_scope;
+    work.step()?;
+    let novarocks_physical_plan::ExprKind::FunctionCall { args, .. } = &source.kind else {
+        return Err(AggregateSourceJournalError::InvalidSource(
+            "scalar journal site is not its original function emission",
+        ));
+    };
+    let same_count = args.len() == entry.arguments.len();
+    work.step()?;
+    if !same_scope || !same_count {
+        return Err(AggregateSourceJournalError::InvalidSource(
+            "scalar journal scope or channel count differs from its emission",
+        ));
+    }
+    for (actual, original) in args.iter().zip(entry.arguments.iter()) {
+        let same_argument = actual == original;
+        work.step()?;
+        if !same_argument {
+            return Err(AggregateSourceJournalError::InvalidSource(
+                "scalar journal channel differs from its original expression identity",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -243,7 +337,17 @@ pub(super) struct LoweredAggregateSourceEntry {
     pub(super) target: AggregateSourceTarget,
 }
 #[derive(Debug)]
-pub(super) struct AggregateLogicalSourceJournal {
+pub(super) struct LoweredScalarSourceEntry {
+    pub(super) captured: CapturedLogicalCallArguments,
+    pub(super) owner: novarocks_physical_plan::NodeId,
+    pub(super) lambda_scope: Option<ExprId>,
+    pub(super) arguments: Box<[ExprId]>,
+}
+#[derive(Debug)]
+pub(super) struct SqlLogicalSourceJournal {
+    // Only actual ordinary TypedExpr::FunctionCall emissions are recorded.
+    // Synthetic conversion/VARIANT calls remain a distinct open source gate.
+    pub(super) scalar_entries: BTreeMap<(FragmentId, ExprId), LoweredScalarSourceEntry>,
     pub(super) entries: BTreeMap<(FragmentId, PhysicalCallSite), LoweredAggregateSourceEntry>,
 }
 
@@ -251,18 +355,18 @@ pub(super) struct AggregateLogicalSourceJournal {
 /// there is no raw-builder conversion or consuming builder accessor.
 pub(crate) struct LoweredSqlPhysicalDraft {
     builder: PlanBuilder,
-    aggregate_sources: AggregateLogicalSourceJournal,
+    call_sources: SqlLogicalSourceJournal,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
 }
 impl LoweredSqlPhysicalDraft {
     pub(super) fn from_lowering(
         builder: PlanBuilder,
-        aggregate_sources: AggregateLogicalSourceJournal,
+        call_sources: SqlLogicalSourceJournal,
         functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     ) -> Self {
         Self {
             builder,
-            aggregate_sources,
+            call_sources,
             functions,
         }
     }
@@ -287,13 +391,13 @@ impl LoweredSqlPhysicalDraft {
             let plan = Arc::new(plan);
             work.step().map_err(control_error)?;
             work.flush().map_err(control_error)?;
-            let aggregate_sources = Arc::new(self.aggregate_sources);
+            let call_sources = Arc::new(self.call_sources);
             work.step().map_err(control_error)?;
             // The source journal moves with this exact immutable plan. The
             // two opaque Arc allocations retain caller admission obligations.
             Ok(SqlAuthoredPhysicalPlan {
                 plan,
-                aggregate_sources,
+                call_sources,
                 functions: self.functions,
             })
         })();
