@@ -192,4 +192,5 @@ mod equality_lowering_tests;
 #[cfg(test)]
 mod arithmetic_lowering_tests;
 
+mod sort;
 mod values;

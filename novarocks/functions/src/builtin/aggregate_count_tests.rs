@@ -112,7 +112,7 @@ impl Fixture {
                         "builtin.aggregate/count/selected-v1",
                     )
                     .unwrap(),
-                    abi: PureKernelAbi::AggregateV1,
+                    abi: PureKernelAbi::AggregateWindowV1,
                 },
                 aggregate_state_format: Some(
                     AggregateStateFormatIdentity::try_new("novarocks/count/state-v1").unwrap(),
@@ -251,7 +251,10 @@ fn aggregate_count_installed_fresh_frozen_preserve_exact_lifecycle_and_policies(
                     .unwrap();
                 assert_eq!(frozen.source(), PurePreparationSource::Frozen);
                 for actual in [&fresh, &frozen] {
-                    assert_eq!(actual.implementation().abi, PureKernelAbi::AggregateV1);
+                    assert_eq!(
+                        actual.implementation().abi,
+                        PureKernelAbi::AggregateWindowV1
+                    );
                     assert_eq!(actual.call_contract().parameters(), &fixture.parameters);
                     assert!(std::ptr::eq(
                         actual.call_contract().selected(),
@@ -270,6 +273,77 @@ fn aggregate_count_installed_fresh_frozen_preserve_exact_lifecycle_and_policies(
                         actual.call_contract().effects().own_row_error,
                         FunctionIntrinsicRowError::NotRowEvaluated
                     );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn aggregate_count_closed_catalog_uses_one_exact_owner_for_aggregate_and_over() {
+    for policy in [
+        DecimalOverflowPolicy::OutputNull,
+        DecimalOverflowPolicy::ReportError,
+    ] {
+        for arguments in [vec![], vec![ty(true)]] {
+            let fixture = Fixture::new(&arguments, policy);
+            let aggregate = fixture
+                .prepare(AggregateKernelPhase::Single, &CompileControl::default())
+                .unwrap();
+            for ignore_nulls in [false, true] {
+                let options = || PureCallPreparation::AggregateWindow {
+                    arguments: ScopedExpressionEffects::pure_value(context()),
+                    options: AggregateWindowPreparationOptions {
+                        aggregate: AggregatePreparationOptions {
+                            phase: AggregateKernelPhase::Single,
+                            distinct: false,
+                            order_keys: Arc::from([]),
+                            state_input_type: None,
+                        },
+                        window: WindowCallOptions::try_new(
+                            None,
+                            ignore_nulls,
+                            &CompileControl::default(),
+                        )
+                        .unwrap(),
+                    },
+                };
+                let fresh = fixture
+                    .catalog
+                    .prepare_fresh(
+                        fixture.input(),
+                        fixture.selected.clone(),
+                        options(),
+                        &CompileControl::default(),
+                    )
+                    .unwrap();
+                let frozen = fixture
+                    .catalog
+                    .prepare_frozen(
+                        fixture.input(),
+                        fixture.selected.clone(),
+                        fresh.call_contract().effects(),
+                        options(),
+                        &CompileControl::default(),
+                    )
+                    .unwrap();
+                for actual in [&fresh, &frozen] {
+                    assert_eq!(actual.implementation(), aggregate.implementation());
+                    assert!(std::ptr::eq(
+                        actual.call_contract().selected(),
+                        fixture.selected.as_ref()
+                    ));
+                    assert_eq!(
+                        actual.call_contract().effects(),
+                        aggregate.call_contract().effects()
+                    );
+                    let PreparedPureKernel::Window(window) = actual.prepared() else {
+                        panic!("COUNT AggregateWindowV1 must prepare its real window adapter")
+                    };
+                    let source = window.contract().aggregate().unwrap();
+                    assert_eq!(source.phase(), AggregateKernelPhase::Single);
+                    assert!(std::ptr::eq(source.call().as_ref(), actual.call_contract()));
+                    assert_eq!(source.call().decimal_overflow_policy(), policy);
                 }
             }
         }

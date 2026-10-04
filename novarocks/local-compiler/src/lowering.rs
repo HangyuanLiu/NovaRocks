@@ -24,6 +24,7 @@ use crate::{
     channels::{ChannelLoweringError, resolve_linear_channels},
     expressions::{ExpressionLoweringError, lower_expressions, prepare_calls},
     repeat::{RepeatLoweringError, lower_repeat},
+    sort::lower_sort,
     unpivot::{UnpivotLoweringError, UnpivotLoweringInput, lower_unpivot},
     values::{lower_values, retired_values_uses},
 };
@@ -264,7 +265,6 @@ fn lower(
             node.output_properties.distribution,
             Distribution::Singleton | Distribution::Unconstrained
         ) || node.output_properties.row_multiplicity != RowMultiplicity::SingleCopy
-            || !node.output_properties.ordering.is_empty()
         {
             return Err(FragmentCompileError::Unsupported {
                 node: Some(id),
@@ -279,6 +279,10 @@ fn lower(
             NodeKind::Filter { predicates } if predicates.len() == 1 && node.inputs.len() == 1 => {
                 next = Some(node.inputs[0])
             }
+            NodeKind::Sort {
+                mode: novarocks_physical_plan::SortMode::Global,
+                ..
+            } if node.inputs.len() == 1 => next = Some(node.inputs[0]),
             NodeKind::Limit { .. } | NodeKind::AssertOneRow(_) if node.inputs.len() == 1 => {
                 next = Some(node.inputs[0])
             }
@@ -307,6 +311,7 @@ fn lower(
     // the exact singleton child and one driver; no exchange/scan is admitted.
     // Only descendants of this actual expansion can consume that uncertainty.
     let mut expanded = false;
+    let mut sorted = false;
     for &id in order.iter().rev() {
         let node = &physical.nodes()[&id];
         let changes = matches!(node.kind, NodeKind::ChangeEventExpand { .. });
@@ -320,6 +325,24 @@ fn lower(
                 feature: "change-event source-chain distribution or driver count",
             });
         }
+        let global = matches!(
+            node.kind,
+            NodeKind::Sort {
+                mode: novarocks_physical_plan::SortMode::Global,
+                ..
+            }
+        );
+        let transparent = matches!(
+            node.kind,
+            NodeKind::Project { .. } | NodeKind::Filter { .. } | NodeKind::Limit { .. }
+        );
+        if !(node.output_properties.ordering.is_empty() || global || (sorted && transparent)) {
+            return Err(FragmentCompileError::Unsupported {
+                node: Some(id),
+                feature: "ordering lacks supported global-sort source",
+            });
+        }
+        sorted = global || (sorted && transparent);
         expanded |= changes;
     }
     work.flush()?;
@@ -361,6 +384,19 @@ fn lower(
                 NodeKind::Values { .. } => {
                     work.flush()?;
                     lower_values(package, node, &expressions, &planned.slots, work.control())?
+                }
+                NodeKind::Sort { .. } => {
+                    let child = *local_ids
+                        .get(&node.inputs[0])
+                        .ok_or(FragmentCompileError::Invalid("missing lowered sort child"))?;
+                    work.flush()?;
+                    lower_sort(
+                        node,
+                        child,
+                        nodes[child.index()].output_layout(),
+                        &expressions.ids,
+                        work.control(),
+                    )?
                 }
                 NodeKind::Filter { predicates } => {
                     let child = *local_ids
@@ -706,6 +742,7 @@ fn lower(
             ExpressionRootRole::FilterPredicate { predicate: 0 } => {
                 ProgramNodeExpressionRole::FilterPredicate
             }
+            ExpressionRootRole::SortOrder { key } => ProgramNodeExpressionRole::SortOrder { key },
             ExpressionRootRole::ProjectOutput { expression } => {
                 ProgramNodeExpressionRole::ProjectOutput { expression }
             }

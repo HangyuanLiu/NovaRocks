@@ -38,6 +38,7 @@ mod abs;
 mod abs_owner;
 mod aggregate_count;
 mod aggregate_count_owner;
+mod aggregate_count_window;
 mod aggregate_extrema;
 mod aggregate_extrema_dispatch;
 mod aggregate_extrema_owner;

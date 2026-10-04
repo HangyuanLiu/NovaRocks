@@ -503,7 +503,8 @@ fn sql_declaration_only_snapshot_refuses_without_fabricating_effects() {
 #[test]
 fn sql_selected_snapshot_prepares_real_window_and_aggregate_owners_without_an_adapter_meter() {
     use novarocks_functions::{
-        AggregateKernelPhase, AggregatePreparationOptions, WindowCallOptions,
+        AggregateKernelPhase, AggregatePreparationOptions, AggregateWindowPreparationOptions,
+        WindowCallOptions,
     };
 
     let catalog = build_builtin_engine_function_catalog().unwrap();
@@ -525,7 +526,24 @@ fn sql_selected_snapshot_prepares_real_window_and_aggregate_owners_without_an_ad
                     state_input_type: None,
                 },
             },
-            PureKernelAbi::AggregateV1,
+            PureKernelAbi::AggregateWindowV1,
+        ),
+        (
+            "count",
+            FunctionKind::Aggregate,
+            PureCallPreparation::AggregateWindow {
+                arguments: ScopedExpressionEffects::pure_value(context()),
+                options: AggregateWindowPreparationOptions {
+                    aggregate: AggregatePreparationOptions {
+                        phase: AggregateKernelPhase::Single,
+                        distinct: false,
+                        order_keys: Arc::new([]),
+                        state_input_type: None,
+                    },
+                    window: WindowCallOptions::try_new(None, false, &control).unwrap(),
+                },
+            },
+            PureKernelAbi::AggregateWindowV1,
         ),
         (
             "row_number",

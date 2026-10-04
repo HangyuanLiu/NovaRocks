@@ -31,7 +31,11 @@ use novarocks_type_contract::{FunctionArgumentType, ValueLogicalType};
 use novarocks_types::SlotId;
 use std::num::NonZeroUsize;
 
-fn checked_pool(array: ArrayRef, nullable: bool, logical: ValueLogicalType) -> ConstantPool {
+pub(super) fn checked_pool(
+    array: ArrayRef,
+    nullable: bool,
+    logical: ValueLogicalType,
+) -> ConstantPool {
     let ty = FunctionValueType::try_with_logical_type(array.data_type().clone(), nullable, logical)
         .unwrap();
     ConstantPool::try_new(
@@ -44,7 +48,7 @@ fn checked_pool(array: ArrayRef, nullable: bool, logical: ValueLogicalType) -> C
     )
     .unwrap()
 }
-fn compile_options() -> LocalCompileOptions {
+pub(super) fn compile_options() -> LocalCompileOptions {
     LocalCompileOptions {
         pipeline_dop: NonZeroUsize::new(1).unwrap(),
         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
@@ -52,13 +56,13 @@ fn compile_options() -> LocalCompileOptions {
         constants: policy(),
     }
 }
-fn providers(package: Arc<FragmentPackage>) -> crate::ProviderValidatedFragment {
+pub(super) fn providers(package: Arc<FragmentPackage>) -> crate::ProviderValidatedFragment {
     let catalog =
         PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &Control::good())
             .unwrap();
     validate_fragment_providers(package, &catalog, &Control::good()).unwrap()
 }
-fn build(
+pub(super) fn build(
     pools: &[ConstantPool],
     rows: &[Vec<(usize, u32)>],
     column_pools: &[usize],
@@ -70,7 +74,7 @@ fn build(
         .collect();
     build_typed(pools, rows, &types, chain)
 }
-fn build_typed(
+pub(super) fn build_typed(
     pools: &[ConstantPool],
     rows: &[Vec<(usize, u32)>],
     column_types: &[FunctionValueType],

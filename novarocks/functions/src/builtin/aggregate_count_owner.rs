@@ -16,7 +16,7 @@
 // under the License.
 
 //! One real immutable owner for the installed COUNT aggregate identity.
-//! DISTINCT and aggregate OVER have separate implementation obligations.
+//! DISTINCT and encoded-source aggregate OVER retain separate obligations.
 
 use super::{aggregate_count::CountKernel, catalogue::BuiltinAggregateResolver};
 use crate::kernel_control::{compile_failure, invalid};
@@ -47,12 +47,11 @@ pub(super) fn definition(
     resolver: Arc<BuiltinAggregateResolver>,
 ) -> Result<FunctionDefinition, FunctionCatalogError> {
     let owner = Arc::new(CountOwner::new(name, declaration, resolver)?);
-    FunctionDefinition::try_new_pure_aggregate(name, FunctionVisibility::Public, owner).map_err(
-        |error| FunctionCatalogError::InvalidStableIdentity {
+    FunctionDefinition::try_new_pure_aggregate_window(name, FunctionVisibility::Public, owner)
+        .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
             subject: "builtin COUNT pure owner",
             value: error.to_string().into(),
-        },
-    )
+        })
 }
 struct CountOwner {
     resolver: Arc<BuiltinAggregateResolver>,
@@ -90,7 +89,7 @@ impl CountOwner {
             .map(|overload| PureImplementationDeclaration {
                 overload: overload.identity.clone(),
                 implementation: implementation.clone(),
-                abi: PureKernelAbi::AggregateV1,
+                abi: PureKernelAbi::AggregateWindowV1,
             })
             .collect();
         Ok(Self {
@@ -112,6 +111,17 @@ impl CountOwner {
             environment: Box::new([]),
             proof_scope,
         }
+    }
+}
+
+impl PureAggregateWindowImplementation for CountOwner {
+    fn prepare_aggregate_window(
+        &self,
+        aggregate: Arc<CountKernel>,
+        contract: Arc<WindowCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedWindowKernel>, KernelFailure> {
+        super::aggregate_count_window::prepare(aggregate, contract, control)
     }
 }
 impl FunctionBindingResolver for CountOwner {

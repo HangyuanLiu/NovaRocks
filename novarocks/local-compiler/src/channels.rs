@@ -286,6 +286,10 @@ fn resolve_core(
                 passthrough(fragment, node, previous, &nodes, &ports, work)?
             }
             NodeKind::Limit { .. } => passthrough(fragment, node, previous, &nodes, &ports, work)?,
+            NodeKind::Sort {
+                mode: novarocks_physical_plan::SortMode::Global,
+                ..
+            } => passthrough(fragment, node, previous, &nodes, &ports, work)?,
             NodeKind::AssertOneRow(spec) => {
                 let child = linear_child(&node.inputs, previous)?;
                 let planned = passthrough(fragment, node, previous, &nodes, &ports, work)?;
