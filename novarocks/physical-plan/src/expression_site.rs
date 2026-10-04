@@ -751,35 +751,10 @@ fn validate_definition_correspondence(
         {
             return Err(RootUseBindingError::WrongDemand);
         }
-        let intrinsic = match &definition.kind {
-            ExprKind::Conjunction { .. } => Some(ControlShape::Conjunction),
-            ExprKind::Disjunction { .. } => Some(ControlShape::Disjunction),
-            ExprKind::Case {
-                operand,
-                when_then,
-                else_expr,
-            } => Some(ControlShape::Case {
-                simple: operand.is_some(),
-                arms: u32::try_from(when_then.len())
-                    .map_err(|_| RootUseBindingError::WrongArguments)?,
-                has_else: else_expr.is_some(),
-            }),
-            ExprKind::Lambda { .. } => Some(ControlShape::LambdaBody),
-            ExprKind::FunctionCall { .. } => None,
-            ExprKind::Value(_)
-            | ExprKind::LambdaParameter { .. }
-            | ExprKind::Literal(_)
-            | ExprKind::Constant(_)
-            | ExprKind::Unary { .. }
-            | ExprKind::Binary { .. }
-            | ExprKind::Cast { .. }
-            | ExprKind::IsNull { .. }
-            | ExprKind::InList { .. }
-            | ExprKind::Between { .. }
-            | ExprKind::Like { .. }
-            | ExprKind::IsTruthValue { .. }
-            | ExprKind::WindowCall { .. } => Some(ControlShape::Eager),
-        };
+        let intrinsic = definition
+            .kind
+            .intrinsic_control_shape()
+            .map_err(|_| RootUseBindingError::WrongArguments)?;
         if intrinsic.is_some_and(|expected| invocation.control != expected)
             || (intrinsic.is_none()
                 && matches!(

@@ -17,6 +17,7 @@
 // under the License.
 
 mod contract_lowering;
+mod expression_occurrences;
 
 pub(crate) use contract_lowering::{
     ContractLoweringError, FinalChangeStreamWriteLowering, FinalWriteLowering,

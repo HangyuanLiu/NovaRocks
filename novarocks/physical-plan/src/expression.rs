@@ -307,6 +307,50 @@ pub enum ExprKind {
 }
 
 impl ExprKind {
+    /// Intrinsic invocation topology from the original definition vocabulary.
+    /// Function calls deliberately return None: their exact installed owner
+    /// supplies control, independently of legacy binding metadata. This proves
+    /// neither installed capability nor complete occurrence effects.
+    pub fn intrinsic_control_shape(
+        &self,
+    ) -> Result<
+        Option<novarocks_type_contract::ControlShape>,
+        novarocks_type_contract::ExpressionControlFlowError,
+    > {
+        use crate::ExprKind;
+        use novarocks_type_contract::ControlShape;
+        Ok(match self {
+            ExprKind::Conjunction { .. } => Some(ControlShape::Conjunction),
+            ExprKind::Disjunction { .. } => Some(ControlShape::Disjunction),
+            ExprKind::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => Some(ControlShape::Case {
+                simple: operand.is_some(),
+                arms: u32::try_from(when_then.len()).map_err(|_| {
+                    novarocks_type_contract::ExpressionControlFlowError::TooManyItems
+                })?,
+                has_else: else_expr.is_some(),
+            }),
+            ExprKind::Lambda { .. } => Some(ControlShape::LambdaBody),
+            ExprKind::FunctionCall { .. } => None,
+            ExprKind::Value(_)
+            | ExprKind::LambdaParameter { .. }
+            | ExprKind::Literal(_)
+            | ExprKind::Constant(_)
+            | ExprKind::Unary { .. }
+            | ExprKind::Binary { .. }
+            | ExprKind::Cast { .. }
+            | ExprKind::IsNull { .. }
+            | ExprKind::InList { .. }
+            | ExprKind::Between { .. }
+            | ExprKind::Like { .. }
+            | ExprKind::IsTruthValue { .. }
+            | ExprKind::WindowCall { .. } => Some(ControlShape::Eager),
+        })
+    }
+
     /// Actual primitive parameter consumers, independent of function-call
     /// occurrence environments and legacy binding migration fields.
     pub fn intrinsic_parameter_references(&self) -> impl Iterator<Item = &SemanticParameterRef> {
@@ -335,7 +379,9 @@ impl ExprKind {
         }
     }
     /// Visit actual ordered children without copying the DAG edge table.
-    pub(crate) fn expression_references_observed<E>(
+    /// The caller meters each callback and admits its own output allocations.
+    /// This loan uses the same ordered children as definition correspondence.
+    pub fn expression_references_observed<E>(
         &self,
         mut visit: impl FnMut(ExprId) -> Result<(), E>,
     ) -> Result<(), E> {
