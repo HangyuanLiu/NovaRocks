@@ -25,6 +25,7 @@ use crate::{
     expressions::{ExpressionLoweringError, lower_expressions, prepare_calls},
     repeat::{RepeatLoweringError, lower_repeat},
     sort::lower_sort,
+    topn::lower_topn,
     unpivot::{UnpivotLoweringError, UnpivotLoweringInput, lower_unpivot},
     values::{lower_values, retired_values_uses},
 };
@@ -283,6 +284,11 @@ fn lower(
                 mode: novarocks_physical_plan::SortMode::Global,
                 ..
             } if node.inputs.len() == 1 => next = Some(node.inputs[0]),
+            NodeKind::TopN {
+                phase: novarocks_physical_plan::TopNPhase::Single,
+                reduction: novarocks_physical_plan::TopNReduction::Rows,
+                ..
+            } if node.inputs.len() == 1 => next = Some(node.inputs[0]),
             NodeKind::Limit { .. } | NodeKind::AssertOneRow(_) if node.inputs.len() == 1 => {
                 next = Some(node.inputs[0])
             }
@@ -329,6 +335,10 @@ fn lower(
             node.kind,
             NodeKind::Sort {
                 mode: novarocks_physical_plan::SortMode::Global,
+                ..
+            } | NodeKind::TopN {
+                phase: novarocks_physical_plan::TopNPhase::Single,
+                reduction: novarocks_physical_plan::TopNReduction::Rows,
                 ..
             }
         );
@@ -391,6 +401,19 @@ fn lower(
                         .ok_or(FragmentCompileError::Invalid("missing lowered sort child"))?;
                     work.flush()?;
                     lower_sort(
+                        node,
+                        child,
+                        nodes[child.index()].output_layout(),
+                        &expressions.ids,
+                        work.control(),
+                    )?
+                }
+                NodeKind::TopN { .. } => {
+                    let child = *local_ids
+                        .get(&node.inputs[0])
+                        .ok_or(FragmentCompileError::Invalid("missing lowered TopN child"))?;
+                    work.flush()?;
+                    lower_topn(
                         node,
                         child,
                         nodes[child.index()].output_layout(),
@@ -743,6 +766,7 @@ fn lower(
                 ProgramNodeExpressionRole::FilterPredicate
             }
             ExpressionRootRole::SortOrder { key } => ProgramNodeExpressionRole::SortOrder { key },
+            ExpressionRootRole::TopNOrder { key } => ProgramNodeExpressionRole::SortOrder { key },
             ExpressionRootRole::ProjectOutput { expression } => {
                 ProgramNodeExpressionRole::ProjectOutput { expression }
             }

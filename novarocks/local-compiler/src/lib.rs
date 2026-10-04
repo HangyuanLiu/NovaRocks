@@ -193,4 +193,5 @@ mod equality_lowering_tests;
 mod arithmetic_lowering_tests;
 
 mod sort;
+mod topn;
 mod values;

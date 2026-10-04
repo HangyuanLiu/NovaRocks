@@ -290,6 +290,11 @@ fn resolve_core(
                 mode: novarocks_physical_plan::SortMode::Global,
                 ..
             } => passthrough(fragment, node, previous, &nodes, &ports, work)?,
+            NodeKind::TopN {
+                phase: novarocks_physical_plan::TopNPhase::Single,
+                reduction: novarocks_physical_plan::TopNReduction::Rows,
+                ..
+            } => passthrough(fragment, node, previous, &nodes, &ports, work)?,
             NodeKind::AssertOneRow(spec) => {
                 let child = linear_child(&node.inputs, previous)?;
                 let planned = passthrough(fragment, node, previous, &nodes, &ports, work)?;

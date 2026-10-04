@@ -29,7 +29,7 @@ use novarocks_physical_plan::{
 };
 use novarocks_type_contract::ValueLogicalType;
 
-fn package(
+pub(super) fn package(
     source: &ConstantPool,
     keys: usize,
     tail: bool,
@@ -351,7 +351,7 @@ fn global_sort_downstream_project_filter_limit_keep_original_ordered_source() {
     assert!(ty.iter().any(|ty| matches!(ty, novarocks_type_contract::FunctionArgumentType::Value(ty) if ty.logical_type==ValueLogicalType::Json && ty.nullable)));
 }
 #[test]
-fn global_sort_other_modes_and_topn_stay_explicitly_unsupported() {
+fn global_sort_other_modes_stay_explicitly_unsupported() {
     let source = integer_pool();
     for (mode, topn) in [
         (
@@ -368,7 +368,6 @@ fn global_sort_other_modes_and_topn_stay_explicitly_unsupported() {
             },
             false,
         ),
-        (SortMode::Global, true),
     ] {
         let package = package(&source, 1, false, mode, topn);
         assert!(

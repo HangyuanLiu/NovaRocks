@@ -169,27 +169,37 @@ pub fn validate_fragment_output_properties_observed(
             &mut work,
         )?;
         let mut errors = ValidationContext::with_limits(limits);
-        for node in fragment.nodes().values() {
-            // Original formula scratch/clone/format operations are opaque.
-            // Own sparse lookups inside them use this exact same meter.
-            work.flush()?;
-            validate_node_output_properties_from(
-                fragment,
-                node,
-                "fragment.output_properties",
-                &mut errors,
-                &mut PropertyEffectSource::Frozen {
-                    proof: &proof,
-                    work: &mut work,
-                },
-            )?;
-            work.step()?;
-            work.flush()?;
-            if errors.is_saturated() {
-                errors.mark_truncated();
-                break;
+        let _completion = super::graph::visit_node_graph_child_first(fragment, |event| {
+            match event {
+                super::graph::NodeGraphEvent::Step => work.step()?,
+                super::graph::NodeGraphEvent::Ready(id) => {
+                    let node = fragment
+                        .nodes()
+                        .get(&id)
+                        .ok_or(FrozenCallError::InvalidSite)?;
+                    // The sole schedule never emits a parent before its actual
+                    // children. Formula scratch/clone/format remains opaque.
+                    work.flush()?;
+                    validate_node_output_properties_from(
+                        fragment,
+                        node,
+                        "fragment.output_properties",
+                        &mut errors,
+                        &mut PropertyEffectSource::Frozen {
+                            proof: &proof,
+                            work: &mut work,
+                        },
+                    )?;
+                    work.step()?;
+                    work.flush()?;
+                    if errors.is_saturated() {
+                        errors.mark_truncated();
+                        return Ok(false);
+                    }
+                }
             }
-        }
+            Ok::<_, FrozenCallError>(true)
+        })?;
         if !errors.is_empty() {
             return Err(FragmentPropertyError::Structure(
                 ValidationErrors::from_collector(errors),

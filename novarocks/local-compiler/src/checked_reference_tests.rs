@@ -483,3 +483,6 @@ mod values_lowering_tests;
 
 #[path = "sort_lowering_tests.rs"]
 mod sort_lowering_tests;
+
+#[path = "topn_lowering_tests.rs"]
+mod topn_lowering_tests;

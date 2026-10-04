@@ -15,19 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Lower the admitted global-sort representation into the original local sort owner.
+//! Ordinary Single TopN uses the sole ordered-key projection and local sort owner.
 
-use crate::{assert_rows::reserve_vec, lowering::FragmentCompileError};
+use crate::{lowering::FragmentCompileError, sort::lower_sort_keys};
 use novarocks_local_program::{
-    ProgramExprId, ProgramNodeId, ProgramNodeKind, SortExpression, SortTopNType, StaticLayout,
+    ProgramExprId, ProgramNodeId, ProgramNodeKind, SortTopNType, StaticLayout,
 };
-use novarocks_physical_plan::{
-    ExprId, NodeKind, NullOrdering, PhysicalNode, SortDirection, SortMode,
-};
+use novarocks_physical_plan::{ExprId, NodeKind, PhysicalNode, TopNPhase, TopNReduction};
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 use std::collections::BTreeMap;
 
-pub(crate) fn lower_sort(
+pub(crate) fn lower_topn(
     node: &PhysicalNode,
     input: ProgramNodeId,
     layout: &StaticLayout,
@@ -49,34 +47,49 @@ fn lower_core(
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(ProgramNodeKind, StaticLayout), FragmentCompileError> {
-    let NodeKind::Sort {
+    let NodeKind::TopN {
         order_by,
-        mode: SortMode::Global,
+        limit,
+        offset,
+        phase: TopNPhase::Single,
+        reduction: TopNReduction::Rows,
     } = &node.kind
     else {
         return Err(FragmentCompileError::Unsupported {
             node: Some(node.id),
-            feature: "non-global sort mode",
+            feature: "non-Single or grouped TopN",
         });
     };
-    if node.inputs.len() != 1
-        || order_by.is_empty()
-        || node.output.columns.len() != layout.slots().len()
-    {
+    let shape = node.inputs.len() == 1
+        && !order_by.is_empty()
+        && node.output.columns.len() == layout.slots().len();
+    let limit = usize::try_from(*limit);
+    let offset = usize::try_from(*offset);
+    work.step()?;
+    if !shape {
         return Err(FragmentCompileError::Invalid(
-            "global sort input, keys or output width differs",
+            "ordinary TopN input, keys or output width differs",
         ));
     }
+    let limit =
+        limit.map_err(|_| FragmentCompileError::Invalid("TopN limit exceeds host range"))?;
+    let offset =
+        offset.map_err(|_| FragmentCompileError::Invalid("TopN offset exceeds host range"))?;
+    let extent = limit.checked_add(offset);
+    work.step()?;
+    extent.ok_or(FragmentCompileError::Invalid(
+        "TopN limit and offset exceed host range",
+    ))?;
     let keys = lower_sort_keys(order_by, expressions, work)?;
-    // These inactive fields express Global mode, not a guessed buffering cap.
-    // The existing full-sort execution path does not consume ranking semantics.
+    // These are the original ordinary row-count TopN fields. No buffering cap,
+    // partition rank semantics or task parallelism is authored here.
     Ok((
         ProgramNodeKind::Sort {
             input,
-            use_top_n: false,
+            use_top_n: true,
             order_by: keys,
-            limit: None,
-            offset: 0,
+            limit: Some(limit),
+            offset,
             topn_type: SortTopNType::RowNumber,
             max_buffered_rows: None,
             max_buffered_bytes: None,
@@ -85,29 +98,4 @@ fn lower_core(
         },
         layout.clone(),
     ))
-}
-
-/// Global Sort and ordinary TopN borrow one ordered-key projection author.
-pub(crate) fn lower_sort_keys(
-    order_by: &[novarocks_physical_plan::SortExpr],
-    expressions: &BTreeMap<ExprId, ProgramExprId>,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<Vec<SortExpression>, FragmentCompileError> {
-    let mut keys = Vec::new();
-    reserve_vec(&mut keys, order_by.len(), work)?;
-    for key in order_by {
-        let expr = expressions
-            .get(&key.expr)
-            .copied()
-            .ok_or(FragmentCompileError::Invalid(
-                "missing global sort expression",
-            ));
-        work.step()?;
-        keys.push(SortExpression {
-            expr: expr?,
-            asc: matches!(key.direction, SortDirection::Ascending),
-            nulls_first: matches!(key.null_ordering, NullOrdering::First),
-        });
-    }
-    Ok(keys)
 }

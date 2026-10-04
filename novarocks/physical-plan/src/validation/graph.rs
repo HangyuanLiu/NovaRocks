@@ -24,6 +24,10 @@ use crate::{
     RowMultiplicity, ValueId, ValueOrigin,
 };
 
+#[cfg(test)]
+#[path = "node_graph_tests.rs"]
+mod node_graph_tests;
+
 pub(crate) fn validate_fragment_graph(plan: &PhysicalPlan, errors: &mut ValidationContext) {
     let mut indegree = plan
         .fragments()
@@ -244,29 +248,55 @@ pub(crate) fn import_origin_matches(
     }
 }
 
-pub(crate) fn validate_node_graph(fragment: &Fragment, errors: &mut ValidationContext) {
-    let path = format!("fragments[{}].nodes", fragment.id().get());
+/// One original Kahn author serves structural validation and observed property
+/// consumers. Scratch remains delegated to the admitted caller; this visitor
+/// grants neither allocation requests nor property publication authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NodeGraphEvent {
+    Step,
+    Ready(NodeId),
+}
+
+/// `None` is an explicit caller stop, not successful graph completion. Missing
+/// references keep the original structural author's treatment; its node-owner
+/// validator independently rejects them before frozen property consumption.
+pub(crate) fn visit_node_graph_child_first<E>(
+    fragment: &Fragment,
+    mut observe: impl FnMut(NodeGraphEvent) -> Result<bool, E>,
+) -> Result<Option<usize>, E> {
     let mut remaining_inputs = BTreeMap::new();
     let mut dependents: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
     let mut ready = Vec::new();
     for (id, node) in fragment.nodes() {
-        let inputs = node
-            .inputs
-            .iter()
-            .copied()
-            .filter(|input| fragment.nodes().contains_key(input))
-            .collect::<BTreeSet<_>>();
+        let mut inputs = BTreeSet::new();
+        for input in &node.inputs {
+            if fragment.nodes().contains_key(input) {
+                inputs.insert(*input);
+            }
+            if !observe(NodeGraphEvent::Step)? {
+                return Ok(None);
+            }
+        }
         remaining_inputs.insert(*id, inputs.len());
         if inputs.is_empty() {
             ready.push(*id);
         }
+        if !observe(NodeGraphEvent::Step)? {
+            return Ok(None);
+        }
         for input in inputs {
             dependents.entry(input).or_default().push(*id);
+            if !observe(NodeGraphEvent::Step)? {
+                return Ok(None);
+            }
         }
     }
     let mut processed = 0_usize;
     while let Some(id) = ready.pop() {
         processed += 1;
+        if !observe(NodeGraphEvent::Ready(id))? {
+            return Ok(None);
+        }
         if let Some(users) = dependents.get(&id) {
             for user in users {
                 if let Some(remaining) = remaining_inputs.get_mut(user) {
@@ -275,10 +305,21 @@ pub(crate) fn validate_node_graph(fragment: &Fragment, errors: &mut ValidationCo
                         ready.push(*user);
                     }
                 }
+                if !observe(NodeGraphEvent::Step)? {
+                    return Ok(None);
+                }
             }
         }
     }
-    if processed != fragment.nodes().len() {
+    Ok(Some(processed))
+}
+
+pub(crate) fn validate_node_graph(fragment: &Fragment, errors: &mut ValidationContext) {
+    let path = format!("fragments[{}].nodes", fragment.id().get());
+    let completed =
+        visit_node_graph_child_first(fragment, |_| Ok::<_, std::convert::Infallible>(true))
+            .unwrap_or_else(|never| match never {});
+    if completed != Some(fragment.nodes().len()) {
         errors.push(ValidationError::new(&path, "node graph contains a cycle"));
     }
 
