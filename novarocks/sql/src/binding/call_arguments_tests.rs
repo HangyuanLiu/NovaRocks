@@ -498,3 +498,156 @@ fn logical_capture_count_admission_precedes_iterator_and_wide_lambda_observes_re
         }
     }
 }
+
+#[test]
+fn authored_move_keeps_actual_none_and_original_binding_without_constant_admission() {
+    let args = [column(ty(DataType::Int64, false))];
+    let selected = binding(&args, ty(DataType::Int64, false), 1);
+    let argument = FunctionArgument::Value {
+        value_type: args[0].value_type.clone(),
+        constant: None,
+    };
+    let zero = ConstantPolicy {
+        max_rows: 0,
+        ..policy()
+    };
+    let captured = move_authored_call_arguments_observed(
+        &selected,
+        1,
+        vec![argument],
+        zero,
+        &Control::default(),
+    )
+    .unwrap();
+    assert!(value(&captured.request().arguments[0]).1.is_none());
+    assert!(std::ptr::eq(
+        selected.resolved(),
+        captured.binding().resolved()
+    ));
+    assert_eq!(captured.constant_policy(), zero);
+}
+
+#[test]
+fn authored_move_uses_the_original_bounded_collection_and_control_tails() {
+    let args = [column(ty(DataType::Int64, false))];
+    let selected = binding(&args, ty(DataType::Int64, false), 1);
+    let make = |count| {
+        (0..count)
+            .map(|_| FunctionArgument::Value {
+                value_type: args[0].value_type.clone(),
+                constant: None,
+            })
+            .collect::<Vec<_>>()
+    };
+    for (logical, count, success) in [(1, 1, true), (0, 1, false), (1, 0, false), (1, 2, false)] {
+        let control = Control::default();
+        assert_eq!(
+            move_authored_call_arguments_observed(
+                &selected,
+                logical,
+                make(count),
+                policy(),
+                &control
+            )
+            .is_ok(),
+            success
+        );
+        let baseline = control.trace();
+        assert_eq!(baseline[0], 0);
+        assert!(baseline.last().is_some_and(|units| *units > 0));
+        for stop in 0..baseline.len() {
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let control = Control {
+                    refusal: Some((stop, cause)),
+                    ..Control::default()
+                };
+                assert!(
+                    matches!(move_authored_call_arguments_observed(&selected,logical,make(count),policy(),&control),Err(LogicalCallArgumentCaptureError::Control(actual)) if actual==cause)
+                );
+                assert_eq!(control.trace(), baseline[..=stop]);
+            }
+        }
+    }
+    let wide_args = vec![args[0].clone(); 320];
+    let wide = binding(&wide_args, ty(DataType::Int64, false), 320);
+    let control = Control::default();
+    let captured =
+        move_authored_call_arguments_observed(&wide, 320, make(320), policy(), &control).unwrap();
+    assert_eq!(captured.request().arguments.len(), 320);
+    let trace = control.trace();
+    assert!(
+        trace.iter().copied().map(u64::from).sum::<u64>() >= 640,
+        "actual authored channel checks and moves are observed"
+    );
+    assert!(
+        trace.iter().filter(|units| **units > 0).count() >= 320,
+        "opaque-author boundaries permit short checkpoints on every channel"
+    );
+    let mut over = selected.resolved().clone();
+    over.selected.argument_types = vec![
+        FunctionArgumentType::Value(args[0].value_type.clone());
+        MAX_CALL_EFFECT_ARGUMENTS + 1
+    ]
+    .into();
+    let over = SqlFunctionBinding::new(over, DecimalOverflowPolicy::OutputNull);
+    let control = Control::default();
+    assert!(matches!(
+        move_authored_call_arguments_observed(&over, 1, make(1), policy(), &control),
+        Err(LogicalCallArgumentCaptureError::Control(
+            CompileControlError::ResourceExhausted
+        ))
+    ));
+    assert_eq!(control.trace(), [0]);
+}
+
+#[test]
+fn authored_move_preserves_original_cv_ordinal_field_and_backing_under_zero_admission_policy() {
+    let full_type = ty(DataType::Float32, true);
+    let field = Arc::new(
+        Field::new("authored", DataType::Float32, true)
+            .with_metadata(HashMap::from([("source.field-id".into(), "81".into())])),
+    );
+    let bits = 0x7f80_0077u32;
+    let pool = ConstantPool::try_new(
+        field.clone(),
+        full_type.clone(),
+        Float32Array::from(vec![Some(0.0), Some(f32::from_bits(bits))]).to_data(),
+        policy(),
+        CompilePhase::FunctionSpecialization,
+        &Control::default(),
+    )
+    .unwrap();
+    let original = pool.value(1).unwrap();
+    let args = [column(full_type.clone())];
+    let selected = binding(&args, ty(DataType::Boolean, false), 1);
+    let zero = ConstantPolicy {
+        max_rows: 0,
+        ..policy()
+    };
+    let captured = move_authored_call_arguments_observed(
+        &selected,
+        1,
+        vec![FunctionArgument::Value {
+            value_type: full_type.clone(),
+            constant: Some(original),
+        }],
+        zero,
+        &Control::default(),
+    )
+    .unwrap();
+    let (actual, cv) = value(&captured.request().arguments[0]);
+    let cv = cv.unwrap();
+    assert_eq!(actual, &full_type);
+    assert_eq!(cv.ordinal(), 1);
+    assert!(Arc::ptr_eq(cv.pool().field_ref(), &field));
+    assert!(Arc::ptr_eq(cv.pool().array(), pool.array()));
+    assert_eq!(cv.try_f32_bits().unwrap(), Some(bits));
+    assert!(std::ptr::eq(
+        selected.resolved(),
+        captured.binding().resolved()
+    ));
+}

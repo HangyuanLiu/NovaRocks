@@ -81,6 +81,22 @@ impl SqlAuthoredPhysicalPlan {
         )
     }
 
+    /// Original synthetic conversion request at its actual intermediate call.
+    /// This is distinct from an ordinary typed FunctionCall producer.
+    pub(crate) fn checked_conversion_source_observed<'a>(
+        &'a self,
+        fragment: &'a Fragment,
+        source: &'a novarocks_physical_plan::ExprNode,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<CheckedExpressionLogicalSourceEntry<'a>, SqlSourceJournalError> {
+        self.checked_expression_source_observed(
+            fragment,
+            source,
+            SqlExpressionCallKind::ValueConversion,
+            work,
+        )
+    }
+
     /// Window positional arguments followed by function ORDER BY channels.
     /// Partition/order/frame expressions have separate static owners.
     pub(crate) fn checked_window_source_observed<'a>(
@@ -311,7 +327,7 @@ pub(super) fn validate_expression_source_entry_observed(
     let (args, order) = match (&source.kind, entry.kind) {
         (
             novarocks_physical_plan::ExprKind::FunctionCall { args, .. },
-            SqlExpressionCallKind::Scalar,
+            SqlExpressionCallKind::Scalar | SqlExpressionCallKind::ValueConversion,
         ) => (args.as_ref(), &[][..]),
         (
             novarocks_physical_plan::ExprKind::WindowCall {
@@ -497,6 +513,7 @@ pub(super) struct LoweredAggregateSourceEntry {
 pub(super) enum SqlExpressionCallKind {
     Scalar,
     Window,
+    ValueConversion,
 }
 #[derive(Debug)]
 pub(super) struct LoweredTableSourceEntry {
@@ -513,8 +530,8 @@ pub(super) struct LoweredExpressionSourceEntry {
 }
 #[derive(Debug)]
 pub(super) struct SqlLogicalSourceJournal {
-    // Actual ordinary and Window expression emissions plus Table producers.
-    // Synthetic conversion/VARIANT calls remain distinct open source gates.
+    // Actual ordinary, Window and original conversion emissions plus Table.
+    // Derived VARIANT calls remain a separate open source gate.
     pub(super) expression_entries: BTreeMap<(FragmentId, ExprId), LoweredExpressionSourceEntry>,
     pub(super) table_entries:
         BTreeMap<(FragmentId, novarocks_physical_plan::NodeId), LoweredTableSourceEntry>,

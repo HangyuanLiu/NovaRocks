@@ -83,7 +83,8 @@ use crate::analysis::cte::CteId;
 use crate::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr, UnOp};
 use crate::binding::{
     AggregateRequestCaptureError, CapturedLogicalCallArguments, LogicalCallArgumentCaptureError,
-    capture_aggregate_logical_request, capture_logical_call_arguments,
+    SqlFunctionBinding, capture_aggregate_logical_request, capture_logical_call_arguments,
+    move_authored_call_arguments_observed,
 };
 use crate::column_id::ColumnId;
 use crate::compiler::{
@@ -8255,9 +8256,10 @@ impl<'a> ContractLoweringVisitor<'a> {
             .get(emitted)
             .ok_or(ContractLoweringError::IdentitySpaceExhausted("expression"))?;
         let (args, order) = match (&source.kind, kind) {
-            (ContractExprKind::FunctionCall { args, .. }, SqlExpressionCallKind::Scalar) => {
-                (args.as_ref(), &[][..])
-            }
+            (
+                ContractExprKind::FunctionCall { args, .. },
+                SqlExpressionCallKind::Scalar | SqlExpressionCallKind::ValueConversion,
+            ) => (args.as_ref(), &[][..]),
             (
                 ContractExprKind::WindowCall {
                     args,
@@ -8465,6 +8467,21 @@ impl<'a> ContractLoweringVisitor<'a> {
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
     ) -> Result<ExprId, ContractLoweringError> {
+        let result = self.convert_expression_to_inner(owner, expression, target, policy);
+        if matches!(&result, Err(ContractLoweringError::Control(_))) {
+            return result;
+        }
+        self.work.flush()?;
+        result
+    }
+
+    fn convert_expression_to_inner(
+        &mut self,
+        owner: NodeId,
+        expression: ExprId,
+        target: &ValueType,
+        policy: novarocks_type_contract::DecimalOverflowPolicy,
+    ) -> Result<ExprId, ContractLoweringError> {
         let source = self.expression_value_type(expression)?;
         if source == *target {
             return Ok(expression);
@@ -8539,22 +8556,55 @@ impl<'a> ContractLoweringVisitor<'a> {
                         .into(),
                 });
             }
+            self.work.flush()?;
+            let binding = SqlFunctionBinding::new(binding, policy);
+            self.work.step()?;
+            self.work.flush()?;
+            let mut arguments = Vec::new();
+            arguments
+                .try_reserve_exact(1)
+                .map_err(|_| CompileControlError::ResourceExhausted)?;
+            self.work.step()?;
+            arguments.push(argument);
+            self.work.step()?;
+            self.work.flush()?;
+            let captured = move_authored_call_arguments_observed(
+                &binding,
+                1,
+                arguments,
+                self.constant_policy,
+                self.control,
+            )?;
+            self.work.flush()?;
+            let resolved = binding.resolved();
+            let novarocks_functions::FunctionResultType::Scalar(result) =
+                &resolved.selected.result_type
+            else {
+                unreachable!("original conversion result was checked before capture")
+            };
             let kind = ContractExprKind::FunctionCall {
                 function: BoundFunction {
                     semantic_parameters: Box::default(),
-                    function_id: binding.function_id.clone(),
-                    overload: binding.selected.overload.clone(),
-                    kind: binding.kind,
-                    argument_types: binding.selected.argument_types.clone(),
+                    function_id: resolved.function_id.clone(),
+                    overload: resolved.selected.overload.clone(),
+                    kind: resolved.kind,
+                    argument_types: resolved.selected.argument_types.clone(),
                     result_type: result.clone(),
-                    volatility: binding.semantics.volatility,
-                    argument_evaluation: binding.semantics.argument_evaluation,
-                    failure_behavior: binding.semantics.failure_behavior,
-                    intrinsic_row_error: binding.semantics.intrinsic_row_error,
+                    volatility: resolved.semantics.volatility,
+                    argument_evaluation: resolved.semantics.argument_evaluation,
+                    failure_behavior: resolved.semantics.failure_behavior,
+                    intrinsic_row_error: resolved.semantics.intrinsic_row_error,
                 },
                 args: Box::from([expression]),
             };
-            self.add_scoped_expression(owner, result.clone(), kind)?
+            let emitted = self.add_scoped_expression(owner, result.clone(), kind)?;
+            self.record_expression_source(
+                owner,
+                emitted,
+                captured,
+                SqlExpressionCallKind::ValueConversion,
+            )?;
+            emitted
         } else {
             expression
         };
@@ -11331,6 +11381,10 @@ mod lowered_scalar_source_tests;
 #[cfg(test)]
 #[path = "lowered_window_table_source_tests.rs"]
 mod lowered_window_table_source_tests;
+
+#[cfg(test)]
+#[path = "lowered_conversion_source_tests.rs"]
+mod lowered_conversion_source_tests;
 
 #[cfg(test)]
 mod tests {

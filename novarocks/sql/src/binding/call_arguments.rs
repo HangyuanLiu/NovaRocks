@@ -113,6 +113,51 @@ pub(crate) fn capture_logical_call_arguments<'a>(
     constant_policy: ConstantPolicy,
     control: &dyn PureCompileControl,
 ) -> Result<CapturedLogicalCallArguments, LogicalCallArgumentCaptureError> {
+    capture_call_arguments_with(
+        binding,
+        logical_argument_count,
+        ordered,
+        constant_policy,
+        control,
+        |expression, control| {
+            crate::analysis::function_argument(expression, constant_policy, control)
+                .map_err(LogicalCallArgumentCaptureError::from)
+        },
+    )
+}
+
+/// Move the actual request already authored by a synthetic SQL producer.
+/// This does not infer constant presence or certify provenance. In particular,
+/// a conversion resolver's original None remains None for a physical Constant.
+/// Caller admission includes both the supplied and collected owned buffers.
+pub(crate) fn move_authored_call_arguments_observed(
+    binding: &SqlFunctionBinding,
+    logical_argument_count: usize,
+    arguments: Vec<FunctionArgument>,
+    constant_policy: ConstantPolicy,
+    control: &dyn PureCompileControl,
+) -> Result<CapturedLogicalCallArguments, LogicalCallArgumentCaptureError> {
+    capture_call_arguments_with(
+        binding,
+        logical_argument_count,
+        arguments,
+        constant_policy,
+        control,
+        |argument, _| Ok(argument),
+    )
+}
+
+fn capture_call_arguments_with<I: IntoIterator>(
+    binding: &SqlFunctionBinding,
+    logical_argument_count: usize,
+    ordered: I,
+    constant_policy: ConstantPolicy,
+    control: &dyn PureCompileControl,
+    mut author: impl FnMut(
+        I::Item,
+        &dyn PureCompileControl,
+    ) -> Result<FunctionArgument, LogicalCallArgumentCaptureError>,
+) -> Result<CapturedLogicalCallArguments, LogicalCallArgumentCaptureError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
     let result = (|| {
         let selected_count = binding.resolved().selected.argument_types.len();
@@ -145,9 +190,7 @@ pub(crate) fn capture_logical_call_arguments<'a>(
                 ));
             }
             work.flush()?;
-            let argument =
-                crate::analysis::function_argument(expression, constant_policy, work.control())
-                    .map_err(LogicalCallArgumentCaptureError::from);
+            let argument = author(expression, work.control());
             if let Err(LogicalCallArgumentCaptureError::Control(cause)) = &argument {
                 return Err(LogicalCallArgumentCaptureError::Control(*cause));
             }

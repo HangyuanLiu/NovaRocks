@@ -26,6 +26,7 @@
 mod call_arguments;
 pub(crate) use call_arguments::{
     CapturedLogicalCallArguments, LogicalCallArgumentCaptureError, capture_logical_call_arguments,
+    move_authored_call_arguments_observed,
 };
 
 mod aggregate_request;
