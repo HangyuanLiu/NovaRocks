@@ -21,6 +21,7 @@ use std::fmt;
 
 use novarocks_execution_contract::{
     DomainProgression, OperationOutcome, TaskDescriptor, TaskDomainReceipt, TaskDomainUpdate,
+    TaskFailureCategory,
 };
 
 use crate::{
@@ -34,13 +35,19 @@ use crate::{
 pub struct DomainExecutionRejection {
     outcome: OperationOutcome,
     detail: String,
+    category: TaskFailureCategory,
 }
 
 impl DomainExecutionRejection {
-    fn new(outcome: OperationOutcome, detail: impl Into<String>) -> Self {
+    fn new(
+        outcome: OperationOutcome,
+        category: TaskFailureCategory,
+        detail: impl Into<String>,
+    ) -> Self {
         Self {
             outcome,
             detail: detail.into(),
+            category,
         }
     }
 
@@ -50,6 +57,10 @@ impl DomainExecutionRejection {
 
     pub fn detail(&self) -> &str {
         &self.detail
+    }
+
+    pub const fn category(&self) -> TaskFailureCategory {
+        self.category
     }
 }
 
@@ -61,7 +72,11 @@ impl fmt::Display for DomainExecutionRejection {
 
 impl From<DomainPolicyRejection> for DomainExecutionRejection {
     fn from(rejection: DomainPolicyRejection) -> Self {
-        Self::new(OperationOutcome::DomainConflict, rejection.detail())
+        Self::new(
+            OperationOutcome::DomainConflict,
+            TaskFailureCategory::Protocol,
+            rejection.detail(),
+        )
     }
 }
 
@@ -130,8 +145,6 @@ pub fn apply_planned_task_domain_updates(
 }
 
 fn rejection_from_host(rejection: HostRejection) -> DomainExecutionRejection {
-    use novarocks_execution_contract::TaskFailureCategory;
-
     let outcome = match rejection.category() {
         TaskFailureCategory::ResourceExhausted => OperationOutcome::ResourceExhausted,
         TaskFailureCategory::Protocol
@@ -139,5 +152,5 @@ fn rejection_from_host(rejection: HostRejection) -> DomainExecutionRejection {
         | TaskFailureCategory::Execution
         | TaskFailureCategory::Internal => OperationOutcome::InvalidStateOrRequest,
     };
-    DomainExecutionRejection::new(outcome, rejection.detail().as_str())
+    DomainExecutionRejection::new(outcome, rejection.category(), rejection.detail().as_str())
 }
