@@ -138,6 +138,32 @@ pub struct PureImplementationDeclaration {
     pub abi: PureKernelAbi,
 }
 
+/// Borrowed base metadata from one actually installed pure overload.
+/// This can author invocation control topology, but does not validate a full
+/// selected signature, refine effects/environment or authorize execution.
+/// Fresh selected preparation against this same catalog remains mandatory.
+pub struct PureOverloadDeclaration<'a> {
+    attachment: &'a PureFunctionAttachment,
+    implementation_index: usize,
+    effects: &'a FunctionEffectDeclaration,
+}
+impl PureOverloadDeclaration<'_> {
+    pub fn implementation(&self) -> &PureImplementationDeclaration {
+        &self.attachment.implementations[self.implementation_index]
+    }
+    pub const fn effects(&self) -> &FunctionEffectDeclaration {
+        self.effects
+    }
+}
+impl fmt::Debug for PureOverloadDeclaration<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PureOverloadDeclaration")
+            .field("implementation", self.implementation())
+            .field("effects", self.effects())
+            .finish()
+    }
+}
+
 /// The same Arc supplies metadata, resolution, effect refinement and typed
 /// preparation. Registration never accepts independently supplied operations.
 /// The owner exposes immutable declarations; registration freezes one backing
@@ -1110,6 +1136,36 @@ impl PureEngineFunctionCatalog {
 }
 
 impl EngineFunctionCatalog {
+    /// Look up one registered base by exact identities without resolving a
+    /// SQL name or constructing a selected signature. A metadata-only entry
+    /// has no capability here. This loan uses the same attachment and effect
+    /// declaration consulted by actual selected preparation below.
+    pub fn pure_overload_declaration_observed<'a>(
+        &'a self,
+        function_id: &FunctionId,
+        kind: FunctionKind,
+        overload: &FunctionOverloadId,
+        control: &dyn PureCompileControl,
+    ) -> Result<PureOverloadDeclaration<'a>, FunctionSpecializationFailure> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        let result = (|| {
+            let binding = lookup_selected_binding(self, function_id, &mut work)?;
+            let exact_kind = binding.declaration.kind() == kind;
+            work.step()?;
+            if !exact_kind {
+                return Err(FunctionSpecializationFailure::InvalidInput(
+                    "pure preparation has a different exact kind or selected owner",
+                ));
+            }
+            lookup_installed_overload(binding, overload, &mut work)
+        })();
+        if matches!(&result, Err(FunctionSpecializationFailure::Control(_))) {
+            return result;
+        }
+        work.finish()?;
+        result
+    }
+
     /// Prepare one exact selected implementation from this catalogue's
     /// original installed attachment. This grants no whole-catalogue seal and
     /// never resolves a SQL name or manufactures missing implementation facts.
@@ -1124,6 +1180,52 @@ impl EngineFunctionCatalog {
     }
 }
 
+fn lookup_selected_binding<'a>(
+    catalog: &'a EngineFunctionCatalog,
+    function_id: &FunctionId,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<&'a FunctionBindingDefinition, FunctionSpecializationFailure> {
+    let definition = catalog.definition_by_id(function_id);
+    work.step()?;
+    let definition = definition.ok_or(FunctionSpecializationFailure::Binding(
+        FunctionBindingError::UnknownFunction,
+    ))?;
+    let binding = definition.binding.as_ref();
+    work.step()?;
+    binding.ok_or(FunctionSpecializationFailure::Binding(
+        FunctionBindingError::MissingBindingDeclaration,
+    ))
+}
+
+fn lookup_installed_overload<'a>(
+    binding: &'a FunctionBindingDefinition,
+    overload: &FunctionOverloadId,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PureOverloadDeclaration<'a>, FunctionSpecializationFailure> {
+    let attachment = binding.pure.as_ref();
+    work.step()?;
+    let attachment = attachment.ok_or(FunctionSpecializationFailure::InvalidInput(
+        "selected function has no installed pure implementation",
+    ))?;
+    let effects = binding.declaration.effect_declaration(overload);
+    work.step()?;
+    let effects = effects?;
+    let index = attachment
+        .implementations
+        .binary_search_by(|record| record.overload.cmp(overload));
+    work.step()?;
+    let implementation_index = index.map_err(|_| {
+        FunctionSpecializationFailure::Binding(FunctionBindingError::UnknownOverload(
+            overload.clone(),
+        ))
+    })?;
+    Ok(PureOverloadDeclaration {
+        attachment,
+        implementation_index,
+        effects,
+    })
+}
+
 fn prepare_selected(
     catalog: &EngineFunctionCatalog,
     input: CallEffectInput<'_>,
@@ -1134,16 +1236,7 @@ fn prepare_selected(
 ) -> Result<PureCallSpecialization, FunctionSpecializationFailure> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
     let result = (|| {
-        let definition = catalog.definition_by_id(input.function_id);
-        work.step()?;
-        let definition = definition.ok_or(FunctionSpecializationFailure::Binding(
-            FunctionBindingError::UnknownFunction,
-        ))?;
-        let binding = definition.binding.as_ref();
-        work.step()?;
-        let binding = binding.ok_or(FunctionSpecializationFailure::Binding(
-            FunctionBindingError::MissingBindingDeclaration,
-        ))?;
+        let binding = lookup_selected_binding(catalog, input.function_id, &mut work)?;
         let exact_owner = binding.declaration.kind() == input.kind
             && std::ptr::eq(input.selected, selected.as_ref());
         work.step()?;
@@ -1163,23 +1256,9 @@ fn prepare_selected(
             control,
         )?;
         work.flush()?;
-        let attachment = binding.pure.as_ref();
-        work.step()?;
-        let attachment = attachment.ok_or(FunctionSpecializationFailure::InvalidInput(
-            "selected function has no installed pure implementation",
-        ))?;
-        let declaration = binding.declaration.effect_declaration(&selected.overload);
-        work.step()?;
-        declaration?;
-        let index = attachment
-            .implementations
-            .binary_search_by(|record| record.overload.cmp(&selected.overload));
-        work.step()?;
-        let index = index.map_err(|_| {
-            FunctionSpecializationFailure::Binding(FunctionBindingError::UnknownOverload(
-                selected.overload.clone(),
-            ))
-        })?;
+        let declaration = lookup_installed_overload(binding, &selected.overload, &mut work)?;
+        let attachment = declaration.attachment;
+        let index = declaration.implementation_index;
         let accepts = attachment.implementations[index]
             .abi
             .accepts_preparation(&options);
@@ -1247,3 +1326,7 @@ mod typed_tests;
 #[cfg(test)]
 #[path = "pure_catalogue/selected_fresh_tests.rs"]
 mod selected_fresh_tests;
+
+#[cfg(test)]
+#[path = "pure_overload_declaration_tests.rs"]
+mod pure_overload_declaration_tests;

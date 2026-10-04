@@ -105,6 +105,25 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         Arc::new(self.clone())
     }
 
+    fn pure_overload_declaration_observed<'a>(
+        &'a self,
+        function_id: &novarocks_functions::FunctionId,
+        kind: novarocks_functions::FunctionKind,
+        overload: &novarocks_functions::FunctionOverloadId,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::PureOverloadDeclaration<'a>,
+        novarocks_functions::FunctionSpecializationFailure,
+    > {
+        EngineFunctionCatalog::pure_overload_declaration_observed(
+            self,
+            function_id,
+            kind,
+            overload,
+            control,
+        )
+    }
+
     fn prepare_fresh_selected(
         &self,
         input: novarocks_functions::CallEffectInput<'_>,
@@ -773,3 +792,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod overload_declaration_tests;
