@@ -59,7 +59,8 @@ use novarocks_execution::runtime::fragment::io::{
 };
 use novarocks_execution::runtime::fragment::{
     DormantFragmentHandle, ExecutionFailureCause, FragmentCancelReason, FragmentExecutionError,
-    FragmentOutcome, FragmentTerminalFact, RunningFragmentHandle, prepare_fragment,
+    FragmentLaunchError, FragmentOutcome, FragmentTerminalFact, RunningFragmentHandle,
+    prepare_fragment,
 };
 use novarocks_execution::runtime::operator_statistics::project_operator_statistics;
 use novarocks_execution::runtime::profile::{Profiler, RuntimeProfileTree, fragment_root_profiler};
@@ -863,9 +864,8 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         // This is the receiver install. It registers every inbound exchange
         // receiver and builds the pipeline in one step, and its rollback is
         // dropping the handle it returns.
-        let dormant = prepare_fragment(submission, context).map_err(|error| {
-            resource_exhausted(format!("task {identity} could not be prepared: {error}"))
-        })?;
+        let dormant = prepare_fragment(submission, context)
+            .map_err(|error| preparation_failure_to_host(identity, &error))?;
 
         crate::task_execution_observation::emit_prepared_task_dop(
             identity,
@@ -1558,8 +1558,31 @@ fn report_terminal(
 /// Classify the original failure payload at the native reporting boundary.
 /// Pipeline text is opaque; matching a diagnostic cannot grant a category.
 fn execution_failure_to_task(error: &FragmentExecutionError) -> TaskFailure {
+    let category = failure_cause_category(error.cause().cause(), TaskFailureCategory::Execution);
+    TaskFailure::new(category, SafeDetail::truncating(&error.to_string()))
+}
+
+/// Preserve typed preparation causes. Opaque legacy launch sources retain
+/// their original category until their own authors supply a typed failure.
+fn preparation_failure_to_host(
+    identity: TaskIdentity,
+    error: &FragmentLaunchError,
+) -> HostRejection {
+    HostRejection::new(
+        failure_cause_category(
+            error.cause().cause(),
+            TaskFailureCategory::ResourceExhausted,
+        ),
+        format!("task {identity} could not be prepared: {error}"),
+    )
+}
+
+fn failure_cause_category(
+    cause: &ExecutionFailureCause,
+    opaque_category: TaskFailureCategory,
+) -> TaskFailureCategory {
     use novarocks_functions::KernelFailure;
-    let category = match error.cause().cause() {
+    match cause {
         ExecutionFailureCause::Kernel(KernelFailure::ResourceExhausted) => {
             TaskFailureCategory::ResourceExhausted
         }
@@ -1573,10 +1596,9 @@ fn execution_failure_to_task(error: &FragmentExecutionError) -> TaskFailure {
             | KernelFailure::DeadlineExceeded
             | KernelFailure::Operational(_),
         )
-        | ExecutionFailureCause::RequiredRow(_)
-        | ExecutionFailureCause::Pipeline(_) => TaskFailureCategory::Execution,
-    };
-    TaskFailure::new(category, SafeDetail::truncating(&error.to_string()))
+        | ExecutionFailureCause::RequiredRow(_) => TaskFailureCategory::Execution,
+        ExecutionFailureCause::Pipeline(_) => opaque_category,
+    }
 }
 
 /// Publishes FAILING before FAILED.
@@ -2844,6 +2866,76 @@ mod tests {
     }
 
     #[test]
+    fn typed_failure_native_preparation_opaque_result_refusal_keeps_category_and_rolls_back() {
+        use novarocks_execution::runtime::fragment::io::{
+            FragmentIoError, FragmentIoErrorKind, FragmentIoOperation, FragmentResultSession,
+            FragmentResultWriter, ResultWriteSpec,
+        };
+        struct RefusingWriter {
+            opens: AtomicUsize,
+            message: &'static str,
+        }
+        impl FragmentResultWriter for RefusingWriter {
+            fn open(
+                &self,
+                _spec: ResultWriteSpec,
+            ) -> Result<Arc<dyn FragmentResultSession>, FragmentIoError> {
+                self.opens.fetch_add(1, Ordering::SeqCst);
+                Err(FragmentIoError::new(
+                    FragmentIoOperation::ResultOpen,
+                    FragmentIoErrorKind::Internal,
+                    self.message,
+                ))
+            }
+        }
+        for (index, message) in [
+            "Internal: same launch text",
+            "Cancelled",
+            "ResourceExhausted",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (mut host, manager) = isolated_resource_host();
+            let writer = Arc::new(RefusingWriter {
+                opens: AtomicUsize::new(0),
+                message,
+            });
+            host.result_writer = writer.clone();
+            let task = identity(80_030 + index as i64, 1, 1);
+            let descriptor = consistent_descriptor(task, UniqueId::new(80_030 + index as i64, 1));
+            let body = Body::with_sink(
+                1,
+                plan::DataSink {
+                    kind: Some(plan::data_sink::Kind::Result(true)),
+                },
+                Vec::new(),
+            );
+            let refusal = host
+                .install_receiver(&descriptor, body.input(&descriptor))
+                .unwrap_err();
+            assert_eq!(writer.opens.load(Ordering::SeqCst), 1);
+            assert_eq!(refusal.category(), TaskFailureCategory::ResourceExhausted);
+            assert!(refusal.detail().as_str().contains(message));
+            assert!(host.task_runtime(task).is_none());
+            assert!(host.split_queues.is_empty());
+            assert!(host.capabilities.is_empty());
+            let released = manager.native_execution_resource_snapshot();
+            assert_eq!(released.active_contexts, 0);
+            assert_eq!(released.active_fragments, 0);
+            // The actual refusal releases the registration and split attempt,
+            // so a later legal body can prepare under the same exact identity.
+            install(&host, &descriptor).unwrap();
+            assert!(host.task_runtime(task).is_some());
+            host.remove_receiver(&descriptor);
+            assert!(host.split_queues.is_empty());
+            let released = manager.native_execution_resource_snapshot();
+            assert_eq!(released.active_contexts, 0);
+            assert_eq!(released.active_fragments, 0);
+        }
+    }
+
+    #[test]
     fn preparation_registration_rolls_back_when_a_prepared_receiver_is_removed() {
         let (host, manager) = isolated_resource_host();
         let descriptor = consistent_descriptor(identity(521, 1, 1), UniqueId::new(521, 522));
@@ -3454,6 +3546,115 @@ mod tests {
             outcome,
             None,
         )
+    }
+
+    #[test]
+    fn typed_failure_native_preparation_preserves_kernel_category_without_stage_or_text_guessing() {
+        use novarocks_execution::runtime::fragment::{
+            FragmentLaunchError, FragmentLaunchErrorKind, FragmentLaunchStage,
+        };
+        use novarocks_functions::{KernelDiagnostic, KernelFailure};
+        let diagnostic = || KernelDiagnostic::new("ResourceExhausted: identical diagnostic text");
+        for (cause, expected) in [
+            (
+                KernelFailure::ResourceExhausted,
+                TaskFailureCategory::ResourceExhausted,
+            ),
+            (
+                KernelFailure::InvalidProgram(diagnostic()),
+                TaskFailureCategory::Internal,
+            ),
+            (
+                KernelFailure::Internal(diagnostic()),
+                TaskFailureCategory::Internal,
+            ),
+            (KernelFailure::InstanceFailed, TaskFailureCategory::Internal),
+            (KernelFailure::Cancelled, TaskFailureCategory::Execution),
+            (
+                KernelFailure::DeadlineExceeded,
+                TaskFailureCategory::Execution,
+            ),
+            (
+                KernelFailure::Operational(diagnostic()),
+                TaskFailureCategory::Execution,
+            ),
+        ] {
+            for (stage, kind) in [
+                (
+                    FragmentLaunchStage::BuildPipelines,
+                    FragmentLaunchErrorKind::PipelineBuild,
+                ),
+                (
+                    FragmentLaunchStage::BuildRuntimeState,
+                    FragmentLaunchErrorKind::ResourceUnavailable,
+                ),
+            ] {
+                let error = FragmentLaunchError::from_failure(stage, kind, cause.clone().into())
+                    .with_cleanup_diagnostics(vec!["ResourceExhausted: cleanup failed".to_owned()]);
+                let task = identity(80_024, 1, 1);
+                let refusal = super::preparation_failure_to_host(task, &error);
+                assert_eq!(refusal.category(), expected);
+                assert_eq!(
+                    refusal.detail().as_str(),
+                    format!("task {task} could not be prepared: {error}")
+                );
+                assert_eq!(
+                    error.cause().cause(),
+                    &super::ExecutionFailureCause::Kernel(cause.clone())
+                );
+            }
+        }
+        // Legacy launch authors have no typed cause yet. Diagnostic text,
+        // launch stage and cleanup cannot reclassify their original refusal.
+        for text in [
+            "Internal: identical diagnostic text",
+            "Cancelled",
+            "required expression row failed",
+        ] {
+            let error = FragmentLaunchError::new(
+                FragmentLaunchStage::BuildPipelines,
+                FragmentLaunchErrorKind::PipelineBuild,
+                text,
+            );
+            assert_eq!(
+                super::preparation_failure_to_host(identity(80_025, 1, 1), &error).category(),
+                TaskFailureCategory::ResourceExhausted,
+            );
+        }
+    }
+
+    #[test]
+    fn typed_failure_native_preparation_preserves_required_row_address_in_final_detail() {
+        use novarocks_execution::runtime::fragment::{
+            FragmentLaunchError, FragmentLaunchErrorKind, FragmentLaunchStage,
+            RequiredExpressionRowError,
+        };
+        use novarocks_functions::{RowDataError, Selection};
+        use novarocks_local_program::{
+            ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
+        };
+        let required = RequiredExpressionRowError::try_new(
+            ProgramExpressionRootSite::Node {
+                node: ProgramNodeId::new(41),
+                role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
+            },
+            Selection::try_sparse(101, &[0, 50, 100]).unwrap(),
+            RowDataError::new(1, "required root cannot publish a placeholder NULL"),
+        )
+        .unwrap();
+        let error = FragmentLaunchError::from_failure(
+            FragmentLaunchStage::BuildPipelines,
+            FragmentLaunchErrorKind::PipelineBuild,
+            required.clone().into(),
+        );
+        let refusal = super::preparation_failure_to_host(identity(80_026, 1, 1), &error);
+        assert_eq!(refusal.category(), TaskFailureCategory::Execution);
+        assert_eq!(
+            error.cause().cause(),
+            &super::ExecutionFailureCause::RequiredRow(required)
+        );
+        assert!(refusal.detail().as_str().contains("selected ordinal 1"));
+        assert!(refusal.detail().as_str().contains("batch row 50"));
     }
 
     #[test]
