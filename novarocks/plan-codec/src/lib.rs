@@ -51,6 +51,7 @@ pub mod physical_repeat_v2;
 pub mod physical_semantics_v2;
 mod physical_type;
 pub mod physical_type_v2;
+pub mod physical_unpivot_v2;
 mod physical_v1;
 pub mod physical_value_origin_v2;
 pub mod physical_value_v2;

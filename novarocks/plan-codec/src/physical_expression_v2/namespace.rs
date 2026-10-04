@@ -321,7 +321,7 @@ pub(super) fn charge(
         work,
     )
 }
-pub(super) fn tree_lookup_work(entries: usize) -> Result<usize, Error> {
+pub(crate) fn tree_lookup_work(entries: usize) -> Result<usize, Error> {
     // Rust 1.92 BTree nodes have at most eleven keys. Even binary fanout
     // gives at most bit-length+1 visited levels; sixteen units per level
     // include key, edge and node-header work without another lookup index.

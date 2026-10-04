@@ -20,6 +20,7 @@
 
 use crate::{
     allocation_exit_v2::reserve_exit,
+    physical_expression_v2::ExpressionCodecError,
     physical_properties_v2::{
         self as properties, PhysicalPropertyCodecError, PhysicalPropertyProjectionFacts,
         PhysicalPropertyProjectionLimits,
@@ -57,6 +58,8 @@ pub enum NodeCodecError {
     Control(CompileControlError),
     Properties(PhysicalPropertyCodecError),
     Value(ValueCodecError),
+    Expression(ExpressionCodecError),
+    Constant(p::ConstantReferenceError),
     InvalidShape(&'static str),
 }
 impl From<CompileControlError> for NodeCodecError {
@@ -80,12 +83,37 @@ impl From<ValueCodecError> for NodeCodecError {
         }
     }
 }
+impl From<ExpressionCodecError> for NodeCodecError {
+    fn from(error: ExpressionCodecError) -> Self {
+        match error {
+            ExpressionCodecError::Control(cause) => Self::Control(cause),
+            error => Self::Expression(error),
+        }
+    }
+}
+impl From<p::ConstantReferenceError> for NodeCodecError {
+    fn from(error: p::ConstantReferenceError) -> Self {
+        use novarocks_constant_contract::ConstantError;
+        match error {
+            p::ConstantReferenceError::Control(cause)
+            | p::ConstantReferenceError::Constant(ConstantError::Control(cause)) => {
+                Self::Control(cause)
+            }
+            p::ConstantReferenceError::Constant(ConstantError::Limit(_)) => {
+                Self::Control(CompileControlError::ResourceExhausted)
+            }
+            error => Self::Constant(error),
+        }
+    }
+}
 impl fmt::Display for NodeCodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Control(e) => e.fmt(f),
             Self::Properties(e) => e.fmt(f),
             Self::Value(e) => e.fmt(f),
+            Self::Expression(e) => e.fmt(f),
+            Self::Constant(e) => e.fmt(f),
             Self::InvalidShape(s) => f.write_str(s),
         }
     }
@@ -96,6 +124,8 @@ impl std::error::Error for NodeCodecError {
             Self::Control(e) => Some(e),
             Self::Properties(e) => Some(e),
             Self::Value(e) => Some(e),
+            Self::Expression(e) => Some(e),
+            Self::Constant(e) => Some(e),
             Self::InvalidShape(_) => None,
         }
     }
@@ -486,3 +516,6 @@ pub(crate) fn decode_header(
     };
     Ok((inputs, required, output_properties, output))
 }
+
+#[cfg(test)]
+mod error_tests;

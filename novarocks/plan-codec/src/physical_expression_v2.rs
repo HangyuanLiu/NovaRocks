@@ -36,6 +36,7 @@ pub use namespace::{
     prepare_expression_definitions,
 };
 
+pub(crate) use namespace::tree_lookup_work as expression_tree_lookup_work;
 pub use read::{DecodedExpressions, ExpressionNamespaceReadFacts, decode_expression_definitions};
 
 #[derive(Debug)]
