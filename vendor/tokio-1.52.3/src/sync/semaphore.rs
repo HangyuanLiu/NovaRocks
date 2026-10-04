@@ -444,6 +444,44 @@ fn bounds() {
 }
 
 impl Semaphore {
+    /// Query one actual standard Arc allocation plus this Semaphore's mutex backing.
+    ///
+    /// Obtain this amount before creating its Arc and prewarming it. Waiter
+    /// futures, external Wakers and shared runtime/parking resources are separate.
+    /// Loom, active unstable tracing and unsupported mutex ABIs are refused.
+    /// This query creates no capacity authority and constructs no Semaphore.
+    #[cfg(feature = "io-util")]
+    pub fn allocation_capacity_bound() -> std::io::Result<usize> {
+        #[cfg(all(tokio_unstable, feature = "tracing"))]
+        {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+        #[cfg(not(all(tokio_unstable, feature = "tracing")))]
+        {
+            let mutex = ll::Semaphore::platform_mutex_allocation_capacity_bound()?;
+            let arc = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
+                .extend(std::alloc::Layout::new::<Self>())
+                .map_err(|_| std::io::ErrorKind::InvalidInput)?
+                .0
+                .pad_to_align()
+                .size();
+            arc.checked_add(mutex)
+                .ok_or_else(|| std::io::ErrorKind::InvalidInput.into())
+        }
+    }
+
+    /// Initialize only the actual private mutex allocation before publication.
+    ///
+    /// The caller retains its original capability and serializes this first
+    /// lock before exposing the final Arc. Permits, closed state and waiters
+    /// remain unchanged. Unsupported allocation configurations are refused.
+    #[cfg(feature = "io-util")]
+    pub fn prewarm_allocation_metadata(&self) -> std::io::Result<()> {
+        Self::allocation_capacity_bound()?;
+        self.ll_sem.prewarm_allocation_metadata();
+        Ok(())
+    }
+
     /// The maximum number of permits which a semaphore can hold. It is `usize::MAX >> 3`.
     ///
     /// Exceeding this limit typically results in a panic.

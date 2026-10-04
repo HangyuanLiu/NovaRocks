@@ -11,7 +11,7 @@ use std::{future::Future, io};
 /// One caller-prepaid logical Channel Worker, independent of physical reconnects.
 /// No worker capability is installed in Endpoint or its connection executor.
 /// Clones share a once-only election and retain the same original capability.
-/// Queue/Semaphore/Handle backing and finite logical admission remain separate.
+/// Queue/readiness backing and finite logical admission remain separate.
 #[derive(Clone, Debug)]
 pub struct OriginalChannelWorker {
     position: OriginalConnectionDriver,
@@ -54,8 +54,14 @@ impl OriginalChannelWorker {
     pub fn response_cell_total_capacity_bound() -> io::Result<usize> {
         ChannelBuffer::response_cell_total_capacity_bound()
     }
+    /// Actual shared Semaphore and error Handle metadata for one logical Worker.
+    /// External error payload, queue, readiness and runtime backing are separate.
+    #[cfg(feature = "original-response-cells")]
+    pub fn common_metadata_capacity_bound() -> io::Result<usize> {
+        ChannelBuffer::common_metadata_capacity_bound()
+    }
     /// Opt into physical response-cell admission on the same original stock.
-    /// Obtain task/metadata and positions * response_cell_total_capacity_bound
+    /// Obtain task/metadata, common metadata and positions * response_cell_total_capacity_bound
     /// before construction. This creates no funding authority or second wallet.
     #[cfg(feature = "original-response-cells")]
     pub fn with_original_response_cells(
@@ -66,8 +72,10 @@ impl OriginalChannelWorker {
         if positions == 0 || positions > tokio::sync::Semaphore::MAX_PERMITS {
             return Err(io::ErrorKind::InvalidInput.into());
         }
+        let common = Self::common_metadata_capacity_bound()?;
         Self::response_cell_total_capacity_bound()?
             .checked_mul(positions)
+            .and_then(|cells| cells.checked_add(common))
             .ok_or(io::ErrorKind::InvalidInput)?;
         Ok(Self {
             position: OriginalConnectionDriver::with_original(task_bound, original)?,

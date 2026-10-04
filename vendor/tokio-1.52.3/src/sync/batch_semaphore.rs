@@ -120,6 +120,47 @@ generate_addr_of_methods! {
 }
 
 impl Semaphore {
+    // Mirror ScheduledIo's effective loom/std mutex selection exactly. This
+    // queries only this mutex's private backing, not shared parking resources.
+    #[cfg(feature = "io-util")]
+    pub(crate) fn platform_mutex_allocation_capacity_bound() -> std::io::Result<usize> {
+        #[cfg(loom)]
+        {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+        #[cfg(all(not(loom), feature = "parking_lot", not(miri)))]
+        {
+            Ok(0)
+        }
+        #[cfg(all(not(loom), not(all(feature = "parking_lot", not(miri)))))]
+        {
+            // Pinned Rust 1.92 pthread Mutex owns one Box<pal::Mutex> on Darwin;
+            // Linux with 32-bit atomics stores its futex state inline.
+            #[cfg(all(target_os = "macos", target_pointer_width = "64"))]
+            {
+                Ok(std::alloc::Layout::new::<(isize, [u8; 56])>().size())
+            }
+            #[cfg(all(target_os = "linux", target_has_atomic = "32"))]
+            {
+                Ok(0)
+            }
+            #[cfg(not(any(
+                all(target_os = "macos", target_pointer_width = "64"),
+                all(target_os = "linux", target_has_atomic = "32")
+            )))]
+            {
+                Err(std::io::ErrorKind::Unsupported.into())
+            }
+        }
+    }
+
+    #[cfg(feature = "io-util")]
+    pub(crate) fn prewarm_allocation_metadata(&self) {
+        // The unpublished constructor owns the sole first-lock path. No permit,
+        // closed state, waiter or Waker is changed by taking this lock.
+        drop(self.waiters.lock());
+    }
+
     /// The maximum number of permits which a semaphore can hold.
     ///
     /// Note that this reserves three bits of flags in the permit counter, but

@@ -216,3 +216,18 @@ Native explicitly enables it; the pre-existing channel feature remains compatibl
 with ordinary Tower consumers and previous standalone reproduction manifests.
 Queue, Semaphore, Handle, external service futures/body/errors, readiness waiters,
 scheduler and the complete connection envelope still require separate receipts.
+
+## Originally owned common Buffer metadata
+
+With original-response-cells enabled, the same caller additionally obtains
+`OriginalChannelWorker::common_metadata_capacity_bound()` before construction.
+This delegates to the actual Buffer Semaphore/Handle geometry, and the constructor
+checks its addition to all response positions before creating worker metadata.
+Native includes it once per logical generation in the original StockCore.
+
+The actual pair prewarms unpublished private mutexes, and the same original Bytes
+enters the final unpinned Worker field as well as Buffer/cells. No Core, JoinHandle,
+cache or executor backlink is added. Original task ownership remains independent:
+the changed actual Worker return type is re-queried at admission and spawn.
+The old worker-only constructor and ordinary None pair retain their existing scope.
+Queue/blocks, readiness, errors, external Wakers and shared runtime remain open.

@@ -83,3 +83,19 @@ channels keep their existing path. Sender/Receiver inline sizes change under
 io-util, so downstream actual task/future layouts must be queried again. This
 cell receipt does not establish original funding for the caller's queue,
 semaphore, external future, error, runtime, or complete Native graph.
+
+## Semaphore private metadata query and prewarm
+
+The io-util APIs `Semaphore::allocation_capacity_bound()` and
+`Semaphore::prewarm_allocation_metadata()` cover the actual std Arc request for
+Self plus batch Waitlist Mutex private backing. This slice changes
+`src/sync/{semaphore,batch_semaphore}.rs`. The platform predicate matches the
+effective loom/std mutex selection used by ScheduledIo: parking_lot is inline
+outside Miri, std Darwin64 has its exact pinned pthread PAL Box, Linux atomic32
+uses inline futex state; unknown std ABIs, Loom and active unstable tracing refuse.
+
+Prewarm locks and drops the actual unpublished waiters mutex without touching
+permits, waiters, closed state or Wakers. The caller obtains original capacity
+before Arc creation and retains it until all strong/Weak aliases physically exit.
+These safe APIs create no owner, funding authority, waiter bound or runtime stock.
+External waiter futures/Wakers and shared parking resources remain separate.

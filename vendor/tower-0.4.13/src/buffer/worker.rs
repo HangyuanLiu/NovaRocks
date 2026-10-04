@@ -12,6 +12,13 @@ use std::{
 use tokio::sync::{mpsc, Semaphore};
 use tower_service::Service;
 
+// pin-project-lite's field grammar does not accept cfg attributes. The disabled
+// feature has no extra backing or inline state; ordinary pairs retain nothing.
+#[cfg(feature = "original-response-cells")]
+type OriginalCommonMetadataOwner = Option<bytes::Bytes>;
+#[cfg(not(feature = "original-response-cells"))]
+type OriginalCommonMetadataOwner = ();
+
 pin_project_lite::pin_project! {
     /// Task that handles processing the buffer. This type should not be used
     /// directly, instead `Buffer` requires an `Executor` that can accept this task.
@@ -32,6 +39,9 @@ pin_project_lite::pin_project! {
         failed: Option<ServiceError>,
         handle: Handle,
         close: Option<Weak<Semaphore>>,
+        // A plain, unpinned final field retains the original through every
+        // preceding field's Drop, including the Semaphore's final Weak exit.
+        original_common_metadata_owner: OriginalCommonMetadataOwner,
     }
 
     impl<T: Service<Request>, Request> PinnedDrop for Worker<T, Request>
@@ -87,9 +97,16 @@ where
             service,
             handle: handle.clone(),
             close: Some(semaphore),
+            original_common_metadata_owner: Default::default(),
         };
 
         (handle, worker)
+    }
+
+    #[cfg(feature = "original-response-cells")]
+    pub(super) fn retain_common_metadata_owner(&mut self, original: bytes::Bytes) {
+        // Called once on the unpublished worker, before original pair returns.
+        self.original_common_metadata_owner = Some(original);
     }
 
     /// Return the next queued Message that hasn't been canceled.
@@ -237,6 +254,45 @@ where
 }
 
 impl Handle {
+    #[cfg(feature = "original-response-cells")]
+    pub(super) fn allocation_capacity_bound() -> std::io::Result<usize> {
+        // Handle uses std::Mutex even when Tokio selects parking_lot. Mirror
+        // the pinned std Arc prefix and this exact payload, not a body model.
+        let arc = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
+            .extend(std::alloc::Layout::new::<Mutex<Option<ServiceError>>>())
+            .map_err(|_| std::io::ErrorKind::InvalidInput)?
+            .0
+            .pad_to_align()
+            .size();
+        #[cfg(all(target_os = "macos", target_pointer_width = "64"))]
+        let mutex = std::alloc::Layout::new::<(isize, [u8; 56])>().size();
+        #[cfg(all(target_os = "linux", target_has_atomic = "32"))]
+        let mutex = 0;
+        #[cfg(not(any(
+            all(target_os = "macos", target_pointer_width = "64"),
+            all(target_os = "linux", target_has_atomic = "32")
+        )))]
+        return Err(std::io::ErrorKind::Unsupported.into());
+        #[cfg(any(
+            all(target_os = "macos", target_pointer_width = "64"),
+            all(target_os = "linux", target_has_atomic = "32")
+        ))]
+        arc.checked_add(mutex)
+            .ok_or_else(|| std::io::ErrorKind::InvalidInput.into())
+    }
+
+    #[cfg(feature = "original-response-cells")]
+    pub(super) fn prewarm_allocation_metadata(&self) -> std::io::Result<()> {
+        // No service error or caller callback is read or changed here.
+        Self::allocation_capacity_bound()?;
+        drop(
+            self.inner
+                .lock()
+                .map_err(|_| std::io::ErrorKind::InvalidData)?,
+        );
+        Ok(())
+    }
+
     pub(crate) fn get_error_on_closed(&self) -> crate::BoxError {
         self.inner
             .lock()

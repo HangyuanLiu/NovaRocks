@@ -120,6 +120,18 @@ where
         (buffer, worker)
     }
 
+    /// Query the actual shared Semaphore and error Handle metadata backing.
+    ///
+    /// This includes their standard Arc allocations and private mutex backing.
+    /// Queues, waiters, external Wakers, service errors and worker tasks are
+    /// separate. The caller obtains this amount before original pair growth.
+    #[cfg(feature = "original-response-cells")]
+    pub fn common_metadata_capacity_bound() -> std::io::Result<usize> {
+        Semaphore::allocation_capacity_bound()?
+            .checked_add(Handle::allocation_capacity_bound()?)
+            .ok_or_else(|| std::io::ErrorKind::InvalidInput.into())
+    }
+
     /// Query the actual typed response-cell Arc allocation without constructing it.
     ///
     /// This excludes the independent owner wrapper, queue, semaphore, service
@@ -166,6 +178,7 @@ where
         T::Error: Send + Sync,
         Request: Send + 'static,
     {
+        let _common = Self::common_metadata_capacity_bound()?;
         let actual = Self::response_cell_allocation_capacity_bound()?;
         let total = Self::response_cell_total_capacity_bound()?;
         if bound == 0
@@ -175,7 +188,12 @@ where
         {
             return Err(std::io::ErrorKind::InvalidInput.into());
         }
-        let (mut buffer, worker) = Self::pair(service, bound);
+        let (mut buffer, mut worker) = Self::pair(service, bound);
+        worker.retain_common_metadata_owner(original.clone());
+        // Prewarm each final, unpublished mutex once while both original
+        // holders retain the same capability. No permits or errors change.
+        buffer.semaphore.as_ref().prewarm_allocation_metadata()?;
+        buffer.handle.prewarm_allocation_metadata()?;
         buffer.original_response_cells = Some(OriginalResponseCells {
             cell_allocation_bound,
             original,

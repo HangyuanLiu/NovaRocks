@@ -83,6 +83,7 @@ struct Dimensions {
     channel_worker_task_bound: usize,
     channel_response_positions: usize,
     channel_response_cell_bound: usize,
+    channel_common_metadata_bound: usize,
     connection_bound: usize,
     stock_bound: usize,
 }
@@ -494,6 +495,8 @@ impl Dimensions {
             channel_response_positions: value(g.transport_tonic_pending_per_connection)?,
             channel_response_cell_bound:
                 tonic::transport::OriginalChannelWorker::response_cell_total_capacity_bound()?,
+            channel_common_metadata_bound:
+                tonic::transport::OriginalChannelWorker::common_metadata_capacity_bound()?,
             connection_bound: 0,
             stock_bound: 0,
         };
@@ -717,6 +720,7 @@ impl Dimensions {
                 dimensions.channel_response_cell_bound,
             )?,
         )?;
+        let worker = add(worker, dimensions.channel_common_metadata_bound)?;
         stock = add(stock, mul(dimensions.channel_worker_positions, worker)?)?;
         if stock > value(g.root_joint_retained_bytes_per_process)? {
             return Err(invalid());
@@ -1449,6 +1453,11 @@ mod tests {
                 d.channel_response_cell_bound
             )
             .unwrap(),
+        );
+        eprintln!(
+            "Original Buffer common metadata: bytes_per_worker={} all_workers_bytes={}",
+            d.channel_common_metadata_bound,
+            mul(d.channel_worker_positions, d.channel_common_metadata_bound).unwrap(),
         );
         eprintln!(
             "Original split client task facts: connection={} pipe={} send={} request_pool_bytes={}",
