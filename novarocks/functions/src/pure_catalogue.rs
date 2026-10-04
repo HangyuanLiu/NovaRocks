@@ -375,6 +375,16 @@ impl<O: PureFunctionMetadataOwner> FunctionBindingResolver for RegisteredOwner<O
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         self.owner.resolve(request, control)
     }
+
+    fn select_at_overload_observed(
+        &self,
+        overload: &FunctionOverloadId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        self.owner
+            .select_at_overload_observed(overload, request, control)
+    }
     fn validate_selected(
         &self,
         selected: &FunctionBindingSelection,

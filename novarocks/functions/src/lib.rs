@@ -49,6 +49,8 @@ pub mod datetime_value;
 mod effect_metadata;
 mod effect_refinement;
 mod evaluation;
+#[cfg(test)]
+mod exact_overload_selection_tests;
 mod higher_order_call;
 mod higher_order_kernel;
 mod kernel_control;

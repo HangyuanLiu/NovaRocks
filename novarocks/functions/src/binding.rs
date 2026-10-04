@@ -440,6 +440,19 @@ pub trait FunctionBindingResolver: Send + Sync {
         control: &dyn PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError>;
 
+    /// Instantiate this exact declared overload through its original owner.
+    /// This authors selection metadata only; it grants no effects, runtime
+    /// occurrence or pure implementation. Unsupported owners refuse explicitly.
+    fn select_at_overload_observed(
+        &self,
+        _overload: &FunctionOverloadId,
+        _request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        let work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        finish_binding_work(Err(FunctionBindingError::MissingBindingDeclaration), work)
+    }
+
     fn validate_selected(
         &self,
         selected: &FunctionBindingSelection,
@@ -818,6 +831,82 @@ impl EngineFunctionCatalog {
                 .definition(name, kind)
                 .ok_or(FunctionBindingError::UnknownFunction)?;
             resolve_definition(definition, request, &mut work)
+        })();
+        finish_binding_work(result, work)
+    }
+
+    /// Author a canonical selection at one exact installed identity/overload.
+    /// The original resolver must implement this capability; there is no user
+    /// name, alternate overload resolution or copied-selection fallback. The
+    /// result still requires real scope/effect/kernel preparation separately.
+    pub fn select_exact_overload_observed(
+        &self,
+        function: &FunctionId,
+        kind: FunctionKind,
+        overload: &FunctionOverloadId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<FunctionBindingSelection>, FunctionBindingError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        let result = (|| {
+            let definition = self.definition_by_id(function);
+            work.step()?;
+            let binding =
+                exact_definition(definition.ok_or(FunctionBindingError::UnknownFunction)?)?;
+            let same_kind = kind == binding.declaration.kind;
+            work.step()?;
+            if !same_kind {
+                return Err(invalid("exact selection kind differs from the declaration"));
+            }
+            validate_request(kind, request, &mut work)?;
+            let mut declared = false;
+            for candidate in binding.declaration.overloads() {
+                let same = &candidate.identity == overload;
+                work.step()?;
+                if same {
+                    declared = true;
+                    break;
+                }
+            }
+            if !declared {
+                return Err(invalid(
+                    "exact selection overload is not declared by this function",
+                ));
+            }
+            work.flush()?;
+            let selected =
+                binding
+                    .resolver
+                    .select_at_overload_observed(overload, request, work.control())?;
+            let same_overload = &selected.overload == overload;
+            work.step()?;
+            if !same_overload {
+                return Err(invalid(
+                    "exact selection owner returned a different overload",
+                ));
+            }
+            if let Some(expected) = request.expected_result_type {
+                let matches = match &selected.result_type {
+                    FunctionResultType::Scalar(actual) => actual
+                        .exactly_equals_observed(expected, || {
+                            work.step().map_err(FunctionBindingError::from)
+                        })?,
+                    FunctionResultType::Relation(_) => {
+                        work.step()?;
+                        false
+                    }
+                };
+                if !matches {
+                    return Err(invalid(
+                        "exact selection result differs from the requested result type",
+                    ));
+                }
+            }
+            validate_selected_definition(binding, &selected, request, &mut work)?;
+            work.flush()?;
+            let selected = Arc::new(selected);
+            work.step()?;
+            Ok(selected)
         })();
         finish_binding_work(result, work)
     }

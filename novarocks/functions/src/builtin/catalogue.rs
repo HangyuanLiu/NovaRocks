@@ -1083,6 +1083,40 @@ fn builtin_fixed_result_domain(function_id: &FunctionId) -> Option<ValueLogicalT
 }
 
 impl BuiltinScalarResolver {
+    /// Instantiate exactly one declared overload through the original scalar
+    /// signature author. Validation and late selection share this same body.
+    fn selection_at_overload_observed(
+        &self,
+        overload: &FunctionOverloadId,
+        request: FunctionBindingRequest<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        request_types_with_constants(request, work)?;
+        let mut index = None;
+        for (ordinal, candidate) in self.overloads.iter().enumerate() {
+            work.step()?;
+            if candidate == overload {
+                index = Some(ordinal);
+                break;
+            }
+        }
+        let index = index.ok_or_else(|| {
+            FunctionBindingError::InvalidBinding(
+                "selected scalar overload is not declared by this function".into(),
+            )
+        })?;
+        let argument_types = binding_control::scalar_types(request, work)?;
+        work.flush()?;
+        let resolved = resolver::resolve_scalar_value_signature_at_overload(
+            &self.canonical_name,
+            index,
+            &argument_types,
+            work.control(),
+        )
+        .map_err(binding_resolution_error)?;
+        self.selection(index, resolved, request, work)
+    }
+
     fn selection(
         &self,
         index: usize,
@@ -1209,6 +1243,17 @@ impl FunctionBindingResolver for BuiltinScalarResolver {
         })
     }
 
+    fn select_at_overload_observed(
+        &self,
+        overload: &FunctionOverloadId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        binding_control::scope(control, |work| {
+            self.selection_at_overload_observed(overload, request, work)
+        })
+    }
+
     fn validate_selected(
         &self,
         selected: &FunctionBindingSelection,
@@ -1216,30 +1261,8 @@ impl FunctionBindingResolver for BuiltinScalarResolver {
         control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         binding_control::scope(control, |work| {
-            request_types_with_constants(request, work)?;
-            let mut index = None;
-            for (ordinal, overload) in self.overloads.iter().enumerate() {
-                work.step()?;
-                if overload == &selected.overload {
-                    index = Some(ordinal);
-                    break;
-                }
-            }
-            let index = index.ok_or_else(|| {
-                FunctionBindingError::InvalidBinding(
-                    "selected scalar overload is not declared by this function".into(),
-                )
-            })?;
-            let argument_types = binding_control::scalar_types(request, work)?;
-            work.flush()?;
-            let resolved = resolver::resolve_scalar_value_signature_at_overload(
-                &self.canonical_name,
-                index,
-                &argument_types,
-                work.control(),
-            )
-            .map_err(binding_resolution_error)?;
-            let expected = self.selection(index, resolved, request, work)?;
+            let expected =
+                self.selection_at_overload_observed(&selected.overload, request, work)?;
             if binding_control::same_selection(&expected, selected, work)? {
                 return Ok(());
             }

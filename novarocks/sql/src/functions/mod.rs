@@ -105,6 +105,22 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         Arc::new(self.clone())
     }
 
+    fn select_exact_overload_observed(
+        &self,
+        function: &novarocks_functions::FunctionId,
+        kind: novarocks_functions::FunctionKind,
+        overload: &novarocks_functions::FunctionOverloadId,
+        request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        Arc<novarocks_functions::FunctionBindingSelection>,
+        novarocks_functions::FunctionBindingError,
+    > {
+        EngineFunctionCatalog::select_exact_overload_observed(
+            self, function, kind, overload, request, control,
+        )
+    }
+
     fn pure_overload_declaration_observed<'a>(
         &'a self,
         function_id: &novarocks_functions::FunctionId,

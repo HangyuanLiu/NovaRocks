@@ -206,6 +206,27 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
     /// analysis so optimizer rewrites cannot consult ambient state.
     fn snapshot(&self) -> Arc<dyn SqlFunctionCatalog>;
 
+    /// Instantiate only this exact installed identity and overload. This does
+    /// not publish a final physical snapshot or grant call effects/capability.
+    fn select_exact_overload_observed(
+        &self,
+        _function: &novarocks_functions::FunctionId,
+        _kind: novarocks_functions::FunctionKind,
+        _overload: &novarocks_functions::FunctionOverloadId,
+        _request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        Arc<novarocks_functions::FunctionBindingSelection>,
+        novarocks_functions::FunctionBindingError,
+    > {
+        let work = novarocks_type_contract::CompileCheckpoints::try_new(
+            control,
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+        )?;
+        work.finish()?;
+        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+    }
+
     /// Borrow the installed exact overload's base to author control domains.
     /// Full selected preparation must still validate/refine types, constants,
     /// environment and the actual implementation. Metadata-only snapshots
