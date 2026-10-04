@@ -21,8 +21,8 @@ use std::collections::BTreeMap;
 
 use novarocks_functions::{ConstantPolicy, ScopedExpressionEffects};
 use novarocks_physical_plan::{
-    AggregateCall, ConstantPools, Fragment, FrozenCallError, FrozenFragmentCalls, NodeKind,
-    PhysicalCallBinding, PhysicalCallSite, PhysicalNode, visit_relational_calls_observed,
+    AggregateCall, AggregatePhase, ConstantPools, Fragment, FrozenCallError, FrozenFragmentCalls,
+    NodeKind, PhysicalCallBinding, PhysicalCallSite, PhysicalNode, visit_relational_calls_observed,
 };
 use novarocks_type_contract::{
     CallProofScope, CompileCheckpoints, CompileControlError, CompilePhase, DecimalOverflowPolicy,
@@ -32,12 +32,16 @@ use novarocks_type_contract::{
 
 use super::{
     expression_occurrences::{AuthoredPhysicalOccurrences, ExpressionOccurrenceError},
+    lowered_draft::{AggregateSourceJournalError, SqlAuthoredPhysicalPlan},
     physical_aggregate_occurrences::{
-        PhysicalAggregateOccurrenceError, PhysicalAggregateOccurrenceInput,
+        PhysicalAggregateMergeOccurrenceInput, PhysicalAggregateOccurrenceError,
+        PhysicalAggregateOccurrenceInput, prepare_physical_aggregate_merge_occurrence_observed,
         prepare_physical_aggregate_occurrence_observed,
     },
     physical_aggregate_requests::{
-        PhysicalAggregateRequestError, author_physical_aggregate_update_request_observed,
+        PhysicalAggregateRequestError, author_physical_aggregate_merge_request_observed,
+        author_physical_aggregate_update_request_from_journal_observed,
+        author_physical_aggregate_update_request_observed,
     },
     physical_expression_effects::{
         PhysicalCallSourceScope, PhysicalExpressionEffectsError, PhysicalExpressionEffectsInput,
@@ -82,6 +86,7 @@ pub(crate) enum PhysicalFragmentEffectsError {
     Occurrence(ExpressionOccurrenceError),
     Expressions(PhysicalExpressionEffectsError),
     AggregateRequest(PhysicalAggregateRequestError),
+    Journal(AggregateSourceJournalError),
     Aggregate(PhysicalAggregateOccurrenceError),
     TableRequest(PhysicalTableRequestError),
     Table(PhysicalTableOccurrenceError),
@@ -110,6 +115,7 @@ macro_rules! nested_error {
 nested_error!(ExpressionOccurrenceError, Occurrence);
 nested_error!(PhysicalExpressionEffectsError, Expressions);
 nested_error!(PhysicalAggregateRequestError, AggregateRequest);
+nested_error!(AggregateSourceJournalError, Journal);
 nested_error!(PhysicalAggregateOccurrenceError, Aggregate);
 nested_error!(PhysicalTableRequestError, TableRequest);
 nested_error!(PhysicalTableOccurrenceError, Table);
@@ -130,8 +136,55 @@ pub(crate) fn author_physical_fragment_effects_observed(
     functions: &dyn SqlFunctionCatalog,
     control: &dyn PureCompileControl,
 ) -> Result<AuthoredPhysicalFragmentEffects, PhysicalFragmentEffectsError> {
+    compose_fragment_effects_observed(input, AggregateSources::DirectPhysical, functions, control)
+}
+
+/// Require the actual SQL producer's journal for every aggregate lifecycle,
+/// including updates. Captured constants and true nonconstants are borrowed
+/// from the original request, independently of physical expression folding.
+/// The supplied fragment, constants and parameters must loan this exact plan.
+/// Other source scopes and the immutable Functions snapshot remain caller
+/// obligations; this component is not full SQL source or Package publication.
+pub(crate) fn author_sql_aggregate_fragment_effects_observed(
+    owner: &SqlAuthoredPhysicalPlan,
+    input: PhysicalFragmentEffectsInput<'_>,
+    functions: &dyn SqlFunctionCatalog,
+    control: &dyn PureCompileControl,
+) -> Result<AuthoredPhysicalFragmentEffects, PhysicalFragmentEffectsError> {
+    compose_fragment_effects_observed(
+        input,
+        AggregateSources::SqlJournal(owner),
+        functions,
+        control,
+    )
+}
+
+enum AggregateSources<'a> {
+    DirectPhysical,
+    SqlJournal(&'a SqlAuthoredPhysicalPlan),
+}
+
+fn compose_fragment_effects_observed(
+    input: PhysicalFragmentEffectsInput<'_>,
+    sources: AggregateSources<'_>,
+    functions: &dyn SqlFunctionCatalog,
+    control: &dyn PureCompileControl,
+) -> Result<AuthoredPhysicalFragmentEffects, PhysicalFragmentEffectsError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
     let result = (|| {
+        if let AggregateSources::SqlJournal(owner) = &sources {
+            let original = owner.plan().fragments().get(&input.fragment.id());
+            work.step()?;
+            let same = original.is_some_and(|value| std::ptr::eq(value, input.fragment))
+                && std::ptr::eq(owner.plan().constants(), input.constants)
+                && std::ptr::eq(owner.plan().parameters(), input.parameters);
+            work.step()?;
+            if !same {
+                return Err(PhysicalFragmentEffectsError::InvalidSource(
+                    "SQL aggregate composition loans a foreign plan, pool or parameter source",
+                ));
+            }
+        }
         if input.relational_scopes.len() > MAX_CONTROL_USE_REFERENCES {
             return Err(CompileControlError::ResourceExhausted.into());
         }
@@ -238,32 +291,100 @@ pub(crate) fn author_physical_fragment_effects_observed(
                 }
                 PhysicalCallBinding::Aggregate(_) => {
                     let source = aggregate_source(scope.source, site)?;
-                    let request = author_physical_aggregate_update_request_observed(
-                        source,
-                        scope.source,
-                        site,
-                        input.fragment,
-                        input.constants,
-                        input.literal_policy,
-                        work,
-                    )?;
-                    let fresh = prepare_physical_aggregate_occurrence_observed(
-                        PhysicalAggregateOccurrenceInput {
-                            fragment: input.fragment,
-                            node: scope.source,
-                            source,
-                            request: &request,
-                            occurrences: input.occurrences,
-                            child_effects: &expressions.summaries,
-                            parameters: input.parameters,
-                            environment: scope.environment,
-                            decimal_overflow_policy: scope.decimal_overflow_policy,
-                            proof_scope: scope.proof_scope,
-                        },
-                        functions,
-                        work,
-                    )?;
-                    fresh.frozen
+                    match &sources {
+                        AggregateSources::DirectPhysical => {
+                            let request = author_physical_aggregate_update_request_observed(
+                                source,
+                                scope.source,
+                                site,
+                                input.fragment,
+                                input.constants,
+                                input.literal_policy,
+                                work,
+                            )?;
+                            prepare_physical_aggregate_occurrence_observed(
+                                PhysicalAggregateOccurrenceInput {
+                                    fragment: input.fragment,
+                                    node: scope.source,
+                                    source,
+                                    request: &request,
+                                    occurrences: input.occurrences,
+                                    child_effects: &expressions.summaries,
+                                    parameters: input.parameters,
+                                    environment: scope.environment,
+                                    decimal_overflow_policy: scope.decimal_overflow_policy,
+                                    proof_scope: scope.proof_scope,
+                                },
+                                functions,
+                                work,
+                            )?
+                            .frozen
+                        }
+                        AggregateSources::SqlJournal(owner) => {
+                            let entry = owner.checked_aggregate_source_observed(
+                                input.fragment,
+                                scope.source,
+                                site,
+                                source,
+                                work,
+                            )?;
+                            let same_policy =
+                                entry.captured().constant_policy() == input.literal_policy;
+                            work.step()?;
+                            if !same_policy {
+                                return Err(PhysicalFragmentEffectsError::InvalidSource(
+                                    "SQL aggregate composition changes the captured constant policy",
+                                ));
+                            }
+                            match entry.phase() {
+                                AggregatePhase::Single | AggregatePhase::Partial { .. } => {
+                                    let request = author_physical_aggregate_update_request_from_journal_observed(
+                                        &entry, work,
+                                    )?;
+                                    prepare_physical_aggregate_occurrence_observed(
+                                        PhysicalAggregateOccurrenceInput {
+                                            fragment: input.fragment,
+                                            node: scope.source,
+                                            source,
+                                            request: &request,
+                                            occurrences: input.occurrences,
+                                            child_effects: &expressions.summaries,
+                                            parameters: input.parameters,
+                                            environment: scope.environment,
+                                            decimal_overflow_policy: scope.decimal_overflow_policy,
+                                            proof_scope: scope.proof_scope,
+                                        },
+                                        functions,
+                                        work,
+                                    )?
+                                    .frozen
+                                }
+                                AggregatePhase::Intermediate { .. }
+                                | AggregatePhase::Final { .. } => {
+                                    let request = author_physical_aggregate_merge_request_observed(
+                                        &entry, work,
+                                    )?;
+                                    prepare_physical_aggregate_merge_occurrence_observed(
+                                        PhysicalAggregateMergeOccurrenceInput {
+                                            fragment: input.fragment,
+                                            node: scope.source,
+                                            source,
+                                            request: &request,
+                                            occurrences: input.occurrences,
+                                            child_effects: &expressions.summaries,
+                                            parameters: input.parameters,
+                                            environment: scope.environment,
+                                            decimal_overflow_policy: scope.decimal_overflow_policy,
+                                            proof_scope: scope.proof_scope,
+                                        },
+                                        functions,
+                                        work,
+                                    )?
+                                    .frozen
+                                }
+                            }
+                        }
+                    }
                 }
                 _ => return Err(PhysicalFragmentEffectsError::UnsupportedLifecycle(site)),
             };
@@ -323,3 +444,7 @@ fn aggregate_source(
             "aggregate site has no original ordered call",
         ))
 }
+
+#[cfg(test)]
+#[path = "physical_fragment_sql_aggregate_tests.rs"]
+mod sql_aggregate_tests;

@@ -135,6 +135,15 @@ pub(crate) fn prepare_physical_aggregate_occurrence_observed(
             "aggregate occurrence and update request have different actual source loans",
         ));
     }
+    if let Some(policy) = input.request.captured_decimal_overflow_policy() {
+        let same_policy = policy == input.decimal_overflow_policy;
+        work.step()?;
+        if !same_policy {
+            return Err(PhysicalAggregateOccurrenceError::InvalidSource(
+                "aggregate update occurrence changes the original logical source policy",
+            ));
+        }
+    }
     let site = input.request.site();
     let (node, call, topn) = match site {
         PhysicalCallSite::Aggregate { node, call } => (node, call, false),

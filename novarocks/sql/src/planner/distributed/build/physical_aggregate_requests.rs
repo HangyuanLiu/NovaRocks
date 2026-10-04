@@ -72,8 +72,13 @@ pub(crate) struct AuthoredPhysicalAggregateUpdateRequest<'a> {
     node: &'a PhysicalNode,
     site: PhysicalCallSite,
     selected: Arc<FunctionBindingSelection>,
-    arguments: Vec<FunctionArgument>,
+    arguments: AggregateUpdateArguments<'a>,
     options: AggregatePreparationOptions,
+}
+#[derive(Debug)]
+enum AggregateUpdateArguments<'a> {
+    OwnedPhysical(Vec<FunctionArgument>),
+    Captured(&'a crate::binding::CapturedAggregateLogicalRequest),
 }
 impl AuthoredPhysicalAggregateUpdateRequest<'_> {
     pub const fn source(&self) -> &AggregateCall {
@@ -95,12 +100,33 @@ impl AuthoredPhysicalAggregateUpdateRequest<'_> {
         &self.selected
     }
     pub fn request(&self) -> FunctionBindingRequest<'_> {
-        FunctionBindingRequest {
-            arguments: &self.arguments,
-            logical_argument_count: self.source.arguments.len(),
-            // A Partial output carries state; the selected SQL result remains
-            // the binding's final result, independently of the output layout.
-            expected_result_type: Some(&self.source.binding.function.result_type),
+        match &self.arguments {
+            AggregateUpdateArguments::OwnedPhysical(arguments) => FunctionBindingRequest {
+                arguments,
+                logical_argument_count: self.source.arguments.len(),
+                // A Partial output carries state; the selected SQL result remains
+                // the binding's final result, independently of the output layout.
+                expected_result_type: Some(&self.source.binding.function.result_type),
+            },
+            AggregateUpdateArguments::Captured(captured) => captured.request(),
+        }
+    }
+    /// None identifies the independent direct-physical component. It supplies
+    /// no inferred policy for callers requiring an authenticated journal loan.
+    pub fn captured_decimal_overflow_policy(
+        &self,
+    ) -> Option<novarocks_type_contract::DecimalOverflowPolicy> {
+        match &self.arguments {
+            AggregateUpdateArguments::OwnedPhysical(_) => None,
+            AggregateUpdateArguments::Captured(captured) => {
+                Some(captured.binding().decimal_overflow_policy())
+            }
+        }
+    }
+    pub fn captured_constant_policy(&self) -> Option<ConstantPolicy> {
+        match &self.arguments {
+            AggregateUpdateArguments::OwnedPhysical(_) => None,
+            AggregateUpdateArguments::Captured(captured) => Some(captured.constant_policy()),
         }
     }
     pub fn preparation(&self, arguments: ScopedExpressionEffects) -> PureCallPreparation {
@@ -258,7 +284,91 @@ pub(crate) fn author_physical_aggregate_update_request_observed<'a>(
         node,
         site,
         selected,
-        arguments,
+        arguments: AggregateUpdateArguments::OwnedPhysical(arguments),
+        options,
+    })
+}
+
+/// Borrow the original admitted logical request for a producer-certified
+/// Single/Partial update. Physical expression channels identify runtime roots;
+/// they never recreate constants or logical argument provenance. ORDER flags
+/// come from the exact actual call, while the request retains the captured CV
+/// handles, nonconstant None values, Lambda types and original result loan.
+///
+/// Caller entry, ordinary footer and opaque clone/coexistence admission remain
+/// mandatory; original typed control refusals return without a footer here.
+pub(crate) fn author_physical_aggregate_update_request_from_journal_observed<'source>(
+    entry: &super::lowered_draft::CheckedAggregateLogicalSourceEntry<'source>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<AuthoredPhysicalAggregateUpdateRequest<'source>, PhysicalAggregateRequestError> {
+    use super::lowered_draft::AggregateRuntimeDemand;
+    let source = entry.source();
+    let phase = match entry.phase() {
+        AggregatePhase::Single => Ok(AggregateKernelPhase::Single),
+        AggregatePhase::Partial { .. } => Ok(AggregateKernelPhase::Partial),
+        phase => Err(PhysicalAggregateRequestError::MissingLogicalSource(phase)),
+    };
+    work.step()?;
+    let phase = phase?;
+    let update =
+        entry.runtime() == AggregateRuntimeDemand::Update && source.binding.phase == entry.phase();
+    work.step()?;
+    if !update {
+        return Err(PhysicalAggregateRequestError::InvalidSource(
+            "journal update request differs from its original runtime demand",
+        ));
+    }
+    let captured = entry.captured();
+    let request = captured.request();
+    let count = source
+        .arguments
+        .len()
+        .checked_add(source.order_by.len())
+        .ok_or(CompileControlError::ResourceExhausted)?;
+    if count > MAX_CALL_EFFECT_ARGUMENTS
+        || request.arguments.len() > MAX_CALL_EFFECT_ARGUMENTS
+        || source.binding.function.argument_types.len() > MAX_CALL_EFFECT_ARGUMENTS
+    {
+        return Err(CompileControlError::ResourceExhausted.into());
+    }
+    let matching = request.logical_argument_count == source.arguments.len()
+        && request.arguments.len() == count
+        && source.binding.function.argument_types.len() == count;
+    work.step()?;
+    if !matching {
+        return Err(PhysicalAggregateRequestError::InvalidSource(
+            "journal update logical and ORDER channels differ from the captured request",
+        ));
+    }
+    Layout::array::<AggregateOrderKey>(source.order_by.len())
+        .map_err(|_| CompileControlError::ResourceExhausted)?;
+    let selected = captured_selected_correspondence_observed(captured, source, work)?;
+    work.flush()?;
+    let mut keys = Vec::new();
+    keys.try_reserve_exact(source.order_by.len())
+        .map_err(|_| CompileControlError::ResourceExhausted)?;
+    work.flush()?;
+    for key in source.order_by.iter() {
+        keys.push(AggregateOrderKey {
+            ascending: key.direction == SortDirection::Ascending,
+            nulls_first: key.null_ordering == NullOrdering::First,
+        });
+        work.step()?;
+    }
+    work.flush()?;
+    let options = AggregatePreparationOptions {
+        phase,
+        distinct: source.distinct,
+        order_keys: keys.into(),
+        state_input_type: None,
+    };
+    work.flush()?;
+    Ok(AuthoredPhysicalAggregateUpdateRequest {
+        source,
+        node: entry.node(),
+        site: entry.site(),
+        selected,
+        arguments: AggregateUpdateArguments::Captured(captured),
         options,
     })
 }
@@ -329,7 +439,6 @@ pub(crate) fn author_physical_aggregate_merge_request_observed<'entry, 'source>(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<AuthoredPhysicalAggregateMergeRequest<'entry, 'source>, PhysicalAggregateRequestError> {
     use super::lowered_draft::AggregateRuntimeDemand;
-    use novarocks_functions::FunctionResultType;
     let source = entry.source();
     let phase = match entry.phase() {
         AggregatePhase::Intermediate { .. } => Ok(AggregateKernelPhase::Intermediate),
@@ -361,7 +470,26 @@ pub(crate) fn author_physical_aggregate_merge_request_observed<'entry, 'source>(
     let state = entry.fragment().expressions().get(state_id);
     work.step()?;
     let state = state.ok_or(PhysicalAggregateRequestError::MissingArgument(state_id))?;
-    let captured = entry.captured();
+    let selected = captured_selected_correspondence_observed(entry.captured(), source, work)?;
+    Ok(AuthoredPhysicalAggregateMergeRequest {
+        entry,
+        state_id,
+        state,
+        phase,
+        selected,
+    })
+}
+
+/// The one signature comparison author serves journal updates and merges.
+/// Equality verifies selected correspondence; only the original sealed journal
+/// establishes logical source provenance. This helper does not inspect state
+/// expression domains or infer nullable coercions.
+fn captured_selected_correspondence_observed(
+    captured: &crate::binding::CapturedAggregateLogicalRequest,
+    source: &AggregateCall,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Arc<FunctionBindingSelection>, PhysicalAggregateRequestError> {
+    use novarocks_functions::FunctionResultType;
     let resolved = captured.binding().resolved();
     let selected = &resolved.selected;
     let function = &source.binding.function;
@@ -438,13 +566,7 @@ pub(crate) fn author_physical_aggregate_merge_request_observed<'entry, 'source>(
     // No local state-domain/nullability inference: the original Functions owner
     // validates the actual state loan and aligns its cloned options exactly.
     let selected = author_scalar_result_selection_observed(function, Some(&source.binding), work)?;
-    Ok(AuthoredPhysicalAggregateMergeRequest {
-        entry,
-        state_id,
-        state,
-        phase,
-        selected,
-    })
+    Ok(selected)
 }
 
 fn merge_argument_type_matches_observed(
@@ -488,3 +610,7 @@ fn merge_argument_type_matches_observed(
         _ => Ok(false),
     }
 }
+
+#[cfg(test)]
+#[path = "physical_aggregate_journal_update_tests.rs"]
+mod journal_update_tests;
