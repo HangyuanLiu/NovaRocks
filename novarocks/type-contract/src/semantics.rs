@@ -95,30 +95,96 @@ impl SemanticParameters {
     pub fn try_new(
         entries: impl IntoIterator<Item = (SemanticParameterId, SemanticParameterValue)>,
     ) -> Result<Self, SemanticParameterError> {
+        match Self::construct(entries, None) {
+            Ok(table) => Ok(table),
+            Err(SemanticParameterProjectionError::Parameter(error)) => Err(error),
+            // Observation is absent on this path, so it cannot refuse control.
+            Err(SemanticParameterProjectionError::Control(_)) => unreachable!(),
+        }
+    }
+
+    /// Construct using the caller's original phase and checkpoints. The caller
+    /// admits iterator copies and tree allocation requests before entering, and
+    /// owns the ordinary/success tail. This port neither admits resources nor
+    /// creates or finishes another control scope.
+    pub fn try_new_observed(
+        entries: impl IntoIterator<Item = (SemanticParameterId, SemanticParameterValue)>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, SemanticParameterProjectionError> {
+        Self::construct(entries, Some(work))
+    }
+
+    fn construct(
+        entries: impl IntoIterator<Item = (SemanticParameterId, SemanticParameterValue)>,
+        mut work: Option<&mut CompileCheckpoints<'_>>,
+    ) -> Result<Self, SemanticParameterProjectionError> {
         let mut table = Self::default();
         let mut has_statement_start = false;
-        for (id, value) in entries {
+        let mut entries = entries.into_iter();
+        loop {
+            // A lazy iterator may allocate one bounded value or latch a codec
+            // error. Observe its actual pull, including termination, without
+            // requiring the iterator to borrow this same mutable checkpoint.
+            construction_flush(&mut work)?;
+            let next = entries.next();
+            construction_step(&mut work)?;
+            construction_flush(&mut work)?;
+            let Some((id, value)) = next else {
+                return Ok(table);
+            };
             let key = value.key();
-            if table.entries.contains_key(&id) {
-                return Err(SemanticParameterError::DuplicateId(id));
+            construction_step(&mut work)?;
+            construction_flush(&mut work)?;
+            let duplicate = table.entries.contains_key(&id);
+            construction_step(&mut work)?;
+            construction_flush(&mut work)?;
+            if duplicate {
+                return Err(SemanticParameterProjectionError::Parameter(
+                    SemanticParameterError::DuplicateId(id),
+                ));
             }
-            if table.entries.len() >= MAX_SEMANTIC_PARAMETERS {
-                return Err(SemanticParameterError::TooManyParameters);
+            let too_many = table.entries.len() >= MAX_SEMANTIC_PARAMETERS;
+            construction_step(&mut work)?;
+            if too_many {
+                return Err(SemanticParameterProjectionError::Parameter(
+                    SemanticParameterError::TooManyParameters,
+                ));
             }
-            if key == SemanticParameterKey::StatementStartUtc {
-                if has_statement_start {
-                    return Err(SemanticParameterError::DuplicateStatementStart);
+            let statement_start = key == SemanticParameterKey::StatementStartUtc;
+            construction_step(&mut work)?;
+            if statement_start {
+                let duplicate = has_statement_start;
+                construction_step(&mut work)?;
+                if duplicate {
+                    return Err(SemanticParameterProjectionError::Parameter(
+                        SemanticParameterError::DuplicateStatementStart,
+                    ));
                 }
                 has_statement_start = true;
             }
-            if let SemanticParameterValue::TimeZone(zone) = &value
-                && (zone.is_empty() || zone.len() > 255 || zone.chars().any(char::is_control))
-            {
-                return Err(SemanticParameterError::InvalidTimeZone);
+            if let SemanticParameterValue::TimeZone(zone) = &value {
+                let invalid_length = zone.is_empty() || zone.len() > 255;
+                construction_step(&mut work)?;
+                if invalid_length {
+                    return Err(SemanticParameterProjectionError::Parameter(
+                        SemanticParameterError::InvalidTimeZone,
+                    ));
+                }
+                for character in zone.chars() {
+                    let invalid = character.is_control();
+                    construction_step(&mut work)?;
+                    if invalid {
+                        return Err(SemanticParameterProjectionError::Parameter(
+                            SemanticParameterError::InvalidTimeZone,
+                        ));
+                    }
+                }
             }
+            construction_flush(&mut work)?;
             table.entries.insert(id, value);
+            construction_step(&mut work)?;
+            construction_flush(&mut work)?;
         }
-        Ok(table)
     }
 
     pub fn entries(&self) -> &BTreeMap<SemanticParameterId, SemanticParameterValue> {
@@ -186,6 +252,26 @@ impl SemanticParameters {
     }
 }
 
+fn construction_flush(
+    work: &mut Option<&mut CompileCheckpoints<'_>>,
+) -> Result<(), SemanticParameterProjectionError> {
+    if let Some(work) = work.as_deref_mut() {
+        work.flush()
+            .map_err(SemanticParameterProjectionError::Control)?;
+    }
+    Ok(())
+}
+
+fn construction_step(
+    work: &mut Option<&mut CompileCheckpoints<'_>>,
+) -> Result<(), SemanticParameterProjectionError> {
+    if let Some(work) = work.as_deref_mut() {
+        work.step()
+            .map_err(SemanticParameterProjectionError::Control)?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SemanticParameterProjectionError {
     Parameter(SemanticParameterError),
@@ -204,6 +290,10 @@ impl std::error::Error for SemanticParameterProjectionError {}
 #[cfg(test)]
 #[path = "semantics/projection_tests.rs"]
 mod projection_tests;
+
+#[cfg(test)]
+#[path = "semantics/construction_tests.rs"]
+mod construction_tests;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SemanticParameterError {

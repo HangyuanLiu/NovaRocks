@@ -325,9 +325,7 @@ pub(crate) fn tree_lookup_work(entries: usize) -> Result<usize, Error> {
     // Rust 1.92 BTree nodes have at most eleven keys. Even binary fanout
     // gives at most bit-length+1 visited levels; sixteen units per level
     // include key, edge and node-header work without another lookup index.
-    let levels = usize::try_from(usize::BITS - entries.leading_zeros())
-        .map_err(|_| shape("expression lookup depth is unrepresentable"))?;
-    mul(add(levels, 1)?, 16)
+    crate::btree_resources_v2::lookup_work(entries).map_err(shape)
 }
 fn signature_source_floor(
     function: &novarocks_physical_plan::BoundFunction,

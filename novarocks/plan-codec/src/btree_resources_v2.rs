@@ -22,6 +22,18 @@
 use crate::resource_source_model::LOCKED_TOOLCHAIN;
 use std::alloc::Layout;
 
+/// Conservative lookup work for the locked B=6 source. Even binary fanout
+/// bounds visited levels by bit-length+1; sixteen units cover each node's
+/// keys, edges and header. Allocation/insert movement is accounted separately.
+pub(crate) fn lookup_work(entries: usize) -> Result<usize, &'static str> {
+    let levels = usize::try_from(usize::BITS - entries.leading_zeros())
+        .map_err(|_| "expression lookup depth is unrepresentable")?;
+    levels
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(16))
+        .ok_or("expression resource product overflow")
+}
+
 pub(crate) fn node_layout<K, V>() -> Result<Layout, &'static str> {
     if !LOCKED_TOOLCHAIN {
         return Err("BTree allocation source model drift");

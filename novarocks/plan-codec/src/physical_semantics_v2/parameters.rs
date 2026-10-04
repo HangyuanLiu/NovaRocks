@@ -206,6 +206,49 @@ pub(super) fn decode_parameters(
     checked.map_err(Into::into)
 }
 
+/// Same wire value grammar, fed lazily into the original observed constructor.
+/// Pulling the iterator brackets the bounded Box source copy with the caller's
+/// existing work scope, so no temporary entries Vec or second meter is needed.
+pub(super) fn decode_parameters_observed(
+    parameters: &wire::SemanticParameters,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<SemanticParameters, SemanticsCodecError> {
+    use novarocks_type_contract::SemanticParameterProjectionError;
+    if parameters.entries.len() > MAX_SEMANTIC_PARAMETERS {
+        return Err(SemanticParameterError::TooManyParameters.into());
+    }
+    let mut input = parameters.entries.iter();
+    let mut projection_error = None;
+    let entries = std::iter::from_fn(|| {
+        if projection_error.is_some() {
+            return None;
+        }
+        let entry = input.next()?;
+        match decode_value(entry.value.as_ref()) {
+            Ok(value) => Some((SemanticParameterId::new(entry.id), value)),
+            Err(error) => {
+                projection_error = Some(error);
+                None
+            }
+        }
+    });
+    let checked = SemanticParameters::try_new_observed(entries, work);
+    // The constructor's originating control refusal must outrank a lazy
+    // decoder latch. An ordinary terminated prefix is never publication.
+    match checked {
+        Err(SemanticParameterProjectionError::Control(cause)) => Err(cause.into()),
+        checked => {
+            if let Some(error) = projection_error {
+                return Err(error);
+            }
+            checked.map_err(|error| match error {
+                SemanticParameterProjectionError::Parameter(error) => error.into(),
+                SemanticParameterProjectionError::Control(cause) => cause.into(),
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

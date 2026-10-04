@@ -36,8 +36,14 @@ use std::fmt;
 use crate::physical_control_v2::ControlCodecError;
 
 mod calls;
+mod parameter_resources;
 mod parameters;
 mod pruning;
+
+pub use parameter_resources::{
+    ParameterProjectionFacts, ParameterProjectionLimits, PreparedSemanticParametersDecode,
+    decode_semantic_parameters, prepare_semantic_parameters_decode,
+};
 
 pub(crate) use calls::{
     decode_policy as decode_decimal_policy, encode_policy as encode_decimal_policy,
