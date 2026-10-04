@@ -1207,3 +1207,6 @@ mod visit_tests;
 
 #[path = "property_derivation_tests.rs"]
 mod property_derivation_tests;
+
+#[path = "all_property_derivation_tests.rs"]
+mod all_property_derivation_tests;

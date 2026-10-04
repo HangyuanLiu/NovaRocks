@@ -17,6 +17,26 @@
 
 use super::*;
 
+pub(crate) fn inbound_cut_output_properties(
+    cut: &crate::InboundFragmentCut,
+) -> crate::PhysicalProperties {
+    crate::PhysicalProperties {
+        distribution: cut.partitioning.destination.clone(),
+        row_multiplicity: cut.partitioning.destination_multiplicity,
+        ordering: Box::default(),
+    }
+}
+
+pub(crate) fn inbound_cut_matches_exchange_source(
+    cut: &crate::InboundFragmentCut,
+    node: &crate::PhysicalNode,
+) -> bool {
+    matches!(&node.kind, NodeKind::ExchangeSource { edge, imports }
+        if *edge == cut.edge && imports.len() == cut.imports.len()
+            && imports.iter().zip(&cut.imports).all(|((source, destination), cut)|
+                *source == cut.source.value && *destination == cut.destination))
+}
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::resource::{
@@ -404,24 +424,8 @@ pub(crate) fn validate_fragment_cuts_into(
             ));
         }
         match fragment.nodes().get(&cut.destination_node) {
-            Some(node)
-                if matches!(
-                    &node.kind,
-                    NodeKind::ExchangeSource { edge, imports }
-                        if *edge == cut.edge
-                            && imports.len() == cut.imports.len()
-                            && imports.iter().zip(&cut.imports).all(
-                                |((source, destination), cut)| {
-                                    *source == cut.source.value && *destination == cut.destination
-                                }
-                            )
-                ) =>
-            {
-                if node.output_properties.distribution != cut.partitioning.destination
-                    || node.output_properties.row_multiplicity
-                        != cut.partitioning.destination_multiplicity
-                    || !node.output_properties.ordering.is_empty()
-                {
+            Some(node) if inbound_cut_matches_exchange_source(cut, node) => {
+                if node.output_properties != inbound_cut_output_properties(cut) {
                     errors.push(ValidationError::new(
                         &path,
                         "exchange source properties differ from its inbound cut",
