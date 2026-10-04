@@ -164,7 +164,7 @@ impl AggregateDeclaration {
     }
 }
 
-struct BuiltinAggregateResolver {
+pub(super) struct BuiltinAggregateResolver {
     declaration: AggregateDeclaration,
 }
 
@@ -1296,10 +1296,10 @@ impl FunctionBindingResolver for BuiltinScalarResolver {
     }
 }
 
-const BUILTIN_UNNEST_FUNCTION_ID: &str = "builtin.table/unnest/v1";
-const BUILTIN_UNNEST_OVERLOAD_ID: &str = "builtin.table/unnest/array-variadic-v1";
+pub(super) const BUILTIN_UNNEST_FUNCTION_ID: &str = "builtin.table/unnest/v1";
+pub(super) const BUILTIN_UNNEST_OVERLOAD_ID: &str = "builtin.table/unnest/array-variadic-v1";
 
-struct BuiltinUnnestResolver;
+pub(super) struct BuiltinUnnestResolver;
 
 fn bind_builtin_unnest(
     request: FunctionBindingRequest<'_>,
@@ -2377,6 +2377,9 @@ pub(super) fn scalar_definition_parts(
             .zip(signatures)
             .map(|(identity, signature)| FunctionOverloadDeclaration {
                 effects: match name {
+                    name if super::window_ranking_owner::operation(name).is_some() => {
+                        Some(super::window_ranking_owner::effects())
+                    }
                     "abs" => Some(super::abs_owner::effects()),
                     name if super::control_owner::operation(name).is_some() => {
                         Some(super::control_owner::effects(
@@ -2624,6 +2627,9 @@ pub fn contribute_builtin_functions(
         };
         let (declaration, resolver) = scalar_definition_parts(&name, &signatures, kind)?;
         let definition = match name.as_str() {
+            name if super::window_ranking_owner::operation(name).is_some() => {
+                super::window_ranking_owner::definition(name, declaration, resolver)?
+            }
             "abs" => super::abs_owner::definition(declaration, resolver)?,
             name if super::control_owner::operation(name).is_some() => {
                 super::control_owner::definition(name, declaration, resolver)?
@@ -2777,7 +2783,7 @@ pub fn contribute_builtin_functions(
             function_id,
             FunctionKind::Aggregate,
             [FunctionOverloadDeclaration {
-                effects: None,
+                effects: (declaration.name == "count").then(super::aggregate_count_owner::effects),
                 semantics: FunctionSemantics {
                     volatility: FunctionVolatility::Immutable,
                     argument_evaluation: FunctionArgumentEvaluation::Eager,
@@ -2801,6 +2807,14 @@ pub fn contribute_builtin_functions(
         // One resolver in both roles: it answers binding questions and it is
         // the typed signature contract an aggregate is resolved through.
         let resolver = Arc::new(BuiltinAggregateResolver { declaration });
+        if declaration.name == "count" {
+            builder.register(super::aggregate_count_owner::definition(
+                declaration.name,
+                binding_declaration,
+                resolver,
+            )?)?;
+            continue;
+        }
         builder.register(FunctionDefinition::try_new_bound_aggregate(
             declaration.name,
             FunctionVisibility::Public,
@@ -2818,7 +2832,7 @@ pub fn contribute_builtin_functions(
         })?,
         FunctionKind::Table,
         [FunctionOverloadDeclaration {
-            effects: None,
+            effects: Some(super::table_unnest_owner::effects()),
             semantics: FunctionSemantics {
                 volatility: FunctionVolatility::Immutable,
                 argument_evaluation: FunctionArgumentEvaluation::Eager,
@@ -2840,11 +2854,9 @@ pub fn contribute_builtin_functions(
         subject: "builtin table function binding declaration",
         value: error.to_string().into(),
     })?;
-    builder.register(FunctionDefinition::try_new_bound(
-        "unnest",
-        FunctionVisibility::Public,
+    builder.register(super::table_unnest_owner::definition(
         unnest_declaration,
-        Arc::new(BuiltinUnnestResolver),
+        BuiltinUnnestResolver,
     )?)?;
     Ok(())
 }

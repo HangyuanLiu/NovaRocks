@@ -36,6 +36,8 @@ mod binding_control_tests;
 
 mod abs;
 mod abs_owner;
+mod aggregate_count;
+mod aggregate_count_owner;
 mod bit_shift;
 mod bit_shift_owner;
 mod bitwise;
@@ -125,5 +127,11 @@ mod string_url_decode;
 mod string_url_decode_owner;
 mod string_url_encode;
 mod string_url_encode_owner;
+mod table_unnest;
+mod table_unnest_owner;
+#[cfg(test)]
+mod table_unnest_tests;
 mod truncate;
 mod truncate_owner;
+mod window_ranking;
+mod window_ranking_owner;

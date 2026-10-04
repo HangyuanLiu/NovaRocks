@@ -18,7 +18,7 @@
 //! Carrier-neutral typed failures and observed kernel evaluation control.
 
 use novarocks_type_contract::CompileControlError;
-use std::{fmt, time::Duration};
+use std::{fmt, sync::Mutex, time::Duration};
 
 /// Bounded diagnostics on outer failures. Only RowDataError enters the
 /// maskable row channel; this carrier cannot be converted to it implicitly.
@@ -75,6 +75,51 @@ pub const MAX_UNOBSERVED_KERNEL_WORK: u32 = 256;
 pub trait KernelEvaluationControl: Send + Sync {
     fn checkpoint(&self, work_units: u32) -> Result<(), KernelFailure>;
     fn wait(&self, duration: Duration) -> Result<(), KernelFailure>;
+}
+
+/// Borrow the original host control across a nested lifecycle call. This
+/// observer forwards the original units and waits, without creating a meter,
+/// budget or cancellation authority. A refusal remains primary across nested
+/// post-call checks, including diagnostic failures returned by that control.
+pub(crate) struct KernelControlObservation<'a> {
+    original: &'a dyn KernelEvaluationControl,
+    refusal: Mutex<Option<KernelFailure>>,
+}
+impl<'a> KernelControlObservation<'a> {
+    pub(crate) fn new(original: &'a dyn KernelEvaluationControl) -> Self {
+        Self {
+            original,
+            refusal: Mutex::new(None),
+        }
+    }
+    fn observe(
+        &self,
+        operation: impl FnOnce() -> Result<(), KernelFailure>,
+    ) -> Result<(), KernelFailure> {
+        let mut refusal = self.refusal.lock().unwrap();
+        if let Some(error) = refusal.as_ref() {
+            return Err(error.clone());
+        }
+        let result = operation();
+        if let Err(error) = &result {
+            *refusal = Some(error.clone());
+        }
+        result
+    }
+    pub(crate) fn finish<T>(&self, result: Result<T, KernelFailure>) -> Result<T, KernelFailure> {
+        match self.refusal.lock().unwrap().as_ref() {
+            Some(error) => Err(error.clone()),
+            None => result,
+        }
+    }
+}
+impl KernelEvaluationControl for KernelControlObservation<'_> {
+    fn checkpoint(&self, work_units: u32) -> Result<(), KernelFailure> {
+        self.observe(|| self.original.checkpoint(work_units))
+    }
+    fn wait(&self, duration: Duration) -> Result<(), KernelFailure> {
+        self.observe(|| self.original.wait(duration))
+    }
 }
 
 pub(crate) fn invalid(message: &str) -> KernelFailure {

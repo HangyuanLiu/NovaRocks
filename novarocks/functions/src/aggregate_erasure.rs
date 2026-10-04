@@ -396,6 +396,8 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
         control: &dyn KernelEvaluationControl,
     ) -> Result<ArrayRef, KernelFailure> {
         self.validate_metadata()?;
+        let observed = crate::kernel_control::KernelControlObservation::new(control);
+        let control = &observed as &dyn KernelEvaluationControl;
         // Each mapping was checked before this private dispatch, and immutable
         // slot borrows keep initialization and exact owner identity unchanged.
         let typed = TypedStateIter::<K> {
@@ -405,6 +407,14 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
             _kernel: PhantomData,
         };
         let result = emit_aggregate(self.kernel.as_ref(), typed.clone(), row_capacity, control);
+        if matches!(
+            &result,
+            Err(KernelFailure::Cancelled
+                | KernelFailure::DeadlineExceeded
+                | KernelFailure::ResourceExhausted)
+        ) {
+            return observed.finish(result);
+        }
         let post = (|| {
             self.validate_metadata()?;
             let mut work = EvaluationCheckpoints::new(control);
@@ -414,7 +424,7 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
             }
             work.finish()
         })();
-        finish_lifecycle(result, post)
+        observed.finish(finish_lifecycle(result, post))
     }
 }
 

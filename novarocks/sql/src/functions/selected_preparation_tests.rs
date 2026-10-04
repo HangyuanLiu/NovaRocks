@@ -178,7 +178,7 @@ fn sql_snapshot_selected_port_preserves_actual_installed_owner_and_direct_trace(
 }
 
 #[test]
-fn sql_selected_port_rejects_substituted_owner_full_type_and_missing_lifecycle() {
+fn sql_selected_port_rejects_substituted_owner_full_type_and_prepares_table_lifecycle() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let control = Control::default();
     let arguments = arguments();
@@ -217,18 +217,21 @@ fn sql_selected_port_rejects_substituted_owner_full_type_and_missing_lifecycle()
         .unwrap();
     let table_selected = Arc::new(table.selected.clone());
     let table_input = input(&table, &table_selected, &arguments, &uses, &parameters);
-    assert!(matches!(
-        catalog.snapshot().prepare_fresh_selected(
+    let prepared = catalog
+        .snapshot()
+        .prepare_fresh_selected(
             table_input,
             table_selected.clone(),
             PureCallPreparation::Table {
-                arguments: ScopedExpressionEffects::pure_value(context())
+                arguments: ScopedExpressionEffects::pure_value(context()),
             },
-            &control
-        ),
-        Err(FunctionSpecializationFailure::InvalidInput(
-            "selected function has no installed pure implementation"
-        ))
+            &control,
+        )
+        .unwrap();
+    assert_eq!(prepared.implementation().abi, PureKernelAbi::TableV1);
+    assert!(std::ptr::eq(
+        prepared.call_contract().selected(),
+        table_selected.as_ref()
     ));
 }
 
@@ -363,15 +366,14 @@ struct DeclarationOnly;
 fn sql_missing_selected_implementation_keeps_ordinary_tail_and_every_control_prefix() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let control = Control::default();
-    let arguments = arguments();
-    let bound = catalog
-        .resolve_table_binding("unnest", &arguments, &control)
-        .unwrap();
+    let arguments = [];
+    let bound =
+        SqlFunctionCatalog::resolve_scalar_binding(&catalog, "uuid", &arguments, &control).unwrap();
     let selected = Arc::new(bound.selected.clone());
-    let uses = [Some(ExpressionUseId::new(0))];
+    let uses = [];
     let parameters = SemanticParameters::try_new([]).unwrap();
     let call = input(&bound, &selected, &arguments, &uses, &parameters);
-    let options = || PureCallPreparation::Table {
+    let options = || PureCallPreparation::Scalar {
         arguments: ScopedExpressionEffects::pure_value(context()),
     };
     let snapshot = catalog.snapshot();
@@ -495,5 +497,75 @@ fn sql_declaration_only_snapshot_refuses_without_fabricating_effects() {
             matches!(DeclarationOnly.snapshot().prepare_fresh_selected(call, selected.clone(), options(), &control), Err(FunctionSpecializationFailure::Control(actual)) if actual == cause)
         );
         assert_eq!(control.trace(), [(CompilePhase::FunctionSpecialization, 0)]);
+    }
+}
+
+#[test]
+fn sql_selected_snapshot_prepares_real_window_and_aggregate_owners_without_an_adapter_meter() {
+    use novarocks_functions::{
+        AggregateKernelPhase, AggregatePreparationOptions, WindowCallOptions,
+    };
+
+    let catalog = build_builtin_engine_function_catalog().unwrap();
+    let snapshot = catalog.snapshot();
+    let control = Control::default();
+    let arguments = [];
+    let uses = [];
+    let parameters = SemanticParameters::try_new([]).unwrap();
+    for (name, kind, options, abi) in [
+        (
+            "count",
+            FunctionKind::Aggregate,
+            PureCallPreparation::Aggregate {
+                arguments: ScopedExpressionEffects::pure_value(context()),
+                options: AggregatePreparationOptions {
+                    phase: AggregateKernelPhase::Single,
+                    distinct: false,
+                    order_keys: Arc::new([]),
+                    state_input_type: None,
+                },
+            },
+            PureKernelAbi::AggregateV1,
+        ),
+        (
+            "row_number",
+            FunctionKind::Window,
+            PureCallPreparation::Window {
+                arguments: ScopedExpressionEffects::pure_value(context()),
+                options: WindowCallOptions::try_new(None, false, &control).unwrap(),
+            },
+            PureKernelAbi::WindowV1,
+        ),
+    ] {
+        let bound = catalog
+            .resolve_bound_user(name, kind, request(&arguments), &control)
+            .unwrap();
+        let selected = Arc::new(bound.selected.clone());
+        let call = input(&bound, &selected, &arguments, &uses, &parameters);
+        control.reset(None);
+        let direct = EngineFunctionCatalog::prepare_fresh_selected(
+            &catalog,
+            call,
+            selected.clone(),
+            options.clone(),
+            &control,
+        )
+        .unwrap();
+        let trace = control.trace();
+        control.reset(None);
+        let projected = snapshot
+            .prepare_fresh_selected(call, selected.clone(), options, &control)
+            .unwrap();
+        assert_eq!(projected.implementation().abi, abi);
+        assert_eq!(projected.call_contract(), direct.call_contract());
+        assert_eq!(control.trace(), trace);
+        assert!(std::ptr::eq(
+            projected.call_contract().selected(),
+            selected.as_ref()
+        ));
+        assert_eq!(
+            projected.call_contract().effects().own_row_error,
+            novarocks_functions::FunctionIntrinsicRowError::NotRowEvaluated
+        );
     }
 }

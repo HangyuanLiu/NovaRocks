@@ -411,8 +411,8 @@ fn preflight(
                     preflight(array.child(id).as_ref(), selection, mode, work)?;
                 }
             } else {
-                for (id, _) in fields.iter() {
-                    let child = selection.map_ranges(work, |range, output, work| {
+                for (child_index, (id, _)) in fields.iter().enumerate() {
+                    let mut child = selection.map_ranges(work, |range, output, work| {
                         for row in range.clone() {
                             work.step()?;
                             if array.type_id(row) == id {
@@ -422,6 +422,12 @@ fn preflight(
                         }
                         Ok(())
                     })?;
+                    // MutableArrayData appends NULLs to the first declared child
+                    // and casts its end offset to i32. Include that padding in
+                    // both the offset bound and the child's recursive extent.
+                    if mode == CopyMode::Extend && child_index == 0 {
+                        child.nulls = selection.nulls;
+                    }
                     // Both take and MutableArrayData write signed i32 offsets.
                     limit(child.len(work)?, i32::MAX as usize)?;
                     let child_mode = if mode.is_take() {
@@ -681,6 +687,49 @@ pub fn preflight_take(
     )
 }
 
+/// Check one contiguous MutableArrayData copy and its trailing NULL padding.
+/// Constructor capacity and selected payload use the existing separate extent
+/// authors. The caller owns source ArrayData, scratch and copy memory scopes;
+/// this operation only describes representability and observes actual work.
+pub fn preflight_extend(
+    source: &dyn Array,
+    start: usize,
+    len: usize,
+    nulls: usize,
+    capacity: usize,
+    mut observe: impl FnMut(bool) -> Result<(), KernelFailure>,
+) -> Result<(), CopyError> {
+    let mut work = CopyObservation(&mut observe);
+    work.boundary()?;
+    let result = (|| {
+        let end = add(start, len)?;
+        let output = add(len, nulls)?;
+        work.step()?;
+        if start > source.len() || end > source.len() || output > capacity {
+            return Err(CopyError::Invalid(
+                "mutable copy range or padding exceeds its source or capacity",
+            ));
+        }
+        work.boundary()?;
+        let data = source.to_data();
+        work.boundary()?;
+        mutable_capacity(&data, capacity, &mut work)?;
+        let selection = Selection {
+            blocks: vec![Block {
+                ranges: std::iter::once(start..end).collect(),
+                repeats: 1,
+            }],
+            nulls,
+        };
+        preflight(source, &selection, CopyMode::Extend, &mut work)
+    })();
+    if matches!(&result, Err(CopyError::Control(_))) {
+        return result;
+    }
+    work.boundary()?;
+    result
+}
+
 // Arrow's MutableBuffer rounds bitmap reservations to 64-byte alignment.
 // This is a format/layout check, not an allocation grant or byte invoice.
 pub fn fixed_interleave_extent(ty: &DataType, rows: usize) -> Result<(), CopyError> {
@@ -859,7 +908,7 @@ mod broadcast_tests {
     use arrow_schema::Field;
     use std::sync::Arc;
 
-    fn failures() -> [KernelFailure; 7] {
+    pub(super) fn failures() -> [KernelFailure; 7] {
         use crate::KernelDiagnostic;
         [
             KernelFailure::Cancelled,
@@ -958,3 +1007,66 @@ mod broadcast_tests {
 #[cfg(test)]
 #[path = "selected_copy/preflight_take_tests.rs"]
 mod preflight_take_tests;
+
+#[cfg(test)]
+mod extend_tests {
+    use super::*;
+    use arrow_array::Int64Array;
+    use arrow_schema::{Field, UnionFields};
+    use std::sync::Arc;
+
+    #[test]
+    fn dense_union_extend_bounds_first_child_null_padding_and_nested_fixed_list() {
+        let fields = UnionFields::try_new(
+            [7, 3],
+            [
+                Arc::new(Field::new("first", DataType::Int64, true)),
+                Arc::new(Field::new("second", DataType::Int64, true)),
+            ],
+        )
+        .unwrap();
+        let source = UnionArray::try_new(
+            fields,
+            vec![7_i8, 3].into(),
+            Some(vec![0_i32, 0].into()),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(11)])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![Some(22)])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let maximum = i32::MAX as usize;
+        // No large output is allocated: these exercise the numeric preflight
+        // against two actual source rows and the library's declared child order.
+        preflight_extend(&source, 0, 1, maximum - 1, maximum, |_| Ok(())).unwrap();
+        assert!(matches!(
+            preflight_extend(&source, 0, 1, maximum, maximum + 1, |_| Ok(())),
+            Err(CopyError::Extent)
+        ));
+        preflight_extend(&source, 1, 1, maximum, maximum + 1, |_| Ok(())).unwrap();
+        let nested = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", source.data_type().clone(), true)),
+            2,
+            Arc::new(source),
+            None,
+        )
+        .unwrap();
+        let exact = (maximum - 1) / 2;
+        preflight_extend(&nested, 0, 1, exact, exact + 1, |_| Ok(())).unwrap();
+        assert!(matches!(
+            preflight_extend(&nested, 0, 1, exact + 1, exact + 2, |_| Ok(())),
+            Err(CopyError::Extent)
+        ));
+        for cause in super::broadcast_tests::failures() {
+            let mut calls = 0;
+            assert!(matches!(
+                preflight_extend(&nested, 0, 1, exact + 1, exact + 2, |_| {
+                    calls += 1;
+                    Err(cause.clone())
+                }),
+                Err(CopyError::Control(actual)) if actual == cause
+            ));
+            assert_eq!(calls, 1);
+        }
+    }
+}

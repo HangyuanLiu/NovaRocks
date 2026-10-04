@@ -155,6 +155,27 @@ impl<'call, 'a> TableOutputPage<'call, 'a> {
         capacities: TablePageCapacity,
         control: &dyn KernelEvaluationControl,
     ) -> Result<Self, KernelFailure> {
+        let observation = crate::kernel_control::KernelControlObservation::new(control);
+        let result = Self::try_new_observed(
+            contract,
+            parents,
+            columns,
+            parent_ordinals,
+            completed_parents,
+            capacities,
+            &observation,
+        );
+        observation.finish(result)
+    }
+    fn try_new_observed(
+        contract: &'call TableCallContract,
+        parents: Selection<'a>,
+        columns: &'a [ArrayRef],
+        parent_ordinals: &'a [usize],
+        completed_parents: &'a [usize],
+        capacities: TablePageCapacity,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Self, KernelFailure> {
         control.checkpoint(0)?;
         if parent_ordinals.len() > capacities.rows
             || completed_parents.len() > capacities.completions

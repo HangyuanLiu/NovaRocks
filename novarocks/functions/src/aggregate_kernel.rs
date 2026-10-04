@@ -474,6 +474,22 @@ where
     K::State: 'state,
     I: ExactSizeIterator<Item = &'state K::State> + Clone,
 {
+    let observed = crate::kernel_control::KernelControlObservation::new(control);
+    let result = emit_aggregate_observed(kernel, states, row_capacity, &observed);
+    observed.finish(result)
+}
+
+fn emit_aggregate_observed<'state, K, I>(
+    kernel: &K,
+    states: I,
+    row_capacity: usize,
+    control: &dyn KernelEvaluationControl,
+) -> Result<ArrayRef, KernelFailure>
+where
+    K: PreparedAggregateKernel,
+    K::State: 'state,
+    I: ExactSizeIterator<Item = &'state K::State> + Clone,
+{
     control.checkpoint(0)?;
     let rows = states.len();
     if rows > row_capacity {
@@ -485,6 +501,16 @@ where
     } else {
         kernel.build_intermediate(states.clone(), control)
     };
+    // Interrupted output is terminal. The host still owns reconciliation and
+    // destruction; another observed state traversal cannot complete this call.
+    if matches!(
+        &result,
+        Err(KernelFailure::Cancelled
+            | KernelFailure::DeadlineExceeded
+            | KernelFailure::ResourceExhausted)
+    ) {
+        return result;
+    }
     // &State may contain interior mutable storage. Both successful and failed
     // emissions are checked, without changing a primary control/resource error.
     let output = finish_lifecycle(result, validate_emission_states(kernel, states, control))?;
