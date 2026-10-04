@@ -27,6 +27,7 @@ pub struct PreparedAggregateBindingHeaders<'loan, 'source> {
     functions: &'loan PreparedFunctionBindingHeaders<'source>,
     index: BindingIndex,
     facts: BindingProjectionFacts,
+    source_invoice: usize,
 }
 impl<'loan, 'source> PreparedAggregateBindingHeaders<'loan, 'source> {
     pub fn as_wire(&self) -> &'loan [wire::AggregateBindingDefinition] {
@@ -44,13 +45,34 @@ impl<'loan, 'source> PreparedAggregateBindingHeaders<'loan, 'source> {
         &self,
         id: u32,
     ) -> Result<Option<&'loan wire::AggregateBindingDefinition>, BindingCodecError> {
-        let mut work =
-            CompileCheckpoints::try_new(self.functions.original_control(), CompilePhase::Decode)?;
-        let result = self
-            .index
-            .find(id, |at| self.definitions[at].id, &mut work)?;
+        let mut work = CompileCheckpoints::try_new(self.original_control(), CompilePhase::Decode)?;
+        let result = self.definition_observed(id, &mut work)?;
         work.finish()?;
-        Ok(result.map(|at| &self.definitions[at]))
+        Ok(result)
+    }
+    /// Borrow the original definition inside the consuming scope's meter.
+    /// This port neither opens nor finishes a second lookup scope.
+    pub(crate) fn definition_observed(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'loan wire::AggregateBindingDefinition>, BindingCodecError> {
+        self.index
+            .find(id, |at| self.definitions[at].id, work)
+            .map(|index| index.map(|at| &self.definitions[at]))
+    }
+    pub(crate) fn original_control(&self) -> &'source dyn PureCompileControl {
+        self.functions.original_control()
+    }
+    /// Preserve the supplied original source invoice once, plus this token
+    /// and its actual retained sparse index capacity. The invoice already
+    /// includes the loaned function owner; do not charge its invoice again.
+    /// This is a necessary composition floor, not a measured total/MEM grant.
+    pub(crate) fn retained_invoice_floor(&self) -> Result<usize, BindingCodecError> {
+        add(
+            self.source_invoice,
+            add(size_of::<Self>(), self.index.backing_bytes()?)?,
+        )
     }
 }
 fn invalid(message: &'static str) -> BindingCodecError {
@@ -267,6 +289,7 @@ pub fn prepare_aggregate_binding_headers<'loan, 'source>(
             functions,
             index,
             facts,
+            source_invoice: source_retained_bytes,
         })
     })();
     if matches!(&result, Err(BindingCodecError::Control(_))) {

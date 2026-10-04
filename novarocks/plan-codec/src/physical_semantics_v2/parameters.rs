@@ -76,7 +76,7 @@ pub(crate) fn encode_reference(
     })
 }
 
-pub(super) fn decode_reference(
+pub(crate) fn decode_reference(
     reference: &wire::SemanticParameterRef,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<SemanticParameterRef, SemanticsCodecError> {

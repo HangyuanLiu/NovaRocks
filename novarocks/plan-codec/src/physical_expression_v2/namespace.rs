@@ -233,23 +233,27 @@ impl<'loan, 'source, 'control> PreparedExpressionNamespaceWrite<'loan, 'source, 
         finish(work, result)
     }
 }
-fn shape(message: &'static str) -> Error {
+pub(super) fn shape(message: &'static str) -> Error {
     Error::InvalidShape(message)
 }
-fn add(a: usize, b: usize) -> Result<usize, Error> {
+pub(super) fn add(a: usize, b: usize) -> Result<usize, Error> {
     a.checked_add(b)
         .ok_or_else(|| shape("expression writer resource sum overflow"))
 }
-fn mul(a: usize, b: usize) -> Result<usize, Error> {
+pub(super) fn mul(a: usize, b: usize) -> Result<usize, Error> {
     a.checked_mul(b)
         .ok_or_else(|| shape("expression writer resource product overflow"))
 }
-fn bytes<T>(count: usize) -> Result<usize, Error> {
+pub(super) fn bytes<T>(count: usize) -> Result<usize, Error> {
     Layout::array::<T>(count)
         .map(|layout| layout.size())
         .map_err(|_| shape("expression writer layout is unrepresentable"))
 }
-fn cap(actual: usize, limit: usize, work: &mut CompileCheckpoints<'_>) -> Result<(), Error> {
+pub(super) fn cap(
+    actual: usize,
+    limit: usize,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), Error> {
     let allowed = actual <= limit;
     work.step()?;
     if !allowed {
@@ -257,7 +261,7 @@ fn cap(actual: usize, limit: usize, work: &mut CompileCheckpoints<'_>) -> Result
     }
     Ok(())
 }
-fn check(
+pub(super) fn check(
     facts: &ExpressionNamespaceWriteFacts,
     limits: ExpressionProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
@@ -290,7 +294,10 @@ fn check(
         work,
     )
 }
-fn vector<T>(facts: &mut ExpressionNamespaceWriteFacts, count: usize) -> Result<(), Error> {
+pub(super) fn vector<T>(
+    facts: &mut ExpressionNamespaceWriteFacts,
+    count: usize,
+) -> Result<(), Error> {
     facts.new_allocation_request_bytes_upper_bound = add(
         facts.new_allocation_request_bytes_upper_bound,
         bytes::<T>(count)?,
@@ -301,7 +308,7 @@ fn vector<T>(facts: &mut ExpressionNamespaceWriteFacts, count: usize) -> Result<
     )?;
     Ok(())
 }
-fn charge(
+pub(super) fn charge(
     facts: &mut ExpressionNamespaceWriteFacts,
     value: usize,
     limits: ExpressionProjectionLimits,
@@ -314,7 +321,7 @@ fn charge(
         work,
     )
 }
-fn tree_lookup_work(entries: usize) -> Result<usize, Error> {
+pub(super) fn tree_lookup_work(entries: usize) -> Result<usize, Error> {
     // Rust 1.92 BTree nodes have at most eleven keys. Even binary fanout
     // gives at most bit-length+1 visited levels; sixteen units per level
     // include key, edge and node-header work without another lookup index.
@@ -360,7 +367,10 @@ fn signature_source_floor(
     }
     Ok(())
 }
-fn finish<T>(work: CompileCheckpoints<'_>, result: Result<T, Error>) -> Result<T, Error> {
+pub(super) fn finish<T>(
+    work: CompileCheckpoints<'_>,
+    result: Result<T, Error>,
+) -> Result<T, Error> {
     if matches!(&result, Err(Error::Control(_))) {
         return result;
     }

@@ -179,23 +179,9 @@ fn cap(
     Ok(())
 }
 
-/// Rust 1.92 alloc/btree/node.rs: B=6, eleven keys/values, twelve edges.
-/// LeafNode has private Rust field order: use the actual member Layout sizes
-/// and maximum padding per member, rather than assert an identical mirror.
+/// The shared locked author uses these actual key/value member layouts.
 fn table_node_layout() -> Result<Layout, Error> {
-    let key = Layout::new::<ConstantPoolId>();
-    let value = Layout::new::<ConstantPool>();
-    let pointer = Layout::new::<usize>();
-    let align = key.align().max(value.align()).max(pointer.align());
-    let members = add(
-        add(pointer.size(), 2 * mem::size_of::<u16>())?,
-        mul(11, add(key.size(), value.size())?)?,
-    )?;
-    let leaf = add(members, mul(5, align - 1)?)?;
-    let internal = add(add(leaf, mul(12, pointer.size())?)?, align - 1)?;
-    Layout::from_size_align(internal, align)
-        .map(|value| value.pad_to_align())
-        .map_err(|_| shape("constant namespace table node layout is unrepresentable"))
+    crate::btree_resources_v2::node_layout::<ConstantPoolId, ConstantPool>().map_err(shape)
 }
 
 fn initial_facts(

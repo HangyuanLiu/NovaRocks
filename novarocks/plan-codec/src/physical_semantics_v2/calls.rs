@@ -263,7 +263,7 @@ pub(crate) fn encode_policy(value: DecimalOverflowPolicy) -> i32 {
         DecimalOverflowPolicy::ReportError => wire::DecimalOverflowPolicy::ReportError as i32,
     }
 }
-fn decode_policy(value: i32) -> Result<DecimalOverflowPolicy, E> {
+pub(crate) fn decode_policy(value: i32) -> Result<DecimalOverflowPolicy, E> {
     match wire::DecimalOverflowPolicy::try_from(value) {
         Ok(wire::DecimalOverflowPolicy::OutputNull) => Ok(DecimalOverflowPolicy::OutputNull),
         Ok(wire::DecimalOverflowPolicy::ReportError) => Ok(DecimalOverflowPolicy::ReportError),

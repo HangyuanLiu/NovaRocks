@@ -32,7 +32,7 @@ use arrow::{
 use arrow_buffer::Buffer;
 use novarocks_constant_contract::ConstantPool;
 use novarocks_type_contract::CompileCheckpoints;
-use std::{alloc::Layout, mem};
+use std::alloc::Layout;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ReaderAllocationRequests {
@@ -87,25 +87,7 @@ fn allocation_set(
         work.step()?;
         return Ok(());
     }
-    // Rust 1.92 btree/node.rs B=6. InternalNode is repr(C), with a LeafNode
-    // and twelve pointer edges. LeafNode's private Rust field order is not
-    // asserted: sum true member sizes plus maximum padding at each member is
-    // a checked upper bound for any such order (all alignments divide usize).
-    // Its members are parent pointer, two u16, eleven (usize,usize) keys and
-    // eleven unit values. Internal nodes dominate leaf requests.
-    let align = mem::align_of::<usize>();
-    let members = add(
-        add(mem::size_of::<usize>(), 2 * mem::size_of::<u16>())?,
-        mul(11, mem::size_of::<(usize, usize)>())?,
-    )?;
-    let padded_leaf = add(members, mul(5, align - 1)?)?;
-    let internal = add(
-        add(padded_leaf, mul(12, mem::size_of::<usize>())?)?,
-        align - 1,
-    )?;
-    let layout = Layout::from_size_align(internal, align)
-        .map_err(|_| invalid("recursive constant allocation-set layout"))?
-        .pad_to_align();
+    let layout = crate::btree_resources_v2::node_layout::<(usize, usize), ()>().map_err(invalid)?;
     // Only insertions occur. Every retained node has at least one key, and no
     // node is deleted/reallocated. Cumulative node allocations <= distinct
     // backing identities, including the first three copied from inline slots.

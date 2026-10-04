@@ -15,24 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Borrowed definition projection from the original expression owner. This
-//! component does not authenticate selected kernels or validate a full package.
+//! Borrowed expression definition projection in both directions. Receiving
+//! retains the original namespaces without inventing legacy effect metadata.
+//! This component does not authenticate kernels or validate a full package.
 
 use crate::{
     physical_binding_v2::BindingCodecError, physical_semantics_v2::SemanticsCodecError,
-    physical_type_v2::TypeCodecError,
+    physical_type_v2::TypeCodecError, physical_value_v2::ValueCodecError,
 };
 use novarocks_type_contract::CompileControlError;
 use std::fmt;
 
 mod kind;
 mod namespace;
+mod read;
 
 pub use namespace::{
     EncodedExpressions, ExpressionNamespaceWriteFacts, ExpressionProjectionLimits,
     ExpressionTypeIds, PreparedExpressionNamespaceWrite, encode_expression_definitions,
     prepare_expression_definitions,
 };
+
+pub use read::{DecodedExpressions, ExpressionNamespaceReadFacts, decode_expression_definitions};
 
 #[derive(Debug)]
 pub enum ExpressionCodecError {
@@ -41,6 +45,8 @@ pub enum ExpressionCodecError {
     Type(TypeCodecError),
     Semantics(SemanticsCodecError),
     Binding(BindingCodecError),
+    Value(ValueCodecError),
+    Constant(novarocks_physical_plan::ConstantReferenceError),
 }
 impl fmt::Display for ExpressionCodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -50,6 +56,8 @@ impl fmt::Display for ExpressionCodecError {
             Self::Type(error) => error.fmt(f),
             Self::Semantics(error) => error.fmt(f),
             Self::Binding(error) => error.fmt(f),
+            Self::Value(error) => error.fmt(f),
+            Self::Constant(error) => error.fmt(f),
         }
     }
 }
@@ -84,6 +92,31 @@ impl From<BindingCodecError> for ExpressionCodecError {
     }
 }
 
+impl From<ValueCodecError> for ExpressionCodecError {
+    fn from(value: ValueCodecError) -> Self {
+        match value {
+            ValueCodecError::Control(error) => Self::Control(error),
+            value => Self::Value(value),
+        }
+    }
+}
+impl From<novarocks_physical_plan::ConstantReferenceError> for ExpressionCodecError {
+    fn from(value: novarocks_physical_plan::ConstantReferenceError) -> Self {
+        use novarocks_constant_contract::ConstantError;
+        use novarocks_physical_plan::ConstantReferenceError;
+        match value {
+            ConstantReferenceError::Control(error)
+            | ConstantReferenceError::Constant(ConstantError::Control(error)) => {
+                Self::Control(error)
+            }
+            ConstantReferenceError::Constant(ConstantError::Limit(_)) => {
+                Self::Control(CompileControlError::ResourceExhausted)
+            }
+            value => Self::Constant(value),
+        }
+    }
+}
+
 /// Internal IDs already bound to this definition's original immutable owners.
 /// The kind leaf never chooses these IDs or authors another type namespace.
 struct PreparedExpressionIds<'a> {
@@ -92,3 +125,6 @@ struct PreparedExpressionIds<'a> {
     function_binding_id: Option<u32>,
     aggregate_binding_id: Option<u32>,
 }
+
+#[cfg(test)]
+mod error_tests;
