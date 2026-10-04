@@ -26,6 +26,7 @@ use novarocks_type_contract::{
 };
 
 use super::catalogue::BuiltinScalarResolver;
+use super::window_default::DefaultValueRecipe;
 use super::window_offset::{OffsetOperation, PreparedOffset};
 use crate::kernel_control::{compile_failure, invalid};
 use crate::{
@@ -259,6 +260,19 @@ impl PureWindowImplementation for WindowOffsetOwner {
                     _ => invalid("window_offset preparation has a stale selected binding"),
                 })?;
             let offset = canonical_call(input, *contract.options(), &mut work)?;
+            let default = if input.request.arguments.len() == 3 {
+                let FunctionArgumentType::Value(source) = &input.selected.argument_types[2] else {
+                    return Err(invalid(
+                        "LEAD/LAG default requires its complete selected value domain",
+                    ));
+                };
+                work.flush().map_err(compile_failure)?;
+                let recipe = DefaultValueRecipe::try_new(source, contract.result_type(), control)?;
+                work.flush().map_err(compile_failure)?;
+                Some(recipe)
+            } else {
+                None
+            };
             work.flush().map_err(compile_failure)?;
             // The prepared object retains the same canonical contract. Its body is
             // a static pure implementation and needs no live resolver or authority.
@@ -266,6 +280,7 @@ impl PureWindowImplementation for WindowOffsetOwner {
                 contract,
                 operation: self.operation,
                 offset,
+                default,
             }) as Arc<dyn PreparedWindowKernel>;
             work.flush().map_err(compile_failure)?;
             Ok(prepared)
@@ -289,15 +304,13 @@ fn canonical_call(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<i64, KernelFailure> {
     let count = input.request.arguments.len();
-    let shape = (1..=2).contains(&count)
+    let shape = (1..=3).contains(&count)
         && input.request.logical_argument_count == count
         && input.selected.argument_types.len() == count;
     work.step().map_err(compile_failure)?;
     if !shape {
-        // The third independent D domain requires the original default cast and
-        // combined zip resource author. It is not a same-type rebinding.
         return Err(invalid(
-            "LEAD/LAG default conversion and zip are not implemented",
+            "LEAD/LAG requires one to three canonical value channels",
         ));
     }
     for (actual, selected) in input

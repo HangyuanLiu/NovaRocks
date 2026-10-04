@@ -18,6 +18,10 @@
 //! Shared format/extent author for Arrow constant broadcasts and selected copies.
 //! Representability checks do not authorize allocations or mint memory grants.
 
+#[path = "selected_copy/zip.rs"]
+mod zip;
+pub use zip::preflight_zip;
+
 use crate::KernelFailure;
 use arrow_array::types::{ByteArrayType, Int16Type, Int32Type, Int64Type, RunEndIndexType};
 use arrow_array::{

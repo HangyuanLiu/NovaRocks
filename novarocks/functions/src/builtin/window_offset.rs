@@ -18,13 +18,14 @@
 //! LEAD/LAG selected values from one complete original partition.
 //! Offset is a checked immutable preparation constant; frame geometry remains host-owned.
 
-use crate::kernel_control::{internal, invalid};
+use super::window_default::DefaultValueRecipe;
+use crate::kernel_control::{KernelControlObservation, internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::{
     KernelEvaluationControl, KernelFailure, PreparedWindowKernel, SelectedValues, Selection,
     WindowCallContract, WindowKernelPartition, WindowPartitionInput,
 };
-use arrow_array::{ArrayRef, UInt64Array};
+use arrow_array::{ArrayRef, BooleanArray, UInt64Array};
 use std::{alloc::Layout, ops::Range, sync::Arc};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,12 +39,15 @@ pub(super) struct PreparedOffset {
     pub(super) contract: Arc<WindowCallContract>,
     pub(super) operation: OffsetOperation,
     pub(super) offset: i64,
+    pub(super) default: Option<DefaultValueRecipe>,
 }
 
 struct OffsetPartition<'a> {
     prepared: Arc<PreparedOffset>,
     input: WindowPartitionInput<'a>,
     addresses: Box<[Option<u64>]>,
+    defaults: Option<ArrayRef>,
+    retained: usize,
     closed: bool,
 }
 
@@ -99,8 +103,13 @@ impl PreparedWindowKernel for PreparedOffset {
         let heap = Layout::array::<Option<u64>>(rows)
             .map_err(|_| KernelFailure::ResourceExhausted)?
             .size();
+        let defaults = match &self.default {
+            Some(recipe) => recipe.retained_upper_bound(rows)?,
+            None => 0,
+        };
         size_of::<OffsetPartition<'_>>()
             .checked_add(heap)
+            .and_then(|bytes| bytes.checked_add(defaults))
             .ok_or(KernelFailure::ResourceExhausted)
     }
     fn begin_partition<'a>(
@@ -108,6 +117,8 @@ impl PreparedWindowKernel for PreparedOffset {
         input: WindowPartitionInput<'a>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<Box<dyn WindowKernelPartition + 'a>, KernelFailure> {
+        let observation = KernelControlObservation::new(control);
+        let control: &dyn KernelEvaluationControl = &observation;
         control.checkpoint(0)?;
         let mut work = EvaluationCheckpoints::new(control);
         let result = (|| {
@@ -120,6 +131,22 @@ impl PreparedWindowKernel for PreparedOffset {
             }
             let rows = input.full_input().partition_rows();
             self.partition_retained_upper_bound(rows)?;
+            // Preserve the original complete D conversion before target setup.
+            // Only later output copying follows Selection; unrelated CV pool
+            // rows are not logical default inputs.
+            let defaults = match &self.default {
+                Some(recipe) => {
+                    work.flush()?;
+                    let converted = recipe.evaluate_complete(
+                        input.full_input().logical_arguments()[2],
+                        rows,
+                        control,
+                    )?;
+                    work.flush()?;
+                    Some(converted)
+                }
+                None => None,
+            };
             let source = input.full_input().logical_arguments()[0];
             let mut addresses = reserve::<Option<u64>>(rows, &mut work)?;
             let ignore = self.contract.options().ignore_nulls();
@@ -181,17 +208,35 @@ impl PreparedWindowKernel for PreparedOffset {
                 work.step()?;
             }
             // Full required setup and format refusal precede output demand.
-            // No full-partition result is materialized or hidden in the cursor.
+            // Source output is copied only on demand; the required converted
+            // default partition remains explicitly retained above.
             copy_plan(source, &addresses, &mut work)?;
             drop(positions);
             drop(prefix);
             work.flush()?;
             let addresses = addresses.into_boxed_slice();
             work.flush()?;
+            let retained = size_of::<OffsetPartition<'_>>()
+                .checked_add(
+                    addresses
+                        .len()
+                        .checked_mul(size_of::<Option<u64>>())
+                        .ok_or(KernelFailure::ResourceExhausted)?,
+                )
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        defaults
+                            .as_ref()
+                            .map_or(0, |array| array.get_array_memory_size()),
+                    )
+                })
+                .ok_or(KernelFailure::ResourceExhausted)?;
             let partition = Box::new(OffsetPartition {
                 prepared: self,
                 input,
                 addresses,
+                defaults,
+                retained,
                 closed: false,
             }) as Box<dyn WindowKernelPartition>;
             work.flush()?;
@@ -206,7 +251,7 @@ impl PreparedWindowKernel for PreparedOffset {
             return result;
         }
         work.finish()?;
-        result
+        observation.finish(result)
     }
 }
 
@@ -220,6 +265,8 @@ impl WindowKernelPartition for OffsetPartition<'_> {
         if self.closed {
             return Err(KernelFailure::InstanceFailed);
         }
+        let observation = KernelControlObservation::new(control);
+        let control: &dyn KernelEvaluationControl = &observation;
         let result = (|| {
             control.checkpoint(0)?;
             let mut work = EvaluationCheckpoints::new(control);
@@ -246,6 +293,70 @@ impl WindowKernelPartition for OffsetPartition<'_> {
                 work.flush()?;
                 let copied: ArrayRef =
                     copied.map_err(|_| internal("window offset Arrow take failed"))?;
+                let copied = if let Some(defaults) = &self.defaults {
+                    let mut default_indices = reserve::<Option<u64>>(selection.len(), &mut work)?;
+                    let mut use_default = reserve::<bool>(selection.len(), &mut work)?;
+                    for row in selection.iter() {
+                        default_indices.push(Some(
+                            u64::try_from(row).map_err(|_| KernelFailure::ResourceExhausted)?,
+                        ));
+                        // A NULL source at an existing target remains NULL.
+                        use_default.push(self.addresses[row].is_none());
+                        work.step()?;
+                    }
+                    copy_plan(
+                        crate::EvaluatedArgument::Column(defaults),
+                        &default_indices,
+                        &mut work,
+                    )?;
+                    work.flush()?;
+                    let default_indices = UInt64Array::from(default_indices);
+                    work.flush()?;
+                    let selected_defaults =
+                        arrow_select::take::take(defaults.as_ref(), &default_indices, None);
+                    work.flush()?;
+                    let selected_defaults = selected_defaults
+                        .map_err(|_| internal("window offset default Arrow take failed"))?;
+                    let bitmap = selection
+                        .len()
+                        .checked_add(7)
+                        .ok_or(KernelFailure::ResourceExhausted)?
+                        / 8;
+                    Layout::array::<u8>(bitmap).map_err(|_| KernelFailure::ResourceExhausted)?;
+                    work.flush()?;
+                    let mask = BooleanArray::from(use_default);
+                    work.flush()?;
+                    match crate::selected_copy::preflight_zip(
+                        &mask,
+                        selected_defaults.as_ref(),
+                        copied.as_ref(),
+                        |opaque| {
+                            if opaque { work.flush() } else { work.step() }
+                        },
+                    ) {
+                        Ok(()) => {}
+                        Err(crate::selected_copy::CopyError::Control(cause)) => return Err(cause),
+                        Err(crate::selected_copy::CopyError::Extent) => {
+                            return Err(KernelFailure::ResourceExhausted);
+                        }
+                        Err(_) => {
+                            work.flush()?;
+                            return Err(invalid(
+                                "window offset default zip profile is unsupported",
+                            ));
+                        }
+                    }
+                    work.flush()?;
+                    let zipped = arrow_select::zip::zip(
+                        &mask,
+                        &selected_defaults.as_ref(),
+                        &copied.as_ref(),
+                    );
+                    work.flush()?;
+                    zipped.map_err(|_| internal("window offset default Arrow zip failed"))?
+                } else {
+                    copied
+                };
                 SelectedValues::try_new_observed::<KernelFailure>(
                     selection,
                     &self.prepared.contract.result_type().data_type,
@@ -265,6 +376,7 @@ impl WindowKernelPartition for OffsetPartition<'_> {
             work.finish()?;
             result
         })();
+        let result = observation.finish(result);
         if result.is_err() {
             self.closed = true;
         }
@@ -281,7 +393,7 @@ impl WindowKernelPartition for OffsetPartition<'_> {
     }
 
     fn retained_bytes(&self) -> usize {
-        size_of::<Self>() + self.addresses.len() * size_of::<Option<u64>>()
+        self.retained
     }
 }
 

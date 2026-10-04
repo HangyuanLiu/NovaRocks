@@ -720,7 +720,7 @@ fn exact_nested_source_fresh_and_frozen_keep_same_installed_attachment_and_metad
 }
 
 #[test]
-fn dynamic_null_negative_and_three_argument_defaults_refuse_before_partition_publication() {
+fn dynamic_null_negative_and_unsupported_defaults_refuse_before_partition_publication() {
     let source = FunctionValueType::new(DataType::Int32, true);
     for name in NAMES {
         let dynamic = Fixture::with_arguments(
@@ -760,9 +760,9 @@ fn dynamic_null_negative_and_three_argument_defaults_refuse_before_partition_pub
             ));
         }
         for default in [
-            FunctionValueType::new(DataType::Int32, true),
-            FunctionValueType::new(DataType::Int64, false),
-            FunctionValueType::new(DataType::Null, true),
+            FunctionValueType::new(DataType::Boolean, true),
+            FunctionValueType::new(DataType::Float64, false),
+            FunctionValueType::new(DataType::LargeUtf8, true),
         ] {
             let offset = cv(Some(1), false);
             let fixture = Fixture::with_arguments(
@@ -837,8 +837,8 @@ fn every_compile_callback_keeps_three_primary_causes_on_success_and_ordinary_off
                 }
             }
         }
-        // A real unsupported three-channel selection must retain its ordinary
-        // error tail and original control, rather than publish a default recipe.
+        // An unsupported default carrier keeps its ordinary error tail and
+        // original control rather than publishing a guessed conversion.
         let offset = cv(Some(1), false);
         let fixture = Fixture::with_arguments(
             name,
@@ -852,7 +852,7 @@ fn every_compile_callback_keeps_three_primary_causes_on_success_and_ordinary_off
                     constant: Some(offset),
                 },
                 FunctionArgument::Value {
-                    value_type: source,
+                    value_type: FunctionValueType::new(DataType::Float64, true),
                     constant: None,
                 },
             ],
@@ -1170,4 +1170,478 @@ fn original_contract_full_input_capacity_and_unsupported_copy_refuse_without_fal
         ),
         Err(KernelFailure::InvalidProgram(_))
     ));
+}
+
+fn default_fixture(
+    name: &str,
+    source: FunctionValueType,
+    default: FunctionValueType,
+    overflow: DecimalOverflowPolicy,
+) -> Fixture {
+    let offset = cv(Some(1), false);
+    Fixture::with_arguments(
+        name,
+        vec![
+            FunctionArgument::Value {
+                value_type: source,
+                constant: None,
+            },
+            FunctionArgument::Value {
+                value_type: offset.value_type().clone(),
+                constant: Some(offset),
+            },
+            FunctionArgument::Value {
+                value_type: default,
+                constant: None,
+            },
+        ],
+        overflow,
+    )
+}
+
+#[test]
+fn three_arguments_convert_complete_defaults_and_only_replace_missing_targets() {
+    let source: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(10), None, Some(30)]));
+    let defaults: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("101"),
+        Some("bad"),
+        Some("303"),
+        Some("404"),
+    ]));
+    let offset: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+    let peers = [WindowRowRange { start: 0, end: 4 }];
+    let frames = whole_frames(4);
+    let rows = [1, 3];
+    for name in NAMES {
+        for ignore in [false, true] {
+            for overflow in [
+                DecimalOverflowPolicy::OutputNull,
+                DecimalOverflowPolicy::ReportError,
+            ] {
+                let fixture =
+                    default_fixture(name, ty(&source, true), ty(&defaults, true), overflow);
+                let prepared = fixture
+                    .prepare(options(ignore), &CompileControl::default())
+                    .unwrap();
+                let args = [
+                    EvaluatedArgument::Column(&source),
+                    EvaluatedArgument::Scalar(&offset),
+                    EvaluatedArgument::Column(&defaults),
+                ];
+                let mut part = WindowEvaluationPartition::begin(
+                    prepared.clone(),
+                    geometry(&prepared, &args, &peers, &frames),
+                    &Control::default(),
+                )
+                .unwrap();
+                let expected = match (name, ignore) {
+                    ("lead", false) => vec![Some(10), None, Some(30), Some(404)],
+                    ("lead", true) => vec![Some(10), Some(30), Some(30), Some(404)],
+                    ("lag", false) => vec![Some(101), None, Some(10), None],
+                    ("lag", true) => vec![Some(101), None, Some(10), Some(10)],
+                    _ => unreachable!(),
+                };
+                let all = part
+                    .evaluate(Selection::all(4), 4, &Control::default())
+                    .unwrap();
+                assert_eq!(
+                    all.values()
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .iter()
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                let sparse = part
+                    .evaluate(
+                        Selection::try_sparse(4, &rows).unwrap(),
+                        2,
+                        &Control::default(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    sparse
+                        .values()
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .iter()
+                        .collect::<Vec<_>>(),
+                    vec![expected[1], expected[3]]
+                );
+                assert!(part.retained_bytes().unwrap() <= part.retained_upper_bound());
+                assert!(
+                    part.evaluate(
+                        Selection::try_sparse(4, &[]).unwrap(),
+                        0,
+                        &Control::default()
+                    )
+                    .unwrap()
+                    .values()
+                    .is_empty()
+                );
+                part.finish(&Control::default()).unwrap();
+            }
+        }
+    }
+    // I64-to-Utf8 conversion uses the original Arrow formatter. A real NULL
+    // target remains NULL; the default only serves an absent target.
+    let text: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("a"),
+        None,
+        Some("c"),
+        Some("d"),
+    ]));
+    let numbers: ArrayRef = Arc::new(Int64Array::from(vec![i64::MIN, 2, 3, i64::MAX]));
+    let fixture = default_fixture(
+        "lead",
+        ty(&text, true),
+        ty(&numbers, false),
+        DecimalOverflowPolicy::OutputNull,
+    );
+    let prepared = fixture
+        .prepare(options(false), &CompileControl::default())
+        .unwrap();
+    let args = [
+        EvaluatedArgument::Column(&text),
+        EvaluatedArgument::Scalar(&offset),
+        EvaluatedArgument::Column(&numbers),
+    ];
+    let mut part = WindowEvaluationPartition::begin(
+        prepared.clone(),
+        geometry(&prepared, &args, &peers, &frames),
+        &Control::default(),
+    )
+    .unwrap();
+    let output = part
+        .evaluate(Selection::all(4), 4, &Control::default())
+        .unwrap();
+    assert_eq!(
+        output
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![None, Some("c"), Some("d"), Some("9223372036854775807")]
+    );
+}
+
+#[test]
+fn default_complete_setup_and_selected_copy_preserve_every_original_control_prefix() {
+    let source: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
+    let defaults: ArrayRef = Arc::new(StringArray::from(vec!["5", "bad", "9"]));
+    let offset: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+    let args = [
+        EvaluatedArgument::Column(&source),
+        EvaluatedArgument::Scalar(&offset),
+        EvaluatedArgument::Column(&defaults),
+    ];
+    let peers = [WindowRowRange { start: 0, end: 3 }];
+    let frames = whole_frames(3);
+    let rows = [0, 2];
+    for name in NAMES {
+        let fixture = default_fixture(
+            name,
+            ty(&source, false),
+            ty(&defaults, false),
+            DecimalOverflowPolicy::OutputNull,
+        );
+        let compilation = CompileControl::default();
+        let prepared = fixture.prepare(options(false), &compilation).unwrap();
+        let trace = compilation.trace.lock().unwrap().clone();
+        for at in 0..trace.len() {
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let control = CompileControl {
+                    trace: Mutex::default(),
+                    refusal: Some((at, cause)),
+                };
+                assert_eq!(
+                    compile_cause(fixture.prepare(options(false), &control).unwrap_err()),
+                    cause
+                );
+                assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+            }
+        }
+        for stage in 0..4 {
+            let baseline = Control::default();
+            let input = geometry(&prepared, &args, &peers, &frames);
+            if stage == 0 {
+                WindowEvaluationPartition::begin(prepared.clone(), input, &baseline).unwrap();
+            } else {
+                let mut part =
+                    WindowEvaluationPartition::begin(prepared.clone(), input, &Control::default())
+                        .unwrap();
+                let selection = match stage {
+                    1 => Selection::all(3),
+                    2 => Selection::try_sparse(3, &rows).unwrap(),
+                    _ => Selection::try_sparse(3, &[]).unwrap(),
+                };
+                part.evaluate(selection, 3, &baseline).unwrap();
+            }
+            let trace = baseline.trace.lock().unwrap().clone();
+            for at in 0..trace.len() {
+                for cause in causes() {
+                    let control = Control {
+                        trace: Mutex::default(),
+                        refusal: Some((at, cause.clone())),
+                    };
+                    let outcome = if stage == 0 {
+                        WindowEvaluationPartition::begin(prepared.clone(), input, &control)
+                            .map(|_| ())
+                    } else {
+                        let mut part = WindowEvaluationPartition::begin(
+                            prepared.clone(),
+                            input,
+                            &Control::default(),
+                        )
+                        .unwrap();
+                        let selection = match stage {
+                            1 => Selection::all(3),
+                            2 => Selection::try_sparse(3, &rows).unwrap(),
+                            _ => Selection::try_sparse(3, &[]).unwrap(),
+                        };
+                        let result = part.evaluate(selection, 3, &control).map(|_| ());
+                        assert_eq!(
+                            part.finish(&Control::default()),
+                            Err(KernelFailure::InstanceFailed)
+                        );
+                        result
+                    };
+                    assert_eq!(outcome.unwrap_err(), cause);
+                    assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn complete_default_logical_addresses_and_required_child_errors_remain_original() {
+    let source: ArrayRef = Arc::new(Int64Array::from(vec![5, 6, 7, 8]));
+    let offset: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+    let default_pool: ArrayRef = Arc::new(StringArray::from(vec!["bad", "19", "bad"]));
+    let default_cv = constant(default_pool, false, 1);
+    let scalar: ArrayRef = Arc::new(StringArray::from(vec!["27"]));
+    let sliced: ArrayRef =
+        Arc::new(StringArray::from(vec!["bad", "31", "32", "33", "34", "bad"]).slice(1, 4));
+    let compact_values: ArrayRef = Arc::new(StringArray::from(vec!["41", "42", "43", "44"]));
+    let compact = SelectedValues::try_new(
+        Selection::all(4),
+        &DataType::Utf8,
+        compact_values,
+        Box::default(),
+    )
+    .unwrap();
+    let peers = [WindowRowRange { start: 0, end: 4 }];
+    let frames = whole_frames(4);
+    for (argument, expected) in [
+        (EvaluatedArgument::Constant(&default_cv), 19),
+        (EvaluatedArgument::Scalar(&scalar), 27),
+        (EvaluatedArgument::Column(&sliced), 34),
+        (EvaluatedArgument::SelectedColumn(&compact), 44),
+    ] {
+        let fixture = default_fixture(
+            "lead",
+            ty(&source, false),
+            FunctionValueType::new(DataType::Utf8, false),
+            DecimalOverflowPolicy::OutputNull,
+        );
+        let prepared = fixture
+            .prepare(options(false), &CompileControl::default())
+            .unwrap();
+        let args = [
+            EvaluatedArgument::Column(&source),
+            EvaluatedArgument::Scalar(&offset),
+            argument,
+        ];
+        let mut part = WindowEvaluationPartition::begin(
+            prepared.clone(),
+            geometry(&prepared, &args, &peers, &frames),
+            &Control::default(),
+        )
+        .unwrap();
+        let output = part
+            .evaluate(Selection::all(4), 4, &Control::default())
+            .unwrap();
+        assert_eq!(
+            output
+                .values()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(6), Some(7), Some(8), Some(expected)]
+        );
+    }
+    let nulls: ArrayRef = Arc::new(arrow_array::NullArray::new(4));
+    let fixture = default_fixture(
+        "lead",
+        ty(&source, false),
+        ty(&nulls, true),
+        DecimalOverflowPolicy::ReportError,
+    );
+    let prepared = fixture
+        .prepare(options(false), &CompileControl::default())
+        .unwrap();
+    let args = [
+        EvaluatedArgument::Column(&source),
+        EvaluatedArgument::Scalar(&offset),
+        EvaluatedArgument::Column(&nulls),
+    ];
+    let mut part = WindowEvaluationPartition::begin(
+        prepared.clone(),
+        geometry(&prepared, &args, &peers, &frames),
+        &Control::default(),
+    )
+    .unwrap();
+    let output = part
+        .evaluate(Selection::all(4), 4, &Control::default())
+        .unwrap();
+    assert_eq!(
+        output
+            .values()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some(6), Some(7), Some(8), None]
+    );
+
+    let bad_values: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("1"),
+        Some("2"),
+        Some("3"),
+        None,
+    ]));
+    let required = SelectedValues::try_new(
+        Selection::all(4),
+        &DataType::Utf8,
+        bad_values,
+        vec![RowDataError::new(3, "required default child")].into(),
+    )
+    .unwrap();
+    let fixture = default_fixture(
+        "lead",
+        ty(&source, false),
+        FunctionValueType::new(DataType::Utf8, true),
+        DecimalOverflowPolicy::OutputNull,
+    );
+    let prepared = fixture
+        .prepare(options(false), &CompileControl::default())
+        .unwrap();
+    // Row three could be absent from every output demand. Required D is still
+    // validated over the complete partition before any cursor is published.
+    assert!(
+        FullPartitionWindowInput::try_new(
+            prepared.contract(),
+            4,
+            &[
+                EvaluatedArgument::Column(&source),
+                EvaluatedArgument::Scalar(&offset),
+                EvaluatedArgument::SelectedColumn(&required)
+            ],
+            &[],
+            &Control::default()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn three_argument_wide_required_setup_and_output_sample_real_quantum_without_type_retag() {
+    let source: ArrayRef = Arc::new(StringArray::from(vec!["a"; 320]));
+    let defaults: ArrayRef = Arc::new(Int64Array::from((0_i64..320).collect::<Vec<_>>()));
+    let offset: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+    let fixture = default_fixture(
+        "lead",
+        ty(&source, false),
+        ty(&defaults, false),
+        DecimalOverflowPolicy::ReportError,
+    );
+    let prepared = fixture
+        .prepare(options(false), &CompileControl::default())
+        .unwrap();
+    let args = [
+        EvaluatedArgument::Column(&source),
+        EvaluatedArgument::Scalar(&offset),
+        EvaluatedArgument::Column(&defaults),
+    ];
+    let peers = [WindowRowRange { start: 0, end: 320 }];
+    let frames = whole_frames(320);
+    let input = geometry(&prepared, &args, &peers, &frames);
+    for stage in 0..2 {
+        let baseline = Control::default();
+        if stage == 0 {
+            WindowEvaluationPartition::begin(prepared.clone(), input, &baseline).unwrap();
+        } else {
+            let mut part =
+                WindowEvaluationPartition::begin(prepared.clone(), input, &Control::default())
+                    .unwrap();
+            let output = part.evaluate(Selection::all(320), 320, &baseline).unwrap();
+            let strings = output
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(strings.value(0), "a");
+            assert_eq!(strings.value(318), "a");
+            assert_eq!(strings.value(319), "319");
+            assert_eq!(strings.null_count(), 0);
+            assert!(part.retained_bytes().unwrap() <= part.retained_upper_bound());
+            let selected = [0, 255, 319];
+            let output = part
+                .evaluate(
+                    Selection::try_sparse(320, &selected).unwrap(),
+                    3,
+                    &Control::default(),
+                )
+                .unwrap();
+            assert_eq!(
+                output
+                    .values()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                vec![Some("a"), Some("a"), Some("319")]
+            );
+        }
+        let trace = baseline.trace.lock().unwrap().clone();
+        let quantum = trace
+            .iter()
+            .position(|units| *units == 256)
+            .expect("actual required conversion or selected copy crosses its quantum");
+        for at in [0, quantum, trace.len() - 1] {
+            for cause in causes() {
+                let control = Control {
+                    trace: Mutex::default(),
+                    refusal: Some((at, cause.clone())),
+                };
+                let outcome = if stage == 0 {
+                    WindowEvaluationPartition::begin(prepared.clone(), input, &control).map(|_| ())
+                } else {
+                    let mut part = WindowEvaluationPartition::begin(
+                        prepared.clone(),
+                        input,
+                        &Control::default(),
+                    )
+                    .unwrap();
+                    part.evaluate(Selection::all(320), 320, &control)
+                        .map(|_| ())
+                };
+                assert_eq!(outcome.unwrap_err(), cause);
+                assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+            }
+        }
+    }
 }
