@@ -523,33 +523,40 @@ impl RefinedCallEffects<'_> {
     ) -> Result<(), CallEffectRefinementError<std::convert::Infallible>> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
             .map_err(CallEffectRefinementError::Control)?;
-        self.validate_input(input)
-            .map_err(CallEffectRefinementError::Contract)?;
-        let actual = self.facts();
-        let mismatch = || {
-            CallEffectRefinementError::InvalidInput(
-                "frozen call effects differ from exact local refinement",
-            )
-        };
-        if actual.value_stability != frozen.value_stability
-            || actual.own_row_error != frozen.own_row_error
-            || actual.failure_behavior != frozen.failure_behavior
-            || actual.null_behavior != frozen.null_behavior
-            || actual.argument_control != frozen.argument_control
-            || actual.instance_state != frozen.instance_state
-            || actual.observable_effects != frozen.observable_effects
-            || actual.proof_scope != frozen.proof_scope
-            || actual.environment.len() != frozen.environment.len()
-        {
-            return Err(mismatch());
-        }
-        for (actual, frozen) in actual.environment.iter().zip(&frozen.environment) {
-            work.step().map_err(CallEffectRefinementError::Control)?;
-            if actual != frozen {
+        let result = (|| {
+            self.validate_input(input)
+                .map_err(CallEffectRefinementError::Contract)?;
+            let actual = self.facts();
+            let mismatch = || {
+                CallEffectRefinementError::InvalidInput(
+                    "frozen call effects differ from exact local refinement",
+                )
+            };
+            if actual.value_stability != frozen.value_stability
+                || actual.own_row_error != frozen.own_row_error
+                || actual.failure_behavior != frozen.failure_behavior
+                || actual.null_behavior != frozen.null_behavior
+                || actual.argument_control != frozen.argument_control
+                || actual.instance_state != frozen.instance_state
+                || actual.observable_effects != frozen.observable_effects
+                || actual.proof_scope != frozen.proof_scope
+                || actual.environment.len() != frozen.environment.len()
+            {
                 return Err(mismatch());
             }
+            for (actual, frozen) in actual.environment.iter().zip(&frozen.environment) {
+                work.step().map_err(CallEffectRefinementError::Control)?;
+                if actual != frozen {
+                    return Err(mismatch());
+                }
+            }
+            Ok(())
+        })();
+        if matches!(&result, Err(CallEffectRefinementError::Control(_))) {
+            return result;
         }
-        work.finish().map_err(CallEffectRefinementError::Control)
+        work.finish().map_err(CallEffectRefinementError::Control)?;
+        result
     }
     pub fn compose_for_use(
         &self,
@@ -988,6 +995,64 @@ mod tests {
             ..result.facts().clone()
         };
         assert!(validate_frozen_call_effects(&owner, input, &forged, &Control(false)).is_err());
+        // Exercise the receipt itself: no second owner refinement can mask a
+        // swapped immutable input or a forged frozen header.
+        #[derive(Default)]
+        struct FrozenControl {
+            trace: std::sync::Mutex<Vec<u32>>,
+            refusal: Option<(usize, CompileControlError)>,
+        }
+        impl PureCompileControl for FrozenControl {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                assert_eq!(phase, CompilePhase::FunctionSpecialization);
+                let mut trace = self.trace.lock().unwrap();
+                let ordinal = trace.len();
+                if let Some((stop, _)) = self.refusal {
+                    assert!(ordinal <= stop, "callback after original refusal");
+                }
+                trace.push(units);
+                match self.refusal {
+                    Some((stop, cause)) if ordinal == stop => Err(cause),
+                    _ => Ok(()),
+                }
+            }
+        }
+        let foreign_input = CallEffectInput {
+            argument_uses: CallArgumentUses::SelectedChannels(&other_arguments),
+            ..input
+        };
+        for (candidate, frozen, succeeds) in [
+            (input, result.facts(), true),
+            (input, &forged, false),
+            (foreign_input, result.facts(), false),
+        ] {
+            let control = FrozenControl::default();
+            let validation = result.validate_frozen(candidate, frozen, &control);
+            assert_eq!(validation.is_ok(), succeeds);
+            let baseline = control.trace.into_inner().unwrap();
+            assert_eq!(baseline, if succeeds { vec![0, 1] } else { vec![0, 0] });
+            for stop in 0..baseline.len() {
+                for cause in [
+                    CompileControlError::Cancelled,
+                    CompileControlError::DeadlineExceeded,
+                    CompileControlError::ResourceExhausted,
+                ] {
+                    let control = FrozenControl {
+                        refusal: Some((stop, cause)),
+                        ..FrozenControl::default()
+                    };
+                    assert!(matches!(
+                        result.validate_frozen(candidate, frozen, &control),
+                        Err(CallEffectRefinementError::Control(actual)) if actual == cause
+                    ));
+                    assert_eq!(control.trace.into_inner().unwrap(), baseline[..=stop]);
+                }
+            }
+        }
         let relaxed = SemanticParameters::try_new([(
             environment[0].id,
             SemanticParameterValue::AllowThrowException(false),

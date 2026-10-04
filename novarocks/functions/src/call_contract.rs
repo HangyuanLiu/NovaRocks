@@ -51,70 +51,83 @@ impl FunctionCallContract {
     ) -> Result<Self, KernelFailure> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
             .map_err(compile_failure)?;
-        receipt
-            .validate_input(input)
-            .map_err(|_| invalid("call refinement receipt differs from exact input"))?;
-        if !std::ptr::eq(input.selected, selected.as_ref()) {
-            return Err(invalid(
-                "signature owner differs from the exact input borrow",
-            ));
-        }
-        if (input.kind == FunctionKind::Aggregate) != input.selected.aggregate.is_some() {
-            return Err(invalid(
-                "aggregate state contract differs from the exact function kind",
-            ));
-        }
-        match &input.selected.result_type {
-            FunctionResultType::Scalar(result) if input.kind != FunctionKind::Table => {
-                validate_type_observed(result, &mut work)?
+        let result = (|| {
+            receipt
+                .validate_input(input)
+                .map_err(|_| invalid("call refinement receipt differs from exact input"))?;
+            if !std::ptr::eq(input.selected, selected.as_ref()) {
+                return Err(invalid(
+                    "signature owner differs from the exact input borrow",
+                ));
             }
-            FunctionResultType::Relation(results) if input.kind == FunctionKind::Table => {
-                if results.len() > crate::MAX_CALL_EFFECT_ARGUMENTS {
-                    return Err(KernelFailure::ResourceExhausted);
-                }
-                for result in results {
-                    validate_type_observed(result, &mut work)?;
-                    work.step().map_err(compile_failure)?;
-                }
+            if (input.kind == FunctionKind::Aggregate) != input.selected.aggregate.is_some() {
+                return Err(invalid(
+                    "aggregate state contract differs from the exact function kind",
+                ));
             }
-            _ => return Err(invalid("result shape differs from the exact function kind")),
-        }
-        if let Some(aggregate) = &input.selected.aggregate {
-            validate_type_observed(&aggregate.intermediate_type, &mut work)?;
-        }
-        for argument in &input.selected.argument_types {
-            match argument {
-                FunctionArgumentType::Value(value) => validate_type_observed(value, &mut work)?,
-                FunctionArgumentType::Lambda {
-                    parameter_types,
-                    result_type,
-                } => {
-                    if parameter_types.len() > crate::MAX_CALL_EFFECT_ARGUMENTS {
+            match &input.selected.result_type {
+                FunctionResultType::Scalar(result) if input.kind != FunctionKind::Table => {
+                    validate_type_observed(result, &mut work)?
+                }
+                FunctionResultType::Relation(results) if input.kind == FunctionKind::Table => {
+                    if results.len() > crate::MAX_CALL_EFFECT_ARGUMENTS {
                         return Err(KernelFailure::ResourceExhausted);
                     }
-                    validate_type_observed(result_type, &mut work)?;
-                    for parameter in parameter_types {
-                        validate_type_observed(parameter, &mut work)?;
+                    for result in results {
+                        validate_type_observed(result, &mut work)?;
                         work.step().map_err(compile_failure)?;
                     }
                 }
+                _ => return Err(invalid("result shape differs from the exact function kind")),
             }
-            work.step().map_err(compile_failure)?;
-        }
-        let parameters = input
-            .parameters
-            .project_observed(
-                receipt.facts().environment.iter().copied(),
-                CompilePhase::FunctionSpecialization,
-                control,
-            )
-            .map_err(|error| match error {
-                SemanticParameterProjectionError::Control(error) => compile_failure(error),
-                SemanticParameterProjectionError::Parameter(_) => {
-                    invalid("call environment is not frozen")
+            if let Some(aggregate) = &input.selected.aggregate {
+                validate_type_observed(&aggregate.intermediate_type, &mut work)?;
+            }
+            for argument in &input.selected.argument_types {
+                match argument {
+                    FunctionArgumentType::Value(value) => validate_type_observed(value, &mut work)?,
+                    FunctionArgumentType::Lambda {
+                        parameter_types,
+                        result_type,
+                    } => {
+                        if parameter_types.len() > crate::MAX_CALL_EFFECT_ARGUMENTS {
+                            return Err(KernelFailure::ResourceExhausted);
+                        }
+                        validate_type_observed(result_type, &mut work)?;
+                        for parameter in parameter_types {
+                            validate_type_observed(parameter, &mut work)?;
+                            work.step().map_err(compile_failure)?;
+                        }
+                    }
                 }
-            })?;
-        work.finish().map_err(compile_failure)?;
+                work.step().map_err(compile_failure)?;
+            }
+            let parameters = input
+                .parameters
+                .project_observed(
+                    receipt.facts().environment.iter().copied(),
+                    CompilePhase::FunctionSpecialization,
+                    control,
+                )
+                .map_err(|error| match error {
+                    SemanticParameterProjectionError::Control(error) => compile_failure(error),
+                    SemanticParameterProjectionError::Parameter(_) => {
+                        invalid("call environment is not frozen")
+                    }
+                })?;
+            Ok(parameters)
+        })();
+        let parameters = match result {
+            Err(
+                error @ (KernelFailure::Cancelled
+                | KernelFailure::DeadlineExceeded
+                | KernelFailure::ResourceExhausted),
+            ) => return Err(error),
+            result => {
+                work.finish().map_err(compile_failure)?;
+                result?
+            }
+        };
         Ok(Self {
             function_id: input.function_id.clone(),
             kind: input.kind,
@@ -157,3 +170,7 @@ impl FunctionCallContract {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "call_contract/control_tail_tests.rs"]
+mod control_tail_tests;
