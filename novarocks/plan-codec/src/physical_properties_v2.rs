@@ -286,14 +286,13 @@ pub(crate) fn preflight_encode_observed(
     facts(references, requests, requested, source, limits, work)
 }
 
-pub(crate) fn encode_observed(
-    input: &physical::PhysicalProperties,
-    source: usize,
-    limits: PhysicalPropertyProjectionLimits,
+/// Emit only after the containing owner has admitted the original request.
+/// Both standalone and full-property paths use this exact distribution grammar.
+fn emit_distribution_observed(
+    input: &physical::Distribution,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(wire::PhysicalProperties, PhysicalPropertyProjectionFacts), Error> {
-    let facts = preflight_encode_observed(input, source, limits, work)?;
-    let keys = match &input.distribution {
+) -> Result<wire::Distribution, Error> {
+    let keys = match input {
         physical::Distribution::Hash { keys, .. }
         | physical::Distribution::BucketShuffle { keys, .. } => &**keys,
         _ => &[],
@@ -303,7 +302,7 @@ pub(crate) fn encode_observed(
         output_keys.push(key.get());
         work.step()?;
     }
-    let kind = match &input.distribution {
+    let kind = match input {
         physical::Distribution::Unconstrained => wire::distribution::Kind::Unconstrained(Empty {}),
         physical::Distribution::Singleton => wire::distribution::Kind::Singleton(Empty {}),
         physical::Distribution::RoundRobin => wire::distribution::Kind::RoundRobin(Empty {}),
@@ -347,6 +346,17 @@ pub(crate) fn encode_observed(
         }
     };
     work.step()?;
+    Ok(wire::Distribution { kind: Some(kind) })
+}
+
+pub(crate) fn encode_observed(
+    input: &physical::PhysicalProperties,
+    source: usize,
+    limits: PhysicalPropertyProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(wire::PhysicalProperties, PhysicalPropertyProjectionFacts), Error> {
+    let facts = preflight_encode_observed(input, source, limits, work)?;
+    let distribution = emit_distribution_observed(&input.distribution, work)?;
     let mut ordering = reserve(input.ordering.len(), work)?;
     for key in &input.ordering {
         ordering.push(wire::OrderingKey {
@@ -358,7 +368,7 @@ pub(crate) fn encode_observed(
     }
     Ok((
         wire::PhysicalProperties {
-            distribution: Some(wire::Distribution { kind: Some(kind) }),
+            distribution: Some(distribution),
             row_multiplicity: encode_multiplicity(input.row_multiplicity),
             ordering,
         },
@@ -454,11 +464,8 @@ fn decode_header(
 }
 /// Allocation-free resource admission through the sole wire-property grammar.
 /// Exact header/ordering validation still occurs before decoder reservations.
-fn decode_source(input: &wire::PhysicalProperties) -> Result<(&[u32], usize), Error> {
+fn decode_distribution_source(input: &wire::Distribution) -> Result<(&[u32], usize), Error> {
     let kind = input
-        .distribution
-        .as_ref()
-        .ok_or_else(|| invalid("physical property distribution is absent"))?
         .kind
         .as_ref()
         .ok_or_else(|| invalid("physical property distribution kind is absent"))?;
@@ -508,6 +515,14 @@ fn decode_source(input: &wire::PhysicalProperties) -> Result<(&[u32], usize), Er
     Ok(source)
 }
 
+fn decode_source(input: &wire::PhysicalProperties) -> Result<(&[u32], usize), Error> {
+    let distribution = input
+        .distribution
+        .as_ref()
+        .ok_or_else(|| invalid("physical property distribution is absent"))?;
+    decode_distribution_source(distribution)
+}
+
 pub(crate) fn preflight_decode_observed(
     input: &wire::PhysicalProperties,
     source: usize,
@@ -551,6 +566,35 @@ pub(crate) fn preflight_decode_observed(
     )
 }
 
+fn materialize_distribution_observed(
+    keys: &[u32],
+    header: DistributionHeader,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<physical::Distribution, Error> {
+    let mut output_keys = reserve(keys.len(), work)?;
+    for key in keys {
+        output_keys.push(physical::ValueId::new(*key));
+        work.step()?;
+    }
+    let output_keys = boxed(output_keys, work)?;
+    let distribution = match header {
+        DistributionHeader::Unconstrained => physical::Distribution::Unconstrained,
+        DistributionHeader::Singleton => physical::Distribution::Singleton,
+        DistributionHeader::RoundRobin => physical::Distribution::RoundRobin,
+        DistributionHeader::Broadcast => physical::Distribution::Broadcast,
+        DistributionHeader::Hash(scheme) => physical::Distribution::Hash {
+            keys: output_keys,
+            scheme,
+        },
+        DistributionHeader::Bucket(scheme) => physical::Distribution::BucketShuffle {
+            keys: output_keys,
+            scheme,
+        },
+    };
+    work.step()?;
+    Ok(distribution)
+}
+
 pub(crate) fn decode_observed(
     input: &wire::PhysicalProperties,
     source: usize,
@@ -581,27 +625,7 @@ pub(crate) fn decode_observed(
         decode_nulls(key.null_ordering)?;
         work.step()?;
     }
-    let mut output_keys = reserve(keys.len(), work)?;
-    for key in keys {
-        output_keys.push(physical::ValueId::new(*key));
-        work.step()?;
-    }
-    let output_keys = boxed(output_keys, work)?;
-    let distribution = match header {
-        DistributionHeader::Unconstrained => physical::Distribution::Unconstrained,
-        DistributionHeader::Singleton => physical::Distribution::Singleton,
-        DistributionHeader::RoundRobin => physical::Distribution::RoundRobin,
-        DistributionHeader::Broadcast => physical::Distribution::Broadcast,
-        DistributionHeader::Hash(scheme) => physical::Distribution::Hash {
-            keys: output_keys,
-            scheme,
-        },
-        DistributionHeader::Bucket(scheme) => physical::Distribution::BucketShuffle {
-            keys: output_keys,
-            scheme,
-        },
-    };
-    work.step()?;
+    let distribution = materialize_distribution_observed(keys, header, work)?;
     let mut ordering = reserve(input.ordering.len(), work)?;
     for key in &input.ordering {
         ordering.push(physical::OrderingKey {
@@ -631,6 +655,114 @@ fn finish<T>(work: CompileCheckpoints<'_>, result: Result<T, Error>) -> Result<T
     work.finish()?;
     result
 }
+/// Allocation-free distribution admission for an original containing source.
+/// No ordering or multiplicity facts are manufactured for a writer requirement.
+pub(crate) fn preflight_distribution_encode_observed(
+    input: &physical::Distribution,
+    source: usize,
+    limits: PhysicalPropertyProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PhysicalPropertyProjectionFacts, Error> {
+    let (keys, keyed) = match input {
+        physical::Distribution::Hash { keys, .. }
+        | physical::Distribution::BucketShuffle { keys, .. } => (&**keys, true),
+        physical::Distribution::Unconstrained
+        | physical::Distribution::Singleton
+        | physical::Distribution::RoundRobin
+        | physical::Distribution::Broadcast => (&[][..], false),
+    };
+    floor(
+        source,
+        add(
+            size_of::<physical::Distribution>(),
+            bytes::<physical::ValueId>(keys.len())?,
+        )?,
+    )?;
+    facts(
+        keys.len(),
+        add(usize::from(!keys.is_empty()), if keyed { 2 } else { 0 })?,
+        add(bytes::<u32>(keys.len())?, if keyed { 64 } else { 0 })?,
+        source,
+        limits,
+        work,
+    )
+}
+
+pub(crate) fn preflight_distribution_decode_observed(
+    input: &wire::Distribution,
+    source: usize,
+    limits: PhysicalPropertyProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PhysicalPropertyProjectionFacts, Error> {
+    let (keys, extra_source) = decode_distribution_source(input)?;
+    floor(source, add(size_of::<wire::Distribution>(), extra_source)?)?;
+    facts(
+        keys.len(),
+        mul(usize::from(!keys.is_empty()), 2)?,
+        mul(bytes::<physical::ValueId>(keys.len())?, 2)?,
+        source,
+        limits,
+        work,
+    )
+}
+
+pub(crate) fn encode_distribution_observed(
+    input: &physical::Distribution,
+    source: usize,
+    limits: PhysicalPropertyProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(wire::Distribution, PhysicalPropertyProjectionFacts), Error> {
+    let facts = preflight_distribution_encode_observed(input, source, limits, work)?;
+    Ok((emit_distribution_observed(input, work)?, facts))
+}
+
+pub(crate) fn decode_distribution_observed(
+    input: &wire::Distribution,
+    source: usize,
+    limits: PhysicalPropertyProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(physical::Distribution, PhysicalPropertyProjectionFacts), Error> {
+    let facts = preflight_distribution_decode_observed(input, source, limits, work)?;
+    let kind = input
+        .kind
+        .as_ref()
+        .ok_or_else(|| invalid("physical property distribution kind is absent"))?;
+    let header = decode_header(kind, work)?;
+    let (keys, _) = decode_distribution_source(input)?;
+    Ok((
+        materialize_distribution_observed(keys, header, work)?,
+        facts,
+    ))
+}
+
+/// Project an independent distribution with explicit source/request bounds.
+/// Actual keys, count/bucket domains and partition coherence still require
+/// FragmentPackage validation; numerical admission is not a formal MEM grant.
+pub fn encode_distribution(
+    input: &physical::Distribution,
+    source_retained_bytes: usize,
+    limits: PhysicalPropertyProjectionLimits,
+    control: &dyn PureCompileControl,
+) -> Result<(wire::Distribution, PhysicalPropertyProjectionFacts), Error> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
+    let result = encode_distribution_observed(input, source_retained_bytes, limits, &mut work);
+    finish(work, result)
+}
+
+/// Decode only the original distribution; no physical-property defaults or
+/// second distribution model are used. Sole partition identity constructors
+/// run before the first reserve, including on noncanonical protobuf values.
+pub fn decode_distribution(
+    input: &wire::Distribution,
+    source_retained_bytes: usize,
+    limits: PhysicalPropertyProjectionLimits,
+    control: &dyn PureCompileControl,
+) -> Result<(physical::Distribution, PhysicalPropertyProjectionFacts), Error> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+    let result = decode_distribution_observed(input, source_retained_bytes, limits, &mut work);
+    finish(work, result)
+}
+
 /// Encode all property variants without changing occurrence order or identity.
 pub fn encode_physical_properties(
     input: &physical::PhysicalProperties,
@@ -663,3 +795,6 @@ pub fn decode_physical_properties(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod distribution_tests;
