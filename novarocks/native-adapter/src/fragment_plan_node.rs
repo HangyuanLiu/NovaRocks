@@ -918,11 +918,11 @@ pub fn lower_sort_node(
     let layout = SlotLayout::for_slots(output_layout.slot_ids().iter().copied());
     let output_schema = output_layout.chunk_schema();
     if layout.order() == child.layout.order() {
-        return Ok(NativeLoweredPlanNode {
-            node: sorted.node,
-            layout,
-            output_schema,
-        });
+        validate_passthrough_output(&sorted.output_schema, &output_schema, output_columns_path)?;
+        // Sort changes row order, not fields. The final result adapter owns
+        // publication of exact root labels and domains; do not claim a field
+        // change that the actual Sort input never materializes.
+        return Ok(sorted);
     }
 
     build_slot_projection(
@@ -2844,11 +2844,45 @@ pub fn lower_redistribute_node(
             ),
         ));
     }
-    Ok(NativeLoweredPlanNode {
-        node: child.node,
-        layout,
-        output_schema: output_layout.chunk_schema(),
-    })
+    validate_passthrough_output(
+        &child.output_schema,
+        &output_layout.chunk_schema(),
+        output_path,
+    )?;
+    // Redistribute preserves the original program and its actual field owners.
+    Ok(child)
+}
+
+fn validate_passthrough_output(
+    actual: &ChunkSchemaRef,
+    declared: &ChunkSchemaRef,
+    path: FieldPath,
+) -> Result<(), NativeFragmentDecodeError> {
+    if actual.slot_ids() != declared.slot_ids() {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path,
+            "pass-through output slots differ from the actual input",
+        ));
+    }
+    for (index, (source, target)) in actual.slots().iter().zip(declared.slots()).enumerate() {
+        if source.data_type() != target.data_type() || (source.nullable() && !target.nullable()) {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                path.clone().index(index),
+                "pass-through output cannot cast a carrier or narrow nullability",
+            ));
+        }
+        if let (Some(source), Some(target)) = (
+            source.field_schema().logical_type(),
+            target.field_schema().logical_type(),
+        ) && source != target
+        {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                path.clone().index(index),
+                "pass-through output cannot reinterpret a known logical domain",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// One fully lowered physical node and its immutable output contract.
@@ -4030,5 +4064,203 @@ mod redistribute_projection_tests {
             protocol.path().to_string(),
             "plan_fragment.redistribute.mode.hash.cols"
         );
+    }
+}
+
+#[cfg(test)]
+mod passthrough_schema_tests {
+    use super::*;
+    use arrow::array::BinaryArray;
+    use novarocks_types::logical::{LogicalType, field_with_logical_type};
+
+    fn child(domain: Option<LogicalType>, nullable: bool) -> NativeLoweredPlanNode {
+        let mut field = Field::new("original", DataType::Binary, nullable);
+        if let Some(domain) = domain {
+            field = field_with_logical_type(field, domain);
+        }
+        let schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(1),
+                field,
+                None,
+                None,
+            )])
+            .unwrap(),
+        );
+        NativeLoweredPlanNode {
+            node: ExecNode {
+                kind: ExecNodeKind::Values(ValuesNode {
+                    chunk: Chunk::try_new_with_columns(
+                        Arc::clone(&schema),
+                        vec![Arc::new(BinaryArray::from(vec![Some(b"state".as_slice())]))],
+                    )
+                    .unwrap(),
+                    node_id: 1,
+                }),
+            },
+            layout: SlotLayout::for_slots([SlotId::new(1)]),
+            output_schema: schema,
+        }
+    }
+
+    fn column(
+        primitive: proto_common::PrimitiveType,
+        nullable: bool,
+    ) -> proto_common::OutputColumn {
+        proto_common::OutputColumn {
+            column_id: 1,
+            name: "final_alias".into(),
+            r#type: Some(proto_common::TypeDesc {
+                kind: Some(proto_common::type_desc::Kind::Scalar(
+                    proto_common::ScalarType {
+                        r#type: primitive as i32,
+                        ..Default::default()
+                    },
+                )),
+            }),
+            nullable,
+            is_internal: false,
+        }
+    }
+
+    fn lower(
+        sort: bool,
+        child: NativeLoweredPlanNode,
+        column: proto_common::OutputColumn,
+        arena: &mut ExprArena,
+    ) -> Result<NativeLoweredPlanNode, NativeFragmentDecodeError> {
+        let physical = plan::PlanNode {
+            output_columns: vec![column],
+            ..Default::default()
+        };
+        let path = FieldPath::root("plan_fragment").field("passthrough");
+        if sort {
+            lower_sort_node(
+                &plan::DistributedNode {
+                    node_id: 2,
+                    limit: -1,
+                    ..Default::default()
+                },
+                &physical,
+                &plan::SortNode::default(),
+                path.clone(),
+                path.field("output_columns"),
+                vec![child],
+                arena,
+            )
+        } else {
+            lower_redistribute_node(
+                &physical,
+                &plan::RedistributeNode {
+                    mode: Some(plan::RedistributeMode {
+                        mode: Some(plan::redistribute_mode::Mode::Gather(true)),
+                    }),
+                    ..Default::default()
+                },
+                path.clone(),
+                path.field("output_columns"),
+                vec![child],
+                arena,
+            )
+        }
+    }
+
+    #[test]
+    fn m07_passthrough_keeps_actual_fields_until_final_domain_publication() {
+        for sort in [false, true] {
+            let source = child(None, false);
+            let original = Arc::clone(&source.output_schema);
+            let declared = column(proto_common::PrimitiveType::Bitmap, true);
+            let mut arena = ExprArena::default();
+            let decoded = lower(sort, source, declared.clone(), &mut arena).unwrap();
+            assert!(Arc::ptr_eq(&decoded.output_schema, &original));
+            let actual =
+                novarocks_execution::exec::pipeline::builder::output_chunk_schema_for_node(
+                    &decoded.node,
+                )
+                .unwrap();
+            assert_eq!(actual.as_ref(), decoded.output_schema.as_ref());
+            assert_eq!(decoded.output_schema.slots()[0].field().name(), "original");
+            assert_eq!(
+                decoded.output_schema.slots()[0]
+                    .field_schema()
+                    .logical_type(),
+                None
+            );
+            let published = crate::final_result_layout::apply_final_root_output_layout(
+                decoded,
+                &[declared],
+                &mut arena,
+                2,
+            )
+            .unwrap();
+            let ExecNodeKind::Project(project) = &published.node.kind else {
+                panic!("final semantic field publication requires a real projection");
+            };
+            assert!(project.validate_final_result_input);
+            assert_eq!(
+                published.output_schema.slots()[0].field().name(),
+                "final_alias"
+            );
+            assert_eq!(
+                published.output_schema.slots()[0]
+                    .field_schema()
+                    .logical_type(),
+                Some(LogicalType::Bitmap)
+            );
+            assert!(published.output_schema.slots()[0].nullable());
+        }
+    }
+
+    #[test]
+    fn m07_passthrough_refuses_carrier_narrowing_and_known_domain_conflicts() {
+        for sort in [false, true] {
+            for (source, declared) in [
+                (
+                    child(None, true),
+                    column(proto_common::PrimitiveType::Bigint, true),
+                ),
+                (
+                    child(None, true),
+                    column(proto_common::PrimitiveType::Varbinary, false),
+                ),
+                (
+                    child(Some(LogicalType::Hll), true),
+                    column(proto_common::PrimitiveType::Bitmap, true),
+                ),
+            ] {
+                assert!(lower(sort, source, declared, &mut ExprArena::default()).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn m07_passthrough_missing_declaration_cannot_erase_known_source_domain() {
+        for sort in [false, true] {
+            let mut arena = ExprArena::default();
+            let declared = column(proto_common::PrimitiveType::Varbinary, true);
+            let decoded = lower(
+                sort,
+                child(Some(LogicalType::Hll), true),
+                declared.clone(),
+                &mut arena,
+            )
+            .unwrap();
+            assert_eq!(
+                decoded.output_schema.slots()[0]
+                    .field_schema()
+                    .logical_type(),
+                Some(LogicalType::Hll)
+            );
+            assert!(
+                crate::final_result_layout::apply_final_root_output_layout(
+                    decoded,
+                    &[declared],
+                    &mut arena,
+                    2,
+                )
+                .is_err()
+            );
+        }
     }
 }

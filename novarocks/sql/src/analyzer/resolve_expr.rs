@@ -2987,7 +2987,7 @@ impl<'a> super::AnalyzerContext<'a> {
 
         let mut key_expr = array_expr.clone();
         for field_name in field_chain {
-            key_expr = self.build_array_struct_subfield_expr(key_expr, field_name, span)?;
+            key_expr = self.build_array_struct_subfield_expr(key_expr, field_name, scope, span)?;
         }
 
         let arg_types = vec![array_expr.data_type.clone(), key_expr.data_type.clone()];
@@ -2998,6 +2998,7 @@ impl<'a> super::AnalyzerContext<'a> {
         &self,
         base: TypedExpr,
         field_name: String,
+        scope: &AnalyzerScope,
         span: Span,
     ) -> Result<TypedExpr, AnalyzeError> {
         let DataType::List(item_field) = &base.data_type else {
@@ -3046,7 +3047,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 "item", field_type, true,
             )))
         );
-        Ok(result)
+        self.adapt_bound_output_domains(result, None, scope, span)
     }
 
     fn try_analyze_higher_order_function(

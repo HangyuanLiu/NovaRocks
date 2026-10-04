@@ -45,18 +45,30 @@ impl AnalyzerContext<'_> {
         {
             return Some(SqlType::Array(Box::new(SqlType::Json)));
         }
-        // A public JSON CAST does not prove arbitrary string contents. Only
-        // its already-proven Json operand preserves the existing domain. All
-        // other explicit CASTs retain their current owner semantics, including
-        // an explicit string CAST clearing ambiguous logical provenance.
+        // A public CAST target alone cannot prove Json contents or serialized
+        // Variant identity. Json retains its already-proven source domain. The
+        // existing exact LargeBinary -> LargeBinary Variant CAST returns the
+        // original array, so a separately proven Variant source also retains
+        // its identity. Other explicit CASTs keep their current owner semantics,
+        // including an explicit VARBINARY/VARCHAR CAST clearing that identity.
         if let Some(ast::Expr::Cast(cast)) = source {
-            let json_target = cast.data_type.name.parts.last().is_some_and(|part| {
-                matches!(part.value.to_ascii_lowercase().as_str(), "json" | "jsonb")
+            let target_name = cast.data_type.name.parts.last();
+            let json_target = target_name.is_some_and(|part| {
+                part.value.eq_ignore_ascii_case("json") || part.value.eq_ignore_ascii_case("jsonb")
             });
-            return match (&expression.kind, json_target) {
-                (ExprKind::Cast { expr: inner, .. }, true) => self
+            let variant_target =
+                target_name.is_some_and(|part| part.value.eq_ignore_ascii_case("variant"));
+            return match (&expression.kind, json_target, variant_target) {
+                (ExprKind::Cast { expr: inner, .. }, true, _) => self
                     .logical_output_type(Some(&cast.expr), inner, scope)
                     .filter(|domain| *domain == SqlType::Json),
+                (ExprKind::Cast { expr: inner, .. }, _, true)
+                    if inner.data_type == DataType::LargeBinary
+                        && expression.data_type == DataType::LargeBinary =>
+                {
+                    self.logical_output_type(Some(&cast.expr), inner, scope)
+                        .filter(|domain| *domain == SqlType::Variant)
+                }
                 _ => None,
             };
         }
@@ -157,6 +169,10 @@ impl AnalyzerContext<'_> {
                     self.container_output_type(source, expression, scope)
                 }
             }),
+            ExprKind::WindowCall {
+                aggregate_binding: None,
+                ..
+            } => self.window_value_output_type(source, expression, scope),
             ExprKind::Case {
                 when_then,
                 else_expr,
@@ -958,6 +974,545 @@ mod scalar_domain_tests {
             .collect()
     }
 
+    fn original_window(expression: &TypedExpr) -> &TypedExpr {
+        match &expression.kind {
+            ExprKind::Cast { expr, .. } => original_window(expr),
+            ExprKind::WindowCall { .. } => expression,
+            _ => panic!("expected selected window"),
+        }
+    }
+
+    #[test]
+    fn m07_window_value_domains_follow_all_actual_value_suppliers() {
+        assert_eq!(
+            output_domains(
+                "select first_value(j) over (),last_value(h) over (),first_value(b) over (),last_value(v) over (),first_value(o) over (),last_value(p) over (),lead(j,1,j) over (),lag(j,1,null) over () from t"
+            ),
+            vec![
+                Some(SqlType::Json),
+                Some(SqlType::Hll),
+                Some(SqlType::Bitmap),
+                Some(SqlType::Variant),
+                Some(SqlType::Object),
+                Some(SqlType::Percentile),
+                Some(SqlType::Json),
+                Some(SqlType::Json)
+            ]
+        );
+        assert_eq!(
+            output_domains(
+                "select lead(j,1,s) over (),lag(s,1,j) over (),lead(h,1,b) over (),lag(b,1,h) over (),lead(j,1,cast(null as varchar)) over (),first_value(cast(j as varchar)) over (),lag(cast(j as varchar),1,j) over () from t"
+            ),
+            vec![
+                Some(SqlType::String),
+                Some(SqlType::String),
+                Some(SqlType::Binary),
+                Some(SqlType::Binary),
+                Some(SqlType::Json),
+                Some(SqlType::String),
+                Some(SqlType::String)
+            ]
+        );
+        // The offset is a control operand, not a supplier of the result value.
+        assert_eq!(
+            output_domains("select lead(j,2) over (),lag(h,2) over () from t"),
+            vec![Some(SqlType::Json), Some(SqlType::Hll)]
+        );
+    }
+
+    #[test]
+    fn m07_window_nested_value_identity_preserves_shape_and_null_siblings() {
+        let sql = "with q as (select [to_bitmap(1)] as b) select first_value(b) over (),last_value(b) over (),lead(b,1,b) over (),lag(b,1,null) over () from q";
+        assert_eq!(
+            output_domains(sql),
+            vec![Some(SqlType::Array(Box::new(SqlType::Bitmap))); 4]
+        );
+        for expression in output_expressions(sql) {
+            let selected = original_window(&expression);
+            let ExprKind::WindowCall {
+                binding,
+                args,
+                aggregate_binding,
+                ..
+            } = &selected.kind
+            else {
+                unreachable!()
+            };
+            assert!(aggregate_binding.is_none());
+            assert_eq!(binding.kind, novarocks_functions::FunctionKind::Window);
+            let novarocks_functions::FunctionResultType::Scalar(result) =
+                &binding.selected.result_type
+            else {
+                panic!("scalar selection")
+            };
+            assert_eq!(result.data_type, selected.data_type);
+            let DataType::List(output) = &expression.data_type else {
+                panic!("list output")
+            };
+            let DataType::List(input) = &args[0].data_type else {
+                panic!("list input")
+            };
+            assert_eq!(output.name(), input.name());
+            assert_eq!(output.is_nullable(), input.is_nullable());
+            assert_eq!(output.data_type(), input.data_type());
+            assert_eq!(
+                novarocks_types::logical::logical_type_of_field(output),
+                Some(LogicalType::Bitmap)
+            );
+        }
+        let expression =
+            output_expressions("select first_value(row(null,to_bitmap(1))) over ()").remove(0);
+        let DataType::Struct(fields) = &expression.data_type else {
+            panic!("struct output")
+        };
+        assert_eq!(fields[0].data_type(), &DataType::Null);
+        assert_eq!(fields[0].name(), "col1");
+        assert_eq!(fields[1].name(), "col2");
+        assert_eq!(
+            novarocks_types::logical::logical_type_of_field(&fields[1]),
+            Some(LogicalType::Bitmap)
+        );
+        assert_eq!(
+            output_domains("select first_value(row(null,to_bitmap(1))) over ()"),
+            vec![None]
+        );
+        // Current default-argument admission rejects these different nested
+        // carriers before binding. Domain forwarding must not widen that owner.
+        let mixed = "with q as (select [parse_json('{}')] as j,['plain'] as s) select lead(j,1,s) over () from q";
+        let error = super::super::analyze(&query(mixed), &Catalog, "db").unwrap_err();
+        assert!(error.to_string().contains("third parameter"), "{error}");
+    }
+
+    #[test]
+    fn m07_window_variant_typed_null_defaults_are_neutral_without_admitting_unproven_values() {
+        assert_eq!(
+            output_domains(
+                "select lead(v,1,cast(null as variant)) over (),lag(v,1,cast(null as variant)) over () from t"
+            ),
+            vec![Some(SqlType::Variant); 2]
+        );
+        // Same-domain public CAST is an actual LargeBinary identity operation,
+        // not an unproven payload. Both value and default contributions retain
+        // the independently established catalog Variant fact.
+        assert_eq!(
+            output_domains(
+                "select lead(v,1,cast(v as variant)) over (),lag(v,1,cast(v as variant)) over (),first_value(cast(v as variant)) over () from t"
+            ),
+            vec![Some(SqlType::Variant); 3]
+        );
+        for sql in [
+            "select lead(v,1,cast(s as variant)) over () from t",
+            "select lag(v,1,cast(s as variant)) over () from t",
+            "select first_value(cast(X'AB01' as variant)) over ()",
+            "select first_value(cast(cast(v as varbinary) as variant)) over () from t",
+        ] {
+            let error = super::super::analyze(&query(sql), &Catalog, "db").unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("LargeBinary requires its original logical identity"),
+                "{error}"
+            );
+        }
+        // A NULL default cannot erase a known sibling in a partial Struct or
+        // a nested Map value. SqlType has no complete Null-bearing counterpart.
+        let sql = "with q as (select row(null,map('k',to_bitmap(1))) as r) select lead(r,1,null) over (),lag(r,1,null) over () from q";
+        for expression in output_expressions(sql) {
+            let ExprKind::WindowCall { args, .. } = &original_window(&expression).kind else {
+                unreachable!()
+            };
+            let DataType::Struct(fields) = &expression.data_type else {
+                panic!("struct result")
+            };
+            assert_eq!(fields[0].data_type(), &DataType::Null);
+            let DataType::Map(entries, sorted) = fields[1].data_type() else {
+                panic!("map sibling")
+            };
+            let DataType::Struct(input) = &args[0].data_type else {
+                panic!("struct input")
+            };
+            let DataType::Map(input_entries, input_sorted) = input[1].data_type() else {
+                panic!("map input")
+            };
+            assert_eq!(sorted, input_sorted);
+            assert_eq!(entries.name(), input_entries.name());
+            assert_eq!(entries.is_nullable(), input_entries.is_nullable());
+            let DataType::Struct(map_fields) = entries.data_type() else {
+                panic!("map entries")
+            };
+            let DataType::Struct(input_fields) = input_entries.data_type() else {
+                panic!("input entries")
+            };
+            assert_eq!(map_fields.len(), 2);
+            for (actual, input) in map_fields.iter().zip(input_fields) {
+                assert_eq!(actual.name(), input.name());
+                assert_eq!(actual.is_nullable(), input.is_nullable());
+                assert_eq!(actual.data_type(), input.data_type());
+            }
+            assert_eq!(
+                novarocks_types::logical::logical_type_of_field(&map_fields[1]),
+                Some(LogicalType::Bitmap)
+            );
+        }
+        assert_eq!(output_domains(sql), vec![None; 2]);
+    }
+
+    #[test]
+    fn m07_variant_public_identity_cast_requires_independent_exact_source_fact() {
+        assert_eq!(
+            output_domains(
+                "select cast(v as variant),cast(cast(v as variant) as variant),cast((v) as variant) from t"
+            ),
+            vec![Some(SqlType::Variant); 3]
+        );
+        assert_eq!(
+            output_domains(
+                "select cast(s as variant),cast(j as variant),cast(X'AB01' as variant),cast(cast(v as varbinary) as variant),cast(v as varbinary) from t"
+            ),
+            vec![None; 5]
+        );
+        assert_eq!(
+            output_domains(
+                "select first_value(cast(variant_get(parse_json('{\"a\":1}'),'$.a') as variant)) over (),last_value(cast(variant_get(parse_json('{\"a\":1}'),'$.a') as variant)) over ()"
+            ),
+            vec![Some(SqlType::Variant); 2]
+        );
+        let sql = "select first_value(cast(variant_get(parse_json('{\"a\":1}'),'$.a') as variant)) over ()";
+        let expression = output_expressions(sql).remove(0);
+        let selected = original_window(&expression);
+        let ExprKind::WindowCall { binding, args, .. } = &selected.kind else {
+            panic!("window")
+        };
+        let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
+        else {
+            panic!("scalar")
+        };
+        assert_eq!(result.data_type, DataType::LargeBinary);
+        assert_eq!(selected.data_type, result.data_type);
+        let ExprKind::Cast { expr, target, .. } = &args[0].kind else {
+            panic!("public CAST")
+        };
+        assert_eq!(target, &DataType::LargeBinary);
+        assert_eq!(expr.data_type, DataType::LargeBinary);
+        let ExprKind::FunctionCall { binding, .. } = &expr.kind else {
+            panic!("original producer")
+        };
+        assert_eq!(
+            binding.function_id.as_str(),
+            "builtin.scalar/variant_get/v1"
+        );
+    }
+
+    #[test]
+    fn m07_window_value_domains_require_exact_selected_binding_and_carrier() {
+        let (resolved, _, factory) = super::super::analyze(
+            &query("select first_value(parse_json('{}')) over ()"),
+            &Catalog,
+            "db",
+        )
+        .unwrap();
+        let crate::analysis::QueryBody::Select(select) = resolved.body else {
+            panic!("select")
+        };
+        let original = original_window(&select.projection[0].expr).clone();
+        let factory = Rc::new(RefCell::new(factory));
+        let scope = AnalyzerScope::new(factory.clone());
+        let context = context(factory);
+        assert_eq!(
+            context.logical_output_type(None, &original, &scope),
+            Some(SqlType::Json)
+        );
+        for change in 0..3 {
+            let mut candidate = original.clone();
+            let ExprKind::WindowCall { binding, .. } = &mut candidate.kind else {
+                unreachable!()
+            };
+            let mut selected = binding.resolved().clone();
+            match change {
+                0 => {
+                    selected.function_id =
+                        novarocks_functions::FunctionId::try_new("test.shadow/first_value/v1")
+                            .unwrap()
+                }
+                1 => selected.kind = novarocks_functions::FunctionKind::Scalar,
+                _ => {
+                    let novarocks_functions::FunctionResultType::Scalar(result) =
+                        &mut selected.selected.result_type
+                    else {
+                        unreachable!()
+                    };
+                    result.data_type = DataType::Binary;
+                }
+            }
+            *binding = selected.into();
+            assert_eq!(context.logical_output_type(None, &candidate, &scope), None);
+            let before = format!("{:?}", candidate.kind);
+            let adapted = context
+                .adapt_bound_output_domains(candidate, None, &scope, Span::new(0, 0))
+                .unwrap();
+            assert_eq!(format!("{:?}", adapted.kind), before);
+        }
+        let ExprKind::WindowCall { binding, args, .. } = &original.kind else {
+            unreachable!()
+        };
+        let selection = binding.resolved().clone();
+        let arguments = format!("{args:?}");
+        let adapted = context
+            .adapt_bound_output_domains(original.clone(), None, &scope, Span::new(0, 0))
+            .unwrap();
+        let ExprKind::WindowCall { binding, args, .. } = &original_window(&adapted).kind else {
+            unreachable!()
+        };
+        assert_eq!(binding.resolved(), &selection);
+        assert_eq!(format!("{args:?}"), arguments);
+    }
+
+    #[test]
+    fn m07_window_input_coercion_cannot_wash_original_nested_markers() {
+        for sql in [
+            "select first_value(m) over () from t",
+            "select last_value(r) over () from t",
+        ] {
+            let error = super::super::analyze(&query(sql), &Catalog, "db").unwrap_err();
+            assert!(
+                error.to_string().contains("logical identity differs"),
+                "{error}"
+            );
+        }
+        let (resolved, _, factory) = super::super::analyze(
+            &query("select first_value([to_bitmap(1)]) over ()"),
+            &Catalog,
+            "db",
+        )
+        .unwrap();
+        let crate::analysis::QueryBody::Select(select) = resolved.body else {
+            panic!("select")
+        };
+        let mut original = original_window(&select.projection[0].expr).clone();
+        let ExprKind::WindowCall { args, .. } = &mut original.kind else {
+            unreachable!()
+        };
+        let clean = args[0].clone();
+        let corrupted = DataType::List(Arc::new(
+            Field::new("item", DataType::Binary, true).with_metadata(
+                [(
+                    novarocks_types::logical::NR_LOGICAL_TYPE_KEY.to_owned(),
+                    "unknown".to_owned(),
+                )]
+                .into(),
+            ),
+        ));
+        let bad_source = TypedExpr {
+            kind: clean.kind.clone(),
+            data_type: corrupted,
+            nullable: clean.nullable,
+        };
+        args[0] = TypedExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(bad_source),
+                target: clean.data_type.clone(),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            data_type: clean.data_type,
+            nullable: clean.nullable,
+        };
+        let factory = Rc::new(RefCell::new(factory));
+        let scope = AnalyzerScope::new(factory.clone());
+        let context = context(factory);
+        assert!(
+            context
+                .adapt_bound_output_domains(original, None, &scope, Span::new(0, 0))
+                .unwrap_err()
+                .to_string()
+                .contains("unknown or incompatible logical marker")
+        );
+    }
+
+    #[test]
+    fn m07_window_partial_null_value_keeps_known_origin_through_internal_cast() {
+        let (resolved, _, factory) = super::super::analyze(
+            &query("select first_value(row(null,to_bitmap(1))) over ()"),
+            &Catalog,
+            "db",
+        )
+        .unwrap();
+        let crate::analysis::QueryBody::Select(select) = resolved.body else {
+            panic!("select")
+        };
+        let mut selected_window = original_window(&select.projection[0].expr).clone();
+        let ExprKind::WindowCall { args, binding, .. } = &mut selected_window.kind else {
+            unreachable!()
+        };
+        let value = args[0].clone();
+        let DataType::Struct(fields) = &value.data_type else {
+            panic!("struct")
+        };
+        let clean = DataType::Struct(
+            fields
+                .iter()
+                .map(|field| {
+                    Arc::new(Field::new(
+                        field.name(),
+                        field.data_type().clone(),
+                        field.is_nullable(),
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        );
+        let coerced = TypedExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(value),
+                target: clean.clone(),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            data_type: clean.clone(),
+            nullable: args[0].nullable,
+        };
+        let factory = Rc::new(RefCell::new(factory));
+        let scope = AnalyzerScope::new(factory.clone());
+        let context = context(factory);
+        // Resolve the real installed Window overload for the executable
+        // coerced argument. The provenance adapter must retain this selection.
+        let original_binding = context
+            .function_catalog
+            .resolve_window_binding(
+                "first_value",
+                &[crate::analysis::function_argument(&coerced)],
+            )
+            .unwrap();
+        *binding = original_binding.clone().into();
+        *args = vec![coerced];
+        selected_window.data_type = clean;
+        let adapted = context
+            .adapt_bound_output_domains(selected_window, None, &scope, Span::new(0, 0))
+            .unwrap();
+        let DataType::Struct(fields) = &adapted.data_type else {
+            panic!("struct")
+        };
+        assert_eq!(fields[0].data_type(), &DataType::Null);
+        assert_eq!(fields[1].name(), "col2");
+        assert_eq!(
+            novarocks_types::logical::logical_type_of_field(&fields[1]),
+            Some(LogicalType::Bitmap)
+        );
+        let ExprKind::WindowCall { binding, args, .. } = &original_window(&adapted).kind else {
+            unreachable!()
+        };
+        assert_eq!(binding.resolved(), &original_binding);
+        let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
+        else {
+            panic!("scalar")
+        };
+        assert_eq!(result.data_type, args[0].data_type);
+        assert_eq!(
+            novarocks_types::logical::logical_type_of_field(match &result.data_type {
+                DataType::Struct(fields) => &fields[1],
+                _ => panic!("selected struct"),
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn m07_window_final_compiler_scalar_proof_matches_the_frozen_output() {
+        use crate::compiler::{
+            DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl,
+            SqlCompileIntent, SqlCompileProgress, SqlCompiler, SqlFinalPlanCompileRequest,
+            SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
+            builtin_sql_function_catalog, noop_constant_evaluator,
+        };
+        use novarocks_physical_plan::{
+            MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId,
+            ResultValueDomain as D, ScanReadBudget,
+        };
+        use novarocks_result_contract::{ScalarOpaqueType as O, ScalarValueType as V};
+        for (sql, domain, scalar) in [
+            (
+                "select first_value(parse_json('{}')) over ()",
+                D::Json,
+                V::Json,
+            ),
+            (
+                "select last_value(to_bitmap(1)) over ()",
+                D::Bitmap,
+                V::Opaque(O::Bitmap),
+            ),
+            (
+                "select lead(parse_json('{}'),1,null) over ()",
+                D::Json,
+                V::Json,
+            ),
+            (
+                "select lag(parse_json('{}'),1,'plain') over ()",
+                D::Plain,
+                V::String,
+            ),
+            (
+                "select lead('plain',1,parse_json('{}')) over ()",
+                D::Plain,
+                V::String,
+            ),
+            (
+                "select first_value(cast(variant_get(parse_json('{\"a\":1}'),'$.a') as variant)) over ()",
+                D::Variant,
+                V::Variant,
+            ),
+            (
+                "with q as (select variant_get(parse_json('{\"a\":1}'),'$.a') as v) select lead(v,1,cast(v as variant)) over () from q",
+                D::Variant,
+                V::Variant,
+            ),
+            (
+                "with q as (select variant_get(parse_json('{\"a\":1}'),'$.a') as v) select lag(v,1,cast(v as variant)) over () from q",
+                D::Variant,
+                V::Variant,
+            ),
+        ] {
+            let request = SqlFinalPlanCompileRequest::new(
+                PlanVersionId::try_new([17; 16]).unwrap(),
+                SqlStatementInput::sql(sql),
+                SqlCompileIntent::Query,
+                SqlSessionContext {
+                    sql_semantics: Default::default(),
+                    current_catalog: Some("iceberg".to_owned()),
+                    current_database: "db".to_owned(),
+                    optimizer_settings: SessionOptimizerSettings::default(),
+                },
+                SqlPlanningEnvironment::Distributed,
+                builtin_sql_function_catalog().snapshot(),
+                noop_constant_evaluator(),
+                SqlCompileControl::unbounded(),
+                PipelineDopDomain {
+                    min: 1,
+                    max: 8,
+                    requires_power_of_two: true,
+                },
+                ScanReadBudget {
+                    max_batch_rows: MAX_SCAN_BATCH_ROWS,
+                    max_batch_bytes: MAX_SCAN_BATCH_BYTES,
+                },
+                DEFAULT_COMPLETION_LIMITS,
+            );
+            let SqlCompileProgress::Complete(completed) =
+                SqlCompiler::start(request.try_into_completion().unwrap()).unwrap()
+            else {
+                panic!("source-free window unexpectedly needs observations: {sql}");
+            };
+            let result = completed.plan().result_port().unwrap();
+            assert_eq!(result.fields[0].domain, domain, "{sql}");
+            let schema = completed.scalar_schema().unwrap();
+            assert_eq!(schema.field().value_type, scalar, "{sql}");
+            assert_eq!(
+                schema.field().nullable,
+                result.fields[0].ty.nullable,
+                "{sql}"
+            );
+            assert_eq!(schema.source_slot(), None);
+            novarocks_physical_plan::validate_plan(completed.plan()).unwrap();
+        }
+    }
+
     #[test]
     fn m07_scalar_exact_aggregate_and_window_producers_forward_domains() {
         assert_eq!(
@@ -1143,5 +1698,532 @@ mod scalar_domain_tests {
         };
         assert_eq!(novarocks_types::logical::logical_type_of_field(field), None);
         assert_eq!(context.logical_output_type(None, &adapted, &scope), None);
+    }
+
+    fn original_transform(expression: &TypedExpr) -> &TypedExpr {
+        let mut original = expression;
+        while let ExprKind::Cast { expr, .. } = &original.kind {
+            original = expr;
+        }
+        original
+    }
+
+    #[test]
+    fn m07_container_transforms_forward_exact_leaf_domains() {
+        assert_eq!(
+            output_domains(
+                "select element_at(array_flatten([[to_bitmap(1)]]),1),element_at(array_repeat(parse_json('{}'),2),1),element_at(__array_struct_subfield([named_struct('payload',to_bitmap(1))],'PAYLOAD'),1)"
+            ),
+            vec![
+                Some(SqlType::Bitmap),
+                Some(SqlType::Json),
+                Some(SqlType::Bitmap)
+            ]
+        );
+        let expressions = output_expressions(
+            "select array_flatten([[parse_json('{}')]]),array_repeat(to_bitmap(1),2),__array_struct_subfield([named_struct('payload',parse_json('{}'))],'PAYLOAD')",
+        );
+        for (expression, id, marker) in [
+            (
+                &expressions[0],
+                "builtin.scalar/array_flatten/v1",
+                LogicalType::Json,
+            ),
+            (
+                &expressions[1],
+                "builtin.scalar/array_repeat/v1",
+                LogicalType::Bitmap,
+            ),
+            (
+                &expressions[2],
+                "builtin.scalar/__array_struct_subfield/v1",
+                LogicalType::Json,
+            ),
+        ] {
+            let ExprKind::FunctionCall { binding, .. } = &original_transform(expression).kind
+            else {
+                panic!("selected call");
+            };
+            assert_eq!(binding.function_id.as_str(), id);
+            let novarocks_functions::FunctionResultType::Scalar(selected) =
+                &binding.selected.result_type
+            else {
+                panic!("scalar selection");
+            };
+            assert_eq!(
+                &selected.data_type,
+                &original_transform(expression).data_type
+            );
+            let (DataType::List(actual), DataType::List(selected)) =
+                (&expression.data_type, &selected.data_type)
+            else {
+                panic!("List result");
+            };
+            assert_eq!(actual.name(), selected.name());
+            assert_eq!(actual.is_nullable(), selected.is_nullable());
+            assert_eq!(
+                novarocks_types::logical::logical_type_of_field(actual),
+                Some(marker)
+            );
+        }
+    }
+
+    #[test]
+    fn m07_container_zip_preserves_selected_names_nullability_and_partial_null() {
+        assert_eq!(
+            output_domains("select arrays_zip([to_bitmap(1)],[parse_json('{}')])"),
+            vec![Some(SqlType::Array(Box::new(SqlType::Struct(vec![
+                ("col1".to_owned(), SqlType::Bitmap),
+                ("col2".to_owned(), SqlType::Json),
+            ]))))]
+        );
+        let sql = "select arrays_zip([row(null,to_bitmap(1))],null)";
+        assert_eq!(output_domains(sql), vec![None]);
+        let expression = output_expressions(sql).remove(0);
+        let ExprKind::FunctionCall { binding, .. } = &original_transform(&expression).kind else {
+            panic!("zip call");
+        };
+        let novarocks_functions::FunctionResultType::Scalar(selected) =
+            &binding.selected.result_type
+        else {
+            panic!("scalar");
+        };
+        let (DataType::List(item), DataType::List(selected_item)) =
+            (&expression.data_type, &selected.data_type)
+        else {
+            panic!("List");
+        };
+        assert_eq!(item.name(), selected_item.name());
+        assert_eq!(item.is_nullable(), selected_item.is_nullable());
+        let (DataType::Struct(fields), DataType::Struct(selected_fields)) =
+            (item.data_type(), selected_item.data_type())
+        else {
+            panic!("Struct");
+        };
+        assert_eq!(fields.len(), 2);
+        for (i, (field, selected)) in fields.iter().zip(selected_fields).enumerate() {
+            assert_eq!(field.name(), &format!("col{}", i + 1));
+            assert_eq!(field.name(), selected.name());
+            assert_eq!(field.is_nullable(), selected.is_nullable());
+            assert!(field.is_nullable());
+        }
+        assert_eq!(fields[1].data_type(), &DataType::Null);
+        let DataType::Struct(children) = fields[0].data_type() else {
+            panic!("partial source");
+        };
+        assert_eq!(children[0].data_type(), &DataType::Null);
+        assert_eq!(
+            novarocks_types::logical::logical_type_of_field(&children[1]),
+            Some(LogicalType::Bitmap)
+        );
+    }
+
+    #[test]
+    fn m07_container_transforms_preserve_null_siblings_and_ordinary_values() {
+        for sql in [
+            "select array_flatten([[row(null,to_bitmap(1))]])",
+            "select array_repeat(row(null,to_bitmap(1)),2)",
+            "select __array_struct_subfield([named_struct('v',row(null,to_bitmap(1)))],'v')",
+        ] {
+            assert_eq!(output_domains(sql), vec![None]);
+            let expression = output_expressions(sql).remove(0);
+            let DataType::List(item) = &expression.data_type else {
+                panic!("List");
+            };
+            let DataType::Struct(fields) = item.data_type() else {
+                panic!("Struct");
+            };
+            assert_eq!(fields[0].data_type(), &DataType::Null);
+            assert_eq!(
+                novarocks_types::logical::logical_type_of_field(&fields[1]),
+                Some(LogicalType::Bitmap)
+            );
+        }
+        for sql in [
+            "select array_flatten([[1,2]])",
+            "select array_repeat('plain',2)",
+            "select arrays_zip([1],[2])",
+        ] {
+            let expression = output_expressions(sql).remove(0);
+            let DataType::List(item) = &expression.data_type else {
+                panic!("ordinary List");
+            };
+            assert_eq!(novarocks_types::logical::logical_type_of_field(item), None);
+        }
+        let expression = output_expressions("select array_repeat(null,2)").remove(0);
+        let DataType::List(item) = &expression.data_type else {
+            panic!("NULL List");
+        };
+        assert_eq!(item.data_type(), &DataType::Null);
+    }
+
+    #[test]
+    fn m07_container_trusted_and_null_variant_preserve_identity_unknown_cast_is_rejected() {
+        let expression =
+            output_expressions("select array_repeat(cast(null as variant),2)").remove(0);
+        let DataType::List(item) = &expression.data_type else {
+            panic!("typed NULL List");
+        };
+        assert_eq!(item.data_type(), &DataType::LargeBinary);
+        assert_eq!(novarocks_types::logical::logical_type_of_field(item), None);
+        // Same-carrier CAST preserves an independently established Variant
+        // identity. Target spelling alone does not establish serialized bytes.
+        assert_eq!(
+            output_domains(
+                "select array_repeat(cast(v as variant),2),element_at(array_repeat(cast(v as variant),2),1) from t"
+            ),
+            vec![
+                Some(SqlType::Array(Box::new(SqlType::Variant))),
+                Some(SqlType::Variant)
+            ],
+        );
+        for sql in ["select array_repeat(cast('x' as variant),2)"] {
+            let error = super::super::analyze(&query(sql), &Catalog, "db").unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("LargeBinary requires its original logical identity"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn m07_container_transform_requires_selected_identity_kind_and_result() {
+        let (resolved, _, factory) = super::super::analyze(
+            &query("select array_repeat(to_bitmap(1),2)"),
+            &Catalog,
+            "db",
+        )
+        .unwrap();
+        let crate::analysis::QueryBody::Select(select) = resolved.body else {
+            panic!("select");
+        };
+        let original = original_transform(&select.projection[0].expr).clone();
+        let factory = Rc::new(RefCell::new(factory));
+        let scope = AnalyzerScope::new(factory.clone());
+        let context = context(factory);
+        let ExprKind::FunctionCall { binding, args, .. } = &original.kind else {
+            panic!("call");
+        };
+        let selection = binding.resolved().clone();
+        let before_args = format!("{args:?}");
+        let adapted = context
+            .adapt_bound_output_domains(original.clone(), None, &scope, Span::new(0, 0))
+            .unwrap();
+        let ExprKind::FunctionCall { binding, args, .. } = &original_transform(&adapted).kind
+        else {
+            panic!("call");
+        };
+        assert_eq!(binding.resolved(), &selection);
+        assert_eq!(format!("{args:?}"), before_args);
+        for change in 0..6 {
+            let mut candidate = original.clone();
+            let ExprKind::FunctionCall { binding, .. } = &mut candidate.kind else {
+                unreachable!();
+            };
+            let mut selected = binding.resolved().clone();
+            match change {
+                0 => {
+                    selected.function_id =
+                        novarocks_functions::FunctionId::try_new("test.shadow/array_repeat/v1")
+                            .unwrap()
+                }
+                1 => selected.kind = novarocks_functions::FunctionKind::Aggregate,
+                2 => {
+                    let novarocks_functions::FunctionResultType::Scalar(result) =
+                        &mut selected.selected.result_type
+                    else {
+                        unreachable!();
+                    };
+                    result.data_type =
+                        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+                }
+                3 => selected.logical_argument_count = 1,
+                4 => {
+                    let novarocks_functions::FunctionArgumentType::Value(value) =
+                        &mut selected.selected.argument_types[0]
+                    else {
+                        unreachable!();
+                    };
+                    value.data_type = DataType::Utf8;
+                }
+                _ => {
+                    let novarocks_functions::FunctionResultType::Scalar(result) =
+                        &mut selected.selected.result_type
+                    else {
+                        unreachable!();
+                    };
+                    result.nullable = !candidate.nullable;
+                }
+            }
+            *binding = selected.into();
+            assert_eq!(context.logical_output_type(None, &candidate, &scope), None);
+            let before = format!("{candidate:?}");
+            let result = context
+                .adapt_bound_output_domains(candidate, None, &scope, Span::new(0, 0))
+                .unwrap();
+            assert_eq!(format!("{result:?}"), before);
+        }
+    }
+
+    #[test]
+    fn m07_container_internal_sortby_subfield_keeps_nested_marker_and_binding() {
+        let sql = "select array_sortby((x)->x.key,[named_struct('key',1,'payload',to_bitmap(1))])";
+        let expression = output_expressions(sql).remove(0);
+        let ExprKind::FunctionCall { args, .. } = &original_transform(&expression).kind else {
+            panic!("sortby");
+        };
+        let ExprKind::FunctionCall { binding, .. } = &original_transform(&args[1]).kind else {
+            panic!("subfield");
+        };
+        assert_eq!(
+            binding.function_id.as_str(),
+            "builtin.scalar/__array_struct_subfield/v1"
+        );
+        let DataType::List(item) = &expression.data_type else {
+            panic!("List");
+        };
+        let DataType::Struct(fields) = item.data_type() else {
+            panic!("Struct");
+        };
+        assert_eq!(
+            novarocks_types::logical::logical_type_of_field(&fields[1]),
+            Some(LogicalType::Bitmap)
+        );
+        // SORTBY executes its exact ordinary List<Utf8> key selection. Its
+        // coercion retains the independently adapted JSON subfield underneath.
+        let (resolved, _, factory) = super::super::analyze(
+            &query("select array_sortby((x)->x.key,[named_struct('key',parse_json('{}'),'payload',1)])"),
+            &Catalog,
+            "db",
+        ).unwrap();
+        let crate::analysis::QueryBody::Select(select) = resolved.body else {
+            panic!("select");
+        };
+        let json = select.projection[0].expr.clone();
+        let ExprKind::FunctionCall { binding, args, .. } = &original_transform(&json).kind else {
+            panic!("sortby");
+        };
+        let outer_selection = binding.resolved().clone();
+        let outer_arguments = format!("{args:?}");
+        let novarocks_functions::FunctionArgumentType::Value(selected_key) =
+            &binding.selected.argument_types[1]
+        else {
+            panic!("selected key value");
+        };
+        let key = &args[1];
+        assert_eq!(key.data_type, selected_key.data_type);
+        assert_eq!(key.nullable, selected_key.nullable);
+        let DataType::List(outer_item) = &key.data_type else {
+            panic!("key List");
+        };
+        assert_eq!(outer_item.data_type(), &DataType::Utf8);
+        assert_eq!(
+            novarocks_types::logical::logical_type_of_field(outer_item),
+            None
+        );
+        let ExprKind::Cast {
+            expr: adapted_key,
+            target,
+            ..
+        } = &key.kind
+        else {
+            panic!("selected key coercion");
+        };
+        assert_eq!(target, &selected_key.data_type);
+        let DataType::List(inner_item) = &adapted_key.data_type else {
+            panic!("adapted key List");
+        };
+        assert_eq!(
+            novarocks_types::logical::logical_type_of_field(inner_item),
+            Some(LogicalType::Json)
+        );
+        let ExprKind::FunctionCall {
+            binding: subfield_binding,
+            args: subfield_args,
+            ..
+        } = &original_transform(adapted_key).kind
+        else {
+            panic!("subfield call");
+        };
+        assert_eq!(
+            subfield_binding.function_id.as_str(),
+            "builtin.scalar/__array_struct_subfield/v1"
+        );
+        assert_eq!(
+            subfield_binding.kind,
+            novarocks_functions::FunctionKind::Scalar
+        );
+        let novarocks_functions::FunctionResultType::Scalar(subfield_result) =
+            &subfield_binding.selected.result_type
+        else {
+            panic!("scalar subfield selection");
+        };
+        assert_eq!(
+            subfield_result.data_type,
+            original_transform(adapted_key).data_type
+        );
+        assert_eq!(
+            subfield_result.nullable,
+            original_transform(adapted_key).nullable
+        );
+        let DataType::List(selected_item) = &subfield_result.data_type else {
+            panic!("selected subfield List");
+        };
+        assert_eq!(
+            novarocks_types::logical::logical_type_of_field(selected_item),
+            None
+        );
+        assert!(
+            matches!(&subfield_args[1].kind, ExprKind::Literal(crate::analysis::LiteralValue::String(name)) if name == "key")
+        );
+        let DataType::List(source_item) = &subfield_args[0].data_type else {
+            panic!("source List");
+        };
+        let DataType::Struct(source_fields) = source_item.data_type() else {
+            panic!("source Struct");
+        };
+        assert_eq!(source_fields[0].name(), "key");
+        assert_eq!(
+            novarocks_types::logical::logical_type_of_field(&source_fields[0]),
+            Some(LogicalType::Json)
+        );
+        let factory = Rc::new(RefCell::new(factory));
+        let scope = AnalyzerScope::new(factory.clone());
+        let context = context(factory);
+        assert_eq!(
+            context.logical_output_type(None, key, &scope),
+            Some(SqlType::Array(Box::new(SqlType::Json)))
+        );
+        let readapted = context
+            .adapt_bound_output_domains(json.clone(), None, &scope, Span::new(0, 0))
+            .unwrap();
+        let ExprKind::FunctionCall { binding, args, .. } = &original_transform(&readapted).kind
+        else {
+            panic!("sortby selection after readaptation");
+        };
+        assert_eq!(binding.resolved(), &outer_selection);
+        assert_eq!(format!("{args:?}"), outer_arguments);
+    }
+
+    #[test]
+    fn m07_container_final_compiler_scalar_proof_matches_exact_domains() {
+        use crate::compiler::{
+            DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl,
+            SqlCompileIntent, SqlCompileProgress, SqlCompiler, SqlFinalPlanCompileRequest,
+            SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
+            builtin_sql_function_catalog, noop_constant_evaluator,
+        };
+        use novarocks_physical_plan::{
+            MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId,
+            ResultValueDomain as D, ScanReadBudget,
+        };
+        use novarocks_result_contract::{
+            NamedScalarField as N, ScalarField as F, ScalarOpaqueType as O, ScalarValueType as V,
+        };
+        for (sql, domain, scalar) in [
+            (
+                "select element_at(array_flatten([[to_bitmap(1)]]),1)",
+                D::Bitmap,
+                V::Opaque(O::Bitmap),
+            ),
+            (
+                "select element_at(array_repeat(parse_json('{}'),2),1)",
+                D::Json,
+                V::Json,
+            ),
+            (
+                "select element_at(__array_struct_subfield([named_struct('payload',to_bitmap(1))],'payload'),1)",
+                D::Bitmap,
+                V::Opaque(O::Bitmap),
+            ),
+            (
+                "select array_repeat(parse_json('{}'),2)",
+                D::Plain,
+                V::List(Box::new(F {
+                    nullable: true,
+                    value_type: V::Json,
+                })),
+            ),
+            (
+                "select array_repeat(cast(variant_get(parse_json('{}'),'$') as variant),2)",
+                D::Plain,
+                V::List(Box::new(F {
+                    nullable: true,
+                    value_type: V::Variant,
+                })),
+            ),
+            (
+                "select element_at(array_repeat(cast(variant_get(parse_json('{}'),'$') as variant),2),1)",
+                D::Variant,
+                V::Variant,
+            ),
+            (
+                "select arrays_zip([to_bitmap(1)],[parse_json('{}')])",
+                D::Plain,
+                V::List(Box::new(F {
+                    nullable: true,
+                    value_type: V::Struct(vec![
+                        N {
+                            name: "col1".to_owned(),
+                            field: F {
+                                nullable: true,
+                                value_type: V::Opaque(O::Bitmap),
+                            },
+                        },
+                        N {
+                            name: "col2".to_owned(),
+                            field: F {
+                                nullable: true,
+                                value_type: V::Json,
+                            },
+                        },
+                    ]),
+                })),
+            ),
+        ] {
+            let request = SqlFinalPlanCompileRequest::new(
+                PlanVersionId::try_new([17; 16]).unwrap(),
+                SqlStatementInput::sql(sql),
+                SqlCompileIntent::Query,
+                SqlSessionContext {
+                    sql_semantics: Default::default(),
+                    current_catalog: Some("iceberg".to_owned()),
+                    current_database: "db".to_owned(),
+                    optimizer_settings: SessionOptimizerSettings::default(),
+                },
+                SqlPlanningEnvironment::Distributed,
+                builtin_sql_function_catalog().snapshot(),
+                noop_constant_evaluator(),
+                SqlCompileControl::unbounded(),
+                PipelineDopDomain {
+                    min: 1,
+                    max: 8,
+                    requires_power_of_two: true,
+                },
+                ScanReadBudget {
+                    max_batch_rows: MAX_SCAN_BATCH_ROWS,
+                    max_batch_bytes: MAX_SCAN_BATCH_BYTES,
+                },
+                DEFAULT_COMPLETION_LIMITS,
+            );
+            let SqlCompileProgress::Complete(completed) =
+                SqlCompiler::start(request.try_into_completion().unwrap()).unwrap()
+            else {
+                panic!("source-free transform unexpectedly needs observations: {sql}");
+            };
+            let result = completed.plan().result_port().unwrap();
+            assert_eq!(result.fields[0].domain, domain, "{sql}");
+            let schema = completed.scalar_schema().unwrap();
+            assert_eq!(schema.field().value_type, scalar, "{sql}");
+            assert_eq!(
+                schema.field().nullable,
+                result.fields[0].ty.nullable,
+                "{sql}"
+            );
+            assert_eq!(schema.source_slot(), None);
+            novarocks_physical_plan::validate_plan(completed.plan()).unwrap();
+        }
     }
 }

@@ -22,6 +22,7 @@
 //! The caller prepays the cursor box and one-column RecordBatch clone BEFORE
 //! construction, proves the complete original Chunk backing separately, and
 //! retains its original RootInputPermit until this cursor and its input exit.
+//! Arbitrary source metadata-container work also remains the caller's responsibility.
 //! These checks neither fund source growth nor admit a root/session assignment.
 //! Empty input, cumulative row admission, NoRows at sealed End, and nested
 //! containers remain the root owner's responsibilities. This module does not
@@ -35,7 +36,7 @@ use arrow::array::{
     Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, NullArray, RecordBatch,
     StringArray, Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray,
 };
-use arrow::datatypes::{DataType, Field, Int32Type};
+use arrow::datatypes::{DataType, Field, FieldRef, Int32Type, TimeUnit};
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_result_contract::{
     BorrowedScalarLeaf, ScalarField, ScalarLeafCursor, ScalarLeafError, ScalarOpaqueType,
@@ -85,29 +86,45 @@ impl From<ScalarLeafError> for NativeScalarLeafError {
 /// RecordBatch columns Vec. The schema Arc retains an existing frozen owner.
 pub struct NativeScalarLeafEncoder {
     batch: RecordBatch,
+    slot_field: FieldRef,
     schema: Arc<ScalarSchema>,
-    encoded_len: usize,
+    candidate_encoded_len: usize,
     offset: usize,
-    failed: bool,
+    phase: ScalarLeafPhase,
+}
+
+#[derive(Clone, Copy)]
+struct ValidatedLeaf {
+    encoded_len: usize,
+}
+#[derive(Clone, Copy)]
+enum ScalarLeafPhase {
+    Validating { source: u8, offset: usize },
+    Encoding(ValidatedLeaf),
+    Complete(ValidatedLeaf),
+    Failed,
 }
 impl NativeScalarLeafEncoder {
     pub const fn inline_capacity_bytes() -> usize {
         size_of::<Self>()
     }
     /// Actual one-column Vec clone Layout plus the caller's cursor Box Layout.
-    /// No schema copy, variable payload, or source backing is included here.
+    /// Arc clones retain original owners without copying variable metadata.
     pub const fn scratch_capacity_bytes() -> usize {
         size_of::<Self>() + size_of::<ArrayRef>()
     }
-    /// Borrowed validation only. Shape/slot checks precede metadata, physical
-    /// cell access and all cursor/RecordBatch cloning. The caller still proves
-    /// complete original ownership and atomically admits cumulative 0/1 rows.
-    pub fn validate_input(
+    /// Begin a prepaid immutable cursor. No full timezone comparison occurs.
+    /// A fixed set of shape/slot/carrier/metadata checks and bounded fixed-coefficient
+    /// validation precede all cloning. The caller separately proves complete
+    /// original backing and retains its original input permit through exit.
+    pub fn try_begin(
         chunk: &Chunk,
-        schema: &ScalarSchema,
-    ) -> Result<(), NativeScalarLeafError> {
+        schema: Arc<ScalarSchema>,
+        prepaid_scratch_capacity: usize,
+    ) -> Result<Self, NativeScalarLeafError> {
         let batch = &chunk.batch;
         if batch.num_columns() != 1
+            || batch.schema_ref().fields().len() != 1
             || batch.num_rows() > 1
             || chunk.chunk_schema().slots().len() != 1
         {
@@ -121,68 +138,154 @@ impl NativeScalarLeafEncoder {
             return Err(NativeScalarLeafError::Slot);
         }
         reject_container(schema.field())?;
-        let logical = expected_logical(&schema.field().value_type);
         if !slot.field_schema().children().is_empty()
-            || slot.field_schema().logical_type() != logical
+            || slot.field_schema().logical_type() != expected_logical(&schema.field().value_type)
         {
             return Err(NativeScalarLeafError::LogicalMetadata);
         }
-        validate_field(schema.field(), slot.field())?;
-        validate_field(schema.field(), &batch.schema_ref().fields()[0])?;
-        let leaf = borrow_leaf(schema.field(), batch.column(0).as_ref())?;
-        ScalarLeafCursor::try_new(schema, leaf)?;
-        Ok(())
-    }
-    pub fn try_new(
-        chunk: &Chunk,
-        schema: Arc<ScalarSchema>,
-        prepaid_scratch_capacity: usize,
-    ) -> Result<Self, NativeScalarLeafError> {
-        Self::validate_input(chunk, &schema)?;
         if Self::scratch_capacity_bytes() > prepaid_scratch_capacity {
             return Err(NativeScalarLeafError::ScratchLimit);
         }
-        let encoded_len = ScalarLeafCursor::try_new(
-            &schema,
-            borrow_validated_leaf(schema.field(), chunk.batch.column(0).as_ref())?,
-        )?
-        .encoded_len();
+        validate_field_preflight(schema.field(), slot.field())?;
+        validate_field_preflight(schema.field(), &batch.schema_ref().fields()[0])?;
+        let array = batch.column(0).as_ref();
+        if array.len() != 1
+            || !carrier_preflight_matches(
+                schema.field(),
+                array.data_type(),
+                schema.field().nullable,
+            )
+        {
+            return Err(NativeScalarLeafError::Type);
+        }
+        // At most 304 fixed coefficient limbs plus constant selected-cell work.
+        // Variable lengths are checked without scanning/copying their payload.
+        let candidate_encoded_len =
+            ScalarLeafCursor::try_new(&schema, borrow_validated_leaf(schema.field(), array)?)?
+                .encoded_len();
         Ok(Self {
-            batch: chunk.batch.clone(),
+            batch: batch.clone(),
+            slot_field: Arc::clone(slot.field_ref()),
             schema,
-            encoded_len,
+            candidate_encoded_len,
             offset: 0,
-            failed: false,
+            phase: ScalarLeafPhase::Validating {
+                source: 0,
+                offset: 0,
+            },
         })
     }
-    pub const fn encoded_len(&self) -> usize {
-        self.encoded_len
+    /// A length is available only after the private immutable validation witness.
+    pub const fn encoded_len(&self) -> Option<usize> {
+        match self.phase {
+            ScalarLeafPhase::Encoding(witness) | ScalarLeafPhase::Complete(witness) => {
+                Some(witness.encoded_len)
+            }
+            ScalarLeafPhase::Validating { .. } | ScalarLeafPhase::Failed => None,
+        }
     }
+    /// Validation advances even with empty output, but never writes output or
+    /// completes a row. Its final turn yields before any encoding can begin.
     pub fn step(&mut self, output: &mut [u8]) -> Result<RenderTurn, NativeScalarLeafError> {
-        if self.failed {
+        if matches!(self.phase, ScalarLeafPhase::Failed) {
             return Err(NativeScalarLeafError::Failed);
         }
-        let result = self.step_inner(output);
-        if result.is_err() {
-            self.failed = true;
-        }
-        result
-    }
-    fn step_inner(&mut self, output: &mut [u8]) -> Result<RenderTurn, NativeScalarLeafError> {
-        if self.offset == self.encoded_len {
-            return Ok(RenderTurn {
+        let result = match self.phase {
+            ScalarLeafPhase::Validating { source, offset } => self.validate_turn(source, offset),
+            ScalarLeafPhase::Encoding(witness) => self.encode_turn(witness, output),
+            ScalarLeafPhase::Complete(_) => Ok(RenderTurn {
                 emitted_bytes: 0,
                 examined_bytes: 0,
                 visited_cells: 0,
                 completed_rows: 0,
                 status: RenderTurnStatus::InputComplete,
-            });
+            }),
+            ScalarLeafPhase::Failed => unreachable!("failed phase checked before dispatch"),
+        };
+        if result.is_err() {
+            self.phase = ScalarLeafPhase::Failed;
         }
+        result
+    }
+    fn source_zone(&self, source: u8) -> Option<&str> {
+        let data_type = match source {
+            0 => self.slot_field.data_type(),
+            1 => self.batch.schema_ref().fields()[0].data_type(),
+            2 => self.batch.column(0).data_type(),
+            _ => unreachable!("closed timezone source index"),
+        };
+        match data_type {
+            DataType::Timestamp(_, zone) => zone.as_deref(),
+            _ => None,
+        }
+    }
+    fn validate_turn(
+        &mut self,
+        mut source: u8,
+        mut offset: usize,
+    ) -> Result<RenderTurn, NativeScalarLeafError> {
+        let mut examined = 0;
+        let mut work = 0;
+        while source < 3 && work + 8 <= 1024 {
+            let expected = match &self.schema.field().value_type {
+                ScalarValueType::Timestamp { timezone, .. } => timezone.as_deref(),
+                _ => None,
+            };
+            let actual = self.source_zone(source);
+            work += 8;
+            match (expected, actual) {
+                (None, None) => {
+                    source += 1;
+                    offset = 0;
+                }
+                (Some(expected), Some(actual)) if expected.len() == actual.len() => {
+                    if offset > expected.len() {
+                        return Err(NativeScalarLeafError::ChangedInput);
+                    }
+                    let count = (expected.len() - offset).min((64 * 1024 - examined) / 2);
+                    if count == 0 && offset < expected.len() {
+                        break;
+                    }
+                    let end = offset + count;
+                    // Count both borrowed inputs, including the frozen schema.
+                    if expected.as_bytes()[offset..end] != actual.as_bytes()[offset..end] {
+                        return Err(NativeScalarLeafError::Type);
+                    }
+                    examined += 2 * count;
+                    offset = end;
+                    if offset == expected.len() {
+                        source += 1;
+                        offset = 0;
+                    }
+                }
+                _ => return Err(NativeScalarLeafError::Type),
+            }
+        }
+        self.phase = if source == 3 {
+            ScalarLeafPhase::Encoding(ValidatedLeaf {
+                encoded_len: self.candidate_encoded_len,
+            })
+        } else {
+            ScalarLeafPhase::Validating { source, offset }
+        };
+        Ok(RenderTurn {
+            emitted_bytes: 0,
+            examined_bytes: examined,
+            visited_cells: work,
+            completed_rows: 0,
+            status: RenderTurnStatus::Yielded,
+        })
+    }
+    fn encode_turn(
+        &mut self,
+        witness: ValidatedLeaf,
+        output: &mut [u8],
+    ) -> Result<RenderTurn, NativeScalarLeafError> {
         let cursor = ScalarLeafCursor::try_new(
             &self.schema,
             borrow_validated_leaf(self.schema.field(), self.batch.column(0).as_ref())?,
         )?;
-        if cursor.encoded_len() != self.encoded_len {
+        if cursor.encoded_len() != witness.encoded_len {
             return Err(NativeScalarLeafError::ChangedInput);
         }
         let turn = cursor.copy_range(self.offset, output)?;
@@ -190,11 +293,12 @@ impl NativeScalarLeafEncoder {
             .offset
             .checked_add(turn.emitted_bytes)
             .ok_or(NativeScalarLeafError::ChangedInput)?;
+        if turn.complete {
+            self.phase = ScalarLeafPhase::Complete(witness);
+        }
         Ok(RenderTurn {
             emitted_bytes: turn.emitted_bytes,
             examined_bytes: 0,
-            // At most 304 coefficient limbs plus constant leaf selection. This
-            // conservative work charge remains below the 1024-cell quantum.
             visited_cells: 512,
             completed_rows: u64::from(turn.complete),
             status: if turn.complete {
@@ -225,8 +329,11 @@ fn expected_logical(value: &ScalarValueType) -> Option<LogicalType> {
         _ => None,
     }
 }
-fn validate_field(expected: &ScalarField, actual: &Field) -> Result<(), NativeScalarLeafError> {
-    if !carrier_matches(expected, actual.data_type(), actual.is_nullable()) {
+fn validate_field_preflight(
+    expected: &ScalarField,
+    actual: &Field,
+) -> Result<(), NativeScalarLeafError> {
+    if !carrier_preflight_matches(expected, actual.data_type(), actual.is_nullable()) {
         return Err(NativeScalarLeafError::Type);
     }
     // Borrow the canonical fact; normalizing with logical_type_of_field would
@@ -244,13 +351,28 @@ fn dictionary_type(data_type: &DataType) -> bool {
     matches!(data_type, DataType::Dictionary(key, value)
         if key.as_ref() == &DataType::Int32 && matches!(value.as_ref(), DataType::Utf8 | DataType::LargeUtf8))
 }
-fn carrier_matches(expected: &ScalarField, actual: &DataType, nullable: bool) -> bool {
+fn carrier_preflight_matches(expected: &ScalarField, actual: &DataType, nullable: bool) -> bool {
     if dictionary_type(actual) {
         expected.nullable == nullable
             && matches!(
                 expected.value_type,
                 ScalarValueType::String | ScalarValueType::Json
             )
+    } else if let ScalarValueType::Timestamp { unit, timezone } = &expected.value_type {
+        let DataType::Timestamp(actual_unit, actual_zone) = actual else {
+            return false;
+        };
+        expected.nullable == nullable
+            && matches!(
+                (unit, actual_unit),
+                (ScalarTimestampUnit::Microsecond, TimeUnit::Microsecond)
+                    | (ScalarTimestampUnit::Nanosecond, TimeUnit::Nanosecond)
+            )
+            && match (timezone.as_deref(), actual_zone.as_deref()) {
+                (None, None) => true,
+                (Some(expected), Some(actual)) => expected.len() == actual.len(),
+                _ => false,
+            }
     } else {
         scalar_field_matches_storage(expected, actual, nullable)
     }
@@ -268,17 +390,8 @@ fn exact<T: Array + 'static>(array: &dyn Array) -> Result<&T, NativeScalarLeafEr
     }
     Ok(value)
 }
-fn borrow_leaf<'a>(
-    expected: &ScalarField,
-    array: &'a dyn Array,
-) -> Result<BorrowedScalarLeaf<'a>, NativeScalarLeafError> {
-    if array.len() != 1 || !carrier_matches(expected, array.data_type(), expected.nullable) {
-        return Err(NativeScalarLeafError::Type);
-    }
-    borrow_validated_leaf(expected, array)
-}
-// Only the constructor's fully validated immutable concrete arrays reach this
-// path. In particular a turn never rescans the retained timezone string.
+// Concrete shape/value preflight and the private witness guard emission.
+// Temporary borrows never rescan timezone bytes or escape the current turn.
 fn borrow_validated_leaf<'a>(
     expected: &ScalarField,
     array: &'a dyn Array,
@@ -482,8 +595,36 @@ mod tests {
         let batch = RecordBatch::try_new(schema.arrow_schema_ref(), vec![array]).unwrap();
         Chunk::try_new_with_chunk_schema(batch, schema).unwrap()
     }
+    fn finish_validation(
+        cursor: &mut NativeScalarLeafEncoder,
+    ) -> Result<(), NativeScalarLeafError> {
+        for _ in 0..16 {
+            if cursor.encoded_len().is_some() {
+                return Ok(());
+            }
+            let mut untouched = [0xa5; 3];
+            let turn = cursor.step(&mut untouched)?;
+            assert_eq!(untouched, [0xa5; 3]);
+            assert_eq!((turn.emitted_bytes, turn.completed_rows), (0, 0));
+            assert_eq!(turn.status, RenderTurnStatus::Yielded);
+            assert!(turn.examined_bytes <= 64 * 1024 && turn.visited_cells <= 1024);
+        }
+        panic!("finite leaf validation failed to complete");
+    }
+    fn validate_to_completion(
+        input: &Chunk,
+        expected: &ScalarSchema,
+    ) -> Result<(), NativeScalarLeafError> {
+        // Test-only schema copies are outside the cursor allocation contract.
+        let mut cursor = NativeScalarLeafEncoder::try_begin(
+            input,
+            Arc::new(expected.clone()),
+            NativeScalarLeafEncoder::scratch_capacity_bytes(),
+        )?;
+        finish_validation(&mut cursor)
+    }
     fn encode(input: &Chunk, expected: Arc<ScalarSchema>, quantum: usize) -> Vec<u8> {
-        let mut cursor = NativeScalarLeafEncoder::try_new(
+        let mut cursor = NativeScalarLeafEncoder::try_begin(
             input,
             expected,
             NativeScalarLeafEncoder::scratch_capacity_bytes(),
@@ -515,7 +656,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            NativeScalarLeafEncoder::validate_input(&empty, &expected),
+            validate_to_completion(&empty, &expected),
             Err(NativeScalarLeafError::EmptyInput)
         );
         let rows = chunk(
@@ -524,7 +665,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            NativeScalarLeafEncoder::validate_input(&rows, &expected),
+            validate_to_completion(&rows, &expected),
             Err(NativeScalarLeafError::Shape)
         );
     }
@@ -533,7 +674,7 @@ mod tests {
         let expected = schema(ScalarValueType::Json, true);
         let plain = chunk(Arc::new(StringArray::from(vec!["{}"])), None, None);
         assert_eq!(
-            NativeScalarLeafEncoder::validate_input(&plain, &expected),
+            validate_to_completion(&plain, &expected),
             Err(NativeScalarLeafError::LogicalMetadata)
         );
         let fake = ChunkFieldSchema::from_field(
@@ -543,7 +684,7 @@ mod tests {
         .unwrap();
         let forged_cache = chunk(Arc::new(StringArray::from(vec!["{}"])), None, Some(fake));
         assert_eq!(
-            NativeScalarLeafEncoder::validate_input(&forged_cache, &expected),
+            validate_to_completion(&forged_cache, &expected),
             Err(NativeScalarLeafError::LogicalMetadata)
         );
         let normalized = chunk(
@@ -552,13 +693,13 @@ mod tests {
             None,
         );
         assert_eq!(
-            NativeScalarLeafEncoder::validate_input(&normalized, &expected),
+            validate_to_completion(&normalized, &expected),
             Err(NativeScalarLeafError::LogicalMetadata)
         );
         let exact = chunk(Arc::new(StringArray::from(vec!["{}"])), Some("json"), None);
-        assert!(NativeScalarLeafEncoder::validate_input(&exact, &expected).is_ok());
+        assert!(validate_to_completion(&exact, &expected).is_ok());
         assert_eq!(
-            NativeScalarLeafEncoder::validate_input(&exact, &schema(ScalarValueType::String, true)),
+            validate_to_completion(&exact, &schema(ScalarValueType::String, true)),
             Err(NativeScalarLeafError::LogicalMetadata)
         );
     }
@@ -570,7 +711,7 @@ mod tests {
             Some(ChunkFieldSchema::empty()),
         );
         assert_eq!(
-            NativeScalarLeafEncoder::validate_input(
+            validate_to_completion(
                 &canonical_json_with_empty_cache,
                 &schema(ScalarValueType::Json, true),
             ),
@@ -587,7 +728,7 @@ mod tests {
             Some(cached_json),
         );
         assert_eq!(
-            NativeScalarLeafEncoder::validate_input(
+            validate_to_completion(
                 &plain_string_with_json_cache,
                 &schema(ScalarValueType::String, true),
             ),
@@ -603,13 +744,15 @@ mod tests {
             None,
         );
         let expected = schema(ScalarValueType::String, true);
-        let mut cursor = NativeScalarLeafEncoder::try_new(
+        let mut cursor = NativeScalarLeafEncoder::try_begin(
             &input,
             Arc::clone(&expected),
             NativeScalarLeafEncoder::scratch_capacity_bytes(),
         )
         .unwrap();
-        assert_eq!(cursor.encoded_len(), 65_560);
+        assert_eq!(cursor.encoded_len(), None);
+        finish_validation(&mut cursor).unwrap();
+        assert_eq!(cursor.encoded_len(), Some(65_560));
         let mut output = vec![0xa5; 64 * 1024 + 17];
         let first = cursor.step(&mut output).unwrap();
         assert_eq!(first.emitted_bytes, 65_536);
@@ -732,7 +875,7 @@ mod tests {
             true,
         );
         assert_eq!(
-            NativeScalarLeafEncoder::validate_input(&input, &wrong_zone),
+            validate_to_completion(&input, &wrong_zone),
             Err(NativeScalarLeafError::Type)
         );
     }
@@ -888,7 +1031,7 @@ mod tests {
         let weak = Arc::downgrade(&array);
         let input = chunk(array, None, None);
         let expected = schema(ScalarValueType::Binary, true);
-        let mut cursor = NativeScalarLeafEncoder::try_new(
+        let mut cursor = NativeScalarLeafEncoder::try_begin(
             &input,
             Arc::clone(&expected),
             NativeScalarLeafEncoder::scratch_capacity_bytes(),
@@ -897,6 +1040,7 @@ mod tests {
         drop(input);
         assert!(weak.upgrade().is_some());
         let mut one = [0; 1];
+        finish_validation(&mut cursor).unwrap();
         assert_eq!(cursor.step(&mut one).unwrap().emitted_bytes, 1);
         drop(cursor);
         assert!(weak.upgrade().is_none());
@@ -914,7 +1058,7 @@ mod tests {
         let input = chunk(Arc::new(wrong), None, None);
         let expected = schema(ScalarValueType::String, true);
         assert_eq!(
-            NativeScalarLeafEncoder::validate_input(&input, &expected),
+            validate_to_completion(&input, &expected),
             Err(NativeScalarLeafError::Type)
         );
         let input = chunk(Arc::new(Int64Array::from(vec![11, -22, 33])), None, None).slice(1, 1);
@@ -927,7 +1071,7 @@ mod tests {
         let input = chunk(Arc::new(StringArray::from(vec!["value"])), None, None);
         let expected = schema(ScalarValueType::String, true);
         assert!(matches!(
-            NativeScalarLeafEncoder::try_new(
+            NativeScalarLeafEncoder::try_begin(
                 &input,
                 Arc::clone(&expected),
                 NativeScalarLeafEncoder::scratch_capacity_bytes() - 1
@@ -941,7 +1085,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            NativeScalarLeafEncoder::validate_input(&oversized, &expected),
+            validate_to_completion(&oversized, &expected),
             Err(NativeScalarLeafError::Leaf(ScalarLeafError::ValueLimit))
         );
     }
@@ -958,7 +1102,7 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(
-            NativeScalarLeafEncoder::validate_input(&input, &wrong),
+            validate_to_completion(&input, &wrong),
             Err(NativeScalarLeafError::Slot)
         );
         let container = schema(
@@ -969,8 +1113,158 @@ mod tests {
             true,
         );
         assert_eq!(
-            NativeScalarLeafEncoder::validate_input(&input, &container),
+            validate_to_completion(&input, &container),
             Err(NativeScalarLeafError::UnsupportedContainer)
         );
+    }
+    #[test]
+    fn initial_timezone_validation_counts_all_three_sources_without_emission() {
+        let zone = "z".repeat(64 * 1024);
+        let input = chunk(
+            Arc::new(TimestampNanosecondArray::from(vec![7]).with_timezone(zone.clone())),
+            None,
+            None,
+        );
+        let expected = schema(
+            ScalarValueType::Timestamp {
+                unit: ScalarTimestampUnit::Nanosecond,
+                timezone: Some(zone),
+            },
+            true,
+        );
+        let mut cursor = NativeScalarLeafEncoder::try_begin(
+            &input,
+            expected,
+            NativeScalarLeafEncoder::scratch_capacity_bytes(),
+        )
+        .unwrap();
+        let mut examined = 0;
+        for turn_index in 0..6 {
+            assert_eq!(cursor.encoded_len(), None);
+            let mut output = [0xa5; 128];
+            let turn = cursor.step(&mut output).unwrap();
+            assert_eq!(output, [0xa5; 128]);
+            assert_eq!((turn.emitted_bytes, turn.completed_rows), (0, 0));
+            assert_eq!(turn.status, RenderTurnStatus::Yielded);
+            assert_eq!(turn.examined_bytes, 64 * 1024);
+            assert!(turn.visited_cells <= 1024);
+            examined += turn.examined_bytes;
+            assert_eq!(cursor.encoded_len().is_some(), turn_index == 5);
+        }
+        assert_eq!(examined, 6 * 64 * 1024);
+        assert_eq!(cursor.encoded_len(), Some(32));
+        let before = cursor.offset;
+        assert_eq!(cursor.step(&mut []).unwrap().emitted_bytes, 0);
+        assert_eq!(cursor.offset, before);
+        let mut output = [0; 32];
+        assert_eq!(cursor.step(&mut output).unwrap().completed_rows, 1);
+        assert_eq!(&output[24..], &7_i64.to_le_bytes());
+    }
+    #[test]
+    fn equal_length_timezone_mismatch_is_incremental_and_latched() {
+        let original_zone = "z".repeat(64 * 1024);
+        let input = chunk(
+            Arc::new(TimestampNanosecondArray::from(vec![7]).with_timezone(original_zone.clone())),
+            None,
+            None,
+        );
+        let mut expected_zone = original_zone.into_bytes();
+        *expected_zone.last_mut().unwrap() = b'q';
+        let expected = schema(
+            ScalarValueType::Timestamp {
+                unit: ScalarTimestampUnit::Nanosecond,
+                timezone: Some(String::from_utf8(expected_zone).unwrap()),
+            },
+            true,
+        );
+        let mut cursor = NativeScalarLeafEncoder::try_begin(
+            &input,
+            expected,
+            NativeScalarLeafEncoder::scratch_capacity_bytes(),
+        )
+        .unwrap();
+        let first = cursor.step(&mut []).unwrap();
+        assert_eq!(first.examined_bytes, 64 * 1024);
+        assert_eq!(cursor.encoded_len(), None);
+        let mut output = [0xa5; 32];
+        assert!(matches!(
+            cursor.step(&mut output),
+            Err(NativeScalarLeafError::Type)
+        ));
+        assert_eq!(output, [0xa5; 32]);
+        assert_eq!(cursor.encoded_len(), None);
+        assert!(matches!(
+            cursor.step(&mut output),
+            Err(NativeScalarLeafError::Failed)
+        ));
+    }
+    #[test]
+    fn batch_timezone_is_checked_after_a_distinct_matching_slot_field() {
+        let zone = "z".repeat(64 * 1024);
+        let good = TimestampNanosecondArray::from(vec![7]).with_timezone(zone.clone());
+        let mut input = chunk(Arc::new(good), None, None);
+        let mut wrong = zone.clone().into_bytes();
+        *wrong.last_mut().unwrap() = b'q';
+        let bad = Arc::new(
+            TimestampNanosecondArray::from(vec![7])
+                .with_timezone(String::from_utf8(wrong).unwrap()),
+        ) as ArrayRef;
+        // The public Chunk batch can be replaced independently of its slot
+        // schema. Keep a valid RecordBatch; do not violate Arrow unsafe APIs.
+        input.batch = RecordBatch::try_new(
+            Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+                "value",
+                bad.data_type().clone(),
+                true,
+            )])),
+            vec![bad],
+        )
+        .unwrap();
+        let expected = schema(
+            ScalarValueType::Timestamp {
+                unit: ScalarTimestampUnit::Nanosecond,
+                timezone: Some(zone),
+            },
+            true,
+        );
+        let mut cursor = NativeScalarLeafEncoder::try_begin(
+            &input,
+            expected,
+            NativeScalarLeafEncoder::scratch_capacity_bytes(),
+        )
+        .unwrap();
+        for _ in 0..3 {
+            let turn = cursor.step(&mut []).unwrap();
+            assert_eq!(turn.examined_bytes, 64 * 1024);
+            assert_eq!(turn.emitted_bytes, 0);
+        }
+        assert!(matches!(
+            cursor.step(&mut []),
+            Err(NativeScalarLeafError::Type)
+        ));
+    }
+    #[test]
+    fn cancellation_in_both_phases_retires_retained_array_and_slot_aliases() {
+        for validate in [false, true] {
+            let array = Arc::new(BinaryArray::from(vec![&b"value"[..]])) as ArrayRef;
+            let weak_array = Arc::downgrade(&array);
+            let input = chunk(array, None, None);
+            let weak_field = Arc::downgrade(input.chunk_schema().slots()[0].field_ref());
+            let mut cursor = NativeScalarLeafEncoder::try_begin(
+                &input,
+                schema(ScalarValueType::Binary, true),
+                NativeScalarLeafEncoder::scratch_capacity_bytes(),
+            )
+            .unwrap();
+            drop(input);
+            if validate {
+                finish_validation(&mut cursor).unwrap();
+            }
+            assert!(weak_array.upgrade().is_some());
+            assert!(weak_field.upgrade().is_some());
+            drop(cursor);
+            assert!(weak_array.upgrade().is_none());
+            assert!(weak_field.upgrade().is_none());
+        }
     }
 }

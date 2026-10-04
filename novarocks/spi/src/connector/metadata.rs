@@ -904,8 +904,11 @@ fn planning_facts_bytes(
         )
 }
 
-/// Provider-neutral SQL type facts used only to render a table definition.
+/// Provider-neutral declared type facts for table-definition rendering.
 ///
+/// The query catalog may also retain an exact declared Variant identity after
+/// validating its read carrier. It must not derive query types generally from
+/// these display spellings: a provider may narrow an integer read carrier.
 /// This deliberately does not reuse the catalog-mutation type vocabulary:
 /// display metadata must retain fixed-binary width, while mutation inputs own
 /// defaults, aggregation semantics, and provider admission rules.

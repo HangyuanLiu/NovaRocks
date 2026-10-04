@@ -1,0 +1,625 @@
+{
+  "schema_version": 1,
+  "scope": "P04 incremental Native leaf validation and physical cursor exit, four Window value-domain handoffs, four collection transforms, exact declared Variant source handoff, and actual Sort/Redistribute schema preservation",
+  "tested_dirty_parent": "7d2d39a74792a13f108fdd64e7d4155b7662eeca",
+  "approved_spec_plan_version": 5,
+  "source_pin_count": 12,
+  "source_pins": "source-pins.json",
+  "full_ci": {
+    "run_dir": "logs/ci-full/20261004-084513",
+    "status": "PASS",
+    "counts": {
+      "cargo-test-component.log": {
+        "passed": 12059,
+        "failed": 0,
+        "ignored": 7,
+        "targets": 208
+      },
+      "cargo-test-server-owner.log": {
+        "passed": 173,
+        "failed": 0,
+        "ignored": 0,
+        "targets": 3
+      },
+      "cargo-test-server-smoke.log": {
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0,
+        "targets": 1
+      }
+    }
+  },
+  "focused": {
+    "sql_lib": 2567,
+    "native_leaf": 19,
+    "native_leaf_physical_exit": 4,
+    "native_leaf_sole_caller": 1,
+    "provider_variant": 7,
+    "passthrough": 3
+  },
+  "compiled_runtime_source_negatives": [
+    {
+      "name": "variant-public-cast-fact",
+      "source": "novarocks/sql/src/analyzer/logical_output.rs",
+      "filter": "m07_variant_public_identity_cast_requires_independent_exact_source_fact",
+      "exit_code": 101,
+      "restored_sha256": "c4f6d9e7e3818782cb29aaa993228924433e855c97ea5aa4d84cbc76bcf82f0f"
+    },
+    {
+      "name": "window-actual-value-binding",
+      "source": "novarocks/sql/src/analyzer/logical_container.rs",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "novarocks-sql",
+        "--lib",
+        "m07_window_value_domains_follow_all_actual_value_suppliers",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 101,
+      "restored_sha256": "833bfdad85bc2546f932aef182c85b0e80b6f93e56c7548637d063bcfa7166ef"
+    },
+    {
+      "name": "flatten-actual-value-fact",
+      "source": "novarocks/sql/src/analyzer/logical_container.rs",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "novarocks-sql",
+        "--lib",
+        "m07_container_transforms_forward_exact_leaf_domains",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 101,
+      "restored_sha256": "833bfdad85bc2546f932aef182c85b0e80b6f93e56c7548637d063bcfa7166ef"
+    },
+    {
+      "name": "leaf-private-witness",
+      "source": "novarocks/native-adapter/src/root_scalar_leaf_codec.rs",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "novarocks-native-adapter",
+        "--test",
+        "native_scalar_leaf_validation",
+        "constructor_and_all_turns_fit_original_scratch_without_extra_allocation",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 101,
+      "restored_sha256": "15486ab00139238056015dc43c961b27da4792c0d16e2404b09b714d18aed0df"
+    },
+    {
+      "name": "leaf-validation-byte-quantum",
+      "source": "novarocks/native-adapter/src/root_scalar_leaf_codec.rs",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "novarocks-native-adapter",
+        "--test",
+        "native_scalar_leaf_validation",
+        "constructor_and_all_turns_fit_original_scratch_without_extra_allocation",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 101,
+      "restored_sha256": "15486ab00139238056015dc43c961b27da4792c0d16e2404b09b714d18aed0df"
+    },
+    {
+      "name": "provider-declared-variant-fact",
+      "source": "novarocks/frontend-application/src/catalog_application/query_catalog/variant_identity.rs",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "novarocks-frontend-application",
+        "--lib",
+        "m07_provider_variant_identity_requires_an_independent_declaration",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 101,
+      "restored_sha256": "9d05f500423a26e0cd6876ad61bd8df066f4cff7bac1f128f25a618b62025f9c"
+    },
+    {
+      "name": "sort-actual-schema",
+      "source": "novarocks/native-adapter/src/fragment_plan_node.rs",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "novarocks-native-adapter",
+        "--lib",
+        "m07_passthrough_keeps_actual_fields_until_final_domain_publication",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 101,
+      "restored_sha256": "102c5aea5ebf27194398926c51d2c76db86faef7376e6430c15ee557e04dc0a2"
+    },
+    {
+      "name": "redistribute-actual-schema",
+      "source": "novarocks/native-adapter/src/fragment_plan_node.rs",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "novarocks-native-adapter",
+        "--lib",
+        "m07_passthrough_keeps_actual_fields_until_final_domain_publication",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 101,
+      "restored_sha256": "102c5aea5ebf27194398926c51d2c76db86faef7376e6430c15ee557e04dc0a2"
+    }
+  ],
+  "ineffective_probe": [
+    {
+      "name": "window-value-binding",
+      "source": "novarocks/sql/src/analyzer/logical_container.rs",
+      "filter": "m07_window_value_domains_follow_all_actual_value_suppliers",
+      "exit_code": 0,
+      "restored_sha256": "833bfdad85bc2546f932aef182c85b0e80b6f93e56c7548637d063bcfa7166ef"
+    }
+  ],
+  "native_local": {
+    "cluster_size": 3,
+    "sql_cases": 8,
+    "system_scenario": "query-lifecycle/distributed-baseline",
+    "binary_sha256": "788909b12312eb8bf0e2035b0e9f2dc56bb4acbad31ca6fb51b2f7547ece391e"
+  },
+  "retained_failures": [
+    "First leaf whole-wrapper-drop probe included existing writable observer callback allocation; cursor actual-free and original-credit checks remain strict in scoped measurement. Callback graph remains open.",
+    "New SQL typed Variant source exposed missing provider-to-FE logical identity; product fixed using independent exact declaration and carrier validation.",
+    "Root Sort (and independent Redistribute seam) claimed declaration fields without materializing them. Pass-through now keeps original fields and final adapter publishes exact result facts.",
+    "New fixture initially expected bare legacy Variant JSON display; changed observer to admitted Variant accessor without removing original CAST/window/typed-null expressions. Scalar Host remains closed.",
+    "New fixture used unavailable struct_element; corrected to admitted array subscript and field access without expanding admission.",
+    "New test compile used mismatched String borrow; corrected. Sortby key selected ordinary carrier was mistaken for inner Json provenance; test now checks both Cast layers and exact binding."
+  ],
+  "limitations": [
+    "Leaf cursor only: source backing/metadata-container work, original RootInputPermit, notification callback graph and Host producer installation are not proven by scratch probe.",
+    "Only the listed admitted Window/collection transform identities are covered; this is not complete scalar producer or function/lambda inventory.",
+    "Exact declared Variant trees with unrepresentable fixed-binary companions are refused rather than guessed as LargeInt. Definition spellings are not general query-type authority.",
+    "V1 not advertised; P04 executing and P05-P10 open. DNS and nested scalar capacity decisions remain pending.",
+    "No full SQL/default System CI, Linux or release-performance claim. Linux validation is user-owned. No push, PR or archive."
+  ],
+  "artifacts": [
+    {
+      "path": "README.md",
+      "bytes": 2218,
+      "sha256": "834c75ce30a50a1fc8b1974108fbb22cf70abd22c9a5436b728c1a8030b99f31"
+    },
+    {
+      "path": "full-ci/application-domain-dependency-boundary-test.log",
+      "bytes": 159,
+      "sha256": "7e1f93ebf3d1d9a814a3c61155b1e0a200ee2e6f90229d2c0eb5b43628921b00"
+    },
+    {
+      "path": "full-ci/application-domain-dependency-boundary.log",
+      "bytes": 104,
+      "sha256": "ca81667ce52af5b5f9b8613a652355d8ba757eb31c2c90b61f26117f4b766d4b"
+    },
+    {
+      "path": "full-ci/cargo-build.log.gz",
+      "bytes": 28494,
+      "sha256": "0928b5e99ef387896cf2673adef3eebf073c06cf8f70d201875a4d57f5784918"
+    },
+    {
+      "path": "full-ci/cargo-check-all-targets.log.gz",
+      "bytes": 34474,
+      "sha256": "1a8fcc930131f1993a870725edef8a4130ae48804270741a3b373c086dd844ec"
+    },
+    {
+      "path": "full-ci/cargo-check-server-system-allocator.log.gz",
+      "bytes": 28453,
+      "sha256": "8950d312f0dbe57a21208d3a4fd961866b39abb035f7dd0ef0047c0529438438"
+    },
+    {
+      "path": "full-ci/cargo-clippy.log.gz",
+      "bytes": 84612,
+      "sha256": "416656c884bf7eeaed7ba43f91398495e633d08fc277d176e80989355f89d22f"
+    },
+    {
+      "path": "full-ci/cargo-deny.log",
+      "bytes": 109,
+      "sha256": "27c3bc20f1e5f2017989973ebd4c82e6c8abc983a78af8e4a6412ca01f08df1f"
+    },
+    {
+      "path": "full-ci/cargo-fmt.log",
+      "bytes": 20,
+      "sha256": "25293c8809a4971b7ad97551d7900c3289770c2e95b4372b44fe03db1359093a"
+    },
+    {
+      "path": "full-ci/cargo-metadata.log.gz",
+      "bytes": 10793,
+      "sha256": "6067c613fb934092fc17cf81e9421718d558ff3334fa7aa2c93a439896c437b6"
+    },
+    {
+      "path": "full-ci/cargo-test-component.log.gz",
+      "bytes": 269438,
+      "sha256": "2f6feb07ced1983aa3a1bdf906c221dbc2eed46d37b6cd4409d82e40c7d3fd92"
+    },
+    {
+      "path": "full-ci/cargo-test-server-owner.log.gz",
+      "bytes": 31896,
+      "sha256": "b873596e0f2f42fa8a9db90da96a893a4d23a6d1251762d8ed29dfec785569c3"
+    },
+    {
+      "path": "full-ci/cargo-test-server-smoke.log.gz",
+      "bytes": 28303,
+      "sha256": "0c2150f2ccd5aa6b0cf8261439514af5144443d26e4e129f287fd6ec03270924"
+    },
+    {
+      "path": "full-ci/connector-role-binding-boundary-test.log",
+      "bytes": 138,
+      "sha256": "c4a85d5ea6058bda3dd76731973593eaaa3752a2a7552f5fc5083b4fa99d8c8a"
+    },
+    {
+      "path": "full-ci/connector-role-binding-boundary.log",
+      "bytes": 90,
+      "sha256": "048e8e08d57aff46ecf298be6177a2dc535d88718bc0892eff8be90c74dff749"
+    },
+    {
+      "path": "full-ci/datasketches-source-test.log",
+      "bytes": 76,
+      "sha256": "0986d4b1602aa389a50a669a7bb291e0d84d720bc4dc5005104770c6998315e5"
+    },
+    {
+      "path": "full-ci/datasketches-source.log",
+      "bytes": 202,
+      "sha256": "27ff6a6c08218ec8b4aa31d554cdb0cef8e1313dd2ab9f249f0a4c63cefc5741"
+    },
+    {
+      "path": "full-ci/error-manifest-check.log",
+      "bytes": 50386,
+      "sha256": "f9cc2542c57cde8079e87e1100188c1d2f9b2abc52bf8c84bfb3e73b13ce4ebc"
+    },
+    {
+      "path": "full-ci/generated-artifact-hygiene.log",
+      "bytes": 83,
+      "sha256": "ab4ae276af81cd6a4f1ce4bff4d6b3a6532242e692ad715e37f4b7c7a6a97f33"
+    },
+    {
+      "path": "full-ci/isolated-fixture-current-link.log",
+      "bytes": 838,
+      "sha256": "be65bcd83ddf89c4d78316ea3b18f6c14fa89daf318b8e64f0759eb4c02643f0"
+    },
+    {
+      "path": "full-ci/legacy-branding-test.log",
+      "bytes": 68,
+      "sha256": "9689a9cc4e2ada9cef5b690109f044ad56315d64eb4275c1ee22b1ba908ede09"
+    },
+    {
+      "path": "full-ci/legacy-branding.log",
+      "bytes": 58,
+      "sha256": "8073cfe9f0f5606237c7b9276449e5ad0fdd6c552d93b2dadc214f4b94b3fa23"
+    },
+    {
+      "path": "full-ci/local-program-dependency-boundary-test.log",
+      "bytes": 184,
+      "sha256": "77ef54f84b032069c24b1ec0e997daa89c83ef631d7f4dc81f42613eb2768a7d"
+    },
+    {
+      "path": "full-ci/local-program-dependency-boundary.log",
+      "bytes": 155,
+      "sha256": "25f001b325e31dc2f99a8948c179800aa271e81f64dc5c70eba2300ebb5c0835"
+    },
+    {
+      "path": "full-ci/memory-dependency-boundary-test.log",
+      "bytes": 1557,
+      "sha256": "6531f455590a0167913a5ddad2f0f20940dedf924a2a7989f260205a697c74a3"
+    },
+    {
+      "path": "full-ci/memory-dependency-boundary.log",
+      "bytes": 921,
+      "sha256": "34eb2544fa14892099b7f284bd95823384f877855aa61e8e9c978ca27e5fd90f"
+    },
+    {
+      "path": "full-ci/native-trust-dependency-boundary-test.log",
+      "bytes": 141,
+      "sha256": "b0646c129ac077cddb2744fe4138b6481182fbe09c997c0e957975c86ee24aa0"
+    },
+    {
+      "path": "full-ci/native-trust-dependency-boundary.log",
+      "bytes": 92,
+      "sha256": "86ab6b328e65a3b3d721ac2457d55c8816a691c79ac22cc8afa83bf8f011305d"
+    },
+    {
+      "path": "full-ci/native-wire-dependency-boundary-test.log",
+      "bytes": 138,
+      "sha256": "432116548d78562baed81388fb7e143da65801aaacf86e9f163493efebd2e2a3"
+    },
+    {
+      "path": "full-ci/native-wire-dependency-boundary.log",
+      "bytes": 90,
+      "sha256": "49206e456a02a375f0f07f7e311c1a452d3ea4ae41491d3611c91b6ea2892a76"
+    },
+    {
+      "path": "full-ci/ncp8-statistics-boundary-test.log",
+      "bytes": 118,
+      "sha256": "b9e7c475f341dec57a4ecb0c7332e7164b34f037c4efba43f63316e1a2622148"
+    },
+    {
+      "path": "full-ci/ncp8-statistics-boundary.log",
+      "bytes": 77,
+      "sha256": "416f80f5d8cb6ddb21988728ff589dd22535f5dae88c50c11b7cc3f1a4f9b2b5"
+    },
+    {
+      "path": "full-ci/physical-plan-dependency-boundary-test.log",
+      "bytes": 104,
+      "sha256": "34fbffee3ca1de3e9afdfac07c956a86c661447291b98af1e2c26f5f26a820ec"
+    },
+    {
+      "path": "full-ci/physical-plan-dependency-boundary.log",
+      "bytes": 458,
+      "sha256": "72b4953a0519ee0760d34ef381c8da2d9c13c29277ff1dcc34354ef27cc823d7"
+    },
+    {
+      "path": "full-ci/shared-benchmark-environment.log",
+      "bytes": 706,
+      "sha256": "bdcfbf723a0b80af475ad627465038ae97fd2b7c615b764acef63fc3e381a120"
+    },
+    {
+      "path": "full-ci/shared-benchmark-fixture-contract.log",
+      "bytes": 176,
+      "sha256": "84ee141f6f42fe10ac9ee4490b389a1aff8ee768cd78dcb7901c931a056b5ce9"
+    },
+    {
+      "path": "full-ci/shared-benchmark-fixture-lifecycle.log",
+      "bytes": 201,
+      "sha256": "3dcc0f461194d3253c5bd84752aad7c25ce527a9f0158e2da0d88fe9bc5a0467"
+    },
+    {
+      "path": "full-ci/spi-dependency-boundary-test.log",
+      "bytes": 84,
+      "sha256": "78080eb31c0cc02a1cb80ef1c47c860f1548bb43d7d691f8a05de1205947ab71"
+    },
+    {
+      "path": "full-ci/spi-dependency-boundary.log",
+      "bytes": 238,
+      "sha256": "e7a45113da2d557f9d582a95e41a67298b1aabb0b5ca9d2043c97965958dbb3d"
+    },
+    {
+      "path": "full-ci/sql-helper-env-file.log",
+      "bytes": 324,
+      "sha256": "0dbb6c33160b4b3e13d171b50c41f307554d52ad2233d66c534dee2548077573"
+    },
+    {
+      "path": "full-ci/state-store-dependency-boundary-test.log",
+      "bytes": 100,
+      "sha256": "8bd19b5f371ad4cbaff9700759e42bf38198fe2fbdfac5ddf51eea2c20e9ea15"
+    },
+    {
+      "path": "full-ci/state-store-dependency-boundary.log",
+      "bytes": 2053,
+      "sha256": "fc74536e0d6e210ace130f7806d36314dcc74909dc60a3c3b981ee296efa4655"
+    },
+    {
+      "path": "full-ci/summary.md",
+      "bytes": 4051,
+      "sha256": "38f9b05f4f6e9221dc0a5d718a88e41dafb4815ab408b275cae9672ac9e2884d"
+    },
+    {
+      "path": "full-ci/system-scenarios-stage-test.log",
+      "bytes": 86,
+      "sha256": "2cfa94d698d66eae7eadcec39ad74eb09714e275d258a89f5c4cd98effc14900"
+    },
+    {
+      "path": "leaf-logs/native-leaf-allocation-backtrace.log",
+      "bytes": 46420,
+      "sha256": "5fef4ddba79de37ee37ddfb7bc1b53482da770926446de603bce91ac94102ad4"
+    },
+    {
+      "path": "leaf-logs/native-leaf-allocation-cursor-scope.log",
+      "bytes": 44959,
+      "sha256": "204be3d81176db0a166f00753e54e8ef83e98da414c64a31010a77284ef00fff"
+    },
+    {
+      "path": "leaf-logs/native-leaf-allocation-first.log",
+      "bytes": 46282,
+      "sha256": "b18fba347f5abb591dcf98d51df39bb57b6b1512800a755ea0d4349f5a91f03d"
+    },
+    {
+      "path": "leaf-logs/native-leaf-first.log",
+      "bytes": 46859,
+      "sha256": "28cd31e172453413890494878fd54da9c32dbff67e72d2fc49e22b97921d0498"
+    },
+    {
+      "path": "leaf-logs/native-leaf-physical-caller.log",
+      "bytes": 44612,
+      "sha256": "79b1ed2935206e3126614744943bf58434d91f1a57131f5b3768e243dea4a682"
+    },
+    {
+      "path": "logs/build-native-first.log.gz",
+      "bytes": 28345,
+      "sha256": "bb77b0bdae6ae8ee1c0705204fdf2f75134b236290c2856f8b72c810639a773a"
+    },
+    {
+      "path": "logs/build-native-passthrough-repair.log.gz",
+      "bytes": 28074,
+      "sha256": "65c28fa43f01c691ba70daf374c221957de824a6220118ffbb47b34debc4d4fb"
+    },
+    {
+      "path": "logs/build-native-provider-repair.log.gz",
+      "bytes": 28417,
+      "sha256": "7db1a2cd412b006035e7f5b1d328c075c6859a10d1950eaae32b06503a8c798c"
+    },
+    {
+      "path": "logs/fe-provider-variant-first.log.gz",
+      "bytes": 24051,
+      "sha256": "36aee5a787e9dc1e975e00356a91a70ec43366bdc76b777ca53d2f9354b1146e"
+    },
+    {
+      "path": "logs/fe-provider-variant-restored.log.gz",
+      "bytes": 23753,
+      "sha256": "552cf9d510bbd36fdf9d653955ac6c0c75312a9f6c7b1c6fb1b79f1c3b3e9984"
+    },
+    {
+      "path": "logs/native-leaf-allocation-restored.log",
+      "bytes": 44855,
+      "sha256": "52e0e01ada8c773dc1d8ab34a5079e7d233c3767f08a034ac2565ed7e574eca3"
+    },
+    {
+      "path": "logs/native-leaf-restored.log",
+      "bytes": 46553,
+      "sha256": "4afbb25aa863441aab9ca907150ddaf5cf09b6dcda009421edf3d1fe47b36e2b"
+    },
+    {
+      "path": "logs/native-passthrough-first.log",
+      "bytes": 44993,
+      "sha256": "95f6b998514b9b6ce76aaf508e085a5700e0d7337a05ae36cae4200aef75e2dc"
+    },
+    {
+      "path": "logs/native-passthrough-restored.log",
+      "bytes": 44889,
+      "sha256": "bf7a2c819fe642d7523a13134aa3273accac4c9a194e3b8229b2847fa3d7667c"
+    },
+    {
+      "path": "logs/sql-aggregate-native-final.log",
+      "bytes": 8391,
+      "sha256": "d2c5aafe9fc4e2836a77735eb36193975dbff8b92b8586b5bb91f6181c6d79dd"
+    },
+    {
+      "path": "logs/sql-all-after-negatives.log.gz",
+      "bytes": 46273,
+      "sha256": "9ccbe5c942408d206aedae1ba4319d2af35414141e0219a8ec3c23297814158e"
+    },
+    {
+      "path": "logs/sql-all-window-container-cast-witness.log.gz",
+      "bytes": 46297,
+      "sha256": "53e3da52749435ee2f68030873367627dd819bc408b0a9e87012929680938c37"
+    },
+    {
+      "path": "logs/sql-all-window-container-variant-restored.log.gz",
+      "bytes": 46582,
+      "sha256": "aa0ea54e93db662926380af6092b879c0aa0eb643c00b6ff7e83baa291dd94fd"
+    },
+    {
+      "path": "logs/sql-all-window-container-variant.log",
+      "bytes": 2783,
+      "sha256": "4359291bba0f1eefcb1d3f4588ed13a721072d665f6af57f9cd7696936ee64fa"
+    },
+    {
+      "path": "logs/sql-all-window.log.gz",
+      "bytes": 46056,
+      "sha256": "f680f195c56217bb83e4780cd9df2a10c67e467ede6b2d5d7b994f13ad452a35"
+    },
+    {
+      "path": "logs/sql-analytic-native-final.log",
+      "bytes": 5649,
+      "sha256": "ffbd783d1538d1eb0f0b9909038bb9e97b0cf98765ba7f8fc9b1f00ef9c1beb6"
+    },
+    {
+      "path": "logs/sql-variant-dml-native-final.log",
+      "bytes": 7585,
+      "sha256": "86671a49b66249c783bcb6939b71208db98aea56e57a4b6fb5b713463f8581f6"
+    },
+    {
+      "path": "logs/sql-window-domains-native-admitted-selector.log",
+      "bytes": 4919,
+      "sha256": "96d54c2dc10ab194d6311a76823ec3790cc081e736463d3571eb41ff90646c40"
+    },
+    {
+      "path": "logs/sql-window-domains-native-first.log",
+      "bytes": 5218,
+      "sha256": "efe040cac3d54b6f6891c03b786aeb1a55eaf27aef85e99acb3b877222a27cce"
+    },
+    {
+      "path": "logs/sql-window-domains-native-passthrough-repair.log",
+      "bytes": 5579,
+      "sha256": "744bc8d83c9b9cc04f1bec969bb5bf0abf65ec5f8ae943d3c1cf7a3530c37ecc"
+    },
+    {
+      "path": "logs/sql-window-domains-native-provider-repair.log",
+      "bytes": 5595,
+      "sha256": "6099eb0fb46c1c3b066b1f1d22aaab42e557c6656ccd7267bd00a1cc38badcb4"
+    },
+    {
+      "path": "logs/system-distributed-baseline-final.log",
+      "bytes": 2949,
+      "sha256": "bd56a97913f413f37d6877305cfd0ec2c5db9969a54b735e46c03aca157b8a18"
+    },
+    {
+      "path": "logs/window-first.log",
+      "bytes": 13947,
+      "sha256": "9ff21abe67f17d6656511f87a17e0d92050c8cb3414df0f77c9d487efe2a7ddc"
+    },
+    {
+      "path": "native-binary-pins-before-provider-native.json",
+      "bytes": 313,
+      "sha256": "375596100f9a36fdae5ec091fd1bc30193ade80dda12a50f68dce290d952ae6c"
+    },
+    {
+      "path": "native-binary-pins-final.json",
+      "bytes": 313,
+      "sha256": "de100a1ec49b3e7b207fd8256a11a08e7744d78f625be56e4ef96b47fa243698"
+    },
+    {
+      "path": "negatives/flatten-actual-value-fact.log",
+      "bytes": 13753,
+      "sha256": "4e7a20d4efec191a5d705909f089565c879ab50380673ade1303884d62ccc90e"
+    },
+    {
+      "path": "negatives/leaf-private-witness.log",
+      "bytes": 47521,
+      "sha256": "dd458d0a9d19f710b9b3c5dc4931493c2eeb03c29c75de42ae20665c848dcf7a"
+    },
+    {
+      "path": "negatives/leaf-validation-byte-quantum.log",
+      "bytes": 45136,
+      "sha256": "75907a424d184a007c1a27b795c6ea2ff76e910408412d178d00f41b6f3d2b94"
+    },
+    {
+      "path": "negatives/provider-declared-variant-fact.log.gz",
+      "bytes": 23772,
+      "sha256": "5837b277b5a1ab29a075633d8b12e23ebf55af376a6cbbccc17825d4b48c1716"
+    },
+    {
+      "path": "negatives/redistribute-actual-schema.log",
+      "bytes": 45200,
+      "sha256": "d768bb3ae4c4c292ed207f11f16623861a5790384f96582bd9f706219c621410"
+    },
+    {
+      "path": "negatives/results.json",
+      "bytes": 3864,
+      "sha256": "7e6bdde3d8744291c71f061d44c9f36f8115733ce41d05f31c17f399cd0b9eef"
+    },
+    {
+      "path": "negatives/sort-actual-schema.log",
+      "bytes": 45304,
+      "sha256": "0355ee16c32c2cadd7850226343b2c458f92ba8a174b1ddaa9dd1d8538a8a839"
+    },
+    {
+      "path": "negatives/variant-public-cast-fact.log",
+      "bytes": 13796,
+      "sha256": "4bc1685809a701e557f9c8c9f28508a50c1a5786ece3f1c28486cff20e55af16"
+    },
+    {
+      "path": "negatives/window-actual-value-binding.log",
+      "bytes": 13887,
+      "sha256": "5c20ad4f98a0120543a0ac099e9d0e5d36e2f6b81ac51a0839cf641e7cabe58a"
+    },
+    {
+      "path": "negatives/window-value-binding.log",
+      "bytes": 13174,
+      "sha256": "77c3cd9e974b3e940ef755574962305169a856b05f245443ee2e4563ee4e3914"
+    },
+    {
+      "path": "source-pins.json",
+      "bytes": 1582,
+      "sha256": "995dc74ea697781ceeb336b7f7a9af7c92630c9de76433122bb3955e74b8c20c"
+    },
+    {
+      "path": "system/safe-evidence.json",
+      "bytes": 1134,
+      "sha256": "d4d212ca95ffacd2e88e3ba6ad0c4f73d62bbbd02cc3a6753c312ae9d5325d19"
+    }
+  ]
+}

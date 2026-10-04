@@ -2324,8 +2324,21 @@ fn exact_root_domains_survive_wire_owned_field_chunk_and_local_program() {
             arrow::record_batch::RecordBatch::try_new(chunk_schema.arrow_schema_ref(), vec![array])
                 .unwrap();
         let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap();
-        crate::root_scalar_leaf_codec::NativeScalarLeafEncoder::validate_input(&chunk, bound)
-            .unwrap();
+        let mut scalar = crate::root_scalar_leaf_codec::NativeScalarLeafEncoder::try_begin(
+            &chunk,
+            Arc::new(bound.clone()),
+            crate::root_scalar_leaf_codec::NativeScalarLeafEncoder::scratch_capacity_bytes(),
+        )
+        .unwrap();
+        assert!(scalar.encoded_len().is_none());
+        let validation = scalar.step(&mut []).unwrap();
+        assert_eq!(validation.emitted_bytes, 0);
+        assert_eq!(validation.completed_rows, 0);
+        assert_eq!(
+            validation.status,
+            novarocks_result_render::RenderTurnStatus::Yielded
+        );
+        assert!(scalar.encoded_len().is_some());
         let exec = ExecPlanBuilder::new(arena, decoded.node).finish().unwrap();
         let profile = exec
             .local_compile_profile(std::num::NonZeroUsize::new(1).unwrap(), None)
