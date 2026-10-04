@@ -48,7 +48,7 @@ pub(crate) fn entry_safety_check(
             return None;
         }
         // Order-sensitive aggregate.
-        if !spec.order_by.is_empty() {
+        if !spec.source.order_by().is_empty() {
             return None;
         }
         // White-list check.
@@ -57,11 +57,11 @@ pub(crate) fn entry_safety_check(
             return None;
         }
         // COUNT(*) has no args.
-        if name == "count" && spec.args.is_empty() {
+        if name == "count" && spec.source.arguments().is_empty() {
             return None;
         }
         // Args must be bare ColumnRefs.
-        for arg_id in &spec.args {
+        for arg_id in spec.source.arguments() {
             if !matches!(arena.node(*arg_id), ScalarNode::ColumnRef(_)) {
                 return None;
             }
@@ -89,7 +89,7 @@ fn collect_required_column_refs(
         }
     }
     for spec in &aggregate.aggregates {
-        for arg_id in &spec.args {
+        for arg_id in spec.source.arguments() {
             if let Some(identity) = column_ref_qualified(arena, *arg_id) {
                 out.push(identity);
             }
@@ -504,17 +504,19 @@ mod tests {
         ScalarAggregateSpec {
             output_column_id: test_col_id(None, &format!("sum({col})")),
             name: "sum".into(),
-            args: vec![
-                intern_typed(
-                    arena,
-                    &arg,
-                    crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
-                )
-                .unwrap(),
-            ],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![
+                    intern_typed(
+                        arena,
+                        &arg,
+                        crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+                    )
+                    .unwrap(),
+                ],
+                vec![],
+                crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            ),
         }
     }
 
@@ -660,16 +662,18 @@ mod tests {
     fn rejects_order_sensitive_aggregate() {
         let mut arena = make_arena();
         let mut spec = sum_spec("v", &mut arena);
-        spec.order_by.push(crate::optimizer::scalar::SortKey {
-            expr: intern_typed(
-                &mut arena,
-                &col_ref_typed("v", DataType::Int64),
-                crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
-            )
-            .unwrap(),
-            asc: true,
-            nulls_first: false,
-            display: None,
+        spec.source.rewrite_channels(|_, order_by| {
+            order_by.push(crate::optimizer::scalar::SortKey {
+                expr: intern_typed(
+                    &mut arena,
+                    &col_ref_typed("v", DataType::Int64),
+                    crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+                )
+                .unwrap(),
+                asc: true,
+                nulls_first: false,
+                display: None,
+            })
         });
         let agg = make_agg(
             vec![col_ref_typed("k", DataType::Int64)],
@@ -686,10 +690,12 @@ mod tests {
         let count_star = ScalarAggregateSpec {
             output_column_id: ColumnId::new_for_test(9001),
             name: "count".into(),
-            args: vec![],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate("count", &[], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![],
+                vec![],
+                crate::functions::test_resolved_aggregate("count", &[], false),
+            ),
         };
         let agg = make_agg(
             vec![col_ref_typed("k", DataType::Int64)],
@@ -712,10 +718,12 @@ mod tests {
         let avg = ScalarAggregateSpec {
             output_column_id: test_col_id(None, "avg(v)"),
             name: "avg".into(),
-            args: vec![avg_arg],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate("avg", &[DataType::Int64], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![avg_arg],
+                vec![],
+                crate::functions::test_resolved_aggregate("avg", &[DataType::Int64], false),
+            ),
         };
         let agg = make_agg(
             vec![col_ref_typed("k", DataType::Int64)],
@@ -748,10 +756,12 @@ mod tests {
         let spec = ScalarAggregateSpec {
             output_column_id: ColumnId::new_for_test(9002),
             name: "sum".into(),
-            args: vec![arg_id],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![arg_id],
+                vec![],
+                crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            ),
         };
         let agg = make_agg(
             vec![col_ref_typed("k", DataType::Int64)],
@@ -790,10 +800,12 @@ mod tests {
         let spec = ScalarAggregateSpec {
             output_column_id: ColumnId::new_for_test(9003),
             name: "sum".into(),
-            args: vec![arg_id],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Float64], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![arg_id],
+                vec![],
+                crate::functions::test_resolved_aggregate("sum", &[DataType::Float64], false),
+            ),
         };
         let agg = make_agg(
             vec![col_ref_typed("k", DataType::Int64)],
@@ -988,13 +1000,11 @@ mod tests {
             vec![ScalarAggregateSpec {
                 output_column_id: test_col_id(Some("cs"), "sum(cs_sales_price)"),
                 name: "sum".into(),
-                args: vec![sum_arg],
                 distinct: false,
-                order_by: vec![],
-                resolved: crate::functions::test_resolved_aggregate(
-                    "sum",
-                    &[DataType::Int64],
-                    false,
+                source: crate::binding::AggregateArgumentSource::uncertified(
+                    vec![sum_arg],
+                    vec![],
+                    crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
                 ),
             }],
             &mut arena,
@@ -1198,10 +1208,12 @@ mod tests {
         let count_spec = ScalarAggregateSpec {
             output_column_id: test_col_id(Some("l"), "count(c0)"),
             name: "count".into(),
-            args: vec![count_arg],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate("count", &[DataType::Int64], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![count_arg],
+                vec![],
+                crate::functions::test_resolved_aggregate("count", &[DataType::Int64], false),
+            ),
         };
 
         let agg = agg_opt(

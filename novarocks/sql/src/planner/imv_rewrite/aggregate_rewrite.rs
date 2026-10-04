@@ -1924,12 +1924,15 @@ fn align_aggregate_call_inputs_to_child(
     input_columns: &[crate::analysis::OutputColumn],
 ) -> Result<AggregateCall, String> {
     let mut call = call.clone();
-    for arg in &mut call.args {
-        align_expr_column_refs_to_child(arg, input_columns)?;
-    }
-    for sort in &mut call.order_by {
-        align_expr_column_refs_to_child(&mut sort.expr, input_columns)?;
-    }
+    call.source.rewrite_channels(|arguments, order_by| {
+        for arg in arguments {
+            align_expr_column_refs_to_child(arg, input_columns)?;
+        }
+        for sort in order_by {
+            align_expr_column_refs_to_child(&mut sort.expr, input_columns)?;
+        }
+        Ok::<_, String>(())
+    })?;
     Ok(call)
 }
 
@@ -2117,7 +2120,7 @@ fn signed_aggregate_output_columns(
             )
         })?;
         let novarocks_functions::FunctionResultType::Scalar(result_type) =
-            &call.resolved.selected.result_type
+            &call.source.binding().selected.result_type
         else {
             return Err(format!(
                 "Iceberg IMV signed state {} did not bind a scalar aggregate",
@@ -2396,12 +2399,14 @@ fn retraction_count_aggregate_call(
     })?;
     Ok(AggregateCall {
         name: "sum".to_string(),
-        args,
         distinct: false,
         result_type: DataType::Int64,
-        order_by: Vec::new(),
         output_column_id: ColumnId::UNSET,
-        resolved: crate::binding::SqlFunctionBinding::new(resolved, policy),
+        source: crate::binding::AggregateArgumentSource::logical_update(
+            args,
+            Vec::new(),
+            crate::binding::SqlFunctionBinding::new(resolved, policy),
+        ),
     })
 }
 
@@ -2429,7 +2434,7 @@ fn signed_aggregate_call(
         value,
         action_column,
         function_catalog,
-        call.resolved.decimal_overflow_policy(),
+        call.source.binding().decimal_overflow_policy(),
         constant_policy,
         control,
     )?;
@@ -2437,7 +2442,7 @@ fn signed_aggregate_call(
         function_catalog,
         signed_name,
         std::slice::from_ref(&input),
-        &call.order_by,
+        call.source.order_by(),
         true,
         constant_policy,
         control,
@@ -2455,20 +2460,22 @@ fn signed_aggregate_call(
     })?;
     Ok(AggregateCall {
         name: signed_name.to_string(),
-        args: vec![input],
         distinct: false,
         result_type: DataType::Binary,
-        order_by: call.order_by.clone(),
         output_column_id: ColumnId::UNSET,
-        resolved: crate::binding::SqlFunctionBinding::new(
-            resolved,
-            call.resolved.decimal_overflow_policy(),
+        source: crate::binding::AggregateArgumentSource::logical_update(
+            vec![input],
+            call.source.order_by().to_vec(),
+            crate::binding::SqlFunctionBinding::new(
+                resolved,
+                call.source.binding().decimal_overflow_policy(),
+            ),
         ),
     })
 }
 
 fn signed_value_arg(call: &AggregateCall) -> Result<TypedExpr, String> {
-    match call.args.as_slice() {
+    match call.source.arguments() {
         [] if call.name.eq_ignore_ascii_case("count") => Ok(TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(1)),
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
@@ -2963,15 +2970,13 @@ mod tests {
                 group_by: vec![col_expr(1, "k")],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
-                    args: vec![col_expr(2, "v")],
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: Vec::new(),
                     output_column_id: ColumnId::new_for_test(3),
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "sum",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![col_expr(2, "v")],
+                        Vec::new(),
+                        crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
                     ),
                 }],
                 output_columns: vec![
@@ -3009,15 +3014,13 @@ mod tests {
                 group_by: vec![col_expr(1, "k")],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
-                    args: vec![col_expr(2, "v")],
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: Vec::new(),
                     output_column_id: ColumnId::new_for_test(3),
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "sum",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![col_expr(2, "v")],
+                        Vec::new(),
+                        crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
                     ),
                 }],
                 output_columns: vec![
@@ -3056,12 +3059,14 @@ mod tests {
         };
         node.aggregates.push(AggregateCall {
             name: "count".to_string(),
-            args: Vec::new(),
             distinct: false,
             result_type: DataType::Int64,
-            order_by: Vec::new(),
             output_column_id: ColumnId::new_for_test(4),
-            resolved: crate::functions::test_resolved_aggregate("count", &[], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                Vec::new(),
+                Vec::new(),
+                crate::functions::test_resolved_aggregate("count", &[], false),
+            ),
         });
         node.output_columns.push(OutputColumn {
             column_id: ColumnId::new_for_test(4),
@@ -3490,7 +3495,7 @@ mod tests {
             DataType::Binary
         );
         assert!(signed_aggregate.output_columns[2].value_type.nullable);
-        let args = &signed_aggregate.aggregates[0].args;
+        let args = signed_aggregate.aggregates[0].source.arguments();
         assert_eq!(args.len(), 1);
         let ExprKind::FunctionCall {
             name,
@@ -4110,7 +4115,7 @@ mod tests {
             assert_eq!(action_column, existing_action);
         }
 
-        let signed_arg = &signed_aggregate.aggregates[0].args[0];
+        let signed_arg = &signed_aggregate.aggregates[0].source.arguments()[0];
         let ExprKind::FunctionCall {
             args: struct_args, ..
         } = &signed_arg.kind
@@ -4126,7 +4131,7 @@ mod tests {
         assert_eq!(column, ImvActionColumn::NAME);
         assert_eq!(*column_id, action_column);
 
-        let retraction_arg = &signed_aggregate.aggregates[1].args[0];
+        let retraction_arg = &signed_aggregate.aggregates[1].source.arguments()[0];
         let ExprKind::ColumnRef {
             column_id, column, ..
         } = &retraction_arg.kind

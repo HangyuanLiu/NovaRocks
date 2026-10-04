@@ -422,10 +422,10 @@ fn tag_aggregate(
         }
         for agg in &node.aggregates {
             if needed.contains(&agg.output_column_id) {
-                for &arg in &agg.args {
+                for &arg in agg.source.arguments() {
                     required_inputs.extend(collect_scalar_column_id_refs(arena, arg));
                 }
-                for item in &agg.order_by {
+                for item in agg.source.order_by() {
                     required_inputs.extend(collect_scalar_column_id_refs(arena, item.expr));
                 }
             }
@@ -1396,30 +1396,34 @@ mod tests {
                     ScalarAggregateSpec {
                         output_column_id: out_sum,
                         name: "sum".to_string(),
-                        args: vec![sum_arg],
                         distinct: false,
-                        order_by: vec![SortKey {
-                            expr: sum_order,
-                            asc: true,
-                            nulls_first: false,
-                            display: None,
-                        }],
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "sum",
-                            &[DataType::Int64],
-                            false,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![sum_arg],
+                            vec![SortKey {
+                                expr: sum_order,
+                                asc: true,
+                                nulls_first: false,
+                                display: None,
+                            }],
+                            crate::functions::test_resolved_aggregate(
+                                "sum",
+                                &[DataType::Int64],
+                                false,
+                            ),
                         ),
                     },
                     ScalarAggregateSpec {
                         output_column_id: out_count,
                         name: "count".to_string(),
-                        args: vec![count_arg],
                         distinct: false,
-                        order_by: vec![],
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "count",
-                            &[DataType::Int64],
-                            false,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![count_arg],
+                            vec![],
+                            crate::functions::test_resolved_aggregate(
+                                "count",
+                                &[DataType::Int64],
+                                false,
+                            ),
                         ),
                     },
                 ],
@@ -1478,13 +1482,11 @@ mod tests {
                 vec![ScalarAggregateSpec {
                     output_column_id: out_sum,
                     name: "sum".to_string(),
-                    args: vec![sum_arg],
                     distinct: false,
-                    order_by: vec![],
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "sum",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![sum_arg],
+                        vec![],
+                        crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
                     ),
                 }],
                 layout,
@@ -1530,10 +1532,12 @@ mod tests {
         let aggregates = vec![ScalarAggregateSpec {
             output_column_id: ColumnId::new_for_test(301),
             name: "sum".to_string(),
-            args: vec![col2],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![col2],
+                vec![],
+                crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            ),
         }];
         let output_columns = vec![make_output_column(ColumnId::new_for_test(301), "sum_x")];
         let output_layout = AggregateOutputLayout::new(

@@ -618,21 +618,23 @@ mod tests {
                 group_by: Vec::new(),
                 aggregates: vec![AggregateCall {
                     name: "sum_state_signed".to_string(),
-                    args: vec![TypedExpr {
-                        kind: ExprKind::Literal(LiteralValue::Int(1)),
-                        value_type: novarocks_type_contract::FunctionValueType::new(
-                            DataType::Int64,
-                            false,
-                        ),
-                    }],
                     distinct: false,
                     result_type: DataType::Binary,
-                    order_by: Vec::new(),
                     output_column_id: ColumnId::new_for_test(20),
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "sum_state_signed",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![TypedExpr {
+                            kind: ExprKind::Literal(LiteralValue::Int(1)),
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
+                        }],
+                        Vec::new(),
+                        crate::functions::test_resolved_aggregate(
+                            "sum_state_signed",
+                            &[DataType::Int64],
+                            false,
+                        ),
                     ),
                 }],
                 output_columns: Vec::new(),

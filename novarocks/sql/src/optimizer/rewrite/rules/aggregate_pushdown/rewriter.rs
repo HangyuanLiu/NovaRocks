@@ -33,9 +33,9 @@ fn agg_spec_display_name(spec: &ScalarAggregateSpec, arena: &ScalarArena) -> Str
     scalar_expr::aggregate_display_name(
         arena,
         &spec.name,
-        &spec.args,
+        spec.source.arguments(),
         spec.distinct,
-        &spec.order_by,
+        spec.source.order_by(),
     )
 }
 
@@ -95,7 +95,7 @@ fn column_ref_scalar(
 }
 
 fn aggregate_result_type(spec: &ScalarAggregateSpec) -> novarocks_type_contract::FunctionValueType {
-    let mut value_type = crate::functions::aggregate_result_type(&spec.resolved).clone();
+    let mut value_type = crate::functions::aggregate_result_type(spec.source.binding()).clone();
     // Preserve the existing pushdown-output root nullability widening.
     value_type.nullable = true;
     value_type
@@ -178,7 +178,7 @@ pub(crate) fn rewrite(
             .iter()
             .map(|spec| {
                 let partial_name = partial_fn_name(&spec.name);
-                let partial_args = spec.args.clone();
+                let partial_args = spec.source.arguments().to_vec();
                 let display_name = scalar_expr::aggregate_display_name(
                     arena,
                     &partial_name,
@@ -193,10 +193,13 @@ pub(crate) fn rewrite(
                 let partial_spec = ScalarAggregateSpec {
                     output_column_id: partial_col_id,
                     name: partial_name,
-                    args: partial_args,
                     distinct: false,
-                    order_by: vec![],
-                    resolved: spec.resolved.clone(),
+                    // This retained call inherits its original provenance;
+                    // a compatible signature does not mint an update source.
+                    source: spec.source.try_map_parts(
+                        |_| Ok::<_, crate::compiler::SqlCompileError>(partial_args),
+                        |keys| Ok(keys.to_vec()),
+                    )?,
                 };
                 let output_col = OutputColumn {
                     column_id: partial_col_id,
@@ -288,9 +291,9 @@ pub(crate) fn rewrite(
                     arena,
                     &name,
                     &[arg_id],
-                    &orig_spec.order_by,
+                    orig_spec.source.order_by(),
                     true,
-                    orig_spec.resolved.decimal_overflow_policy(),
+                    orig_spec.source.binding().decimal_overflow_policy(),
                     control,
                 )
                 .map_err(|error| match error {
@@ -304,10 +307,12 @@ pub(crate) fn rewrite(
                 Ok(ScalarAggregateSpec {
                     output_column_id: orig_spec.output_column_id,
                     name,
-                    args: vec![arg_id],
                     distinct: false,
-                    order_by: orig_spec.order_by.clone(),
-                    resolved,
+                    source: crate::binding::AggregateArgumentSource::logical_update(
+                        vec![arg_id],
+                        orig_spec.source.order_by().to_vec(),
+                        resolved,
+                    ),
                 })
             },
         )
@@ -689,17 +694,19 @@ mod tests {
         ScalarAggregateSpec {
             output_column_id: test_col_id(&format!("count({col})")),
             name: "count".into(),
-            args: vec![
-                intern_typed(
-                    arena,
-                    &arg,
-                    crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
-                )
-                .unwrap(),
-            ],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate("count", &[DataType::Int64], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![
+                    intern_typed(
+                        arena,
+                        &arg,
+                        crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+                    )
+                    .unwrap(),
+                ],
+                vec![],
+                crate::functions::test_resolved_aggregate("count", &[DataType::Int64], false),
+            ),
         }
     }
 
@@ -708,17 +715,19 @@ mod tests {
         ScalarAggregateSpec {
             output_column_id: test_col_id(&format!("sum({col})")),
             name: "sum".into(),
-            args: vec![
-                intern_typed(
-                    arena,
-                    &arg,
-                    crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
-                )
-                .unwrap(),
-            ],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![
+                    intern_typed(
+                        arena,
+                        &arg,
+                        crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+                    )
+                    .unwrap(),
+                ],
+                vec![],
+                crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            ),
         }
     }
 
@@ -742,9 +751,13 @@ mod tests {
         let join = join_opt(a.clone(), b, Some(eq_typed("k", "k")), &mut arena);
 
         let mut count = count_spec("v", &mut arena);
-        count.resolved = crate::binding::SqlFunctionBinding::new(
-            count.resolved.resolved().clone(),
-            novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+        count.source = crate::binding::AggregateArgumentSource::uncertified(
+            count.source.arguments().to_vec(),
+            count.source.order_by().to_vec(),
+            crate::binding::SqlFunctionBinding::new(
+                count.source.binding().resolved().clone(),
+                novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+            ),
         );
         let original = make_agg(
             vec![col_ref_typed("k", DataType::Int64)],
@@ -798,7 +811,7 @@ mod tests {
         assert!(top.is_split);
         assert_eq!(top.aggregates[0].name, "sum");
         assert_eq!(
-            top.aggregates[0].resolved.decimal_overflow_policy(),
+            top.aggregates[0].source.binding().decimal_overflow_policy(),
             novarocks_type_contract::DecimalOverflowPolicy::ReportError
         );
         let join_plan = top_plan.children.first().expect("final agg child");
@@ -810,7 +823,10 @@ mod tests {
         assert!(!partial.is_split);
         assert_eq!(partial.aggregates[0].name, "count");
         assert_eq!(
-            partial.aggregates[0].resolved.decimal_overflow_policy(),
+            partial.aggregates[0]
+                .source
+                .binding()
+                .decimal_overflow_policy(),
             novarocks_type_contract::DecimalOverflowPolicy::ReportError
         );
     }
@@ -902,10 +918,12 @@ mod tests {
             let spec = ScalarAggregateSpec {
                 output_column_id: ColumnId(2),
                 name: name.into(),
-                args: vec![arg],
                 distinct: false,
-                order_by: vec![],
-                resolved,
+                source: crate::binding::AggregateArgumentSource::uncertified(
+                    vec![arg],
+                    vec![],
+                    resolved,
+                ),
             };
             let original = make_agg(
                 vec![],
@@ -954,7 +972,7 @@ mod tests {
                 expected
             );
             assert_eq!(
-                arena.value_type(final_aggregate.aggregates[0].args[0]),
+                arena.value_type(final_aggregate.aggregates[0].source.arguments()[0]),
                 &expected
             );
             assert_eq!(arena.value_type(exposure[0].expr), &expected);
@@ -969,8 +987,10 @@ mod tests {
                 expected
             );
             assert_eq!(
-                crate::functions::aggregate_result_type(&partial.aggregates[0].resolved),
-                crate::functions::aggregate_result_type(&final_aggregate.aggregates[0].resolved)
+                crate::functions::aggregate_result_type(partial.aggregates[0].source.binding()),
+                crate::functions::aggregate_result_type(
+                    final_aggregate.aggregates[0].source.binding()
+                )
             );
         }
     }
@@ -1013,7 +1033,7 @@ mod tests {
         };
         assert_eq!(top.aggregates[0].name, "sum");
         // The final SUM arg must be a ColumnRef into partial output.
-        let final_arg = materialize(&arena, top.aggregates[0].args[0]);
+        let final_arg = materialize(&arena, top.aggregates[0].source.arguments()[0]);
         match &final_arg.kind {
             ExprKind::ColumnRef { column, .. } => {
                 assert_eq!(column, "sum(v)");
@@ -1152,10 +1172,12 @@ mod tests {
         let sum = ScalarAggregateSpec {
             output_column_id: c_key,
             name: "sum".into(),
-            args: vec![sum_arg],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int32], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![sum_arg],
+                vec![],
+                crate::functions::test_resolved_aggregate("sum", &[DataType::Int32], false),
+            ),
         };
         let gb_id = intern_typed(
             &mut arena,
@@ -1322,10 +1344,12 @@ mod tests {
         let sum = ScalarAggregateSpec {
             output_column_id: sales_price,
             name: "sum".into(),
-            args: vec![sum_arg],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![sum_arg],
+                vec![],
+                crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            ),
         };
         let gb_id = intern_typed(
             &mut arena,
@@ -1474,10 +1498,12 @@ mod tests {
         let count_spec = ScalarAggregateSpec {
             output_column_id: ColumnId::new_for_test(9003),
             name: "count".into(),
-            args: vec![count_arg],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate("count", &[DataType::Int32], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![count_arg],
+                vec![],
+                crate::functions::test_resolved_aggregate("count", &[DataType::Int32], false),
+            ),
         };
         let expected_count_display = agg_spec_display_name(&count_spec, &arena);
 
@@ -1542,5 +1568,112 @@ mod tests {
                 .iter()
                 .any(|item| item.output_name == expected_count_display)
         );
+    }
+
+    #[test]
+    fn actual_pushdown_retains_partial_origin_and_authors_only_new_final_update() {
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        for authored in [false, true] {
+            let mut arena = ScalarArena::new();
+            let a = scan_opt("a", &[("k", DataType::Int64), ("v", DataType::Int64)]);
+            let b = scan_opt("b", &[("k", DataType::Int64)]);
+            let join = join_opt(a.clone(), b, Some(eq_typed("k", "k")), &mut arena);
+            let input = count_spec("v", &mut arena);
+            // Use the actual installed binding rather than the fixture declaration.
+            let binding = crate::optimizer::scalar::resolve_aggregate_binding(
+                crate::functions::builtin_sql_function_catalog(),
+                &arena,
+                "count",
+                input.source.arguments(),
+                &[],
+                false,
+                novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+                &control,
+            )
+            .unwrap();
+            let original_binding = binding.clone();
+            let original_argument = input.source.arguments()[0];
+            let source = if authored {
+                crate::binding::AggregateArgumentSource::logical_update(
+                    vec![original_argument],
+                    vec![],
+                    binding,
+                )
+            } else {
+                crate::binding::AggregateArgumentSource::uncertified(
+                    vec![original_argument],
+                    vec![],
+                    binding,
+                )
+            };
+            let count = ScalarAggregateSpec { source, ..input };
+            let original = make_agg(
+                vec![col_ref_typed("k", DataType::Int64)],
+                vec![count.clone()],
+                vec![],
+                &mut arena,
+            );
+            let push = PushPlan {
+                side: super::super::context::Side::Left,
+                target_subtree: a,
+                partial_groupby: original.group_by.clone(),
+                partial_extra_groupby: vec![],
+                partial_aggregates: vec![count],
+            };
+            let mut factory = ColumnRefFactory::new();
+            let out = rewrite(
+                &original,
+                &join,
+                push,
+                &mut factory,
+                &mut arena,
+                crate::functions::builtin_sql_function_catalog(),
+                &control,
+            )
+            .expect("actual aggregate pushdown");
+            let (_, top_plan) = unwrap_exposure_project(out);
+            let Operator::LogicalAggregate(top) = &top_plan.op else {
+                panic!("expected final aggregate");
+            };
+            let final_call = &top.aggregates[0];
+            assert_eq!(final_call.name, "sum");
+            assert!(final_call.source.logical_parts().is_some());
+            assert_ne!(
+                final_call.source.binding().function_id,
+                original_binding.function_id
+            );
+            assert_eq!(
+                final_call.source.binding().decimal_overflow_policy(),
+                novarocks_type_contract::DecimalOverflowPolicy::ReportError
+            );
+            let join_plan = top_plan.children.first().expect("final join child");
+            let partial_plan = join_plan.children.first().expect("partial child");
+            let Operator::LogicalAggregate(partial) = &partial_plan.op else {
+                panic!("expected retained partial aggregate");
+            };
+            let partial_call = &partial.aggregates[0];
+            assert_eq!(partial_call.name, "count");
+            assert_eq!(partial_call.source.arguments(), &[original_argument]);
+            assert_eq!(partial_call.source.logical_parts().is_some(), authored);
+            assert!(std::ptr::eq(
+                partial_call.source.binding().resolved(),
+                original_binding.resolved()
+            ));
+            assert_eq!(
+                partial_call.source.binding().decimal_overflow_policy(),
+                novarocks_type_contract::DecimalOverflowPolicy::ReportError
+            );
+            // The final call reads the new selected partial result, not the original input.
+            assert_ne!(
+                final_call.source.arguments(),
+                partial_call.source.arguments()
+            );
+            let ExprKind::ColumnRef { column_id, .. } =
+                materialize(&arena, final_call.source.arguments()[0]).kind
+            else {
+                panic!("expected actual partial result reference");
+            };
+            assert_eq!(column_id, partial_call.output_column_id);
+        }
     }
 }

@@ -142,10 +142,8 @@ pub(crate) struct ScalarProjectItem {
 pub(crate) struct ScalarAggregateSpec {
     pub output_column_id: ColumnId,
     pub name: String,
-    pub args: Vec<ScalarId>,
     pub distinct: bool,
-    pub order_by: Vec<SortKey>,
-    pub resolved: crate::binding::SqlFunctionBinding,
+    pub source: crate::binding::AggregateArgumentSource<ScalarId, SortKey>,
 }
 
 #[derive(Clone, Debug)]
@@ -829,13 +827,15 @@ mod aggregate_stage_tests {
         ScalarAggregateSpec {
             output_column_id: ColumnId::new_for_test(3),
             name: "count".to_string(),
-            args: vec![scalar_col_ref(arena, 2, "v")],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate(
-                "count",
-                &[arrow::datatypes::DataType::Int64],
-                false,
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![scalar_col_ref(arena, 2, "v")],
+                vec![],
+                crate::functions::test_resolved_aggregate(
+                    "count",
+                    &[arrow::datatypes::DataType::Int64],
+                    false,
+                ),
             ),
         }
     }
@@ -844,17 +844,19 @@ mod aggregate_stage_tests {
         ScalarAggregateSpec {
             output_column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            args: vec![],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate(
-                name,
-                if name == "count" {
-                    &[]
-                } else {
-                    &[arrow::datatypes::DataType::Int64]
-                },
-                false,
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![],
+                vec![],
+                crate::functions::test_resolved_aggregate(
+                    name,
+                    if name == "count" {
+                        &[]
+                    } else {
+                        &[arrow::datatypes::DataType::Int64]
+                    },
+                    false,
+                ),
             ),
         }
     }

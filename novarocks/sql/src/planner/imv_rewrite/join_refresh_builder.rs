@@ -474,12 +474,14 @@ fn build_payload_coalesce_aggregate(
             group_by,
             aggregates: vec![AggregateCall {
                 name: "sum".to_string(),
-                args: aggregate_args,
                 distinct: false,
                 result_type: DataType::Int64,
-                order_by: Vec::new(),
                 output_column_id: net_column.column_id,
-                resolved: crate::binding::SqlFunctionBinding::new(resolved, policy),
+                source: crate::binding::AggregateArgumentSource::logical_update(
+                    aggregate_args,
+                    Vec::new(),
+                    crate::binding::SqlFunctionBinding::new(resolved, policy),
+                ),
             }],
             output_columns,
             already_pushed: false,
@@ -634,21 +636,25 @@ fn build_key_shape_assert_join(
             aggregates: vec![
                 AggregateCall {
                     name: "sum".to_string(),
-                    args: insert_args,
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: Vec::new(),
                     output_column_id: pending_insert_count.column_id,
-                    resolved: crate::binding::SqlFunctionBinding::new(resolved.clone(), policy),
+                    source: crate::binding::AggregateArgumentSource::logical_update(
+                        insert_args,
+                        Vec::new(),
+                        crate::binding::SqlFunctionBinding::new(resolved.clone(), policy),
+                    ),
                 },
                 AggregateCall {
                     name: "sum".to_string(),
-                    args: delete_args,
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: Vec::new(),
                     output_column_id: pending_delete_count.column_id,
-                    resolved: crate::binding::SqlFunctionBinding::new(resolved, policy),
+                    source: crate::binding::AggregateArgumentSource::logical_update(
+                        delete_args,
+                        Vec::new(),
+                        crate::binding::SqlFunctionBinding::new(resolved, policy),
+                    ),
                 },
             ],
             output_columns: vec![
@@ -2040,7 +2046,7 @@ mod tests {
             LogicalPlanKind::Aggregate(aggregate) => {
                 exprs.extend(aggregate.group_by.iter());
                 for call in &aggregate.aggregates {
-                    exprs.extend(call.args.iter());
+                    exprs.extend(call.source.arguments().iter());
                 }
             }
             LogicalPlanKind::Join(join) => {
@@ -2242,10 +2248,10 @@ mod tests {
                 .collect::<HashSet<_>>();
             for call in &aggregate.aggregates {
                 let mut refs = HashSet::new();
-                for arg in &call.args {
+                for arg in call.source.arguments() {
                     collect_column_refs(arg, &mut refs);
                 }
-                for sort_item in &call.order_by {
+                for sort_item in call.source.order_by() {
                     collect_column_refs(&sort_item.expr, &mut refs);
                 }
                 for column_id in refs {

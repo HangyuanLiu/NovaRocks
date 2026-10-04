@@ -165,9 +165,9 @@ fn is_signed_state_aggregate(node: &LogicalAggregateNode) -> bool {
 
 fn is_hidden_retraction_count_call(call: &crate::planner::payload::AggregateCall) -> bool {
     call.name.eq_ignore_ascii_case("sum")
-        && call.args.len() == 1
+        && call.source.arguments().len() == 1
         && matches!(
-            &call.args[0].kind,
+            &call.source.arguments()[0].kind,
             ExprKind::ColumnRef { column, .. } if column.eq_ignore_ascii_case(ImvActionColumn::NAME)
         )
 }

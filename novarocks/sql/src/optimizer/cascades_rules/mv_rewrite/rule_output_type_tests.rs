@@ -27,10 +27,16 @@ fn output_type_rollup_fixture(
     } else {
         sum_call(&mv_a, &mv_value)
     };
-    mv_call.resolved =
-        crate::binding::SqlFunctionBinding::new(mv_call.resolved.resolved().clone(), policy);
+    mv_call.source = crate::binding::AggregateArgumentSource::uncertified(
+        mv_call.source.arguments().to_vec(),
+        mv_call.source.order_by().to_vec(),
+        crate::binding::SqlFunctionBinding::new(
+            mv_call.source.binding().resolved().clone(),
+            policy,
+        ),
+    );
     let novarocks_functions::FunctionResultType::Scalar(selected) =
-        &mv_call.resolved.selected.result_type
+        &mv_call.source.binding().selected.result_type
     else {
         panic!("test aggregate must be scalar");
     };
@@ -71,10 +77,13 @@ fn output_type_rollup_fixture(
     } else {
         sum_call(&a, &published)
     };
-    call.resolved =
-        crate::binding::SqlFunctionBinding::new(call.resolved.resolved().clone(), policy);
+    call.source = crate::binding::AggregateArgumentSource::uncertified(
+        call.source.arguments().to_vec(),
+        call.source.order_by().to_vec(),
+        crate::binding::SqlFunctionBinding::new(call.source.binding().resolved().clone(), policy),
+    );
     let novarocks_functions::FunctionResultType::Scalar(selected) =
-        &call.resolved.selected.result_type
+        &call.source.binding().selected.result_type
     else {
         panic!("test aggregate must be scalar");
     };
@@ -142,7 +151,7 @@ fn count_rollup_internal_sum_uses_selected_nullable_type_and_exact_visible_count
             panic!("expected the actual rollup aggregate")
         };
         let novarocks_functions::FunctionResultType::Scalar(sum_result) =
-            &inner.aggregates[0].resolved.selected.result_type
+            &inner.aggregates[0].source.binding().selected.result_type
         else {
             panic!("SUM must be scalar")
         };
@@ -159,7 +168,10 @@ fn count_rollup_internal_sum_uses_selected_nullable_type_and_exact_visible_count
         assert_ne!(inner.output_columns[0].column_id, published.column_id);
         assert_eq!(inner.output_columns[0].name, published.name);
         assert_eq!(
-            inner.aggregates[0].resolved.decimal_overflow_policy(),
+            inner.aggregates[0]
+                .source
+                .binding()
+                .decimal_overflow_policy(),
             policy
         );
     }
@@ -179,7 +191,7 @@ fn sum_rollup_without_coalesce_keeps_exact_selected_result_and_original_id() {
         panic!("SUM rollup does not require COALESCE");
     };
     let novarocks_functions::FunctionResultType::Scalar(selected) =
-        &inner.aggregates[0].resolved.selected.result_type
+        &inner.aggregates[0].source.binding().selected.result_type
     else {
         panic!("SUM must be scalar")
     };

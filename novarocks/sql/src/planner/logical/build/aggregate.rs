@@ -428,9 +428,9 @@ pub(super) fn split_projection_for_aggregate(
         .map(|call| {
             let name = agg_call_display_name_from_parts(
                 &call.name,
-                &call.args,
+                call.source.arguments(),
                 call.distinct,
-                &call.order_by,
+                call.source.order_by(),
                 control,
             )?;
             Ok(OutputColumn {
@@ -539,9 +539,9 @@ pub(super) fn ensure_aggregate_output_columns(
             work.flush()?;
             let name = agg_call_display_name_from_parts(
                 &call.name,
-                &call.args,
+                call.source.arguments(),
                 call.distinct,
-                &call.order_by,
+                call.source.order_by(),
                 work.control(),
             )?;
             work.flush()?;
@@ -1040,20 +1040,20 @@ fn aggregate_call_matches(
     resolved: &crate::binding::SqlFunctionBinding,
     control: &dyn PureCompileControl,
 ) -> Result<bool, SqlCompileError> {
-    if call.resolved != *resolved
+    if call.source.binding() != resolved
         || call.name != name
         || call.distinct != distinct
-        || call.args.len() != args.len()
-        || call.order_by.len() != order_by.len()
+        || call.source.arguments().len() != args.len()
+        || call.source.order_by().len() != order_by.len()
     {
         return Ok(false);
     }
-    for (left, right) in call.args.iter().zip(args) {
+    for (left, right) in call.source.arguments().iter().zip(args) {
         if !typed_expr_semantically_eq(left, right, control)? {
             return Ok(false);
         }
     }
-    for (left, right) in call.order_by.iter().zip(order_by) {
+    for (left, right) in call.source.order_by().iter().zip(order_by) {
         if left.asc != right.asc
             || left.nulls_first != right.nulls_first
             || !typed_expr_semantically_eq(&left.expr, &right.expr, control)?
@@ -1098,12 +1098,14 @@ pub(super) fn collect_aggregates(
                 let output_column_id = factory.create(None, display, expr.value_type.clone());
                 out.push(AggregateCall {
                     name: name.clone(),
-                    args: args.clone(),
                     distinct: *distinct,
                     result_type: expr.value_type.data_type.clone(),
-                    order_by: order_by.clone(),
                     output_column_id,
-                    resolved: resolved.clone(),
+                    source: crate::binding::AggregateArgumentSource::logical_update(
+                        args.clone(),
+                        order_by.clone(),
+                        resolved.clone(),
+                    ),
                 });
             }
         }
@@ -1329,11 +1331,11 @@ mod call_policy_tests {
         collect_aggregates(&output_null, &mut calls, &mut factory, &control).unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!(
-            calls[0].resolved.decimal_overflow_policy(),
+            calls[0].source.binding().decimal_overflow_policy(),
             DecimalOverflowPolicy::OutputNull
         );
         assert_eq!(
-            calls[1].resolved.decimal_overflow_policy(),
+            calls[1].source.binding().decimal_overflow_policy(),
             DecimalOverflowPolicy::ReportError
         );
         for (expression, call) in [output_null, report_error].iter().zip(&calls) {
@@ -1429,6 +1431,186 @@ mod call_policy_tests {
             2,
             "different unused rows cannot split equal selected aggregate arguments"
         );
+    }
+
+    fn collected_bridge_call(argument: TypedExpr, name: &str) -> AggregateCall {
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let selected = crate::functions::resolve_sql_aggregate_binding(
+            crate::functions::builtin_sql_function_catalog(),
+            name,
+            std::slice::from_ref(&argument),
+            &[],
+            false,
+            crate::constant::test_constant_policy(),
+            &control,
+        )
+        .unwrap();
+        let expression = TypedExpr {
+            value_type: crate::functions::aggregate_result_type(&selected).clone(),
+            kind: ExprKind::AggregateCall {
+                name: name.into(),
+                args: vec![argument],
+                distinct: false,
+                order_by: vec![],
+                resolved: crate::binding::SqlFunctionBinding::new(
+                    selected,
+                    DecimalOverflowPolicy::ReportError,
+                ),
+            },
+        };
+        let mut calls = Vec::new();
+        collect_aggregates(
+            &expression,
+            &mut calls,
+            &mut ColumnRefFactory::new(),
+            &control,
+        )
+        .unwrap();
+        assert_eq!(calls.len(), 1);
+        calls.remove(0)
+    }
+
+    fn bridge_round_trip(call: &AggregateCall) -> AggregateCall {
+        use crate::optimizer::operator::AggregateOutputLayout;
+        use crate::planner::optimizer_bridge::scalar::{
+            intern_aggregate_call, materialize_aggregate_call,
+        };
+        let mut arena = crate::optimizer::scalar::ScalarArena::new();
+        let spec = intern_aggregate_call(
+            &mut arena,
+            call,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        assert_eq!(
+            spec.source.logical_parts().is_some(),
+            call.source.logical_parts().is_some()
+        );
+        let layout = AggregateOutputLayout::new(
+            vec![],
+            vec![crate::analysis::OutputColumn {
+                column_id: call.output_column_id,
+                name: "original_result".into(),
+                value_type: crate::functions::aggregate_result_type(call.source.binding()).clone(),
+                is_internal: false,
+            }],
+        );
+        materialize_aggregate_call(&arena, &spec, &layout)
+    }
+
+    #[test]
+    fn aggregate_logical_source_bridge_and_capture_preserve_shared_pool_ordinals() {
+        use std::sync::Arc;
+        let first = constant_expr(vec![-99, 42, 71], 1);
+        let ExprKind::Constant(original) = &first.kind else {
+            unreachable!()
+        };
+        let second = TypedExpr {
+            kind: ExprKind::Constant(original.pool().value(2).unwrap()),
+            value_type: first.value_type.clone(),
+        };
+        let source = collected_bridge_call(first.clone(), "sum");
+        // The actual collector is the source author; the bridge must only transfer it.
+        assert!(source.source.logical_parts().is_some());
+        let mut second_source = source.clone();
+        second_source
+            .source
+            .rewrite_channels(|arguments, _| arguments[0] = second);
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        for (call, ordinal, expected) in [(&source, 1, 42), (&second_source, 2, 71)] {
+            let materialized = bridge_round_trip(call);
+            assert!(std::ptr::eq(
+                materialized.source.binding().resolved(),
+                source.source.binding().resolved()
+            ));
+            assert!(std::ptr::eq(
+                &materialized.source.binding().resolved().selected,
+                &source.source.binding().resolved().selected
+            ));
+            assert_eq!(
+                materialized.source.binding().decimal_overflow_policy(),
+                DecimalOverflowPolicy::ReportError
+            );
+            let captured = crate::binding::capture_aggregate_logical_request(
+                &materialized.source,
+                crate::constant::test_constant_policy(),
+                &control,
+            )
+            .unwrap();
+            assert!(std::ptr::eq(
+                captured.binding().resolved(),
+                source.source.binding().resolved()
+            ));
+            assert_eq!(
+                captured.constant_policy(),
+                crate::constant::test_constant_policy()
+            );
+            let request = captured.request();
+            assert_eq!(request.logical_argument_count, 1);
+            let [
+                novarocks_functions::FunctionArgument::Value {
+                    value_type,
+                    constant: Some(value),
+                },
+            ] = request.arguments
+            else {
+                panic!("the original selected constant must remain a checked handle")
+            };
+            assert_eq!(value_type, original.value_type());
+            assert_eq!(value.ordinal(), ordinal);
+            assert_eq!(value.try_i64().unwrap(), Some(expected));
+            assert_eq!(
+                value.pool().backing_identity(),
+                original.pool().backing_identity()
+            );
+            assert!(Arc::ptr_eq(
+                value.pool().field_ref(),
+                original.pool().field_ref()
+            ));
+        }
+    }
+
+    #[test]
+    fn aggregate_materialization_does_not_certify_equal_state_only_input() {
+        let genuine = collected_bridge_call(constant_expr(vec![9, 42], 1), "count");
+        let mut uncertified = genuine.clone();
+        // Equal channels, complete types and the same selected Arc do not prove origin.
+        uncertified.source = crate::binding::AggregateArgumentSource::uncertified(
+            genuine.source.arguments().to_vec(),
+            genuine.source.order_by().to_vec(),
+            genuine.source.binding().clone(),
+        );
+        let source = bridge_round_trip(&genuine);
+        let state_only = bridge_round_trip(&uncertified);
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        assert!(
+            typed_expr_semantically_eq(
+                &source.source.arguments()[0],
+                &state_only.source.arguments()[0],
+                &control
+            )
+            .unwrap()
+        );
+        assert!(std::ptr::eq(
+            source.source.binding().resolved(),
+            state_only.source.binding().resolved()
+        ));
+        assert!(
+            crate::binding::capture_aggregate_logical_request(
+                &source.source,
+                crate::constant::test_constant_policy(),
+                &control
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            crate::binding::capture_aggregate_logical_request(
+                &state_only.source,
+                crate::constant::test_constant_policy(),
+                &control
+            ),
+            Err(crate::binding::AggregateRequestCaptureError::MissingLogicalSource)
+        ));
     }
 
     struct EqualityControl {
@@ -1739,7 +1921,11 @@ mod call_policy_tests {
         );
         let success_trace = recording.trace.into_inner().unwrap();
         let mut invalid = original.clone();
-        invalid.aggregates[1].args[0].value_type.nullable = true;
+        invalid.aggregates[1]
+            .source
+            .rewrite_channels(|arguments, _| {
+                arguments[0].value_type.nullable = true;
+            });
         let ordinary = EqualityControl {
             trace: Default::default(),
             refuse: None,

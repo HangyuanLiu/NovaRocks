@@ -104,12 +104,11 @@ fn sum(arena: &mut ScalarArena, value: ConstantValue, output: u32) -> ScalarAggr
     ScalarAggregateSpec {
         output_column_id: ColumnId(output),
         name: "sum".into(),
-        args: vec![insert(arena, value)],
         distinct: false,
-        order_by: vec![],
-        resolved: crate::binding::SqlFunctionBinding::new(
-            resolved,
-            DecimalOverflowPolicy::OutputNull,
+        source: crate::binding::AggregateArgumentSource::uncertified(
+            vec![insert(arena, value)],
+            vec![],
+            crate::binding::SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::OutputNull),
         ),
     }
 }
@@ -180,7 +179,8 @@ fn actual_cv_rollup_keeps_selected_values_complete_type_and_last_exact_output() 
         plan.items[0].mv_output_index, 1,
         "last exact output wins across independent selected pools"
     );
-    let FunctionResultType::Scalar(result_type) = &fixture.query_call.resolved.selected.result_type
+    let FunctionResultType::Scalar(result_type) =
+        &fixture.query_call.source.binding().selected.result_type
     else {
         panic!("scalar SUM result");
     };

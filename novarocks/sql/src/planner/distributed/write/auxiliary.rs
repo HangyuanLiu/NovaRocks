@@ -48,7 +48,8 @@ const MAX_UNPIVOT_OUTPUT_BYTES: usize =
 pub struct WriterPartialAggregateCall {
     pub(crate) input_slot_id: u32,
     pub(crate) function_name: String,
-    pub(crate) resolved: SqlFunctionBinding,
+    pub(crate) source:
+        crate::binding::AggregateArgumentSource<TypedExpr, crate::analysis::SortItem>,
     pub(crate) intermediate_slot_id: u32,
 }
 
@@ -60,10 +61,10 @@ impl WriterPartialAggregateCall {
         &self.function_name
     }
     pub fn resolved(&self) -> &ResolvedFunctionBinding {
-        self.resolved.resolved()
+        self.source.binding().resolved()
     }
-    pub const fn binding(&self) -> &SqlFunctionBinding {
-        &self.resolved
+    pub fn binding(&self) -> &SqlFunctionBinding {
+        self.source.binding()
     }
     pub const fn intermediate_slot_id(&self) -> u32 {
         self.intermediate_slot_id
@@ -84,7 +85,8 @@ impl WriterPartialAggregatePlan {
 #[derive(Clone, Debug)]
 pub struct WriterFinalAggregateCall {
     pub(crate) function_name: String,
-    pub(crate) resolved: SqlFunctionBinding,
+    pub(crate) source:
+        crate::binding::AggregateArgumentSource<TypedExpr, crate::analysis::SortItem>,
     pub(crate) intermediate_input_slot_id: u32,
     pub(crate) final_output_slot_id: u32,
 }
@@ -94,10 +96,10 @@ impl WriterFinalAggregateCall {
         &self.function_name
     }
     pub fn resolved(&self) -> &ResolvedFunctionBinding {
-        self.resolved.resolved()
+        self.source.binding().resolved()
     }
-    pub const fn binding(&self) -> &SqlFunctionBinding {
-        &self.resolved
+    pub fn binding(&self) -> &SqlFunctionBinding {
+        self.source.binding()
     }
     pub const fn intermediate_input_slot_id(&self) -> u32 {
         self.intermediate_input_slot_id
@@ -379,6 +381,11 @@ pub fn plan_writer_statistics(
                 .into());
             }
             let resolved = SqlFunctionBinding::new(resolved, decimal_overflow_policy);
+            let source = crate::binding::AggregateArgumentSource::logical_update(
+                vec![input_expr],
+                Vec::new(),
+                resolved.clone(),
+            );
             let occurrence = occurrence_by_signature.entry(resolved.clone()).or_default();
             let shared_key = (resolved.clone(), *occurrence);
             *occurrence = occurrence
@@ -409,7 +416,7 @@ pub fn plan_writer_statistics(
                 );
                 final_calls.push(WriterFinalAggregateCall {
                     function_name: requirement.function_name().to_string(),
-                    resolved: resolved.clone(),
+                    source: source.clone(),
                     intermediate_input_slot_id: intermediate_slot_id,
                     final_output_slot_id,
                 });
@@ -419,7 +426,7 @@ pub fn plan_writer_statistics(
             partial_calls.push(WriterPartialAggregateCall {
                 input_slot_id: target_input_slot_id(requirement.input().ordinal())?,
                 function_name: requirement.function_name().to_string(),
-                resolved: resolved.clone(),
+                source,
                 intermediate_slot_id,
             });
             mappings.push(WriteUnpivotMapping {
@@ -543,7 +550,7 @@ fn validate_plan(
         let Some(data_type) = channels.get(&call.intermediate_input_slot_id) else {
             return Err("write final aggregate reads an unknown auxiliary slot".to_string());
         };
-        let mut transport_type = crate::functions::aggregate_selection(&call.resolved)
+        let mut transport_type = crate::functions::aggregate_selection(call.source.binding())
             .intermediate_type
             .clone();
         transport_type.nullable = true;

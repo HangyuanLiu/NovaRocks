@@ -395,15 +395,13 @@ mod tests {
                 group_by: vec![col_ref(id_b, "b")],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
-                    args: vec![col_ref(id_c, "c")],
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: vec![],
                     output_column_id: out_sum,
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "sum",
-                        &[DataType::Int32],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![col_ref(id_c, "c")],
+                        vec![],
+                        crate::functions::test_resolved_aggregate("sum", &[DataType::Int32], false),
                     ),
                 }],
                 output_columns: vec![

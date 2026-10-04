@@ -643,13 +643,13 @@ fn eliminated_count_value(
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<i64>, SqlCompileError> {
     if !aggregate.name.eq_ignore_ascii_case("count")
-        || !is_builtin_count_binding(&aggregate.resolved)
+        || !is_builtin_count_binding(aggregate.source.binding())
         || aggregate.distinct
-        || !aggregate.order_by.is_empty()
+        || !aggregate.source.order_by().is_empty()
     {
         return Ok(None);
     }
-    count_arguments_value(&aggregate.args, arena, control)
+    count_arguments_value(aggregate.source.arguments(), arena, control)
 }
 
 fn is_builtin_count_binding(binding: &crate::binding::SqlFunctionBinding) -> bool {
@@ -973,18 +973,22 @@ mod tests {
         let count_one = ScalarAggregateSpec {
             output_column_id: ColumnId::new_for_test(9001),
             name: "count".to_string(),
-            args: vec![one],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate("count", &[DataType::Int64], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![one],
+                vec![],
+                crate::functions::test_resolved_aggregate("count", &[DataType::Int64], false),
+            ),
         };
         let count_null = ScalarAggregateSpec {
             output_column_id: ColumnId::new_for_test(9002),
             name: "count".to_string(),
-            args: vec![null],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate("count", &[DataType::Null], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![null],
+                vec![],
+                crate::functions::test_resolved_aggregate("count", &[DataType::Null], false),
+            ),
         };
 
         assert_eq!(
@@ -1080,13 +1084,11 @@ mod tests {
             specs.push(ScalarAggregateSpec {
                 output_column_id: ColumnId::new_for_test(output_id),
                 name: "count".to_owned(),
-                args: vec![argument],
                 distinct: false,
-                order_by: vec![],
-                resolved: crate::functions::test_resolved_aggregate(
-                    "count",
-                    &[DataType::Int64],
-                    false,
+                source: crate::binding::AggregateArgumentSource::uncertified(
+                    vec![argument],
+                    vec![],
+                    crate::functions::test_resolved_aggregate("count", &[DataType::Int64], false),
                 ),
             });
             outputs.push(output_col(output_id, "count.result"));
@@ -1206,7 +1208,7 @@ mod tests {
                 unreachable!()
             };
             let spec = &mut aggregate.aggregates[0];
-            let mut foreign = spec.resolved.resolved().clone();
+            let mut foreign = spec.source.binding().resolved().clone();
             if foreign_overload {
                 foreign.selected.overload = novarocks_functions::FunctionOverloadId::try_new(
                     "foreign.aggregate/count/derived-v1",
@@ -1216,17 +1218,21 @@ mod tests {
                 foreign.function_id =
                     novarocks_functions::FunctionId::try_new("foreign.aggregate/count/v1").unwrap();
             }
-            spec.resolved = crate::binding::SqlFunctionBinding::new(
-                foreign,
-                spec.resolved.decimal_overflow_policy(),
+            spec.source = crate::binding::AggregateArgumentSource::uncertified(
+                spec.source.arguments().to_vec(),
+                spec.source.order_by().to_vec(),
+                crate::binding::SqlFunctionBinding::new(
+                    foreign,
+                    spec.source.binding().decimal_overflow_policy(),
+                ),
             );
             let direct = arena.borrow_mut().intern(
                 ScalarNode::AggregateCall {
                     name: spec.name.clone(),
-                    args: spec.args.clone(),
+                    args: spec.source.arguments().to_vec(),
                     distinct: false,
                     order_by: vec![],
-                    resolved: spec.resolved.clone(),
+                    resolved: spec.source.binding().clone(),
                 },
                 novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             );
@@ -1284,10 +1290,10 @@ mod tests {
         let direct = arena.borrow_mut().intern(
             ScalarNode::AggregateCall {
                 name: spec.name.clone(),
-                args: spec.args.clone(),
+                args: spec.source.arguments().to_vec(),
                 distinct: false,
                 order_by: vec![],
-                resolved: spec.resolved.clone(),
+                resolved: spec.source.binding().clone(),
             },
             novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         );

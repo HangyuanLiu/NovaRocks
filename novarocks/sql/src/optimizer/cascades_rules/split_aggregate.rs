@@ -176,9 +176,9 @@ fn local_output_columns(agg: &LogicalAggregateOp, arena: &ScalarArena) -> Vec<Ou
         let name = scalar_expr::aggregate_display_name(
             arena,
             &call.name,
-            &call.args,
+            call.source.arguments(),
             call.distinct,
-            &call.order_by,
+            call.source.order_by(),
         );
         let source_output = aggregate_output_column(agg, idx);
         OutputColumn {
@@ -193,7 +193,7 @@ fn local_output_columns(agg: &LogicalAggregateOp, arena: &ScalarArena) -> Vec<Ou
 }
 
 fn local_aggregate_intermediate_type(call: &ScalarAggregateSpec) -> FunctionValueType {
-    let mut value_type = crate::functions::aggregate_selection(&call.resolved)
+    let mut value_type = crate::functions::aggregate_selection(call.source.binding())
         .intermediate_type
         .clone();
     // Preserve the existing phase-output root nullability widening.
@@ -311,15 +311,13 @@ mod tests {
     fn count_call(distinct: bool) -> AggregateCall {
         AggregateCall {
             name: "count".to_string(),
-            args: vec![col_ref(2, "v")],
             distinct,
             result_type: DataType::Int64,
-            order_by: vec![],
             output_column_id: ColumnId::new_for_test(3),
-            resolved: crate::functions::test_resolved_aggregate(
-                "count",
-                &[DataType::Int64],
-                distinct,
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![col_ref(2, "v")],
+                vec![],
+                crate::functions::test_resolved_aggregate("count", &[DataType::Int64], distinct),
             ),
         }
     }
@@ -582,13 +580,11 @@ mod tests {
             vec![ScalarAggregateSpec {
                 output_column_id: sum_output_id,
                 name: "sum".to_string(),
-                args: vec![arg],
                 distinct: false,
-                order_by: vec![],
-                resolved: crate::functions::test_resolved_aggregate(
-                    "sum",
-                    &[DataType::Int64],
-                    false,
+                source: crate::binding::AggregateArgumentSource::uncertified(
+                    vec![arg],
+                    vec![],
+                    crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
                 ),
             }],
             AggregateOutputLayout::new(
@@ -703,12 +699,14 @@ mod tests {
     fn avg_call() -> AggregateCall {
         AggregateCall {
             name: "avg".to_string(),
-            args: vec![col_ref(2, "v")],
             distinct: false,
             result_type: arrow::datatypes::DataType::Float64,
-            order_by: vec![],
             output_column_id: ColumnId::new_for_test(3),
-            resolved: crate::functions::test_resolved_aggregate("avg", &[DataType::Int64], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![col_ref(2, "v")],
+                vec![],
+                crate::functions::test_resolved_aggregate("avg", &[DataType::Int64], false),
+            ),
         }
     }
 
@@ -804,12 +802,14 @@ mod tests {
             };
             let call = AggregateCall {
                 name: name.into(),
-                args: vec![typed(&input)],
                 distinct: false,
                 result_type: result.data_type.clone(),
-                order_by: vec![],
                 output_column_id: output.column_id,
-                resolved: resolved.clone(),
+                source: crate::binding::AggregateArgumentSource::uncertified(
+                    vec![typed(&input)],
+                    vec![],
+                    resolved.clone(),
+                ),
             };
             let mut memo = Memo::new();
             let id = memo.next_expr_id();
@@ -858,11 +858,11 @@ mod tests {
             assert_eq!(global.output_columns[1].value_type, output.value_type);
             assert_eq!(memo.scalars.value_type(global.group_by[0]), &source);
             assert!(std::ptr::eq(
-                local.aggregates[0].resolved.resolved(),
+                local.aggregates[0].source.binding().resolved(),
                 resolved.resolved()
             ));
             assert!(std::ptr::eq(
-                global.aggregates[0].resolved.resolved(),
+                global.aggregates[0].source.binding().resolved(),
                 resolved.resolved()
             ));
         }

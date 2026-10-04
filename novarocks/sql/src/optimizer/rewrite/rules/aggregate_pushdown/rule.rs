@@ -282,10 +282,12 @@ mod tests {
         let sum_spec = ScalarAggregateSpec {
             output_column_id: ColumnId::new_for_test(9001),
             name: "sum".into(),
-            args: vec![sum_arg],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![sum_arg],
+                vec![],
+                crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            ),
         };
         let output_layout = AggregateOutputLayout::new(
             vec![OutputColumn {

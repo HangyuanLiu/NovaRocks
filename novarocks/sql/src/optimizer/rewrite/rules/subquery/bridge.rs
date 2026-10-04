@@ -277,13 +277,11 @@ mod tests {
                 vec![ScalarAggregateSpec {
                     output_column_id: sum_output.column_id,
                     name: "sum".to_string(),
-                    args: vec![value],
                     distinct: false,
-                    order_by: vec![],
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "sum",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![value],
+                        vec![],
+                        crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
                     ),
                 }],
                 AggregateOutputLayout::new(vec![group_output.clone()], vec![sum_output.clone()]),

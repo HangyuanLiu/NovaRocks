@@ -263,7 +263,8 @@ fn format_node_with_work(
                 .iter()
                 .map(|a| {
                     let args: Vec<String> = a
-                        .args
+                        .source
+                        .arguments()
                         .iter()
                         .map(|expr| format_expr_with_work(expr, work))
                         .collect::<Result<_, SqlCompileError>>()?;

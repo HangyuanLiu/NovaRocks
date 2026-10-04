@@ -434,10 +434,10 @@ fn collect_output_column(column: &OutputColumn, max_id: &mut u32) {
 
 fn collect_aggregate_call_column_ids(call: &AggregateCall, max_id: &mut u32) {
     collect_column_id(call.output_column_id, max_id);
-    for arg in &call.args {
+    for arg in call.source.arguments() {
         collect_expr_column_ids(arg, max_id);
     }
-    collect_sort_items(&call.order_by, max_id);
+    collect_sort_items(call.source.order_by(), max_id);
 }
 
 fn collect_window_expr_column_ids(window: &WindowExpr, max_id: &mut u32) {
@@ -746,12 +746,14 @@ pub(crate) mod tests {
                 group_by: vec![normalization_column_ref(&g1), normalization_column_ref(&g2)],
                 aggregates: vec![AggregateCall {
                     name: "count".to_string(),
-                    args: Vec::new(),
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: Vec::new(),
                     output_column_id: sum_output.column_id,
-                    resolved: crate::functions::test_resolved_aggregate("count", &[], false),
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        Vec::new(),
+                        Vec::new(),
+                        crate::functions::test_resolved_aggregate("count", &[], false),
+                    ),
                 }],
                 output_columns: vec![g1, g2, sum_output],
                 already_pushed: false,
@@ -787,12 +789,14 @@ pub(crate) mod tests {
                 group_by: vec![normalization_column_ref(&group_output)],
                 aggregates: vec![AggregateCall {
                     name: "count".to_string(),
-                    args: Vec::new(),
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: Vec::new(),
                     output_column_id: aggregate_output.column_id,
-                    resolved: crate::functions::test_resolved_aggregate("count", &[], false),
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        Vec::new(),
+                        Vec::new(),
+                        crate::functions::test_resolved_aggregate("count", &[], false),
+                    ),
                 }],
                 output_columns: vec![group_output.clone(), aggregate_output.clone()],
                 already_pushed: false,
@@ -1438,15 +1442,13 @@ pub(crate) mod tests {
                 group_by: vec![column_ref(1, "k", DataType::Int64, false)],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
-                    args: vec![column_ref(2, "v", DataType::Int64, true)],
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: Vec::new(),
                     output_column_id: ColumnId(3),
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "sum",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![column_ref(2, "v", DataType::Int64, true)],
+                        Vec::new(),
+                        crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
                     ),
                 }],
                 output_columns: vec![
@@ -1592,15 +1594,13 @@ pub(crate) mod tests {
                 group_by: vec![column_expr(1, "k", false)],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
-                    args: vec![column_expr(11, "v", true)],
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: Vec::new(),
                     output_column_id: ColumnId(12),
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "sum",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![column_expr(11, "v", true)],
+                        Vec::new(),
+                        crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
                     ),
                 }],
                 output_columns: vec![
@@ -2849,7 +2849,7 @@ pub(crate) mod tests {
             .find(|column| ImvActionColumn::matches(column))
             .expect("delta scan must carry action column")
             .column_id;
-        let signed_input = &delta_aggregate.aggregates[0].args[0];
+        let signed_input = &delta_aggregate.aggregates[0].source.arguments()[0];
         let ExprKind::FunctionCall { args, .. } = &signed_input.kind else {
             panic!("expected signed state named_struct input");
         };
@@ -3965,7 +3965,7 @@ crate::constant::test_constant_policy(),
         reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
     )]
     fn signed_action_column_id(aggregate: &LogicalAggregateNode) -> ColumnId {
-        let signed_input = &aggregate.aggregates[0].args[0];
+        let signed_input = &aggregate.aggregates[0].source.arguments()[0];
         let ExprKind::FunctionCall { args, .. } = &signed_input.kind else {
             panic!("expected signed state named_struct input");
         };

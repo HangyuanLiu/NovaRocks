@@ -323,16 +323,20 @@ impl<'a, 'control> ConstantFolder<'a, 'control> {
             Operator::LogicalAggregate(agg) => {
                 let mut changed = self.fold_slots(&mut agg.group_by)?;
                 for aggregate in &mut agg.aggregates {
-                    changed |= self.fold_slots(&mut aggregate.args)?;
-                    changed |= self.fold_sort_keys(&mut aggregate.order_by)?;
+                    changed |= aggregate.source.rewrite_channels(|arguments, order_by| {
+                        let args_changed = self.fold_slots(arguments)?;
+                        Ok::<_, SqlCompileError>(args_changed | self.fold_sort_keys(order_by)?)
+                    })?;
                 }
                 changed
             }
             Operator::PhysicalHashAggregate(agg) => {
                 let mut changed = self.fold_slots(&mut agg.group_by)?;
                 for aggregate in &mut agg.aggregates {
-                    changed |= self.fold_slots(&mut aggregate.args)?;
-                    changed |= self.fold_sort_keys(&mut aggregate.order_by)?;
+                    changed |= aggregate.source.rewrite_channels(|arguments, order_by| {
+                        let args_changed = self.fold_slots(arguments)?;
+                        Ok::<_, SqlCompileError>(args_changed | self.fold_sort_keys(order_by)?)
+                    })?;
                 }
                 changed
             }

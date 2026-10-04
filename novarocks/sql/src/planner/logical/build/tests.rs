@@ -397,12 +397,14 @@ fn planner_group_by_targets_ignore_aggregate_public_output_order() {
         group_by: vec![col(1, "k"), col(2, "region")],
         aggregates: vec![AggregateCall {
             name: "count".to_string(),
-            args: Vec::new(),
             distinct: false,
             result_type: DataType::Int64,
-            order_by: Vec::new(),
             output_column_id: ColumnId(30),
-            resolved: crate::functions::test_resolved_aggregate("count", &[], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                Vec::new(),
+                Vec::new(),
+                crate::functions::test_resolved_aggregate("count", &[], false),
+            ),
         }],
         output_columns: vec![output(30, "sum(v)"), output(1, "k"), output(2, "region")],
         already_pushed: false,
@@ -2396,9 +2398,9 @@ fn grouping_input_sum_distinct_count_and_ordered_array_keep_original_rows() {
         assert_eq!(column_ref_id(&project.items[0].expr), repeat_key_id);
         assert_eq!(aggregate.aggregates.len(), 3);
         for call in &aggregate.aggregates {
-            assert_eq!(call.args.len(), 1);
+            assert_eq!(call.source.arguments().len(), 1);
             assert_eq!(
-                grouping_input_expr_column_ids(&call.args[0]),
+                grouping_input_expr_column_ids(&call.source.arguments()[0]),
                 [source_id].into(),
                 "{grouping}: {} must aggregate the original input, including total levels",
                 call.name
@@ -2407,10 +2409,10 @@ fn grouping_input_sum_distinct_count_and_ordered_array_keep_original_rows() {
                 assert!(call.distinct);
             }
             if call.name == "array_agg" {
-                assert_eq!(call.order_by.len(), 1);
-                assert!(!call.order_by[0].asc);
+                assert_eq!(call.source.order_by().len(), 1);
+                assert!(!call.source.order_by()[0].asc);
                 assert_eq!(
-                    grouping_input_expr_column_ids(&call.order_by[0].expr),
+                    grouping_input_expr_column_ids(&call.source.order_by()[0].expr),
                     [source_id].into(),
                     "ordered aggregate sorting belongs to the original row domain"
                 );
@@ -2430,7 +2432,7 @@ fn grouping_input_computed_key_does_not_replace_aggregate_arithmetic() {
         panic!("expected SUM");
     };
     assert_eq!(call.name, "sum");
-    let [arg] = call.args.as_slice() else {
+    let [arg] = call.source.arguments() else {
         panic!("expected SUM input expression");
     };
     assert!(
@@ -2452,7 +2454,7 @@ fn grouping_input_having_uses_group_outputs_and_original_aggregate_inputs() {
         panic!("expected one deduplicated SUM");
     };
     assert_eq!(
-        grouping_input_expr_column_ids(&sum.args[0]),
+        grouping_input_expr_column_ids(&sum.source.arguments()[0]),
         [source_id].into()
     );
     assert_eq!(column_ref_id(&project.items[0].expr), repeat_key_id);
@@ -2475,7 +2477,7 @@ fn grouping_input_window_orders_group_outputs_without_rewriting_inner_sum() {
         panic!("expected one inner SUM");
     };
     assert_eq!(
-        grouping_input_expr_column_ids(&sum.args[0]),
+        grouping_input_expr_column_ids(&sum.source.arguments()[0]),
         [source_id].into()
     );
     let windows = first_window_exprs(&plan);
@@ -2506,7 +2508,7 @@ fn grouping_input_scalar_predicate_preserves_non_group_argument_columns() {
         panic!("expected one SUM");
     };
     assert_eq!(
-        grouping_input_expr_column_ids(&sum.args[0]),
+        grouping_input_expr_column_ids(&sum.source.arguments()[0]),
         [b.output_column_id].into()
     );
     assert_ne!(b.output_column_id, repeat_key_id);
@@ -2556,7 +2558,7 @@ fn grouping_input_quoted_column_name_cannot_replace_an_entire_aggregate() {
     };
     assert_eq!(sum.name, "sum");
     assert_eq!(
-        grouping_input_expr_column_ids(&sum.args[0]),
+        grouping_input_expr_column_ids(&sum.source.arguments()[0]),
         [source_id].into()
     );
     assert_eq!(column_ref_id(&project.items[0].expr), key_id);
@@ -3160,7 +3162,7 @@ fn array_agg_json_project_retains_semantics_above_exact_aggregate_slots() {
             .iter()
             .find(|call| call.output_column_id == column_id)
             .unwrap();
-        let selected = crate::functions::aggregate_result_type(&call.resolved);
+        let selected = crate::functions::aggregate_result_type(call.source.binding());
         assert_eq!(&reference.value_type, selected);
         assert_eq!(call.result_type, selected.data_type);
         let DataType::List(selected_item) = &selected.data_type else {

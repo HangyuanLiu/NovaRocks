@@ -251,7 +251,7 @@ fn try_rewrite_candidate(
         let value_type = candidate!(col_def.declared_value_type().ok());
         let source_type = match &mv_out.expr {
             SpjgOutputExpr::Dimension(expr) => cand.mv_scalars.value_type(*expr),
-            SpjgOutputExpr::Aggregate(call) => match &call.resolved.selected.result_type {
+            SpjgOutputExpr::Aggregate(call) => match &call.source.binding().selected.result_type {
                 novarocks_functions::FunctionResultType::Scalar(ty) => ty,
                 novarocks_functions::FunctionResultType::Relation(_) => return Ok(None),
             },
@@ -549,13 +549,17 @@ fn try_rewrite_candidate(
                     let mut aggregates = Vec::new();
                     for (idx, item) in plan.items.iter().enumerate() {
                         let original_column = &original_agg.output_layout.aggregate_columns[idx];
-                        let original_result =
-                            match &original_agg.aggregates[idx].resolved.selected.result_type {
-                                novarocks_functions::FunctionResultType::Scalar(ty) => ty,
-                                novarocks_functions::FunctionResultType::Relation(_) => {
-                                    return Ok(None);
-                                }
-                            };
+                        let original_result = match &original_agg.aggregates[idx]
+                            .source
+                            .binding()
+                            .selected
+                            .result_type
+                        {
+                            novarocks_functions::FunctionResultType::Scalar(ty) => ty,
+                            novarocks_functions::FunctionResultType::Relation(_) => {
+                                return Ok(None);
+                            }
+                        };
                         if !same_output_type(original_result, &original_column.value_type, control)?
                         {
                             return Ok(None);
@@ -571,7 +575,8 @@ fn try_rewrite_candidate(
                                 &[],
                                 true,
                                 original_agg.aggregates[idx]
-                                    .resolved
+                                    .source
+                                    .binding()
                                     .decimal_overflow_policy(),
                                 control,
                             )
@@ -602,10 +607,12 @@ fn try_rewrite_candidate(
                         aggregates.push(ScalarAggregateSpec {
                             output_column_id: column.column_id,
                             name: item.rollup_fn.to_string(),
-                            args: vec![arg],
                             distinct: false,
-                            order_by: vec![],
-                            resolved,
+                            source: crate::binding::AggregateArgumentSource::logical_update(
+                                vec![arg],
+                                vec![],
+                                resolved,
+                            ),
                         });
                         aggregate_columns.push(column);
                     }
@@ -677,7 +684,8 @@ fn try_rewrite_candidate(
                         children: vec![child_group],
                     });
                     let function_catalog = memo.function_catalog().snapshot();
-                    let items: Vec<ScalarProjectItem> = candidate!(
+                    let items: Vec<ScalarProjectItem> =
+                        candidate!(
                         original_agg
                             .output_columns
                             .iter()
@@ -703,8 +711,7 @@ fn try_rewrite_candidate(
                                                 &mut memo.scalars,
                                                 inner,
                                                 oc,
-                                                original_agg.aggregates[idx]
-                                                    .resolved
+                                                original_agg.aggregates[idx].source.binding()
                                                     .decimal_overflow_policy(),
                                                 control,
                                             ))
@@ -833,10 +840,10 @@ fn collect_aggregate_required_columns(
     aggregate: &ScalarAggregateSpec,
     out: &mut HashSet<ColumnId>,
 ) {
-    for arg in &aggregate.args {
+    for arg in aggregate.source.arguments() {
         collect_required_columns(arena, *arg, out);
     }
-    for key in &aggregate.order_by {
+    for key in aggregate.source.order_by() {
         collect_required_columns(arena, key.expr, out);
     }
 }
@@ -868,27 +875,32 @@ fn rewrite_aggregate_to_mv(
     query_base_names: &std::collections::HashMap<crate::column_id::ColumnId, String>,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<ScalarAggregateSpec>, crate::compiler::SqlCompileError> {
+    let arguments = candidate!(
+        call.source
+            .arguments()
+            .iter()
+            .map(|arg| col_map.rewrite(arena, *arg, query_base_names, control))
+            .map(Result::transpose)
+            .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+            .transpose()?
+    );
+    let order_by = candidate!(
+        call.source
+            .order_by()
+            .iter()
+            .map(|key| rewrite_sort_key(arena, key, col_map, query_base_names, control))
+            .map(Result::transpose)
+            .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+            .transpose()?
+    );
     Ok(Some(ScalarAggregateSpec {
         output_column_id: call.output_column_id,
         name: call.name.clone(),
-        args: candidate!(
-            call.args
-                .iter()
-                .map(|arg| col_map.rewrite(arena, *arg, query_base_names, control))
-                .map(Result::transpose)
-                .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
-                .transpose()?
-        ),
         distinct: call.distinct,
-        order_by: candidate!(
-            call.order_by
-                .iter()
-                .map(|key| rewrite_sort_key(arena, key, col_map, query_base_names, control))
-                .map(Result::transpose)
-                .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
-                .transpose()?
-        ),
-        resolved: call.resolved.clone(),
+        source: call.source.try_map_parts(
+            |_| Ok::<_, crate::compiler::SqlCompileError>(arguments),
+            |_| Ok::<_, crate::compiler::SqlCompileError>(order_by),
+        )?,
     }))
 }
 
@@ -1224,24 +1236,28 @@ mod tests {
     fn sum_call(arg: &OutputColumn, out: &OutputColumn) -> AggregateCall {
         AggregateCall {
             name: "sum".to_string(),
-            args: vec![col_ref(arg)],
             distinct: false,
             result_type: DataType::Int64,
-            order_by: vec![],
             output_column_id: out.column_id,
-            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![col_ref(arg)],
+                vec![],
+                crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            ),
         }
     }
 
     fn count_star(out: &OutputColumn) -> AggregateCall {
         AggregateCall {
             name: "count".to_string(),
-            args: vec![],
             distinct: false,
             result_type: DataType::Int64,
-            order_by: vec![],
             output_column_id: out.column_id,
-            resolved: crate::functions::test_resolved_aggregate("count", &[], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![],
+                vec![],
+                crate::functions::test_resolved_aggregate("count", &[], false),
+            ),
         }
     }
 
@@ -2223,7 +2239,7 @@ mod tests {
         // empty MV result is NULL where COUNT must be 0 -> COALESCE(sum, 0).
         let mv_a = col(100, "a");
         let mut mv_c = col(110, "c");
-        let count_type = match &count_star(&mv_c).resolved.selected.result_type {
+        let count_type = match &count_star(&mv_c).source.binding().selected.result_type {
             novarocks_functions::FunctionResultType::Scalar(ty) => ty.clone(),
             _ => panic!("COUNT must select a scalar result"),
         };
@@ -2265,9 +2281,13 @@ mod tests {
             panic!("expected MV aggregate");
         };
         let mv_count = &mut mv_aggregate.aggregates[0];
-        mv_count.resolved = crate::binding::SqlFunctionBinding::new(
-            mv_count.resolved.resolved().clone(),
-            novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+        mv_count.source = crate::binding::AggregateArgumentSource::uncertified(
+            mv_count.source.arguments().to_vec(),
+            mv_count.source.order_by().to_vec(),
+            crate::binding::SqlFunctionBinding::new(
+                mv_count.source.binding().resolved().clone(),
+                novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+            ),
         );
         let candidate = candidate_for(&mv_plan);
 
@@ -2275,9 +2295,13 @@ mod tests {
         let mut cnt = col(3, "cnt"); // original scalar count output id
         cnt.value_type = count_type;
         let mut count = count_star(&cnt);
-        count.resolved = crate::binding::SqlFunctionBinding::new(
-            count.resolved.resolved().clone(),
-            novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+        count.source = crate::binding::AggregateArgumentSource::uncertified(
+            count.source.arguments().to_vec(),
+            count.source.order_by().to_vec(),
+            crate::binding::SqlFunctionBinding::new(
+                count.source.binding().resolved().clone(),
+                novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+            ),
         );
         let query_plan = LogicalPlanNode::new(
             LogicalPlanKind::Aggregate(LogicalAggregateNode {
@@ -2371,7 +2395,10 @@ mod tests {
         assert_eq!(inner.aggregates.len(), 1);
         assert_eq!(inner.aggregates[0].name, "sum");
         assert_eq!(
-            inner.aggregates[0].resolved.decimal_overflow_policy(),
+            inner.aggregates[0]
+                .source
+                .binding()
+                .decimal_overflow_policy(),
             novarocks_type_contract::DecimalOverflowPolicy::ReportError
         );
         // The inner aggregate's output id is the freshly-minted one used by the

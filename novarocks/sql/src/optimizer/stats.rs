@@ -3513,15 +3513,17 @@ mod tests {
         fn count_call() -> AggregateCall {
             AggregateCall {
                 name: "count".to_string(),
-                args: vec![col_ref(2, "v")],
                 distinct: false,
                 result_type: arrow::datatypes::DataType::Int64,
-                order_by: vec![],
                 output_column_id: ColumnId::new_for_test(3),
-                resolved: crate::functions::test_resolved_aggregate(
-                    "count",
-                    &[arrow::datatypes::DataType::Int64],
-                    false,
+                source: crate::binding::AggregateArgumentSource::uncertified(
+                    vec![col_ref(2, "v")],
+                    vec![],
+                    crate::functions::test_resolved_aggregate(
+                        "count",
+                        &[arrow::datatypes::DataType::Int64],
+                        false,
+                    ),
                 ),
             }
         }

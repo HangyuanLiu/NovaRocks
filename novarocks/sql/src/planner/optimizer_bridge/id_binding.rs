@@ -223,11 +223,11 @@ fn verify_hash_aggregate(
     let aggregates = materialize_aggregate_calls(scalars, &op.aggregates, &op.output_layout);
     for (idx, aggregate) in aggregates.iter().enumerate() {
         if !op.is_merge.get(idx).copied().unwrap_or(false) {
-            for arg in &aggregate.args {
+            for arg in aggregate.source.arguments() {
                 verify_expr(arg, input, "PhysicalHashAggregate aggregate arg")?;
             }
             verify_sort_items(
-                &aggregate.order_by,
+                aggregate.source.order_by(),
                 input,
                 "PhysicalHashAggregate aggregate order-by",
             )?;
@@ -733,12 +733,14 @@ mod tests {
             .unwrap_or_else(ScalarArena::new);
         let aggregate_calls = vec![AggregateCall {
             name: "max".to_string(),
-            args: vec![column_ref(ColumnId::new_for_test(1), "a")],
             distinct: false,
             result_type: DataType::Int32,
-            order_by: vec![],
             output_column_id: aggregate_output_id,
-            resolved: crate::functions::test_resolved_aggregate("max", &[DataType::Int32], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![column_ref(ColumnId::new_for_test(1), "a")],
+                vec![],
+                crate::functions::test_resolved_aggregate("max", &[DataType::Int32], false),
+            ),
         }];
         let mut plan = OptimizedOperatorNode {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
@@ -870,12 +872,14 @@ mod tests {
         let mut scalars = ScalarArena::new();
         let aggregate_calls = vec![AggregateCall {
             name: "max".to_string(),
-            args: vec![column_ref(input_id, "a")],
             distinct: false,
             result_type: DataType::Int32,
-            order_by: vec![],
             output_column_id: aggregate_output_id,
-            resolved: crate::functions::test_resolved_aggregate("max", &[DataType::Int32], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![column_ref(input_id, "a")],
+                vec![],
+                crate::functions::test_resolved_aggregate("max", &[DataType::Int32], false),
+            ),
         }];
         let mut aggregate = OptimizedOperatorNode {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {

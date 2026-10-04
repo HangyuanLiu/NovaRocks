@@ -866,15 +866,13 @@ mod tests {
                 group_by: vec![col_expr(1, "region")],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
-                    args: vec![col_expr(2, "amount")],
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: Vec::new(),
                     output_column_id: ColumnId::new_for_test(3),
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "sum",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![col_expr(2, "amount")],
+                        Vec::new(),
+                        crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
                     ),
                 }],
                 output_columns: vec![output_column(1, "region"), output_column(3, "s")],

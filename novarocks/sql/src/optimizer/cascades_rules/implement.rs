@@ -2416,15 +2416,13 @@ mod two_phase_agg_tests {
     fn count_call(arg: &str, distinct: bool) -> AggregateCall {
         AggregateCall {
             name: "count".into(),
-            args: vec![col(arg)],
             distinct,
             result_type: DataType::Int64,
-            order_by: vec![],
             output_column_id: ColumnId::new_for_test(3),
-            resolved: crate::functions::test_resolved_aggregate(
-                "count",
-                &[DataType::Int64],
-                distinct,
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![col(arg)],
+                vec![],
+                crate::functions::test_resolved_aggregate("count", &[DataType::Int64], distinct),
             ),
         }
     }
@@ -2623,15 +2621,17 @@ mod two_phase_agg_tests {
                 vec![col("city")],
                 vec![AggregateCall {
                     name: "count".into(),
-                    args: vec![col("id")],
                     distinct: true,
                     result_type: DataType::Int64,
-                    order_by: vec![],
                     output_column_id: ColumnId::new_for_test(6),
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "count",
-                        &[DataType::Int64],
-                        true,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![col("id")],
+                        vec![],
+                        crate::functions::test_resolved_aggregate(
+                            "count",
+                            &[DataType::Int64],
+                            true,
+                        ),
                     ),
                 }],
                 vec![

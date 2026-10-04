@@ -753,10 +753,12 @@ pub(super) fn count_one_spec(
     Ok(ScalarAggregateSpec {
         output_column_id,
         name: "count".to_string(),
-        args: vec![int_literal(arena, 1, control)?],
         distinct: false,
-        order_by: vec![],
-        resolved,
+        source: crate::binding::AggregateArgumentSource::logical_update(
+            vec![int_literal(arena, 1, control)?],
+            vec![],
+            resolved,
+        ),
     })
 }
 
@@ -768,10 +770,12 @@ pub(super) fn any_value_spec(
     ScalarAggregateSpec {
         output_column_id,
         name: "any_value".to_string(),
-        args: vec![arg],
         distinct: false,
-        order_by: vec![],
-        resolved,
+        source: crate::binding::AggregateArgumentSource::logical_update(
+            vec![arg],
+            vec![],
+            resolved,
+        ),
     }
 }
 
@@ -895,10 +899,12 @@ mod tests {
                 vec![ScalarAggregateSpec {
                     output_column_id: count_id,
                     name: "count".to_string(),
-                    args: vec![],
                     distinct: false,
-                    order_by: vec![],
-                    resolved: crate::functions::test_resolved_aggregate("count", &[], false),
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![],
+                        vec![],
+                        crate::functions::test_resolved_aggregate("count", &[], false),
+                    ),
                 }],
                 AggregateOutputLayout::new(
                     vec![output_column(group_id, "k")],

@@ -67,13 +67,13 @@ fn norm_agg(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Option<NormExpr>, SqlCompileError> {
     let novarocks_functions::FunctionResultType::Scalar(value_type) =
-        &call.resolved.selected.result_type
+        &call.source.binding().selected.result_type
     else {
         work.step()?;
         return Ok(None);
     };
-    let mut order_by = Vec::with_capacity(call.order_by.len());
-    for key in &call.order_by {
+    let mut order_by = Vec::with_capacity(call.source.order_by().len());
+    for key in call.source.order_by() {
         work.flush()?;
         let Some(expr) = normalize(arena, key.expr, base_names, work.control())? else {
             return Ok(None);
@@ -85,8 +85,8 @@ fn norm_agg(
         });
         work.step()?;
     }
-    let mut args = Vec::with_capacity(call.args.len());
-    for arg in &call.args {
+    let mut args = Vec::with_capacity(call.source.arguments().len());
+    for arg in call.source.arguments() {
         work.flush()?;
         let Some(expr) = normalize(arena, *arg, base_names, work.control())? else {
             return Ok(None);
@@ -101,7 +101,7 @@ fn norm_agg(
         value_type: value_type.clone(),
         name: format!("agg:{}", call.name.to_ascii_lowercase()),
         distinct: call.distinct,
-        binding: Some(call.resolved.clone()),
+        binding: Some(call.source.binding().clone()),
         decimal_overflow_policy: None,
         argument_order: NormArgumentOrder::Ordered,
         order_by,
@@ -328,12 +328,14 @@ mod tests {
             .collect::<Vec<_>>();
         AggregateCall {
             name: name.to_string(),
-            args,
             distinct,
             result_type: DataType::Int64,
-            order_by: vec![],
             output_column_id,
-            resolved: crate::functions::test_resolved_aggregate(name, &argument_types, distinct),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                args,
+                vec![],
+                crate::functions::test_resolved_aggregate(name, &argument_types, distinct),
+            ),
         }
     }
 

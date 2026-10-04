@@ -1204,8 +1204,8 @@ fn rewrite_aggregate(
         if aggregate.is_merge.get(index).copied().unwrap_or(false) {
             continue;
         }
-        roots.extend(spec.args.iter().copied());
-        roots.extend(spec.order_by.iter().map(|key| key.expr));
+        roots.extend(spec.source.arguments().iter().copied());
+        roots.extend(spec.source.order_by().iter().map(|key| key.expr));
     }
     let commons = pick_commons(scalars, &roots);
     if commons.is_empty() {
@@ -1224,12 +1224,15 @@ fn rewrite_aggregate(
         if is_merge.get(index).copied().unwrap_or(false) {
             continue;
         }
-        for arg in &mut spec.args {
-            *arg = substitute(scalars, *arg, &subst, control)?;
-        }
-        for key in &mut spec.order_by {
-            key.expr = substitute(scalars, key.expr, &subst, control)?;
-        }
+        spec.source.rewrite_channels(|arguments, order_by| {
+            for arg in arguments {
+                *arg = substitute(scalars, *arg, &subst, control)?;
+            }
+            for key in order_by {
+                key.expr = substitute(scalars, key.expr, &subst, control)?;
+            }
+            Ok::<_, SqlCompileError>(())
+        })?;
     }
     insert_or_reuse_project_below(
         &mut node.children[0],
@@ -3021,25 +3024,29 @@ mod tests {
                     ScalarAggregateSpec {
                         output_column_id: ColumnId::new_for_test(201),
                         name: "sum".to_string(),
-                        args: vec![a_mul_b],
                         distinct: false,
-                        order_by: vec![],
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "sum",
-                            &[DataType::Int64],
-                            false,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![a_mul_b],
+                            vec![],
+                            crate::functions::test_resolved_aggregate(
+                                "sum",
+                                &[DataType::Int64],
+                                false,
+                            ),
                         ),
                     },
                     ScalarAggregateSpec {
                         output_column_id: ColumnId::new_for_test(202),
                         name: "avg".to_string(),
-                        args: vec![a_mul_b],
                         distinct: false,
-                        order_by: vec![],
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "avg",
-                            &[DataType::Int64],
-                            false,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![a_mul_b],
+                            vec![],
+                            crate::functions::test_resolved_aggregate(
+                                "avg",
+                                &[DataType::Int64],
+                                false,
+                            ),
                         ),
                     },
                 ],
@@ -3084,7 +3091,7 @@ mod tests {
         };
         for spec in &aggregate.aggregates {
             assert!(matches!(
-                arena.node(spec.args[0]),
+                arena.node(spec.source.arguments()[0]),
                 ScalarNode::ColumnRef(column_id) if *column_id == cse_column
             ));
         }
@@ -3135,25 +3142,29 @@ mod tests {
                     ScalarAggregateSpec {
                         output_column_id: ColumnId::new_for_test(201),
                         name: "sum".to_string(),
-                        args: vec![a_plus_b],
                         distinct: false,
-                        order_by: vec![],
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "sum",
-                            &[DataType::Int64],
-                            false,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![a_plus_b],
+                            vec![],
+                            crate::functions::test_resolved_aggregate(
+                                "sum",
+                                &[DataType::Int64],
+                                false,
+                            ),
                         ),
                     },
                     ScalarAggregateSpec {
                         output_column_id: ColumnId::new_for_test(202),
                         name: "avg".to_string(),
-                        args: vec![a_plus_b],
                         distinct: false,
-                        order_by: vec![],
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "avg",
-                            &[DataType::Int64],
-                            false,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![a_plus_b],
+                            vec![],
+                            crate::functions::test_resolved_aggregate(
+                                "avg",
+                                &[DataType::Int64],
+                                false,
+                            ),
                         ),
                     },
                 ],
@@ -3223,25 +3234,29 @@ mod tests {
                     ScalarAggregateSpec {
                         output_column_id: ColumnId::new_for_test(201),
                         name: "sum".to_string(),
-                        args: vec![a_mul_b],
                         distinct: false,
-                        order_by: vec![],
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "sum",
-                            &[DataType::Int64],
-                            false,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![a_mul_b],
+                            vec![],
+                            crate::functions::test_resolved_aggregate(
+                                "sum",
+                                &[DataType::Int64],
+                                false,
+                            ),
                         ),
                     },
                     ScalarAggregateSpec {
                         output_column_id: ColumnId::new_for_test(202),
                         name: "avg".to_string(),
-                        args: vec![a_mul_b],
                         distinct: false,
-                        order_by: vec![],
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "avg",
-                            &[DataType::Int64],
-                            false,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![a_mul_b],
+                            vec![],
+                            crate::functions::test_resolved_aggregate(
+                                "avg",
+                                &[DataType::Int64],
+                                false,
+                            ),
                         ),
                     },
                 ],
@@ -3273,7 +3288,7 @@ mod tests {
             panic!("expected physical aggregate");
         };
         for spec in &aggregate.aggregates {
-            assert_eq!(spec.args[0], a_mul_b);
+            assert_eq!(spec.source.arguments()[0], a_mul_b);
         }
     }
 
@@ -3293,25 +3308,29 @@ mod tests {
                     ScalarAggregateSpec {
                         output_column_id: ColumnId::new_for_test(201),
                         name: "array_agg".to_string(),
-                        args: vec![a],
                         distinct: false,
-                        order_by: vec![sort_key(a_mul_b)],
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "array_agg",
-                            &[DataType::Int64],
-                            false,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![a],
+                            vec![sort_key(a_mul_b)],
+                            crate::functions::test_resolved_aggregate(
+                                "array_agg",
+                                &[DataType::Int64],
+                                false,
+                            ),
                         ),
                     },
                     ScalarAggregateSpec {
                         output_column_id: ColumnId::new_for_test(202),
                         name: "array_agg".to_string(),
-                        args: vec![b],
                         distinct: false,
-                        order_by: vec![sort_key(a_mul_b)],
-                        resolved: crate::functions::test_resolved_aggregate(
-                            "array_agg",
-                            &[DataType::Int64],
-                            false,
+                        source: crate::binding::AggregateArgumentSource::uncertified(
+                            vec![b],
+                            vec![sort_key(a_mul_b)],
+                            crate::functions::test_resolved_aggregate(
+                                "array_agg",
+                                &[DataType::Int64],
+                                false,
+                            ),
                         ),
                     },
                 ],
@@ -3359,11 +3378,11 @@ mod tests {
         let Operator::PhysicalHashAggregate(aggregate) = &node.op else {
             panic!("expected physical aggregate");
         };
-        assert_eq!(aggregate.aggregates[0].args[0], a);
-        assert_eq!(aggregate.aggregates[1].args[0], b);
+        assert_eq!(aggregate.aggregates[0].source.arguments()[0], a);
+        assert_eq!(aggregate.aggregates[1].source.arguments()[0], b);
         for spec in &aggregate.aggregates {
             assert!(matches!(
-                arena.node(spec.order_by[0].expr),
+                arena.node(spec.source.order_by()[0].expr),
                 ScalarNode::ColumnRef(column_id) if *column_id == cse_column
             ));
         }

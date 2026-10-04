@@ -485,15 +485,13 @@ mod tests {
                 group_by: vec![],
                 aggregates: vec![AggregateCall {
                     name: "max".to_string(),
-                    args: vec![col_ref(T2_V2, "v2", DataType::Int64)],
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: vec![],
                     output_column_id: MAX_RESULT,
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "max",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![col_ref(T2_V2, "v2", DataType::Int64)],
+                        vec![],
+                        crate::functions::test_resolved_aggregate("max", &[DataType::Int64], false),
                     ),
                 }],
                 output_columns: vec![OutputColumn {
@@ -695,15 +693,13 @@ mod tests {
                 group_by: vec![],
                 aggregates: vec![AggregateCall {
                     name: "max".to_string(),
-                    args: vec![col_ref(T2_V2, "v2", DataType::Int64)],
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: vec![],
                     output_column_id: MAX_RESULT,
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "max",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![col_ref(T2_V2, "v2", DataType::Int64)],
+                        vec![],
+                        crate::functions::test_resolved_aggregate("max", &[DataType::Int64], false),
                     ),
                 }],
                 output_columns: vec![OutputColumn {
@@ -1011,15 +1007,13 @@ mod tests {
                 group_by: vec![],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
-                    args: vec![col_ref(T2_V2, "v2", DataType::Int64)],
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: vec![],
                     output_column_id: SUM_RESULT,
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "sum",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![col_ref(T2_V2, "v2", DataType::Int64)],
+                        vec![],
+                        crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
                     ),
                 }],
                 output_columns: vec![OutputColumn {

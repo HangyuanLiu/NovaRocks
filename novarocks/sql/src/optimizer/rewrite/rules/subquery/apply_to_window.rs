@@ -161,7 +161,7 @@ fn apply_plan_inner(
             phys_to_outer.insert((tab.clone(), name.clone()), oc.clone());
         }
     }
-    let mut agg_args = m.inner_agg.args.clone();
+    let mut agg_args = m.inner_agg.source.arguments().to_vec();
     for arg in &mut agg_args {
         let Some(remapped) =
             remap_inner_to_outer(arena, *arg, &inner_map, &phys_to_outer, &ctx.control_view())?
@@ -196,9 +196,9 @@ fn apply_plan_inner(
         name: m.inner_agg.name.clone(),
         args: agg_args,
         distinct: m.inner_agg.distinct,
-        binding: m.inner_agg.resolved.clone(),
-        function_order_by: m.inner_agg.order_by.clone(),
-        aggregate_binding: Some(m.inner_agg.resolved.clone()),
+        binding: m.inner_agg.source.binding().clone(),
+        function_order_by: m.inner_agg.source.order_by().to_vec(),
+        aggregate_binding: Some(m.inner_agg.source.binding().clone()),
         partition_by: m.partition_by.clone(),
         order_by: vec![],
         window_frame: None,
@@ -914,15 +914,17 @@ mod tests {
                 group_by: vec![col_ref(INNER_L_PARTKEY, "l_partkey", DataType::Int64)],
                 aggregates: vec![AggregateCall {
                     name: "avg".to_string(),
-                    args: vec![col_ref(INNER_L_QUANTITY, "l_quantity", DataType::Float64)],
                     distinct: false,
                     result_type: DataType::Float64,
-                    order_by: vec![],
                     output_column_id: AVG_RESULT,
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "avg",
-                        &[DataType::Float64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![col_ref(INNER_L_QUANTITY, "l_quantity", DataType::Float64)],
+                        vec![],
+                        crate::functions::test_resolved_aggregate(
+                            "avg",
+                            &[DataType::Float64],
+                            false,
+                        ),
                     ),
                 }],
                 output_columns: vec![
@@ -1871,15 +1873,13 @@ mod tests {
             group_by: vec![col_ref(INNER_L_PARTKEY, "l_partkey", DataType::Int64)],
             aggregates: vec![AggregateCall {
                 name: "avg".to_string(),
-                args: vec![col_ref(INNER_L_QUANTITY, "l_quantity", DataType::Float64)],
                 distinct: false,
                 result_type: DataType::Float64,
-                order_by: vec![],
                 output_column_id: AVG_RESULT,
-                resolved: crate::functions::test_resolved_aggregate(
-                    "avg",
-                    &[DataType::Float64],
-                    false,
+                source: crate::binding::AggregateArgumentSource::uncertified(
+                    vec![col_ref(INNER_L_QUANTITY, "l_quantity", DataType::Float64)],
+                    vec![],
+                    crate::functions::test_resolved_aggregate("avg", &[DataType::Float64], false),
                 ),
             }],
             output_columns: vec![
@@ -2125,15 +2125,17 @@ mod tests {
                 group_by: vec![],
                 aggregates: vec![AggregateCall {
                     name: "avg".to_string(),
-                    args: vec![col_ref(INNER_L_QUANTITY, "l_quantity", DataType::Float64)],
                     distinct: false,
                     result_type: DataType::Float64,
-                    order_by: vec![],
                     output_column_id: AVG_RESULT,
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "avg",
-                        &[DataType::Float64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![col_ref(INNER_L_QUANTITY, "l_quantity", DataType::Float64)],
+                        vec![],
+                        crate::functions::test_resolved_aggregate(
+                            "avg",
+                            &[DataType::Float64],
+                            false,
+                        ),
                     ),
                 }],
                 output_columns: vec![OutputColumn {

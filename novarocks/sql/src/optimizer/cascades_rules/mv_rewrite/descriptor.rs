@@ -566,7 +566,9 @@ fn references_any(arena: &ScalarArena, expr: ScalarId, ids: &[ColumnId]) -> bool
 }
 
 fn aggregate_has_order_by(agg: &LogicalAggregateOp) -> bool {
-    agg.aggregates.iter().any(|call| !call.order_by.is_empty())
+    agg.aggregates
+        .iter()
+        .any(|call| !call.source.order_by().is_empty())
 }
 
 fn substitute_aggregate(
@@ -575,20 +577,22 @@ fn substitute_aggregate(
     defs: &HashMap<ColumnId, ScalarId>,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<ScalarAggregateSpec>, crate::compiler::SqlCompileError> {
-    if !call.order_by.is_empty() {
+    if !call.source.order_by().is_empty() {
         return Ok(None);
     }
     Ok(Some(ScalarAggregateSpec {
         output_column_id: call.output_column_id,
         name: call.name.clone(),
-        args: call
-            .args
-            .iter()
-            .map(|arg| substitute_scalar(arena, *arg, defs, control))
-            .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?,
         distinct: call.distinct,
-        order_by: vec![],
-        resolved: call.resolved.clone(),
+        source: call.source.try_map_parts(
+            |arguments| {
+                arguments
+                    .iter()
+                    .map(|arg| substitute_scalar(arena, *arg, defs, control))
+                    .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()
+            },
+            |_| Ok::<_, crate::compiler::SqlCompileError>(vec![]),
+        )?,
     }))
 }
 
@@ -1638,15 +1642,13 @@ mod tests {
                 group_by: vec![col_ref(&a)],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
-                    args: vec![col_ref(&v)],
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: vec![],
                     output_column_id: sum_out.column_id,
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "sum",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![col_ref(&v)],
+                        vec![],
+                        crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
                     ),
                 }],
                 output_columns: vec![col(1, "a"), sum_out.clone()],
@@ -1864,15 +1866,13 @@ mod tests {
                 group_by: vec![col_ref(&a)],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
-                    args: vec![col_ref(&v)],
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: vec![],
                     output_column_id: sum_out.column_id,
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "sum",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![col_ref(&v)],
+                        vec![],
+                        crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
                     ),
                 }],
                 output_columns: vec![col(1, "a"), sum_out.clone()],
@@ -1938,15 +1938,13 @@ mod tests {
             &mut memo.scalars,
             &[AggregateCall {
                 name: "sum".to_string(),
-                args: vec![col_ref(&v)],
                 distinct: false,
                 result_type: DataType::Int64,
-                order_by: vec![],
                 output_column_id: sum_out.column_id,
-                resolved: crate::functions::test_resolved_aggregate(
-                    "sum",
-                    &[DataType::Int64],
-                    false,
+                source: crate::binding::AggregateArgumentSource::uncertified(
+                    vec![col_ref(&v)],
+                    vec![],
+                    crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
                 ),
             }],
             crate::optimizer::test_optimizer_control(),

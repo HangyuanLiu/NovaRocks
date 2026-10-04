@@ -1005,11 +1005,9 @@ pub(crate) struct WindowExpr {
 #[derive(Clone, Debug)]
 pub(crate) struct AggregateCall {
     pub name: String,
-    pub args: Vec<TypedExpr>,
     pub distinct: bool,
     pub result_type: DataType,
-    pub order_by: Vec<SortItem>,
-    pub resolved: crate::binding::SqlFunctionBinding,
+    pub source: crate::binding::AggregateArgumentSource<TypedExpr, SortItem>,
     /// G1: id of THIS aggregate's output column. Planner-created calls are
     /// minted by `collect_aggregates`; rewrite paths should preserve existing
     /// ids or allocate ids for newly-defined aggregate outputs. Fixtures and

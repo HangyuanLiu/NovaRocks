@@ -146,13 +146,17 @@ pub(crate) fn intern_aggregate_call(
         "AggregateCall {} must carry output_column_id before optimizer bridge",
         call.name
     );
+    let arguments = intern_exprs(arena, call.source.arguments(), control)?;
+    let order_by = intern_sort_items(arena, call.source.order_by(), control)?;
+    let source = call.source.try_map_parts(
+        |_| Ok::<_, crate::compiler::SqlCompileError>(arguments),
+        |_| Ok::<_, crate::compiler::SqlCompileError>(order_by),
+    )?;
     Ok(ScalarAggregateSpec {
         output_column_id: call.output_column_id,
         name: call.name.clone(),
-        args: intern_exprs(arena, &call.args, control)?,
+        source,
         distinct: call.distinct,
-        order_by: intern_sort_items(arena, &call.order_by, control)?,
-        resolved: call.resolved.clone(),
     })
 }
 
@@ -200,14 +204,19 @@ pub(crate) fn materialize_aggregate_call(
     output_layout: &AggregateOutputLayout,
 ) -> AggregateCall {
     let output_column = aggregate_output_column(call, output_layout);
+    let source = match call.source.try_map_parts(
+        |arguments| Ok::<_, std::convert::Infallible>(materialize_exprs(arena, arguments)),
+        |order_by| Ok::<_, std::convert::Infallible>(materialize_sort_keys(arena, order_by)),
+    ) {
+        Ok(source) => source,
+        Err(never) => match never {},
+    };
     AggregateCall {
         name: call.name.clone(),
-        args: materialize_exprs(arena, &call.args),
+        source,
         distinct: call.distinct,
         result_type: output_column.value_type.data_type.clone(),
-        order_by: materialize_sort_keys(arena, &call.order_by),
         output_column_id: call.output_column_id,
-        resolved: call.resolved.clone(),
     }
 }
 
@@ -395,20 +404,22 @@ mod tests {
     fn aggregate_call(output_column_id: ColumnId, name: &str) -> AggregateCall {
         AggregateCall {
             name: name.to_string(),
-            args: vec![],
             distinct: false,
             result_type: DataType::Int64,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate(
-                name,
-                if name == "count" {
-                    &[]
-                } else {
-                    &[DataType::Int64]
-                },
-                false,
-            ),
             output_column_id,
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![],
+                vec![],
+                crate::functions::test_resolved_aggregate(
+                    name,
+                    if name == "count" {
+                        &[]
+                    } else {
+                        &[DataType::Int64]
+                    },
+                    false,
+                ),
+            ),
         }
     }
 
@@ -416,17 +427,19 @@ mod tests {
         ScalarAggregateSpec {
             output_column_id,
             name: name.to_string(),
-            args: vec![],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate(
-                name,
-                if name == "count" {
-                    &[]
-                } else {
-                    &[DataType::Int64]
-                },
-                false,
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![],
+                vec![],
+                crate::functions::test_resolved_aggregate(
+                    name,
+                    if name == "count" {
+                        &[]
+                    } else {
+                        &[DataType::Int64]
+                    },
+                    false,
+                ),
             ),
         }
     }
@@ -561,10 +574,12 @@ mod tests {
         let spec = ScalarAggregateSpec {
             output_column_id: output_id,
             name: "avg".into(),
-            args: vec![argument_id],
             distinct: false,
-            order_by: vec![],
-            resolved: binding.clone(),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![argument_id],
+                vec![],
+                binding.clone(),
+            ),
         };
         let layout = AggregateOutputLayout::new(
             vec![OutputColumn {
@@ -583,9 +598,12 @@ mod tests {
         let materialized = materialize_aggregate_call(&arena, &spec, &layout);
         assert_eq!(materialized.output_column_id, output_id);
         assert_eq!(materialized.result_type, intermediate.data_type);
-        assert_eq!(materialized.args[0].value_type, *argument_type);
+        assert_eq!(
+            materialized.source.arguments()[0].value_type,
+            *argument_type
+        );
         assert!(std::ptr::eq(
-            materialized.resolved.as_ref(),
+            materialized.source.binding().as_ref(),
             binding.as_ref()
         ));
         assert_eq!(

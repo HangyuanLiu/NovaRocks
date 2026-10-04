@@ -54,11 +54,11 @@ fn has_two_phase_merge(name: &str) -> bool {
 
 #[cfg(test)]
 pub(crate) fn aggregate_mergeability(call: &AggregateCall) -> AggMergeability {
-    aggregate_mergeability_from_parts(&call.name, call.distinct, call.order_by.is_empty())
+    aggregate_mergeability_from_parts(&call.name, call.distinct, call.source.order_by().is_empty())
 }
 
 pub(crate) fn scalar_aggregate_mergeability(call: &ScalarAggregateSpec) -> AggMergeability {
-    aggregate_mergeability_from_parts(&call.name, call.distinct, call.order_by.is_empty())
+    aggregate_mergeability_from_parts(&call.name, call.distinct, call.source.order_by().is_empty())
 }
 
 fn aggregate_mergeability_from_parts(
@@ -104,20 +104,22 @@ mod tests {
             .collect::<Vec<_>>();
         AggregateCall {
             name: name.into(),
-            args,
             distinct,
             result_type: DataType::Float64,
-            order_by: if ordered {
-                vec![SortItem {
-                    expr: arg(DataType::Int64),
-                    asc: true,
-                    nulls_first: false,
-                }]
-            } else {
-                vec![]
-            },
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                args,
+                if ordered {
+                    vec![SortItem {
+                        expr: arg(DataType::Int64),
+                        asc: true,
+                        nulls_first: false,
+                    }]
+                } else {
+                    vec![]
+                },
+                crate::functions::test_resolved_aggregate(name, &argument_types, distinct),
+            ),
             output_column_id: ColumnId::UNSET,
-            resolved: crate::functions::test_resolved_aggregate(name, &argument_types, distinct),
         }
     }
 

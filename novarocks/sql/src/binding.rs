@@ -23,7 +23,14 @@
 //! layers and are copied into the final physical-plan contract only at its
 //! lowering boundary.
 
+mod aggregate_request;
+mod aggregate_source;
+pub(crate) use aggregate_request::{
+    AggregateRequestCaptureError, CapturedAggregateLogicalRequest,
+    capture_aggregate_logical_request,
+};
 pub(crate) mod observed;
+pub(crate) use aggregate_source::AggregateArgumentSource;
 
 use std::{
     num::{NonZeroU32, NonZeroU64},

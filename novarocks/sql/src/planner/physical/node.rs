@@ -342,7 +342,7 @@ pub(crate) fn hash_aggregate_outputs_intermediate(mode: AggMode) -> bool {
 /// Only the call's positional `args` participate (matching the wire the encoder
 /// historically emitted); `order_by` inputs are intentionally excluded.
 pub(crate) fn aggregate_intermediate_type(call: &AggregateCall) -> Result<DataType, String> {
-    Ok(crate::functions::aggregate_selection(&call.resolved)
+    Ok(crate::functions::aggregate_selection(call.source.binding())
         .intermediate_type
         .data_type
         .clone())
@@ -370,18 +370,21 @@ mod aggregate_wire_tests {
         let resolved = crate::functions::test_resolved_aggregate(name, &args, distinct);
         AggregateCall {
             name: name.to_string(),
-            args: args
-                .into_iter()
-                .map(|data_type| TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Int(1)),
-                    value_type: novarocks_type_contract::FunctionValueType::new(data_type, true),
-                })
-                .collect(),
             distinct,
             result_type: DataType::Int64,
-            order_by: Vec::new(),
             output_column_id: ColumnId::new_for_test(1),
-            resolved,
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                args.into_iter()
+                    .map(|data_type| TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::Int(1)),
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            data_type, true,
+                        ),
+                    })
+                    .collect(),
+                Vec::new(),
+                resolved,
+            ),
         }
     }
 

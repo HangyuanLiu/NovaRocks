@@ -5051,12 +5051,14 @@ impl<'a> ContractLoweringVisitor<'a> {
             let mut order_by = Vec::new();
             if phase.consumes_logical_arguments() {
                 arguments = call
-                    .args
+                    .source
+                    .arguments()
                     .iter()
                     .map(|argument| self.lower_expression(node, argument, &child.columns))
                     .collect::<Result<Vec<_>, _>>()?;
                 order_by = call
-                    .order_by
+                    .source
+                    .order_by()
                     .iter()
                     .map(|item| {
                         Ok(SortExpr {
@@ -5084,7 +5086,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 // with -- the planner keeps the flag on every phase of a
                 // `count(distinct x)` because it is how the call is named --
                 // and the phase simply does not apply it again.
-                if !call.order_by.is_empty() {
+                if !call.source.order_by().is_empty() {
                     return Err(ContractLoweringError::InvalidAggregate {
                         detail: "state-consuming aggregate carries no ORDER BY",
                     });
@@ -9309,14 +9311,15 @@ fn lower_aggregate_binding(
     call: &crate::planner::payload::AggregateCall,
     phase: AggregatePhase,
 ) -> Result<AggregateBinding, ContractLoweringError> {
-    let resolved = &call.resolved;
+    let resolved = call.source.binding();
     if resolved.kind != novarocks_physical_plan::FunctionKind::Aggregate {
         return Err(ContractLoweringError::InvalidAggregate {
             detail: "call carries a non-aggregate function binding",
         });
     }
-    if resolved.logical_argument_count != call.args.len()
-        || resolved.selected.argument_types.len() != call.args.len() + call.order_by.len()
+    if resolved.logical_argument_count != call.source.arguments().len()
+        || resolved.selected.argument_types.len()
+            != call.source.arguments().len() + call.source.order_by().len()
     {
         return Err(ContractLoweringError::InvalidAggregate {
             detail: "binding logical/ORDER BY arity differs from the call",
@@ -11998,11 +12001,13 @@ mod tests {
     ) -> crate::planner::payload::AggregateCall {
         crate::planner::payload::AggregateCall {
             name: "sum".into(),
-            args: vec![argument],
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![argument],
+                Vec::new(),
+                crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            ),
             distinct: false,
             result_type: DataType::Int64,
-            order_by: Vec::new(),
-            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
             output_column_id,
         }
     }

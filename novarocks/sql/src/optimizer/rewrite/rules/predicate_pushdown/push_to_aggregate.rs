@@ -337,17 +337,19 @@ mod tests {
         let count_spec = ScalarAggregateSpec {
             output_column_id: test_col_id("sum_b"),
             name: "sum".into(),
-            args: vec![
-                intern_typed(
-                    arena,
-                    &col_typed_expr("b"),
-                    crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
-                )
-                .unwrap(),
-            ],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![
+                    intern_typed(
+                        arena,
+                        &col_typed_expr("b"),
+                        crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+                    )
+                    .unwrap(),
+                ],
+                vec![],
+                crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            ),
         };
         let aggregates = vec![count_spec];
         let output_columns = vec![output_col("a"), output_col("sum_b")];

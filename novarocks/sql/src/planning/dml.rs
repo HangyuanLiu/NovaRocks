@@ -2582,36 +2582,26 @@ fn build_statistics_connector_physical(
 
             is_internal: true,
         });
+        let result_type = crate::functions::aggregate_result_type(&resolved)
+            .data_type
+            .clone();
+        // Both phases retain the original logical update source. The merge
+        // lowerer selects the materialized state channel independently.
+        let source =
+            crate::binding::AggregateArgumentSource::logical_update(args, Vec::new(), resolved);
         local_calls.push(crate::planner::payload::AggregateCall {
             name: requirement.function_name().to_string(),
-            args,
             distinct: false,
-            result_type: crate::functions::aggregate_result_type(&resolved)
-                .data_type
-                .clone(),
-            order_by: Vec::new(),
+            result_type: result_type.clone(),
+            source: source.clone(),
             output_column_id: partial_output_id,
-            resolved: resolved.clone(),
         });
         global_calls.push(crate::planner::payload::AggregateCall {
             name: requirement.function_name().to_string(),
-            args: vec![crate::analysis::TypedExpr {
-                kind: crate::analysis::ExprKind::ColumnRef {
-                    column_id: partial_output_id,
-                    qualifier: None,
-                    column: format!("analyze_state_{index}"),
-                },
-                value_type: crate::functions::aggregate_selection(&resolved)
-                    .intermediate_type
-                    .clone(),
-            }],
             distinct: false,
-            result_type: crate::functions::aggregate_result_type(&resolved)
-                .data_type
-                .clone(),
-            order_by: Vec::new(),
+            result_type,
+            source,
             output_column_id: final_output_id,
-            resolved,
         });
     }
 
@@ -3088,26 +3078,102 @@ mod tests {
         )
         .expect("requirement");
 
+        let scan_source = super::StatisticsConnectorScan {
+            binding: crate::binding::SqlTableBindingId::new_for_test(1),
+            catalog: "iceberg".into(),
+            namespace: "db".into(),
+            table: "t".into(),
+            version_ordinal: 42,
+            columns: vec![
+                StatisticsScanColumn::try_new(
+                    0,
+                    "id",
+                    novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Int64,
+                        true,
+                    ),
+                )
+                .expect("scan column"),
+            ],
+        };
+        let physical = super::build_statistics_connector_physical(
+            scan_source.clone(),
+            std::slice::from_ref(&requirement),
+            &functions,
+            novarocks_physical_plan::ProviderReadOccurrenceId::new(37),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .expect("ANALYZE physical source");
+        // Project -> Unpivot -> Global -> Gather -> Local -> Scan is the
+        // production two-phase tree, before runtime state-channel lowering.
+        let global_node = &physical.children[0].children[0];
+        let local_node = &global_node.children[0].children[0];
+        let crate::planner::physical::PhysicalPlanKind::HashAggregate(global_source) =
+            &global_node.kind
+        else {
+            panic!("expected Global aggregate");
+        };
+        let crate::planner::physical::PhysicalPlanKind::HashAggregate(local_source) =
+            &local_node.kind
+        else {
+            panic!("expected Local aggregate");
+        };
+        assert_eq!(
+            global_source.mode,
+            crate::planner::physical::AggMode::Global
+        );
+        assert_eq!(local_source.mode, crate::planner::physical::AggMode::Local);
+        assert_eq!(global_source.is_merge, [true]);
+        assert_eq!(local_source.is_merge, [false]);
+        let local_call = &local_source.aggregates[0];
+        let global_call = &global_source.aggregates[0];
+        let (local_args, local_order, local_binding) = local_call
+            .source
+            .logical_parts()
+            .expect("Local authors a certified logical update");
+        let (global_args, global_order, global_binding) = global_call
+            .source
+            .logical_parts()
+            .expect("Global transfers the certified update source");
+        assert!(std::ptr::eq(
+            local_binding.resolved(),
+            global_binding.resolved()
+        ));
+        assert_eq!(
+            local_binding.decimal_overflow_policy(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull
+        );
+        assert!(local_order.is_empty() && global_order.is_empty());
+        assert_eq!(local_args.len(), 1);
+        assert_eq!(global_args.len(), 1);
+        let scan_input = &local_node.children[0].output_columns[0];
+        for argument in [&local_args[0], &global_args[0]] {
+            assert_eq!(argument.value_type, scan_input.value_type);
+            assert_eq!(
+                argument.value_type,
+                requirement.input().value_type().clone()
+            );
+            let crate::analysis::ExprKind::ColumnRef {
+                column_id, column, ..
+            } = &argument.kind
+            else {
+                panic!("logical update must read the original scan column");
+            };
+            assert_eq!(*column_id, scan_input.column_id);
+            assert_eq!(column, "id");
+            assert_ne!(*column_id, local_call.output_column_id);
+        }
+        assert_eq!(
+            local_node.output_columns[0].value_type.data_type,
+            arrow::datatypes::DataType::Binary
+        );
+        assert_eq!(global_call.result_type, arrow::datatypes::DataType::Binary);
+
         let plan = super::build_final_statistics_connector_plan(
-            super::StatisticsConnectorScan {
-                binding: crate::binding::SqlTableBindingId::new_for_test(1),
-                catalog: "iceberg".into(),
-                namespace: "db".into(),
-                table: "t".into(),
-                version_ordinal: 42,
-                columns: vec![
-                    StatisticsScanColumn::try_new(
-                        0,
-                        "id",
-                        novarocks_type_contract::FunctionValueType::new(
-                            arrow::datatypes::DataType::Int64,
-                            true,
-                        ),
-                    )
-                    .expect("scan column"),
-                ],
-            },
-            &[requirement],
+            scan_source,
+            std::slice::from_ref(&requirement),
             &functions,
             &SessionOptimizerSettings::default(),
             statistics_final_context(),
@@ -3148,6 +3214,16 @@ mod tests {
                         }) =>
                     {
                         local += 1;
+                        assert_eq!(calls[0].arguments.len(), 1);
+                        assert_eq!(
+                            fragment
+                                .expressions()
+                                .get(calls[0].arguments[0])
+                                .unwrap()
+                                .ty,
+                            requirement.input().value_type().clone(),
+                            "Partial runtime channel reads the original logical input"
+                        );
                     }
                     NodeKind::Aggregate { calls, .. }
                         if calls.iter().all(|call| {
@@ -3155,6 +3231,23 @@ mod tests {
                         }) =>
                     {
                         global += 1;
+                        assert_eq!(calls[0].arguments.len(), 1);
+                        assert_eq!(
+                            fragment
+                                .expressions()
+                                .get(calls[0].arguments[0])
+                                .unwrap()
+                                .ty,
+                            calls[0].binding.intermediate_type,
+                            "Final runtime channel reads the actual materialized state"
+                        );
+                        assert_eq!(
+                            calls[0].binding.function.argument_types[0],
+                            novarocks_type_contract::FunctionArgumentType::Value(
+                                requirement.input().value_type().clone()
+                            ),
+                            "Final still carries the original logical signature"
+                        );
                     }
                     NodeKind::ExchangeSource { .. } => exchange += 1,
                     NodeKind::Unpivot { spec } => {
