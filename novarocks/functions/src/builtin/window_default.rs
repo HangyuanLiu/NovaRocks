@@ -18,6 +18,7 @@
 //! The original safe Arrow default conversion on complete logical partition rows.
 //! This private prerequisite is not a function catalogue or a host memory grant.
 
+use crate::builtin::window_default_numeric::NumericDefaultRecipe;
 use crate::kernel_control::{compile_failure, internal, invalid};
 use crate::kernel_input::{
     EvaluationCheckpoints, validate_argument_observed, validate_type_observed,
@@ -33,10 +34,10 @@ use novarocks_type_contract::{
 };
 use std::{alloc::Layout, ops::Range};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 enum Conversion {
     Identity,
-    Signed,
+    Numeric(NumericDefaultRecipe),
     Parse,
     Format,
     Null,
@@ -49,10 +50,15 @@ pub(super) struct DefaultValueRecipe {
     conversion: Conversion,
 }
 
-fn signed(ty: &DataType) -> bool {
+fn numeric(ty: &DataType) -> bool {
     matches!(
         ty,
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
     )
 }
 
@@ -68,7 +74,7 @@ impl DefaultValueRecipe {
             validate_type_observed(source, &mut work)?;
             validate_type_observed(target, &mut work)?;
             let supported_target = target.nullable
-                && (signed(&target.data_type) || target.data_type == DataType::Utf8);
+                && (numeric(&target.data_type) || target.data_type == DataType::Utf8);
             work.step().map_err(compile_failure)?;
             if !supported_target {
                 return Err(invalid(
@@ -77,7 +83,10 @@ impl DefaultValueRecipe {
             }
             let physical = source.logical_type == ValueLogicalType::Physical
                 && target.logical_type == ValueLogicalType::Physical;
-            let conversion = if source.data_type == target.data_type
+            let numeric_recipe = NumericDefaultRecipe::try_new(source, target, &mut work)?;
+            let conversion = if let Some(recipe) = numeric_recipe {
+                Conversion::Numeric(recipe)
+            } else if source.data_type == target.data_type
                 && source.logical_type == target.logical_type
             {
                 Conversion::Identity
@@ -85,8 +94,6 @@ impl DefaultValueRecipe {
                 && source.logical_type == ValueLogicalType::Physical
             {
                 Conversion::Null
-            } else if physical && signed(&source.data_type) && signed(&target.data_type) {
-                Conversion::Signed
             } else if physical
                 && source.data_type == DataType::Utf8
                 && target.data_type == DataType::Int64
@@ -135,31 +142,18 @@ impl DefaultValueRecipe {
     /// not an allocation grant or a bound on temporary cast/take coexistence,
     /// Arc headers, private Bytes owners, or installed host accounting.
     pub(super) fn retained_upper_bound(&self, rows: usize) -> Result<usize, KernelFailure> {
+        if let Conversion::Numeric(recipe) = &self.conversion {
+            return recipe.retained_upper_bound(rows);
+        }
+        if numeric(&self.target.data_type) {
+            return NumericDefaultRecipe::retained_target_upper_bound(&self.target.data_type, rows);
+        }
         let bitmap = round64(
             rows.checked_add(7)
                 .ok_or(KernelFailure::ResourceExhausted)?
                 / 8,
         )?;
         let (header, values, offsets, nulls) = match &self.target.data_type {
-            DataType::Int8 => (std::mem::size_of::<Int8Array>(), round64(rows)?, 0, bitmap),
-            DataType::Int16 => (
-                std::mem::size_of::<Int16Array>(),
-                round64(mul(rows, 2)?)?,
-                0,
-                bitmap,
-            ),
-            DataType::Int32 => (
-                std::mem::size_of::<Int32Array>(),
-                round64(mul(rows, 4)?)?,
-                0,
-                bitmap,
-            ),
-            DataType::Int64 => (
-                std::mem::size_of::<Int64Array>(),
-                round64(mul(rows, 8)?)?,
-                0,
-                bitmap,
-            ),
             DataType::Utf8 => {
                 let offsets = rows
                     .checked_add(1)
@@ -215,21 +209,29 @@ impl DefaultValueRecipe {
         validate_argument_observed(input, Selection::all(rows), &self.source, control)?;
         let mut work = EvaluationCheckpoints::new(control);
         let result = (|| {
-            let class = match &self.source.data_type {
-                DataType::Int8 => input.array().as_any().is::<Int8Array>(),
-                DataType::Int16 => input.array().as_any().is::<Int16Array>(),
-                DataType::Int32 => input.array().as_any().is::<Int32Array>(),
-                DataType::Int64 => input.array().as_any().is::<Int64Array>(),
-                DataType::Utf8 => input.array().as_any().is::<StringArray>(),
-                DataType::Null => input.array().as_any().is::<NullArray>(),
-                _ => false,
+            let class = if let Conversion::Numeric(recipe) = &self.conversion {
+                recipe.source_class(input.array().as_ref())
+            } else {
+                match &self.source.data_type {
+                    DataType::Int8 => input.array().as_any().is::<Int8Array>(),
+                    DataType::Int16 => input.array().as_any().is::<Int16Array>(),
+                    DataType::Int32 => input.array().as_any().is::<Int32Array>(),
+                    DataType::Int64 => input.array().as_any().is::<Int64Array>(),
+                    DataType::Utf8 => input.array().as_any().is::<StringArray>(),
+                    DataType::Null => input.array().as_any().is::<NullArray>(),
+                    _ => false,
+                }
             };
             work.step()?;
             if !class {
                 return Err(invalid("window default source has a foreign carrier class"));
             }
             gather_layout(rows)?;
-            output_layout(&self.target.data_type, rows, 0)?;
+            if let Conversion::Numeric(recipe) = &self.conversion {
+                recipe.preflight_output(rows)?;
+            } else {
+                output_layout(&self.target.data_type, rows, 0)?;
+            }
             if matches!(self.conversion, Conversion::Format) {
                 let array = input
                     .array()
@@ -367,16 +369,15 @@ fn gather_layout(rows: usize) -> Result<(), KernelFailure> {
     Ok(())
 }
 fn output_layout(ty: &DataType, rows: usize, bytes: usize) -> Result<(), KernelFailure> {
+    if numeric(ty) {
+        return NumericDefaultRecipe::preflight_target(ty, rows);
+    }
     let bitmap = rows
         .checked_add(7)
         .ok_or(KernelFailure::ResourceExhausted)?
         / 8;
     Layout::array::<u8>(bitmap).map_err(|_| KernelFailure::ResourceExhausted)?;
     match ty {
-        DataType::Int8 => Layout::array::<i8>(rows),
-        DataType::Int16 => Layout::array::<i16>(rows),
-        DataType::Int32 => Layout::array::<i32>(rows),
-        DataType::Int64 => Layout::array::<i64>(rows),
         DataType::Utf8 => {
             i32::try_from(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
             Layout::array::<u8>(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;

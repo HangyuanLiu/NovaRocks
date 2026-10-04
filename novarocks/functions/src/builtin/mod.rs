@@ -138,6 +138,7 @@ mod table_unnest_tests;
 mod truncate;
 mod truncate_owner;
 mod window_default;
+mod window_default_numeric;
 mod window_ntile;
 mod window_ntile_owner;
 mod window_offset;

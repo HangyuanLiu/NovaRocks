@@ -658,7 +658,7 @@ fn admitted_non_power_of_two_dop_and_wide_result_sink_are_refused() {
 }
 
 #[test]
-fn duplicate_produced_value_and_multiple_empty_source_rows_do_not_enter_first_family() {
+fn duplicate_produced_value_refuses_and_multiple_empty_source_rows_preserve_cardinality() {
     let functions = rng_subset();
     let duplicate = package_with_case(&functions, 2, PackageCase::DuplicateProducedValue);
     let project = &duplicate.fragment().nodes()[&NodeId::new(41)];
@@ -675,10 +675,23 @@ fn duplicate_produced_value_and_multiple_empty_source_rows_do_not_enter_first_fa
         ))
     ));
     let two_rows = package_with_case(&functions, 2, PackageCase::TwoEmptyRows);
-    assert!(matches!(
-        compile_fragment(providers(two_rows), &functions, options(1), &FixtureControl),
-        Err(FragmentCompileError::Unsupported { node: Some(node), feature: "node family or occurrence shape" }) if node == NodeId::new(u32::MAX)
-    ));
+    let program =
+        compile_fragment(providers(two_rows), &functions, options(1), &FixtureControl).unwrap();
+    let ProgramNodeKind::Values { values } = program.graph().nodes()[0].kind() else {
+        panic!("actual Values source");
+    };
+    assert_eq!(values.batch().num_rows(), 2);
+    assert_eq!(values.batch().num_columns(), 0);
+    assert_eq!(
+        program
+            .checked()
+            .channels()
+            .expressions()
+            .resolved_calls()
+            .calls()
+            .len(),
+        2
+    );
 }
 
 #[test]

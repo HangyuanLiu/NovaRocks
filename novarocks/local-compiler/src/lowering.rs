@@ -25,8 +25,8 @@ use crate::{
     expressions::{ExpressionLoweringError, lower_expressions, prepare_calls},
     repeat::{RepeatLoweringError, lower_repeat},
     unpivot::{UnpivotLoweringError, UnpivotLoweringInput, lower_unpivot},
+    values::{lower_values, retired_values_uses},
 };
-use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::Schema;
 use novarocks_functions::{ConstantPolicy, PureEngineFunctionCatalog};
 use novarocks_local_program::*;
@@ -275,14 +275,7 @@ fn lower(
             NodeKind::Project { .. } if node.inputs.len() == 1 => {
                 next = Some(node.inputs[0]);
             }
-            NodeKind::Values { rows }
-                if rows.len() == 1
-                    && rows[0].is_empty()
-                    && node.output.columns.is_empty()
-                    && node.inputs.is_empty() =>
-            {
-                next = None
-            }
+            NodeKind::Values { .. } if node.inputs.is_empty() => next = None,
             NodeKind::Filter { predicates } if predicates.len() == 1 && node.inputs.len() == 1 => {
                 next = Some(node.inputs[0])
             }
@@ -367,25 +360,7 @@ fn lower(
             match &node.kind {
                 NodeKind::Values { .. } => {
                     work.flush()?;
-                    let layout = StaticLayout::try_new_for_compile(
-                        Arc::new(Schema::empty()),
-                        Arc::from([]),
-                        work.control(),
-                    )?;
-                    work.flush()?;
-                    let batch = RecordBatch::try_new_with_options(
-                        layout.schema().clone(),
-                        vec![],
-                        &RecordBatchOptions::new().with_row_count(Some(1)),
-                    )
-                    .map_err(|error| FragmentCompileError::Owner {
-                        phase: "empty-row values",
-                        error: Box::new(error),
-                    })?;
-                    work.flush()?;
-                    let values =
-                        StaticValues::try_new_for_compile(batch, layout.clone(), work.control())?;
-                    (ProgramNodeKind::Values { values }, layout)
+                    lower_values(package, node, &expressions, &planned.slots, work.control())?
                 }
                 NodeKind::Filter { predicates } => {
                     let child = *local_ids
@@ -669,6 +644,9 @@ fn lower(
         Some(StaticSinkProgram::Result),
         work.control(),
     )?;
+    // StaticValues has no runtime expression roots. Retire only the actual
+    // constant-cell source occurrences whose materialization succeeded above.
+    let retired = retired_values_uses(package, &expressions, work)?;
     let mut domains = Vec::new();
     for domain in package.expression_uses().flow().domains().values() {
         work.step()?;
@@ -677,6 +655,9 @@ fn lower(
     let mut uses = Vec::new();
     for invocation in package.expression_uses().flow().uses().values() {
         work.step()?;
+        if retired.contains(&invocation.context.use_id) {
+            continue;
+        }
         let definition =
             *expressions
                 .ids
@@ -706,6 +687,9 @@ fn lower(
     let mut roots = Vec::new();
     for (site, use_id) in package.expression_uses().bindings() {
         work.step()?;
+        if retired.contains(use_id) {
+            continue;
+        }
         let node = *local_ids
             .get(&site.node)
             .ok_or(FragmentCompileError::Invalid("missing root node"))?;

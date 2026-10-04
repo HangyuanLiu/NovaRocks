@@ -392,7 +392,7 @@ fn unsupported_nominal_and_nonnullable_targets_refuse_without_rebinding() {
     for (source, target) in [
         (ty(DataType::Int64, false), ty(DataType::Int64, false)),
         (ty(DataType::Int64, true), ty(DataType::Boolean, true)),
-        (ty(DataType::Float64, true), ty(DataType::Int64, true)),
+        (ty(DataType::UInt64, true), ty(DataType::Int64, true)),
         (ty(DataType::LargeUtf8, true), ty(DataType::Int64, true)),
         (
             FunctionValueType {

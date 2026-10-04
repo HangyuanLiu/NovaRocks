@@ -41,7 +41,10 @@ pub use limits::*;
 pub(crate) use node::*;
 pub(crate) use package::*;
 pub(crate) use properties::*;
-pub use properties::{FragmentPropertyError, validate_fragment_output_properties_observed};
+pub use properties::{
+    FragmentPropertyError, derive_replica_sensitive_output_properties_observed,
+    validate_fragment_output_properties_observed,
+};
 pub(crate) use runtime_filter::*;
 
 use std::collections::{BTreeMap, BTreeSet};

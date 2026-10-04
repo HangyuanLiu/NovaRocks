@@ -737,6 +737,149 @@ pub(crate) fn validate_node_output_properties(
     }
 }
 
+/// Derive the original replica-sensitive operator formulas from complete
+/// occurrence claims for this immutable snapshot. The child properties must
+/// already be final in this same source. This does not plan placement, derive
+/// the other operator families, mutate the source or publish a fragment.
+///
+/// `None` explicitly means this node has no formula in this port. Consumers
+/// must not substitute a default. After applying a result to a new snapshot,
+/// rebuild its exact roots/call proofs and perform full package admission.
+///
+/// This port validates claim correspondence, not installed implementation
+/// ownership; the FE must prepare the original selected owner first.
+///
+/// Projection ceilings cover only the occurrence index. The caller must admit
+/// delegated structural scratch and output property clones before entry;
+/// neither these ceilings nor the returned facts grant host memory.
+#[allow(clippy::too_many_arguments)]
+pub fn derive_replica_sensitive_output_properties_observed(
+    fragment: &Fragment,
+    uses: &crate::PhysicalRootUses,
+    calls: &crate::FrozenFragmentCalls,
+    node: NodeId,
+    limits: PlanLimits,
+    source_retained_bytes: usize,
+    projection_limits: crate::PropertyProofProjectionLimits,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<
+    Option<(
+        crate::PhysicalProperties,
+        crate::PropertyProofProjectionFacts,
+    )>,
+    FragmentPropertyError,
+> {
+    let mut work =
+        CompileCheckpoints::try_new(control, novarocks_type_contract::CompilePhase::Validate)?;
+    let result = (|| {
+        work.flush()?;
+        let proof = calls.property_proof(
+            fragment,
+            uses,
+            &limits,
+            source_retained_bytes,
+            projection_limits,
+            control,
+        )?;
+        work.flush()?;
+        let structure = super::validate_fragment_construction_after_admission(fragment, limits);
+        work.step()?;
+        work.flush()?;
+        structure.map_err(FragmentPropertyError::Structure)?;
+        let found = fragment.nodes().get(&node);
+        work.step()?;
+        let Some(node) = found else {
+            let mut errors = ValidationContext::with_limits(limits);
+            errors.push(ValidationError::new(
+                "fragment.property_derivation.node",
+                "property derivation references an absent node",
+            ));
+            return Err(FragmentPropertyError::Structure(
+                ValidationErrors::from_collector(errors),
+            ));
+        };
+        // Provisional output claims are not replica authority. In particular,
+        // a Filter or Project may relinquish an unsafe Broadcast claim here.
+        // Final package validation checks the rebuilt snapshot, not this loan.
+        let mut source = PropertyEffectSource::Frozen {
+            proof: &proof,
+            work: &mut work,
+        };
+        let properties = match &node.kind {
+            NodeKind::Filter { predicates } => {
+                filter_output_properties_from(fragment, node, predicates, &mut source)?
+            }
+            NodeKind::Project { expressions } => {
+                project_output_properties_from(fragment, node, expressions, &mut source)?
+            }
+            NodeKind::TableFunction {
+                function,
+                arguments,
+                outputs,
+                ..
+            } => table_function_output_properties_from(
+                fragment,
+                node,
+                (function, arguments, outputs),
+                &mut source,
+            )?,
+            _ => None,
+        };
+        work.step()?;
+        work.flush()?;
+        Ok(properties.map(|properties| (properties, proof.facts())))
+    })();
+    if matches!(&result, Err(FragmentPropertyError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+
+fn filter_output_properties_from(
+    fragment: &Fragment,
+    node: &PhysicalNode,
+    predicates: &[ExprId],
+    source: &mut PropertyEffectSource<'_, '_, '_>,
+) -> Result<Option<crate::PhysicalProperties>, FrozenCallError> {
+    let Some(input) = node
+        .inputs
+        .first()
+        .and_then(|input| fragment.nodes().get(input))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(crate::derive_filter_output_properties(
+        &input.output_properties,
+        source.expressions_safe(fragment, node.id, predicates.iter().copied(), true)?,
+    )))
+}
+
+fn project_output_properties_from(
+    fragment: &Fragment,
+    node: &PhysicalNode,
+    expressions: &[(ExprId, ValueId)],
+    source: &mut PropertyEffectSource<'_, '_, '_>,
+) -> Result<Option<crate::PhysicalProperties>, FrozenCallError> {
+    let Some(input) = node
+        .inputs
+        .first()
+        .and_then(|input| fragment.nodes().get(input))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(crate::derive_project_output_properties(
+        &input.output_properties,
+        &node.output.columns,
+        source.expressions_safe(
+            fragment,
+            node.id,
+            expressions.iter().map(|(expression, _)| *expression),
+            true,
+        )?,
+    )))
+}
+
 pub(crate) fn validate_node_output_properties_from(
     fragment: &Fragment,
     node: &PhysicalNode,
@@ -762,17 +905,10 @@ pub(crate) fn validate_node_output_properties_from(
             Some(relation.provided_properties())
         }
         NodeKind::Filter { predicates } => {
-            let Some(input) = node
-                .inputs
-                .first()
-                .and_then(|input| fragment.nodes().get(input))
+            let Some(expected) = filter_output_properties_from(fragment, node, predicates, source)?
             else {
                 return Ok(());
             };
-            let expected = crate::derive_filter_output_properties(
-                &input.output_properties,
-                source.expressions_safe(fragment, node.id, predicates.iter().copied(), true)?,
-            );
             if node.output_properties != expected {
                 errors.push(ValidationError::new(
                     path,
@@ -805,23 +941,11 @@ pub(crate) fn validate_node_output_properties_from(
             return Ok(());
         }
         NodeKind::Project { expressions } => {
-            let Some(input) = node
-                .inputs
-                .first()
-                .and_then(|input| fragment.nodes().get(input))
+            let Some(expected) =
+                project_output_properties_from(fragment, node, expressions, source)?
             else {
                 return Ok(());
             };
-            let expected = crate::derive_project_output_properties(
-                &input.output_properties,
-                &node.output.columns,
-                source.expressions_safe(
-                    fragment,
-                    node.id,
-                    expressions.iter().map(|(expression, _)| *expression),
-                    true,
-                )?,
-            );
             if node.output_properties != expected {
                 errors.push(ValidationError::new(
                     path,
@@ -1463,25 +1587,42 @@ pub(crate) fn validate_table_function_properties(
     errors: &mut ValidationContext,
     source: &mut PropertyEffectSource<'_, '_, '_>,
 ) -> Result<(), FrozenCallError> {
+    let Some(expected) = table_function_output_properties_from(fragment, node, table, source)?
+    else {
+        return Ok(());
+    };
+    if node.output_properties != expected {
+        let message = if node.inputs.is_empty() {
+            "standalone table function requires singleton placement with single-copy ownership"
+        } else {
+            "table function output properties differ from its explicit passthrough guarantees"
+        };
+        errors.push(ValidationError::new(path, message));
+    }
+    Ok(())
+}
+
+fn table_function_output_properties_from(
+    fragment: &Fragment,
+    node: &PhysicalNode,
+    table: (
+        &crate::BoundTableFunction,
+        &[ExprId],
+        &[crate::TableFunctionOutput],
+    ),
+    source: &mut PropertyEffectSource<'_, '_, '_>,
+) -> Result<Option<crate::PhysicalProperties>, FrozenCallError> {
     let (function, arguments, outputs) = table;
     let Some(input) = node
         .inputs
         .first()
         .and_then(|input| fragment.nodes().get(input))
     else {
-        if node.output_properties
-            != (crate::PhysicalProperties {
-                distribution: Distribution::Singleton,
-                row_multiplicity: RowMultiplicity::SingleCopy,
-                ordering: Box::default(),
-            })
-        {
-            errors.push(ValidationError::new(
-                path,
-                "standalone table function requires singleton placement with single-copy ownership",
-            ));
-        }
-        return Ok(());
+        return Ok(Some(crate::PhysicalProperties {
+            distribution: Distribution::Singleton,
+            row_multiplicity: RowMultiplicity::SingleCopy,
+            ordering: Box::default(),
+        }));
     };
     let passthrough = outputs
         .iter()
@@ -1513,19 +1654,11 @@ pub(crate) fn validate_table_function_properties(
         .take_while(|key| passthrough.contains(&key.value))
         .count();
     let ordering = Box::from(&input.output_properties.ordering[..ordering_len]);
-    if node.output_properties
-        != (crate::PhysicalProperties {
-            distribution,
-            row_multiplicity: input.output_properties.row_multiplicity,
-            ordering,
-        })
-    {
-        errors.push(ValidationError::new(
-            path,
-            "table function output properties differ from its explicit passthrough guarantees",
-        ));
-    }
-    Ok(())
+    Ok(Some(crate::PhysicalProperties {
+        distribution,
+        row_multiplicity: input.output_properties.row_multiplicity,
+        ordering,
+    }))
 }
 
 pub(crate) fn validate_property_keys_on_port(

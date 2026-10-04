@@ -477,3 +477,6 @@ fn package_admission() -> novarocks_physical_plan::FragmentPackageAdmission {
         },
     }
 }
+
+#[path = "values_lowering_tests.rs"]
+mod values_lowering_tests;

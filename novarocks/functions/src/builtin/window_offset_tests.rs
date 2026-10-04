@@ -761,7 +761,7 @@ fn dynamic_null_negative_and_unsupported_defaults_refuse_before_partition_public
         }
         for default in [
             FunctionValueType::new(DataType::Boolean, true),
-            FunctionValueType::new(DataType::Float64, false),
+            FunctionValueType::new(DataType::UInt64, false),
             FunctionValueType::new(DataType::LargeUtf8, true),
         ] {
             let offset = cv(Some(1), false);
@@ -852,7 +852,7 @@ fn every_compile_callback_keeps_three_primary_causes_on_success_and_ordinary_off
                     constant: Some(offset),
                 },
                 FunctionArgument::Value {
-                    value_type: FunctionValueType::new(DataType::Float64, true),
+                    value_type: FunctionValueType::new(DataType::UInt64, true),
                     constant: None,
                 },
             ],
@@ -1641,6 +1641,140 @@ fn three_argument_wide_required_setup_and_output_sample_real_quantum_without_typ
                 };
                 assert_eq!(outcome.unwrap_err(), cause);
                 assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+            }
+        }
+    }
+}
+
+#[test]
+fn installed_numeric_defaults_keep_safe_nulls_float_bits_and_original_window_latch() {
+    use arrow_array::{Float32Array, Float64Array};
+    let source_i64: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(10), None, Some(30)]));
+    let defaults_f64: ArrayRef = Arc::new(Float64Array::from(vec![101.9, f64::NAN, 303.9, 404.9]));
+    let source_f32: ArrayRef = Arc::new(Float32Array::from(vec![
+        Some(-0.0),
+        None,
+        Some(7.5),
+        Some(f32::INFINITY),
+    ]));
+    let defaults_i64: ArrayRef = Arc::new(Int64Array::from(vec![
+        (1_i64 << 54) + (1_i64 << 30) + 1,
+        202,
+        303,
+        404,
+    ]));
+    let offset: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+    let peers = [WindowRowRange { start: 0, end: 4 }];
+    let frames = whole_frames(4);
+    let rows = [0, 1, 3];
+    let selection = Selection::try_sparse(4, &rows).unwrap();
+    for name in NAMES {
+        for (source, defaults) in [(&source_i64, &defaults_f64), (&source_f32, &defaults_i64)] {
+            for policy in [
+                DecimalOverflowPolicy::OutputNull,
+                DecimalOverflowPolicy::ReportError,
+            ] {
+                let fixture = default_fixture(name, ty(source, true), ty(defaults, false), policy);
+                let prepared = fixture
+                    .prepare(options(false), &CompileControl::default())
+                    .unwrap();
+                let args = [
+                    EvaluatedArgument::Column(source),
+                    EvaluatedArgument::Scalar(&offset),
+                    EvaluatedArgument::Column(defaults),
+                ];
+                let input = geometry(&prepared, &args, &peers, &frames);
+                let mut partition =
+                    WindowEvaluationPartition::begin(prepared.clone(), input, &Control::default())
+                        .unwrap();
+                let out = partition
+                    .evaluate(selection, 3, &Control::default())
+                    .unwrap();
+                if source.data_type() == &DataType::Int64 {
+                    let array = out.values().as_any().downcast_ref::<Int64Array>().unwrap();
+                    let expected = if name == "lead" {
+                        vec![Some(10), None, Some(404)]
+                    } else {
+                        vec![Some(101), None, None]
+                    };
+                    assert_eq!(array.iter().collect::<Vec<_>>(), expected);
+                } else {
+                    let array = out
+                        .values()
+                        .as_any()
+                        .downcast_ref::<Float32Array>()
+                        .unwrap();
+                    let expected = if name == "lead" {
+                        vec![None, Some(7.5_f32.to_bits()), Some(404_f32.to_bits())]
+                    } else {
+                        vec![
+                            Some(0x5a80_0001),
+                            Some((-0.0_f32).to_bits()),
+                            Some(7.5_f32.to_bits()),
+                        ]
+                    };
+                    assert_eq!(
+                        array
+                            .iter()
+                            .map(|v| v.map(f32::to_bits))
+                            .collect::<Vec<_>>(),
+                        expected
+                    );
+                }
+                partition.finish(&Control::default()).unwrap();
+                // Both actual setup and selected output run through the original
+                // lifecycle host. The leaf's numeric cast has no new policy.
+                for setup in [true, false] {
+                    let baseline = Control::default();
+                    if setup {
+                        WindowEvaluationPartition::begin(prepared.clone(), input, &baseline)
+                            .unwrap();
+                    } else {
+                        let mut part = WindowEvaluationPartition::begin(
+                            prepared.clone(),
+                            input,
+                            &Control::default(),
+                        )
+                        .unwrap();
+                        part.evaluate(selection, 3, &baseline).unwrap();
+                    }
+                    let trace = baseline.trace.lock().unwrap().clone();
+                    for at in 0..trace.len() {
+                        for cause in causes() {
+                            let control = Control {
+                                trace: Mutex::default(),
+                                refusal: Some((at, cause.clone())),
+                            };
+                            if setup {
+                                assert_eq!(
+                                    WindowEvaluationPartition::begin(
+                                        prepared.clone(),
+                                        input,
+                                        &control
+                                    )
+                                    .map(|_| ())
+                                    .unwrap_err(),
+                                    cause
+                                );
+                            } else {
+                                let mut part = WindowEvaluationPartition::begin(
+                                    prepared.clone(),
+                                    input,
+                                    &Control::default(),
+                                )
+                                .unwrap();
+                                assert_eq!(
+                                    part.evaluate(selection, 3, &control).unwrap_err(),
+                                    cause
+                                );
+                                let clean = Control::default();
+                                assert_eq!(part.finish(&clean), Err(KernelFailure::InstanceFailed));
+                                assert!(clean.trace.lock().unwrap().is_empty());
+                            }
+                            assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+                        }
+                    }
+                }
             }
         }
     }

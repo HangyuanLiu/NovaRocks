@@ -1204,3 +1204,6 @@ fn relational_and_window_sites_preserve_their_own_explicit_decimal_policy() {
 
 #[path = "visit_tests.rs"]
 mod visit_tests;
+
+#[path = "property_derivation_tests.rs"]
+mod property_derivation_tests;

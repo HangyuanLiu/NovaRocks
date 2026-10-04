@@ -4009,6 +4009,7 @@ version = "0.1.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "arrow-select",
  "bytes",
  "novarocks-connector-contract",
  "novarocks-functions",

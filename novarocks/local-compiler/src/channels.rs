@@ -159,14 +159,49 @@ fn resolve_core(
         let local = ProgramNodeId::new(nodes.len());
         work.step()?;
         let (slots, port) = match &node.kind {
-            NodeKind::Values { rows }
-                if previous.is_none()
-                    && node.inputs.is_empty()
-                    && rows.len() == 1
-                    && rows[0].is_empty()
-                    && node.output.columns.is_empty() =>
-            {
-                (Arc::<[SlotId]>::from([]), Port::new())
+            NodeKind::Values { rows } if previous.is_none() && node.inputs.is_empty() => {
+                let mut slots = Vec::new();
+                reserve_vec(&mut slots, node.output.columns.len(), work)?;
+                let mut port = Port::new();
+                for (ordinal, &value) in node.output.columns.iter().enumerate() {
+                    let output = fragment
+                        .values()
+                        .get(&value)
+                        .ok_or(ChannelLoweringError::Invalid("missing Values output value"))?;
+                    for row in rows {
+                        let expression = *row.get(ordinal).ok_or(ChannelLoweringError::Invalid(
+                            "Values occurrence width differs",
+                        ))?;
+                        let definition = fragment
+                            .expressions()
+                            .get(expression)
+                            .ok_or(ChannelLoweringError::Invalid("missing Values definition"))?;
+                        work.step()?;
+                        exact_type(&definition.ty, &output.ty, work)?;
+                        if let Some(&representative) = port.get(&value) {
+                            // This proof is transparent only for the same definition
+                            // at every row. Values materialization separately admits
+                            // constant cells, so it cannot merge independent calls.
+                            if row.get(representative) != Some(&expression) {
+                                return Err(ChannelLoweringError::Invalid(
+                                    "independent Values cells share a produced value",
+                                ));
+                            }
+                        }
+                    }
+                    let slot = u32::try_from(next_slot)
+                        .map_err(|_| ChannelLoweringError::Invalid("slot identity exhausted"))?;
+                    next_slot = next_slot
+                        .checked_add(1)
+                        .ok_or(ChannelLoweringError::Invalid("slot identity exhausted"))?;
+                    slots.push(SlotId::new(slot));
+                    port.entry(value).or_insert(ordinal);
+                    work.step()?;
+                }
+                work.flush()?;
+                let slots: Arc<[SlotId]> = Arc::from(slots);
+                work.flush()?;
+                (slots, port)
             }
             NodeKind::Project { expressions } => {
                 let child = linear_child(node.inputs.as_ref(), previous)?;
