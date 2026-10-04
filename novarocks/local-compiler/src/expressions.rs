@@ -386,54 +386,15 @@ fn lower_core(
                         .resolve_observed(*reference, &node.ty, work)?,
                 ),
                 ExprKind::Literal(literal) => {
-                    // The original CV owner performs type/resource preflight
-                    // before Arrow construction. Field creation/type clones
-                    // remain opaque work with observations around them.
-                    work.flush()?;
-                    let field = Arc::new(node.ty.try_to_field("constant")?);
-                    work.flush()?;
-                    macro_rules! scalar {
-                        ($factory:ident, $value:expr) => {
-                            ConstantValue::$factory(
-                                field,
-                                node.ty.clone(),
-                                $value,
-                                policy,
-                                CompilePhase::LowerProgram,
-                                control,
-                            )?
-                        };
-                    }
-                    let value = match literal {
-                        LiteralValue::Null => ConstantValue::null(
-                            field,
-                            node.ty.clone(),
-                            policy,
-                            CompilePhase::LowerProgram,
-                            control,
-                        )?,
-                        LiteralValue::Boolean(value) => scalar!(from_boolean, *value),
-                        LiteralValue::Int64(value) => scalar!(from_i64, *value),
-                        LiteralValue::UInt64(value) => scalar!(from_u64, *value),
-                        LiteralValue::Float64Bits(value) => scalar!(from_f64_bits, *value),
-                        LiteralValue::LargeInt(value) => scalar!(from_largeint, *value),
-                        LiteralValue::Decimal128(value) => scalar!(from_decimal128, *value),
-                        LiteralValue::Decimal256(value) => scalar!(from_decimal256_be, *value),
-                        LiteralValue::Utf8(value) => scalar!(from_utf8, value.as_ref()),
-                        LiteralValue::Binary(value) => scalar!(from_binary, value.as_ref()),
-                        LiteralValue::Date32(value) => scalar!(from_date32, *value),
-                        LiteralValue::Time64(value) => scalar!(from_time64, *value),
-                        LiteralValue::Timestamp(value) => scalar!(from_timestamp, *value),
-                        LiteralValue::IntervalMonthDayNano {
-                            months,
-                            days,
-                            nanoseconds,
-                        } => {
-                            scalar!(from_interval_month_day_nano, (*months, *days, *nanoseconds))
-                        }
-                    };
-                    work.flush()?;
-                    StaticExprKind::Constant(value)
+                    StaticExprKind::Constant(novarocks_physical_plan::literal_constant_observed::<
+                        ExpressionLoweringError,
+                    >(
+                        literal,
+                        &node.ty,
+                        policy,
+                        CompilePhase::LowerProgram,
+                        work,
+                    )?)
                 }
                 ExprKind::Conjunction { args } | ExprKind::Disjunction { args } => {
                     if args.is_empty()
