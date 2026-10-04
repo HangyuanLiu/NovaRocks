@@ -21,8 +21,8 @@ use std::collections::BTreeMap;
 
 use novarocks_functions::{ConstantPolicy, ScopedExpressionEffects};
 use novarocks_physical_plan::{
-    ConstantPools, Fragment, FrozenCallError, FrozenFragmentCalls, PhysicalCallBinding,
-    PhysicalCallSite, PhysicalNode, visit_relational_calls_observed,
+    AggregateCall, ConstantPools, Fragment, FrozenCallError, FrozenFragmentCalls, NodeKind,
+    PhysicalCallBinding, PhysicalCallSite, PhysicalNode, visit_relational_calls_observed,
 };
 use novarocks_type_contract::{
     CallProofScope, CompileCheckpoints, CompileControlError, CompilePhase, DecimalOverflowPolicy,
@@ -32,6 +32,13 @@ use novarocks_type_contract::{
 
 use super::{
     expression_occurrences::{AuthoredPhysicalOccurrences, ExpressionOccurrenceError},
+    physical_aggregate_occurrences::{
+        PhysicalAggregateOccurrenceError, PhysicalAggregateOccurrenceInput,
+        prepare_physical_aggregate_occurrence_observed,
+    },
+    physical_aggregate_requests::{
+        PhysicalAggregateRequestError, author_physical_aggregate_update_request_observed,
+    },
     physical_expression_effects::{
         PhysicalCallSourceScope, PhysicalExpressionEffectsError, PhysicalExpressionEffectsInput,
         author_physical_expression_effects_observed,
@@ -74,6 +81,8 @@ pub(crate) enum PhysicalFragmentEffectsError {
     Control(CompileControlError),
     Occurrence(ExpressionOccurrenceError),
     Expressions(PhysicalExpressionEffectsError),
+    AggregateRequest(PhysicalAggregateRequestError),
+    Aggregate(PhysicalAggregateOccurrenceError),
     TableRequest(PhysicalTableRequestError),
     Table(PhysicalTableOccurrenceError),
     Calls(FrozenCallError),
@@ -100,6 +109,8 @@ macro_rules! nested_error {
 }
 nested_error!(ExpressionOccurrenceError, Occurrence);
 nested_error!(PhysicalExpressionEffectsError, Expressions);
+nested_error!(PhysicalAggregateRequestError, AggregateRequest);
+nested_error!(PhysicalAggregateOccurrenceError, Aggregate);
 nested_error!(PhysicalTableRequestError, TableRequest);
 nested_error!(PhysicalTableOccurrenceError, Table);
 nested_error!(FrozenCallError, Calls);
@@ -128,23 +139,27 @@ pub(crate) fn author_physical_fragment_effects_observed(
         // grammar before preparing any expression or relational owner.
         let mut relational_count = 0usize;
         visit_relational_calls_observed(input.fragment, &mut work, |site, binding, work| {
-            let PhysicalCallBinding::Table(function) = binding else {
-                return Err(PhysicalFragmentEffectsError::UnsupportedLifecycle(site));
-            };
-            let PhysicalCallSite::Table { node } = site else {
-                return Err(PhysicalFragmentEffectsError::InvalidSource(
-                    "table binding has a different actual call-site kind",
-                ));
+            let node = match site {
+                PhysicalCallSite::Table { node }
+                | PhysicalCallSite::Aggregate { node, .. }
+                | PhysicalCallSite::TopNState { node, .. } => node,
+                _ => return Err(PhysicalFragmentEffectsError::UnsupportedLifecycle(site)),
             };
             let actual = input.fragment.nodes().get(&node);
             work.step()?;
             let scope = input.relational_scopes.get(&site);
             work.step()?;
             let scope = scope.ok_or(PhysicalFragmentEffectsError::MissingScope(site))?;
-            let same = actual.is_some_and(|actual| std::ptr::eq(actual, scope.source))
-                && matches!(&scope.source.kind,
-                    novarocks_physical_plan::NodeKind::TableFunction { function: original, .. }
-                        if std::ptr::eq(original, function));
+            let original_binding = match binding {
+                PhysicalCallBinding::Table(function) => {
+                    matches!(&scope.source.kind, NodeKind::TableFunction { function: original, .. } if std::ptr::eq(original, function))
+                }
+                PhysicalCallBinding::Aggregate(binding) => aggregate_source(scope.source, site)
+                    .is_ok_and(|source| std::ptr::eq(&source.binding, binding)),
+                _ => false,
+            };
+            let same =
+                actual.is_some_and(|actual| std::ptr::eq(actual, scope.source)) && original_binding;
             work.step()?;
             if !same {
                 return Err(PhysicalFragmentEffectsError::InvalidSource(
@@ -192,35 +207,67 @@ pub(crate) fn author_physical_fragment_effects_observed(
             .map_err(|_| CompileControlError::ResourceExhausted)?;
         work.flush()?;
         visit_relational_calls_observed(input.fragment, &mut work, |site, binding, work| {
-            let PhysicalCallBinding::Table(_) = binding else {
-                return Err(PhysicalFragmentEffectsError::UnsupportedLifecycle(site));
-            };
             let scope = input.relational_scopes.get(&site);
             work.step()?;
             let scope = scope.ok_or(PhysicalFragmentEffectsError::MissingScope(site))?;
-            let request = author_physical_table_request_observed(
-                scope.source,
-                input.fragment,
-                input.constants,
-                input.literal_policy,
-                work,
-            )?;
-            let fresh = prepare_physical_table_occurrence_observed(
-                PhysicalTableOccurrenceInput {
-                    fragment: input.fragment,
-                    source: scope.source,
-                    request: &request,
-                    occurrences: input.occurrences,
-                    child_effects: &expressions.summaries,
-                    parameters: input.parameters,
-                    environment: scope.environment,
-                    decimal_overflow_policy: scope.decimal_overflow_policy,
-                    proof_scope: scope.proof_scope,
-                },
-                functions,
-                work,
-            )?;
-            calls.push(fresh.frozen);
+            let frozen = match binding {
+                PhysicalCallBinding::Table(_) => {
+                    let request = author_physical_table_request_observed(
+                        scope.source,
+                        input.fragment,
+                        input.constants,
+                        input.literal_policy,
+                        work,
+                    )?;
+                    let fresh = prepare_physical_table_occurrence_observed(
+                        PhysicalTableOccurrenceInput {
+                            fragment: input.fragment,
+                            source: scope.source,
+                            request: &request,
+                            occurrences: input.occurrences,
+                            child_effects: &expressions.summaries,
+                            parameters: input.parameters,
+                            environment: scope.environment,
+                            decimal_overflow_policy: scope.decimal_overflow_policy,
+                            proof_scope: scope.proof_scope,
+                        },
+                        functions,
+                        work,
+                    )?;
+                    fresh.frozen
+                }
+                PhysicalCallBinding::Aggregate(_) => {
+                    let source = aggregate_source(scope.source, site)?;
+                    let request = author_physical_aggregate_update_request_observed(
+                        source,
+                        scope.source,
+                        site,
+                        input.fragment,
+                        input.constants,
+                        input.literal_policy,
+                        work,
+                    )?;
+                    let fresh = prepare_physical_aggregate_occurrence_observed(
+                        PhysicalAggregateOccurrenceInput {
+                            fragment: input.fragment,
+                            node: scope.source,
+                            source,
+                            request: &request,
+                            occurrences: input.occurrences,
+                            child_effects: &expressions.summaries,
+                            parameters: input.parameters,
+                            environment: scope.environment,
+                            decimal_overflow_policy: scope.decimal_overflow_policy,
+                            proof_scope: scope.proof_scope,
+                        },
+                        functions,
+                        work,
+                    )?;
+                    fresh.frozen
+                }
+                _ => return Err(PhysicalFragmentEffectsError::UnsupportedLifecycle(site)),
+            };
+            calls.push(frozen);
             work.step()?;
             Ok(())
         })?;
@@ -242,4 +289,37 @@ pub(crate) fn author_physical_fragment_effects_observed(
     }
     work.finish()?;
     result
+}
+
+/// Borrow the original call selected by the sole visitor's node/ordinal site.
+/// The sealed request still verifies this exact call/node/source association.
+fn aggregate_source(
+    node: &PhysicalNode,
+    site: PhysicalCallSite,
+) -> Result<&AggregateCall, PhysicalFragmentEffectsError> {
+    let (ordinal, calls) = match (site, &node.kind) {
+        (PhysicalCallSite::Aggregate { node: id, call }, NodeKind::Aggregate { calls, .. })
+            if id == node.id =>
+        {
+            (call, calls)
+        }
+        (
+            PhysicalCallSite::TopNState { node: id, call },
+            NodeKind::TopN {
+                reduction: novarocks_physical_plan::TopNReduction::GroupedStates { calls, .. },
+                ..
+            },
+        ) if id == node.id => (call, calls),
+        _ => {
+            return Err(PhysicalFragmentEffectsError::InvalidSource(
+                "aggregate site differs from the original node kind",
+            ));
+        }
+    };
+    usize::try_from(ordinal)
+        .ok()
+        .and_then(|ordinal| calls.get(ordinal))
+        .ok_or(PhysicalFragmentEffectsError::InvalidSource(
+            "aggregate site has no original ordered call",
+        ))
 }

@@ -43,9 +43,9 @@ use novarocks_physical_plan::{
     PlanLimits, TableFunctionOutput, ValueOrigin,
 };
 use novarocks_type_contract::{
-    CompilePhase, FunctionInstanceState, FunctionIntrinsicRowError, FunctionNullBehavior,
-    FunctionValueType, PureCompileControl, SemanticParameterId, SemanticParameterKey,
-    SemanticParameterValue,
+    CompilePhase, ExpressionEffectContext, FunctionInstanceState, FunctionIntrinsicRowError,
+    FunctionNullBehavior, FunctionValueType, PureCompileControl, SemanticParameterId,
+    SemanticParameterKey, SemanticParameterValue,
 };
 use std::sync::{Arc, Mutex};
 

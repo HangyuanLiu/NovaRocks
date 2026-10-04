@@ -29,12 +29,16 @@ use novarocks_physical_plan::{
 };
 use novarocks_type_contract::{
     ArgumentControl, CallProofScope, CompileCheckpoints, CompileControlError,
-    DecimalOverflowPolicy, EffectContractError, EvaluationDemand, ExpressionEffectContext,
-    ExpressionEffects, ExpressionUseId, FunctionKind, SemanticParameterRef, SemanticParameters,
+    DecimalOverflowPolicy, EffectContractError, ExpressionEffects, ExpressionUseId, FunctionKind,
+    SemanticParameterRef, SemanticParameters,
 };
 
 use super::{
     expression_occurrences::{AuthoredPhysicalOccurrences, ExpressionOccurrenceError},
+    physical_relational_effects::{
+        PhysicalRelationalEffectsError, relational_context_observed,
+        relational_root_effects_observed,
+    },
     physical_table_requests::AuthoredPhysicalTableRequest,
 };
 use crate::compiler::SqlFunctionCatalog;
@@ -68,6 +72,19 @@ impl From<ExpressionOccurrenceError> for PhysicalTableOccurrenceError {
 impl From<EffectContractError> for PhysicalTableOccurrenceError {
     fn from(error: EffectContractError) -> Self {
         Self::Effects(error)
+    }
+}
+
+impl From<PhysicalRelationalEffectsError> for PhysicalTableOccurrenceError {
+    fn from(error: PhysicalRelationalEffectsError) -> Self {
+        match error {
+            PhysicalRelationalEffectsError::Control(cause) => Self::Control(cause),
+            PhysicalRelationalEffectsError::Effects(error) => Self::Effects(error),
+            PhysicalRelationalEffectsError::MissingChildEffects(id) => {
+                Self::MissingChildEffects(id)
+            }
+            PhysicalRelationalEffectsError::InvalidSource(reason) => Self::InvalidSource(reason),
+        }
     }
 }
 
@@ -142,7 +159,7 @@ pub(crate) fn prepare_physical_table_occurrence_observed(
     let site = PhysicalCallSite::Table {
         node: input.source.id,
     };
-    let context = table_context(input.occurrences, site, work)?;
+    let context = relational_context_observed(input.occurrences, site, work)?;
     work.flush()?;
     let declaration = functions
         .pure_overload_declaration_observed(
@@ -186,53 +203,14 @@ pub(crate) fn prepare_physical_table_occurrence_observed(
             node: input.source.id,
             role: ExpressionRootRole::TableFunctionArgument { argument: ordinal },
         };
-        let root = roots.roots().sites().get(&root_site);
-        work.step()?;
-        let matching = root
-            .is_some_and(|root| root.expr == definition && root.demand == EvaluationDemand::Value);
-        work.step()?;
-        if !matching {
-            return Err(PhysicalTableOccurrenceError::InvalidSource(
-                "ordered table argument root differs from actual source",
-            ));
-        }
-        let use_id = roots.bindings().get(&root_site).copied();
-        work.step()?;
-        let use_id = use_id.ok_or(PhysicalTableOccurrenceError::InvalidSource(
-            "ordered table argument root has no actual use",
-        ))?;
-        let invocation = roots.flow().uses().get(&use_id);
-        work.step()?;
-        let matching = invocation.is_some_and(|invocation| {
-            invocation.definition == definition
-                && invocation.context.use_id == use_id
-                && invocation.context.demand == EvaluationDemand::Value
-        });
-        work.step()?;
-        if !matching {
-            return Err(PhysicalTableOccurrenceError::InvalidSource(
-                "table argument invocation differs from its original root",
-            ));
-        }
-        let invocation = invocation.expect("checked original invocation");
-        let domain = roots.flow().domains().get(&invocation.context.domain);
-        work.step()?;
-        let unguarded = invocation.context.domain != context.domain
-            && domain.is_some_and(|domain| domain.parent.is_none() && domain.guard.is_none());
-        work.step()?;
-        if !unguarded {
-            return Err(PhysicalTableOccurrenceError::InvalidSource(
-                "table argument root has a guarded or absent domain",
-            ));
-        }
-        let summary = input.child_effects.get(&use_id).copied();
-        work.step()?;
-        let summary = summary.ok_or(PhysicalTableOccurrenceError::MissingChildEffects(use_id))?;
-        // for_use retains the child's exact context. Only the neutral result
-        // of this check is joined; no scoped cross-domain join is permitted.
-        let actual_effects = summary.for_use(invocation.context);
-        work.step()?;
-        children = children.join(actual_effects?);
+        let (use_id, actual_effects) = relational_root_effects_observed(
+            roots,
+            root_site,
+            definition,
+            input.child_effects,
+            work,
+        )?;
+        children = children.join(actual_effects);
         argument_uses.push(Some(use_id));
         work.step()?;
     }
@@ -271,65 +249,4 @@ pub(crate) fn prepare_physical_table_occurrence_observed(
         frozen,
         preparation,
     })
-}
-
-/// Relational contexts are not flow invocations. Keep their original authored
-/// disjoint use namespace and unguarded Value domain, with exactly one context
-/// for this actual Table site. The complete topology remains caller-validated.
-fn table_context(
-    occurrences: &AuthoredPhysicalOccurrences,
-    site: PhysicalCallSite,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<ExpressionEffectContext, PhysicalTableOccurrenceError> {
-    let mut found = None;
-    for &(actual_site, context) in &occurrences.relational_contexts {
-        let matching = actual_site == site;
-        work.step()?;
-        if matching {
-            let repeated = found.replace(context).is_some();
-            work.step()?;
-            if repeated {
-                return Err(PhysicalTableOccurrenceError::InvalidSource(
-                    "table site has repeated relational contexts",
-                ));
-            }
-        }
-    }
-    let context = found.ok_or(PhysicalTableOccurrenceError::InvalidSource(
-        "table site has no original relational context",
-    ))?;
-    for &(other_site, other) in &occurrences.relational_contexts {
-        let colliding = other_site != site
-            && (other.use_id == context.use_id || other.domain == context.domain);
-        work.step()?;
-        if colliding {
-            return Err(PhysicalTableOccurrenceError::InvalidSource(
-                "table context shares another relational use identity or domain",
-            ));
-        }
-    }
-    let flow = occurrences.root_uses.flow();
-    for invocation in flow.uses().values() {
-        let shares_domain = invocation.context.domain == context.domain;
-        work.step()?;
-        if shares_domain {
-            return Err(PhysicalTableOccurrenceError::InvalidSource(
-                "table context borrows an expression invocation domain",
-            ));
-        }
-    }
-    let expression_collision = flow.uses().contains_key(&context.use_id);
-    work.step()?;
-    let domain = flow.domains().get(&context.domain);
-    work.step()?;
-    let matching = !expression_collision
-        && context.demand == EvaluationDemand::Value
-        && domain.is_some_and(|domain| domain.parent.is_none() && domain.guard.is_none());
-    work.step()?;
-    if !matching {
-        return Err(PhysicalTableOccurrenceError::InvalidSource(
-            "table context differs from original disjoint Value domain",
-        ));
-    }
-    Ok(context)
 }
