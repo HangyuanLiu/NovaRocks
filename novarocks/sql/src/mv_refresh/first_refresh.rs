@@ -334,7 +334,7 @@ pub fn compile_final_mv_first_refresh_connector_write_plan(
     required_aggregations: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     final_write: crate::planning::dml::DmlFinalWritePlanContext,
-) -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError> {
+) -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError> {
     let decimal_overflow_policy = analyzed.analyzed.decimal_overflow_policy();
     crate::planning::dml::compile_final_connector_write_plan(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
@@ -488,7 +488,7 @@ pub fn compile_final_join_first_refresh_connector_write_plan(
     required_aggregations: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     final_write: crate::planning::dml::DmlFinalWritePlanContext,
-) -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError> {
+) -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError> {
     let decimal_overflow_policy = analyzed.analyzed.decimal_overflow_policy();
     crate::planning::dml::compile_final_connector_write_plan(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
@@ -2979,7 +2979,7 @@ mod tests {
             novarocks_spi::connector::write_stack::WriteTargetOrdinal,
             crate::planning::dml::DmlFinalWritePlanContext,
         )
-            -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError>;
+            -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError>;
 
     type FinalJoinIncrementalCompile = fn(
         SqlMvJoinIncrementalRefreshAnalyzed,

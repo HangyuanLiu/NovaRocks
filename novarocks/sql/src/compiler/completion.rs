@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 
 use novarocks_physical_plan::{
-    NullOrdering, PlanBuilder, PlanVersionId, PredicateGuaranteeKind, ProviderColumnReference,
+    NullOrdering, PlanVersionId, PredicateGuaranteeKind, ProviderColumnReference,
     ProviderReadOccurrenceId, ProviderReadReference, SortDirection, ValueType,
 };
 use novarocks_spi::connector::read_stack::{
@@ -38,11 +38,15 @@ use novarocks_spi::connector::{ConnectorCodecCategory, ConnectorEncodedPayload, 
 use novarocks_type_contract::{BucketLayoutAlgorithm, PartitionHashAlgorithm};
 use novarocks_types::naming::TableIdentity;
 
-use super::{SqlCompileError, SqlCompiler};
+#[cfg(test)]
+use novarocks_physical_plan::PlanBuilder;
+
+use super::{SqlAuthoredPhysicalPlan, SqlCompileError, SqlCompiler};
 use crate::binding::SqlTableBindingId;
 use crate::catalog::{ResolvedAnalyzerTable, TableLookupMode};
 use crate::compiler::mv_rewrite::SqlMvRewriteDefinitionFacts;
 use crate::explain::ExplainLevel;
+use crate::planner::distributed::build::LoweredSqlPhysicalDraft;
 use crate::planner::table::{SqlScanKind, SqlTableVersionSelector};
 use crate::planning::catalog::MetadataTableKind;
 use crate::planning::dml::DmlStatisticsEvidence;
@@ -1574,13 +1578,20 @@ impl CompilerContinuation {
 }
 
 /// One private pure-compiler transition. A pending transition cannot contain
-/// a `PlanBuilder`; only `Ready` owns the builder that `finish` will consume.
+/// a lowered draft; only `Ready` owns the source-certified draft to consume.
 pub(crate) enum CompilerStep {
     Need {
         batch: SqlNeedBatch,
         continuation: CompilerContinuation,
     },
     Ready {
+        version: PlanVersionId,
+        draft: LoweredSqlPhysicalDraft,
+        display_intent: SqlDisplayIntent,
+        display_annotations: Box<[SqlDisplayAnnotation]>,
+    },
+    #[cfg(test)]
+    TestReady {
         version: PlanVersionId,
         builder: PlanBuilder,
         display_intent: SqlDisplayIntent,
@@ -1598,13 +1609,13 @@ impl CompilerStep {
 
     pub(super) fn ready(
         version: PlanVersionId,
-        builder: PlanBuilder,
+        draft: LoweredSqlPhysicalDraft,
         display_intent: SqlDisplayIntent,
         display_annotations: impl Into<Box<[SqlDisplayAnnotation]>>,
     ) -> Self {
         Self::Ready {
             version,
-            builder,
+            draft,
             display_intent,
             display_annotations: display_annotations.into(),
         }
@@ -1627,7 +1638,12 @@ impl SqlCompileRequest {
         limits: CompletionLimits,
     ) -> Self {
         Self {
-            first_step: CompilerStep::ready(version, builder, display_intent, display_annotations),
+            first_step: CompilerStep::TestReady {
+                version,
+                builder,
+                display_intent,
+                display_annotations: display_annotations.into(),
+            },
             limits,
         }
     }
@@ -1683,15 +1699,41 @@ impl SqlCompileProgress {
     }
 }
 
+enum CompletedPlanSource {
+    Authored(SqlAuthoredPhysicalPlan),
+    #[cfg(test)]
+    StructurallyUntrusted(novarocks_physical_plan::PhysicalPlan),
+}
+
+impl CompletedPlanSource {
+    fn plan(&self) -> &novarocks_physical_plan::PhysicalPlan {
+        match self {
+            Self::Authored(source) => source.plan(),
+            #[cfg(test)]
+            Self::StructurallyUntrusted(plan) => plan,
+        }
+    }
+
+    fn into_authored(self) -> SqlAuthoredPhysicalPlan {
+        match self {
+            Self::Authored(source) => source,
+            #[cfg(test)]
+            Self::StructurallyUntrusted(_) => {
+                panic!("a structural-only test plan has no authored source journal")
+            }
+        }
+    }
+}
+
 pub struct SqlCompletedPlan {
-    plan: novarocks_physical_plan::PhysicalPlan,
+    plan: CompletedPlanSource,
     display_intent: SqlDisplayIntent,
     display_annotations: Box<[SqlDisplayAnnotation]>,
 }
 
 impl SqlCompletedPlan {
-    pub const fn plan(&self) -> &novarocks_physical_plan::PhysicalPlan {
-        &self.plan
+    pub fn plan(&self) -> &novarocks_physical_plan::PhysicalPlan {
+        self.plan.plan()
     }
 
     pub const fn display_intent(&self) -> SqlDisplayIntent {
@@ -1702,18 +1744,22 @@ impl SqlCompletedPlan {
         &self.display_annotations
     }
 
-    pub fn into_plan(self) -> novarocks_physical_plan::PhysicalPlan {
-        self.plan
+    pub fn into_plan(self) -> SqlAuthoredPhysicalPlan {
+        self.plan.into_authored()
     }
 
     pub fn into_parts(
         self,
     ) -> (
-        novarocks_physical_plan::PhysicalPlan,
+        SqlAuthoredPhysicalPlan,
         SqlDisplayIntent,
         Box<[SqlDisplayAnnotation]>,
     ) {
-        (self.plan, self.display_intent, self.display_annotations)
+        (
+            self.plan.into_authored(),
+            self.display_intent,
+            self.display_annotations,
+        )
     }
 }
 
@@ -2210,16 +2256,27 @@ fn advance_step(
         }
         CompilerStep::Ready {
             version,
-            builder,
+            draft,
             display_intent,
             display_annotations,
-        } => complete(
+        } => complete(version, draft, display_intent, display_annotations, control),
+        #[cfg(test)]
+        CompilerStep::TestReady {
             version,
             builder,
             display_intent,
             display_annotations,
-            control,
-        ),
+        } => {
+            let plan = builder
+                .finish_observed(control)
+                .map_err(completion_plan_construction_error)?;
+            complete_source(
+                version,
+                CompletedPlanSource::StructurallyUntrusted(plan),
+                display_intent,
+                display_annotations,
+            )
+        }
     }
 }
 
@@ -2283,25 +2340,45 @@ fn validate_and_account_facts(
 
 fn complete(
     version: PlanVersionId,
-    builder: PlanBuilder,
+    draft: LoweredSqlPhysicalDraft,
     display_intent: SqlDisplayIntent,
     display_annotations: Box<[SqlDisplayAnnotation]>,
     control: &super::SqlCompileControl,
 ) -> Result<SqlCompileProgress, SqlCompileProgressError> {
-    let plan = builder
+    let source = draft
         .finish_observed(control)
-        .map_err(|error| match error {
-            novarocks_physical_plan::PlanConstructionError::Constants(
-                novarocks_physical_plan::ConstantReferenceError::Control(error),
-            ) => SqlCompileProgressError::Compile(SqlCompileError::from(error)),
-            error => SqlCompileProgressError::Protocol(CompletionProtocolError::PlanValidation(
-                error.to_string(),
-            )),
-        })?;
-    if plan.version() != version {
+        .map_err(completion_plan_construction_error)?;
+    complete_source(
+        version,
+        CompletedPlanSource::Authored(source),
+        display_intent,
+        display_annotations,
+    )
+}
+
+fn completion_plan_construction_error(
+    error: novarocks_physical_plan::PlanConstructionError,
+) -> SqlCompileProgressError {
+    match error {
+        novarocks_physical_plan::PlanConstructionError::Constants(
+            novarocks_physical_plan::ConstantReferenceError::Control(error),
+        ) => SqlCompileProgressError::Compile(SqlCompileError::from(error)),
+        error => SqlCompileProgressError::Protocol(CompletionProtocolError::PlanValidation(
+            error.to_string(),
+        )),
+    }
+}
+
+fn complete_source(
+    version: PlanVersionId,
+    plan: CompletedPlanSource,
+    display_intent: SqlDisplayIntent,
+    display_annotations: Box<[SqlDisplayAnnotation]>,
+) -> Result<SqlCompileProgress, SqlCompileProgressError> {
+    if plan.plan().version() != version {
         return Err(CompletionProtocolError::PlanVersionMismatch {
             expected: version,
-            actual: plan.version(),
+            actual: plan.plan().version(),
         }
         .into());
     }
@@ -3753,6 +3830,15 @@ mod tests {
                 .unwrap();
         assert_eq!(completed.plan().version(), version);
         assert_eq!(completed.display_annotations()[0].key(), "optimizer");
+        assert!(matches!(
+            &completed.plan,
+            CompletedPlanSource::StructurallyUntrusted(_)
+        ));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| completed.into_plan()))
+                .is_err(),
+            "a raw structural test builder cannot publish an authored source owner"
+        );
     }
 
     #[test]

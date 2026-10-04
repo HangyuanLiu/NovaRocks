@@ -1680,9 +1680,9 @@ fn prepare_frozen_rewrite_cohort_with_ports(
         constant_policy,
         control,
     )?;
-    let version = plan.version();
+    let version = plan.plan().version();
     let candidate =
-        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_sql_program(
             plan, control,
         )
         .map_err(|error| error.to_string())?;

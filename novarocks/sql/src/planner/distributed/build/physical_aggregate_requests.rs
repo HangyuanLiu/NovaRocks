@@ -50,6 +50,11 @@ impl From<CompileControlError> for PhysicalAggregateRequestError {
         Self::Control(error)
     }
 }
+impl From<novarocks_type_contract::ValueTypeError> for PhysicalAggregateRequestError {
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        PhysicalArgumentError::from(error).into()
+    }
+}
 impl From<PhysicalArgumentError> for PhysicalAggregateRequestError {
     fn from(error: PhysicalArgumentError) -> Self {
         match error {
@@ -256,4 +261,230 @@ pub(crate) fn author_physical_aggregate_update_request_observed<'a>(
         arguments,
         options,
     })
+}
+
+/// A merge borrows its original producer journal and logical request. Runtime
+/// state is a separate source loan; it never becomes a selected SQL argument.
+/// The one authored selected Arc is shared by refinement and fresh preparation.
+pub(crate) struct AuthoredPhysicalAggregateMergeRequest<'entry, 'source> {
+    entry: &'entry super::lowered_draft::CheckedAggregateLogicalSourceEntry<'source>,
+    state_id: ExprId,
+    state: &'source novarocks_physical_plan::ExprNode,
+    phase: AggregateKernelPhase,
+    selected: Arc<FunctionBindingSelection>,
+}
+impl AuthoredPhysicalAggregateMergeRequest<'_, '_> {
+    pub fn source(&self) -> &AggregateCall {
+        self.entry.source()
+    }
+    pub fn node(&self) -> &PhysicalNode {
+        self.entry.node()
+    }
+    pub fn fragment(&self) -> &Fragment {
+        self.entry.fragment()
+    }
+    pub fn site(&self) -> PhysicalCallSite {
+        self.entry.site()
+    }
+    pub fn function(&self) -> &BoundFunction {
+        &self.source().binding.function
+    }
+    pub const fn selected(&self) -> &Arc<FunctionBindingSelection> {
+        &self.selected
+    }
+    pub const fn state_id(&self) -> ExprId {
+        self.state_id
+    }
+    pub const fn state(&self) -> &novarocks_physical_plan::ExprNode {
+        self.state
+    }
+    pub const fn phase(&self) -> AggregateKernelPhase {
+        self.phase
+    }
+    pub fn request(&self) -> FunctionBindingRequest<'_> {
+        self.entry.captured().request()
+    }
+    pub fn decimal_overflow_policy(&self) -> novarocks_type_contract::DecimalOverflowPolicy {
+        self.entry.captured().binding().decimal_overflow_policy()
+    }
+    pub fn preparation(&self, arguments: ScopedExpressionEffects) -> PureCallPreparation {
+        PureCallPreparation::Aggregate {
+            arguments,
+            options: AggregatePreparationOptions {
+                phase: self.phase,
+                distinct: false,
+                order_keys: Arc::from([]),
+                state_input_type: Some(self.state.ty.clone()),
+            },
+        }
+    }
+}
+
+/// Selected correspondence checks signature facts only. Source certification
+/// comes exclusively from the sealed original producer journal. The caller
+/// admits exact-type comparison scratch and opaque metadata/Arc clones, and
+/// owns entry and the ordinary footer on this same meter.
+pub(crate) fn author_physical_aggregate_merge_request_observed<'entry, 'source>(
+    entry: &'entry super::lowered_draft::CheckedAggregateLogicalSourceEntry<'source>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<AuthoredPhysicalAggregateMergeRequest<'entry, 'source>, PhysicalAggregateRequestError> {
+    use super::lowered_draft::AggregateRuntimeDemand;
+    use novarocks_functions::FunctionResultType;
+    let source = entry.source();
+    let phase = match entry.phase() {
+        AggregatePhase::Intermediate { .. } => Ok(AggregateKernelPhase::Intermediate),
+        AggregatePhase::Final { .. } => Ok(AggregateKernelPhase::Final),
+        _ => Err(PhysicalAggregateRequestError::InvalidSource(
+            "merge request has an update phase",
+        )),
+    };
+    work.step()?;
+    let phase = phase?;
+    let state_id = match entry.runtime() {
+        AggregateRuntimeDemand::ExpressionState(id) => Some(id),
+        _ => None,
+    };
+    work.step()?;
+    let state_id = state_id.ok_or(PhysicalAggregateRequestError::InvalidSource(
+        "merge request has no original expression state",
+    ))?;
+    let channels = source.arguments.as_ref() == [state_id]
+        && source.order_by.is_empty()
+        && !source.distinct
+        && source.binding.phase == entry.phase();
+    work.step()?;
+    if !channels {
+        return Err(PhysicalAggregateRequestError::InvalidSource(
+            "merge request differs from its original state channels",
+        ));
+    }
+    let state = entry.fragment().expressions().get(state_id);
+    work.step()?;
+    let state = state.ok_or(PhysicalAggregateRequestError::MissingArgument(state_id))?;
+    let captured = entry.captured();
+    let resolved = captured.binding().resolved();
+    let selected = &resolved.selected;
+    let function = &source.binding.function;
+    if selected.argument_types.len() > MAX_CALL_EFFECT_ARGUMENTS
+        || function.argument_types.len() > MAX_CALL_EFFECT_ARGUMENTS
+    {
+        return Err(CompileControlError::ResourceExhausted.into());
+    }
+    let identity = resolved.function_id == function.function_id
+        && resolved.kind == FunctionKind::Aggregate
+        && function.kind == FunctionKind::Aggregate
+        && selected.overload == function.overload
+        && usize::try_from(source.binding.logical_argument_count).ok()
+            == Some(resolved.logical_argument_count)
+        && resolved.logical_argument_count == captured.request().logical_argument_count
+        && selected.argument_types.len() == function.argument_types.len();
+    work.step()?;
+    if !identity {
+        return Err(PhysicalAggregateRequestError::InvalidSource(
+            "merge binding differs from its captured logical identity or arity",
+        ));
+    }
+    for (original, actual) in selected.argument_types.iter().zip(&function.argument_types) {
+        work.flush()?;
+        let matching = merge_argument_type_matches_observed(original, actual, work)?;
+        work.flush()?;
+        if !matching {
+            return Err(PhysicalAggregateRequestError::InvalidSource(
+                "merge binding differs from its captured full argument signature",
+            ));
+        }
+    }
+    let FunctionResultType::Scalar(result) = &selected.result_type else {
+        return Err(PhysicalAggregateRequestError::InvalidSource(
+            "merge source selected a relation result",
+        ));
+    };
+    work.flush()?;
+    let matching = result
+        .exactly_equals_observed::<PhysicalAggregateRequestError>(&function.result_type, || {
+            work.step().map_err(PhysicalAggregateRequestError::from)
+        })?;
+    work.flush()?;
+    if !matching {
+        return Err(PhysicalAggregateRequestError::InvalidSource(
+            "merge binding differs from its captured final result type",
+        ));
+    }
+    let aggregate = selected.aggregate.as_ref();
+    work.step()?;
+    let aggregate = aggregate.ok_or(PhysicalAggregateRequestError::InvalidSource(
+        "merge logical source has no aggregate state contract",
+    ))?;
+    let format = aggregate.state_format == source.binding.state_format;
+    work.step()?;
+    if !format {
+        return Err(PhysicalAggregateRequestError::InvalidSource(
+            "merge binding differs from its captured state format",
+        ));
+    }
+    work.flush()?;
+    let matching = aggregate
+        .intermediate_type
+        .exactly_equals_observed::<PhysicalAggregateRequestError>(
+            &source.binding.intermediate_type,
+            || work.step().map_err(PhysicalAggregateRequestError::from),
+        )?;
+    work.flush()?;
+    if !matching {
+        return Err(PhysicalAggregateRequestError::InvalidSource(
+            "merge binding differs from its captured intermediate type",
+        ));
+    }
+    // No local state-domain/nullability inference: the original Functions owner
+    // validates the actual state loan and aligns its cloned options exactly.
+    let selected = author_scalar_result_selection_observed(function, Some(&source.binding), work)?;
+    Ok(AuthoredPhysicalAggregateMergeRequest {
+        entry,
+        state_id,
+        state,
+        phase,
+        selected,
+    })
+}
+
+fn merge_argument_type_matches_observed(
+    left: &novarocks_type_contract::FunctionArgumentType,
+    right: &novarocks_type_contract::FunctionArgumentType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, PhysicalAggregateRequestError> {
+    use novarocks_type_contract::FunctionArgumentType;
+    work.step()?;
+    match (left, right) {
+        (FunctionArgumentType::Value(left), FunctionArgumentType::Value(right)) => left
+            .exactly_equals_observed(right, || {
+                work.step().map_err(PhysicalAggregateRequestError::from)
+            }),
+        (
+            FunctionArgumentType::Lambda {
+                parameter_types: left,
+                result_type: left_result,
+            },
+            FunctionArgumentType::Lambda {
+                parameter_types: right,
+                result_type: right_result,
+            },
+        ) => {
+            let same_count = left.len() == right.len();
+            work.step()?;
+            if !same_count {
+                return Ok(false);
+            }
+            for (left, right) in left.iter().zip(right) {
+                if !left.exactly_equals_observed(right, || {
+                    work.step().map_err(PhysicalAggregateRequestError::from)
+                })? {
+                    return Ok(false);
+                }
+            }
+            left_result.exactly_equals_observed(right_result, || {
+                work.step().map_err(PhysicalAggregateRequestError::from)
+            })
+        }
+        _ => Ok(false),
+    }
 }

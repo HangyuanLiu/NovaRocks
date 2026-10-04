@@ -274,9 +274,12 @@ impl QueryStatsSnapshot {
 
     /// Keep precisely the facts optimization consumed, without consulting a
     /// catalog or converting derived operator estimates into base-table facts.
-    pub(crate) fn annotate_final_plan(&self, builder: &mut novarocks_physical_plan::PlanBuilder) {
+    pub(crate) fn annotate_final_plan(
+        &self,
+        draft: &mut crate::planner::distributed::build::LoweredSqlPhysicalDraft,
+    ) {
         for row in self.display_rows() {
-            builder.add_annotation(novarocks_physical_plan::PlanAnnotation {
+            draft.add_annotation(novarocks_physical_plan::PlanAnnotation {
                 subject: novarocks_physical_plan::AnnotationSubject::Plan,
                 key: TABLE_STATISTICS_ANNOTATION_KEY.into(),
                 value: row.into_boxed_str(),

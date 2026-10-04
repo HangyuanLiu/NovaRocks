@@ -34,6 +34,9 @@ pub use crate::functions::{
     builtin_sql_function_catalog, contribute_builtin_functions,
 };
 pub use crate::optimizer::options::SessionOptimizerSettings;
+pub use crate::planner::distributed::build::SqlAuthoredPhysicalPlan;
+#[cfg(test)]
+pub(crate) use completion_driver::compile_authored_aggregate_for_test;
 pub use mv_rewrite::{
     MvRewriteDefinitionIndex, SqlImvAggregateContractFacts, SqlImvAggregateExecutionFacts,
     SqlImvAggregateExecutionStateColumnFacts, SqlImvAggregateStateColumnFacts,
@@ -2570,7 +2573,7 @@ mod tests {
             .unwrap()
             .finish_observed(&crate::compiler::SqlCompileControl::unbounded())
             .unwrap();
-            let result = plan.result_port().unwrap();
+            let result = plan.plan().result_port().unwrap();
             assert_eq!(result.fields.len(), 2);
             let DataType::List(json_item) = &result.fields[0].ty.data_type else {
                 panic!("expected JSON List");
@@ -2592,7 +2595,7 @@ mod tests {
                     .is_json_value()
             );
             let mut aggregate_count = 0;
-            for fragment in plan.fragments().values() {
+            for fragment in plan.plan().fragments().values() {
                 for node in fragment.nodes().values() {
                     if let novarocks_physical_plan::NodeKind::Aggregate { calls, .. } = &node.kind {
                         for call in calls {
@@ -3034,7 +3037,7 @@ mod tests {
             .unwrap()
             .finish_observed(&crate::compiler::SqlCompileControl::unbounded())
             .unwrap();
-            let result = plan.result_port().unwrap();
+            let result = plan.plan().result_port().unwrap();
             assert_eq!(result.fields.len(), 1);
             assert_eq!(result.fields[0].ty.data_type, expected);
             assert!(result.fields[0].ty.nullable);

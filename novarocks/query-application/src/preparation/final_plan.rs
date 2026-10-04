@@ -30,9 +30,9 @@ use novarocks_physical_plan::{
     ConstantReferenceError, PhysicalPlan, PlanConstructionError, validate_plan_observed,
 };
 use novarocks_sql::compiler::{
-    ExplainRenderBudget, SqlCompileProgress, SqlCompiler, SqlDisplayAnnotation, SqlDisplayIntent,
-    SqlFactBatch, SqlFinalPlanCompileRequest, SqlNeedBatch, render_completed_plan,
-    render_completed_plan_tree,
+    ExplainRenderBudget, SqlAuthoredPhysicalPlan, SqlCompileProgress, SqlCompiler,
+    SqlDisplayAnnotation, SqlDisplayIntent, SqlFactBatch, SqlFinalPlanCompileRequest, SqlNeedBatch,
+    render_completed_plan, render_completed_plan_tree,
 };
 use novarocks_workload_control::{CancellationView, WorkScope};
 
@@ -45,9 +45,17 @@ use super::runtime_access::{
 /// unchecked-plan constructor.
 #[derive(Clone, Debug)]
 pub struct CompletedPhysicalPlanCandidate {
-    plan: Arc<PhysicalPlan>,
+    source: CompletedPlanSource,
     display_intent: SqlDisplayIntent,
     display_annotations: Arc<[SqlDisplayAnnotation]>,
+}
+
+/// Keep SQL's original immutable source journal alongside its physical view.
+/// Structural programs carry no SQL source certification.
+#[derive(Clone, Debug)]
+enum CompletedPlanSource {
+    Sql(Arc<SqlAuthoredPhysicalPlan>),
+    Program(Arc<PhysicalPlan>),
 }
 
 impl CompletedPhysicalPlanCandidate {
@@ -56,46 +64,52 @@ impl CompletedPhysicalPlanCandidate {
         control: &novarocks_sql::compiler::SqlCompileControl,
     ) -> Result<Self, FinalPlanCompletionError> {
         let (plan, display_intent, display_annotations) = completed.into_parts();
-        Self::try_new(plan, display_intent, display_annotations, control)
+        Self::try_new_sql(plan, display_intent, display_annotations, control)
     }
 
-    /// Hold a plan an application built for work no statement described.
-    ///
-    /// Statistics collection and the other internal programs are not
-    /// statements: nothing parsed them, so there is no text to explain and no
-    /// display annotation to carry. They are still plans, and they are held to
-    /// the same validation as a compiled one -- this constructor accepts the
-    /// plan and its original compile control, without statement display semantics.
+    /// Hold an application-authored structural program without a SQL source
+    /// journal. SQL statement and DML results use `for_sql_program` so their
+    /// complete immutable lowering source remains available to later owners.
     pub fn for_program(
         plan: PhysicalPlan,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<Self, FinalPlanCompletionError> {
-        Self::try_new(plan, SqlDisplayIntent::Execute, Box::default(), control)
+        validate_candidate_plan(&plan, control)?;
+        Ok(Self {
+            source: CompletedPlanSource::Program(Arc::new(plan)),
+            display_intent: SqlDisplayIntent::Execute,
+            display_annotations: Arc::from([]),
+        })
     }
 
-    fn try_new(
-        plan: PhysicalPlan,
+    /// Preserve SQL's complete source owner for an internal statement or DML
+    /// program, including its original aggregate logical-source journal.
+    pub fn for_sql_program(
+        source: SqlAuthoredPhysicalPlan,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Self, FinalPlanCompletionError> {
+        Self::try_new_sql(source, SqlDisplayIntent::Execute, Box::default(), control)
+    }
+
+    fn try_new_sql(
+        source: SqlAuthoredPhysicalPlan,
         display_intent: SqlDisplayIntent,
         display_annotations: Box<[SqlDisplayAnnotation]>,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<Self, FinalPlanCompletionError> {
-        validate_plan_observed(&plan, control).map_err(|error| match error {
-            PlanConstructionError::Constants(ConstantReferenceError::Control(error)) => {
-                compiler_error(novarocks_sql::compiler::SqlCompileError::from(error))
-            }
-            error => FinalPlanCompletionError::InvalidPlan {
-                message: Arc::from(error.to_string()),
-            },
-        })?;
+        validate_candidate_plan(source.plan(), control)?;
         Ok(Self {
-            plan: Arc::new(plan),
+            source: CompletedPlanSource::Sql(Arc::new(source)),
             display_intent,
             display_annotations: display_annotations.into(),
         })
     }
 
-    pub const fn plan(&self) -> &Arc<PhysicalPlan> {
-        &self.plan
+    pub fn plan(&self) -> &Arc<PhysicalPlan> {
+        match &self.source {
+            CompletedPlanSource::Sql(source) => source.plan_arc(),
+            CompletedPlanSource::Program(plan) => plan,
+        }
     }
 
     /// SQL's completed display semantics are part of the same immutable
@@ -133,12 +147,26 @@ impl CompletedPhysicalPlanCandidate {
         // operator tree. What the plan states to the backend is a different
         // question, and it has its own level.
         let lines = if matches!(level, novarocks_sql::compiler::ExplainLevel::Contract) {
-            render_completed_plan(&self.plan, &self.display_annotations, level, None, budget)
+            render_completed_plan(self.plan(), &self.display_annotations, level, None, budget)
         } else {
-            render_completed_plan_tree(&self.plan, level, control)
+            render_completed_plan_tree(self.plan(), level, control)
         };
         lines.map_err(compiler_error)
     }
+}
+
+fn validate_candidate_plan(
+    plan: &PhysicalPlan,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(), FinalPlanCompletionError> {
+    validate_plan_observed(plan, control).map_err(|error| match error {
+        PlanConstructionError::Constants(ConstantReferenceError::Control(error)) => {
+            compiler_error(novarocks_sql::compiler::SqlCompileError::from(error))
+        }
+        error => FinalPlanCompletionError::InvalidPlan {
+            message: Arc::from(error.to_string()),
+        },
+    })
 }
 
 /// Role composition supplies the application-owned adapter that resolves the
@@ -561,6 +589,65 @@ mod tests {
         assert_eq!(candidate.display_intent(), SqlDisplayIntent::Execute);
         assert!(candidate.display_annotations().is_empty());
         assert_eq!(source.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn sql_candidate_clone_and_internal_publication_retain_the_original_source_owner() {
+        let driver = FinalPlanCompletionDriver::new(Arc::new(NoFactSource {
+            calls: AtomicUsize::new(0),
+        }));
+        let (_root, scope) = scope();
+        let completed = driver
+            .complete(
+                request(
+                    "SELECT COUNT(*)",
+                    SqlCompileControl::unbounded(),
+                    SqlCompileIntent::Query,
+                ),
+                &scope,
+            )
+            .await
+            .unwrap();
+        let candidate = completed.candidate();
+        let CompletedPlanSource::Sql(source) = &candidate.source else {
+            panic!("SQL completion must retain its complete source owner");
+        };
+        assert!(source.plan().fragments().values().any(|fragment| {
+            fragment.nodes().values().any(|node| {
+                matches!(
+                    node.kind,
+                    novarocks_physical_plan::NodeKind::Aggregate { .. }
+                )
+            })
+        }));
+        let original_plan = Arc::clone(source.plan_arc());
+        let weak_source = Arc::downgrade(source);
+        let cloned = candidate.clone();
+        let CompletedPlanSource::Sql(cloned_source) = &cloned.source else {
+            panic!("candidate clone must keep the SQL source variant");
+        };
+        assert!(Arc::ptr_eq(source, cloned_source));
+        let published = CompletedPhysicalPlanCandidate::for_sql_program(
+            source.as_ref().clone(),
+            &SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        assert!(matches!(&published.source, CompletedPlanSource::Sql(_)));
+        assert!(Arc::ptr_eq(published.plan(), &original_plan));
+        let structural = CompletedPhysicalPlanCandidate::for_program(
+            original_plan.as_ref().clone(),
+            &SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        assert!(matches!(
+            &structural.source,
+            CompletedPlanSource::Program(_)
+        ));
+        drop(completed);
+        assert!(weak_source.upgrade().is_some());
+        drop(cloned);
+        assert!(weak_source.upgrade().is_none());
+        assert!(Arc::ptr_eq(published.plan(), &original_plan));
     }
 
     #[tokio::test]

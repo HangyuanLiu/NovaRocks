@@ -787,7 +787,7 @@ fn prepare_planned_ctas_connector_write(
         &completion_control,
     )?;
     let candidate =
-        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_sql_program(
             plan,
             &completion_control,
         )

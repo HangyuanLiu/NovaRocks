@@ -380,8 +380,8 @@ pub fn prepare_completed_statistics_collection(
         &completion_control,
     )
     .map_err(DistributedQueryError::from_compile)?;
-    let version = plan.version();
-    let candidate = CompletedPhysicalPlanCandidate::for_program(plan, &completion_control)
+    let version = plan.plan().version();
+    let candidate = CompletedPhysicalPlanCandidate::for_sql_program(plan, &completion_control)
         .map_err(|error| contract_violation(error.to_string()))?;
     let output = novarocks_query_application::preparation::OutputContract::from_completed_plan(
         novarocks_query_application::api::QueryExecutionKind::Statistics,

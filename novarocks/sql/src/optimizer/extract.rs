@@ -1446,6 +1446,7 @@ mod tests {
                 join.execution_mode,
                 Some(crate::planner::physical::JoinExecutionMode::Singleton)
             );
+            let control = crate::compiler::SqlCompileControl::unbounded();
             let final_plan = crate::planner::distributed::build::lower_final_physical_plan(
                 &physical,
                 novarocks_physical_plan::PlanVersionId::try_new([seed; 16]).unwrap(),
@@ -1457,12 +1458,13 @@ mod tests {
                 crate::functions::builtin_sql_function_catalog(),
                 false,
                 crate::constant::test_constant_policy(), // This test authors a statement with throwing disabled.
-                &crate::compiler::SqlCompileControl::unbounded(),
+                &control,
             )
             .expect("lower final physical plan")
-            .finish()
+            .finish_observed(&control)
             .expect("finish final physical plan exactly once");
             let fragment = final_plan
+                .plan()
                 .fragments()
                 .get(&novarocks_physical_plan::FragmentId::new(0))
                 .unwrap();

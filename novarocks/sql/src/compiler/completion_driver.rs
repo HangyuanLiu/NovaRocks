@@ -850,7 +850,7 @@ fn provider_or_ready_step(
             }),
         ));
     }
-    let mut builder = crate::planner::distributed::build::lower_final_physical_plan(
+    let mut draft = crate::planner::distributed::build::lower_final_physical_plan(
         &physical,
         common.version,
         common.dop_domain,
@@ -860,10 +860,10 @@ fn provider_or_ready_step(
         control,
     )
     .map_err(SqlCompileError::from)?;
-    query_statistics.annotate_final_plan(&mut builder);
+    query_statistics.annotate_final_plan(&mut draft);
     Ok(CompilerStep::ready(
         common.version,
-        builder,
+        draft,
         common.display_intent,
         [],
     ))
@@ -1202,7 +1202,7 @@ pub(super) fn resume_provider_read(
             .into_iter()
             .map(|fact| (fact, state.common.scan_read_budget)),
     )?;
-    let mut builder =
+    let mut draft =
         crate::planner::distributed::build::lower_final_physical_plan_with_provider_reads(
             &state.physical,
             state.common.version,
@@ -1214,10 +1214,10 @@ pub(super) fn resume_provider_read(
             control,
         )
         .map_err(SqlCompileError::from)?;
-    state.query_statistics.annotate_final_plan(&mut builder);
+    state.query_statistics.annotate_final_plan(&mut draft);
     Ok(CompilerStep::ready(
         state.common.version,
-        builder,
+        draft,
         state.common.display_intent,
         [],
     ))
@@ -2796,7 +2796,7 @@ mod tests {
         .expect("statistics round")
     }
 
-    fn complete_with_exact_statistics(
+    pub(super) fn complete_with_exact_statistics(
         sql: &str,
         intent: SqlCompileIntent,
         rows: u64,
@@ -2817,7 +2817,9 @@ mod tests {
             .expect("completed plan")
     }
 
-    fn frozen_table_statistics(plan: &novarocks_physical_plan::PhysicalPlan) -> Vec<&str> {
+    pub(super) fn frozen_table_statistics(
+        plan: &novarocks_physical_plan::PhysicalPlan,
+    ) -> Vec<&str> {
         plan.annotations()
             .iter()
             .filter_map(|annotation| {
@@ -3052,10 +3054,10 @@ mod tests {
             )
             .expect("DML final plan");
         let expected = "TABLE STATS ref=0 table=iceberg.db.orders rows=23 confidence=Exact source=IcebergManifest";
-        assert_eq!(frozen_table_statistics(&plan), vec![expected]);
+        assert_eq!(frozen_table_statistics(plan.plan()), vec![expected]);
         assert!(
             crate::explain::completed_tree::render_completed_plan_tree(
-                &plan,
+                plan.plan(),
                 crate::explain::ExplainLevel::Costs,
                 &SqlCompileControl::unbounded(),
             )
@@ -3301,3 +3303,12 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) fn compile_authored_aggregate_for_test(sql: &str) -> super::SqlAuthoredPhysicalPlan {
+    tests::complete_with_exact_statistics(sql, SqlCompileIntent::Query, 13).into_plan()
+}
+
+#[cfg(test)]
+#[path = "owned_plan_movement_tests.rs"]
+mod owned_plan_movement_tests;

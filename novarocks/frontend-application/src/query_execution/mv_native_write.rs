@@ -157,7 +157,7 @@ pub(crate) fn prepare_completed_mv_write(
         novarocks_sql::planning::dml::DmlFinalizedProviderReadSet,
         novarocks_sql::planning::dml::DmlFinalizedWriteTargetSet,
     ) -> Result<
-        novarocks_physical_plan::PhysicalPlan,
+        novarocks_sql::compiler::SqlAuthoredPhysicalPlan,
         novarocks_sql::compiler::SqlCompileError,
     >,
     control: &novarocks_sql::compiler::SqlCompileControl,
@@ -208,7 +208,7 @@ pub(crate) fn prepare_completed_mv_write(
         ))?;
     let plan = finish(version, dop_domain, reads, targets)?;
     let candidate =
-        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_sql_program(
             plan, control,
         )
         .map_err(|error| error.to_string())?;

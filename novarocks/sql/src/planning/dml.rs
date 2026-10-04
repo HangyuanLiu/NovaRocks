@@ -614,7 +614,7 @@ pub fn build_final_frozen_connector_write_plan(
     root_allow_throw_exception: bool,
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
-) -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError> {
+) -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError> {
     let scan_occurrence = final_write
         .plan
         .provider_reads
@@ -742,8 +742,8 @@ impl DmlWriteCompletion {
         reads: DmlFinalizedProviderReadSet,
         targets: DmlFinalizedWriteTargetSet,
         control: &crate::compiler::SqlCompileControl,
-    ) -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError> {
-        let mut builder = crate::planner::distributed::build::lower_final_physical_write_plan(
+    ) -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError> {
+        let mut draft = crate::planner::distributed::build::lower_final_physical_write_plan(
             &self.physical,
             version,
             dop_domain,
@@ -760,8 +760,8 @@ impl DmlWriteCompletion {
             control,
         )
         .map_err(final_lowering_error)?;
-        self.query_statistics.annotate_final_plan(&mut builder);
-        builder
+        self.query_statistics.annotate_final_plan(&mut draft);
+        draft
             .finish_observed(control)
             .map_err(final_plan_construction_error)
     }
@@ -776,7 +776,7 @@ pub fn compile_final_connector_write_plan(
     settings: &crate::compiler::SessionOptimizerSettings,
     final_write: DmlFinalWritePlanContext,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-) -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError> {
+) -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError> {
     let constant_policy = request.constant_policy();
     let control = request.control().clone();
     let compiled = crate::compiler::SqlCompiler::optimize(request)?
@@ -826,14 +826,14 @@ fn complete_connector_write_plan(
     root_allow_throw_exception: bool,
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
-) -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError> {
+) -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError> {
     crate::planner::physical::runtime_filter_placement::place_runtime_filters(
         &mut physical,
         settings,
     );
     let (final_context, finalized_targets) = final_write.into_parts();
     let (version, dop_domain, reads) = final_context.into_parts();
-    let mut builder = crate::planner::distributed::build::lower_final_physical_write_plan(
+    let mut draft = crate::planner::distributed::build::lower_final_physical_write_plan(
         &physical,
         version,
         dop_domain,
@@ -850,8 +850,8 @@ fn complete_connector_write_plan(
         control,
     )
     .map_err(final_lowering_error)?;
-    query_statistics.annotate_final_plan(&mut builder);
-    builder
+    query_statistics.annotate_final_plan(&mut draft);
+    draft
         .finish_observed(control)
         .map_err(final_plan_construction_error)
 }
@@ -908,8 +908,8 @@ impl DmlReadCompletion {
         dop_domain: novarocks_physical_plan::PipelineDopDomain,
         reads: DmlFinalizedProviderReadSet,
         control: &crate::compiler::SqlCompileControl,
-    ) -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError> {
-        let mut builder = match reads.into_optional() {
+    ) -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError> {
+        let mut draft = match reads.into_optional() {
             Some(reads) => {
                 crate::planner::distributed::build::lower_final_physical_plan_with_provider_reads(
                     &self.physical,
@@ -933,8 +933,8 @@ impl DmlReadCompletion {
             ),
         }
         .map_err(final_lowering_error)?;
-        self.query_statistics.annotate_final_plan(&mut builder);
-        builder
+        self.query_statistics.annotate_final_plan(&mut draft);
+        draft
             .finish_observed(control)
             .map_err(final_plan_construction_error)
     }
@@ -1188,7 +1188,7 @@ pub fn optimizer_settings_stable_digest_material(
 
 /// Staged final change-stream contract and its typed writer destinations.
 pub struct DmlFinalChangeStreamPlan {
-    physical_plan: novarocks_physical_plan::PhysicalPlan,
+    physical_plan: crate::compiler::SqlAuthoredPhysicalPlan,
     writer_routes: Vec<DmlFinalChangeStreamWriterRoute>,
 }
 
@@ -1212,7 +1212,7 @@ impl DmlChangeStreamCompletion {
     ) -> Result<DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
         let (final_context, finalized_targets) = final_write.into_parts();
         let (version, dop_domain, reads) = final_context.into_parts();
-        let mut builder = crate::planner::distributed::build::lower_final_change_stream_write_plan(
+        let mut draft = crate::planner::distributed::build::lower_final_change_stream_write_plan(
             &self.physical,
             version,
             dop_domain,
@@ -1228,11 +1228,11 @@ impl DmlChangeStreamCompletion {
             control,
         )
         .map_err(final_lowering_error)?;
-        self.query_statistics.annotate_final_plan(&mut builder);
-        let physical_plan = builder
+        self.query_statistics.annotate_final_plan(&mut draft);
+        let physical_plan = draft
             .finish_observed(control)
             .map_err(final_plan_construction_error)?;
-        let writer_routes = completed_change_stream_writer_routes(&physical_plan)?;
+        let writer_routes = completed_change_stream_writer_routes(physical_plan.plan())?;
         Ok(DmlFinalChangeStreamPlan {
             physical_plan,
             writer_routes,
@@ -1334,13 +1334,13 @@ pub struct DmlFinalChangeStreamWriterRoute {
 
 impl DmlFinalChangeStreamPlan {
     pub fn physical_plan(&self) -> &novarocks_physical_plan::PhysicalPlan {
-        &self.physical_plan
+        self.physical_plan.plan()
     }
 
     pub fn into_parts(
         self,
     ) -> (
-        novarocks_physical_plan::PhysicalPlan,
+        crate::compiler::SqlAuthoredPhysicalPlan,
         Vec<DmlFinalChangeStreamWriterRoute>,
     ) {
         (self.physical_plan, self.writer_routes)
@@ -1577,7 +1577,7 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
     );
     let (final_context, finalized_targets) = context.final_write.into_parts();
     let (version, dop_domain, reads) = final_context.into_parts();
-    let mut builder = crate::planner::distributed::build::lower_final_change_stream_write_plan(
+    let mut draft = crate::planner::distributed::build::lower_final_change_stream_write_plan(
         &physical,
         version,
         dop_domain,
@@ -1593,11 +1593,11 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
         control,
     )
     .map_err(final_lowering_error)?;
-    query_statistics.annotate_final_plan(&mut builder);
-    let physical_plan = builder
+    query_statistics.annotate_final_plan(&mut draft);
+    let physical_plan = draft
         .finish_observed(control)
         .map_err(final_plan_construction_error)?;
-    let writer_routes = completed_change_stream_writer_routes(&physical_plan)?;
+    let writer_routes = completed_change_stream_writer_routes(physical_plan.plan())?;
     Ok(DmlFinalChangeStreamPlan {
         physical_plan,
         writer_routes,
@@ -2330,7 +2330,7 @@ pub fn build_final_statistics_connector_plan(
     root_allow_throw_exception: bool,
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
-) -> Result<novarocks_physical_plan::PhysicalPlan, crate::compiler::SqlCompileError> {
+) -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError> {
     if required.is_empty() {
         return Err(
             "empty ANALYZE requirements must bypass distributed planning and execution"
@@ -2358,19 +2358,18 @@ pub fn build_final_statistics_connector_plan(
         &mut physical,
         settings,
     );
-    let builder =
-        crate::planner::distributed::build::lower_final_physical_plan_with_provider_reads(
-            &physical,
-            version,
-            dop_domain,
-            reads,
-            functions,
-            root_allow_throw_exception,
-            constant_policy,
-            control,
-        )
-        .map_err(final_lowering_error)?;
-    builder
+    let draft = crate::planner::distributed::build::lower_final_physical_plan_with_provider_reads(
+        &physical,
+        version,
+        dop_domain,
+        reads,
+        functions,
+        root_allow_throw_exception,
+        constant_policy,
+        control,
+    )
+    .map_err(final_lowering_error)?;
+    draft
         .finish_observed(control)
         .map_err(final_plan_construction_error)
 }
@@ -3171,7 +3170,7 @@ mod tests {
         );
         assert_eq!(global_call.result_type, arrow::datatypes::DataType::Binary);
 
-        let plan = super::build_final_statistics_connector_plan(
+        let authored = super::build_final_statistics_connector_plan(
             scan_source,
             std::slice::from_ref(&requirement),
             &functions,
@@ -3183,6 +3182,7 @@ mod tests {
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("ANALYZE plan");
+        let plan = authored.plan();
 
         assert_eq!(plan.fragments().len(), 2);
         assert!(matches!(
@@ -3199,6 +3199,41 @@ mod tests {
         let mut unpivot = 0;
         for fragment in plan.fragments().values() {
             for node in fragment.nodes().values() {
+                if let NodeKind::Aggregate { calls, .. } = &node.kind {
+                    let control = crate::compiler::SqlCompileControl::unbounded();
+                    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+                        &control,
+                        novarocks_type_contract::CompilePhase::Validate,
+                    )
+                    .unwrap();
+                    for (ordinal, call) in calls.iter().enumerate() {
+                        let source = authored
+                            .checked_aggregate_source_observed(
+                                fragment,
+                                node,
+                                novarocks_physical_plan::PhysicalCallSite::Aggregate {
+                                    node: node.id,
+                                    call: u32::try_from(ordinal).unwrap(),
+                                },
+                                call,
+                                &mut work,
+                            )
+                            .expect("ANALYZE retains its exact logical source journal");
+                        assert_eq!(source.phase(), call.binding.phase);
+                        let request = source.captured().request();
+                        assert_eq!(request.logical_argument_count, 1);
+                        let novarocks_functions::FunctionArgument::Value {
+                            value_type,
+                            constant,
+                        } = &request.arguments[0]
+                        else {
+                            panic!("ANALYZE logical input is its original scan value");
+                        };
+                        assert_eq!(value_type, requirement.input().value_type());
+                        assert!(constant.is_none());
+                    }
+                    work.finish().unwrap();
+                }
                 match &node.kind {
                     NodeKind::Scan { occurrence, .. } => {
                         scan += 1;

@@ -296,3 +296,149 @@ pub(crate) fn prepare_physical_aggregate_occurrence_observed(
         preparation,
     })
 }
+
+pub(crate) struct PhysicalAggregateMergeOccurrenceInput<'a> {
+    pub fragment: &'a Fragment,
+    pub node: &'a PhysicalNode,
+    pub source: &'a AggregateCall,
+    pub request:
+        &'a super::physical_aggregate_requests::AuthoredPhysicalAggregateMergeRequest<'a, 'a>,
+    pub occurrences: &'a AuthoredPhysicalOccurrences,
+    pub child_effects: &'a BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
+    pub parameters: &'a SemanticParameters,
+    pub environment: &'a [SemanticParameterRef],
+    pub decimal_overflow_policy: DecimalOverflowPolicy,
+    pub proof_scope: CallProofScope,
+}
+
+/// Merge consumes the producer-certified logical request and one independent
+/// actual state root. Its neutral child effects are preserved in the operator
+/// context. The sole Functions owner checks state domain and nullable widening.
+/// This loan is not Package admission, a lifecycle execution or a host grant.
+/// Caller entry/ordinary footer and opaque clones remain caller obligations;
+/// all originating control failures return immediately on the same control.
+pub(crate) fn prepare_physical_aggregate_merge_occurrence_observed(
+    input: PhysicalAggregateMergeOccurrenceInput<'_>,
+    functions: &dyn SqlFunctionCatalog,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FreshPhysicalAggregateOccurrence, PhysicalAggregateOccurrenceError> {
+    let same = std::ptr::eq(input.fragment, input.request.fragment())
+        && std::ptr::eq(input.node, input.request.node())
+        && std::ptr::eq(input.source, input.request.source())
+        && input.occurrences.root_uses.roots().fragment() == input.fragment.id();
+    work.step()?;
+    if !same {
+        return Err(PhysicalAggregateOccurrenceError::InvalidSource(
+            "aggregate merge occurrence borrows a different original journal source",
+        ));
+    }
+    let policy = input.decimal_overflow_policy == input.request.decimal_overflow_policy();
+    work.step()?;
+    if !policy {
+        return Err(PhysicalAggregateOccurrenceError::InvalidSource(
+            "aggregate merge occurrence changes the original logical source policy",
+        ));
+    }
+    let site = input.request.site();
+    let (node, call, topn) = match site {
+        PhysicalCallSite::Aggregate { node, call } => (node, call, false),
+        PhysicalCallSite::TopNState { node, call } => (node, call, true),
+        _ => {
+            return Err(PhysicalAggregateOccurrenceError::InvalidSource(
+                "aggregate merge has a different lifecycle site",
+            ));
+        }
+    };
+    let context = relational_context_observed(input.occurrences, site, work)?;
+    let function = input.request.function();
+    work.flush()?;
+    let declaration = functions
+        .pure_overload_declaration_observed(
+            &function.function_id,
+            FunctionKind::Aggregate,
+            &input.request.selected().overload,
+            work.control(),
+        )
+        .map_err(ExpressionOccurrenceError::function)?;
+    work.flush()?;
+    let abi = declaration.implementation().abi;
+    let supported = matches!(
+        abi,
+        PureKernelAbi::AggregateV1 | PureKernelAbi::AggregateWindowV1
+    );
+    work.step()?;
+    if !supported {
+        return Err(PhysicalAggregateOccurrenceError::UnsupportedAbi(abi));
+    }
+    let supported = declaration.effects().argument_control == ArgumentControl::Aggregate;
+    work.step()?;
+    if !supported {
+        return Err(PhysicalAggregateOccurrenceError::InvalidSource(
+            "installed merge owner has different aggregate argument control",
+        ));
+    }
+    let role = if topn {
+        ExpressionRootRole::TopNStateArgument { call, argument: 0 }
+    } else {
+        ExpressionRootRole::AggregateArgument { call, argument: 0 }
+    };
+    let (state_use, children) = relational_root_effects_observed(
+        &input.occurrences.root_uses,
+        ExpressionRootSite { node, role },
+        input.request.state_id(),
+        input.child_effects,
+        work,
+    )?;
+    let invocation = input.occurrences.root_uses.flow().uses().get(&state_use);
+    work.step()?;
+    let state_context = invocation
+        .ok_or(PhysicalAggregateOccurrenceError::InvalidSource(
+            "aggregate merge state root has no original invocation",
+        ))?
+        .context;
+    let call = CallEffectInput {
+        context,
+        argument_uses: novarocks_functions::CallArgumentUses::AggregateMerge {
+            phase: input.request.phase(),
+            state_context,
+            state_input_type: &input.request.state().ty,
+        },
+        function_id: &function.function_id,
+        kind: FunctionKind::Aggregate,
+        selected: input.request.selected().as_ref(),
+        request: input.request.request(),
+        environment: input.environment,
+        parameters: input.parameters,
+        decimal_overflow_policy: input.decimal_overflow_policy,
+        proof_scope: input.proof_scope,
+    };
+    work.flush()?;
+    let options = input
+        .request
+        .preparation(ScopedExpressionEffects::primitive(context, children));
+    work.flush()?;
+    let preparation = functions
+        .prepare_fresh_selected(
+            call,
+            Arc::clone(input.request.selected()),
+            options,
+            work.control(),
+        )
+        .map_err(ExpressionOccurrenceError::function)?;
+    work.flush()?;
+    let frozen = FrozenPhysicalCall {
+        site,
+        context,
+        effects: preparation.call_contract().effects().clone(),
+        decimal_overflow_policy: input.decimal_overflow_policy,
+    };
+    work.flush()?;
+    Ok(FreshPhysicalAggregateOccurrence {
+        frozen,
+        preparation,
+    })
+}
+
+#[cfg(test)]
+#[path = "physical_aggregate_merge_tests.rs"]
+mod merge_tests;

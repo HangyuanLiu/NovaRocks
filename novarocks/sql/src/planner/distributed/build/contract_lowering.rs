@@ -71,8 +71,13 @@ use novarocks_type_contract::{
 };
 use sha2::{Digest, Sha256};
 
+use super::lowered_draft::{
+    AggregateLogicalSourceJournal, AggregateRuntimeDemand, AggregateSourceTarget,
+    LoweredAggregateLogicalSource, LoweredAggregateSourceEntry, LoweredSqlPhysicalDraft,
+};
 use crate::analysis::cte::CteId;
 use crate::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr, UnOp};
+use crate::binding::{AggregateRequestCaptureError, capture_aggregate_logical_request};
 use crate::column_id::ColumnId;
 use crate::compiler::{
     FinalizedProviderRead, FinalizedProviderReadSet, ProviderBucketPartitionScheme,
@@ -106,7 +111,7 @@ pub(crate) fn lower_final_physical_plan(
     root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantPolicy,
     control: &dyn PureCompileControl,
-) -> Result<PlanBuilder, ContractLoweringError> {
+) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     lower_final_physical_plan_inner(
         plan,
         version,
@@ -132,7 +137,7 @@ pub(crate) fn lower_final_physical_plan_with_provider_reads(
     root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantPolicy,
     control: &dyn PureCompileControl,
-) -> Result<PlanBuilder, ContractLoweringError> {
+) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     lower_final_physical_plan_inner(
         plan,
         version,
@@ -170,7 +175,7 @@ pub(crate) fn lower_final_physical_write_plan(
     root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantPolicy,
     control: &dyn PureCompileControl,
-) -> Result<PlanBuilder, ContractLoweringError> {
+) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     let FinalWriteLowering {
         reads,
         write,
@@ -225,7 +230,7 @@ pub(crate) fn lower_final_change_stream_write_plan(
     root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantPolicy,
     control: &dyn PureCompileControl,
-) -> Result<PlanBuilder, ContractLoweringError> {
+) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     let FinalChangeStreamWriteLowering {
         reads,
         dag,
@@ -272,7 +277,7 @@ fn lower_final_physical_plan_inner(
     root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantPolicy,
     control: &dyn PureCompileControl,
-) -> Result<PlanBuilder, ContractLoweringError> {
+) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     let mut visitor = ContractLoweringVisitor::new(
         version,
         dop_domain,
@@ -355,6 +360,7 @@ struct ContractLoweringVisitor<'a> {
     completions: BTreeMap<FragmentId, (NodeId, FragmentSink)>,
     plan_version: PlanVersionId,
     plan_builder: PlanBuilder,
+    aggregate_sources: AggregateLogicalSourceJournal,
     provider_partition_definitions: BTreeMap<PartitionSpaceId, ProviderPartitionDefinition>,
     dop_domain: PipelineDopDomain,
     provider_reads: Option<FinalizedProviderReadSet>,
@@ -1397,6 +1403,9 @@ impl<'a> ContractLoweringVisitor<'a> {
             completions: BTreeMap::new(),
             plan_version: version,
             plan_builder: PlanBuilder::new(version),
+            aggregate_sources: AggregateLogicalSourceJournal {
+                entries: BTreeMap::new(),
+            },
             provider_partition_definitions: BTreeMap::new(),
             dop_domain,
             provider_reads,
@@ -1623,10 +1632,84 @@ impl<'a> ContractLoweringVisitor<'a> {
         Ok(())
     }
 
+    fn capture_aggregate_source(
+        &mut self,
+        source: &crate::binding::AggregateArgumentSource<TypedExpr, crate::analysis::SortItem>,
+    ) -> Result<LoweredAggregateLogicalSource, ContractLoweringError> {
+        self.work.flush()?;
+        let certified = source.logical_parts().is_some();
+        self.work.step()?;
+        if !certified {
+            // Existing structural/manual IR has an explicit missing origin.
+            // Retaining it cannot mint a fresh specialization source.
+            return Ok(LoweredAggregateLogicalSource::Uncertified);
+        }
+        let captured =
+            capture_aggregate_logical_request(source, self.constant_policy, self.control)?;
+        self.work.flush()?;
+        Ok(LoweredAggregateLogicalSource::Captured(captured))
+    }
+
+    fn lower_captured_aggregate_argument(
+        &mut self,
+        owner: NodeId,
+        expression: &TypedExpr,
+        ordinal: usize,
+        logical: &LoweredAggregateLogicalSource,
+        visible: &BTreeMap<ColumnId, ValueId>,
+    ) -> Result<ExprId, ContractLoweringError> {
+        if matches!(
+            expression.kind,
+            ExprKind::Literal(_) | ExprKind::Constant(_)
+        ) {
+            if let Some(captured) = logical.captured() {
+                let captured_argument = captured.request().arguments.get(ordinal);
+                self.work.step()?;
+                let novarocks_functions::FunctionArgument::Value {
+                    constant: Some(value),
+                    ..
+                } = captured_argument.ok_or(ContractLoweringError::InvalidAggregate {
+                    detail: "captured aggregate argument ordinal is absent",
+                })?
+                else {
+                    return Err(ContractLoweringError::InvalidAggregate {
+                        detail: "literal aggregate argument has no captured constant source",
+                    });
+                };
+                self.work.step()?;
+                // Reuse the admitted literal/constant handle. The original
+                // factory is not called a second time for physical lowering.
+                return self.lower_constant_expression(owner, value, expression_type(expression));
+            }
+        }
+        self.lower_expression(owner, expression, visible)
+    }
+
+    fn record_aggregate_source(
+        &mut self,
+        site: novarocks_physical_plan::PhysicalCallSite,
+        entry: LoweredAggregateSourceEntry,
+    ) -> Result<(), ContractLoweringError> {
+        self.work.flush()?;
+        let key = (self.current_fragment, site);
+        let duplicate = self.aggregate_sources.entries.contains_key(&key);
+        self.work.step()?;
+        if duplicate {
+            return Err(ContractLoweringError::InvalidAggregate {
+                detail: "aggregate source site is duplicated",
+            });
+        }
+        // BTree allocation and retained captured arguments remain original
+        // caller admission obligations, not an allocation grant.
+        self.aggregate_sources.entries.insert(key, entry);
+        self.work.step()?;
+        Ok(())
+    }
+
     fn finish_draft(
         mut self,
         result_port: ResultPort,
-    ) -> Result<PlanBuilder, ContractLoweringError> {
+    ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
         self.plan_builder.set_result_port(result_port)?;
         let mut finished_fragments = BTreeMap::new();
         for (fragment_id, builder) in std::mem::take(&mut self.fragments) {
@@ -1654,6 +1737,42 @@ impl<'a> ContractLoweringVisitor<'a> {
                     detail: error.to_string(),
                 })?;
         }
+        // The sole physical call visitor proves exact source-journal coverage
+        // before the immutable draft can escape. Missing/extra sources are not
+        // repaired from a selected signature or an aggregate sequence.
+        let mut source_count = 0usize;
+        for fragment in finished_fragments.values() {
+            novarocks_physical_plan::visit_relational_calls_observed(
+                fragment,
+                &mut self.work,
+                |site, binding, work| {
+                    if let novarocks_physical_plan::PhysicalCallBinding::Aggregate(binding) =
+                        binding
+                    {
+                        let entry = self.aggregate_sources.entries.get(&(fragment.id(), site));
+                        work.step()?;
+                        let entry = entry.ok_or(ContractLoweringError::InvalidAggregate {
+                            detail: "actual aggregate call has no lowered source journal entry",
+                        })?;
+                        if entry.phase != binding.phase {
+                            return Err(ContractLoweringError::InvalidAggregate {
+                                detail: "aggregate source journal phase differs from actual call",
+                            });
+                        }
+                        source_count = source_count
+                            .checked_add(1)
+                            .ok_or(CompileControlError::ResourceExhausted)?;
+                        work.step()?;
+                    }
+                    Ok::<_, ContractLoweringError>(())
+                },
+            )?;
+        }
+        if source_count != self.aggregate_sources.entries.len() {
+            return Err(ContractLoweringError::InvalidAggregate {
+                detail: "aggregate source journal has an extra call site",
+            });
+        }
         for filter in self.materialize_runtime_filters(&finished_fragments)? {
             self.plan_builder.add_runtime_filter(filter)?;
         }
@@ -1672,7 +1791,10 @@ impl<'a> ContractLoweringVisitor<'a> {
             self.plan_builder = self.plan_builder.with_semantic_parameters(parameters);
         }
         self.work.finish()?;
-        Ok(self.plan_builder)
+        Ok(LoweredSqlPhysicalDraft::from_lowering(
+            self.plan_builder,
+            self.aggregate_sources,
+        ))
     }
 
     fn materialize_runtime_filters(
@@ -2802,7 +2924,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         let partial_aggregates = partial
             .calls()
             .iter()
-            .map(|call| {
+            .enumerate()
+            .map(|(call_ordinal, call)| {
                 let input_index = usize::try_from(call.input_slot_id().saturating_sub(1))
                     .map_err(|_| invalid_write("writer input slot is outside host range".into()))?;
                 if call.input_slot_id() == 0 {
@@ -2824,12 +2947,25 @@ impl<'a> ContractLoweringVisitor<'a> {
                     .get(&call.intermediate_slot_id())
                     .copied()
                     .ok_or_else(|| invalid_write("writer aggregate sequence is missing".into()))?;
+                let phase = AggregatePhase::Partial { sequence };
+                let binding = lower_writer_aggregate_binding(call.resolved(), phase)?;
+                let logical = self.capture_aggregate_source(&call.source)?;
+                self.record_aggregate_source(
+                    novarocks_physical_plan::PhysicalCallSite::WriterPartial {
+                        node,
+                        call: u32::try_from(call_ordinal)
+                            .map_err(|_| CompileControlError::ResourceExhausted)?,
+                    },
+                    LoweredAggregateSourceEntry {
+                        logical,
+                        phase,
+                        runtime: AggregateRuntimeDemand::Update,
+                        target: AggregateSourceTarget::Writer(output),
+                    },
+                )?;
                 Ok(WriterAggregateCall {
                     input,
-                    binding: lower_writer_aggregate_binding(
-                        call.resolved(),
-                        AggregatePhase::Partial { sequence },
-                    )?,
+                    binding,
                     output,
                 })
             })
@@ -3360,7 +3496,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         ordinal: WriteTargetOrdinal,
         auxiliary: &WriterAuxiliaryPlan,
         sequences: &BTreeMap<u32, AggregateSequenceId>,
-    ) -> Result<PlanBuilder, ContractLoweringError> {
+    ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
         self.lower_writer_finish(vec![writer], Box::from([ordinal]), auxiliary, sequences)
     }
 
@@ -3370,7 +3506,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         ordinals: Box<[WriteTargetOrdinal]>,
         auxiliary: &WriterAuxiliaryPlan,
         sequences: &BTreeMap<u32, AggregateSequenceId>,
-    ) -> Result<PlanBuilder, ContractLoweringError> {
+    ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
         if writers.is_empty() || writers.len() != ordinals.len() {
             return Err(invalid_write(
                 "writer finish has no exact writer set".into(),
@@ -3498,7 +3634,8 @@ impl<'a> ContractLoweringVisitor<'a> {
             .final_plan()
             .calls()
             .iter()
-            .map(|call| {
+            .enumerate()
+            .map(|(call_ordinal, call)| {
                 let input = input_slots
                     .get(&call.intermediate_input_slot_id())
                     .copied()
@@ -3522,12 +3659,25 @@ impl<'a> ContractLoweringVisitor<'a> {
                     .get(&call.intermediate_input_slot_id())
                     .copied()
                     .ok_or_else(|| invalid_write("final aggregate sequence is missing".into()))?;
+                let phase = AggregatePhase::Final { sequence };
+                let binding = lower_writer_aggregate_binding(call.resolved(), phase)?;
+                let logical = self.capture_aggregate_source(&call.source)?;
+                self.record_aggregate_source(
+                    novarocks_physical_plan::PhysicalCallSite::WriterFinal {
+                        node: finish,
+                        call: u32::try_from(call_ordinal)
+                            .map_err(|_| CompileControlError::ResourceExhausted)?,
+                    },
+                    LoweredAggregateSourceEntry {
+                        logical,
+                        phase,
+                        runtime: AggregateRuntimeDemand::WriterState(input),
+                        target: AggregateSourceTarget::Writer(output),
+                    },
+                )?;
                 Ok(WriterAggregateCall {
                     input,
-                    binding: lower_writer_aggregate_binding(
-                        call.resolved(),
-                        AggregatePhase::Final { sequence },
-                    )?,
+                    binding,
                     output,
                 })
             })
@@ -5047,6 +5197,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 });
             }
             let binding = lower_aggregate_binding(call, phase)?;
+            let logical_source = self.capture_aggregate_source(&call.source)?;
             let mut arguments = Vec::new();
             let mut order_by = Vec::new();
             if phase.consumes_logical_arguments() {
@@ -5054,15 +5205,31 @@ impl<'a> ContractLoweringVisitor<'a> {
                     .source
                     .arguments()
                     .iter()
-                    .map(|argument| self.lower_expression(node, argument, &child.columns))
+                    .enumerate()
+                    .map(|(ordinal, argument)| {
+                        self.lower_captured_aggregate_argument(
+                            node,
+                            argument,
+                            ordinal,
+                            &logical_source,
+                            &child.columns,
+                        )
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 order_by = call
                     .source
                     .order_by()
                     .iter()
-                    .map(|item| {
+                    .enumerate()
+                    .map(|(ordinal, item)| {
                         Ok(SortExpr {
-                            expr: self.lower_expression(node, &item.expr, &child.columns)?,
+                            expr: self.lower_captured_aggregate_argument(
+                                node,
+                                &item.expr,
+                                call.source.arguments().len() + ordinal,
+                                &logical_source,
+                                &child.columns,
+                            )?,
                             direction: if item.asc {
                                 SortDirection::Ascending
                             } else {
@@ -5086,11 +5253,8 @@ impl<'a> ContractLoweringVisitor<'a> {
                 // with -- the planner keeps the flag on every phase of a
                 // `count(distinct x)` because it is how the call is named --
                 // and the phase simply does not apply it again.
-                if !call.source.order_by().is_empty() {
-                    return Err(ContractLoweringError::InvalidAggregate {
-                        detail: "state-consuming aggregate carries no ORDER BY",
-                    });
-                }
+                // The retained logical request may include original ORDER
+                // channels. This physical phase consumes only their state.
                 let state_column = plan.children[0]
                     .output_columns
                     .get(state_base + merge_ordinal)
@@ -5159,6 +5323,25 @@ impl<'a> ContractLoweringVisitor<'a> {
                 &mut columns,
             )?;
             output.push(value);
+            let site = novarocks_physical_plan::PhysicalCallSite::Aggregate {
+                node,
+                call: u32::try_from(call_ordinal)
+                    .map_err(|_| CompileControlError::ResourceExhausted)?,
+            };
+            let runtime = if phase.consumes_logical_arguments() {
+                AggregateRuntimeDemand::Update
+            } else {
+                AggregateRuntimeDemand::ExpressionState(arguments[0])
+            };
+            self.record_aggregate_source(
+                site,
+                LoweredAggregateSourceEntry {
+                    logical: logical_source,
+                    phase,
+                    runtime,
+                    target: AggregateSourceTarget::Aggregate(call_id),
+                },
+            )?;
             calls.push(ContractAggregateCall {
                 id: call_id,
                 binding,
@@ -10293,6 +10476,7 @@ fn metadata_relation_kind(
 #[derive(Debug)]
 pub(crate) enum ContractLoweringError {
     Control(CompileControlError),
+    AggregateSource(AggregateRequestCaptureError),
     IdentitySpaceExhausted(&'static str),
     InvalidPlanIdentity {
         detail: String,
@@ -10457,6 +10641,7 @@ impl fmt::Display for ContractLoweringError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Control(error) => error.fmt(formatter),
+            Self::AggregateSource(error) => error.fmt(formatter),
             Self::IdentitySpaceExhausted(kind) => {
                 write!(formatter, "{kind} identity space exhausted")
             }
@@ -10659,6 +10844,26 @@ impl From<novarocks_physical_plan::ConstantReferenceError> for ContractLoweringE
     }
 }
 
+impl From<novarocks_physical_plan::FrozenCallError> for ContractLoweringError {
+    fn from(error: novarocks_physical_plan::FrozenCallError) -> Self {
+        match error {
+            novarocks_physical_plan::FrozenCallError::Control(cause) => Self::Control(cause),
+            _ => Self::InvalidAggregate {
+                detail: "aggregate source journal physical-call coverage is invalid",
+            },
+        }
+    }
+}
+
+impl From<AggregateRequestCaptureError> for ContractLoweringError {
+    fn from(error: AggregateRequestCaptureError) -> Self {
+        match error {
+            AggregateRequestCaptureError::Control(cause) => Self::Control(cause),
+            other => Self::AggregateSource(other),
+        }
+    }
+}
+
 impl From<CompileControlError> for ContractLoweringError {
     fn from(error: CompileControlError) -> Self {
         Self::Control(error)
@@ -10784,7 +10989,7 @@ mod tests {
     }
 
     fn lowering_control_error(
-        result: Result<PlanBuilder, ContractLoweringError>,
+        result: Result<LoweredSqlPhysicalDraft, ContractLoweringError>,
     ) -> CompileControlError {
         match result {
             Err(ContractLoweringError::Control(error)) => error,
@@ -11085,6 +11290,8 @@ mod tests {
             builder
                 .finish_observed(&crate::compiler::SqlCompileControl::unbounded())
                 .unwrap()
+                .plan()
+                .clone()
                 .fragments()
                 .len(),
             1
@@ -11530,7 +11737,9 @@ mod tests {
             crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
         )?
-        .finish_observed(&crate::compiler::SqlCompileControl::unbounded())?)
+        .finish_observed(&crate::compiler::SqlCompileControl::unbounded())?
+        .plan()
+        .clone())
     }
 
     fn write_handle() -> ConnectorEncodedPayload {
@@ -11574,7 +11783,9 @@ mod tests {
         )
         .unwrap()
         .finish_observed(&crate::compiler::SqlCompileControl::unbounded())
-        .unwrap();
+        .unwrap()
+        .plan()
+        .clone();
 
         assert_eq!(plan.fragments().len(), 2);
         assert_eq!(plan.edges().len(), 1);
@@ -11633,7 +11844,9 @@ mod tests {
         )
         .unwrap()
         .finish_observed(&crate::compiler::SqlCompileControl::unbounded())
-        .unwrap();
+        .unwrap()
+        .plan()
+        .clone();
         let target = plan
             .fragments()
             .values()
@@ -11721,7 +11934,9 @@ mod tests {
         )
         .unwrap()
         .finish_observed(&crate::compiler::SqlCompileControl::unbounded())
-        .unwrap();
+        .unwrap()
+        .plan()
+        .clone();
         let finish = plan
             .fragments()
             .values()
@@ -11850,7 +12065,9 @@ mod tests {
         )
         .unwrap()
         .finish_observed(&crate::compiler::SqlCompileControl::unbounded())
-        .unwrap();
+        .unwrap()
+        .plan()
+        .clone();
 
         assert_eq!(plan.fragments().len(), 4);
         assert_eq!(
@@ -11944,7 +12161,9 @@ mod tests {
         )
         .unwrap()
         .finish_observed(&crate::compiler::SqlCompileControl::unbounded())
-        .unwrap();
+        .unwrap()
+        .plan()
+        .clone();
         let edge = plan
             .edges()
             .values()
@@ -12357,7 +12576,9 @@ mod tests {
         )
         .unwrap()
         .finish_observed(&crate::compiler::SqlCompileControl::unbounded())
-        .expect("interleaved scan output must finish validation");
+        .expect("interleaved scan output must finish validation")
+        .plan()
+        .clone();
         let fragment = final_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
         let root = fragment.nodes().get(&fragment.root()).unwrap();
         assert_eq!(root.output.columns.len(), 3);
@@ -12419,7 +12640,9 @@ mod tests {
         )
         .unwrap()
         .finish_observed(&crate::compiler::SqlCompileControl::unbounded())
-        .expect("interleaved bucket scan output must finish validation");
+        .expect("interleaved bucket scan output must finish validation")
+        .plan()
+        .clone();
         let bucket_fragment = bucket_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
         let bucket_root = bucket_fragment
             .nodes()

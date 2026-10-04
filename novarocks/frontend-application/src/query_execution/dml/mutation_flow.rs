@@ -528,7 +528,7 @@ fn compile_dml_change_stream_write(
     )?;
     let (plan, writer_routes) = finalized.into_parts();
     let candidate =
-        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_sql_program(
             plan,
             &completion_control,
         )
@@ -3092,7 +3092,7 @@ fn execute_exact_cow_match_query(
         &completion_control,
     )?;
     let candidate =
-        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_sql_program(
             plan,
             &completion_control,
         )

@@ -17,6 +17,12 @@
 // under the License.
 
 mod contract_lowering;
+mod lowered_draft;
+pub use lowered_draft::SqlAuthoredPhysicalPlan;
+pub(crate) use lowered_draft::{
+    AggregateRuntimeDemand, AggregateSourceJournalError, CheckedAggregateLogicalSourceEntry,
+    LoweredSqlPhysicalDraft,
+};
 mod expression_occurrences;
 mod physical_aggregate_occurrences;
 mod physical_aggregate_requests;

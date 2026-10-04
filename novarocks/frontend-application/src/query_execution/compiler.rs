@@ -1523,9 +1523,9 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         ])?,
         &completion_control,
     )?;
-    let version = plan.version();
+    let version = plan.plan().version();
     let candidate =
-        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_sql_program(
             plan,
             &completion_control,
         )
