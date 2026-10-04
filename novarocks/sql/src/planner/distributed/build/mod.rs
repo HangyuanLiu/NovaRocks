@@ -19,6 +19,7 @@
 mod contract_lowering;
 mod expression_occurrences;
 mod physical_call_arguments;
+mod physical_expression_effects;
 mod physical_scalar_occurrences;
 mod physical_scalar_requests;
 

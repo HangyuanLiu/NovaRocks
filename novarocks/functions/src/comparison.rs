@@ -21,14 +21,14 @@
 use arrow_array::{types::*, *};
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
-    ValueLogicalType, arrow_data_types_exact_observed,
+    CompileCheckpoints, CompileControlError, CompilePhase, ExpressionEffectContext,
+    FunctionValueType, PureCompileControl, ValueLogicalType, arrow_data_types_exact_observed,
 };
 use std::{cmp::Ordering, error::Error, fmt};
 
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::{EvaluationCheckpoints, validate_type_observed};
-use crate::{EvaluatedArgument, KernelEvaluationControl, KernelFailure};
+use crate::{EvaluatedArgument, KernelEvaluationControl, KernelFailure, ScopedExpressionEffects};
 
 pub use novarocks_type_contract::ComparisonOperator;
 
@@ -264,6 +264,10 @@ impl PreparedComparisonRecipe {
     }
     pub fn nullable_result(&self) -> bool {
         self.left.nullable || self.right.nullable || self.leaf == FlatLeaf::Null
+    }
+    /// Only an admitted ordinary comparison recipe supplies its own pure summary.
+    pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
+        ScopedExpressionEffects::pure_value(context)
     }
 
     /// The host supplies an actual required row and excludes inherited errors.

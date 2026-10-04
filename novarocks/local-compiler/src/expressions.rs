@@ -1221,7 +1221,28 @@ fn prepare_core(
                             )?
                             .own_effects(invocation.context)
                         } else {
-                            ScopedExpressionEffects::pure_value(invocation.context)
+                            let (operator, _, _) =
+                                kind.ordinary_comparison().expect("checked comparison kind");
+                            let definitions = package.fragment().expressions();
+                            work.flush()?;
+                            let recipe = novarocks_functions::PreparedComparisonRecipe::try_new(
+                                operator,
+                                &definitions
+                                    .get(*left)
+                                    .ok_or(ExpressionLoweringError::Invalid(
+                                        "missing ordinary comparison left source",
+                                    ))?
+                                    .ty,
+                                &definitions
+                                    .get(*right)
+                                    .ok_or(ExpressionLoweringError::Invalid(
+                                        "missing ordinary comparison right source",
+                                    ))?
+                                    .ty,
+                                control,
+                            )?;
+                            work.flush()?;
+                            recipe.own_effects(invocation.context)
                         };
                     for (ordinal, physical) in [*left, *right].into_iter().enumerate() {
                         let child_use = invocation.arguments[ordinal];
