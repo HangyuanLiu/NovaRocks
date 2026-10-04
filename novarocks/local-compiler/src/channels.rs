@@ -29,11 +29,14 @@ use novarocks_type_contract::{
 };
 use novarocks_types::SlotId;
 
+use crate::unpivot::{UnpivotInputPort, UnpivotLoweringError, plan_unpivot_channels};
+
 use crate::repeat::{RepeatInputPort, RepeatLoweringError, plan_repeat_channels};
 
 pub(crate) struct LinearChannels {
     pub nodes: BTreeMap<NodeId, NodeChannels>,
     pub inputs: BTreeMap<ExprId, ResolvedInput>,
+    pub unpivot_sources: BTreeMap<NodeId, BTreeMap<ValueId, SlotId>>,
 }
 
 pub(crate) struct NodeChannels {
@@ -52,6 +55,7 @@ pub(crate) enum ChannelLoweringError {
     Control(CompileControlError),
     ValueType(ValueTypeError),
     Repeat(RepeatLoweringError),
+    Unpivot(UnpivotLoweringError),
     Invalid(&'static str),
 }
 
@@ -74,12 +78,22 @@ impl From<RepeatLoweringError> for ChannelLoweringError {
         }
     }
 }
+impl From<UnpivotLoweringError> for ChannelLoweringError {
+    fn from(error: UnpivotLoweringError) -> Self {
+        match error {
+            UnpivotLoweringError::Control(c) => Self::Control(c),
+            UnpivotLoweringError::Invalid(m) => Self::Invalid(m),
+            e => Self::Unpivot(e),
+        }
+    }
+}
 impl fmt::Display for ChannelLoweringError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Control(error) => error.fmt(f),
             Self::ValueType(error) => error.fmt(f),
             Self::Repeat(error) => error.fmt(f),
+            Self::Unpivot(error) => error.fmt(f),
             Self::Invalid(message) => write!(f, "invalid linear channels: {message}"),
         }
     }
@@ -90,6 +104,7 @@ impl Error for ChannelLoweringError {
             Self::Control(error) => Some(error),
             Self::ValueType(error) => Some(error),
             Self::Repeat(error) => Some(error),
+            Self::Unpivot(error) => Some(error),
             Self::Invalid(_) => None,
         }
     }
@@ -128,6 +143,7 @@ fn resolve_core(
     let mut nodes = BTreeMap::<NodeId, NodeChannels>::new();
     let mut ports = BTreeMap::<NodeId, Port>::new();
     let mut next_slot = 0_u64;
+    let mut unpivot_sources = BTreeMap::new();
     let mut previous = None;
     for &source in root_first.iter().rev() {
         let node = fragment
@@ -232,6 +248,26 @@ fn resolve_core(
                 passthrough(fragment, node, previous, &nodes, &ports, work)?
             }
             NodeKind::Limit { .. } => passthrough(fragment, node, previous, &nodes, &ports, work)?,
+            NodeKind::Unpivot { .. } => {
+                let child = linear_child(&node.inputs, previous)?;
+                let child_channels = nodes.get(&child).ok_or(ChannelLoweringError::Invalid(
+                    "missing lowered Unpivot child",
+                ))?;
+                let planned = plan_unpivot_channels(
+                    fragment,
+                    node,
+                    UnpivotInputPort {
+                        node: &fragment.nodes()[&child],
+                        slots: &child_channels.slots,
+                        representatives: &ports[&child],
+                    },
+                    &mut next_slot,
+                    work,
+                )?;
+                unpivot_sources.insert(source, planned.sources);
+                work.step()?;
+                (planned.slots, planned.port)
+            }
             NodeKind::Repeat { .. } => {
                 let child = linear_child(&node.inputs, previous)?;
                 let child_channels = nodes.get(&child).ok_or(ChannelLoweringError::Invalid(
@@ -292,7 +328,11 @@ fn resolve_core(
         }
         work.step()?;
     }
-    Ok(LinearChannels { nodes, inputs })
+    Ok(LinearChannels {
+        nodes,
+        inputs,
+        unpivot_sources,
+    })
 }
 
 fn linear_child(

@@ -22,9 +22,13 @@ mod channels;
 mod expressions;
 mod lowering;
 mod repeat;
+mod unpivot;
 
 #[cfg(test)]
 mod repeat_lowering_tests;
+
+#[cfg(test)]
+mod unpivot_lowering_tests;
 
 pub use lowering::{FragmentCompileError, LocalCompileOptions, compile_fragment};
 

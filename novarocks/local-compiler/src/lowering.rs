@@ -22,6 +22,7 @@ use crate::{
     channels::{ChannelLoweringError, resolve_linear_channels},
     expressions::{ExpressionLoweringError, lower_expressions, prepare_calls},
     repeat::{RepeatLoweringError, lower_repeat},
+    unpivot::{UnpivotLoweringError, UnpivotLoweringInput, lower_unpivot},
 };
 use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::Schema;
@@ -134,6 +135,18 @@ impl From<RepeatLoweringError> for FragmentCompileError {
             error => Self::Owner {
                 phase: "Repeat",
                 error: Box::new(error),
+            },
+        }
+    }
+}
+impl From<UnpivotLoweringError> for FragmentCompileError {
+    fn from(error: UnpivotLoweringError) -> Self {
+        match error {
+            UnpivotLoweringError::Control(c) => Self::Control(c),
+            UnpivotLoweringError::Invalid(m) => Self::Invalid(m),
+            e => Self::Owner {
+                phase: "Unpivot",
+                error: Box::new(e),
             },
         }
     }
@@ -270,7 +283,9 @@ fn lower(
                 next = Some(node.inputs[0])
             }
             NodeKind::Limit { .. } if node.inputs.len() == 1 => next = Some(node.inputs[0]),
-            NodeKind::Repeat { .. } if node.inputs.len() == 1 => next = Some(node.inputs[0]),
+            NodeKind::Repeat { .. } | NodeKind::Unpivot { .. } if node.inputs.len() == 1 => {
+                next = Some(node.inputs[0])
+            }
             _ => {
                 return Err(FragmentCompileError::Unsupported {
                     node: Some(id),
@@ -376,6 +391,31 @@ fn lower(
                         },
                         nodes[child.index()].output_layout().clone(),
                     )
+                }
+                NodeKind::Unpivot { .. } => {
+                    let child =
+                        *local_ids
+                            .get(&node.inputs[0])
+                            .ok_or(FragmentCompileError::Invalid(
+                                "missing lowered Unpivot child",
+                            ))?;
+                    let sources = channels_plan.unpivot_sources.get(&source).ok_or(
+                        FragmentCompileError::Invalid("missing planned Unpivot input sources"),
+                    )?;
+                    work.flush()?;
+                    lower_unpivot(
+                        package,
+                        node,
+                        id,
+                        UnpivotLoweringInput {
+                            node: child,
+                            layout: nodes[child.index()].output_layout(),
+                            sources,
+                            expressions: &expressions.ids,
+                        },
+                        &planned.slots,
+                        work.control(),
+                    )?
                 }
                 NodeKind::Repeat { .. } => {
                     let child =
@@ -604,6 +644,9 @@ fn lower(
             .get(&site.node)
             .ok_or(FragmentCompileError::Invalid("missing root node"))?;
         let role = match site.role {
+            ExpressionRootRole::UnpivotConstant { mapping, constant } => {
+                ProgramNodeExpressionRole::UnpivotConstant { mapping, constant }
+            }
             ExpressionRootRole::FilterPredicate { predicate: 0 } => {
                 ProgramNodeExpressionRole::FilterPredicate
             }
