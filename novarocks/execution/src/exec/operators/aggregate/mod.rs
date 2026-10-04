@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 pub(crate) mod final_domain;
 pub(crate) mod native_runtime_filter;
 mod retained;
@@ -762,26 +764,26 @@ impl Operator for AggregateProcessorOperator {
         self.profiles = Some(profiles);
     }
 
-    fn prepare(&mut self) -> Result<(), String> {
+    fn prepare(&mut self) -> ExecutionResult<()> {
         if let Some(error) = self.memory_bind_error.clone() {
-            return Err(error);
+            return Err(error.into());
         }
         self.operator_vectors_memory
             .ensure_bound(&mut self.group_states, &mut self.state_ptrs)?;
         if let Some(error) = self.final_domain_bind_error.clone() {
             self.fail_final_domain();
-            return Err(error);
+            return Err(error.into());
         }
         let result = self.init_from_plan();
         if result.is_err() {
             self.fail_final_domain();
         }
-        result
+        Ok(result?)
     }
 
-    fn bind_runtime_state(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn bind_runtime_state(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         if let Some(error) = self.native_topn_bind_error.take() {
-            return Err(error);
+            return Err(error.into());
         }
         if let Some(session) = self.native_topn_session.as_mut() {
             session.bind()?;
@@ -797,8 +799,8 @@ impl Operator for AggregateProcessorOperator {
         let _ = self.fail_native_topn_producers(RuntimeFilterProducerFailure::ExecutionFailed);
     }
 
-    fn close(&mut self) -> Result<(), String> {
-        self.fail_native_topn_producers(RuntimeFilterProducerFailure::ExecutionFailed)
+    fn close(&mut self) -> ExecutionResult<()> {
+        Ok(self.fail_native_topn_producers(RuntimeFilterProducerFailure::ExecutionFailed)?)
     }
 
     fn is_finished(&self) -> bool {
@@ -1235,7 +1237,7 @@ impl ProcessorOperator for AggregateProcessorOperator {
         self.pending_output.is_some()
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         let result = (|| {
             if self.finished {
                 return if self.final_domain_session_bound {
@@ -1263,10 +1265,10 @@ impl ProcessorOperator for AggregateProcessorOperator {
             self.fail_final_domain();
             let _ = self.fail_native_topn_producers(RuntimeFilterProducerFailure::ExecutionFailed);
         }
-        result
+        Ok(result?)
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         let out = self.pending_output.take();
         if self.finishing && self.finalized && self.pending_output.is_none() {
             self.finished = true;
@@ -1274,7 +1276,7 @@ impl ProcessorOperator for AggregateProcessorOperator {
         Ok(out)
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         let result = (|| {
             if self.finished {
                 return Ok(());
@@ -2251,7 +2253,7 @@ mod tests {
             .push_chunk(&state, group_chunk([2]))
             .expect_err("aggregate must reject post-freeze input");
 
-        assert_eq!(error, "aggregate received input after set_finishing");
+        assert_eq!(error, "aggregate received input after set_finishing".into());
         assert_eq!(fixture.accepted_partitions(), vec![0]);
 
         processor
@@ -2262,7 +2264,7 @@ mod tests {
         let error = processor
             .push_chunk(&state, group_chunk([3]))
             .expect_err("finished aggregate must reject post-freeze input");
-        assert_eq!(error, "aggregate received input after set_finishing");
+        assert_eq!(error, "aggregate received input after set_finishing".into());
         assert_eq!(fixture.accepted_partitions(), vec![0]);
     }
 
@@ -2291,7 +2293,7 @@ mod tests {
 
             assert_eq!(
                 operator.prepare().expect_err("structural miswire"),
-                expected
+                expected.into()
             );
             assert_eq!(fixture.failure_count(), 1);
             assert_eq!(fixture.producer_failed_unavailable_count(), 1);
@@ -2307,7 +2309,7 @@ mod tests {
 
         assert_eq!(
             operator.prepare().expect_err("DOP mismatch"),
-            "aggregate final-domain DOP mismatch: declared=2 actual=3"
+            "aggregate final-domain DOP mismatch: declared=2 actual=3".into()
         );
         assert_eq!(fixture.failure_count(), 1);
         assert_eq!(fixture.producer_failed_unavailable_count(), 1);
@@ -2327,7 +2329,7 @@ mod tests {
             operator
                 .prepare()
                 .expect_err("unsupported final-domain key must fail prepare"),
-            "unsupported aggregate final-domain membership key type: Decimal256(10, 2)"
+            "unsupported aggregate final-domain membership key type: Decimal256(10, 2)".into()
         );
         assert!(
             !operator
@@ -2352,7 +2354,7 @@ mod tests {
             operator
                 .prepare()
                 .expect_err("installed schema mismatch must fail prepare"),
-            "aggregate final-domain key type mismatch: installed=Int64 aggregate=Int32"
+            "aggregate final-domain key type mismatch: installed=Int64 aggregate=Int32".into()
         );
         assert!(
             !operator
@@ -2374,6 +2376,7 @@ mod tests {
             assert_eq!(
                 operator.prepare().expect_err("out-of-range driver"),
                 "aggregate final-domain driver id is outside the actual DOP: driver_id=2 dop=2"
+                    .into()
             );
             assert_eq!(fixture.failure_count(), 1);
             assert_eq!(fixture.producer_failed_unavailable_count(), 1);
@@ -2386,8 +2389,12 @@ mod tests {
             let mut duplicate = factory.create(2, 0);
 
             let error = duplicate.prepare().expect_err("duplicate driver");
-            assert!(error.contains("partition acquisition failed for driver_id=0"));
-            assert!(error.contains("already created"));
+            assert!(
+                error
+                    .detail()
+                    .contains("partition acquisition failed for driver_id=0")
+            );
+            assert!(error.detail().contains("already created"));
             assert_eq!(fixture.failure_count(), 1);
             assert_eq!(fixture.producer_failed_unavailable_count(), 1);
             drop(first);

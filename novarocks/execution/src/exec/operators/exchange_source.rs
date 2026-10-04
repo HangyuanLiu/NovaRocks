@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -325,7 +327,7 @@ impl Operator for ExchangeSourceOperator {
         self.event_sink = event_sink;
     }
 
-    fn prepare(&mut self) -> Result<(), String> {
+    fn prepare(&mut self) -> ExecutionResult<()> {
         if self.receiver.is_some() {
             return Ok(());
         }
@@ -345,19 +347,19 @@ impl Operator for ExchangeSourceOperator {
         Ok(())
     }
 
-    fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         let _ = state;
         Ok(())
     }
 
-    fn activate(&mut self, state: &RuntimeState) -> Result<(), String> {
+    fn activate(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         if let Some(consumers) = self.native_runtime_filter_consumers.as_ref() {
             consumers.bind(state)?;
         }
         Ok(())
     }
 
-    fn close(&mut self) -> Result<(), String> {
+    fn close(&mut self) -> ExecutionResult<()> {
         self.idle_deadline.cancel();
         Ok(())
     }
@@ -419,17 +421,19 @@ impl ProcessorOperator for ExchangeSourceOperator {
         ready
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
-        Err("exchange source operator does not accept input".to_string())
+    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
+        Err("exchange source operator does not accept input"
+            .to_string()
+            .into())
     }
 
-    fn pull_chunk(&mut self, state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         if self.finished {
             return Ok(None);
         }
 
         if self.receiver.is_none() {
-            return Err("exchange source operator not prepared".to_string());
+            return Err("exchange source operator not prepared".to_string().into());
         }
 
         if !self.receiver_mem_tracker_ready {
@@ -550,7 +554,7 @@ impl ProcessorOperator for ExchangeSourceOperator {
                             self.binding.key.finst_uuid(),
                             self.node.node_id,
                             self.binding.expected_senders,
-                        ));
+                        ).into());
                     }
                     let first_none = !self.logged_first_none;
                     if first_none {
@@ -605,7 +609,7 @@ impl ProcessorOperator for ExchangeSourceOperator {
         }
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         Ok(())
     }
 
@@ -878,16 +882,16 @@ mod tests {
             false
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
             self.rows.fetch_add(chunk.len(), Ordering::AcqRel);
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             self.finishing = true;
             Ok(())
         }
@@ -982,7 +986,7 @@ mod tests {
     fn wait_for_exchange_timeout(
         completion: &Arc<FragmentCompletion>,
         fragment: &Arc<FragmentContext>,
-    ) -> String {
+    ) -> crate::runtime::fragment::ExecutionFailure {
         let deadline = Instant::now() + Duration::from_secs(2);
         while !completion.should_abort() && Instant::now() < deadline {
             std::thread::yield_now();
@@ -1026,7 +1030,11 @@ mod tests {
 
         let error = wait_for_exchange_timeout(&completion, &fragment);
 
-        assert!(error.contains("exchange timeout waiting for senders"));
+        assert!(
+            error
+                .detail()
+                .contains("exchange timeout waiting for senders")
+        );
         assert_eq!(
             observable.generation(),
             before,
@@ -1086,7 +1094,11 @@ mod tests {
         );
 
         let error = wait_for_exchange_timeout(&completion, &fragment);
-        assert!(error.contains("exchange timeout waiting for senders"));
+        assert!(
+            error
+                .detail()
+                .contains("exchange timeout waiting for senders")
+        );
         assert_eq!(
             observable.generation(),
             after_receiver,

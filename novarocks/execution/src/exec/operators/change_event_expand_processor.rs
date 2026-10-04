@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -125,20 +127,22 @@ impl ProcessorOperator for ChangeEventExpandProcessorOperator {
         self.pending_output.is_some()
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if self.finished {
             return Ok(());
         }
         if self.pending_output.is_some() {
             return Err(
-                "change event expand received input while output buffer is full".to_string(),
+                "change event expand received input while output buffer is full"
+                    .to_string()
+                    .into(),
             );
         }
         self.pending_output = Some(self.process_one(&chunk)?);
         Ok(())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         let out = self.pending_output.take();
         if self.finishing && self.pending_output.is_none() {
             self.finished = true;
@@ -146,7 +150,7 @@ impl ProcessorOperator for ChangeEventExpandProcessorOperator {
         Ok(out)
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         self.finishing = true;
         if self.pending_output.is_none() {
             self.finished = true;

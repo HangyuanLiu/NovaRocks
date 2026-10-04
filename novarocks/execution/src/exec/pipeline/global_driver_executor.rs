@@ -28,6 +28,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -59,11 +61,11 @@ pub struct FragmentCompletion {
 /// lifecycle transition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FragmentStoppedFact {
-    conclusion: Result<(), String>,
+    conclusion: ExecutionResult<()>,
 }
 
 impl FragmentStoppedFact {
-    pub fn conclusion(&self) -> Result<(), String> {
+    pub fn conclusion(&self) -> ExecutionResult<()> {
         self.conclusion.clone()
     }
 }
@@ -81,7 +83,7 @@ fn invoke_stopped_observer(observer: FragmentStoppedObserver, stopped: FragmentS
 struct FragmentCompletionState {
     remaining: usize,
     aborting: bool,
-    conclusion: Option<Result<(), String>>,
+    conclusion: Option<ExecutionResult<()>>,
     stopped: Option<FragmentStoppedFact>,
     stopped_observers: Vec<FragmentStoppedObserver>,
 }
@@ -105,12 +107,13 @@ impl FragmentCompletion {
         self.mu.lock().expect("fragment completion lock").aborting
     }
 
-    pub fn fail(&self, err: String) -> bool {
+    pub fn fail(&self, err: impl Into<ExecutionFailure>) -> bool {
+        let err = err.into();
         let mut st = self.mu.lock().expect("fragment completion lock");
         self.fail_locked(&mut st, err)
     }
 
-    fn fail_locked(&self, st: &mut FragmentCompletionState, err: String) -> bool {
+    fn fail_locked(&self, st: &mut FragmentCompletionState, err: ExecutionFailure) -> bool {
         if st.conclusion.is_some() || st.stopped.is_some() {
             return false;
         }
@@ -149,7 +152,7 @@ impl FragmentCompletion {
     ///
     /// Failure is known when cancellation or a driver error wins. Success is
     /// known only when every driver has actually stopped.
-    pub fn conclusion(&self) -> Option<Result<(), String>> {
+    pub fn conclusion(&self) -> Option<ExecutionResult<()>> {
         self.mu
             .lock()
             .expect("fragment completion lock")
@@ -193,7 +196,7 @@ impl FragmentCompletion {
         }
     }
 
-    pub fn wait(&self) -> Result<(), String> {
+    pub fn wait(&self) -> ExecutionResult<()> {
         let mut st = self.mu.lock().expect("fragment completion lock");
         while st.remaining > 0 {
             st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
@@ -205,7 +208,7 @@ impl FragmentCompletion {
             .conclusion()
     }
 
-    pub fn wait_timeout(&self, timeout: Duration, err: String) -> Result<(), String> {
+    pub fn wait_timeout(&self, timeout: Duration, err: String) -> ExecutionResult<()> {
         self.wait_timeout_with_local_cancel(timeout, err, || {})
     }
 
@@ -214,7 +217,7 @@ impl FragmentCompletion {
         timeout: Duration,
         err: String,
         on_timeout: F,
-    ) -> Result<(), String>
+    ) -> ExecutionResult<()>
     where
         F: FnOnce(),
     {
@@ -224,7 +227,7 @@ impl FragmentCompletion {
         while st.remaining > 0 {
             let now = Instant::now();
             if now >= deadline {
-                let timeout_won = self.fail_locked(&mut st, err.clone());
+                let timeout_won = self.fail_locked(&mut st, err.clone().into());
                 drop(st);
                 if timeout_won {
                     on_timeout.take().expect("timeout callback is available")();
@@ -247,7 +250,7 @@ impl FragmentCompletion {
                 .unwrap_or_else(|e| e.into_inner());
             st = guard;
             if result.timed_out() && st.remaining > 0 {
-                let timeout_won = self.fail_locked(&mut st, err.clone());
+                let timeout_won = self.fail_locked(&mut st, err.clone().into());
                 drop(st);
                 if timeout_won {
                     on_timeout.take().expect("timeout callback is available")();
@@ -398,7 +401,8 @@ impl DriverTask {
         None
     }
 
-    pub(crate) fn fail(&self, err: String) {
+    pub(crate) fn fail(&self, err: impl Into<ExecutionFailure>) {
+        let err = err.into();
         if self.completion.fail(err.clone()) {
             self.fragment_ctx.set_final_status(err);
         }
@@ -1081,15 +1085,15 @@ mod tests {
             false
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             Ok(())
         }
     }
@@ -1101,7 +1105,7 @@ mod tests {
             "panicking_source"
         }
 
-        fn activate(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn activate(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             panic!("injected driver panic")
         }
 
@@ -1123,15 +1127,15 @@ mod tests {
             panic!("injected driver panic")
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
             unreachable!("panicking source receives no input")
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             unreachable!("panicking source produces no output")
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             Ok(())
         }
     }
@@ -1171,7 +1175,7 @@ mod tests {
             .expect_err("incomplete fragment should time out");
         join.join().expect("timeout waiter thread must not panic");
 
-        assert_eq!(err, "query timed out after 5 ms");
+        assert_eq!(err, "query timed out after 5 ms".into());
         assert!(completion.should_abort());
     }
 
@@ -1182,7 +1186,7 @@ mod tests {
         assert!(completion.fail("injected failure".to_string()));
         assert_eq!(
             completion.conclusion(),
-            Some(Err("injected failure".to_string()))
+            Some(Err("injected failure".into()))
         );
         assert_eq!(completion.remaining_drivers(), 2);
         assert_eq!(completion.stopped_fact(), None);
@@ -1198,7 +1202,7 @@ mod tests {
                 .stopped_fact()
                 .expect("final driver publishes actual stop")
                 .conclusion(),
-            Err("injected failure".to_string())
+            Err("injected failure".into())
         );
     }
 
@@ -1405,7 +1409,7 @@ mod tests {
                 .stopped_fact()
                 .expect("actual stop follows pending finish")
                 .conclusion(),
-            Err("driver executor is shutting down".to_string())
+            Err("driver executor is shutting down".into())
         );
     }
 
@@ -1598,7 +1602,7 @@ mod tests {
         }));
         assert_eq!(
             harness.completion.conclusion(),
-            Some(Err("injected failure".to_string()))
+            Some(Err("injected failure".into()))
         );
         executor.shutdown().expect("executor shutdown");
     }
@@ -1628,7 +1632,7 @@ mod tests {
         assert!(probes.all_exited());
         assert_eq!(
             harness.completion.conclusion(),
-            Some(Err("driver executor is shutting down".to_string()))
+            Some(Err("driver executor is shutting down".into()))
         );
     }
 
@@ -1717,7 +1721,7 @@ mod tests {
             .expect("rejected driver must publish actual stop");
         assert_eq!(
             stopped.conclusion(),
-            Err("driver executor is shutting down".to_string())
+            Err("driver executor is shutting down".into())
         );
     }
 
@@ -1778,6 +1782,7 @@ mod tests {
                 .expect("driver stopped after cleanup")
                 .conclusion()
                 .expect_err("panic is a failure")
+                .detail()
                 .contains("panic in driver execution: injected driver panic")
         );
     }
@@ -1824,7 +1829,7 @@ mod tests {
         assert!(observed.load(Ordering::Acquire));
         assert_eq!(
             completion.conclusion(),
-            Some(Err("driver executor is shutting down".to_string()))
+            Some(Err("driver executor is shutting down".into()))
         );
         assert_eq!(completion.stopped_fact(), None);
         assert_eq!(completion.remaining_drivers(), 1);
@@ -1838,7 +1843,7 @@ mod tests {
                 .stopped_fact()
                 .expect("rejected driver stopped")
                 .conclusion(),
-            Err("driver executor is shutting down".to_string())
+            Err("driver executor is shutting down".into())
         );
     }
 
@@ -1889,7 +1894,7 @@ mod tests {
         assert!(observed.load(Ordering::Acquire));
         assert_eq!(
             completion.conclusion(),
-            Some(Err("driver executor is shutting down".to_string()))
+            Some(Err("driver executor is shutting down".into()))
         );
         assert_eq!(completion.stopped_fact(), None);
         assert_eq!(completion.remaining_drivers(), 1);
@@ -1907,7 +1912,7 @@ mod tests {
                 .stopped_fact()
                 .expect("rejected driver stopped")
                 .conclusion(),
-            Err("driver executor is shutting down".to_string())
+            Err("driver executor is shutting down".into())
         );
     }
 
@@ -1990,5 +1995,20 @@ mod tests {
             1,
             "concurrent rejections must not create per-task cleanup threads"
         );
+    }
+
+    #[test]
+    fn typed_failure_completion_first_cause_precedes_actual_stop_and_survives_second_failure() {
+        let completion = FragmentCompletion::new(2);
+        let first: ExecutionFailure = novarocks_functions::KernelFailure::ResourceExhausted.into();
+        assert!(completion.fail(first.clone()));
+        assert!(!completion.fail(novarocks_functions::KernelFailure::Cancelled));
+        assert_eq!(completion.conclusion(), Some(Err(first.clone())));
+        assert_eq!(completion.remaining_drivers(), 2);
+        assert!(completion.stopped_fact().is_none());
+        assert!(!completion.driver_finished());
+        assert!(completion.stopped_fact().is_none());
+        assert!(completion.driver_finished());
+        assert_eq!(completion.stopped_fact().unwrap().conclusion(), Err(first));
     }
 }

@@ -58,8 +58,8 @@ use novarocks_execution::runtime::fragment::io::{
     FragmentCommitPort, FragmentEvent, FragmentEventSink, FragmentResultWriter,
 };
 use novarocks_execution::runtime::fragment::{
-    DormantFragmentHandle, FragmentCancelReason, FragmentOutcome, FragmentTerminalFact,
-    RunningFragmentHandle, prepare_fragment,
+    DormantFragmentHandle, ExecutionFailureCause, FragmentCancelReason, FragmentExecutionError,
+    FragmentOutcome, FragmentTerminalFact, RunningFragmentHandle, prepare_fragment,
 };
 use novarocks_execution::runtime::operator_statistics::project_operator_statistics;
 use novarocks_execution::runtime::profile::{Profiler, RuntimeProfileTree, fragment_root_profiler};
@@ -1492,13 +1492,7 @@ fn report_terminal(
             }
             StandDown::Quiesce => {
                 if let FragmentOutcome::Failed(error) = fact.outcome() {
-                    report_failure(
-                        reporter,
-                        TaskFailure::new(
-                            TaskFailureCategory::Execution,
-                            SafeDetail::truncating(&error.to_string()),
-                        ),
-                    );
+                    report_failure(reporter, execution_failure_to_task(error));
                 } else {
                     reporter.canceling(CancelReason::UpstreamNoLongerNeeded);
                     let output = if matches!(fact.outcome(), FragmentOutcome::Succeeded)
@@ -1556,15 +1550,33 @@ fn report_terminal(
             );
         }
         FragmentOutcome::Failed(error) => {
-            report_failure(
-                reporter,
-                TaskFailure::new(
-                    TaskFailureCategory::Execution,
-                    SafeDetail::truncating(&error.to_string()),
-                ),
-            );
+            report_failure(reporter, execution_failure_to_task(error));
         }
     }
+}
+
+/// Classify the original failure payload at the native reporting boundary.
+/// Pipeline text is opaque; matching a diagnostic cannot grant a category.
+fn execution_failure_to_task(error: &FragmentExecutionError) -> TaskFailure {
+    use novarocks_functions::KernelFailure;
+    let category = match error.cause().cause() {
+        ExecutionFailureCause::Kernel(KernelFailure::ResourceExhausted) => {
+            TaskFailureCategory::ResourceExhausted
+        }
+        ExecutionFailureCause::Kernel(
+            KernelFailure::InvalidProgram(_)
+            | KernelFailure::Internal(_)
+            | KernelFailure::InstanceFailed,
+        ) => TaskFailureCategory::Internal,
+        ExecutionFailureCause::Kernel(
+            KernelFailure::Cancelled
+            | KernelFailure::DeadlineExceeded
+            | KernelFailure::Operational(_),
+        )
+        | ExecutionFailureCause::RequiredRow(_)
+        | ExecutionFailureCause::Pipeline(_) => TaskFailureCategory::Execution,
+    };
+    TaskFailure::new(category, SafeDetail::truncating(&error.to_string()))
 }
 
 /// Publishes FAILING before FAILED.
@@ -3442,6 +3454,157 @@ mod tests {
             outcome,
             None,
         )
+    }
+
+    #[test]
+    fn typed_failure_native_reporting_uses_original_kernel_cause_including_normal_quiesce() {
+        use novarocks_execution_contract::task_execution::status::{
+            TaskFailurePhase, TerminationDetail,
+        };
+        use novarocks_functions::{KernelDiagnostic, KernelFailure};
+        let diagnostic = || KernelDiagnostic::new("ResourceExhausted: identical diagnostic text");
+        for (index, (cause, expected)) in [
+            (
+                KernelFailure::ResourceExhausted,
+                TaskFailureCategory::ResourceExhausted,
+            ),
+            (
+                KernelFailure::InvalidProgram(diagnostic()),
+                TaskFailureCategory::Internal,
+            ),
+            (
+                KernelFailure::Internal(diagnostic()),
+                TaskFailureCategory::Internal,
+            ),
+            (KernelFailure::InstanceFailed, TaskFailureCategory::Internal),
+            (KernelFailure::Cancelled, TaskFailureCategory::Execution),
+            (
+                KernelFailure::DeadlineExceeded,
+                TaskFailureCategory::Execution,
+            ),
+            (
+                KernelFailure::Operational(diagnostic()),
+                TaskFailureCategory::Execution,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for quiesce in [false, true] {
+                let (owner, reporter) = reporter_for(identity(
+                    80_000 + index as i64 * 2 + i64::from(quiesce),
+                    1,
+                    1,
+                ));
+                reporter.running();
+                if quiesce {
+                    reporter.canceling(CancelReason::UpstreamNoLongerNeeded);
+                }
+                let error = FragmentExecutionError::from_failure(
+                    FragmentExecutionErrorKind::Pipeline,
+                    cause.clone().into(),
+                );
+                assert_eq!(
+                    error.cause().cause(),
+                    &novarocks_execution::runtime::fragment::ExecutionFailureCause::Kernel(
+                        cause.clone()
+                    )
+                );
+                report_terminal(
+                    &reporter,
+                    FragmentSinkKind::Noop,
+                    &terminal_fact(FragmentOutcome::Failed(error)),
+                    quiesce.then_some(StandDown::Quiesce),
+                );
+                assert_eq!(owner.state(), TaskState::Failed);
+                assert!(owner.output_released());
+                let status = owner.current();
+                let Some(TerminationDetail::Failed(failure)) = status.termination() else {
+                    panic!("original failure must be terminal");
+                };
+                assert_eq!(failure.category(), expected);
+                assert_eq!(failure.phase(), TaskFailurePhase::Execution);
+            }
+        }
+    }
+
+    #[test]
+    fn typed_failure_native_pipeline_text_does_not_claim_kernel_resource_category() {
+        use novarocks_execution_contract::task_execution::status::TerminationDetail;
+        let (owner, reporter) = reporter_for(identity(80_020, 1, 1));
+        reporter.running();
+        report_terminal(
+            &reporter,
+            FragmentSinkKind::Noop,
+            &terminal_fact(FragmentOutcome::Failed(FragmentExecutionError::new(
+                FragmentExecutionErrorKind::Pipeline,
+                "kernel evaluation resources were exhausted: ResourceExhausted",
+            ))),
+            None,
+        );
+        let status = owner.current();
+        let Some(TerminationDetail::Failed(failure)) = status.termination() else {
+            panic!("expected explicit pipeline failure");
+        };
+        assert_eq!(failure.category(), TaskFailureCategory::Execution);
+        assert_eq!(owner.state(), TaskState::Failed);
+        assert!(owner.output_released());
+    }
+
+    #[test]
+    fn typed_failure_native_required_root_reports_original_selected_and_batch_row() {
+        use novarocks_execution::runtime::fragment::RequiredExpressionRowError;
+        use novarocks_execution_contract::task_execution::status::{
+            TaskFailurePhase, TerminationDetail,
+        };
+        use novarocks_functions::{RowDataError, Selection};
+        use novarocks_local_program::{
+            ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
+        };
+        let selection = Selection::try_sparse(101, &[0, 50, 100]).unwrap();
+        let original = RowDataError::new(1, "required root cannot publish a placeholder NULL");
+        let required = RequiredExpressionRowError::try_new(
+            ProgramExpressionRootSite::Node {
+                node: ProgramNodeId::new(41),
+                role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
+            },
+            selection,
+            original,
+        )
+        .unwrap();
+        let (owner, reporter) = reporter_for(identity(80_021, 1, 1));
+        reporter.running();
+        report_terminal(
+            &reporter,
+            FragmentSinkKind::Noop,
+            &terminal_fact(FragmentOutcome::Failed(
+                FragmentExecutionError::from_failure(
+                    FragmentExecutionErrorKind::Pipeline,
+                    required.into(),
+                ),
+            )),
+            None,
+        );
+        let status = owner.current();
+        let Some(TerminationDetail::Failed(failure)) = status.termination() else {
+            panic!("required row is an execution failure");
+        };
+        assert_eq!(failure.category(), TaskFailureCategory::Execution);
+        assert_eq!(failure.phase(), TaskFailurePhase::Execution);
+        assert!(
+            failure
+                .detail()
+                .as_str()
+                .contains("batch row 50 (selected ordinal 1)")
+        );
+        assert!(
+            failure
+                .detail()
+                .as_str()
+                .contains("required root cannot publish a placeholder NULL")
+        );
+        assert_eq!(owner.state(), TaskState::Failed);
+        assert!(owner.output_released());
     }
 
     #[test]

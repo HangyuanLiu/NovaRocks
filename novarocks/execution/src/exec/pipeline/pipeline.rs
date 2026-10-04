@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::sync::Arc;
 
 use super::driver::{PipelineDriver, PipelineDriverBindings};
@@ -63,7 +65,7 @@ impl Pipeline {
     pub(crate) fn instantiate_drivers(
         &self,
         ctx: &Arc<FragmentContext>,
-    ) -> Result<Vec<PipelineDriver>, String> {
+    ) -> ExecutionResult<Vec<PipelineDriver>> {
         let mut drivers = Vec::new();
         let pipeline_profiler = ctx
             .profiler()
@@ -98,13 +100,13 @@ impl Pipeline {
             for (idx, factory) in self.op_factories.iter().enumerate() {
                 if factory.is_source() {
                     if source_idx.is_some() {
-                        return Err("pipeline has multiple source operators".to_string());
+                        return Err("pipeline has multiple source operators".to_string().into());
                     }
                     source_idx = Some(idx);
                 }
                 if factory.is_sink() {
                     if sink_idx.is_some() {
-                        return Err("pipeline has multiple sink operators".to_string());
+                        return Err("pipeline has multiple sink operators".to_string().into());
                     }
                     sink_idx = Some(idx);
                 }
@@ -134,10 +136,12 @@ impl Pipeline {
                 source_idx.ok_or_else(|| "pipeline missing source operator".to_string())?;
             let sink_idx = sink_idx.ok_or_else(|| "pipeline missing sink operator".to_string())?;
             if source_idx != 0 {
-                return Err("pipeline source must be the first operator".to_string());
+                return Err("pipeline source must be the first operator"
+                    .to_string()
+                    .into());
             }
             if sink_idx + 1 != operators.len() {
-                return Err("pipeline sink must be the last operator".to_string());
+                return Err("pipeline sink must be the last operator".to_string().into());
             }
             drivers.push(PipelineDriver::new_with_event_sink(
                 driver_id,

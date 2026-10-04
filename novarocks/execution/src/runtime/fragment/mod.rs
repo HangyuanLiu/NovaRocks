@@ -2,6 +2,7 @@
 
 pub mod error;
 pub mod exchange;
+pub mod execution_failure;
 pub mod fact;
 pub mod handle;
 pub mod instance;
@@ -22,3 +23,8 @@ pub use handle::{
 };
 pub use instance::*;
 pub use submission::FragmentSubmission;
+
+pub use execution_failure::{
+    ExecutionFailure, ExecutionFailureCause, ExecutionFailureContext, ExecutionResult,
+    PipelineOperation, RequiredExpressionRowError,
+};

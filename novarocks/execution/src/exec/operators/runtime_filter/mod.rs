@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1117,13 +1119,13 @@ impl Operator for NativeRuntimeFilterProcessor {
         self.event_sink = event_sink;
     }
 
-    fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         let _ = state;
         Ok(())
     }
 
-    fn activate(&mut self, state: &RuntimeState) -> Result<(), String> {
-        self.consumers.bind(state)
+    fn activate(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        Ok(self.consumers.bind(state)?)
     }
 
     fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
@@ -1154,7 +1156,7 @@ impl ProcessorOperator for NativeRuntimeFilterProcessor {
 
     /// The gate's wait starts here, with a chunk actually on the edge. While
     /// the gate is pending the chunk stays on the edge.
-    fn can_accept_input(&self, _chunk: &Chunk) -> Result<bool, String> {
+    fn can_accept_input(&self, _chunk: &Chunk) -> ExecutionResult<bool> {
         Ok(self.has_room() && matches!(self.consumers.poll_gate(), RuntimeFilterGate::Open))
     }
 
@@ -1162,7 +1164,7 @@ impl ProcessorOperator for NativeRuntimeFilterProcessor {
         self.output.is_some()
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if !self.has_room() {
             return Err("native runtime-filter processor cannot accept input".into());
         }
@@ -1177,11 +1179,11 @@ impl ProcessorOperator for NativeRuntimeFilterProcessor {
         Ok(())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         Ok(self.output.take())
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         self.finishing = true;
         Ok(())
     }
@@ -1802,15 +1804,15 @@ mod tests {
             !self.chunks.lock().expect("chunks lock").is_empty()
         }
 
-        fn push_chunk(&mut self, _: &RuntimeState, _: Chunk) -> Result<(), String> {
-            Err("a source accepts no input".to_string())
+        fn push_chunk(&mut self, _: &RuntimeState, _: Chunk) -> ExecutionResult<()> {
+            Err("a source accepts no input".to_string().into())
         }
 
-        fn pull_chunk(&mut self, _: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(self.chunks.lock().expect("chunks lock").pop_front())
         }
 
-        fn set_finishing(&mut self, _: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
             Ok(())
         }
 
@@ -1852,7 +1854,7 @@ mod tests {
             false
         }
 
-        fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
             self.values
                 .lock()
                 .expect("values lock")
@@ -1860,11 +1862,11 @@ mod tests {
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
             self.finished = true;
             Ok(())
         }

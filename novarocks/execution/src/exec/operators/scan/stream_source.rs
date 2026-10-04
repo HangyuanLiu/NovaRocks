@@ -29,6 +29,8 @@
 
 // Design: ADR-0159 (docs/adr/ADR-0159-driver-polled-connector-scan-streams.md)
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
@@ -301,7 +303,7 @@ impl Operator for StreamScanSourceOperator {
         self.event_sink = sink;
     }
 
-    fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         if let Some(consumers) = self.filter.blocking() {
             consumers.set_wait_timeout(scan_runtime_filter_wait_timeout(state));
             consumers.bind(state)?;
@@ -316,7 +318,7 @@ impl Operator for StreamScanSourceOperator {
         Ok(())
     }
 
-    fn close(&mut self) -> Result<(), String> {
+    fn close(&mut self) -> ExecutionResult<()> {
         self.end_delivery();
         Ok(())
     }
@@ -381,11 +383,13 @@ impl ProcessorOperator for StreamScanSourceOperator {
         }
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
-        Err("scan source operator does not accept input".to_string())
+    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
+        Err("scan source operator does not accept input"
+            .to_string()
+            .into())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         if matches!(self.stage, StreamStage::Ended) {
             return Ok(None);
         }
@@ -428,7 +432,7 @@ impl ProcessorOperator for StreamScanSourceOperator {
                 }
                 Poll::Ready(Some(Err(error))) => {
                     self.end_delivery();
-                    return Err(error);
+                    return Err(error.into());
                 }
                 Poll::Ready(Some(Ok(chunk))) => {
                     self.wake_generation = None;
@@ -465,7 +469,7 @@ impl ProcessorOperator for StreamScanSourceOperator {
         }
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         Ok(())
     }
 
@@ -697,16 +701,16 @@ mod tests {
             false
         }
 
-        fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
             self.values.lock().expect("values").push(value_of(&chunk));
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
             self.finished = true;
             Ok(())
         }
@@ -1030,16 +1034,16 @@ mod tests {
             false
         }
 
-        fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
             self.values.lock().expect("values").push(value_of(&chunk));
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
             Ok(())
         }
 
@@ -1128,7 +1132,7 @@ mod tests {
             false
         }
 
-        fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
             self.entered.send(value_of(&chunk)).expect("entered");
             self.release
                 .lock()
@@ -1138,11 +1142,11 @@ mod tests {
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
             Ok(())
         }
 

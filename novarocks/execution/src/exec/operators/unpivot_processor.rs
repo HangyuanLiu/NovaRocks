@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -171,9 +173,11 @@ impl ProcessorOperator for UnpivotProcessorOperator {
         self.input.is_some() && !self.finished
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if !self.need_input() {
-            return Err("unpivot received input while its input buffer is full".to_string());
+            return Err("unpivot received input while its input buffer is full"
+                .to_string()
+                .into());
         }
         validate_input_contract(
             &chunk,
@@ -189,7 +193,7 @@ impl ProcessorOperator for UnpivotProcessorOperator {
         Ok(())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         let Some(input) = self.input.as_ref() else {
             if self.finishing {
                 self.finished = true;
@@ -229,7 +233,7 @@ impl ProcessorOperator for UnpivotProcessorOperator {
                     return Err(format!(
                         "ResourceExhausted: one unpivot output value requires {actual_bytes} bytes, limit is {}",
                         self.max_output_bytes
-                    ));
+                    ).into());
                 }
                 candidate_rows = (candidate_rows / 2).max(1);
                 output = track_candidate(
@@ -305,7 +309,7 @@ impl ProcessorOperator for UnpivotProcessorOperator {
         Ok(Some(output))
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         self.finishing = true;
         if self.input.is_none() {
             self.finished = true;
@@ -1082,7 +1086,7 @@ mod tests {
         let processor = operator.as_processor_mut().unwrap();
         processor.push_chunk(&state, input_chunk()).unwrap();
         let error = processor.pull_chunk(&state).unwrap_err();
-        assert!(error.contains("ResourceExhausted"), "{error}");
+        assert!(error.detail().contains("ResourceExhausted"), "{error}");
     }
 
     #[test]
@@ -1370,7 +1374,7 @@ mod tests {
             .unwrap()
             .pull_chunk(&state)
             .expect_err("retained input plus pending output must exceed the query limit");
-        assert!(error.contains("ResourceExhausted"), "{error}");
+        assert!(error.detail().contains("ResourceExhausted"), "{error}");
         assert_eq!(tracker.current(), input_bytes);
 
         drop(operator);

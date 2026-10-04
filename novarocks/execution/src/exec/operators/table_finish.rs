@@ -30,6 +30,8 @@
 //!
 //! Design: ADR-0136 (docs/adr/ADR-0136-ordinary-aggregate-statistics-dataflow.md)
 
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
@@ -504,12 +506,12 @@ impl TableFinishOperator {
         self.final_groups_seen.clear();
     }
 
-    fn fail<T>(&mut self, error: String) -> Result<T, String> {
+    fn fail<T>(&mut self, error: impl Into<ExecutionFailure>) -> ExecutionResult<T> {
         self.release_buffer();
         self.phase = FinishPhase::Failed;
         self.finish_final_aggregate_blocked_interval();
         self.sync_metrics();
-        Err(error)
+        Err(error.into())
     }
 
     /// Read one target ordinal off the signed carrier. A negative value is
@@ -689,7 +691,7 @@ impl TableFinishOperator {
         Chunk::try_new_with_chunk_schema(batch, Arc::clone(self.writer_schema.chunk_schema()))
     }
 
-    fn begin_finalize(&mut self, state: &RuntimeState) -> Result<(), String> {
+    fn begin_finalize(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.validate_coverage()?;
         self.prefix_output = Some(PrefixOutputDriver::try_new(
             self.rows.get(),
@@ -761,7 +763,7 @@ impl TableFinishOperator {
         ))
     }
 
-    fn runtime_error(&self) -> Option<String> {
+    fn runtime_error(&self) -> Option<ExecutionFailure> {
         self.runtime_error.as_ref().and_then(|state| state.error())
     }
 
@@ -1007,7 +1009,7 @@ impl GroupedUnpivotDriver {
         ChunkSchema::try_new(fields).map(Arc::new)
     }
 
-    fn start_next(&mut self, state: &RuntimeState) -> Result<bool, String> {
+    fn start_next(&mut self, state: &RuntimeState) -> ExecutionResult<bool> {
         let Some((target, row)) = self.rows.get(self.next_row).copied() else {
             return Ok(false);
         };
@@ -1051,7 +1053,7 @@ impl GroupedUnpivotDriver {
         Ok(true)
     }
 
-    fn pull(&mut self, state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         loop {
             if self.active.is_none() && !self.start_next(state)? {
                 return Ok(None);
@@ -1062,7 +1064,11 @@ impl GroupedUnpivotDriver {
                 .expect("grouped Unpivot processor")
                 .pull_chunk(state)?
             {
-                return root_artifact_chunk(chunk, &self.root_schema, self.tracker.as_ref());
+                return Ok(root_artifact_chunk(
+                    chunk,
+                    &self.root_schema,
+                    self.tracker.as_ref(),
+                )?);
             }
             if !active.is_finished() {
                 return Ok(None);
@@ -1193,16 +1199,16 @@ impl Operator for TableFinishOperator {
         &self.name
     }
 
-    fn prepare(&mut self) -> Result<(), String> {
+    fn prepare(&mut self) -> ExecutionResult<()> {
         if let Some(error) = self.parallelism_error.take() {
             self.phase = FinishPhase::Failed;
-            return Err(error);
+            return Err(error.into());
         }
         if self.final_plan.calls.is_empty() != self.final_plan.unpivot.is_none() {
             self.phase = FinishPhase::Failed;
             return Err(
                 "table finish final aggregate and grouped Unpivot must be both empty or both present"
-                    .to_string(),
+                    .to_string().into(),
             );
         }
         if self.channel_to_call.iter().any(Option::is_none)
@@ -1211,7 +1217,8 @@ impl Operator for TableFinishOperator {
             self.phase = FinishPhase::Failed;
             return Err(
                 "table finish final aggregates do not exactly cover the frozen writer tail"
-                    .to_string(),
+                    .to_string()
+                    .into(),
             );
         }
         Ok(())
@@ -1228,7 +1235,7 @@ impl Operator for TableFinishOperator {
         self.sync_metrics();
     }
 
-    fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.runtime_error = Some(state.error_state());
         if self.final_plan.calls.is_empty() {
             return Ok(());
@@ -1255,7 +1262,7 @@ impl Operator for TableFinishOperator {
         Ok(())
     }
 
-    fn activate(&mut self, state: &RuntimeState) -> Result<(), String> {
+    fn activate(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         if let Some(aggregate) = self.aggregate.as_mut() {
             aggregate.activate(state)?;
         }
@@ -1269,7 +1276,7 @@ impl Operator for TableFinishOperator {
         self.sync_metrics();
     }
 
-    fn close(&mut self) -> Result<(), String> {
+    fn close(&mut self) -> ExecutionResult<()> {
         self.finish_final_aggregate_blocked_interval();
         self.sync_metrics();
         Ok(())
@@ -1360,15 +1367,17 @@ impl ProcessorOperator for TableFinishOperator {
         self.runtime_error().is_some() || (producing && (other_output || aggregate_ready))
     }
 
-    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if chunk.is_empty() {
             return Ok(());
         }
         if self.phase != FinishPhase::Consuming {
-            return Err("table finish received a writer row after EOS".to_string());
+            return Err("table finish received a writer row after EOS"
+                .to_string()
+                .into());
         }
         if let Some(error) = self.runtime_error() {
-            return self.fail(format!("table finish runtime failed: {error}"));
+            return self.fail(error);
         }
         if self.aggregate.as_ref().is_some_and(|aggregate| {
             !aggregate
@@ -1430,7 +1439,7 @@ impl ProcessorOperator for TableFinishOperator {
                 .expect("final aggregate processor")
                 .push_chunk(state, filtered)
             {
-                return self.fail(format!("table finish final aggregate merge: {error}"));
+                return self.fail(error);
             }
         }
         if let Some(profiles) = self.profiles.as_ref() {
@@ -1444,9 +1453,9 @@ impl ProcessorOperator for TableFinishOperator {
         Ok(())
     }
 
-    fn pull_chunk(&mut self, state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         if let Some(error) = self.runtime_error() {
-            return self.fail(format!("table finish runtime failed: {error}"));
+            return self.fail(error);
         }
         if self.phase != FinishPhase::Producing {
             return Ok(None);
@@ -1523,9 +1532,7 @@ impl ProcessorOperator for TableFinishOperator {
                         );
                     }
                     Err(error) => {
-                        return self.fail(format!(
-                            "table finish final aggregate output failed: {error}"
-                        ));
+                        return self.fail(error);
                     }
                 }
             }
@@ -1547,7 +1554,7 @@ impl ProcessorOperator for TableFinishOperator {
         }
     }
 
-    fn set_finishing(&mut self, state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         if matches!(
             self.phase,
             FinishPhase::Finalizing | FinishPhase::Producing | FinishPhase::Finished
@@ -1555,7 +1562,9 @@ impl ProcessorOperator for TableFinishOperator {
             return Ok(());
         }
         if self.phase == FinishPhase::Failed {
-            return Err("table finish cannot finalize a failed write stream".to_string());
+            return Err("table finish cannot finalize a failed write stream"
+                .to_string()
+                .into());
         }
         self.phase = FinishPhase::Finalizing;
         self.finish_final_aggregate_blocked_interval();
@@ -1734,22 +1743,22 @@ mod tests {
             self.finishing && self.ready.load(Ordering::Acquire) && !self.outputs.is_empty()
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
             if !self.need_input() {
-                return Err("scripted final aggregate is blocked".to_string());
+                return Err("scripted final aggregate is blocked".to_string().into());
             }
             self.pushed_rows += chunk.len();
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             if !self.has_output() {
                 return Ok(None);
             }
             Ok(self.outputs.pop_front())
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             self.finishing = true;
             Ok(())
         }
@@ -1792,15 +1801,15 @@ mod tests {
             false
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
             state
                 .error_state()
                 .set_error("scripted final aggregate failed asynchronously".to_string());
@@ -1833,16 +1842,16 @@ mod tests {
             false
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
-            Err("scripted synchronous finalize failure".to_string())
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
+            Err("scripted synchronous finalize failure".to_string().into())
         }
     }
 
@@ -2180,7 +2189,7 @@ mod tests {
         (kinds, ordinals, row_counts, fragments)
     }
 
-    fn run(operator: &mut Box<dyn Operator>, chunks: Vec<Chunk>) -> Result<Vec<Chunk>, String> {
+    fn run(operator: &mut Box<dyn Operator>, chunks: Vec<Chunk>) -> ExecutionResult<Vec<Chunk>> {
         let state = RuntimeState::default();
         let processor = operator.as_processor_mut().expect("processor");
         for chunk in chunks {
@@ -2212,13 +2221,13 @@ mod tests {
 
         let mut wide = factory.create(4, 0);
         let error = wide.prepare().expect_err("DOP > 1 must fail closed");
-        assert!(error.contains("must run at DOP 1"));
+        assert!(error.detail().contains("must run at DOP 1"));
 
         let mut second_driver = factory.create(1, 1);
         let error = second_driver
             .prepare()
             .expect_err("a second driver must fail closed");
-        assert!(error.contains("must run at DOP 1"));
+        assert!(error.detail().contains("must run at DOP 1"));
     }
 
     #[test]
@@ -2344,7 +2353,7 @@ mod tests {
                 .push_chunk(&state, writer_rows(rows))
                 .expect_err("invalid row shape");
             assert!(
-                error.contains(expected),
+                error.detail().contains(expected),
                 "expected {expected:?} in error {error:?}"
             );
         }
@@ -2361,7 +2370,11 @@ mod tests {
             .expect("processor")
             .push_chunk(&state, writer_rows(vec![row_count_row(2, 1)]))
             .expect_err("ordinal outside the sealed set");
-        assert!(error.contains("outside the sealed set of 2 targets"));
+        assert!(
+            error
+                .detail()
+                .contains("outside the sealed set of 2 targets")
+        );
     }
 
     #[test]
@@ -2377,7 +2390,11 @@ mod tests {
             .expect("processor")
             .push_chunk(&state, writer_rows(vec![fragment_row(0, b"junk".to_vec())]))
             .expect_err("foreign carrier");
-        assert!(error.contains("not a canonical carrier of the expected provider"));
+        assert!(
+            error
+                .detail()
+                .contains("not a canonical carrier of the expected provider")
+        );
     }
 
     #[test]
@@ -2397,7 +2414,7 @@ mod tests {
         let error = processor
             .push_chunk(&state, writer_rows(vec![row_count_row(0, i64::MAX)]))
             .expect_err("row count overflow");
-        assert!(error.contains("row count overflowed"));
+        assert!(error.detail().contains("row count overflowed"));
     }
 
     #[test]
@@ -2415,7 +2432,7 @@ mod tests {
             .push_chunk(&state, writer_rows(vec![row_count_row(0, -1)]))
             .expect_err("a negative row count is corrupt data");
         assert!(
-            error.contains("payload does not match"),
+            error.detail().contains("payload does not match"),
             "unexpected error {error:?}"
         );
     }
@@ -2432,7 +2449,7 @@ mod tests {
             .push_chunk(&state, writer_rows(vec![row_count_row(-1, 1)]))
             .expect_err("a negative target ordinal is corrupt data");
         assert!(
-            error.contains("target ordinal is negative"),
+            error.detail().contains("target ordinal is negative"),
             "unexpected error {error:?}"
         );
     }
@@ -2469,7 +2486,11 @@ mod tests {
                 )]),
             )
             .expect_err("over the single-fragment budget");
-        assert!(error.contains("exceeds the frozen single-fragment budget"));
+        assert!(
+            error
+                .detail()
+                .contains("exceeds the frozen single-fragment budget")
+        );
     }
 
     #[test]
@@ -2494,7 +2515,7 @@ mod tests {
         let error = processor
             .push_chunk(&state, writer_rows(vec![fragment_row(0, vec![1])]))
             .expect_err("over the set byte budget");
-        assert!(error.contains("exceeds the frozen byte budget"));
+        assert!(error.detail().contains("exceeds the frozen byte budget"));
     }
 
     #[test]
@@ -2513,7 +2534,7 @@ mod tests {
         let error = processor
             .push_chunk(&state, writer_rows(vec![fragment_row(0, vec![1])]))
             .expect_err("over the entry budget");
-        assert!(error.contains("exceeds the frozen entry budget"));
+        assert!(error.detail().contains("exceeds the frozen entry budget"));
     }
 
     #[test]
@@ -2658,11 +2679,19 @@ mod tests {
                 )]),
             )
             .expect_err("invalid row");
-        assert!(error.contains("payload does not match its row kind"));
+        assert!(
+            error
+                .detail()
+                .contains("payload does not match its row kind")
+        );
         let finish_error = processor
             .set_finishing(&state)
             .expect_err("a failed stream cannot be repaired into a summary");
-        assert!(finish_error.contains("cannot finalize a failed write stream"));
+        assert!(
+            finish_error
+                .detail()
+                .contains("cannot finalize a failed write stream")
+        );
         assert!(!processor.has_output());
     }
 
@@ -2677,7 +2706,7 @@ mod tests {
         let error = processor
             .push_chunk(&state, writer_rows(vec![row_count_row(0, 1)]))
             .expect_err("a row after EOS is a contract violation");
-        assert!(error.contains("after EOS"));
+        assert!(error.detail().contains("after EOS"));
     }
 
     #[test]
@@ -2734,7 +2763,7 @@ mod tests {
         let error = processor
             .push_chunk(&state, writer_rows(vec![row_count_row(0, 1)]))
             .expect_err("a target this query never compiled a writer for");
-        assert!(error.contains("outside the sealed set"), "{error}");
+        assert!(error.detail().contains("outside the sealed set"), "{error}");
     }
 
     #[test]
@@ -3274,7 +3303,7 @@ mod tests {
         let error = operator
             .pull_chunk(&state)
             .expect_err("runtime finalization error");
-        assert!(error.contains("failed asynchronously"), "{error}");
+        assert!(error.detail().contains("failed asynchronously"), "{error}");
         assert!(operator.is_finished());
     }
 
@@ -3314,7 +3343,10 @@ mod tests {
         let error = operator
             .set_finishing(&state)
             .expect_err("final aggregate rejects finalize");
-        assert!(error.contains("synchronous finalize failure"), "{error}");
+        assert!(
+            error.detail().contains("synchronous finalize failure"),
+            "{error}"
+        );
         assert!(operator.is_finished());
         assert_eq!(tracker.current(), 0, "failed finalize releases all buffers");
     }
@@ -3346,7 +3378,7 @@ mod tests {
             )
             .expect_err("final merge fault");
 
-        assert!(error.contains("FinalMerge"), "{error}");
+        assert!(error.detail().contains("FinalMerge"), "{error}");
         assert!(operator.is_finished(), "the Root operator must fail closed");
         assert!(
             !operator.has_output(),
@@ -3391,7 +3423,7 @@ mod tests {
             .set_finishing(&state)
             .expect_err("final finalize fault");
 
-        assert!(error.contains("FinalFinalize"), "{error}");
+        assert!(error.detail().contains("FinalFinalize"), "{error}");
         assert!(operator.is_finished(), "the Root operator must fail closed");
         assert!(
             !operator.has_output(),
@@ -3495,7 +3527,11 @@ mod tests {
             .expect("processor")
             .set_finishing(&state)
             .expect_err("the second channel never arrived");
-        assert!(error.contains("no non-null aggregate partial for channel 1"));
+        assert!(
+            error
+                .detail()
+                .contains("no non-null aggregate partial for channel 1")
+        );
         assert!(operator.is_finished());
     }
 
@@ -3522,7 +3558,11 @@ mod tests {
                 ),
             )
             .expect_err("an all-null partial carries no contribution");
-        assert!(error.contains("payload does not match its row kind"));
+        assert!(
+            error
+                .detail()
+                .contains("payload does not match its row kind")
+        );
 
         let mut drifted = factory.create(1, 0);
         drifted.prepare().expect("prepare");
@@ -3532,7 +3572,11 @@ mod tests {
             .expect("processor")
             .push_chunk(&state, writer_rows(vec![row_count_row(0, 1)]))
             .expect_err("the four-column legacy schema is not the frozen multiplex schema");
-        assert!(error.contains("schema drifted from the frozen plan"));
+        assert!(
+            error
+                .detail()
+                .contains("schema drifted from the frozen plan")
+        );
     }
 
     #[test]

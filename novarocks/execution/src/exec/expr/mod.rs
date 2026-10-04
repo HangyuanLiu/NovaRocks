@@ -185,14 +185,16 @@ impl ExprArena {
 
     pub(crate) fn check_runtime_error(&self) -> Result<(), String> {
         match self.runtime_error.as_ref().and_then(|error| error.error()) {
-            Some(error) => Err(error),
+            Some(error) => Err(error.to_string()),
             None => Ok(()),
         }
     }
 
     pub(crate) fn wait_interruptibly(&self, duration: std::time::Duration) -> Result<(), String> {
         match &self.runtime_error {
-            Some(error) => error.wait_interruptibly(duration),
+            Some(error) => error
+                .wait_interruptibly(duration)
+                .map_err(|error| error.to_string()),
             None => Err("SLEEP requires an exact fragment runtime binding".to_string()),
         }
     }

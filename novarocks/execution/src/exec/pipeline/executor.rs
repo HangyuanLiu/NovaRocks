@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -84,13 +86,13 @@ impl PreparedPipelineExecution {
     }
 
     /// Submit this execution with a terminal failure already latched.
-    pub fn start_failed(self, error: String) -> RunningPipelineExecution {
-        self.start_with_initial_failure(Some(error))
+    pub fn start_failed(self, error: impl Into<ExecutionFailure>) -> RunningPipelineExecution {
+        self.start_with_initial_failure(Some(error.into()))
     }
 
     fn start_with_initial_failure(
         self,
-        initial_failure: Option<String>,
+        initial_failure: Option<ExecutionFailure>,
     ) -> RunningPipelineExecution {
         let Self {
             tasks,
@@ -160,7 +162,8 @@ impl RunningPipelineExecution {
     }
 
     /// Locally cancel this fragment and wake any blocked drivers so join can drain them.
-    pub fn cancel(&self, err: String) -> bool {
+    pub fn cancel(&self, err: impl Into<ExecutionFailure>) -> bool {
+        let err = err.into();
         let won = self.completion.fail(err.clone());
         if won {
             self.fragment_ctx.set_final_status(err);
@@ -169,14 +172,14 @@ impl RunningPipelineExecution {
         won
     }
 
-    pub fn fail(&self, err: String) -> bool {
+    pub fn fail(&self, err: impl Into<ExecutionFailure>) -> bool {
         self.cancel(err)
     }
 
     /// Returns the local execution conclusion as soon as it is known.
     ///
     /// An error can be visible while submitted drivers are still draining.
-    pub fn conclusion(&self) -> Option<Result<(), String>> {
+    pub fn conclusion(&self) -> Option<ExecutionResult<()>> {
         self.completion.conclusion()
     }
 
@@ -192,7 +195,7 @@ impl RunningPipelineExecution {
     }
 
     /// Drain submitted drivers and return their local terminal result.
-    pub fn join(&self) -> Result<(), String> {
+    pub fn join(&self) -> ExecutionResult<()> {
         let timeout_error = self
             .runtime_state
             .query_options()
@@ -250,7 +253,7 @@ pub fn execute_native_plan_with_pipeline(
     query_id: Option<novarocks_types::QueryId>,
     fe_addr: Option<RuntimeEndpoint>,
     backend_num: Option<i32>,
-) -> Result<(), String> {
+) -> ExecutionResult<()> {
     execute_native_plan_with_pipeline_with_root_sink_dop(
         plan,
         debug,
@@ -288,7 +291,7 @@ pub(crate) fn execute_native_plan_with_pipeline_with_root_sink_dop(
     fe_addr: Option<RuntimeEndpoint>,
     backend_num: Option<i32>,
     root_sink_dop: Option<i32>,
-) -> Result<(), String> {
+) -> ExecutionResult<()> {
     let runtime_filter_session = runtime_state.runtime_filter_session().cloned();
     execute_plan_with_pipeline(
         plan,
@@ -327,7 +330,7 @@ pub(crate) fn prepare_pipeline_execution(
     root_sink_dop: Option<i32>,
     runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
     event_sink: Arc<dyn FragmentEventSink>,
-) -> Result<PreparedPipelineExecution, String> {
+) -> ExecutionResult<PreparedPipelineExecution> {
     prepare_pipeline_execution_inner(
         plan,
         debug,
@@ -364,7 +367,7 @@ pub fn prepare_report_neutral_pipeline_execution(
     root_sink_dop: Option<i32>,
     runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
     event_sink: Arc<dyn FragmentEventSink>,
-) -> Result<PreparedPipelineExecution, String> {
+) -> ExecutionResult<PreparedPipelineExecution> {
     prepare_pipeline_execution_inner(
         plan,
         debug,
@@ -405,7 +408,7 @@ fn prepare_pipeline_execution_inner(
     runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
     event_sink: Arc<dyn FragmentEventSink>,
     report_neutral: bool,
-) -> Result<PreparedPipelineExecution, String> {
+) -> ExecutionResult<PreparedPipelineExecution> {
     let dep_manager = DependencyManager::new();
     let terminal_scan_ops = scan_bindings.terminal_ops();
     // Use the FE-calculated DOP as the base graph DOP. Some terminal sinks can
@@ -478,14 +481,15 @@ pub(crate) fn prepare_report_neutral_local_program_pipeline_execution(
     root_sink_dop: Option<i32>,
     runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
     event_sink: Arc<dyn FragmentEventSink>,
-) -> Result<PreparedPipelineExecution, String> {
+) -> ExecutionResult<PreparedPipelineExecution> {
     let profile = program.profile();
     if profile.kernel_abi() != KernelAbiVersion::CURRENT {
         return Err(format!(
             "local program kernel ABI mismatch: frozen {:?}, runtime {:?}",
             profile.kernel_abi(),
             KernelAbiVersion::CURRENT,
-        ));
+        )
+        .into());
     }
     if usize::try_from(pipeline_dop).ok() != Some(profile.pipeline_dop().get())
         || root_sink_dop.and_then(|dop| usize::try_from(dop).ok())
@@ -495,7 +499,7 @@ pub(crate) fn prepare_report_neutral_local_program_pipeline_execution(
             "local program profile mismatch: requested dop={pipeline_dop} root_sink_dop={root_sink_dop:?}, frozen dop={} root_sink_dop={:?}",
             profile.pipeline_dop(),
             profile.root_sink_dop(),
-        ));
+        ).into());
     }
     let dep_manager = DependencyManager::new();
     let terminal_scan_ops = scan_bindings.terminal_ops();
@@ -556,7 +560,7 @@ fn prepare_pipeline_execution_from_graph(
     backend_num: Option<i32>,
     event_sink: Arc<dyn FragmentEventSink>,
     report_neutral: bool,
-) -> Result<PreparedPipelineExecution, String> {
+) -> ExecutionResult<PreparedPipelineExecution> {
     let ctx = Arc::new(if report_neutral {
         FragmentContext::new_report_neutral(
             profiler.clone(),
@@ -582,14 +586,14 @@ fn prepare_pipeline_execution_from_graph(
         let mut factories = pipeline_plan.factories;
         if pipeline_plan.id == graph.root_id {
             if !pipeline_plan.needs_sink {
-                return Err("root pipeline missing sink requirement".to_string());
+                return Err("root pipeline missing sink requirement".to_string().into());
             }
             let root_sink = sink
                 .take()
                 .ok_or_else(|| "root pipeline sink already attached".to_string())?;
             factories.push(root_sink);
         } else if pipeline_plan.needs_sink {
-            return Err("non-root pipeline requires sink".to_string());
+            return Err("non-root pipeline requires sink".to_string().into());
         }
 
         let pipeline = Pipeline::new(pipeline_plan.id, factories, pipeline_plan.dop);
@@ -598,7 +602,7 @@ fn prepare_pipeline_execution_from_graph(
     }
 
     if sink.is_some() {
-        return Err("root pipeline sink not attached".to_string());
+        return Err("root pipeline sink not attached".to_string().into());
     }
 
     // Fixed time slice: 10ms (similar to StarRocks)
@@ -669,7 +673,7 @@ fn execute_plan_with_pipeline(
     backend_num: Option<i32>,
     root_sink_dop: Option<i32>,
     runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
-) -> Result<(), String> {
+) -> ExecutionResult<()> {
     prepare_pipeline_execution(
         plan,
         debug,
@@ -694,6 +698,7 @@ fn execute_plan_with_pipeline(
 
 #[cfg(test)]
 mod tests {
+    use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, OnceLock, mpsc};
@@ -789,7 +794,7 @@ mod tests {
             "ActivationProbe"
         }
 
-        fn activate(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn activate(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             self.activations.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -826,15 +831,15 @@ mod tests {
             self.ready.load(Ordering::Acquire)
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
             unreachable!("never-ready source must not receive input")
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             unreachable!("never-ready source must not produce output")
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             Ok(())
         }
 
@@ -866,15 +871,15 @@ mod tests {
             panic!("injected pipeline panic")
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
             unreachable!("panic source must not receive input")
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             unreachable!("panic source must not produce output")
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             Ok(())
         }
     }
@@ -906,6 +911,218 @@ mod tests {
             runtime_state,
             fragment_profiler: None,
             terminal_scan_ops: Vec::new(),
+        }
+    }
+
+    struct TypedFailureSource {
+        error: ExecutionFailure,
+        during_activation: bool,
+        failure_signals: Arc<AtomicUsize>,
+    }
+    impl Operator for TypedFailureSource {
+        fn name(&self) -> &str {
+            "TypedFailureSource"
+        }
+        fn activate(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
+            if self.during_activation {
+                Err(self.error.clone())
+            } else {
+                Ok(())
+            }
+        }
+        fn on_driver_failure(&mut self) {
+            self.failure_signals.fetch_add(1, Ordering::SeqCst);
+        }
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+    impl ProcessorOperator for TypedFailureSource {
+        fn need_input(&self) -> bool {
+            false
+        }
+        fn has_output(&self) -> bool {
+            true
+        }
+        fn push_chunk(&mut self, _: &RuntimeState, _: Chunk) -> ExecutionResult<()> {
+            panic!("source must not receive input")
+        }
+        fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+            Err(self.error.clone())
+        }
+        fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
+            Ok(())
+        }
+    }
+    fn run_typed_failure_source(
+        error: ExecutionFailure,
+        during_activation: bool,
+    ) -> ExecutionFailure {
+        use crate::exec::operators::NoopSinkFactory;
+        use crate::exec::pipeline::operator_factory::OperatorFactory;
+        let runtime_state = test_runtime_state();
+        let failure_signals = Arc::new(AtomicUsize::new(0));
+        let driver = PipelineDriver::new(
+            7,
+            vec![
+                Box::new(TypedFailureSource {
+                    error: error.clone(),
+                    during_activation,
+                    failure_signals: Arc::clone(&failure_signals),
+                }),
+                NoopSinkFactory::new().create(1, 7),
+            ],
+            None,
+            vec![],
+            Arc::clone(&runtime_state),
+            None,
+        );
+        let running = manually_prepared_execution(driver, Arc::clone(&runtime_state), None).start();
+        let original = running.join().expect_err("the actual operator failed");
+        assert_eq!(original.cause(), error.cause());
+        assert_eq!(failure_signals.load(Ordering::SeqCst), 1);
+        assert_eq!(running.conclusion(), Some(Err(original.clone())));
+        assert_eq!(
+            running
+                .stopped_fact()
+                .expect("all actual drivers stopped")
+                .conclusion(),
+            Err(original.clone())
+        );
+        assert_eq!(
+            runtime_state.error().expect("same runtime latch").cause(),
+            error.cause()
+        );
+        assert!(!running.fail("later identical-looking failure".to_owned()));
+        assert_eq!(running.join(), Err(original.clone()));
+        assert_eq!(failure_signals.load(Ordering::SeqCst), 1);
+        original
+    }
+    #[test]
+    fn typed_failure_all_kernel_causes_survive_activation_pull_completion_and_runtime_latches() {
+        use novarocks_functions::{KernelDiagnostic, KernelFailure};
+        let diagnostic = || KernelDiagnostic::new("ResourceExhausted: identical diagnostic text");
+        for error in [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+            KernelFailure::InvalidProgram(diagnostic()),
+            KernelFailure::Internal(diagnostic()),
+            KernelFailure::Operational(diagnostic()),
+            KernelFailure::InstanceFailed,
+        ] {
+            for activation in [true, false] {
+                let result = run_typed_failure_source(error.clone().into(), activation);
+                assert_eq!(
+                    std::error::Error::source(&result)
+                        .unwrap()
+                        .downcast_ref::<KernelFailure>(),
+                    Some(&error)
+                );
+                if !activation {
+                    assert_eq!(
+                        result.context(),
+                        Some(crate::runtime::fragment::ExecutionFailureContext {
+                            operator_ordinal: 0,
+                            operation: crate::runtime::fragment::PipelineOperation::Pull,
+                        })
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn typed_failure_required_root_preserves_original_sparse_row_journal_and_typed_site() {
+        use crate::runtime::fragment::{ExecutionFailureCause, RequiredExpressionRowError};
+        use novarocks_functions::{RowDataError, Selection};
+        use novarocks_local_program::{
+            ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
+        };
+        let site = ProgramExpressionRootSite::Node {
+            node: ProgramNodeId::new(41),
+            role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
+        };
+        let error = RowDataError::new(1, "required row error is not a successful SQL NULL");
+        let selection = Selection::try_sparse(101, &[0, 50, 100]).unwrap();
+        let required = RequiredExpressionRowError::try_new(site, selection, error.clone()).unwrap();
+        assert_eq!(required.batch_row(), 50);
+        assert_eq!(required.root(), site);
+        assert_eq!(required.error(), &error);
+        let failure = run_typed_failure_source(required.clone().into(), false);
+        assert_eq!(
+            failure.cause(),
+            &ExecutionFailureCause::RequiredRow(required)
+        );
+        assert!(matches!(
+            RequiredExpressionRowError::try_new(site, selection, RowDataError::new(3, "outside")),
+            Err(novarocks_functions::KernelFailure::Internal(_))
+        ));
+    }
+
+    struct PrepareFailureFactory {
+        error: ExecutionFailure,
+        in_bind: bool,
+    }
+    impl crate::exec::pipeline::operator_factory::OperatorFactory for PrepareFailureFactory {
+        fn name(&self) -> &str {
+            "PrepareFailureFactory"
+        }
+        fn is_source(&self) -> bool {
+            true
+        }
+        fn create(&self, _: i32, _: i32) -> Box<dyn Operator> {
+            Box::new(Self {
+                error: self.error.clone(),
+                in_bind: self.in_bind,
+            })
+        }
+    }
+    impl Operator for PrepareFailureFactory {
+        fn name(&self) -> &str {
+            "PrepareFailureOperator"
+        }
+        fn prepare(&mut self) -> ExecutionResult<()> {
+            if self.in_bind {
+                Ok(())
+            } else {
+                Err(self.error.clone())
+            }
+        }
+        fn bind_runtime_state(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
+            Err(self.error.clone())
+        }
+    }
+    #[test]
+    fn typed_failure_real_pipeline_preparation_and_binding_preserve_original_kernel_cause() {
+        use crate::exec::pipeline::pipeline::Pipeline;
+        for in_bind in [false, true] {
+            let original: ExecutionFailure =
+                novarocks_functions::KernelFailure::ResourceExhausted.into();
+            let context = Arc::new(FragmentContext::new(
+                None,
+                test_runtime_state(),
+                None,
+                None,
+                None,
+                None,
+            ));
+            let pipeline = Pipeline::new(
+                41,
+                vec![Box::new(PrepareFailureFactory {
+                    error: original.clone(),
+                    in_bind,
+                })],
+                1,
+            );
+            let error = pipeline
+                .instantiate_drivers(&context)
+                .err()
+                .expect("actual preparation failed");
+            assert_eq!(error, original);
+            assert_eq!(error.context(), None);
         }
     }
 
@@ -1105,7 +1322,7 @@ mod tests {
             entered_sleep,
             "the single execution thread must enter SLEEP before cancellation"
         );
-        assert_eq!(result, Err("cancel actual SLEEP".to_string()));
+        assert_eq!(result, Err("cancel actual SLEEP".into()));
         assert_eq!(state.error_state().waiting_count(), 0);
         assert!(
             output.take_chunks().is_empty(),
@@ -1152,7 +1369,7 @@ mod tests {
 
         let running = manually_prepared_execution(driver, runtime_state, None)
             .start_failed("injected prestart failure".to_string());
-        assert_eq!(running.join(), Err("injected prestart failure".to_string()));
+        assert_eq!(running.join(), Err("injected prestart failure".into()));
         assert_eq!(activations.load(Ordering::SeqCst), 0);
         assert_eq!(cancels.load(Ordering::SeqCst), 1);
     }
@@ -1192,7 +1409,7 @@ mod tests {
         running.cancel("local cancel".to_string());
         assert_eq!(
             running.join(),
-            Err("local cancel".to_string()),
+            Err("local cancel".into()),
             "cancel must remain a fragment-local terminal result after the submitted driver drains"
         );
         assert_eq!(
@@ -1272,7 +1489,7 @@ mod tests {
             returned_before_cleanup,
             "timeout must wake the parked driver without test-side recovery"
         );
-        assert_eq!(result, Err("query timed out after 1000 ms".to_string()));
+        assert_eq!(result, Err("query timed out after 1000 ms".into()));
         assert!(
             !schedule_state.is_in_blocked(),
             "timeout join must return only after the parked driver drains"
@@ -1304,8 +1521,12 @@ mod tests {
             .start()
             .join()
             .expect_err("driver panic must become a fragment-local error");
-        assert!(error.contains("panic in driver execution: injected pipeline panic"));
-        assert!(error.contains("injected pipeline panic"));
+        assert!(
+            error
+                .detail()
+                .contains("panic in driver execution: injected pipeline panic")
+        );
+        assert!(error.detail().contains("injected pipeline panic"));
     }
 
     #[test]

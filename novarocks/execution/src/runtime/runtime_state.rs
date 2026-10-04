@@ -14,6 +14,8 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
@@ -54,14 +56,15 @@ impl std::fmt::Debug for RuntimeState {
 
 #[derive(Debug, Default)]
 pub struct RuntimeErrorState {
-    error: std::sync::Mutex<Option<String>>,
+    error: std::sync::Mutex<Option<ExecutionFailure>>,
     stopped: std::sync::Condvar,
     #[cfg(test)]
     waiting: std::sync::atomic::AtomicUsize,
 }
 
 impl RuntimeErrorState {
-    pub fn set_error(&self, err: String) {
+    pub fn set_error(&self, err: impl Into<ExecutionFailure>) {
+        let err = err.into();
         let mut guard = self.error.lock().expect("runtime error lock");
         if guard.is_none() {
             *guard = Some(err);
@@ -69,7 +72,7 @@ impl RuntimeErrorState {
         }
     }
 
-    pub fn error(&self) -> Option<String> {
+    pub fn error(&self) -> Option<ExecutionFailure> {
         self.error.lock().expect("runtime error lock").clone()
     }
 
@@ -81,7 +84,7 @@ impl RuntimeErrorState {
     /// Wait without holding execution after this exact fragment stops.
     /// The predicate and notification share the error lock, including an error
     /// published before registration and spurious condition-variable wakes.
-    pub(crate) fn wait_interruptibly(&self, duration: std::time::Duration) -> Result<(), String> {
+    pub(crate) fn wait_interruptibly(&self, duration: std::time::Duration) -> ExecutionResult<()> {
         let guard = self.error.lock().expect("runtime error lock");
         #[cfg(test)]
         self.waiting.fetch_add(1, Ordering::Release);
@@ -258,7 +261,7 @@ impl RuntimeState {
         self.execution_runtime.as_deref()
     }
 
-    pub fn error(&self) -> Option<String> {
+    pub fn error(&self) -> Option<ExecutionFailure> {
         self.error_state.error()
     }
 

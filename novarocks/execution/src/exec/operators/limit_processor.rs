@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use crate::exec::chunk::Chunk;
 
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
@@ -119,12 +121,14 @@ impl ProcessorOperator for LimitProcessorOperator {
         self.pending_output.is_some()
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if self.finished {
             return Ok(());
         }
         if self.pending_output.is_some() {
-            return Err("limit received input while output buffer is full".to_string());
+            return Err("limit received input while output buffer is full"
+                .to_string()
+                .into());
         }
         let chunk_rows = chunk.len();
         if chunk_rows == 0 {
@@ -163,7 +167,7 @@ impl ProcessorOperator for LimitProcessorOperator {
         Ok(())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         let out = self.pending_output.take();
         if self.pending_output.is_none() {
             let exhausted_limit = {
@@ -177,7 +181,7 @@ impl ProcessorOperator for LimitProcessorOperator {
         Ok(out)
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         self.finishing = true;
         if self.pending_output.is_none() {
             self.finished = true;

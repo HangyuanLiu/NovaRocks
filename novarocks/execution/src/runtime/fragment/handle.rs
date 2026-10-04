@@ -872,7 +872,7 @@ impl DormantFragmentHandle {
         #[cfg(test)]
         let initial_failure = self
             .start_failure
-            .map(|failure| failure.detail().to_string());
+            .map(|failure| super::ExecutionFailure::from(failure.detail()));
         #[cfg(not(test))]
         let initial_failure = None;
         self.start_with_initial_failure(initial_failure)
@@ -881,11 +881,14 @@ impl DormantFragmentHandle {
     /// Enter the running lifecycle with a terminal execution failure already latched.
     ///
     /// Drivers are still submitted and drained through the normal terminal-fact path.
-    pub fn start_failed(self, error: impl Into<String>) -> RunningFragmentHandle {
+    pub fn start_failed(self, error: impl Into<super::ExecutionFailure>) -> RunningFragmentHandle {
         self.start_with_initial_failure(Some(error.into()))
     }
 
-    fn start_with_initial_failure(self, initial_failure: Option<String>) -> RunningFragmentHandle {
+    fn start_with_initial_failure(
+        self,
+        initial_failure: Option<super::ExecutionFailure>,
+    ) -> RunningFragmentHandle {
         let Self {
             prepared,
             resources,
@@ -1033,7 +1036,7 @@ impl RunningFragmentHandle {
 }
 
 impl RunningFragmentLifecycle {
-    fn freeze_terminal(&self, result: Result<(), String>) -> FragmentTerminalFact {
+    fn freeze_terminal(&self, result: super::ExecutionResult<()>) -> FragmentTerminalFact {
         let (fact, observers) = {
             let mut state = self.state.lock().expect("running fragment state lock");
             if let Some(fact) = state.terminal.as_ref() {
@@ -1103,14 +1106,14 @@ impl RunningFragmentLifecycle {
 }
 
 fn outcome_from_result(
-    result: Result<(), String>,
+    result: super::ExecutionResult<()>,
     cancel_reason: Option<FragmentCancelReason>,
 ) -> FragmentOutcome {
     match result {
         Ok(()) => FragmentOutcome::Succeeded,
         Err(error) => match cancel_reason {
             Some(reason) => FragmentOutcome::Cancelled { reason },
-            None => FragmentOutcome::Failed(FragmentExecutionError::new(
+            None => FragmentOutcome::Failed(FragmentExecutionError::from_failure(
                 FragmentExecutionErrorKind::Pipeline,
                 error,
             )),
@@ -1233,7 +1236,7 @@ pub fn prepare_fragment(
             Arc::clone(&context.event_sink),
         )
         .map_err(|error| {
-            FragmentLaunchError::new(
+            FragmentLaunchError::from_failure(
                 FragmentLaunchStage::BuildPipelines,
                 FragmentLaunchErrorKind::PipelineBuild,
                 error,
@@ -1251,5 +1254,57 @@ pub fn prepare_fragment(
             start_failure: context.start_failure(),
         }),
         Err(error) => Err(error.with_cleanup_diagnostics(resources.rollback())),
+    }
+}
+
+#[cfg(test)]
+mod typed_failure_tests {
+    use super::*;
+    use novarocks_functions::{KernelDiagnostic, KernelFailure};
+    #[test]
+    fn typed_failure_fragment_outcome_preserves_original_cause_and_source() {
+        for cause in [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+            KernelFailure::InstanceFailed,
+            KernelFailure::Internal(KernelDiagnostic::new("internal")),
+            KernelFailure::InvalidProgram(KernelDiagnostic::new("invalid")),
+            KernelFailure::Operational(KernelDiagnostic::new("operational")),
+        ] {
+            let FragmentOutcome::Failed(error) =
+                outcome_from_result(Err(cause.clone().into()), None)
+            else {
+                panic!("unrequested kernel cancellation remains a failure");
+            };
+            assert_eq!(error.kind(), FragmentExecutionErrorKind::Pipeline);
+            assert_eq!(
+                error.cause().cause(),
+                &super::super::ExecutionFailureCause::Kernel(cause.clone())
+            );
+            assert_eq!(
+                std::error::Error::source(&error)
+                    .unwrap()
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<KernelFailure>(),
+                Some(&cause)
+            );
+        }
+    }
+    #[test]
+    fn typed_failure_fragment_preserves_existing_explicit_cancel_reason_priority() {
+        let reason = FragmentCancelReason::new("existing owner requested cancellation");
+        assert_eq!(
+            outcome_from_result(
+                Err(KernelFailure::ResourceExhausted.into()),
+                Some(reason.clone())
+            ),
+            FragmentOutcome::Cancelled { reason }
+        );
+        assert_eq!(
+            outcome_from_result(Ok(()), None),
+            FragmentOutcome::Succeeded
+        );
     }
 }

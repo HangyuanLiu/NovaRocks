@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -331,12 +333,14 @@ impl ProcessorOperator for FilterProcessorOperator {
         self.pending_output.is_some()
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if self.finished {
             return Ok(());
         }
         if self.pending_output.is_some() {
-            return Err("filter received input while output buffer is full".to_string());
+            return Err("filter received input while output buffer is full"
+                .to_string()
+                .into());
         }
         if chunk.is_empty() {
             self.pending_output = Some(Chunk::default());
@@ -363,7 +367,7 @@ impl ProcessorOperator for FilterProcessorOperator {
         Ok(())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         let out = self.pending_output.take();
         if out.is_some() && self.finishing && self.pending_output.is_none() {
             self.finished = true;
@@ -371,7 +375,7 @@ impl ProcessorOperator for FilterProcessorOperator {
         Ok(out)
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         self.finishing = true;
         if self.pending_output.is_none() {
             self.finished = true;

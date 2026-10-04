@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::fragment::sink::{DataStreamPartitionType, DataStreamSinkFactoryInput};
@@ -1343,7 +1345,7 @@ impl Operator for DataStreamSinkOperator {
         self.profiles = Some(profiles);
     }
 
-    fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.be_number = state.backend_num().unwrap_or(0);
         self.max_transmit_batched_bytes = state
             .execution_runtime()
@@ -1354,7 +1356,9 @@ impl Operator for DataStreamSinkOperator {
             #[cfg(test)]
             return Ok(());
             #[cfg(not(test))]
-            return Err("exchange sink requires an ExecutionRuntime".to_string());
+            return Err("exchange sink requires an ExecutionRuntime"
+                .to_string()
+                .into());
         };
         let queue = runtime.exchange_send_queue();
         queue.register_send_observer(&self.send_observable);
@@ -1362,7 +1366,7 @@ impl Operator for DataStreamSinkOperator {
         Ok(())
     }
 
-    fn prepare(&mut self) -> Result<(), String> {
+    fn prepare(&mut self) -> ExecutionResult<()> {
         // Align with StarRocks: count actual sink drivers prepared, not planned DOP.
         self.finish_state.register_driver();
         // The edge opening is the only event that can unpark this driver once
@@ -1644,7 +1648,7 @@ impl DataStreamSinkOperator {
         }
     }
 
-    fn current_error(&self) -> Option<String> {
+    fn current_error(&self) -> Option<ExecutionFailure> {
         self.error_state.as_ref().and_then(|state| state.error())
     }
 
@@ -2352,12 +2356,12 @@ impl ProcessorOperator for DataStreamSinkOperator {
         false
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if self.aborting.load(Ordering::Acquire) {
-            return Err("exchange sink was cancelled".to_string());
+            return Err("exchange sink was cancelled".to_string().into());
         }
         if let Some(err) = self.init_error.as_ref() {
-            return Err(err.clone());
+            return Err(err.clone().into());
         }
         if self.finished.load(Ordering::Acquire) {
             return Ok(());
@@ -2377,11 +2381,11 @@ impl ProcessorOperator for DataStreamSinkOperator {
         Ok(())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         Ok(None)
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         use tracing::debug;
 
         if self.aborting.load(Ordering::Acquire) {
@@ -2389,7 +2393,7 @@ impl ProcessorOperator for DataStreamSinkOperator {
         }
 
         if let Some(err) = self.init_error.as_ref() {
-            return Err(err.clone());
+            return Err(err.clone().into());
         }
         if self.finished.load(Ordering::Acquire) {
             return Ok(());

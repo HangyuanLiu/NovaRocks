@@ -395,16 +395,26 @@ impl ProcessorOperator for TestResultSink {
         false
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(
+        &mut self,
+        _state: &RuntimeState,
+        chunk: Chunk,
+    ) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
         self.handle.0.lock().unwrap().push(chunk);
         Ok(())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(
+        &mut self,
+        _state: &RuntimeState,
+    ) -> novarocks_execution::runtime::fragment::ExecutionResult<Option<Chunk>> {
         Ok(None)
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(
+        &mut self,
+        _state: &RuntimeState,
+    ) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
         self.finished = true;
         Ok(())
     }

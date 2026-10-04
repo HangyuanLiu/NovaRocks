@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -183,9 +185,11 @@ impl ProcessorOperator for TableFunctionProcessorOperator {
             .unwrap_or(false)
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if !self.need_input() {
-            return Err("table function received input while not ready".to_string());
+            return Err("table function received input while not ready"
+                .to_string()
+                .into());
         }
         self.validate_config()?;
         if chunk.is_empty() {
@@ -207,7 +211,7 @@ impl ProcessorOperator for TableFunctionProcessorOperator {
         Ok(())
     }
 
-    fn pull_chunk(&mut self, state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         if !self.has_output() {
             return Ok(None);
         }
@@ -239,7 +243,7 @@ impl ProcessorOperator for TableFunctionProcessorOperator {
         Ok(Some(slice))
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         self.finishing = true;
         if self.output_chunk.is_none() && !self.emit_empty_once {
             self.finished = true;
