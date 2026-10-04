@@ -60,8 +60,15 @@ impl OriginalChannelWorker {
     pub fn common_metadata_capacity_bound() -> io::Result<usize> {
         ChannelBuffer::common_metadata_capacity_bound()
     }
+    /// Actual fixed FIFO Arc, typed slots and mutex metadata for this generation.
+    /// The caller prepays this once; external request/Waker backing is separate.
+    #[cfg(feature = "original-response-cells")]
+    pub fn queue_metadata_capacity_bound(positions: usize) -> io::Result<usize> {
+        ChannelBuffer::queue_metadata_capacity_bound(positions)
+    }
     /// Opt into physical response-cell admission on the same original stock.
-    /// Obtain task/metadata, common metadata and positions * response_cell_total_capacity_bound
+    /// Obtain task/metadata, common metadata, fixed FIFO metadata and
+    /// positions * response_cell_total_capacity_bound
     /// before construction. This creates no funding authority or second wallet.
     #[cfg(feature = "original-response-cells")]
     pub fn with_original_response_cells(
@@ -73,9 +80,11 @@ impl OriginalChannelWorker {
             return Err(io::ErrorKind::InvalidInput.into());
         }
         let common = Self::common_metadata_capacity_bound()?;
+        let queue = Self::queue_metadata_capacity_bound(positions)?;
         Self::response_cell_total_capacity_bound()?
             .checked_mul(positions)
             .and_then(|cells| cells.checked_add(common))
+            .and_then(|value| value.checked_add(queue))
             .ok_or(io::ErrorKind::InvalidInput)?;
         Ok(Self {
             position: OriginalConnectionDriver::with_original(task_bound, original)?,

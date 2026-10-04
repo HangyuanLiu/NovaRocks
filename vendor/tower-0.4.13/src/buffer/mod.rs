@@ -40,6 +40,7 @@ pub mod error;
 pub mod future;
 mod layer;
 mod message;
+mod queue;
 mod service;
 mod worker;
 

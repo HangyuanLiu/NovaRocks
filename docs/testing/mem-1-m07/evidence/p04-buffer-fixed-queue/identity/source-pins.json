@@ -1,0 +1,21 @@
+{
+  "source_parent": "ed2901a625e1b5b20cb4e12a2c09a1ffb8d6d3bd",
+  "pins": {
+    "Cargo.lock": "c825ef311246920f100dc218b5d9660bb502d4e1ce9fdcc017bd90b29283951e",
+    "novarocks/native-adapter/src/native_transport_capacity.rs": "eb1432bb863e2f66ba71e0183707aaa92d718a8723e351cf7c8c515ec7fe77f4",
+    "novarocks/native-adapter/tests/native_tower_common_metadata.rs": "d08e2baa501b8c2c42bd3fb45b8c900f3564cd41498410d7d9fc4ff769d70a22",
+    "novarocks/native-adapter/tests/native_tower_fixed_queue.rs": "b27e1ef3c0a008671a0bb9ab272aeaa6d9b747fc54cacc5f9be381d719e46501",
+    "novarocks/native-adapter/tests/native_tower_original_response_ports.rs": "dcfba7ba97ad01771cc1f611a29613e6d5884195025948e34045e376ae43be7b",
+    "vendor/bytes-1.11.0/src/bytes.rs": "2eba59f03a7089202ac514b2e2c6bcd17fe2f12e2c776ecb9b16e6ea65d44ac7",
+    "vendor/tokio-1.52.3/src/sync/batch_semaphore.rs": "7e002b0b9a92c1101e82a4024b60a968ed4d351448130106e5d98cfbe4334846",
+    "vendor/tokio-1.52.3/src/sync/oneshot.rs": "7771da8ff5f67ec71a1f0d0fa82e8663d92d800b4bbbe3a78d10edf8b1be404c",
+    "vendor/tokio-1.52.3/src/sync/semaphore.rs": "c2e90a10517982faa15ec2ace0b361531a712a26f32d28144a3715ac192e2c78",
+    "vendor/tonic-0.12.3/PATCH.md": "6026b3b0f7f2ad62c6ed28209163efb34364471d9479504d9496ac36277348ee",
+    "vendor/tonic-0.12.3/src/transport/channel/service/channel_worker.rs": "95d8daa67c4838eb0a381b75cc61ab91ee460db3312791993d1aa90dc4e04b6c",
+    "vendor/tower-0.4.13/PATCH.md": "7267d5aa0bb70fe3efb1de82fb2010747199c48d4183d6ead2fd08703759b655",
+    "vendor/tower-0.4.13/src/buffer/mod.rs": "0b2de97b5886110647b1b670c863698a230babdc0a1ed324f631c555da90166d",
+    "vendor/tower-0.4.13/src/buffer/queue.rs": "5fb9169db0a5d11f521c5697aaafaf5d0e59fe1eebe93ed75d1579671b11a838",
+    "vendor/tower-0.4.13/src/buffer/service.rs": "4c64b56fa68617089eec82f4cc968395565ca90159f6aadb0830ec91438464b6",
+    "vendor/tower-0.4.13/src/buffer/worker.rs": "a621a247fcbc8acccd1d54d0412f916b58de744e58bcf30e89f20613d8fb352b"
+  }
+}

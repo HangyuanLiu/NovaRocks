@@ -16,7 +16,7 @@
 // under the License.
 
 //! Actual shared Semaphore/Handle metadata probes.
-//! Queues, readiness Boxes, service/error payloads, external Wakers and Worker
+//! Readiness Boxes, service/error payloads, external Wakers and Worker
 //! task/pin backing remain outside this funding receipt. Pair allocations are
 //! observed only to distinguish exact common metadata and real final exit.
 
@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use tokio::sync::Semaphore;
 use tower::Service;
-use tower_buffer_04::buffer::{Buffer, error::ServiceError};
+use tower_buffer_04::buffer::Buffer;
 
 const PORTS: usize = 8;
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -212,6 +212,8 @@ impl Funding {
         let state = Arc::new(State::default());
         let total = ActualBuffer::common_metadata_capacity_bound()
             .unwrap()
+            .checked_add(ActualBuffer::queue_metadata_capacity_bound(PORTS).unwrap())
+            .unwrap()
             .checked_add(
                 ActualBuffer::response_cell_total_capacity_bound()
                     .unwrap()
@@ -281,16 +283,6 @@ fn requested_bytes() -> usize {
         .iter()
         .map(|allocation| allocation.bytes.load(Ordering::SeqCst))
         .sum()
-}
-fn actual_arc_layout<T>() -> usize {
-    // Actual public payload types and pinned std Arc prefix, not a substitute
-    // private algorithm or guessed container size. System measures these next.
-    Layout::new::<[AtomicUsize; 2]>()
-        .extend(Layout::new::<T>())
-        .unwrap()
-        .0
-        .pad_to_align()
-        .size()
 }
 fn warm_shared_parking_outside_measurement() {
     // parking_lot's shared runtime resources are explicitly outside per-Mutex
@@ -381,7 +373,7 @@ fn actual_semaphore_arc_and_prewarm_match_query_without_changing_state() {
 }
 
 #[test]
-fn actual_owned_pair_prewarm_delta_matches_both_real_mutex_backings() {
+fn actual_original_pair_matches_complete_private_metadata_query() {
     let _serial = SERIAL.lock().unwrap();
     if let Err(error) = ActualBuffer::common_metadata_capacity_bound() {
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
@@ -400,15 +392,14 @@ fn actual_owned_pair_prewarm_delta_matches_both_real_mutex_backings() {
     drop(ordinary);
     let owned = measure(|| funding.pair());
     let owned_bytes = requested_bytes();
-    assert!(COUNT.load(Ordering::SeqCst) >= ordinary_count);
-    let arc_bytes = actual_arc_layout::<Semaphore>()
-        .checked_add(actual_arc_layout::<Mutex<Option<ServiceError>>>())
+    assert!(owned_bytes > 0 && ordinary_bytes > 0);
+    let expected = ActualBuffer::common_metadata_capacity_bound()
+        .unwrap()
+        .checked_add(ActualBuffer::queue_metadata_capacity_bound(PORTS).unwrap())
         .unwrap();
-    let actual_private_mutex_bytes = owned_bytes.checked_sub(ordinary_bytes).unwrap();
     assert_eq!(
-        arc_bytes.checked_add(actual_private_mutex_bytes).unwrap(),
-        ActualBuffer::common_metadata_capacity_bound().unwrap(),
-        "identical real queue/Arc constructors cancel only for this comparison; observed first locks supply PAL bytes"
+        owned_bytes, expected,
+        "actual fixed FIFO, common Arcs and all first-lock PAL requests match the prepaid metadata"
     );
     // This lifetime check observes actual pair allocations, without charging or
     // claiming a finite MPSC block graph. No requests grow that graph here.

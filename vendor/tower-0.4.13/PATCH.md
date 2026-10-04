@@ -62,3 +62,34 @@ bound. Queue Chan/blocks, readiness futures/waiters, shared parking resources,
 external Wakers and ServiceError payload remain separate. The actual Worker
 layout changes; callers query its real TaskCell again and supply independent
 task backing ownership through physical task exit.
+
+## Originally owned fixed FIFO backing
+
+The original-response-cells pair now constructs a private fixed FIFO directly;
+ordinary pairs retain the upstream MPSC. `src/buffer/queue.rs` is new, and the
+Buffer/Worker private endpoints use that module. There is no additional semaphore
+or admission wallet. Every queued Message retains one of the same pending permits,
+so the preallocated slot count is the existing bound.
+
+`Buffer::queue_metadata_capacity_bound(bound)` queries the actual Core Arc,
+`Option<Message<Request, T::Future>>` slots and the exact private std Mutex PAL.
+The caller obtains this complete amount before construction, together with common
+metadata and all response cells. The constructor checks the typed array Layout,
+checked additions and exact Vec capacity, prewarms the final unpublished mutex,
+and never grows slots after publication. Request/future/Span/Waker target backing
+is separate. Ordinary None constructs no fixed FIFO.
+
+Private strong-only handles export no Weak/raw Arc. The last Arc::into_inner
+physically frees Core's Arc before returning its value. Core takes its entire
+Option<Mutex<State>> into a local drop frame, retaining original through Vec/value,
+Waker and PAL cleanup, including unwind. Receiver Drop moves slots and Waker out
+under a short lock, then drops them outside it. User Waker clone/drop/wake and
+value destruction all occur outside queue locks. Pending registration rechecks
+state after cloning outside the lock, so a concurrent send cannot lose its wake.
+Ready receive does not clone a Waker. Close refuses new sends but drains accepted
+messages; last sender wakes EOF; these cuts clear the stored Waker's task cycle.
+
+The ordinary/original endpoint enum changes actual Buffer/Worker inline layouts;
+production admission and spawn query their exact current TaskCell again. Readiness
+future/clone counts, external backing, errors, shared runtime and complete Native
+capacity remain separate. This patch description is not validation evidence.

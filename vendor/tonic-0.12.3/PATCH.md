@@ -231,3 +231,19 @@ cache or executor backlink is added. Original task ownership remains independent
 the changed actual Worker return type is re-queried at admission and spawn.
 The old worker-only constructor and ordinary None pair retain their existing scope.
 Queue/blocks, readiness, errors, external Wakers and shared runtime remain open.
+
+## Fixed original Buffer FIFO
+
+`OriginalChannelWorker::queue_metadata_capacity_bound(positions)` forwards the
+actual private Message's fixed FIFO geometry. The original response-cell
+constructor checks queue + common metadata + every response position before
+creating logical worker metadata. Native obtains this queue amount once per
+logical generation from the same StockCore. No queue is shared between lanes or
+replaced by an ordinary MPSC fallback. The worker-only and None paths preserve
+their existing ordinary queue scope.
+
+The paired Tower implementation provides fixed slots and original physical exit,
+without changing pending positions or the native protocol. The actual Worker
+return type, including its endpoint enum, remains the source of the task query.
+This does not cover readiness waiter counts, external request/future/error/Waker
+targets, shared scheduler or the complete transport envelope.

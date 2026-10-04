@@ -1,0 +1,5 @@
+{
+  "novarocks": "b9c152c3210195b5b98671a764a40836d3ad4818f9c8bc04706228bf66a7dc3d",
+  "novarocks-system-tests": "ce79217aff428e120a983791991efd96e10e3ab171f0fa62bac23c58302a3905",
+  "novarocks-sql-test": "67cd8faa53cd8dadd696874a3bcf40b69f72ea7061c4706f402d2753f9ee5f02"
+}

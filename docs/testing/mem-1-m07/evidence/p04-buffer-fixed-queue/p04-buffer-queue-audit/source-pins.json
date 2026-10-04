@@ -1,0 +1,12 @@
+{
+  "scope": "Read-only source audit, not executed queue/model evidence",
+  "files": {
+    "vendor/tokio-1.52.3/src/sync/mpsc/list.rs": "3b587ddaf224eb6876ce6312bf856f5f22a487138b5e1464b8d57930fec4fde0",
+    "vendor/tokio-1.52.3/src/sync/mpsc/block.rs": "527b3d9e8b762898029e70d52d3d72b28f3851ed273a585b34729847e102f584",
+    "vendor/tokio-1.52.3/src/sync/mpsc/chan.rs": "2e463d33a25da97be3a9af31e0659aa91acedfc223d766e3c3cafa30d6a75b14",
+    "vendor/tokio-1.52.3/src/sync/mpsc/unbounded.rs": "038ec725b3ee672df78e98e0aef152bf1daad79518843d75c009e114f30ccfa5",
+    "vendor/tokio-1.52.3/src/sync/mpsc/mod.rs": "455441acb6e0fadf2ba5599d8459bd5eabe823aae8a84782cc0056fb1053f5dc",
+    "vendor/tower-0.4.13/src/buffer/service.rs": "260546175304a82b59476c6e5291aee170efa7902af6414f4abb10affe2eab92",
+    "vendor/tower-0.4.13/src/buffer/worker.rs": "5d143a8aa1003a2f52615801028ed00dbbf0ed2ad1af68bc4e8b97f662a6b4e7"
+  }
+}

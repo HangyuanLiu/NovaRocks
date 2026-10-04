@@ -17,8 +17,9 @@
 
 //! Actual Tower Buffer response ports, sharing one original Worker budget.
 //! Cell+exit-wrapper capacity is pregranted for all eight simultaneous ports.
-//! Queue, semaphore, Buffer/Handle/PAL, service futures and scheduler backing
-//! remain separate obligations. One test separately funds the real Worker
+//! The current original constructor also prepays common and fixed FIFO metadata.
+//! External service futures and scheduler backing remain separate obligations.
+//! One test separately funds the real Worker
 //! TaskCell through Tokio's actual typed constructor query, without attributing
 //! that TaskCell to Tower's response-cell query. No deadline proves reclamation.
 
@@ -221,6 +222,10 @@ impl Funding {
         let state = Arc::new(State::default());
         let total = PORTS
             .checked_mul(ActualBuffer::response_cell_total_capacity_bound().unwrap())
+            .unwrap()
+            .checked_add(ActualBuffer::common_metadata_capacity_bound().unwrap())
+            .unwrap()
+            .checked_add(ActualBuffer::queue_metadata_capacity_bound(PORTS).unwrap())
             .unwrap()
             .checked_add(Bytes::owner_with_exit_guard_metadata_size::<Bytes, Exit>())
             .unwrap()

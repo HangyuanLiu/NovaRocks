@@ -1,0 +1,210 @@
+[
+  {
+    "schema_version": 5,
+    "scenario": "native-ingress/blocking-saturation-control",
+    "outcome": "passed",
+    "exit_code": 0,
+    "started_unix_millis": 1791082707558,
+    "ended_unix_millis": 1791082707824,
+    "source_revision": "ed2901a625e1b5b20cb4e12a2c09a1ffb8d6d3bd",
+    "source_dirty": true,
+    "source_tree_sha256": "9c899e0064f11ae99865a36617e9034e66aaac6af17768217f72db4382f34446",
+    "runner_native_build_identity": "ed2901a625e1b5b20cb4e12a2c09a1ffb8d6d3bd",
+    "runner_executable": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/mem-1-m07/p04-response-port/product-target/debug/novarocks-system-tests",
+    "cargo_lock_sha256": "c825ef311246920f100dc218b5d9660bb502d4e1ce9fdcc017bd90b29283951e",
+    "cluster_size": 3,
+    "launch_profile": "fault-scenario",
+    "platform": {
+      "os": "macos",
+      "architecture": "aarch64",
+      "logical_cpu_count": 10
+    },
+    "source_artifact": {
+      "path": "logs/mem-1-m07/p04-buffer-fixed-queue-system/native-ingress-blocking-saturation-control/scenario-evidence.json",
+      "sha256": "3c6064efa4d1ca90a1976ec1d20687b27fb1d1c84cf0f551614a3c42f843cbcf"
+    },
+    "primary_binary_sha256": "b9c152c3210195b5b98671a764a40836d3ad4818f9c8bc04706228bf66a7dc3d"
+  },
+  {
+    "schema_version": 5,
+    "scenario": "native-ingress/outer-preflight-rejection",
+    "outcome": "passed",
+    "exit_code": 0,
+    "started_unix_millis": 1791082707087,
+    "ended_unix_millis": 1791082707309,
+    "source_revision": "ed2901a625e1b5b20cb4e12a2c09a1ffb8d6d3bd",
+    "source_dirty": true,
+    "source_tree_sha256": "9c899e0064f11ae99865a36617e9034e66aaac6af17768217f72db4382f34446",
+    "runner_native_build_identity": "ed2901a625e1b5b20cb4e12a2c09a1ffb8d6d3bd",
+    "runner_executable": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/mem-1-m07/p04-response-port/product-target/debug/novarocks-system-tests",
+    "cargo_lock_sha256": "c825ef311246920f100dc218b5d9660bb502d4e1ce9fdcc017bd90b29283951e",
+    "cluster_size": 3,
+    "launch_profile": "fault-scenario",
+    "platform": {
+      "os": "macos",
+      "architecture": "aarch64",
+      "logical_cpu_count": 10
+    },
+    "source_artifact": {
+      "path": "logs/mem-1-m07/p04-buffer-fixed-queue-system/native-ingress-outer-preflight-rejection/scenario-evidence.json",
+      "sha256": "8d48e94fa4af535e59ed53104f98c60d6b98cfb22c982bb9f587e4ca40699cf3"
+    },
+    "primary_binary_sha256": "b9c152c3210195b5b98671a764a40836d3ad4818f9c8bc04706228bf66a7dc3d"
+  },
+  {
+    "schema_version": 5,
+    "scenario": "native-ingress/partial-body-deadline",
+    "outcome": "passed",
+    "exit_code": 0,
+    "started_unix_millis": 1791082708188,
+    "ended_unix_millis": 1791082708526,
+    "source_revision": "ed2901a625e1b5b20cb4e12a2c09a1ffb8d6d3bd",
+    "source_dirty": true,
+    "source_tree_sha256": "9c899e0064f11ae99865a36617e9034e66aaac6af17768217f72db4382f34446",
+    "runner_native_build_identity": "ed2901a625e1b5b20cb4e12a2c09a1ffb8d6d3bd",
+    "runner_executable": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/mem-1-m07/p04-response-port/product-target/debug/novarocks-system-tests",
+    "cargo_lock_sha256": "c825ef311246920f100dc218b5d9660bb502d4e1ce9fdcc017bd90b29283951e",
+    "cluster_size": 3,
+    "launch_profile": "fault-scenario",
+    "platform": {
+      "os": "macos",
+      "architecture": "aarch64",
+      "logical_cpu_count": 10
+    },
+    "source_artifact": {
+      "path": "logs/mem-1-m07/p04-buffer-fixed-queue-system/native-ingress-partial-body-deadline/scenario-evidence.json",
+      "sha256": "b4fa627c837e15073918a054230c3e28ef03caf627c63803f70b8f0282395ab8"
+    },
+    "primary_binary_sha256": "b9c152c3210195b5b98671a764a40836d3ad4818f9c8bc04706228bf66a7dc3d"
+  },
+  {
+    "schema_version": 5,
+    "scenario": "native-ingress/registry-contention-control",
+    "outcome": "passed",
+    "exit_code": 0,
+    "started_unix_millis": 1791082708771,
+    "ended_unix_millis": 1791082709008,
+    "source_revision": "ed2901a625e1b5b20cb4e12a2c09a1ffb8d6d3bd",
+    "source_dirty": true,
+    "source_tree_sha256": "9c899e0064f11ae99865a36617e9034e66aaac6af17768217f72db4382f34446",
+    "runner_native_build_identity": "ed2901a625e1b5b20cb4e12a2c09a1ffb8d6d3bd",
+    "runner_executable": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/mem-1-m07/p04-response-port/product-target/debug/novarocks-system-tests",
+    "cargo_lock_sha256": "c825ef311246920f100dc218b5d9660bb502d4e1ce9fdcc017bd90b29283951e",
+    "cluster_size": 3,
+    "launch_profile": "fault-scenario",
+    "platform": {
+      "os": "macos",
+      "architecture": "aarch64",
+      "logical_cpu_count": 10
+    },
+    "source_artifact": {
+      "path": "logs/mem-1-m07/p04-buffer-fixed-queue-system/native-ingress-registry-contention-control/scenario-evidence.json",
+      "sha256": "f32a8a32a64904d0a43b597a1cc8632a0e35999508c4bc40801747e206e33625"
+    },
+    "primary_binary_sha256": "b9c152c3210195b5b98671a764a40836d3ad4818f9c8bc04706228bf66a7dc3d"
+  },
+  {
+    "schema_version": 5,
+    "scenario": "native-trust/automatic-dns",
+    "outcome": "passed",
+    "exit_code": 0,
+    "started_unix_millis": 1791082705552,
+    "ended_unix_millis": 1791082706019,
+    "source_revision": "ed2901a625e1b5b20cb4e12a2c09a1ffb8d6d3bd",
+    "source_dirty": true,
+    "source_tree_sha256": "9c899e0064f11ae99865a36617e9034e66aaac6af17768217f72db4382f34446",
+    "runner_native_build_identity": "ed2901a625e1b5b20cb4e12a2c09a1ffb8d6d3bd",
+    "runner_executable": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/mem-1-m07/p04-response-port/product-target/debug/novarocks-system-tests",
+    "cargo_lock_sha256": "c825ef311246920f100dc218b5d9660bb502d4e1ce9fdcc017bd90b29283951e",
+    "cluster_size": 3,
+    "launch_profile": "fault-scenario",
+    "platform": {
+      "os": "macos",
+      "architecture": "aarch64",
+      "logical_cpu_count": 10
+    },
+    "source_artifact": {
+      "path": "logs/mem-1-m07/p04-buffer-fixed-queue-system/native-trust-automatic-dns/scenario-evidence.json",
+      "sha256": "4f142125fb9a7258dfcbd00155a73e0480a26b3a66c173cdc7abea544e1ed0f4"
+    },
+    "primary_binary_sha256": "b9c152c3210195b5b98671a764a40836d3ad4818f9c8bc04706228bf66a7dc3d"
+  },
+  {
+    "schema_version": 5,
+    "scenario": "native-trust/pem-ip",
+    "outcome": "passed",
+    "exit_code": 0,
+    "started_unix_millis": 1791082706380,
+    "ended_unix_millis": 1791082706831,
+    "source_revision": "ed2901a625e1b5b20cb4e12a2c09a1ffb8d6d3bd",
+    "source_dirty": true,
+    "source_tree_sha256": "9c899e0064f11ae99865a36617e9034e66aaac6af17768217f72db4382f34446",
+    "runner_native_build_identity": "ed2901a625e1b5b20cb4e12a2c09a1ffb8d6d3bd",
+    "runner_executable": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/mem-1-m07/p04-response-port/product-target/debug/novarocks-system-tests",
+    "cargo_lock_sha256": "c825ef311246920f100dc218b5d9660bb502d4e1ce9fdcc017bd90b29283951e",
+    "cluster_size": 3,
+    "launch_profile": "fault-scenario",
+    "platform": {
+      "os": "macos",
+      "architecture": "aarch64",
+      "logical_cpu_count": 10
+    },
+    "source_artifact": {
+      "path": "logs/mem-1-m07/p04-buffer-fixed-queue-system/native-trust-pem-ip/scenario-evidence.json",
+      "sha256": "9ac84aa51ca3cc95fb062fd974807802e4697c94b07ef2169c65db801713be87"
+    },
+    "primary_binary_sha256": "b9c152c3210195b5b98671a764a40836d3ad4818f9c8bc04706228bf66a7dc3d"
+  },
+  {
+    "schema_version": 5,
+    "scenario": "native-trust/plaintext-ip",
+    "outcome": "passed",
+    "exit_code": 0,
+    "started_unix_millis": 1791082704768,
+    "ended_unix_millis": 1791082705190,
+    "source_revision": "ed2901a625e1b5b20cb4e12a2c09a1ffb8d6d3bd",
+    "source_dirty": true,
+    "source_tree_sha256": "9c899e0064f11ae99865a36617e9034e66aaac6af17768217f72db4382f34446",
+    "runner_native_build_identity": "ed2901a625e1b5b20cb4e12a2c09a1ffb8d6d3bd",
+    "runner_executable": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/mem-1-m07/p04-response-port/product-target/debug/novarocks-system-tests",
+    "cargo_lock_sha256": "c825ef311246920f100dc218b5d9660bb502d4e1ce9fdcc017bd90b29283951e",
+    "cluster_size": 3,
+    "launch_profile": "fault-scenario",
+    "platform": {
+      "os": "macos",
+      "architecture": "aarch64",
+      "logical_cpu_count": 10
+    },
+    "source_artifact": {
+      "path": "logs/mem-1-m07/p04-buffer-fixed-queue-system/native-trust-plaintext-ip/scenario-evidence.json",
+      "sha256": "709b8c8f3586490471c816efb7f9899f21b3787d66b887697cdb4f3fc02b517a"
+    },
+    "primary_binary_sha256": "b9c152c3210195b5b98671a764a40836d3ad4818f9c8bc04706228bf66a7dc3d"
+  },
+  {
+    "schema_version": 5,
+    "scenario": "query-lifecycle/distributed-baseline",
+    "outcome": "passed",
+    "exit_code": 0,
+    "started_unix_millis": 1791082704078,
+    "ended_unix_millis": 1791082704507,
+    "source_revision": "ed2901a625e1b5b20cb4e12a2c09a1ffb8d6d3bd",
+    "source_dirty": true,
+    "source_tree_sha256": "9c899e0064f11ae99865a36617e9034e66aaac6af17768217f72db4382f34446",
+    "runner_native_build_identity": "ed2901a625e1b5b20cb4e12a2c09a1ffb8d6d3bd",
+    "runner_executable": "/Users/harbor/.codex/worktrees/b92b/NovaRocks/logs/mem-1-m07/p04-response-port/product-target/debug/novarocks-system-tests",
+    "cargo_lock_sha256": "c825ef311246920f100dc218b5d9660bb502d4e1ce9fdcc017bd90b29283951e",
+    "cluster_size": 3,
+    "launch_profile": "fault-scenario",
+    "platform": {
+      "os": "macos",
+      "architecture": "aarch64",
+      "logical_cpu_count": 10
+    },
+    "source_artifact": {
+      "path": "logs/mem-1-m07/p04-buffer-fixed-queue-system/query-lifecycle-distributed-baseline/scenario-evidence.json",
+      "sha256": "af63ce272e86d6b084236dca741aa54fdcdb53ac7076a6e97f8cae3164e3b772"
+    },
+    "primary_binary_sha256": "b9c152c3210195b5b98671a764a40836d3ad4818f9c8bc04706228bf66a7dc3d"
+  }
+]

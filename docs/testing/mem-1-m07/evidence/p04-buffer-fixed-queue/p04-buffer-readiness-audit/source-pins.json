@@ -1,0 +1,24 @@
+{
+  "status": "ReadOnlySourceAudit",
+  "cargo_executed": false,
+  "product_edited": false,
+  "source_files": {
+    "vendor/tower-0.4.13/src/buffer/service.rs": "4c64b56fa68617089eec82f4cc968395565ca90159f6aadb0830ec91438464b6",
+    "vendor/tower-0.4.13/src/buffer/worker.rs": "a621a247fcbc8acccd1d54d0412f916b58de744e58bcf30e89f20613d8fb352b",
+    "vendor/tower-0.4.13/src/buffer/error.rs": "cb32f3412eaa5c6317d3b1a2cb7d23416ba74e6b08967229699a9c62fe201c36",
+    "vendor/tower-0.4.13/src/buffer/future.rs": "86825db0749a56d8590d572271814fb9b3ee068809d54efb79a765879157fe5a",
+    "vendor/tower-0.4.13/src/buffer/queue.rs": "5fb9169db0a5d11f521c5697aaafaf5d0e59fe1eebe93ed75d1579671b11a838",
+    "vendor/tokio-1.52.3/src/sync/semaphore.rs": "c2e90a10517982faa15ec2ace0b361531a712a26f32d28144a3715ac192e2c78",
+    "vendor/tokio-1.52.3/src/sync/batch_semaphore.rs": "7e002b0b9a92c1101e82a4024b60a968ed4d351448130106e5d98cfbe4334846",
+    "vendor/tonic-0.12.3/src/transport/channel/service/channel_worker.rs": "95d8daa67c4838eb0a381b75cc61ab91ee460db3312791993d1aa90dc4e04b6c",
+    "vendor/tonic-0.12.3/src/transport/channel/mod.rs": "3b648e2a5784ad1109126d5f0bb972d43f6e7f4f11c9f27768ccf5c1a8f6962b",
+    "vendor/tonic-0.12.3/src/transport/error.rs": "e7136ea9a47a89c61a8feff30cf7098f63da92b45317c210fc3be4c2eb6e8439",
+    "novarocks/native-adapter/src/native_client.rs": "d86c0c89d3f24b0649dc34e4f608f3a1b2e11f836f43b38a33b15a966411ee50",
+    "novarocks/native-adapter/src/native_transport_capacity.rs": "eb1432bb863e2f66ba71e0183707aaa92d718a8723e351cf7c8c515ec7fe77f4"
+  },
+  "cached_sources": {
+    "/Users/harbor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-util-0.7.17/src/sync/poll_semaphore.rs": "97b635299703a7e345d5d966496dbd31b32f18490b9c24c9bffc6b251a0529d1",
+    "/Users/harbor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-util-0.7.17/src/sync/reusable_box.rs": "491fced798b9961b1aba8d1603110584e4657f5e8f6aed0336557e7bb8c240bc"
+  },
+  "limits": "No readiness clone count or complete opaque error/Waker funding claim"
+}

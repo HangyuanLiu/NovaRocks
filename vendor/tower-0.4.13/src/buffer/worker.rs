@@ -1,6 +1,7 @@
 use super::{
     error::{Closed, ServiceError},
     message::Message,
+    queue,
 };
 use futures_core::ready;
 use std::sync::{Arc, Mutex, Weak};
@@ -9,7 +10,7 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::Semaphore;
 use tower_service::Service;
 
 // pin-project-lite's field grammar does not accept cfg attributes. The disabled
@@ -33,7 +34,7 @@ pin_project_lite::pin_project! {
         T: Service<Request>,
     {
         current_message: Option<Message<Request, T::Future>>,
-        rx: mpsc::UnboundedReceiver<Message<Request, T::Future>>,
+        rx: queue::Receiver<Message<Request, T::Future>>,
         service: T,
         finish: bool,
         failed: Option<ServiceError>,
@@ -81,7 +82,7 @@ where
 {
     pub(crate) fn new(
         service: T,
-        rx: mpsc::UnboundedReceiver<Message<Request, T::Future>>,
+        rx: queue::Receiver<Message<Request, T::Future>>,
         semaphore: &Arc<Semaphore>,
     ) -> (Handle, Worker<T, Request>) {
         let handle = Handle {

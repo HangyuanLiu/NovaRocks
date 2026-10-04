@@ -1,17 +1,18 @@
 use super::{
     future::ResponseFuture,
     message::Message,
+    queue,
     worker::{Handle, Worker},
 };
 
 use futures_core::ready;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::PollSemaphore;
 use tower_service::Service;
 
-/// Adds an mpsc buffer in front of an inner service.
+/// Adds a request buffer in front of an inner service.
 ///
 /// See the module documentation for more details.
 #[derive(Debug)]
@@ -21,7 +22,7 @@ where
 {
     // Note: this actually _is_ bounded, but rather than using Tokio's bounded
     // channel, we use Tokio's semaphore separately to implement the bound.
-    tx: mpsc::UnboundedSender<Message<Request, T::Future>>,
+    tx: queue::Sender<Message<Request, T::Future>>,
     // When the buffer's channel is full, we want to exert backpressure in
     // `poll_ready`, so that callers such as load balancers could choose to call
     // another service rather than waiting for buffer capacity.
@@ -106,7 +107,21 @@ where
         T::Error: Send + Sync,
         Request: Send + 'static,
     {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = queue::pair();
+        Self::pair_with_queue(service, bound, tx, rx)
+    }
+
+    fn pair_with_queue(
+        service: T,
+        bound: usize,
+        tx: queue::Sender<Message<Request, T::Future>>,
+        rx: queue::Receiver<Message<Request, T::Future>>,
+    ) -> (Buffer<T, Request>, Worker<T, Request>)
+    where
+        T: Send + 'static,
+        T::Error: Send + Sync,
+        Request: Send + 'static,
+    {
         let semaphore = Arc::new(Semaphore::new(bound));
         let (handle, worker) = Worker::new(service, rx, &semaphore);
         let buffer = Buffer {
@@ -130,6 +145,15 @@ where
         Semaphore::allocation_capacity_bound()?
             .checked_add(Handle::allocation_capacity_bound()?)
             .ok_or_else(|| std::io::ErrorKind::InvalidInput.into())
+    }
+
+    /// Query the actual fixed FIFO Core, typed slots and std mutex PAL backing.
+    ///
+    /// This includes every preallocated Option<Message> slot. It excludes the
+    /// external request/future/Span/Waker backing and creates no authority.
+    #[cfg(feature = "original-response-cells")]
+    pub fn queue_metadata_capacity_bound(bound: usize) -> std::io::Result<usize> {
+        queue::allocation_capacity_bound::<Message<Request, T::Future>>(bound)
     }
 
     /// Query the actual typed response-cell Arc allocation without constructing it.
@@ -162,10 +186,12 @@ where
     /// generation owner. The typed cell bound and wrapper geometry are checked
     /// before any queue, semaphore, or worker handle construction. The original
     /// does not point back to a Buffer, Worker, Channel, or task JoinHandle.
+    /// The caller also prepays queue_metadata_capacity_bound(bound); this path
+    /// constructs a fixed FIFO directly rather than first creating an MPSC.
     ///
     /// A handed-off service future does not free its pending position until the
     /// response cell's final endpoint, retained value and Wakers actually exit.
-    /// This API does not fund the worker task or omitted queue/error backings.
+    /// This API does not fund the worker task or external request/error backing.
     #[cfg(feature = "original-response-cells")]
     pub fn pair_with_original_response_cells(
         service: T,
@@ -178,17 +204,23 @@ where
         T::Error: Send + Sync,
         Request: Send + 'static,
     {
-        let _common = Self::common_metadata_capacity_bound()?;
+        let common = Self::common_metadata_capacity_bound()?;
+        let queue = Self::queue_metadata_capacity_bound(bound)?;
         let actual = Self::response_cell_allocation_capacity_bound()?;
         let total = Self::response_cell_total_capacity_bound()?;
         if bound == 0
             || bound > Semaphore::MAX_PERMITS
             || cell_allocation_bound < actual
-            || total.checked_mul(bound).is_none()
+            || total
+                .checked_mul(bound)
+                .and_then(|value| value.checked_add(common))
+                .and_then(|value| value.checked_add(queue))
+                .is_none()
         {
             return Err(std::io::ErrorKind::InvalidInput.into());
         }
-        let (mut buffer, mut worker) = Self::pair(service, bound);
+        let (tx, rx) = queue::pair_original(bound, original.clone())?;
+        let (mut buffer, mut worker) = Self::pair_with_queue(service, bound, tx, rx);
         worker.retain_common_metadata_owner(original.clone());
         // Prewarm each final, unpublished mutex once while both original
         // holders retain the same capability. No permits or errors change.
@@ -282,14 +314,26 @@ where
             (tx, rx, Some(_permit))
         };
 
-        match self.tx.send(Message {
+        let result = self.tx.send(Message {
             request,
             span,
             tx,
             _permit,
-        }) {
+        });
+        #[cfg(feature = "original-response-cells")]
+        match result {
+            Err(queue::SendError::Closed(_)) => ResponseFuture::failed(self.get_worker_error()),
+            // All actual messages hold one of the same pending permits. This
+            // branch refuses an internal invariant violation without growth.
+            Err(queue::SendError::Capacity(_)) => ResponseFuture::failed(Box::new(
+                std::io::Error::from(std::io::ErrorKind::InvalidData),
+            )),
+            Ok(()) => ResponseFuture::new(rx),
+        }
+        #[cfg(not(feature = "original-response-cells"))]
+        match result {
             Err(_) => ResponseFuture::failed(self.get_worker_error()),
-            Ok(_) => ResponseFuture::new(rx),
+            Ok(()) => ResponseFuture::new(rx),
         }
     }
 }
