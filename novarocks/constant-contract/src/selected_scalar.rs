@@ -115,7 +115,7 @@ impl ConstantValue {
     }
 }
 
-fn selected_row<'a>(
+pub(super) fn selected_row<'a>(
     value: &'a ConstantValue,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Option<Row<'a>>, ConstantError> {
