@@ -38,6 +38,13 @@ fn dependency_refusals_preserve_the_first_cause_without_an_enclosing_tail() {
     ] {
         for error in [
             NodeCodecError::from(ExpressionCodecError::Control(cause)),
+            NodeCodecError::from(RelationCodecError::Control(cause)),
+            NodeCodecError::from(ConnectorPayloadCodecError::Control(cause)),
+            NodeCodecError::from(RelationCodecError::from(
+                crate::physical_provider_read_v2::ProviderReadCodecError::from(
+                    ConnectorPayloadCodecError::Control(cause),
+                ),
+            )),
             NodeCodecError::from(p::ConstantReferenceError::Control(cause)),
             NodeCodecError::from(p::ConstantReferenceError::Constant(ConstantError::Control(
                 cause,
@@ -75,6 +82,8 @@ fn ordinary_dependency_errors_retain_typed_details_and_completed_work() {
         NodeCodecError::from(p::ConstantReferenceError::MissingPool(
             p::ConstantPoolId::new(u32::MAX),
         )),
+        NodeCodecError::from(RelationCodecError::InvalidShape("missing relation")),
+        NodeCodecError::from(ConnectorPayloadCodecError::InvalidShape("missing payload")),
     ] {
         let control = Control(Mutex::new(Vec::new()));
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
@@ -87,6 +96,12 @@ fn ordinary_dependency_errors_retain_typed_details_and_completed_work() {
             }
             NodeCodecError::Constant(p::ConstantReferenceError::MissingPool(id)) => {
                 assert_eq!(id.get(), u32::MAX)
+            }
+            NodeCodecError::Relation(RelationCodecError::InvalidShape(message)) => {
+                assert_eq!(message, "missing relation")
+            }
+            NodeCodecError::Payload(ConnectorPayloadCodecError::InvalidShape(message)) => {
+                assert_eq!(message, "missing payload")
             }
             other => panic!("unexpected dependency error: {other:?}"),
         }

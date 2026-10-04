@@ -1036,6 +1036,7 @@ fn decode_core<'loan, 'wire, 'control>(
 mod tests;
 
 mod materialization;
+pub(crate) use materialization::prepare_observed as prepare_relation_materialization_observed;
 pub use materialization::{
     PreparedRelationMaterialization, materialize_relation, prepare_relation_materialization,
 };

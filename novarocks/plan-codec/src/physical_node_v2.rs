@@ -20,11 +20,13 @@
 
 use crate::{
     allocation_exit_v2::reserve_exit,
+    physical_connector_payload_v2::ConnectorPayloadCodecError,
     physical_expression_v2::ExpressionCodecError,
     physical_properties_v2::{
         self as properties, PhysicalPropertyCodecError, PhysicalPropertyProjectionFacts,
         PhysicalPropertyProjectionLimits,
     },
+    physical_relation_v2::RelationCodecError,
     physical_value_v2::{DecodedValues, EncodedValues, ValueCodecError},
 };
 use novarocks_physical_plan as p;
@@ -59,6 +61,8 @@ pub enum NodeCodecError {
     Properties(PhysicalPropertyCodecError),
     Value(ValueCodecError),
     Expression(ExpressionCodecError),
+    Relation(RelationCodecError),
+    Payload(ConnectorPayloadCodecError),
     Constant(p::ConstantReferenceError),
     InvalidShape(&'static str),
 }
@@ -91,6 +95,22 @@ impl From<ExpressionCodecError> for NodeCodecError {
         }
     }
 }
+impl From<RelationCodecError> for NodeCodecError {
+    fn from(error: RelationCodecError) -> Self {
+        match error {
+            RelationCodecError::Control(cause) => Self::Control(cause),
+            error => Self::Relation(error),
+        }
+    }
+}
+impl From<ConnectorPayloadCodecError> for NodeCodecError {
+    fn from(error: ConnectorPayloadCodecError) -> Self {
+        match error {
+            ConnectorPayloadCodecError::Control(cause) => Self::Control(cause),
+            error => Self::Payload(error),
+        }
+    }
+}
 impl From<p::ConstantReferenceError> for NodeCodecError {
     fn from(error: p::ConstantReferenceError) -> Self {
         use novarocks_constant_contract::ConstantError;
@@ -113,6 +133,8 @@ impl fmt::Display for NodeCodecError {
             Self::Properties(e) => e.fmt(f),
             Self::Value(e) => e.fmt(f),
             Self::Expression(e) => e.fmt(f),
+            Self::Relation(e) => e.fmt(f),
+            Self::Payload(e) => e.fmt(f),
             Self::Constant(e) => e.fmt(f),
             Self::InvalidShape(s) => f.write_str(s),
         }
@@ -125,6 +147,8 @@ impl std::error::Error for NodeCodecError {
             Self::Properties(e) => Some(e),
             Self::Value(e) => Some(e),
             Self::Expression(e) => Some(e),
+            Self::Relation(e) => Some(e),
+            Self::Payload(e) => Some(e),
             Self::Constant(e) => Some(e),
             Self::InvalidShape(_) => None,
         }
