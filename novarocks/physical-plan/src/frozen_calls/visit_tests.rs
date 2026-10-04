@@ -678,3 +678,6 @@ fn observed_visitor_empty_occurrences_and_plain_window_keep_original_representat
     work.finish().unwrap();
     assert_eq!(windows, 1);
 }
+#[cfg(test)]
+#[path = "relational_visit_tests.rs"]
+mod relational_visit_tests;

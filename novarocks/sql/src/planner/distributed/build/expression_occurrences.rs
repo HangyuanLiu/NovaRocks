@@ -21,8 +21,9 @@
 
 use novarocks_functions::FunctionSpecializationFailure;
 use novarocks_physical_plan::{
-    ExprId, ExprKind, ExpressionRootError, Fragment, PhysicalExpressionRoots, PhysicalRootUses,
-    RootUseBindingError,
+    ExprId, ExprKind, ExpressionRootError, Fragment, FrozenCallError, PhysicalCallBinding,
+    PhysicalCallSite, PhysicalExpressionRoots, PhysicalRootUses, RootUseBindingError,
+    visit_relational_calls_observed,
 };
 use novarocks_type_contract::{
     ArgumentControl, CompileCheckpoints, CompileControlError, CompilePhase, ControlShape,
@@ -44,12 +45,31 @@ pub(crate) enum ExpressionOccurrenceError {
     MissingDefinition(ExprId),
     InvalidFunctionControl(ExprId),
     TooManyItems,
+    Calls(FrozenCallError),
+    InvalidRelationalControl(PhysicalCallSite),
 }
 impl From<CompileControlError> for ExpressionOccurrenceError {
     fn from(value: CompileControlError) -> Self {
         Self::Control(value)
     }
 }
+impl From<FrozenCallError> for ExpressionOccurrenceError {
+    fn from(value: FrozenCallError) -> Self {
+        match value {
+            FrozenCallError::Control(error) => Self::Control(error),
+            error => Self::Calls(error),
+        }
+    }
+}
+
+/// Expression and relational contexts authored from the same original source.
+/// These identities and domains are topology, not refined call-effect facts.
+#[derive(Debug)]
+pub(crate) struct AuthoredPhysicalOccurrences {
+    pub root_uses: PhysicalRootUses,
+    pub relational_contexts: Vec<(PhysicalCallSite, ExpressionEffectContext)>,
+}
+
 impl ExpressionOccurrenceError {
     fn flow(error: ExpressionControlFlowError) -> Self {
         match error {
@@ -83,11 +103,11 @@ impl ExpressionOccurrenceError {
 /// or cross-use cache is involved. Static TypeOnly arguments create no runtime
 /// invocation. All caller-owned maps, vectors and owner lookups require prior
 /// admission; bounded cooperative work is not a memory funding grant.
-pub(crate) fn author_expression_occurrences_observed(
+pub(crate) fn author_physical_occurrences_observed(
     fragment: &Fragment,
     functions: &dyn SqlFunctionCatalog,
     control: &dyn PureCompileControl,
-) -> Result<PhysicalRootUses, ExpressionOccurrenceError> {
+) -> Result<AuthoredPhysicalOccurrences, ExpressionOccurrenceError> {
     let mut author = Author {
         fragment,
         functions,
@@ -118,6 +138,66 @@ pub(crate) fn author_expression_occurrences_observed(
             bindings.push((*site, id));
             author.work.step()?;
         }
+        let mut relational_contexts = Vec::new();
+        let expression_use_count = author.uses.len();
+        let domains = &mut author.domains;
+        visit_relational_calls_observed(fragment, &mut author.work, |site, binding, work| {
+            if relational_contexts.len() == MAX_CONTROL_USE_REFERENCES
+                || domains.len() == MAX_CONTROL_DEFINITIONS
+            {
+                return Err(ExpressionOccurrenceError::TooManyItems);
+            }
+            let (function_id, kind, overload, expected_control) = match binding {
+                PhysicalCallBinding::Aggregate(binding) => (
+                    &binding.function.function_id,
+                    binding.function.kind,
+                    &binding.function.overload,
+                    ArgumentControl::Aggregate,
+                ),
+                PhysicalCallBinding::Table(function) => (
+                    &function.function_id,
+                    novarocks_type_contract::FunctionKind::Table,
+                    &function.overload,
+                    ArgumentControl::Table,
+                ),
+                _ => return Err(ExpressionOccurrenceError::InvalidRelationalControl(site)),
+            };
+            work.flush()?;
+            let declaration = functions
+                .pure_overload_declaration_observed(function_id, kind, overload, control)
+                .map_err(ExpressionOccurrenceError::function)?;
+            let matches_control = declaration.effects().argument_control == expected_control;
+            work.step()?;
+            if !matches_control {
+                return Err(ExpressionOccurrenceError::InvalidRelationalControl(site));
+            }
+            let domain = EvaluationDomainId::new(domains.len() as u32);
+            // Both expression and relational counts are independently bounded
+            // by 65536, so their disjoint namespace fits u32 without wrapping.
+            let id =
+                ExpressionUseId::new((expression_use_count + relational_contexts.len()) as u32);
+            domains
+                .try_reserve(1)
+                .map_err(|_| CompileControlError::ResourceExhausted)?;
+            relational_contexts
+                .try_reserve(1)
+                .map_err(|_| CompileControlError::ResourceExhausted)?;
+            domains.push(ExpressionEvaluationDomain {
+                id: domain,
+                parent: None,
+                guard: None,
+            });
+            relational_contexts.push((
+                site,
+                ExpressionEffectContext {
+                    use_id: id,
+                    domain,
+                    demand: novarocks_type_contract::EvaluationDemand::Value,
+                },
+            ));
+            work.step()?;
+            Ok(())
+        })?;
         author.work.flush()?;
         let flow = ExpressionControlFlow::try_new(
             std::mem::take(&mut author.domains),
@@ -128,9 +208,18 @@ pub(crate) fn author_expression_occurrences_observed(
         )
         .map_err(ExpressionOccurrenceError::flow)?;
         author.work.flush()?;
-        PhysicalRootUses::try_new(fragment, flow, bindings, control).map_err(|error| match error {
-            RootUseBindingError::Control(error) => ExpressionOccurrenceError::Control(error),
-            error => ExpressionOccurrenceError::RootBinding(error),
+        let root_uses =
+            PhysicalRootUses::try_new(fragment, flow, bindings, control).map_err(|error| {
+                match error {
+                    RootUseBindingError::Control(error) => {
+                        ExpressionOccurrenceError::Control(error)
+                    }
+                    error => ExpressionOccurrenceError::RootBinding(error),
+                }
+            })?;
+        Ok(AuthoredPhysicalOccurrences {
+            root_uses,
+            relational_contexts,
         })
     })();
     if matches!(&result, Err(ExpressionOccurrenceError::Control(_))) {
@@ -138,6 +227,15 @@ pub(crate) fn author_expression_occurrences_observed(
     }
     author.work.finish()?;
     result
+}
+
+#[cfg(test)]
+fn author_expression_occurrences_observed(
+    fragment: &Fragment,
+    functions: &dyn SqlFunctionCatalog,
+    control: &dyn PureCompileControl,
+) -> Result<PhysicalRootUses, ExpressionOccurrenceError> {
+    author_physical_occurrences_observed(fragment, functions, control).map(|value| value.root_uses)
 }
 
 struct Author<'a> {
@@ -212,9 +310,11 @@ impl Author<'_> {
                     self.work.control(),
                 )
                 .map_err(ExpressionOccurrenceError::function)?;
-            scalar_shape(declaration.effects().argument_control, args.len()).ok_or(
-                ExpressionOccurrenceError::InvalidFunctionControl(definition),
-            )?
+            let shape = scalar_shape(declaration.effects().argument_control, args.len());
+            self.work.step()?;
+            shape.ok_or(ExpressionOccurrenceError::InvalidFunctionControl(
+                definition,
+            ))?
         };
         let id = ExpressionUseId::new(self.uses.len() as u32);
         self.uses
@@ -298,3 +398,7 @@ fn scalar_shape(control: ArgumentControl, count: usize) -> Option<ControlShape> 
 #[cfg(test)]
 #[path = "expression_occurrences_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "relational_occurrences_tests.rs"]
+mod relational_tests;

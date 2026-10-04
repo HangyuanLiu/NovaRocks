@@ -508,6 +508,24 @@ fn visit_calls<'a, E: From<FrozenCallError>>(
         }
         work.step().map_err(FrozenCallError::Control)?;
     }
+    visit_relational_calls_observed(fragment, work, visit)
+}
+
+/// Visit the original non-expression call sites before root-flow construction.
+/// This is the same relational half of the complete physical call visitor:
+/// zero-argument calls and materialized writer channels still have occurrences.
+/// It borrows actual bindings only; structure, phase, selected owner facts and
+/// runtime domains remain separate obligations. The caller admits the source
+/// and callback allocations, owns entry/finish and preserves the first refusal.
+pub fn visit_relational_calls_observed<'a, E: From<FrozenCallError>>(
+    fragment: &'a Fragment,
+    work: &mut CompileCheckpoints<'_>,
+    mut visit: impl FnMut(
+        PhysicalCallSite,
+        PhysicalCallBinding<'a>,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<(), E>,
+) -> Result<(), E> {
     for node in fragment.nodes().values() {
         match &node.kind {
             NodeKind::Aggregate { calls, .. } => {
