@@ -24,8 +24,9 @@
 //! retains its original RootInputPermit until this cursor and its input exit.
 //! Arbitrary source metadata-container work also remains the caller's responsibility.
 //! These checks neither fund source growth nor admit a root/session assignment.
-//! Empty input, cumulative row admission, NoRows at sealed End, and nested
-//! containers remain the root owner's responsibilities. This module does not
+//! Empty batches have a separate schema-only validation cursor that emits no
+//! record. Cumulative row admission, NoRows at sealed End, and nested containers
+//! remain the root owner's responsibilities. This module does not
 //! install a producer or enable the Host's ScalarValueV1 gate.
 
 use std::sync::Arc;
@@ -122,6 +123,25 @@ impl NativeScalarLeafEncoder {
         schema: Arc<ScalarSchema>,
         prepaid_scratch_capacity: usize,
     ) -> Result<Self, NativeScalarLeafError> {
+        Self::try_begin_mode(chunk, schema, prepaid_scratch_capacity, false)
+    }
+    /// Validate an exactly empty one-column batch under the same original input
+    /// and scratch contract. No cell is selected and no ScalarValueV1 record is
+    /// emitted. A successful witness exposes Some(0), not a NoRows record: only
+    /// the root owner may decide absence after its entire input stream seals.
+    pub fn try_validate_empty(
+        chunk: &Chunk,
+        schema: Arc<ScalarSchema>,
+        prepaid_scratch_capacity: usize,
+    ) -> Result<Self, NativeScalarLeafError> {
+        Self::try_begin_mode(chunk, schema, prepaid_scratch_capacity, true)
+    }
+    fn try_begin_mode(
+        chunk: &Chunk,
+        schema: Arc<ScalarSchema>,
+        prepaid_scratch_capacity: usize,
+        empty_validation: bool,
+    ) -> Result<Self, NativeScalarLeafError> {
         let batch = &chunk.batch;
         if batch.num_columns() != 1
             || batch.schema_ref().fields().len() != 1
@@ -130,7 +150,11 @@ impl NativeScalarLeafEncoder {
         {
             return Err(NativeScalarLeafError::Shape);
         }
-        if batch.num_rows() == 0 {
+        if empty_validation {
+            if batch.num_rows() != 0 {
+                return Err(NativeScalarLeafError::Shape);
+            }
+        } else if batch.num_rows() == 0 {
             return Err(NativeScalarLeafError::EmptyInput);
         }
         let slot = &chunk.chunk_schema().slots()[0];
@@ -149,7 +173,7 @@ impl NativeScalarLeafEncoder {
         validate_field_preflight(schema.field(), slot.field())?;
         validate_field_preflight(schema.field(), &batch.schema_ref().fields()[0])?;
         let array = batch.column(0).as_ref();
-        if array.len() != 1
+        if array.len() != usize::from(!empty_validation)
             || !carrier_preflight_matches(
                 schema.field(),
                 array.data_type(),
@@ -160,9 +184,13 @@ impl NativeScalarLeafEncoder {
         }
         // At most 304 fixed coefficient limbs plus constant selected-cell work.
         // Variable lengths are checked without scanning/copying their payload.
-        let candidate_encoded_len =
+        let candidate_encoded_len = if empty_validation {
+            validate_empty_carrier(schema.field(), array)?;
+            0
+        } else {
             ScalarLeafCursor::try_new(&schema, borrow_validated_leaf(schema.field(), array)?)?
-                .encoded_len();
+                .encoded_len()
+        };
         Ok(Self {
             batch: batch.clone(),
             slot_field: Arc::clone(slot.field_ref()),
@@ -185,7 +213,8 @@ impl NativeScalarLeafEncoder {
         }
     }
     /// Validation advances even with empty output, but never writes output or
-    /// completes a row. Its final turn yields before any encoding can begin.
+    /// completes a row. Its final value-validation turn yields before encoding;
+    /// empty validation completes immediately with a zero-length witness.
     pub fn step(&mut self, output: &mut [u8]) -> Result<RenderTurn, NativeScalarLeafError> {
         if matches!(self.phase, ScalarLeafPhase::Failed) {
             return Err(NativeScalarLeafError::Failed);
@@ -261,10 +290,16 @@ impl NativeScalarLeafEncoder {
                 _ => return Err(NativeScalarLeafError::Type),
             }
         }
+        let empty_complete = source == 3 && self.candidate_encoded_len == 0;
         self.phase = if source == 3 {
-            ScalarLeafPhase::Encoding(ValidatedLeaf {
+            let witness = ValidatedLeaf {
                 encoded_len: self.candidate_encoded_len,
-            })
+            };
+            if empty_complete {
+                ScalarLeafPhase::Complete(witness)
+            } else {
+                ScalarLeafPhase::Encoding(witness)
+            }
         } else {
             ScalarLeafPhase::Validating { source, offset }
         };
@@ -273,7 +308,11 @@ impl NativeScalarLeafEncoder {
             examined_bytes: examined,
             visited_cells: work,
             completed_rows: 0,
-            status: RenderTurnStatus::Yielded,
+            status: if empty_complete {
+                RenderTurnStatus::InputComplete
+            } else {
+                RenderTurnStatus::Yielded
+            },
         })
     }
     fn encode_turn(
@@ -390,6 +429,68 @@ fn exact<T: Array + 'static>(array: &dyn Array) -> Result<&T, NativeScalarLeafEr
     }
     Ok(value)
 }
+// Verify closed concrete carriers without touching a selected cell. In particular,
+// an empty dictionary may retain a nonempty values array, but no key/value index
+// or null bitmap bit is read here. Original backing inspection stays with caller.
+fn validate_empty_carrier(
+    expected: &ScalarField,
+    array: &dyn Array,
+) -> Result<(), NativeScalarLeafError> {
+    use ScalarValueType as S;
+    if !array.is_empty() {
+        return Err(NativeScalarLeafError::Type);
+    }
+    if dictionary_type(array.data_type()) {
+        let dictionary = exact::<DictionaryArray<Int32Type>>(array)?;
+        return match dictionary.values().data_type() {
+            DataType::Utf8 => exact::<StringArray>(dictionary.values().as_ref()).map(|_| ()),
+            DataType::LargeUtf8 => {
+                exact::<LargeStringArray>(dictionary.values().as_ref()).map(|_| ())
+            }
+            _ => Err(NativeScalarLeafError::Type),
+        };
+    }
+    macro_rules! carrier {
+        ($ty:ty) => {
+            exact::<$ty>(array).map(|_| ())
+        };
+    }
+    match &expected.value_type {
+        S::Null => carrier!(NullArray),
+        S::Boolean => carrier!(BooleanArray),
+        S::SignedInteger(8) => carrier!(Int8Array),
+        S::SignedInteger(16) => carrier!(Int16Array),
+        S::SignedInteger(32) => carrier!(Int32Array),
+        S::SignedInteger(64) => carrier!(Int64Array),
+        S::LargeInt => carrier!(FixedSizeBinaryArray),
+        S::Float32 => carrier!(Float32Array),
+        S::Float64 => carrier!(Float64Array),
+        S::Decimal { bits: 128, .. } => carrier!(Decimal128Array),
+        S::Decimal { bits: 256, .. } => carrier!(Decimal256Array),
+        S::String | S::Json => carrier!(StringArray),
+        S::Binary | S::Opaque(_) => carrier!(BinaryArray),
+        S::Variant => carrier!(LargeBinaryArray),
+        S::Date => carrier!(Date32Array),
+        S::TimeMicros => carrier!(Time64MicrosecondArray),
+        S::Timestamp {
+            unit: ScalarTimestampUnit::Microsecond,
+            ..
+        } => {
+            carrier!(TimestampMicrosecondArray)
+        }
+        S::Timestamp {
+            unit: ScalarTimestampUnit::Nanosecond,
+            ..
+        } => {
+            carrier!(TimestampNanosecondArray)
+        }
+        S::List(_) | S::Map { .. } | S::Struct(_) => {
+            Err(NativeScalarLeafError::UnsupportedContainer)
+        }
+        _ => Err(NativeScalarLeafError::Type),
+    }
+}
+
 // Concrete shape/value preflight and the private witness guard emission.
 // Temporary borrows never rescan timezone bytes or escape the current turn.
 fn borrow_validated_leaf<'a>(
@@ -581,6 +682,44 @@ mod tests {
             .bind_native_slots(&[7])
             .unwrap(),
         )
+    }
+    #[test]
+    fn empty_dictionary_does_not_select_retained_values_and_requires_logical_facts() {
+        let values: ArrayRef =
+            Arc::new(LargeStringArray::from(vec!["x".repeat(
+                novarocks_result_contract::ScalarProfileV1::SINGLE_VALUE_BYTES + 1,
+            )]));
+        let dictionary: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(Int32Array::from(Vec::<i32>::new()), values)
+                .unwrap(),
+        );
+        let source = chunk(
+            Arc::clone(&dictionary),
+            Some(LogicalType::Json.metadata_value()),
+            None,
+        );
+        let mut cursor = NativeScalarLeafEncoder::try_validate_empty(
+            &source,
+            schema(ScalarValueType::Json, true),
+            NativeScalarLeafEncoder::scratch_capacity_bytes(),
+        )
+        .unwrap();
+        assert_eq!(cursor.encoded_len(), None);
+        let mut output = [0xa5; 32];
+        let turn = cursor.step(&mut output).unwrap();
+        assert_eq!(turn.status, RenderTurnStatus::InputComplete);
+        assert_eq!((turn.emitted_bytes, turn.completed_rows), (0, 0));
+        assert_eq!(cursor.encoded_len(), Some(0));
+        assert_eq!(output, [0xa5; 32]);
+        let untrusted = chunk(dictionary, None, None);
+        assert!(matches!(
+            NativeScalarLeafEncoder::try_validate_empty(
+                &untrusted,
+                schema(ScalarValueType::Json, true),
+                NativeScalarLeafEncoder::scratch_capacity_bytes(),
+            ),
+            Err(NativeScalarLeafError::LogicalMetadata)
+        ));
     }
     // These source fixtures are not original funding/provenance proofs. The
     // leaf bridge is tested separately from the caller's complete Chunk proof.

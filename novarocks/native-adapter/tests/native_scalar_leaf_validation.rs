@@ -344,3 +344,241 @@ fn cancellation_in_each_phase_frees_cursor_backings_before_original_credit() {
         returned(&budget);
     }
 }
+
+fn empty_fixture(wrong_last_byte: bool) -> (Chunk, Arc<ScalarSchema>) {
+    let (input, schema) = fixture(wrong_last_byte);
+    // Slice preserves the actual timestamp carrier and timezone owners, while
+    // making every selected-cell read invalid. Source fixtures are unmeasured.
+    let batch = RecordBatch::try_new(
+        Arc::clone(input.batch.schema_ref()),
+        vec![input.batch.column(0).slice(0, 0)],
+    )
+    .unwrap();
+    let empty = Chunk::try_new_with_chunk_schema(batch, input.chunk_schema_ref()).unwrap();
+    (empty, schema)
+}
+fn begin_empty(
+    input: &Chunk,
+    schema: Arc<ScalarSchema>,
+    credit: ResultWriteCredit,
+) -> FundedCursor {
+    let (cursor, calls, requested) = measure(2, || {
+        Box::new(
+            NativeScalarLeafEncoder::try_validate_empty(
+                input,
+                schema,
+                NativeScalarLeafEncoder::scratch_capacity_bytes(),
+            )
+            .unwrap(),
+        )
+    });
+    assert_eq!(
+        calls, 2,
+        "empty witness owns one cursor Box and one columns Vec"
+    );
+    assert_eq!(requested, NativeScalarLeafEncoder::scratch_capacity_bytes());
+    FundedCursor {
+        cursor,
+        _exit: PhysicalExit {
+            family: 2,
+            _credit: credit,
+        },
+    }
+}
+
+#[test]
+fn empty_schema_witness_emits_neither_value_nor_absent_record() {
+    let (input, schema) = empty_fixture(false);
+    let (budget, credit) = budget_and_credit();
+    let mut owned = begin_empty(&input, schema, credit);
+    assert_eq!(owned.cursor.encoded_len(), None);
+    let mut untouched = [0xa5; 32];
+    for index in 0..6 {
+        let output = if index % 2 == 0 {
+            &mut untouched[..]
+        } else {
+            &mut []
+        };
+        let turn = no_allocation(|| owned.cursor.step(output).unwrap());
+        assert_eq!(untouched, [0xa5; 32]);
+        assert_eq!((turn.emitted_bytes, turn.completed_rows), (0, 0));
+        assert_eq!(turn.examined_bytes, 64 * 1024);
+        assert!(turn.visited_cells <= 1024);
+        assert_eq!(
+            turn.status,
+            if index == 5 {
+                RenderTurnStatus::InputComplete
+            } else {
+                RenderTurnStatus::Yielded
+            }
+        );
+        assert_eq!(
+            owned.cursor.encoded_len(),
+            if index == 5 { Some(0) } else { None }
+        );
+        held(&budget);
+    }
+    for _ in 0..2 {
+        let turn = no_allocation(|| owned.cursor.step(&mut untouched).unwrap());
+        assert_eq!(turn.status, RenderTurnStatus::InputComplete);
+        assert_eq!(
+            (
+                turn.emitted_bytes,
+                turn.examined_bytes,
+                turn.visited_cells,
+                turn.completed_rows
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(untouched, [0xa5; 32]);
+    }
+    close_cursor(owned);
+    returned(&budget);
+}
+
+#[test]
+fn empty_preflight_preserves_value_gate_and_refuses_shape_slot_carrier_and_scratch() {
+    let (empty, schema) = empty_fixture(false);
+    let error = no_allocation(|| {
+        NativeScalarLeafEncoder::try_begin(
+            &empty,
+            Arc::clone(&schema),
+            NativeScalarLeafEncoder::scratch_capacity_bytes(),
+        )
+    });
+    assert!(matches!(error, Err(NativeScalarLeafError::EmptyInput)));
+    let (value, _) = fixture(false);
+    let error = no_allocation(|| {
+        NativeScalarLeafEncoder::try_validate_empty(
+            &value,
+            Arc::clone(&schema),
+            NativeScalarLeafEncoder::scratch_capacity_bytes(),
+        )
+    });
+    assert!(matches!(error, Err(NativeScalarLeafError::Shape)));
+    let error = no_allocation(|| {
+        NativeScalarLeafEncoder::try_validate_empty(
+            &empty,
+            Arc::clone(&schema),
+            NativeScalarLeafEncoder::scratch_capacity_bytes() - 1,
+        )
+    });
+    assert!(matches!(error, Err(NativeScalarLeafError::ScratchLimit)));
+    let wrong_slot = Arc::new(
+        ScalarSchema::try_new(schema.field().clone())
+            .unwrap()
+            .bind_native_slots(&[8])
+            .unwrap(),
+    );
+    let error = no_allocation(|| {
+        NativeScalarLeafEncoder::try_validate_empty(
+            &empty,
+            wrong_slot,
+            NativeScalarLeafEncoder::scratch_capacity_bytes(),
+        )
+    });
+    assert!(matches!(error, Err(NativeScalarLeafError::Slot)));
+    let wrong_carrier = Arc::new(
+        ScalarSchema::try_new(ScalarField {
+            nullable: true,
+            value_type: ScalarValueType::SignedInteger(64),
+        })
+        .unwrap()
+        .bind_native_slots(&[7])
+        .unwrap(),
+    );
+    let error = no_allocation(|| {
+        NativeScalarLeafEncoder::try_validate_empty(
+            &empty,
+            wrong_carrier,
+            NativeScalarLeafEncoder::scratch_capacity_bytes(),
+        )
+    });
+    assert!(matches!(error, Err(NativeScalarLeafError::Type)));
+    let mut wrong_nullable_field = schema.field().clone();
+    wrong_nullable_field.nullable = false;
+    let wrong_nullable = Arc::new(
+        ScalarSchema::try_new(wrong_nullable_field)
+            .unwrap()
+            .bind_native_slots(&[7])
+            .unwrap(),
+    );
+    let error = no_allocation(|| {
+        NativeScalarLeafEncoder::try_validate_empty(
+            &empty,
+            wrong_nullable,
+            NativeScalarLeafEncoder::scratch_capacity_bytes(),
+        )
+    });
+    assert!(matches!(error, Err(NativeScalarLeafError::Type)));
+    let wrong_length = Arc::new(
+        ScalarSchema::try_new(ScalarField {
+            nullable: true,
+            value_type: ScalarValueType::Timestamp {
+                unit: ScalarTimestampUnit::Nanosecond,
+                timezone: Some("UTC".to_owned()),
+            },
+        })
+        .unwrap()
+        .bind_native_slots(&[7])
+        .unwrap(),
+    );
+    let error = no_allocation(|| {
+        NativeScalarLeafEncoder::try_validate_empty(
+            &empty,
+            wrong_length,
+            NativeScalarLeafEncoder::scratch_capacity_bytes(),
+        )
+    });
+    assert!(matches!(error, Err(NativeScalarLeafError::Type)));
+}
+
+#[test]
+fn empty_zone_mismatch_latches_failure_without_emission_or_credit_return() {
+    let (input, schema) = empty_fixture(true);
+    let (budget, credit) = budget_and_credit();
+    let mut owned = begin_empty(&input, schema, credit);
+    let mut untouched = [0xa5; 32];
+    let first = no_allocation(|| owned.cursor.step(&mut untouched).unwrap());
+    assert_eq!((first.emitted_bytes, first.completed_rows), (0, 0));
+    assert_eq!(first.examined_bytes, 64 * 1024);
+    assert!(matches!(
+        no_allocation(|| owned.cursor.step(&mut untouched)),
+        Err(NativeScalarLeafError::Type)
+    ));
+    assert_eq!(owned.cursor.encoded_len(), None);
+    assert!(matches!(
+        no_allocation(|| owned.cursor.step(&mut [])),
+        Err(NativeScalarLeafError::Failed)
+    ));
+    assert_eq!(untouched, [0xa5; 32]);
+    held(&budget);
+    close_cursor(owned);
+    returned(&budget);
+}
+
+#[test]
+fn empty_cancellation_before_and_after_witness_frees_backing_before_credit() {
+    for validated in [false, true] {
+        let (input, schema) = empty_fixture(false);
+        let weak_array = Arc::downgrade(input.batch.column(0));
+        let weak_field = Arc::downgrade(input.chunk_schema().slots()[0].field_ref());
+        let (budget, credit) = budget_and_credit();
+        let mut owned = begin_empty(&input, schema, credit);
+        drop(input);
+        for _ in 0..if validated { 6 } else { 1 } {
+            no_allocation(|| owned.cursor.step(&mut []).unwrap());
+        }
+        assert_eq!(
+            owned.cursor.encoded_len(),
+            if validated { Some(0) } else { None }
+        );
+        assert!(weak_array.upgrade().is_some());
+        assert!(weak_field.upgrade().is_some());
+        held(&budget);
+        close_cursor(owned);
+        assert!(weak_array.upgrade().is_none());
+        assert!(weak_field.upgrade().is_none());
+        returned(&budget);
+    }
+}

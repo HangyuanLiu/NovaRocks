@@ -1,0 +1,161 @@
+{
+  "schema_version": 1,
+  "scope": "P04 exactly-empty Scalar leaf source schema-only validation precursor; no Session or Host installation",
+  "tested_dirty_parent": "8b84aa16449cda87d2d336ecdb654e7bf6256b2b",
+  "approved_spec_plan_revision": 5,
+  "source_pin_count": 8,
+  "source_pins": "source-pins.json",
+  "focused_passed": 768,
+  "counts": {
+    "native_lib": 745,
+    "native_scalar_leaf_validation": 8,
+    "root_producer_session": 15
+  },
+  "formatting": "cargo fmt --all -- --check PASS",
+  "clippy": "cargo clippy --offline --locked -p novarocks-native-adapter --all-targets PASS with existing warnings; not strict -Dwarnings",
+  "compiled_runtime_negatives": [
+    {
+      "label": "empty-bypasses-zone-witness",
+      "source": "novarocks/native-adapter/src/root_scalar_leaf_codec.rs",
+      "test": "empty_zone_mismatch_latches_failure_without_emission_or_credit_return",
+      "exit_code": 101,
+      "compiled_runtime_failure": true,
+      "source_before_sha256": "f2bf62c672a0df204dda7baf4b221197a138323e19cff1459c6b1eed1d9c669b",
+      "source_mutated_sha256": "1bd261b9ecef3a3773f9a07ec802f7383af6cc93b4b1463d0332fe2113c1b266"
+    },
+    {
+      "label": "empty-is-one-row",
+      "source": "novarocks/native-adapter/src/root_scalar_leaf_codec.rs",
+      "test": "empty_schema_witness_emits_neither_value_nor_absent_record",
+      "exit_code": 101,
+      "compiled_runtime_failure": true,
+      "source_before_sha256": "f2bf62c672a0df204dda7baf4b221197a138323e19cff1459c6b1eed1d9c669b",
+      "source_mutated_sha256": "057e78db4f6bc0c88797e8488ef8eadb051a18122ed5703024f491c2ab9d8c31"
+    },
+    {
+      "label": "empty-length-before-witness",
+      "source": "novarocks/native-adapter/src/root_scalar_leaf_codec.rs",
+      "test": "empty_schema_witness_emits_neither_value_nor_absent_record",
+      "exit_code": 101,
+      "compiled_runtime_failure": true,
+      "source_before_sha256": "f2bf62c672a0df204dda7baf4b221197a138323e19cff1459c6b1eed1d9c669b",
+      "source_mutated_sha256": "705ef561494cd4421e98ce31b49256839ece27b7ccb77c67c9559dfe5a797f17"
+    }
+  ],
+  "retained_failures": [
+    "First filtered command ran 19 old leaf lib cases but zero integration cases; the final unfiltered command runs all eight actual allocator/credit tests.",
+    "First root-added dictionary fixture named nonexistent ScalarLimits; compilation failed. Corrected to actual ScalarProfileV1 and canonical Json metadata before runtime."
+  ],
+  "behavior": [
+    "try_begin still rejects EmptyInput. The separate try_validate_empty accepts exactly zero rows and shares exact slot, physical carrier, nullability, logical metadata and prepaid scratch checks before clone growth.",
+    "Concrete empty carriers are downcast without selecting index0. Empty dictionary values may be nonempty or contain an unselected value above the scalar ceiling; no value is selected or expanded.",
+    "All three timezone sources require the same private incremental witness. Each turn examines at most64KiB, writes zero bytes and counts zero rows; only the completed witness exposes Some(0)/InputComplete.",
+    "No SCV1 value or NoRows record is emitted. Cumulative cardinality and a single NoRows at sealed stream EOF remain Session responsibilities.",
+    "Real existing Worker budget pregrants the cursor Box plus one-column Vec. Actual System allocation/free oracles verify both exit before that scoped credit returns, including cancellation before/after witness and failed validation."
+  ],
+  "limitations": [
+    "Additive leaf bridge and native-adapter-only helper/test changes; no shared wire/type vocabulary, public runtime profile, source admission or production path is changed. Focused native lib/leaf allocator/producer session tests and all-target Clippy are the scoped verification; no new full Cargo/native/SQL run is claimed.",
+    "Prior fixed-FIFO checkpoint8b84aa164 contains full Cargo and final1FE3BE evidence for its own frozen sources. That evidence is not represented as a final full-CI/native result for this later precursor.",
+    "Complete RootInputPermit/Chunk source-growth coverage, notification callback ownership, cumulative Scalar Session producer and FE collector remain open. Session/Host still reject Scalar and the actual gates are covered by regressions.",
+    "Nested scalar64KiB policy and DNS finite exit remain pending; this empty-validation-only precursor makes neither decision.",
+    "P04 executing, P05-P10 open, V1 None, Scalar Host closed. No complete M07, whole Native graph, full SQL/default System/Linux/release-performance claim. Linux testing is user-owned.",
+    "No new production unsafe or additional authority/wallet. No push, PR or archive."
+  ],
+  "artifacts": [
+    {
+      "path": "logs/clippy-final.log.gz",
+      "bytes": 20926,
+      "sha256": "7b24c33ef91c15444b807c00fcbc0b5da4cab005d4a5475d527215981971b053"
+    },
+    {
+      "path": "logs/fmt-final.log.gz",
+      "bytes": 20,
+      "sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "path": "logs/leaf-first.log.gz",
+      "bytes": 8895,
+      "sha256": "9b8f797abf7ed056d0ebeef696d407d49d334fc68000e946d333acd8aa611170"
+    },
+    {
+      "path": "logs/negatives-summary.log.gz",
+      "bytes": 453,
+      "sha256": "7cc3a1cdcd5684ec6a968e98a0b182233048d3fc7deba7f20530dc9f120a0291"
+    },
+    {
+      "path": "logs/related-final.log.gz",
+      "bytes": 25577,
+      "sha256": "5d6cf74b98b8ffc2da2013458d92e6236fb29f54b65a89a861962ab0dc70404d"
+    },
+    {
+      "path": "logs/related-first.log.gz",
+      "bytes": 8197,
+      "sha256": "d7e6a80cb87620079f3398a1d4f8da1e9d61f125289b5a81a1bb601bb9f99446"
+    },
+    {
+      "path": "logs/related-v2.log.gz",
+      "bytes": 25615,
+      "sha256": "c48146e59f21db9449da9d03d1ed3d29b907599207058643feb6a27141c3b5b7"
+    },
+    {
+      "path": "negatives/empty-bypasses-zone-witness.log.gz",
+      "bytes": 8452,
+      "sha256": "9c1214a0be6de9853ec06872208c5da47cbfcf52a887a7117c61ebeb55f48541"
+    },
+    {
+      "path": "negatives/empty-bypasses-zone-witness.patch.gz",
+      "bytes": 251,
+      "sha256": "fdea0bef9d97a3ffa2142664d1c3371beea3ff38352ee454d9596fb7ec37f1bd"
+    },
+    {
+      "path": "negatives/empty-is-one-row.log.gz",
+      "bytes": 8383,
+      "sha256": "ec430307be5489f3a9d84178013aa232606499b8abbc2fa896e2c5a1b9d0e030"
+    },
+    {
+      "path": "negatives/empty-is-one-row.patch.gz",
+      "bytes": 222,
+      "sha256": "20afa508dd27c632e96be514dae1e19ee28892bce6ca8679a59c6066c0dd1b08"
+    },
+    {
+      "path": "negatives/empty-length-before-witness.log.gz",
+      "bytes": 8384,
+      "sha256": "50f3be178ad2141a1e9575589fd7b41146a9031f83aca6d83b783e8089cd5e5b"
+    },
+    {
+      "path": "negatives/empty-length-before-witness.patch.gz",
+      "bytes": 237,
+      "sha256": "0818ce4fd111fd91800e12d3d93fd47a50f8b162987aa593bd1157bfb8244d8f"
+    },
+    {
+      "path": "negatives/results.json",
+      "bytes": 1356,
+      "sha256": "04f96485f340ca79a2c7ac70c9305384578ed8c17d85863358e10e14e02e7c4f"
+    },
+    {
+      "path": "remaining-audit/notes.md.gz",
+      "bytes": 5438,
+      "sha256": "beba252b1d5186b26d17b4e579b7c173ee280ae677279828dedeee15163ff3f2"
+    },
+    {
+      "path": "remaining-audit/source-pins.json",
+      "bytes": 4211,
+      "sha256": "69ad1cf6b52b81c118ff51ba1694db2a8f87a46a8e9804ed2dfe2ed36eff9d74"
+    },
+    {
+      "path": "run-negatives.py",
+      "bytes": 2697,
+      "sha256": "53ee50b4f85ca730ac3132d1205d3b1f8622aafdf26ebfd3a504e402cd5dcb72"
+    },
+    {
+      "path": "source-pins.json",
+      "bytes": 1075,
+      "sha256": "7ea351dbc269b79895e774452829c389b1a457bac906202955f4e0498d61bed8"
+    },
+    {
+      "path": "stage.json",
+      "bytes": 1952,
+      "sha256": "d57383685296efd0414549589d2e080f521bf3bea77869018bbde7c2a499afce"
+    }
+  ]
+}
