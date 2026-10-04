@@ -58,12 +58,18 @@ impl From<PhysicalArgumentError> for PhysicalScalarRequestError {
 /// Signature metadata alone grants no effects or installed implementation.
 #[derive(Debug)]
 pub(crate) struct AuthoredPhysicalScalarRequest<'a> {
-    pub function: &'a BoundFunction,
-    pub selected: Arc<FunctionBindingSelection>,
+    function: &'a BoundFunction,
+    selected: Arc<FunctionBindingSelection>,
     arguments: Vec<FunctionArgument>,
     result_constraint: &'a FunctionValueType,
 }
 impl AuthoredPhysicalScalarRequest<'_> {
+    pub const fn function(&self) -> &BoundFunction {
+        self.function
+    }
+    pub const fn selected(&self) -> &Arc<FunctionBindingSelection> {
+        &self.selected
+    }
     pub fn request(&self) -> FunctionBindingRequest<'_> {
         FunctionBindingRequest {
             arguments: &self.arguments,

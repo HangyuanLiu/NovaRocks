@@ -77,7 +77,7 @@ impl ExpressionOccurrenceError {
             error => Self::Flow(error),
         }
     }
-    fn function(error: FunctionSpecializationFailure) -> Self {
+    pub(super) fn function(error: FunctionSpecializationFailure) -> Self {
         match error {
             FunctionSpecializationFailure::Control(error) => Self::Control(error),
             FunctionSpecializationFailure::Binding(
@@ -367,7 +367,7 @@ impl Author<'_> {
 
 // Only the installed owner supplies this enum. Case arity follows the same
 // ordered operand/WHEN/THEN/ELSE vocabulary checked by the control graph.
-fn scalar_shape(control: ArgumentControl, count: usize) -> Option<ControlShape> {
+pub(super) fn scalar_shape(control: ArgumentControl, count: usize) -> Option<ControlShape> {
     Some(match control {
         ArgumentControl::Eager => ControlShape::Eager,
         ArgumentControl::TypeOnly => ControlShape::TypeOnly,

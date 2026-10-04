@@ -19,6 +19,7 @@
 mod contract_lowering;
 mod expression_occurrences;
 mod physical_call_arguments;
+mod physical_scalar_occurrences;
 mod physical_scalar_requests;
 
 pub(crate) use contract_lowering::{
