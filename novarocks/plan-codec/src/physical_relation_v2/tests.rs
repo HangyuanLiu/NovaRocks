@@ -664,10 +664,8 @@ fn run(
                 .unwrap();
             let ts = decode_type_table(types.as_wire(), type_limits(), c).unwrap();
             let mut raw = expected(1);
-            if bad {
-                if let Some(wire::relation_definition::Kind::Metadata(v)) = &mut raw.kind {
-                    v.kind.clear();
-                }
+            if bad && let Some(wire::relation_definition::Kind::Metadata(v)) = &mut raw.kind {
+                v.kind.clear();
             }
             let defs = [raw];
             c.arm(stop);
@@ -891,3 +889,5 @@ fn relation_namespace_original_dictionary_boxes_are_required_without_output_clon
 {
     check_original_owned_backing_floor(true);
 }
+
+mod materialization_tests;

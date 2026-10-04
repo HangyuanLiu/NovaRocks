@@ -845,14 +845,14 @@ pub fn decode_relations<'loan, 'wire, 'control>(
     let r = decode_core(defs, reads, types, source, limits, &mut w);
     finish(r, w)
 }
-fn decode_core<'loan, 'wire, 'control>(
-    defs: &'wire [wire::RelationDefinition],
-    reads: &'loan DecodedProviderReads<'wire, 'control>,
-    types: &'loan DecodedTypeTable,
+fn preflight_decode_observed(
+    defs: &[wire::RelationDefinition],
+    reads: &DecodedProviderReads<'_, '_>,
+    types: &DecodedTypeTable,
     source: usize,
     l: RelationProjectionLimits,
     w: &mut CompileCheckpoints<'_>,
-) -> Result<DecodedRelations<'loan, 'wire, 'control>, Error> {
+) -> Result<RelationProjectionFacts, Error> {
     cap(defs.len(), l.max_definitions, w)?;
     let mut m = Model::default();
     let mut known = bytes::<wire::RelationDefinition>(defs.len())?;
@@ -937,7 +937,17 @@ fn decode_core<'loan, 'wire, 'control>(
         cap(m.work, l.max_work, w)?;
         w.step()?;
     }
-    let facts = m.gate(defs.len(), source, l, w)?;
+    m.gate(defs.len(), source, l, w)
+}
+fn decode_core<'loan, 'wire, 'control>(
+    defs: &'wire [wire::RelationDefinition],
+    reads: &'loan DecodedProviderReads<'wire, 'control>,
+    types: &'loan DecodedTypeTable,
+    source: usize,
+    l: RelationProjectionLimits,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<DecodedRelations<'loan, 'wire, 'control>, Error> {
+    let facts = preflight_decode_observed(defs, reads, types, source, l, w)?;
     let indices = BindingIndex::prepare(defs.len(), |at| defs[at].id, w)?;
     let mut output = reserve(defs.len(), w)?;
     for def in defs {
@@ -1024,3 +1034,8 @@ fn decode_core<'loan, 'wire, 'control>(
 }
 #[cfg(test)]
 mod tests;
+
+mod materialization;
+pub use materialization::{
+    PreparedRelationMaterialization, materialize_relation, prepare_relation_materialization,
+};
