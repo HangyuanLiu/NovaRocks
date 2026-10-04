@@ -20,6 +20,7 @@
 use crate::{
     ProviderValidatedFragment,
     assert_rows::lower_assert_rows,
+    change_events::lower_change_events,
     channels::{ChannelLoweringError, resolve_linear_channels},
     expressions::{ExpressionLoweringError, lower_expressions, prepare_calls},
     repeat::{RepeatLoweringError, lower_repeat},
@@ -259,8 +260,10 @@ fn lower(
             .nodes()
             .get(&id)
             .ok_or(FragmentCompileError::Invalid("missing physical node"))?;
-        if node.output_properties.distribution != Distribution::Singleton
-            || node.output_properties.row_multiplicity != RowMultiplicity::SingleCopy
+        if !matches!(
+            node.output_properties.distribution,
+            Distribution::Singleton | Distribution::Unconstrained
+        ) || node.output_properties.row_multiplicity != RowMultiplicity::SingleCopy
             || !node.output_properties.ordering.is_empty()
         {
             return Err(FragmentCompileError::Unsupported {
@@ -286,7 +289,11 @@ fn lower(
             NodeKind::Limit { .. } | NodeKind::AssertOneRow(_) if node.inputs.len() == 1 => {
                 next = Some(node.inputs[0])
             }
-            NodeKind::Repeat { .. } | NodeKind::Unpivot { .. } if node.inputs.len() == 1 => {
+            NodeKind::Repeat { .. }
+            | NodeKind::Unpivot { .. }
+            | NodeKind::ChangeEventExpand { .. }
+                if node.inputs.len() == 1 =>
+            {
                 next = Some(node.inputs[0])
             }
             _ => {
@@ -302,6 +309,25 @@ fn lower(
         return Err(FragmentCompileError::Invalid(
             "unrepresented physical nodes",
         ));
+    }
+    // Expansion conservatively loses distribution knowledge. It still has
+    // the exact singleton child and one driver; no exchange/scan is admitted.
+    // Only descendants of this actual expansion can consume that uncertainty.
+    let mut expanded = false;
+    for &id in order.iter().rev() {
+        let node = &physical.nodes()[&id];
+        let changes = matches!(node.kind, NodeKind::ChangeEventExpand { .. });
+        let unknown = node.output_properties.distribution == Distribution::Unconstrained;
+        work.step()?;
+        if (unknown && !expanded && !changes)
+            || ((expanded || changes) && options.pipeline_dop.get() != 1)
+        {
+            return Err(FragmentCompileError::Unsupported {
+                node: Some(id),
+                feature: "change-event source-chain distribution or driver count",
+            });
+        }
+        expanded |= changes;
     }
     work.flush()?;
     let channels_plan = resolve_linear_channels(package, &order, work.control())?;
@@ -417,6 +443,24 @@ fn lower(
                             expressions: &expressions.ids,
                         },
                         &planned.slots,
+                        work.control(),
+                    )?
+                }
+                NodeKind::ChangeEventExpand { .. } => {
+                    let child =
+                        *local_ids
+                            .get(&node.inputs[0])
+                            .ok_or(FragmentCompileError::Invalid(
+                                "missing lowered change-event child",
+                            ))?;
+                    work.flush()?;
+                    lower_change_events(
+                        package,
+                        node,
+                        id,
+                        child,
+                        &planned.slots,
+                        &expressions.ids,
                         work.control(),
                     )?
                 }
@@ -666,6 +710,12 @@ fn lower(
             .get(&site.node)
             .ok_or(FragmentCompileError::Invalid("missing root node"))?;
         let role = match site.role {
+            ExpressionRootRole::ChangePredicate { event } => {
+                ProgramNodeExpressionRole::ChangePredicate { event }
+            }
+            ExpressionRootRole::ChangeAssignment { event, assignment } => {
+                ProgramNodeExpressionRole::ChangeAssignment { event, assignment }
+            }
             ExpressionRootRole::UnpivotConstant { mapping, constant } => {
                 ProgramNodeExpressionRole::UnpivotConstant { mapping, constant }
             }

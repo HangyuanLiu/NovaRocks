@@ -19,6 +19,10 @@
 //! phase; its result is not a complete semantic validation or a LocalProgram.
 
 mod assert_rows;
+mod change_events;
+
+#[cfg(test)]
+mod change_events_lowering_tests;
 mod channels;
 mod expressions;
 mod lowering;
