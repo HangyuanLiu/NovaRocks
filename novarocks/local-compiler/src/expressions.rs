@@ -1546,17 +1546,7 @@ fn literal_argument(
 fn comparison_operator(
     operator: novarocks_physical_plan::BinaryOperator,
 ) -> Option<novarocks_functions::ComparisonOperator> {
-    use novarocks_functions::ComparisonOperator;
-    use novarocks_physical_plan::BinaryOperator;
-    Some(match operator {
-        BinaryOperator::Eq => ComparisonOperator::Eq,
-        BinaryOperator::NotEq => ComparisonOperator::Ne,
-        BinaryOperator::Lt => ComparisonOperator::Lt,
-        BinaryOperator::LtEq => ComparisonOperator::Le,
-        BinaryOperator::Gt => ComparisonOperator::Gt,
-        BinaryOperator::GtEq => ComparisonOperator::Ge,
-        _ => return None,
-    })
+    operator.comparison_operator()
 }
 
 #[cfg(test)]
@@ -1566,16 +1556,7 @@ mod literal_metadata_tests;
 fn arithmetic_operator(
     operator: novarocks_physical_plan::BinaryOperator,
 ) -> Option<novarocks_type_contract::ArithmeticOperator> {
-    use novarocks_physical_plan::BinaryOperator as B;
-    use novarocks_type_contract::ArithmeticOperator as A;
-    Some(match operator {
-        B::Add => A::Add,
-        B::Subtract => A::Subtract,
-        B::Multiply => A::Multiply,
-        B::Divide => A::Divide,
-        B::Modulo => A::Modulo,
-        _ => return None,
-    })
+    operator.arithmetic_operator()
 }
 
 #[cfg(test)]

@@ -176,6 +176,37 @@ pub enum BinaryOperator {
     BitXor,
 }
 
+impl BinaryOperator {
+    /// Borrow the original neutral arithmetic identity. This mapping does not
+    /// authorize a type profile or supply primitive effects.
+    pub const fn arithmetic_operator(self) -> Option<novarocks_type_contract::ArithmeticOperator> {
+        use novarocks_type_contract::ArithmeticOperator as A;
+        Some(match self {
+            Self::Add => A::Add,
+            Self::Subtract => A::Subtract,
+            Self::Multiply => A::Multiply,
+            Self::Divide => A::Divide,
+            Self::Modulo => A::Modulo,
+            _ => return None,
+        })
+    }
+
+    /// Borrow the original ordinary comparison identity. NULL-safe equality
+    /// has its own owner and deliberately supplies no ordinary operator here.
+    pub const fn comparison_operator(self) -> Option<novarocks_type_contract::ComparisonOperator> {
+        use novarocks_type_contract::ComparisonOperator as C;
+        Some(match self {
+            Self::Eq => C::Eq,
+            Self::NotEq => C::Ne,
+            Self::Lt => C::Lt,
+            Self::LtEq => C::Le,
+            Self::Gt => C::Gt,
+            Self::GtEq => C::Ge,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum LiteralValue {
     Null,

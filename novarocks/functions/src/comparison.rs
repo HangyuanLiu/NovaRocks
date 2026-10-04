@@ -30,31 +30,7 @@ use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::{EvaluationCheckpoints, validate_type_observed};
 use crate::{EvaluatedArgument, KernelEvaluationControl, KernelFailure};
 
-/// Frozen ordinary scalar operation; never interpreted from a runtime name.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ComparisonOperator {
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-}
-impl ComparisonOperator {
-    fn apply(self, ordering: Ordering) -> bool {
-        match self {
-            Self::Eq => ordering == Ordering::Equal,
-            Self::Ne => ordering != Ordering::Equal,
-            Self::Lt => ordering == Ordering::Less,
-            Self::Le => ordering != Ordering::Greater,
-            Self::Gt => ordering == Ordering::Greater,
-            Self::Ge => ordering != Ordering::Less,
-        }
-    }
-    fn is_ordering(self) -> bool {
-        matches!(self, Self::Lt | Self::Le | Self::Gt | Self::Ge)
-    }
-}
+pub use novarocks_type_contract::ComparisonOperator;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ComparisonPrepareError {

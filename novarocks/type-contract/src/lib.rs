@@ -51,7 +51,7 @@ pub use arithmetic::{
 pub use array_generate::array_generate_item_type;
 pub use carrier_parameters::{CarrierParameterError, validate_arrow_carrier_parameters_observed};
 pub use coercion::wider_type;
-pub use comparison::OrderedComparisonAlgorithm;
+pub use comparison::{ComparisonOperator, OrderedComparisonAlgorithm};
 pub use comparison_coercion::{
     comparison_common_type, comparison_common_value_type, decimal_compare_type,
     wider_comparison_value_type,
