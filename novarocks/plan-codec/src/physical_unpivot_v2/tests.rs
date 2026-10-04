@@ -49,7 +49,7 @@ const CAUSES: [CompileControlError; 3] = [
     CompileControlError::ResourceExhausted,
 ];
 #[derive(Default)]
-struct Control {
+pub(crate) struct Control {
     trace: Mutex<Vec<(CompilePhase, u32)>>,
     state: Mutex<(bool, Option<(usize, CompileControlError)>)>,
 }
@@ -73,15 +73,15 @@ impl PureCompileControl for Control {
     }
 }
 impl Control {
-    fn arm(&self, stop: Option<(usize, CompileControlError)>) {
+    pub(crate) fn arm(&self, stop: Option<(usize, CompileControlError)>) {
         self.trace.lock().unwrap().clear();
         *self.state.lock().unwrap() = (true, stop);
     }
-    fn trace(&self) -> Vec<(CompilePhase, u32)> {
+    pub(crate) fn trace(&self) -> Vec<(CompilePhase, u32)> {
         self.trace.lock().unwrap().clone()
     }
 }
-fn limits() -> UnpivotNodeProjectionLimits {
+pub(crate) fn limits() -> UnpivotNodeProjectionLimits {
     UnpivotNodeProjectionLimits {
         max_input_nodes: 8,
         max_value_references: 8192,
@@ -188,7 +188,7 @@ fn reference(pool: u32, ordinal: u32) -> p::ConstantReference {
         ordinal,
     }
 }
-struct Fixture {
+pub(crate) struct Fixture {
     roots: Vec<(u32, FunctionValueType)>,
     definitions: Vec<p::ValueDef>,
     arena: p::ExprArena,
@@ -196,7 +196,7 @@ struct Fixture {
     pools: p::ConstantPools,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let ty = FunctionValueType::new(DataType::Int64, true);
         let definitions = [0, 7, u32::MAX]
             .into_iter()
@@ -275,7 +275,7 @@ impl Fixture {
             pools,
         }
     }
-    fn with_tokens<R>(
+    pub(crate) fn with_tokens<R>(
         &self,
         control: &Control,
         run: impl FnOnce(

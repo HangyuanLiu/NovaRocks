@@ -34,7 +34,7 @@ use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 type Error = UnpivotNodeCodecError;
 
-trait Expressions {
+pub(crate) trait Expressions {
     fn control(&self) -> &dyn PureCompileControl;
     fn floor(&self, w: &mut CompileCheckpoints<'_>) -> Result<usize, Error>;
     fn lookup_work(&self) -> Result<usize, Error>;
@@ -98,7 +98,7 @@ impl Expressions for DecodedExpressions<'_, '_, '_> {
         }
     }
 }
-fn address(
+pub(crate) fn address(
     reference: p::ConstantReference,
     expressions: &impl Expressions,
     w: &mut CompileCheckpoints<'_>,
@@ -129,7 +129,7 @@ fn encode_address(input: p::ConstantReference) -> wire::ConstantReference {
         row_ordinal: input.ordinal,
     }
 }
-fn delegate_counts(
+pub(crate) fn delegate_counts(
     model: &mut Model,
     scalars: usize,
     pools: usize,
@@ -147,6 +147,40 @@ fn delegate_counts(
         )?,
     )?;
     Ok(())
+}
+/// Both Unpivot forms borrow this same constant-address grammar. These
+/// projections allocate no backing and leave each occurrence's work step to
+/// the original enclosing loop.
+pub(crate) fn encode_constant(input: &p::UnpivotConstant) -> wire::UnpivotConstant {
+    let kind = match input {
+        p::UnpivotConstant::Scalar(id) => wire::unpivot_constant::Kind::ScalarExprId(id.get()),
+        p::UnpivotConstant::Int32List(reference) => {
+            wire::unpivot_constant::Kind::Int32List(encode_address(*reference))
+        }
+        p::UnpivotConstant::Utf8Map(reference) => {
+            wire::unpivot_constant::Kind::Utf8Map(encode_address(*reference))
+        }
+    };
+    wire::UnpivotConstant { kind: Some(kind) }
+}
+pub(crate) fn decode_constant(input: &wire::UnpivotConstant) -> Result<p::UnpivotConstant, Error> {
+    Ok(
+        match input
+            .kind
+            .as_ref()
+            .ok_or_else(|| invalid("prepared Unpivot constant kind is absent"))?
+        {
+            wire::unpivot_constant::Kind::ScalarExprId(id) => {
+                p::UnpivotConstant::Scalar(p::ExprId::new(*id))
+            }
+            wire::unpivot_constant::Kind::Int32List(reference) => {
+                p::UnpivotConstant::Int32List(decode_address(reference)?)
+            }
+            wire::unpivot_constant::Kind::Utf8Map(reference) => {
+                p::UnpivotConstant::Utf8Map(decode_address(reference)?)
+            }
+        },
+    )
 }
 fn encode_spec(input: &p::PhysicalNode) -> Result<&p::UnpivotSpec, Error> {
     match &input.kind {
@@ -449,18 +483,7 @@ fn emit_encode(
     for mapping in &spec.mappings {
         let mut constants = reserve(mapping.constants.len(), w)?;
         for constant in &mapping.constants {
-            let kind = match constant {
-                p::UnpivotConstant::Scalar(id) => {
-                    wire::unpivot_constant::Kind::ScalarExprId(id.get())
-                }
-                p::UnpivotConstant::Int32List(reference) => {
-                    wire::unpivot_constant::Kind::Int32List(encode_address(*reference))
-                }
-                p::UnpivotConstant::Utf8Map(reference) => {
-                    wire::unpivot_constant::Kind::Utf8Map(encode_address(*reference))
-                }
-            };
-            constants.push(wire::UnpivotConstant { kind: Some(kind) });
+            constants.push(encode_constant(constant));
             w.step()?;
         }
         mappings.push(wire::UnpivotMapping {
@@ -515,22 +538,7 @@ fn emit_decode(
     for mapping in &spec.mappings {
         let mut constants = reserve(mapping.constants.len(), w)?;
         for constant in &mapping.constants {
-            let constant = match constant
-                .kind
-                .as_ref()
-                .ok_or_else(|| invalid("prepared Unpivot constant kind is absent"))?
-            {
-                wire::unpivot_constant::Kind::ScalarExprId(id) => {
-                    p::UnpivotConstant::Scalar(p::ExprId::new(*id))
-                }
-                wire::unpivot_constant::Kind::Int32List(reference) => {
-                    p::UnpivotConstant::Int32List(decode_address(reference)?)
-                }
-                wire::unpivot_constant::Kind::Utf8Map(reference) => {
-                    p::UnpivotConstant::Utf8Map(decode_address(reference)?)
-                }
-            };
-            constants.push(constant);
+            constants.push(decode_constant(constant)?);
             w.step()?;
         }
         mappings.push(p::UnpivotValueMapping {
@@ -694,4 +702,4 @@ pub fn decode_unpivot_node(
     finish(work, result)
 }
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

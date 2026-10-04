@@ -84,6 +84,7 @@ fn ordinary_dependency_errors_retain_typed_details_and_completed_work() {
         )),
         NodeCodecError::from(RelationCodecError::InvalidShape("missing relation")),
         NodeCodecError::from(ConnectorPayloadCodecError::InvalidShape("missing payload")),
+        NodeCodecError::Identity(ConnectorIdentityError::InvalidWriteTargetOrdinal),
     ] {
         let control = Control(Mutex::new(Vec::new()));
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
@@ -103,6 +104,7 @@ fn ordinary_dependency_errors_retain_typed_details_and_completed_work() {
             NodeCodecError::Payload(ConnectorPayloadCodecError::InvalidShape(message)) => {
                 assert_eq!(message, "missing payload")
             }
+            NodeCodecError::Identity(ConnectorIdentityError::InvalidWriteTargetOrdinal) => {}
             other => panic!("unexpected dependency error: {other:?}"),
         }
         assert_eq!(*control.0.lock().unwrap(), [0, 1]);

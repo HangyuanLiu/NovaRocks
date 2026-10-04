@@ -196,12 +196,38 @@ impl SqlImvPlanningInput {
 
 /// Immutable SQL function semantics used by analysis and optimization.
 ///
-/// The function implementation and its execution kernels are explicitly out
-/// of scope for this compiler-facing contract.
+/// Selected pure preparation borrows the same installed owner as analysis.
+/// Mutable runtime instances remain outside this compiler-facing contract.
 pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
     /// Freeze an owned handle to exactly the immutable catalog used for
     /// analysis so optimizer rewrites cannot consult ambient state.
     fn snapshot(&self) -> Arc<dyn SqlFunctionCatalog>;
+
+    /// Prepare the exact selected implementation from this immutable snapshot.
+    /// There is no SQL name to resolve again and no declaration-only effect
+    /// fallback. An adapter without an installed owner refuses the capability.
+    fn prepare_fresh_selected(
+        &self,
+        _input: novarocks_functions::CallEffectInput<'_>,
+        _selected: Arc<novarocks_functions::FunctionBindingSelection>,
+        _options: novarocks_functions::PureCallPreparation,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::PureCallSpecialization,
+        novarocks_functions::FunctionSpecializationFailure,
+    > {
+        control
+            .checkpoint(
+                novarocks_type_contract::CompilePhase::FunctionSpecialization,
+                0,
+            )
+            .map_err(novarocks_functions::FunctionSpecializationFailure::Control)?;
+        Err(
+            novarocks_functions::FunctionSpecializationFailure::InvalidInput(
+                "SQL function snapshot has no installed selected preparation owner",
+            ),
+        )
+    }
 
     fn resolve_scalar_signature(
         &self,

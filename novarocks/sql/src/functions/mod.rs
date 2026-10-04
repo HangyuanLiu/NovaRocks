@@ -29,6 +29,8 @@ mod intrinsic_integration_tests;
 #[cfg(test)]
 #[path = "registry.rs"]
 mod registry_integration_tests;
+#[cfg(test)]
+mod selected_preparation_tests;
 pub use novarocks_functions::builtin::catalogue::{
     build_builtin_engine_function_catalog, builtin_engine_function_catalog,
     contribute_builtin_functions,
@@ -101,6 +103,19 @@ pub(crate) fn aggregate_selection(
 impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
     fn snapshot(&self) -> Arc<dyn crate::compiler::SqlFunctionCatalog> {
         Arc::new(self.clone())
+    }
+
+    fn prepare_fresh_selected(
+        &self,
+        input: novarocks_functions::CallEffectInput<'_>,
+        selected: Arc<novarocks_functions::FunctionBindingSelection>,
+        options: novarocks_functions::PureCallPreparation,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::PureCallSpecialization,
+        novarocks_functions::FunctionSpecializationFailure,
+    > {
+        EngineFunctionCatalog::prepare_fresh_selected(self, input, selected, options, control)
     }
 
     fn resolve_scalar_signature(

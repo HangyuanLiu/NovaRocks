@@ -29,6 +29,7 @@ use crate::{
     physical_relation_v2::RelationCodecError,
     physical_value_v2::{DecodedValues, EncodedValues, ValueCodecError},
 };
+use novarocks_connector_contract::ConnectorIdentityError;
 use novarocks_physical_plan as p;
 use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
@@ -64,6 +65,7 @@ pub enum NodeCodecError {
     Relation(RelationCodecError),
     Payload(ConnectorPayloadCodecError),
     Constant(p::ConstantReferenceError),
+    Identity(ConnectorIdentityError),
     InvalidShape(&'static str),
 }
 impl From<CompileControlError> for NodeCodecError {
@@ -136,6 +138,7 @@ impl fmt::Display for NodeCodecError {
             Self::Relation(e) => e.fmt(f),
             Self::Payload(e) => e.fmt(f),
             Self::Constant(e) => e.fmt(f),
+            Self::Identity(e) => e.fmt(f),
             Self::InvalidShape(s) => f.write_str(s),
         }
     }
@@ -150,6 +153,7 @@ impl std::error::Error for NodeCodecError {
             Self::Relation(e) => Some(e),
             Self::Payload(e) => Some(e),
             Self::Constant(e) => Some(e),
+            Self::Identity(e) => Some(e),
             Self::InvalidShape(_) => None,
         }
     }
