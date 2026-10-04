@@ -21,6 +21,10 @@
 mod channels;
 mod expressions;
 mod lowering;
+mod repeat;
+
+#[cfg(test)]
+mod repeat_lowering_tests;
 
 pub use lowering::{FragmentCompileError, LocalCompileOptions, compile_fragment};
 

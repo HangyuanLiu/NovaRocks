@@ -21,6 +21,7 @@ use crate::{
     ProviderValidatedFragment,
     channels::{ChannelLoweringError, resolve_linear_channels},
     expressions::{ExpressionLoweringError, lower_expressions, prepare_calls},
+    repeat::{RepeatLoweringError, lower_repeat},
 };
 use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::Schema;
@@ -125,6 +126,18 @@ impl From<ChannelLoweringError> for FragmentCompileError {
     }
 }
 owner_error!(ExpressionLoweringError, "expressions");
+impl From<RepeatLoweringError> for FragmentCompileError {
+    fn from(error: RepeatLoweringError) -> Self {
+        match error {
+            RepeatLoweringError::Control(cause) => Self::Control(cause),
+            RepeatLoweringError::Invalid(message) => Self::Invalid(message),
+            error => Self::Owner {
+                phase: "Repeat",
+                error: Box::new(error),
+            },
+        }
+    }
+}
 owner_error!(LayoutCompileError, "layout");
 owner_error!(ValuesCompileError, "values");
 owner_error!(BindingRequirementsCompileError, "requirements");
@@ -257,6 +270,7 @@ fn lower(
                 next = Some(node.inputs[0])
             }
             NodeKind::Limit { .. } if node.inputs.len() == 1 => next = Some(node.inputs[0]),
+            NodeKind::Repeat { .. } if node.inputs.len() == 1 => next = Some(node.inputs[0]),
             _ => {
                 return Err(FragmentCompileError::Unsupported {
                     node: Some(id),
@@ -362,6 +376,23 @@ fn lower(
                         },
                         nodes[child.index()].output_layout().clone(),
                     )
+                }
+                NodeKind::Repeat { .. } => {
+                    let child =
+                        *local_ids
+                            .get(&node.inputs[0])
+                            .ok_or(FragmentCompileError::Invalid(
+                                "missing lowered Repeat child",
+                            ))?;
+                    work.flush()?;
+                    lower_repeat(
+                        package,
+                        node,
+                        id,
+                        (child, nodes[child.index()].output_layout()),
+                        &planned.slots,
+                        work.control(),
+                    )?
                 }
                 NodeKind::Project {
                     expressions: projected,

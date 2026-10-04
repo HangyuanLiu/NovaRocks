@@ -29,6 +29,8 @@ use novarocks_type_contract::{
 };
 use novarocks_types::SlotId;
 
+use crate::repeat::{RepeatInputPort, RepeatLoweringError, plan_repeat_channels};
+
 pub(crate) struct LinearChannels {
     pub nodes: BTreeMap<NodeId, NodeChannels>,
     pub inputs: BTreeMap<ExprId, ResolvedInput>,
@@ -49,6 +51,7 @@ pub(crate) struct ResolvedInput {
 pub(crate) enum ChannelLoweringError {
     Control(CompileControlError),
     ValueType(ValueTypeError),
+    Repeat(RepeatLoweringError),
     Invalid(&'static str),
 }
 
@@ -62,11 +65,21 @@ impl From<ValueTypeError> for ChannelLoweringError {
         Self::ValueType(error)
     }
 }
+impl From<RepeatLoweringError> for ChannelLoweringError {
+    fn from(error: RepeatLoweringError) -> Self {
+        match error {
+            RepeatLoweringError::Control(cause) => Self::Control(cause),
+            RepeatLoweringError::Invalid(message) => Self::Invalid(message),
+            error => Self::Repeat(error),
+        }
+    }
+}
 impl fmt::Display for ChannelLoweringError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Control(error) => error.fmt(f),
             Self::ValueType(error) => error.fmt(f),
+            Self::Repeat(error) => error.fmt(f),
             Self::Invalid(message) => write!(f, "invalid linear channels: {message}"),
         }
     }
@@ -76,6 +89,7 @@ impl Error for ChannelLoweringError {
         match self {
             Self::Control(error) => Some(error),
             Self::ValueType(error) => Some(error),
+            Self::Repeat(error) => Some(error),
             Self::Invalid(_) => None,
         }
     }
@@ -218,6 +232,24 @@ fn resolve_core(
                 passthrough(fragment, node, previous, &nodes, &ports, work)?
             }
             NodeKind::Limit { .. } => passthrough(fragment, node, previous, &nodes, &ports, work)?,
+            NodeKind::Repeat { .. } => {
+                let child = linear_child(&node.inputs, previous)?;
+                let child_channels = nodes.get(&child).ok_or(ChannelLoweringError::Invalid(
+                    "missing lowered Repeat child",
+                ))?;
+                let planned = plan_repeat_channels(
+                    fragment,
+                    node,
+                    RepeatInputPort {
+                        node: &fragment.nodes()[&child],
+                        slots: &child_channels.slots,
+                        representatives: &ports[&child],
+                    },
+                    &mut next_slot,
+                    work,
+                )?;
+                (planned.slots, planned.port)
+            }
             _ => {
                 return Err(ChannelLoweringError::Invalid(
                     "unsupported linear channel node",
