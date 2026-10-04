@@ -445,6 +445,13 @@ impl<'a> CheckedTableLogicalSourceEntry<'a> {
     pub(crate) fn arguments(&self) -> &'a [ExprId] {
         &self.entry.arguments
     }
+    /// Metadata authored by the original owner before this exact table site.
+    /// This is not an effects, runtime-use or pure implementation certificate.
+    pub(crate) fn canonical_selection(
+        &self,
+    ) -> &'a Arc<novarocks_functions::FunctionBindingSelection> {
+        &self.entry.canonical_selection
+    }
 }
 
 pub(super) fn validate_table_source_entry_observed(
@@ -575,6 +582,7 @@ pub(super) enum SqlExpressionCallKind {
 }
 #[derive(Debug)]
 pub(super) struct LoweredTableSourceEntry {
+    pub(super) canonical_selection: Arc<novarocks_functions::FunctionBindingSelection>,
     pub(super) captured: CapturedLogicalCallArguments,
     pub(super) arguments: Box<[ExprId]>,
     pub(super) channels: Box<[LoweredOperationalChannel]>,

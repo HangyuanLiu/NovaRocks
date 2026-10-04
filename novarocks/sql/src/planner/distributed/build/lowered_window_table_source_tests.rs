@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[path = "lowered_window_table_canonical_tests.rs"]
+mod lowered_window_table_canonical_tests;
+
 use super::tests::{column, dop, stats, values, version};
 use super::*;
 use crate::analysis::{SortItem, WindowBound, WindowFrame, WindowFrameType};

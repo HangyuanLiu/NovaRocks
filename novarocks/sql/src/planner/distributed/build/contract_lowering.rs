@@ -6963,6 +6963,22 @@ impl<'a> ContractLoweringVisitor<'a> {
         let arguments = arguments.into_boxed_slice();
         self.work.step()?;
         self.work.flush()?;
+        let channels = channels.into_boxed_slice();
+        self.work.step()?;
+        let selected =
+            self.author_canonical_call_selection(node, &captured, None, &arguments, &channels)?;
+        let novarocks_functions::FunctionResultType::Relation(result_types) = &selected.result_type
+        else {
+            return Err(ContractLoweringError::InvalidTableFunction {
+                detail: "canonical table owner selected a scalar result".into(),
+            });
+        };
+        if selected.aggregate.is_some() || result_types.len() != table_function.output_columns.len()
+        {
+            return Err(ContractLoweringError::InvalidTableFunction {
+                detail: "canonical table selection has inconsistent relation metadata".into(),
+            });
+        }
         self.work.flush()?;
         let mut retained_arguments = Vec::new();
         retained_arguments
@@ -7059,9 +7075,8 @@ impl<'a> ContractLoweringVisitor<'a> {
                 function: BoundTableFunction {
                     semantic_parameters: Box::default(),
                     function_id: binding.function_id.clone(),
-                    overload: binding.selected.overload.clone(),
-                    argument_types: binding
-                        .selected
+                    overload: selected.overload.clone(),
+                    argument_types: selected
                         .argument_types
                         .iter()
                         .map(full_source_argument)
@@ -7081,9 +7096,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             },
         )?;
         self.work.flush()?;
-        let channels = channels.into_boxed_slice();
-        self.work.step()?;
-        self.record_table_source(node, captured, retained_arguments, channels)?;
+        self.record_table_source(node, captured, retained_arguments, channels, selected)?;
         let properties = self
             .fragment_mut()
             .node_output_properties(node)
@@ -7243,9 +7256,20 @@ impl<'a> ContractLoweringVisitor<'a> {
                     detail: "window group signature or output identity differs".to_string(),
                 });
             }
+            let original_type = window_result_type(&expression.binding)?;
+            if original_type != value_type(output_column) {
+                return Err(ContractLoweringError::OutputColumnMismatch {
+                    node: "Window",
+                    ordinal: child.output.len() + index,
+                    detail: "window output type differs from its original function binding".into(),
+                });
+            }
             let expression_id = self.lower_window_call(node, expression, &child.columns)?;
-            let expression_type = window_result_type(&expression.binding)?;
-            if expression_type != value_type(output_column) {
+            let expression_type = self.expression_value_type(expression_id)?;
+            // The actual expression owns the answer. An older declaration
+            // may omit root null extension, but cannot change the carrier,
+            // logical or nested facts, or widen an exact nonnullable answer.
+            if expression_type != published_value_type(&original_type, &expression_type) {
                 return Err(ContractLoweringError::OutputColumnMismatch {
                     node: "Window",
                     ordinal: child.output.len() + index,
@@ -7393,6 +7417,11 @@ impl<'a> ContractLoweringVisitor<'a> {
                             .to_string(),
                     });
                 }
+                if aggregate.selected.aggregate.is_none() {
+                    return Err(ContractLoweringError::InvalidWindow {
+                        detail: "aggregate window binding lacks state metadata".into(),
+                    });
+                }
                 Some(aggregate)
             }
             other => {
@@ -7413,21 +7442,6 @@ impl<'a> ContractLoweringVisitor<'a> {
             self.control,
         )?;
         self.work.flush()?;
-        let aggregate_binding = aggregate_source
-            .map(|aggregate| {
-                lower_resolved_aggregate_binding(
-                    aggregate,
-                    window.args.len(),
-                    window.function_order_by.len(),
-                    AggregatePhase::Single,
-                )
-            })
-            .transpose()?;
-        self.work.step()?;
-        self.work.flush()?;
-        let function = bound_function_from_resolved(binding, &result_type);
-        self.work.step()?;
-        self.work.flush()?;
         let mut args = Vec::new();
         args.try_reserve_exact(window.args.len())
             .map_err(|_| CompileControlError::ResourceExhausted)?;
@@ -7437,7 +7451,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         for (ordinal, (argument, expected)) in window
             .args
             .iter()
-            .zip(function.argument_types.iter())
+            .zip(binding.selected.argument_types.iter())
             .enumerate()
         {
             let channel = self.lower_captured_scalar_argument(
@@ -7487,6 +7501,62 @@ impl<'a> ContractLoweringVisitor<'a> {
         let function_order_by = function_order_by.into_boxed_slice();
         self.work.step()?;
         self.work.flush()?;
+        let mut selection_arguments = Vec::new();
+        selection_arguments
+            .try_reserve_exact(captured.request().arguments.len())
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        self.work.step()?;
+        for argument in args
+            .iter()
+            .copied()
+            .chain(function_order_by.iter().map(|key| key.expr))
+        {
+            selection_arguments.push(argument);
+            self.work.step()?;
+        }
+        self.work.flush()?;
+        let channels = channels.into_boxed_slice();
+        self.work.step()?;
+        let selected = self.author_canonical_call_selection(
+            owner,
+            &captured,
+            Some(SqlExpressionCallKind::Window),
+            &selection_arguments,
+            &channels,
+        )?;
+        let novarocks_functions::FunctionResultType::Scalar(result_type) = &selected.result_type
+        else {
+            return Err(ContractLoweringError::InvalidWindow {
+                detail: "canonical window owner selected a relation result".into(),
+            });
+        };
+        if binding.kind == novarocks_physical_plan::FunctionKind::Window
+            && selected.aggregate.is_some()
+        {
+            return Err(ContractLoweringError::InvalidWindow {
+                detail: "canonical window selection carries aggregate state".into(),
+            });
+        }
+        self.work.flush()?;
+        let aggregate_binding = aggregate_source
+            .map(|aggregate| {
+                lower_resolved_aggregate_binding(
+                    aggregate,
+                    &selected,
+                    window.args.len(),
+                    window.function_order_by.len(),
+                    AggregatePhase::Single,
+                )
+            })
+            .transpose()?;
+        self.work.step()?;
+        self.work.flush()?;
+        let function = bound_function_from_selection(binding, &selected, result_type);
+        self.work.step()?;
+        self.work.flush()?;
+        let result_type = result_type.clone();
+        self.work.step()?;
+        self.work.flush()?;
         let frame = window
             .window_frame
             .as_ref()
@@ -7506,15 +7576,13 @@ impl<'a> ContractLoweringVisitor<'a> {
             },
         )?;
         self.work.flush()?;
-        let channels = channels.into_boxed_slice();
-        self.work.step()?;
         self.record_expression_source(
             owner,
             emitted,
             captured,
             SqlExpressionCallKind::Window,
             channels,
-            None,
+            Some(selected),
         )?;
         Ok(emitted)
     }
@@ -8162,9 +8230,10 @@ impl<'a> ContractLoweringVisitor<'a> {
                 self.work.flush()?;
                 let channels = channels.into_boxed_slice();
                 self.work.step()?;
-                let selected = self.author_canonical_scalar_selection(
+                let selected = self.author_canonical_call_selection(
                     owner,
                     &captured,
+                    Some(SqlExpressionCallKind::Scalar),
                     &lowered_args,
                     &channels,
                 )?;
@@ -8313,13 +8382,14 @@ impl<'a> ContractLoweringVisitor<'a> {
         Ok(emitted)
     }
 
-    /// Author the actual ordinary scalar signature before its parent enters
+    /// Author the actual call signature before its parent enters
     /// the same builder. Original logical capture and actual canonical metadata
     /// remain distinct; neither is a fresh effect or kernel capability proof.
-    fn author_canonical_scalar_selection(
+    fn author_canonical_call_selection(
         &mut self,
         owner: NodeId,
         captured: &CapturedLogicalCallArguments,
+        kind: Option<SqlExpressionCallKind>,
         arguments: &[ExprId],
         channels: &[LoweredOperationalChannel],
     ) -> Result<Arc<novarocks_functions::FunctionBindingSelection>, ContractLoweringError> {
@@ -8329,8 +8399,13 @@ impl<'a> ContractLoweringVisitor<'a> {
                 expressions: self.fragments[&self.current_fragment].expressions(),
                 pools: self.plan_builder.constants(),
                 owner,
-                lambda_scope: self.lambda_scope.last().map(|scope| scope.lambda),
-                kind: Some(SqlExpressionCallKind::Scalar),
+                lambda_scope: match kind {
+                    Some(SqlExpressionCallKind::Scalar) => {
+                        self.lambda_scope.last().map(|scope| scope.lambda)
+                    }
+                    _ => None,
+                },
+                kind,
                 captured,
                 derived: None,
                 arguments,
@@ -8362,7 +8437,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     ContractLoweringError::Control(cause)
                 }
                 error => ContractLoweringError::InvalidFunctionBinding {
-                    detail: format!("canonical scalar selection: {error}"),
+                    detail: format!("canonical call selection: {error}"),
                 },
             });
         self.completed_specialization_result(selection)
@@ -8637,6 +8712,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         captured: CapturedLogicalCallArguments,
         arguments: Box<[ExprId]>,
         channels: Box<[LoweredOperationalChannel]>,
+        canonical_selection: Arc<novarocks_functions::FunctionBindingSelection>,
     ) -> Result<(), ContractLoweringError> {
         self.work.flush()?;
         let same_count = arguments.len() == channels.len()
@@ -8667,6 +8743,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         self.call_sources.table_entries.insert(
             key,
             LoweredTableSourceEntry {
+                canonical_selection,
                 captured,
                 arguments,
                 channels,
@@ -10122,13 +10199,20 @@ fn bound_function_from_resolved(
     binding: &novarocks_functions::ResolvedFunctionBinding,
     result_type: &ValueType,
 ) -> BoundFunction {
+    bound_function_from_selection(binding, &binding.selected, result_type)
+}
+
+fn bound_function_from_selection(
+    binding: &novarocks_functions::ResolvedFunctionBinding,
+    selected: &novarocks_functions::FunctionBindingSelection,
+    result_type: &ValueType,
+) -> BoundFunction {
     BoundFunction {
         semantic_parameters: Box::default(),
         function_id: binding.function_id.clone(),
-        overload: binding.selected.overload.clone(),
+        overload: selected.overload.clone(),
         kind: binding.kind,
-        argument_types: binding
-            .selected
+        argument_types: selected
             .argument_types
             .iter()
             .map(full_source_argument)
@@ -10143,26 +10227,33 @@ fn bound_function_from_resolved(
 
 fn lower_resolved_aggregate_binding(
     resolved: &novarocks_functions::ResolvedFunctionBinding,
+    selected: &novarocks_functions::FunctionBindingSelection,
     logical_argument_count: usize,
     order_by_count: usize,
     phase: AggregatePhase,
 ) -> Result<AggregateBinding, ContractLoweringError> {
     if resolved.kind != novarocks_physical_plan::FunctionKind::Aggregate
         || resolved.logical_argument_count != logical_argument_count
-        || resolved.selected.argument_types.len() != logical_argument_count + order_by_count
+        || selected.argument_types.len() != logical_argument_count + order_by_count
     {
         return Err(ContractLoweringError::InvalidWindow {
             detail: "aggregate window binding arity or kind is inconsistent".to_string(),
         });
     }
-    let result_type = window_result_type(resolved)?;
-    let aggregate = resolved.selected.aggregate.as_ref().ok_or_else(|| {
-        ContractLoweringError::InvalidWindow {
-            detail: "aggregate window binding lacks state metadata".to_string(),
-        }
-    })?;
+    let novarocks_functions::FunctionResultType::Scalar(result_type) = &selected.result_type else {
+        return Err(ContractLoweringError::InvalidWindow {
+            detail: "canonical aggregate window selection carries a relation result".into(),
+        });
+    };
+    let aggregate =
+        selected
+            .aggregate
+            .as_ref()
+            .ok_or_else(|| ContractLoweringError::InvalidWindow {
+                detail: "aggregate window binding lacks state metadata".to_string(),
+            })?;
     Ok(AggregateBinding {
-        function: bound_function_from_resolved(resolved, &result_type),
+        function: bound_function_from_selection(resolved, selected, result_type),
         phase,
         logical_argument_count: u32::try_from(logical_argument_count).map_err(|_| {
             ContractLoweringError::InvalidWindow {
@@ -14249,18 +14340,40 @@ mod tests {
         let result = column(2, "item", DataType::Utf8, true);
         let result_types = [novarocks_functions::FunctionValueType::new(
             DataType::Utf8,
-            false,
+            true,
         )];
-        let binding = crate::optimizer::scalar::test_table_binding(
-            &crate::optimizer::scalar::ScalarArena::new(),
-            "unnest",
-            &[],
-            &result_types,
+        // Use the installed UNNEST owner and a real List input. An empty
+        // argument list or invented nonnullable relation is not its contract.
+        let args = vec![scalar_call(
+            "__array_literal",
+            vec![TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::String("item".into())),
+                value_type: ValueType::new(DataType::Utf8, false),
+            }],
+        )];
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let arguments = args
+            .iter()
+            .map(|argument| {
+                crate::analysis::function_argument(
+                    argument,
+                    crate::constant::test_constant_policy(),
+                    &control,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let resolved = crate::functions::builtin_sql_function_catalog()
+            .resolve_table_binding("unnest", &arguments, &control)
+            .unwrap();
+        let binding = SqlFunctionBinding::new(
+            resolved,
+            novarocks_type_contract::DecimalOverflowPolicy::ReportError,
         );
         let plan = PhysicalPlanNode {
             kind: PhysicalPlanKind::TableFunction(PlanTableFunctionNode {
                 function_name: "unnest".to_string(),
-                args: Vec::new(),
+                args,
                 binding,
                 output_columns: vec![result.clone()],
                 alias: None,
@@ -14299,9 +14412,18 @@ mod tests {
     #[test]
     fn window_preserves_exact_function_order_and_frame() {
         let input = column(1, "k", DataType::Int64, false);
-        let result = column(2, "rn", DataType::Int64, false);
-        let binding =
-            crate::analysis::test_window_binding("row_number", &[], DataType::Int64, false);
+        let result = column(2, "rn", DataType::Int64, true);
+        let resolved = crate::functions::builtin_sql_function_catalog()
+            .resolve_window_binding(
+                "row_number",
+                &[],
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
+        let binding = SqlFunctionBinding::new(
+            resolved,
+            novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+        );
         let plan = PhysicalPlanNode {
             kind: PhysicalPlanKind::Window(PlanWindowNode {
                 window_exprs: vec![WindowExpr {
