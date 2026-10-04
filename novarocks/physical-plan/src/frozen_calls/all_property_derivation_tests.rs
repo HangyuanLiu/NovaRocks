@@ -49,7 +49,7 @@ impl PureCompileControl for DeriveControl {
         }
     }
 }
-fn frozen_fixture(fragment: Fragment) -> Fixture {
+pub(super) fn frozen_fixture(fragment: Fragment) -> Fixture {
     let uses = leaf_roots(&fragment);
     let calls = uses
         .flow()
@@ -68,7 +68,10 @@ fn frozen_fixture(fragment: Fragment) -> Fixture {
         calls,
     }
 }
-fn replace_properties(fixture: &mut Fixture, change: impl FnOnce(&mut crate::plan::FragmentParts)) {
+pub(super) fn replace_properties(
+    fixture: &mut Fixture,
+    change: impl FnOnce(&mut crate::plan::FragmentParts),
+) {
     let mut parts = fixture.fragment.clone().into_parts();
     change(&mut parts);
     fixture.fragment = Fragment::from(parts);
@@ -88,7 +91,7 @@ fn unconstrained(multiplicity: RowMultiplicity) -> PhysicalProperties {
         ordering: Box::default(),
     }
 }
-fn unsafe_filter() -> Fixture {
+pub(super) fn unsafe_filter() -> Fixture {
     let mut builder = FragmentBuilder::new(FragmentId::new(u32::MAX));
     let source = NodeId::new(u32::MAX);
     builder
@@ -279,7 +282,7 @@ fn all_derivation_required_broadcast_consumer_refuses_candidate_without_old_fall
     );
 }
 
-fn single_copy_dag() -> Fixture {
+pub(super) fn single_copy_dag() -> Fixture {
     let mut builder = FragmentBuilder::new(FragmentId::new(41));
     let source = NodeId::new(u32::MAX);
     builder
@@ -442,7 +445,7 @@ fn all_derivation_values_anchor_effect_authority_and_foreign_proof_stay_exact() 
     work.finish().unwrap();
 }
 
-fn exchange() -> (Fixture, FragmentCuts) {
+pub(super) fn exchange() -> (Fixture, FragmentCuts) {
     let mut builder = FragmentBuilder::new(FragmentId::new(71));
     let node = NodeId::new(u32::MAX);
     let edge = EdgeId::new(u32::MAX);

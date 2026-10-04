@@ -1210,3 +1210,6 @@ mod property_derivation_tests;
 
 #[path = "all_property_derivation_tests.rs"]
 mod all_property_derivation_tests;
+
+#[path = "owned_property_finalization_tests.rs"]
+mod owned_property_finalization_tests;

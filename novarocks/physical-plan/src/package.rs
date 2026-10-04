@@ -96,16 +96,7 @@ impl FragmentPackage {
             admission.property_projection_limits,
             control,
         )
-        .map_err(|error| match error {
-            crate::FragmentPropertyError::Control(cause) => FragmentPackageError::Control(cause),
-            crate::FragmentPropertyError::Calls(FrozenCallError::Roots(cause)) => {
-                FragmentPackageError::ExpressionUses(cause)
-            }
-            crate::FragmentPropertyError::Calls(cause) => FragmentPackageError::Calls(cause),
-            crate::FragmentPropertyError::Structure(cause) => {
-                FragmentPackageError::Structure(cause)
-            }
-        })?;
+        .map_err(property_error)?;
         crate::constants::validate_fragment_constants_observed(
             &input.fragment,
             &input.constants,
@@ -179,6 +170,103 @@ impl FragmentPackage {
         Ok(package)
     }
 
+    /// Derive and apply all output candidates before mandatory full admission.
+    /// The derivation proof borrows the original source only and is dropped
+    /// before its fields are moved. Roots and calls are rebuilt against the
+    /// new immutable snapshot; no old proof is promoted to its authority.
+    ///
+    /// This changes output claims only. Definitions, invocation flow, exact
+    /// binding selections, requirements, cuts and application facts retain
+    /// their original authors. Their installed capabilities remain separately
+    /// mandatory. Coexisting root/call copies, maps and delegated scratch must
+    /// be caller-admitted; this is not a complete allocation model or MEM grant.
+    pub fn try_new_with_derived_properties(
+        mut input: FragmentPackageInput,
+        admission: FragmentPackageAdmission,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, FragmentPackageError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)
+            .map_err(FragmentPackageError::Control)?;
+        let result = (|| {
+            work.flush().map_err(FragmentPackageError::Control)?;
+            let (candidates, _) = crate::derive_fragment_output_properties_observed(
+                &input.fragment,
+                &input.cuts,
+                &input.expression_uses,
+                &input.calls,
+                admission.plan_limits,
+                admission.source_retained_bytes,
+                admission.property_projection_limits,
+                control,
+            )
+            .map_err(property_error)?;
+            work.step().map_err(FragmentPackageError::Control)?;
+            work.flush().map_err(FragmentPackageError::Control)?;
+            // No occurrence proof or other source loan survives the preceding
+            // call. Consume one construction source; do not clone its nodes.
+            let mut parts = input.fragment.into_parts();
+            for (id, properties) in candidates {
+                let node = parts
+                    .nodes
+                    .get_mut(&id)
+                    .ok_or(FragmentPackageError::Calls(FrozenCallError::InvalidSite))?;
+                node.output_properties = properties;
+                work.step().map_err(FragmentPackageError::Control)?;
+            }
+            input.fragment = Fragment::from(parts);
+            work.flush().map_err(FragmentPackageError::Control)?;
+
+            let mut bindings = Vec::new();
+            bindings
+                .try_reserve_exact(input.expression_uses.bindings().len())
+                .map_err(|_| {
+                    FragmentPackageError::Control(CompileControlError::ResourceExhausted)
+                })?;
+            for (site, use_id) in input.expression_uses.bindings() {
+                bindings.push((*site, *use_id));
+                work.step().map_err(FragmentPackageError::Control)?;
+            }
+            // Flow storage is immutable and unchanged by this output-only
+            // transformation. The actual constructor regenerates all physical
+            // roots and checks every current definition/control correspondence.
+            let flow = input.expression_uses.flow().clone();
+            work.step().map_err(FragmentPackageError::Control)?;
+            work.flush().map_err(FragmentPackageError::Control)?;
+            input.expression_uses =
+                PhysicalRootUses::try_new(&input.fragment, flow, bindings, control)
+                    .map_err(root_use_error)?;
+            work.flush().map_err(FragmentPackageError::Control)?;
+
+            let mut calls = Vec::new();
+            calls
+                .try_reserve_exact(input.calls.entries().len())
+                .map_err(|_| {
+                    FragmentPackageError::Control(CompileControlError::ResourceExhausted)
+                })?;
+            for call in input.calls.entries().values() {
+                // Full occurrence effects remain claims for the unchanged
+                // selection, never synthesized from legacy binding flags.
+                calls.push(call.clone());
+                work.step().map_err(FragmentPackageError::Control)?;
+            }
+            work.flush().map_err(FragmentPackageError::Control)?;
+            input.calls = FrozenFragmentCalls::try_new(
+                &input.fragment,
+                &input.expression_uses,
+                calls,
+                control,
+            )
+            .map_err(call_error)?;
+            work.flush().map_err(FragmentPackageError::Control)?;
+            Self::try_new(input, admission, control)
+        })();
+        if matches!(&result, Err(FragmentPackageError::Control(_))) {
+            return result;
+        }
+        work.finish().map_err(FragmentPackageError::Control)?;
+        result
+    }
+
     pub const fn version(&self) -> PlanVersionId {
         self.0.version
     }
@@ -233,6 +321,27 @@ impl FragmentPackage {
 
     pub fn into_input(self) -> FragmentPackageInput {
         self.0
+    }
+}
+
+fn property_error(error: crate::FragmentPropertyError) -> FragmentPackageError {
+    match error {
+        crate::FragmentPropertyError::Control(cause) => FragmentPackageError::Control(cause),
+        crate::FragmentPropertyError::Calls(cause) => call_error(cause),
+        crate::FragmentPropertyError::Structure(cause) => FragmentPackageError::Structure(cause),
+    }
+}
+fn root_use_error(error: RootUseBindingError) -> FragmentPackageError {
+    match error {
+        RootUseBindingError::Control(cause) => FragmentPackageError::Control(cause),
+        error => FragmentPackageError::ExpressionUses(error),
+    }
+}
+fn call_error(error: FrozenCallError) -> FragmentPackageError {
+    match error {
+        FrozenCallError::Control(cause) => FragmentPackageError::Control(cause),
+        FrozenCallError::Roots(cause) => root_use_error(cause),
+        error => FragmentPackageError::Calls(error),
     }
 }
 
