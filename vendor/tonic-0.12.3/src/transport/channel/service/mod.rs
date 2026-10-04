@@ -42,3 +42,5 @@ pub use connection_driver::{
 };
 
 pub use self::channel_worker::OriginalChannelWorker;
+
+pub(super) use self::channel_worker::PreparedChannelWorker;

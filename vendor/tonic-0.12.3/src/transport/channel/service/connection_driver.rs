@@ -104,6 +104,12 @@ impl OriginalConnectionDriver {
         drop(original);
         Ok(Self { core: Some(core) })
     }
+    // Clone only the original physical stock carrier, never the holder with
+    // its JoinHandle. Buffer/cell aliases cannot point back to the worker task.
+    #[cfg(feature = "original-response-cells")]
+    pub(super) fn original_owner(&self) -> Bytes {
+        self.core().original.clone()
+    }
     /// A finite observation/control handle for transport lifecycle owners.
     /// An unpolled completed handle still retains the real TaskCell allocation.
     pub fn take_task_handle(&self) -> Option<JoinHandle<()>> {

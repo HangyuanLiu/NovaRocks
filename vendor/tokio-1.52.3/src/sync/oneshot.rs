@@ -220,7 +220,7 @@ use std::task::{ready, Context, Poll, Waker};
 /// [`Option::take`]: std::option::Option::take
 #[derive(Debug)]
 pub struct Sender<T> {
-    inner: Option<Arc<Inner<T>>>,
+    inner: Option<InnerHandle<T>>,
     #[cfg(all(tokio_unstable, feature = "tracing"))]
     resource_span: tracing::Span,
 }
@@ -327,7 +327,7 @@ pub struct Sender<T> {
 /// ```
 #[derive(Debug)]
 pub struct Receiver<T> {
-    inner: Option<Arc<Inner<T>>>,
+    inner: Option<InnerHandle<T>>,
     #[cfg(all(tokio_unstable, feature = "tracing"))]
     resource_span: tracing::Span,
     #[cfg(all(tokio_unstable, feature = "tracing"))]
@@ -382,6 +382,125 @@ pub mod error {
 }
 
 use self::error::*;
+
+// The default allocation retains its original Inner layout and Arc behavior.
+#[cfg(not(feature = "io-util"))]
+type InnerHandle<T> = Arc<Inner<T>>;
+
+#[cfg(feature = "io-util")]
+enum InnerHandle<T> {
+    Ordinary(Arc<Inner<T>>),
+    Original(OriginalInnerHandle<T>),
+}
+
+#[cfg(feature = "io-util")]
+impl<T: fmt::Debug> fmt::Debug for InnerHandle<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Preserve the ordinary handle's pre-existing Inner debug projection.
+        fmt::Debug::fmt(&**self, formatter)
+    }
+}
+
+#[cfg(feature = "io-util")]
+impl<T> Clone for InnerHandle<T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Ordinary(inner) => Self::Ordinary(inner.clone()),
+            Self::Original(inner) => Self::Original(inner.clone()),
+        }
+    }
+}
+
+#[cfg(feature = "io-util")]
+impl<T> std::ops::Deref for InnerHandle<T> {
+    type Target = Inner<T>;
+    fn deref(&self) -> &Inner<T> {
+        match self {
+            Self::Ordinary(inner) => inner,
+            Self::Original(inner) => &inner.0.as_ref().expect("live original oneshot").inner,
+        }
+    }
+}
+
+#[cfg(feature = "io-util")]
+fn ordinary_inner<T>(inner: Arc<Inner<T>>) -> InnerHandle<T> {
+    InnerHandle::Ordinary(inner)
+}
+
+#[cfg(not(feature = "io-util"))]
+fn ordinary_inner<T>(inner: Arc<Inner<T>>) -> InnerHandle<T> {
+    inner
+}
+
+// No Weak, raw pointer, or cloned Arc leaves this private strong-only wrapper.
+// Use std Arc only on the non-Loom original path; the constructor refuses Loom.
+#[cfg(feature = "io-util")]
+#[derive(Debug)]
+struct OriginalInnerHandle<T>(Option<std::sync::Arc<OriginalInner<T>>>);
+
+#[cfg(feature = "io-util")]
+impl<T> Clone for OriginalInnerHandle<T> {
+    fn clone(&self) -> Self {
+        Self(Some(
+            self.0.as_ref().expect("live original oneshot").clone(),
+        ))
+    }
+}
+
+#[cfg(feature = "io-util")]
+impl<T> Drop for OriginalInnerHandle<T> {
+    fn drop(&mut self) {
+        let inner = self.0.take().expect("live original oneshot");
+        // With no exported Weak handles, the winner frees the Arc allocation
+        // before into_inner returns its value, including concurrent last drops.
+        if let Some(inner) = std::sync::Arc::into_inner(inner) {
+            drop(inner);
+        }
+    }
+}
+
+#[cfg(feature = "io-util")]
+#[derive(Debug)]
+struct OriginalInner<T> {
+    inner: Inner<T>,
+    original: Option<bytes::Bytes>,
+}
+
+#[cfg(feature = "io-util")]
+impl<T> Drop for OriginalInner<T> {
+    fn drop(&mut self) {
+        // This is the unique value returned after the last Arc allocation has
+        // exited. Move every initialized resource into an ordinary drop frame
+        // before running any user destructor. Original is declared first and
+        // therefore exits last even when value or Waker destruction unwinds.
+        let original = self.original.take();
+        let state = State(mut_load(&mut self.inner.state));
+        // Suppress Inner's ordinary Waker cleanup after taking those resources.
+        self.inner
+            .state
+            .with_mut(|value| *value = State::new().as_usize());
+        let rx_task = if state.is_rx_task_set() {
+            // SAFETY: no other strong handle exists; the state bit proves the
+            // Waker was initialized, and the bit has now been cleared.
+            Some(unsafe { self.inner.rx_task.take_task() })
+        } else {
+            None
+        };
+        let tx_task = if state.is_tx_task_set() {
+            // SAFETY: same unique ownership and initialization proof as above.
+            Some(unsafe { self.inner.tx_task.take_task() })
+        } else {
+            None
+        };
+        // SAFETY: the last strong handle owns all access to this cell. This
+        // also covers send/wake unwinding before a retained value is consumed.
+        let value = unsafe { self.inner.consume_value() };
+        drop(value);
+        drop(tx_task);
+        drop(rx_task);
+        drop(original);
+    }
+}
 
 struct Inner<T> {
     /// Manages the state of the inner cell.
@@ -450,6 +569,16 @@ impl Task {
     ///
     /// The caller must do the necessary synchronization to ensure that
     /// the [`Self::0`] contains the valid [`Waker`] during the call.
+    /// Move an initialized Waker out during unique original-owner cleanup.
+    #[cfg(feature = "io-util")]
+    unsafe fn take_task(&self) -> Waker {
+        self.0.with_mut(|ptr| {
+            // SAFETY: the caller proves initialization and exclusive access,
+            // and clears the state bit to prevent any subsequent second drop.
+            unsafe { (*ptr).as_ptr().read() }
+        })
+    }
+
     unsafe fn set_task(&self, cx: &mut Context<'_>) {
         self.0.with_mut(|ptr| {
             let ptr: *mut Waker = unsafe { (*ptr).as_mut_ptr() };
@@ -551,6 +680,7 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
         rx_task: Task(UnsafeCell::new(MaybeUninit::uninit())),
     });
 
+    let inner = ordinary_inner(inner);
     let tx = Sender {
         inner: Some(inner.clone()),
         #[cfg(all(tokio_unstable, feature = "tracing"))]
@@ -576,6 +706,82 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     };
 
     (tx, rx)
+}
+
+/// Exact requested Arc allocation for one originally owned oneshot cell.
+///
+/// The layout includes the real Inner<T>, original Bytes field, and the pinned
+/// standard-library Arc counters/alignment. External T and Waker allocations,
+/// Bytes carrier metadata, queues, and runtime backing are separate. The caller
+/// must obtain this amount before channel_with_original_owner; Bytes alone does
+/// not prove funding and this API creates no capacity authority.
+///
+/// Loom and unstable tracing are refused before any allocation because their
+/// instrumentation is outside this receipt. Ordinary channel is unchanged.
+#[cfg(feature = "io-util")]
+pub fn allocation_capacity_bound<T>() -> std::io::Result<usize> {
+    #[cfg(any(loom, all(tokio_unstable, feature = "tracing")))]
+    {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+    #[cfg(not(any(loom, all(tokio_unstable, feature = "tracing"))))]
+    {
+        // std 1.92 ArcInner is repr(C, align(2)) with these two counters followed
+        // by the actual payload. Query this typed layout without construction.
+        #[repr(C, align(2))]
+        struct ArcAllocation<T> {
+            strong: std::sync::atomic::AtomicUsize,
+            weak: std::sync::atomic::AtomicUsize,
+            payload: OriginalInner<T>,
+        }
+        Ok(std::alloc::Layout::new::<ArcAllocation<T>>().size())
+    }
+}
+
+/// Construct a oneshot cell using an already obtained original allocation.
+///
+/// allocation_bound must cover allocation_capacity_bound<T>(); a short bound
+/// is refused before Arc construction. Original remains through both endpoints,
+/// retained value and Wakers, and exits after the final Arc allocation is freed.
+/// A completed send, closed receiver, or returned value is not itself proof of
+/// final allocation exit. Endpoint inline sizes change with this opt-in support;
+/// callers must query their real task constructors rather than reuse old sizes.
+#[cfg(feature = "io-util")]
+#[track_caller]
+pub fn channel_with_original_owner<T>(
+    allocation_bound: usize,
+    original: bytes::Bytes,
+) -> std::io::Result<(Sender<T>, Receiver<T>)> {
+    let actual = allocation_capacity_bound::<T>()?;
+    if allocation_bound < actual {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    #[cfg(any(loom, all(tokio_unstable, feature = "tracing")))]
+    {
+        // The bound query always refuses this configuration above.
+        let _ = original;
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+    #[cfg(not(any(loom, all(tokio_unstable, feature = "tracing"))))]
+    {
+        let inner = InnerHandle::Original(OriginalInnerHandle(Some(std::sync::Arc::new(
+            OriginalInner {
+                inner: Inner {
+                    state: AtomicUsize::new(State::new().as_usize()),
+                    value: UnsafeCell::new(None),
+                    tx_task: Task(UnsafeCell::new(MaybeUninit::uninit())),
+                    rx_task: Task(UnsafeCell::new(MaybeUninit::uninit())),
+                },
+                original: Some(original),
+            },
+        ))));
+        Ok((
+            Sender {
+                inner: Some(inner.clone()),
+            },
+            Receiver { inner: Some(inner) },
+        ))
+    }
 }
 
 impl<T> Sender<T> {

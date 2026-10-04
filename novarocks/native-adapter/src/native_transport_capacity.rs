@@ -81,6 +81,8 @@ struct Dimensions {
     request_send_task_bound: usize,
     channel_worker_positions: usize,
     channel_worker_task_bound: usize,
+    channel_response_positions: usize,
+    channel_response_cell_bound: usize,
     connection_bound: usize,
     stock_bound: usize,
 }
@@ -489,6 +491,9 @@ impl Dimensions {
             channel_worker_positions: crate::native_channel_cache::entry_positions()?,
             channel_worker_task_bound:
                 tonic::transport::OriginalChannelWorker::task_allocation_capacity_bound()?,
+            channel_response_positions: value(g.transport_tonic_pending_per_connection)?,
+            channel_response_cell_bound:
+                tonic::transport::OriginalChannelWorker::response_cell_total_capacity_bound()?,
             connection_bound: 0,
             stock_bound: 0,
         };
@@ -705,6 +710,13 @@ impl Dimensions {
             worker,
             Bytes::owner_with_exit_guard_metadata_size::<Bytes, ChannelWorkerExit>(),
         )?;
+        let worker = add(
+            worker,
+            mul(
+                dimensions.channel_response_positions,
+                dimensions.channel_response_cell_bound,
+            )?,
+        )?;
         stock = add(stock, mul(dimensions.channel_worker_positions, worker)?)?;
         if stock > value(g.root_joint_retained_bytes_per_process)? {
             return Err(invalid());
@@ -882,8 +894,9 @@ impl NativeTransportCapacityFactory {
                 token,
             },
         );
-        let worker = tonic::transport::OriginalChannelWorker::with_original(
+        let worker = tonic::transport::OriginalChannelWorker::with_original_response_cells(
             self.core().dimensions.channel_worker_task_bound,
+            self.core().dimensions.channel_response_positions,
             owner,
         )?;
         rollback.armed = false;
@@ -1426,6 +1439,16 @@ mod tests {
             tonic::transport::OriginalChannelWorker::metadata_allocation_capacity_bound().unwrap(),
             NativeChannelWorkerCapacity::additional_backing_bytes(d.channel_worker_positions)
                 .unwrap()
+        );
+        eprintln!(
+            "Original response cell stock: positions_per_worker={} actual_cell_with_wrapper_bytes={} all_worker_cells_bytes={}",
+            d.channel_response_positions,
+            d.channel_response_cell_bound,
+            mul(
+                mul(d.channel_worker_positions, d.channel_response_positions).unwrap(),
+                d.channel_response_cell_bound
+            )
+            .unwrap(),
         );
         eprintln!(
             "Original split client task facts: connection={} pipe={} send={} request_pool_bytes={}",

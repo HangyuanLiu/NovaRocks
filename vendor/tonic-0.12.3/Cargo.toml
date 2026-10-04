@@ -242,6 +242,7 @@ channel = [
     "tokio?/io-util",
     "dep:hyper-timeout",
 ]
+original-response-cells = ["channel", "tower?/original-response-cells"]
 codegen = ["dep:async-trait"]
 default = [
     "transport",

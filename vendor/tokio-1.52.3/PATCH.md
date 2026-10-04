@@ -60,3 +60,26 @@ socket `PollEvented::drop` 只完成 deregistration，并不代表 reactor alias
 `cfg(loom)`、实际生效的 unstable tracing instrumentation、实际生效的 Linux taskdump 分支在 bound 和 opt-in spawn 的编译期互补 `#[cfg]` 分支中返回 `Unsupported`；拒绝分支不实例化 uninstrumented Future 的 Cell Layout 或 scheduler 调用，私有 owner-only 调用链沿相同完整谓词仅在支持配置下编译。公开 API 仍接受 `std::future::Future`，拒绝时先退出 Future 再退出原能力，不要求调用方实现私有 `InstrumentedFuture`。普通 traced/default spawn 仍走原 instrumentation 路径。此拒绝准确沿既有 cfg，不将仅开启普通 tracing feature 误判为 Tokio unstable instrumentation。
 
 此 bound 只覆盖 TaskCell 与现有自动 Future Box。Future/Output 内部外部 heap、owner wrapper、scheduler shared Arc/OwnedTasks/PAL/ready queues、用户 hooks、其他 Waker 目标、panic payload、runtime/socket/TLS 和完整 Native task graph 仍属外层 OPEN composition；TaskCell 释放不证明这些 shared backing 也退出。
+
+
+## Originally owned oneshot allocation
+
+The additive io-util APIs `oneshot::allocation_capacity_bound<T>()` and
+`oneshot::channel_with_original_owner<T>(bound, original)` query the exact
+pinned standard-library Arc layout and refuse a short caller bound before
+allocation. Bytes is an original carrier, not a funding authority. This bound
+excludes external T/Waker backing and the carrier's own allocation.
+
+Ordinary channels keep their Inner allocation and synchronization. An opt-in
+channel uses a private strong-only wrapper with no Weak/raw/Arc escape. Each
+handle drop participates in `Arc::into_inner`; the winner physically frees the
+Arc allocation before consuming its retained value and initialized Wakers,
+then drops the original. Unique last-owner cleanup clears initialization bits
+before moving the Wakers into RAII locals. User value/Waker destructor unwind
+and notification unwind retain the original through cleanup.
+
+Loom and active unstable tracing return Unsupported on the opt-in API; ordinary
+channels keep their existing path. Sender/Receiver inline sizes change under
+io-util, so downstream actual task/future layouts must be queried again. This
+cell receipt does not establish original funding for the caller's queue,
+semaphore, external future, error, runtime, or complete Native graph.

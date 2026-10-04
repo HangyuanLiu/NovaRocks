@@ -16,7 +16,9 @@ pub use service::{
 #[cfg(feature = "tls")]
 pub use tls::ClientTlsConfig;
 
-use self::service::{Connection, DynamicServiceStream, Executor, SharedExec};
+use self::service::{
+    Connection, DynamicServiceStream, Executor, PreparedChannelWorker, SharedExec,
+};
 use crate::body::BoxBody;
 use bytes::Bytes;
 use http::{
@@ -192,17 +194,19 @@ impl Channel {
     {
         // Reserve before service/factory/dial/Buffer growth. This capability is
         // never passed into Connection or SharedExec, preventing a task backlink.
+        let buffer_size = endpoint.buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE);
         let original_worker = original_worker
-            .map(|worker| worker.prepare())
+            .map(|worker| worker.prepare(buffer_size))
             .transpose()
             .map_err(super::Error::from_source)?;
-        let buffer_size = endpoint.buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE);
         let executor = endpoint.executor.clone();
 
         let svc = Connection::connect(connector, endpoint)
             .await
             .map_err(super::Error::from_source)?;
-        let (svc, worker) = Buffer::pair(Either::A(svc), buffer_size);
+        let (svc, worker) =
+            PreparedChannelWorker::pair(original_worker.as_ref(), Either::A(svc), buffer_size)
+                .map_err(super::Error::from_source)?;
         match original_worker {
             Some(original) => original.spawn(worker).map_err(super::Error::from_source)?,
             None => executor.execute(worker),
@@ -252,16 +256,18 @@ impl Channel {
     {
         // Reserve before service/factory/dial/Buffer growth. This capability is
         // never passed into Connection or SharedExec, preventing a task backlink.
+        let buffer_size = endpoint.buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE);
         let original_worker = original_worker
-            .map(|worker| worker.prepare())
+            .map(|worker| worker.prepare(buffer_size))
             .transpose()
             .map_err(super::Error::from_source)?;
-        let buffer_size = endpoint.buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE);
         let executor = endpoint.executor.clone();
         let svc = Connection::connect_attempt(connector, endpoint)
             .await
             .map_err(super::Error::from_source)?;
-        let (svc, worker) = Buffer::pair(Either::A(svc), buffer_size);
+        let (svc, worker) =
+            PreparedChannelWorker::pair(original_worker.as_ref(), Either::A(svc), buffer_size)
+                .map_err(super::Error::from_source)?;
         match original_worker {
             Some(original) => original.spawn(worker).map_err(super::Error::from_source)?,
             None => executor.execute(worker),

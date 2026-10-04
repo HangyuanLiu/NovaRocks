@@ -1,0 +1,3 @@
+# Preserve whitespace in exact upstream files pinned by UPSTREAM.json.
+CHANGELOG.md whitespace=-blank-at-eol,-blank-at-eof
+README.md whitespace=-blank-at-eol,-blank-at-eof

@@ -191,3 +191,28 @@ This closes the actual eager Worker task and metadata slice. It does not fund
 Buffer queue/Handle/Semaphore backings, service futures, socket/TLS owners, or
 prove the complete Native connection allocation envelope. Native logical
 admission and cache attachment retirement belong to the application issuer.
+
+
+## Originally owned pending response cells
+
+`OriginalChannelWorker::with_original_response_cells(task_bound, positions,
+original)` additionally covers the exact Buffer response-cell and physical-exit
+wrapper layout. The caller obtains `positions * response_cell_total_capacity_bound()`
+in the same original logical-generation stock before construction. The existing
+worker-only constructor preserves its original scope.
+
+Both eager connector paths compare the exact prepaid positions with Endpoint's
+buffer size before service growth or connector.call. Only a clone of the original
+Bytes carrier enters Buffer; neither the worker holder nor its JoinHandle enters
+that graph. The actual Worker constructor query and spawn-time bound comparison
+continue to use the real private return type. Each opt-in cell retains the same
+existing semaphore permit until its physical Arc, retained payload/Wakers, and
+exit wrapper have exited, including unpolled responses after worker handoff.
+Cloned channels share those positions. Worker completion alone cannot retire a
+logical generation while response cells still retain its original carrier.
+
+The additive original-response-cells feature enables Tower's paired feature.
+Native explicitly enables it; the pre-existing channel feature remains compatible
+with ordinary Tower consumers and previous standalone reproduction manifests.
+Queue, Semaphore, Handle, external service futures/body/errors, readiness waiters,
+scheduler and the complete connection envelope still require separate receipts.

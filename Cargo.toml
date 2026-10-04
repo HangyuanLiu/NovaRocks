@@ -190,6 +190,8 @@ hyper = { path = "vendor/hyper-1.8.1" }
 tonic = { path = "vendor/tonic-0.12.3" }
 # Original-funded socket registrations retain capacity through reactor retirement.
 tokio = { path = "vendor/tokio-1.52.3" }
+# Opt-in response cells keep original pending permits until physical exit.
+tower = { path = "vendor/tower-0.4.13" }
 # Borrowed allocation-capacity introspection for bounded root input owners.
 # Existing Arrow data/encoding/capacity semantics stay unchanged; Custom
 # buffers require a source-owner proof rather than a declared-length guess.

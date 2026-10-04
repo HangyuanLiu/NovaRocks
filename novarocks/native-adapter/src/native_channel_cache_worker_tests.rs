@@ -199,6 +199,10 @@ async fn open_with_cache_mode(
     let executor = JoinedExecutor::default();
     let endpoint = Endpoint::from_shared(format!("http://{address}"))
         .unwrap()
+        .buffer_size(
+            novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1
+                .transport_tonic_pending_per_connection as usize,
+        )
         .executor(executor.clone())
         .http2_connection_factory(|| {
             Ok::<_, io::Error>(Http2ConnectionConfig {
@@ -390,6 +394,122 @@ async fn actual_cold_ready_eviction_detaches_worker_without_retiring_escaped_cha
     drop(next);
     drop(listener);
     held(&budget);
+    drop(factory);
+    returned(&budget, bytes);
+}
+
+#[tokio::test]
+async fn detached_original_cache_generation_waits_for_unpolled_actual_response_cells() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Waker};
+    use tower::Service;
+    let (cache, factory, budget, bytes) = fixture();
+    let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+    let key = endpoint_key(&listener);
+    let address = listener.local_addr().unwrap();
+    let received = Arc::new(AtomicUsize::new(0));
+    let observed = received.clone();
+    let (stop, mut stopped) = oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (io, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(io).await.unwrap();
+        loop {
+            tokio::select! {
+                _ = &mut stopped => break,
+                request = connection.accept() => match request {
+                    Some(Ok((_request, mut respond))) => {
+                        respond.send_response(Response::new(()), true).unwrap();
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Some(Err(error)) => panic!("actual response peer error: {error:?}"),
+                    None => break,
+                }
+            }
+        }
+    });
+    let mut leader = elect(&cache, &key).await;
+    let original = leader.original_channel_worker().unwrap();
+    let executor = JoinedExecutor::default();
+    let endpoint = Endpoint::from_shared(format!("http://{address}"))
+        .unwrap()
+        .buffer_size(8)
+        .executor(executor.clone());
+    let connector =
+        service_fn(
+            move |_: Uri| async move { TcpStream::connect(address).await.map(TokioIo::new) },
+        );
+    let mut channel = endpoint
+        .connect_with_connector_and_original_worker(connector, original.clone())
+        .await
+        .unwrap();
+    let handle = original.take_task_handle().unwrap();
+    drop(original);
+    leader.publish(channel.clone()).unwrap();
+    drop(cache.remove(&key).unwrap());
+    let mut responses = Vec::new();
+    for _ in 0..8 {
+        let mut alias = channel.clone();
+        alias.ready().await.unwrap();
+        responses.push(alias.call(Request::new(tonic::body::empty_body())));
+    }
+    // Actual peer receipt proves the Worker has already handed off all eight
+    // inner futures, not merely that an eight-message queue has filled.
+    tokio::time::timeout(WATCHDOG, async {
+        while received.load(Ordering::SeqCst) != 8 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("actual Worker failed to hand off eight requests");
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(
+        channel.poll_ready(&mut cx).is_pending(),
+        "unpolled physical response cells must retain all eight original permits"
+    );
+    drop(channel);
+    drop(endpoint);
+    completed(&handle).await;
+    joined(handle).await;
+    stop.send(()).unwrap();
+    joined(peer).await;
+    executor.join().await;
+    drop(cache);
+    blocked_cache(&factory);
+    for _ in 0..7 {
+        drop(responses.pop().unwrap());
+    }
+    blocked_cache(&factory);
+    held(&budget);
+    drop(responses);
+    let next = NativeChannelCache::bounded(factory.clone()).unwrap();
+    drop(next);
+    drop(factory);
+    returned(&budget, bytes);
+}
+
+#[tokio::test]
+async fn original_response_position_mismatch_refuses_before_actual_connector_call() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (cache, factory, budget, bytes) = fixture();
+    let original = cache.transient_original_channel_worker().unwrap().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let connector = service_fn(move |_: Uri| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        async { Err::<TokioIo<TcpStream>, _>(io::Error::from(io::ErrorKind::ConnectionRefused)) }
+    });
+    let result = Endpoint::from_static("http://127.0.0.1:1")
+        .buffer_size(9)
+        .connect_with_connector_and_original_worker(connector, original.clone())
+        .await;
+    assert!(
+        result.is_err(),
+        "exact original eight-position admission must reject nine"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(original.take_task_handle().is_none());
+    drop(original);
+    drop(cache);
     drop(factory);
     returned(&budget, bytes);
 }
