@@ -727,6 +727,12 @@ fn runtime_control_failures_preserve_entry_and_mid_partition_quantum() {
         KernelFailure::Cancelled,
         KernelFailure::DeadlineExceeded,
         KernelFailure::ResourceExhausted,
+        invalid("original output validation refusal"),
+        internal("original output validation refusal"),
+        KernelFailure::Operational(crate::KernelDiagnostic::new(
+            "original output validation refusal",
+        )),
+        KernelFailure::InstanceFailed,
     ] {
         for argument in [
             EvaluatedArgument::Column(&array),
@@ -866,6 +872,12 @@ fn output_projection_preserves_entry_and_midwork_outer_control_failures() {
         KernelFailure::Cancelled,
         KernelFailure::DeadlineExceeded,
         KernelFailure::ResourceExhausted,
+        invalid("original output validation refusal"),
+        internal("original output validation refusal"),
+        KernelFailure::Operational(crate::KernelDiagnostic::new(
+            "original output validation refusal",
+        )),
+        KernelFailure::InstanceFailed,
     ] {
         let control = RuntimeControl {
             failure: Some(failure.clone()),

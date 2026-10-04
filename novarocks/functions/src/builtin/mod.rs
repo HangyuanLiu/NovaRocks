@@ -38,6 +38,8 @@ mod abs;
 mod abs_owner;
 mod aggregate_count;
 mod aggregate_count_owner;
+mod aggregate_extrema;
+mod aggregate_extrema_owner;
 mod bit_shift;
 mod bit_shift_owner;
 mod bitwise;
@@ -135,3 +137,8 @@ mod truncate;
 mod truncate_owner;
 mod window_ranking;
 mod window_ranking_owner;
+
+mod window_value;
+mod window_value_owner;
+#[cfg(test)]
+mod window_value_tests;

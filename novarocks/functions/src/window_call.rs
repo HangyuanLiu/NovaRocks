@@ -307,6 +307,15 @@ impl<'input, 'call, 'a, 'selection> WindowOutputProjection<'input, 'call, 'a, 's
         capacity: usize,
         control: &dyn KernelEvaluationControl,
     ) -> Result<(), KernelFailure> {
+        let observation = crate::kernel_control::KernelControlObservation::new(control);
+        observation.finish(self.validate_result_observed(result, capacity, &observation))
+    }
+    fn validate_result_observed(
+        self,
+        result: &SelectedValues<'_>,
+        capacity: usize,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<(), KernelFailure> {
         control.checkpoint(0)?;
         if result.values().len() > capacity {
             return Err(internal("window output exceeds its host row grant"));

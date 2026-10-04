@@ -2380,6 +2380,9 @@ pub(super) fn scalar_definition_parts(
                     name if super::window_ranking_owner::operation(name).is_some() => {
                         Some(super::window_ranking_owner::effects())
                     }
+                    name if super::window_value_owner::operation(name).is_some() => {
+                        Some(super::window_value_owner::effects())
+                    }
                     "abs" => Some(super::abs_owner::effects()),
                     name if super::control_owner::operation(name).is_some() => {
                         Some(super::control_owner::effects(
@@ -2630,6 +2633,9 @@ pub fn contribute_builtin_functions(
             name if super::window_ranking_owner::operation(name).is_some() => {
                 super::window_ranking_owner::definition(name, declaration, resolver)?
             }
+            name if super::window_value_owner::operation(name).is_some() => {
+                super::window_value_owner::definition(name, declaration, resolver)?
+            }
             "abs" => super::abs_owner::definition(declaration, resolver)?,
             name if super::control_owner::operation(name).is_some() => {
                 super::control_owner::definition(name, declaration, resolver)?
@@ -2783,7 +2789,13 @@ pub fn contribute_builtin_functions(
             function_id,
             FunctionKind::Aggregate,
             [FunctionOverloadDeclaration {
-                effects: (declaration.name == "count").then(super::aggregate_count_owner::effects),
+                effects: match declaration.name {
+                    "count" => Some(super::aggregate_count_owner::effects()),
+                    name if super::aggregate_extrema_owner::operation(name).is_some() => {
+                        Some(super::aggregate_extrema_owner::effects())
+                    }
+                    _ => None,
+                },
                 semantics: FunctionSemantics {
                     volatility: FunctionVolatility::Immutable,
                     argument_evaluation: FunctionArgumentEvaluation::Eager,
@@ -2809,6 +2821,14 @@ pub fn contribute_builtin_functions(
         let resolver = Arc::new(BuiltinAggregateResolver { declaration });
         if declaration.name == "count" {
             builder.register(super::aggregate_count_owner::definition(
+                declaration.name,
+                binding_declaration,
+                resolver,
+            )?)?;
+            continue;
+        }
+        if super::aggregate_extrema_owner::operation(declaration.name).is_some() {
+            builder.register(super::aggregate_extrema_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,

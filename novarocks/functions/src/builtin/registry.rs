@@ -1533,13 +1533,13 @@ fn register_window_fns(m: &mut HashMap<String, Vec<Signature>>) {
             ),
         );
     }
-    // first_value/last_value: preserve the value's type. A second argument is
-    // the null-treatment marker rather than another value.
+    // FIRST/LAST take exactly one value. Null treatment is a Window option,
+    // authored by the SQL modifier rather than a second value argument.
     for name in ["first_value", "last_value"] {
         add(
             m,
             name,
-            Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Any("T")),
+            Signature::new(vec![TypeSpec::Any("T")], TypeSpec::Any("T")),
         );
     }
 }
