@@ -97,8 +97,46 @@ pub(super) fn encode_parameters(
     if parameters.entries().len() > MAX_SEMANTIC_PARAMETERS {
         return Err(SemanticParameterError::TooManyParameters.into());
     }
-    let mut entries = Vec::with_capacity(parameters.entries().len());
-    for (id, value) in parameters.entries() {
+    emit_parameter_entries(
+        parameters,
+        Vec::with_capacity(parameters.entries().len()),
+        work,
+        false,
+    )
+}
+
+/// Same wire grammar as the legacy component, with a preadmitted fallible Vec
+/// and original checkpoints around the actual iterator/string copy exits.
+pub(super) fn encode_parameters_observed(
+    parameters: &SemanticParameters,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<wire::SemanticParameters, SemanticsCodecError> {
+    work.flush()?;
+    let mut entries = Vec::new();
+    let request = entries.try_reserve_exact(parameters.entries().len());
+    crate::allocation_exit_v2::reserve_exit::<SemanticsCodecError>(request, work)?;
+    emit_parameter_entries(parameters, entries, work, true)
+}
+
+fn emit_parameter_entries(
+    parameters: &SemanticParameters,
+    mut entries: Vec<wire::SemanticParameter>,
+    work: &mut CompileCheckpoints<'_>,
+    observed: bool,
+) -> Result<wire::SemanticParameters, SemanticsCodecError> {
+    let mut input = parameters.entries().iter();
+    loop {
+        if observed {
+            work.flush()?;
+        }
+        let next = input.next();
+        if observed {
+            work.step()?;
+            work.flush()?;
+        }
+        let Some((id, value)) = next else {
+            break;
+        };
         // A single item includes at most 255 bytes of owned text and bounded
         // table work. Do not let a future unchecked text source expand it.
         work.step()?;
@@ -110,7 +148,18 @@ pub(super) fn encode_parameters(
                 if value.len() > 255 {
                     return Err(SemanticParameterError::InvalidTimeZone.into());
                 }
-                wire::semantic_parameter::Value::TimeZone(value.to_string())
+                if observed {
+                    work.flush()?;
+                }
+                // Borrow the actual str specialization: formatting Box<str>
+                // through Display would grow short Strings to at least eight
+                // bytes, invalidating the exact source-length request bound.
+                let copied = value.as_ref().to_string();
+                if observed {
+                    work.step()?;
+                    work.flush()?;
+                }
+                wire::semantic_parameter::Value::TimeZone(copied)
             }
             SemanticParameterValue::AllowThrowException(value) => {
                 wire::semantic_parameter::Value::AllowThrowException(*value)

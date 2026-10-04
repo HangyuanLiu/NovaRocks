@@ -30,9 +30,8 @@ struct Control {
     trace: Mutex<Vec<(CompilePhase, u32)>>,
     stop: Option<(usize, CompileControlError)>,
 }
-impl PureCompileControl for Control {
-    fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
-        assert_eq!(phase, CompilePhase::Decode);
+impl Control {
+    fn record(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         let at = trace.len();
@@ -46,6 +45,21 @@ impl PureCompileControl for Control {
         }
     }
 }
+impl PureCompileControl for Control {
+    fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+        assert_eq!(phase, CompilePhase::Decode);
+        self.record(phase, units)
+    }
+}
+#[derive(Default)]
+struct EncodeControl(Control);
+impl PureCompileControl for EncodeControl {
+    fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+        assert_eq!(phase, CompilePhase::Encode);
+        self.0.record(phase, units)
+    }
+}
+
 fn limits() -> ParameterProjectionLimits {
     ParameterProjectionLimits {
         max_parameters: MAX_SEMANTIC_PARAMETERS,
@@ -345,6 +359,158 @@ fn bounded_parameters_every_actual_callback_retains_first_control_and_never_publ
                 );
                 assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
             }
+        }
+    }
+}
+
+#[test]
+fn bounded_parameter_sending_matches_independent_canonical_wire_and_prepared_loan() {
+    let raw = source();
+    let (table, _) =
+        decode_semantic_parameters(&raw, SOURCE, limits(), &Control::default()).unwrap();
+    let mut expected = raw;
+    expected.entries.sort_by_key(|entry| entry.id);
+    let control = EncodeControl::default();
+    let (wire, facts) = encode_semantic_parameters(&table, SOURCE, limits(), &control).unwrap();
+    assert_eq!(wire, expected);
+    if let Some(wire::semantic_parameter::Value::TimeZone(zone)) = &wire.entries[0].value {
+        assert_eq!(zone.capacity(), zone.len());
+    } else {
+        panic!("expected original timezone spelling");
+    }
+    assert_eq!(facts.parameter_count, 7);
+    assert_eq!(facts.timezone_request_bytes_upper_bound, 4);
+    assert_eq!(facts.allocation_requests_upper_bound, 2);
+    assert_eq!(
+        facts.allocation_request_bytes_upper_bound,
+        std::alloc::Layout::array::<wire::SemanticParameter>(7)
+            .unwrap()
+            .size()
+            + 4
+    );
+    let prepared = prepare_semantic_parameters_encode(&table, SOURCE, limits(), &control).unwrap();
+    assert_eq!(*prepared.facts(), facts);
+    let (emitted, emitted_facts) = prepared.emit().unwrap();
+    assert_eq!(emitted, expected);
+    assert_eq!(emitted_facts, facts);
+    let (again, _) =
+        decode_semantic_parameters(&wire, SOURCE, limits(), &Control::default()).unwrap();
+    assert_eq!(again, table);
+}
+#[test]
+fn bounded_parameter_sending_six_exact_caps_empty_and_occupied_source_floors() {
+    let (table, _) =
+        decode_semantic_parameters(&source(), SOURCE, limits(), &Control::default()).unwrap();
+    let (_, facts) =
+        encode_semantic_parameters(&table, SOURCE, limits(), &EncodeControl::default()).unwrap();
+    let exact = ParameterProjectionLimits {
+        max_parameters: facts.parameter_count,
+        max_timezone_request_bytes: facts.timezone_request_bytes_upper_bound,
+        max_allocation_requests: facts.allocation_requests_upper_bound,
+        max_allocation_request_bytes: facts.allocation_request_bytes_upper_bound,
+        max_coexisting_source_and_request_bytes: facts
+            .coexisting_source_and_request_bytes_upper_bound,
+        max_work: facts.cumulative_work_upper_bound,
+    };
+    assert!(encode_semantic_parameters(&table, SOURCE, exact, &EncodeControl::default()).is_ok());
+    for axis in 0..6 {
+        let mut cap = exact;
+        match axis {
+            0 => cap.max_parameters -= 1,
+            1 => cap.max_timezone_request_bytes -= 1,
+            2 => cap.max_allocation_requests -= 1,
+            3 => cap.max_allocation_request_bytes -= 1,
+            4 => cap.max_coexisting_source_and_request_bytes -= 1,
+            5 => cap.max_work -= 1,
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            encode_semantic_parameters(&table, SOURCE, cap, &EncodeControl::default()),
+            Err(Error::InvalidShape(_))
+        ));
+    }
+    let known = size_of::<SemanticParameters>()
+        + 7 * (size_of::<SemanticParameterId>() + size_of::<SemanticParameterValue>())
+        + 4;
+    assert!(matches!(
+        prepare_semantic_parameters_encode(&table, known - 1, limits(), &EncodeControl::default()),
+        Err(Error::InvalidShape(_))
+    ));
+    // This lower floor does not assert the actual BTree headers/capacity fit;
+    // the original caller still owes its complete retained-source invoice.
+    let empty = SemanticParameters::default();
+    let (_, facts) =
+        encode_semantic_parameters(&empty, SOURCE, limits(), &EncodeControl::default()).unwrap();
+    assert_eq!(facts.allocation_requests_upper_bound, 0);
+    assert_eq!(facts.allocation_request_bytes_upper_bound, 0);
+}
+#[test]
+fn bounded_parameter_sending_every_callback_and_real_source_quantum_use_original_control() {
+    let empty = SemanticParameters::default();
+    let (raw, _) =
+        decode_semantic_parameters(&source(), SOURCE, limits(), &Control::default()).unwrap();
+    let zone = SemanticParameters::try_new([(
+        SemanticParameterId::new(0),
+        SemanticParameterValue::TimeZone("x".repeat(255).into_boxed_str()),
+    )])
+    .unwrap();
+    let short = SemanticParameters::try_new([(
+        SemanticParameterId::new(0),
+        SemanticParameterValue::TimeZone("UTC".into()),
+    )])
+    .unwrap();
+    let unicode = SemanticParameters::try_new([(
+        SemanticParameterId::new(0),
+        SemanticParameterValue::TimeZone("雪".repeat(85).into_boxed_str()),
+    )])
+    .unwrap();
+    for table in [&empty, &raw, &zone, &short, &unicode] {
+        let control = EncodeControl::default();
+        let (wire, facts) = encode_semantic_parameters(table, SOURCE, limits(), &control).unwrap();
+        for entry in &wire.entries {
+            if let Some(wire::semantic_parameter::Value::TimeZone(zone)) = &entry.value {
+                assert_eq!(zone.capacity(), zone.len());
+                assert_eq!(zone.len(), facts.timezone_request_bytes_upper_bound);
+            }
+        }
+        let trace = control.0.trace.into_inner().unwrap();
+        assert_eq!(trace[0], (CompilePhase::Encode, 0));
+        for at in 0..trace.len() {
+            for cause in CAUSES {
+                let control = EncodeControl(Control {
+                    stop: Some((at, cause)),
+                    ..Control::default()
+                });
+                assert!(
+                    matches!(encode_semantic_parameters(table, SOURCE, limits(), &control), Err(Error::Control(actual)) if actual == cause)
+                );
+                assert_eq!(*control.0.trace.lock().unwrap(), trace[..=at]);
+            }
+        }
+    }
+    let wide = SemanticParameters::try_new((0..320).map(|id| {
+        (
+            SemanticParameterId::new(id),
+            SemanticParameterValue::AllowThrowException(false),
+        )
+    }))
+    .unwrap();
+    let control = EncodeControl::default();
+    assert!(encode_semantic_parameters(&wide, SOURCE, limits(), &control).is_ok());
+    let trace = control.0.trace.into_inner().unwrap();
+    assert!(trace.iter().map(|(_, n)| n).sum::<u32>() > 256);
+    // Each actual opaque tree pull is flushed; count/source work need not be
+    // batched into a synthetic 256-unit callback just to hit a round number.
+    for at in [0, trace.len() / 2, trace.len() - 1] {
+        for cause in CAUSES {
+            let control = EncodeControl(Control {
+                stop: Some((at, cause)),
+                ..Control::default()
+            });
+            assert!(
+                matches!(encode_semantic_parameters(&wide, SOURCE, limits(), &control), Err(Error::Control(actual)) if actual == cause)
+            );
+            assert_eq!(*control.0.trace.lock().unwrap(), trace[..=at]);
         }
     }
 }

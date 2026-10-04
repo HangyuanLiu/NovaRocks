@@ -187,13 +187,13 @@ fn decode_hash(value: i32) -> Result<PartitionHashAlgorithm, Error> {
         )),
     }
 }
-fn encode_direction(value: physical::SortDirection) -> i32 {
+pub(crate) fn encode_direction(value: physical::SortDirection) -> i32 {
     match value {
         physical::SortDirection::Ascending => wire::SortDirection::Ascending as i32,
         physical::SortDirection::Descending => wire::SortDirection::Descending as i32,
     }
 }
-fn decode_direction(value: i32) -> Result<physical::SortDirection, Error> {
+pub(crate) fn decode_direction(value: i32) -> Result<physical::SortDirection, Error> {
     match wire::SortDirection::try_from(value) {
         Ok(wire::SortDirection::Ascending) => Ok(physical::SortDirection::Ascending),
         Ok(wire::SortDirection::Descending) => Ok(physical::SortDirection::Descending),
@@ -202,13 +202,13 @@ fn decode_direction(value: i32) -> Result<physical::SortDirection, Error> {
         )),
     }
 }
-fn encode_nulls(value: physical::NullOrdering) -> i32 {
+pub(crate) fn encode_nulls(value: physical::NullOrdering) -> i32 {
     match value {
         physical::NullOrdering::First => wire::NullOrdering::First as i32,
         physical::NullOrdering::Last => wire::NullOrdering::Last as i32,
     }
 }
-fn decode_nulls(value: i32) -> Result<physical::NullOrdering, Error> {
+pub(crate) fn decode_nulls(value: i32) -> Result<physical::NullOrdering, Error> {
     match wire::NullOrdering::try_from(value) {
         Ok(wire::NullOrdering::First) => Ok(physical::NullOrdering::First),
         Ok(wire::NullOrdering::Last) => Ok(physical::NullOrdering::Last),

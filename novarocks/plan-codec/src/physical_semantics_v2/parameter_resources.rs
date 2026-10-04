@@ -222,5 +222,140 @@ pub fn decode_semantic_parameters(
     finish_projection(work, result)
 }
 
+fn preflight_encode(
+    input: &SemanticParameters,
+    source: usize,
+    limits: ParameterProjectionLimits,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<ParameterProjectionFacts, Error> {
+    let n = input.entries().len();
+    let too_many = n > MAX_SEMANTIC_PARAMETERS;
+    w.step()?;
+    if too_many {
+        return Err(SemanticParameterError::TooManyParameters.into());
+    }
+    cap(n, limits.max_parameters, w)?;
+    // The actual BTree may have spare slots and headers; these are necessary
+    // occupied-entry lower floors, never a claim of exact retained backing.
+    let mut known = add(
+        size_of::<SemanticParameters>(),
+        mul(
+            n,
+            add(
+                size_of::<SemanticParameterId>(),
+                size_of::<SemanticParameterValue>(),
+            )?,
+        )?,
+    )?;
+    floor(source, known, w)?;
+    let array = bytes::<wire::SemanticParameter>(n)?;
+    let lookup = btree_resources_v2::lookup_work(n).map_err(invalid)?;
+    let own = add(256, add(mul(n, add(64, lookup)?)?, mul(array, 4)?)?)?;
+    cap(own, limits.max_work, w)?;
+    let mut strings = 0;
+    let mut string_bytes = 0;
+    // Iteration follows the original immutable table. A pull is an opaque
+    // bounded-height BTree operation, not a second index or cloned table.
+    let mut entries = input.entries().iter();
+    loop {
+        w.flush()?;
+        let next = entries.next();
+        w.step()?;
+        w.flush()?;
+        let Some((_, value)) = next else {
+            break;
+        };
+        if let SemanticParameterValue::TimeZone(zone) = value {
+            known = add(known, zone.len())?;
+            // Only calculate copy requests; semantic spelling remains with
+            // the original owner and sole encoder grammar.
+            if !zone.is_empty() && zone.len() <= 255 {
+                strings = add(strings, 1)?;
+                string_bytes = add(string_bytes, bytes::<u8>(zone.len())?)?;
+            }
+        }
+        w.step()?;
+    }
+    floor(source, known, w)?;
+    let requested = add(array, string_bytes)?;
+    let facts = ParameterProjectionFacts {
+        parameter_count: n,
+        timezone_request_bytes_upper_bound: string_bytes,
+        allocation_requests_upper_bound: add(usize::from(n != 0), strings)?,
+        allocation_request_bytes_upper_bound: requested,
+        coexisting_source_and_request_bytes_upper_bound: add(source, requested)?,
+        // Both the source-count pass and actual emission iterate the table.
+        cumulative_work_upper_bound: add(own, add(mul(n, lookup)?, mul(string_bytes, 4)?)?)?,
+    };
+    cap(
+        facts.timezone_request_bytes_upper_bound,
+        limits.max_timezone_request_bytes,
+        w,
+    )?;
+    cap(
+        facts.allocation_requests_upper_bound,
+        limits.max_allocation_requests,
+        w,
+    )?;
+    cap(
+        facts.allocation_request_bytes_upper_bound,
+        limits.max_allocation_request_bytes,
+        w,
+    )?;
+    cap(
+        facts.coexisting_source_and_request_bytes_upper_bound,
+        limits.max_coexisting_source_and_request_bytes,
+        w,
+    )?;
+    cap(facts.cumulative_work_upper_bound, limits.max_work, w)?;
+    Ok(facts)
+}
+
+pub struct PreparedSemanticParametersEncode<'source, 'control> {
+    input: &'source SemanticParameters,
+    control: &'control dyn PureCompileControl,
+    facts: ParameterProjectionFacts,
+}
+impl PreparedSemanticParametersEncode<'_, '_> {
+    pub fn facts(&self) -> &ParameterProjectionFacts {
+        &self.facts
+    }
+    pub fn emit(self) -> Result<(wire::SemanticParameters, ParameterProjectionFacts), Error> {
+        let mut work = CompileCheckpoints::try_new(self.control, CompilePhase::Encode)?;
+        let result = parameters::encode_parameters_observed(self.input, &mut work)
+            .map(|wire| (wire, self.facts));
+        finish_projection(work, result)
+    }
+}
+pub fn prepare_semantic_parameters_encode<'source, 'control>(
+    input: &'source SemanticParameters,
+    source_retained_bytes: usize,
+    limits: ParameterProjectionLimits,
+    control: &'control dyn PureCompileControl,
+) -> Result<PreparedSemanticParametersEncode<'source, 'control>, Error> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
+    let result = preflight_encode(input, source_retained_bytes, limits, &mut work);
+    let facts = finish_projection(work, result)?;
+    Ok(PreparedSemanticParametersEncode {
+        input,
+        control,
+        facts,
+    })
+}
+pub fn encode_semantic_parameters(
+    input: &SemanticParameters,
+    source_retained_bytes: usize,
+    limits: ParameterProjectionLimits,
+    control: &dyn PureCompileControl,
+) -> Result<(wire::SemanticParameters, ParameterProjectionFacts), Error> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
+    let result = (|| {
+        let facts = preflight_encode(input, source_retained_bytes, limits, &mut work)?;
+        let wire = parameters::encode_parameters_observed(input, &mut work)?;
+        Ok((wire, facts))
+    })();
+    finish_projection(work, result)
+}
+
 #[cfg(test)]
 mod tests;

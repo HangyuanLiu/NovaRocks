@@ -47,6 +47,7 @@ pub mod physical_properties_v2;
 pub mod physical_provider_binding_v2;
 pub mod physical_provider_read_v2;
 pub mod physical_relation_v2;
+pub mod physical_relational_nodes_v2;
 pub mod physical_repeat_v2;
 pub mod physical_semantics_v2;
 pub mod physical_simple_nodes_v2;

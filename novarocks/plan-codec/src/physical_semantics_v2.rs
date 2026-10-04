@@ -42,7 +42,8 @@ mod pruning;
 
 pub use parameter_resources::{
     ParameterProjectionFacts, ParameterProjectionLimits, PreparedSemanticParametersDecode,
-    decode_semantic_parameters, prepare_semantic_parameters_decode,
+    PreparedSemanticParametersEncode, decode_semantic_parameters, encode_semantic_parameters,
+    prepare_semantic_parameters_decode, prepare_semantic_parameters_encode,
 };
 
 pub(crate) use calls::{
