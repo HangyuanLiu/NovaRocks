@@ -306,8 +306,8 @@ fn collect_plan_column_ids(plan: &LogicalPlanNode, max_id: &mut u32) {
                 collect_expr_column_ids(predicate, max_id);
             }
             for variant in &scan.variant_columns {
-                collect_column_id(variant.source_column_id, max_id);
-                collect_column_id(variant.synthetic_column_id, max_id);
+                collect_column_id(variant.source_column_id(), max_id);
+                collect_column_id(variant.synthetic_column_id(), max_id);
             }
         }
         LogicalPlanKind::Filter(filter) => collect_expr_column_ids(&filter.predicate, max_id),

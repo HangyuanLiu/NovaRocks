@@ -446,7 +446,7 @@ pub(crate) fn resolve_function_binding(
         .map_err(crate::compiler::SqlCompileError::from)
 }
 
-fn function_argument(
+pub(crate) fn function_argument(
     arena: &ScalarArena,
     arg: ScalarId,
     control: &dyn novarocks_type_contract::PureCompileControl,

@@ -32,17 +32,45 @@ use novarocks_types::value::variant::{
     VariantPathSegment, parse_variant_path, variant_get_target_type,
 };
 
+#[path = "source.rs"]
+mod source;
+
 #[derive(Default)]
 pub(crate) struct VariantPathPushdownRule;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 struct VariantRequest {
+    call: ScalarId,
     source_column_id: ColumnId,
     canonical_path: String,
     requested_type: DataType,
     requested_type_literal: String,
     strict: bool,
     binding: crate::binding::SqlFunctionBinding,
+}
+
+impl PartialEq for VariantRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.source_column_id == other.source_column_id
+            && self.canonical_path == other.canonical_path
+            && self.requested_type == other.requested_type
+            && self.requested_type_literal == other.requested_type_literal
+            && self.strict == other.strict
+            && self.binding == other.binding
+    }
+}
+impl Eq for VariantRequest {}
+impl std::fmt::Debug for VariantRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VariantRequest")
+            .field("source_column_id", &self.source_column_id)
+            .field("canonical_path", &self.canonical_path)
+            .field("requested_type", &self.requested_type)
+            .field("requested_type_literal", &self.requested_type_literal)
+            .field("strict", &self.strict)
+            .field("binding", &self.binding)
+            .finish()
+    }
 }
 
 impl LogicalRewriteRule for VariantPathPushdownRule {
@@ -721,6 +749,7 @@ fn variant_request_scalar(
             return Ok(None);
         };
         Ok(Some(VariantRequest {
+            call: expr,
             source_column_id: *column_id,
             canonical_path,
             requested_type,
@@ -1005,12 +1034,12 @@ fn find_or_create_slot_on_scan(
     }
 
     if let Some(existing) = scan.variant_columns.iter().find(|column| {
-        column.source_column_id == request.source_column_id
-            && column.canonical_path == request.canonical_path
-            && column.requested_type == request.requested_type
-            && column.requested_type_literal == request.requested_type_literal
-            && column.strict == request.strict
-            && column.binding == request.binding
+        column.source_column_id() == request.source_column_id
+            && column.canonical_path() == request.canonical_path
+            && column.requested_type() == &request.requested_type
+            && column.requested_type_literal() == request.requested_type_literal
+            && column.strict() == request.strict
+            && column.binding() == &request.binding
     }) {
         return Ok(Some(column_ref_for_variant_slot(arena, existing, control)?));
     }
@@ -1028,22 +1057,32 @@ fn find_or_create_slot_on_scan(
 
     let source_name = source_column.name.clone();
     let synthetic_name = next_synthetic_column_name(scan, &source_name);
+    let source = source::capture_variant_source_observed(
+        arena,
+        request.call,
+        &request.binding,
+        &request.canonical_path,
+        &request.requested_type_literal,
+        control,
+    )?;
     let synthetic_column_id = factory.create(
         None,
         synthetic_name.clone(),
         novarocks_type_contract::FunctionValueType::new(request.requested_type.clone(), true),
     );
-    let descriptor = ScanVariantColumn {
-        source_column_id: request.source_column_id,
-        source_column: source_name,
+    let descriptor = ScanVariantColumn::new_observed(
+        request.source_column_id,
+        source_name,
         synthetic_column_id,
-        synthetic_column: synthetic_name.clone(),
-        canonical_path: request.canonical_path.clone(),
-        requested_type: request.requested_type.clone(),
-        requested_type_literal: request.requested_type_literal.clone(),
-        strict: request.strict,
-        binding: request.binding.clone(),
-    };
+        synthetic_name.clone(),
+        request.canonical_path.clone(),
+        request.requested_type.clone(),
+        request.requested_type_literal.clone(),
+        request.strict,
+        source,
+        control,
+    )?;
+
     scan.columns.push(OutputColumn {
         column_id: synthetic_column_id,
         name: synthetic_name,
@@ -1069,13 +1108,13 @@ fn column_ref_for_variant_slot(
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<ScalarId, SqlCompileError> {
     arena.remember_source_column_display(
-        descriptor.synthetic_column_id,
+        descriptor.synthetic_column_id(),
         None,
-        descriptor.synthetic_column.clone(),
+        descriptor.synthetic_column().to_owned(),
     );
     arena.intern_observed(
-        ScalarNode::ColumnRef(descriptor.synthetic_column_id),
-        novarocks_type_contract::FunctionValueType::new(descriptor.requested_type.clone(), true),
+        ScalarNode::ColumnRef(descriptor.synthetic_column_id()),
+        novarocks_type_contract::FunctionValueType::new(descriptor.requested_type().clone(), true),
         control,
     )
 }

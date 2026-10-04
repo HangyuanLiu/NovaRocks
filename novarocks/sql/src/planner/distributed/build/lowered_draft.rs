@@ -97,6 +97,21 @@ impl SqlAuthoredPhysicalPlan {
         )
     }
 
+    /// A derived descriptor's original request at its exact emission site.
+    pub(crate) fn checked_variant_source_observed<'a>(
+        &'a self,
+        fragment: &'a Fragment,
+        source: &'a novarocks_physical_plan::ExprNode,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<CheckedExpressionLogicalSourceEntry<'a>, SqlSourceJournalError> {
+        self.checked_expression_source_observed(
+            fragment,
+            source,
+            SqlExpressionCallKind::DerivedVariant,
+            work,
+        )
+    }
+
     /// Window positional arguments followed by function ORDER BY channels.
     /// Partition/order/frame expressions have separate static owners.
     pub(crate) fn checked_window_source_observed<'a>(
@@ -303,8 +318,8 @@ pub(crate) struct CheckedExpressionLogicalSourceEntry<'a> {
     source: &'a novarocks_physical_plan::ExprNode,
 }
 impl<'a> CheckedExpressionLogicalSourceEntry<'a> {
-    pub(crate) const fn captured(&self) -> &'a CapturedLogicalCallArguments {
-        &self.entry.captured
+    pub(crate) fn captured(&self) -> &'a CapturedLogicalCallArguments {
+        self.entry.captured.captured()
     }
     pub(crate) const fn fragment(&self) -> &'a Fragment {
         self.fragment
@@ -322,12 +337,32 @@ pub(super) fn validate_expression_source_entry_observed(
     source: &novarocks_physical_plan::ExprNode,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), SqlSourceJournalError> {
+    let same_origin = matches!(
+        (&entry.captured, entry.kind),
+        (
+            LoweredExpressionLogicalSource::DerivedVariant(_),
+            SqlExpressionCallKind::DerivedVariant
+        ) | (
+            LoweredExpressionLogicalSource::Owned(_),
+            SqlExpressionCallKind::Scalar
+                | SqlExpressionCallKind::Window
+                | SqlExpressionCallKind::ValueConversion
+        )
+    );
+    work.step()?;
+    if !same_origin {
+        return Err(SqlSourceJournalError::InvalidSource(
+            "expression journal has a different source producer",
+        ));
+    }
     let same_scope = source.owner == entry.owner && source.lambda_scope == entry.lambda_scope;
     work.step()?;
     let (args, order) = match (&source.kind, entry.kind) {
         (
             novarocks_physical_plan::ExprKind::FunctionCall { args, .. },
-            SqlExpressionCallKind::Scalar | SqlExpressionCallKind::ValueConversion,
+            SqlExpressionCallKind::Scalar
+            | SqlExpressionCallKind::ValueConversion
+            | SqlExpressionCallKind::DerivedVariant,
         ) => (args.as_ref(), &[][..]),
         (
             novarocks_physical_plan::ExprKind::WindowCall {
@@ -381,7 +416,7 @@ pub(crate) struct CheckedTableLogicalSourceEntry<'a> {
     source: &'a PhysicalNode,
 }
 impl<'a> CheckedTableLogicalSourceEntry<'a> {
-    pub(crate) const fn captured(&self) -> &'a CapturedLogicalCallArguments {
+    pub(crate) fn captured(&self) -> &'a CapturedLogicalCallArguments {
         &self.entry.captured
     }
     pub(crate) const fn fragment(&self) -> &'a Fragment {
@@ -514,24 +549,48 @@ pub(super) enum SqlExpressionCallKind {
     Scalar,
     Window,
     ValueConversion,
+    DerivedVariant,
 }
 #[derive(Debug)]
 pub(super) struct LoweredTableSourceEntry {
     pub(super) captured: CapturedLogicalCallArguments,
     pub(super) arguments: Box<[ExprId]>,
 }
+pub(super) enum LoweredExpressionLogicalSource {
+    Owned(CapturedLogicalCallArguments),
+    DerivedVariant(Arc<crate::common::variant_source::DerivedVariantSource>),
+}
+impl LoweredExpressionLogicalSource {
+    pub(super) fn captured(&self) -> &CapturedLogicalCallArguments {
+        match self {
+            Self::Owned(original) => original,
+            Self::DerivedVariant(source) => source.captured(),
+        }
+    }
+    pub(super) fn request(&self) -> novarocks_functions::FunctionBindingRequest<'_> {
+        self.captured().request()
+    }
+}
+impl std::fmt::Debug for LoweredExpressionLogicalSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Owned(source) => f.debug_tuple("Owned").field(source).finish(),
+            Self::DerivedVariant(_) => f.write_str("DerivedVariantSource"),
+        }
+    }
+}
 #[derive(Debug)]
 pub(super) struct LoweredExpressionSourceEntry {
     pub(super) kind: SqlExpressionCallKind,
-    pub(super) captured: CapturedLogicalCallArguments,
+    pub(super) captured: LoweredExpressionLogicalSource,
     pub(super) owner: novarocks_physical_plan::NodeId,
     pub(super) lambda_scope: Option<ExprId>,
     pub(super) arguments: Box<[ExprId]>,
 }
 #[derive(Debug)]
 pub(super) struct SqlLogicalSourceJournal {
-    // Actual ordinary, Window and original conversion emissions plus Table.
-    // Derived VARIANT calls remain a separate open source gate.
+    // Original ordinary, Window, conversion and derived descriptor emissions.
+    // Retained source validation does not certify fresh effects or full coverage.
     pub(super) expression_entries: BTreeMap<(FragmentId, ExprId), LoweredExpressionSourceEntry>,
     pub(super) table_entries:
         BTreeMap<(FragmentId, novarocks_physical_plan::NodeId), LoweredTableSourceEntry>,

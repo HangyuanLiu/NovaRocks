@@ -75,9 +75,10 @@ use sha2::{Digest, Sha256};
 
 use super::lowered_draft::{
     AggregateRuntimeDemand, AggregateSourceTarget, LoweredAggregateLogicalSource,
-    LoweredAggregateSourceEntry, LoweredExpressionSourceEntry, LoweredSqlPhysicalDraft,
-    LoweredTableSourceEntry, SqlExpressionCallKind, SqlLogicalSourceJournal,
-    validate_expression_source_entry_observed, validate_table_source_entry_observed,
+    LoweredAggregateSourceEntry, LoweredExpressionLogicalSource, LoweredExpressionSourceEntry,
+    LoweredSqlPhysicalDraft, LoweredTableSourceEntry, SqlExpressionCallKind,
+    SqlLogicalSourceJournal, validate_expression_source_entry_observed,
+    validate_table_source_entry_observed,
 };
 use crate::analysis::cte::CteId;
 use crate::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr, UnOp};
@@ -2528,9 +2529,9 @@ impl<'a> ContractLoweringVisitor<'a> {
         }
         let mut variant_by_output = BTreeMap::new();
         for descriptor in &scan.variant_columns {
-            if descriptor.synthetic_column_id == descriptor.source_column_id
+            if descriptor.synthetic_column_id() == descriptor.source_column_id()
                 || variant_by_output
-                    .insert(descriptor.synthetic_column_id, descriptor)
+                    .insert(descriptor.synthetic_column_id(), descriptor)
                     .is_some()
             {
                 return Err(ContractLoweringError::InvalidFunctionBinding {
@@ -2625,13 +2626,13 @@ impl<'a> ContractLoweringVisitor<'a> {
             let output_ordinal = plan
                 .output_columns
                 .iter()
-                .position(|column| column.column_id == descriptor.synthetic_column_id)
+                .position(|column| column.column_id == descriptor.synthetic_column_id())
                 .ok_or(ContractLoweringError::UnknownColumnReference(
-                    descriptor.synthetic_column_id,
+                    descriptor.synthetic_column_id(),
                 ))?;
             let output_column = &plan.output_columns[output_ordinal];
-            if output_column.name != descriptor.synthetic_column
-                || output_column.value_type.data_type != descriptor.requested_type
+            if output_column.name != descriptor.synthetic_column()
+                || output_column.value_type.data_type != *descriptor.requested_type()
                 || !output_column.value_type.nullable
             {
                 return Err(ContractLoweringError::OutputColumnMismatch {
@@ -2643,11 +2644,11 @@ impl<'a> ContractLoweringVisitor<'a> {
             let source_column = plan
                 .output_columns
                 .iter()
-                .find(|column| column.column_id == descriptor.source_column_id)
+                .find(|column| column.column_id == descriptor.source_column_id())
                 .ok_or(ContractLoweringError::UnknownColumnReference(
-                    descriptor.source_column_id,
+                    descriptor.source_column_id(),
                 ))?;
-            if source_column.name != descriptor.source_column {
+            if source_column.name != descriptor.source_column() {
                 return Err(ContractLoweringError::OutputColumnMismatch {
                     node: "Scan",
                     ordinal: output_ordinal,
@@ -2655,10 +2656,10 @@ impl<'a> ContractLoweringVisitor<'a> {
                         .to_string(),
                 });
             }
-            let source_value = columns.get(&descriptor.source_column_id).copied().ok_or(
-                ContractLoweringError::UnknownColumnReference(descriptor.source_column_id),
+            let source_value = columns.get(&descriptor.source_column_id()).copied().ok_or(
+                ContractLoweringError::UnknownColumnReference(descriptor.source_column_id()),
             )?;
-            let binding = &descriptor.binding;
+            let binding = descriptor.binding();
             let expected_result = value_type(output_column);
             let expected_arguments = Box::from([
                 FunctionArgumentType::Value(value_type(source_column)),
@@ -2666,15 +2667,15 @@ impl<'a> ContractLoweringVisitor<'a> {
                 FunctionArgumentType::Value(ValueType::new(DataType::Utf8, false)),
             ]);
             if novarocks_types::value::variant::variant_get_target_type(
-                &descriptor.requested_type_literal,
+                descriptor.requested_type_literal(),
             )
             .as_ref()
-                != Ok(&descriptor.requested_type)
+                != Ok(descriptor.requested_type())
             {
                 return Err(ContractLoweringError::InvalidFunctionBinding {
                     detail: format!(
                         "derived VARIANT output {} has inconsistent requested type metadata",
-                        descriptor.synthetic_column_id
+                        descriptor.synthetic_column_id()
                     ),
                 });
             }
@@ -2688,7 +2689,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 return Err(ContractLoweringError::InvalidFunctionBinding {
                     detail: format!(
                         "derived VARIANT output {} has an inconsistent exact scalar binding",
-                        descriptor.synthetic_column_id
+                        descriptor.synthetic_column_id()
                     ),
                 });
             }
@@ -2697,9 +2698,16 @@ impl<'a> ContractLoweringVisitor<'a> {
                 value_type(source_column),
                 ContractExprKind::Value(source_value),
             )?;
-            let path_expression = self.author_utf8_expression(node, &descriptor.canonical_path)?;
-            let type_expression =
-                self.author_utf8_expression(node, &descriptor.requested_type_literal)?;
+            let path_expression = self.lower_constant_expression(
+                node,
+                descriptor.source().canonical_path(),
+                ValueType::new(DataType::Utf8, false),
+            )?;
+            let type_expression = self.lower_constant_expression(
+                node,
+                descriptor.source().type_literal(),
+                ValueType::new(DataType::Utf8, false),
+            )?;
             let expression = self.fragment_mut().add_expression(
                 node,
                 expected_result.clone(),
@@ -2707,6 +2715,16 @@ impl<'a> ContractLoweringVisitor<'a> {
                     function: bound_function_from_resolved(binding, &expected_result),
                     args: Box::from([source_expression, path_expression, type_expression]),
                 },
+            )?;
+            self.work.flush()?;
+            let source = Arc::clone(descriptor.source());
+            self.work.step()?;
+            self.work.flush()?;
+            self.record_expression_source_with_data(
+                node,
+                expression,
+                LoweredExpressionLogicalSource::DerivedVariant(source),
+                SqlExpressionCallKind::DerivedVariant,
             )?;
             let value = self.fragment_mut().add_value(
                 expected_result,
@@ -8243,6 +8261,21 @@ impl<'a> ContractLoweringVisitor<'a> {
         captured: CapturedLogicalCallArguments,
         kind: SqlExpressionCallKind,
     ) -> Result<(), ContractLoweringError> {
+        self.record_expression_source_with_data(
+            owner,
+            emitted,
+            LoweredExpressionLogicalSource::Owned(captured),
+            kind,
+        )
+    }
+
+    fn record_expression_source_with_data(
+        &mut self,
+        owner: NodeId,
+        emitted: ExprId,
+        captured: LoweredExpressionLogicalSource,
+        kind: SqlExpressionCallKind,
+    ) -> Result<(), ContractLoweringError> {
         self.work.flush()?;
         let mut arguments = Vec::new();
         arguments
@@ -8258,7 +8291,9 @@ impl<'a> ContractLoweringVisitor<'a> {
         let (args, order) = match (&source.kind, kind) {
             (
                 ContractExprKind::FunctionCall { args, .. },
-                SqlExpressionCallKind::Scalar | SqlExpressionCallKind::ValueConversion,
+                SqlExpressionCallKind::Scalar
+                | SqlExpressionCallKind::ValueConversion
+                | SqlExpressionCallKind::DerivedVariant,
             ) => (args.as_ref(), &[][..]),
             (
                 ContractExprKind::WindowCall {
@@ -12904,23 +12939,17 @@ mod tests {
                             synthetic.column_id,
                             row_id.column_id,
                         ]),
-                        variant_columns: vec![crate::common::ScanVariantColumn {
-                            source_column_id: payload.column_id,
-                            source_column: payload.name.clone(),
-                            synthetic_column_id: synthetic.column_id,
-                            synthetic_column: synthetic.name.clone(),
-                            canonical_path: "$.k".to_string(),
-                            requested_type: DataType::Utf8,
-                            requested_type_literal: "string".to_string(),
-                            strict: true,
-                            binding: crate::analysis::test_function_binding(
-                                "variant_get",
-                                &binding_args,
-                                DataType::Utf8,
-                                true,
-                                novarocks_functions::FunctionVolatility::Immutable,
-                            ),
-                        }],
+                        variant_columns: vec![crate::common::ScanVariantColumn::test_fixture(
+                            payload.column_id,
+                            payload.name.clone(),
+                            synthetic.column_id,
+                            synthetic.name.clone(),
+                            "$.k".to_owned(),
+                            DataType::Utf8,
+                            "string".to_owned(),
+                            true,
+                            binding_args[0].value_type.clone(),
+                        )],
                         mv_rewritten_from: None,
                     },
                 )
@@ -13026,14 +13055,79 @@ mod tests {
         let reads = FinalizedProviderReadSet::single_for_test(
             binding,
             ProviderReadOccurrenceId::new(0),
-            contract,
+            contract.clone(),
             novarocks_physical_plan::ScanReadBudget {
                 max_batch_rows: 1024,
                 max_batch_bytes: 1 << 20,
             },
         );
 
-        let final_plan = lower_final_physical_plan_with_provider_reads(
+        #[derive(Default)]
+        struct PrefixControl {
+            trace: std::sync::Mutex<Vec<(CompilePhase, u32)>>,
+            refusal: Option<(usize, CompileControlError)>,
+        }
+        impl PureCompileControl for PrefixControl {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                assert!(units <= 256);
+                let mut trace = self.trace.lock().unwrap();
+                let at = trace.len();
+                if let Some((stop, _)) = self.refusal {
+                    assert!(at <= stop, "callback after original derived-source refusal");
+                }
+                trace.push((phase, units));
+                match self.refusal {
+                    Some((stop, cause)) if stop == at => Err(cause),
+                    _ => Ok(()),
+                }
+            }
+        }
+        let functions = crate::functions::builtin_sql_function_catalog().snapshot();
+        let capture = |control: &dyn PureCompileControl| {
+            lower_final_physical_plan_with_provider_reads(
+                &plan,
+                version(),
+                dop(),
+                FinalizedProviderReadSet::single_for_test(
+                    binding,
+                    ProviderReadOccurrenceId::new(0),
+                    contract.clone(),
+                    novarocks_physical_plan::ScanReadBudget {
+                        max_batch_rows: 1024,
+                        max_batch_bytes: 1 << 20,
+                    },
+                ),
+                Arc::clone(&functions),
+                false,
+                crate::constant::test_constant_policy(),
+                control,
+            )
+        };
+        let baseline = PrefixControl::default();
+        assert!(capture(&baseline).is_ok());
+        let trace = baseline.trace.lock().unwrap().clone();
+        for stop in 0..trace.len() {
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let control = PrefixControl {
+                    refusal: Some((stop, cause)),
+                    ..PrefixControl::default()
+                };
+                assert!(
+                    matches!(capture(&control),Err(ContractLoweringError::Control(actual)) if actual==cause)
+                );
+                assert_eq!(*control.trace.lock().unwrap(), trace[..=stop]);
+            }
+        }
+
+        let source_owner = lower_final_physical_plan_with_provider_reads(
             &plan,
             version(),
             dop(),
@@ -13045,9 +13139,8 @@ mod tests {
         )
         .unwrap()
         .finish_observed(&crate::compiler::SqlCompileControl::unbounded())
-        .expect("interleaved scan output must finish validation")
-        .plan()
-        .clone();
+        .expect("interleaved scan output must finish validation");
+        let final_plan = source_owner.plan();
         let fragment = final_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
         let root = fragment.nodes().get(&fragment.root()).unwrap();
         assert_eq!(root.output.columns.len(), 3);
@@ -13075,6 +13168,63 @@ mod tests {
                 .origin,
             ValueOrigin::ProviderField { .. }
         ));
+        let ValueOrigin::Expr { expr, .. } = fragment
+            .values()
+            .get(&root.output.columns[1])
+            .unwrap()
+            .origin
+        else {
+            unreachable!()
+        };
+        let emitted = fragment.expressions().get(expr).unwrap();
+        let loan_control = crate::compiler::SqlCompileControl::unbounded();
+        let mut work = CompileCheckpoints::try_new(&loan_control, CompilePhase::Validate).unwrap();
+        // The source owner loans the exact descriptor creation payload. This
+        // structural scan fixture makes no installed VARIANT capability claim.
+        let checked = source_owner
+            .checked_variant_source_observed(fragment, emitted, &mut work)
+            .unwrap();
+        let PhysicalPlanKind::Scan(scan) = &plan.kind else {
+            unreachable!()
+        };
+        let original = scan.variant_columns[0].source();
+        assert!(std::ptr::eq(checked.captured(), original.captured()));
+        assert!(std::ptr::eq(
+            checked.captured().binding().resolved(),
+            scan.variant_columns[0].binding().resolved()
+        ));
+        assert!(matches!(
+            &checked.captured().request().arguments[0],
+            novarocks_functions::FunctionArgument::Value { constant: None, .. }
+        ));
+        for (argument, original_value) in checked.arguments()[1..]
+            .iter()
+            .zip([original.canonical_path(), original.type_literal()])
+        {
+            let ContractExprKind::Constant(reference) =
+                fragment.expressions().get(*argument).unwrap().kind
+            else {
+                unreachable!()
+            };
+            let actual = final_plan
+                .constants()
+                .resolve_source_observed(reference, &mut work)
+                .unwrap();
+            assert_eq!(actual.ordinal(), original_value.ordinal());
+            assert_eq!(
+                actual.pool().backing_identity(),
+                original_value.pool().backing_identity()
+            );
+            assert!(Arc::ptr_eq(
+                actual.pool().field_ref(),
+                original_value.pool().field_ref()
+            ));
+        }
+        assert!(matches!(
+            source_owner.checked_scalar_source_observed(fragment, emitted, &mut work),
+            Err(super::super::lowered_draft::SqlSourceJournalError::InvalidSource(_))
+        ));
+        work.finish().unwrap();
         let Distribution::Hash { keys, .. } = &root.output_properties.distribution else {
             panic!("expected provider hash distribution");
         };

@@ -303,26 +303,26 @@ mod tests {
         let scan = scan_from_plan(&rewritten);
         assert_eq!(scan.variant_columns.len(), 1);
         let descriptor = &scan.variant_columns[0];
-        assert_eq!(descriptor.source_column_id, source_column.column_id);
-        assert_eq!(descriptor.source_column, "v");
-        assert_eq!(descriptor.synthetic_column, "__nr_var_v_0");
-        assert_eq!(descriptor.canonical_path, "$.a");
-        assert_eq!(descriptor.requested_type, DataType::Int64);
-        assert_eq!(descriptor.requested_type_literal, "bigint");
+        assert_eq!(descriptor.source_column_id(), source_column.column_id);
+        assert_eq!(descriptor.source_column(), "v");
+        assert_eq!(descriptor.synthetic_column(), "__nr_var_v_0");
+        assert_eq!(descriptor.canonical_path(), "$.a");
+        assert_eq!(descriptor.requested_type(), &DataType::Int64);
+        assert_eq!(descriptor.requested_type_literal(), "bigint");
         assert_eq!(
-            descriptor.binding.kind,
+            descriptor.binding().kind,
             novarocks_functions::FunctionKind::Scalar
         );
-        assert_eq!(descriptor.binding.logical_argument_count, 3);
-        assert!(descriptor.strict);
-        assert_ne!(descriptor.synthetic_column_id, source_column.column_id);
+        assert_eq!(descriptor.binding().logical_argument_count, 3);
+        assert!(descriptor.strict());
+        assert_ne!(descriptor.synthetic_column_id(), source_column.column_id);
 
         let synthetic_output = scan
             .columns
             .iter()
-            .find(|column| column.column_id == descriptor.synthetic_column_id)
+            .find(|column| column.column_id == descriptor.synthetic_column_id())
             .expect("synthetic scan output");
-        assert_eq!(synthetic_output.name, descriptor.synthetic_column);
+        assert_eq!(synthetic_output.name, descriptor.synthetic_column());
         assert_eq!(synthetic_output.value_type.data_type, DataType::Int64);
         assert!(synthetic_output.value_type.nullable);
         assert!(synthetic_output.is_internal);
@@ -330,7 +330,7 @@ mod tests {
         let rewritten_left = binary_column_ref_side(&filter.predicate);
         assert_eq!(
             column_ref_id(rewritten_left),
-            descriptor.synthetic_column_id
+            descriptor.synthetic_column_id()
         );
         assert_eq!(rewritten_left.value_type.data_type, DataType::Int64);
         assert!(rewritten_left.value_type.nullable);
@@ -364,10 +364,10 @@ mod tests {
         let scan = scan_from_plan(&rewritten);
         assert_eq!(scan.variant_columns.len(), 1);
         let descriptor = &scan.variant_columns[0];
-        assert_eq!(descriptor.synthetic_column, "__nr_var_v_0");
+        assert_eq!(descriptor.synthetic_column(), "__nr_var_v_0");
         assert_eq!(
             column_ref_id(&project.items[0].expr),
-            descriptor.synthetic_column_id
+            descriptor.synthetic_column_id()
         );
         assert_eq!(project.items[0].output_column_id, project_output);
     }
@@ -479,7 +479,7 @@ mod tests {
         };
         let scan = scan_from_plan(&rewritten);
         assert_eq!(scan.variant_columns.len(), 1);
-        let synthetic_id = scan.variant_columns[0].synthetic_column_id;
+        let synthetic_id = scan.variant_columns[0].synthetic_column_id();
         assert_eq!(column_ref_id(&project.items[0].expr), synthetic_id);
         assert_eq!(
             column_ref_id(binary_column_ref_side(&filter.predicate)),
@@ -522,7 +522,7 @@ mod tests {
         assert!(changed_once);
         let scan_once = scan_from_plan(&rewritten_once);
         assert_eq!(scan_once.variant_columns.len(), 1);
-        let synthetic_id = scan_once.variant_columns[0].synthetic_column_id;
+        let synthetic_id = scan_once.variant_columns[0].synthetic_column_id();
         let before_second = format!("{rewritten_once:?}");
 
         let (rewritten_twice, changed_twice) = rewrite(rewritten_once, Rc::clone(&factory));
@@ -532,7 +532,7 @@ mod tests {
         let scan_twice = scan_from_plan(&rewritten_twice);
         assert_eq!(scan_twice.variant_columns.len(), 1);
         assert_eq!(
-            scan_twice.variant_columns[0].synthetic_column_id,
+            scan_twice.variant_columns[0].synthetic_column_id(),
             synthetic_id
         );
     }
@@ -561,7 +561,7 @@ mod tests {
         assert!(changed);
         let scan = scan_from_plan(&rewritten);
         assert_eq!(scan.variant_columns.len(), 1);
-        assert!(!scan.variant_columns[0].strict);
+        assert!(!scan.variant_columns[0].strict());
     }
 
     #[test]
@@ -588,7 +588,7 @@ mod tests {
         assert_eq!(scan.variant_columns.len(), 1);
         assert_eq!(
             column_ref_id(binary_column_ref_side(&scan.predicates[0])),
-            scan.variant_columns[0].synthetic_column_id
+            scan.variant_columns[0].synthetic_column_id()
         );
     }
 
@@ -836,5 +836,8 @@ mod tests {
             assert!(!changed, "{name}");
             assert_eq!(format!("{rewritten:?}"), before, "{name}");
         }
+    }
+    mod source_tests {
+        include!("source_tests.rs");
     }
 }

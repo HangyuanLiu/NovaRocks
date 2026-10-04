@@ -134,7 +134,7 @@ fn lower_column(
     if scan
         .variant_columns
         .iter()
-        .any(|column| column.synthetic_column_id == *column_id)
+        .any(|column| column.synthetic_column_id() == *column_id)
     {
         return None;
     }

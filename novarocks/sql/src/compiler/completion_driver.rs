@@ -1054,7 +1054,7 @@ fn provider_columns(
     let mut synthetic = BTreeSet::new();
     for column in &scan.variant_columns {
         work.step()?;
-        synthetic.insert(column.synthetic_column_id);
+        synthetic.insert(column.synthetic_column_id());
     }
     let source_columns = scan
         .table

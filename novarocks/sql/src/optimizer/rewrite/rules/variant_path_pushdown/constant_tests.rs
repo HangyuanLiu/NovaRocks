@@ -320,10 +320,10 @@ fn selected_multirow_text_carriers_push_exact_path_type_and_preserve_metadata_so
         };
         assert_eq!(scan.variant_columns.len(), 1);
         assert_eq!(
-            scan.variant_columns[0].canonical_path,
+            scan.variant_columns[0].canonical_path(),
             request.canonical_path
         );
-        assert_eq!(scan.variant_columns[0].binding, request.binding);
+        assert_eq!(scan.variant_columns[0].binding(), &request.binding);
         for original in [&path, &target] {
             assert_eq!(
                 original.pool().field_ref().metadata()["provider.unknown"],

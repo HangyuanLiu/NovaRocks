@@ -21,6 +21,7 @@ pub(crate) mod imv;
 pub(crate) mod plan_hints;
 pub(crate) mod row_lineage;
 pub(crate) mod schema;
+pub(crate) mod variant_source;
 
 #[allow(unused_imports)]
 pub(crate) use change_stream::{

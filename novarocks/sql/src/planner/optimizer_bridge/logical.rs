@@ -1036,23 +1036,19 @@ mod tests {
     fn variant_path_scan_descriptor_survives_physical_conversion() {
         let source_column_id = ColumnId::new_for_test(100);
         let synthetic_column_id = ColumnId::new_for_test(101);
-        let variant_descriptor = ScanVariantColumn {
+        let source_type =
+            novarocks_type_contract::FunctionValueType::new(DataType::LargeBinary, true);
+        let variant_descriptor = ScanVariantColumn::test_fixture(
             source_column_id,
-            source_column: "payload".to_string(),
+            "payload".to_string(),
             synthetic_column_id,
-            synthetic_column: "__nr_var_payload_0".to_string(),
-            canonical_path: "$.user.id".to_string(),
-            requested_type: DataType::Int64,
-            requested_type_literal: "bigint".to_string(),
-            strict: true,
-            binding: crate::analysis::test_function_binding(
-                "variant_get",
-                &[],
-                DataType::Int64,
-                true,
-                novarocks_functions::FunctionVolatility::Immutable,
-            ),
-        };
+            "__nr_var_payload_0".to_string(),
+            "$.user.id".to_string(),
+            DataType::Int64,
+            "bigint".to_string(),
+            true,
+            source_type.clone(),
+        );
 
         let scan = LogicalPlanNode::new(
             LogicalPlanKind::Scan(PlanScanNode {
@@ -1063,10 +1059,7 @@ mod tests {
                     OutputColumn {
                         column_id: source_column_id,
                         name: "payload".to_string(),
-                        value_type: novarocks_type_contract::FunctionValueType::new(
-                            DataType::LargeBinary,
-                            true,
-                        ),
+                        value_type: source_type.clone(),
 
                         is_internal: false,
                     },
@@ -1114,16 +1107,34 @@ mod tests {
         assert_eq!(scan.stats_ref, Some(stats_ref));
         assert_eq!(scan.variant_columns.len(), 1);
         let actual = &scan.variant_columns[0];
-        assert_eq!(actual.source_column_id, variant_descriptor.source_column_id);
-        assert_eq!(actual.source_column, variant_descriptor.source_column);
         assert_eq!(
-            actual.synthetic_column_id,
-            variant_descriptor.synthetic_column_id
+            actual.source_column_id(),
+            variant_descriptor.source_column_id()
         );
-        assert_eq!(actual.synthetic_column, variant_descriptor.synthetic_column);
-        assert_eq!(actual.canonical_path, variant_descriptor.canonical_path);
-        assert_eq!(actual.requested_type, variant_descriptor.requested_type);
-        assert_eq!(actual.strict, variant_descriptor.strict);
+        assert_eq!(actual.source_column(), variant_descriptor.source_column());
+        assert_eq!(
+            actual.synthetic_column_id(),
+            variant_descriptor.synthetic_column_id()
+        );
+        assert_eq!(
+            actual.synthetic_column(),
+            variant_descriptor.synthetic_column()
+        );
+        assert_eq!(actual.canonical_path(), variant_descriptor.canonical_path());
+        assert_eq!(actual.requested_type(), variant_descriptor.requested_type());
+        assert_eq!(actual.strict(), variant_descriptor.strict());
+        assert!(Arc::ptr_eq(actual.source(), variant_descriptor.source()));
+        let request = actual.source().captured().request();
+        assert_eq!(request.arguments.len(), 3);
+        let novarocks_functions::FunctionArgument::Value {
+            value_type,
+            constant,
+        } = &request.arguments[0]
+        else {
+            panic!("original variant source channel");
+        };
+        assert_eq!(value_type, &source_type);
+        assert!(constant.is_none());
     }
 
     #[test]

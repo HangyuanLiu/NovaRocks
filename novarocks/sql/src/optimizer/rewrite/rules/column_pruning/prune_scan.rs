@@ -205,21 +205,21 @@ impl LogicalRewriteRule for PruneScanColumns {
             .variant_columns
             .iter()
             .filter(|descriptor| {
-                needed.contains(&descriptor.synthetic_column_id)
-                    || pred_col_ids.contains(&descriptor.synthetic_column_id)
+                needed.contains(&descriptor.synthetic_column_id())
+                    || pred_col_ids.contains(&descriptor.synthetic_column_id())
             })
-            .map(|descriptor| descriptor.synthetic_column_id)
+            .map(|descriptor| descriptor.synthetic_column_id())
             .collect::<HashSet<_>>();
         let all_synthetic = node
             .variant_columns
             .iter()
-            .map(|descriptor| descriptor.synthetic_column_id)
+            .map(|descriptor| descriptor.synthetic_column_id())
             .collect::<HashSet<_>>();
         let variant_sources = node
             .variant_columns
             .iter()
-            .filter(|descriptor| retained_synthetic.contains(&descriptor.synthetic_column_id))
-            .map(|descriptor| descriptor.source_column_id)
+            .filter(|descriptor| retained_synthetic.contains(&descriptor.synthetic_column_id()))
+            .map(|descriptor| descriptor.source_column_id())
             .collect::<HashSet<_>>();
         let required_columns = node
             .columns
@@ -259,7 +259,7 @@ impl LogicalRewriteRule for PruneScanColumns {
         });
         let variant_count = node.variant_columns.len();
         node.variant_columns
-            .retain(|descriptor| retained_synthetic.contains(&descriptor.synthetic_column_id));
+            .retain(|descriptor| retained_synthetic.contains(&descriptor.synthetic_column_id()));
 
         let unchanged = node.required_columns.as_ref() == Some(&required_columns)
             && node.columns.len() == column_count
@@ -555,23 +555,17 @@ mod tests {
 
             is_internal: true,
         });
-        scan.variant_columns.push(ScanVariantColumn {
-            source_column_id: source_id,
-            source_column: "payload".to_string(),
-            synthetic_column_id: synthetic_id,
-            synthetic_column: "__nr_var_payload_0".to_string(),
-            canonical_path: "$.id".to_string(),
-            requested_type: DataType::Int64,
-            requested_type_literal: "bigint".to_string(),
-            strict: true,
-            binding: crate::analysis::test_function_binding(
-                "variant_get",
-                &args,
-                DataType::Int64,
-                true,
-                novarocks_functions::FunctionVolatility::Immutable,
-            ),
-        });
+        scan.variant_columns.push(ScanVariantColumn::test_fixture(
+            source_id,
+            "payload".to_string(),
+            synthetic_id,
+            "__nr_var_payload_0".to_string(),
+            "$.id".to_string(),
+            DataType::Int64,
+            "bigint".to_string(),
+            true,
+            args[0].value_type.clone(),
+        ));
 
         let rule = PruneScanColumns;
         let mut ctx = ctx_with_arena();
@@ -605,23 +599,17 @@ mod tests {
 
             is_internal: true,
         });
-        scan.variant_columns.push(ScanVariantColumn {
-            source_column_id: source_id,
-            source_column: "payload".to_string(),
-            synthetic_column_id: synthetic_id,
-            synthetic_column: "__nr_var_payload_0".to_string(),
-            canonical_path: "$.id".to_string(),
-            requested_type: DataType::Int64,
-            requested_type_literal: "bigint".to_string(),
-            strict: true,
-            binding: crate::analysis::test_function_binding(
-                "variant_get",
-                &[],
-                DataType::Int64,
-                true,
-                novarocks_functions::FunctionVolatility::Immutable,
-            ),
-        });
+        scan.variant_columns.push(ScanVariantColumn::test_fixture(
+            source_id,
+            "payload".to_string(),
+            synthetic_id,
+            "__nr_var_payload_0".to_string(),
+            "$.id".to_string(),
+            DataType::Int64,
+            "bigint".to_string(),
+            true,
+            scan.columns[0].value_type.clone(),
+        ));
 
         let rule = PruneScanColumns;
         let mut ctx = ctx_with_arena();
