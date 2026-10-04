@@ -16,6 +16,9 @@
 // under the License.
 
 use super::tests::{column, dop, stats, values, version};
+#[path = "lowered_conversion_canonical_tests.rs"]
+mod lowered_conversion_canonical_tests;
+
 use super::*;
 use crate::compiler::SqlAuthoredPhysicalPlan;
 use crate::planner::distributed::build::lowered_draft::{
