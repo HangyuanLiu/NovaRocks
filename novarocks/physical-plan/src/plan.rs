@@ -541,8 +541,10 @@ pub struct WriterAggregateCall {
 #[derive(Clone, Debug, PartialEq)]
 pub enum UnpivotConstant {
     Scalar(ExprId),
-    Int32List(Box<[i32]>),
-    Utf8Map(Box<[(Box<str>, Box<str>)]>),
+    /// Selected rows in the enclosing plan's original checked constant pools.
+    /// These addresses do not authorize a logical domain or reconstruct data.
+    Int32List(crate::ConstantReference),
+    Utf8Map(crate::ConstantReference),
 }
 
 #[derive(Clone, Debug, PartialEq)]

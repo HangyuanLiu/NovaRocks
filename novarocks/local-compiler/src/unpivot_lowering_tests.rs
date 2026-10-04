@@ -16,12 +16,12 @@
 // under the License.
 
 use super::*;
-use arrow_array::{Array, ListArray, StringArray};
+use arrow_array::{Array, ListArray, MapArray, StringArray, StructArray};
 use arrow_schema::{DataType, Field};
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_functions::{
-    ConstantPolicy, ConstantPool, EngineFunctionCatalogBuilder, FunctionId, FunctionKind,
-    FunctionOverloadId, InstalledPureKernel, PureEngineFunctionCatalog,
+    ConstantError, ConstantPolicy, ConstantPool, EngineFunctionCatalogBuilder, FunctionId,
+    FunctionKind, FunctionOverloadId, InstalledPureKernel, PureEngineFunctionCatalog,
     PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
 };
 use novarocks_local_program::{
@@ -30,12 +30,13 @@ use novarocks_local_program::{
     ProgramNodeId, ProgramNodeKind, StaticExprKind, UnpivotConstant as LocalConstant,
 };
 use novarocks_physical_plan::{
-    ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentBuilder, FragmentCuts,
-    FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentPackageInput, FragmentSink,
-    FrozenFragmentCalls, FrozenFragmentPruning, LiteralValue, NodeId, NodeKind,
-    PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId,
-    PropertyProofProjectionLimits, RequiredContracts, ResultField, ResultPort, UnpivotConstant,
-    UnpivotSpec, UnpivotValueMapping, ValueId, ValueOrigin,
+    ConstantPoolId, ConstantPools, ConstantReference, ConstantReferenceError, ExprKind,
+    FragmentBuilder, FragmentCuts, FragmentId, FragmentPackage, FragmentPackageAdmission,
+    FragmentPackageError, FragmentPackageInput, FragmentSink, FrozenFragmentCalls,
+    FrozenFragmentPruning, LiteralValue, NodeId, NodeKind, PhysicalExpressionRoots,
+    PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits,
+    RequiredContracts, ResultField, ResultPort, UnpivotConstant, UnpivotSpec, UnpivotValueMapping,
+    ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, ControlShape, EvaluationDomainId, ExpressionControlFlow,
@@ -137,6 +138,11 @@ enum Shape {
     BadScalar,
     BadMapOrder,
     ZeroBounds,
+    JoinedCollectionNullable,
+    MissingCollectionPool,
+    BadCollectionOrdinal,
+    BadCollectionType,
+    BadCollectionNullable,
 }
 struct Fixture {
     package: Arc<FragmentPackage>,
@@ -189,6 +195,104 @@ fn map_type() -> DataType {
         false,
     )
 }
+fn checked_list_pool(first: i32, nullable: bool, wrong_type: bool) -> ConstantPool {
+    let (ty, data) = if wrong_type {
+        let field = Arc::new(Field::new("item", DataType::Int64, false));
+        let raw = ListArray::from_iter_primitive::<arrow_array::types::Int64Type, _, _>([
+            Some(vec![Some(9999)]),
+            Some(vec![Some(i64::from(first)), Some(-2)]),
+            Some(vec![Some(i64::from(first) + 1), Some(-2)]),
+        ]);
+        let array = ListArray::try_new(
+            field.clone(),
+            raw.offsets().clone(),
+            raw.values().clone(),
+            None,
+        )
+        .unwrap();
+        (
+            FunctionValueType::new(DataType::List(field), nullable),
+            array.to_data(),
+        )
+    } else {
+        let DataType::List(field) = list_type() else {
+            unreachable!()
+        };
+        let raw = ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>([
+            Some(vec![Some(9999)]),
+            Some(vec![Some(first), Some(-2)]),
+            Some(vec![Some(first + 1), Some(-2)]),
+        ]);
+        let array = ListArray::try_new(
+            field.clone(),
+            raw.offsets().clone(),
+            raw.values().clone(),
+            None,
+        )
+        .unwrap();
+        (
+            FunctionValueType::new(DataType::List(field), nullable),
+            array.to_data(),
+        )
+    };
+    ConstantPool::try_new(
+        Arc::new(ty.try_to_field("original-special-list").unwrap()),
+        ty,
+        data,
+        options().constants,
+        CompilePhase::Validate,
+        &Control,
+    )
+    .unwrap()
+}
+fn checked_map_pool(bad_order: bool) -> ConstantPool {
+    let ty = FunctionValueType::new(map_type(), false);
+    let DataType::Map(entries, _) = &ty.data_type else {
+        unreachable!()
+    };
+    let DataType::Struct(fields) = entries.data_type() else {
+        unreachable!()
+    };
+    let keys = if bad_order {
+        vec!["unused", "zz", "z", "a", "z", "a"]
+    } else {
+        vec!["unused", "zz", "a", "z", "a", "z"]
+    };
+    let children = StructArray::try_new(
+        fields.clone(),
+        vec![
+            Arc::new(StringArray::from(keys)),
+            Arc::new(StringArray::from(vec![
+                "unused", "unused", "λ\0", "tail", "λ\0", "tail",
+            ])),
+        ],
+        None,
+    )
+    .unwrap();
+    let offsets = ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>([
+        Some(vec![Some(0), Some(0)]),
+        Some(vec![Some(0), Some(0)]),
+        Some(vec![Some(0), Some(0)]),
+    ]);
+    let array = MapArray::try_new(
+        entries.clone(),
+        offsets.offsets().clone(),
+        children,
+        None,
+        false,
+    )
+    .unwrap();
+    ConstantPool::try_new(
+        Arc::new(ty.try_to_field("original-special-map").unwrap()),
+        ty,
+        array.to_data(),
+        options().constants,
+        CompilePhase::Validate,
+        &Control,
+    )
+    .unwrap()
+}
+
 fn fixture(
     shape: Shape,
     mappings: usize,
@@ -280,6 +384,24 @@ fn fixture(
         .unwrap();
         scalar_type = FunctionValueType::new(DataType::List(field), true);
         data = array.to_data();
+    } else if matches!(shape, Shape::JoinedCollectionNullable) {
+        let DataType::List(field) = list_type() else {
+            unreachable!()
+        };
+        let raw = ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>([
+            Some(vec![Some(999)]),
+            Some(vec![Some(2), Some(-2)]),
+            None,
+        ]);
+        let array = ListArray::try_new(
+            field.clone(),
+            raw.offsets().clone(),
+            raw.values().clone(),
+            raw.nulls().cloned(),
+        )
+        .unwrap();
+        scalar_type = FunctionValueType::new(DataType::List(field), true);
+        data = array.to_data();
     } else {
         scalar_type = FunctionValueType::new(DataType::Utf8, true);
         data = StringArray::from(vec![Some("unused"), Some("selected-λ\0"), None]).to_data();
@@ -338,7 +460,10 @@ fn fixture(
             nullable.clone()
         },
         scalar_type.clone(),
-        FunctionValueType::new(list_type(), false),
+        FunctionValueType::new(
+            list_type(),
+            matches!(shape, Shape::JoinedCollectionNullable),
+        ),
         FunctionValueType::new(map_type(), false),
     ];
     for (ordinal, ty) in types.into_iter().enumerate() {
@@ -370,12 +495,41 @@ fn fixture(
     } else {
         mappings
     };
+    let mut constants = ConstantPools::empty();
+    constants.insert(pool_id, pool)?;
+    let map_pool_id = ConstantPoolId::new(u32::MAX - 1);
+    if actual_mappings != 0 {
+        constants.insert(
+            map_pool_id,
+            checked_map_pool(matches!(shape, Shape::BadMapOrder)),
+        )?;
+    }
     let mut items = Vec::new();
     for index in 0..actual_mappings {
-        let entries = if matches!(shape, Shape::BadMapOrder) {
-            vec![("z".into(), "one".into()), ("a".into(), "two".into())]
-        } else {
-            vec![("a".into(), "λ\0".into()), ("z".into(), "tail".into())]
+        // Each pair shares the original three-row backing and selects a
+        // different nonzero ordinal. The unused row is never copied to LP.
+        let list_pool_id = ConstantPoolId::new((index / 2) as u32);
+        if index % 2 == 0 {
+            constants.insert(
+                list_pool_id,
+                checked_list_pool(
+                    index as i32,
+                    matches!(shape, Shape::BadCollectionNullable),
+                    matches!(shape, Shape::BadCollectionType),
+                ),
+            )?;
+        }
+        let list_reference = ConstantReference {
+            pool: if matches!(shape, Shape::MissingCollectionPool) {
+                ConstantPoolId::new(u32::MAX - 2)
+            } else {
+                list_pool_id
+            },
+            ordinal: if matches!(shape, Shape::BadCollectionOrdinal) {
+                42
+            } else {
+                1 + (index % 2) as u32
+            },
         };
         items.push(UnpivotValueMapping {
             input: if index % 2 == 0 { child[0] } else { child[2] },
@@ -385,8 +539,15 @@ fn fixture(
                 } else {
                     null_expr
                 })),
-                UnpivotConstant::Int32List(vec![index as i32, -2].into()),
-                UnpivotConstant::Utf8Map(entries.into_boxed_slice()),
+                if matches!(shape, Shape::JoinedCollectionNullable) && index % 2 == 1 {
+                    UnpivotConstant::Scalar(null_expr)
+                } else {
+                    UnpivotConstant::Int32List(list_reference)
+                },
+                UnpivotConstant::Utf8Map(ConstantReference {
+                    pool: map_pool_id,
+                    ordinal: 1 + (index % 2) as u32,
+                }),
             ]
             .into_boxed_slice(),
         });
@@ -488,8 +649,6 @@ fn fixture(
             .collect::<Vec<_>>()
             .into_boxed_slice(),
     };
-    let mut constants = ConstantPools::empty();
-    constants.insert(pool_id, pool)?;
     let package = FragmentPackage::try_new(
         FragmentPackageInput {
             constants,
@@ -571,6 +730,27 @@ fn unpivot_complete_lowering_preserves_ordered_roles_repeated_sources_constants_
     assert_eq!(*value_output_slot_id, slots[2]);
     assert_eq!(literal_output_slot_ids, &vec![slots[3], slots[4], slots[5]]);
     assert_eq!(value_mappings.len(), 2);
+    let NodeKind::Unpivot { spec } = &source.package.fragment().nodes()[&source.unpivot].kind
+    else {
+        panic!("original checked source")
+    };
+    for position in [1, 2] {
+        let references = spec
+            .mappings
+            .iter()
+            .map(|mapping| match &mapping.constants[position] {
+                UnpivotConstant::Int32List(reference) | UnpivotConstant::Utf8Map(reference) => {
+                    *reference
+                }
+                _ => panic!("actual checked collection reference"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(references[0].pool, references[1].pool);
+        assert_eq!((references[0].ordinal, references[1].ordinal), (1, 2));
+        let original = &source.package.constants().entries()[&references[0].pool];
+        assert_eq!(original.resource_facts().rows, 3);
+        assert!(!original.value_type().nullable);
+    }
     assert_eq!(value_mappings[0].input_value_slot_id, old[0]);
     assert_eq!(value_mappings[1].input_value_slot_id, old[2]);
     for (index, mapping) in value_mappings.iter().enumerate() {
@@ -783,6 +963,101 @@ fn unpivot_real_static_author_refuses_nonliteral_constant_domain_nullability_map
         );
     }
 }
+#[test]
+fn unpivot_special_reference_borrows_nonnullable_source_under_nullable_joined_output() {
+    let source = fixture(Shape::JoinedCollectionNullable, 2, false).unwrap();
+    let source_node = &source.package.fragment().nodes()[&source.unpivot];
+    let NodeKind::Unpivot { spec } = &source_node.kind else {
+        panic!("physical Unpivot")
+    };
+    let UnpivotConstant::Int32List(reference) = &spec.mappings[0].constants[1] else {
+        panic!("source reference")
+    };
+    let original = &source.package.constants().entries()[&reference.pool];
+    assert_eq!(reference.ordinal, 1);
+    assert!(!original.value_type().nullable);
+    assert!(
+        source.package.fragment().values()[&spec.literal_outputs[1]]
+            .ty
+            .nullable
+    );
+    assert_eq!(original.resource_facts().rows, 3);
+    let program = compile(&source, &functions(), &Control).unwrap();
+    let graph = program.graph();
+    let node = &graph.nodes()[3];
+    let ProgramNodeKind::Unpivot { value_mappings, .. } = node.kind() else {
+        panic!("compiled Unpivot")
+    };
+    assert!(
+        matches!(&value_mappings[0].constants[1], LocalConstant::Int32List(values) if values == &vec![0,-2])
+    );
+    let LocalConstant::Scalar { expr_id, nullable } = &value_mappings[1].constants[1] else {
+        panic!("individual Scalar NULL")
+    };
+    assert!(*nullable);
+    let StaticExprKind::Constant(value) = graph.expressions().node(*expr_id).unwrap().kind() else {
+        panic!("original CV")
+    };
+    assert_eq!(value.ordinal(), 2);
+    assert!(
+        value
+            .is_null_observed(CompilePhase::Validate, &Control)
+            .unwrap()
+    );
+    assert!(node.output_layout().schema().field(4).is_nullable());
+    // The source promise and original field/backing have not been retagged to
+    // the joined output's true nullable metadata.
+    assert!(!original.value_type().nullable);
+    assert_eq!(original.field_ref().name(), "original-special-list");
+}
+
+#[test]
+fn unpivot_special_reference_missing_pool_and_ordinal_are_exact_package_errors() {
+    for shape in [Shape::MissingCollectionPool, Shape::BadCollectionOrdinal] {
+        let error = match fixture(shape, 2, false) {
+            Ok(_) => panic!("invalid actual source reference must not publish a package"),
+            Err(error) => error,
+        };
+        let Some(FragmentPackageError::Constant(error)) =
+            error.downcast_ref::<FragmentPackageError>()
+        else {
+            panic!("reference fault must reach its exact package owner: {error}");
+        };
+        match shape {
+            Shape::MissingCollectionPool => assert!(matches!(error,
+                ConstantReferenceError::MissingPool(id) if id.get()==u32::MAX-2)),
+            Shape::BadCollectionOrdinal => assert!(matches!(
+                error,
+                ConstantReferenceError::Constant(ConstantError::Invalid(
+                    "constant ordinal is outside its pool"
+                ))
+            )),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn unpivot_special_reference_source_full_type_and_nullable_promise_are_mandatory() {
+    for shape in [Shape::BadCollectionType, Shape::BadCollectionNullable] {
+        let error = match fixture(shape, 2, false) {
+            Ok(_) => panic!("an invalid original special source must not publish a package"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error.downcast_ref::<FragmentPackageError>(),
+                Some(FragmentPackageError::Constant(
+                    ConstantReferenceError::InvalidConsumer(
+                        "Unpivot collection source differs from its exact non-null special type"
+                    )
+                ))
+            ),
+            "actual source profile must refuse before output or selected payload: {error}"
+        );
+    }
+}
+
 struct Trace {
     events: Mutex<Vec<(CompilePhase, u32)>>,
     at: Option<usize>,

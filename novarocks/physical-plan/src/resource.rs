@@ -105,6 +105,15 @@ impl CutResourcePreflight {
     ) -> Result<(), CompileControlError> {
         add_constant_pool_usage(pools, &mut self.usage, work)
     }
+    pub(crate) fn add_unpivot_sources_observed(
+        &mut self,
+        fragment: &Fragment,
+        pools: &crate::ConstantPools,
+        limits: crate::PlanLimits,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), crate::ConstantReferenceError> {
+        add_unpivot_source_usage(fragment, pools, limits, &mut self.usage, work)
+    }
 
     pub(crate) fn add_items(&mut self, count: usize) {
         self.usage.add_items(count);
@@ -363,9 +372,38 @@ pub(crate) fn validate_plan_resources_observed(
     plan: &PhysicalPlan,
     errors: &mut ValidationContext,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(), CompileControlError> {
+) -> Result<(), crate::ConstantReferenceError> {
     let mut usage = plan_usage(plan, errors);
     add_constant_pool_usage(plan.constants(), &mut usage, work)?;
+    for fragment in plan.fragments().values() {
+        // Reuse the original fragment author for its baseline. Only selected
+        // consumer expansion is added to the already counted plan baseline;
+        // checked retained backing remains counted once by the pool author.
+        work.flush()?;
+        let mut fragment_usage = fragment_usage(fragment, errors);
+        work.flush()?;
+        let before = fragment_usage;
+        add_unpivot_source_usage(
+            fragment,
+            plan.constants(),
+            crate::PlanLimits::FROZEN,
+            &mut fragment_usage,
+            work,
+        )?;
+        validate_usage(
+            "constants.fragment.resources",
+            fragment_usage,
+            MAX_FRAGMENT_DYNAMIC_ITEMS,
+            MAX_FRAGMENT_DYNAMIC_BYTES,
+            errors,
+        );
+        usage.add_items(fragment_usage.items.saturating_sub(before.items));
+        usage.add_bytes(fragment_usage.bytes.saturating_sub(before.bytes));
+        work.step()?;
+        if usage.exhausted() {
+            break;
+        }
+    }
     validate_usage(
         "resources",
         usage,
@@ -374,6 +412,75 @@ pub(crate) fn validate_plan_resources_observed(
         errors,
     );
     Ok(())
+}
+
+fn add_unpivot_source_usage(
+    fragment: &Fragment,
+    pools: &crate::ConstantPools,
+    limits: crate::PlanLimits,
+    usage: &mut ResourceUsage,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), crate::ConstantReferenceError> {
+    if usage.exhausted() {
+        return Ok(());
+    }
+    let resource =
+        || crate::ConstantReferenceError::Control(CompileControlError::ResourceExhausted);
+    let mut previous = None;
+    let mut node_items = 0_usize;
+    let mut node_bytes = 0_u64;
+    crate::constants::visit_unpivot_constants_observed(
+        fragment,
+        work,
+        |node, constant, output, work| {
+            if crate::constants::collection_reference(constant).is_none() {
+                return Ok(());
+            }
+            if previous != Some(node) {
+                previous = Some(node);
+                node_items = 0;
+                node_bytes = 0;
+            }
+            let item_bound = limits
+                .unpivot_collection_items
+                .checked_sub(node_items)
+                .ok_or_else(resource)?
+                .min(
+                    usage
+                        .max_items
+                        .checked_sub(usage.items)
+                        .ok_or_else(resource)?,
+                );
+            let byte_bound = (crate::MAX_UNPIVOT_LITERAL_BYTES as u64)
+                .checked_sub(node_bytes)
+                .ok_or_else(resource)?
+                .min(
+                    u64::try_from(
+                        usage
+                            .max_bytes
+                            .checked_sub(usage.bytes)
+                            .ok_or_else(resource)?,
+                    )
+                    .map_err(|_| resource())?,
+                );
+            let selected = crate::constants::unpivot_collection_usage_observed(
+                pools, constant, output, item_bound, byte_bound, work,
+            )?;
+            node_items = node_items
+                .checked_add(selected.items)
+                .ok_or_else(resource)?;
+            node_bytes = node_bytes
+                .checked_add(selected.payload_bytes)
+                .ok_or_else(resource)?;
+            // Preserve the original per-occurrence expansion invoice, even for
+            // repeated addresses or alias pool keys. This conservative request
+            // bound is separate from once-per-backing retained pool storage.
+            usage.add_items(selected.items);
+            usage.add_bytes(usize::try_from(selected.payload_bytes).map_err(|_| resource())?);
+            work.step()?;
+            Ok(())
+        },
+    )
 }
 
 fn plan_usage(plan: &PhysicalPlan, errors: &mut ValidationContext) -> ResourceUsage {
@@ -1041,20 +1148,10 @@ fn add_writer_schema_usage(
     }
 }
 
-fn add_unpivot_constant_usage(constant: &UnpivotConstant, usage: &mut ResourceUsage) {
-    match constant {
-        UnpivotConstant::Scalar(_) => {}
-        UnpivotConstant::Int32List(values) => usage.add_items(values.len()),
-        UnpivotConstant::Utf8Map(entries) => {
-            usage.add_items(entries.len());
-            for (key, value) in entries {
-                if usage.exhausted() {
-                    return;
-                }
-                usage.add_byte_counts([key.len(), value.len()]);
-            }
-        }
-    }
+fn add_unpivot_constant_usage(_constant: &UnpivotConstant, _usage: &mut ResourceUsage) {
+    // All payloads are selected addresses or expression IDs. The sole pool
+    // resource author accounts retained checked backing once by identity;
+    // observed constant publication accounts repeated consumer work/limits.
 }
 
 fn add_relation_usage(

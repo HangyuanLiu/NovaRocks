@@ -35,6 +35,7 @@ pub use recursive_resources::{RecursiveConstantResourceInput, preflight_recursiv
 
 mod semantic_key;
 pub use semantic_key::ConstantSemanticKey;
+mod collection_factory;
 mod diagnostic;
 mod selected_collections;
 mod selected_scalar;

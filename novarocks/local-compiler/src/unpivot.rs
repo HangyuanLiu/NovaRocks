@@ -20,12 +20,13 @@
 //! capability, constant re-admission, or formal allocation grant is created.
 
 use arrow_schema::Schema;
+use novarocks_functions::ConstantError;
 use novarocks_local_program::{
     LayoutCompileError, ProgramExprId, ProgramNodeId, ProgramNodeKind, StaticLayout,
     UnpivotConstant, UnpivotMapping, UnpivotPassthrough,
 };
 use novarocks_physical_plan::{
-    ExprId, ExprKind, Fragment, FragmentPackage, NodeKind, PhysicalNode,
+    ConstantReferenceError, ExprId, ExprKind, Fragment, FragmentPackage, NodeKind, PhysicalNode,
     UnpivotConstant as SourceConstant, ValueId,
 };
 use novarocks_type_contract::{
@@ -40,6 +41,7 @@ pub(crate) enum UnpivotLoweringError {
     Control(CompileControlError),
     ValueType(ValueTypeError),
     Layout(LayoutCompileError),
+    Constant(ConstantReferenceError),
     Invalid(&'static str),
 }
 impl From<CompileControlError> for UnpivotLoweringError {
@@ -60,12 +62,26 @@ impl From<LayoutCompileError> for UnpivotLoweringError {
         }
     }
 }
+impl From<ConstantReferenceError> for UnpivotLoweringError {
+    fn from(error: ConstantReferenceError) -> Self {
+        match error {
+            ConstantReferenceError::Control(cause) => Self::Control(cause),
+            error => Self::Constant(error),
+        }
+    }
+}
+impl From<ConstantError> for UnpivotLoweringError {
+    fn from(error: ConstantError) -> Self {
+        ConstantReferenceError::from(error).into()
+    }
+}
 impl fmt::Display for UnpivotLoweringError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Control(e) => e.fmt(f),
             Self::ValueType(e) => e.fmt(f),
             Self::Layout(e) => e.fmt(f),
+            Self::Constant(e) => e.fmt(f),
             Self::Invalid(m) => write!(f, "invalid Unpivot lowering: {m}"),
         }
     }
@@ -76,6 +92,7 @@ impl Error for UnpivotLoweringError {
             Self::Control(e) => Some(e),
             Self::ValueType(e) => Some(e),
             Self::Layout(e) => Some(e),
+            Self::Constant(e) => Some(e),
             Self::Invalid(_) => None,
         }
     }
@@ -373,58 +390,94 @@ fn lower_core(
         exact_type(&source, value_type(fragment, spec.value_output)?, work)?;
         let mut constants = Vec::new();
         for (constant, &output) in mapping.constants.iter().zip(&spec.literal_outputs) {
-            let lowered =
-                match constant {
-                    SourceConstant::Scalar(id) => {
-                        let definition = fragment.expressions().get(*id).ok_or(
-                            UnpivotLoweringError::Invalid("missing Unpivot scalar constant"),
-                        )?;
-                        let valid = matches!(
-                            definition.kind,
-                            ExprKind::Literal(_) | ExprKind::Constant(_)
-                        );
-                        let expr_id = input.expressions.get(id).copied();
+            let lowered = match constant {
+                SourceConstant::Scalar(id) => {
+                    let definition =
+                        fragment
+                            .expressions()
+                            .get(*id)
+                            .ok_or(UnpivotLoweringError::Invalid(
+                                "missing Unpivot scalar constant",
+                            ))?;
+                    let valid = matches!(
+                        definition.kind,
+                        ExprKind::Literal(_) | ExprKind::Constant(_)
+                    );
+                    let expr_id = input.expressions.get(id).copied();
+                    work.step()?;
+                    if !valid {
+                        return Err(UnpivotLoweringError::Invalid(
+                            "Unpivot scalar source is not a static constant",
+                        ));
+                    }
+                    work.flush()?;
+                    let output_type = value_type(fragment, output)?;
+                    if definition.ty.nullable && !output_type.nullable {
+                        return Err(UnpivotLoweringError::Invalid(
+                            "Unpivot constant narrows source nullability",
+                        ));
+                    }
+                    let mut expected = definition.ty.clone();
+                    expected.nullable = output_type.nullable;
+                    work.flush()?;
+                    exact_type(&expected, value_type(fragment, output)?, work)?;
+                    UnpivotConstant::Scalar {
+                        expr_id: expr_id.ok_or(UnpivotLoweringError::Invalid(
+                            "missing lowered Unpivot constant",
+                        ))?,
+                        nullable: definition.ty.nullable,
+                    }
+                }
+                SourceConstant::Int32List(reference) => {
+                    let value = package
+                        .constants()
+                        .resolve_source_observed(*reference, work)?;
+                    special_source_domain(value.value_type(), value_type(fragment, output)?, work)?;
+                    work.flush()?;
+                    let selected =
+                        value.int32_list_observed(CompilePhase::LowerProgram, work.control())?;
+                    work.flush()?;
+                    let selected = selected.ok_or(UnpivotLoweringError::Invalid(
+                        "Unpivot Int32List source is NULL",
+                    ))?;
+                    let mut copied = reserve_collection::<i32>(selected.len(), work)?;
+                    for index in 0..selected.len() {
+                        let item = selected.item_observed(index, work)?;
+                        let item = item.ok_or(UnpivotLoweringError::Invalid(
+                            "Unpivot Int32List item is NULL",
+                        ))?;
+                        copied.push(item);
                         work.step()?;
-                        if !valid {
-                            return Err(UnpivotLoweringError::Invalid(
-                                "Unpivot scalar source is not a static constant",
-                            ));
-                        }
-                        work.flush()?;
-                        let output_type = value_type(fragment, output)?;
-                        if definition.ty.nullable && !output_type.nullable {
-                            return Err(UnpivotLoweringError::Invalid(
-                                "Unpivot constant narrows source nullability",
-                            ));
-                        }
-                        let mut expected = definition.ty.clone();
-                        expected.nullable = output_type.nullable;
-                        work.flush()?;
-                        exact_type(&expected, value_type(fragment, output)?, work)?;
-                        UnpivotConstant::Scalar {
-                            expr_id: expr_id.ok_or(UnpivotLoweringError::Invalid(
-                                "missing lowered Unpivot constant",
-                            ))?,
-                            nullable: definition.ty.nullable,
-                        }
                     }
-                    SourceConstant::Int32List(values) => {
-                        let mut copied = Vec::new();
-                        for &value in values {
-                            copied.push(value);
-                            work.step()?;
-                        }
-                        UnpivotConstant::Int32List(copied)
+                    UnpivotConstant::Int32List(copied)
+                }
+                SourceConstant::Utf8Map(reference) => {
+                    let value = package
+                        .constants()
+                        .resolve_source_observed(*reference, work)?;
+                    special_source_domain(value.value_type(), value_type(fragment, output)?, work)?;
+                    work.flush()?;
+                    let selected =
+                        value.utf8_map_observed(CompilePhase::LowerProgram, work.control())?;
+                    work.flush()?;
+                    let selected = selected.ok_or(UnpivotLoweringError::Invalid(
+                        "Unpivot Utf8Map source is NULL",
+                    ))?;
+                    let mut copied =
+                        reserve_collection::<(Arc<str>, Arc<str>)>(selected.len(), work)?;
+                    for index in 0..selected.len() {
+                        let (key, value) = selected.item_observed(index, work)?;
+                        let key = key
+                            .ok_or(UnpivotLoweringError::Invalid("Unpivot Utf8Map key is NULL"))?;
+                        let value = value.ok_or(UnpivotLoweringError::Invalid(
+                            "Unpivot Utf8Map value is NULL",
+                        ))?;
+                        copied.push((copy_text(key, work)?, copy_text(value, work)?));
+                        work.step()?;
                     }
-                    SourceConstant::Utf8Map(entries) => {
-                        let mut copied = Vec::new();
-                        for (key, value) in entries {
-                            copied.push((copy_text(key, work)?, copy_text(value, work)?));
-                            work.step()?;
-                        }
-                        UnpivotConstant::Utf8Map(copied)
-                    }
-                };
+                    UnpivotConstant::Utf8Map(copied)
+                }
+            };
             constants.push(lowered);
             work.step()?;
         }
@@ -494,6 +547,44 @@ fn lower_core(
         layout,
     ))
 }
+/// A sealed package has checked the collection-specific source profile. Keep
+/// its actual source type intact while proving the individual output edge;
+/// the physical owner has already checked the complete mapping nullable OR.
+fn special_source_domain(
+    source: &FunctionValueType,
+    output: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), UnpivotLoweringError> {
+    let nonnullable = !source.nullable;
+    work.step()?;
+    if !nonnullable {
+        return Err(UnpivotLoweringError::Invalid(
+            "Unpivot special collection source must be nonnullable",
+        ));
+    }
+    if !source.same_value_domain_observed::<UnpivotLoweringError>(output, || {
+        work.step().map_err(Into::into)
+    })? {
+        return Err(UnpivotLoweringError::Invalid(
+            "Unpivot special collection source/output domains differ",
+        ));
+    }
+    Ok(())
+}
+
+fn reserve_collection<T>(
+    len: usize,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<T>, UnpivotLoweringError> {
+    std::alloc::Layout::array::<T>(len)
+        .map_err(|_| UnpivotLoweringError::Control(CompileControlError::ResourceExhausted))?;
+    let mut output = Vec::new();
+    work.flush()?;
+    let reserved = output.try_reserve_exact(len);
+    reservation_exit(reserved, work)?;
+    Ok(output)
+}
+
 fn copy_text(
     source: &str,
     work: &mut CompileCheckpoints<'_>,
@@ -566,6 +657,16 @@ mod tests {
             [(CompilePhase::LowerProgram, 0)]
         );
         assert_eq!(allocation.capacity(), 0);
+        assert!(matches!(
+            reserve_collection::<i32>(usize::MAX, &mut work),
+            Err(UnpivotLoweringError::Control(
+                CompileControlError::ResourceExhausted
+            ))
+        ));
+        assert_eq!(
+            *control.observations.lock().unwrap(),
+            [(CompilePhase::LowerProgram, 0)]
+        );
         // A successful opaque reservation still observes its exit and may be
         // refused there; the failed reservation never reaches that callback.
         assert!(matches!(

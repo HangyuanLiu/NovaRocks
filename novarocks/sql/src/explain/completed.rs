@@ -3306,28 +3306,17 @@ impl fmt::Display for UnpivotConstantsDisplay<'_> {
                         format_expr(self.plan, self.fragment_id, self.fragment, *expression)
                             .fmt(output)
                     }
-                    novarocks_physical_plan::UnpivotConstant::Int32List(values) => write!(
+                    novarocks_physical_plan::UnpivotConstant::Int32List(reference) => write!(
                         output,
-                        "int32[{}]",
-                        joined(
-                            values,
-                            ",",
-                            |value: &i32, nested: &mut fmt::Formatter<'_>| value.fmt(nested)
-                        )
+                        "int32-constant-reference(pool={}, ordinal={})",
+                        reference.pool.get(),
+                        reference.ordinal,
                     ),
-                    novarocks_physical_plan::UnpivotConstant::Utf8Map(entries) => write!(
+                    novarocks_physical_plan::UnpivotConstant::Utf8Map(reference) => write!(
                         output,
-                        "utf8[{}]",
-                        joined(
-                            entries,
-                            ",",
-                            |entry: &(Box<str>, Box<str>), nested: &mut fmt::Formatter<'_>| write!(
-                                nested,
-                                "{}->{}",
-                                quote_text(&entry.0),
-                                quote_text(&entry.1)
-                            )
-                        )
+                        "utf8-map-constant-reference(pool={}, ordinal={})",
+                        reference.pool.get(),
+                        reference.ordinal,
                     ),
                 }
             },

@@ -2757,16 +2757,10 @@ pub(crate) fn validate_unpivot_resource_limits<'a>(
                 crate::UnpivotConstant::Scalar(expression) => {
                     (0, unpivot_scalar_literal_bytes(fragment, *expression))
                 }
-                crate::UnpivotConstant::Int32List(values) => (
-                    values.len(),
-                    values.len().saturating_mul(std::mem::size_of::<i32>()),
-                ),
-                crate::UnpivotConstant::Utf8Map(entries) => (
-                    entries.len(),
-                    entries.iter().fold(0_usize, |total, (key, value)| {
-                        total.saturating_add(key.len()).saturating_add(value.len())
-                    }),
-                ),
+                // Selected collections belong to the original checked pools.
+                // Their actual per-consumer item/byte and key-policy checks
+                // run at mandatory observed plan/package publication.
+                crate::UnpivotConstant::Int32List(_) | crate::UnpivotConstant::Utf8Map(_) => (0, 0),
             };
             collection_items = collection_items.saturating_add(items);
             literal_bytes = literal_bytes.saturating_add(bytes);
@@ -2813,6 +2807,40 @@ pub(crate) fn unpivot_scalar_literal_bytes(fragment: &Fragment, expression: Expr
     }
 }
 
+pub(crate) fn unpivot_collection_carrier_matches(
+    constant: &crate::UnpivotConstant,
+    data_type: &DataType,
+) -> bool {
+    match constant {
+        crate::UnpivotConstant::Int32List(_) => matches!(
+            data_type,
+            DataType::List(field)
+                if field.name() == "item"
+                    && field.data_type() == &DataType::Int32
+                    && !field.is_nullable()
+                    && field.metadata().is_empty()
+        ),
+        crate::UnpivotConstant::Utf8Map(_) => matches!(
+            data_type,
+            DataType::Map(entries, false)
+                if entries.name() == "entries"
+                    && !entries.is_nullable()
+                    && entries.metadata().is_empty()
+                    && matches!(entries.data_type(), DataType::Struct(fields)
+                        if fields.len() == 2
+                            && fields[0].name() == "key"
+                            && fields[0].data_type() == &DataType::Utf8
+                            && !fields[0].is_nullable()
+                            && fields[0].metadata().is_empty()
+                            && fields[1].name() == "value"
+                            && fields[1].data_type() == &DataType::Utf8
+                            && !fields[1].is_nullable()
+                            && fields[1].metadata().is_empty())
+        ),
+        crate::UnpivotConstant::Scalar(_) => false,
+    }
+}
+
 pub(crate) fn validate_unpivot_constant(
     fragment: &Fragment,
     constant: &crate::UnpivotConstant,
@@ -2840,35 +2868,8 @@ pub(crate) fn validate_unpivot_constant(
                 return None;
             }
         },
-        crate::UnpivotConstant::Int32List(_) => (
-            matches!(
-                &output_type.data_type,
-                DataType::List(field)
-                    if field.name() == "item"
-                        && field.data_type() == &DataType::Int32
-                        && !field.is_nullable()
-                        && field.metadata().is_empty()
-            ),
-            false,
-        ),
-        crate::UnpivotConstant::Utf8Map(_) => (
-            matches!(
-                &output_type.data_type,
-                DataType::Map(entries, false)
-                    if entries.name() == "entries"
-                        && !entries.is_nullable()
-                        && entries.metadata().is_empty()
-                        && matches!(entries.data_type(), DataType::Struct(fields)
-                            if fields.len() == 2
-                                && fields[0].name() == "key"
-                                && fields[0].data_type() == &DataType::Utf8
-                                && !fields[0].is_nullable()
-                                && fields[0].metadata().is_empty()
-                                && fields[1].name() == "value"
-                                && fields[1].data_type() == &DataType::Utf8
-                                && !fields[1].is_nullable()
-                                && fields[1].metadata().is_empty())
-            ),
+        crate::UnpivotConstant::Int32List(_) | crate::UnpivotConstant::Utf8Map(_) => (
+            unpivot_collection_carrier_matches(constant, &output_type.data_type),
             false,
         ),
     };
@@ -2876,17 +2877,6 @@ pub(crate) fn validate_unpivot_constant(
         errors.push(ValidationError::new(
             path,
             format!("{context} constant type differs from its literal output"),
-        ));
-    }
-    if let crate::UnpivotConstant::Utf8Map(entries) = constant
-        && (entries.iter().any(|(key, _)| key.is_empty())
-            || entries
-                .windows(2)
-                .any(|pair| pair[0].0.as_ref() >= pair[1].0.as_ref()))
-    {
-        errors.push(ValidationError::new(
-            path,
-            format!("{context} map keys must be non-empty and strictly increasing"),
         ));
     }
     Some(nullable)

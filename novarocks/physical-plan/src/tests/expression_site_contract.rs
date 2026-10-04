@@ -255,7 +255,11 @@ fn optional_and_non_scalar_fields_keep_original_multidimensional_positions() {
             mappings: Box::from([UnpivotValueMapping {
                 input: ValueId::new(1),
                 constants: Box::from([
-                    crate::UnpivotConstant::Int32List(Box::from([1])),
+                    // Root-site extraction deliberately does not claim pool admission.
+                    crate::UnpivotConstant::Int32List(crate::ConstantReference {
+                        pool: crate::ConstantPoolId::new(u32::MAX),
+                        ordinal: 1,
+                    }),
                     crate::UnpivotConstant::Scalar(expr()),
                 ]),
             }]),

@@ -1074,3 +1074,6 @@ fn package_admissions(
         .map(|id| (*id, package_admission()))
         .collect()
 }
+
+#[path = "collection_reference_tests.rs"]
+mod collection_reference_tests;

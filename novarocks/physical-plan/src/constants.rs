@@ -69,16 +69,36 @@ impl ConstantPools {
     ) -> Result<ConstantValue, ConstantReferenceError> {
         // The caller owns the encompassing finish; an originating control or
         // resource refusal must never be replaced by a later observation.
-        work.step()?;
-        let pool = self
-            .entries
-            .get(&reference.pool)
-            .ok_or(ConstantReferenceError::MissingPool(reference.pool))?;
+        let pool = self.pool_observed(reference.pool, work)?;
         if !expected.exactly_equals_observed(pool.value_type(), || {
             work.step().map_err(ConstantReferenceError::from)
         })? {
             return Err(ConstantReferenceError::SourceTypeMismatch(reference));
         }
+        work.step()?;
+        pool.value(reference.ordinal)
+            .map_err(ConstantReferenceError::from)
+    }
+    fn pool_observed(
+        &self,
+        id: ConstantPoolId,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<&ConstantPool, ConstantReferenceError> {
+        work.step()?;
+        self.entries
+            .get(&id)
+            .ok_or(ConstantReferenceError::MissingPool(id))
+    }
+    /// Borrow the selected row and its actual admitted source type. This
+    /// resolves an address only: each consumer must independently prove its
+    /// complete type/profile and output relation. No expected type is guessed
+    /// from a joined output, and no source Field or backing is reconstructed.
+    pub fn resolve_source_observed(
+        &self,
+        reference: ConstantReference,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<ConstantValue, ConstantReferenceError> {
+        let pool = self.pool_observed(reference.pool, work)?;
         work.step()?;
         pool.value(reference.ordinal)
             .map_err(ConstantReferenceError::from)
@@ -113,6 +133,37 @@ impl ConstantPools {
                 .entry(reference.pool)
                 .or_insert_with(|| value.pool().clone());
         }
+        Ok(projected)
+    }
+    /// Preserve every actual pool address used by expressions or either
+    /// relational/writer-statistics Unpivot. Reference identity is sparse
+    /// namespace identity, even when two keys loan the same checked backing.
+    pub fn project_fragment_observed(
+        &self,
+        fragment: &crate::Fragment,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, ConstantReferenceError> {
+        let mut projected = self.project_optional_references_observed(
+            fragment
+                .expressions()
+                .iter()
+                .map(|(_, node)| match node.kind {
+                    crate::ExprKind::Constant(reference) => Some((reference, &node.ty)),
+                    _ => None,
+                }),
+            work,
+        )?;
+        visit_unpivot_constants_observed(fragment, work, |_, constant, _, work| {
+            if let Some(reference) = collection_reference(constant) {
+                let value = self.resolve_source_observed(reference, work)?;
+                projected
+                    .entries
+                    .entry(reference.pool)
+                    .or_insert_with(|| value.pool().clone());
+                work.step()?;
+            }
+            Ok(())
+        })?;
         Ok(projected)
     }
 }
@@ -170,6 +221,219 @@ impl fmt::Display for ConstantReferenceError {
 }
 impl std::error::Error for ConstantReferenceError {}
 
+pub(crate) fn collection_reference(constant: &crate::UnpivotConstant) -> Option<ConstantReference> {
+    match constant {
+        crate::UnpivotConstant::Int32List(reference)
+        | crate::UnpivotConstant::Utf8Map(reference) => Some(*reference),
+        crate::UnpivotConstant::Scalar(_) => None,
+    }
+}
+
+/// Visit all source definitions, including noncollection constants and nodes.
+/// Do not hide work by filtering these source occurrences before this owner.
+pub(crate) fn visit_unpivot_constants_observed(
+    fragment: &crate::Fragment,
+    work: &mut CompileCheckpoints<'_>,
+    mut visit: impl FnMut(
+        crate::NodeId,
+        &crate::UnpivotConstant,
+        Option<&FunctionValueType>,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<(), ConstantReferenceError>,
+) -> Result<(), ConstantReferenceError> {
+    for node in fragment.nodes().values() {
+        work.step()?;
+        match &node.kind {
+            crate::NodeKind::Unpivot { spec } => {
+                for mapping in &spec.mappings {
+                    work.step()?;
+                    for (index, constant) in mapping.constants.iter().enumerate() {
+                        work.step()?;
+                        let output = spec
+                            .literal_outputs
+                            .get(index)
+                            .and_then(|id| fragment.values().get(id))
+                            .map(|v| &v.ty);
+                        visit(node.id, constant, output, work)?;
+                    }
+                }
+            }
+            crate::NodeKind::TableFinish(spec) => {
+                if let Some(spec) = &spec.grouped_unpivot {
+                    for mapping in &spec.mappings {
+                        work.step()?;
+                        for (index, constant) in mapping.constants.iter().enumerate() {
+                            work.step()?;
+                            let output = spec
+                                .literal_outputs
+                                .get(index)
+                                .and_then(|id| fragment.values().get(id))
+                                .map(|v| &v.ty);
+                            visit(node.id, constant, output, work)?;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UnpivotCollectionUsage {
+    pub(crate) items: usize,
+    pub(crate) payload_bytes: u64,
+}
+
+fn resource_refusal() -> ConstantReferenceError {
+    ConstantReferenceError::Control(CompileControlError::ResourceExhausted)
+}
+
+fn strictly_increasing(
+    left: &str,
+    right: &str,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, ConstantReferenceError> {
+    for (&left, &right) in left.as_bytes().iter().zip(right.as_bytes()) {
+        let order = left.cmp(&right);
+        work.step()?;
+        if order != std::cmp::Ordering::Equal {
+            return Ok(order == std::cmp::Ordering::Less);
+        }
+    }
+    let ordered = left.len() < right.len();
+    work.step()?;
+    Ok(ordered)
+}
+
+/// Sole special-consumer policy. Generic checked Map/List readers remain
+/// permissive; this consumer retains the original exact special source rules.
+pub(crate) fn unpivot_collection_usage_observed(
+    pools: &ConstantPools,
+    constant: &crate::UnpivotConstant,
+    output: Option<&FunctionValueType>,
+    max_items: usize,
+    max_bytes: u64,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<UnpivotCollectionUsage, ConstantReferenceError> {
+    let reference = collection_reference(constant).ok_or(
+        ConstantReferenceError::InvalidConsumer("Unpivot collection source is scalar"),
+    )?;
+    let source = pools.resolve_source_observed(reference, work)?;
+    let ty = source.value_type();
+    let valid = !ty.nullable
+        && crate::validation::unpivot_collection_carrier_matches(constant, &ty.data_type);
+    work.step()?;
+    if !valid {
+        return Err(ConstantReferenceError::InvalidConsumer(
+            "Unpivot collection source differs from its exact non-null special type",
+        ));
+    }
+    let output = output.ok_or(ConstantReferenceError::InvalidConsumer(
+        "Unpivot literal output is missing",
+    ))?;
+    if !ty
+        .same_value_domain_observed(output, || work.step().map_err(ConstantReferenceError::from))?
+    {
+        return Err(ConstantReferenceError::InvalidConsumer(
+            "Unpivot collection source differs from its complete output domain",
+        ));
+    }
+    match constant {
+        crate::UnpivotConstant::Int32List(_) => {
+            work.flush()?;
+            let view = source
+                .int32_list_observed(
+                    novarocks_type_contract::CompilePhase::Validate,
+                    work.control(),
+                )?
+                .ok_or(ConstantReferenceError::InvalidConsumer(
+                    "Unpivot collection root is NULL",
+                ))?;
+            work.flush()?;
+            let items = view.len();
+            let bytes = u64::try_from(items)
+                .map_err(|_| resource_refusal())?
+                .checked_mul(4)
+                .ok_or_else(resource_refusal)?;
+            let admitted = items <= max_items && bytes <= max_bytes;
+            if !admitted {
+                return Err(resource_refusal());
+            }
+            work.step()?;
+            for index in 0..items {
+                if view.item_observed(index, work)?.is_none() {
+                    return Err(ConstantReferenceError::InvalidConsumer(
+                        "Unpivot Int32List item is NULL",
+                    ));
+                }
+            }
+            Ok(UnpivotCollectionUsage {
+                items,
+                payload_bytes: bytes,
+            })
+        }
+        crate::UnpivotConstant::Utf8Map(_) => {
+            work.flush()?;
+            let view = source
+                .utf8_map_observed(
+                    novarocks_type_contract::CompilePhase::Validate,
+                    work.control(),
+                )?
+                .ok_or(ConstantReferenceError::InvalidConsumer(
+                    "Unpivot collection root is NULL",
+                ))?;
+            work.flush()?;
+            let items = view.len();
+            let admitted = items <= max_items;
+            if !admitted {
+                return Err(resource_refusal());
+            }
+            work.step()?;
+            let mut bytes = 0_u64;
+            let mut previous = None;
+            for index in 0..items {
+                let (key, value) = view.item_observed(index, work)?;
+                let (Some(key), Some(value)) = (key, value) else {
+                    return Err(ConstantReferenceError::InvalidConsumer(
+                        "Unpivot Utf8Map key/value is NULL",
+                    ));
+                };
+                let nonempty = !key.is_empty();
+                work.step()?;
+                if !nonempty {
+                    return Err(ConstantReferenceError::InvalidConsumer(
+                        "unpivot map keys must be non-empty and strictly increasing",
+                    ));
+                }
+                if let Some(previous) = previous
+                    && !strictly_increasing(previous, key, work)?
+                {
+                    return Err(ConstantReferenceError::InvalidConsumer(
+                        "unpivot map keys must be non-empty and strictly increasing",
+                    ));
+                }
+                previous = Some(key);
+                bytes = bytes
+                    .checked_add(u64::try_from(key.len()).map_err(|_| resource_refusal())?)
+                    .and_then(|b| b.checked_add(u64::try_from(value.len()).ok()?))
+                    .ok_or_else(resource_refusal)?;
+                let admitted = bytes <= max_bytes;
+                if !admitted {
+                    return Err(resource_refusal());
+                }
+                work.step()?;
+            }
+            Ok(UnpivotCollectionUsage {
+                items,
+                payload_bytes: bytes,
+            })
+        }
+        crate::UnpivotConstant::Scalar(_) => unreachable!("collection source matched above"),
+    }
+}
+
 /// Source-address/type validation and actual scalar consumer facts. A mutable
 /// fragment definition is still a construction input; this check is mandatory
 /// before publishing its enclosing plan or local package.
@@ -177,6 +441,7 @@ pub(crate) fn validate_fragment_constants_observed(
     fragment: &crate::Fragment,
     pools: &ConstantPools,
     require_closed: bool,
+    limits: crate::PlanLimits,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<(), ConstantReferenceError> {
     use novarocks_type_contract::CompilePhase;
@@ -190,6 +455,7 @@ pub(crate) fn validate_fragment_constants_observed(
             let mut usage = crate::resource::CutResourcePreflight::new();
             usage.add_fragment(fragment, &mut errors);
             usage.add_constants_observed(pools, &mut work)?;
+            usage.add_unpivot_sources_observed(fragment, pools, limits, &mut work)?;
             usage.validate("package.constants.resources", &mut errors);
             if !errors.is_empty() {
                 return Err(ConstantReferenceError::Structure(
@@ -207,9 +473,6 @@ pub(crate) fn validate_fragment_constants_observed(
                 }
             }
         }
-        if require_closed && used.len() != pools.entries.len() {
-            return Err(ConstantReferenceError::UnusedPools);
-        }
         for (_, expression) in fragment.expressions().iter() {
             work.step()?;
             if let crate::ExprKind::WindowCall {
@@ -219,7 +482,10 @@ pub(crate) fn validate_fragment_constants_observed(
                 validate_window_constants(fragment, pools, frame, &mut work)?;
             }
         }
-        validate_unpivot_constants(fragment, pools, &mut work)?;
+        validate_unpivot_constants(fragment, pools, limits, &mut used, &mut work)?;
+        if require_closed && used.len() != pools.entries.len() {
+            return Err(ConstantReferenceError::UnusedPools);
+        }
         Ok(())
     })();
     if matches!(result, Err(ConstantReferenceError::Control(_))) {
@@ -300,75 +566,66 @@ fn validate_window_constants(
 fn validate_unpivot_constants(
     fragment: &crate::Fragment,
     pools: &ConstantPools,
+    limits: crate::PlanLimits,
+    used: &mut std::collections::BTreeSet<ConstantPoolId>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ConstantReferenceError> {
-    use crate::{NodeKind, UnpivotConstant};
-    for node in fragment.nodes().values() {
-        work.step()?;
-        let mut bytes = 0u64;
-        let ordinary = match &node.kind {
-            NodeKind::Unpivot { spec } => Some(spec),
-            _ => None,
-        };
-        let grouped = match &node.kind {
-            NodeKind::TableFinish(spec) => spec.grouped_unpivot.as_ref(),
-            _ => None,
-        };
-        let lists = ordinary
-            .into_iter()
-            .flat_map(|spec| {
-                spec.mappings
-                    .iter()
-                    .map(|mapping| mapping.constants.as_ref())
-            })
-            .chain(grouped.into_iter().flat_map(|spec| {
-                spec.mappings
-                    .iter()
-                    .map(|mapping| mapping.constants.as_ref())
-            }));
-        for list in lists {
-            for constant in list {
-                work.step()?;
-                let selected = match constant {
-                    UnpivotConstant::Scalar(id) => {
-                        let Some(expression) = fragment.expressions().get(*id) else {
-                            continue;
-                        };
-                        if let crate::ExprKind::Constant(reference) = expression.kind {
-                            let value = pools.resolve_observed(reference, &expression.ty, work)?;
-                            work.flush()?;
-                            let bytes = value.selected_payload_bytes_observed(
-                                novarocks_type_contract::CompilePhase::Validate,
-                                work.control(),
-                            )?;
-                            work.flush()?;
-                            bytes
-                        } else {
-                            crate::validation::unpivot_scalar_literal_bytes(fragment, *id) as u64
-                        }
-                    }
-                    UnpivotConstant::Int32List(values) => (values.len() as u64).saturating_mul(4),
-                    UnpivotConstant::Utf8Map(entries) => {
-                        let mut bytes = 0u64;
-                        for (key, value) in entries {
-                            work.step()?;
-                            bytes = bytes
-                                .saturating_add(key.len() as u64)
-                                .saturating_add(value.len() as u64);
-                        }
-                        bytes
-                    }
+    let mut previous_node = None;
+    let mut bytes = 0_u64;
+    let mut items = 0_usize;
+    visit_unpivot_constants_observed(fragment, work, |node, constant, output, work| {
+        if previous_node != Some(node) {
+            previous_node = Some(node);
+            bytes = 0;
+            items = 0;
+        }
+        let selected = match constant {
+            crate::UnpivotConstant::Scalar(id) => {
+                let Some(expression) = fragment.expressions().get(*id) else {
+                    return Ok(());
                 };
-                bytes = bytes.saturating_add(selected);
-                if bytes > crate::MAX_UNPIVOT_LITERAL_BYTES as u64 {
-                    return Err(ConstantReferenceError::Control(
-                        CompileControlError::ResourceExhausted,
-                    ));
+                if let crate::ExprKind::Constant(reference) = expression.kind {
+                    let value = pools.resolve_observed(reference, &expression.ty, work)?;
+                    work.flush()?;
+                    let selected = value.selected_payload_bytes_observed(
+                        novarocks_type_contract::CompilePhase::Validate,
+                        work.control(),
+                    )?;
+                    work.flush()?;
+                    selected
+                } else {
+                    crate::validation::unpivot_scalar_literal_bytes(fragment, *id) as u64
                 }
             }
+            crate::UnpivotConstant::Int32List(reference)
+            | crate::UnpivotConstant::Utf8Map(reference) => {
+                let usage = unpivot_collection_usage_observed(
+                    pools,
+                    constant,
+                    output,
+                    limits
+                        .unpivot_collection_items
+                        .checked_sub(items)
+                        .ok_or_else(resource_refusal)?,
+                    (crate::MAX_UNPIVOT_LITERAL_BYTES as u64)
+                        .checked_sub(bytes)
+                        .ok_or_else(resource_refusal)?,
+                    work,
+                )?;
+                items = items
+                    .checked_add(usage.items)
+                    .ok_or_else(resource_refusal)?;
+                used.insert(reference.pool);
+                work.step()?;
+                usage.payload_bytes
+            }
+        };
+        bytes = bytes.checked_add(selected).ok_or_else(resource_refusal)?;
+        if bytes > crate::MAX_UNPIVOT_LITERAL_BYTES as u64 {
+            return Err(resource_refusal());
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 pub(crate) fn validate_plan_constants_observed(
@@ -389,7 +646,13 @@ pub(crate) fn validate_plan_constants_observed(
         for fragment in plan.fragments().values() {
             work.step()?;
             work.flush()?;
-            validate_fragment_constants_observed(fragment, plan.constants(), false, control)?;
+            validate_fragment_constants_observed(
+                fragment,
+                plan.constants(),
+                false,
+                crate::PlanLimits::FROZEN,
+                control,
+            )?;
             work.flush()?;
             for (_, expression) in fragment.expressions().iter() {
                 work.step()?;
@@ -397,6 +660,13 @@ pub(crate) fn validate_plan_constants_observed(
                     used.insert(reference.pool);
                 }
             }
+            visit_unpivot_constants_observed(fragment, &mut work, |_, constant, _, work| {
+                if let Some(reference) = collection_reference(constant) {
+                    used.insert(reference.pool);
+                    work.step()?;
+                }
+                Ok(())
+            })?;
         }
         if used.len() != plan.constants().entries().len() {
             return Err(ConstantReferenceError::UnusedPools);

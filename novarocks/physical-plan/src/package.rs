@@ -110,6 +110,7 @@ impl FragmentPackage {
             &input.fragment,
             &input.constants,
             true,
+            admission.plan_limits,
             control,
         )
         .map_err(|error| match error {
@@ -472,16 +473,9 @@ pub fn extract_fragment_packages(
             .map_err(FragmentPackageExtractionError::Control)?;
         let mut constant_work = CompileCheckpoints::try_new(control, CompilePhase::Validate)
             .map_err(FragmentPackageExtractionError::Control)?;
-        let projected = plan.constants().project_optional_references_observed(
-            fragment
-                .expressions()
-                .iter()
-                .map(|(_, node)| match &node.kind {
-                    crate::ExprKind::Constant(reference) => Some((*reference, &node.ty)),
-                    _ => None,
-                }),
-            &mut constant_work,
-        );
+        let projected = plan
+            .constants()
+            .project_fragment_observed(fragment, &mut constant_work);
         let projected = match projected {
             Err(crate::ConstantReferenceError::Control(error)) => {
                 return Err(FragmentPackageExtractionError::Control(error));

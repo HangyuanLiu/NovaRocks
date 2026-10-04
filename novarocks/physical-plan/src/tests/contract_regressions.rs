@@ -2742,7 +2742,116 @@ fn writer_schema_role(ordinal: usize) -> WriterRelationFieldRole {
     }
 }
 
-fn grouped_writer_fragment(fixture: GroupedWriterFixture) -> Result<Fragment, ValidationErrors> {
+// These are explicit finite test-source admission ceilings, not production
+// defaults or a replacement for the mandatory special-consumer gate.
+fn grouped_constant_policy() -> novarocks_constant_contract::ConstantPolicy {
+    novarocks_constant_contract::ConstantPolicy {
+        max_rows: 3,
+        max_array_nodes: 4096,
+        max_logical_elements: 1_000_000,
+        max_retained_buffer_bytes: 16_777_216,
+        max_type_depth: 64,
+        max_type_nodes: 4096,
+        max_dictionary_depth: 16,
+        max_metadata_bytes: 1_048_576,
+        max_library_validation_work: 67_108_864,
+        max_library_validation_bytes: 67_108_864,
+    }
+}
+#[derive(Default)]
+struct GroupedConstantControl;
+impl novarocks_type_contract::PureCompileControl for GroupedConstantControl {
+    fn checkpoint(
+        &self,
+        _: novarocks_type_contract::CompilePhase,
+        units: u32,
+    ) -> Result<(), novarocks_type_contract::CompileControlError> {
+        assert!(units <= 256);
+        Ok(())
+    }
+}
+fn grouped_collection_pools(
+    fixture: GroupedWriterFixture,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> ConstantPools {
+    use arrow_array::{
+        Array,
+        builder::{Int32Builder, ListBuilder, MapBuilder, StringBuilder},
+    };
+    use arrow_schema::Field;
+    use std::sync::Arc;
+    let mut lists = ListBuilder::new(Int32Builder::new()).with_field(Arc::new(Field::new(
+        "item",
+        DataType::Int32,
+        false,
+    )));
+    // The first row is deliberately unused; selected rows are nonzero ordinals.
+    for row in 0..3 {
+        let n = if row == 1 && matches!(fixture, GroupedWriterFixture::NestedLiteralBudgetExceeded)
+        {
+            PlanLimits::FROZEN.unpivot_collection_items + 1
+        } else {
+            1
+        };
+        for _ in 0..n {
+            lists
+                .values()
+                .append_value(if row == 0 { 99 } else { row + 10 });
+        }
+        lists.append(true);
+    }
+    let lists = lists.finish();
+    let mut maps = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new())
+        .with_keys_field(Arc::new(Field::new("key", DataType::Utf8, false)))
+        .with_values_field(Arc::new(Field::new("value", DataType::Utf8, false)));
+    for row in 0..3 {
+        let pairs: &[(&str, &str)] = match (row, fixture) {
+            (0, _) => &[("unused", "prefix")],
+            (1, GroupedWriterFixture::EmptyMapKey) => &[("", "value")],
+            (1, GroupedWriterFixture::UnsortedMapKeys) => &[("zeta", "first"), ("alpha", "second")],
+            (1, GroupedWriterFixture::DuplicateMapKey) => &[("same", "first"), ("same", "second")],
+            _ => &[],
+        };
+        for (key, value) in pairs {
+            maps.keys().append_value(key);
+            maps.values().append_value(value);
+        }
+        maps.append(true).unwrap();
+    }
+    let maps = maps.finish();
+    let mut pools = ConstantPools::empty();
+    for (id, data) in [(0, lists.to_data()), (u32::MAX, maps.to_data())] {
+        let source = ty(data.data_type().clone(), false);
+        let field = Arc::new(source.try_to_field("grouped_collection_source").unwrap());
+        let pool = novarocks_constant_contract::ConstantPool::try_new(
+            field,
+            source,
+            data,
+            grouped_constant_policy(),
+            novarocks_type_contract::CompilePhase::Validate,
+            control,
+        )
+        .unwrap();
+        pools.insert(ConstantPoolId::new(id), pool).unwrap();
+    }
+    pools
+}
+fn grouped_reference(pool: u32, target: usize) -> ConstantReference {
+    ConstantReference {
+        pool: ConstantPoolId::new(pool),
+        ordinal: u32::try_from(target + 1).unwrap(),
+    }
+}
+fn grouped_writer_fragment(
+    fixture: GroupedWriterFixture,
+) -> Result<Fragment, PlanConstructionError> {
+    grouped_writer_fragment_with_sources(fixture).map(|(fragment, _)| fragment)
+}
+// This helper exercises structure first, then the original mandatory observed
+// constant consumer. It is not a complete FragmentPackage or runtime fixture.
+fn grouped_writer_fragment_with_sources(
+    fixture: GroupedWriterFixture,
+) -> Result<(Fragment, ConstantPools), PlanConstructionError> {
     use std::sync::Arc;
 
     use arrow_schema::{Field, Fields};
@@ -2757,6 +2866,8 @@ fn grouped_writer_fragment(fixture: GroupedWriterFixture) -> Result<Fragment, Va
     const WRITER_MULTIPLEX_SCHEMA_REVISION: u32 = 1;
     const ROOT_WRITE_RESULT_SCHEMA_REVISION: u32 = 1;
 
+    let control = GroupedConstantControl;
+    let pools = grouped_collection_pools(fixture, &control);
     let mut builder = FragmentBuilder::new(FragmentId::new(103));
     let input = builder.reserve_node_id().unwrap();
     let finish = builder.reserve_node_id().unwrap();
@@ -2978,38 +3089,20 @@ fn grouped_writer_fragment(fixture: GroupedWriterFixture) -> Result<Fragment, Va
                 )
                 .unwrap()
         };
-        let properties = match fixture {
-            GroupedWriterFixture::EmptyMapKey if target == 0 => {
-                Box::from([("".into(), "value".into())])
-            }
-            GroupedWriterFixture::UnsortedMapKeys if target == 0 => Box::from([
-                ("zeta".into(), "first".into()),
-                ("alpha".into(), "second".into()),
-            ]),
-            GroupedWriterFixture::DuplicateMapKey if target == 0 => Box::from([
-                ("same".into(), "first".into()),
-                ("same".into(), "second".into()),
-            ]),
-            _ => Box::default(),
-        };
         let mut constants = vec![
-            if matches!(fixture, GroupedWriterFixture::NestedLiteralBudgetExceeded) && target == 0 {
-                UnpivotConstant::Int32List(
-                    vec![0; PlanLimits::FROZEN.unpivot_collection_items + 1].into_boxed_slice(),
-                )
-            } else if matches!(fixture, GroupedWriterFixture::WrongConstantType) {
-                UnpivotConstant::Utf8Map(Box::default())
+            if matches!(fixture, GroupedWriterFixture::WrongConstantType) {
+                UnpivotConstant::Utf8Map(grouped_reference(u32::MAX, target))
             } else {
-                UnpivotConstant::Int32List(Box::from([i32::try_from(target + 11).unwrap()]))
+                UnpivotConstant::Int32List(grouped_reference(0, target))
             },
             UnpivotConstant::Scalar(scalar_constant),
-            UnpivotConstant::Utf8Map(properties),
+            UnpivotConstant::Utf8Map(grouped_reference(u32::MAX, target)),
         ];
         if matches!(fixture, GroupedWriterFixture::UncoveredAuxiliaryOutput) {
             constants.pop();
         }
         mappings.push(WriterGroupedUnpivotMapping {
-            write_target_ordinal: write_target_ordinal(target),
+            write_target_ordinal: write_target_ordinal(u32::try_from(target).unwrap()),
             input: if matches!(fixture, GroupedWriterFixture::NonFinalInput) {
                 shared_state_input
             } else {
@@ -3115,7 +3208,15 @@ fn grouped_writer_fragment(fixture: GroupedWriterFixture) -> Result<Fragment, Va
             }),
         })
         .unwrap();
-    builder.finish_definition(finish, FragmentSink::Noop, dop())
+    let fragment = builder.finish_definition(finish, FragmentSink::Noop, dop())?;
+    crate::constants::validate_fragment_constants_observed(
+        &fragment,
+        &pools,
+        true,
+        PlanLimits::FROZEN,
+        &control,
+    )?;
+    Ok((fragment, pools))
 }
 
 #[test]
@@ -3138,7 +3239,8 @@ fn writer_grouped_unpivot_allows_a_write_target_without_statistics() {
 
 #[test]
 fn writer_grouped_unpivot_keeps_target_local_mappings_for_a_shared_aggregate_channel() {
-    let fragment = grouped_writer_fragment(GroupedWriterFixture::SharedChannel).unwrap();
+    let (fragment, pools) =
+        grouped_writer_fragment_with_sources(GroupedWriterFixture::SharedChannel).unwrap();
     let NodeKind::TableFinish(finish) = &fragment.nodes()[&fragment.root()].kind else {
         panic!("expected a table finish node");
     };
@@ -3157,6 +3259,43 @@ fn writer_grouped_unpivot_keeps_target_local_mappings_for_a_shared_aggregate_cha
     assert_ne!(unpivot.mappings[0].constants, unpivot.mappings[1].constants);
     assert!(fragment.values()[&unpivot.passthrough_output].ty.nullable);
     assert!(!fragment.values()[&unpivot.grouping_output].ty.nullable);
+
+    let control = GroupedConstantControl;
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        &control,
+        novarocks_type_contract::CompilePhase::Validate,
+    )
+    .unwrap();
+    for (target, expected) in [11, 12].into_iter().enumerate() {
+        let UnpivotConstant::Int32List(reference) = unpivot.mappings[target].constants[0] else {
+            panic!("selected list source");
+        };
+        assert_eq!(reference, grouped_reference(0, target));
+        let selected = pools.resolve_source_observed(reference, &mut work).unwrap();
+        work.flush().unwrap();
+        let view = selected
+            .int32_list_observed(novarocks_type_contract::CompilePhase::Validate, &control)
+            .unwrap()
+            .unwrap();
+        work.flush().unwrap();
+        assert_eq!(view.len(), 1);
+        assert_eq!(view.item_observed(0, &mut work).unwrap(), Some(expected));
+        assert_eq!(selected.ordinal(), u32::try_from(target + 1).unwrap());
+        assert!(!selected.value_type().nullable);
+        let UnpivotConstant::Utf8Map(reference) = unpivot.mappings[target].constants[2] else {
+            panic!("selected map source");
+        };
+        assert_eq!(reference, grouped_reference(u32::MAX, target));
+        let selected = pools.resolve_source_observed(reference, &mut work).unwrap();
+        work.flush().unwrap();
+        let view = selected
+            .utf8_map_observed(novarocks_type_contract::CompilePhase::Validate, &control)
+            .unwrap()
+            .unwrap();
+        work.flush().unwrap();
+        assert!(view.is_empty());
+    }
+    work.finish().unwrap();
 }
 
 #[test]
@@ -3249,31 +3388,34 @@ fn writer_grouped_unpivot_roles_must_cover_every_auxiliary_output() {
 
 #[test]
 fn writer_grouped_unpivot_map_keys_must_be_non_empty() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::EmptyMapKey)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains("writer grouped Unpivot map keys must be non-empty and strictly increasing")
+    let error = grouped_writer_fragment(GroupedWriterFixture::EmptyMapKey).unwrap_err();
+    assert_eq!(
+        error,
+        PlanConstructionError::Constants(ConstantReferenceError::InvalidConsumer(
+            "unpivot map keys must be non-empty and strictly increasing",
+        ))
     );
 }
 
 #[test]
 fn writer_grouped_unpivot_map_keys_must_be_strictly_ordered() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::UnsortedMapKeys)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains("writer grouped Unpivot map keys must be non-empty and strictly increasing")
+    let error = grouped_writer_fragment(GroupedWriterFixture::UnsortedMapKeys).unwrap_err();
+    assert_eq!(
+        error,
+        PlanConstructionError::Constants(ConstantReferenceError::InvalidConsumer(
+            "unpivot map keys must be non-empty and strictly increasing",
+        ))
     );
 }
 
 #[test]
 fn writer_grouped_unpivot_map_keys_must_be_unique() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::DuplicateMapKey)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains("writer grouped Unpivot map keys must be non-empty and strictly increasing")
+    let error = grouped_writer_fragment(GroupedWriterFixture::DuplicateMapKey).unwrap_err();
+    assert_eq!(
+        error,
+        PlanConstructionError::Constants(ConstantReferenceError::InvalidConsumer(
+            "unpivot map keys must be non-empty and strictly increasing",
+        ))
     );
 }
 
@@ -3333,10 +3475,100 @@ fn writer_grouped_unpivot_rejects_output_bounds_above_the_contract_maximum() {
 
 #[test]
 fn writer_grouped_unpivot_rejects_nested_literal_collections_above_the_budget() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::NestedLiteralBudgetExceeded)
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("unpivot literal collections exceed the contract budget"));
+    let error =
+        grouped_writer_fragment(GroupedWriterFixture::NestedLiteralBudgetExceeded).unwrap_err();
+    assert_eq!(
+        error,
+        PlanConstructionError::Constants(ConstantReferenceError::Control(
+            novarocks_type_contract::CompileControlError::ResourceExhausted,
+        ))
+    );
+}
+
+#[test]
+fn writer_grouped_unpivot_source_gate_preserves_each_original_control_and_ordinary_tail() {
+    use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+    use std::sync::Mutex;
+    struct Control {
+        trace: Mutex<Vec<(CompilePhase, u32)>>,
+        refusal: Option<(usize, CompileControlError)>,
+    }
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            assert_eq!(phase, CompilePhase::Validate);
+            assert!(units <= 256);
+            let mut trace = self.trace.lock().unwrap();
+            let at = trace.len();
+            if let Some((stop, _)) = self.refusal {
+                assert!(at <= stop, "callback after original refusal");
+            }
+            trace.push((phase, units));
+            match self.refusal {
+                Some((stop, cause)) if stop == at => Err(cause),
+                _ => Ok(()),
+            }
+        }
+    }
+    let (fragment, pools) =
+        grouped_writer_fragment_with_sources(GroupedWriterFixture::SharedChannel).unwrap();
+    let mut parts = fragment.clone().into_parts();
+    let NodeKind::TableFinish(finish) = &mut parts.nodes.get_mut(&fragment.root()).unwrap().kind
+    else {
+        unreachable!()
+    };
+    let UnpivotConstant::Int32List(reference) =
+        &mut finish.grouped_unpivot.as_mut().unwrap().mappings[0].constants[0]
+    else {
+        unreachable!()
+    };
+    reference.pool = ConstantPoolId::new(42);
+    let missing: Fragment = parts.into();
+    for (source, ordinary) in [(&fragment, false), (&missing, true)] {
+        let baseline = Control {
+            trace: Mutex::default(),
+            refusal: None,
+        };
+        let result = crate::constants::validate_fragment_constants_observed(
+            source,
+            &pools,
+            true,
+            PlanLimits::FROZEN,
+            &baseline,
+        );
+        if ordinary {
+            assert_eq!(
+                result,
+                Err(ConstantReferenceError::MissingPool(ConstantPoolId::new(42)))
+            );
+        } else {
+            result.unwrap();
+        }
+        let trace = baseline.trace.lock().unwrap().clone();
+        assert!(trace.len() >= 2);
+        for at in 0..trace.len() {
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let refusal = Control {
+                    trace: Mutex::default(),
+                    refusal: Some((at, cause)),
+                };
+                assert_eq!(
+                    crate::constants::validate_fragment_constants_observed(
+                        source,
+                        &pools,
+                        true,
+                        PlanLimits::FROZEN,
+                        &refusal
+                    ),
+                    Err(ConstantReferenceError::Control(cause))
+                );
+                assert_eq!(*refusal.trace.lock().unwrap(), trace[..=at]);
+            }
+        }
+    }
 }
 
 #[test]

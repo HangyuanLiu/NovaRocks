@@ -1181,6 +1181,26 @@ impl PlanBuilder {
                 .expressions()
                 .iter()
                 .any(|(_, node)| matches!(node.kind, crate::ExprKind::Constant(_)))
+                || fragment.nodes().values().any(|node| {
+                    let special = |constant: &crate::UnpivotConstant| {
+                        crate::constants::collection_reference(constant).is_some()
+                    };
+                    match &node.kind {
+                        crate::NodeKind::Unpivot { spec } => spec
+                            .mappings
+                            .iter()
+                            .any(|mapping| mapping.constants.iter().any(special)),
+                        crate::NodeKind::TableFinish(spec) => {
+                            spec.grouped_unpivot.as_ref().is_some_and(|grouped| {
+                                grouped
+                                    .mappings
+                                    .iter()
+                                    .any(|mapping| mapping.constants.iter().any(special))
+                            })
+                        }
+                        _ => false,
+                    }
+                })
         }) || !self.constants.entries().is_empty()
         {
             let mut errors = crate::validation::ValidationContext::new();

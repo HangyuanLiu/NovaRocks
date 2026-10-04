@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::physical_properties_v2::PhysicalPropertyProjectionLimits;
 use crate::{
     physical_connector_payload_v2::{
         ConnectorPayloadProjectionLimits, decode_connector_payloads, encode_connector_payloads,
@@ -27,8 +28,8 @@ use crate::{
 use arrow::datatypes::DataType;
 use novarocks_proto_models::physical_control_v2::Empty;
 use novarocks_type_contract::{
-    FunctionValueType, PartitionCountParameterId, PartitionHashAlgorithm, PartitionSpaceId,
-    PureCompileControl,
+    CompileControlError, FunctionValueType, PartitionCountParameterId, PartitionHashAlgorithm,
+    PartitionSpaceId, PureCompileControl,
 };
 use std::sync::Mutex;
 
@@ -837,5 +838,140 @@ fn real_wide_lists_observe_quantum_and_original_refusal_before_further_work() {
             }
             control.arm(None);
         }
+    });
+}
+
+#[test]
+fn original_repeat_envelope_trace_remains_exact_after_shared_author_extraction() {
+    // Literal traces were recorded by the original sole Repeat author before extraction.
+    let control = Control::default();
+    with_namespaces(&definitions(), &control, |encoded, decoded| {
+        let original = source();
+        let wire = expected();
+        control.arm(None);
+        assert_eq!(
+            encode_repeat_node(&original, encoded, SOURCE, limits())
+                .unwrap()
+                .0,
+            wire
+        );
+        assert_eq!(
+            control.trace(),
+            [
+                (CompilePhase::Encode, 0),
+                (CompilePhase::Encode, 60),
+                (CompilePhase::Encode, 0),
+                (CompilePhase::Encode, 1),
+                (CompilePhase::Encode, 0),
+                (CompilePhase::Encode, 5),
+                (CompilePhase::Encode, 0),
+                (CompilePhase::Encode, 1),
+                (CompilePhase::Encode, 0),
+                (CompilePhase::Encode, 6),
+                (CompilePhase::Encode, 0),
+                (CompilePhase::Encode, 1),
+                (CompilePhase::Encode, 0),
+                (CompilePhase::Encode, 0),
+                (CompilePhase::Encode, 0),
+                (CompilePhase::Encode, 3),
+                (CompilePhase::Encode, 0),
+                (CompilePhase::Encode, 1),
+                (CompilePhase::Encode, 0),
+                (CompilePhase::Encode, 0),
+                (CompilePhase::Encode, 0),
+                (CompilePhase::Encode, 2),
+                (CompilePhase::Encode, 0),
+                (CompilePhase::Encode, 1),
+                (CompilePhase::Encode, 0),
+                (CompilePhase::Encode, 1),
+                (CompilePhase::Encode, 0),
+                (CompilePhase::Encode, 0),
+                (CompilePhase::Encode, 0),
+                (CompilePhase::Encode, 3)
+            ]
+        );
+        control.arm(None);
+        assert_eq!(
+            decode_repeat_node(&wire, decoded, SOURCE, limits())
+                .unwrap()
+                .0,
+            original
+        );
+        assert_eq!(
+            control.trace(),
+            [
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 60),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 1),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 6),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 1),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 1),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 6),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 1),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 3),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 1),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 1),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 1),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 1),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 1),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 1),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 1),
+                (CompilePhase::Decode, 0),
+                (CompilePhase::Decode, 1)
+            ]
+        );
+        let mut bad = wire.clone();
+        repeat_mut(&mut bad).grouping_values[0].destination_value_id = None;
+        control.arm(None);
+        assert!(matches!(
+            decode_repeat_node(&bad, decoded, SOURCE, limits()),
+            Err(Error::InvalidShape(
+                "Repeat grouping destination value is absent"
+            ))
+        ));
+        assert_eq!(
+            control.trace(),
+            [(CompilePhase::Decode, 0), (CompilePhase::Decode, 46)]
+        );
     });
 }

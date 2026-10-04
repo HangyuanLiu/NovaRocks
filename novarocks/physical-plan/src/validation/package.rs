@@ -53,6 +53,14 @@ pub(crate) fn validate_package(
     usage
         .add_constants_observed(&input.constants, work)
         .map_err(crate::FragmentPackageError::Control)?;
+    usage
+        .add_unpivot_sources_observed(fragment, &input.constants, limits, work)
+        .map_err(|error| match error {
+            crate::ConstantReferenceError::Control(cause) => {
+                crate::FragmentPackageError::Control(cause)
+            }
+            error => crate::FragmentPackageError::Constant(error),
+        })?;
     // Count the immutable control representation in the same package dynamic
     // item bound. These counts are not a decoded-allocation or peak-byte model.
     let control = &input.expression_uses;

@@ -3645,43 +3645,199 @@ fn encode_unpivot_constant(
     constant: &UnpivotConstant,
     context: ExpressionEncodingContext<'_>,
 ) -> Result<plan::UnpivotConstant, PhysicalEncodeError> {
+    use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
     use plan::unpivot_constant::Value;
-    let value = match constant {
-        UnpivotConstant::Scalar(expression) => {
-            if !matches!(
-                fragment
-                    .expressions()
-                    .get(*expression)
-                    .map(|node| &node.kind),
-                Some(ExprKind::Constant(_))
-            ) {
-                return Err(
-                    "native wire v1 Unpivot scalar requires a checked constant reference".into(),
-                );
+    let mut work = CompileCheckpoints::try_new(context.control, CompilePhase::Encode)?;
+    let result = (|| {
+        let value = match constant {
+            UnpivotConstant::Scalar(expression) => {
+                if !matches!(
+                    fragment
+                        .expressions()
+                        .get(*expression)
+                        .map(|node| &node.kind),
+                    Some(ExprKind::Constant(_))
+                ) {
+                    return Err(
+                        "native wire v1 Unpivot scalar requires a checked constant reference"
+                            .into(),
+                    );
+                }
+                work.flush()?;
+                let scalar = encode_physical_expr(
+                    fragment,
+                    layout,
+                    owner,
+                    *expression,
+                    ValueResolution::NodeInput,
+                    context,
+                )?;
+                work.step()?;
+                Value::ScalarLiteral(scalar)
             }
-            Value::ScalarLiteral(encode_physical_expr(
-                fragment,
-                layout,
-                owner,
-                *expression,
-                ValueResolution::NodeInput,
-                context,
-            )?)
+            UnpivotConstant::Int32List(reference) => {
+                let source = context
+                    .constants
+                    .resolve_source_observed(*reference, &mut work)
+                    .map_err(unpivot_reference_error)?;
+                // The public encoder has already validated the sole Unpivot source
+                // policy. The accessor retains the actual selected backing/ordinal;
+                // it does not retag that source to a joined nullable output.
+                work.flush()?;
+                let view = source
+                    .int32_list_observed(CompilePhase::Encode, context.control)
+                    .map_err(unpivot_constant_error)?
+                    .ok_or("native wire v1 Unpivot list source is NULL")?;
+                let mut values = unpivot_wire_vector(view.len(), &mut work)?;
+                for index in 0..view.len() {
+                    let value = view
+                        .item_observed(index, &mut work)
+                        .map_err(unpivot_constant_error)?
+                        .ok_or("native wire v1 Unpivot list item is NULL")?;
+                    values.push(value);
+                    work.step()?;
+                }
+                Value::Int32List(plan::Int32List { values })
+            }
+            UnpivotConstant::Utf8Map(reference) => {
+                let source = context
+                    .constants
+                    .resolve_source_observed(*reference, &mut work)
+                    .map_err(unpivot_reference_error)?;
+                work.flush()?;
+                let view = source
+                    .utf8_map_observed(CompilePhase::Encode, context.control)
+                    .map_err(unpivot_constant_error)?
+                    .ok_or("native wire v1 Unpivot map source is NULL")?;
+                // Complete selected request geometry is checked before the first
+                // output reserve. No unused pool row or hidden NULL payload is read.
+                let mut request_bytes = unpivot_wire_layout::<plan::Utf8MapEntry>(view.len())?;
+                work.step()?;
+                for index in 0..view.len() {
+                    let (key, value) = unpivot_wire_map_item(&view, index, &mut work)?;
+                    for text in [key, value] {
+                        let bytes = unpivot_wire_layout::<u8>(text.len())?;
+                        request_bytes = request_bytes
+                            .checked_add(bytes)
+                            .filter(|total| *total <= isize::MAX as usize)
+                            .ok_or_else(unpivot_resource_error)?;
+                        work.step()?;
+                    }
+                }
+                let mut entries = unpivot_wire_vector(view.len(), &mut work)?;
+                for index in 0..view.len() {
+                    let (key, value) = unpivot_wire_map_item(&view, index, &mut work)?;
+                    entries.push(plan::Utf8MapEntry {
+                        key: unpivot_wire_text(key, &mut work)?,
+                        value: unpivot_wire_text(value, &mut work)?,
+                    });
+                    work.step()?;
+                }
+                Value::Utf8Map(plan::Utf8Map { entries })
+            }
+        };
+        Ok(plan::UnpivotConstant { value: Some(value) })
+    })();
+    if matches!(&result, Err(PhysicalEncodeError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+
+fn unpivot_resource_error() -> PhysicalEncodeError {
+    PhysicalEncodeError::Control(novarocks_type_contract::CompileControlError::ResourceExhausted)
+}
+
+fn unpivot_constant_error(
+    error: novarocks_constant_contract::ConstantError,
+) -> PhysicalEncodeError {
+    match error {
+        novarocks_constant_contract::ConstantError::Control(cause) => {
+            PhysicalEncodeError::Control(cause)
         }
-        UnpivotConstant::Int32List(values) => Value::Int32List(plan::Int32List {
-            values: values.to_vec(),
-        }),
-        UnpivotConstant::Utf8Map(entries) => Value::Utf8Map(plan::Utf8Map {
-            entries: entries
-                .iter()
-                .map(|(key, value)| plan::Utf8MapEntry {
-                    key: key.to_string(),
-                    value: value.to_string(),
-                })
-                .collect(),
-        }),
-    };
-    Ok(plan::UnpivotConstant { value: Some(value) })
+        novarocks_constant_contract::ConstantError::Limit(_) => unpivot_resource_error(),
+        error => PhysicalEncodeError::Invalid(error.to_string()),
+    }
+}
+
+fn unpivot_reference_error(
+    error: novarocks_physical_plan::ConstantReferenceError,
+) -> PhysicalEncodeError {
+    match error {
+        novarocks_physical_plan::ConstantReferenceError::Control(cause) => {
+            PhysicalEncodeError::Control(cause)
+        }
+        novarocks_physical_plan::ConstantReferenceError::Constant(error) => {
+            unpivot_constant_error(error)
+        }
+        error => PhysicalEncodeError::Invalid(error.to_string()),
+    }
+}
+
+fn unpivot_wire_layout<T>(length: usize) -> Result<usize, PhysicalEncodeError> {
+    std::alloc::Layout::array::<T>(length)
+        .map(|layout| layout.size())
+        .map_err(|_| unpivot_resource_error())
+}
+
+fn unpivot_wire_vector<T>(
+    length: usize,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<Vec<T>, PhysicalEncodeError> {
+    unpivot_wire_layout::<T>(length)?;
+    work.step()?;
+    work.flush()?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(length)
+        .map_err(|_| unpivot_resource_error())?;
+    // A failed reserve is the primary resource refusal; only success reaches
+    // the opaque exit observation.
+    work.flush()?;
+    Ok(output)
+}
+
+fn unpivot_wire_map_item<'a>(
+    view: &novarocks_constant_contract::SelectedUtf8Map<'a>,
+    index: usize,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<(&'a str, &'a str), PhysicalEncodeError> {
+    let (key, value) = view
+        .item_observed(index, work)
+        .map_err(unpivot_constant_error)?;
+    Ok((
+        key.ok_or("native wire v1 Unpivot map key is NULL")?,
+        value.ok_or("native wire v1 Unpivot map value is NULL")?,
+    ))
+}
+
+fn unpivot_wire_text(
+    text: &str,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<String, PhysicalEncodeError> {
+    unpivot_wire_layout::<u8>(text.len())?;
+    work.step()?;
+    work.flush()?;
+    let mut output = String::new();
+    output
+        .try_reserve_exact(text.len())
+        .map_err(|_| unpivot_resource_error())?;
+    work.flush()?;
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        let mut end = remaining.len().min(256);
+        while !remaining.is_char_boundary(end) {
+            end -= 1;
+            work.step()?;
+        }
+        output.push_str(&remaining[..end]);
+        for _ in &remaining.as_bytes()[..end] {
+            work.step()?;
+        }
+        remaining = &remaining[end..];
+    }
+    Ok(output)
 }
 
 fn encode_unpivot_schema(
@@ -5387,6 +5543,520 @@ mod tests {
     };
 
     use super::*;
+
+    fn unpivot_collection_pools(list_items: usize) -> novarocks_physical_plan::ConstantPools {
+        use arrow::array::{
+            Array, ArrayRef, Int32Array, ListArray, MapArray, StringArray, StructArray,
+        };
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::Field;
+        use novarocks_constant_contract::ConstantPool;
+        use novarocks_physical_plan::ConstantPoolId;
+        use novarocks_type_contract::CompilePhase;
+        let child: ArrayRef = Arc::new(Int32Array::from(
+            std::iter::once(999)
+                .chain((0..list_items).map(|i| -(i as i32)))
+                .chain([888])
+                .collect::<Vec<_>>(),
+        ));
+        let list = ListArray::try_new(
+            Arc::new(Field::new("item", DataType::Int32, false)),
+            OffsetBuffer::new(
+                vec![
+                    0,
+                    1,
+                    i32::try_from(list_items + 1).unwrap(),
+                    i32::try_from(list_items + 2).unwrap(),
+                ]
+                .into(),
+            ),
+            child,
+            None,
+        )
+        .unwrap();
+        let keys: ArrayRef = Arc::new(StringArray::from(vec!["unused", "a", "z", "unused"]));
+        let values: ArrayRef = Arc::new(StringArray::from(vec![
+            "unused", "λ\0雪", "tail☃", "unused",
+        ]));
+        let entries = StructArray::new(
+            vec![
+                Arc::new(Field::new("key", DataType::Utf8, false)),
+                Arc::new(Field::new("value", DataType::Utf8, false)),
+            ]
+            .into(),
+            vec![keys, values],
+            None,
+        );
+        let map = MapArray::try_new(
+            Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+            OffsetBuffer::new(vec![0, 1, 3, 4].into()),
+            entries,
+            None,
+            false,
+        )
+        .unwrap();
+        let mut pools = fixture_i64_constants();
+        for (id, data) in [(u32::MAX, list.to_data()), (1, map.to_data())] {
+            let field = Arc::new(
+                Field::new("original_collection", data.data_type().clone(), false)
+                    .with_metadata(HashMap::from([("provider.source".into(), "kept".into())])),
+            );
+            let ty = FunctionValueType::try_from_field(&field).unwrap();
+            let pool = ConstantPool::try_new(
+                field,
+                ty,
+                data,
+                codec_constant_policy(),
+                CompilePhase::Encode,
+                &CodecTestControl,
+            )
+            .unwrap();
+            pools.insert(ConstantPoolId::new(id), pool).unwrap();
+        }
+        pools
+    }
+
+    fn unpivot_collection_plan(pools: novarocks_physical_plan::ConstantPools) -> PhysicalPlan {
+        use novarocks_physical_plan::{
+            ConstantPoolId, ConstantReference, UnpivotSpec, UnpivotValueMapping,
+        };
+        let mut builder = FragmentBuilder::new(FragmentId::new(31));
+        let source = builder.reserve_node_id().unwrap();
+        let source_type = FunctionValueType::new(DataType::Int64, false);
+        let expr = builder
+            .add_expression(source, source_type.clone(), fixture_i64_reference(1))
+            .unwrap();
+        let input = builder
+            .add_value(
+                source_type.clone(),
+                ValueOrigin::NodeOutput {
+                    node: source,
+                    output_ordinal: 0,
+                },
+            )
+            .unwrap();
+        builder
+            .insert_node_unchecked(PhysicalNode {
+                id: source,
+                inputs: Box::default(),
+                required_inputs: Box::default(),
+                output_properties: properties(),
+                output: OutputPort {
+                    node: source,
+                    columns: Box::from([input]),
+                },
+                kind: NodeKind::Values {
+                    rows: Box::from([Box::from([expr])]),
+                },
+            })
+            .unwrap();
+        let root = builder.reserve_node_id().unwrap();
+        let output_types = [
+            source_type,
+            pools.entries()[&ConstantPoolId::new(u32::MAX)]
+                .value_type()
+                .clone(),
+            pools.entries()[&ConstantPoolId::new(1)]
+                .value_type()
+                .clone(),
+        ];
+        let outputs = output_types
+            .iter()
+            .enumerate()
+            .map(|(ordinal, ty)| {
+                builder
+                    .add_value(
+                        ty.clone(),
+                        ValueOrigin::NodeOutput {
+                            node: root,
+                            output_ordinal: ordinal as u32,
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        builder
+            .insert_node_unchecked(PhysicalNode {
+                id: root,
+                inputs: Box::from([source]),
+                required_inputs: Box::from([PhysicalProperties {
+                    distribution: Distribution::Unconstrained,
+                    ..properties()
+                }]),
+                output_properties: properties(),
+                output: OutputPort {
+                    node: root,
+                    columns: outputs.clone().into_boxed_slice(),
+                },
+                kind: NodeKind::Unpivot {
+                    spec: UnpivotSpec {
+                        passthrough: Box::default(),
+                        value_output: outputs[0],
+                        literal_outputs: Box::from([outputs[1], outputs[2]]),
+                        mappings: Box::from([UnpivotValueMapping {
+                            input,
+                            constants: Box::from([
+                                UnpivotConstant::Int32List(ConstantReference {
+                                    pool: ConstantPoolId::new(u32::MAX),
+                                    ordinal: 1,
+                                }),
+                                UnpivotConstant::Utf8Map(ConstantReference {
+                                    pool: ConstantPoolId::new(1),
+                                    ordinal: 1,
+                                }),
+                            ]),
+                        }]),
+                        max_output_rows: 1024,
+                        max_output_bytes: 1 << 20,
+                    },
+                },
+            })
+            .unwrap();
+        let fragment = builder
+            .finish_definition(
+                root,
+                FragmentSink::Result,
+                PipelineDopDomain {
+                    min: 1,
+                    max: 1,
+                    requires_power_of_two: false,
+                },
+            )
+            .unwrap();
+        let output = fragment.nodes()[&root].output.clone();
+        let mut plan =
+            PlanBuilder::new(PlanVersionId::try_new([37; 16]).unwrap()).with_constant_pools(pools);
+        plan.add_fragment(fragment).unwrap();
+        plan.set_result_port(ResultPort {
+            fragment: FragmentId::new(31),
+            output,
+            fields: outputs
+                .into_iter()
+                .zip(output_types)
+                .enumerate()
+                .map(|(index, (value, ty))| ResultField {
+                    name: format!("field{index}").into(),
+                    alias: None,
+                    value,
+                    ty,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        })
+        .unwrap();
+        plan.finish_observed(&CodecTestControl).unwrap()
+    }
+
+    #[derive(Default)]
+    struct UnpivotProjectionControl {
+        calls: std::sync::Mutex<Vec<(novarocks_type_contract::CompilePhase, u32)>>,
+        reject: Option<(usize, novarocks_type_contract::CompileControlError)>,
+    }
+    impl novarocks_type_contract::PureCompileControl for UnpivotProjectionControl {
+        fn checkpoint(
+            &self,
+            phase: novarocks_type_contract::CompilePhase,
+            units: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            assert!(units <= 256);
+            let mut trace = self.calls.lock().unwrap();
+            let index = trace.len();
+            if let Some((stop, _)) = self.reject {
+                assert!(index <= stop, "callback after first refusal");
+            }
+            trace.push((phase, units));
+            match self.reject {
+                Some((stop, cause)) if stop == index => Err(cause),
+                _ => Ok(()),
+            }
+        }
+    }
+    fn unpivot_projection_prefix<T>(
+        invoke: impl Fn(&UnpivotProjectionControl) -> Result<T, PhysicalEncodeError>,
+        ordinary: bool,
+    ) {
+        use novarocks_type_contract::CompileControlError;
+        let good = UnpivotProjectionControl::default();
+        let result = invoke(&good);
+        if ordinary {
+            assert!(matches!(result, Err(PhysicalEncodeError::Invalid(_))));
+        } else {
+            assert!(result.is_ok());
+        }
+        let trace = good.calls.lock().unwrap().clone();
+        assert_eq!(trace[0].1, 0);
+        assert!(trace.len() > 1);
+        for at in 0..trace.len() {
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let control = UnpivotProjectionControl {
+                    calls: Default::default(),
+                    reject: Some((at, cause)),
+                };
+                assert!(
+                    matches!(invoke(&control), Err(PhysicalEncodeError::Control(actual)) if actual == cause)
+                );
+                assert_eq!(*control.calls.lock().unwrap(), trace[..=at]);
+            }
+        }
+    }
+
+    #[test]
+    fn unpivot_checked_collection_v1_public_projection_preserves_selected_ordinal_and_order() {
+        let physical = unpivot_collection_plan(unpivot_collection_pools(3));
+        let (catalog, _) = exact_scalar_catalog();
+        let wire = encode_physical_plan_v1(
+            &physical,
+            &catalog,
+            &NoPhysicalV1PrivateFacts,
+            false,
+            &CodecTestControl,
+        )
+        .unwrap();
+        let Some(plan::distributed_node::Payload::Physical(physical_node)) =
+            &wire.fragments[0].root.as_ref().unwrap().payload
+        else {
+            panic!("actual physical payload missing")
+        };
+        let Some(plan::plan_node::Kind::Unpivot(node)) = &physical_node.kind else {
+            panic!("actual Unpivot payload missing")
+        };
+        assert_eq!(node.value_mappings.len(), 1);
+        assert_eq!(
+            node.value_mappings[0].constants,
+            vec![
+                plan::UnpivotConstant {
+                    value: Some(plan::unpivot_constant::Value::Int32List(plan::Int32List {
+                        values: vec![0, -1, -2]
+                    }))
+                },
+                plan::UnpivotConstant {
+                    value: Some(plan::unpivot_constant::Value::Utf8Map(plan::Utf8Map {
+                        entries: vec![
+                            plan::Utf8MapEntry {
+                                key: "a".into(),
+                                value: "λ\0雪".into()
+                            },
+                            plan::Utf8MapEntry {
+                                key: "z".into(),
+                                value: "tail☃".into()
+                            },
+                        ]
+                    }))
+                },
+            ]
+        );
+        // This is the real public entry, including mandatory original plan
+        // validation, preflight, materialization, and its final tail.
+        unpivot_projection_prefix(
+            |control| {
+                encode_physical_plan_v1(
+                    &physical,
+                    &catalog,
+                    &NoPhysicalV1PrivateFacts,
+                    false,
+                    control,
+                )
+            },
+            false,
+        );
+    }
+
+    #[test]
+    fn unpivot_checked_collection_v1_ordinary_errors_preserve_each_control_prefix() {
+        use novarocks_physical_plan::{ConstantPoolId, ConstantReference};
+        let physical = unpivot_collection_plan(unpivot_collection_pools(3));
+        let fragment = physical.fragments().values().next().unwrap();
+        let layout = WireLayout::try_new(fragment).unwrap();
+        for constant in [
+            UnpivotConstant::Int32List(ConstantReference {
+                pool: ConstantPoolId::new(7),
+                ordinal: 1,
+            }),
+            UnpivotConstant::Int32List(ConstantReference {
+                pool: ConstantPoolId::new(u32::MAX),
+                ordinal: u32::MAX,
+            }),
+            UnpivotConstant::Utf8Map(ConstantReference {
+                pool: ConstantPoolId::new(u32::MAX),
+                ordinal: 1,
+            }),
+        ] {
+            unpivot_projection_prefix(
+                |control| {
+                    encode_unpivot_constant(
+                        fragment,
+                        &layout,
+                        fragment.root(),
+                        &constant,
+                        ExpressionEncodingContext {
+                            constants: physical.constants(),
+                            control,
+                        },
+                    )
+                },
+                true,
+            );
+        }
+    }
+
+    #[test]
+    fn unpivot_checked_collection_v1_nullable_items_are_not_wire_defaults() {
+        use arrow::array::{Array, ListArray, types::Int32Type};
+        use arrow::datatypes::Field;
+        use novarocks_constant_contract::ConstantPool;
+        use novarocks_physical_plan::{ConstantPoolId, ConstantReference};
+        use novarocks_type_contract::CompilePhase;
+        let physical = unpivot_collection_plan(unpivot_collection_pools(3));
+        let fragment = physical.fragments().values().next().unwrap();
+        let layout = WireLayout::try_new(fragment).unwrap();
+        // A legal generic checked List contains a NULL child and a NULL root.
+        // The private wire consumer cannot turn either into an integer default;
+        // the public special-source policy rejects this profile earlier.
+        let array = ListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(99)]),
+            Some(vec![Some(7), None]),
+            None,
+        ]);
+        let field = Arc::new(Field::new(
+            "actual_nullable_source",
+            array.data_type().clone(),
+            true,
+        ));
+        let ty = FunctionValueType::try_from_field(&field).unwrap();
+        let pool = ConstantPool::try_new(
+            field,
+            ty,
+            array.to_data(),
+            codec_constant_policy(),
+            CompilePhase::Encode,
+            &CodecTestControl,
+        )
+        .unwrap();
+        let mut pools = novarocks_physical_plan::ConstantPools::empty();
+        pools.insert(ConstantPoolId::new(u32::MAX), pool).unwrap();
+        for ordinal in [1, 2] {
+            let constant = UnpivotConstant::Int32List(ConstantReference {
+                pool: ConstantPoolId::new(u32::MAX),
+                ordinal,
+            });
+            unpivot_projection_prefix(
+                |control| {
+                    encode_unpivot_constant(
+                        fragment,
+                        &layout,
+                        fragment.root(),
+                        &constant,
+                        ExpressionEncodingContext {
+                            constants: &pools,
+                            control,
+                        },
+                    )
+                },
+                true,
+            );
+        }
+    }
+
+    #[test]
+    fn unpivot_checked_collection_v1_wide_selected_copy_observes_real_quantum_and_resource_layout()
+    {
+        use novarocks_physical_plan::{ConstantPoolId, ConstantReference};
+        use novarocks_type_contract::CompileControlError;
+        let physical = unpivot_collection_plan(unpivot_collection_pools(320));
+        let fragment = physical.fragments().values().next().unwrap();
+        let layout = WireLayout::try_new(fragment).unwrap();
+        let constant = UnpivotConstant::Int32List(ConstantReference {
+            pool: ConstantPoolId::new(u32::MAX),
+            ordinal: 1,
+        });
+        let good = UnpivotProjectionControl::default();
+        let result = encode_unpivot_constant(
+            fragment,
+            &layout,
+            fragment.root(),
+            &constant,
+            ExpressionEncodingContext {
+                constants: physical.constants(),
+                control: &good,
+            },
+        )
+        .unwrap();
+        let Some(plan::unpivot_constant::Value::Int32List(values)) = result.value else {
+            panic!("list payload missing")
+        };
+        assert_eq!(values.values.len(), 320);
+        assert_eq!((values.values[0], values.values[319]), (0, -319));
+        let trace = good.calls.lock().unwrap().clone();
+        assert!(trace.iter().any(|(_, units)| *units == 256));
+        for at in [0, trace.len() - 1].into_iter().chain(
+            trace
+                .iter()
+                .enumerate()
+                .filter_map(|(at, (_, units))| (*units == 256).then_some(at)),
+        ) {
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let control = UnpivotProjectionControl {
+                    calls: Default::default(),
+                    reject: Some((at, cause)),
+                };
+                assert!(
+                    matches!(encode_unpivot_constant(fragment, &layout, fragment.root(), &constant, ExpressionEncodingContext { constants: physical.constants(), control: &control }), Err(PhysicalEncodeError::Control(actual)) if actual == cause)
+                );
+                assert_eq!(*control.calls.lock().unwrap(), trace[..=at]);
+            }
+        }
+        assert!(matches!(
+            unpivot_wire_layout::<plan::Utf8MapEntry>(usize::MAX),
+            Err(PhysicalEncodeError::Control(
+                CompileControlError::ResourceExhausted
+            ))
+        ));
+    }
+
+    #[test]
+    fn unpivot_checked_collection_v1_utf8_copy_observes_actual_bytes_and_all_refusals() {
+        use novarocks_type_contract::{CompileCheckpoints, CompileControlError, CompilePhase};
+        let text = format!("{}\0tail", "λ雪☃".repeat(150));
+        let copy = |control: &UnpivotProjectionControl| {
+            let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
+            let result = unpivot_wire_text(&text, &mut work);
+            if matches!(&result, Err(PhysicalEncodeError::Control(_))) {
+                return result;
+            }
+            work.finish()?;
+            result
+        };
+        let good = UnpivotProjectionControl::default();
+        assert_eq!(copy(&good).unwrap(), text);
+        let trace = good.calls.lock().unwrap().clone();
+        assert!(trace.iter().any(|(_, units)| *units == 256));
+        let measured: u64 = trace.iter().map(|(_, units)| u64::from(*units)).sum();
+        assert!(measured >= text.len() as u64);
+        for at in 0..trace.len() {
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let control = UnpivotProjectionControl {
+                    calls: Default::default(),
+                    reject: Some((at, cause)),
+                };
+                assert!(
+                    matches!(copy(&control), Err(PhysicalEncodeError::Control(actual)) if actual == cause)
+                );
+                assert_eq!(*control.calls.lock().unwrap(), trace[..=at]);
+            }
+        }
+    }
 
     #[derive(Clone)]
     struct ExactResolver {

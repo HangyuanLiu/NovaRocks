@@ -3592,24 +3592,9 @@ impl<'a> ContractLoweringVisitor<'a> {
                                             &BTreeMap::new(),
                                         )?))
                                     }
-                                    crate::analysis::UnpivotConstant::Int32List(values) => {
-                                        Ok(ContractUnpivotConstant::Int32List(
-                                            values.clone().into_boxed_slice(),
-                                        ))
-                                    }
-                                    crate::analysis::UnpivotConstant::Utf8Map(entries) => {
-                                        Ok(ContractUnpivotConstant::Utf8Map(
-                                            entries
-                                                .iter()
-                                                .map(|(key, value)| {
-                                                    (
-                                                        key.clone().into_boxed_str(),
-                                                        value.clone().into_boxed_str(),
-                                                    )
-                                                })
-                                                .collect::<Vec<_>>()
-                                                .into_boxed_slice(),
-                                        ))
+                                    crate::analysis::UnpivotConstant::Int32List(_)
+                                    | crate::analysis::UnpivotConstant::Utf8Map(_) => {
+                                        self.author_unpivot_collection(constant)
                                     }
                                 })
                                 .collect::<Result<Vec<_>, ContractLoweringError>>()?;
@@ -5811,19 +5796,9 @@ impl<'a> ContractLoweringVisitor<'a> {
                             &BTreeMap::new(),
                         )?)
                     }
-                    crate::analysis::UnpivotConstant::Int32List(values) => {
-                        ContractUnpivotConstant::Int32List(values.clone().into_boxed_slice())
-                    }
-                    crate::analysis::UnpivotConstant::Utf8Map(entries) => {
-                        ContractUnpivotConstant::Utf8Map(
-                            entries
-                                .iter()
-                                .map(|(key, value)| {
-                                    (key.clone().into_boxed_str(), value.clone().into_boxed_str())
-                                })
-                                .collect::<Vec<_>>()
-                                .into_boxed_slice(),
-                        )
+                    crate::analysis::UnpivotConstant::Int32List(_)
+                    | crate::analysis::UnpivotConstant::Utf8Map(_) => {
+                        self.author_unpivot_collection(constant)?
                     }
                 });
             }
@@ -8069,6 +8044,17 @@ impl<'a> ContractLoweringVisitor<'a> {
         value: &novarocks_constant_contract::ConstantValue,
         ty: ValueType,
     ) -> Result<ExprId, ContractLoweringError> {
+        let reference = self.register_constant_source(value, &ty)?;
+        self.add_scoped_expression(owner, ty, ContractExprKind::Constant(reference))
+    }
+
+    // Scalar expressions and direct collection consumers share the original
+    // backing-identity table and sparse pool allocator.
+    fn register_constant_source(
+        &mut self,
+        value: &novarocks_constant_contract::ConstantValue,
+        ty: &ValueType,
+    ) -> Result<novarocks_physical_plan::ConstantReference, ContractLoweringError> {
         self.work.flush()?;
         if !ty.exactly_equals_observed(value.value_type(), || {
             self.work.step().map_err(ContractLoweringError::from)
@@ -8094,11 +8080,63 @@ impl<'a> ContractLoweringVisitor<'a> {
                 id
             }
         };
-        let kind = ContractExprKind::Constant(novarocks_physical_plan::ConstantReference {
+        Ok(novarocks_physical_plan::ConstantReference {
             pool,
             ordinal: value.ordinal(),
-        });
-        self.add_scoped_expression(owner, ty, kind)
+        })
+    }
+
+    fn author_unpivot_collection(
+        &mut self,
+        constant: &crate::analysis::UnpivotConstant,
+    ) -> Result<ContractUnpivotConstant, ContractLoweringError> {
+        // This is the actual SQL literal source type, not the joined output
+        // type. Its non-NULL row can feed an output widened by scalar NULLs.
+        self.work.flush()?;
+        let ty = ValueType::new(constant.data_type(), constant.nullable());
+        let field = std::sync::Arc::new(ty.try_to_field("unpivot_literal")?);
+        self.work.flush()?;
+        let value = match constant {
+            crate::analysis::UnpivotConstant::Int32List(values) => {
+                novarocks_constant_contract::ConstantValue::from_int32_list(
+                    field,
+                    ty.clone(),
+                    values,
+                    self.constant_policy,
+                    CompilePhase::Validate,
+                    self.control,
+                )?
+            }
+            crate::analysis::UnpivotConstant::Utf8Map(entries) => {
+                novarocks_constant_contract::ConstantValue::from_utf8_map(
+                    field,
+                    ty.clone(),
+                    entries,
+                    self.constant_policy,
+                    CompilePhase::Validate,
+                    self.control,
+                )?
+            }
+            crate::analysis::UnpivotConstant::Scalar(_) => {
+                return Err(ContractLoweringError::InvalidLiteral {
+                    kind: "Unpivot collection",
+                    detail: "scalar source requires expression lowering".into(),
+                });
+            }
+        };
+        self.work.flush()?;
+        let reference = self.register_constant_source(&value, &ty)?;
+        Ok(match constant {
+            crate::analysis::UnpivotConstant::Int32List(_) => {
+                ContractUnpivotConstant::Int32List(reference)
+            }
+            crate::analysis::UnpivotConstant::Utf8Map(_) => {
+                ContractUnpivotConstant::Utf8Map(reference)
+            }
+            crate::analysis::UnpivotConstant::Scalar(_) => {
+                unreachable!("scalar source rejected before pool registration")
+            }
+        })
     }
 
     fn author_utf8_expression(
@@ -11691,7 +11729,48 @@ mod tests {
             })
             .unwrap();
         assert_eq!(finish.final_aggregates.len(), 1);
-        assert!(finish.grouped_unpivot.is_some());
+        let grouped = finish.grouped_unpivot.as_ref().unwrap();
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        let mut checked_collections = 0;
+        for mapping in &grouped.mappings {
+            for constant in &mapping.constants {
+                match constant {
+                    ContractUnpivotConstant::Int32List(reference) => {
+                        let source = plan
+                            .constants()
+                            .resolve_source_observed(*reference, &mut work)
+                            .unwrap();
+                        assert!(!source.value_type().nullable);
+                        let view = source
+                            .int32_list_observed(CompilePhase::Validate, &control)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(view.len(), 1);
+                        assert_eq!(view.item_observed(0, &mut work).unwrap(), Some(1));
+                        checked_collections += 1;
+                    }
+                    ContractUnpivotConstant::Utf8Map(reference) => {
+                        let source = plan
+                            .constants()
+                            .resolve_source_observed(*reference, &mut work)
+                            .unwrap();
+                        assert!(!source.value_type().nullable);
+                        assert!(
+                            source
+                                .utf8_map_observed(CompilePhase::Validate, &control)
+                                .unwrap()
+                                .unwrap()
+                                .is_empty()
+                        );
+                        checked_collections += 1;
+                    }
+                    ContractUnpivotConstant::Scalar(_) => {}
+                }
+            }
+        }
+        work.finish().unwrap();
+        assert_eq!(checked_collections, 2);
     }
 
     #[test]
@@ -12638,6 +12717,123 @@ mod tests {
         assert_eq!(spec.mappings.len(), 1);
         assert!(matches!(
             spec.mappings[0].constants[0],
+            ContractUnpivotConstant::Scalar(_)
+        ));
+    }
+
+    #[test]
+    fn unpivot_collection_producer_publishes_actual_checked_sources() {
+        let first = column(1, "first", DataType::Int64, false);
+        let second = column(2, "second", DataType::Int64, false);
+        let value_output = column(3, "value", DataType::Int64, false);
+        let list = crate::analysis::UnpivotConstant::Int32List(vec![7, -3]);
+        let map = crate::analysis::UnpivotConstant::Utf8Map(vec![
+            ("a".into(), "雪\0".into()),
+            ("z".into(), "tail".into()),
+        ]);
+        let list_output = column(4, "list", list.data_type(), true);
+        let map_output = column(5, "map", map.data_type(), false);
+        let child = values(
+            vec![first.clone(), second.clone()],
+            vec![vec![literal_int(1), literal_int(2)]],
+        );
+        let output_columns = vec![
+            value_output.clone(),
+            list_output.clone(),
+            map_output.clone(),
+        ];
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let payload = PlanUnpivotNode::try_new(
+            &child.output_columns,
+            vec![],
+            value_output.column_id,
+            vec![list_output.column_id, map_output.column_id],
+            vec![
+                PlanUnpivotValueMapping {
+                    input_value_column_id: first.column_id,
+                    constants: vec![list.clone(), map.clone()],
+                },
+                PlanUnpivotValueMapping {
+                    input_value_column_id: second.column_id,
+                    constants: vec![
+                        crate::analysis::UnpivotConstant::Scalar(TypedExpr {
+                            kind: ExprKind::Literal(LiteralValue::Null),
+                            value_type: ValueType::new(list.data_type(), true),
+                        }),
+                        map,
+                    ],
+                },
+            ],
+            output_columns.clone(),
+            512,
+            65_536,
+            crate::constant::test_constant_policy(),
+            &control,
+        )
+        .unwrap();
+        let input = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Unpivot(payload),
+            children: vec![child],
+            output_columns,
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+        let plan = finish_for_test(&input).unwrap();
+        let fragment = plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+        let NodeKind::Unpivot { spec } = &fragment.nodes().get(&fragment.root()).unwrap().kind
+        else {
+            panic!("expected actual Unpivot");
+        };
+        assert!(
+            fragment
+                .values()
+                .get(&spec.literal_outputs[0])
+                .unwrap()
+                .ty
+                .nullable
+        );
+        let ContractUnpivotConstant::Int32List(reference) = spec.mappings[0].constants[0] else {
+            panic!("expected checked list address");
+        };
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        let source = plan
+            .constants()
+            .resolve_source_observed(reference, &mut work)
+            .unwrap();
+        assert!(!source.value_type().nullable);
+        assert_eq!(source.pool().field().name(), "unpivot_literal");
+        let view = source
+            .int32_list_observed(CompilePhase::Validate, &control)
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.len(), 2);
+        assert_eq!(view.item_observed(0, &mut work).unwrap(), Some(7));
+        assert_eq!(view.item_observed(1, &mut work).unwrap(), Some(-3));
+        for mapping in &spec.mappings {
+            let ContractUnpivotConstant::Utf8Map(reference) = mapping.constants[1] else {
+                panic!("expected checked map address");
+            };
+            let source = plan
+                .constants()
+                .resolve_source_observed(reference, &mut work)
+                .unwrap();
+            let view = source
+                .utf8_map_observed(CompilePhase::Validate, &control)
+                .unwrap()
+                .unwrap();
+            assert_eq!(view.len(), 2);
+            assert_eq!(
+                view.item_observed(0, &mut work).unwrap(),
+                (Some("a"), Some("雪\0"))
+            );
+            assert_eq!(
+                view.item_observed(1, &mut work).unwrap(),
+                (Some("z"), Some("tail"))
+            );
+        }
+        work.finish().unwrap();
+        assert!(matches!(
+            spec.mappings[1].constants[0],
             ContractUnpivotConstant::Scalar(_)
         ));
     }
