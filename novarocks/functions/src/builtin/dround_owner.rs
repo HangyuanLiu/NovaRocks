@@ -137,6 +137,16 @@ impl FunctionBindingResolver for DroundOwner {
         self.resolver.resolve(request, control)
     }
 
+    fn select_at_overload_observed(
+        &self,
+        overload: &crate::FunctionOverloadId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        self.resolver
+            .select_at_overload_observed(overload, request, control)
+    }
+
     fn validate_selected(
         &self,
         selected: &FunctionBindingSelection,

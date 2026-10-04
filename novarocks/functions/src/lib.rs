@@ -50,6 +50,8 @@ mod effect_metadata;
 mod effect_refinement;
 mod evaluation;
 #[cfg(test)]
+mod exact_installed_owner_selection_tests;
+#[cfg(test)]
 mod exact_overload_selection_tests;
 mod higher_order_call;
 mod higher_order_kernel;

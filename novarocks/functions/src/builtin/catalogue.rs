@@ -387,6 +387,17 @@ impl FunctionBindingResolver for BuiltinAggregateResolver {
             self.bind_value_selection(request, None, work)
         })
     }
+    fn select_at_overload_observed(
+        &self,
+        overload: &FunctionOverloadId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        binding_control::scope(control, |work| {
+            self.bind_value_selection(request, Some(overload), work)
+        })
+    }
+
     fn validate_selected(
         &self,
         selected: &FunctionBindingSelection,
@@ -1360,6 +1371,21 @@ fn bind_builtin_unnest(
     })
 }
 
+impl BuiltinUnnestResolver {
+    fn selection_at_overload_observed(
+        &self,
+        overload: &FunctionOverloadId,
+        request: FunctionBindingRequest<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        request_types_with_constants(request, work)?;
+        if overload.as_str() != BUILTIN_UNNEST_OVERLOAD_ID {
+            return Err(FunctionBindingError::UnknownOverload(overload.clone()));
+        }
+        bind_builtin_unnest(request, work)
+    }
+}
+
 impl FunctionBindingResolver for BuiltinUnnestResolver {
     fn resolve(
         &self,
@@ -1372,6 +1398,17 @@ impl FunctionBindingResolver for BuiltinUnnestResolver {
         })
     }
 
+    fn select_at_overload_observed(
+        &self,
+        overload: &FunctionOverloadId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        binding_control::scope(control, |work| {
+            self.selection_at_overload_observed(overload, request, work)
+        })
+    }
+
     fn validate_selected(
         &self,
         selected: &FunctionBindingSelection,
@@ -1379,13 +1416,8 @@ impl FunctionBindingResolver for BuiltinUnnestResolver {
         control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         binding_control::scope(control, |work| {
-            request_types_with_constants(request, work)?;
-            if selected.overload.as_str() != BUILTIN_UNNEST_OVERLOAD_ID {
-                return Err(FunctionBindingError::UnknownOverload(
-                    selected.overload.clone(),
-                ));
-            }
-            let expected = bind_builtin_unnest(request, work)?;
+            let expected =
+                self.selection_at_overload_observed(&selected.overload, request, work)?;
             if binding_control::same_selection(selected, &expected, work)? {
                 Ok(())
             } else {
@@ -2277,53 +2309,74 @@ fn self_array_subfield(function_id: &FunctionId) -> bool {
     function_id.as_str() == "builtin.scalar/__array_struct_subfield/v1"
 }
 
+impl BuiltinDynamicScalarResolver {
+    fn bind_selection_observed(
+        &self,
+        request: FunctionBindingRequest<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        if !matches!(self.canonical_name.as_ref(), "round" | "truncate") {
+            request_types_with_constants(request, work)?;
+        }
+        if request.logical_argument_count != request.arguments.len() {
+            return Err(FunctionBindingError::NoMatchingOverload);
+        }
+        let result =
+            bind_dynamic_scalar_result(&self.function_id, &self.canonical_name, request, work)?;
+        let argument_types = if self.function_id.as_str() == "builtin.scalar/__array_literal/v1" {
+            let item = full_list_item(&result)?;
+            request
+                .arguments
+                .iter()
+                .map(|argument| {
+                    let FunctionArgument::Value {
+                        value_type: source, ..
+                    } = argument
+                    else {
+                        return Err(FunctionBindingError::NoMatchingOverload);
+                    };
+                    let target = FunctionValueType {
+                        nullable: source.nullable,
+                        ..item.clone()
+                    };
+                    work.step()?;
+                    super::value_conversion::conversion_intermediate_type(source, &target)?;
+                    work.step()?;
+                    Ok(FunctionArgumentType::Value(target))
+                })
+                .collect::<Result<Vec<_>, FunctionBindingError>>()?
+        } else {
+            binding_control::argument_types(request, work)?.into_vec()
+        };
+        Ok(FunctionBindingSelection {
+            overload: self.overload.clone(),
+            argument_types: argument_types.into(),
+            result_type: FunctionResultType::Scalar(result),
+            aggregate: None,
+        })
+    }
+}
+
 impl FunctionBindingResolver for BuiltinDynamicScalarResolver {
     fn resolve(
         &self,
         request: FunctionBindingRequest<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        binding_control::scope(control, |work| self.bind_selection_observed(request, work))
+    }
+
+    fn select_at_overload_observed(
+        &self,
+        overload: &FunctionOverloadId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         binding_control::scope(control, |work| {
-            if !matches!(self.canonical_name.as_ref(), "round" | "truncate") {
-                request_types_with_constants(request, work)?;
+            if overload != &self.overload {
+                return Err(FunctionBindingError::UnknownOverload(overload.clone()));
             }
-            if request.logical_argument_count != request.arguments.len() {
-                return Err(FunctionBindingError::NoMatchingOverload);
-            }
-            let result =
-                bind_dynamic_scalar_result(&self.function_id, &self.canonical_name, request, work)?;
-            let argument_types = if self.function_id.as_str() == "builtin.scalar/__array_literal/v1"
-            {
-                let item = full_list_item(&result)?;
-                request
-                    .arguments
-                    .iter()
-                    .map(|argument| {
-                        let FunctionArgument::Value {
-                            value_type: source, ..
-                        } = argument
-                        else {
-                            return Err(FunctionBindingError::NoMatchingOverload);
-                        };
-                        let target = FunctionValueType {
-                            nullable: source.nullable,
-                            ..item.clone()
-                        };
-                        work.step()?;
-                        super::value_conversion::conversion_intermediate_type(source, &target)?;
-                        work.step()?;
-                        Ok(FunctionArgumentType::Value(target))
-                    })
-                    .collect::<Result<Vec<_>, FunctionBindingError>>()?
-            } else {
-                binding_control::argument_types(request, work)?.into_vec()
-            };
-            Ok(FunctionBindingSelection {
-                overload: self.overload.clone(),
-                argument_types: argument_types.into(),
-                result_type: FunctionResultType::Scalar(result),
-                aggregate: None,
-            })
+            self.bind_selection_observed(request, work)
         })
     }
 
