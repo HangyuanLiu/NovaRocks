@@ -1,0 +1,150 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Static requests from actual scalar definitions, before occurrence refinement.
+
+use std::sync::Arc;
+
+use novarocks_functions::{
+    ConstantPolicy, FunctionArgument, FunctionBindingRequest, FunctionBindingSelection,
+    FunctionKind, FunctionResultType, MAX_CALL_EFFECT_ARGUMENTS,
+};
+use novarocks_physical_plan::{
+    BoundFunction, ConstantPools, ExprArena, ExprId, ExprKind, ExprNode,
+};
+use novarocks_type_contract::{
+    CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType,
+};
+
+use super::physical_call_arguments::{PhysicalArgumentError, author_physical_argument_observed};
+
+#[derive(Debug)]
+pub(crate) enum PhysicalScalarRequestError {
+    Control(CompileControlError),
+    Argument(PhysicalArgumentError),
+    InvalidSource(&'static str),
+    MissingArgument(ExprId),
+    TooManyArguments,
+}
+impl From<CompileControlError> for PhysicalScalarRequestError {
+    fn from(error: CompileControlError) -> Self {
+        Self::Control(error)
+    }
+}
+impl From<PhysicalArgumentError> for PhysicalScalarRequestError {
+    fn from(error: PhysicalArgumentError) -> Self {
+        match error {
+            PhysicalArgumentError::Control(cause) => Self::Control(cause),
+            other => Self::Argument(other),
+        }
+    }
+}
+
+/// The same selected Arc must feed both CallEffectInput and fresh preparation.
+/// Signature metadata alone grants no effects or installed implementation.
+#[derive(Debug)]
+pub(crate) struct AuthoredPhysicalScalarRequest<'a> {
+    pub function: &'a BoundFunction,
+    pub selected: Arc<FunctionBindingSelection>,
+    arguments: Vec<FunctionArgument>,
+    result_constraint: &'a FunctionValueType,
+}
+impl AuthoredPhysicalScalarRequest<'_> {
+    pub fn request(&self) -> FunctionBindingRequest<'_> {
+        FunctionBindingRequest {
+            arguments: &self.arguments,
+            logical_argument_count: self.arguments.len(),
+            expected_result_type: Some(self.result_constraint),
+        }
+    }
+}
+
+/// Preserve ordered actual argument definitions and the original physical
+/// signature separately. The installed owner validates the original selected
+/// overload against these actual source types; nullable covariance remains its
+/// responsibility. No legacy effect bits or parameter references are copied.
+/// TypeOnly still has a complete static request; runtime uses are a separate
+/// control-flow obligation. Only scalar definitions are accepted here, including
+/// control intrinsics; relational/window phase contracts use their own owners.
+///
+/// Caller admission covers the immutable source and opaque nested type clones.
+/// Bounds and fallible vector allocation precede argument expansion. The caller
+/// owns entry/ordinary footer, exact policy/environment and subsequent fresh
+/// preparation; this leaf observes only its work on the original meter.
+pub(crate) fn author_physical_scalar_request_observed<'a>(
+    source: &'a ExprNode,
+    expressions: &ExprArena,
+    pools: &ConstantPools,
+    literal_policy: ConstantPolicy,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<AuthoredPhysicalScalarRequest<'a>, PhysicalScalarRequestError> {
+    work.step()?;
+    let ExprKind::FunctionCall { function, args } = &source.kind else {
+        return Err(PhysicalScalarRequestError::InvalidSource(
+            "physical scalar request requires an actual function call",
+        ));
+    };
+    if function.kind != FunctionKind::Scalar {
+        return Err(PhysicalScalarRequestError::InvalidSource(
+            "physical scalar request carries a non-scalar binding",
+        ));
+    }
+    if args.len() > MAX_CALL_EFFECT_ARGUMENTS {
+        return Err(PhysicalScalarRequestError::TooManyArguments);
+    }
+    if args.len() != function.argument_types.len() {
+        return Err(PhysicalScalarRequestError::InvalidSource(
+            "physical scalar argument count differs from its selected signature",
+        ));
+    }
+    work.flush()?;
+    let mut arguments = Vec::new();
+    arguments
+        .try_reserve_exact(args.len())
+        .map_err(|_| CompileControlError::ResourceExhausted)?;
+    for &id in args {
+        let argument = expressions.get(id);
+        work.step()?;
+        let argument = argument.ok_or(PhysicalScalarRequestError::MissingArgument(id))?;
+        arguments.push(author_physical_argument_observed(
+            argument,
+            pools,
+            literal_policy,
+            CompilePhase::FunctionSpecialization,
+            work,
+        )?);
+        work.step()?;
+    }
+    work.flush()?;
+    let selected = Arc::new(FunctionBindingSelection {
+        overload: function.overload.clone(),
+        argument_types: function.argument_types.clone(),
+        result_type: FunctionResultType::Scalar(function.result_type.clone()),
+        aggregate: None,
+    });
+    work.flush()?;
+    Ok(AuthoredPhysicalScalarRequest {
+        function,
+        selected,
+        arguments,
+        result_constraint: &source.ty,
+    })
+}
+
+#[cfg(test)]
+#[path = "physical_scalar_requests_tests.rs"]
+mod tests;
