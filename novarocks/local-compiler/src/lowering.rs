@@ -21,8 +21,8 @@ use crate::{
     ProviderValidatedFragment,
     assert_rows::lower_assert_rows,
     change_events::lower_change_events,
-    channels::{ChannelLoweringError, resolve_linear_channels},
-    expressions::{ExpressionLoweringError, lower_expressions, prepare_calls},
+    channels::{ChannelLoweringError, resolve_tree_channels},
+    expressions::{ExpressionLoweringError, lower_expressions_with_unions, prepare_calls},
     repeat::{RepeatLoweringError, lower_repeat},
     sort::lower_sort,
     topn::lower_topn,
@@ -245,18 +245,118 @@ fn lower(
     let result = package
         .result()
         .ok_or(FragmentCompileError::Invalid("missing result port"))?;
-    // A child-first schedule is independent of arbitrary sparse physical IDs.
-    // This initial linear family has one parent per actual input occurrence;
-    // shared/multi-input lowering requires its own execution ownership proof.
+    // Borrowed input order determines the bounded postorder. Each physical
+    // node has one execution owner; shared subgraphs remain unsupported.
     let mut order = Vec::new();
     let mut visited = BTreeSet::new();
-    let mut next = Some(physical.root());
-    while let Some(id) = next {
+    let mut stack = Vec::new();
+    let mut expanded_nodes = physical.nodes().len();
+    let mut derived_definitions = 0usize;
+    let mut channel_count = 0usize;
+    for node in physical.nodes().values() {
+        let pieces = if matches!(
+            node.kind,
+            NodeKind::SetOp {
+                kind: novarocks_physical_plan::SetOperationKind::UnionAll,
+                ..
+            }
+        ) {
+            node.inputs
+                .len()
+                .checked_add(1)
+                .ok_or(CompileControlError::ResourceExhausted)?
+        } else {
+            1
+        };
+        channel_count = channel_count
+            .checked_add(
+                pieces
+                    .checked_mul(node.output.columns.len())
+                    .ok_or(CompileControlError::ResourceExhausted)?,
+            )
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        if matches!(
+            node.kind,
+            NodeKind::SetOp {
+                kind: novarocks_physical_plan::SetOperationKind::UnionAll,
+                ..
+            }
+        ) {
+            expanded_nodes = expanded_nodes
+                .checked_add(node.inputs.len())
+                .ok_or(CompileControlError::ResourceExhausted)?;
+            derived_definitions = derived_definitions
+                .checked_add(
+                    node.inputs
+                        .len()
+                        .checked_mul(node.output.columns.len())
+                        .ok_or(CompileControlError::ResourceExhausted)?,
+                )
+                .ok_or(CompileControlError::ResourceExhausted)?;
+        }
         work.step()?;
+    }
+    let original_flow = package.expression_uses().flow();
+    let mut references = original_flow
+        .uses()
+        .len()
+        .checked_add(derived_definitions)
+        .ok_or(CompileControlError::ResourceExhausted)?;
+    for invocation in original_flow.uses().values() {
+        references = references
+            .checked_add(invocation.arguments.len())
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        work.step()?;
+    }
+    if channel_count > MAX_PROGRAM_TYPED_CHANNELS
+        || expanded_nodes
+            .checked_mul(2)
+            .is_none_or(|n| n > MAX_PROFILE_REFERENCES)
+        || expanded_nodes > MAX_PROGRAM_NODES
+        || expanded_nodes > MAX_PROGRAM_EXPANDED_OCCURRENCES
+        || physical
+            .expressions()
+            .len()
+            .checked_add(derived_definitions)
+            .is_none_or(|n| n > novarocks_type_contract::MAX_CONTROL_DEFINITIONS)
+        || original_flow
+            .domains()
+            .len()
+            .checked_add(derived_definitions)
+            .is_none_or(|n| n > novarocks_type_contract::MAX_CONTROL_DEFINITIONS)
+        || original_flow
+            .uses()
+            .len()
+            .checked_add(derived_definitions)
+            .is_none_or(|n| n > novarocks_type_contract::MAX_CONTROL_DEFINITIONS)
+        || references > novarocks_type_contract::MAX_CONTROL_USE_REFERENCES
+    {
+        return Err(CompileControlError::ResourceExhausted.into());
+    }
+    std::alloc::Layout::array::<(NodeId, bool, usize)>(expanded_nodes)
+        .map_err(|_| CompileControlError::ResourceExhausted)?;
+    work.flush()?;
+    stack
+        .try_reserve_exact(expanded_nodes)
+        .map_err(|_| CompileControlError::ResourceExhausted)?;
+    order
+        .try_reserve_exact(physical.nodes().len())
+        .map_err(|_| CompileControlError::ResourceExhausted)?;
+    stack.push((physical.root(), false, 1usize));
+    while let Some((id, exiting, depth)) = stack.pop() {
+        work.step()?;
+        if exiting {
+            order.push(id);
+            continue;
+        }
+        if depth > MAX_PROGRAM_NODE_DEPTH {
+            return Err(CompileControlError::ResourceExhausted.into());
+        }
         if !visited.insert(id) {
-            return Err(FragmentCompileError::Invalid(
-                "shared or cyclic linear input",
-            ));
+            return Err(FragmentCompileError::Unsupported {
+                node: Some(id),
+                feature: "shared or cyclic physical input",
+            });
         }
         let node = physical
             .nodes()
@@ -269,45 +369,53 @@ fn lower(
         {
             return Err(FragmentCompileError::Unsupported {
                 node: Some(id),
-                feature: "non-singleton source-chain properties",
+                feature: "non-singleton source-tree properties",
             });
         }
-        match &node.kind {
-            NodeKind::Project { .. } if node.inputs.len() == 1 => {
-                next = Some(node.inputs[0]);
+        let union = matches!(
+            node.kind,
+            NodeKind::SetOp {
+                kind: novarocks_physical_plan::SetOperationKind::UnionAll,
+                ..
             }
-            NodeKind::Values { .. } if node.inputs.is_empty() => next = None,
-            NodeKind::Filter { predicates } if predicates.len() == 1 && node.inputs.len() == 1 => {
-                next = Some(node.inputs[0])
-            }
+        );
+        let supported = match &node.kind {
+            NodeKind::Values { .. } => node.inputs.is_empty(),
+            NodeKind::Project { .. }
+            | NodeKind::Limit { .. }
+            | NodeKind::AssertOneRow(_)
+            | NodeKind::Repeat { .. }
+            | NodeKind::Unpivot { .. }
+            | NodeKind::ChangeEventExpand { .. } => node.inputs.len() == 1,
+            NodeKind::Filter { predicates } => predicates.len() == 1 && node.inputs.len() == 1,
             NodeKind::Sort {
                 mode: novarocks_physical_plan::SortMode::Global,
                 ..
-            } if node.inputs.len() == 1 => next = Some(node.inputs[0]),
-            NodeKind::TopN {
+            }
+            | NodeKind::TopN {
                 phase: novarocks_physical_plan::TopNPhase::Single,
                 reduction: novarocks_physical_plan::TopNReduction::Rows,
                 ..
-            } if node.inputs.len() == 1 => next = Some(node.inputs[0]),
-            NodeKind::Limit { .. } | NodeKind::AssertOneRow(_) if node.inputs.len() == 1 => {
-                next = Some(node.inputs[0])
-            }
-            NodeKind::Repeat { .. }
-            | NodeKind::Unpivot { .. }
-            | NodeKind::ChangeEventExpand { .. }
-                if node.inputs.len() == 1 =>
-            {
-                next = Some(node.inputs[0])
-            }
-            _ => {
-                return Err(FragmentCompileError::Unsupported {
-                    node: Some(id),
-                    feature: "node family or occurrence shape",
-                });
-            }
+            } => node.inputs.len() == 1,
+            NodeKind::SetOp {
+                kind: novarocks_physical_plan::SetOperationKind::UnionAll,
+                ..
+            } => node.inputs.len() >= 2,
+            _ => false,
+        };
+        if !supported {
+            return Err(FragmentCompileError::Unsupported {
+                node: Some(id),
+                feature: "node family or occurrence shape",
+            });
         }
-        order.push(id);
+        stack.push((id, true, depth));
+        for &child in node.inputs.iter().rev() {
+            stack.push((child, false, depth + if union { 2 } else { 1 }));
+            work.step()?;
+        }
     }
+    order.reverse();
     if order.len() != physical.nodes().len() {
         return Err(FragmentCompileError::Invalid(
             "unrepresented physical nodes",
@@ -316,10 +424,15 @@ fn lower(
     // Expansion conservatively loses distribution knowledge. It still has
     // the exact singleton child and one driver; no exchange/scan is admitted.
     // Only descendants of this actual expansion can consume that uncertainty.
-    let mut expanded = false;
-    let mut sorted = false;
+    let mut properties = BTreeMap::<NodeId, (bool, bool)>::new();
     for &id in order.iter().rev() {
         let node = &physical.nodes()[&id];
+        let mut expanded = false;
+        for child in &node.inputs {
+            expanded |= properties.get(child).is_some_and(|p| p.0);
+            work.step()?;
+        }
+        let sorted = node.inputs.len() == 1 && properties.get(&node.inputs[0]).is_some_and(|p| p.1);
         let changes = matches!(node.kind, NodeKind::ChangeEventExpand { .. });
         let unknown = node.output_properties.distribution == Distribution::Unconstrained;
         work.step()?;
@@ -352,16 +465,16 @@ fn lower(
                 feature: "ordering lacks supported global-sort source",
             });
         }
-        sorted = global || (sorted && transparent);
-        expanded |= changes;
+        properties.insert(id, (expanded || changes, global || (sorted && transparent)));
     }
     work.flush()?;
-    let channels_plan = resolve_linear_channels(package, &order, work.control())?;
+    let channels_plan = resolve_tree_channels(package, &order, work.control())?;
     work.flush()?;
-    let expressions = lower_expressions(
+    let expressions = lower_expressions_with_unions(
         package,
         options.constants,
         &channels_plan.inputs,
+        &channels_plan.unions,
         work.control(),
     )?;
     work.flush()?;
@@ -371,6 +484,11 @@ fn lower(
     let mut channels = Vec::new();
     let mut operators = Vec::new();
     let mut allowed = BTreeSet::new();
+    let mut union_roots = Vec::new();
+    crate::assert_rows::reserve_vec(&mut nodes, expanded_nodes, work)?;
+    crate::assert_rows::reserve_vec(&mut operators, expanded_nodes, work)?;
+    crate::assert_rows::reserve_vec(&mut channels, channel_count, work)?;
+    crate::assert_rows::reserve_vec(&mut union_roots, derived_definitions, work)?;
     for &source in order.iter().rev() {
         work.step()?;
         let node = &physical.nodes()[&source];
@@ -381,6 +499,89 @@ fn lower(
                 "missing planned node channels",
             ))?;
         let id = planned.local;
+        if let Some(branches) = channels_plan.unions.get(&source) {
+            let definitions =
+                expressions
+                    .union_ids
+                    .get(&source)
+                    .ok_or(FragmentCompileError::Invalid(
+                        "missing UnionAll definitions",
+                    ))?;
+            work.flush()?;
+            let emitted = crate::union::lower_union(
+                package,
+                node,
+                id,
+                branches,
+                definitions,
+                &planned.slots,
+                work.control(),
+            )?;
+            let owner = LocalOperatorId::new(
+                u32::try_from(id.index()).map_err(|_| CompileControlError::ResourceExhausted)?,
+            );
+            for (branch, definitions) in branches.iter().zip(definitions) {
+                for (ordinal, (input, &definition)) in
+                    branch.sources.iter().zip(definitions).enumerate()
+                {
+                    union_roots.push(crate::union_flow::UnionRoot {
+                        node: branch.normalizer,
+                        ordinal: u32::try_from(ordinal)
+                            .map_err(|_| CompileControlError::ResourceExhausted)?,
+                        definition,
+                        source: input.input.source,
+                    });
+                    work.step()?;
+                }
+            }
+            let source_id = DiagnosticSourceNodeId::new(source.get());
+            allowed.insert(source_id);
+            local_ids.insert(source, id);
+            for (piece, emitted_node) in emitted.into_iter().enumerate() {
+                let emitted_id = emitted_node
+                    .local_id()
+                    .ok_or(FragmentCompileError::Invalid(
+                        "missing UnionAll local node identity",
+                    ))?;
+                if emitted_id.index() != nodes.len() {
+                    return Err(FragmentCompileError::Invalid("UnionAll schedule differs"));
+                }
+                for (ordinal, value) in node.output.columns.iter().enumerate() {
+                    work.flush()?;
+                    channels.push((
+                        ProgramChannelSite::Layout {
+                            node: emitted_id,
+                            role: ProgramChannelLayoutRole::NodeOutput,
+                            ordinal: u32::try_from(ordinal)
+                                .map_err(|_| CompileControlError::ResourceExhausted)?,
+                        },
+                        physical.values()[value].ty.clone(),
+                    ));
+                    work.step()?;
+                }
+                operators.push(LocalOperatorProvenance {
+                    id: LocalOperatorId::new(
+                        u32::try_from(emitted_id.index())
+                            .map_err(|_| CompileControlError::ResourceExhausted)?,
+                    ),
+                    lowered_nodes: Box::from([emitted_id]),
+                    sources: Box::from([source_id]),
+                    origin: LocalOperatorOrigin::Split {
+                        piece: u32::try_from(piece)
+                            .map_err(|_| CompileControlError::ResourceExhausted)?,
+                    },
+                    cost_owner: owner,
+                    metrics: OperatorMetricAggregation {
+                        cpu_time: MetricAggregation::Sum,
+                        wall_time: MetricAggregation::Maximum,
+                        peak_retained_bytes: MetricAggregation::Maximum,
+                    },
+                });
+                nodes.push(emitted_node);
+                work.step()?;
+            }
+            continue;
+        }
         if id.index() != nodes.len() {
             return Err(FragmentCompileError::Invalid(
                 "channel schedule differs from node schedule",
@@ -736,14 +937,17 @@ fn lower(
             arguments: arguments.into_boxed_slice(),
         });
     }
+    let mut roots = Vec::new();
+    let mut union_slot_bindings = Vec::new();
     work.flush()?;
-    let flow = ProgramControlFlow::try_new(
-        domains,
-        uses,
-        expressions.arena.nodes().len(),
+    crate::union_flow::append_union_roots(
+        &union_roots,
+        &mut domains,
+        &mut uses,
+        &mut roots,
+        &mut union_slot_bindings,
         work.control(),
     )?;
-    let mut roots = Vec::new();
     for (site, use_id) in package.expression_uses().bindings() {
         work.step()?;
         if retired.contains(use_id) {
@@ -783,6 +987,13 @@ fn lower(
         });
     }
     work.flush()?;
+    let flow = ProgramControlFlow::try_new(
+        domains,
+        uses,
+        expressions.arena.nodes().len(),
+        work.control(),
+    )?;
+    work.flush()?;
     let snapshot = ProgramRootControlBindings::try_new(
         graph,
         BTreeMap::from([(ProgramExpressionArena::Main, flow)]),
@@ -800,7 +1011,7 @@ fn lower(
     work.flush()?;
     let channels = ProgramTypedChannels::try_new(typed, channels, work.control())?;
     work.flush()?;
-    let mut slot_bindings = Vec::new();
+    let mut slot_bindings = union_slot_bindings;
     for invocation in package.expression_uses().flow().uses().values() {
         work.step()?;
         if let Some(input) = channels_plan.inputs.get(&invocation.definition) {

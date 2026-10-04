@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Ordered channels and exact input sources for the supported linear graph.
+//! Ordered channels and exact input sources for the supported source tree.
 //! Repeated publication is proved from transparent reads, never from sharing
 //! an expression definition or from a function's apparent determinism.
 
@@ -34,16 +34,27 @@ use crate::unpivot::{UnpivotInputPort, UnpivotLoweringError, plan_unpivot_channe
 
 use crate::repeat::{RepeatInputPort, RepeatLoweringError, plan_repeat_channels};
 
-pub(crate) struct LinearChannels {
+pub(crate) struct PlannedChannels {
     pub nodes: BTreeMap<NodeId, NodeChannels>,
     pub inputs: BTreeMap<ExprId, ResolvedInput>,
     pub unpivot_sources: BTreeMap<NodeId, BTreeMap<ValueId, SlotId>>,
     pub assertion_keys: BTreeMap<NodeId, Vec<SlotId>>,
+    pub unions: BTreeMap<NodeId, Vec<UnionChannelBranch>>,
 }
 
 pub(crate) struct NodeChannels {
     pub local: ProgramNodeId,
     pub slots: Arc<[SlotId]>,
+}
+
+pub(crate) struct UnionChannelBranch {
+    pub normalizer: ProgramNodeId,
+    pub input: ProgramNodeId,
+    pub sources: Vec<UnionChannelSource>,
+}
+pub(crate) struct UnionChannelSource {
+    pub input: ResolvedInput,
+    pub ty: FunctionValueType,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,7 +107,7 @@ impl fmt::Display for ChannelLoweringError {
             Self::ValueType(error) => error.fmt(f),
             Self::Repeat(error) => error.fmt(f),
             Self::Unpivot(error) => error.fmt(f),
-            Self::Invalid(message) => write!(f, "invalid linear channels: {message}"),
+            Self::Invalid(message) => write!(f, "invalid planned channels: {message}"),
         }
     }
 }
@@ -117,11 +128,11 @@ impl Error for ChannelLoweringError {
 // It is an actual column ordinal, not an ordinal inferred from a ValueId.
 type Port = BTreeMap<ValueId, usize>;
 
-pub(crate) fn resolve_linear_channels(
+pub(crate) fn resolve_tree_channels(
     package: &FragmentPackage,
     root_first: &[NodeId],
     control: &dyn PureCompileControl,
-) -> Result<LinearChannels, ChannelLoweringError> {
+) -> Result<PlannedChannels, ChannelLoweringError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
     let result = resolve_core(package, root_first, &mut work);
     if matches!(&result, Err(ChannelLoweringError::Control(_))) {
@@ -135,31 +146,50 @@ fn resolve_core(
     package: &FragmentPackage,
     root_first: &[NodeId],
     work: &mut CompileCheckpoints<'_>,
-) -> Result<LinearChannels, ChannelLoweringError> {
+) -> Result<PlannedChannels, ChannelLoweringError> {
     let fragment = package.fragment();
     if root_first.first() != Some(&fragment.root()) || root_first.len() != fragment.nodes().len() {
-        return Err(ChannelLoweringError::Invalid(
-            "linear node coverage differs",
-        ));
+        return Err(ChannelLoweringError::Invalid("tree node coverage differs"));
     }
     let mut nodes = BTreeMap::<NodeId, NodeChannels>::new();
     let mut ports = BTreeMap::<NodeId, Port>::new();
     let mut next_slot = 0_u64;
     let mut unpivot_sources = BTreeMap::new();
     let mut assertion_keys = BTreeMap::new();
-    let mut previous = None;
+    let mut next_node = 0usize;
+    let mut unions = BTreeMap::new();
     for &source in root_first.iter().rev() {
         let node = fragment
             .nodes()
             .get(&source)
             .ok_or(ChannelLoweringError::Invalid("missing physical node"))?;
         if nodes.contains_key(&source) {
-            return Err(ChannelLoweringError::Invalid("duplicate linear node"));
+            return Err(ChannelLoweringError::Invalid("duplicate tree node"));
         }
-        let local = ProgramNodeId::new(nodes.len());
+        let additional = if matches!(
+            node.kind,
+            NodeKind::SetOp {
+                kind: novarocks_physical_plan::SetOperationKind::UnionAll,
+                ..
+            }
+        ) {
+            node.inputs.len()
+        } else {
+            0
+        };
+        let local_index = next_node
+            .checked_add(additional)
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        next_node = local_index
+            .checked_add(1)
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        if next_node > novarocks_local_program::MAX_PROGRAM_NODES {
+            return Err(CompileControlError::ResourceExhausted.into());
+        }
+        let local = ProgramNodeId::new(local_index);
         work.step()?;
         let (slots, port) = match &node.kind {
-            NodeKind::Values { rows } if previous.is_none() && node.inputs.is_empty() => {
+            NodeKind::Values { rows } if node.inputs.is_empty() => {
                 let mut slots = Vec::new();
                 reserve_vec(&mut slots, node.output.columns.len(), work)?;
                 let mut port = Port::new();
@@ -203,8 +233,107 @@ fn resolve_core(
                 work.flush()?;
                 (slots, port)
             }
+            NodeKind::SetOp {
+                kind: novarocks_physical_plan::SetOperationKind::UnionAll,
+                input_mappings,
+            } => {
+                if node.inputs.len() < 2 || input_mappings.len() != node.inputs.len() {
+                    return Err(ChannelLoweringError::Invalid(
+                        "UnionAll input occurrence shape differs",
+                    ));
+                }
+                let mut slots = Vec::new();
+                reserve_vec(&mut slots, node.output.columns.len(), work)?;
+                let mut port = Port::new();
+                for (ordinal, &value) in node.output.columns.iter().enumerate() {
+                    if let Some(&representative) = port.get(&value) {
+                        for mapping in input_mappings {
+                            let same = mapping
+                                .get(representative)
+                                .zip(mapping.get(ordinal))
+                                .is_some_and(|(a, b)| a == b);
+                            work.step()?;
+                            if !same {
+                                return Err(ChannelLoweringError::Invalid(
+                                    "independent UnionAll mappings share one produced value",
+                                ));
+                            }
+                        }
+                    } else {
+                        port.insert(value, ordinal);
+                    }
+                    let slot = u32::try_from(next_slot)
+                        .map_err(|_| CompileControlError::ResourceExhausted)?;
+                    next_slot = next_slot
+                        .checked_add(1)
+                        .ok_or(CompileControlError::ResourceExhausted)?;
+                    slots.push(SlotId::new(slot));
+                    work.step()?;
+                }
+                let mut branches = Vec::new();
+                reserve_vec(&mut branches, node.inputs.len(), work)?;
+                for (branch, (&child, mapping)) in
+                    node.inputs.iter().zip(input_mappings).enumerate()
+                {
+                    let child_channels = nodes.get(&child).ok_or(ChannelLoweringError::Invalid(
+                        "UnionAll child has not been lowered",
+                    ))?;
+                    let child_port = ports.get(&child).ok_or(ChannelLoweringError::Invalid(
+                        "UnionAll child port is missing",
+                    ))?;
+                    if mapping.len() != node.output.columns.len() {
+                        return Err(ChannelLoweringError::Invalid(
+                            "UnionAll mapping width differs",
+                        ));
+                    }
+                    let mut sources = Vec::new();
+                    reserve_vec(&mut sources, mapping.len(), work)?;
+                    for (&value, &output) in mapping.iter().zip(&node.output.columns) {
+                        let input = resolve_input(value, child_channels, child_port)?;
+                        work.step()?;
+                        let source_ty = &fragment
+                            .values()
+                            .get(&value)
+                            .ok_or(ChannelLoweringError::Invalid(
+                                "UnionAll mapped value missing",
+                            ))?
+                            .ty;
+                        let target_ty = &fragment
+                            .values()
+                            .get(&output)
+                            .ok_or(ChannelLoweringError::Invalid(
+                                "UnionAll output value missing",
+                            ))?
+                            .ty;
+                        if source_ty.nullable && !target_ty.nullable {
+                            return Err(ChannelLoweringError::Invalid(
+                                "UnionAll narrows nullable input",
+                            ));
+                        }
+                        work.flush()?;
+                        let mut widened = source_ty.clone();
+                        widened.nullable = target_ty.nullable;
+                        exact_type(&widened, target_ty, work)?;
+                        sources.push(UnionChannelSource {
+                            input,
+                            ty: source_ty.clone(),
+                        });
+                        work.step()?;
+                        work.flush()?;
+                    }
+                    branches.push(UnionChannelBranch {
+                        normalizer: ProgramNodeId::new(local_index - node.inputs.len() + branch),
+                        input: child_channels.local,
+                        sources,
+                    });
+                    work.step()?;
+                }
+                unions.insert(source, branches);
+                work.flush()?;
+                (Arc::from(slots), port)
+            }
             NodeKind::Project { expressions } => {
-                let child = linear_child(node.inputs.as_ref(), previous)?;
+                let child = single_child(node.inputs.as_ref())?;
                 let child_node = &fragment.nodes()[&child];
                 let child_channels = nodes
                     .get(&child)
@@ -283,21 +412,21 @@ fn resolve_core(
                 (slots, port)
             }
             NodeKind::Filter { predicates } if predicates.len() == 1 => {
-                passthrough(fragment, node, previous, &nodes, &ports, work)?
+                passthrough(fragment, node, &nodes, &ports, work)?
             }
-            NodeKind::Limit { .. } => passthrough(fragment, node, previous, &nodes, &ports, work)?,
+            NodeKind::Limit { .. } => passthrough(fragment, node, &nodes, &ports, work)?,
             NodeKind::Sort {
                 mode: novarocks_physical_plan::SortMode::Global,
                 ..
-            } => passthrough(fragment, node, previous, &nodes, &ports, work)?,
+            } => passthrough(fragment, node, &nodes, &ports, work)?,
             NodeKind::TopN {
                 phase: novarocks_physical_plan::TopNPhase::Single,
                 reduction: novarocks_physical_plan::TopNReduction::Rows,
                 ..
-            } => passthrough(fragment, node, previous, &nodes, &ports, work)?,
+            } => passthrough(fragment, node, &nodes, &ports, work)?,
             NodeKind::AssertOneRow(spec) => {
-                let child = linear_child(&node.inputs, previous)?;
-                let planned = passthrough(fragment, node, previous, &nodes, &ports, work)?;
+                let child = single_child(&node.inputs)?;
+                let planned = passthrough(fragment, node, &nodes, &ports, work)?;
                 let mut keys = Vec::new();
                 if let novarocks_physical_plan::RowCountAssertionSpec::PerKeyAtMostOne {
                     keys: source_keys,
@@ -329,7 +458,7 @@ fn resolve_core(
                 planned
             }
             NodeKind::ChangeEventExpand { .. } => {
-                linear_child(&node.inputs, previous)?;
+                single_child(&node.inputs)?;
                 let mut slots = Vec::new();
                 let mut port = Port::new();
                 reserve_vec(&mut slots, node.output.columns.len(), work)?;
@@ -349,7 +478,7 @@ fn resolve_core(
                 (slots, port)
             }
             NodeKind::Unpivot { .. } => {
-                let child = linear_child(&node.inputs, previous)?;
+                let child = single_child(&node.inputs)?;
                 let child_channels = nodes.get(&child).ok_or(ChannelLoweringError::Invalid(
                     "missing lowered Unpivot child",
                 ))?;
@@ -369,7 +498,7 @@ fn resolve_core(
                 (planned.slots, planned.port)
             }
             NodeKind::Repeat { .. } => {
-                let child = linear_child(&node.inputs, previous)?;
+                let child = single_child(&node.inputs)?;
                 let child_channels = nodes.get(&child).ok_or(ChannelLoweringError::Invalid(
                     "missing lowered Repeat child",
                 ))?;
@@ -387,14 +516,11 @@ fn resolve_core(
                 (planned.slots, planned.port)
             }
             _ => {
-                return Err(ChannelLoweringError::Invalid(
-                    "unsupported linear channel node",
-                ));
+                return Err(ChannelLoweringError::Invalid("unsupported channel node"));
             }
         };
         nodes.insert(source, NodeChannels { local, slots });
         ports.insert(source, port);
-        previous = Some(source);
         work.step()?;
     }
     let mut inputs = BTreeMap::new();
@@ -414,7 +540,7 @@ fn resolve_core(
             }
             let child = owner.inputs[0];
             let child_channels = nodes.get(&child).ok_or(ChannelLoweringError::Invalid(
-                "value input is outside the linear graph",
+                "value input is outside the source tree",
             ))?;
             let input = resolve_input(value, child_channels, &ports[&child])?;
             let source_type = &fragment
@@ -428,20 +554,20 @@ fn resolve_core(
         }
         work.step()?;
     }
-    Ok(LinearChannels {
+    Ok(PlannedChannels {
         nodes,
         inputs,
         unpivot_sources,
         assertion_keys,
+        unions,
     })
 }
 
-fn linear_child(
-    inputs: &[NodeId],
-    previous: Option<NodeId>,
-) -> Result<NodeId, ChannelLoweringError> {
-    if inputs.len() != 1 || previous != Some(inputs[0]) {
-        return Err(ChannelLoweringError::Invalid("linear child order differs"));
+fn single_child(inputs: &[NodeId]) -> Result<NodeId, ChannelLoweringError> {
+    if inputs.len() != 1 {
+        return Err(ChannelLoweringError::Invalid(
+            "operator requires one exact input",
+        ));
     }
     Ok(inputs[0])
 }
@@ -449,12 +575,11 @@ fn linear_child(
 fn passthrough(
     fragment: &novarocks_physical_plan::Fragment,
     node: &novarocks_physical_plan::PhysicalNode,
-    previous: Option<NodeId>,
     nodes: &BTreeMap<NodeId, NodeChannels>,
     ports: &BTreeMap<NodeId, Port>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(Arc<[SlotId]>, Port), ChannelLoweringError> {
-    let child = linear_child(&node.inputs, previous)?;
+    let child = single_child(&node.inputs)?;
     let child_node = &fragment.nodes()[&child];
     if node.output.columns.len() != child_node.output.columns.len() {
         return Err(ChannelLoweringError::Invalid(

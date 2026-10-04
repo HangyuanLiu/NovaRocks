@@ -27,6 +27,8 @@ mod channels;
 mod expressions;
 mod lowering;
 mod repeat;
+mod union;
+mod union_flow;
 mod unpivot;
 
 #[cfg(test)]
@@ -195,3 +197,9 @@ mod arithmetic_lowering_tests;
 mod sort;
 mod topn;
 mod values;
+
+#[cfg(test)]
+mod union_flow_tests;
+
+#[cfg(test)]
+mod union_lowering_tests;

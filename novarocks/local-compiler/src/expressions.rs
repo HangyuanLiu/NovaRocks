@@ -52,6 +52,7 @@ pub(crate) struct LoweredExpressions {
     pub arena: Arc<ImmutableExpressions>,
     pub ids: BTreeMap<ExprId, ProgramExprId>,
     pub types: Vec<FunctionArgumentType>,
+    pub union_ids: BTreeMap<novarocks_physical_plan::NodeId, Vec<Vec<ProgramExprId>>>,
 }
 
 #[derive(Debug)]
@@ -223,6 +224,7 @@ fn finish<T>(
 /// Lower every actual definition, including unused definitions, without
 /// creating invocation tokens for definitions with no evaluation use. IDs are
 /// topologically assigned; sparse numeric order is never dependency order.
+#[cfg(test)]
 pub(crate) fn lower_expressions(
     package: &FragmentPackage,
     policy: ConstantPolicy,
@@ -230,7 +232,26 @@ pub(crate) fn lower_expressions(
     control: &dyn PureCompileControl,
 ) -> Result<LoweredExpressions, ExpressionLoweringError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = lower_core(package, policy, inputs, control, &mut work);
+    let result = lower_core(
+        package,
+        policy,
+        inputs,
+        &BTreeMap::new(),
+        control,
+        &mut work,
+    );
+    finish(result, &mut work)
+}
+
+pub(crate) fn lower_expressions_with_unions(
+    package: &FragmentPackage,
+    policy: ConstantPolicy,
+    inputs: &BTreeMap<ExprId, crate::channels::ResolvedInput>,
+    unions: &BTreeMap<novarocks_physical_plan::NodeId, Vec<crate::channels::UnionChannelBranch>>,
+    control: &dyn PureCompileControl,
+) -> Result<LoweredExpressions, ExpressionLoweringError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let result = lower_core(package, policy, inputs, unions, control, &mut work);
     finish(result, &mut work)
 }
 
@@ -280,11 +301,21 @@ fn lower_core(
     package: &FragmentPackage,
     policy: ConstantPolicy,
     inputs: &BTreeMap<ExprId, crate::channels::ResolvedInput>,
+    unions: &BTreeMap<novarocks_physical_plan::NodeId, Vec<crate::channels::UnionChannelBranch>>,
     control: &dyn PureCompileControl,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<LoweredExpressions, ExpressionLoweringError> {
     let source = package.fragment().expressions();
-    if source.len() > MAX_CONTROL_DEFINITIONS {
+    let mut count = source.len();
+    for branches in unions.values() {
+        for branch in branches {
+            count = count
+                .checked_add(branch.sources.len())
+                .ok_or(CompileControlError::ResourceExhausted)?;
+            work.step()?;
+        }
+    }
+    if count > MAX_CONTROL_DEFINITIONS {
         return Err(ExpressionLoweringError::Invalid(
             "expression definition limit exceeded",
         ));
@@ -670,6 +701,45 @@ fn lower_core(
             work.step()?;
         }
     }
+    let mut union_ids = BTreeMap::new();
+    std::alloc::Layout::array::<StaticExprNode>(count)
+        .map_err(|_| CompileControlError::ResourceExhausted)?;
+    std::alloc::Layout::array::<FunctionArgumentType>(count)
+        .map_err(|_| CompileControlError::ResourceExhausted)?;
+    work.flush()?;
+    nodes
+        .try_reserve_exact(count - nodes.len())
+        .map_err(|_| CompileControlError::ResourceExhausted)?;
+    types
+        .try_reserve_exact(count - types.len())
+        .map_err(|_| CompileControlError::ResourceExhausted)?;
+    for (&owner, branches) in unions {
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(branches.len())
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        for branch in branches {
+            let mut definitions = Vec::new();
+            definitions
+                .try_reserve_exact(branch.sources.len())
+                .map_err(|_| CompileControlError::ResourceExhausted)?;
+            for source in &branch.sources {
+                work.flush()?;
+                definitions.push(ProgramExprId::new(nodes.len()));
+                nodes.push(StaticExprNode::new(
+                    StaticExprKind::SlotId(source.input.slot),
+                    source.ty.data_type.clone(),
+                    None,
+                ));
+                types.push(FunctionArgumentType::Value(source.ty.clone()));
+                work.step()?;
+                work.flush()?;
+            }
+            rows.push(definitions);
+            work.step()?;
+        }
+        union_ids.insert(owner, rows);
+        work.step()?;
+    }
     work.flush()?;
     // No legacy exception or session-timezone capability is authored here.
     // Frozen semantic parameters remain on exact prepared call contracts.
@@ -681,7 +751,12 @@ fn lower_core(
         control,
     )?);
     work.flush()?;
-    Ok(LoweredExpressions { arena, ids, types })
+    Ok(LoweredExpressions {
+        arena,
+        ids,
+        types,
+        union_ids,
+    })
 }
 
 /// Prepare actual expression occurrences using exact frozen identities and
