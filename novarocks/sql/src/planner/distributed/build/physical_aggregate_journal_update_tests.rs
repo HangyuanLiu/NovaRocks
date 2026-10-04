@@ -18,7 +18,7 @@
 //! Genuine SQL Update journal requests, with no synthetic checked-entry constructor.
 
 use super::super::lowered_draft::{
-    AggregateRuntimeDemand, AggregateSourceJournalError, CheckedAggregateLogicalSourceEntry,
+    AggregateRuntimeDemand, CheckedAggregateLogicalSourceEntry, SqlSourceJournalError,
 };
 use super::*;
 use novarocks_type_contract::{
@@ -349,7 +349,7 @@ fn journal_update_foreign_equal_owner_is_refused_before_a_checked_loan_is_publis
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
         let result =
             owner.checked_aggregate_source_observed(fragment, node, site, source, &mut work);
-        if matches!(&result, Err(AggregateSourceJournalError::Control(_))) {
+        if matches!(&result, Err(SqlSourceJournalError::Control(_))) {
             return result.map(|_| ());
         }
         work.finish()?;
@@ -358,7 +358,7 @@ fn journal_update_foreign_equal_owner_is_refused_before_a_checked_loan_is_publis
     let baseline = Control::default();
     assert!(matches!(
         invoke(&baseline),
-        Err(AggregateSourceJournalError::InvalidSource(
+        Err(SqlSourceJournalError::InvalidSource(
             "aggregate journal loans a foreign plan or node"
         ))
     ));
@@ -374,7 +374,7 @@ fn journal_update_foreign_equal_owner_is_refused_before_a_checked_loan_is_publis
                 refusal: Some((at, cause)),
             };
             assert!(
-                matches!(invoke(&control), Err(AggregateSourceJournalError::Control(actual)) if actual == cause)
+                matches!(invoke(&control), Err(SqlSourceJournalError::Control(actual)) if actual == cause)
             );
             assert_eq!(*control.trace.lock().unwrap(), expected[..=at]);
         }

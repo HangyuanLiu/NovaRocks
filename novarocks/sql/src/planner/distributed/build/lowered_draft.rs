@@ -72,7 +72,38 @@ impl SqlAuthoredPhysicalPlan {
         fragment: &'a Fragment,
         source: &'a novarocks_physical_plan::ExprNode,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<CheckedScalarLogicalSourceEntry<'a>, AggregateSourceJournalError> {
+    ) -> Result<CheckedExpressionLogicalSourceEntry<'a>, SqlSourceJournalError> {
+        self.checked_expression_source_observed(
+            fragment,
+            source,
+            SqlExpressionCallKind::Scalar,
+            work,
+        )
+    }
+
+    /// Window positional arguments followed by function ORDER BY channels.
+    /// Partition/order/frame expressions have separate static owners.
+    pub(crate) fn checked_window_source_observed<'a>(
+        &'a self,
+        fragment: &'a Fragment,
+        source: &'a novarocks_physical_plan::ExprNode,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<CheckedExpressionLogicalSourceEntry<'a>, SqlSourceJournalError> {
+        self.checked_expression_source_observed(
+            fragment,
+            source,
+            SqlExpressionCallKind::Window,
+            work,
+        )
+    }
+
+    fn checked_expression_source_observed<'a>(
+        &'a self,
+        fragment: &'a Fragment,
+        source: &'a novarocks_physical_plan::ExprNode,
+        kind: SqlExpressionCallKind,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<CheckedExpressionLogicalSourceEntry<'a>, SqlSourceJournalError> {
         work.flush()?;
         let same_fragment = self
             .plan
@@ -86,19 +117,66 @@ impl SqlAuthoredPhysicalPlan {
             .is_some_and(|original| std::ptr::eq(original, source));
         work.step()?;
         if !same_fragment || !same_expression {
-            return Err(AggregateSourceJournalError::InvalidSource(
-                "scalar journal loans a foreign plan or expression",
+            return Err(SqlSourceJournalError::InvalidSource(
+                "expression journal loans a foreign plan or expression",
             ));
         }
         let entry = self
             .call_sources
-            .scalar_entries
+            .expression_entries
             .get(&(fragment.id(), source.id));
         work.step()?;
-        let entry = entry.ok_or(AggregateSourceJournalError::MissingEntry)?;
-        validate_scalar_source_entry_observed(entry, source, work)?;
+        let entry = entry.ok_or(SqlSourceJournalError::MissingEntry)?;
+        let same_kind = entry.kind == kind;
+        work.step()?;
+        if !same_kind {
+            return Err(SqlSourceJournalError::InvalidSource(
+                "expression journal loan uses a different call lifecycle",
+            ));
+        }
+        validate_expression_source_entry_observed(entry, source, work)?;
         work.flush()?;
-        Ok(CheckedScalarLogicalSourceEntry {
+        Ok(CheckedExpressionLogicalSourceEntry {
+            entry,
+            fragment,
+            source,
+        })
+    }
+
+    /// Only the actual Table lowering producer can loan this relation request.
+    /// Its selected relation remains whole; no scalar result is invented.
+    pub(crate) fn checked_table_source_observed<'a>(
+        &'a self,
+        fragment: &'a Fragment,
+        source: &'a PhysicalNode,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<CheckedTableLogicalSourceEntry<'a>, SqlSourceJournalError> {
+        work.flush()?;
+        let same_fragment = self
+            .plan
+            .fragments()
+            .get(&fragment.id())
+            .is_some_and(|original| std::ptr::eq(original, fragment));
+        work.step()?;
+        let same_node = fragment
+            .nodes()
+            .get(&source.id)
+            .is_some_and(|original| std::ptr::eq(original, source));
+        work.step()?;
+        if !same_fragment || !same_node {
+            return Err(SqlSourceJournalError::InvalidSource(
+                "table journal loans a foreign plan or node",
+            ));
+        }
+        let entry = self
+            .call_sources
+            .table_entries
+            .get(&(fragment.id(), source.id));
+        work.step()?;
+        let entry = entry.ok_or(SqlSourceJournalError::MissingEntry)?;
+        validate_table_source_entry_observed(entry, source, work)?;
+        work.flush()?;
+        Ok(CheckedTableLogicalSourceEntry {
             entry,
             fragment,
             source,
@@ -114,7 +192,7 @@ impl SqlAuthoredPhysicalPlan {
         site: PhysicalCallSite,
         source: &'a AggregateCall,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<CheckedAggregateLogicalSourceEntry<'a>, AggregateSourceJournalError> {
+    ) -> Result<CheckedAggregateLogicalSourceEntry<'a>, SqlSourceJournalError> {
         work.flush()?;
         let original_fragment = self.plan.fragments().get(&fragment.id());
         let same_fragment = original_fragment.is_some_and(|value| std::ptr::eq(value, fragment));
@@ -125,7 +203,7 @@ impl SqlAuthoredPhysicalPlan {
             .is_some_and(|value| std::ptr::eq(value, node));
         work.step()?;
         if !same_fragment || !same_node {
-            return Err(AggregateSourceJournalError::InvalidSource(
+            return Err(SqlSourceJournalError::InvalidSource(
                 "aggregate journal loans a foreign plan or node",
             ));
         }
@@ -147,18 +225,18 @@ impl SqlAuthoredPhysicalPlan {
         let same_call = actual.is_some_and(|value| std::ptr::eq(value, source));
         work.step()?;
         if !same_call {
-            return Err(AggregateSourceJournalError::InvalidSource(
+            return Err(SqlSourceJournalError::InvalidSource(
                 "aggregate journal call differs from its original site",
             ));
         }
         let entry = self.call_sources.entries.get(&(fragment.id(), site));
         work.step()?;
-        let entry = entry.ok_or(AggregateSourceJournalError::MissingEntry)?;
+        let entry = entry.ok_or(SqlSourceJournalError::MissingEntry)?;
         let same_phase = entry.phase == source.binding.phase;
         let same_call_id = entry.target == AggregateSourceTarget::Aggregate(source.id);
         work.step()?;
         if !same_phase || !same_call_id {
-            return Err(AggregateSourceJournalError::InvalidSource(
+            return Err(SqlSourceJournalError::InvalidSource(
                 "aggregate journal phase or producer association differs",
             ));
         }
@@ -168,7 +246,7 @@ impl SqlAuthoredPhysicalPlan {
             }
             AggregatePhase::Intermediate { .. } | AggregatePhase::Final { .. } => {
                 if source.arguments.len() != 1 || !source.order_by.is_empty() || source.distinct {
-                    return Err(AggregateSourceJournalError::InvalidSource(
+                    return Err(SqlSourceJournalError::InvalidSource(
                         "aggregate merge has invalid physical state channels",
                     ));
                 }
@@ -177,14 +255,14 @@ impl SqlAuthoredPhysicalPlan {
         };
         work.step()?;
         if entry.runtime != expected_state {
-            return Err(AggregateSourceJournalError::InvalidSource(
+            return Err(SqlSourceJournalError::InvalidSource(
                 "aggregate journal runtime state differs from its producer",
             ));
         }
         let captured = match &entry.logical {
             LoweredAggregateLogicalSource::Captured(captured) => captured,
             LoweredAggregateLogicalSource::Uncertified => {
-                return Err(AggregateSourceJournalError::MissingLogicalSource);
+                return Err(SqlSourceJournalError::MissingLogicalSource);
             }
         };
         work.step()?;
@@ -203,12 +281,12 @@ impl SqlAuthoredPhysicalPlan {
 
 /// Only the source owner can create this original emission loan. There is no
 /// conversion from a binding, a selected signature or captured data alone.
-pub(crate) struct CheckedScalarLogicalSourceEntry<'a> {
-    entry: &'a LoweredScalarSourceEntry,
+pub(crate) struct CheckedExpressionLogicalSourceEntry<'a> {
+    entry: &'a LoweredExpressionSourceEntry,
     fragment: &'a Fragment,
     source: &'a novarocks_physical_plan::ExprNode,
 }
-impl<'a> CheckedScalarLogicalSourceEntry<'a> {
+impl<'a> CheckedExpressionLogicalSourceEntry<'a> {
     pub(crate) const fn captured(&self) -> &'a CapturedLogicalCallArguments {
         &self.entry.captured
     }
@@ -223,31 +301,110 @@ impl<'a> CheckedScalarLogicalSourceEntry<'a> {
     }
 }
 
-pub(super) fn validate_scalar_source_entry_observed(
-    entry: &LoweredScalarSourceEntry,
+pub(super) fn validate_expression_source_entry_observed(
+    entry: &LoweredExpressionSourceEntry,
     source: &novarocks_physical_plan::ExprNode,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(), AggregateSourceJournalError> {
+) -> Result<(), SqlSourceJournalError> {
     let same_scope = source.owner == entry.owner && source.lambda_scope == entry.lambda_scope;
     work.step()?;
-    let novarocks_physical_plan::ExprKind::FunctionCall { args, .. } = &source.kind else {
-        return Err(AggregateSourceJournalError::InvalidSource(
-            "scalar journal site is not its original function emission",
-        ));
+    let (args, order) = match (&source.kind, entry.kind) {
+        (
+            novarocks_physical_plan::ExprKind::FunctionCall { args, .. },
+            SqlExpressionCallKind::Scalar,
+        ) => (args.as_ref(), &[][..]),
+        (
+            novarocks_physical_plan::ExprKind::WindowCall {
+                args,
+                function_order_by,
+                ..
+            },
+            SqlExpressionCallKind::Window,
+        ) => (args.as_ref(), function_order_by.as_ref()),
+        _ => {
+            return Err(SqlSourceJournalError::InvalidSource(
+                "expression journal site has a different call lifecycle",
+            ));
+        }
     };
-    let same_count = args.len() == entry.arguments.len();
+    let count = args
+        .len()
+        .checked_add(order.len())
+        .ok_or(CompileControlError::ResourceExhausted)?;
+    let request = entry.captured.request();
+    let same_count = count == entry.arguments.len()
+        && count == request.arguments.len()
+        && args.len() == request.logical_argument_count;
     work.step()?;
     if !same_scope || !same_count {
-        return Err(AggregateSourceJournalError::InvalidSource(
-            "scalar journal scope or channel count differs from its emission",
+        return Err(SqlSourceJournalError::InvalidSource(
+            "expression journal scope or channel count differs from its emission",
         ));
     }
-    for (actual, original) in args.iter().zip(entry.arguments.iter()) {
+    for (actual, original) in args
+        .iter()
+        .copied()
+        .chain(order.iter().map(|key| key.expr))
+        .zip(entry.arguments.iter().copied())
+    {
         let same_argument = actual == original;
         work.step()?;
         if !same_argument {
-            return Err(AggregateSourceJournalError::InvalidSource(
-                "scalar journal channel differs from its original expression identity",
+            return Err(SqlSourceJournalError::InvalidSource(
+                "expression journal channel differs from its original expression identity",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Original table producer loan; constructors remain private to this journal.
+pub(crate) struct CheckedTableLogicalSourceEntry<'a> {
+    entry: &'a LoweredTableSourceEntry,
+    fragment: &'a Fragment,
+    source: &'a PhysicalNode,
+}
+impl<'a> CheckedTableLogicalSourceEntry<'a> {
+    pub(crate) const fn captured(&self) -> &'a CapturedLogicalCallArguments {
+        &self.entry.captured
+    }
+    pub(crate) const fn fragment(&self) -> &'a Fragment {
+        self.fragment
+    }
+    pub(crate) const fn source(&self) -> &'a PhysicalNode {
+        self.source
+    }
+    pub(crate) fn arguments(&self) -> &'a [ExprId] {
+        &self.entry.arguments
+    }
+}
+
+pub(super) fn validate_table_source_entry_observed(
+    entry: &LoweredTableSourceEntry,
+    source: &PhysicalNode,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), SqlSourceJournalError> {
+    let NodeKind::TableFunction { arguments, .. } = &source.kind else {
+        return Err(SqlSourceJournalError::InvalidSource(
+            "table journal site is not its original producer",
+        ));
+    };
+    let request = entry.captured.request();
+    let same_count = arguments.len() == entry.arguments.len()
+        && arguments.len() == request.arguments.len()
+        && arguments.len() == request.logical_argument_count;
+    work.step()?;
+    if !same_count {
+        return Err(SqlSourceJournalError::InvalidSource(
+            "table journal channel count differs from its emission",
+        ));
+    }
+    for (actual, original) in arguments.iter().zip(entry.arguments.iter()) {
+        let same_argument = actual == original;
+        work.step()?;
+        if !same_argument {
+            return Err(SqlSourceJournalError::InvalidSource(
+                "table journal channel differs from its original expression identity",
             ));
         }
     }
@@ -255,13 +412,13 @@ pub(super) fn validate_scalar_source_entry_observed(
 }
 
 #[derive(Debug)]
-pub(crate) enum AggregateSourceJournalError {
+pub(crate) enum SqlSourceJournalError {
     Control(CompileControlError),
     MissingEntry,
     MissingLogicalSource,
     InvalidSource(&'static str),
 }
-impl From<CompileControlError> for AggregateSourceJournalError {
+impl From<CompileControlError> for SqlSourceJournalError {
     fn from(value: CompileControlError) -> Self {
         Self::Control(value)
     }
@@ -336,8 +493,19 @@ pub(super) struct LoweredAggregateSourceEntry {
     pub(super) runtime: AggregateRuntimeDemand,
     pub(super) target: AggregateSourceTarget,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SqlExpressionCallKind {
+    Scalar,
+    Window,
+}
 #[derive(Debug)]
-pub(super) struct LoweredScalarSourceEntry {
+pub(super) struct LoweredTableSourceEntry {
+    pub(super) captured: CapturedLogicalCallArguments,
+    pub(super) arguments: Box<[ExprId]>,
+}
+#[derive(Debug)]
+pub(super) struct LoweredExpressionSourceEntry {
+    pub(super) kind: SqlExpressionCallKind,
     pub(super) captured: CapturedLogicalCallArguments,
     pub(super) owner: novarocks_physical_plan::NodeId,
     pub(super) lambda_scope: Option<ExprId>,
@@ -345,9 +513,11 @@ pub(super) struct LoweredScalarSourceEntry {
 }
 #[derive(Debug)]
 pub(super) struct SqlLogicalSourceJournal {
-    // Only actual ordinary TypedExpr::FunctionCall emissions are recorded.
-    // Synthetic conversion/VARIANT calls remain a distinct open source gate.
-    pub(super) scalar_entries: BTreeMap<(FragmentId, ExprId), LoweredScalarSourceEntry>,
+    // Actual ordinary and Window expression emissions plus Table producers.
+    // Synthetic conversion/VARIANT calls remain distinct open source gates.
+    pub(super) expression_entries: BTreeMap<(FragmentId, ExprId), LoweredExpressionSourceEntry>,
+    pub(super) table_entries:
+        BTreeMap<(FragmentId, novarocks_physical_plan::NodeId), LoweredTableSourceEntry>,
     pub(super) entries: BTreeMap<(FragmentId, PhysicalCallSite), LoweredAggregateSourceEntry>,
 }
 

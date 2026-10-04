@@ -37,7 +37,7 @@ use super::SqlCompileIntent;
 use super::tests::{complete_with_exact_statistics, frozen_table_statistics};
 use crate::compiler::SqlAuthoredPhysicalPlan;
 use crate::planner::distributed::build::{
-    AggregateRuntimeDemand, AggregateSourceJournalError, CheckedAggregateLogicalSourceEntry,
+    AggregateRuntimeDemand, CheckedAggregateLogicalSourceEntry, SqlSourceJournalError,
 };
 
 fn completed_min() -> crate::compiler::SqlCompletedPlan {
@@ -78,13 +78,11 @@ fn loan<'a>(
     site: PhysicalCallSite,
     call: &'a AggregateCall,
     control: &dyn PureCompileControl,
-) -> Result<CheckedAggregateLogicalSourceEntry<'a>, AggregateSourceJournalError> {
+) -> Result<CheckedAggregateLogicalSourceEntry<'a>, SqlSourceJournalError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
     let result = owner.checked_aggregate_source_observed(fragment, node, site, call, &mut work);
     match result {
-        Err(AggregateSourceJournalError::Control(cause)) => {
-            Err(AggregateSourceJournalError::Control(cause))
-        }
+        Err(SqlSourceJournalError::Control(cause)) => Err(SqlSourceJournalError::Control(cause)),
         result => {
             work.finish()?;
             result
@@ -192,7 +190,7 @@ fn journal_rejects_equal_foreign_fragment_and_wrong_actual_array_ordinal() {
             &calls[0],
             &control
         ),
-        Err(AggregateSourceJournalError::InvalidSource(
+        Err(SqlSourceJournalError::InvalidSource(
             "aggregate journal loans a foreign plan or node"
         ))
     ));
@@ -208,7 +206,7 @@ fn journal_rejects_equal_foreign_fragment_and_wrong_actual_array_ordinal() {
             call,
             &control
         ),
-        Err(AggregateSourceJournalError::InvalidSource(
+        Err(SqlSourceJournalError::InvalidSource(
             "aggregate journal call differs from its original site"
         ))
     ));
@@ -257,7 +255,7 @@ fn journal_moved_owner_preserves_each_original_control_prefix_and_ordinary_tail(
         if invalid {
             assert!(matches!(
                 result,
-                Err(AggregateSourceJournalError::InvalidSource(
+                Err(SqlSourceJournalError::InvalidSource(
                     "aggregate journal call differs from its original site"
                 ))
             ));
@@ -283,7 +281,7 @@ fn journal_moved_owner_preserves_each_original_control_prefix_and_ordinary_tail(
                 };
                 let result = loan(&owner, fragment, node, attempted, call, &control);
                 assert!(
-                    matches!(result, Err(AggregateSourceJournalError::Control(actual)) if actual == cause)
+                    matches!(result, Err(SqlSourceJournalError::Control(actual)) if actual == cause)
                 );
                 assert_eq!(control.trace.into_inner().unwrap(), baseline[..=index]);
             }

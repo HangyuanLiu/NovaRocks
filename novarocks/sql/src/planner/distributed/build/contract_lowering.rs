@@ -75,8 +75,9 @@ use sha2::{Digest, Sha256};
 
 use super::lowered_draft::{
     AggregateRuntimeDemand, AggregateSourceTarget, LoweredAggregateLogicalSource,
-    LoweredAggregateSourceEntry, LoweredScalarSourceEntry, LoweredSqlPhysicalDraft,
-    SqlLogicalSourceJournal, validate_scalar_source_entry_observed,
+    LoweredAggregateSourceEntry, LoweredExpressionSourceEntry, LoweredSqlPhysicalDraft,
+    LoweredTableSourceEntry, SqlExpressionCallKind, SqlLogicalSourceJournal,
+    validate_expression_source_entry_observed, validate_table_source_entry_observed,
 };
 use crate::analysis::cte::CteId;
 use crate::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr, UnOp};
@@ -1410,7 +1411,8 @@ impl<'a> ContractLoweringVisitor<'a> {
             plan_version: version,
             plan_builder: PlanBuilder::new(version),
             call_sources: SqlLogicalSourceJournal {
-                scalar_entries: BTreeMap::new(),
+                expression_entries: BTreeMap::new(),
+                table_entries: BTreeMap::new(),
                 entries: BTreeMap::new(),
             },
             provider_partition_definitions: BTreeMap::new(),
@@ -1782,7 +1784,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         }
         // Validate retained ordinary emissions only. Missing synthetic/window/
         // table sources stay open; this is not full FunctionCall coverage.
-        for (&(fragment_id, expression_id), entry) in &self.call_sources.scalar_entries {
+        for (&(fragment_id, expression_id), entry) in &self.call_sources.expression_entries {
             self.work.step()?;
             let fragment = finished_fragments.get(&fragment_id).ok_or(
                 ContractLoweringError::UnknownFragmentCompletion {
@@ -1793,7 +1795,20 @@ impl<'a> ContractLoweringVisitor<'a> {
                 .expressions()
                 .get(expression_id)
                 .ok_or(ContractLoweringError::IdentitySpaceExhausted("expression"))?;
-            validate_scalar_source_entry_observed(entry, source, &mut self.work)?;
+            validate_expression_source_entry_observed(entry, source, &mut self.work)?;
+        }
+        for (&(fragment_id, node_id), entry) in &self.call_sources.table_entries {
+            self.work.step()?;
+            let fragment = finished_fragments.get(&fragment_id).ok_or(
+                ContractLoweringError::UnknownFragmentCompletion {
+                    fragment: fragment_id,
+                },
+            )?;
+            let source = fragment
+                .nodes()
+                .get(&node_id)
+                .ok_or(ContractLoweringError::IdentitySpaceExhausted("node"))?;
+            validate_table_source_entry_observed(entry, source, &mut self.work)?;
         }
         for filter in self.materialize_runtime_filters(&finished_fragments)? {
             self.plan_builder.add_runtime_filter(filter)?;
@@ -6812,6 +6827,21 @@ impl<'a> ContractLoweringVisitor<'a> {
         plan: &PhysicalPlanNode,
         table_function: &crate::planner::payload::PlanTableFunctionNode,
     ) -> Result<LoweredNode, ContractLoweringError> {
+        let result = self.lower_table_function_inner(plan, table_function);
+        if matches!(&result, Err(ContractLoweringError::Control(_))) {
+            return result;
+        }
+        if result.is_err() {
+            self.work.flush()?;
+        }
+        result
+    }
+
+    fn lower_table_function_inner(
+        &mut self,
+        plan: &PhysicalPlanNode,
+        table_function: &crate::planner::payload::PlanTableFunctionNode,
+    ) -> Result<LoweredNode, ContractLoweringError> {
         expect_children(plan, 1)?;
         let child = self.lower_node(&plan.children[0])?;
         let binding = &table_function.binding;
@@ -6858,11 +6888,50 @@ impl<'a> ContractLoweringVisitor<'a> {
         )?;
 
         let node = self.fragment_mut().reserve_node_id()?;
-        let arguments = table_function
-            .args
-            .iter()
-            .map(|argument| self.lower_expression(node, argument, &child.columns))
-            .collect::<Result<Vec<_>, _>>()?;
+        self.work.flush()?;
+        let captured = capture_logical_call_arguments(
+            binding,
+            table_function.args.len(),
+            table_function.args.iter(),
+            self.constant_policy,
+            self.control,
+        )?;
+        self.work.flush()?;
+        let mut arguments = Vec::new();
+        arguments
+            .try_reserve_exact(table_function.args.len())
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        self.work.step()?;
+        self.work.flush()?;
+        for (ordinal, argument) in table_function.args.iter().enumerate() {
+            arguments.push(self.lower_captured_unbound_argument(
+                node,
+                argument,
+                ordinal,
+                &captured,
+                &child.columns,
+            )?);
+            self.work.step()?;
+        }
+        self.work.flush()?;
+        let arguments = arguments.into_boxed_slice();
+        self.work.step()?;
+        self.work.flush()?;
+        self.work.flush()?;
+        let mut retained_arguments = Vec::new();
+        retained_arguments
+            .try_reserve_exact(arguments.len())
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        self.work.step()?;
+        self.work.flush()?;
+        for &argument in arguments.iter() {
+            retained_arguments.push(argument);
+            self.work.step()?;
+        }
+        self.work.flush()?;
+        let retained_arguments = retained_arguments.into_boxed_slice();
+        self.work.step()?;
+        self.work.flush()?;
         let mut output = child.output.to_vec();
         let mut outputs = child
             .output
@@ -6960,11 +7029,12 @@ impl<'a> ContractLoweringVisitor<'a> {
                     failure_behavior: binding.semantics.failure_behavior,
                     intrinsic_row_error: binding.semantics.intrinsic_row_error,
                 },
-                arguments: arguments.into_boxed_slice(),
+                arguments,
                 outputs: outputs.into_boxed_slice(),
                 left_outer: table_function.is_left_join,
             },
         )?;
+        self.record_table_source(node, captured, retained_arguments)?;
         let properties = self
             .fragment_mut()
             .node_output_properties(node)
@@ -7216,6 +7286,22 @@ impl<'a> ContractLoweringVisitor<'a> {
         window: &crate::planner::payload::WindowExpr,
         visible: &BTreeMap<ColumnId, ValueId>,
     ) -> Result<ExprId, ContractLoweringError> {
+        let result = self.lower_window_call_inner(owner, window, visible);
+        if matches!(&result, Err(ContractLoweringError::Control(_))) {
+            return result;
+        }
+        if result.is_err() {
+            self.work.flush()?;
+        }
+        result
+    }
+
+    fn lower_window_call_inner(
+        &mut self,
+        owner: NodeId,
+        window: &crate::planner::payload::WindowExpr,
+        visible: &BTreeMap<ColumnId, ValueId>,
+    ) -> Result<ExprId, ContractLoweringError> {
         let binding = &window.binding;
         if binding.logical_argument_count != window.args.len()
             || binding.selected.argument_types.len()
@@ -7234,8 +7320,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 detail: "window payload result type differs from its exact binding".to_string(),
             });
         }
-        let function = bound_function_from_resolved(binding, &result_type);
-        let aggregate_binding = match binding.kind {
+        let aggregate_source = match binding.kind {
             novarocks_physical_plan::FunctionKind::Window => {
                 if window.aggregate_binding.is_some()
                     || window.distinct
@@ -7259,12 +7344,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                             .to_string(),
                     });
                 }
-                Some(lower_resolved_aggregate_binding(
-                    aggregate,
-                    window.args.len(),
-                    window.function_order_by.len(),
-                    AggregatePhase::Single,
-                )?)
+                Some(aggregate)
             }
             other => {
                 return Err(ContractLoweringError::InvalidWindow {
@@ -7272,35 +7352,106 @@ impl<'a> ContractLoweringVisitor<'a> {
                 });
             }
         };
-        let args = window
+        self.work.flush()?;
+        let captured = capture_logical_call_arguments(
+            binding,
+            window.args.len(),
+            window
+                .args
+                .iter()
+                .chain(window.function_order_by.iter().map(|key| &key.expr)),
+            self.constant_policy,
+            self.control,
+        )?;
+        self.work.flush()?;
+        let aggregate_binding = aggregate_source
+            .map(|aggregate| {
+                lower_resolved_aggregate_binding(
+                    aggregate,
+                    window.args.len(),
+                    window.function_order_by.len(),
+                    AggregatePhase::Single,
+                )
+            })
+            .transpose()?;
+        self.work.step()?;
+        self.work.flush()?;
+        let function = bound_function_from_resolved(binding, &result_type);
+        self.work.step()?;
+        self.work.flush()?;
+        let mut args = Vec::new();
+        args.try_reserve_exact(window.args.len())
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        self.work.step()?;
+        self.work.flush()?;
+        for (ordinal, (argument, expected)) in window
             .args
             .iter()
             .zip(function.argument_types.iter())
-            .map(|(argument, expected)| {
-                self.lower_bound_argument(owner, argument, visible, expected)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let function_order_by = self
-            .lower_ordering(owner, &window.function_order_by, visible)?
-            .expressions;
+            .enumerate()
+        {
+            args.push(self.lower_captured_scalar_argument(
+                owner, argument, ordinal, &captured, visible, expected,
+            )?);
+            self.work.step()?;
+        }
+        self.work.flush()?;
+        let args = args.into_boxed_slice();
+        self.work.step()?;
+        self.work.flush()?;
+        let mut function_order_by = Vec::new();
+        function_order_by
+            .try_reserve_exact(window.function_order_by.len())
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        self.work.step()?;
+        self.work.flush()?;
+        for (ordinal, key) in window.function_order_by.iter().enumerate() {
+            let expr = self.lower_captured_unbound_argument(
+                owner,
+                &key.expr,
+                window.args.len() + ordinal,
+                &captured,
+                visible,
+            )?;
+            function_order_by.push(SortExpr {
+                expr,
+                direction: if key.asc {
+                    SortDirection::Ascending
+                } else {
+                    SortDirection::Descending
+                },
+                null_ordering: if key.nulls_first {
+                    NullOrdering::First
+                } else {
+                    NullOrdering::Last
+                },
+            });
+            self.work.step()?;
+        }
+        self.work.flush()?;
+        let function_order_by = function_order_by.into_boxed_slice();
+        self.work.step()?;
+        self.work.flush()?;
         let frame = window
             .window_frame
             .as_ref()
             .map(|frame| self.lower_window_frame(owner, frame))
             .transpose()?;
-        Ok(self.fragment_mut().add_expression(
+        let emitted = self.fragment_mut().add_expression(
             owner,
             result_type,
             ContractExprKind::WindowCall {
                 function,
                 distinct: window.distinct,
-                args: args.into_boxed_slice(),
+                args,
                 function_order_by,
                 frame,
                 ignore_nulls: window.ignore_nulls,
                 aggregate_binding: aggregate_binding.map(Box::new),
             },
-        )?)
+        )?;
+        self.record_expression_source(owner, emitted, captured, SqlExpressionCallKind::Window)?;
+        Ok(emitted)
     }
 
     fn lower_window_frame(
@@ -8078,17 +8229,18 @@ impl<'a> ContractLoweringVisitor<'a> {
         }
         let emitted = self.add_scoped_expression(owner, ty, kind)?;
         if let Some(captured) = captured_call {
-            self.record_scalar_source(owner, emitted, captured)?;
+            self.record_expression_source(owner, emitted, captured, SqlExpressionCallKind::Scalar)?;
         }
         Ok(emitted)
     }
 
     /// Retain the original ordered emission association alongside its request.
-    fn record_scalar_source(
+    fn record_expression_source(
         &mut self,
         owner: NodeId,
         emitted: ExprId,
         captured: CapturedLogicalCallArguments,
+        kind: SqlExpressionCallKind,
     ) -> Result<(), ContractLoweringError> {
         self.work.flush()?;
         let mut arguments = Vec::new();
@@ -8102,12 +8254,25 @@ impl<'a> ContractLoweringVisitor<'a> {
             .expressions()
             .get(emitted)
             .ok_or(ContractLoweringError::IdentitySpaceExhausted("expression"))?;
-        let ContractExprKind::FunctionCall { args, .. } = &source.kind else {
-            return Err(ContractLoweringError::InvalidFunctionBinding {
-                detail: "captured scalar source has no actual function emission".into(),
-            });
+        let (args, order) = match (&source.kind, kind) {
+            (ContractExprKind::FunctionCall { args, .. }, SqlExpressionCallKind::Scalar) => {
+                (args.as_ref(), &[][..])
+            }
+            (
+                ContractExprKind::WindowCall {
+                    args,
+                    function_order_by,
+                    ..
+                },
+                SqlExpressionCallKind::Window,
+            ) => (args.as_ref(), function_order_by.as_ref()),
+            _ => {
+                return Err(ContractLoweringError::InvalidFunctionBinding {
+                    detail: "captured expression source has a different emission lifecycle".into(),
+                });
+            }
         };
-        for &argument in args.iter() {
+        for argument in args.iter().copied().chain(order.iter().map(|key| key.expr)) {
             arguments.push(argument);
             self.work.step()?;
         }
@@ -8116,7 +8281,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         self.work.step()?;
         self.work.flush()?;
         let key = (self.current_fragment, emitted);
-        let duplicate = self.call_sources.scalar_entries.contains_key(&key);
+        let duplicate = self.call_sources.expression_entries.contains_key(&key);
         self.work.step()?;
         if duplicate {
             return Err(ContractLoweringError::InvalidFunctionBinding {
@@ -8125,9 +8290,10 @@ impl<'a> ContractLoweringVisitor<'a> {
         }
         // Map allocation and retained request/type/backing coexistence remain
         // caller admission obligations, not an independently granted wallet.
-        self.call_sources.scalar_entries.insert(
+        self.call_sources.expression_entries.insert(
             key,
-            LoweredScalarSourceEntry {
+            LoweredExpressionSourceEntry {
+                kind,
                 captured,
                 owner,
                 lambda_scope,
@@ -8168,6 +8334,60 @@ impl<'a> ContractLoweringVisitor<'a> {
             return self.lower_constant_expression(owner, value, expression_type(argument));
         }
         self.lower_bound_argument(owner, argument, visible, expected)
+    }
+
+    fn lower_captured_unbound_argument(
+        &mut self,
+        owner: NodeId,
+        expression: &TypedExpr,
+        ordinal: usize,
+        captured: &CapturedLogicalCallArguments,
+        visible: &BTreeMap<ColumnId, ValueId>,
+    ) -> Result<ExprId, ContractLoweringError> {
+        if matches!(
+            expression.kind,
+            ExprKind::Literal(_) | ExprKind::Constant(_)
+        ) {
+            let argument = captured.request().arguments.get(ordinal);
+            self.work.step()?;
+            let Some(novarocks_functions::FunctionArgument::Value {
+                constant: Some(value),
+                ..
+            }) = argument
+            else {
+                return Err(ContractLoweringError::InvalidFunctionBinding {
+                    detail: "literal call channel has no captured constant source".into(),
+                });
+            };
+            return self.lower_constant_expression(owner, value, expression_type(expression));
+        }
+        self.lower_expression(owner, expression, visible)
+    }
+
+    fn record_table_source(
+        &mut self,
+        emitted: NodeId,
+        captured: CapturedLogicalCallArguments,
+        arguments: Box<[ExprId]>,
+    ) -> Result<(), ContractLoweringError> {
+        self.work.flush()?;
+        let key = (self.current_fragment, emitted);
+        let duplicate = self.call_sources.table_entries.contains_key(&key);
+        self.work.step()?;
+        if duplicate {
+            return Err(ContractLoweringError::InvalidTableFunction {
+                detail: "table source emission is duplicated".into(),
+            });
+        }
+        self.call_sources.table_entries.insert(
+            key,
+            LoweredTableSourceEntry {
+                captured,
+                arguments,
+            },
+        );
+        self.work.step()?;
+        Ok(())
     }
 
     /// Builds an expression in the scope that is open.
@@ -11028,12 +11248,10 @@ impl From<LogicalCallArgumentCaptureError> for ContractLoweringError {
         }
     }
 }
-impl From<super::lowered_draft::AggregateSourceJournalError> for ContractLoweringError {
-    fn from(error: super::lowered_draft::AggregateSourceJournalError) -> Self {
+impl From<super::lowered_draft::SqlSourceJournalError> for ContractLoweringError {
+    fn from(error: super::lowered_draft::SqlSourceJournalError) -> Self {
         match error {
-            super::lowered_draft::AggregateSourceJournalError::Control(cause) => {
-                Self::Control(cause)
-            }
+            super::lowered_draft::SqlSourceJournalError::Control(cause) => Self::Control(cause),
             _ => Self::InvalidFunctionBinding {
                 detail: "scalar source journal emission association is invalid".into(),
             },
@@ -11109,6 +11327,10 @@ impl From<ValidationErrors> for ContractLoweringError {
 #[cfg(test)]
 #[path = "lowered_scalar_source_tests.rs"]
 mod lowered_scalar_source_tests;
+
+#[cfg(test)]
+#[path = "lowered_window_table_source_tests.rs"]
+mod lowered_window_table_source_tests;
 
 #[cfg(test)]
 mod tests {

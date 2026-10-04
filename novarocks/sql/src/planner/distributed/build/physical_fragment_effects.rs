@@ -32,7 +32,7 @@ use novarocks_type_contract::{
 
 use super::{
     expression_occurrences::{AuthoredPhysicalOccurrences, ExpressionOccurrenceError},
-    lowered_draft::{AggregateSourceJournalError, SqlAuthoredPhysicalPlan},
+    lowered_draft::{SqlAuthoredPhysicalPlan, SqlSourceJournalError},
     physical_aggregate_occurrences::{
         PhysicalAggregateMergeOccurrenceInput, PhysicalAggregateOccurrenceError,
         PhysicalAggregateOccurrenceInput, prepare_physical_aggregate_merge_occurrence_observed,
@@ -86,7 +86,7 @@ pub(crate) enum PhysicalFragmentEffectsError {
     Occurrence(ExpressionOccurrenceError),
     Expressions(PhysicalExpressionEffectsError),
     AggregateRequest(PhysicalAggregateRequestError),
-    Journal(AggregateSourceJournalError),
+    Journal(SqlSourceJournalError),
     Aggregate(PhysicalAggregateOccurrenceError),
     TableRequest(PhysicalTableRequestError),
     Table(PhysicalTableOccurrenceError),
@@ -115,7 +115,7 @@ macro_rules! nested_error {
 nested_error!(ExpressionOccurrenceError, Occurrence);
 nested_error!(PhysicalExpressionEffectsError, Expressions);
 nested_error!(PhysicalAggregateRequestError, AggregateRequest);
-nested_error!(AggregateSourceJournalError, Journal);
+nested_error!(SqlSourceJournalError, Journal);
 nested_error!(PhysicalAggregateOccurrenceError, Aggregate);
 nested_error!(PhysicalTableRequestError, TableRequest);
 nested_error!(PhysicalTableOccurrenceError, Table);

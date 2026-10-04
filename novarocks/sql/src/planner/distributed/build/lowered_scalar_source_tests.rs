@@ -20,7 +20,7 @@ use super::*;
 use crate::binding::SqlFunctionBinding;
 use crate::compiler::SqlAuthoredPhysicalPlan;
 use crate::planner::distributed::build::lowered_draft::{
-    AggregateSourceJournalError, CheckedScalarLogicalSourceEntry,
+    CheckedExpressionLogicalSourceEntry, SqlSourceJournalError,
 };
 use crate::planner::payload::PlanProjectNode;
 use arrow::array::{Array, StringArray};
@@ -145,10 +145,10 @@ fn loan<'a>(
     fragment: &'a Fragment,
     source: &'a novarocks_physical_plan::ExprNode,
     control: &dyn PureCompileControl,
-) -> Result<CheckedScalarLogicalSourceEntry<'a>, AggregateSourceJournalError> {
+) -> Result<CheckedExpressionLogicalSourceEntry<'a>, SqlSourceJournalError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
     let result = owner.checked_scalar_source_observed(fragment, source, &mut work);
-    if matches!(&result, Err(AggregateSourceJournalError::Control(_))) {
+    if matches!(&result, Err(SqlSourceJournalError::Control(_))) {
         return result;
     }
     work.finish()?;
@@ -214,8 +214,8 @@ fn scalar_journal_real_sql_retains_same_owner_binding_and_request_loans() {
     for (fragment, source) in [(&foreign_fragment, source), (fragment, &foreign_source)] {
         assert!(matches!(
             loan(&owner, fragment, source, &Control::default()),
-            Err(AggregateSourceJournalError::InvalidSource(
-                "scalar journal loans a foreign plan or expression"
+            Err(SqlSourceJournalError::InvalidSource(
+                "expression journal loans a foreign plan or expression"
             ))
         ));
     }
@@ -336,8 +336,13 @@ fn scalar_journal_lambda_body_call_keeps_its_actual_emission_scope() {
     let lambda = visitor
         .lower_expression(NodeId::new(73), &expression, &BTreeMap::new())
         .unwrap();
-    let (key, entry) = visitor.call_sources.scalar_entries.iter().next().unwrap();
-    assert_eq!(visitor.call_sources.scalar_entries.len(), 1);
+    let (key, entry) = visitor
+        .call_sources
+        .expression_entries
+        .iter()
+        .next()
+        .unwrap();
+    assert_eq!(visitor.call_sources.expression_entries.len(), 1);
     assert_eq!(key.0, ROOT_FRAGMENT_ID);
     assert_eq!(entry.owner, NodeId::new(73));
     assert_eq!(entry.lambda_scope, Some(lambda));
@@ -347,7 +352,7 @@ fn scalar_journal_lambda_body_call_keeps_its_actual_emission_scope() {
         .get(key.1)
         .unwrap();
     assert_eq!(source.lambda_scope, Some(lambda));
-    validate_scalar_source_entry_observed(entry, source, &mut visitor.work).unwrap();
+    validate_expression_source_entry_observed(entry, source, &mut visitor.work).unwrap();
     visitor.work.finish().unwrap();
 }
 
@@ -365,14 +370,11 @@ fn scalar_journal_loan_success_and_ordinary_errors_observe_every_original_contro
         let control = Control::default();
         let result = loan(&owner, fragment, source, &control);
         if std::ptr::eq(source, missing) {
-            assert!(matches!(
-                result,
-                Err(AggregateSourceJournalError::MissingEntry)
-            ));
+            assert!(matches!(result, Err(SqlSourceJournalError::MissingEntry)));
         } else if std::ptr::eq(source, &foreign_source) {
             assert!(matches!(
                 result,
-                Err(AggregateSourceJournalError::InvalidSource(_))
+                Err(SqlSourceJournalError::InvalidSource(_))
             ));
         } else {
             assert!(result.is_ok());
@@ -395,7 +397,7 @@ fn scalar_journal_loan_success_and_ordinary_errors_observe_every_original_contro
                     ..Control::default()
                 };
                 assert!(matches!(loan(&owner, fragment, source, &control),
-                    Err(AggregateSourceJournalError::Control(actual)) if actual == cause));
+                    Err(SqlSourceJournalError::Control(actual)) if actual == cause));
                 assert_eq!(control.trace(), baseline[..=stop]);
             }
         }
@@ -472,7 +474,7 @@ fn scalar_journal_bare_null_and_cast_null_keep_distinct_original_request_sources
             &BTreeMap::new(),
         )
         .unwrap();
-    let entry = &visitor.call_sources.scalar_entries[&(ROOT_FRAGMENT_ID, emitted_call)];
+    let entry = &visitor.call_sources.expression_entries[&(ROOT_FRAGMENT_ID, emitted_call)];
     assert!(constant(&entry.captured.request().arguments[0]).is_none());
     let emitted = visitor.fragments[&ROOT_FRAGMENT_ID]
         .expressions()
