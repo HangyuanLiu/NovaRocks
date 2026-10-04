@@ -18,6 +18,7 @@
 //! Pure fragment preparation. Provider validation is a distinct intermediate
 //! phase; its result is not a complete semantic validation or a LocalProgram.
 
+mod assert_rows;
 mod channels;
 mod expressions;
 mod lowering;
@@ -29,6 +30,9 @@ mod repeat_lowering_tests;
 
 #[cfg(test)]
 mod unpivot_lowering_tests;
+
+#[cfg(test)]
+mod assert_rows_lowering_tests;
 
 pub use lowering::{FragmentCompileError, LocalCompileOptions, compile_fragment};
 

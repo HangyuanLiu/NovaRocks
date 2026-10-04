@@ -19,6 +19,7 @@
 
 use crate::{
     ProviderValidatedFragment,
+    assert_rows::lower_assert_rows,
     channels::{ChannelLoweringError, resolve_linear_channels},
     expressions::{ExpressionLoweringError, lower_expressions, prepare_calls},
     repeat::{RepeatLoweringError, lower_repeat},
@@ -282,7 +283,9 @@ fn lower(
             NodeKind::Filter { predicates } if predicates.len() == 1 && node.inputs.len() == 1 => {
                 next = Some(node.inputs[0])
             }
-            NodeKind::Limit { .. } if node.inputs.len() == 1 => next = Some(node.inputs[0]),
+            NodeKind::Limit { .. } | NodeKind::AssertOneRow(_) if node.inputs.len() == 1 => {
+                next = Some(node.inputs[0])
+            }
             NodeKind::Repeat { .. } | NodeKind::Unpivot { .. } if node.inputs.len() == 1 => {
                 next = Some(node.inputs[0])
             }
@@ -414,6 +417,25 @@ fn lower(
                             expressions: &expressions.ids,
                         },
                         &planned.slots,
+                        work.control(),
+                    )?
+                }
+                NodeKind::AssertOneRow(_) => {
+                    let child =
+                        *local_ids
+                            .get(&node.inputs[0])
+                            .ok_or(FragmentCompileError::Invalid(
+                                "missing lowered assertion child",
+                            ))?;
+                    let keys = channels_plan.assertion_keys.get(&source).ok_or(
+                        FragmentCompileError::Invalid("missing planned assertion keys"),
+                    )?;
+                    work.flush()?;
+                    lower_assert_rows(
+                        node,
+                        child,
+                        nodes[child.index()].output_layout(),
+                        keys,
                         work.control(),
                     )?
                 }

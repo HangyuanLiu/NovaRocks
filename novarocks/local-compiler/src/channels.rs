@@ -29,6 +29,7 @@ use novarocks_type_contract::{
 };
 use novarocks_types::SlotId;
 
+use crate::assert_rows::reserve_vec;
 use crate::unpivot::{UnpivotInputPort, UnpivotLoweringError, plan_unpivot_channels};
 
 use crate::repeat::{RepeatInputPort, RepeatLoweringError, plan_repeat_channels};
@@ -37,6 +38,7 @@ pub(crate) struct LinearChannels {
     pub nodes: BTreeMap<NodeId, NodeChannels>,
     pub inputs: BTreeMap<ExprId, ResolvedInput>,
     pub unpivot_sources: BTreeMap<NodeId, BTreeMap<ValueId, SlotId>>,
+    pub assertion_keys: BTreeMap<NodeId, Vec<SlotId>>,
 }
 
 pub(crate) struct NodeChannels {
@@ -144,6 +146,7 @@ fn resolve_core(
     let mut ports = BTreeMap::<NodeId, Port>::new();
     let mut next_slot = 0_u64;
     let mut unpivot_sources = BTreeMap::new();
+    let mut assertion_keys = BTreeMap::new();
     let mut previous = None;
     for &source in root_first.iter().rev() {
         let node = fragment
@@ -248,6 +251,39 @@ fn resolve_core(
                 passthrough(fragment, node, previous, &nodes, &ports, work)?
             }
             NodeKind::Limit { .. } => passthrough(fragment, node, previous, &nodes, &ports, work)?,
+            NodeKind::AssertOneRow(spec) => {
+                let child = linear_child(&node.inputs, previous)?;
+                let planned = passthrough(fragment, node, previous, &nodes, &ports, work)?;
+                let mut keys = Vec::new();
+                if let novarocks_physical_plan::RowCountAssertionSpec::PerKeyAtMostOne {
+                    keys: source_keys,
+                    ..
+                } = spec
+                {
+                    reserve_vec(&mut keys, source_keys.len(), work)?;
+                    for &value in source_keys {
+                        let resolved = resolve_input(value, &nodes[&child], &ports[&child]);
+                        work.step()?;
+                        let resolved = resolved?;
+                        let matches = fragment.nodes()[&child]
+                            .output
+                            .columns
+                            .get(input_ordinal(resolved)?)
+                            == Some(&value);
+                        work.step()?;
+                        if !matches {
+                            return Err(ChannelLoweringError::Invalid(
+                                "assertion key representative differs",
+                            ));
+                        }
+                        keys.push(resolved.slot);
+                        work.step()?;
+                    }
+                }
+                assertion_keys.insert(source, keys);
+                work.step()?;
+                planned
+            }
             NodeKind::Unpivot { .. } => {
                 let child = linear_child(&node.inputs, previous)?;
                 let child_channels = nodes.get(&child).ok_or(ChannelLoweringError::Invalid(
@@ -332,6 +368,7 @@ fn resolve_core(
         nodes,
         inputs,
         unpivot_sources,
+        assertion_keys,
     })
 }
 
