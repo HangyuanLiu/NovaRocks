@@ -29,8 +29,8 @@ mod kind;
 mod namespace;
 
 pub use namespace::{
-    ExpressionNamespaceWriteFacts, ExpressionProjectionLimits, ExpressionTypeIds,
-    PreparedExpressionNamespaceWrite, encode_expression_definitions,
+    EncodedExpressions, ExpressionNamespaceWriteFacts, ExpressionProjectionLimits,
+    ExpressionTypeIds, PreparedExpressionNamespaceWrite, encode_expression_definitions,
     prepare_expression_definitions,
 };
 

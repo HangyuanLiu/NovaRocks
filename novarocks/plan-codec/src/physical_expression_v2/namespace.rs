@@ -77,12 +77,119 @@ pub struct PreparedExpressionNamespaceWrite<'loan, 'source, 'control> {
     _pools: &'loan ConstantPools,
     facts: ExpressionNamespaceWriteFacts,
     control: &'control dyn PureCompileControl,
+    source_retained_bytes: usize,
 }
-impl PreparedExpressionNamespaceWrite<'_, '_, '_> {
+/// The private DTO and the original immutable source loans form one emission.
+/// Borrowing this owner never clones a type, signature or constant backing.
+/// Consuming its DTO ends this source-correspondence capability.
+pub struct EncodedExpressions<'loan, 'source, 'control> {
+    source: PreparedExpressionNamespaceWrite<'loan, 'source, 'control>,
+    wire: Vec<wire::ExpressionDefinition>,
+}
+impl<'loan, 'source, 'control> EncodedExpressions<'loan, 'source, 'control> {
+    pub fn as_wire(&self) -> &[wire::ExpressionDefinition] {
+        &self.wire
+    }
+    pub fn into_wire(self) -> Vec<wire::ExpressionDefinition> {
+        self.wire
+    }
+    pub const fn facts(&self) -> &ExpressionNamespaceWriteFacts {
+        &self.source.facts
+    }
+    pub fn source_count(&self) -> usize {
+        self.source.arena.len()
+    }
+    pub fn arena(&self) -> &'loan ExprArena {
+        self.source.arena
+    }
+    pub fn types(&self) -> &'loan EncodedTypeTable<'source> {
+        self.source.types
+    }
+    pub fn functions(&self) -> &'loan EncodedFunctionBindings<'loan, 'source> {
+        self.source._functions
+    }
+    pub fn aggregates(&self) -> &'loan EncodedAggregateBindings<'loan, 'source> {
+        self.source._aggregates
+    }
+    pub fn parameters(&self) -> &'loan SemanticParameters {
+        self.source._parameters
+    }
+    pub fn pools(&self) -> &'loan ConstantPools {
+        self.source._pools
+    }
+    pub(crate) fn original_control(&self) -> &'control dyn PureCompileControl {
+        self.source.control
+    }
+    /// Numeric cost of one original sparse lookup for an encompassing caller
+    /// to accumulate before delegation. This is not a separate resource grant.
+    pub fn lookup_work_upper_bound(&self) -> Result<usize, Error> {
+        tree_lookup_work(self.source_count())
+    }
+    pub fn expression(&self, id: u32) -> Result<Option<&'loan ExprNode>, Error> {
+        let mut work = CompileCheckpoints::try_new(self.original_control(), CompilePhase::Encode)?;
+        let result = self.expression_observed(id, &mut work);
+        finish(work, result)
+    }
+    pub(crate) fn expression_observed(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'loan ExprNode>, Error> {
+        // The actual BTree lookup remains opaque, rather than claiming its
+        // internal comparisons as completed checkpoint units.
+        work.flush()?;
+        let node = self.source.arena.get(ExprId::new(id));
+        work.flush()?;
+        work.step()?;
+        Ok(node)
+    }
+    pub fn source_id(&self, source: &ExprNode) -> Result<u32, Error> {
+        let mut work = CompileCheckpoints::try_new(self.original_control(), CompilePhase::Encode)?;
+        let result = self.source_id_observed(source, &mut work);
+        finish(work, result)
+    }
+    pub(crate) fn source_id_observed(
+        &self,
+        source: &ExprNode,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<u32, Error> {
+        let actual = self.expression_observed(source.id.get(), work)?;
+        let same = actual.is_some_and(|actual| std::ptr::eq(actual, source));
+        work.step()?;
+        if !same {
+            return Err(shape("expression source owner is not in this namespace"));
+        }
+        Ok(source.id.get())
+    }
+    /// Necessary live-storage floor: original whole-source invoice, inline
+    /// token and actual root DTO Vec capacity. Nested DTO backing is covered
+    /// by the emitted owner's request model and the caller's whole invoice;
+    /// this floor is not a complete retained-size measurement or host grant.
+    pub fn retained_invoice_floor(&self) -> Result<usize, Error> {
+        let mut work = CompileCheckpoints::try_new(self.original_control(), CompilePhase::Encode)?;
+        let result = self.retained_floor_observed(&mut work);
+        finish(work, result)
+    }
+    pub(crate) fn retained_floor_observed(
+        &self,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<usize, Error> {
+        let floor = add(
+            self.source.source_retained_bytes,
+            add(
+                std::mem::size_of::<Self>(),
+                bytes::<wire::ExpressionDefinition>(self.wire.capacity())?,
+            )?,
+        );
+        work.step()?;
+        floor
+    }
+}
+impl<'loan, 'source, 'control> PreparedExpressionNamespaceWrite<'loan, 'source, 'control> {
     pub const fn facts(&self) -> &ExpressionNamespaceWriteFacts {
         &self.facts
     }
-    pub fn emit(self) -> Result<Vec<wire::ExpressionDefinition>, Error> {
+    pub fn emit(self) -> Result<EncodedExpressions<'loan, 'source, 'control>, Error> {
         let mut work = CompileCheckpoints::try_new(self.control, CompilePhase::Encode)?;
         let result = (|| {
             work.flush()?;
@@ -118,7 +225,10 @@ impl PreparedExpressionNamespaceWrite<'_, '_, '_> {
                 });
                 work.step()?;
             }
-            Ok(output)
+            Ok(EncodedExpressions {
+                source: self,
+                wire: output,
+            })
         })();
         finish(work, result)
     }
@@ -771,12 +881,13 @@ pub fn prepare_expression_definitions<'loan, 'source, 'control>(
             _pools: pools,
             facts,
             control,
+            source_retained_bytes,
         })
     })();
     finish(work, result)
 }
 #[allow(clippy::too_many_arguments)]
-pub fn encode_expression_definitions<'loan, 'source>(
+pub fn encode_expression_definitions<'loan, 'source, 'control>(
     arena: &'loan ExprArena,
     inputs: &'loan [ExpressionTypeIds<'source>],
     types: &'loan EncodedTypeTable<'source>,
@@ -786,8 +897,8 @@ pub fn encode_expression_definitions<'loan, 'source>(
     pools: &'loan ConstantPools,
     source_retained_bytes: usize,
     limits: ExpressionProjectionLimits,
-    control: &dyn PureCompileControl,
-) -> Result<Vec<wire::ExpressionDefinition>, Error> {
+    control: &'control dyn PureCompileControl,
+) -> Result<EncodedExpressions<'loan, 'source, 'control>, Error> {
     prepare_expression_definitions(
         arena,
         inputs,

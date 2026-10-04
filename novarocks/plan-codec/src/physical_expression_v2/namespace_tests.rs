@@ -42,7 +42,7 @@ use novarocks_type_contract::{
 };
 use std::{
     collections::HashMap,
-    mem::size_of,
+    mem::{size_of, size_of_val},
     sync::{Arc, Mutex},
 };
 
@@ -279,6 +279,25 @@ impl Fixture {
         ),
         Error,
     > {
+        self.with_prepared(control, source, caps, |prepared| {
+            let facts = *prepared.facts();
+            Ok((
+                facts,
+                if emit {
+                    prepared.emit()?.into_wire()
+                } else {
+                    vec![]
+                },
+            ))
+        })
+    }
+    fn with_prepared<T>(
+        &self,
+        control: &Control,
+        source: usize,
+        caps: ExpressionProjectionLimits,
+        consume: impl FnOnce(PreparedExpressionNamespaceWrite<'_, '_, '_>) -> Result<T, Error>,
+    ) -> Result<T, Error> {
         // These original namespace owners are constructed on a separate setup
         // control. Only the actual expression prepare/emit trace is replayed.
         let types = encode_type_table_sources(&self.roots, &[], type_limits(), &Setup).unwrap();
@@ -357,8 +376,7 @@ impl Fixture {
             caps,
             control,
         )?;
-        let facts = *prepared.facts();
-        Ok((facts, if emit { prepared.emit()? } else { vec![] }))
+        consume(prepared)
     }
 }
 fn policy() -> ConstantPolicy {
@@ -1149,7 +1167,7 @@ fn namespace_seven_projection_limits_admit_exact_facts_and_refuse_one_over() {
     assert_eq!(prepared.facts().new_allocation_requests_upper_bound, 0);
     let empty_work = prepared.facts().cumulative_work_upper_bound;
     assert!(empty_work > 0);
-    assert!(prepared.emit().unwrap().is_empty());
+    assert!(prepared.emit().unwrap().as_wire().is_empty());
     let mut under = zero;
     under.max_cumulative_work = empty_work - 1;
     assert!(
@@ -1240,6 +1258,216 @@ fn namespace_prepare_and_consuming_emit_preserve_every_small_callback_and_ordina
     let mut no_key = all_kinds();
     no_key.parameters = SemanticParameters::default();
     prefixes(|c| no_key.run(c, SOURCE, limits(), true), false);
+}
+
+#[test]
+fn sealed_namespace_preserves_original_loans_sparse_sources_and_selected_constant() {
+    let f = Fixture::new(vec![
+        node(0, ExprKind::Value(ValueId::new(u32::MAX)), int()),
+        node(
+            u32::MAX,
+            ExprKind::Constant(ConstantReference {
+                pool: ConstantPoolId::new(u32::MAX),
+                ordinal: 2,
+            }),
+            int(),
+        ),
+    ]);
+    let c = Control::default();
+    f.with_prepared(&c, SOURCE, limits(), |prepared| {
+        let arena = prepared.arena;
+        let types = prepared.types;
+        let functions = prepared._functions;
+        let aggregates = prepared._aggregates;
+        let facts = prepared.facts;
+        let encoded = prepared.emit()?;
+        assert!(std::ptr::eq(encoded.arena(), arena));
+        assert!(std::ptr::eq(encoded.types(), types));
+        assert!(std::ptr::eq(encoded.functions(), functions));
+        assert!(std::ptr::eq(encoded.aggregates(), aggregates));
+        assert!(std::ptr::eq(encoded.parameters(), &f.parameters));
+        assert!(std::ptr::eq(encoded.pools(), &f.pools));
+        assert!(std::ptr::eq(
+            encoded.original_control(),
+            &c as &dyn PureCompileControl
+        ));
+        assert_eq!(encoded.facts().definition_count, facts.definition_count);
+        assert_eq!(encoded.source_count(), 2);
+        assert_eq!(
+            encoded.as_wire().iter().map(|n| n.id).collect::<Vec<_>>(),
+            [0, u32::MAX]
+        );
+        for id in [0, u32::MAX] {
+            let original = f.arena.get(ExprId::new(id)).unwrap();
+            assert!(std::ptr::eq(encoded.expression(id)?.unwrap(), original));
+            assert_eq!(encoded.source_id(original)?, id);
+        }
+        assert!(encoded.expression(1)?.is_none());
+        let mut foreign = f.arena.get(ExprId::new(0)).unwrap().clone();
+        assert!(matches!(
+            encoded.source_id(&foreign),
+            Err(Error::InvalidShape(_))
+        ));
+        foreign.ty = FunctionValueType::new(DataType::Float64, false);
+        assert!(matches!(
+            encoded.source_id(&foreign),
+            Err(Error::InvalidShape(_))
+        ));
+        assert_eq!(encoded.lookup_work_upper_bound()?, 48);
+        let Some(wire::expression_definition::Kind::Literal(reference)) =
+            &encoded.as_wire()[1].kind
+        else {
+            panic!("selected constant reference")
+        };
+        assert_eq!(reference.pool_id, Some(u32::MAX));
+        assert_eq!(reference.row_ordinal, 2);
+        assert_eq!(
+            encoded.pools().entries()[&ConstantPoolId::new(u32::MAX)]
+                .value(2)
+                .unwrap()
+                .try_i64()
+                .unwrap(),
+            Some(71)
+        );
+        let output = encoded.into_wire();
+        assert_eq!(output.len(), 2);
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn sealed_namespace_live_floor_uses_original_invoice_and_actual_root_capacity() {
+    let f = Fixture::single(ExprKind::Conjunction {
+        args: vec![ExprId::new(0); 320].into_boxed_slice(),
+    });
+    let inspect = |source| {
+        f.with_prepared(&Control::default(), source, limits(), |prepared| {
+            let encoded = prepared.emit()?;
+            let expected = source
+                + size_of_val(&encoded)
+                + size_of::<wire::ExpressionDefinition>() * encoded.wire.capacity();
+            let floor = encoded.retained_invoice_floor()?;
+            assert_eq!(floor, expected);
+            // Root DTO capacity is a necessary floor, not the nested argument
+            // Vec's retained backing or an allocator/grant measurement.
+            assert!(
+                encoded.facts().new_allocation_request_bytes_upper_bound
+                    > std::mem::size_of_val(encoded.wire.as_slice())
+            );
+            Ok((
+                floor,
+                encoded
+                    .facts()
+                    .coexisting_source_and_request_bytes_upper_bound,
+            ))
+        })
+        .unwrap()
+    };
+    let first = inspect(SOURCE);
+    let second = inspect(SOURCE + 4096);
+    assert_eq!(second.0 - first.0, 4096);
+    assert_eq!(second.1 - first.1, 4096);
+}
+
+#[test]
+fn sealed_namespace_empty_public_encoder_keeps_zero_requests_and_real_lookup_tails() {
+    let types = encode_type_table_sources(&[], &[], type_limits(), &Setup).unwrap();
+    let functions = encode_function_bindings(&types, &[], 0, binding_limits(), &Setup).unwrap();
+    let aggregates =
+        encode_aggregate_bindings(&types, &functions, &[], 0, binding_limits(), &Setup).unwrap();
+    let arena = arena(vec![]);
+    let parameters = SemanticParameters::default();
+    let pools = ConstantPools::empty();
+    let c = Control::default();
+    let caps = ExpressionProjectionLimits {
+        max_definitions: 0,
+        max_type_references: 0,
+        max_expression_references: 0,
+        max_new_allocation_requests: 0,
+        max_new_allocation_request_bytes: 0,
+        max_coexisting_source_and_request_bytes: 0,
+        max_cumulative_work: limits().max_cumulative_work,
+    };
+    let encoded = encode_expression_definitions(
+        &arena,
+        &[],
+        &types,
+        &functions,
+        &aggregates,
+        &parameters,
+        &pools,
+        0,
+        caps,
+        &c,
+    )
+    .unwrap();
+    assert!(encoded.as_wire().is_empty());
+    assert_eq!(encoded.source_count(), 0);
+    assert_eq!(encoded.facts().new_allocation_requests_upper_bound, 0);
+    assert_eq!(
+        encoded.retained_invoice_floor().unwrap(),
+        size_of_val(&encoded)
+    );
+    assert!(encoded.expression(0).unwrap().is_none());
+    assert!(encoded.expression(u32::MAX).unwrap().is_none());
+    let foreign = node(0, ExprKind::Value(ValueId::new(0)), int());
+    assert!(matches!(
+        encoded.source_id(&foreign),
+        Err(Error::InvalidShape(_))
+    ));
+    assert!(encoded.into_wire().is_empty());
+}
+
+#[test]
+fn sealed_namespace_queries_keep_every_original_control_prefix_and_ordinary_tail() {
+    let f = Fixture::single(ExprKind::Value(ValueId::new(0)));
+    let foreign = f.arena.get(ExprId::new(0)).unwrap().clone();
+    for ordinary in [false, true] {
+        let invoke = |control: &Control| {
+            f.with_prepared(control, SOURCE, limits(), |prepared| {
+                let encoded = prepared.emit()?;
+                assert!(std::ptr::eq(
+                    encoded.expression(0)?.unwrap(),
+                    f.arena.get(ExprId::new(0)).unwrap()
+                ));
+                assert!(encoded.expression(u32::MAX)?.is_none());
+                encoded.retained_invoice_floor()?;
+                if ordinary {
+                    encoded.source_id(&foreign)?;
+                } else {
+                    assert_eq!(encoded.source_id(f.arena.get(ExprId::new(0)).unwrap())?, 0);
+                }
+                Ok(())
+            })
+        };
+        let good = Control::default();
+        let result = invoke(&good);
+        assert_eq!(result.is_err(), ordinary);
+        if ordinary {
+            assert!(matches!(
+                result,
+                Err(Error::InvalidShape(
+                    "expression source owner is not in this namespace"
+                ))
+            ));
+        }
+        let trace = good.trace.lock().unwrap().clone();
+        assert_eq!(trace[0], 0);
+        // The final source identity comparison is actual completed work,
+        // including the ordinary mismatch, before its publication tail.
+        assert_eq!(*trace.last().unwrap(), 2);
+        for at in 0..trace.len() {
+            for cause in CAUSES {
+                let control = Control {
+                    trace: Mutex::new(vec![]),
+                    stop: Some((at, cause)),
+                };
+                assert!(matches!(invoke(&control), Err(Error::Control(actual)) if actual == cause));
+                assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+            }
+        }
+    }
 }
 
 #[test]
