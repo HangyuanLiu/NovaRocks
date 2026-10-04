@@ -32,7 +32,10 @@ use crate::binding::{CapturedAggregateLogicalRequest, CapturedLogicalCallArgumen
 
 mod operational_channels;
 pub(crate) use operational_channels::SqlOperationalProjectionError;
-pub(super) use operational_channels::{LoweredOperationalChannel, SqlOperationalChannelRole};
+pub(super) use operational_channels::{
+    EmittedOperationalCall, LoweredOperationalChannel, SqlOperationalChannelRole,
+    project_emitted_call_arguments_observed,
+};
 
 /// A completed SQL source owner. Its physical view is read-only; consuming a
 /// statement or DML result transfers this entire owner, including its original
@@ -334,6 +337,14 @@ impl<'a> CheckedExpressionLogicalSourceEntry<'a> {
     pub(crate) fn arguments(&self) -> &'a [ExprId] {
         &self.entry.arguments
     }
+    /// The original owner selection obtained before this actual emission.
+    /// Other lifecycles still have no canonical author receipt here. This
+    /// metadata loan does not authenticate effects, uses or kernel coverage.
+    pub(crate) fn canonical_selection(
+        &self,
+    ) -> Option<&'a Arc<novarocks_functions::FunctionBindingSelection>> {
+        self.entry.canonical_selection.as_ref()
+    }
 }
 
 pub(super) fn validate_expression_source_entry_observed(
@@ -594,6 +605,7 @@ impl std::fmt::Debug for LoweredExpressionLogicalSource {
 #[derive(Debug)]
 pub(super) struct LoweredExpressionSourceEntry {
     pub(super) kind: SqlExpressionCallKind,
+    pub(super) canonical_selection: Option<Arc<novarocks_functions::FunctionBindingSelection>>,
     pub(super) captured: LoweredExpressionLogicalSource,
     pub(super) owner: novarocks_physical_plan::NodeId,
     pub(super) lambda_scope: Option<ExprId>,

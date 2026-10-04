@@ -29,6 +29,12 @@ use novarocks_functions::{FunctionArgument, FunctionResultType};
 use novarocks_type_contract::DecimalOverflowPolicy;
 use std::sync::Mutex;
 
+#[path = "lowered_canonical_scalar_tests.rs"]
+mod lowered_canonical_scalar_tests;
+
+#[path = "lowered_canonical_constraint_tests.rs"]
+mod lowered_canonical_constraint_tests;
+
 #[path = "lowered_operational_channel_tests.rs"]
 mod operational_tests;
 

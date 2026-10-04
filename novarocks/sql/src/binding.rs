@@ -59,6 +59,8 @@ pub struct SqlFunctionBinding(Arc<SqlFunctionCallFacts>);
 struct SqlFunctionCallFacts {
     resolved: novarocks_functions::ResolvedFunctionBinding,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    /// A real producer-supplied result target, separate from inferred selection.
+    result_constraint: Option<novarocks_functions::FunctionValueType>,
 }
 
 impl SqlFunctionBinding {
@@ -69,7 +71,26 @@ impl SqlFunctionBinding {
         Self(Arc::new(SqlFunctionCallFacts {
             resolved,
             decimal_overflow_policy,
+            result_constraint: None,
         }))
+    }
+
+    /// Preserve the exact target supplied to the original binding owner.
+    /// An inferred selected result must never be passed as this constraint.
+    pub(crate) fn new_with_result_constraint(
+        resolved: novarocks_functions::ResolvedFunctionBinding,
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+        result_constraint: novarocks_functions::FunctionValueType,
+    ) -> Self {
+        Self(Arc::new(SqlFunctionCallFacts {
+            resolved,
+            decimal_overflow_policy,
+            result_constraint: Some(result_constraint),
+        }))
+    }
+
+    pub(crate) fn result_constraint(&self) -> Option<&novarocks_functions::FunctionValueType> {
+        self.0.result_constraint.as_ref()
     }
 
     pub fn resolved(&self) -> &novarocks_functions::ResolvedFunctionBinding {

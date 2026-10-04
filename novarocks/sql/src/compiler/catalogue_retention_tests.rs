@@ -35,6 +35,7 @@ use std::sync::{
 struct CatalogObservations {
     snapshots: AtomicUsize,
     aggregate_bindings: AtomicUsize,
+    exact_selections: AtomicUsize,
     latest: std::sync::Mutex<Option<Weak<dyn SqlFunctionCatalog>>>,
 }
 #[derive(Debug)]
@@ -77,6 +78,23 @@ impl SqlFunctionCatalog for CountingCatalog {
         });
         *self.observations.latest.lock().unwrap() = Some(Arc::downgrade(&captured));
         captured
+    }
+    fn select_exact_overload_observed(
+        &self,
+        function_id: &novarocks_functions::FunctionId,
+        kind: novarocks_functions::FunctionKind,
+        overload: &novarocks_functions::FunctionOverloadId,
+        request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        Arc<novarocks_functions::FunctionBindingSelection>,
+        novarocks_functions::FunctionBindingError,
+    > {
+        self.observations
+            .exact_selections
+            .fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .select_exact_overload_observed(function_id, kind, overload, request, control)
     }
     fn pure_overload_declaration_observed<'a>(
         &'a self,
@@ -312,6 +330,10 @@ fn catalogue_query_no_io_retains_the_analyzed_owner_through_clone_and_parts() {
     ));
     assert!(Arc::ptr_eq(owner.plan_arc(), owner_clone.plan_arc()));
     assert_eq!(catalog.count(), 2, "publication and clone never recapture");
+    assert!(
+        catalog.observations.exact_selections.load(Ordering::SeqCst) > 0,
+        "the retained original owner must author actual late selections"
+    );
 }
 
 #[test]

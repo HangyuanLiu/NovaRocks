@@ -24,11 +24,11 @@ use novarocks_functions::{
     ConstantError, ConstantValue, FunctionArgument, MAX_CALL_EFFECT_ARGUMENTS,
 };
 use novarocks_physical_plan::{
-    ConstantPools, ConstantReferenceError, ExprId, ExprKind, ExprNode, Fragment, NodeId,
+    ConstantPools, ConstantReferenceError, ExprArena, ExprId, ExprKind, ExprNode, NodeId,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, FunctionArgumentType, FunctionValueType,
-    ValueTypeError,
+    PureCompileControl, ValueTypeError,
 };
 
 use super::{
@@ -139,7 +139,7 @@ impl<'a> CheckedExpressionLogicalSourceEntry<'a> {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Box<[FunctionArgument]>, SqlOperationalProjectionError> {
         let context = Projection {
-            fragment: self.fragment,
+            expressions: self.fragment.expressions(),
             owner: self.entry.owner,
             lambda_scope: self.entry.lambda_scope,
             kind: Some(self.entry.kind),
@@ -171,7 +171,7 @@ impl<'a> CheckedTableLogicalSourceEntry<'a> {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Box<[FunctionArgument]>, SqlOperationalProjectionError> {
         let context = Projection {
-            fragment: self.fragment,
+            expressions: self.fragment.expressions(),
             owner: self.source.id,
             lambda_scope: None,
             kind: None,
@@ -186,8 +186,51 @@ impl<'a> CheckedTableLogicalSourceEntry<'a> {
     }
 }
 
+/// Borrowed channels from the original emitter before its parent call exists.
+/// This is a projection input, not a checked source loan or call certificate.
+pub(in crate::planner::distributed::build) struct EmittedOperationalCall<'a> {
+    pub(in crate::planner::distributed::build) expressions: &'a ExprArena,
+    pub(in crate::planner::distributed::build) pools: &'a ConstantPools,
+    pub(in crate::planner::distributed::build) owner: NodeId,
+    pub(in crate::planner::distributed::build) lambda_scope: Option<ExprId>,
+    pub(in crate::planner::distributed::build) kind: Option<SqlExpressionCallKind>,
+    pub(in crate::planner::distributed::build) captured: &'a CapturedLogicalCallArguments,
+    pub(in crate::planner::distributed::build) derived: Option<&'a DerivedVariantSource>,
+    pub(in crate::planner::distributed::build) arguments: &'a [ExprId],
+    pub(in crate::planner::distributed::build) channels: &'a [LoweredOperationalChannel],
+}
+
+/// Use the same projection body with the emitter's original source and control.
+/// Caller admission still owns source, comparison scratch, clones and retained
+/// coexistence; this scope supplies no allocation grant or fresh call facts.
+pub(in crate::planner::distributed::build) fn project_emitted_call_arguments_observed(
+    input: EmittedOperationalCall<'_>,
+    control: &dyn PureCompileControl,
+) -> Result<Box<[FunctionArgument]>, SqlOperationalProjectionError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+    let context = Projection {
+        expressions: input.expressions,
+        owner: input.owner,
+        lambda_scope: input.lambda_scope,
+        kind: input.kind,
+        captured: input.captured,
+        derived: input.derived,
+        arguments: input.arguments,
+        channels: input.channels,
+    };
+    let result = (|| {
+        context.check_extent(&mut work)?;
+        context.project(input.pools, &mut work)
+    })();
+    if matches!(&result, Err(SqlOperationalProjectionError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+
 struct Projection<'a> {
-    fragment: &'a Fragment,
+    expressions: &'a ExprArena,
     owner: NodeId,
     lambda_scope: Option<ExprId>,
     kind: Option<SqlExpressionCallKind>,
@@ -225,7 +268,7 @@ impl Projection<'_> {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<&'a ExprNode, SqlOperationalProjectionError> {
         work.flush()?;
-        let expression = self.fragment.expressions().get(id);
+        let expression = self.expressions.get(id);
         work.step()?;
         work.flush()?;
         expression.ok_or(SqlOperationalProjectionError::InvalidSource(

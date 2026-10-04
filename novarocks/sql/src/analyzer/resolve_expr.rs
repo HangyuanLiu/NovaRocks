@@ -1358,9 +1358,10 @@ impl<'a> super::AnalyzerContext<'a> {
                 kind: ExprKind::FunctionCall {
                     volatility: binding.semantics.volatility,
                     name: "__array_literal".to_string(),
-                    binding: crate::binding::SqlFunctionBinding::new(
+                    binding: crate::binding::SqlFunctionBinding::new_with_result_constraint(
                         binding,
                         self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                        expected,
                     ),
                     args,
                     distinct: false,

@@ -74,11 +74,13 @@ use novarocks_type_contract::{
 use sha2::{Digest, Sha256};
 
 use super::lowered_draft::{
-    AggregateRuntimeDemand, AggregateSourceTarget, LoweredAggregateLogicalSource,
-    LoweredAggregateSourceEntry, LoweredExpressionLogicalSource, LoweredExpressionSourceEntry,
-    LoweredOperationalChannel, LoweredSqlPhysicalDraft, LoweredTableSourceEntry,
-    SqlExpressionCallKind, SqlLogicalSourceJournal, SqlOperationalChannelRole,
-    validate_expression_source_entry_observed, validate_table_source_entry_observed,
+    AggregateRuntimeDemand, AggregateSourceTarget, EmittedOperationalCall,
+    LoweredAggregateLogicalSource, LoweredAggregateSourceEntry, LoweredExpressionLogicalSource,
+    LoweredExpressionSourceEntry, LoweredOperationalChannel, LoweredSqlPhysicalDraft,
+    LoweredTableSourceEntry, SqlExpressionCallKind, SqlLogicalSourceJournal,
+    SqlOperationalChannelRole, SqlOperationalProjectionError,
+    project_emitted_call_arguments_observed, validate_expression_source_entry_observed,
+    validate_table_source_entry_observed,
 };
 use crate::analysis::cte::CteId;
 use crate::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr, UnOp};
@@ -2745,6 +2747,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 LoweredExpressionLogicalSource::DerivedVariant(source),
                 SqlExpressionCallKind::DerivedVariant,
                 channels,
+                None,
             )?;
             let value = self.fragment_mut().add_value(
                 expected_result,
@@ -7511,6 +7514,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             captured,
             SqlExpressionCallKind::Window,
             channels,
+            None,
         )?;
         Ok(emitted)
     }
@@ -7837,7 +7841,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         }
         let mut ty = expression_type(expression);
         let mut captured_call = None;
-        let mut kind = match &expression.kind {
+        let kind = match &expression.kind {
             ExprKind::ColumnRef { column_id, .. } => {
                 // A reference is the value, so it is typed by the value's own
                 // definition rather than by what the statement was analyzed
@@ -8158,7 +8162,28 @@ impl<'a> ContractLoweringVisitor<'a> {
                 self.work.flush()?;
                 let channels = channels.into_boxed_slice();
                 self.work.step()?;
-                captured_call = Some((captured, channels));
+                let selected = self.author_canonical_scalar_selection(
+                    owner,
+                    &captured,
+                    &lowered_args,
+                    &channels,
+                )?;
+                let novarocks_functions::FunctionResultType::Scalar(result) = &selected.result_type
+                else {
+                    return Err(ContractLoweringError::InvalidFunctionBinding {
+                        detail: "canonical scalar owner selected a relation result".into(),
+                    });
+                };
+                self.work.flush()?;
+                let argument_types = selected.argument_types.clone();
+                self.work.step()?;
+                self.work.flush()?;
+                let result_type = result.clone();
+                self.work.step()?;
+                self.work.flush()?;
+                ty = result_type.clone();
+                self.work.step()?;
+                captured_call = Some((captured, channels, selected));
                 ContractExprKind::FunctionCall {
                     function: BoundFunction {
                         semantic_parameters: Box::default(),
@@ -8259,27 +8284,6 @@ impl<'a> ContractLoweringVisitor<'a> {
                 });
             }
         };
-        // A binding records the arguments it was resolved with, not something
-        // the function demands: an overload is chosen by data type, and the
-        // engine reads validity off every array it is handed. So where a value
-        // has since passed through something that nulls it, the record says
-        // so rather than describing a call this plan is not making.
-        if let ContractExprKind::FunctionCall { function, args } = &mut kind {
-            let mut nullable = Vec::with_capacity(args.len());
-            for argument in args.iter() {
-                nullable.push(
-                    self.fragment_mut()
-                        .expressions()
-                        .get(*argument)
-                        .is_some_and(|expression| expression.ty.nullable),
-                );
-            }
-            for (expected, nullable) in function.argument_types.iter_mut().zip(nullable) {
-                if let FunctionArgumentType::Value(value) = expected {
-                    value.nullable = value.nullable || nullable;
-                }
-            }
-        }
         // Nullability widens on the way out. An operator whose operand may be
         // null may answer null, whatever the statement was analyzed to say
         // about an operand that has since passed through something that nulls
@@ -8296,16 +8300,84 @@ impl<'a> ContractLoweringVisitor<'a> {
             }
         }
         let emitted = self.add_scoped_expression(owner, ty, kind)?;
-        if let Some((captured, channels)) = captured_call {
+        if let Some((captured, channels, selected)) = captured_call {
             self.record_expression_source(
                 owner,
                 emitted,
                 captured,
                 SqlExpressionCallKind::Scalar,
                 channels,
+                Some(selected),
             )?;
         }
         Ok(emitted)
+    }
+
+    /// Author the actual ordinary scalar signature before its parent enters
+    /// the same builder. Original logical capture and actual canonical metadata
+    /// remain distinct; neither is a fresh effect or kernel capability proof.
+    fn author_canonical_scalar_selection(
+        &mut self,
+        owner: NodeId,
+        captured: &CapturedLogicalCallArguments,
+        arguments: &[ExprId],
+        channels: &[LoweredOperationalChannel],
+    ) -> Result<Arc<novarocks_functions::FunctionBindingSelection>, ContractLoweringError> {
+        self.work.flush()?;
+        let projection = project_emitted_call_arguments_observed(
+            EmittedOperationalCall {
+                expressions: self.fragments[&self.current_fragment].expressions(),
+                pools: self.plan_builder.constants(),
+                owner,
+                lambda_scope: self.lambda_scope.last().map(|scope| scope.lambda),
+                kind: Some(SqlExpressionCallKind::Scalar),
+                captured,
+                derived: None,
+                arguments,
+                channels,
+            },
+            self.control,
+        )
+        .map_err(ContractLoweringError::from);
+        let operational = self.completed_specialization_result(projection)?;
+        let original = captured.binding().resolved();
+        self.work.flush()?;
+        let selection = self
+            .functions
+            .select_exact_overload_observed(
+                &original.function_id,
+                original.kind,
+                &original.selected.overload,
+                novarocks_functions::FunctionBindingRequest {
+                    arguments: &operational,
+                    logical_argument_count: captured.request().logical_argument_count,
+                    // Only the producer-supplied target constrains this result.
+                    // An inferred selected result is never an explicit target.
+                    expected_result_type: captured.binding().result_constraint(),
+                },
+                self.control,
+            )
+            .map_err(|error| match error {
+                novarocks_functions::FunctionBindingError::Control(cause) => {
+                    ContractLoweringError::Control(cause)
+                }
+                error => ContractLoweringError::InvalidFunctionBinding {
+                    detail: format!("canonical scalar selection: {error}"),
+                },
+            });
+        self.completed_specialization_result(selection)
+    }
+
+    fn completed_specialization_result<T>(
+        &mut self,
+        outcome: Result<T, ContractLoweringError>,
+    ) -> Result<T, ContractLoweringError> {
+        if matches!(&outcome, Err(ContractLoweringError::Control(_))) {
+            return outcome;
+        }
+        self.work.step()?;
+        self.work.flush()?;
+        outcome
     }
 
     /// Retain the original ordered emission association alongside its request.
@@ -8317,6 +8389,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         captured: CapturedLogicalCallArguments,
         kind: SqlExpressionCallKind,
         channels: Box<[LoweredOperationalChannel]>,
+        canonical_selection: Option<Arc<novarocks_functions::FunctionBindingSelection>>,
     ) -> Result<(), ContractLoweringError> {
         self.record_expression_source_with_data(
             owner,
@@ -8324,6 +8397,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             LoweredExpressionLogicalSource::Owned(captured),
             kind,
             channels,
+            canonical_selection,
         )
     }
 
@@ -8334,6 +8408,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         captured: LoweredExpressionLogicalSource,
         kind: SqlExpressionCallKind,
         channels: Box<[LoweredOperationalChannel]>,
+        canonical_selection: Option<Arc<novarocks_functions::FunctionBindingSelection>>,
     ) -> Result<(), ContractLoweringError> {
         self.work.flush()?;
         let mut arguments = Vec::new();
@@ -8412,6 +8487,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             key,
             LoweredExpressionSourceEntry {
                 kind,
+                canonical_selection,
                 captured,
                 owner,
                 lambda_scope,
@@ -8765,7 +8841,8 @@ impl<'a> ContractLoweringVisitor<'a> {
                 });
             }
             self.work.flush()?;
-            let binding = SqlFunctionBinding::new(binding, policy);
+            let binding =
+                SqlFunctionBinding::new_with_result_constraint(binding, policy, intermediate);
             self.work.step()?;
             self.work.flush()?;
             let mut arguments = Vec::new();
@@ -8821,6 +8898,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 captured,
                 SqlExpressionCallKind::ValueConversion,
                 channels,
+                None,
             )?;
             emitted
         } else {
@@ -11521,6 +11599,17 @@ impl From<novarocks_physical_plan::FrozenCallError> for ContractLoweringError {
     }
 }
 
+impl From<SqlOperationalProjectionError> for ContractLoweringError {
+    fn from(error: SqlOperationalProjectionError) -> Self {
+        match error {
+            SqlOperationalProjectionError::Control(cause) => Self::Control(cause),
+            error => Self::InvalidFunctionBinding {
+                detail: format!("scalar operational source: {error}"),
+            },
+        }
+    }
+}
+
 impl From<LogicalCallArgumentCaptureError> for ContractLoweringError {
     fn from(error: LogicalCallArgumentCaptureError) -> Self {
         match error {
@@ -12263,18 +12352,32 @@ mod tests {
         }
     }
 
-    fn scalar_call(
-        name: &str,
-        args: Vec<TypedExpr>,
-        data_type: DataType,
-        volatility: novarocks_functions::FunctionVolatility,
-    ) -> TypedExpr {
-        let binding = crate::analysis::test_function_binding(
-            name,
-            &args,
-            data_type.clone(),
-            false,
-            volatility,
+    fn scalar_call(name: &str, args: Vec<TypedExpr>) -> TypedExpr {
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let arguments = args
+            .iter()
+            .map(|argument| {
+                crate::analysis::function_argument(
+                    argument,
+                    crate::constant::test_constant_policy(),
+                    &control,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let resolved = crate::functions::builtin_sql_function_catalog()
+            .resolve_scalar_binding(name, &arguments, &control)
+            .unwrap();
+        let novarocks_functions::FunctionResultType::Scalar(result) =
+            &resolved.selected.result_type
+        else {
+            panic!("actual scalar selected result");
+        };
+        let value_type = result.clone();
+        let volatility = resolved.semantics.volatility;
+        let binding = SqlFunctionBinding::new(
+            resolved,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         );
         TypedExpr {
             kind: ExprKind::FunctionCall {
@@ -12284,7 +12387,7 @@ mod tests {
                 binding,
                 volatility,
             },
-            value_type: novarocks_type_contract::FunctionValueType::new(data_type, false),
+            value_type,
         }
     }
 
@@ -15220,24 +15323,32 @@ mod tests {
 
     #[test]
     fn broadcast_project_and_filter_require_replica_deterministic_expressions() {
-        let input = column(1, "number", DataType::Int64, false);
+        let input = column(1, "number", DataType::Int32, false);
         let broadcast = || {
             redistribute(
-                values(vec![input.clone()], vec![vec![literal_int(7)]]),
+                values(vec![input.clone()], vec![vec![literal_int32(7)]]),
                 RedistributeMode::Broadcast,
             )
         };
-        let project = |volatility| {
-            let output = column(2, "computed", DataType::Int64, false);
+        let project = |volatile| {
+            // Both expressions come from real registered owners. No fabricated
+            // identity or hand-edited volatility is accepted by the lowerer.
+            let expression = if volatile {
+                scalar_call("rand", vec![])
+            } else {
+                scalar_call("abs", vec![column_ref(&input)])
+            };
+            let mut output = column(
+                2,
+                "computed",
+                expression.value_type.data_type.clone(),
+                expression.value_type.nullable,
+            );
+            output.value_type = expression.value_type.clone();
             PhysicalPlanNode {
                 kind: PhysicalPlanKind::Project(PlanProjectNode {
                     items: vec![ProjectItem {
-                        expr: scalar_call(
-                            "project_value",
-                            vec![column_ref(&input)],
-                            DataType::Int64,
-                            volatility,
-                        ),
+                        expr: expression,
                         output_name: output.name.clone(),
                         output_column_id: output.column_id,
                     }],
@@ -15249,14 +15360,28 @@ mod tests {
                 probe_runtime_filters: Vec::new(),
             }
         };
-        let filter = |volatility| PhysicalPlanNode {
-            kind: PhysicalPlanKind::Filter(PlanFilterNode {
-                predicate: scalar_call("filter_value", Vec::new(), DataType::Boolean, volatility),
-            }),
-            children: vec![broadcast()],
-            output_columns: vec![input.clone()],
-            stats: stats(),
-            probe_runtime_filters: Vec::new(),
+        let filter = |volatile| {
+            let predicate = if volatile {
+                TypedExpr {
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(scalar_call("rand", vec![])),
+                        op: BinOp::Gt,
+                        right: Box::new(literal_float(0.0)),
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    },
+                    value_type: ValueType::new(DataType::Boolean, false),
+                }
+            } else {
+                literal_bool(true)
+            };
+            PhysicalPlanNode {
+                kind: PhysicalPlanKind::Filter(PlanFilterNode { predicate }),
+                children: vec![broadcast()],
+                output_columns: vec![input.clone()],
+                stats: stats(),
+                probe_runtime_filters: Vec::new(),
+            }
         };
         let root_distribution = |plan: PhysicalPlanNode| {
             let control = crate::compiler::SqlCompileControl::unbounded();
@@ -15277,22 +15402,13 @@ mod tests {
                 .distribution
         };
 
+        assert_eq!(root_distribution(project(false)), Distribution::Broadcast);
         assert_eq!(
-            root_distribution(project(novarocks_functions::FunctionVolatility::Immutable)),
-            Distribution::Broadcast
-        );
-        assert_eq!(
-            root_distribution(project(novarocks_functions::FunctionVolatility::Stable)),
+            root_distribution(project(true)),
             Distribution::Unconstrained
         );
-        assert_eq!(
-            root_distribution(filter(novarocks_functions::FunctionVolatility::Immutable)),
-            Distribution::Broadcast
-        );
-        assert_eq!(
-            root_distribution(filter(novarocks_functions::FunctionVolatility::Volatile)),
-            Distribution::Unconstrained
-        );
+        assert_eq!(root_distribution(filter(false)), Distribution::Broadcast);
+        assert_eq!(root_distribution(filter(true)), Distribution::Unconstrained);
     }
 
     #[test]
