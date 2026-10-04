@@ -135,6 +135,10 @@ mod table_unnest_owner;
 mod table_unnest_tests;
 mod truncate;
 mod truncate_owner;
+mod window_ntile;
+mod window_ntile_owner;
+mod window_offset;
+mod window_offset_owner;
 mod window_ranking;
 mod window_ranking_owner;
 

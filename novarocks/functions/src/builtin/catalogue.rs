@@ -2383,6 +2383,12 @@ pub(super) fn scalar_definition_parts(
                     name if super::window_value_owner::operation(name).is_some() => {
                         Some(super::window_value_owner::effects())
                     }
+                    name if super::window_ntile_owner::operation(name).is_some() => {
+                        Some(super::window_ntile_owner::effects())
+                    }
+                    name if super::window_offset_owner::operation(name).is_some() => {
+                        Some(super::window_offset_owner::effects())
+                    }
                     "abs" => Some(super::abs_owner::effects()),
                     name if super::control_owner::operation(name).is_some() => {
                         Some(super::control_owner::effects(
@@ -2635,6 +2641,12 @@ pub fn contribute_builtin_functions(
             }
             name if super::window_value_owner::operation(name).is_some() => {
                 super::window_value_owner::definition(name, declaration, resolver)?
+            }
+            name if super::window_ntile_owner::operation(name).is_some() => {
+                super::window_ntile_owner::definition(name, declaration, resolver)?
+            }
+            name if super::window_offset_owner::operation(name).is_some() => {
+                super::window_offset_owner::definition(name, declaration, resolver)?
             }
             "abs" => super::abs_owner::definition(declaration, resolver)?,
             name if super::control_owner::operation(name).is_some() => {
