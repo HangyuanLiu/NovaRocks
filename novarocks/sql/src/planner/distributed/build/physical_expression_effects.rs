@@ -42,7 +42,16 @@ use super::{
         prepare_physical_scalar_occurrence_observed,
     },
     physical_scalar_requests::{
-        PhysicalScalarRequestError, author_physical_scalar_request_observed,
+        AuthoredPhysicalScalarRequest, PhysicalScalarRequestError,
+        author_physical_scalar_request_observed,
+    },
+    physical_window_occurrences::{
+        PhysicalWindowOccurrenceError, PhysicalWindowOccurrenceInput,
+        prepare_physical_window_occurrence_observed,
+    },
+    physical_window_requests::{
+        AuthoredPhysicalWindowRequest, PhysicalWindowRequestError,
+        author_physical_window_request_observed,
     },
 };
 use crate::compiler::SqlFunctionCatalog;
@@ -54,7 +63,7 @@ mod tests;
 /// SQL-authored facts for one invocation. The actual immutable source loan
 /// prevents a stale journal entry from authenticating rewritten contents by ID.
 /// Definitions may have several uses with different scopes and policies.
-pub(crate) struct PhysicalScalarSourceScope<'a> {
+pub(crate) struct PhysicalCallSourceScope<'a> {
     pub source: &'a ExprNode,
     pub decimal_overflow_policy: DecimalOverflowPolicy,
     pub environment: &'a [SemanticParameterRef],
@@ -67,10 +76,10 @@ pub(crate) struct PhysicalExpressionEffectsInput<'a> {
     pub constants: &'a ConstantPools,
     pub parameters: &'a SemanticParameters,
     pub literal_policy: ConstantPolicy,
-    pub scalar_scopes: &'a BTreeMap<ExpressionUseId, PhysicalScalarSourceScope<'a>>,
+    pub call_scopes: &'a BTreeMap<ExpressionUseId, PhysicalCallSourceScope<'a>>,
 }
 
-/// These are expression-use facts only. Relational/window/HOF lifecycles,
+/// These are expression-use facts only. Relational/HOF lifecycles,
 /// dead-definition capability admission and complete Package publication
 /// remain mandatory separate owners; this result is not an executable plan.
 #[derive(Debug)]
@@ -86,13 +95,15 @@ pub(crate) enum PhysicalExpressionEffectsError {
     Argument(PhysicalArgumentError),
     Request(PhysicalScalarRequestError),
     Scalar(PhysicalScalarOccurrenceError),
+    WindowRequest(PhysicalWindowRequestError),
+    Window(PhysicalWindowOccurrenceError),
     Cast(CastPrepareError),
     Arithmetic(ArithmeticPrepareError),
     Comparison(ComparisonPrepareError),
     Effects(EffectContractError),
     Parameter(SemanticParameterError),
     Type(ValueTypeError),
-    MissingScalarScope(ExpressionUseId),
+    MissingCallScope(ExpressionUseId),
     InvalidSource(&'static str),
     UnsupportedExpression(ExprId),
 }
@@ -132,6 +143,13 @@ source_error!(RootUseBindingError, Roots);
 source_error!(PhysicalArgumentError, Argument);
 source_error!(PhysicalScalarRequestError, Request);
 source_error!(PhysicalScalarOccurrenceError, Scalar);
+source_error!(PhysicalWindowRequestError, WindowRequest);
+source_error!(PhysicalWindowOccurrenceError, Window);
+
+enum AuthoredPhysicalExpressionRequest<'a> {
+    Scalar(AuthoredPhysicalScalarRequest<'a>),
+    Window(AuthoredPhysicalWindowRequest<'a>),
+}
 macro_rules! recipe_error {
     ($error:ty, $variant:ident) => {
         impl From<$error> for PhysicalExpressionEffectsError {
@@ -172,7 +190,7 @@ pub(crate) fn author_physical_expression_effects_observed(
         let definitions = input.fragment.expressions();
         // Exact scope coverage is checked before any owner preparation. A
         // matching topology is not proof of matching immutable source contents.
-        for (&id, scope) in input.scalar_scopes {
+        for (&id, scope) in input.call_scopes {
             let source = flow
                 .uses()
                 .get(&id)
@@ -180,12 +198,15 @@ pub(crate) fn author_physical_expression_effects_observed(
             work.step()?;
             let matching_source = source.is_some_and(|source| {
                 std::ptr::eq(source, scope.source)
-                    && matches!(source.kind, ExprKind::FunctionCall { .. })
+                    && matches!(
+                        source.kind,
+                        ExprKind::FunctionCall { .. } | ExprKind::WindowCall { .. }
+                    )
             });
             work.step()?;
             if !matching_source {
                 return Err(PhysicalExpressionEffectsError::InvalidSource(
-                    "scalar scope does not loan this actual source invocation",
+                    "call scope does not loan this actual source invocation",
                 ));
             }
         }
@@ -195,21 +216,38 @@ pub(crate) fn author_physical_expression_effects_observed(
                 PhysicalExpressionEffectsError::InvalidSource("missing source definition"),
             )?;
             work.step()?;
-            if matches!(source.kind, ExprKind::FunctionCall { .. }) {
-                let has_scope = input.scalar_scopes.contains_key(&id);
+            if matches!(
+                source.kind,
+                ExprKind::FunctionCall { .. } | ExprKind::WindowCall { .. }
+            ) {
+                let has_scope = input.call_scopes.contains_key(&id);
                 work.step()?;
                 if !has_scope {
-                    return Err(PhysicalExpressionEffectsError::MissingScalarScope(id));
+                    return Err(PhysicalExpressionEffectsError::MissingCallScope(id));
                 }
                 if let std::collections::btree_map::Entry::Vacant(entry) = requests.entry(source.id)
                 {
-                    let request = author_physical_scalar_request_observed(
-                        source,
-                        definitions,
-                        input.constants,
-                        input.literal_policy,
-                        &mut work,
-                    )?;
+                    let request = if matches!(source.kind, ExprKind::FunctionCall { .. }) {
+                        AuthoredPhysicalExpressionRequest::Scalar(
+                            author_physical_scalar_request_observed(
+                                source,
+                                definitions,
+                                input.constants,
+                                input.literal_policy,
+                                &mut work,
+                            )?,
+                        )
+                    } else {
+                        AuthoredPhysicalExpressionRequest::Window(
+                            author_physical_window_request_observed(
+                                source,
+                                input.fragment,
+                                input.constants,
+                                input.literal_policy,
+                                &mut work,
+                            )?,
+                        )
+                    };
                     entry.insert(request);
                     work.step()?;
                 }
@@ -225,7 +263,7 @@ pub(crate) fn author_physical_expression_effects_observed(
             .try_reserve_exact(novarocks_type_contract::MAX_CONTROL_DEPTH)
             .map_err(|_| CompileControlError::ResourceExhausted)?;
         calls
-            .try_reserve_exact(input.scalar_scopes.len())
+            .try_reserve_exact(input.call_scopes.len())
             .map_err(|_| CompileControlError::ResourceExhausted)?;
         for &root in flow.root_use_ids() {
             active.insert(root);
@@ -265,25 +303,47 @@ pub(crate) fn author_physical_expression_effects_observed(
                     PhysicalExpressionEffectsError::InvalidSource("missing actual definition"),
                 )?;
                 work.step()?;
-                let summary = if let ExprKind::FunctionCall { .. } = &source.kind {
-                    let scope = &input.scalar_scopes[&id];
-                    let fresh = prepare_physical_scalar_occurrence_observed(
-                        PhysicalScalarOccurrenceInput {
-                            source,
-                            request: &requests[&source.id],
-                            flow,
-                            use_id: id,
-                            child_effects: &summaries,
-                            parameters: input.parameters,
-                            environment: scope.environment,
-                            decimal_overflow_policy: scope.decimal_overflow_policy,
-                            proof_scope: scope.proof_scope,
-                        },
-                        functions,
-                        &mut work,
-                    )?;
-                    let summary = fresh.preparation.effects();
-                    calls.push(fresh.frozen);
+                let summary = if let Some(request) = requests.get(&source.id) {
+                    let scope = &input.call_scopes[&id];
+                    let (frozen, summary) = match request {
+                        AuthoredPhysicalExpressionRequest::Scalar(request) => {
+                            let fresh = prepare_physical_scalar_occurrence_observed(
+                                PhysicalScalarOccurrenceInput {
+                                    source,
+                                    request,
+                                    flow,
+                                    use_id: id,
+                                    child_effects: &summaries,
+                                    parameters: input.parameters,
+                                    environment: scope.environment,
+                                    decimal_overflow_policy: scope.decimal_overflow_policy,
+                                    proof_scope: scope.proof_scope,
+                                },
+                                functions,
+                                &mut work,
+                            )?;
+                            (fresh.frozen, fresh.preparation.effects())
+                        }
+                        AuthoredPhysicalExpressionRequest::Window(request) => {
+                            let fresh = prepare_physical_window_occurrence_observed(
+                                PhysicalWindowOccurrenceInput {
+                                    source,
+                                    request,
+                                    flow,
+                                    use_id: id,
+                                    child_effects: &summaries,
+                                    parameters: input.parameters,
+                                    environment: scope.environment,
+                                    decimal_overflow_policy: scope.decimal_overflow_policy,
+                                    proof_scope: scope.proof_scope,
+                                },
+                                functions,
+                                &mut work,
+                            )?;
+                            (fresh.frozen, fresh.preparation.effects())
+                        }
+                    };
+                    calls.push(frozen);
                     work.step()?;
                     summary
                 } else {
@@ -338,7 +398,7 @@ pub(crate) fn author_physical_expression_effects_observed(
             }
         }
         let complete =
-            summaries.len() == flow.uses().len() && calls.len() == input.scalar_scopes.len();
+            summaries.len() == flow.uses().len() && calls.len() == input.call_scopes.len();
         work.step()?;
         if !complete {
             return Err(PhysicalExpressionEffectsError::InvalidSource(

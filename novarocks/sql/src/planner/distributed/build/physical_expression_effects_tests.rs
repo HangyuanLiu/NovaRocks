@@ -227,7 +227,7 @@ fn uses(fragment: &Fragment, catalog: &EngineFunctionCatalog) -> PhysicalRootUse
 fn source_scopes<'a>(
     fragment: &'a Fragment,
     roots: &PhysicalRootUses,
-) -> BTreeMap<ExpressionUseId, PhysicalScalarSourceScope<'a>> {
+) -> BTreeMap<ExpressionUseId, PhysicalCallSourceScope<'a>> {
     roots
         .flow()
         .uses()
@@ -236,7 +236,7 @@ fn source_scopes<'a>(
             let source = fragment.expressions().get(item.definition).unwrap();
             matches!(source.kind, ExprKind::FunctionCall { .. }).then_some((
                 id,
-                PhysicalScalarSourceScope {
+                PhysicalCallSourceScope {
                     source,
                     decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
                     environment: &[],
@@ -251,7 +251,7 @@ fn run(
     roots: &PhysicalRootUses,
     pools: &ConstantPools,
     params: &SemanticParameters,
-    scopes: &BTreeMap<ExpressionUseId, PhysicalScalarSourceScope<'_>>,
+    scopes: &BTreeMap<ExpressionUseId, PhysicalCallSourceScope<'_>>,
     catalog: &EngineFunctionCatalog,
     control: &Control,
 ) -> Result<AuthoredPhysicalExpressionEffects, PhysicalExpressionEffectsError> {
@@ -262,7 +262,7 @@ fn run(
             constants: pools,
             parameters: params,
             literal_policy: policy(),
-            scalar_scopes: scopes,
+            call_scopes: scopes,
         },
         catalog,
         control,
@@ -843,7 +843,7 @@ fn expression_effects_missing_spurious_and_stale_same_id_scalar_source_scopes_re
     let id = root_use(&roots, root);
     scopes.remove(&id);
     assert!(
-        matches!(run(&fragment,&roots,&pools,&params,&scopes,&catalog,&Control::default()),Err(PhysicalExpressionEffectsError::MissingScalarScope(actual)) if actual==id)
+        matches!(run(&fragment,&roots,&pools,&params,&scopes,&catalog,&Control::default()),Err(PhysicalExpressionEffectsError::MissingCallScope(actual)) if actual==id)
     );
     prefixes(
         |control| {
@@ -857,7 +857,7 @@ fn expression_effects_missing_spurious_and_stale_same_id_scalar_source_scopes_re
     let foreign = fragment.expressions().get(root).unwrap().clone();
     scopes.insert(
         id,
-        PhysicalScalarSourceScope {
+        PhysicalCallSourceScope {
             source: &foreign,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
             environment: &[],
@@ -875,7 +875,7 @@ fn expression_effects_missing_spurious_and_stale_same_id_scalar_source_scopes_re
             &Control::default()
         ),
         Err(PhysicalExpressionEffectsError::InvalidSource(
-            "scalar scope does not loan this actual source invocation"
+            "call scope does not loan this actual source invocation"
         ))
     ));
     prefixes(
@@ -890,7 +890,7 @@ fn expression_effects_missing_spurious_and_stale_same_id_scalar_source_scopes_re
     let mut valid = source_scopes(&fragment, &roots);
     valid.insert(
         ExpressionUseId::new(u32::MAX),
-        PhysicalScalarSourceScope {
+        PhysicalCallSourceScope {
             source: fragment.expressions().get(root).unwrap(),
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             environment: &[],
@@ -985,7 +985,7 @@ fn expression_effects_primitive_invalid_nullable_and_parameter_sources_are_typed
 }
 
 #[test]
-fn expression_effects_runtime_window_is_explicitly_unsupported_without_scalar_fallback() {
+fn expression_effects_runtime_window_requires_explicit_scope_and_keeps_its_lifecycle() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let (mut builder, leaf, owner) = empty();
     let resolved =
@@ -1051,7 +1051,7 @@ fn expression_effects_runtime_window_is_explicitly_unsupported_without_scalar_fa
     let pools = ConstantPools::empty();
     let params = SemanticParameters::try_new([]).unwrap();
     assert!(
-        matches!(run(&fragment,&roots,&pools,&params,&scopes,&catalog,&Control::default()),Err(PhysicalExpressionEffectsError::UnsupportedExpression(actual)) if actual==root)
+        matches!(run(&fragment,&roots,&pools,&params,&scopes,&catalog,&Control::default()),Err(PhysicalExpressionEffectsError::MissingCallScope(actual)) if actual==root_use(&roots,root))
     );
     prefixes(
         |control| {
@@ -1060,6 +1060,46 @@ fn expression_effects_runtime_window_is_explicitly_unsupported_without_scalar_fa
             )
         },
         false,
+        false,
+    );
+    let mut scopes = scopes;
+    let id = root_use(&roots, root);
+    scopes.insert(
+        id,
+        PhysicalCallSourceScope {
+            source: fragment.expressions().get(root).unwrap(),
+            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+            environment: &[],
+            proof_scope: CallProofScope::Domain(roots.flow().uses()[&id].context.domain),
+        },
+    );
+    let result = run(
+        &fragment,
+        &roots,
+        &pools,
+        &params,
+        &scopes,
+        &catalog,
+        &Control::default(),
+    )
+    .unwrap();
+    assert_eq!(result.calls.len(), 1);
+    assert!(summary(&result, &roots, root).has_instance_state);
+    let calls =
+        FrozenFragmentCalls::try_new(&fragment, &roots, result.calls, &Control::default()).unwrap();
+    assert_eq!(
+        calls.entries()[&PhysicalCallSite::Expression(id)]
+            .effects
+            .instance_state,
+        novarocks_type_contract::FunctionInstanceState::WindowPartition
+    );
+    prefixes(
+        |control| {
+            run(
+                &fragment, &roots, &pools, &params, &scopes, &catalog, control,
+            )
+        },
+        true,
         false,
     );
 }

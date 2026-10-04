@@ -22,6 +22,8 @@ mod physical_call_arguments;
 mod physical_expression_effects;
 mod physical_scalar_occurrences;
 mod physical_scalar_requests;
+mod physical_window_occurrences;
+mod physical_window_requests;
 
 pub(crate) use contract_lowering::{
     ContractLoweringError, FinalChangeStreamWriteLowering, FinalWriteLowering,

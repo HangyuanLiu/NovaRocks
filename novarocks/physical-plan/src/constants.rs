@@ -559,7 +559,12 @@ pub(crate) fn validate_fragment_constants_observed(
     result
 }
 
-fn window_offset(
+/// Read the original window-bound constant through its admitted source type.
+/// Checked references retain the existing exact non-null I64/U64 rules;
+/// legacy literals use the same structural validator's extraction.
+/// The caller owns entry and the ordinary/success footer. Originating control
+/// or resource failures return without an additional observation.
+pub fn window_offset_observed(
     fragment: &crate::Fragment,
     pools: &ConstantPools,
     id: crate::ExprId,
@@ -604,7 +609,7 @@ fn validate_window_constants(
     for (index, bound) in [&frame.start, &frame.end].into_iter().enumerate() {
         work.step()?;
         if let crate::WindowBound::Preceding(id) | crate::WindowBound::Following(id) = bound {
-            offsets[index] = window_offset(fragment, pools, *id, work)?;
+            offsets[index] = window_offset_observed(fragment, pools, *id, work)?;
         }
     }
     let ordered = match (&frame.start, &frame.end, offsets) {

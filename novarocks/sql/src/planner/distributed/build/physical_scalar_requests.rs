@@ -135,20 +135,35 @@ pub(crate) fn author_physical_scalar_request_observed<'a>(
         )?);
         work.step()?;
     }
-    work.flush()?;
-    let selected = Arc::new(FunctionBindingSelection {
-        overload: function.overload.clone(),
-        argument_types: function.argument_types.clone(),
-        result_type: FunctionResultType::Scalar(function.result_type.clone()),
-        aggregate: None,
-    });
-    work.flush()?;
+    let selected = author_scalar_result_selection_observed(function, None, work)?;
     Ok(AuthoredPhysicalScalarRequest {
         function,
         selected,
         arguments,
         result_constraint: &source.ty,
     })
+}
+
+/// Loan the actual frozen signature; neither resolve a name nor reconstruct
+/// effects. Aggregate state identity is the original neutral type, not a
+/// string conversion. The caller admits opaque signature/type clones.
+pub(super) fn author_scalar_result_selection_observed(
+    function: &BoundFunction,
+    aggregate: Option<&novarocks_physical_plan::AggregateBinding>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Arc<FunctionBindingSelection>, CompileControlError> {
+    work.flush()?;
+    let selected = Arc::new(FunctionBindingSelection {
+        overload: function.overload.clone(),
+        argument_types: function.argument_types.clone(),
+        result_type: FunctionResultType::Scalar(function.result_type.clone()),
+        aggregate: aggregate.map(|binding| novarocks_functions::AggregateBindingSelection {
+            intermediate_type: binding.intermediate_type.clone(),
+            state_format: binding.state_format.clone(),
+        }),
+    });
+    work.flush()?;
+    Ok(selected)
 }
 
 #[cfg(test)]
