@@ -56,6 +56,7 @@ pub(crate) mod physical_result_v2;
 pub mod physical_scan_v2;
 pub mod physical_semantics_v2;
 pub mod physical_simple_nodes_v2;
+pub mod physical_table_function_node_v2;
 mod physical_type;
 pub mod physical_type_v2;
 pub mod physical_unpivot_v2;
