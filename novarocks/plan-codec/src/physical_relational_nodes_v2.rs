@@ -99,13 +99,13 @@ fn decode_join_kind(input: i32, w: &mut CompileCheckpoints<'_>) -> Result<p::Joi
     w.step()?;
     result
 }
-fn encode_join_side(input: p::JoinSide) -> i32 {
+pub(crate) fn encode_join_side(input: p::JoinSide) -> i32 {
     match input {
         p::JoinSide::Left => wire::JoinSide::Left as i32,
         p::JoinSide::Right => wire::JoinSide::Right as i32,
     }
 }
-fn decode_join_side(input: i32, w: &mut CompileCheckpoints<'_>) -> Result<p::JoinSide, Error> {
+pub(crate) fn decode_join_side(input: i32, w: &mut CompileCheckpoints<'_>) -> Result<p::JoinSide, Error> {
     let result = match wire::JoinSide::try_from(input) {
         Ok(wire::JoinSide::Left) => Ok(p::JoinSide::Left),
         Ok(wire::JoinSide::Right) => Ok(p::JoinSide::Right),

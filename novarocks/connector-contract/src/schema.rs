@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{
-    ConnectorError, ConnectorErrorKind,
-    owned_copy::{OwnedCopy, PlainCopy},
-};
-use arrow_schema::{DataType, Field};
+#[cfg(test)]
+use crate::owned_copy::PlainCopy;
+use crate::{ConnectorError, ConnectorErrorKind, owned_copy::OwnedCopy};
+use arrow_schema::{DataType, Field, Schema};
 use novarocks_type_contract::owned_resources::{hashmap, layout};
 use std::{alloc::Layout, collections::HashMap, sync::Arc};
 
@@ -43,6 +42,7 @@ fn reserve<T, O: OwnedCopy>(count: usize, context: &mut O) -> Result<Vec<T>, O::
 /// Rebuild physical fields without retaining excess source backing. The caller
 /// validates its own schema domain first; this grammar adds no Value/Writer
 /// limits. The plain entry delegates the same original constructor body.
+#[cfg(test)]
 pub(crate) fn owned_field(field: &Field) -> Result<Field, ConnectorError> {
     owned_field_core(field, &mut PlainCopy)?.ok_or_else(absent)
 }
@@ -62,11 +62,49 @@ pub(crate) fn owned_field_core<O: OwnedCopy>(
     context.source_floor(base)?;
     let name = context.string(field.name())?;
     let data_type = owned_type_core(field.data_type(), context)?;
-    let entries = field.metadata().len();
-    let buckets = context.table::<String, String>(entries)?;
-    // A partial materialized field may be destroyed on any later refusal.
-    // Prefund the fresh raw-table walk and two closed String destructors.
-    context.table_cleanup::<String, String>(entries, 256)?;
+    let metadata = owned_metadata_core(field.metadata(), base, None, context)?;
+    context.work(128)?;
+    context.step()?;
+    if !context.materializes() {
+        return Ok(None);
+    }
+    let name = present(name, context)?;
+    let data_type = present(data_type, context)?;
+    let metadata = present(metadata, context)?;
+    context.flush()?;
+    // Preserve physical dictionary identity/order, omitted by ordinary Field
+    // equality and Field::new. The existing constructor remains the author.
+    #[allow(deprecated)]
+    let copied = Field::new_dict(
+        name,
+        data_type,
+        field.is_nullable(),
+        field.dict_id().unwrap_or(0),
+        field.dict_is_ordered().unwrap_or(false),
+    )
+    .with_metadata(metadata);
+    context.step()?;
+    context.flush()?;
+    Ok(Some(copied))
+}
+
+/// The original Field metadata copy, also used by the root Schema owner.
+fn owned_metadata_core<O: OwnedCopy>(
+    source: &HashMap<String, String>,
+    base: usize,
+    prefunded_buckets: Option<usize>,
+    context: &mut O,
+) -> Result<Option<HashMap<String, String>>, O::Error> {
+    let entries = source.len();
+    let buckets = if let Some(buckets) = prefunded_buckets {
+        buckets
+    } else {
+        let buckets = context.table::<String, String>(entries)?;
+        // A partial materialized field may be destroyed on any later refusal.
+        // Prefund the fresh raw-table walk and two closed String destructors.
+        context.table_cleanup::<String, String>(entries, 256)?;
+        buckets
+    };
     context.metadata_iteration(entries, 2)?;
     let mut metadata = if context.materializes() {
         context.flush()?;
@@ -77,7 +115,7 @@ pub(crate) fn owned_field_core<O: OwnedCopy>(
     } else {
         None
     };
-    let mut iter = field.metadata().iter();
+    let mut iter = source.iter();
     loop {
         context.flush()?;
         let next = iter.next();
@@ -102,29 +140,73 @@ pub(crate) fn owned_field_core<O: OwnedCopy>(
             context.flush()?;
         }
     }
+    Ok(metadata)
+}
+
+/// Root allocations are prefunded before the read owner's validation scratch.
+pub(crate) fn preflight_owned_schema<O: OwnedCopy>(
+    schema: &Schema,
+    context: &mut O,
+) -> Result<usize, O::Error> {
+    let count = schema.fields().len();
+    context.array::<Arc<Field>>(count, 2)?;
+    context.arc_slice::<Arc<Field>>(count)?;
+    context.arc::<Schema>()?;
+    context.work(context.add(context.mul(count, 2 * size_of::<Arc<Field>>())?, 256)?)?;
+    let base = context.add(
+        size_of::<Schema>(),
+        context.mul(count, size_of::<Arc<Field>>())?,
+    )?;
+    context.source_floor(context.add(
+        base,
+        context.mul(schema.metadata().len(), size_of::<(String, String)>())?,
+    )?)?;
+    let buckets = context.table::<String, String>(schema.metadata().len())?;
+    context.table_cleanup::<String, String>(schema.metadata().len(), 256)?;
+    Ok(buckets)
+}
+
+/// Count returns no partial schema. Both passes use the sole Field/type and
+/// metadata copy bodies; this adds no schema-domain law or control scope.
+pub(crate) fn owned_schema_core<O: OwnedCopy>(
+    schema: &Schema,
+    metadata_buckets: usize,
+    context: &mut O,
+) -> Result<Option<Arc<Schema>>, O::Error> {
+    let mut fields = if context.materializes() {
+        Some(reserve(schema.fields().len(), context)?)
+    } else {
+        None
+    };
+    for field in schema.fields() {
+        let field = owned_arc_field(field, context)?;
+        if let Some(fields) = fields.as_mut() {
+            fields.push(present(field, context)?);
+        }
+        context.step()?;
+    }
+    let base = context.add(
+        size_of::<Schema>(),
+        context.mul(schema.metadata().len(), size_of::<(String, String)>())?,
+    )?;
+    let metadata = owned_metadata_core(schema.metadata(), base, Some(metadata_buckets), context)?;
     context.work(128)?;
-    context.step()?;
     if !context.materializes() {
         return Ok(None);
     }
-    let name = present(name, context)?;
-    let data_type = present(data_type, context)?;
+    let fields = present(fields, context)?;
     let metadata = present(metadata, context)?;
     context.flush()?;
-    // Preserve physical dictionary identity/order, omitted by ordinary Field
-    // equality and Field::new. The existing constructor remains the author.
-    #[allow(deprecated)]
-    let copied = Field::new_dict(
-        name,
-        data_type,
-        field.is_nullable(),
-        field.dict_id().unwrap_or(0),
-        field.dict_is_ordered().unwrap_or(false),
-    )
-    .with_metadata(metadata);
+    let fields = fields.into_boxed_slice().into_vec();
     context.step()?;
     context.flush()?;
-    Ok(Some(copied))
+    let fields: arrow_schema::Fields = fields.into();
+    context.step()?;
+    context.flush()?;
+    let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
+    context.step()?;
+    context.flush()?;
+    Ok(Some(schema))
 }
 
 fn owned_arc_field<O: OwnedCopy>(

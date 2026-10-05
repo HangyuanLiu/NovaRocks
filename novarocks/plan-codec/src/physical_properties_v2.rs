@@ -234,13 +234,13 @@ pub(crate) fn decode_nulls(value: i32) -> Result<physical::NullOrdering, Error> 
         )),
     }
 }
-fn encode_multiplicity(value: physical::RowMultiplicity) -> i32 {
+pub(crate) fn encode_multiplicity(value: physical::RowMultiplicity) -> i32 {
     match value {
         physical::RowMultiplicity::SingleCopy => wire::RowMultiplicity::SingleCopy as i32,
         physical::RowMultiplicity::Replicated => wire::RowMultiplicity::Replicated as i32,
     }
 }
-fn decode_multiplicity(value: i32) -> Result<physical::RowMultiplicity, Error> {
+pub(crate) fn decode_multiplicity(value: i32) -> Result<physical::RowMultiplicity, Error> {
     match wire::RowMultiplicity::try_from(value) {
         Ok(wire::RowMultiplicity::SingleCopy) => Ok(physical::RowMultiplicity::SingleCopy),
         Ok(wire::RowMultiplicity::Replicated) => Ok(physical::RowMultiplicity::Replicated),
@@ -727,20 +727,38 @@ pub(crate) fn preflight_distribution_encode_observed(
     )
 }
 
-/// Original numerical author for a containing node's synchronous admission.
-/// No observation, allocation, deep traversal or second source invoice occurs.
-pub(crate) fn distribution_encode_numerical_facts(
-    input: &physical::Distribution,
-    source: usize,
-) -> Result<PhysicalPropertyProjectionFacts, Error> {
-    let (keys, keyed) = match input {
+fn distribution_encode_source(input: &physical::Distribution) -> (&[physical::ValueId], bool) {
+    match input {
         physical::Distribution::Hash { keys, .. }
         | physical::Distribution::BucketShuffle { keys, .. } => (&**keys, true),
         physical::Distribution::Unconstrained
         | physical::Distribution::Singleton
         | physical::Distribution::RoundRobin
         | physical::Distribution::Broadcast => (&[][..], false),
-    };
+    }
+}
+
+/// Necessary backing only; the containing source already owns the inline header.
+pub(crate) fn distribution_encode_source_backing_floor(
+    input: &physical::Distribution,
+) -> Result<usize, Error> {
+    bytes::<physical::ValueId>(distribution_encode_source(input).0.len())
+}
+
+/// Reuse the original presence/capacity author without a second distribution grammar.
+pub(crate) fn distribution_decode_source_backing_floor(
+    input: &wire::Distribution,
+) -> Result<usize, Error> {
+    Ok(decode_distribution_source(input)?.1)
+}
+
+/// Original numerical author for a containing node's synchronous admission.
+/// No observation, allocation, deep traversal or second source invoice occurs.
+pub(crate) fn distribution_encode_numerical_facts(
+    input: &physical::Distribution,
+    source: usize,
+) -> Result<PhysicalPropertyProjectionFacts, Error> {
+    let (keys, keyed) = distribution_encode_source(input);
     floor(
         source,
         add(

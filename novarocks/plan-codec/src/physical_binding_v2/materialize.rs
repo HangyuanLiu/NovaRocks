@@ -21,7 +21,7 @@ use crate::{
     physical_node_v2 as resources,
     physical_type_v2::{
         DecodedTypeTable, clone_value_type_observed, preflight_value_type_clone,
-        value_type_clone_preflight_work_upper_bound,
+        preflight_value_type_clone_admitted, value_type_clone_preflight_work_upper_bound,
     },
 };
 use novarocks_type_contract::{
@@ -312,15 +312,36 @@ impl Model {
         work_ceiling: usize,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<resources::NodeProjectionFacts, Error> {
+        let (model, values, limits) = self.node_projection_model(work_ceiling)?;
+        model
+            .facts(self.source, values, limits, work)
+            .map_err(numeric)
+    }
+    /// Compose the same current child snapshot and original work peak before
+    /// a caller's synchronous parent admission. This adds no observation.
+    pub(crate) fn node_numerical_facts(
+        &mut self,
+        work_ceiling: usize,
+    ) -> Result<resources::NodeProjectionFacts, Error> {
+        let (model, values, limits) = self.node_projection_model(work_ceiling)?;
+        model
+            .numerical_facts(self.source, values, limits)
+            .map_err(numeric)
+    }
+    fn node_projection_model(
+        &mut self,
+        work_ceiling: usize,
+    ) -> Result<(resources::Model, usize, resources::NodeProjectionLimits), Error> {
         let parent = self
             .node_admission
             .as_mut()
             .ok_or_else(|| shape("binding model has no containing node admission"))?;
         parent.peak = parent.peak.max(work_ceiling);
-        parent
-            .composed(self.items, self.facts)?
-            .facts(self.source, parent.values, parent.limits, work)
-            .map_err(numeric)
+        Ok((
+            parent.composed(self.items, self.facts)?,
+            parent.values,
+            parent.limits,
+        ))
     }
     pub(crate) fn request<T>(&mut self, count: usize, times: usize) -> Result<(), Error> {
         let size = bytes::<T>(count)?;
@@ -440,15 +461,10 @@ impl Model {
         self.check(limits)?;
         w.flush()?;
         let clone = preflight_value_type_clone(source, w)?;
-        self.facts.allocation_requests_upper_bound = add(
-            self.facts.allocation_requests_upper_bound,
+        self.merge_clone_requests(
             clone.allocation_requests_upper_bound(),
-        )?;
-        self.facts.request_bytes_upper_bound = add(
-            self.facts.request_bytes_upper_bound,
             clone.allocation_request_bytes_upper_bound(),
         )?;
-        self.retained = add(self.retained, clone.allocation_request_bytes_upper_bound())?;
         // The original facts must fit the original shared maximum; no second
         // datatype grammar or recursive measurement is constructed here.
         cap(
@@ -460,6 +476,55 @@ impl Model {
         self.check(limits)?;
         w.step()?;
         w.flush()?;
+        Ok(())
+    }
+    /// Admit the exact containing-node snapshot before observation and each
+    /// growing request prefix in the original clone author.
+    pub(crate) fn count_owned_type_clone_admitted(
+        &mut self,
+        source: &FunctionValueType,
+        limits: BindingProjectionLimits,
+        admit: &mut impl FnMut(&resources::NodeProjectionFacts) -> Result<(), CompileControlError>,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), Error> {
+        self.check(limits)?;
+        admit(&self.node_numerical_facts(self.node_work_peak())?)?;
+        let mut first_prefix = true;
+        let mut previous_requests = 0;
+        let mut previous_bytes = 0;
+        preflight_value_type_clone_admitted(
+            source,
+            &mut |clone, work| {
+                let requests = clone.allocation_requests_upper_bound();
+                let bytes = clone.allocation_request_bytes_upper_bound();
+                self.merge_clone_requests(requests - previous_requests, bytes - previous_bytes)?;
+                previous_requests = requests;
+                previous_bytes = bytes;
+                cap(
+                    clone.work_upper_bound(),
+                    value_type_clone_preflight_work_upper_bound(),
+                )?;
+                self.check(limits)?;
+                admit(&self.node_numerical_facts(self.node_work_peak())?)?;
+                if first_prefix {
+                    first_prefix = false;
+                    work.flush()?;
+                }
+                Ok::<_, Error>(())
+            },
+            w,
+        )?;
+        self.check(limits)?;
+        admit(&self.node_numerical_facts(self.node_work_peak())?)?;
+        w.step()?;
+        w.flush()?;
+        Ok(())
+    }
+    fn merge_clone_requests(&mut self, requests: usize, bytes: usize) -> Result<(), Error> {
+        self.facts.allocation_requests_upper_bound =
+            add(self.facts.allocation_requests_upper_bound, requests)?;
+        self.facts.request_bytes_upper_bound = add(self.facts.request_bytes_upper_bound, bytes)?;
+        self.retained = add(self.retained, bytes)?;
         Ok(())
     }
 }

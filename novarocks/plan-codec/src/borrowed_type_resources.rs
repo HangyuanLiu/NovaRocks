@@ -119,14 +119,15 @@ impl Metrics {
         )
     }
 
-    fn observe(
+    fn observe<E: From<TypeCodecError>>(
         &mut self,
         event: ValueTypeVisit<'_>,
         source: usize,
         prefix: usize,
         maximum: usize,
+        admit: &mut impl FnMut(BoundTypeComparisonFacts) -> Result<(), E>,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<(), TypeCodecError> {
+    ) -> Result<(), E> {
         let opaque_boundary = matches!(
             event,
             ValueTypeVisit::Field(_) | ValueTypeVisit::ChildEdge(_)
@@ -142,13 +143,18 @@ impl Metrics {
             }
         }
         self.model_visits = add(self.model_visits, 1)?;
-        cap(self.bound(source, prefix)?, maximum)?;
-        work.step()?;
+        let work_upper_bound = self.bound(source, prefix)?;
+        cap(work_upper_bound, maximum)?;
+        admit(BoundTypeComparisonFacts {
+            work_upper_bound,
+            flags_match: true,
+        })?;
+        work.step().map_err(TypeCodecError::from)?;
         if opaque_boundary {
             // Field: entry before the grammar's actual metadata probe.
             // ChildEdge: exit after that completed probe. No predicted-byte
             // loop substitutes for library work or a resource grant.
-            work.flush()?;
+            work.flush().map_err(TypeCodecError::from)?;
         }
         Ok(())
     }
@@ -175,6 +181,16 @@ pub(crate) fn type_binding_prefix_work_upper_bound(
     })
 }
 
+enum ComparisonWalkError<E> {
+    Grammar(TypeCodecError),
+    Admission(E),
+}
+impl<E> From<novarocks_type_contract::ValueTypeError> for ComparisonWalkError<E> {
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::Grammar(error.into())
+    }
+}
+
 /// Admit one exact FVT relation. The caller owns entry/ordinary/success finish
 /// on this original meter. This only returns numerical facts and flag equality;
 /// it does not prove datatype equality or root logical/carrier authorization.
@@ -185,6 +201,26 @@ pub(crate) fn preflight_type_binding(
     max_work: usize,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<BoundTypeComparisonFacts, TypeCodecError> {
+    preflight_type_binding_admitted(
+        left,
+        right,
+        source_retained_bytes,
+        max_work,
+        &mut |_| Ok(()),
+        work,
+    )
+}
+
+/// Expose the sole comparison model before its next observation or opaque
+/// metadata probe. The caller accumulates actual prefixes, never a guessed B multiplier.
+pub(crate) fn preflight_type_binding_admitted<E: From<TypeCodecError>>(
+    left: &FunctionValueType,
+    right: &FunctionValueType,
+    source_retained_bytes: usize,
+    max_work: usize,
+    admit: &mut impl FnMut(BoundTypeComparisonFacts) -> Result<(), E>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<BoundTypeComparisonFacts, E> {
     // Distinct immutable source roots occupy distinct inline storage, even
     // when their nested Field/type allocations alias. This is only a known
     // floor; it cannot prove the trusted invoice's complete retained backing.
@@ -197,20 +233,20 @@ pub(crate) fn preflight_type_binding(
     // precede the first opaque boundary, including a caller's pending tail.
     if source_covers_roots && let Ok(prefix) = &prefix {
         cap(prefix.work_upper_bound(), max_work)?;
+        admit(*prefix)?;
     }
-    work.flush()?;
-    work.step()?;
+    work.flush().map_err(TypeCodecError::from)?;
+    work.step().map_err(TypeCodecError::from)?;
     if !source_covers_roots {
-        return Err(shape(
-            "borrowed type source invoice omits original inline roots",
-        ));
+        return Err(shape("borrowed type source invoice omits original inline roots").into());
     }
-    work.step()?;
+    work.step().map_err(TypeCodecError::from)?;
     // Preserve an ordinary arithmetic error's original completed root steps.
     let prefix = prefix?;
     cap(prefix.work_upper_bound(), max_work)?;
-    work.step()?;
-    work.flush()?;
+    admit(prefix)?;
+    work.step().map_err(TypeCodecError::from)?;
+    work.flush().map_err(TypeCodecError::from)?;
     // The sole FVT equality rule stops on these flags before traversing a
     // datatype. No scratch is initialized and no metadata is inspected then.
     if !prefix.flags_match() {
@@ -218,19 +254,36 @@ pub(crate) fn preflight_type_binding(
     }
     let prefix_work = prefix.work_upper_bound();
     let mut scratch = [None; MAX_VALUE_TYPE_NODES];
-    work.flush()?;
+    work.flush().map_err(TypeCodecError::from)?;
     let mut metrics = Metrics::default();
-    validate_value_type_structure_with_scratch_observed::<TypeCodecError>(
+    match validate_value_type_structure_with_scratch_observed::<ComparisonWalkError<E>>(
         &left.data_type,
         &mut scratch,
-        |event| metrics.observe(event, source_retained_bytes, prefix_work, max_work, work),
-    )?;
+        |event| {
+            metrics
+                .observe(
+                    event,
+                    source_retained_bytes,
+                    prefix_work,
+                    max_work,
+                    admit,
+                    work,
+                )
+                .map_err(ComparisonWalkError::Admission)
+        },
+    ) {
+        Ok(()) => {}
+        Err(ComparisonWalkError::Grammar(error)) => return Err(error.into()),
+        Err(ComparisonWalkError::Admission(error)) => return Err(error),
+    }
     let work_upper_bound = metrics.bound(source_retained_bytes, prefix_work)?;
-    work.flush()?;
-    Ok(BoundTypeComparisonFacts {
+    let facts = BoundTypeComparisonFacts {
         work_upper_bound,
         flags_match: prefix.flags_match(),
-    })
+    };
+    admit(facts)?;
+    work.flush().map_err(TypeCodecError::from)?;
+    Ok(facts)
 }
 
 /// Gate once, then call the original borrowed exact datatype author. Even the
@@ -243,25 +296,46 @@ pub(crate) fn verify_type_binding(
     max_work: usize,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<VerifiedTypeBinding, TypeCodecError> {
-    let facts = preflight_type_binding(left, right, source_retained_bytes, max_work, work)?;
+    verify_type_binding_admitted(
+        left,
+        right,
+        source_retained_bytes,
+        max_work,
+        &mut |_| Ok(()),
+        work,
+    )
+}
+
+/// One actual numerical pass and its exact comparison, using the original
+/// body. Every growing prefix is synchronously admitted by the parent.
+pub(crate) fn verify_type_binding_admitted<E: From<TypeCodecError>>(
+    left: &FunctionValueType,
+    right: &FunctionValueType,
+    source_retained_bytes: usize,
+    max_work: usize,
+    admit: &mut impl FnMut(BoundTypeComparisonFacts) -> Result<(), E>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<VerifiedTypeBinding, E> {
+    let facts =
+        preflight_type_binding_admitted(left, right, source_retained_bytes, max_work, admit, work)?;
     if !facts.flags_match() {
         return Ok(VerifiedTypeBinding {
             facts,
             matches: false,
         });
     }
-    work.flush()?;
+    work.flush().map_err(TypeCodecError::from)?;
     let compared =
         arrow_data_types_exact_borrowed_observed(&left.data_type, &right.data_type, || {
             work.step().map_err(TypeCodecError::from)
         });
     let compared = match compared {
-        Err(TypeCodecError::Control(error)) => return Err(TypeCodecError::Control(error)),
+        Err(TypeCodecError::Control(error)) => return Err(TypeCodecError::Control(error).into()),
         result => result,
     };
-    // Also observe the actual comparison's ordinary refusal exit. Publication
-    // and the enclosing caller's ordinary/success finish still occur later.
-    work.flush()?;
+    // Observe the actual comparison's ordinary refusal exit. Publication and
+    // the enclosing caller's ordinary/success finish still occur later.
+    work.flush().map_err(TypeCodecError::from)?;
     Ok(VerifiedTypeBinding {
         facts,
         matches: compared?,

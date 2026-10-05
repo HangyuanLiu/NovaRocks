@@ -423,7 +423,7 @@ pub fn decode_type_table(
     finish(work, result)
 }
 
-fn encode_logical(logical: ValueLogicalType) -> i32 {
+pub(crate) fn encode_logical(logical: ValueLogicalType) -> i32 {
     use wire::LogicalType as W;
     (match logical {
         ValueLogicalType::Physical => W::Physical,
@@ -438,7 +438,7 @@ fn encode_logical(logical: ValueLogicalType) -> i32 {
     }) as i32
 }
 
-fn decode_logical(logical: i32) -> Result<ValueLogicalType, TypeCodecError> {
+pub(crate) fn decode_logical(logical: i32) -> Result<ValueLogicalType, TypeCodecError> {
     use wire::LogicalType as W;
     Ok(match W::try_from(logical) {
         Ok(W::Physical) => ValueLogicalType::Physical,
@@ -498,6 +498,16 @@ pub(crate) fn preflight_value_type_clone(
     value: &FunctionValueType,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ValueTypeCloneFacts, TypeCodecError> {
+    preflight_value_type_clone_admitted(value, &mut |_, _| Ok(()), work)
+}
+
+/// The same clone grammar exposes each captured request prefix before the
+/// next completed-work checkpoint. Admission owns no scope or observation.
+pub(crate) fn preflight_value_type_clone_admitted<E: From<TypeCodecError>>(
+    value: &FunctionValueType,
+    admit: &mut impl FnMut(ValueTypeCloneFacts, &mut CompileCheckpoints<'_>) -> Result<(), E>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ValueTypeCloneFacts, E> {
     use novarocks_type_contract::{MAX_VALUE_TYPE_DEPTH, MAX_VALUE_TYPE_NODES};
     let mut pending = [None; MAX_VALUE_TYPE_DEPTH + 1];
     pending[0] = Some((&value.data_type, 1usize));
@@ -512,34 +522,52 @@ pub(crate) fn preflight_value_type_clone(
         nodes = nodes.checked_add(1).ok_or(TypeCodecError::InvalidShape(
             "value type clone node count overflow",
         ))?;
-        work.step()?;
         if nodes > MAX_VALUE_TYPE_NODES || depth > MAX_VALUE_TYPE_DEPTH {
+            work.step().map_err(TypeCodecError::from)?;
             return Err(TypeCodecError::InvalidShape(
                 "value type clone exceeds the checked carrier grammar",
-            ));
+            )
+            .into());
         }
         if let DataType::Dictionary(key, item) = carrier {
             requests = requests.checked_add(2).ok_or(TypeCodecError::InvalidShape(
                 "value type clone request count overflow",
             ))?;
+            // Preserve the original ordinary-error checkpoint and its grammar.
             if length + 2 > pending.len() {
+                work.step().map_err(TypeCodecError::from)?;
                 return Err(TypeCodecError::InvalidShape(
                     "value type clone scratch capacity exceeded",
-                ));
+                )
+                .into());
             }
+            admit(value_type_clone_facts(nodes, requests)?, work)?;
+            work.step().map_err(TypeCodecError::from)?;
             pending[length] = Some((item.as_ref(), depth + 1));
             pending[length + 1] = Some((key.as_ref(), depth + 1));
             length += 2;
-            work.step()?;
+            work.step().map_err(TypeCodecError::from)?;
+        } else {
+            admit(value_type_clone_facts(nodes, requests)?, work)?;
+            work.step().map_err(TypeCodecError::from)?;
         }
     }
+    let facts = value_type_clone_facts(nodes, requests)?;
+    admit(facts, work)?;
+    work.step().map_err(TypeCodecError::from)?;
+    Ok(facts)
+}
+
+fn value_type_clone_facts(
+    nodes: usize,
+    requests: usize,
+) -> Result<ValueTypeCloneFacts, TypeCodecError> {
     let bytes = std::alloc::Layout::array::<DataType>(requests)
         .map_err(|_| TypeCodecError::InvalidShape("value type clone layout is unrepresentable"))?
         .size();
     let bound = nodes.checked_mul(8).and_then(|n| n.checked_add(16)).ok_or(
         TypeCodecError::InvalidShape("value type clone work overflow"),
     )?;
-    work.step()?;
     Ok(ValueTypeCloneFacts {
         requests,
         bytes,

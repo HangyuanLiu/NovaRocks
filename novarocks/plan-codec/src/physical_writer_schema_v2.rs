@@ -127,7 +127,7 @@ fn required(id: Option<u32>, w: &mut CompileCheckpoints<'_>) -> Result<u32, Erro
     w.step()?;
     result
 }
-fn role(value: p::WriterRelationFieldRole) -> i32 {
+pub(crate) fn role(value: p::WriterRelationFieldRole) -> i32 {
     use wire::WriterRelationFieldRole as W;
     (match value {
         p::WriterRelationFieldRole::Kind => W::Kind,
@@ -137,7 +137,7 @@ fn role(value: p::WriterRelationFieldRole) -> i32 {
         p::WriterRelationFieldRole::Auxiliary => W::Auxiliary,
     }) as i32
 }
-fn decode_role(value: i32) -> Result<p::WriterRelationFieldRole, Error> {
+pub(crate) fn decode_role(value: i32) -> Result<p::WriterRelationFieldRole, Error> {
     use wire::WriterRelationFieldRole as W;
     match W::try_from(value) {
         Ok(W::Kind) => Ok(p::WriterRelationFieldRole::Kind),

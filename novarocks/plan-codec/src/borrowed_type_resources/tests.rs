@@ -500,3 +500,123 @@ fn borrowed_type_pure_prefix_keeps_ordinary_source_and_arithmetic_error_observat
         }
     }
 }
+
+#[test]
+fn admitted_comparison_preserves_original_bound_trace_and_every_actual_control_exit() {
+    let left = nested(false);
+    let right = nested(false);
+    let run_admitted = |control: &Control| -> Result<VerifiedTypeBinding, TypeCodecError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
+        let mut last = 0;
+        let result = verify_type_binding_admitted(
+            &left,
+            &right,
+            SOURCE,
+            WORK,
+            &mut |facts| {
+                assert!(facts.work_upper_bound() >= last);
+                last = facts.work_upper_bound();
+                Ok::<_, TypeCodecError>(())
+            },
+            &mut work,
+        );
+        if matches!(&result, Err(TypeCodecError::Control(_))) {
+            return result;
+        }
+        work.finish()?;
+        result
+    };
+    let original_control = Control::default();
+    let original = run(&left, &right, SOURCE, WORK, &original_control).unwrap();
+    assert!(original.matches());
+    let trace = original_control.trace.lock().unwrap().clone();
+    let admitted_control = Control::default();
+    let admitted = run_admitted(&admitted_control).unwrap();
+    assert!(admitted.matches());
+    assert_eq!(admitted.work_upper_bound(), original.work_upper_bound());
+    assert_eq!(*admitted_control.trace.lock().unwrap(), trace);
+    for at in 0..trace.len() {
+        for cause in CAUSES {
+            let control = Control {
+                refusal: Some((at, cause)),
+                ..Control::default()
+            };
+            assert!(
+                matches!(run_admitted(&control), Err(TypeCodecError::Control(actual)) if actual == cause)
+            );
+            assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+        }
+    }
+}
+
+#[test]
+fn admitted_comparison_known_prefix_and_field_growth_precede_next_observation() {
+    let left = FunctionValueType::new(
+        DataType::Struct(
+            vec![
+                Field::new("x", DataType::Int64, true).with_metadata(HashMap::from([
+                    ("a".to_owned(), "1".to_owned()),
+                    ("b".to_owned(), "2".to_owned()),
+                ])),
+            ]
+            .into(),
+        ),
+        false,
+    );
+    let prefix = SOURCE + mem::size_of::<[Option<(&DataType, usize)>; MAX_VALUE_TYPE_NODES]>() + 2;
+    // The first real TypeNode contributes B+4 headers+one model visit.
+    let first_node = prefix + SOURCE + 5;
+    for stop_at in [prefix - 1, first_node] {
+        let baseline = Control::default();
+        let run = |control: &Control| -> Result<VerifiedTypeBinding, TypeCodecError> {
+            let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
+            for _ in 0..255 {
+                work.step()?;
+            }
+            verify_type_binding_admitted(
+                &left,
+                &left,
+                SOURCE,
+                WORK,
+                &mut |facts| {
+                    if facts.work_upper_bound() > stop_at {
+                        Err(TypeCodecError::Control(
+                            CompileControlError::ResourceExhausted,
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+                &mut work,
+            )
+        };
+        assert!(matches!(
+            run(&baseline),
+            Err(TypeCodecError::Control(
+                CompileControlError::ResourceExhausted
+            ))
+        ));
+        let trace = baseline.trace.lock().unwrap().clone();
+        assert_eq!(
+            trace,
+            if stop_at < prefix {
+                vec![0]
+            } else {
+                vec![0, 255, 3, 0]
+            }
+        );
+        for cause in CAUSES {
+            let control = Control {
+                refusal: Some((trace.len(), cause)),
+                ..Control::default()
+            };
+            assert!(matches!(
+                run(&control),
+                Err(TypeCodecError::Control(
+                    CompileControlError::ResourceExhausted
+                ))
+            ));
+            assert_eq!(*control.trace.lock().unwrap(), trace);
+        }
+    }
+}

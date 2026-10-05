@@ -93,7 +93,7 @@ fn physical_collections(reduction: &p::TopNReduction) -> Collections<'_> {
         } => (group_by, calls),
     }
 }
-fn encode_phase(phase: p::TopNPhase) -> wire::TopNPhase {
+pub(crate) fn encode_phase(phase: p::TopNPhase) -> wire::TopNPhase {
     let kind = match phase {
         p::TopNPhase::Single => wire::top_n_phase::Kind::Single(Empty {}),
         p::TopNPhase::Partial { sequence } => {
@@ -105,7 +105,7 @@ fn encode_phase(phase: p::TopNPhase) -> wire::TopNPhase {
     };
     wire::TopNPhase { kind: Some(kind) }
 }
-fn decode_phase(phase: Option<&wire::TopNPhase>) -> Result<p::TopNPhase, Error> {
+pub(crate) fn decode_phase(phase: Option<&wire::TopNPhase>) -> Result<p::TopNPhase, Error> {
     match phase.and_then(|p| p.kind.as_ref()) {
         Some(wire::top_n_phase::Kind::Single(_)) => Ok(p::TopNPhase::Single),
         Some(wire::top_n_phase::Kind::PartialSequenceId(id)) => Ok(p::TopNPhase::Partial {
@@ -117,14 +117,14 @@ fn decode_phase(phase: Option<&wire::TopNPhase>) -> Result<p::TopNPhase, Error> 
         None => Err(invalid("TopN phase or phase kind is absent")),
     }
 }
-fn encode_comparator(comparator: OrderedComparisonAlgorithm) -> i32 {
+pub(crate) fn encode_comparator(comparator: OrderedComparisonAlgorithm) -> i32 {
     match comparator {
         OrderedComparisonAlgorithm::NativeScalarOrderV1 => {
             wire::OrderedComparisonAlgorithm::NativeScalarOrderV1 as i32
         }
     }
 }
-fn decode_comparator(comparator: i32) -> Result<OrderedComparisonAlgorithm, Error> {
+pub(crate) fn decode_comparator(comparator: i32) -> Result<OrderedComparisonAlgorithm, Error> {
     match wire::OrderedComparisonAlgorithm::try_from(comparator) {
         Ok(wire::OrderedComparisonAlgorithm::NativeScalarOrderV1) => {
             Ok(OrderedComparisonAlgorithm::NativeScalarOrderV1)

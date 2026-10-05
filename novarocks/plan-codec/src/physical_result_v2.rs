@@ -347,7 +347,7 @@ fn preflight_decode(
     }
     model.facts(source, values.count(), limits, w)
 }
-fn copy_string(input: &str, w: &mut CompileCheckpoints<'_>) -> Result<String, Error> {
+pub(crate) fn copy_string(input: &str, w: &mut CompileCheckpoints<'_>) -> Result<String, Error> {
     let mut bytes = reserve::<u8>(input.len(), w)?;
     for byte in input.bytes() {
         bytes.push(byte);
@@ -361,7 +361,7 @@ fn copy_string(input: &str, w: &mut CompileCheckpoints<'_>) -> Result<String, Er
     w.flush()?;
     result
 }
-fn copy_box(input: &str, w: &mut CompileCheckpoints<'_>) -> Result<Box<str>, Error> {
+pub(crate) fn copy_box(input: &str, w: &mut CompileCheckpoints<'_>) -> Result<Box<str>, Error> {
     let copied = copy_string(input, w)?;
     w.flush()?;
     let output = copied.into_boxed_str();

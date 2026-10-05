@@ -628,9 +628,14 @@ fn containing_node_all_known_axes_are_checked_without_late_observation() {
     let control = Control::default();
     control.arm(None);
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let pure = model
+        .node_numerical_facts(model.facts.cumulative_work_upper_bound)
+        .unwrap();
+    assert_eq!(control.trace(), [0]);
     let facts = model
         .node_facts(model.facts.cumulative_work_upper_bound, &mut work)
         .unwrap();
+    assert_eq!(pure, facts);
     assert_eq!(facts.input_node_count, 1);
     assert_eq!(facts.value_reference_count, 1);
     assert_eq!(facts.list_item_count, 5);
@@ -840,4 +845,122 @@ fn containing_node_updates_keep_original_envelope_and_monotone_base() {
         .compose_in_node(grown, 1, original_limits, limits())
         .unwrap();
     assert_eq!(model.node_work_peak(), peak);
+}
+
+#[test]
+fn admitted_clone_uses_original_requests_and_callbacks_without_double_charge() {
+    let source = FunctionValueType::new(
+        DataType::Dictionary(
+            Box::new(DataType::Int8),
+            Box::new(DataType::Dictionary(
+                Box::new(DataType::Int16),
+                Box::new(DataType::Utf8),
+            )),
+        ),
+        true,
+    );
+    let control = Control::default();
+    let run = |admitted, control: &Control| -> Result<BindingProjectionFacts, Error> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+        let mut model = Model::for_composition(1, 0, SOURCE, 0);
+        model.facts.type_reference_count = 1;
+        model.compose_in_node(resources::Model::default(), 0, node_limits(), limits())?;
+        if admitted {
+            let mut last = 0;
+            model.count_owned_type_clone_admitted(
+                &source,
+                limits(),
+                &mut |facts| {
+                    assert!(facts.allocation_requests_upper_bound >= last);
+                    last = facts.allocation_requests_upper_bound;
+                    Ok(())
+                },
+                &mut work,
+            )?;
+        } else {
+            model.count_owned_type_clone(&source, limits(), &mut work)?;
+        }
+        work.finish()?;
+        Ok(model.facts)
+    };
+    control.arm(None);
+    let original = run(false, &control).unwrap();
+    let trace = control.trace();
+    assert_eq!(original.allocation_requests_upper_bound, 4);
+    assert_eq!(
+        original.request_bytes_upper_bound,
+        4 * Layout::new::<DataType>().size()
+    );
+    control.arm(None);
+    let admitted = run(true, &control).unwrap();
+    assert_eq!(admitted.definition_count, original.definition_count);
+    assert_eq!(admitted.type_reference_count, original.type_reference_count);
+    assert_eq!(
+        admitted.allocation_requests_upper_bound,
+        original.allocation_requests_upper_bound
+    );
+    assert_eq!(
+        admitted.request_bytes_upper_bound,
+        original.request_bytes_upper_bound
+    );
+    assert_eq!(
+        admitted.coexisting_source_and_request_bytes_upper_bound,
+        original.coexisting_source_and_request_bytes_upper_bound
+    );
+    assert_eq!(
+        admitted.cumulative_work_upper_bound,
+        original.cumulative_work_upper_bound
+    );
+    assert_eq!(control.trace(), trace);
+    for at in 0..trace.len() {
+        for cause in CAUSES {
+            control.arm(Some((at, cause)));
+            assert!(matches!(run(true, &control), Err(Error::Control(actual)) if actual == cause));
+            assert_eq!(control.trace(), trace[..=at]);
+        }
+    }
+}
+
+#[test]
+fn admitted_clone_known_dictionary_growth_precedes_late_quantum_and_parent_refusal() {
+    let source = FunctionValueType::new(
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        true,
+    );
+    for numeric in [false, true] {
+        for cause in CAUSES {
+            let control = Control::default();
+            control.arm(Some((1, cause)));
+            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+            let mut model = Model::for_composition(1, 0, SOURCE, 0);
+            model.facts.type_reference_count = 1;
+            let mut node = node_limits();
+            if numeric {
+                node.max_allocation_requests = 1;
+            }
+            model
+                .compose_in_node(resources::Model::default(), 0, node, limits())
+                .unwrap();
+            for _ in 0..255 {
+                work.step().unwrap();
+            }
+            let result = model.count_owned_type_clone_admitted(
+                &source,
+                limits(),
+                &mut |facts| {
+                    if !numeric && facts.allocation_requests_upper_bound > 1 {
+                        return Err(CompileControlError::ResourceExhausted);
+                    }
+                    Ok(())
+                },
+                &mut work,
+            );
+            assert!(matches!(
+                result,
+                Err(Error::Control(CompileControlError::ResourceExhausted))
+            ));
+            assert_eq!(control.trace(), [0]);
+            assert!(model.facts.allocation_requests_upper_bound >= 2);
+        }
+    }
 }
