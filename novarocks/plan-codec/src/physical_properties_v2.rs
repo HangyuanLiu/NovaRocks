@@ -107,13 +107,11 @@ fn cap(value: usize, limit: usize, work: &mut CompileCheckpoints<'_>) -> Result<
         Err(invalid("physical property projection envelope exceeded"))
     }
 }
-fn facts(
+fn numerical_facts(
     references: usize,
     requests: usize,
     requested_bytes: usize,
     source: usize,
-    limits: PhysicalPropertyProjectionLimits,
-    work: &mut CompileCheckpoints<'_>,
 ) -> Result<PhysicalPropertyProjectionFacts, Error> {
     // All own passes inspect only fixed-size keys/ordering/identity values.
     // This includes numerical gates, constructors, copies and conversion
@@ -129,9 +127,28 @@ fn facts(
             add(mul(references, 32)?, mul(requested_bytes, 4)?)?,
         )?,
     };
-    cap(references, limits.max_value_references, work)?;
-    cap(requests, limits.max_allocation_requests, work)?;
-    cap(requested_bytes, limits.max_allocation_request_bytes, work)?;
+    Ok(result)
+}
+fn admit_facts(
+    result: PhysicalPropertyProjectionFacts,
+    limits: PhysicalPropertyProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PhysicalPropertyProjectionFacts, Error> {
+    cap(
+        result.value_reference_count,
+        limits.max_value_references,
+        work,
+    )?;
+    cap(
+        result.allocation_requests_upper_bound,
+        limits.max_allocation_requests,
+        work,
+    )?;
+    cap(
+        result.allocation_request_bytes_upper_bound,
+        limits.max_allocation_request_bytes,
+        work,
+    )?;
     cap(
         result.coexisting_source_and_request_bytes_upper_bound,
         limits.max_coexisting_source_and_request_bytes,
@@ -246,6 +263,18 @@ pub(crate) fn preflight_encode_observed(
     limits: PhysicalPropertyProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PhysicalPropertyProjectionFacts, Error> {
+    admit_facts(
+        properties_encode_numerical_facts(input, source)?,
+        limits,
+        work,
+    )
+}
+
+/// The original complete property counts, before a containing node observes work.
+pub(crate) fn properties_encode_numerical_facts(
+    input: &physical::PhysicalProperties,
+    source: usize,
+) -> Result<PhysicalPropertyProjectionFacts, Error> {
     let keys = match &input.distribution {
         physical::Distribution::Hash { keys, .. }
         | physical::Distribution::BucketShuffle { keys, .. } => &**keys,
@@ -283,12 +312,12 @@ pub(crate) fn preflight_encode_observed(
             if keyed { 2 } else { 0 },
         )?,
     )?;
-    facts(references, requests, requested, source, limits, work)
+    numerical_facts(references, requests, requested, source)
 }
 
 /// Emit only after the containing owner has admitted the original request.
 /// Both standalone and full-property paths use this exact distribution grammar.
-fn emit_distribution_observed(
+pub(crate) fn emit_distribution_observed(
     input: &physical::Distribution,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::Distribution, Error> {
@@ -529,6 +558,18 @@ pub(crate) fn preflight_decode_observed(
     limits: PhysicalPropertyProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PhysicalPropertyProjectionFacts, Error> {
+    admit_facts(
+        properties_decode_numerical_facts(input, source)?,
+        limits,
+        work,
+    )
+}
+
+/// The original complete property counts, before a containing node observes work.
+pub(crate) fn properties_decode_numerical_facts(
+    input: &wire::PhysicalProperties,
+    source: usize,
+) -> Result<PhysicalPropertyProjectionFacts, Error> {
     let (keys, extra_source) = decode_source(input)?;
     floor(
         source,
@@ -556,13 +597,11 @@ pub(crate) fn preflight_decode_observed(
         )?,
         2,
     )?;
-    facts(
+    numerical_facts(
         add(keys.len(), input.ordering.len())?,
         requests,
         requested,
         source,
-        limits,
-        work,
     )
 }
 
@@ -595,19 +634,11 @@ fn materialize_distribution_observed(
     Ok(distribution)
 }
 
-pub(crate) fn decode_observed(
-    input: &wire::PhysicalProperties,
-    source: usize,
-    limits: PhysicalPropertyProjectionLimits,
+type DecodedPropertyHeader<'a> = (&'a [u32], DistributionHeader, physical::RowMultiplicity);
+fn decode_property_header_observed<'a>(
+    input: &'a wire::PhysicalProperties,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<
-    (
-        physical::PhysicalProperties,
-        PhysicalPropertyProjectionFacts,
-    ),
-    Error,
-> {
-    let facts = preflight_decode_observed(input, source, limits, work)?;
+) -> Result<DecodedPropertyHeader<'a>, Error> {
     let kind = input
         .distribution
         .as_ref()
@@ -625,6 +656,32 @@ pub(crate) fn decode_observed(
         decode_nulls(key.null_ordering)?;
         work.step()?;
     }
+    Ok((keys, header, row_multiplicity))
+}
+
+/// Validate the original closed header and ordering before node reservations.
+/// This borrows the decoder's sole grammar and performs no materialization.
+pub(crate) fn validate_properties_source_observed(
+    input: &wire::PhysicalProperties,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), Error> {
+    decode_property_header_observed(input, work).map(|_| ())
+}
+
+pub(crate) fn decode_observed(
+    input: &wire::PhysicalProperties,
+    source: usize,
+    limits: PhysicalPropertyProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<
+    (
+        physical::PhysicalProperties,
+        PhysicalPropertyProjectionFacts,
+    ),
+    Error,
+> {
+    let facts = preflight_decode_observed(input, source, limits, work)?;
+    let (keys, header, row_multiplicity) = decode_property_header_observed(input, work)?;
     let distribution = materialize_distribution_observed(keys, header, work)?;
     let mut ordering = reserve(input.ordering.len(), work)?;
     for key in &input.ordering {
@@ -663,6 +720,19 @@ pub(crate) fn preflight_distribution_encode_observed(
     limits: PhysicalPropertyProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PhysicalPropertyProjectionFacts, Error> {
+    admit_facts(
+        distribution_encode_numerical_facts(input, source)?,
+        limits,
+        work,
+    )
+}
+
+/// Original numerical author for a containing node's synchronous admission.
+/// No observation, allocation, deep traversal or second source invoice occurs.
+pub(crate) fn distribution_encode_numerical_facts(
+    input: &physical::Distribution,
+    source: usize,
+) -> Result<PhysicalPropertyProjectionFacts, Error> {
     let (keys, keyed) = match input {
         physical::Distribution::Hash { keys, .. }
         | physical::Distribution::BucketShuffle { keys, .. } => (&**keys, true),
@@ -678,13 +748,11 @@ pub(crate) fn preflight_distribution_encode_observed(
             bytes::<physical::ValueId>(keys.len())?,
         )?,
     )?;
-    facts(
+    numerical_facts(
         keys.len(),
         add(usize::from(!keys.is_empty()), if keyed { 2 } else { 0 })?,
         add(bytes::<u32>(keys.len())?, if keyed { 64 } else { 0 })?,
         source,
-        limits,
-        work,
     )
 }
 
@@ -694,15 +762,25 @@ pub(crate) fn preflight_distribution_decode_observed(
     limits: PhysicalPropertyProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PhysicalPropertyProjectionFacts, Error> {
+    admit_facts(
+        distribution_decode_numerical_facts(input, source)?,
+        limits,
+        work,
+    )
+}
+
+/// The same raw-capacity/header-presence author, before any child observation.
+pub(crate) fn distribution_decode_numerical_facts(
+    input: &wire::Distribution,
+    source: usize,
+) -> Result<PhysicalPropertyProjectionFacts, Error> {
     let (keys, extra_source) = decode_distribution_source(input)?;
     floor(source, add(size_of::<wire::Distribution>(), extra_source)?)?;
-    facts(
+    numerical_facts(
         keys.len(),
         mul(usize::from(!keys.is_empty()), 2)?,
         mul(bytes::<physical::ValueId>(keys.len())?, 2)?,
         source,
-        limits,
-        work,
     )
 }
 
@@ -723,16 +801,37 @@ pub(crate) fn decode_distribution_observed(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(physical::Distribution, PhysicalPropertyProjectionFacts), Error> {
     let facts = preflight_distribution_decode_observed(input, source, limits, work)?;
+    Ok((
+        materialize_distribution_source_observed(input, work)?,
+        facts,
+    ))
+}
+
+/// Check the sole immutable distribution header before containing reservations.
+pub(crate) fn validate_distribution_source_observed(
+    input: &wire::Distribution,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), Error> {
+    let kind = input
+        .kind
+        .as_ref()
+        .ok_or_else(|| invalid("physical property distribution kind is absent"))?;
+    decode_header(kind, work).map(|_| ())
+}
+
+/// Materialize only after the containing owner has admitted the original source.
+/// Keep header validation and key conversion in the standalone author's order.
+pub(crate) fn materialize_distribution_source_observed(
+    input: &wire::Distribution,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<physical::Distribution, Error> {
     let kind = input
         .kind
         .as_ref()
         .ok_or_else(|| invalid("physical property distribution kind is absent"))?;
     let header = decode_header(kind, work)?;
     let (keys, _) = decode_distribution_source(input)?;
-    Ok((
-        materialize_distribution_observed(keys, header, work)?,
-        facts,
-    ))
+    materialize_distribution_observed(keys, header, work)
 }
 
 /// Project an independent distribution with explicit source/request bounds.

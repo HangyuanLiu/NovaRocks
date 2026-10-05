@@ -206,7 +206,7 @@ pub(crate) fn cap(n: usize, maximum: usize, w: &mut CompileCheckpoints<'_>) -> R
     w.step()?;
     Ok(())
 }
-fn check_cap(n: usize, maximum: usize) -> Result<(), Error> {
+pub(crate) fn check_cap(n: usize, maximum: usize) -> Result<(), Error> {
     if n > maximum {
         Err(CompileControlError::ResourceExhausted.into())
     } else {

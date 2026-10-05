@@ -562,3 +562,367 @@ fn composing_property_preflight_preserves_each_original_callback_cause() {
         }
     }
 }
+
+#[test]
+fn distribution_pure_counts_keep_independent_layout_and_original_five_gate_trace() {
+    for original in [
+        properties(physical::Distribution::Unconstrained),
+        properties(physical::Distribution::Singleton),
+        properties(physical::Distribution::RoundRobin),
+        properties(physical::Distribution::Broadcast),
+        hash(),
+        bucket(),
+    ] {
+        let raw = match &original.distribution {
+            physical::Distribution::Hash { .. } => expected_hash().distribution.unwrap(),
+            physical::Distribution::BucketShuffle { .. } => expected_bucket().distribution.unwrap(),
+            physical::Distribution::Unconstrained => wire::Distribution {
+                kind: Some(wire::distribution::Kind::Unconstrained(Empty {})),
+            },
+            physical::Distribution::Singleton => wire::Distribution {
+                kind: Some(wire::distribution::Kind::Singleton(Empty {})),
+            },
+            physical::Distribution::RoundRobin => wire::Distribution {
+                kind: Some(wire::distribution::Kind::RoundRobin(Empty {})),
+            },
+            physical::Distribution::Broadcast => wire::Distribution {
+                kind: Some(wire::distribution::Kind::Broadcast(Empty {})),
+            },
+        };
+        let (key_count, keyed) = match &original.distribution {
+            physical::Distribution::Hash { .. } => (3, true),
+            physical::Distribution::BucketShuffle { .. } => (2, true),
+            _ => (0, false),
+        };
+        for receiving in [false, true] {
+            let requested = if receiving {
+                2 * Layout::array::<physical::ValueId>(key_count)
+                    .unwrap()
+                    .size()
+            } else {
+                Layout::array::<u32>(key_count).unwrap().size() + if keyed { 64 } else { 0 }
+            };
+            let expected = PhysicalPropertyProjectionFacts {
+                value_reference_count: key_count,
+                allocation_requests_upper_bound: if receiving {
+                    if key_count == 0 { 0 } else { 2 }
+                } else {
+                    usize::from(key_count != 0) + if keyed { 2 } else { 0 }
+                },
+                allocation_request_bytes_upper_bound: requested,
+                coexisting_source_and_request_bytes_upper_bound: SOURCE + requested,
+                cumulative_work_upper_bound: 128 + key_count * 32 + requested * 4,
+            };
+            let pure = if receiving {
+                distribution_decode_numerical_facts(&raw, SOURCE)
+            } else {
+                distribution_encode_numerical_facts(&original.distribution, SOURCE)
+            }
+            .unwrap();
+            assert_eq!(pure, expected);
+            let phase = if receiving {
+                CompilePhase::Decode
+            } else {
+                CompilePhase::Encode
+            };
+            let control = Control::default();
+            let mut work = CompileCheckpoints::try_new(&control, phase).unwrap();
+            for _ in 0..255 {
+                work.step().unwrap();
+            }
+            assert_eq!(*control.trace.lock().unwrap(), [(phase, 0)]);
+            let admitted = if receiving {
+                preflight_distribution_decode_observed(&raw, SOURCE, limits(), &mut work)
+            } else {
+                preflight_distribution_encode_observed(
+                    &original.distribution,
+                    SOURCE,
+                    limits(),
+                    &mut work,
+                )
+            }
+            .unwrap();
+            assert_eq!(admitted, pure);
+            work.finish().unwrap();
+            assert_eq!(
+                *control.trace.lock().unwrap(),
+                [(phase, 0), (phase, 256), (phase, 4)]
+            );
+        }
+    }
+}
+
+#[test]
+fn distribution_containing_node_known_four_axes_precede_pending_255_and_late_control() {
+    use crate::physical_node_v2::{Model, NodeCodecError, NodeProjectionLimits};
+
+    let original = hash();
+    let raw = expected_hash();
+    // A real one-u64 request and fixed header contributions form a numerical
+    // caller seam. This does not certify a complete Writer node or Package.
+    let base_bytes = Layout::array::<u64>(1).unwrap().size();
+    let base = Model {
+        inputs: 1,
+        refs: 1,
+        items: 2,
+        requests: 1,
+        requested: base_bytes,
+        delegated_work: 19,
+    };
+    for full_properties in [false, true] {
+        for receiving in [false, true] {
+            let phase = if receiving {
+                CompilePhase::Decode
+            } else {
+                CompilePhase::Encode
+            };
+            // The full header adds the original three ordering occurrences; it
+            // is not replaced by a distribution with manufactured empty ordering.
+            let child_refs = if full_properties { 6 } else { 3 };
+            let child_bytes = if receiving {
+                2 * (Layout::array::<physical::ValueId>(3).unwrap().size()
+                    + if full_properties {
+                        Layout::array::<physical::OrderingKey>(3).unwrap().size()
+                    } else {
+                        0
+                    })
+            } else {
+                Layout::array::<u32>(3).unwrap().size()
+                    + 64
+                    + if full_properties {
+                        Layout::array::<wire::OrderingKey>(3).unwrap().size()
+                    } else {
+                        0
+                    }
+            };
+            let child_requests = if full_properties {
+                4
+            } else if receiving {
+                2
+            } else {
+                3
+            };
+            let requests = 1 + child_requests;
+            let requested = base_bytes + child_bytes;
+            let child_work = 128 + child_refs * 32 + child_bytes * 4;
+            // Three admitted Value definitions give original search height three.
+            let whole_work =
+                256 + 3 * 32 + (1 + child_refs) * 35 + requested * 4 + 19 + 2 * child_work;
+            let exact = NodeProjectionLimits {
+                max_input_nodes: 1,
+                max_value_references: 1 + child_refs,
+                max_list_items: 2,
+                max_allocation_requests: requests,
+                max_allocation_request_bytes: requested,
+                max_coexisting_source_and_request_bytes: SOURCE + requested,
+                max_work: whole_work,
+                properties: limits(),
+            };
+            let run = |control: &Control, parent_limits: NodeProjectionLimits| {
+                let mut work = CompileCheckpoints::try_new(control, phase)?;
+                for _ in 0..255 {
+                    work.step()?;
+                }
+                let result = (|| -> Result<PhysicalPropertyProjectionFacts, NodeCodecError> {
+                    let pure = match (full_properties, receiving) {
+                        (true, true) => properties_decode_numerical_facts(&raw, SOURCE)?,
+                        (true, false) => properties_encode_numerical_facts(&original, SOURCE)?,
+                        (false, true) => distribution_decode_numerical_facts(
+                            raw.distribution.as_ref().unwrap(),
+                            SOURCE,
+                        )?,
+                        (false, false) => {
+                            distribution_encode_numerical_facts(&original.distribution, SOURCE)?
+                        }
+                    };
+                    assert_eq!(pure.value_reference_count, child_refs);
+                    assert_eq!(pure.allocation_requests_upper_bound, child_requests);
+                    assert_eq!(pure.allocation_request_bytes_upper_bound, child_bytes);
+                    assert_eq!(pure.cumulative_work_upper_bound, child_work);
+                    let mut merged = base;
+                    merged.property(pure)?;
+                    let parent = merged.numerical_facts(SOURCE, 3, parent_limits)?;
+                    assert_eq!(parent.allocation_requests_upper_bound, requests);
+                    assert_eq!(parent.allocation_request_bytes_upper_bound, requested);
+                    assert_eq!(
+                        parent.coexisting_source_and_request_bytes_upper_bound,
+                        SOURCE + requested
+                    );
+                    assert_eq!(parent.cumulative_work_upper_bound, whole_work);
+                    let observed = match (full_properties, receiving) {
+                        (true, true) => {
+                            preflight_decode_observed(&raw, SOURCE, limits(), &mut work)?
+                        }
+                        (true, false) => {
+                            preflight_encode_observed(&original, SOURCE, limits(), &mut work)?
+                        }
+                        (false, true) => preflight_distribution_decode_observed(
+                            raw.distribution.as_ref().unwrap(),
+                            SOURCE,
+                            limits(),
+                            &mut work,
+                        )?,
+                        (false, false) => preflight_distribution_encode_observed(
+                            &original.distribution,
+                            SOURCE,
+                            limits(),
+                            &mut work,
+                        )?,
+                    };
+                    assert_eq!(observed, pure);
+                    Ok(observed)
+                })();
+                crate::physical_node_v2::finish(work, result)
+            };
+            let accepted = Control::default();
+            run(&accepted, exact).unwrap();
+            assert_eq!(
+                *accepted.trace.lock().unwrap(),
+                [(phase, 0), (phase, 256), (phase, 4)]
+            );
+            for stop in 0..3 {
+                for cause in CAUSES {
+                    let control = Control {
+                        stop: Some((stop, cause)),
+                        ..Control::default()
+                    };
+                    assert!(
+                        matches!(run(&control, exact), Err(NodeCodecError::Control(actual)) if actual == cause)
+                    );
+                    assert_eq!(
+                        *control.trace.lock().unwrap(),
+                        [(phase, 0), (phase, 256), (phase, 4)][..=stop]
+                    );
+                }
+            }
+            for axis in 0..4 {
+                let mut under = exact;
+                match axis {
+                    0 => under.max_allocation_requests -= 1,
+                    1 => under.max_allocation_request_bytes -= 1,
+                    2 => under.max_coexisting_source_and_request_bytes -= 1,
+                    3 => under.max_work -= 1,
+                    _ => unreachable!(),
+                }
+                let control = Control::default();
+                assert!(matches!(
+                    run(&control, under),
+                    Err(NodeCodecError::Control(
+                        CompileControlError::ResourceExhausted
+                    ))
+                ));
+                assert_eq!(*control.trace.lock().unwrap(), [(phase, 0)]);
+                for cause in CAUSES {
+                    let control = Control {
+                        stop: Some((1, cause)),
+                        ..Control::default()
+                    };
+                    assert!(matches!(
+                        run(&control, under),
+                        Err(NodeCodecError::Control(
+                            CompileControlError::ResourceExhausted
+                        ))
+                    ));
+                    assert_eq!(*control.trace.lock().unwrap(), [(phase, 0)]);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn distribution_numerical_source_capacity_and_overflow_keep_original_ordinary_tails() {
+    let original = hash().distribution;
+    let valid = expected_hash().distribution.unwrap();
+    let mut over = valid.clone();
+    if let Some(wire::distribution::Kind::Hash(hash)) = &mut over.kind {
+        hash.key_value_ids.reserve(SOURCE);
+        assert!(
+            Layout::array::<u32>(hash.key_value_ids.capacity())
+                .unwrap()
+                .size()
+                > SOURCE
+        );
+    } else {
+        unreachable!();
+    }
+    let absent = wire::Distribution { kind: None };
+    for (receiving, raw, source, message) in [
+        (
+            false,
+            &valid,
+            0,
+            "physical property source invoice omits original backing",
+        ),
+        (
+            true,
+            &valid,
+            0,
+            "physical property source invoice omits original backing",
+        ),
+        (
+            true,
+            &over,
+            SOURCE,
+            "physical property source invoice omits original backing",
+        ),
+        (
+            true,
+            &absent,
+            SOURCE,
+            "physical property distribution kind is absent",
+        ),
+        (
+            false,
+            &valid,
+            usize::MAX,
+            "physical property resource sum overflow",
+        ),
+        (
+            true,
+            &valid,
+            usize::MAX,
+            "physical property resource sum overflow",
+        ),
+    ] {
+        let pure = if receiving {
+            distribution_decode_numerical_facts(raw, source)
+        } else {
+            distribution_encode_numerical_facts(&original, source)
+        };
+        assert_eq!(pure, Err(Error::InvalidShape(message)));
+        let phase = if receiving {
+            CompilePhase::Decode
+        } else {
+            CompilePhase::Encode
+        };
+        let run = |control: &Control| -> Result<PhysicalPropertyProjectionFacts, Error> {
+            let mut work = CompileCheckpoints::try_new(control, phase)?;
+            for _ in 0..255 {
+                work.step()?;
+            }
+            let result = if receiving {
+                preflight_distribution_decode_observed(raw, source, limits(), &mut work)
+            } else {
+                preflight_distribution_encode_observed(&original, source, limits(), &mut work)
+            };
+            finish(work, result)
+        };
+        let control = Control::default();
+        assert_eq!(run(&control), pure);
+        assert_eq!(*control.trace.lock().unwrap(), [(phase, 0), (phase, 255)]);
+        for stop in 0..2 {
+            for cause in CAUSES {
+                let control = Control {
+                    stop: Some((stop, cause)),
+                    ..Control::default()
+                };
+                assert_eq!(run(&control), Err(Error::Control(cause)));
+                assert_eq!(
+                    *control.trace.lock().unwrap(),
+                    [(phase, 0), (phase, 255)][..=stop]
+                );
+            }
+        }
+    }
+}
