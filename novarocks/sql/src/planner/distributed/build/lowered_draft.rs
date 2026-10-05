@@ -430,6 +430,11 @@ pub(crate) struct CheckedWriterAggregateLogicalSourceEntry<'a> {
     source: &'a WriterAggregateCall,
 }
 impl<'a> CheckedWriterAggregateLogicalSourceEntry<'a> {
+    /// Borrow exactly the immutable catalog retained by this source owner.
+    pub(crate) fn function_catalog(&self) -> &'a Arc<dyn crate::compiler::SqlFunctionCatalog> {
+        self.owner.function_catalog()
+    }
+
     pub(crate) fn state_inputs_observed(
         &self,
         work: &mut CompileCheckpoints<'_>,

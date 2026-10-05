@@ -65,11 +65,11 @@ impl PureCompileControl for Control {
         }
     }
 }
-fn run(
-    fragment: &Fragment,
+fn run<'a>(
+    fragment: &'a Fragment,
     catalog: &dyn SqlFunctionCatalog,
     control: &Control,
-) -> Result<AuthoredPhysicalOccurrences, ExpressionOccurrenceError> {
+) -> Result<AuthoredPhysicalOccurrences<'a>, ExpressionOccurrenceError> {
     author_physical_occurrences_observed(fragment, catalog, control)
 }
 fn prefixes(

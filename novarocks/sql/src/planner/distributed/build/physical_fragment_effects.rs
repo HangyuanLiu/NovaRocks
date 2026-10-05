@@ -22,7 +22,8 @@ use std::collections::BTreeMap;
 use novarocks_functions::{ConstantPolicy, ScopedExpressionEffects};
 use novarocks_physical_plan::{
     AggregateCall, AggregatePhase, ConstantPools, Fragment, FrozenCallError, FrozenFragmentCalls,
-    NodeKind, PhysicalCallBinding, PhysicalCallSite, PhysicalNode, visit_relational_calls_observed,
+    NodeKind, PhysicalCallBinding, PhysicalCallSite, PhysicalNode, WriterAggregateCall,
+    visit_relational_calls_observed,
 };
 use novarocks_type_contract::{
     CallProofScope, CompileCheckpoints, CompileControlError, CompilePhase, DecimalOverflowPolicy,
@@ -52,6 +53,13 @@ use super::{
         prepare_physical_table_occurrence_observed,
     },
     physical_table_requests::{PhysicalTableRequestError, author_physical_table_request_observed},
+    physical_writer_occurrences::{
+        PhysicalWriterOccurrenceError, PhysicalWriterOccurrenceInput,
+        prepare_physical_writer_occurrence_observed,
+    },
+    physical_writer_requests::{
+        PhysicalWriterRequestError, author_physical_writer_request_observed,
+    },
 };
 use crate::compiler::SqlFunctionCatalog;
 
@@ -64,7 +72,7 @@ pub(crate) struct PhysicalRelationalCallSourceScope<'a> {
 
 pub(crate) struct PhysicalFragmentEffectsInput<'a> {
     pub fragment: &'a Fragment,
-    pub occurrences: &'a AuthoredPhysicalOccurrences,
+    pub occurrences: &'a AuthoredPhysicalOccurrences<'a>,
     pub constants: &'a ConstantPools,
     pub parameters: &'a SemanticParameters,
     pub literal_policy: ConstantPolicy,
@@ -90,6 +98,8 @@ pub(crate) enum PhysicalFragmentEffectsError {
     Aggregate(PhysicalAggregateOccurrenceError),
     TableRequest(PhysicalTableRequestError),
     Table(PhysicalTableOccurrenceError),
+    WriterRequest(PhysicalWriterRequestError),
+    Writer(PhysicalWriterOccurrenceError),
     Calls(FrozenCallError),
     MissingScope(PhysicalCallSite),
     InvalidSource(&'static str),
@@ -119,6 +129,8 @@ nested_error!(SqlSourceJournalError, Journal);
 nested_error!(PhysicalAggregateOccurrenceError, Aggregate);
 nested_error!(PhysicalTableRequestError, TableRequest);
 nested_error!(PhysicalTableOccurrenceError, Table);
+nested_error!(PhysicalWriterRequestError, WriterRequest);
+nested_error!(PhysicalWriterOccurrenceError, Writer);
 nested_error!(FrozenCallError, Calls);
 
 /// Compose the original expression roots first and then each actual relational
@@ -195,7 +207,9 @@ fn compose_fragment_effects_observed(
             let node = match site {
                 PhysicalCallSite::Table { node }
                 | PhysicalCallSite::Aggregate { node, .. }
-                | PhysicalCallSite::TopNState { node, .. } => node,
+                | PhysicalCallSite::TopNState { node, .. }
+                | PhysicalCallSite::WriterPartial { node, .. }
+                | PhysicalCallSite::WriterFinal { node, .. } => node,
                 _ => return Err(PhysicalFragmentEffectsError::UnsupportedLifecycle(site)),
             };
             let actual = input.fragment.nodes().get(&node);
@@ -207,8 +221,19 @@ fn compose_fragment_effects_observed(
                 PhysicalCallBinding::Table(function) => {
                     matches!(&scope.source.kind, NodeKind::TableFunction { function: original, .. } if std::ptr::eq(original, function))
                 }
-                PhysicalCallBinding::Aggregate(binding) => aggregate_source(scope.source, site)
-                    .is_ok_and(|source| std::ptr::eq(&source.binding, binding)),
+                PhysicalCallBinding::Aggregate(binding) => {
+                    if matches!(
+                        site,
+                        PhysicalCallSite::WriterPartial { .. }
+                            | PhysicalCallSite::WriterFinal { .. }
+                    ) {
+                        writer_source(scope.source, site)
+                            .is_ok_and(|source| std::ptr::eq(&source.binding, binding))
+                    } else {
+                        aggregate_source(scope.source, site)
+                            .is_ok_and(|source| std::ptr::eq(&source.binding, binding))
+                    }
+                }
                 _ => false,
             };
             let same =
@@ -288,6 +313,49 @@ fn compose_fragment_effects_observed(
                         work,
                     )?;
                     fresh.frozen
+                }
+                PhysicalCallBinding::Aggregate(_)
+                    if matches!(
+                        site,
+                        PhysicalCallSite::WriterPartial { .. }
+                            | PhysicalCallSite::WriterFinal { .. }
+                    ) =>
+                {
+                    let AggregateSources::SqlJournal(owner) = &sources else {
+                        return Err(PhysicalFragmentEffectsError::UnsupportedLifecycle(site));
+                    };
+                    let source = writer_source(scope.source, site)?;
+                    let entry = owner.checked_writer_aggregate_source_observed(
+                        input.fragment,
+                        scope.source,
+                        site,
+                        source,
+                        work,
+                    )?;
+                    let same_policy = entry.captured().constant_policy() == input.literal_policy;
+                    work.step()?;
+                    if !same_policy {
+                        return Err(PhysicalFragmentEffectsError::InvalidSource(
+                            "SQL Writer composition changes the captured constant policy",
+                        ));
+                    }
+                    let request = author_physical_writer_request_observed(&entry, work)?;
+                    prepare_physical_writer_occurrence_observed(
+                        PhysicalWriterOccurrenceInput {
+                            fragment: input.fragment,
+                            node: scope.source,
+                            source,
+                            request: &request,
+                            occurrences: input.occurrences,
+                            parameters: input.parameters,
+                            environment: scope.environment,
+                            decimal_overflow_policy: scope.decimal_overflow_policy,
+                            proof_scope: scope.proof_scope,
+                        },
+                        functions,
+                        work,
+                    )?
+                    .frozen
                 }
                 PhysicalCallBinding::Aggregate(_) => {
                     let source = aggregate_source(scope.source, site)?;
@@ -448,3 +516,31 @@ fn aggregate_source(
 #[cfg(test)]
 #[path = "physical_fragment_sql_aggregate_tests.rs"]
 mod sql_aggregate_tests;
+
+/// Writer calls loan actual Value channels and cannot be converted to ordinary
+/// aggregate calls or expression-based argument roots.
+fn writer_source(
+    node: &PhysicalNode,
+    site: PhysicalCallSite,
+) -> Result<&WriterAggregateCall, PhysicalFragmentEffectsError> {
+    let source = match (site, &node.kind) {
+        (PhysicalCallSite::WriterPartial { node: id, call }, NodeKind::TableWriter { target })
+            if id == node.id =>
+        {
+            target.partial_aggregates.get(call as usize)
+        }
+        (PhysicalCallSite::WriterFinal { node: id, call }, NodeKind::TableFinish(finish))
+            if id == node.id =>
+        {
+            finish.final_aggregates.get(call as usize)
+        }
+        _ => None,
+    };
+    source.ok_or(PhysicalFragmentEffectsError::InvalidSource(
+        "Writer site has no original ordered call",
+    ))
+}
+
+#[cfg(test)]
+#[path = "physical_fragment_sql_writer_tests.rs"]
+mod sql_writer_tests;

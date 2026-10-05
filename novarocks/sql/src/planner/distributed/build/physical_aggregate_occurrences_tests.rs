@@ -410,7 +410,7 @@ impl Fixture {
             call: ordinal,
         }
     }
-    fn occurrences(&self) -> AuthoredPhysicalOccurrences {
+    fn occurrences(&self) -> AuthoredPhysicalOccurrences<'_> {
         author_physical_occurrences_observed(&self.fragment, &self.catalog, &Control::default())
             .unwrap()
     }
@@ -486,7 +486,7 @@ fn summaries(
 fn input<'a>(
     f: &'a Fixture,
     r: &'a AuthoredPhysicalAggregateUpdateRequest<'a>,
-    o: &'a AuthoredPhysicalOccurrences,
+    o: &'a AuthoredPhysicalOccurrences<'a>,
     e: &'a BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
     p: &'a SemanticParameters,
 ) -> PhysicalAggregateOccurrenceInput<'a> {
@@ -952,20 +952,14 @@ fn aggregate_occurrences_missing_foreign_source_scope_environment_and_proof_keep
         false,
         false,
     );
-    let mut o2 = AuthoredPhysicalOccurrences {
-        root_uses: o.root_uses.clone(),
-        relational_contexts: o.relational_contexts.clone(),
-    };
+    let mut o2 = o.clone();
     o2.relational_contexts.push(o2.relational_contexts[0]);
     prefixes(
         |c| run(input(&f, &r, &o2, &e, &p), &f.catalog, c),
         false,
         false,
     );
-    let mut o3 = AuthoredPhysicalOccurrences {
-        root_uses: o.root_uses.clone(),
-        relational_contexts: o.relational_contexts.clone(),
-    };
+    let mut o3 = o.clone();
     o3.relational_contexts[0].1 = o.root_uses.flow().uses()[&id].context;
     prefixes(
         |c| run(input(&f, &r, &o3, &e, &p), &f.catalog, c),

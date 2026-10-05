@@ -95,7 +95,7 @@ pub(crate) struct PhysicalTableOccurrenceInput<'a> {
     pub fragment: &'a Fragment,
     pub source: &'a PhysicalNode,
     pub request: &'a AuthoredPhysicalTableRequest<'a>,
-    pub occurrences: &'a AuthoredPhysicalOccurrences,
+    pub occurrences: &'a AuthoredPhysicalOccurrences<'a>,
     pub child_effects: &'a BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
     pub parameters: &'a SemanticParameters,
     pub environment: &'a [SemanticParameterRef],

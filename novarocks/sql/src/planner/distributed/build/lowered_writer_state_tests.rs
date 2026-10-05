@@ -80,10 +80,17 @@ fn catalogue() -> Arc<dyn SqlFunctionCatalog> {
 
 // Each branch is authored by the real router, auxiliary planner and Writer
 // lowerer. Requirements are distinct provider artifacts, not forged calls.
-fn authored(counts: &[usize], nullable: &[bool]) -> SqlAuthoredPhysicalPlan {
+pub(crate) fn authored(counts: &[usize], nullable: &[bool]) -> SqlAuthoredPhysicalPlan {
+    authored_with_catalog(counts, nullable, catalogue())
+}
+
+pub(crate) fn authored_with_catalog(
+    counts: &[usize],
+    nullable: &[bool],
+    functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
+) -> SqlAuthoredPhysicalPlan {
     assert_eq!(counts.len(), nullable.len());
     assert!(!counts.is_empty());
-    let functions = catalogue();
     let schemas = nullable
         .iter()
         .map(|nullable| Schema::new(vec![Field::new("order_id", DataType::Int64, *nullable)]))
@@ -224,7 +231,7 @@ fn authored(counts: &[usize], nullable: &[bool]) -> SqlAuthoredPhysicalPlan {
     };
     draft.finish_observed(&setup).unwrap()
 }
-fn final_call(
+pub(crate) fn final_call(
     owner: &SqlAuthoredPhysicalPlan,
     ordinal: usize,
 ) -> (
@@ -250,7 +257,7 @@ fn final_call(
     }
     panic!("actual Final call is missing")
 }
-fn final_entry<'a>(
+pub(crate) fn final_entry<'a>(
     owner: &'a SqlAuthoredPhysicalPlan,
     ordinal: usize,
     work: &mut CompileCheckpoints<'_>,

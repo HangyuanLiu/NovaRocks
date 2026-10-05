@@ -336,7 +336,7 @@ impl Fixture {
     fn source(&self) -> &PhysicalNode {
         &self.fragment.nodes()[&self.owner]
     }
-    fn occurrences(&self) -> AuthoredPhysicalOccurrences {
+    fn occurrences(&self) -> AuthoredPhysicalOccurrences<'_> {
         author_physical_occurrences_observed(&self.fragment, &self.catalog, &Control::default())
             .unwrap()
     }
@@ -366,11 +366,10 @@ fn request<'a>(
     work.finish()?;
     result
 }
-fn copy_occurrences(source: &AuthoredPhysicalOccurrences) -> AuthoredPhysicalOccurrences {
-    AuthoredPhysicalOccurrences {
-        root_uses: source.root_uses.clone(),
-        relational_contexts: source.relational_contexts.clone(),
-    }
+fn copy_occurrences<'a>(
+    source: &AuthoredPhysicalOccurrences<'a>,
+) -> AuthoredPhysicalOccurrences<'a> {
+    source.clone()
 }
 fn summaries(
     occurrences: &AuthoredPhysicalOccurrences,
@@ -404,7 +403,7 @@ fn child(
 fn input<'a>(
     fixture: &'a Fixture,
     req: &'a AuthoredPhysicalTableRequest<'a>,
-    occ: &'a AuthoredPhysicalOccurrences,
+    occ: &'a AuthoredPhysicalOccurrences<'a>,
     effects: &'a BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
     params: &'a SemanticParameters,
 ) -> PhysicalTableOccurrenceInput<'a> {

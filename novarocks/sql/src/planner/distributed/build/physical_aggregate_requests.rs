@@ -598,9 +598,27 @@ fn selected_correspondence_observed(
     source: &AggregateCall,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), PhysicalAggregateRequestError> {
+    selected_binding_correspondence_observed(
+        captured,
+        selected,
+        logical_argument_count,
+        &source.binding,
+        work,
+    )
+}
+
+/// Shared exact selected-signature author. Actual source and phase loans stay
+/// with their respective ordinary or Writer journal owners.
+pub(crate) fn selected_binding_correspondence_observed(
+    captured: &crate::binding::CapturedAggregateLogicalRequest,
+    selected: &FunctionBindingSelection,
+    logical_argument_count: usize,
+    binding: &AggregateBinding,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), PhysicalAggregateRequestError> {
     use novarocks_functions::FunctionResultType;
     let resolved = captured.binding().resolved();
-    let function = &source.binding.function;
+    let function = &binding.function;
     if selected.argument_types.len() > MAX_CALL_EFFECT_ARGUMENTS
         || function.argument_types.len() > MAX_CALL_EFFECT_ARGUMENTS
     {
@@ -611,7 +629,7 @@ fn selected_correspondence_observed(
         && function.kind == FunctionKind::Aggregate
         && selected.overload == function.overload
         && selected.overload == resolved.selected.overload
-        && usize::try_from(source.binding.logical_argument_count).ok()
+        && usize::try_from(binding.logical_argument_count).ok()
             == Some(resolved.logical_argument_count)
         && resolved.logical_argument_count == logical_argument_count
         && selected.argument_types.len() == function.argument_types.len();
@@ -652,8 +670,8 @@ fn selected_correspondence_observed(
     let aggregate = aggregate.ok_or(PhysicalAggregateRequestError::InvalidSource(
         "merge logical source has no aggregate state contract",
     ))?;
-    let format = aggregate.state_format == source.binding.state_format
-        && aggregate.state_argument_contract == source.binding.state_argument_contract;
+    let format = aggregate.state_format == binding.state_format
+        && aggregate.state_argument_contract == binding.state_argument_contract;
     work.step()?;
     if !format {
         return Err(PhysicalAggregateRequestError::InvalidSource(
@@ -664,7 +682,7 @@ fn selected_correspondence_observed(
     let matching = aggregate
         .intermediate_type
         .exactly_equals_observed::<PhysicalAggregateRequestError>(
-            &source.binding.intermediate_type,
+            &binding.intermediate_type,
             || work.step().map_err(PhysicalAggregateRequestError::from),
         )?;
     work.flush()?;

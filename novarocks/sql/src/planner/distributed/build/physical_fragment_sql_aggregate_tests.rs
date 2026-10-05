@@ -91,7 +91,7 @@ fn source_scopes<'a>(
 fn input<'a>(
     owner: &'a SqlAuthoredPhysicalPlan,
     fragment: &'a Fragment,
-    occurrences: &'a AuthoredPhysicalOccurrences,
+    occurrences: &'a AuthoredPhysicalOccurrences<'a>,
     policy: ConstantPolicy,
     scopes: &'a BTreeMap<PhysicalCallSite, PhysicalRelationalCallSourceScope<'a>>,
     expressions: &'a BTreeMap<ExpressionUseId, PhysicalCallSourceScope<'a>>,

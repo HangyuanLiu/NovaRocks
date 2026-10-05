@@ -12472,7 +12472,7 @@ mod lowered_writer_canonical_tests;
 
 #[cfg(test)]
 #[path = "lowered_writer_state_tests.rs"]
-mod lowered_writer_state_tests;
+pub(super) mod lowered_writer_state_tests;
 
 #[cfg(test)]
 mod tests {

@@ -36,6 +36,8 @@ mod physical_table_occurrences;
 mod physical_table_requests;
 mod physical_window_occurrences;
 mod physical_window_requests;
+mod physical_writer_occurrences;
+mod physical_writer_requests;
 
 pub(crate) use contract_lowering::{
     ContractLoweringError, FinalChangeStreamWriteLowering, FinalWriteLowering,

@@ -435,7 +435,7 @@ fn primitive_own_effects(
     };
     work.step()?;
     Ok(match &source.kind {
-        ExprKind::Value(_) => ScopedExpressionEffects::pure_value(context),
+        ExprKind::Value(_) => materialized_value_effects(context),
         ExprKind::Literal(_) | ExprKind::Constant(_) => {
             // Resolve/construct the actual leaf even when it is not a function
             // argument. NULL remains a checked constant, never a missing fact.
@@ -547,4 +547,12 @@ fn primitive_own_effects(
             ));
         }
     })
+}
+
+/// The original Value leaf author is shared by authenticated materialized
+/// Writer channels. Upstream evaluation effects stay with their own operators.
+pub(crate) fn materialized_value_effects(
+    context: novarocks_type_contract::ExpressionEffectContext,
+) -> ScopedExpressionEffects {
+    ScopedExpressionEffects::pure_value(context)
 }

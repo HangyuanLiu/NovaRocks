@@ -90,11 +90,11 @@ fn loan<'a>(
     work.finish().unwrap();
     entry
 }
-fn setup(
-    entry: &CheckedAggregateLogicalSourceEntry<'_>,
+fn setup<'a>(
+    entry: &CheckedAggregateLogicalSourceEntry<'a>,
     owner: &crate::compiler::SqlAuthoredPhysicalPlan,
 ) -> (
-    AuthoredPhysicalOccurrences,
+    AuthoredPhysicalOccurrences<'a>,
     BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
 ) {
     let control = Control::default();

@@ -21,9 +21,9 @@
 
 use novarocks_functions::FunctionSpecializationFailure;
 use novarocks_physical_plan::{
-    ExprId, ExprKind, ExpressionRootError, Fragment, FrozenCallError, PhysicalCallBinding,
-    PhysicalCallSite, PhysicalExpressionRoots, PhysicalRootUses, RootUseBindingError,
-    visit_relational_calls_observed,
+    ExprId, ExprKind, ExpressionRootError, Fragment, FrozenCallError, NodeKind,
+    PhysicalCallBinding, PhysicalCallSite, PhysicalExpressionRoots, PhysicalRootUses,
+    RootUseBindingError, ValueDef, visit_relational_calls_observed,
 };
 use novarocks_type_contract::{
     ArgumentControl, CompileCheckpoints, CompileControlError, CompilePhase, ControlShape,
@@ -64,10 +64,34 @@ impl From<FrozenCallError> for ExpressionOccurrenceError {
 
 /// Expression and relational contexts authored from the same original source.
 /// These identities and domains are topology, not refined call-effect facts.
-#[derive(Debug)]
-pub(crate) struct AuthoredPhysicalOccurrences {
+#[derive(Clone, Debug)]
+pub(crate) struct AuthoredPhysicalOccurrences<'a> {
     pub root_uses: PhysicalRootUses,
     pub relational_contexts: Vec<(PhysicalCallSite, ExpressionEffectContext)>,
+    fragment: &'a Fragment,
+    writer_values: Vec<WriterValueUse<'a>>,
+}
+
+/// Materialized values have actual use/domain facts, without expression
+/// invocations or substituted expression roots. The original source is loaned.
+#[derive(Clone, Copy, Debug)]
+struct WriterValueUse<'a> {
+    site: PhysicalCallSite,
+    value: &'a ValueDef,
+    context: ExpressionEffectContext,
+}
+
+impl<'a> AuthoredPhysicalOccurrences<'a> {
+    pub(crate) fn fragment(&self) -> &'a Fragment {
+        self.fragment
+    }
+    pub(crate) fn writer_value_uses(
+        &self,
+    ) -> impl Iterator<Item = (PhysicalCallSite, &'a ValueDef, ExpressionEffectContext)> + '_ {
+        self.writer_values
+            .iter()
+            .map(|entry| (entry.site, entry.value, entry.context))
+    }
 }
 
 impl ExpressionOccurrenceError {
@@ -103,11 +127,11 @@ impl ExpressionOccurrenceError {
 /// or cross-use cache is involved. Static TypeOnly arguments create no runtime
 /// invocation. All caller-owned maps, vectors and owner lookups require prior
 /// admission; bounded cooperative work is not a memory funding grant.
-pub(crate) fn author_physical_occurrences_observed(
-    fragment: &Fragment,
+pub(crate) fn author_physical_occurrences_observed<'a>(
+    fragment: &'a Fragment,
     functions: &dyn SqlFunctionCatalog,
     control: &dyn PureCompileControl,
-) -> Result<AuthoredPhysicalOccurrences, ExpressionOccurrenceError> {
+) -> Result<AuthoredPhysicalOccurrences<'a>, ExpressionOccurrenceError> {
     let mut author = Author {
         fragment,
         functions,
@@ -139,7 +163,8 @@ pub(crate) fn author_physical_occurrences_observed(
             author.work.step()?;
         }
         let mut relational_contexts = Vec::new();
-        let expression_use_count = author.uses.len();
+        let mut next_use = author.uses.len();
+        let mut writer_values = Vec::new();
         let domains = &mut author.domains;
         visit_relational_calls_observed(fragment, &mut author.work, |site, binding, work| {
             if relational_contexts.len() == MAX_CONTROL_USE_REFERENCES
@@ -172,10 +197,14 @@ pub(crate) fn author_physical_occurrences_observed(
                 return Err(ExpressionOccurrenceError::InvalidRelationalControl(site));
             }
             let domain = EvaluationDomainId::new(domains.len() as u32);
-            // Both expression and relational counts are independently bounded
-            // by 65536, so their disjoint namespace fits u32 without wrapping.
-            let id =
-                ExpressionUseId::new((expression_use_count + relational_contexts.len()) as u32);
+            // Expression, relational and materialized channel counts are
+            // bounded independently. Allocate every use in one checked namespace.
+            let id = ExpressionUseId::new(
+                u32::try_from(next_use).map_err(|_| CompileControlError::ResourceExhausted)?,
+            );
+            next_use = next_use
+                .checked_add(1)
+                .ok_or(CompileControlError::ResourceExhausted)?;
             domains
                 .try_reserve(1)
                 .map_err(|_| CompileControlError::ResourceExhausted)?;
@@ -196,6 +225,75 @@ pub(crate) fn author_physical_occurrences_observed(
                 },
             ));
             work.step()?;
+            let channel = match site {
+                PhysicalCallSite::WriterPartial { node, call } => {
+                    match fragment.nodes().get(&node).map(|node| &node.kind) {
+                        Some(NodeKind::TableWriter { target }) => {
+                            target.partial_aggregates.get(call as usize)
+                        }
+                        _ => None,
+                    }
+                }
+                PhysicalCallSite::WriterFinal { node, call } => {
+                    match fragment.nodes().get(&node).map(|node| &node.kind) {
+                        Some(NodeKind::TableFinish(finish)) => {
+                            finish.final_aggregates.get(call as usize)
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            work.step()?;
+            if let Some(channel) = channel {
+                let value = fragment.values().get(&channel.input);
+                work.step()?;
+                let value =
+                    value.ok_or(ExpressionOccurrenceError::InvalidRelationalControl(site))?;
+                if writer_values.len() == MAX_CONTROL_USE_REFERENCES
+                    || domains.len() == MAX_CONTROL_DEFINITIONS
+                {
+                    return Err(ExpressionOccurrenceError::TooManyItems);
+                }
+                let domain = EvaluationDomainId::new(
+                    u32::try_from(domains.len())
+                        .map_err(|_| CompileControlError::ResourceExhausted)?,
+                );
+                let use_id = ExpressionUseId::new(
+                    u32::try_from(next_use).map_err(|_| CompileControlError::ResourceExhausted)?,
+                );
+                next_use = next_use
+                    .checked_add(1)
+                    .ok_or(CompileControlError::ResourceExhausted)?;
+                work.flush()?;
+                domains
+                    .try_reserve(1)
+                    .map_err(|_| CompileControlError::ResourceExhausted)?;
+                writer_values
+                    .try_reserve(1)
+                    .map_err(|_| CompileControlError::ResourceExhausted)?;
+                work.flush()?;
+                domains.push(ExpressionEvaluationDomain {
+                    id: domain,
+                    parent: None,
+                    guard: None,
+                });
+                writer_values.push(WriterValueUse {
+                    site,
+                    value,
+                    context: ExpressionEffectContext {
+                        use_id,
+                        domain,
+                        demand: novarocks_type_contract::EvaluationDemand::Value,
+                    },
+                });
+                work.step()?;
+            } else if matches!(
+                site,
+                PhysicalCallSite::WriterPartial { .. } | PhysicalCallSite::WriterFinal { .. }
+            ) {
+                return Err(ExpressionOccurrenceError::InvalidRelationalControl(site));
+            }
             Ok(())
         })?;
         author.work.flush()?;
@@ -220,6 +318,8 @@ pub(crate) fn author_physical_occurrences_observed(
         Ok(AuthoredPhysicalOccurrences {
             root_uses,
             relational_contexts,
+            fragment,
+            writer_values,
         })
     })();
     if matches!(&result, Err(ExpressionOccurrenceError::Control(_))) {

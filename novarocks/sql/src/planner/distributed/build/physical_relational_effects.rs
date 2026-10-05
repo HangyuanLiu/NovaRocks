@@ -19,7 +19,9 @@
 
 use super::expression_occurrences::AuthoredPhysicalOccurrences;
 use novarocks_functions::ScopedExpressionEffects;
-use novarocks_physical_plan::{ExprId, ExpressionRootSite, PhysicalCallSite, PhysicalRootUses};
+use novarocks_physical_plan::{
+    ExprId, ExpressionRootSite, Fragment, PhysicalCallSite, PhysicalRootUses, ValueDef,
+};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, EffectContractError, EvaluationDemand,
     ExpressionEffectContext, ExpressionEffects, ExpressionUseId,
@@ -141,6 +143,15 @@ pub(crate) fn relational_context_observed(
             ));
         }
     }
+    for (_, _, other) in occurrences.writer_value_uses() {
+        let colliding = other.use_id == context.use_id || other.domain == context.domain;
+        work.step()?;
+        if colliding {
+            return Err(PhysicalRelationalEffectsError::InvalidSource(
+                "relational context borrows a materialized Writer channel use or domain",
+            ));
+        }
+    }
     let flow = occurrences.root_uses.flow();
     for invocation in flow.uses().values() {
         let shares_domain = invocation.context.domain == context.domain;
@@ -165,4 +176,79 @@ pub(crate) fn relational_context_observed(
         ));
     }
     Ok(context)
+}
+
+/// Authenticate an actual materialized Writer channel from the same source
+/// loan. It reads that Value; it never re-evaluates an origin expression.
+pub(crate) fn writer_value_effects_observed(
+    occurrences: &AuthoredPhysicalOccurrences<'_>,
+    fragment: &Fragment,
+    site: PhysicalCallSite,
+    actual_value: &ValueDef,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(ExpressionEffectContext, ExpressionEffects), PhysicalRelationalEffectsError> {
+    let same_fragment = std::ptr::eq(occurrences.fragment(), fragment);
+    work.step()?;
+    let same_value = fragment
+        .values()
+        .get(&actual_value.id)
+        .is_some_and(|value| std::ptr::eq(value, actual_value));
+    work.step()?;
+    if !same_fragment || !same_value {
+        return Err(PhysicalRelationalEffectsError::InvalidSource(
+            "Writer Value occurrence loans a foreign fragment or Value definition",
+        ));
+    }
+    let mut found = None;
+    for (actual_site, value, context) in occurrences.writer_value_uses() {
+        let same_site = actual_site == site;
+        work.step()?;
+        if same_site {
+            let same = std::ptr::eq(value, actual_value) && found.is_none();
+            work.step()?;
+            if !same {
+                return Err(PhysicalRelationalEffectsError::InvalidSource(
+                    "Writer channel differs from its original unique Value occurrence",
+                ));
+            }
+            found = Some(context);
+        }
+    }
+    let context = found.ok_or(PhysicalRelationalEffectsError::InvalidSource(
+        "Writer channel has no original materialized Value occurrence",
+    ))?;
+    let flow = occurrences.root_uses.flow();
+    let domain = flow.domains().get(&context.domain);
+    work.step()?;
+    let actual = !flow.uses().contains_key(&context.use_id)
+        && context.demand == EvaluationDemand::Value
+        && domain.is_some_and(|domain| domain.parent.is_none() && domain.guard.is_none());
+    work.step()?;
+    if !actual {
+        return Err(PhysicalRelationalEffectsError::InvalidSource(
+            "Writer channel differs from its original unguarded materialized Value domain",
+        ));
+    }
+    for (_, other) in &occurrences.relational_contexts {
+        let colliding = other.use_id == context.use_id || other.domain == context.domain;
+        work.step()?;
+        if colliding {
+            return Err(PhysicalRelationalEffectsError::InvalidSource(
+                "Writer channel borrows a relational operator use or domain",
+            ));
+        }
+    }
+    for invocation in flow.uses().values() {
+        let shares = invocation.context.domain == context.domain;
+        work.step()?;
+        if shares {
+            return Err(PhysicalRelationalEffectsError::InvalidSource(
+                "Writer channel borrows an expression invocation domain",
+            ));
+        }
+    }
+    let scoped = super::physical_expression_effects::materialized_value_effects(context);
+    let effects = scoped.for_use(context);
+    work.step()?;
+    Ok((context, effects?))
 }

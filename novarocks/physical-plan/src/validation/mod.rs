@@ -556,3 +556,5 @@ pub(crate) fn _assert_required_contract_is_copy(_: RequiredContracts) {}
 
 #[allow(dead_code)]
 pub(crate) fn _assert_maps_are_deterministic(_: BTreeMap<FragmentId, Fragment>) {}
+
+pub use aggregate::aggregate_bindings_match_observed;

@@ -85,7 +85,7 @@ pub(crate) struct PhysicalAggregateOccurrenceInput<'a> {
     pub node: &'a PhysicalNode,
     pub source: &'a AggregateCall,
     pub request: &'a AuthoredPhysicalAggregateUpdateRequest<'a>,
-    pub occurrences: &'a AuthoredPhysicalOccurrences,
+    pub occurrences: &'a AuthoredPhysicalOccurrences<'a>,
     pub child_effects: &'a BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
     pub parameters: &'a SemanticParameters,
     pub environment: &'a [SemanticParameterRef],
@@ -312,7 +312,7 @@ pub(crate) struct PhysicalAggregateMergeOccurrenceInput<'a> {
     pub source: &'a AggregateCall,
     pub request:
         &'a super::physical_aggregate_requests::AuthoredPhysicalAggregateMergeRequest<'a, 'a>,
-    pub occurrences: &'a AuthoredPhysicalOccurrences,
+    pub occurrences: &'a AuthoredPhysicalOccurrences<'a>,
     pub child_effects: &'a BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
     pub parameters: &'a SemanticParameters,
     pub environment: &'a [SemanticParameterRef],

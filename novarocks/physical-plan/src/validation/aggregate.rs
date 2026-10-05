@@ -191,6 +191,7 @@ fn aggregate_outputs_reduce_into(produced: &[ValueId], expected: &[ValueId]) -> 
 enum StateSignatureComparisonError {
     WorkExhausted,
     InvalidType,
+    Control(novarocks_type_contract::CompileControlError),
 }
 impl From<novarocks_type_contract::ValueTypeError> for StateSignatureComparisonError {
     fn from(_: novarocks_type_contract::ValueTypeError) -> Self {
@@ -202,33 +203,26 @@ fn state_value_types_match(
     left: &crate::ValueType,
     right: &crate::ValueType,
     ignore_root_nullability: bool,
-    budget: &mut SemanticTraceWorkBudget,
-) -> bool {
-    if !budget.charge(1)
-        || left.logical_type != right.logical_type
+    charge: &mut impl FnMut(usize) -> Result<(), StateSignatureComparisonError>,
+) -> Result<bool, StateSignatureComparisonError> {
+    charge(1)?;
+    if left.logical_type != right.logical_type
         || (!ignore_root_nullability && left.nullable != right.nullable)
     {
-        return false;
+        return Ok(false);
     }
     novarocks_type_contract::arrow_data_types_exact_observed::<StateSignatureComparisonError>(
         &left.data_type,
         &right.data_type,
-        || {
-            if budget.charge(1) {
-                Ok(())
-            } else {
-                Err(StateSignatureComparisonError::WorkExhausted)
-            }
-        },
+        || charge(1),
     )
-    .unwrap_or(false)
 }
 
-pub(crate) fn aggregate_bindings_match(
+fn aggregate_bindings_match_with(
     expected: &crate::AggregateBinding,
     actual: &crate::AggregateBinding,
-    budget: &mut SemanticTraceWorkBudget,
-) -> bool {
+    charge: &mut impl FnMut(usize) -> Result<(), StateSignatureComparisonError>,
+) -> Result<bool, StateSignatureComparisonError> {
     use novarocks_type_contract::{AggregateStateArgumentContract, FunctionArgumentType};
     let left = &expected.function;
     let right = &actual.function;
@@ -242,8 +236,8 @@ pub(crate) fn aggregate_bindings_match(
     ]
     .into_iter()
     .try_fold(8usize, usize::checked_add);
-    if !identity_work.is_some_and(|work| budget.charge(work))
-        || left.function_id != right.function_id
+    charge(identity_work.ok_or(StateSignatureComparisonError::WorkExhausted)?)?;
+    if left.function_id != right.function_id
         || left.overload != right.overload
         || left.kind != right.kind
         || left.argument_types.len() != right.argument_types.len()
@@ -254,7 +248,7 @@ pub(crate) fn aggregate_bindings_match(
         || usize::try_from(expected.logical_argument_count)
             .map_or(true, |count| count > left.argument_types.len())
     {
-        return false;
+        return Ok(false);
     }
     for (ordinal, (a, b)) in left
         .argument_types
@@ -267,7 +261,7 @@ pub(crate) fn aggregate_bindings_match(
             && ordinal < expected.logical_argument_count as usize;
         let matches = match (a, b) {
             (FunctionArgumentType::Value(a), FunctionArgumentType::Value(b)) => {
-                state_value_types_match(a, b, ignore_root, budget)
+                state_value_types_match(a, b, ignore_root, charge)?
             }
             (
                 FunctionArgumentType::Lambda {
@@ -279,27 +273,79 @@ pub(crate) fn aggregate_bindings_match(
                     result_type: br,
                 },
             ) => {
-                budget.charge(1)
-                    && ap.len() == bp.len()
-                    && ap
-                        .iter()
-                        .zip(bp)
-                        .all(|(a, b)| state_value_types_match(a, b, false, budget))
-                    && state_value_types_match(ar, br, false, budget)
+                charge(1)?;
+                if ap.len() != bp.len() {
+                    return Ok(false);
+                }
+                for (a, b) in ap.iter().zip(bp) {
+                    if !state_value_types_match(a, b, false, charge)? {
+                        return Ok(false);
+                    }
+                }
+                state_value_types_match(ar, br, false, charge)?
             }
             _ => false,
         };
         if !matches {
-            return false;
+            return Ok(false);
         }
     }
-    state_value_types_match(&left.result_type, &right.result_type, false, budget)
-        && state_value_types_match(
-            &expected.intermediate_type,
-            &actual.intermediate_type,
-            false,
-            budget,
-        )
+    Ok(
+        state_value_types_match(&left.result_type, &right.result_type, false, charge)?
+            && state_value_types_match(
+                &expected.intermediate_type,
+                &actual.intermediate_type,
+                false,
+                charge,
+            )?,
+    )
+}
+
+pub(crate) fn aggregate_bindings_match(
+    expected: &crate::AggregateBinding,
+    actual: &crate::AggregateBinding,
+    budget: &mut SemanticTraceWorkBudget,
+) -> bool {
+    aggregate_bindings_match_with(expected, actual, &mut |units| {
+        if budget.charge(units) {
+            Ok(())
+        } else {
+            Err(StateSignatureComparisonError::WorkExhausted)
+        }
+    })
+    .unwrap_or(false)
+}
+
+/// Borrow the original cross-phase state comparison with the caller's exact
+/// control meter. Installed declarations and source provenance remain separate
+/// mandatory gates; a matching signature alone supplies neither proof.
+pub fn aggregate_bindings_match_observed(
+    expected: &crate::AggregateBinding,
+    actual: &crate::AggregateBinding,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<bool, novarocks_type_contract::CompileControlError> {
+    work.flush()?;
+    let result = aggregate_bindings_match_with(expected, actual, &mut |units| {
+        for _ in 0..units {
+            work.step()
+                .map_err(StateSignatureComparisonError::Control)?;
+        }
+        Ok(())
+    });
+    match result {
+        Ok(matches) => {
+            work.flush()?;
+            Ok(matches)
+        }
+        Err(StateSignatureComparisonError::Control(cause)) => Err(cause),
+        Err(StateSignatureComparisonError::WorkExhausted) => {
+            Err(novarocks_type_contract::CompileControlError::ResourceExhausted)
+        }
+        Err(StateSignatureComparisonError::InvalidType) => {
+            work.flush()?;
+            Ok(false)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
