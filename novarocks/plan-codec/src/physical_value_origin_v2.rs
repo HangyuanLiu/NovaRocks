@@ -187,11 +187,18 @@ pub(crate) fn encode_phase(phase: physical::AggregatePhase) -> wire::AggregatePh
 pub(crate) fn decode_phase(
     phase: &wire::AggregatePhase,
 ) -> Result<physical::AggregatePhase, Error> {
+    decode_phase_with(phase, invalid)
+}
+/// Share the exact closed phase grammar without coupling callers' error graphs.
+pub(crate) fn decode_phase_with<E>(
+    phase: &wire::AggregatePhase,
+    missing: impl FnOnce(&'static str) -> E,
+) -> Result<physical::AggregatePhase, E> {
     Ok(
         match phase
             .kind
             .as_ref()
-            .ok_or_else(|| invalid("value origin aggregate phase kind is absent"))?
+            .ok_or_else(|| missing("value origin aggregate phase kind is absent"))?
         {
             wire::aggregate_phase::Kind::Single(_) => physical::AggregatePhase::Single,
             wire::aggregate_phase::Kind::PartialSequenceId(sequence) => {

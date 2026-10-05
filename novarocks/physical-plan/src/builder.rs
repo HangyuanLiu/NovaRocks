@@ -32,6 +32,7 @@ use crate::{
 
 mod structure;
 pub use structure::FragmentStructureError;
+pub(crate) use structure::admit_structure_counts;
 
 #[cfg(test)]
 #[path = "builder/structure_tests.rs"]

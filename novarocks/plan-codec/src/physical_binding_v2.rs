@@ -29,13 +29,18 @@ use std::fmt;
 
 mod encode;
 mod materialize;
+pub(crate) use materialize::{
+    Model as MaterializationModel, add, boxed, completed, finish, mul, reserve,
+};
 mod read;
+mod signature_copy;
 pub use materialize::{
     MaterializedFunctionBinding, MaterializedFunctionBindings,
     PreparedFunctionBindingsMaterialization, materialize_function_bindings,
     prepare_function_bindings_materialization,
 };
 pub use read::{PreparedFunctionBindingHeaders, prepare_function_binding_headers};
+pub(crate) use signature_copy::{copy_scalar_signature_observed, preflight_scalar_signature_copy};
 
 #[derive(Debug)]
 pub enum BindingCodecError {

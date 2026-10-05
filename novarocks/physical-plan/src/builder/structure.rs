@@ -72,23 +72,15 @@ impl FragmentBuilder {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
         let result = (|| {
             let mut errors = ValidationContext::for_construction(limits);
-            for (path, actual, limit) in [
-                ("nodes", self.nodes.len(), limits.fragment_nodes),
-                ("values", self.values.len(), limits.fragment_values),
-                (
-                    "expressions",
-                    self.expressions.len(),
-                    limits.fragment_expressions,
-                ),
-                (
-                    "runtime_filters",
-                    self.runtime_filters.len(),
-                    limits.plan_runtime_filters,
-                ),
-            ] {
-                work.step()?;
-                bounded_count(&mut errors, path, actual, limit);
-            }
+            admit_structure_counts(
+                self.nodes.len(),
+                self.values.len(),
+                self.expressions.len(),
+                self.runtime_filters.len(),
+                limits,
+                &mut errors,
+                &mut work,
+            )?;
             if !errors.is_empty() {
                 return Err(FragmentStructureError::Structure(
                     ValidationErrors::from_collector(errors),
@@ -141,4 +133,30 @@ impl FragmentBuilder {
         work.finish()?;
         result
     }
+}
+
+/// The same count gate for mutable construction and owned receiving inputs.
+pub(crate) fn admit_structure_counts(
+    nodes: usize,
+    values: usize,
+    expressions: usize,
+    runtime_filters: usize,
+    limits: crate::PlanLimits,
+    errors: &mut ValidationContext,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), FragmentStructureError> {
+    for (path, actual, limit) in [
+        ("nodes", nodes, limits.fragment_nodes),
+        ("values", values, limits.fragment_values),
+        ("expressions", expressions, limits.fragment_expressions),
+        (
+            "runtime_filters",
+            runtime_filters,
+            limits.plan_runtime_filters,
+        ),
+    ] {
+        work.step()?;
+        bounded_count(errors, path, actual, limit);
+    }
+    Ok(())
 }

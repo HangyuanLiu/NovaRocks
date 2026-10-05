@@ -35,6 +35,7 @@ mod predicate;
 mod pruning_structure;
 mod relation;
 mod resource;
+mod structure_input;
 mod validation;
 
 pub use builder::*;
@@ -73,6 +74,7 @@ pub use resource::{
     MAX_PLAN_DERIVED_CUT_ITEMS, MAX_PLAN_DYNAMIC_BYTES, MAX_PLAN_DYNAMIC_ITEMS,
     MAX_TIMESTAMP_TIMEZONE_BYTES,
 };
+pub use structure_input::FragmentStructureInput;
 pub use validation::*;
 
 /// Exact revision of the semantic plan contract implemented by this crate.

@@ -19,11 +19,13 @@ use super::*;
 use crate::{
     allocation_exit_v2::reserve_exit,
     physical_node_v2 as resources,
-    physical_type_v2::{DecodedTypeTable, clone_value_type_observed, preflight_value_type_clone},
+    physical_type_v2::{
+        DecodedTypeTable, clone_value_type_observed, preflight_value_type_clone,
+        value_type_clone_preflight_work_upper_bound,
+    },
 };
 use novarocks_type_contract::{
     FunctionArgumentType, FunctionId, FunctionKind, FunctionOverloadId, FunctionValueType,
-    MAX_VALUE_TYPE_NODES,
 };
 use std::mem::size_of;
 
@@ -37,30 +39,33 @@ fn numeric(error: resources::NodeCodecError) -> Error {
         _ => Error::Control(CompileControlError::ResourceExhausted),
     }
 }
-fn add(a: usize, b: usize) -> Result<usize, Error> {
+pub(crate) fn add(a: usize, b: usize) -> Result<usize, Error> {
     resources::add(a, b).map_err(numeric)
 }
-fn mul(a: usize, b: usize) -> Result<usize, Error> {
+pub(crate) fn mul(a: usize, b: usize) -> Result<usize, Error> {
     resources::mul(a, b).map_err(numeric)
 }
-fn bytes<T>(n: usize) -> Result<usize, Error> {
+pub(crate) fn bytes<T>(n: usize) -> Result<usize, Error> {
     resources::bytes::<T>(n).map_err(numeric)
 }
-fn cap(n: usize, maximum: usize) -> Result<(), Error> {
+pub(crate) fn cap(n: usize, maximum: usize) -> Result<(), Error> {
     if n > maximum {
         Err(CompileControlError::ResourceExhausted.into())
     } else {
         Ok(())
     }
 }
-fn finish<T>(w: CompileCheckpoints<'_>, result: Result<T, Error>) -> Result<T, Error> {
+pub(crate) fn finish<T>(w: CompileCheckpoints<'_>, result: Result<T, Error>) -> Result<T, Error> {
     if matches!(&result, Err(Error::Control(_))) {
         return result;
     }
     w.finish()?;
     result
 }
-fn completed<T>(result: Result<T, Error>, w: &mut CompileCheckpoints<'_>) -> Result<T, Error> {
+pub(crate) fn completed<T>(
+    result: Result<T, Error>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<T, Error> {
     if matches!(&result, Err(Error::Control(_))) {
         return result;
     }
@@ -92,7 +97,7 @@ pub struct MaterializedFunctionBindings<'loan, 'source> {
     retained_bytes: usize,
     facts: BindingProjectionFacts,
 }
-impl MaterializedFunctionBindings<'_, '_> {
+impl<'loan, 'source> MaterializedFunctionBindings<'loan, 'source> {
     pub fn definitions(&self) -> &[(u32, MaterializedFunctionBinding)] {
         &self.definitions
     }
@@ -125,12 +130,17 @@ impl MaterializedFunctionBindings<'_, '_> {
     pub fn into_definitions(self) -> Box<[(u32, MaterializedFunctionBinding)]> {
         self.definitions
     }
+    /// The exact original namespace loan, not an equal reconstructed table.
+    pub(crate) fn headers(&self) -> &'loan PreparedFunctionBindingHeaders<'source> {
+        self.headers
+    }
+    /// Only this owned output; excludes the already invoiced source namespace.
+    pub(crate) fn retained_output_floor(&self) -> Result<usize, Error> {
+        add(size_of::<Self>(), self.retained_bytes)
+    }
     /// A necessary retained composition floor, not full backing or a MEM grant.
     pub fn retained_invoice_floor(&self) -> Result<usize, Error> {
-        add(
-            self.source_invoice,
-            add(size_of::<Self>(), self.retained_bytes)?,
-        )
+        add(self.source_invoice, self.retained_output_floor()?)
     }
 }
 /// Preparation allocates no output and keeps all original header/type/control
@@ -146,19 +156,34 @@ impl PreparedFunctionBindingsMaterialization<'_, '_> {
         &self.facts
     }
 }
-struct Model {
-    facts: BindingProjectionFacts,
-    items: usize,
+pub(crate) struct Model {
+    pub(crate) facts: BindingProjectionFacts,
+    pub(crate) items: usize,
     lookup: usize,
     source: usize,
     known: usize,
-    retained: usize,
+    pub(crate) retained: usize,
 }
 impl Model {
     fn new(headers: &PreparedFunctionBindingHeaders<'_>, source: usize) -> Result<Self, Error> {
-        Ok(Self {
+        Ok(Self::for_composition(
+            headers.as_wire().len(),
+            add(headers.type_table().value_types().len(), 1)?,
+            source,
+            headers.retained_invoice_floor()?,
+        ))
+    }
+    /// One cumulative model for an owning composition. The caller supplies the
+    /// real original namespace lookup ceiling and necessary source floor.
+    pub(crate) fn for_composition(
+        definitions: usize,
+        lookup_work: usize,
+        source: usize,
+        known: usize,
+    ) -> Self {
+        Self {
             facts: BindingProjectionFacts {
-                definition_count: headers.as_wire().len(),
+                definition_count: definitions,
                 type_reference_count: 0,
                 allocation_requests_upper_bound: 0,
                 request_bytes_upper_bound: 0,
@@ -166,13 +191,13 @@ impl Model {
                 cumulative_work_upper_bound: 0,
             },
             items: 0,
-            lookup: add(headers.type_table().value_types().len(), 1)?,
+            lookup: lookup_work,
             source,
-            known: headers.retained_invoice_floor()?,
+            known,
             retained: 0,
-        })
+        }
     }
-    fn request<T>(&mut self, count: usize, times: usize) -> Result<(), Error> {
+    pub(crate) fn request<T>(&mut self, count: usize, times: usize) -> Result<(), Error> {
         let size = bytes::<T>(count)?;
         self.retained = add(self.retained, size)?;
         self.facts.request_bytes_upper_bound =
@@ -183,7 +208,7 @@ impl Model {
         }
         Ok(())
     }
-    fn check(&mut self, limits: BindingProjectionLimits) -> Result<(), Error> {
+    pub(crate) fn check(&mut self, limits: BindingProjectionLimits) -> Result<(), Error> {
         cap(self.facts.definition_count, limits.max_definitions)?;
         cap(self.facts.type_reference_count, limits.max_type_references)?;
         cap(
@@ -203,7 +228,7 @@ impl Model {
         // The sole clone grammar's maximum admits its preflight before that
         // bounded traversal. Keep the conservative ceiling in final facts so
         // exact-envelope replay cannot rely on an unreported early ceiling.
-        let clone_work = add(16, mul(8, MAX_VALUE_TYPE_NODES)?)?;
+        let clone_work = value_type_clone_preflight_work_upper_bound();
         self.facts.cumulative_work_upper_bound = add(
             add(128, mul(32, add(self.items, self.facts.definition_count)?)?)?,
             add(
@@ -247,27 +272,41 @@ fn count_clone(
     // Coarse bounded-type work was included before entering the sole grammar.
     model.check(limits)?;
     let source = value(types, id, w)?;
-    w.flush()?;
-    let clone = preflight_value_type_clone(source, w)?;
-    w.step()?;
-    w.flush()?;
-    model.facts.allocation_requests_upper_bound = add(
-        model.facts.allocation_requests_upper_bound,
-        clone.allocation_requests_upper_bound(),
-    )?;
-    model.facts.request_bytes_upper_bound = add(
-        model.facts.request_bytes_upper_bound,
-        clone.allocation_request_bytes_upper_bound(),
-    )?;
-    model.retained = add(model.retained, clone.allocation_request_bytes_upper_bound())?;
-    // The original facts must fit the original shared maximum; no second
-    // datatype grammar or recursive measurement is constructed here.
-    cap(
-        clone.work_upper_bound(),
-        add(16, mul(8, MAX_VALUE_TYPE_NODES)?)?,
-    )?;
-    model.check(limits)
+    model.count_owned_type_clone(source, limits, w)
 }
+impl Model {
+    /// Caller admits this occurrence's reference count before visiting the sole
+    /// clone grammar. Repeated owned roots are charged once per actual copy.
+    pub(crate) fn count_owned_type_clone(
+        &mut self,
+        source: &FunctionValueType,
+        limits: BindingProjectionLimits,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), Error> {
+        self.check(limits)?;
+        w.flush()?;
+        let clone = preflight_value_type_clone(source, w)?;
+        w.step()?;
+        w.flush()?;
+        self.facts.allocation_requests_upper_bound = add(
+            self.facts.allocation_requests_upper_bound,
+            clone.allocation_requests_upper_bound(),
+        )?;
+        self.facts.request_bytes_upper_bound = add(
+            self.facts.request_bytes_upper_bound,
+            clone.allocation_request_bytes_upper_bound(),
+        )?;
+        self.retained = add(self.retained, clone.allocation_request_bytes_upper_bound())?;
+        // The original facts must fit the original shared maximum; no second
+        // datatype grammar or recursive measurement is constructed here.
+        cap(
+            clone.work_upper_bound(),
+            value_type_clone_preflight_work_upper_bound(),
+        )?;
+        self.check(limits)
+    }
+}
+
 fn preflight(
     headers: &PreparedFunctionBindingHeaders<'_>,
     source: usize,
@@ -384,7 +423,7 @@ pub fn prepare_function_bindings_materialization<'loan, 'source>(
         });
     finish(w, result)
 }
-fn reserve<T>(count: usize, w: &mut CompileCheckpoints<'_>) -> Result<Vec<T>, Error> {
+pub(crate) fn reserve<T>(count: usize, w: &mut CompileCheckpoints<'_>) -> Result<Vec<T>, Error> {
     bytes::<T>(count)?;
     w.flush()?;
     let mut values = Vec::new();
@@ -393,7 +432,7 @@ fn reserve<T>(count: usize, w: &mut CompileCheckpoints<'_>) -> Result<Vec<T>, Er
     w.flush()?;
     Ok(values)
 }
-fn boxed<T>(values: Vec<T>, w: &mut CompileCheckpoints<'_>) -> Result<Box<[T]>, Error> {
+pub(crate) fn boxed<T>(values: Vec<T>, w: &mut CompileCheckpoints<'_>) -> Result<Box<[T]>, Error> {
     w.flush()?;
     let values = values.into_boxed_slice();
     w.step()?;

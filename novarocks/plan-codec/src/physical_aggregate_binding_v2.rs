@@ -27,15 +27,24 @@ use crate::{
     },
     physical_type_v2::EncodedTypeTable,
 };
-use novarocks_physical_plan::{AggregateBinding, AggregatePhase, BoundFunction};
-use novarocks_proto_models::{physical_control_v2, physical_package_v2 as wire};
+#[cfg(test)]
+use novarocks_physical_plan::AggregatePhase;
+use novarocks_physical_plan::{AggregateBinding, BoundFunction};
+#[cfg(test)]
+use novarocks_proto_models::physical_control_v2;
+use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{
     AggregateStateArgumentContract, CompileCheckpoints, CompilePhase, FunctionKind,
     PureCompileControl,
 };
 use std::{alloc::Layout, mem::size_of};
 
+mod materialize;
 mod read;
+pub use materialize::{
+    MaterializedAggregateBindings, PreparedAggregateBindingsMaterialization,
+    materialize_aggregate_bindings, prepare_aggregate_bindings_materialization,
+};
 pub use read::{PreparedAggregateBindingHeaders, prepare_aggregate_binding_headers};
 
 /// Projects the explicit state owner's contract, independently of function identity.
@@ -469,24 +478,12 @@ fn encode(
         state_format.push_str(input.source.state_format.as_str());
         work.step()?;
         work.flush()?;
-        let kind = match input.source.phase {
-            AggregatePhase::Single => {
-                wire::aggregate_phase::Kind::Single(physical_control_v2::Empty {})
-            }
-            AggregatePhase::Partial { sequence } => {
-                wire::aggregate_phase::Kind::PartialSequenceId(sequence.get())
-            }
-            AggregatePhase::Intermediate { sequence } => {
-                wire::aggregate_phase::Kind::IntermediateSequenceId(sequence.get())
-            }
-            AggregatePhase::Final { sequence } => {
-                wire::aggregate_phase::Kind::FinalSequenceId(sequence.get())
-            }
-        };
         definitions.push(wire::AggregateBindingDefinition {
             id: input.id,
             function_binding_id: Some(input.function_binding_id),
-            phase: Some(wire::AggregatePhase { kind: Some(kind) }),
+            phase: Some(crate::physical_value_origin_v2::encode_phase(
+                input.source.phase,
+            )),
             logical_argument_count: input.source.logical_argument_count,
             intermediate_value_type_id: Some(input.intermediate_value_type_id),
             state_format,

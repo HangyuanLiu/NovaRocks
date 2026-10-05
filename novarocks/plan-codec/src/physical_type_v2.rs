@@ -305,6 +305,12 @@ impl ValueTypeCloneFacts {
     }
 }
 
+/// Admit the original bounded clone preflight before walking its immutable
+/// source. This is a numerical ceiling, never synthetic completed work.
+pub(crate) const fn value_type_clone_preflight_work_upper_bound() -> usize {
+    16 + 8 * novarocks_type_contract::MAX_VALUE_TYPE_NODES
+}
+
 /// Fixed borrowed scratch covers only children which the sole clone author
 /// actually clones. Dictionaries underneath shared FieldRef owners allocate
 /// nothing here. This is numerical admission, not a host allocation grant.
