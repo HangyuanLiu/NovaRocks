@@ -38,6 +38,62 @@ use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
 use std::mem::size_of;
 type Error = WriterGroupedUnpivotCodecError;
 
+/// The original containing node before this payload's one contribution.
+/// These references are Value occurrences, unlike WriterSchema type roots.
+#[derive(Clone, Copy)]
+pub(crate) struct GroupedNodeAdmission {
+    pub(crate) base: Model,
+    pub(crate) values: usize,
+    pub(crate) limits: NodeProjectionLimits,
+}
+impl GroupedNodeAdmission {
+    pub(crate) fn merge(self, child: NodeProjectionFacts) -> Result<Model, Error> {
+        let mut merged = self.base;
+        merged.refs = add(merged.refs, child.value_reference_count)?;
+        merged.items = add(merged.items, child.list_item_count)?;
+        merged.requests = add(merged.requests, child.allocation_requests_upper_bound)?;
+        merged.requested = add(merged.requested, child.allocation_request_bytes_upper_bound)?;
+        merged.delegated_work = add(merged.delegated_work, child.cumulative_work_upper_bound)?;
+        Ok(merged)
+    }
+    fn admit(self, source: usize, child: NodeProjectionFacts) -> Result<(), Error> {
+        self.merge(child)?
+            .numerical_facts(source, self.values, self.limits)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct GroupedProjection {
+    pub(crate) source: usize,
+    pub(crate) limits: NodeProjectionLimits,
+    pub(crate) parent: Option<GroupedNodeAdmission>,
+}
+impl GroupedProjection {
+    fn admit(self, model: &Model, values: usize) -> Result<NodeProjectionFacts, Error> {
+        let facts = model.numerical_facts(self.source, values, self.limits)?;
+        if let Some(parent) = self.parent {
+            parent.admit(self.source, facts)?;
+        }
+        Ok(facts)
+    }
+}
+fn admit_counts(
+    projection: GroupedProjection,
+    model: &Model,
+    values: usize,
+    scalars: usize,
+    pools: usize,
+    expressions: &impl Expressions,
+) -> Result<(), Error> {
+    // Snapshot the current own model and add the sole lookup bound once.
+    // Do not cumulatively add each earlier prefix to the eventual facts.
+    let mut counted = *model;
+    delegate_counts(&mut counted, scalars, pools, expressions)?;
+    projection.admit(&counted, values)?;
+    Ok(())
+}
+
 fn prepare_encode(
     input: &p::WriterGroupedUnpivotSpec,
     values: &EncodedValues<'_, '_, '_>,
@@ -46,14 +102,28 @@ fn prepare_encode(
     limits: WriterGroupedUnpivotProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<WriterGroupedUnpivotProjectionFacts, Error> {
+    preflight_grouped_encode_observed(
+        input,
+        values,
+        expressions,
+        GroupedProjection {
+            source,
+            limits,
+            parent: None,
+        },
+        work,
+    )
+}
+pub(crate) fn preflight_grouped_encode_observed(
+    input: &p::WriterGroupedUnpivotSpec,
+    values: &EncodedValues<'_, '_, '_>,
+    expressions: &EncodedExpressions<'_, '_, '_>,
+    projection: GroupedProjection,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<WriterGroupedUnpivotProjectionFacts, Error> {
+    let GroupedProjection { source, limits, .. } = projection;
     let same = std::ptr::eq(values.types(), expressions.types())
         && std::ptr::eq(values.original_control(), expressions.control());
-    work.step()?;
-    if !same {
-        return Err(invalid(
-            "grouped Unpivot namespaces do not retain the same types and control",
-        ));
-    }
     let mut known = add(
         size_of::<p::WriterGroupedUnpivotSpec>(),
         add(
@@ -72,29 +142,53 @@ fn prepare_encode(
         refs: add(4, add(input.literal_outputs.len(), input.mappings.len())?)?,
         ..Model::default()
     };
-    count_prefix(0, model.items, source, known, limits, work)?;
-    floor(source, values.retained_floor(work)?, work)?;
-    floor(source, expressions.floor(work)?, work)?;
     model.request::<u32>(input.statistics_target_ordinals.len(), 1)?;
     model.request::<u32>(input.literal_outputs.len(), 1)?;
     model.request::<wire::WriterGroupedUnpivotMapping>(input.mappings.len(), 1)?;
+    projection.admit(&model, values.count())?;
+    work.step()?;
+    if !same {
+        return Err(invalid(
+            "grouped Unpivot namespaces do not retain the same types and control",
+        ));
+    }
+    count_prefix(0, model.items, source, known, limits, work)?;
+    floor(source, values.retained_floor(work)?, work)?;
+    floor(source, expressions.floor(work)?, work)?;
     let (mut scalars, mut pools) = (0, 0);
     for mapping in &input.mappings {
         model.items = add(model.items, mapping.constants.len())?;
         known = add(known, bytes::<p::UnpivotConstant>(mapping.constants.len())?)?;
         model.request::<wire::UnpivotConstant>(mapping.constants.len(), 1)?;
+        admit_counts(
+            projection,
+            &model,
+            values.count(),
+            scalars,
+            pools,
+            expressions,
+        )?;
         count_prefix(0, model.items, source, known, limits, work)?;
         for constant in &mapping.constants {
             match constant {
                 p::UnpivotConstant::Scalar(_) => scalars = add(scalars, 1)?,
                 _ => pools = add(pools, 1)?,
             }
+            admit_counts(
+                projection,
+                &model,
+                values.count(),
+                scalars,
+                pools,
+                expressions,
+            )?;
             work.step()?;
         }
         work.step()?;
     }
     floor(source, known, work)?;
     delegate_counts(&mut model, scalars, pools, expressions)?;
+    projection.admit(&model, values.count())?;
     let facts = model.facts(source, values.count(), limits, work)?;
     for id in [
         input.grouping_input,
@@ -141,18 +235,25 @@ fn prepare_decode(
     limits: WriterGroupedUnpivotProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<WriterGroupedUnpivotProjectionFacts, Error> {
+    preflight_grouped_decode_observed(
+        input,
+        expressions,
+        GroupedProjection {
+            source,
+            limits,
+            parent: None,
+        },
+        work,
+    )
+}
+pub(crate) fn preflight_grouped_decode_observed(
+    input: &wire::WriterGroupedUnpivot,
+    expressions: &DecodedExpressions<'_, '_, '_>,
+    projection: GroupedProjection,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<WriterGroupedUnpivotProjectionFacts, Error> {
+    let GroupedProjection { source, limits, .. } = projection;
     let values = expressions.values();
-    // Presence is not an ID-zero default; preserve the ordinary node's order.
-    for id in [
-        input.grouping_input_value_id,
-        input.grouping_output_value_id,
-        input.passthrough_output_value_id,
-        input.value_output_id,
-    ] {
-        let result = required(id);
-        work.step()?;
-        result?;
-    }
     let mut known = add(
         size_of::<wire::WriterGroupedUnpivot>(),
         add(
@@ -174,12 +275,24 @@ fn prepare_decode(
         )?,
         ..Model::default()
     };
-    count_prefix(0, model.items, source, known, limits, work)?;
-    floor(source, values.retained_floor(work)?, work)?;
-    floor(source, expressions.floor(work)?, work)?;
     model.request::<p::WriteTargetOrdinal>(input.statistics_target_ordinals.len(), 2)?;
     model.request::<p::ValueId>(input.literal_output_ids.len(), 2)?;
     model.request::<p::WriterGroupedUnpivotMapping>(input.mappings.len(), 2)?;
+    projection.admit(&model, values.count())?;
+    // Presence is not an ID-zero default; preserve the ordinary node's order.
+    for id in [
+        input.grouping_input_value_id,
+        input.grouping_output_value_id,
+        input.passthrough_output_value_id,
+        input.value_output_id,
+    ] {
+        let result = required(id);
+        work.step()?;
+        result?;
+    }
+    count_prefix(0, model.items, source, known, limits, work)?;
+    floor(source, values.retained_floor(work)?, work)?;
+    floor(source, expressions.floor(work)?, work)?;
     for raw in &input.statistics_target_ordinals {
         let result = target_ordinal(*raw);
         work.step()?;
@@ -193,6 +306,14 @@ fn prepare_decode(
             bytes::<wire::UnpivotConstant>(mapping.constants.capacity())?,
         )?;
         model.request::<p::UnpivotConstant>(mapping.constants.len(), 2)?;
+        admit_counts(
+            projection,
+            &model,
+            values.count(),
+            scalars,
+            pools,
+            expressions,
+        )?;
         count_prefix(0, model.items, source, known, limits, work)?;
         let result = target_ordinal(mapping.write_target_ordinal);
         work.step()?;
@@ -202,16 +323,27 @@ fn prepare_decode(
                 .kind
                 .as_ref()
                 .ok_or_else(|| invalid("grouped Unpivot constant kind is absent"));
-            work.step()?;
-            match kind? {
-                wire::unpivot_constant::Kind::ScalarExprId(_) => scalars = add(scalars, 1)?,
-                _ => pools = add(pools, 1)?,
+            match &kind {
+                Ok(wire::unpivot_constant::Kind::ScalarExprId(_)) => scalars = add(scalars, 1)?,
+                Ok(_) => pools = add(pools, 1)?,
+                Err(_) => {}
             }
+            admit_counts(
+                projection,
+                &model,
+                values.count(),
+                scalars,
+                pools,
+                expressions,
+            )?;
+            work.step()?;
+            kind?;
         }
         work.step()?;
     }
     floor(source, known, work)?;
     delegate_counts(&mut model, scalars, pools, expressions)?;
+    projection.admit(&model, values.count())?;
     let facts = model.facts(source, values.count(), limits, work)?;
     for id in [
         input.grouping_input_value_id,
@@ -236,7 +368,7 @@ fn prepare_decode(
     }
     Ok(facts)
 }
-fn emit_encode(
+pub(crate) fn emit_encode(
     input: &p::WriterGroupedUnpivotSpec,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::WriterGroupedUnpivot, Error> {
@@ -274,7 +406,7 @@ fn emit_encode(
     work.step()?;
     Ok(output)
 }
-fn emit_decode(
+pub(crate) fn emit_decode(
     input: &wire::WriterGroupedUnpivot,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<p::WriterGroupedUnpivotSpec, Error> {

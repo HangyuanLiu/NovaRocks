@@ -549,3 +549,308 @@ fn grouped_unpivot_wide_inner_constants_observe_real_quantum_and_no_retry() {
         c.arm(None);
     });
 }
+
+#[test]
+fn grouped_known_root_and_nested_requests_precede_the_next_real_wide_quantum() {
+    let fixture = Fixture::new();
+    let c = Control::default();
+    let mut input = source();
+    input.mappings[0].constants =
+        vec![p::UnpivotConstant::Scalar(p::ExprId::new(0)); 320].into_boxed_slice();
+    let mut raw = expected();
+    raw.mappings[0].constants = vec![
+        wire::UnpivotConstant {
+            kind: Some(wire::unpivot_constant::Kind::ScalarExprId(0)),
+        };
+        320
+    ];
+    fixture.with_tokens(&c, |values, expressions, read| {
+        for decode in [false, true] {
+            c.arm(None);
+            if decode {
+                decode_writer_grouped_unpivot(&raw, read, SOURCE, limits()).unwrap();
+            } else {
+                encode_writer_grouped_unpivot(&input, values, expressions, SOURCE, limits())
+                    .unwrap();
+            }
+            let success = c.trace();
+            let quantum = success.iter().position(|(_, units)| *units == 256).unwrap();
+            let root_bytes = if decode {
+                2 * (Layout::array::<p::WriteTargetOrdinal>(3).unwrap().size()
+                    + Layout::array::<p::ValueId>(3).unwrap().size()
+                    + Layout::array::<p::WriterGroupedUnpivotMapping>(2)
+                        .unwrap()
+                        .size())
+            } else {
+                Layout::array::<u32>(6).unwrap().size()
+                    + Layout::array::<wire::WriterGroupedUnpivotMapping>(2)
+                        .unwrap()
+                        .size()
+            };
+            let first_nested_bytes = if decode {
+                2 * Layout::array::<p::UnpivotConstant>(320).unwrap().size()
+            } else {
+                Layout::array::<wire::UnpivotConstant>(320).unwrap().size()
+            };
+            for bytes in [root_bytes, root_bytes + first_nested_bytes] {
+                let mut l = limits();
+                l.max_allocation_request_bytes = bytes - 1;
+                c.arm(None);
+                let refused = if decode {
+                    decode_writer_grouped_unpivot(&raw, read, SOURCE, l).map(|_| ())
+                } else {
+                    encode_writer_grouped_unpivot(&input, values, expressions, SOURCE, l)
+                        .map(|_| ())
+                };
+                assert!(matches!(
+                    refused,
+                    Err(Error::Control(CompileControlError::ResourceExhausted))
+                ));
+                let refused_trace = c.trace();
+                assert!(refused_trace.len() <= quantum);
+                assert!(!refused_trace.iter().any(|(_, units)| *units == 256));
+                for cause in CAUSES {
+                    c.arm(Some((quantum, cause)));
+                    let refused = if decode {
+                        decode_writer_grouped_unpivot(&raw, read, SOURCE, l).map(|_| ())
+                    } else {
+                        encode_writer_grouped_unpivot(&input, values, expressions, SOURCE, l)
+                            .map(|_| ())
+                    };
+                    assert!(matches!(
+                        refused,
+                        Err(Error::Control(CompileControlError::ResourceExhausted))
+                    ));
+                    assert_eq!(c.trace(), refused_trace);
+                }
+            }
+        }
+        c.arm(None);
+    });
+}
+
+fn observed_encode(
+    input: &p::WriterGroupedUnpivotSpec,
+    values: &EncodedValues<'_, '_, '_>,
+    expressions: &EncodedExpressions<'_, '_, '_>,
+    projection: GroupedProjection,
+) -> Result<(wire::WriterGroupedUnpivot, NodeProjectionFacts), Error> {
+    let mut work = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
+    let result = (|| {
+        let facts =
+            preflight_grouped_encode_observed(input, values, expressions, projection, &mut work)?;
+        Ok((emit_encode(input, &mut work)?, facts))
+    })();
+    finish(work, result)
+}
+fn observed_decode(
+    input: &wire::WriterGroupedUnpivot,
+    expressions: &DecodedExpressions<'_, '_, '_>,
+    projection: GroupedProjection,
+) -> Result<(p::WriterGroupedUnpivotSpec, NodeProjectionFacts), Error> {
+    let mut work = CompileCheckpoints::try_new(expressions.control(), CompilePhase::Decode)?;
+    let result = (|| {
+        let facts = preflight_grouped_decode_observed(input, expressions, projection, &mut work)?;
+        Ok((emit_decode(input, &mut work)?, facts))
+    })();
+    finish(work, result)
+}
+
+#[test]
+fn grouped_observed_ports_keep_standalone_success_and_ordinary_control_traces() {
+    let fixture = Fixture::new();
+    let c = Control::default();
+    let input = source();
+    let raw = expected();
+    let projection = GroupedProjection {
+        source: SOURCE,
+        limits: limits(),
+        parent: None,
+    };
+    fixture.with_tokens(&c, |values, expressions, read| {
+        c.arm(None);
+        let public =
+            encode_writer_grouped_unpivot(&input, values, expressions, SOURCE, limits()).unwrap();
+        let trace = c.trace();
+        c.arm(None);
+        let observed = observed_encode(&input, values, expressions, projection).unwrap();
+        assert_eq!(observed, public);
+        assert_eq!(c.trace(), trace);
+        c.arm(None);
+        let public = decode_writer_grouped_unpivot(&raw, read, SOURCE, limits()).unwrap();
+        let trace = c.trace();
+        c.arm(None);
+        assert_eq!(observed_decode(&raw, read, projection).unwrap(), public);
+        assert_eq!(c.trace(), trace);
+        assert_prefix(&c, || {
+            observed_encode(&input, values, expressions, projection)
+        });
+        assert_prefix(&c, || observed_decode(&raw, read, projection));
+        let mut bad = raw.clone();
+        bad.mappings[1].input_value_id = None;
+        c.arm(None);
+        assert!(matches!(
+            decode_writer_grouped_unpivot(&bad, read, SOURCE, limits()),
+            Err(Error::InvalidShape(_))
+        ));
+        let trace = c.trace();
+        c.arm(None);
+        assert!(matches!(
+            observed_decode(&bad, read, projection),
+            Err(Error::InvalidShape(_))
+        ));
+        assert_eq!(c.trace(), trace);
+        assert_prefix(&c, || observed_decode(&bad, read, projection));
+        c.arm(None);
+    });
+}
+
+#[test]
+fn grouped_nonempty_header_parent_merges_value_occurrences_and_source_invoice_once() {
+    let fixture = Fixture::new();
+    let c = Control::default();
+    let input = source();
+    let props = p::PhysicalProperties {
+        distribution: p::Distribution::Singleton,
+        row_multiplicity: p::RowMultiplicity::SingleCopy,
+        ordering: Box::default(),
+    };
+    // This is an actual header allocation contribution, not a certified
+    // TableFinish or a fabricated namespace. Its writer schemas stay outside
+    // this narrow composition oracle.
+    let node = p::PhysicalNode {
+        id: p::NodeId::new(u32::MAX),
+        inputs: Box::from([p::NodeId::new(0)]),
+        required_inputs: Box::from([props.clone()]),
+        output_properties: props,
+        output: p::OutputPort {
+            node: p::NodeId::new(u32::MAX),
+            columns: Box::from([
+                p::ValueId::new(0),
+                p::ValueId::new(7),
+                p::ValueId::new(u32::MAX),
+            ]),
+        },
+        kind: p::NodeKind::TableFinish(p::WriterFinishSpec {
+            expected_target_ordinals: Box::default(),
+            input_schema: p::WriterRelationSchema {
+                revision: 0,
+                fields: Box::default(),
+            },
+            output_schema: p::WriterRelationSchema {
+                revision: 0,
+                fields: Box::default(),
+            },
+            final_aggregates: Box::default(),
+            grouped_unpivot: Some(input.clone()),
+        }),
+    };
+    fixture.with_tokens(&c, |values, expressions, read| {
+        for decode in [false, true] {
+            let mut base = Model {
+                inputs: 1,
+                refs: 3,
+                items: 4,
+                ..Model::default()
+            };
+            let header_bytes = if decode {
+                base.request::<p::NodeId>(1, 2).unwrap();
+                base.request::<p::PhysicalProperties>(1, 2).unwrap();
+                base.request::<p::ValueId>(3, 2).unwrap();
+                2 * (Layout::array::<p::NodeId>(1).unwrap().size()
+                    + Layout::array::<p::PhysicalProperties>(1).unwrap().size()
+                    + Layout::array::<p::ValueId>(3).unwrap().size())
+            } else {
+                encode_header_requests(&node, &mut base).unwrap();
+                Layout::array::<u32>(1).unwrap().size()
+                    + Layout::array::<wire::PhysicalProperties>(1).unwrap().size()
+                    + Layout::array::<u32>(3).unwrap().size()
+            };
+            c.arm(None);
+            let child = if decode {
+                decode_writer_grouped_unpivot(&expected(), read, SOURCE, limits())
+                    .unwrap()
+                    .1
+            } else {
+                encode_writer_grouped_unpivot(&input, values, expressions, SOURCE, limits())
+                    .unwrap()
+                    .1
+            };
+            let requested = header_bytes + child.allocation_request_bytes_upper_bound;
+            let height = (usize::BITS - values.count().leading_zeros()) as usize + 1;
+            let whole_work = 256
+                + 19 * 32
+                + 12 * (height + 32)
+                + requested * 4
+                + child.cumulative_work_upper_bound;
+            let whole = NodeProjectionFacts {
+                input_node_count: 1,
+                value_reference_count: 12,
+                list_item_count: 18,
+                allocation_requests_upper_bound: if decode { 16 } else { 8 },
+                allocation_request_bytes_upper_bound: requested,
+                coexisting_source_and_request_bytes_upper_bound: SOURCE + requested,
+                cumulative_work_upper_bound: whole_work,
+            };
+            let mut l = exact(whole);
+            l.max_input_nodes = 1;
+            let parent = GroupedNodeAdmission {
+                base,
+                values: values.count(),
+                limits: l,
+            };
+            assert_eq!(
+                parent
+                    .merge(child)
+                    .unwrap()
+                    .numerical_facts(SOURCE, values.count(), l)
+                    .unwrap(),
+                whole
+            );
+            let run = |parent| {
+                let projection = GroupedProjection {
+                    source: SOURCE,
+                    limits: limits(),
+                    parent: Some(parent),
+                };
+                if decode {
+                    observed_decode(&expected(), read, projection).map(|(_, facts)| facts)
+                } else {
+                    observed_encode(&input, values, expressions, projection).map(|(_, facts)| facts)
+                }
+            };
+            c.arm(None);
+            assert_eq!(run(parent).unwrap(), child);
+            assert_prefix(&c, || run(parent));
+            for axis in 0..7 {
+                let mut under_limits = l;
+                if axis == 6 {
+                    under_limits.max_input_nodes -= 1;
+                } else {
+                    under_limits = under(under_limits, axis);
+                }
+                c.arm(None);
+                assert!(matches!(
+                    run(GroupedNodeAdmission {
+                        limits: under_limits,
+                        ..parent
+                    }),
+                    Err(Error::Control(CompileControlError::ResourceExhausted))
+                ));
+                let trace = c.trace();
+                for cause in CAUSES {
+                    c.arm(Some((trace.len(), cause)));
+                    assert!(matches!(
+                        run(GroupedNodeAdmission {
+                            limits: under_limits,
+                            ..parent
+                        }),
+                        Err(Error::Control(CompileControlError::ResourceExhausted))
+                    ));
+                    assert_eq!(c.trace(), trace);
+                }
+            }
+        }
+        c.arm(None);
+    });
+}

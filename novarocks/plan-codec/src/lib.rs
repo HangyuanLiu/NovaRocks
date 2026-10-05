@@ -61,6 +61,7 @@ pub mod physical_schema_v2;
 pub mod physical_semantics_v2;
 pub mod physical_simple_nodes_v2;
 pub mod physical_table_function_node_v2;
+pub mod physical_topn_node_v2;
 mod physical_type;
 pub mod physical_type_v2;
 pub mod physical_unpivot_v2;
