@@ -24,6 +24,8 @@
 
 #![allow(dead_code)]
 
+mod neutral_requests;
+
 use std::sync::Arc;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1856,115 +1858,157 @@ impl<'a> ContractLoweringVisitor<'a> {
         mut self,
         result_port: ResultPort,
     ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
-        self.plan_builder.set_result_port(result_port)?;
-        let mut finished_fragments = BTreeMap::new();
-        for (fragment_id, builder) in std::mem::take(&mut self.fragments) {
-            self.work.step()?;
-            let (root, sink) = self.completions.remove(&fragment_id).ok_or(
-                ContractLoweringError::IncompleteFragment {
-                    fragment: fragment_id,
-                },
-            )?;
-            // A fragment that can only run one driver says so. The plan's
-            // domain is what a fragment may widen to, and a fragment whose
-            // root delivers one stream -- a metadata read the provider hands
-            // to one reader, a gather, a finish -- never does.
-            let dop_domain = fragment_dop_domain(&builder, root, self.dop_domain);
-            let fragment = builder.finish_definition(root, sink, dop_domain)?;
-            finished_fragments.insert(fragment_id, fragment);
-        }
-        if let Some((&fragment, _)) = self.completions.first_key_value() {
-            return Err(ContractLoweringError::UnknownFragmentCompletion { fragment });
-        }
-        if let Some(reads) = self.provider_reads.take() {
-            reads
-                .ensure_consumed()
-                .map_err(|error| ContractLoweringError::ProviderRead {
-                    detail: error.to_string(),
-                })?;
-        }
-        // The sole physical call visitor proves exact source-journal coverage
-        // before the immutable draft can escape. Missing/extra sources are not
-        // repaired from a selected signature or an aggregate sequence.
-        let mut source_count = 0usize;
-        for fragment in finished_fragments.values() {
-            novarocks_physical_plan::visit_relational_calls_observed(
-                fragment,
-                &mut self.work,
-                |site, binding, work| {
-                    if let novarocks_physical_plan::PhysicalCallBinding::Aggregate(binding) =
-                        binding
-                    {
-                        let entry = self.call_sources.entries.get(&(fragment.id(), site));
-                        work.step()?;
-                        let entry = entry.ok_or(ContractLoweringError::InvalidAggregate {
-                            detail: "actual aggregate call has no lowered source journal entry",
-                        })?;
-                        if entry.phase != binding.phase {
-                            return Err(ContractLoweringError::InvalidAggregate {
-                                detail: "aggregate source journal phase differs from actual call",
-                            });
+        let result: Result<Option<SemanticParameters>, ContractLoweringError> = (|| {
+            self.plan_builder.set_result_port(result_port)?;
+            let mut finished_fragments = BTreeMap::new();
+            for (fragment_id, builder) in std::mem::take(&mut self.fragments) {
+                self.work.step()?;
+                let (root, sink) = self.completions.remove(&fragment_id).ok_or(
+                    ContractLoweringError::IncompleteFragment {
+                        fragment: fragment_id,
+                    },
+                )?;
+                // A fragment that can only run one driver says so. The plan's
+                // domain is what a fragment may widen to, and a fragment whose
+                // root delivers one stream -- a metadata read the provider hands
+                // to one reader, a gather, a finish -- never does.
+                let dop_domain = fragment_dop_domain(&builder, root, self.dop_domain);
+                let fragment = builder.finish_definition(root, sink, dop_domain)?;
+                finished_fragments.insert(fragment_id, fragment);
+            }
+            if let Some((&fragment, _)) = self.completions.first_key_value() {
+                return Err(ContractLoweringError::UnknownFragmentCompletion { fragment });
+            }
+            if let Some(reads) = self.provider_reads.take() {
+                reads
+                    .ensure_consumed()
+                    .map_err(|error| ContractLoweringError::ProviderRead {
+                        detail: error.to_string(),
+                    })?;
+            }
+            // The sole physical call visitor proves exact source-journal coverage
+            // before the immutable draft can escape. Missing/extra sources are not
+            // repaired from a selected signature or an aggregate sequence.
+            let mut source_count = 0usize;
+            for fragment in finished_fragments.values() {
+                novarocks_physical_plan::visit_relational_calls_observed(
+                    fragment,
+                    &mut self.work,
+                    |site, binding, work| {
+                        if let novarocks_physical_plan::PhysicalCallBinding::Aggregate(binding) =
+                            binding
+                        {
+                            let entry = self.call_sources.entries.get(&(fragment.id(), site));
+                            work.step()?;
+                            let entry = entry.ok_or(ContractLoweringError::InvalidAggregate {
+                                detail: "actual aggregate call has no lowered source journal entry",
+                            })?;
+                            if entry.phase != binding.phase {
+                                return Err(ContractLoweringError::InvalidAggregate {
+                                    detail: "aggregate source journal phase differs from actual call",
+                                });
+                            }
+                            source_count = source_count
+                                .checked_add(1)
+                                .ok_or(CompileControlError::ResourceExhausted)?;
+                            work.step()?;
                         }
-                        source_count = source_count
-                            .checked_add(1)
-                            .ok_or(CompileControlError::ResourceExhausted)?;
-                        work.step()?;
+                        Ok::<_, ContractLoweringError>(())
+                    },
+                )?;
+            }
+            if source_count != self.call_sources.entries.len() {
+                return Err(ContractLoweringError::InvalidAggregate {
+                    detail: "aggregate source journal has an extra call site",
+                });
+            }
+            // Check retained source authors first. The mandatory static request
+            // attachment below separately closes every actual call definition,
+            // including definitions with no runtime invocation occurrence.
+            for (&(fragment_id, expression_id), entry) in &self.call_sources.expression_entries {
+                self.work.step()?;
+                let fragment = finished_fragments.get(&fragment_id).ok_or(
+                    ContractLoweringError::UnknownFragmentCompletion {
+                        fragment: fragment_id,
+                    },
+                )?;
+                let source = fragment
+                    .expressions()
+                    .get(expression_id)
+                    .ok_or(ContractLoweringError::IdentitySpaceExhausted("expression"))?;
+                validate_expression_source_entry_observed(entry, source, &mut self.work)?;
+            }
+            for (&(fragment_id, node_id), entry) in &self.call_sources.table_entries {
+                self.work.step()?;
+                let fragment = finished_fragments.get(&fragment_id).ok_or(
+                    ContractLoweringError::UnknownFragmentCompletion {
+                        fragment: fragment_id,
+                    },
+                )?;
+                let source = fragment
+                    .nodes()
+                    .get(&node_id)
+                    .ok_or(ContractLoweringError::IdentitySpaceExhausted("node"))?;
+                validate_table_source_entry_observed(entry, source, &mut self.work)?;
+            }
+            let mut requests = neutral_requests::transfer_neutral_requests_observed(
+                &self.call_sources,
+                &mut self.work,
+                |value, work| {
+                    register_constant_source_observed(
+                        &mut self.plan_builder,
+                        &mut self.constant_sources,
+                        &mut self.next_constant_pool,
+                        value,
+                        value.value_type(),
+                        work,
+                    )
+                },
+            )?;
+            for &fragment in requests.keys() {
+                let present = finished_fragments.contains_key(&fragment);
+                self.work.step()?;
+                if !present {
+                    return Err(ContractLoweringError::UnknownFragmentCompletion { fragment });
+                }
+            }
+            for filter in self.materialize_runtime_filters(&finished_fragments)? {
+                self.plan_builder.add_runtime_filter(filter)?;
+            }
+            for fragment in finished_fragments.into_values() {
+                self.work.step()?;
+                let entries = requests.remove(&fragment.id());
+                self.work.step()?;
+                // An explicit empty author is valid only for a call-free fragment.
+                // The same constructor refuses every missing actual definition.
+                let fragment = fragment
+                    .with_call_requests_observed(entries.unwrap_or_default(), self.control)?;
+                self.plan_builder.add_fragment(fragment)?;
+            }
+            if self.root_allow_throw_exception_used {
+                let parameters = SemanticParameters::try_new([(
+                    SemanticParameterId::new(0),
+                    SemanticParameterValue::AllowThrowException(self.root_allow_throw_exception),
+                )])
+                .map_err(|error| {
+                    ContractLoweringError::InvalidFunctionBinding {
+                        detail: error.to_string(),
                     }
-                    Ok::<_, ContractLoweringError>(())
-                },
-            )?;
+                })?;
+                Ok(Some(parameters))
+            } else {
+                Ok(None)
+            }
+        })();
+        if let Err(ContractLoweringError::Control(cause)) = &result {
+            return Err(ContractLoweringError::Control(*cause));
         }
-        if source_count != self.call_sources.entries.len() {
-            return Err(ContractLoweringError::InvalidAggregate {
-                detail: "aggregate source journal has an extra call site",
-            });
-        }
-        // Validate retained ordinary emissions only. Missing synthetic/window/
-        // table sources stay open; this is not full FunctionCall coverage.
-        for (&(fragment_id, expression_id), entry) in &self.call_sources.expression_entries {
-            self.work.step()?;
-            let fragment = finished_fragments.get(&fragment_id).ok_or(
-                ContractLoweringError::UnknownFragmentCompletion {
-                    fragment: fragment_id,
-                },
-            )?;
-            let source = fragment
-                .expressions()
-                .get(expression_id)
-                .ok_or(ContractLoweringError::IdentitySpaceExhausted("expression"))?;
-            validate_expression_source_entry_observed(entry, source, &mut self.work)?;
-        }
-        for (&(fragment_id, node_id), entry) in &self.call_sources.table_entries {
-            self.work.step()?;
-            let fragment = finished_fragments.get(&fragment_id).ok_or(
-                ContractLoweringError::UnknownFragmentCompletion {
-                    fragment: fragment_id,
-                },
-            )?;
-            let source = fragment
-                .nodes()
-                .get(&node_id)
-                .ok_or(ContractLoweringError::IdentitySpaceExhausted("node"))?;
-            validate_table_source_entry_observed(entry, source, &mut self.work)?;
-        }
-        for filter in self.materialize_runtime_filters(&finished_fragments)? {
-            self.plan_builder.add_runtime_filter(filter)?;
-        }
-        for fragment in finished_fragments.into_values() {
-            self.work.step()?;
-            self.plan_builder.add_fragment(fragment)?;
-        }
-        if self.root_allow_throw_exception_used {
-            let parameters = SemanticParameters::try_new([(
-                SemanticParameterId::new(0),
-                SemanticParameterValue::AllowThrowException(self.root_allow_throw_exception),
-            )])
-            .map_err(|error| ContractLoweringError::InvalidFunctionBinding {
-                detail: error.to_string(),
-            })?;
+        // Success and ordinary refusals complete the original lowering scope.
+        // An originating control refusal must never trigger another callback.
+        self.work.finish()?;
+        if let Some(parameters) = result? {
             self.plan_builder = self.plan_builder.with_semantic_parameters(parameters);
         }
-        self.work.finish()?;
         Ok(LoweredSqlPhysicalDraft::from_lowering(
             self.plan_builder,
             self.call_sources,
@@ -9733,35 +9777,14 @@ impl<'a> ContractLoweringVisitor<'a> {
         value: &novarocks_constant_contract::ConstantValue,
         ty: &ValueType,
     ) -> Result<novarocks_physical_plan::ConstantReference, ContractLoweringError> {
-        self.work.flush()?;
-        if !ty.exactly_equals_observed(value.value_type(), || {
-            self.work.step().map_err(ContractLoweringError::from)
-        })? {
-            return Err(ContractLoweringError::InvalidLiteral {
-                kind: "checked constant",
-                detail: "constant source differs from its complete expression type".into(),
-            });
-        }
-        let source = value.pool().backing_identity();
-        self.work.step()?;
-        let pool = match self.constant_sources.get(&source) {
-            Some(id) => *id,
-            None => {
-                let next = self.next_constant_pool.ok_or(
-                    ContractLoweringError::IdentitySpaceExhausted("constant pool"),
-                )?;
-                let id = novarocks_physical_plan::ConstantPoolId::new(next);
-                self.plan_builder
-                    .insert_constant_pool(id, value.pool().clone())?;
-                self.constant_sources.insert(source, id);
-                self.next_constant_pool = next.checked_add(1);
-                id
-            }
-        };
-        Ok(novarocks_physical_plan::ConstantReference {
-            pool,
-            ordinal: value.ordinal(),
-        })
+        register_constant_source_observed(
+            &mut self.plan_builder,
+            &mut self.constant_sources,
+            &mut self.next_constant_pool,
+            value,
+            ty,
+            &mut self.work,
+        )
     }
 
     fn author_unpivot_collection(
@@ -11992,6 +12015,7 @@ fn metadata_relation_kind(
 
 #[derive(Debug)]
 pub(crate) enum ContractLoweringError {
+    CallRequests(novarocks_physical_plan::CallRequestError),
     Control(CompileControlError),
     AggregateSource(AggregateRequestCaptureError),
     LogicalCallSource(LogicalCallArgumentCaptureError),
@@ -12158,6 +12182,7 @@ pub(crate) enum ContractLoweringError {
 impl fmt::Display for ContractLoweringError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CallRequests(error) => error.fmt(formatter),
             Self::Control(error) => error.fmt(formatter),
             Self::AggregateSource(error) => error.fmt(formatter),
             Self::LogicalCallSource(error) => error.fmt(formatter),
@@ -12457,6 +12482,7 @@ impl From<BuildError> for ContractLoweringError {
 impl From<novarocks_physical_plan::PlanConstructionError> for ContractLoweringError {
     fn from(error: novarocks_physical_plan::PlanConstructionError) -> Self {
         match error {
+            novarocks_physical_plan::PlanConstructionError::Requests(error) => Self::from(error),
             novarocks_physical_plan::PlanConstructionError::Constants(error) => Self::from(error),
             novarocks_physical_plan::PlanConstructionError::Structure(error) => Self::from(error),
         }
@@ -17274,4 +17300,69 @@ mod logical_projection_tests {
         assert_eq!(parameter_types[1], projected);
         assert_eq!(result_type, variant);
     }
+}
+
+impl From<novarocks_physical_plan::CallRequestError> for ContractLoweringError {
+    fn from(error: novarocks_physical_plan::CallRequestError) -> Self {
+        match error {
+            novarocks_physical_plan::CallRequestError::Control(cause) => Self::Control(cause),
+            other => Self::CallRequests(other),
+        }
+    }
+}
+
+fn register_constant_source_observed(
+    plan_builder: &mut PlanBuilder,
+    sources: &mut BTreeMap<
+        novarocks_constant_contract::ConstantBackingIdentity,
+        novarocks_physical_plan::ConstantPoolId,
+    >,
+    next_pool: &mut Option<u32>,
+    value: &novarocks_constant_contract::ConstantValue,
+    ty: &ValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<novarocks_physical_plan::ConstantReference, ContractLoweringError> {
+    work.flush()?;
+    if !ty.exactly_equals_observed(value.value_type(), || {
+        work.step().map_err(ContractLoweringError::from)
+    })? {
+        return Err(ContractLoweringError::InvalidLiteral {
+            kind: "checked constant",
+            detail: "constant source differs from its complete expression type".into(),
+        });
+    }
+    let source = value.pool().backing_identity();
+    work.step()?;
+    let existing = sources.get(&source);
+    work.step()?;
+    let pool = match existing {
+        Some(id) => *id,
+        None => {
+            let next = (*next_pool).ok_or(ContractLoweringError::IdentitySpaceExhausted(
+                "constant pool",
+            ))?;
+            let id = novarocks_physical_plan::ConstantPoolId::new(next);
+            work.flush()?;
+            let pool = value.pool().clone();
+            work.step()?;
+            let inserted = plan_builder.insert_constant_pool(id, pool);
+            if let Err(novarocks_physical_plan::ConstantReferenceError::Control(cause)) = &inserted
+            {
+                return Err(ContractLoweringError::Control(*cause));
+            }
+            work.step()?;
+            work.flush()?;
+            inserted?;
+            work.flush()?;
+            sources.insert(source, id);
+            work.step()?;
+            work.flush()?;
+            *next_pool = next.checked_add(1);
+            id
+        }
+    };
+    Ok(novarocks_physical_plan::ConstantReference {
+        pool,
+        ordinal: value.ordinal(),
+    })
 }

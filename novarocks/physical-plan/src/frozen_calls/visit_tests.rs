@@ -66,6 +66,7 @@ fn with_nodes(fragment: &Fragment, nodes: BTreeMap<NodeId, PhysicalNode>) -> Fra
         sink: fragment.sink().clone(),
         dop_domain: fragment.dop_domain(),
         runtime_filters: fragment.runtime_filters().into(),
+        call_requests: fragment.call_requests().clone(),
     }
     .into()
 }
@@ -212,6 +213,7 @@ fn all_sites() -> (Fragment, PhysicalRootUses) {
         sink: base.fragment.sink().clone(),
         dop_domain: base.fragment.dop_domain(),
         runtime_filters: Box::default(),
+        call_requests: base.fragment.call_requests().clone(),
     }
     .into();
     let uses = leaf_roots(&fragment);

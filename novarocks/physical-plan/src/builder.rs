@@ -1033,6 +1033,7 @@ impl FragmentBuilder {
             // The author installs the exact ordered references before this
             // unpublished construction input reaches any validator.
             runtime_filters: Box::default(),
+            call_requests: crate::FragmentCallRequests::unpublished_empty(self.id),
         };
         (parts, self.runtime_filters)
     }
@@ -1177,10 +1178,30 @@ impl PlanBuilder {
     }
     pub fn finish(self) -> Result<PhysicalPlan, ValidationErrors> {
         if self.fragments.values().any(|fragment| {
-            fragment
-                .expressions()
-                .iter()
-                .any(|(_, node)| matches!(node.kind, crate::ExprKind::Constant(_)))
+            !fragment.call_requests().entries().is_empty()
+                || fragment.expressions().iter().any(|(_, node)| {
+                    matches!(
+                        node.kind,
+                        crate::ExprKind::FunctionCall { .. } | crate::ExprKind::WindowCall { .. }
+                    )
+                })
+                || fragment
+                    .expressions()
+                    .iter()
+                    .any(|(_, node)| matches!(node.kind, crate::ExprKind::Constant(_)))
+                || fragment.nodes().values().any(|node| match &node.kind {
+                    crate::NodeKind::Aggregate { calls, .. } => !calls.is_empty(),
+                    crate::NodeKind::TopN {
+                        reduction: crate::TopNReduction::GroupedStates { calls, .. },
+                        ..
+                    } => !calls.is_empty(),
+                    crate::NodeKind::TableWriter { target } => {
+                        !target.partial_aggregates.is_empty()
+                    }
+                    crate::NodeKind::TableFinish(finish) => !finish.final_aggregates.is_empty(),
+                    crate::NodeKind::TableFunction { .. } => true,
+                    _ => false,
+                })
                 || fragment.nodes().values().any(|node| {
                     let special = |constant: &crate::UnpivotConstant| {
                         crate::constants::collection_reference(constant).is_some()
@@ -1206,7 +1227,7 @@ impl PlanBuilder {
             let mut errors = crate::validation::ValidationContext::new();
             errors.push(crate::ValidationError::new(
                 "constants",
-                "constant references require caller-observed plan publication",
+                "checked constants and original call requests require caller-observed plan publication",
             ));
             return Err(crate::ValidationErrors::from_collector(errors));
         }
@@ -1505,8 +1526,19 @@ mod sparse_node_identity_tests {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PlanConstructionError {
+    Requests(crate::CallRequestError),
     Constants(crate::ConstantReferenceError),
     Structure(crate::ValidationErrors),
+}
+impl From<crate::CallRequestError> for PlanConstructionError {
+    fn from(error: crate::CallRequestError) -> Self {
+        match error {
+            crate::CallRequestError::Control(cause) => {
+                Self::Constants(crate::ConstantReferenceError::Control(cause))
+            }
+            other => Self::Requests(other),
+        }
+    }
 }
 impl From<crate::ConstantReferenceError> for PlanConstructionError {
     fn from(error: crate::ConstantReferenceError) -> Self {
@@ -1521,6 +1553,7 @@ impl From<crate::ValidationErrors> for PlanConstructionError {
 impl fmt::Display for PlanConstructionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Requests(error) => error.fmt(formatter),
             Self::Constants(error) => error.fmt(formatter),
             Self::Structure(error) => error.fmt(formatter),
         }
@@ -1534,6 +1567,12 @@ pub fn validate_plan_observed(
     plan: &PhysicalPlan,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<(), PlanConstructionError> {
+    for fragment in plan.fragments().values() {
+        fragment
+            .call_requests()
+            .validate_fragment(fragment, control)
+            .map_err(PlanConstructionError::from)?;
+    }
     crate::constants::validate_plan_constants_observed(plan, control)?;
     // Structural validation is still an opaque legacy traversal. Observe its
     // entry and ordinary/success completion with the original control without

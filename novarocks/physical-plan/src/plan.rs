@@ -1017,6 +1017,7 @@ pub struct Fragment {
     sink: FragmentSink,
     dop_domain: PipelineDopDomain,
     runtime_filters: Box<[RuntimeFilterId]>,
+    pub(crate) call_requests: crate::FragmentCallRequests,
 }
 
 impl Fragment {
@@ -1030,6 +1031,7 @@ impl Fragment {
             sink: self.sink,
             dop_domain: self.dop_domain,
             runtime_filters: self.runtime_filters,
+            call_requests: self.call_requests,
         }
     }
 
@@ -1059,6 +1061,10 @@ impl Fragment {
 
     pub const fn dop_domain(&self) -> PipelineDopDomain {
         self.dop_domain
+    }
+
+    pub const fn call_requests(&self) -> &crate::FragmentCallRequests {
+        &self.call_requests
     }
 
     pub fn runtime_filters(&self) -> &[RuntimeFilterId] {
@@ -1600,6 +1606,7 @@ pub(crate) struct FragmentParts {
     pub sink: FragmentSink,
     pub dop_domain: PipelineDopDomain,
     pub runtime_filters: Box<[RuntimeFilterId]>,
+    pub call_requests: crate::FragmentCallRequests,
 }
 
 impl From<FragmentParts> for Fragment {
@@ -1613,6 +1620,7 @@ impl From<FragmentParts> for Fragment {
             sink: parts.sink,
             dop_domain: parts.dop_domain,
             runtime_filters: parts.runtime_filters,
+            call_requests: parts.call_requests,
         }
     }
 }

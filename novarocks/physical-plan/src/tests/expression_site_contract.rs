@@ -92,6 +92,7 @@ fn fragment(kind: NodeKind) -> Fragment {
             requires_power_of_two: false,
         },
         runtime_filters: Box::default(),
+        call_requests: crate::FragmentCallRequests::unpublished_empty(FragmentId::new(19)),
     }
     .into()
 }
@@ -426,6 +427,7 @@ fn scan_derived_roots_cover_real_value_origins_and_exclude_provider_proofs() {
             sink: source.sink().clone(),
             dop_domain: source.dop_domain(),
             runtime_filters: source.runtime_filters().into(),
+            call_requests: source.call_requests().clone(),
         })
     };
     let scan = make(ValueOrigin::Expr {
@@ -552,6 +554,7 @@ fn operator_roots_cannot_escape_from_a_lambda_lexical_scope() {
         sink: source.sink().clone(),
         dop_domain: source.dop_domain(),
         runtime_filters: source.runtime_filters().into(),
+        call_requests: source.call_requests().clone(),
     });
     assert_eq!(
         PhysicalExpressionRoots::try_new(&fragment, &control()).unwrap_err(),
@@ -659,6 +662,7 @@ fn conjunct_fragment() -> Fragment {
         sink: source.sink().clone(),
         dop_domain: source.dop_domain(),
         runtime_filters: source.runtime_filters().into(),
+        call_requests: source.call_requests().clone(),
     })
 }
 fn conjunct_uses(
@@ -831,6 +835,7 @@ fn source_responsibility_rechecks_the_actual_fragment_field_and_boolean_type() {
             sink: source.sink().clone(),
             dop_domain: source.dop_domain(),
             runtime_filters: source.runtime_filters().into(),
+            call_requests: source.call_requests().clone(),
         })
     };
     let different_fragment = clone(
@@ -893,6 +898,7 @@ fn positive_conjunct_paths_do_not_cross_not_or_null_testing() {
             sink: source.sink().clone(),
             dop_domain: source.dop_domain(),
             runtime_filters: source.runtime_filters().into(),
+            call_requests: source.call_requests().clone(),
         });
         let domain = EvaluationDomainId::new(0);
         let invoke = |id, definition, demand, arguments| ExpressionInvocation {
@@ -972,6 +978,7 @@ fn positive_source_depth_matches_the_checked_invocation_depth_bound() {
         sink: source.sink().clone(),
         dop_domain: source.dop_domain(),
         runtime_filters: source.runtime_filters().into(),
+        call_requests: source.call_requests().clone(),
     });
     let domain = EvaluationDomainId::new(0);
     let invocations = (0..depth as u32)

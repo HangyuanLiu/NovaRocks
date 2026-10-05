@@ -97,6 +97,14 @@ impl FragmentPackage {
             control,
         )
         .map_err(property_error)?;
+        input
+            .fragment
+            .call_requests()
+            .validate_fragment(&input.fragment, control)
+            .map_err(|error| match error {
+                crate::CallRequestError::Control(cause) => FragmentPackageError::Control(cause),
+                other => FragmentPackageError::Requests(other),
+            })?;
         crate::constants::validate_fragment_constants_observed(
             &input.fragment,
             &input.constants,
@@ -347,6 +355,7 @@ fn call_error(error: FrozenCallError) -> FragmentPackageError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FragmentPackageError {
+    Requests(crate::CallRequestError),
     Control(CompileControlError),
     Constant(crate::ConstantReferenceError),
     Structure(ValidationErrors),
@@ -359,6 +368,7 @@ pub enum FragmentPackageError {
 impl fmt::Display for FragmentPackageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Requests(error) => error.fmt(f),
             Self::Control(error) => error.fmt(f),
             Self::Constant(error) => error.fmt(f),
             Self::Structure(error) => error.fmt(f),

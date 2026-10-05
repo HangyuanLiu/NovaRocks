@@ -150,6 +150,7 @@ fn snapshot(
         sink: source.sink().clone(),
         dop_domain: source.dop_domain(),
         runtime_filters: source.runtime_filters().into(),
+        call_requests: source.call_requests().clone(),
     })
 }
 

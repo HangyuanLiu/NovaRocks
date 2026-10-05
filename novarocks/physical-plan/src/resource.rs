@@ -625,6 +625,7 @@ fn fragment_usage(fragment: &Fragment, errors: &mut ValidationContext) -> Resour
         fragment.nodes().len(),
         fragment.runtime_filters().len(),
     ]);
+    add_call_request_table_usage(fragment.call_requests(), &mut usage, errors);
     for (id, value) in fragment.values() {
         if usage.exhausted() {
             return usage;
@@ -1937,3 +1938,190 @@ mod constant_resource_tests {
         }
     }
 }
+
+// Source and immutable request storage are counted separately. These public
+// structural ceilings are not allocator/MEM grants or a BTree node peak model.
+fn validate_call_request_type_with<E>(
+    ty: &ValueType,
+    path: &str,
+    usage: &mut ResourceUsage,
+    errors: &mut ValidationContext,
+    observe: &mut impl FnMut(bool) -> Result<(), E>,
+) -> Result<(), E> {
+    if usage.exhausted() {
+        return Ok(());
+    }
+    // This is the original bounded type author, including its own scratch.
+    // Bracketing it does not claim cooperation inside that opaque delegate.
+    observe(true)?;
+    validate_value_type(ty, path, usage, errors);
+    if usage.exhausted() {
+        return Ok(());
+    }
+    observe(false)?;
+    observe(true)
+}
+
+fn add_call_request_usage<E>(
+    request: &crate::PhysicalCallRequest,
+    usage: &mut ResourceUsage,
+    errors: &mut ValidationContext,
+    observe: &mut impl FnMut(bool) -> Result<(), E>,
+) -> Result<(), E> {
+    use novarocks_function_contract::FunctionArgument;
+    usage.add_items(request.arguments.len());
+    usage.add_bytes(request.arguments.len().saturating_mul(std::mem::size_of::<
+        FunctionArgument<crate::ConstantReference>,
+    >()));
+    for argument in &request.arguments {
+        if usage.exhausted() {
+            return Ok(());
+        }
+        observe(false)?;
+        match argument {
+            FunctionArgument::Value { value_type, .. } => {
+                validate_call_request_type_with(
+                    value_type,
+                    "requests.argument.type",
+                    usage,
+                    errors,
+                    observe,
+                )?;
+            }
+            FunctionArgument::Lambda {
+                parameter_types,
+                result_type,
+            } => {
+                usage.add_items(parameter_types.len());
+                usage.add_bytes(
+                    parameter_types
+                        .len()
+                        .saturating_mul(std::mem::size_of::<ValueType>()),
+                );
+                for ty in parameter_types {
+                    if usage.exhausted() {
+                        return Ok(());
+                    }
+                    observe(false)?;
+                    validate_call_request_type_with(
+                        ty,
+                        "requests.lambda.parameter",
+                        usage,
+                        errors,
+                        observe,
+                    )?;
+                }
+                validate_call_request_type_with(
+                    result_type,
+                    "requests.lambda.result",
+                    usage,
+                    errors,
+                    observe,
+                )?;
+            }
+        }
+    }
+    if let Some(ty) = &request.expected_result_type {
+        validate_call_request_type_with(ty, "requests.constraint.type", usage, errors, observe)?;
+    }
+    Ok(())
+}
+
+fn add_call_request_table_usage(
+    requests: &crate::FragmentCallRequests,
+    usage: &mut ResourceUsage,
+    errors: &mut ValidationContext,
+) {
+    let result = add_call_request_table_usage_with(requests, usage, errors, &mut |_| {
+        Ok::<(), std::convert::Infallible>(())
+    });
+    match result {
+        Ok(()) => {}
+        Err(never) => match never {},
+    }
+}
+
+fn add_call_request_table_usage_with<E>(
+    requests: &crate::FragmentCallRequests,
+    usage: &mut ResourceUsage,
+    errors: &mut ValidationContext,
+    observe: &mut impl FnMut(bool) -> Result<(), E>,
+) -> Result<(), E> {
+    usage.add_items(requests.entries().len());
+    usage.add_bytes(
+        requests
+            .entries()
+            .len()
+            .saturating_mul(std::mem::size_of::<(
+                crate::PhysicalCallDefinition,
+                crate::PhysicalCallRequest,
+            )>()),
+    );
+    for request in requests.entries().values() {
+        if usage.exhausted() {
+            return Ok(());
+        }
+        observe(false)?;
+        add_call_request_usage(request, usage, errors, observe)?;
+    }
+    Ok(())
+}
+pub(crate) fn validate_call_request_source_observed(
+    requests: &[(crate::PhysicalCallDefinition, crate::PhysicalCallRequest)],
+    capacity: usize,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), crate::CallRequestError> {
+    let mut errors = ValidationContext::new();
+    let mut usage = ResourceUsage::limited(MAX_FRAGMENT_DYNAMIC_ITEMS, MAX_FRAGMENT_DYNAMIC_BYTES);
+    usage.add_items(requests.len());
+    // The caller's original Vec capacity coexists with the destination table.
+    usage.add_bytes(
+        capacity
+            .saturating_add(requests.len())
+            .saturating_mul(std::mem::size_of::<(
+                crate::PhysicalCallDefinition,
+                crate::PhysicalCallRequest,
+            )>()),
+    );
+    for (_, request) in requests {
+        if usage.exhausted() {
+            break;
+        }
+        work.step()?;
+        add_call_request_usage(request, &mut usage, &mut errors, &mut |opaque| {
+            if opaque { work.flush() } else { work.step() }
+        })?;
+    }
+    if usage.exhausted() {
+        return Err(CompileControlError::ResourceExhausted.into());
+    }
+    if !errors.is_empty() {
+        return Err(crate::CallRequestError::Structure(
+            crate::ValidationErrors::from_collector(errors),
+        ));
+    }
+    Ok(())
+}
+pub(crate) fn validate_call_request_table_observed(
+    requests: &crate::FragmentCallRequests,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), crate::CallRequestError> {
+    let mut errors = ValidationContext::new();
+    let mut usage = ResourceUsage::limited(MAX_FRAGMENT_DYNAMIC_ITEMS, MAX_FRAGMENT_DYNAMIC_BYTES);
+    add_call_request_table_usage_with(requests, &mut usage, &mut errors, &mut |opaque| {
+        if opaque { work.flush() } else { work.step() }
+    })?;
+    if usage.exhausted() {
+        return Err(CompileControlError::ResourceExhausted.into());
+    }
+    if !errors.is_empty() {
+        return Err(crate::CallRequestError::Structure(
+            crate::ValidationErrors::from_collector(errors),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "resource/call_request_tests.rs"]
+mod call_request_tests;

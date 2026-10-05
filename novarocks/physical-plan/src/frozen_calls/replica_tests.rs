@@ -55,6 +55,7 @@ fn edit_fragment(fragment: &Fragment, edit: impl FnOnce(&mut FragmentParts)) -> 
         sink: fragment.sink().clone(),
         dop_domain: fragment.dop_domain(),
         runtime_filters: fragment.runtime_filters().into(),
+        call_requests: fragment.call_requests().clone(),
     };
     edit(&mut parts);
     Fragment::from(parts)

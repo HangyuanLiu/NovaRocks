@@ -199,37 +199,77 @@ impl ConstantPools {
         }
         Ok(projected)
     }
-    /// Preserve every actual pool address used by expressions or either
-    /// relational/writer-statistics Unpivot. Reference identity is sparse
+    /// Preserve every actual pool address used by expressions, original call
+    /// requests or either relational/writer-statistics Unpivot. Identity is sparse
     /// namespace identity, even when two keys loan the same checked backing.
     pub fn project_fragment_observed(
         &self,
         fragment: &crate::Fragment,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, ConstantReferenceError> {
-        let mut projected = self.project_optional_references_observed(
-            fragment
-                .expressions()
-                .iter()
-                .map(|(_, node)| match node.kind {
-                    crate::ExprKind::Constant(reference) => Some((reference, &node.ty)),
-                    _ => None,
-                }),
-            work,
-        )?;
+        let mut projected = Self::empty();
+        visit_typed_constant_references_observed(fragment, work, |reference, expected, work| {
+            let value = self.resolve_observed(reference, expected, work)?;
+            work.flush()?;
+            projected
+                .entries
+                .entry(reference.pool)
+                .or_insert_with(|| value.pool().clone());
+            work.step()?;
+            work.flush()?;
+            Ok(())
+        })?;
         visit_unpivot_constants_observed(fragment, work, |_, constant, _, work| {
             if let Some(reference) = collection_reference(constant) {
                 let value = self.resolve_source_observed(reference, work)?;
+                work.flush()?;
                 projected
                     .entries
                     .entry(reference.pool)
                     .or_insert_with(|| value.pool().clone());
                 work.step()?;
+                work.flush()?;
             }
             Ok(())
         })?;
         Ok(projected)
     }
+}
+
+/// Visit the actual typed expression and original request references. Every
+/// source definition, request and ordered argument is observed, including
+/// nonconstant values and Lambdas. Collection consumer policy remains in the
+/// original Unpivot visitor rather than becoming a second typed-reference DSL.
+/// The caller owns admission, entry and completion on this same meter.
+fn visit_typed_constant_references_observed(
+    fragment: &crate::Fragment,
+    work: &mut CompileCheckpoints<'_>,
+    mut visit: impl FnMut(
+        ConstantReference,
+        &FunctionValueType,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<(), ConstantReferenceError>,
+) -> Result<(), ConstantReferenceError> {
+    for (_, expression) in fragment.expressions().iter() {
+        work.step()?;
+        if let crate::ExprKind::Constant(reference) = expression.kind {
+            visit(reference, &expression.ty, work)?;
+        }
+    }
+    for request in fragment.call_requests().entries().values() {
+        work.step()?;
+        for argument in &request.arguments {
+            work.step()?;
+            if let novarocks_function_contract::FunctionArgument::Value {
+                value_type,
+                constant: Some(reference),
+            } = argument
+            {
+                visit(*reference, value_type, work)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -528,15 +568,20 @@ pub(crate) fn validate_fragment_constants_observed(
             }
         }
         let mut used = std::collections::BTreeSet::new();
-        for (_, expression) in fragment.expressions().iter() {
-            work.step()?;
-            if let crate::ExprKind::Constant(reference) = expression.kind {
-                pools.resolve_observed(reference, &expression.ty, &mut work)?;
+        visit_typed_constant_references_observed(
+            fragment,
+            &mut work,
+            |reference, expected, work| {
+                pools.resolve_observed(reference, expected, work)?;
                 if require_closed {
+                    work.flush()?;
                     used.insert(reference.pool);
+                    work.step()?;
+                    work.flush()?;
                 }
-            }
-        }
+                Ok(())
+            },
+        )?;
         for (_, expression) in fragment.expressions().iter() {
             work.step()?;
             if let crate::ExprKind::WindowCall {
@@ -723,12 +768,13 @@ pub(crate) fn validate_plan_constants_observed(
                 control,
             )?;
             work.flush()?;
-            for (_, expression) in fragment.expressions().iter() {
+            visit_typed_constant_references_observed(fragment, &mut work, |reference, _, work| {
+                work.flush()?;
+                used.insert(reference.pool);
                 work.step()?;
-                if let crate::ExprKind::Constant(reference) = expression.kind {
-                    used.insert(reference.pool);
-                }
-            }
+                work.flush()?;
+                Ok(())
+            })?;
             visit_unpivot_constants_observed(fragment, &mut work, |_, constant, _, work| {
                 if let Some(reference) = collection_reference(constant) {
                     used.insert(reference.pool);
@@ -752,5 +798,8 @@ pub(crate) fn validate_plan_constants_observed(
 #[cfg(test)]
 #[path = "constants/literal_factory_tests.rs"]
 mod literal_factory_tests;
+#[cfg(test)]
+#[path = "constants/request_reference_tests.rs"]
+mod request_reference_tests;
 #[cfg(test)]
 mod tests;

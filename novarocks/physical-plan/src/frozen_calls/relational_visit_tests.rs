@@ -242,6 +242,7 @@ fn relational_visitor_needs_no_expression_roots_for_zero_argument_occurrences() 
         sink: source.sink().clone(),
         dop_domain: source.dop_domain(),
         runtime_filters: Box::default(),
+        call_requests: source.call_requests().clone(),
     }
     .into();
     assert!(rootless.expressions().is_empty());

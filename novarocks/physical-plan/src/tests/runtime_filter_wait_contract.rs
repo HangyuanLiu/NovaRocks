@@ -714,6 +714,7 @@ fn replace_source_fragment(
         sink: source.sink().clone(),
         dop_domain: source.dop_domain(),
         runtime_filters: source.runtime_filters().to_vec().into_boxed_slice(),
+        call_requests: source.call_requests().clone(),
     };
     change(&mut parts);
     let mut fragments = plan.fragments().clone();

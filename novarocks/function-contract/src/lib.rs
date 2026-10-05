@@ -34,7 +34,7 @@ use std::fmt;
 /// NULL, selected ordinal, original Field and shared backing. A transport
 /// owner may instead carry a checked reference into its sole pool namespace.
 /// Lambdas cannot carry a scalar constant.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FunctionArgument<C = ConstantValue> {
     Value {
         value_type: FunctionValueType,

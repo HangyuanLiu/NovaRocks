@@ -4197,6 +4197,7 @@ dependencies = [
  "arrow-schema",
  "novarocks-connector-contract",
  "novarocks-constant-contract",
+ "novarocks-function-contract",
  "novarocks-type-contract",
 ]
 

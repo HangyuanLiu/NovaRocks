@@ -22,6 +22,7 @@
 //! provider implementation, runtime object, or I/O capability.
 
 mod builder;
+mod call_requests;
 mod constants;
 mod expression;
 mod expression_site;
@@ -37,6 +38,7 @@ mod resource;
 mod validation;
 
 pub use builder::*;
+pub use call_requests::*;
 pub use constants::*;
 pub use expression::*;
 pub use expression_site::*;
@@ -47,6 +49,7 @@ pub use novarocks_connector_contract::{ConnectorWriteRouteId, WriteTargetOrdinal
 pub use novarocks_constant_contract::{
     ConstantError, ConstantPolicy, ConstantPool, ConstantResourceFacts, ConstantValue,
 };
+pub use novarocks_function_contract::FunctionArgument as StaticFunctionArgument;
 pub use novarocks_type_contract::FunctionValueType as ValueType;
 pub use novarocks_type_contract::{
     AggregateStateFormatId, BucketLayoutAlgorithm, DecimalOverflowPolicy,

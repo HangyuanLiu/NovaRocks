@@ -561,6 +561,7 @@ fn package_rechecks_ordered_children_intrinsic_control_and_roots_with_reused_ids
             sink: original.sink().clone(),
             dop_domain: original.dop_domain(),
             runtime_filters: original.runtime_filters().into(),
+            call_requests: original.call_requests().clone(),
         });
         validate_fragment_definition(&changed).unwrap();
         assert_eq!(changed.id(), original.id());
@@ -676,6 +677,7 @@ fn package_control_checks_correspondence_without_claiming_literal_content_identi
         sink: original.sink().clone(),
         dop_domain: original.dop_domain(),
         runtime_filters: original.runtime_filters().into(),
+        call_requests: original.call_requests().clone(),
     });
     validate_fragment_definition(&changed).unwrap();
     let package = FragmentPackage::try_new(
@@ -730,6 +732,7 @@ fn package_preserves_actual_case_branch_guards_and_root_occurrences() {
         sink: original.sink().clone(),
         dop_domain: original.dop_domain(),
         runtime_filters: original.runtime_filters().into(),
+        call_requests: original.call_requests().clone(),
     });
     validate_fragment_definition(&fragment).unwrap();
     let domain = EvaluationDomainId::new(0);
@@ -1394,6 +1397,7 @@ fn duplicate_scan_payloads_keep_runtime_filter_assignment_occurrences() {
         sink: fragment.sink().clone(),
         dop_domain: fragment.dop_domain(),
         runtime_filters: fragment.runtime_filters().into(),
+        call_requests: fragment.call_requests().clone(),
     });
     let NodeKind::Scan {
         relation,
@@ -1509,6 +1513,122 @@ fn parameter_occurrences_fragment(reference: SemanticParameterRef, occurrences: 
     builder
         .finish_definition(node, FragmentSink::Noop, dop())
         .unwrap()
+        // The exact zero-argument fixture's own original request. No selected
+        // result or runtime occurrence is used to reconstruct this author.
+        .with_call_requests_observed(
+            vec![(
+                crate::PhysicalCallDefinition::Expression(expr),
+                crate::PhysicalCallRequest {
+                    arguments: Box::default(),
+                    logical_argument_count: 0,
+                    expected_result_type: None,
+                    constant_policy: crate::ConstantPolicy {
+                        max_rows: 16,
+                        max_array_nodes: 32,
+                        max_logical_elements: 128,
+                        max_retained_buffer_bytes: 64 * 1024,
+                        max_type_depth: 16,
+                        max_type_nodes: 128,
+                        max_dictionary_depth: 8,
+                        max_metadata_bytes: 4096,
+                        max_library_validation_work: 1_000_000,
+                        max_library_validation_bytes: 1024 * 1024,
+                    },
+                },
+            )],
+            &Control,
+        )
+        .unwrap()
+}
+
+#[test]
+fn package_and_observed_plan_require_original_static_requests_and_keep_first_control_cause() {
+    let source = parameter_fragment(SemanticParameterRef {
+        id: SemanticParameterId::new(7),
+        expected_key: SemanticParameterKey::TimeZone,
+    });
+    let definition = *source.call_requests().entries().keys().next().unwrap();
+    let mut parts = source.into_parts();
+    parts.call_requests = crate::FragmentCallRequests::unpublished_empty(parts.id);
+    let fragment = Fragment::from(parts);
+    let mut input = package_input(fragment.clone());
+    input.parameters = SemanticParameters::try_new([(
+        SemanticParameterId::new(7),
+        SemanticParameterValue::TimeZone("UTC".into()),
+    )])
+    .unwrap();
+    let expected = crate::CallRequestError::MissingDefinition(definition);
+    assert_eq!(
+        FragmentPackage::try_new(input.clone(), package_admission(), &Control).unwrap_err(),
+        FragmentPackageError::Requests(expected.clone())
+    );
+    let observed_plan = |control: &dyn PureCompileControl| {
+        let mut builder = PlanBuilder::new(version());
+        builder.add_fragment(fragment.clone()).unwrap();
+        builder.finish_observed(control)
+    };
+    assert_eq!(
+        observed_plan(&Control).unwrap_err(),
+        crate::PlanConstructionError::Requests(expected)
+    );
+    let mut builder = PlanBuilder::new(version());
+    builder.add_fragment(fragment.clone()).unwrap();
+    assert!(builder.finish().is_err());
+
+    #[derive(Default)]
+    struct Trace {
+        calls: std::sync::Mutex<Vec<(CompilePhase, u32)>>,
+        refusal: Option<(usize, CompileControlError)>,
+    }
+    impl PureCompileControl for Trace {
+        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            let mut calls = self.calls.lock().unwrap();
+            if let Some((at, _)) = self.refusal {
+                assert!(calls.len() < at, "callback after the originating refusal");
+            }
+            calls.push((phase, units));
+            match self.refusal {
+                Some((at, cause)) if calls.len() == at => Err(cause),
+                _ => Ok(()),
+            }
+        }
+    }
+    for package in [false, true] {
+        let run = |control: &dyn PureCompileControl| {
+            if package {
+                match FragmentPackage::try_new(input.clone(), package_admission(), control) {
+                    Err(FragmentPackageError::Control(cause)) => Some(cause),
+                    Err(FragmentPackageError::Requests(_)) => None,
+                    other => panic!("unexpected package verdict: {other:?}"),
+                }
+            } else {
+                match observed_plan(control) {
+                    Err(crate::PlanConstructionError::Constants(
+                        crate::ConstantReferenceError::Control(cause),
+                    )) => Some(cause),
+                    Err(crate::PlanConstructionError::Requests(_)) => None,
+                    other => panic!("unexpected plan verdict: {other:?}"),
+                }
+            }
+        };
+        let baseline = Trace::default();
+        assert_eq!(run(&baseline), None);
+        let calls = baseline.calls.into_inner().unwrap();
+        for at in 1..=calls.len() {
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let control = Trace {
+                    calls: Default::default(),
+                    refusal: Some((at, cause)),
+                };
+                assert_eq!(run(&control), Some(cause));
+                assert_eq!(*control.calls.lock().unwrap(), calls[..at]);
+            }
+        }
+    }
 }
 
 #[test]
@@ -1659,7 +1779,7 @@ fn package_preserves_same_key_different_lexical_references_for_shared_definition
     }
     let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment).unwrap();
-    let plan = builder.finish().unwrap();
+    let plan = builder.finish_observed(&Control).unwrap();
     let packages = extract_fragment_packages(
         &fixture_plan_parameters(&plan, input.parameters.clone()),
         &BTreeMap::new(),
@@ -1759,7 +1879,7 @@ fn frozen_call_environment_is_the_only_package_dependency_authority() {
 
     let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment).unwrap();
-    let plan = builder.finish().unwrap();
+    let plan = builder.finish_observed(&Control).unwrap();
     let snapshot = SemanticParameters::try_new([(
         active.id,
         SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
@@ -1816,7 +1936,7 @@ fn package_parameters_are_the_exact_call_dependency_closure() {
     let fragment = parameter_fragment(reference);
     let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment).unwrap();
-    let plan = builder.finish().unwrap();
+    let plan = builder.finish_observed(&Control).unwrap();
     let parameters = SemanticParameters::try_new([(
         reference.id,
         SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
@@ -2017,6 +2137,7 @@ fn writer_package_preserves_nested_dictionary_field_identity() {
         sink: original.sink().clone(),
         dop_domain: original.dop_domain(),
         runtime_filters: original.runtime_filters().into(),
+        call_requests: original.call_requests().clone(),
     });
     let mut input = package_input(fragment);
     input.cuts = fragment_cuts(&plan, original.id()).unwrap();
@@ -2098,7 +2219,7 @@ fn extraction_preserves_per_occurrence_decimal_policy_and_package_receipt_identi
     assert_ne!(checked.calls(), changed.calls());
     let mut builder = PlanBuilder::new(version());
     builder.add_fragment(fragment.clone()).unwrap();
-    let plan = builder.finish().unwrap();
+    let plan = builder.finish_observed(&Control).unwrap();
     let packages = extract_fragment_packages(
         &fixture_plan_parameters(&plan, parameters.clone()),
         &BTreeMap::new(),
@@ -2406,6 +2527,7 @@ fn intrinsic_operator_profiles_refuse_missing_extra_or_foreign_key_refs() {
             sink: input.fragment.sink().clone(),
             dop_domain: input.fragment.dop_domain(),
             runtime_filters: input.fragment.runtime_filters().into(),
+            call_requests: input.fragment.call_requests().clone(),
         });
         let errors = validate_fragment_definition(&fragment).unwrap_err();
         assert!(
