@@ -44,6 +44,7 @@ pub mod physical_control_v2;
 mod physical_encode;
 mod physical_expr;
 pub mod physical_expression_v2;
+pub(crate) mod physical_fragment_envelope_v2;
 pub mod physical_node_v2;
 pub mod physical_properties_v2;
 pub mod physical_provider_binding_v2;
