@@ -31,12 +31,20 @@ use std::{collections::BTreeMap, fmt, sync::Arc};
 
 mod decode;
 mod encode;
+mod graph;
+mod graph_domains;
+mod package_graph;
 mod root_sources;
 mod scalars;
 
 pub use root_sources::{
     PackageTypeRootSource, PackageTypeRootSourceFacts, PackageTypeRootSources, WriterTypeRootRole,
     prepare_package_type_root_sources,
+};
+
+pub use package_graph::{
+    PackageTypeGraphDefinition, PackageTypeGraphFacts, PackageTypeRootDomain,
+    PreparedPackageTypeGraph, prepare_package_type_graph,
 };
 
 #[derive(Debug)]
@@ -538,3 +546,9 @@ mod sources_tests;
 
 #[cfg(test)]
 mod node_tests;
+
+#[cfg(test)]
+mod graph_tests;
+
+#[cfg(test)]
+mod package_graph_tests;

@@ -37,110 +37,14 @@ use std::{
 };
 use wire::carrier_type_definition::Kind;
 
-type E = TypeCodecError;
+use super::graph::{Index, Node, add, required};
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum Node {
-    Carrier(u32),
-    Field(u32),
-}
+type E = TypeCodecError;
 
 #[derive(Clone, Copy, Default)]
 struct Summary {
     nodes: usize,
     depth: usize,
-}
-
-struct Index<'a> {
-    carriers: BTreeMap<u32, &'a wire::CarrierTypeDefinition>,
-    fields: BTreeMap<u32, &'a wire::FieldDefinition>,
-}
-
-fn required(id: Option<u32>) -> Result<u32, E> {
-    id.ok_or(E::InvalidShape("missing type table reference"))
-}
-
-fn add(total: &mut usize, amount: usize, limit: usize) -> Result<(), E> {
-    *total = total
-        .checked_add(amount)
-        .ok_or(E::InvalidShape("type projection count overflow"))?;
-    if *total > limit {
-        return Err(E::InvalidShape("type projection exceeds caller limit"));
-    }
-    Ok(())
-}
-
-impl Index<'_> {
-    fn carrier(&self, id: u32) -> Result<&wire::CarrierTypeDefinition, E> {
-        self.carriers
-            .get(&id)
-            .copied()
-            .ok_or(E::InvalidShape("dangling carrier type reference"))
-    }
-    fn field(&self, id: u32) -> Result<&wire::FieldDefinition, E> {
-        self.fields
-            .get(&id)
-            .copied()
-            .ok_or(E::InvalidShape("dangling field reference"))
-    }
-    fn kind(&self, id: u32) -> Result<&Kind, E> {
-        self.carrier(id)?
-            .kind
-            .as_ref()
-            .ok_or(E::InvalidShape("missing carrier kind"))
-    }
-    fn child_count(&self, node: Node) -> Result<usize, E> {
-        Ok(match node {
-            Node::Field(_) => 1,
-            Node::Carrier(id) => match self.kind(id)? {
-                Kind::ListFieldId(_)
-                | Kind::ListViewFieldId(_)
-                | Kind::FixedSizeList(_)
-                | Kind::LargeListFieldId(_)
-                | Kind::LargeListViewFieldId(_)
-                | Kind::Map(_) => 1,
-                Kind::StructType(fields) => fields.field_ids.len(),
-                Kind::UnionType(fields) => fields.fields.len(),
-                Kind::Dictionary(_) | Kind::RunEndEncoded(_) => 2,
-                _ => 0,
-            },
-        })
-    }
-    fn child(&self, node: Node, ordinal: usize) -> Result<Node, E> {
-        let child = match node {
-            Node::Field(id) => Node::Carrier(required(self.field(id)?.carrier_type_id)?),
-            Node::Carrier(id) => match self.kind(id)? {
-                Kind::ListFieldId(id)
-                | Kind::ListViewFieldId(id)
-                | Kind::LargeListFieldId(id)
-                | Kind::LargeListViewFieldId(id) => Node::Field(*id),
-                Kind::FixedSizeList(value) => Node::Field(required(value.item_field_id)?),
-                Kind::StructType(value) => Node::Field(value.field_ids[ordinal]),
-                Kind::UnionType(value) => Node::Field(required(value.fields[ordinal].field_id)?),
-                Kind::Dictionary(value) => Node::Carrier(required(if ordinal == 0 {
-                    value.key_type_id
-                } else {
-                    value.value_type_id
-                })?),
-                Kind::Map(value) => Node::Field(required(value.entries_field_id)?),
-                Kind::RunEndEncoded(value) => Node::Field(required(if ordinal == 0 {
-                    value.run_ends_field_id
-                } else {
-                    value.values_field_id
-                })?),
-                _ => return Err(E::InvalidShape("invalid carrier child ordinal")),
-            },
-        };
-        match child {
-            Node::Carrier(id) => {
-                self.carrier(id)?;
-            }
-            Node::Field(id) => {
-                self.field(id)?;
-            }
-        }
-        Ok(child)
-    }
 }
 
 fn preflight<'a>(
@@ -161,6 +65,7 @@ fn preflight<'a>(
         limits.max_definitions,
     )?;
     let mut index = Index {
+        table,
         carriers: BTreeMap::new(),
         fields: BTreeMap::new(),
     };
