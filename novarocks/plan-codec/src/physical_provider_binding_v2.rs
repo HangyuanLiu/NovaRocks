@@ -26,7 +26,7 @@ use crate::{
 };
 use novarocks_connector_contract::{
     CatalogHandle, CatalogVersion, ConnectorIdentityError, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorProviderId, ConnectorReadBinding,
+    ConnectorInstanceId, ConnectorProviderId, ConnectorReadBinding, ConnectorWriteBinding,
 };
 use novarocks_proto_models::{catalog, physical_package_v2 as wire};
 use novarocks_type_contract::{
@@ -123,13 +123,11 @@ fn bytes<T>(n: usize) -> Result<usize, Error> {
         .map_err(|_| invalid("provider binding allocation layout is unrepresentable"))
 }
 fn cap(n: usize, max: usize, work: &mut CompileCheckpoints<'_>) -> Result<(), Error> {
-    let valid = n <= max;
-    work.step()?;
-    if valid {
-        Ok(())
-    } else {
-        Err(invalid("provider binding projection envelope exceeded"))
+    if n > max {
+        return Err(CompileControlError::ResourceExhausted.into());
     }
+    work.step()?;
+    Ok(())
 }
 fn floor(source: usize, known: usize, work: &mut CompileCheckpoints<'_>) -> Result<(), Error> {
     let valid = source >= known;
@@ -186,13 +184,11 @@ impl Requests {
         Ok(())
     }
 }
-fn facts(
+fn numerical_facts(
     n: usize,
     input_bytes: usize,
-    requests: Requests,
+    requests: &Requests,
     source: usize,
-    limits: ProviderBindingProjectionLimits,
-    work: &mut CompileCheckpoints<'_>,
 ) -> Result<ProviderBindingProjectionFacts, Error> {
     let height = (usize::BITS - n.leading_zeros()) as usize;
     // Sole BindingIndex: <=4 completed operations per heap level, plus build,
@@ -217,16 +213,43 @@ fn facts(
         coexisting_source_and_request_bytes_upper_bound: add(source, requests.bytes)?,
         cumulative_work_upper_bound: bound,
     };
-    cap(requests.count, limits.max_allocation_requests, work)?;
-    cap(requests.bytes, limits.max_allocation_request_bytes, work)?;
-    cap(
-        facts.coexisting_source_and_request_bytes_upper_bound,
-        limits.max_coexisting_source_and_request_bytes,
-        work,
-    )?;
-    cap(bound, limits.max_work, work)?;
     Ok(facts)
 }
+// Refuse all facts already known at this point before a completed-operation
+// checkpoint can expose a later cause. This is the same numerical author used
+// by both legacy read sources and the joint namespace.
+fn admit_known(
+    facts: &ProviderBindingProjectionFacts,
+    limits: ProviderBindingProjectionLimits,
+) -> Result<(), Error> {
+    if facts.definition_count > limits.max_definitions
+        || facts.allocation_requests_upper_bound > limits.max_allocation_requests
+        || facts.allocation_request_bytes_upper_bound > limits.max_allocation_request_bytes
+        || facts.coexisting_source_and_request_bytes_upper_bound
+            > limits.max_coexisting_source_and_request_bytes
+        || facts.cumulative_work_upper_bound > limits.max_work
+    {
+        return Err(CompileControlError::ResourceExhausted.into());
+    }
+    Ok(())
+}
+fn facts(
+    n: usize,
+    input_bytes: usize,
+    requests: Requests,
+    source: usize,
+    limits: ProviderBindingProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ProviderBindingProjectionFacts, Error> {
+    let facts = numerical_facts(n, input_bytes, &requests, source)?;
+    admit_known(&facts, limits)?;
+    // Preserve the original successful observation sequence.
+    for _ in 0..4 {
+        work.step()?;
+    }
+    Ok(facts)
+}
+
 fn catalog<'a>(
     definition: &'a wire::ProviderBindingDefinition,
     work: &mut CompileCheckpoints<'_>,
@@ -239,8 +262,61 @@ fn provider_arc(n: usize) -> Result<usize, Error> {
     Ok(arc_str_bytes(n)?)
 }
 
+/// Actual immutable owners in the single package-wide ID namespace. A write
+/// source is never reconstructed from a read source with equal metadata.
+#[derive(Clone, Copy)]
+pub enum ProviderBindingSource<'source> {
+    Read(&'source ConnectorReadBinding),
+    Write(&'source ConnectorWriteBinding),
+}
+impl ProviderBindingSource<'_> {
+    fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        match self {
+            Self::Read(v) => v.descriptor(),
+            Self::Write(v) => v.descriptor(),
+        }
+    }
+    fn catalog_handle(&self) -> &CatalogHandle {
+        match self {
+            Self::Read(v) => v.catalog_handle(),
+            Self::Write(v) => v.catalog_handle(),
+        }
+    }
+    fn owner_bytes(&self) -> usize {
+        match self {
+            Self::Read(_) => size_of::<ConnectorReadBinding>(),
+            Self::Write(_) => size_of::<ConnectorWriteBinding>(),
+        }
+    }
+}
+#[derive(Clone, Copy)]
+enum BindingSources<'source> {
+    Read(&'source [(u32, &'source ConnectorReadBinding)]),
+    Joint(&'source [(u32, ProviderBindingSource<'source>)]),
+}
+impl<'source> BindingSources<'source> {
+    fn len(self) -> usize {
+        match self {
+            Self::Read(v) => v.len(),
+            Self::Joint(v) => v.len(),
+        }
+    }
+    fn at(self, at: usize) -> (u32, ProviderBindingSource<'source>) {
+        match self {
+            Self::Read(v) => (v[at].0, ProviderBindingSource::Read(v[at].1)),
+            Self::Joint(v) => v[at],
+        }
+    }
+    fn backing_bytes(self) -> Result<usize, Error> {
+        match self {
+            Self::Read(v) => bytes::<(u32, &ConnectorReadBinding)>(v.len()),
+            Self::Joint(v) => bytes::<(u32, ProviderBindingSource<'_>)>(v.len()),
+        }
+    }
+}
+
 pub struct EncodedProviderBindings<'source, 'control> {
-    inputs: &'source [(u32, &'source ConnectorReadBinding)],
+    inputs: BindingSources<'source>,
     wire: Vec<wire::ProviderBindingDefinition>,
     indices: BindingIndex,
     facts: ProviderBindingProjectionFacts,
@@ -275,8 +351,11 @@ impl<'source, 'control> EncodedProviderBindings<'source, 'control> {
     ) -> Result<Option<&'source ConnectorReadBinding>, Error> {
         Ok(self
             .indices
-            .find(id, |at| self.inputs[at].0, work)?
-            .map(|at| self.inputs[at].1))
+            .find(id, |at| self.inputs.at(at).0, work)?
+            .and_then(|at| match self.inputs.at(at).1 {
+                ProviderBindingSource::Read(v) => Some(v),
+                ProviderBindingSource::Write(_) => None,
+            }))
     }
     /// Resolve an exact source owner, not an equivalent reconstructed binding.
     pub fn source_id(&self, source: &ConnectorReadBinding) -> Result<u32, Error> {
@@ -290,14 +369,58 @@ impl<'source, 'control> EncodedProviderBindings<'source, 'control> {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<u32, Error> {
         let mut found = None;
-        for (id, binding) in self.inputs {
-            let same = std::ptr::eq(*binding, source);
+        for at in 0..self.inputs.len() {
+            let (id, binding) = self.inputs.at(at);
+            let same = matches!(binding, ProviderBindingSource::Read(v) if std::ptr::eq(v, source));
             work.step()?;
             if same {
                 if found.is_some() {
                     return Err(invalid("provider binding source association is ambiguous"));
                 }
-                found = Some(*id);
+                found = Some(id);
+            }
+        }
+        found.ok_or_else(|| invalid("provider binding source owner is not in this namespace"))
+    }
+    pub fn write_binding(&self, id: u32) -> Result<Option<&'source ConnectorWriteBinding>, Error> {
+        let mut work = CompileCheckpoints::try_new(self.original_control(), CompilePhase::Encode)?;
+        let result = self.write_binding_observed(id, &mut work);
+        finish(result, work)
+    }
+    pub(crate) fn write_binding_observed(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'source ConnectorWriteBinding>, Error> {
+        Ok(self
+            .indices
+            .find(id, |at| self.inputs.at(at).0, work)?
+            .and_then(|at| match self.inputs.at(at).1 {
+                ProviderBindingSource::Write(v) => Some(v),
+                ProviderBindingSource::Read(_) => None,
+            }))
+    }
+    pub fn write_source_id(&self, source: &ConnectorWriteBinding) -> Result<u32, Error> {
+        let mut work = CompileCheckpoints::try_new(self.original_control(), CompilePhase::Encode)?;
+        let result = self.write_source_id_observed(source, &mut work);
+        finish(result, work)
+    }
+    pub(crate) fn write_source_id_observed(
+        &self,
+        source: &ConnectorWriteBinding,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<u32, Error> {
+        let mut found = None;
+        for at in 0..self.inputs.len() {
+            let (id, binding) = self.inputs.at(at);
+            let same =
+                matches!(binding, ProviderBindingSource::Write(v) if std::ptr::eq(v, source));
+            work.step()?;
+            if same {
+                if found.is_some() {
+                    return Err(invalid("provider binding source association is ambiguous"));
+                }
+                found = Some(id);
             }
         }
         found.ok_or_else(|| invalid("provider binding source owner is not in this namespace"))
@@ -340,6 +463,7 @@ impl<'source, 'control> EncodedProviderBindings<'source, 'control> {
 pub struct DecodedProviderBindings<'wire, 'control> {
     wire: &'wire [wire::ProviderBindingDefinition],
     bindings: Vec<ConnectorReadBinding>,
+    write_bindings: Vec<ConnectorWriteBinding>,
     indices: BindingIndex,
     facts: ProviderBindingProjectionFacts,
     control: &'control dyn PureCompileControl,
@@ -373,6 +497,22 @@ impl<'wire, 'control> DecodedProviderBindings<'wire, 'control> {
             .find(id, |at| self.wire[at].id, work)?
             .map(|at| &self.bindings[at]))
     }
+    /// This is a neutral metadata view, not an installed write capability.
+    pub fn write_binding(&self, id: u32) -> Result<Option<&ConnectorWriteBinding>, Error> {
+        let mut work = CompileCheckpoints::try_new(self.original_control(), CompilePhase::Decode)?;
+        let result = self.write_binding_observed(id, &mut work);
+        finish(result, work)
+    }
+    pub(crate) fn write_binding_observed(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&ConnectorWriteBinding>, Error> {
+        Ok(self
+            .indices
+            .find(id, |at| self.wire[at].id, work)?
+            .and_then(|at| self.write_bindings.get(at)))
+    }
     pub fn retained_invoice_floor(&self) -> Result<usize, Error> {
         let mut work = CompileCheckpoints::try_new(self.original_control(), CompilePhase::Decode)?;
         let result = self.retained_floor_observed(&mut work);
@@ -387,6 +527,12 @@ impl<'wire, 'control> DecodedProviderBindings<'wire, 'control> {
         result = add(
             result,
             bytes::<ConnectorReadBinding>(self.bindings.capacity())?,
+        )?;
+        // Joint metadata views share the three immutable identity Arcs. Their
+        // separate vector backing remains live and is charged independently.
+        result = add(
+            result,
+            bytes::<ConnectorWriteBinding>(self.write_bindings.capacity())?,
         )?;
         work.step()?;
         for binding in &self.bindings {
@@ -417,25 +563,55 @@ pub fn encode_provider_bindings<'source, 'control>(
     control: &'control dyn PureCompileControl,
 ) -> Result<EncodedProviderBindings<'source, 'control>, Error> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
-    let result = encode_core(inputs, source_retained_bytes, limits, control, &mut work);
+    let result = encode_core(
+        BindingSources::Read(inputs),
+        source_retained_bytes,
+        limits,
+        control,
+        &mut work,
+    );
+    finish(result, work)
+}
+pub fn encode_joint_provider_bindings<'source, 'control>(
+    inputs: &'source [(u32, ProviderBindingSource<'source>)],
+    source_retained_bytes: usize,
+    limits: ProviderBindingProjectionLimits,
+    control: &'control dyn PureCompileControl,
+) -> Result<EncodedProviderBindings<'source, 'control>, Error> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
+    let result = encode_core(
+        BindingSources::Joint(inputs),
+        source_retained_bytes,
+        limits,
+        control,
+        &mut work,
+    );
     finish(result, work)
 }
 fn encode_core<'source, 'control>(
-    inputs: &'source [(u32, &'source ConnectorReadBinding)],
+    inputs: BindingSources<'source>,
     source: usize,
     limits: ProviderBindingProjectionLimits,
     control: &'control dyn PureCompileControl,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<EncodedProviderBindings<'source, 'control>, Error> {
-    cap(inputs.len(), limits.max_definitions, work)?;
-    let roots = bytes::<(u32, &ConnectorReadBinding)>(inputs.len())?;
-    floor(source, roots, work)?;
+    if inputs.len() > limits.max_definitions {
+        return Err(CompileControlError::ResourceExhausted.into());
+    }
+    let roots = inputs.backing_bytes()?;
     let mut requests = Requests::default();
     requests.record(bytes::<usize>(inputs.len())?)?;
     requests.record(bytes::<wire::ProviderBindingDefinition>(inputs.len())?)?;
+    admit_known(
+        &numerical_facts(inputs.len(), 0, &requests, source)?,
+        limits,
+    )?;
+    cap(inputs.len(), limits.max_definitions, work)?;
+    floor(source, roots, work)?;
     let mut input_bytes = 0;
     let mut individual = 0;
-    for (_, binding) in inputs {
+    for at in 0..inputs.len() {
+        let (_, binding) = inputs.at(at);
         let provider = binding.descriptor().provider_id.as_str().len();
         let instance = binding.descriptor().instance_id.as_str().len();
         let catalog = binding.catalog_handle().catalog_name().as_str().len();
@@ -444,7 +620,7 @@ fn encode_core<'source, 'control>(
         // their sum would reject an exactly invoiced lawful source. Max is a
         // safe floor whether those immutable owners alias or are independent.
         individual = individual.max(add(
-            size_of::<ConnectorReadBinding>(),
+            binding.owner_bytes(),
             add(
                 provider_arc(provider)?,
                 provider_arc(instance)?.max(provider_arc(catalog)?),
@@ -453,15 +629,20 @@ fn encode_core<'source, 'control>(
         for n in [provider, instance, catalog, 32] {
             requests.record(bytes::<u8>(n)?)?;
         }
+        admit_known(
+            &numerical_facts(inputs.len(), input_bytes, &requests, source)?,
+            limits,
+        )?;
         work.step()?;
     }
     floor(source, add(roots, individual)?, work)?;
     let facts = facts(inputs.len(), input_bytes, requests, source, limits, work)?;
-    let indices = BindingIndex::prepare(inputs.len(), |at| inputs[at].0, work)?;
+    let indices = BindingIndex::prepare(inputs.len(), |at| inputs.at(at).0, work)?;
     let mut output = reserve(inputs.len(), work)?;
-    for (id, binding) in inputs {
+    for at in 0..inputs.len() {
+        let (id, binding) = inputs.at(at);
         output.push(wire::ProviderBindingDefinition {
-            id: *id,
+            id,
             provider_id: string(binding.descriptor().provider_id.as_str(), work)?,
             instance_id: string(binding.descriptor().instance_id.as_str(), work)?,
             catalog: Some(catalog::CatalogHandle {
@@ -492,6 +673,24 @@ pub fn decode_provider_bindings<'wire, 'control>(
         source_retained_bytes,
         limits,
         control,
+        false,
+        &mut work,
+    );
+    finish(result, work)
+}
+pub fn decode_joint_provider_bindings<'wire, 'control>(
+    definitions: &'wire [wire::ProviderBindingDefinition],
+    source_retained_bytes: usize,
+    limits: ProviderBindingProjectionLimits,
+    control: &'control dyn PureCompileControl,
+) -> Result<DecodedProviderBindings<'wire, 'control>, Error> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+    let result = decode_core(
+        definitions,
+        source_retained_bytes,
+        limits,
+        control,
+        true,
         &mut work,
     );
     finish(result, work)
@@ -501,25 +700,39 @@ fn decode_core<'wire, 'control>(
     source: usize,
     limits: ProviderBindingProjectionLimits,
     control: &'control dyn PureCompileControl,
+    joint: bool,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedProviderBindings<'wire, 'control>, Error> {
-    cap(definitions.len(), limits.max_definitions, work)?;
+    if definitions.len() > limits.max_definitions {
+        return Err(CompileControlError::ResourceExhausted.into());
+    }
     let roots = bytes::<wire::ProviderBindingDefinition>(definitions.len())?;
-    floor(source, roots, work)?;
     let mut known = roots;
     let mut requests = Requests::default();
     requests.record(bytes::<usize>(definitions.len())?)?;
     requests.record(bytes::<ConnectorReadBinding>(definitions.len())?)?;
+    if joint {
+        requests.record(bytes::<ConnectorWriteBinding>(definitions.len())?)?;
+    }
+    admit_known(
+        &numerical_facts(definitions.len(), 0, &requests, source)?,
+        limits,
+    )?;
+    cap(definitions.len(), limits.max_definitions, work)?;
+    floor(source, roots, work)?;
     let mut input_bytes = 0;
     for definition in definitions {
-        let catalog = catalog(definition, work)?;
-        let version = catalog.version.len() == 32;
-        work.step()?;
-        if !version {
-            return Err(invalid(
-                "provider binding catalog version is not exactly 32 bytes",
-            ));
-        }
+        let catalog = definition
+            .catalog
+            .as_ref()
+            .ok_or_else(|| invalid("provider binding catalog is absent"));
+        let catalog = match catalog {
+            Ok(v) => v,
+            Err(e) => {
+                work.step()?;
+                return Err(e);
+            }
+        };
         input_bytes = add(
             input_bytes,
             add(
@@ -544,6 +757,18 @@ fn decode_core<'wire, 'control>(
         ] {
             requests.record(provider_arc(n)?)?;
         }
+        admit_known(
+            &numerical_facts(definitions.len(), input_bytes, &requests, source)?,
+            limits,
+        )?;
+        work.step()?; // Original catalog-presence observation.
+        let version = catalog.version.len() == 32;
+        work.step()?;
+        if !version {
+            return Err(invalid(
+                "provider binding catalog version is not exactly 32 bytes",
+            ));
+        }
         work.step()?;
     }
     floor(source, known, work)?;
@@ -557,6 +782,11 @@ fn decode_core<'wire, 'control>(
     )?;
     let indices = BindingIndex::prepare(definitions.len(), |at| definitions[at].id, work)?;
     let mut output = reserve(definitions.len(), work)?;
+    let mut write_output = if joint {
+        reserve(definitions.len(), work)?
+    } else {
+        Vec::new()
+    };
     for definition in definitions {
         let catalog = catalog(definition, work)?;
         work.flush()?;
@@ -575,18 +805,27 @@ fn decode_core<'wire, 'control>(
             CatalogVersion::from_bytes(catalog.version.as_slice().try_into().map_err(|_| {
                 invalid("provider binding catalog version is not exactly 32 bytes")
             })?);
-        output.push(ConnectorReadBinding::new(
-            ConnectorInstanceDescriptor {
-                provider_id,
-                instance_id,
-            },
-            CatalogHandle::new(catalog_name, version),
-        ));
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id,
+            instance_id,
+        };
+        let handle = CatalogHandle::new(catalog_name, version);
+        if joint {
+            // Cloning these metadata carriers increments the same three Arcs;
+            // it does not parse, allocate identity backing or grant capability.
+            write_output.push(ConnectorWriteBinding::new(
+                descriptor.clone(),
+                handle.clone(),
+            ));
+            work.step()?;
+        }
+        output.push(ConnectorReadBinding::new(descriptor, handle));
         work.step()?;
     }
     Ok(DecodedProviderBindings {
         wire: definitions,
         bindings: output,
+        write_bindings: write_output,
         indices,
         facts,
         control,
@@ -596,3 +835,6 @@ fn decode_core<'wire, 'control>(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod joint_tests;

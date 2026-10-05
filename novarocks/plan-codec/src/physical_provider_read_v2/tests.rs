@@ -619,3 +619,75 @@ fn provider_read_namespace_real_wide_original_quantum_and_lookup_tail_keep_exact
         assert_eq!(trace(&ctrl), positive[..=at]);
     }
 }
+
+#[test]
+fn provider_read_namespace_consumes_joint_read_write_ids_without_rebinding_read_sources() {
+    use crate::physical_provider_binding_v2::{
+        ProviderBindingSource, decode_joint_provider_bindings, encode_joint_provider_bindings,
+    };
+    use novarocks_connector_contract::ConnectorWriteBinding;
+
+    for (at, kind) in KINDS.into_iter().enumerate() {
+        let source = read(kind);
+        let write = ConnectorWriteBinding::new(
+            source.binding.descriptor().clone(),
+            source.binding.catalog_handle().clone(),
+        );
+        let control = Control::default();
+        let mixed = [
+            (0, ProviderBindingSource::Write(&write)),
+            (u32::MAX, ProviderBindingSource::Read(&source.binding)),
+        ];
+        let payload_inputs = [
+            (0, source.relation.table()),
+            (u32::MAX, source.relation.view()),
+        ];
+        let bindings =
+            encode_joint_provider_bindings(&mixed, PRIOR_SOURCE, binding_limits(), &control)
+                .unwrap();
+        let payloads =
+            encode_connector_payloads(&payload_inputs, PRIOR_SOURCE, payload_limits(), &control)
+                .unwrap();
+        let inputs = [(0, &source)];
+        let projected =
+            encode_provider_reads(&inputs, &bindings, &payloads, SOURCE, limits()).unwrap();
+        let raw = [expected(0, at as i32 + 1)];
+        assert_eq!(projected.as_wire(), raw);
+        assert!(std::ptr::eq(projected.bindings(), &bindings));
+        assert!(std::ptr::eq(
+            bindings.write_binding(0).unwrap().unwrap(),
+            &write
+        ));
+        assert!(bindings.binding(0).unwrap().is_none());
+
+        let received_bindings = decode_joint_provider_bindings(
+            bindings.as_wire(),
+            PRIOR_SOURCE,
+            binding_limits(),
+            &control,
+        )
+        .unwrap();
+        let received_payloads =
+            decode_connector_payloads(payloads.as_wire(), PRIOR_SOURCE, payload_limits(), &control)
+                .unwrap();
+        let received = decode_provider_reads(
+            &raw,
+            &received_bindings,
+            &received_payloads,
+            SOURCE,
+            limits(),
+        )
+        .unwrap();
+        assert_eq!(received.read(0).unwrap(), Some(&source));
+        assert!(std::ptr::eq(received.bindings(), &received_bindings));
+        // Equal neutral metadata at a write source is not the original read
+        // source loan. The encoder cannot select it as a convenient fallback.
+        let only_write = [(u32::MAX, ProviderBindingSource::Write(&write))];
+        let foreign_role =
+            encode_joint_provider_bindings(&only_write, PRIOR_SOURCE, binding_limits(), &control)
+                .unwrap();
+        assert!(
+            encode_provider_reads(&inputs, &foreign_role, &payloads, SOURCE, limits(),).is_err()
+        );
+    }
+}
