@@ -126,11 +126,14 @@ fn function(kind: FunctionKind) -> BoundFunction {
         kind,
         argument_types: Box::from([FunctionArgumentType::Value(int())]),
         result_type: int(),
-        volatility: FunctionVolatility::Immutable,
-        argument_evaluation: FunctionArgumentEvaluation::Eager,
-        failure_behavior: FunctionFailureBehavior::Propagate,
-        intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
-        semantic_parameters: Box::new([]),
+
+        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+            volatility: FunctionVolatility::Immutable,
+            argument_evaluation: FunctionArgumentEvaluation::Eager,
+            failure_behavior: FunctionFailureBehavior::Propagate,
+            intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
+            semantic_parameters: Box::new([]),
+        }),
     }
 }
 fn aggregate(function: &BoundFunction) -> AggregateBinding {

@@ -84,11 +84,14 @@ fn scalar(
         kind,
         argument_types: arguments.into_boxed_slice(),
         result_type: result,
-        volatility: FunctionVolatility::Immutable,
-        argument_evaluation: FunctionArgumentEvaluation::Eager,
-        failure_behavior: FunctionFailureBehavior::Propagate,
-        intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
-        semantic_parameters: Box::new([]),
+
+        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+            volatility: FunctionVolatility::Immutable,
+            argument_evaluation: FunctionArgumentEvaluation::Eager,
+            failure_behavior: FunctionFailureBehavior::Propagate,
+            intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
+            semantic_parameters: Box::new([]),
+        }),
     }
 }
 fn table(
@@ -100,11 +103,14 @@ fn table(
         overload: FunctionOverloadId::try_new("builtin/table-signature/exact-v1").unwrap(),
         argument_types: arguments.into_boxed_slice(),
         result_types: results.into_boxed_slice(),
-        volatility: FunctionVolatility::Immutable,
-        argument_evaluation: FunctionArgumentEvaluation::Eager,
-        failure_behavior: FunctionFailureBehavior::Propagate,
-        intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
-        semantic_parameters: Box::new([]),
+
+        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+            volatility: FunctionVolatility::Immutable,
+            argument_evaluation: FunctionArgumentEvaluation::Eager,
+            failure_behavior: FunctionFailureBehavior::Propagate,
+            intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
+            semantic_parameters: Box::new([]),
+        }),
     }
 }
 fn check_prefix<T>(call: impl Fn(&Control) -> Result<T, BindingCodecError>, success: bool) {
@@ -470,11 +476,14 @@ fn signature_comparison_ignores_five_legacy_fields_but_keeps_full_ordered_contra
         int.clone(),
     );
     let mut legacy = source.clone();
-    legacy.volatility = FunctionVolatility::Volatile;
-    legacy.argument_evaluation = FunctionArgumentEvaluation::ShortCircuit;
-    legacy.failure_behavior = FunctionFailureBehavior::ReturnsNull;
-    legacy.intrinsic_row_error = FunctionIntrinsicRowError::MayRaise;
-    legacy.semantic_parameters = vec![SemanticParameterRef {
+    legacy.legacy_metadata.as_mut().unwrap().volatility = FunctionVolatility::Volatile;
+    legacy.legacy_metadata.as_mut().unwrap().argument_evaluation =
+        FunctionArgumentEvaluation::ShortCircuit;
+    legacy.legacy_metadata.as_mut().unwrap().failure_behavior =
+        FunctionFailureBehavior::ReturnsNull;
+    legacy.legacy_metadata.as_mut().unwrap().intrinsic_row_error =
+        FunctionIntrinsicRowError::MayRaise;
+    legacy.legacy_metadata.as_mut().unwrap().semantic_parameters = vec![SemanticParameterRef {
         id: SemanticParameterId::new(u32::MAX),
         expected_key: SemanticParameterKey::TimeZone,
     }]

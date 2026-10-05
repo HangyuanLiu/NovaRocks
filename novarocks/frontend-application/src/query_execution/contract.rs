@@ -610,6 +610,9 @@ impl DistributedQueryError {
             novarocks_plan_codec::PhysicalEncodeError::Invalid(error) => {
                 Self::new(DistributedQueryErrorKind::ContractViolation, error)
             }
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(message) => {
+                Self::new(DistributedQueryErrorKind::ContractViolation, message)
+            }
         }
     }
     fn from_compile_control(error: novarocks_type_contract::CompileControlError) -> Self {

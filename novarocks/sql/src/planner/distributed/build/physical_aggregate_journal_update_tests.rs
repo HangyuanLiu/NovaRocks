@@ -469,10 +469,34 @@ fn journal_update_shared_signature_comparison_rejects_full_type_drift_and_ignore
     // This directly tests the private correspondence helper, not a fabricated
     // journal token or source certification of an altered physical call.
     let mut changed = entry.source().clone();
-    changed.binding.function.volatility = FunctionVolatility::Volatile;
-    changed.binding.function.argument_evaluation = FunctionArgumentEvaluation::ShortCircuit;
-    changed.binding.function.failure_behavior = FunctionFailureBehavior::ReturnsNull;
-    changed.binding.function.intrinsic_row_error = FunctionIntrinsicRowError::MayRaise;
+    changed
+        .binding
+        .function
+        .legacy_metadata
+        .as_mut()
+        .expect("actual legacy fixture")
+        .volatility = FunctionVolatility::Volatile;
+    changed
+        .binding
+        .function
+        .legacy_metadata
+        .as_mut()
+        .expect("actual legacy fixture")
+        .argument_evaluation = FunctionArgumentEvaluation::ShortCircuit;
+    changed
+        .binding
+        .function
+        .legacy_metadata
+        .as_mut()
+        .expect("actual legacy fixture")
+        .failure_behavior = FunctionFailureBehavior::ReturnsNull;
+    changed
+        .binding
+        .function
+        .legacy_metadata
+        .as_mut()
+        .expect("actual legacy fixture")
+        .intrinsic_row_error = FunctionIntrinsicRowError::MayRaise;
     let control = Control::default();
     let mut work =
         CompileCheckpoints::try_new(&control, CompilePhase::FunctionSpecialization).unwrap();

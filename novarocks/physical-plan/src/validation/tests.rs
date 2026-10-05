@@ -542,7 +542,14 @@ mod validation_error_tests {
             state_argument_contract:
                 novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
             function: crate::BoundFunction {
-                semantic_parameters: Box::default(),
+                legacy_metadata: Some(crate::LegacyBindingMetadata {
+                    semantic_parameters: Box::default(),
+                    volatility: crate::FunctionVolatility::Immutable,
+                    argument_evaluation: crate::FunctionArgumentEvaluation::Eager,
+                    failure_behavior: crate::FunctionFailureBehavior::Propagate,
+                    intrinsic_row_error:
+                        novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
+                }),
                 function_id: crate::FunctionId::try_new("builtin/test_sum/v1").unwrap(),
                 overload: crate::FunctionOverloadId::try_new("i64").unwrap(),
                 kind: crate::FunctionKind::Aggregate,
@@ -551,11 +558,6 @@ mod validation_error_tests {
                     false,
                 ))]),
                 result_type: ValueType::new(DataType::Int64, false),
-                volatility: crate::FunctionVolatility::Immutable,
-                argument_evaluation: crate::FunctionArgumentEvaluation::Eager,
-                failure_behavior: crate::FunctionFailureBehavior::Propagate,
-                intrinsic_row_error:
-                    novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
             },
             phase: AggregatePhase::Partial { sequence },
             logical_argument_count: 1,

@@ -66,11 +66,13 @@ fn function(volatility: FunctionVolatility) -> BoundFunction {
         kind: FunctionKind::Scalar,
         argument_types: Box::default(),
         result_type: ty(DataType::Boolean, false),
-        volatility,
-        argument_evaluation: FunctionArgumentEvaluation::Eager,
-        failure_behavior: FunctionFailureBehavior::Propagate,
-        intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
-        semantic_parameters: Box::default(),
+        legacy_metadata: Some(crate::LegacyBindingMetadata {
+            volatility,
+            argument_evaluation: FunctionArgumentEvaluation::Eager,
+            failure_behavior: FunctionFailureBehavior::Propagate,
+            intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
+            semantic_parameters: Box::default(),
+        }),
     }
 }
 
@@ -167,7 +169,7 @@ fn fixture_uses_and_calls(fragment: &Fragment) -> (PhysicalRootUses, FrozenFragm
                 site: PhysicalCallSite::Expression(*id),
                 context: invocation.context,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                effects: occurrence_effects(function.volatility),
+                effects: occurrence_effects(function.legacy_metadata.as_ref().unwrap().volatility),
             })
         })
         .collect();

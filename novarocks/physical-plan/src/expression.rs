@@ -37,15 +37,9 @@ pub struct ExprUse {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct BoundFunction {
-    pub function_id: FunctionId,
-    pub overload: FunctionOverloadId,
-    pub kind: FunctionKind,
-    pub argument_types: Box<[FunctionArgumentType]>,
-    pub result_type: ValueType,
-    /// Legacy binding metadata retained for producer migration. The new pure
-    /// path uses complete occurrence facts and recomputes the exact owner base;
-    /// it never refines, prepares or builds a parameter closure from these bits.
+pub struct LegacyBindingMetadata {
+    /// Original producer metadata for the remaining legacy publication path.
+    /// This is not an occurrence effect declaration or an environment proof.
     pub volatility: FunctionVolatility,
     pub argument_evaluation: FunctionArgumentEvaluation,
     pub failure_behavior: FunctionFailureBehavior,
@@ -55,7 +49,56 @@ pub struct BoundFunction {
     pub semantic_parameters: Box<[novarocks_type_contract::SemanticParameterRef]>,
 }
 
+/// Missing legacy provenance cannot be filled from a selected signature.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MissingLegacyBindingMetadata;
+impl fmt::Display for MissingLegacyBindingMetadata {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("exact signature has no legacy binding metadata")
+    }
+}
+impl std::error::Error for MissingLegacyBindingMetadata {}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundFunction {
+    pub function_id: FunctionId,
+    pub overload: FunctionOverloadId,
+    pub kind: FunctionKind,
+    pub argument_types: Box<[FunctionArgumentType]>,
+    pub result_type: ValueType,
+    /// Explicit migration provenance. V2 never manufactures this metadata;
+    /// its occurrence effects and environment belong to FrozenFragmentCalls.
+    pub legacy_metadata: Option<LegacyBindingMetadata>,
+}
+
 impl BoundFunction {
+    /// Materialize only the exact signature. This does not certify an installed
+    /// implementation, original request, effects or an executable occurrence.
+    pub fn from_exact_signature(
+        function_id: FunctionId,
+        overload: FunctionOverloadId,
+        kind: FunctionKind,
+        argument_types: Box<[FunctionArgumentType]>,
+        result_type: ValueType,
+    ) -> Self {
+        Self {
+            function_id,
+            overload,
+            kind,
+            argument_types,
+            result_type,
+            legacy_metadata: None,
+        }
+    }
+
+    pub fn require_legacy_metadata(
+        &self,
+    ) -> Result<&LegacyBindingMetadata, MissingLegacyBindingMetadata> {
+        self.legacy_metadata
+            .as_ref()
+            .ok_or(MissingLegacyBindingMetadata)
+    }
+
     /// Structural correspondence of the selected signature. Occurrence
     /// effects and environments are independent and require their own proof.
     pub(crate) fn signature_matches(&self, other: &Self) -> bool {
@@ -76,14 +119,34 @@ pub struct BoundTableFunction {
     pub overload: FunctionOverloadId,
     pub argument_types: Box<[FunctionArgumentType]>,
     pub result_types: Box<[ValueType]>,
-    /// Legacy producer metadata, not complete occurrence effect claims.
-    pub volatility: FunctionVolatility,
-    pub argument_evaluation: FunctionArgumentEvaluation,
-    pub failure_behavior: FunctionFailureBehavior,
-    pub intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError,
-    /// Legacy producer/v1 projection; the new pure path uses only the mandatory
-    /// call table's complete environment and frozen SemanticParameters values.
-    pub semantic_parameters: Box<[novarocks_type_contract::SemanticParameterRef]>,
+    /// Original legacy producer provenance, absent on a V2 exact signature.
+    pub legacy_metadata: Option<LegacyBindingMetadata>,
+}
+impl BoundTableFunction {
+    /// Relation signature only; pass-through columns and actual occurrence
+    /// effects are separate facts, never inferred from these result types.
+    pub fn from_exact_signature(
+        function_id: FunctionId,
+        overload: FunctionOverloadId,
+        argument_types: Box<[FunctionArgumentType]>,
+        result_types: Box<[ValueType]>,
+    ) -> Self {
+        Self {
+            function_id,
+            overload,
+            argument_types,
+            result_types,
+            legacy_metadata: None,
+        }
+    }
+
+    pub fn require_legacy_metadata(
+        &self,
+    ) -> Result<&LegacyBindingMetadata, MissingLegacyBindingMetadata> {
+        self.legacy_metadata
+            .as_ref()
+            .ok_or(MissingLegacyBindingMetadata)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -657,7 +720,7 @@ pub fn expressions_are_replica_deterministic(
     arena: &ExprArena,
     expressions: impl IntoIterator<Item = ExprId>,
     allow_values: bool,
-) -> bool {
+) -> Result<bool, MissingLegacyBindingMetadata> {
     check_definition_properties(arena, expressions, allow_values, true)
 }
 
@@ -668,7 +731,11 @@ pub(crate) fn expressions_have_closed_value_scope(
     arena: &ExprArena,
     expressions: impl IntoIterator<Item = ExprId>,
 ) -> bool {
-    check_definition_properties(arena, expressions, false, false)
+    // This branch never reads legacy provenance or certifies effects.
+    matches!(
+        check_definition_properties(arena, expressions, false, false),
+        Ok(true)
+    )
 }
 
 fn check_definition_properties(
@@ -676,7 +743,7 @@ fn check_definition_properties(
     expressions: impl IntoIterator<Item = ExprId>,
     allow_values: bool,
     check_legacy_stability: bool,
-) -> bool {
+) -> Result<bool, MissingLegacyBindingMetadata> {
     let mut pending = expressions.into_iter().collect::<Vec<_>>();
     let mut visited = BTreeSet::new();
     while let Some(expression) = pending.pop() {
@@ -684,12 +751,14 @@ fn check_definition_properties(
             continue;
         }
         let Some(expression) = arena.get(expression) else {
-            return false;
+            return Ok(false);
         };
         let immutable = match &expression.kind {
             ExprKind::Value(_) => allow_values,
             ExprKind::FunctionCall { function, .. } | ExprKind::WindowCall { function, .. } => {
-                !check_legacy_stability || function.volatility == FunctionVolatility::Immutable
+                !check_legacy_stability
+                    || function.require_legacy_metadata()?.volatility
+                        == FunctionVolatility::Immutable
             }
             ExprKind::Literal(_)
             | ExprKind::Constant(_)
@@ -708,11 +777,11 @@ fn check_definition_properties(
             | ExprKind::IsTruthValue { .. } => true,
         };
         if !immutable {
-            return false;
+            return Ok(false);
         }
         expression.kind.expression_references(&mut pending);
     }
-    true
+    Ok(true)
 }
 
 /// Value a sort key reads directly, when it reads one at all.

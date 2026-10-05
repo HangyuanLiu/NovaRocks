@@ -86,11 +86,14 @@ fn function(value: &FunctionValueType) -> BoundFunction {
         kind: FunctionKind::Aggregate,
         argument_types: Box::from([FunctionArgumentType::Value(value.clone())]),
         result_type: value.clone(),
-        volatility: FunctionVolatility::Immutable,
-        argument_evaluation: FunctionArgumentEvaluation::Eager,
-        failure_behavior: FunctionFailureBehavior::Propagate,
-        intrinsic_row_error: FunctionIntrinsicRowError::NotRowEvaluated,
-        semantic_parameters: Box::default(),
+
+        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+            volatility: FunctionVolatility::Immutable,
+            argument_evaluation: FunctionArgumentEvaluation::Eager,
+            failure_behavior: FunctionFailureBehavior::Propagate,
+            intrinsic_row_error: FunctionIntrinsicRowError::NotRowEvaluated,
+            semantic_parameters: Box::default(),
+        }),
     }
 }
 fn aggregate(
@@ -240,7 +243,7 @@ fn aggregate_signature_checks_complete_phase_format_function_and_nested_type() {
     };
     let mut right = left.clone();
     // Legacy occurrence projections are deliberately outside the definition signature.
-    right.function.volatility = FunctionVolatility::Volatile;
+    right.function.legacy_metadata.as_mut().unwrap().volatility = FunctionVolatility::Volatile;
     assert!(compare(&right));
     right.phase = AggregatePhase::Final {
         sequence: AggregateSequenceId::new(0),

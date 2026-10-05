@@ -269,11 +269,13 @@ impl Fixture {
             overload: resolved.selected.overload,
             argument_types: resolved.selected.argument_types,
             result_types: result_types.clone(),
-            volatility: resolved.semantics.volatility,
-            argument_evaluation: resolved.semantics.argument_evaluation,
-            failure_behavior: resolved.semantics.failure_behavior,
-            intrinsic_row_error: resolved.semantics.intrinsic_row_error,
-            semantic_parameters: Box::default(),
+            legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+                volatility: resolved.semantics.volatility,
+                argument_evaluation: resolved.semantics.argument_evaluation,
+                failure_behavior: resolved.semantics.failure_behavior,
+                intrinsic_row_error: resolved.semantics.intrinsic_row_error,
+                semantic_parameters: Box::default(),
+            }),
         };
         // Two repeated outer occurrences precede the relation columns. They
         // belong to the host layout, never the selected function relation.

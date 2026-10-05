@@ -92,6 +92,9 @@ impl FrontendQueryCompilerError {
         match error {
             novarocks_plan_codec::PhysicalEncodeError::Control(error) => Self::Control(error),
             novarocks_plan_codec::PhysicalEncodeError::Invalid(error) => Self::Engine(error),
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(message) => {
+                Self::Engine(message.into())
+            }
         }
     }
     fn from_completion(

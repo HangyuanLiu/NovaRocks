@@ -2202,7 +2202,14 @@ fn table_function_fragment(
             },
             kind: NodeKind::TableFunction {
                 function: BoundTableFunction {
-                    semantic_parameters: Box::default(),
+                    legacy_metadata: Some(crate::LegacyBindingMetadata {
+                        semantic_parameters: Box::default(),
+                        volatility: FunctionVolatility::Immutable,
+                        argument_evaluation: FunctionArgumentEvaluation::Eager,
+                        failure_behavior: FunctionFailureBehavior::Propagate,
+                        intrinsic_row_error:
+                            novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
+                    }),
                     function_id: FunctionId::try_new("builtin/test_relation/v1").unwrap(),
                     overload: FunctionOverloadId::try_new("i64-to-i64-utf8").unwrap(),
                     argument_types: Box::from([FunctionArgumentType::Value(ty(
@@ -2213,11 +2220,6 @@ fn table_function_fragment(
                         ty(DataType::Int64, false),
                         ty(DataType::Utf8, false),
                     ]),
-                    volatility: FunctionVolatility::Immutable,
-                    argument_evaluation: FunctionArgumentEvaluation::Eager,
-                    failure_behavior: FunctionFailureBehavior::Propagate,
-                    intrinsic_row_error:
-                        novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
                 },
                 arguments: Box::from([argument]),
                 outputs: Box::from([
@@ -2295,17 +2297,19 @@ fn table_function_binding_cannot_be_published_as_a_scalar_call() {
             value_type.clone(),
             ExprKind::FunctionCall {
                 function: BoundFunction {
-                    semantic_parameters: Box::default(),
+                    legacy_metadata: Some(crate::LegacyBindingMetadata {
+                        semantic_parameters: Box::default(),
+                        volatility: FunctionVolatility::Immutable,
+                        argument_evaluation: FunctionArgumentEvaluation::Eager,
+                        failure_behavior: FunctionFailureBehavior::Propagate,
+                        intrinsic_row_error:
+                            novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
+                    }),
                     function_id: FunctionId::try_new("builtin/test_relation/v1").unwrap(),
                     overload: FunctionOverloadId::try_new("disguised-scalar").unwrap(),
                     kind: FunctionKind::Table,
                     argument_types: Box::default(),
                     result_type: value_type.clone(),
-                    volatility: FunctionVolatility::Immutable,
-                    argument_evaluation: FunctionArgumentEvaluation::Eager,
-                    failure_behavior: FunctionFailureBehavior::Propagate,
-                    intrinsic_row_error:
-                        novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
                 },
                 args: Box::default(),
             },
@@ -2416,17 +2420,19 @@ fn higher_order_function_fragment(
             parameter_type.clone(),
             ExprKind::FunctionCall {
                 function: BoundFunction {
-                    semantic_parameters: Box::default(),
+                    legacy_metadata: Some(crate::LegacyBindingMetadata {
+                        semantic_parameters: Box::default(),
+                        volatility: FunctionVolatility::Immutable,
+                        argument_evaluation: FunctionArgumentEvaluation::Eager,
+                        failure_behavior: FunctionFailureBehavior::Propagate,
+                        intrinsic_row_error:
+                            novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
+                    }),
                     function_id: FunctionId::try_new("builtin/test_higher_order/v1").unwrap(),
                     overload: FunctionOverloadId::try_new("lambda-i64-to-i64").unwrap(),
                     kind: FunctionKind::Scalar,
                     argument_types,
                     result_type: parameter_type.clone(),
-                    volatility: FunctionVolatility::Immutable,
-                    argument_evaluation: FunctionArgumentEvaluation::Eager,
-                    failure_behavior: FunctionFailureBehavior::Propagate,
-                    intrinsic_row_error:
-                        novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
                 },
                 args: arguments,
             },
@@ -3006,7 +3012,14 @@ fn grouped_writer_fragment_with_sources(
             state_argument_contract:
                 novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
             function: BoundFunction {
-                semantic_parameters: Box::default(),
+                legacy_metadata: Some(crate::LegacyBindingMetadata {
+                    semantic_parameters: Box::default(),
+                    volatility: FunctionVolatility::Immutable,
+                    argument_evaluation: FunctionArgumentEvaluation::Eager,
+                    failure_behavior: FunctionFailureBehavior::Propagate,
+                    intrinsic_row_error:
+                        novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
+                }),
                 function_id: FunctionId::try_new("builtin/test_statistics/v1").unwrap(),
                 overload: FunctionOverloadId::try_new("i64-to-binary").unwrap(),
                 kind: FunctionKind::Aggregate,
@@ -3019,11 +3032,6 @@ fn grouped_writer_fragment_with_sources(
                     Box::from([FunctionArgumentType::Value(ty(DataType::Int64, true))])
                 },
                 result_type: ty(DataType::Binary, true),
-                volatility: FunctionVolatility::Immutable,
-                argument_evaluation: FunctionArgumentEvaluation::Eager,
-                failure_behavior: FunctionFailureBehavior::Propagate,
-                intrinsic_row_error:
-                    novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
             },
             phase: AggregatePhase::Final {
                 sequence: AggregateSequenceId::new(1),
@@ -3666,7 +3674,15 @@ fn package_parameter_closure_includes_writer_final_state_calls() {
         unreachable!()
     };
     assert!(std::ptr::eq(binding, &finish.final_aggregates[0].binding));
-    assert!(binding.function.semantic_parameters.is_empty());
+    assert!(
+        binding
+            .function
+            .legacy_metadata
+            .as_ref()
+            .unwrap()
+            .semantic_parameters
+            .is_empty()
+    );
     assert_eq!(
         calls.parameter_references().collect::<Vec<_>>(),
         vec![reference]

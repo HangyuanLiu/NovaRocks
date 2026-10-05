@@ -168,11 +168,13 @@ fn physical_call(bound: &novarocks_functions::ResolvedFunctionBinding) -> BoundF
         kind: bound.kind,
         argument_types: bound.selected.argument_types.clone(),
         result_type: result_type.clone(),
-        volatility: bound.semantics.volatility,
-        argument_evaluation: bound.semantics.argument_evaluation,
-        failure_behavior: bound.semantics.failure_behavior,
-        intrinsic_row_error: bound.semantics.intrinsic_row_error,
-        semantic_parameters: Box::default(),
+        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+            volatility: bound.semantics.volatility,
+            argument_evaluation: bound.semantics.argument_evaluation,
+            failure_behavior: bound.semantics.failure_behavior,
+            intrinsic_row_error: bound.semantics.intrinsic_row_error,
+            semantic_parameters: Box::default(),
+        }),
     }
 }
 

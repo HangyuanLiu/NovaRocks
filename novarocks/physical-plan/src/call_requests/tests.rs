@@ -116,11 +116,13 @@ fn function(types: Vec<FunctionArgumentType>) -> crate::BoundFunction {
         kind: FunctionKind::Scalar,
         argument_types: types.into_boxed_slice(),
         result_type: integer(false),
-        volatility: FunctionVolatility::Immutable,
-        argument_evaluation: FunctionArgumentEvaluation::Eager,
-        failure_behavior: FunctionFailureBehavior::Propagate,
-        intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
-        semantic_parameters: Box::default(),
+        legacy_metadata: Some(crate::LegacyBindingMetadata {
+            volatility: FunctionVolatility::Immutable,
+            argument_evaluation: FunctionArgumentEvaluation::Eager,
+            failure_behavior: FunctionFailureBehavior::Propagate,
+            intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
+            semantic_parameters: Box::default(),
+        }),
     }
 }
 fn expression(id: u32, types: Vec<FunctionArgumentType>, args: Vec<ExprId>) -> ExprNode {

@@ -180,12 +180,14 @@ impl PhysicalV1PrivateFacts for NoPhysicalV1PrivateFacts {
 pub enum PhysicalEncodeError {
     Control(novarocks_type_contract::CompileControlError),
     Invalid(String),
+    UnsupportedCapability(&'static str),
 }
 impl std::fmt::Display for PhysicalEncodeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Control(error) => error.fmt(formatter),
             Self::Invalid(error) => formatter.write_str(error),
+            Self::UnsupportedCapability(message) => formatter.write_str(message),
         }
     }
 }
@@ -1833,7 +1835,12 @@ fn validate_table_binding(
     arguments: &[ExprId],
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<(), PhysicalEncodeError> {
-    if !function.semantic_parameters.is_empty() {
+    let metadata = function.require_legacy_metadata().map_err(|_| {
+        PhysicalEncodeError::UnsupportedCapability(
+            "native wire v1 requires original legacy binding metadata",
+        )
+    })?;
+    if !metadata.semantic_parameters.is_empty() {
         return Err("native wire v1 cannot carry frozen semantic parameter references".into());
     }
     for argument in &function.argument_types {
@@ -1851,10 +1858,10 @@ fn validate_table_binding(
         function_id: function.function_id.clone(),
         kind: novarocks_functions::FunctionKind::Table,
         semantics: FunctionSemantics {
-            volatility: function.volatility,
-            argument_evaluation: function.argument_evaluation,
-            failure_behavior: function.failure_behavior,
-            intrinsic_row_error: function.intrinsic_row_error,
+            volatility: metadata.volatility,
+            argument_evaluation: metadata.argument_evaluation,
+            failure_behavior: metadata.failure_behavior,
+            intrinsic_row_error: metadata.intrinsic_row_error,
         },
         logical_argument_count: request_arguments.len(),
         selected: FunctionBindingSelection {
@@ -1958,7 +1965,12 @@ fn validate_bound_function(
     aggregate: Option<AggregateBindingSelection>,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<(), PhysicalEncodeError> {
-    if !function.semantic_parameters.is_empty() {
+    let metadata = function.require_legacy_metadata().map_err(|_| {
+        PhysicalEncodeError::UnsupportedCapability(
+            "native wire v1 requires original legacy binding metadata",
+        )
+    })?;
+    if !metadata.semantic_parameters.is_empty() {
         return Err("native wire v1 cannot carry frozen semantic parameter references".into());
     }
     for argument in &function.argument_types {
@@ -1974,10 +1986,10 @@ fn validate_bound_function(
         function_id: function.function_id.clone(),
         kind: function.kind,
         semantics: FunctionSemantics {
-            volatility: function.volatility,
-            argument_evaluation: function.argument_evaluation,
-            failure_behavior: function.failure_behavior,
-            intrinsic_row_error: function.intrinsic_row_error,
+            volatility: metadata.volatility,
+            argument_evaluation: metadata.argument_evaluation,
+            failure_behavior: metadata.failure_behavior,
+            intrinsic_row_error: metadata.intrinsic_row_error,
         },
         logical_argument_count,
         selected: FunctionBindingSelection {
@@ -6136,16 +6148,19 @@ mod tests {
         builder.register(definition).unwrap();
         let catalog = builder.seal_bound().unwrap();
         let function = novarocks_physical_plan::BoundFunction {
-            semantic_parameters: Box::default(),
             function_id,
             overload,
             kind: FunctionKind::Scalar,
             argument_types: selected.argument_types,
             result_type: value_type,
-            volatility: semantics.volatility,
-            argument_evaluation: semantics.argument_evaluation,
-            failure_behavior: semantics.failure_behavior,
-            intrinsic_row_error: semantics.intrinsic_row_error,
+
+            legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+                semantic_parameters: Box::default(),
+                volatility: semantics.volatility,
+                argument_evaluation: semantics.argument_evaluation,
+                failure_behavior: semantics.failure_behavior,
+                intrinsic_row_error: semantics.intrinsic_row_error,
+            }),
         };
         (catalog, function)
     }
@@ -6323,17 +6338,33 @@ mod tests {
         let (catalog, function) = exact_scalar_catalog();
         validate_test_scalar(&catalog, &function).unwrap();
 
+        let mut exact_only = function.clone();
+        exact_only.legacy_metadata = None;
+        assert!(matches!(
+            validate_test_scalar(&catalog, &exact_only),
+            Err(PhysicalEncodeError::UnsupportedCapability(
+                "native wire v1 requires original legacy binding metadata"
+            ))
+        ));
+
         let mut forged_overload = function.clone();
         forged_overload.overload =
             FunctionOverloadId::try_new("builtin.scalar/test_identity/forged/v1").unwrap();
         assert!(validate_test_scalar(&catalog, &forged_overload).is_err());
 
         let mut forged_semantics = function.clone();
-        forged_semantics.volatility = FunctionVolatility::Stable;
+        forged_semantics
+            .legacy_metadata
+            .as_mut()
+            .unwrap()
+            .volatility = FunctionVolatility::Stable;
         assert!(validate_test_scalar(&catalog, &forged_semantics).is_err());
         let mut forged_intrinsic = function.clone();
-        forged_intrinsic.intrinsic_row_error =
-            novarocks_functions::FunctionIntrinsicRowError::MayRaise;
+        forged_intrinsic
+            .legacy_metadata
+            .as_mut()
+            .unwrap()
+            .intrinsic_row_error = novarocks_functions::FunctionIntrinsicRowError::MayRaise;
         assert!(validate_test_scalar(&catalog, &forged_intrinsic).is_err());
 
         let mut forged_argument = function.clone();

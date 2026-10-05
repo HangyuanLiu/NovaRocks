@@ -201,7 +201,8 @@ impl FragmentBuilder {
             &self.expressions,
             predicates.iter().copied(),
             true,
-        );
+        )
+        .map_err(BuildError::MissingLegacyMetadata)?;
         let output_properties =
             crate::derive_filter_output_properties(&input_properties, replica_deterministic);
         self.insert_node_unchecked(PhysicalNode {
@@ -420,7 +421,8 @@ impl FragmentBuilder {
             &self.expressions,
             expressions.iter().map(|(expression, _)| *expression),
             true,
-        );
+        )
+        .map_err(BuildError::MissingLegacyMetadata)?;
         let output_properties = crate::derive_project_output_properties(
             &input_properties,
             &output,
@@ -1249,6 +1251,7 @@ impl PlanBuilder {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BuildError {
+    MissingLegacyMetadata(crate::MissingLegacyBindingMetadata),
     IdentitySpaceExhausted(&'static str),
     DuplicateFragment(FragmentId),
     DuplicateNode(NodeId),
@@ -1338,6 +1341,7 @@ pub enum RequiredInputs {
 impl fmt::Display for BuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MissingLegacyMetadata(error) => error.fmt(formatter),
             Self::IdentitySpaceExhausted(kind) => {
                 write!(formatter, "{kind} identity space exhausted")
             }

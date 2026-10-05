@@ -46,11 +46,10 @@ impl PropertyEffectSource<'_, '_, '_> {
         allow_values: bool,
     ) -> Result<bool, FrozenCallError> {
         match self {
-            Self::Legacy => Ok(fragment_expressions_are_replica_deterministic(
-                fragment,
-                expressions,
-                allow_values,
-            )),
+            Self::Legacy => {
+                fragment_expressions_are_replica_deterministic(fragment, expressions, allow_values)
+                    .map_err(FrozenCallError::MissingLegacyMetadata)
+            }
             Self::Frozen { proof, work } => {
                 proof.require_fragment(fragment, work)?;
                 if !allow_values {
@@ -82,12 +81,17 @@ impl PropertyEffectSource<'_, '_, '_> {
         arguments: &[ExprId],
     ) -> Result<bool, FrozenCallError> {
         match self {
-            Self::Legacy => Ok(function.volatility == crate::FunctionVolatility::Immutable
+            Self::Legacy => Ok(function
+                .require_legacy_metadata()
+                .map_err(FrozenCallError::MissingLegacyMetadata)?
+                .volatility
+                == crate::FunctionVolatility::Immutable
                 && fragment_expressions_are_replica_deterministic(
                     fragment,
                     arguments.iter().copied(),
                     true,
-                )),
+                )
+                .map_err(FrozenCallError::MissingLegacyMetadata)?),
             Self::Frozen { proof, work } => {
                 proof.require_fragment(fragment, work)?;
                 proof.replica_safe(node, work)
@@ -772,7 +776,15 @@ pub(crate) fn validate_node_output_properties(
     ) {
         // Legacy mode has no compile owner and cannot produce Control; any
         // new invariant failure must still prevent standalone publication.
-        errors.push(ValidationError::new(path, error.to_string()));
+        match error {
+            FrozenCallError::MissingLegacyMetadata(_) => {
+                errors.push(ValidationError::unsupported_capability(
+                    path,
+                    "legacy property publication requires original binding metadata",
+                ));
+            }
+            error => errors.push(ValidationError::new(path, error.to_string())),
+        }
     }
 }
 
@@ -1734,7 +1746,7 @@ pub(crate) fn fragment_expressions_are_replica_deterministic(
     fragment: &Fragment,
     expressions: impl IntoIterator<Item = ExprId>,
     allow_values: bool,
-) -> bool {
+) -> Result<bool, crate::MissingLegacyBindingMetadata> {
     crate::expressions_are_replica_deterministic(fragment.expressions(), expressions, allow_values)
 }
 

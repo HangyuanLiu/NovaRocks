@@ -174,11 +174,13 @@ fn function_builder() -> FragmentBuilder {
                     kind: FunctionKind::Scalar,
                     argument_types: Box::default(),
                     result_type: ty.clone(),
-                    volatility: FunctionVolatility::Immutable,
-                    argument_evaluation: FunctionArgumentEvaluation::Eager,
-                    failure_behavior: FunctionFailureBehavior::Propagate,
-                    intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
-                    semantic_parameters: Box::default(),
+                    legacy_metadata: Some(crate::LegacyBindingMetadata {
+                        volatility: FunctionVolatility::Immutable,
+                        argument_evaluation: FunctionArgumentEvaluation::Eager,
+                        failure_behavior: FunctionFailureBehavior::Propagate,
+                        intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
+                        semantic_parameters: Box::default(),
+                    }),
                 },
                 args: Box::default(),
             },
@@ -426,7 +428,11 @@ fn structure_stage_defers_legacy_intrinsic_bits_without_deferring_kind_or_signat
         let ExprKind::FunctionCall { function, .. } = &mut expr.kind else {
             unreachable!()
         };
-        function.intrinsic_row_error = FunctionIntrinsicRowError::NotRowEvaluated;
+        function
+            .legacy_metadata
+            .as_mut()
+            .unwrap()
+            .intrinsic_row_error = FunctionIntrinsicRowError::NotRowEvaluated;
         builder.expressions.insert(expr);
         builder
     };
@@ -564,15 +570,30 @@ fn structure_signature_correspondence_ignores_only_legacy_effects_and_keeps_full
         unreachable!()
     };
     let mut legacy_changed = original.clone();
-    legacy_changed.volatility = FunctionVolatility::Volatile;
-    legacy_changed.argument_evaluation = FunctionArgumentEvaluation::ShortCircuit;
-    legacy_changed.failure_behavior = FunctionFailureBehavior::ReturnsNull;
-    legacy_changed.intrinsic_row_error = FunctionIntrinsicRowError::NotRowEvaluated;
-    legacy_changed.semantic_parameters =
-        Box::from([novarocks_type_contract::SemanticParameterRef {
-            id: novarocks_type_contract::SemanticParameterId::new(u32::MAX),
-            expected_key: novarocks_type_contract::SemanticParameterKey::TimeZone,
-        }]);
+    legacy_changed.legacy_metadata.as_mut().unwrap().volatility = FunctionVolatility::Volatile;
+    legacy_changed
+        .legacy_metadata
+        .as_mut()
+        .unwrap()
+        .argument_evaluation = FunctionArgumentEvaluation::ShortCircuit;
+    legacy_changed
+        .legacy_metadata
+        .as_mut()
+        .unwrap()
+        .failure_behavior = FunctionFailureBehavior::ReturnsNull;
+    legacy_changed
+        .legacy_metadata
+        .as_mut()
+        .unwrap()
+        .intrinsic_row_error = FunctionIntrinsicRowError::NotRowEvaluated;
+    legacy_changed
+        .legacy_metadata
+        .as_mut()
+        .unwrap()
+        .semantic_parameters = Box::from([novarocks_type_contract::SemanticParameterRef {
+        id: novarocks_type_contract::SemanticParameterId::new(u32::MAX),
+        expected_key: novarocks_type_contract::SemanticParameterKey::TimeZone,
+    }]);
     assert!(original.signature_matches(&legacy_changed));
     assert_ne!(original, &legacy_changed);
     for dimension in 0..6 {
@@ -664,4 +685,83 @@ fn package_admission() -> crate::FragmentPackageAdmission {
             max_projection_work: 16 * 1024 * 1024,
         },
     }
+}
+
+#[test]
+fn exact_signature_structure_keeps_types_but_requires_legacy_publication_provenance() {
+    let make = |fault: u8| {
+        let mut builder = function_builder();
+        let mut definition = builder.expressions.get(ExprId::new(0)).unwrap().clone();
+        let ExprKind::FunctionCall { function, .. } = &mut definition.kind else {
+            unreachable!()
+        };
+        *function = BoundFunction::from_exact_signature(
+            function.function_id.clone(),
+            function.overload.clone(),
+            function.kind,
+            function.argument_types.clone(),
+            function.result_type.clone(),
+        );
+        match fault {
+            0 => {}
+            1 => function.kind = FunctionKind::Window,
+            2 => {
+                function.result_type = ValueType::new(
+                    DataType::List(std::sync::Arc::new(arrow_schema::Field::new(
+                        "element",
+                        DataType::Int64,
+                        false,
+                    ))),
+                    false,
+                );
+            }
+            _ => unreachable!(),
+        }
+        builder.expressions.insert(definition);
+        builder
+    };
+    let fragment = finish(make(0), 0, PlanLimits::FROZEN, &Control::default()).unwrap();
+    assert_eq!(
+        expressions_are_replica_deterministic(fragment.expressions(), [ExprId::new(0)], true),
+        Err(MissingLegacyBindingMetadata)
+    );
+    let errors = make(0)
+        .finish_definition(NodeId::new(0), FragmentSink::Noop, dop())
+        .unwrap_err();
+    assert!(
+        errors
+            .errors()
+            .iter()
+            .any(|error| { error.category() == ValidationErrorCategory::UnsupportedCapability })
+    );
+    for fault in [1, 2] {
+        reject_both(|| make(fault), 0);
+    }
+
+    let mut builder = make(0);
+    let node = NodeId::new(1);
+    let mut definition = builder.expressions.get(ExprId::new(0)).unwrap().clone();
+    definition.id = ExprId::new(1);
+    definition.owner = node;
+    builder.insert_expression(definition).unwrap();
+    let value = builder
+        .add_value(
+            ValueType::new(DataType::Int64, false),
+            ValueOrigin::NodeOutput {
+                node,
+                output_ordinal: 0,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        builder.add_project(
+            node,
+            NodeId::new(0),
+            Box::from([(ExprId::new(1), value)]),
+            Box::from([value])
+        ),
+        Err(BuildError::MissingLegacyMetadata(
+            MissingLegacyBindingMetadata
+        ))
+    ));
 }

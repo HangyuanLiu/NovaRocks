@@ -28,7 +28,13 @@ use novarocks_type_contract::{
 use std::fmt;
 
 mod encode;
+mod materialize;
 mod read;
+pub use materialize::{
+    MaterializedFunctionBinding, MaterializedFunctionBindings,
+    PreparedFunctionBindingsMaterialization, materialize_function_bindings,
+    prepare_function_bindings_materialization,
+};
 pub use read::{PreparedFunctionBindingHeaders, prepare_function_binding_headers};
 
 #[derive(Debug)]

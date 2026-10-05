@@ -45,7 +45,12 @@ fn assert_selection(
     assert_eq!(args.len(), 1);
     assert!(selected.aggregate.is_none());
     assert!(
-        function.semantic_parameters.is_empty(),
+        function
+            .legacy_metadata
+            .as_ref()
+            .expect("actual legacy fixture")
+            .semantic_parameters
+            .is_empty(),
         "conversion's original parameter shape"
     );
     assert!(matches!(&captured.request().arguments[0],

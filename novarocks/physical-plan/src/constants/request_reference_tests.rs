@@ -130,11 +130,13 @@ fn request_fragment(
             .map(|_| crate::FunctionArgumentType::Value(ty.clone()))
             .collect(),
         result_type: result.clone(),
-        volatility: FunctionVolatility::Immutable,
-        argument_evaluation: FunctionArgumentEvaluation::Eager,
-        failure_behavior: FunctionFailureBehavior::Propagate,
-        intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
-        semantic_parameters: Box::default(),
+        legacy_metadata: Some(crate::LegacyBindingMetadata {
+            volatility: FunctionVolatility::Immutable,
+            argument_evaluation: FunctionArgumentEvaluation::Eager,
+            failure_behavior: FunctionFailureBehavior::Propagate,
+            intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
+            semantic_parameters: Box::default(),
+        }),
     };
     let call = builder
         .add_expression(

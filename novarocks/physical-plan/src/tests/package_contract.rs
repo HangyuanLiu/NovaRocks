@@ -55,7 +55,11 @@ fn fixture_expression_uses(fragment: &Fragment) -> PhysicalRootUses {
                 assert_eq!(function.function_id.as_str(), "test.parameter");
                 assert_eq!(function.overload.as_str(), "test.parameter.zero");
                 assert_eq!(
-                    function.argument_evaluation,
+                    function
+                        .legacy_metadata
+                        .as_ref()
+                        .unwrap()
+                        .argument_evaluation,
                     FunctionArgumentEvaluation::Eager
                 );
                 assert!(function.argument_types.is_empty());
@@ -132,7 +136,13 @@ fn fixture_calls(fragment: &Fragment, uses: &PhysicalRootUses) -> FrozenFragment
             assert_eq!(function.result_type, ty(DataType::Int64, false));
             assert!(args.is_empty());
             assert!(function.argument_types.is_empty());
-            let [reference] = function.semantic_parameters.as_ref() else {
+            let [reference] = function
+                .legacy_metadata
+                .as_ref()
+                .unwrap()
+                .semantic_parameters
+                .as_ref()
+            else {
                 panic!("the parameter fixture requires its selected timezone reference");
             };
             calls.push(FrozenPhysicalCall {
@@ -1472,11 +1482,13 @@ fn parameter_occurrences_fragment(reference: SemanticParameterRef, occurrences: 
                     kind: FunctionKind::Scalar,
                     argument_types: Box::default(),
                     result_type: value_type.clone(),
-                    volatility: FunctionVolatility::Stable,
-                    argument_evaluation: FunctionArgumentEvaluation::Eager,
-                    failure_behavior: FunctionFailureBehavior::Propagate,
-                    intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
-                    semantic_parameters: Box::from([reference]),
+                    legacy_metadata: Some(crate::LegacyBindingMetadata {
+                        volatility: FunctionVolatility::Stable,
+                        argument_evaluation: FunctionArgumentEvaluation::Eager,
+                        failure_behavior: FunctionFailureBehavior::Propagate,
+                        intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
+                        semantic_parameters: Box::from([reference]),
+                    }),
                 },
                 args: Box::default(),
             },
@@ -1868,7 +1880,15 @@ fn frozen_call_environment_is_the_only_package_dependency_authority() {
     let ExprKind::FunctionCall { function, .. } = definition else {
         unreachable!();
     };
-    assert_eq!(function.semantic_parameters.as_ref(), &[legacy]);
+    assert_eq!(
+        function
+            .legacy_metadata
+            .as_ref()
+            .unwrap()
+            .semantic_parameters
+            .as_ref(),
+        &[legacy]
+    );
     assert_eq!(
         checked.calls().entries()[&PhysicalCallSite::Expression(ExpressionUseId::new(0))]
             .effects
@@ -2697,4 +2717,136 @@ fn package_admissions(
         .keys()
         .map(|id| (*id, package_admission()))
         .collect()
+}
+
+#[test]
+fn exact_signature_without_legacy_metadata_uses_fresh_frozen_package_authority() {
+    let reference = SemanticParameterRef {
+        id: SemanticParameterId::new(7),
+        expected_key: SemanticParameterKey::TimeZone,
+    };
+    let original = parameter_fragment(reference);
+    // Retain the fixture's original zero-argument request, not its selected
+    // signature or old occurrence facts. Recheck it against the new snapshot.
+    let requests = original
+        .call_requests()
+        .entries()
+        .iter()
+        .map(|(definition, request)| (*definition, request.clone()))
+        .collect();
+    let mut parts = original.into_parts();
+    let definitions = parts
+        .expressions
+        .iter()
+        .map(|(_, definition)| {
+            let mut definition = definition.clone();
+            let ExprKind::FunctionCall { function, .. } = &mut definition.kind else {
+                panic!("the actual parameter fixture must contain its call");
+            };
+            *function = BoundFunction::from_exact_signature(
+                function.function_id.clone(),
+                function.overload.clone(),
+                function.kind,
+                function.argument_types.clone(),
+                function.result_type.clone(),
+            );
+            definition
+        })
+        .collect::<Vec<_>>();
+    parts.expressions = ExprArena::try_from_definitions_observed(
+        definitions.into_iter(),
+        &PlanLimits::FROZEN,
+        &Control,
+    )
+    .unwrap();
+    let fragment = Fragment::from(parts)
+        .with_call_requests_observed(requests, &Control)
+        .unwrap();
+    let definition = fragment.expressions().iter().next().unwrap().1;
+    let definition_id = definition.id;
+    let ExprKind::FunctionCall { function, .. } = &definition.kind else {
+        unreachable!()
+    };
+    assert_eq!(
+        function.require_legacy_metadata(),
+        Err(MissingLegacyBindingMetadata)
+    );
+    assert_eq!(
+        expressions_are_replica_deterministic(fragment.expressions(), [definition.id], true),
+        Err(MissingLegacyBindingMetadata)
+    );
+    let legacy = validate_fragment(&fragment, &FragmentCuts::default()).unwrap_err();
+    assert!(
+        legacy
+            .errors()
+            .iter()
+            .any(|error| { error.category() == ValidationErrorCategory::UnsupportedCapability })
+    );
+
+    // Author roots, uses and all nine effects against this exact new fragment.
+    // These are the explicit parameter fixture owner, including its own frozen
+    // timezone; no missing legacy fields are promoted into effect facts.
+    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
+    let domain = EvaluationDomainId::new(0);
+    let invocations = roots
+        .sites()
+        .values()
+        .enumerate()
+        .map(|(ordinal, root)| ExpressionInvocation {
+            context: ExpressionEffectContext {
+                use_id: ExpressionUseId::new(u32::try_from(ordinal).unwrap()),
+                domain,
+                demand: root.demand,
+            },
+            definition: root.expr,
+            control: ControlShape::Eager,
+            arguments: Box::default(),
+        })
+        .collect::<Vec<_>>();
+    let root_bindings = roots
+        .sites()
+        .keys()
+        .enumerate()
+        .map(|(ordinal, site)| (*site, ExpressionUseId::new(u32::try_from(ordinal).unwrap())))
+        .collect();
+    let flow = ExpressionControlFlow::try_new(
+        vec![ExpressionEvaluationDomain {
+            id: domain,
+            parent: None,
+            guard: None,
+        }],
+        invocations,
+        fragment.expressions(),
+        CompilePhase::Validate,
+        &Control,
+    )
+    .unwrap();
+    let uses = PhysicalRootUses::try_new(&fragment, flow, root_bindings, &Control).unwrap();
+    let calls = parameter_calls_with_references(&fragment, &uses, &[reference]);
+    let mut input = package_input_with_controls(fragment, uses, calls);
+    input.parameters = SemanticParameters::try_new([(
+        reference.id,
+        SemanticParameterValue::TimeZone("UTC".into()),
+    )])
+    .unwrap();
+    let checked = FragmentPackage::try_new(input.clone(), package_admission(), &Control).unwrap();
+    assert_eq!(checked.calls().entries().len(), 1);
+    assert_eq!(checked.parameters().entries().len(), 1);
+    let ExprKind::FunctionCall { function, .. } = &checked
+        .fragment()
+        .expressions()
+        .get(definition_id)
+        .unwrap()
+        .kind
+    else {
+        unreachable!()
+    };
+    assert!(function.legacy_metadata.is_none());
+
+    let mut illegal = input.calls.entries().values().cloned().collect::<Vec<_>>();
+    illegal[0].effects.own_row_error = FunctionIntrinsicRowError::NotRowEvaluated;
+    assert!(matches!(
+        FrozenFragmentCalls::try_new(&input.fragment, &input.expression_uses, illegal, &Control),
+        Err(FrozenCallError::InvalidEffects(_))
+    ));
 }

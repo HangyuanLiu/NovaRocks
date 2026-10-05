@@ -98,6 +98,7 @@ pub(super) fn unsafe_filter() -> Fixture {
         .add_values(source, Box::from([Box::default()]), Box::default())
         .unwrap();
     let filter = NodeId::new(0);
+    let request = zero_argument_request();
     let predicate = builder
         .add_expression(
             filter,
@@ -131,6 +132,11 @@ pub(super) fn unsafe_filter() -> Fixture {
     let mut fixture = frozen_fixture(
         builder
             .finish_definition(repeat, FragmentSink::Noop, dop())
+            .unwrap()
+            .with_call_requests_observed(
+                vec![(PhysicalCallDefinition::Expression(predicate), request)],
+                &Control::default(),
+            )
             .unwrap(),
     );
     replace_properties(&mut fixture, |parts| {
@@ -308,8 +314,10 @@ pub(super) fn single_copy_dag() -> Fixture {
         )
         .unwrap();
     let join = NodeId::new(2);
+    let mut requests = Vec::new();
     let mut key = || {
-        builder
+        let request = zero_argument_request();
+        let expression = builder
             .add_expression(
                 join,
                 integer(),
@@ -318,7 +326,9 @@ pub(super) fn single_copy_dag() -> Fixture {
                     args: Box::default(),
                 },
             )
-            .unwrap()
+            .unwrap();
+        requests.push((PhysicalCallDefinition::Expression(expression), request));
+        expression
     };
     let left = key();
     let right = key();
@@ -346,6 +356,8 @@ pub(super) fn single_copy_dag() -> Fixture {
     let mut fixture = frozen_fixture(
         builder
             .finish_definition(join, FragmentSink::Noop, dop())
+            .unwrap()
+            .with_call_requests_observed(requests, &Control::default())
             .unwrap(),
     );
     replace_properties(&mut fixture, |parts| {
@@ -405,7 +417,7 @@ fn all_derivation_values_anchor_effect_authority_and_foreign_proof_stay_exact() 
             let ExprKind::FunctionCall { function, .. } = &mut expr.kind else {
                 unreachable!()
             };
-            function.volatility = FunctionVolatility::Volatile;
+            function.legacy_metadata.as_mut().unwrap().volatility = FunctionVolatility::Volatile;
             parts.expressions.insert(expr);
         }
     });

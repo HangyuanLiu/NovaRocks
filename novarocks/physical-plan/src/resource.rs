@@ -752,7 +752,10 @@ fn add_function_usage(
 ) {
     usage.add_item_counts([
         function.argument_types.len(),
-        function.semantic_parameters.len(),
+        function
+            .legacy_metadata
+            .as_ref()
+            .map_or(0, |metadata| metadata.semantic_parameters.len()),
     ]);
     usage.add_byte_counts([
         function.function_id.as_str().len(),
@@ -776,7 +779,10 @@ fn add_table_function_usage(
     usage.add_item_counts([
         function.argument_types.len(),
         function.result_types.len(),
-        function.semantic_parameters.len(),
+        function
+            .legacy_metadata
+            .as_ref()
+            .map_or(0, |metadata| metadata.semantic_parameters.len()),
     ]);
     usage.add_byte_counts([
         function.function_id.as_str().len(),
@@ -1663,7 +1669,14 @@ mod tests {
     #[test]
     fn function_and_aggregate_identity_bytes_are_accounted() {
         let function = BoundFunction {
-            semantic_parameters: Box::default(),
+            legacy_metadata: Some(crate::LegacyBindingMetadata {
+                semantic_parameters: Box::default(),
+                volatility: novarocks_type_contract::FunctionVolatility::Immutable,
+                argument_evaluation: novarocks_type_contract::FunctionArgumentEvaluation::Eager,
+                failure_behavior: novarocks_type_contract::FunctionFailureBehavior::Propagate,
+                intrinsic_row_error:
+                    novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
+            }),
             function_id: novarocks_type_contract::FunctionId::try_new("f".repeat(1024)).unwrap(),
             overload: novarocks_type_contract::FunctionOverloadId::try_new("o".repeat(1024))
                 .unwrap(),
@@ -1674,11 +1687,6 @@ mod tests {
                 data_type: DataType::Int64,
                 nullable: false,
             },
-            volatility: novarocks_type_contract::FunctionVolatility::Immutable,
-            argument_evaluation: novarocks_type_contract::FunctionArgumentEvaluation::Eager,
-            failure_behavior: novarocks_type_contract::FunctionFailureBehavior::Propagate,
-            intrinsic_row_error:
-                novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
         };
         let binding = AggregateBinding {
             state_argument_contract:

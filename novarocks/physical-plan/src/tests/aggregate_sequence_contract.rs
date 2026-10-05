@@ -56,17 +56,19 @@ fn aggregate_binding(phase: AggregatePhase, drift: BindingDrift) -> AggregateBin
         state_argument_contract:
             novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
         function: BoundFunction {
-            semantic_parameters: Box::default(),
+            legacy_metadata: Some(crate::LegacyBindingMetadata {
+                semantic_parameters: Box::default(),
+                volatility: FunctionVolatility::Immutable,
+                argument_evaluation: FunctionArgumentEvaluation::Eager,
+                failure_behavior: FunctionFailureBehavior::Propagate,
+                intrinsic_row_error:
+                    novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
+            }),
             function_id: FunctionId::try_new(function_id).unwrap(),
             overload: FunctionOverloadId::try_new(overload).unwrap(),
             kind: FunctionKind::Aggregate,
             argument_types: Box::from([FunctionArgumentType::Value(ty(DataType::Int64, false))]),
             result_type: ty(DataType::Int64, false),
-            volatility: FunctionVolatility::Immutable,
-            argument_evaluation: FunctionArgumentEvaluation::Eager,
-            failure_behavior: FunctionFailureBehavior::Propagate,
-            intrinsic_row_error:
-                novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
         },
         phase,
         logical_argument_count: 1,

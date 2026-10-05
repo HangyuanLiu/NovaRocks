@@ -1057,6 +1057,31 @@ pub(crate) fn is_utf8(ty: &DataType) -> bool {
     )
 }
 
+/// Only the legacy publication path requires original legacy provenance.
+/// Package construction separately checks actual FrozenFragmentCalls and never
+/// substitutes these projections for the occurrence's complete effect facts.
+pub(crate) fn validate_legacy_binding_metadata(
+    metadata: Option<&crate::LegacyBindingMetadata>,
+    kind: crate::FunctionKind,
+    path: &str,
+    invalid_kind_message: &'static str,
+    errors: &mut ValidationContext,
+) {
+    if !errors.checks_output_and_effect_proofs() {
+        return;
+    }
+    match metadata {
+        None => errors.push(ValidationError::unsupported_capability(
+            path,
+            "legacy publication requires original binding metadata; use frozen package admission for an exact signature",
+        )),
+        Some(metadata) if !metadata.intrinsic_row_error.is_valid_for_kind(kind) => {
+            errors.push(ValidationError::new(path, invalid_kind_message));
+        }
+        Some(_) => {}
+    }
+}
+
 pub(crate) fn validate_function_call(
     fragment: &Fragment,
     expression: &crate::ExprNode,
@@ -1065,16 +1090,13 @@ pub(crate) fn validate_function_call(
     path: &str,
     errors: &mut ValidationContext,
 ) {
-    if errors.checks_output_and_effect_proofs()
-        && !function
-            .intrinsic_row_error
-            .is_valid_for_kind(function.kind)
-    {
-        errors.push(ValidationError::new(
-            path,
-            "bound function intrinsic row-error fact differs from its kind",
-        ));
-    }
+    validate_legacy_binding_metadata(
+        function.legacy_metadata.as_ref(),
+        function.kind,
+        path,
+        "bound function intrinsic row-error fact differs from its kind",
+        errors,
+    );
     validate_function_arguments(
         fragment,
         &function.function_id,
@@ -1283,17 +1305,13 @@ pub(crate) fn validate_aggregate_arguments(
     path: &str,
     errors: &mut ValidationContext,
 ) {
-    if errors.checks_output_and_effect_proofs()
-        && !binding
-            .function
-            .intrinsic_row_error
-            .is_valid_for_kind(binding.function.kind)
-    {
-        errors.push(ValidationError::new(
-            path,
-            "bound aggregate intrinsic row-error fact differs from its kind",
-        ));
-    }
+    validate_legacy_binding_metadata(
+        binding.function.legacy_metadata.as_ref(),
+        binding.function.kind,
+        path,
+        "bound aggregate intrinsic row-error fact differs from its kind",
+        errors,
+    );
     match binding.phase {
         AggregatePhase::Single | AggregatePhase::Partial { .. } => {
             let logical_count =

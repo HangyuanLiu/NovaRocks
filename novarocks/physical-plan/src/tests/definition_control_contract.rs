@@ -96,16 +96,18 @@ fn boolean(builder: &mut FragmentBuilder, node: NodeId, value: bool) -> ExprId {
 }
 fn function(arguments: Box<[FunctionArgumentType]>, result: ValueType) -> BoundFunction {
     BoundFunction {
-        semantic_parameters: Box::default(),
+        legacy_metadata: Some(crate::LegacyBindingMetadata {
+            semantic_parameters: Box::default(),
+            volatility: FunctionVolatility::Immutable,
+            argument_evaluation: FunctionArgumentEvaluation::Eager,
+            failure_behavior: FunctionFailureBehavior::Propagate,
+            intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
+        }),
         function_id: FunctionId::try_new("fixture/definition-control/exact-shape").unwrap(),
         overload: FunctionOverloadId::try_new("fixture/definition-control/selected-shape").unwrap(),
         kind: FunctionKind::Scalar,
         argument_types: arguments,
         result_type: result,
-        volatility: FunctionVolatility::Immutable,
-        argument_evaluation: FunctionArgumentEvaluation::Eager,
-        failure_behavior: FunctionFailureBehavior::Propagate,
-        intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
     }
 }
 

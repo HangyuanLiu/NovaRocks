@@ -150,11 +150,13 @@ fn scalar(resolved: novarocks_functions::ResolvedFunctionBinding) -> BoundFuncti
         kind: resolved.kind,
         argument_types: resolved.selected.argument_types,
         result_type,
-        volatility: resolved.semantics.volatility,
-        argument_evaluation: resolved.semantics.argument_evaluation,
-        failure_behavior: resolved.semantics.failure_behavior,
-        intrinsic_row_error: resolved.semantics.intrinsic_row_error,
-        semantic_parameters: Box::default(),
+        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+            volatility: resolved.semantics.volatility,
+            argument_evaluation: resolved.semantics.argument_evaluation,
+            failure_behavior: resolved.semantics.failure_behavior,
+            intrinsic_row_error: resolved.semantics.intrinsic_row_error,
+            semantic_parameters: Box::default(),
+        }),
     }
 }
 fn window_binding(

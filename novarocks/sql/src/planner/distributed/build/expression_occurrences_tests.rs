@@ -170,11 +170,13 @@ fn binding(
         kind: resolved.kind,
         argument_types: resolved.selected.argument_types,
         result_type,
-        volatility: resolved.semantics.volatility,
-        argument_evaluation: resolved.semantics.argument_evaluation,
-        failure_behavior: resolved.semantics.failure_behavior,
-        intrinsic_row_error: resolved.semantics.intrinsic_row_error,
-        semantic_parameters: Box::default(),
+        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+            volatility: resolved.semantics.volatility,
+            argument_evaluation: resolved.semantics.argument_evaluation,
+            failure_behavior: resolved.semantics.failure_behavior,
+            intrinsic_row_error: resolved.semantics.intrinsic_row_error,
+            semantic_parameters: Box::default(),
+        }),
     }
 }
 fn project(builder: &mut FragmentBuilder, owner: NodeId, input: NodeId, roots: &[ExprId]) {
@@ -248,7 +250,11 @@ fn occurrence_shared_sparse_if_definition_keeps_value_truth_domains_and_ignores_
         FunctionKind::Scalar,
     );
     // Deliberately stale legacy metadata cannot select the new control protocol.
-    function.argument_evaluation = FunctionArgumentEvaluation::Eager;
+    function
+        .legacy_metadata
+        .as_mut()
+        .expect("actual legacy fixture")
+        .argument_evaluation = FunctionArgumentEvaluation::Eager;
     let root = ExprId::new(u32::MAX - 1);
     builder
         .insert_expression(ExprNode {

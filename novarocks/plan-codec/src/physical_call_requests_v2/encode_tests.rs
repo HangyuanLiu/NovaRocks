@@ -140,11 +140,14 @@ fn binding(args: Vec<FunctionArgumentType>) -> p::BoundFunction {
         kind: FunctionKind::Scalar,
         argument_types: args.into_boxed_slice(),
         result_type: int(),
-        volatility: FunctionVolatility::Immutable,
-        argument_evaluation: FunctionArgumentEvaluation::Eager,
-        failure_behavior: FunctionFailureBehavior::Propagate,
-        intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
-        semantic_parameters: Box::default(),
+
+        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+            volatility: FunctionVolatility::Immutable,
+            argument_evaluation: FunctionArgumentEvaluation::Eager,
+            failure_behavior: FunctionFailureBehavior::Propagate,
+            intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
+            semantic_parameters: Box::default(),
+        }),
     }
 }
 /// Real checked structural source; no installed function/provenance claim.

@@ -7626,7 +7626,13 @@ impl<'a> ContractLoweringVisitor<'a> {
             output.clone().into_boxed_slice(),
             NodeKind::TableFunction {
                 function: BoundTableFunction {
-                    semantic_parameters: Box::default(),
+                    legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+                        semantic_parameters: Box::default(),
+                        volatility: binding.semantics.volatility,
+                        argument_evaluation: binding.semantics.argument_evaluation,
+                        failure_behavior: binding.semantics.failure_behavior,
+                        intrinsic_row_error: binding.semantics.intrinsic_row_error,
+                    }),
                     function_id: binding.function_id.clone(),
                     overload: selected.overload.clone(),
                     argument_types: selected
@@ -7638,10 +7644,6 @@ impl<'a> ContractLoweringVisitor<'a> {
                     // are read in; the binding's came from the arguments it
                     // was resolved against, decoration and all.
                     result_types: result_types.iter().map(full_source_type).collect(),
-                    volatility: binding.semantics.volatility,
-                    argument_evaluation: binding.semantics.argument_evaluation,
-                    failure_behavior: binding.semantics.failure_behavior,
-                    intrinsic_row_error: binding.semantics.intrinsic_row_error,
                 },
                 arguments,
                 outputs: outputs.into_boxed_slice(),
@@ -8812,16 +8814,18 @@ impl<'a> ContractLoweringVisitor<'a> {
                 captured_call = Some((captured, channels, canonical));
                 ContractExprKind::FunctionCall {
                     function: BoundFunction {
-                        semantic_parameters: Box::default(),
+                        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+                            semantic_parameters: Box::default(),
+                            volatility: binding.semantics.volatility,
+                            argument_evaluation: binding.semantics.argument_evaluation,
+                            failure_behavior: binding.semantics.failure_behavior,
+                            intrinsic_row_error: binding.semantics.intrinsic_row_error,
+                        }),
                         function_id: binding.function_id.clone(),
                         overload: binding.selected.overload.clone(),
                         kind: binding.kind,
                         argument_types,
                         result_type,
-                        volatility: binding.semantics.volatility,
-                        argument_evaluation: binding.semantics.argument_evaluation,
-                        failure_behavior: binding.semantics.failure_behavior,
-                        intrinsic_row_error: binding.semantics.intrinsic_row_error,
                     },
                     args: lowered_args,
                 }
@@ -10925,7 +10929,13 @@ fn bound_function_from_selection(
     result_type: &ValueType,
 ) -> BoundFunction {
     BoundFunction {
-        semantic_parameters: Box::default(),
+        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+            semantic_parameters: Box::default(),
+            volatility: binding.semantics.volatility,
+            argument_evaluation: binding.semantics.argument_evaluation,
+            failure_behavior: binding.semantics.failure_behavior,
+            intrinsic_row_error: binding.semantics.intrinsic_row_error,
+        }),
         function_id: binding.function_id.clone(),
         overload: selected.overload.clone(),
         kind: binding.kind,
@@ -10935,10 +10945,6 @@ fn bound_function_from_selection(
             .map(full_source_argument)
             .collect(),
         result_type: full_source_type(result_type),
-        volatility: binding.semantics.volatility,
-        argument_evaluation: binding.semantics.argument_evaluation,
-        failure_behavior: binding.semantics.failure_behavior,
-        intrinsic_row_error: binding.semantics.intrinsic_row_error,
     }
 }
 

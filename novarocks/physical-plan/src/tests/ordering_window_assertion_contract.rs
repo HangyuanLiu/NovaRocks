@@ -438,16 +438,19 @@ fn finish_topn_reduction(
 
 fn window_function() -> BoundFunction {
     BoundFunction {
-        semantic_parameters: Box::default(),
+        legacy_metadata: Some(crate::LegacyBindingMetadata {
+            semantic_parameters: Box::default(),
+            volatility: FunctionVolatility::Immutable,
+            argument_evaluation: FunctionArgumentEvaluation::Eager,
+            failure_behavior: FunctionFailureBehavior::Propagate,
+            intrinsic_row_error:
+                novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
+        }),
         function_id: FunctionId::try_new("builtin/row_number/v1").unwrap(),
         overload: FunctionOverloadId::try_new("row-number-empty").unwrap(),
         kind: FunctionKind::Window,
         argument_types: Box::default(),
         result_type: ty(DataType::Int64, false),
-        volatility: FunctionVolatility::Immutable,
-        argument_evaluation: FunctionArgumentEvaluation::Eager,
-        failure_behavior: FunctionFailureBehavior::Propagate,
-        intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
     }
 }
 
@@ -996,20 +999,22 @@ fn finish_table_function_with_sink(
             },
             kind: NodeKind::TableFunction {
                 function: BoundTableFunction {
-                    semantic_parameters: Box::default(),
+                    legacy_metadata: Some(crate::LegacyBindingMetadata {
+                        semantic_parameters: Box::default(),
+                        volatility: if volatile {
+                            FunctionVolatility::Volatile
+                        } else {
+                            FunctionVolatility::Immutable
+                        },
+                        argument_evaluation: FunctionArgumentEvaluation::Eager,
+                        failure_behavior: FunctionFailureBehavior::Propagate,
+                        intrinsic_row_error:
+                            novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
+                    }),
                     function_id: FunctionId::try_new("builtin/generate_one/v1").unwrap(),
                     overload: FunctionOverloadId::try_new("empty-to-i64").unwrap(),
                     argument_types: Box::default(),
                     result_types: Box::from([ty(DataType::Int64, false)]),
-                    volatility: if volatile {
-                        FunctionVolatility::Volatile
-                    } else {
-                        FunctionVolatility::Immutable
-                    },
-                    argument_evaluation: FunctionArgumentEvaluation::Eager,
-                    failure_behavior: FunctionFailureBehavior::Propagate,
-                    intrinsic_row_error:
-                        novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
                 },
                 arguments: Box::default(),
                 outputs,

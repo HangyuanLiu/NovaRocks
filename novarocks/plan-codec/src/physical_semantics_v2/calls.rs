@@ -482,16 +482,21 @@ mod tests {
             kind,
             argument_types: Box::default(),
             result_type,
-            volatility: FunctionVolatility::Immutable,
-            argument_evaluation: FunctionArgumentEvaluation::Eager,
-            failure_behavior: FunctionFailureBehavior::Propagate,
-            intrinsic_row_error: match kind {
-                FunctionKind::Scalar | FunctionKind::Table => FunctionIntrinsicRowError::NoRowError,
-                FunctionKind::Aggregate | FunctionKind::Window => {
-                    FunctionIntrinsicRowError::NotRowEvaluated
-                }
-            },
-            semantic_parameters: Box::default(),
+
+            legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+                volatility: FunctionVolatility::Immutable,
+                argument_evaluation: FunctionArgumentEvaluation::Eager,
+                failure_behavior: FunctionFailureBehavior::Propagate,
+                intrinsic_row_error: match kind {
+                    FunctionKind::Scalar | FunctionKind::Table => {
+                        FunctionIntrinsicRowError::NoRowError
+                    }
+                    FunctionKind::Aggregate | FunctionKind::Window => {
+                        FunctionIntrinsicRowError::NotRowEvaluated
+                    }
+                },
+                semantic_parameters: Box::default(),
+            }),
         }
     }
     fn effects(kind: FunctionKind, domain: EvaluationDomainId) -> CallEffects {
@@ -796,11 +801,26 @@ mod tests {
                     overload: scalar_fields.overload,
                     argument_types: Box::default(),
                     result_types: Box::from([integer()]),
-                    volatility: scalar_fields.volatility,
-                    argument_evaluation: scalar_fields.argument_evaluation,
-                    failure_behavior: scalar_fields.failure_behavior,
-                    intrinsic_row_error: scalar_fields.intrinsic_row_error,
-                    semantic_parameters: Box::default(),
+
+                    legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+                        volatility: scalar_fields.legacy_metadata.as_ref().unwrap().volatility,
+                        argument_evaluation: scalar_fields
+                            .legacy_metadata
+                            .as_ref()
+                            .unwrap()
+                            .argument_evaluation,
+                        failure_behavior: scalar_fields
+                            .legacy_metadata
+                            .as_ref()
+                            .unwrap()
+                            .failure_behavior,
+                        intrinsic_row_error: scalar_fields
+                            .legacy_metadata
+                            .as_ref()
+                            .unwrap()
+                            .intrinsic_row_error,
+                        semantic_parameters: Box::default(),
+                    }),
                 },
                 arguments: Box::default(),
                 outputs: Box::from([TableFunctionOutput::FunctionResult {

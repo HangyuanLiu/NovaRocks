@@ -158,11 +158,13 @@ fn author(
         kind: bound.kind,
         argument_types: selected.argument_types.clone(),
         result_type: result.clone(),
-        volatility: bound.semantics.volatility,
-        argument_evaluation: bound.semantics.argument_evaluation,
-        failure_behavior: bound.semantics.failure_behavior,
-        intrinsic_row_error: bound.semantics.intrinsic_row_error,
-        semantic_parameters: Box::default(),
+        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+            volatility: bound.semantics.volatility,
+            argument_evaluation: bound.semantics.argument_evaluation,
+            failure_behavior: bound.semantics.failure_behavior,
+            intrinsic_row_error: bound.semantics.intrinsic_row_error,
+            semantic_parameters: Box::default(),
+        }),
     };
     Author {
         function,

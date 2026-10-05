@@ -129,11 +129,13 @@ fn binding(
         kind: resolved.kind,
         argument_types: resolved.selected.argument_types,
         result_type,
-        volatility: resolved.semantics.volatility,
-        argument_evaluation: resolved.semantics.argument_evaluation,
-        failure_behavior: resolved.semantics.failure_behavior,
-        intrinsic_row_error: resolved.semantics.intrinsic_row_error,
-        semantic_parameters: Box::default(),
+        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+            volatility: resolved.semantics.volatility,
+            argument_evaluation: resolved.semantics.argument_evaluation,
+            failure_behavior: resolved.semantics.failure_behavior,
+            intrinsic_row_error: resolved.semantics.intrinsic_row_error,
+            semantic_parameters: Box::default(),
+        }),
     }
 }
 fn call(function: BoundFunction, ids: &[u32]) -> ExprNode {
@@ -508,11 +510,31 @@ fn scalar_requests_legacy_effect_fields_do_not_author_effects_and_real_owner_rej
     let ExprKind::FunctionCall { function, .. } = &mut source.kind else {
         unreachable!()
     };
-    function.volatility = FunctionVolatility::Volatile;
-    function.argument_evaluation = FunctionArgumentEvaluation::ShortCircuit;
-    function.failure_behavior = FunctionFailureBehavior::ReturnsNull;
-    function.intrinsic_row_error = FunctionIntrinsicRowError::MayRaise;
-    function.semantic_parameters = Box::from([SemanticParameterRef {
+    function
+        .legacy_metadata
+        .as_mut()
+        .expect("actual legacy fixture")
+        .volatility = FunctionVolatility::Volatile;
+    function
+        .legacy_metadata
+        .as_mut()
+        .expect("actual legacy fixture")
+        .argument_evaluation = FunctionArgumentEvaluation::ShortCircuit;
+    function
+        .legacy_metadata
+        .as_mut()
+        .expect("actual legacy fixture")
+        .failure_behavior = FunctionFailureBehavior::ReturnsNull;
+    function
+        .legacy_metadata
+        .as_mut()
+        .expect("actual legacy fixture")
+        .intrinsic_row_error = FunctionIntrinsicRowError::MayRaise;
+    function
+        .legacy_metadata
+        .as_mut()
+        .expect("actual legacy fixture")
+        .semantic_parameters = Box::from([SemanticParameterRef {
         id: SemanticParameterId::new(u32::MAX),
         expected_key: SemanticParameterKey::TimeZone,
     }]);

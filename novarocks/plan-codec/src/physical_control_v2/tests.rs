@@ -403,11 +403,14 @@ fn branch_fixture(is_case: bool) -> (Fragment, PhysicalRootUses) {
                 kind: FunctionKind::Scalar,
                 argument_types: vec![FunctionArgumentType::Value(ty.clone()); 3].into_boxed_slice(),
                 result_type: ty.clone(),
-                semantic_parameters: Box::default(),
-                volatility: FunctionVolatility::Immutable,
-                argument_evaluation: FunctionArgumentEvaluation::Eager,
-                failure_behavior: FunctionFailureBehavior::Propagate,
-                intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
+
+                legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+                    semantic_parameters: Box::default(),
+                    volatility: FunctionVolatility::Immutable,
+                    argument_evaluation: FunctionArgumentEvaluation::Eager,
+                    failure_behavior: FunctionFailureBehavior::Propagate,
+                    intrinsic_row_error: FunctionIntrinsicRowError::NoRowError,
+                }),
             },
             args: Box::from(arguments),
         }

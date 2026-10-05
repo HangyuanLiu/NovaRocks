@@ -160,11 +160,13 @@ fn scalar(resolved: ResolvedFunctionBinding) -> BoundFunction {
         kind: resolved.kind,
         argument_types: resolved.selected.argument_types,
         result_type,
-        volatility: resolved.semantics.volatility,
-        argument_evaluation: resolved.semantics.argument_evaluation,
-        failure_behavior: resolved.semantics.failure_behavior,
-        intrinsic_row_error: resolved.semantics.intrinsic_row_error,
-        semantic_parameters: Box::default(),
+        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+            volatility: resolved.semantics.volatility,
+            argument_evaluation: resolved.semantics.argument_evaluation,
+            failure_behavior: resolved.semantics.failure_behavior,
+            intrinsic_row_error: resolved.semantics.intrinsic_row_error,
+            semantic_parameters: Box::default(),
+        }),
     }
 }
 fn count(catalog: &EngineFunctionCatalog, types: &[FunctionValueType]) -> AggregateBinding {
@@ -511,11 +513,13 @@ fn relational_unnest_keeps_real_argument_root_separate_from_table_context_and_or
         overload: resolved.selected.overload,
         argument_types: resolved.selected.argument_types,
         result_types: result_types.clone(),
-        volatility: resolved.semantics.volatility,
-        argument_evaluation: resolved.semantics.argument_evaluation,
-        failure_behavior: resolved.semantics.failure_behavior,
-        intrinsic_row_error: resolved.semantics.intrinsic_row_error,
-        semantic_parameters: Box::default(),
+        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+            volatility: resolved.semantics.volatility,
+            argument_evaluation: resolved.semantics.argument_evaluation,
+            failure_behavior: resolved.semantics.failure_behavior,
+            intrinsic_row_error: resolved.semantics.intrinsic_row_error,
+            semantic_parameters: Box::default(),
+        }),
     };
     assert_eq!(result_types.len(), 1);
     let output = builder

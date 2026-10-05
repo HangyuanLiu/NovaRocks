@@ -105,7 +105,7 @@ fn fixture(operator: Operator, ordered: bool) -> Fixture {
         Operator::Project => 802,
         Operator::Table => 803,
     }));
-    let values = add_values(&mut builder, 1, false);
+    let (values, _) = add_values(&mut builder, 1, false);
     let input_value = ValueId::new(0);
     let child = if ordered {
         let sort = builder.reserve_node_id().unwrap();
@@ -229,11 +229,25 @@ fn fixture(operator: Operator, ordered: bool) -> Fixture {
                             overload: selected.overload,
                             argument_types: Box::default(),
                             result_types: Box::from([result]),
-                            volatility: selected.volatility,
-                            argument_evaluation: selected.argument_evaluation,
-                            failure_behavior: selected.failure_behavior,
-                            intrinsic_row_error: selected.intrinsic_row_error,
-                            semantic_parameters: Box::default(),
+                            legacy_metadata: Some(crate::LegacyBindingMetadata {
+                                volatility: selected.legacy_metadata.as_ref().unwrap().volatility,
+                                argument_evaluation: selected
+                                    .legacy_metadata
+                                    .as_ref()
+                                    .unwrap()
+                                    .argument_evaluation,
+                                failure_behavior: selected
+                                    .legacy_metadata
+                                    .as_ref()
+                                    .unwrap()
+                                    .failure_behavior,
+                                intrinsic_row_error: selected
+                                    .legacy_metadata
+                                    .as_ref()
+                                    .unwrap()
+                                    .intrinsic_row_error,
+                                semantic_parameters: Box::default(),
+                            }),
                         },
                         arguments: Box::default(),
                         outputs: Box::from([

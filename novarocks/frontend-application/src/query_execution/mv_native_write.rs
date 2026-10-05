@@ -242,6 +242,9 @@ pub(crate) fn encode_compile_error(
         novarocks_plan_codec::PhysicalEncodeError::Invalid(error) => {
             novarocks_sql::compiler::SqlCompileError::Compilation(error)
         }
+        novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(message) => {
+            novarocks_sql::compiler::SqlCompileError::Compilation(message.into())
+        }
     }
 }
 

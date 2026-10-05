@@ -87,13 +87,15 @@ fn legacy_volatile(fixture: &mut Fixture) {
             .collect::<Vec<_>>();
         for mut definition in definitions {
             if let ExprKind::FunctionCall { function, .. } = &mut definition.kind {
-                function.volatility = FunctionVolatility::Volatile;
+                function.legacy_metadata.as_mut().unwrap().volatility =
+                    FunctionVolatility::Volatile;
             }
             parts.expressions.insert(definition);
         }
         for node in parts.nodes.values_mut() {
             if let NodeKind::TableFunction { function, .. } = &mut node.kind {
-                function.volatility = FunctionVolatility::Volatile;
+                function.legacy_metadata.as_mut().unwrap().volatility =
+                    FunctionVolatility::Volatile;
             }
         }
     });
@@ -209,7 +211,7 @@ fn frozen_property_formulas_single_copy_does_not_impose_replication_or_drop_effe
 
 fn table_fixture() -> Fixture {
     let mut builder = FragmentBuilder::new(FragmentId::new(37));
-    let input = add_values(&mut builder, 1, false);
+    let (input, _) = add_values(&mut builder, 1, false);
     let input_value = ValueId::new(0);
     assert!(matches!(builder.value(input_value).unwrap().origin,
         ValueOrigin::NodeOutput { node, output_ordinal: 0 } if node == input));
@@ -235,11 +237,21 @@ fn table_fixture() -> Fixture {
                 overload: selected.overload,
                 argument_types: Box::default(),
                 result_types: Box::from([integer()]),
-                volatility: selected.volatility,
-                argument_evaluation: selected.argument_evaluation,
-                failure_behavior: selected.failure_behavior,
-                intrinsic_row_error: selected.intrinsic_row_error,
-                semantic_parameters: Box::default(),
+                legacy_metadata: Some(crate::LegacyBindingMetadata {
+                    volatility: selected.legacy_metadata.as_ref().unwrap().volatility,
+                    argument_evaluation: selected
+                        .legacy_metadata
+                        .as_ref()
+                        .unwrap()
+                        .argument_evaluation,
+                    failure_behavior: selected.legacy_metadata.as_ref().unwrap().failure_behavior,
+                    intrinsic_row_error: selected
+                        .legacy_metadata
+                        .as_ref()
+                        .unwrap()
+                        .intrinsic_row_error,
+                    semantic_parameters: Box::default(),
+                }),
             },
             arguments: Box::default(),
             outputs: Box::from([

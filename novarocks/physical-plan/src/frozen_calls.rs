@@ -92,6 +92,7 @@ pub struct FrozenFragmentCalls {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrozenCallError {
+    MissingLegacyMetadata(crate::MissingLegacyBindingMetadata),
     Control(CompileControlError),
     Roots(RootUseBindingError),
     TooManyItems,

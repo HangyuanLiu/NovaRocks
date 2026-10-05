@@ -78,16 +78,18 @@ fn function(kind: FunctionKind, result_type: ValueType) -> BoundFunction {
         kind,
         argument_types: Box::default(),
         result_type,
-        volatility: FunctionVolatility::Immutable,
-        argument_evaluation: FunctionArgumentEvaluation::Eager,
-        failure_behavior: FunctionFailureBehavior::Propagate,
-        intrinsic_row_error: match kind {
-            FunctionKind::Scalar | FunctionKind::Table => FunctionIntrinsicRowError::NoRowError,
-            FunctionKind::Aggregate | FunctionKind::Window => {
-                FunctionIntrinsicRowError::NotRowEvaluated
-            }
-        },
-        semantic_parameters: Box::default(),
+        legacy_metadata: Some(crate::LegacyBindingMetadata {
+            volatility: FunctionVolatility::Immutable,
+            argument_evaluation: FunctionArgumentEvaluation::Eager,
+            failure_behavior: FunctionFailureBehavior::Propagate,
+            intrinsic_row_error: match kind {
+                FunctionKind::Scalar | FunctionKind::Table => FunctionIntrinsicRowError::NoRowError,
+                FunctionKind::Aggregate | FunctionKind::Window => {
+                    FunctionIntrinsicRowError::NotRowEvaluated
+                }
+            },
+            semantic_parameters: Box::default(),
+        }),
     }
 }
 fn effects(kind: FunctionKind, domain: EvaluationDomainId) -> CallEffects {
@@ -153,7 +155,28 @@ fn install_node(
         })
         .unwrap();
 }
-fn add_values(builder: &mut FragmentBuilder, count: usize, scalar: bool) -> NodeId {
+// The zero-argument fixture is requested without a result constraint. This
+// source record is authored before emission, independently of selected metadata.
+fn zero_argument_request() -> PhysicalCallRequest {
+    PhysicalCallRequest {
+        arguments: Box::default(),
+        logical_argument_count: 0,
+        expected_result_type: None,
+        constant_policy: ConstantPolicy {
+            max_rows: 16,
+            max_array_nodes: 32,
+            max_logical_elements: 128,
+            max_retained_buffer_bytes: 64 * 1024,
+            max_type_depth: 16,
+            max_type_nodes: 128,
+            max_dictionary_depth: 8,
+            max_metadata_bytes: 4096,
+            max_library_validation_work: 1_000_000,
+            max_library_validation_bytes: 1024 * 1024,
+        },
+    }
+}
+fn add_values(builder: &mut FragmentBuilder, count: usize, scalar: bool) -> (NodeId, ExprId) {
     let node = builder.reserve_node_id().unwrap();
     let ty = if scalar { boolean() } else { integer() };
     let expression = builder
@@ -188,7 +211,7 @@ fn add_values(builder: &mut FragmentBuilder, count: usize, scalar: bool) -> Node
             rows: vec![Box::from([expression]); count].into_boxed_slice(),
         },
     );
-    node
+    (node, expression)
 }
 fn leaf_roots(fragment: &Fragment) -> PhysicalRootUses {
     let roots = PhysicalExpressionRoots::try_new(fragment, &Control::default()).unwrap();
@@ -245,9 +268,15 @@ impl Fixture {
 }
 fn scalar_fixture(count: usize, fragment_id: u32) -> Fixture {
     let mut builder = FragmentBuilder::new(FragmentId::new(fragment_id));
-    let node = add_values(&mut builder, count, true);
+    let request = zero_argument_request();
+    let (node, expression) = add_values(&mut builder, count, true);
     let fragment = builder
         .finish_definition(node, FragmentSink::Noop, dop())
+        .unwrap()
+        .with_call_requests_observed(
+            vec![(PhysicalCallDefinition::Expression(expression), request)],
+            &Control::default(),
+        )
         .unwrap();
     validate_fragment_definition(&fragment).unwrap();
     let uses = leaf_roots(&fragment);
@@ -323,7 +352,7 @@ fn repeated_definition_preserves_complete_per_use_claims_and_exact_binding_borro
     // Public shape claims intentionally do not authenticate an installed owner.
     assert_ne!(
         fixture.calls[0].effects.value_stability,
-        function.volatility
+        function.legacy_metadata.as_ref().unwrap().volatility
     );
 }
 
@@ -603,7 +632,7 @@ fn special_fixture() -> Fixture {
 
 fn special_fixture_with_rows(input_rows: usize) -> Fixture {
     let mut builder = FragmentBuilder::new(FragmentId::new(41));
-    let input = add_values(&mut builder, input_rows, false);
+    let (input, _) = add_values(&mut builder, input_rows, false);
     let aggregate = builder.reserve_node_id().unwrap();
     let mut outputs = Vec::new();
     let mut aggregate_calls = Vec::new();
@@ -700,11 +729,25 @@ fn special_fixture_with_rows(input_rows: usize) -> Fixture {
                 overload: scalar_fields.overload,
                 argument_types: Box::default(),
                 result_types: Box::from([integer()]),
-                volatility: scalar_fields.volatility,
-                argument_evaluation: scalar_fields.argument_evaluation,
-                failure_behavior: scalar_fields.failure_behavior,
-                intrinsic_row_error: scalar_fields.intrinsic_row_error,
-                semantic_parameters: Box::default(),
+                legacy_metadata: Some(crate::LegacyBindingMetadata {
+                    volatility: scalar_fields.legacy_metadata.as_ref().unwrap().volatility,
+                    argument_evaluation: scalar_fields
+                        .legacy_metadata
+                        .as_ref()
+                        .unwrap()
+                        .argument_evaluation,
+                    failure_behavior: scalar_fields
+                        .legacy_metadata
+                        .as_ref()
+                        .unwrap()
+                        .failure_behavior,
+                    intrinsic_row_error: scalar_fields
+                        .legacy_metadata
+                        .as_ref()
+                        .unwrap()
+                        .intrinsic_row_error,
+                    semantic_parameters: Box::default(),
+                }),
             },
             arguments: Box::default(),
             outputs: Box::from([TableFunctionOutput::FunctionResult {

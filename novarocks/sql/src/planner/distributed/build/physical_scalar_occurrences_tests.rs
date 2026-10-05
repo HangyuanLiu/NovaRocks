@@ -112,11 +112,13 @@ fn binding(
         kind: resolved.kind,
         argument_types: resolved.selected.argument_types,
         result_type,
-        volatility: resolved.semantics.volatility,
-        argument_evaluation: resolved.semantics.argument_evaluation,
-        failure_behavior: resolved.semantics.failure_behavior,
-        intrinsic_row_error: resolved.semantics.intrinsic_row_error,
-        semantic_parameters: Box::default(),
+        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+            volatility: resolved.semantics.volatility,
+            argument_evaluation: resolved.semantics.argument_evaluation,
+            failure_behavior: resolved.semantics.failure_behavior,
+            intrinsic_row_error: resolved.semantics.intrinsic_row_error,
+            semantic_parameters: Box::default(),
+        }),
     }
 }
 fn empty() -> (FragmentBuilder, NodeId, NodeId) {
@@ -234,10 +236,26 @@ fn shared_if(catalog: &EngineFunctionCatalog) -> (Fragment, ExprId) {
         &[boolean.clone(), boolean.clone(), boolean.clone()],
     );
     // These contradictory legacy fields are not authority for the new owner.
-    function.argument_evaluation = FunctionArgumentEvaluation::Eager;
-    function.volatility = FunctionVolatility::Volatile;
-    function.intrinsic_row_error = FunctionIntrinsicRowError::MayRaise;
-    function.failure_behavior = FunctionFailureBehavior::ReturnsNull;
+    function
+        .legacy_metadata
+        .as_mut()
+        .expect("actual legacy fixture")
+        .argument_evaluation = FunctionArgumentEvaluation::Eager;
+    function
+        .legacy_metadata
+        .as_mut()
+        .expect("actual legacy fixture")
+        .volatility = FunctionVolatility::Volatile;
+    function
+        .legacy_metadata
+        .as_mut()
+        .expect("actual legacy fixture")
+        .intrinsic_row_error = FunctionIntrinsicRowError::MayRaise;
+    function
+        .legacy_metadata
+        .as_mut()
+        .expect("actual legacy fixture")
+        .failure_behavior = FunctionFailureBehavior::ReturnsNull;
     let root = ExprId::new(u32::MAX - 1);
     builder
         .insert_expression(ExprNode {
@@ -1050,11 +1068,13 @@ fn scalar_occurrences_typeof_unknown_and_metadata_only_catalog_never_supply_owne
         kind: resolved.kind,
         argument_types: resolved.selected.argument_types,
         result_type: result.clone(),
-        volatility: resolved.semantics.volatility,
-        argument_evaluation: resolved.semantics.argument_evaluation,
-        failure_behavior: resolved.semantics.failure_behavior,
-        intrinsic_row_error: resolved.semantics.intrinsic_row_error,
-        semantic_parameters: Box::default(),
+        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+            volatility: resolved.semantics.volatility,
+            argument_evaluation: resolved.semantics.argument_evaluation,
+            failure_behavior: resolved.semantics.failure_behavior,
+            intrinsic_row_error: resolved.semantics.intrinsic_row_error,
+            semantic_parameters: Box::default(),
+        }),
     };
     let owner = NodeId::new(901);
     let nodes = vec![

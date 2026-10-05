@@ -242,11 +242,13 @@ fn fixture(
                 kind: rand.kind,
                 argument_types: selected.argument_types.clone(),
                 result_type: result.clone(),
-                volatility: rand.semantics.volatility,
-                argument_evaluation: rand.semantics.argument_evaluation,
-                failure_behavior: rand.semantics.failure_behavior,
-                intrinsic_row_error: rand.semantics.intrinsic_row_error,
-                semantic_parameters: Box::default(),
+                legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+                    volatility: rand.semantics.volatility,
+                    argument_evaluation: rand.semantics.argument_evaluation,
+                    failure_behavior: rand.semantics.failure_behavior,
+                    intrinsic_row_error: rand.semantics.intrinsic_row_error,
+                    semantic_parameters: Box::default(),
+                }),
             };
             let first = builder
                 .add_expression(

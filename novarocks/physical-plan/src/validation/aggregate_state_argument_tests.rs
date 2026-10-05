@@ -29,12 +29,14 @@ fn binding(ty: crate::ValueType) -> crate::AggregateBinding {
             kind: novarocks_type_contract::FunctionKind::Aggregate,
             argument_types: Box::from([FunctionArgumentType::Value(ty)]),
             result_type: crate::ValueType::new(arrow_schema::DataType::Int64, false),
-            volatility: novarocks_type_contract::FunctionVolatility::Immutable,
-            argument_evaluation: novarocks_type_contract::FunctionArgumentEvaluation::Eager,
-            failure_behavior: novarocks_type_contract::FunctionFailureBehavior::Propagate,
-            intrinsic_row_error:
-                novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
-            semantic_parameters: Box::default(),
+            legacy_metadata: Some(crate::LegacyBindingMetadata {
+                volatility: novarocks_type_contract::FunctionVolatility::Immutable,
+                argument_evaluation: novarocks_type_contract::FunctionArgumentEvaluation::Eager,
+                failure_behavior: novarocks_type_contract::FunctionFailureBehavior::Propagate,
+                intrinsic_row_error:
+                    novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
+                semantic_parameters: Box::default(),
+            }),
         },
         phase: crate::AggregatePhase::Final {
             sequence: crate::AggregateSequenceId::new(9),

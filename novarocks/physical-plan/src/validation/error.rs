@@ -81,10 +81,6 @@ impl ValidationError {
     }
 
     /// The target cannot honour something the plan legitimately names.
-    #[expect(
-        dead_code,
-        reason = "consumed once T07-P lowers provider capability refusals"
-    )]
     pub(crate) fn unsupported_capability(path: impl AsRef<str>, message: impl AsRef<str>) -> Self {
         Self::categorized(
             ValidationErrorCategory::UnsupportedCapability,

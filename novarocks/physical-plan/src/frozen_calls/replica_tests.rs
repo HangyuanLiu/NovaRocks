@@ -291,7 +291,8 @@ fn replica_equivalence_complete_claims_override_contradictory_legacy_volatility(
             .collect::<Vec<_>>();
         for mut expression in nodes {
             if let ExprKind::FunctionCall { function, .. } = &mut expression.kind {
-                function.volatility = FunctionVolatility::Volatile;
+                function.legacy_metadata.as_mut().unwrap().volatility =
+                    FunctionVolatility::Volatile;
             }
             parts.expressions.insert(expression);
         }
@@ -453,7 +454,7 @@ fn replica_equivalence_small_success_error_and_wide_quantum_preserve_all_control
 
 fn broadcast_table_fixture() -> Fixture {
     let mut builder = FragmentBuilder::new(FragmentId::new(71));
-    let input = add_values(&mut builder, 1, true);
+    let (input, _) = add_values(&mut builder, 1, true);
     // The input is an actual deterministic scalar occurrence. The table
     // argument reads its published value, rather than introducing a call
     // whose lifecycle state is inferred from legacy metadata.
@@ -483,11 +484,21 @@ fn broadcast_table_fixture() -> Fixture {
                 overload: fields.overload,
                 argument_types: Box::from([FunctionArgumentType::Value(boolean())]),
                 result_types: Box::from([integer()]),
-                volatility: fields.volatility,
-                argument_evaluation: fields.argument_evaluation,
-                failure_behavior: fields.failure_behavior,
-                intrinsic_row_error: fields.intrinsic_row_error,
-                semantic_parameters: Box::default(),
+                legacy_metadata: Some(crate::LegacyBindingMetadata {
+                    volatility: fields.legacy_metadata.as_ref().unwrap().volatility,
+                    argument_evaluation: fields
+                        .legacy_metadata
+                        .as_ref()
+                        .unwrap()
+                        .argument_evaluation,
+                    failure_behavior: fields.legacy_metadata.as_ref().unwrap().failure_behavior,
+                    intrinsic_row_error: fields
+                        .legacy_metadata
+                        .as_ref()
+                        .unwrap()
+                        .intrinsic_row_error,
+                    semantic_parameters: Box::default(),
+                }),
             },
             arguments: Box::from([argument]),
             outputs: Box::from([
@@ -683,7 +694,8 @@ fn package_property_author_uses_complete_occurrence_facts_and_ignores_legacy_vol
             .map(|(_, node)| {
                 let mut node = node.clone();
                 if let ExprKind::FunctionCall { function, .. } = &mut node.kind {
-                    function.volatility = FunctionVolatility::Volatile;
+                    function.legacy_metadata.as_mut().unwrap().volatility =
+                        FunctionVolatility::Volatile;
                 }
                 node
             })

@@ -1503,16 +1503,13 @@ pub(crate) fn validate_node_semantics(
             outputs,
             left_outer,
         } => {
-            if errors.checks_output_and_effect_proofs()
-                && !function
-                    .intrinsic_row_error
-                    .is_valid_for_kind(crate::FunctionKind::Table)
-            {
-                errors.push(ValidationError::new(
-                    path,
-                    "bound table function has a non-row intrinsic fact",
-                ));
-            }
+            validate_legacy_binding_metadata(
+                function.legacy_metadata.as_ref(),
+                crate::FunctionKind::Table,
+                path,
+                "bound table function has a non-row intrinsic fact",
+                errors,
+            );
             if function.result_types.is_empty() {
                 errors.push(ValidationError::new(
                     path,
@@ -2977,17 +2974,22 @@ pub(crate) fn validate_scan_predicate_contract(
                 "relation predicate guarantee is not owned by its scan",
             ));
         }
-        if errors.checks_output_and_effect_proofs()
-            && !fragment_expressions_are_replica_deterministic(
+        if errors.checks_output_and_effect_proofs() {
+            match fragment_expressions_are_replica_deterministic(
                 fragment,
                 std::iter::once(guarantee.predicate),
                 true,
-            )
-        {
-            errors.push(ValidationError::new(
-                path,
-                "relation predicate guarantee must be replica deterministic",
-            ));
+            ) {
+                Ok(true) => {}
+                Ok(false) => errors.push(ValidationError::new(
+                    path,
+                    "relation predicate guarantee must be replica deterministic",
+                )),
+                Err(_) => errors.push(ValidationError::unsupported_capability(
+                    path,
+                    "legacy predicate guarantee requires original binding metadata",
+                )),
+            }
         }
     }
 
