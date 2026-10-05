@@ -120,6 +120,28 @@ pub fn charge_write_type_header(
     Ok(())
 }
 
+/// Events at the original writer-law traversal. Before events permit the
+/// caller to admit opaque source lookup/iteration before it starts. Completed
+/// events retain the existing observer trace and partial charge behavior.
+#[derive(Clone, Copy, Debug)]
+pub enum WriteSchemaVisit<'a> {
+    BeforeField(&'a Field),
+    BeforeType(&'a DataType),
+    Completed,
+}
+
+/// Borrow an existing caller context; this function owns no entry, footer,
+/// resource budget or new control scope. It uses the same validation grammar
+/// as the plain and completed-only observed entry points below.
+pub fn validate_write_field_schema_events<E: From<ConnectorError>>(
+    field: &Field,
+    depth: usize,
+    decoded_bytes: &mut usize,
+    mut observe: impl FnMut(WriteSchemaVisit<'_>) -> Result<(), E>,
+) -> Result<(), E> {
+    validate_field_core(field, depth, decoded_bytes, &mut observe)
+}
+
 pub fn validate_write_field_schema(
     field: &Field,
     depth: usize,
@@ -127,7 +149,7 @@ pub fn validate_write_field_schema(
 ) -> Result<(), ConnectorError> {
     // The existing unobserved contract delegates the same traversal. It does
     // not manufacture a PureCompileControl or certify a preparation budget.
-    validate_field_core(field, depth, decoded_bytes, &mut || Ok(()))
+    validate_field_core(field, depth, decoded_bytes, &mut |_| Ok(()))
 }
 
 /// Validate the same writer domain on the caller's existing observer. The
@@ -141,25 +163,31 @@ pub fn validate_write_field_schema_observed<E: From<ConnectorError>>(
     decoded_bytes: &mut usize,
     mut observe: impl FnMut() -> Result<(), E>,
 ) -> Result<(), E> {
-    validate_field_core(field, depth, decoded_bytes, &mut observe)
+    validate_field_core(field, depth, decoded_bytes, &mut |event| {
+        if matches!(event, WriteSchemaVisit::Completed) {
+            observe()?;
+        }
+        Ok(())
+    })
 }
 
 fn validate_field_core<E: From<ConnectorError>>(
     field: &Field,
     depth: usize,
     decoded_bytes: &mut usize,
-    observe: &mut impl FnMut() -> Result<(), E>,
+    observe: &mut impl FnMut(WriteSchemaVisit<'_>) -> Result<(), E>,
 ) -> Result<(), E> {
     // Preserve name, logical metadata, entry count and storage diagnostic order.
+    observe(WriteSchemaVisit::BeforeField(field))?;
     validate_write_field_name(field.name())?;
     novarocks_type_contract::field_logical_type(field).map_err(|error| {
         ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
     })?;
     charge_write_field_header(field.name(), field.metadata().len(), decoded_bytes)?;
-    observe()?;
+    observe(WriteSchemaVisit::Completed)?;
     for (key, value) in field.metadata() {
         charge_write_metadata_entry(key, value, decoded_bytes)?;
-        observe()?;
+        observe(WriteSchemaVisit::Completed)?;
     }
     validate_type_core(field.data_type(), depth, decoded_bytes, observe)
 }
@@ -169,7 +197,7 @@ pub fn validate_write_data_type(
     depth: usize,
     decoded_bytes: &mut usize,
 ) -> Result<(), ConnectorError> {
-    validate_type_core(data_type, depth, decoded_bytes, &mut || Ok(()))
+    validate_type_core(data_type, depth, decoded_bytes, &mut |_| Ok(()))
 }
 
 /// Borrow the caller's observer for the original type traversal. All child
@@ -180,21 +208,27 @@ pub fn validate_write_data_type_observed<E: From<ConnectorError>>(
     decoded_bytes: &mut usize,
     mut observe: impl FnMut() -> Result<(), E>,
 ) -> Result<(), E> {
-    validate_type_core(data_type, depth, decoded_bytes, &mut observe)
+    validate_type_core(data_type, depth, decoded_bytes, &mut |event| {
+        if matches!(event, WriteSchemaVisit::Completed) {
+            observe()?;
+        }
+        Ok(())
+    })
 }
 
 fn validate_type_core<E: From<ConnectorError>>(
     data_type: &DataType,
     depth: usize,
     decoded_bytes: &mut usize,
-    observe: &mut impl FnMut() -> Result<(), E>,
+    observe: &mut impl FnMut(WriteSchemaVisit<'_>) -> Result<(), E>,
 ) -> Result<(), E> {
+    observe(WriteSchemaVisit::BeforeType(data_type))?;
     let timezone = match data_type {
         DataType::Timestamp(_, timezone) => timezone.as_deref(),
         _ => None,
     };
     charge_write_type_header(depth, timezone, decoded_bytes)?;
-    observe()?;
+    observe(WriteSchemaVisit::Completed)?;
     match data_type {
         DataType::List(field)
         | DataType::ListView(field)

@@ -26,6 +26,7 @@ mod codec;
 mod error;
 mod identity;
 mod mutation;
+mod owned_copy;
 mod predicate;
 mod pure_catalogue;
 mod pure_compile;
@@ -53,6 +54,7 @@ pub use identity::{
     ConnectorIdentityError, ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
 };
 pub use mutation::{ConnectorRowMutationEffect, ConnectorWriteRouteId};
+pub use owned_copy::WriterOwnedResourceFacts;
 pub use predicate::{
     Bound, ConnectorExpression, ConnectorFunctionName, Constraint, Domain,
     MAX_CONNECTOR_EXPRESSION_DEPTH, MAX_CONNECTOR_EXPRESSION_NODES, MAX_CONNECTOR_VALUE_BYTES,

@@ -15,75 +15,331 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{ConnectorError, ConnectorErrorKind};
+use crate::{
+    ConnectorError, ConnectorErrorKind,
+    owned_copy::{OwnedCopy, PlainCopy},
+};
 use arrow_schema::{DataType, Field};
+use novarocks_type_contract::owned_resources::{hashmap, layout};
+use std::{alloc::Layout, collections::HashMap, sync::Arc};
 
-/// Rebuild bounded physical fields without retaining excess collection/string
-/// capacity or unrelated backing through nested Arc fields. Callers validate
-/// the aggregate schema before invoking this copy.
+fn absent() -> ConnectorError {
+    ConnectorError::new(
+        ConnectorErrorKind::InvalidRequest,
+        "writer owned field copy did not materialize",
+    )
+}
+fn present<T, O: OwnedCopy>(value: Option<T>, _: &O) -> Result<T, O::Error> {
+    value.ok_or_else(|| absent().into())
+}
+fn reserve<T, O: OwnedCopy>(count: usize, context: &mut O) -> Result<Vec<T>, O::Error> {
+    context.flush()?;
+    let mut values = Vec::new();
+    let result = values.try_reserve_exact(count);
+    context.reserve_exit(result)?;
+    Ok(values)
+}
+
+/// Rebuild physical fields without retaining excess source backing. The caller
+/// validates its own schema domain first; this grammar adds no Value/Writer
+/// limits. The plain entry delegates the same original constructor body.
 pub(crate) fn owned_field(field: &Field) -> Result<Field, ConnectorError> {
-    // This constructor is required to preserve Arrow's physical dictionary ID
-    // and ordering; ordinary Field equality/constructors omit those attributes.
+    owned_field_core(field, &mut PlainCopy)?.ok_or_else(absent)
+}
+
+/// Count and materialize share every source occurrence and request author.
+/// Count returns no partial Field and is not a schema-validity certificate;
+/// Arrow Union identity validation remains with try_new during actual copy.
+pub(crate) fn owned_field_core<O: OwnedCopy>(
+    field: &Field,
+    context: &mut O,
+) -> Result<Option<Field>, O::Error> {
+    let base = context.add(size_of::<Field>(), field.name().capacity())?;
+    let base = context.add(
+        base,
+        context.mul(field.metadata().len(), size_of::<(String, String)>())?,
+    )?;
+    context.source_floor(base)?;
+    let name = context.string(field.name())?;
+    let data_type = owned_type_core(field.data_type(), context)?;
+    let entries = field.metadata().len();
+    let buckets = context.table::<String, String>(entries)?;
+    // A partial materialized field may be destroyed on any later refusal.
+    // Prefund the fresh raw-table walk and two closed String destructors.
+    context.table_cleanup::<String, String>(entries, 256)?;
+    context.metadata_iteration(entries, 2)?;
+    let mut metadata = if context.materializes() {
+        context.flush()?;
+        let mut map = HashMap::new();
+        let result = map.try_reserve(entries);
+        context.reserve_exit(result)?;
+        Some(map)
+    } else {
+        None
+    };
+    let mut iter = field.metadata().iter();
+    loop {
+        context.flush()?;
+        let next = iter.next();
+        context.step()?;
+        context.flush()?;
+        let Some((key, value)) = next else { break };
+        context.source_floor(context.add(base, context.add(key.capacity(), value.capacity())?)?)?;
+        if context.source_invoice().is_some() {
+            let units =
+                hashmap::string_operations_work_upper_bound(buckets, 1, key.len(), key.len())
+                    .map_err(|error| context.hash_error(error))?;
+            context.work(context.mul(units, 2)?)?;
+        }
+        let key = context.string(key)?;
+        let value = context.string(value)?;
+        if let Some(metadata) = metadata.as_mut() {
+            let key = present(key, context)?;
+            let value = present(value, context)?;
+            context.flush()?;
+            metadata.insert(key, value);
+            context.step()?;
+            context.flush()?;
+        }
+    }
+    context.work(128)?;
+    context.step()?;
+    if !context.materializes() {
+        return Ok(None);
+    }
+    let name = present(name, context)?;
+    let data_type = present(data_type, context)?;
+    let metadata = present(metadata, context)?;
+    context.flush()?;
+    // Preserve physical dictionary identity/order, omitted by ordinary Field
+    // equality and Field::new. The existing constructor remains the author.
     #[allow(deprecated)]
-    let copy = Field::new_dict(
-        field.name().to_owned(),
-        owned_type(field.data_type())?,
+    let copied = Field::new_dict(
+        name,
+        data_type,
         field.is_nullable(),
         field.dict_id().unwrap_or(0),
         field.dict_is_ordered().unwrap_or(false),
-    );
-    Ok(copy.with_metadata(
-        field
-            .metadata()
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
-    ))
+    )
+    .with_metadata(metadata);
+    context.step()?;
+    context.flush()?;
+    Ok(Some(copied))
 }
 
-fn owned_type(data_type: &DataType) -> Result<DataType, ConnectorError> {
-    use std::sync::Arc;
-    let field = |field: &Field| owned_field(field).map(Arc::new);
-    Ok(match data_type {
-        DataType::Timestamp(unit, zone) => DataType::Timestamp(
-            *unit,
-            zone.as_ref().map(|zone| Arc::<str>::from(zone.as_ref())),
-        ),
-        DataType::List(item) => DataType::List(field(item)?),
-        DataType::ListView(item) => DataType::ListView(field(item)?),
-        DataType::LargeList(item) => DataType::LargeList(field(item)?),
-        DataType::LargeListView(item) => DataType::LargeListView(field(item)?),
-        DataType::FixedSizeList(item, size) => DataType::FixedSizeList(field(item)?, *size),
-        DataType::Struct(fields) => DataType::Struct(
-            fields
-                .iter()
-                .map(|item| field(item))
-                .collect::<Result<Vec<_>, _>>()?
-                .into(),
-        ),
+fn owned_arc_field<O: OwnedCopy>(
+    field: &Field,
+    context: &mut O,
+) -> Result<Option<Arc<Field>>, O::Error> {
+    context.arc::<Field>()?;
+    let minimum = layout::arc_layout(Layout::new::<Field>()).map_err(|_| context.arithmetic())?;
+    context.source_floor(minimum.size())?;
+    context.work(128)?;
+    let field = owned_field_core(field, context)?;
+    if !context.materializes() {
+        return Ok(None);
+    }
+    let field = present(field, context)?;
+    context.flush()?;
+    let field = Arc::new(field);
+    context.step()?;
+    context.flush()?;
+    Ok(Some(field))
+}
+
+fn union_requests<O: OwnedCopy>(count: usize, context: &mut O) -> Result<(), O::Error> {
+    // Arrow 58.2 try_new's Vec grows 4..128 before its original nonnegative,
+    // unique i8-ID gate. This is a library request upper, not a source cap:
+    // all source children are still copied before the opaque constructor.
+    let success_prefix = count.min(128);
+    let mut capacity = 4usize;
+    if success_prefix != 0 {
+        loop {
+            context.array::<(i8, Arc<Field>)>(capacity, 1)?;
+            context.work(context.mul(context.mul(capacity, size_of::<(i8, Arc<Field>)>())?, 2)?)?;
+            if capacity >= success_prefix {
+                break;
+            }
+            capacity = context.mul(capacity, 2)?;
+        }
+    }
+    context.arc_slice::<(i8, Arc<Field>)>(success_prefix)?;
+    context.work(context.add(context.mul(success_prefix, 128)?, 128)?)
+}
+
+fn owned_type_core<O: OwnedCopy>(
+    data_type: &DataType,
+    context: &mut O,
+) -> Result<Option<DataType>, O::Error> {
+    context.source_floor(size_of::<DataType>())?;
+    context.work(128)?;
+    let copied = match data_type {
+        DataType::Timestamp(unit, zone) => {
+            let zone = if let Some(zone) = zone {
+                context.arc_slice::<u8>(zone.len())?;
+                let minimum = layout::arc_layout(
+                    Layout::array::<u8>(zone.len()).map_err(|_| context.arithmetic())?,
+                )
+                .map_err(|_| context.arithmetic())?;
+                context.source_floor(minimum.size())?;
+                context.work(context.add(context.mul(zone.len(), 2)?, 64)?)?;
+                if context.materializes() {
+                    context.flush()?;
+                    let copied = Arc::<str>::from(zone.as_ref());
+                    context.step()?;
+                    context.flush()?;
+                    Some(copied)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            Some(DataType::Timestamp(*unit, zone))
+        }
+        DataType::List(item)
+        | DataType::ListView(item)
+        | DataType::LargeList(item)
+        | DataType::LargeListView(item)
+        | DataType::FixedSizeList(item, _)
+        | DataType::Map(item, _) => {
+            let field = owned_arc_field(item, context)?;
+            if context.materializes() {
+                let field = present(field, context)?;
+                Some(match data_type {
+                    DataType::List(_) => DataType::List(field),
+                    DataType::ListView(_) => DataType::ListView(field),
+                    DataType::LargeList(_) => DataType::LargeList(field),
+                    DataType::LargeListView(_) => DataType::LargeListView(field),
+                    DataType::FixedSizeList(_, size) => DataType::FixedSizeList(field, *size),
+                    DataType::Map(_, sorted) => DataType::Map(field, *sorted),
+                    _ => unreachable!(),
+                })
+            } else {
+                None
+            }
+        }
+        DataType::Struct(fields) => {
+            let minimum = layout::arc_layout(
+                Layout::array::<Arc<Field>>(fields.len()).map_err(|_| context.arithmetic())?,
+            )
+            .map_err(|_| context.arithmetic())?;
+            context.source_floor(minimum.size())?;
+            context.array::<Arc<Field>>(fields.len(), 1)?;
+            context.arc_slice::<Arc<Field>>(fields.len())?;
+            context.work(context.mul(context.mul(fields.len(), size_of::<Arc<Field>>())?, 2)?)?;
+            let mut values = if context.materializes() {
+                Some(reserve(fields.len(), context)?)
+            } else {
+                None
+            };
+            for field in fields {
+                let value = owned_arc_field(field, context)?;
+                if let Some(values) = values.as_mut() {
+                    values.push(present(value, context)?);
+                }
+                context.step()?;
+            }
+            if let Some(values) = values {
+                context.flush()?;
+                let fields = values.into();
+                context.step()?;
+                context.flush()?;
+                Some(DataType::Struct(fields))
+            } else {
+                None
+            }
+        }
         DataType::Union(fields, mode) => {
-            let (ids, fields): (Vec<_>, Vec<_>) = fields
-                .iter()
-                .map(|(id, item)| field(item).map(|item| (id, item)))
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .unzip();
-            DataType::Union(
-                arrow_schema::UnionFields::try_new(ids, fields).map_err(|_| {
+            let minimum = layout::arc_layout(
+                Layout::array::<(i8, Arc<Field>)>(fields.len())
+                    .map_err(|_| context.arithmetic())?,
+            )
+            .map_err(|_| context.arithmetic())?;
+            context.source_floor(minimum.size())?;
+            context.array::<i8>(fields.len(), 1)?;
+            context.array::<Arc<Field>>(fields.len(), 1)?;
+            union_requests(fields.len(), context)?;
+            let mut ids = if context.materializes() {
+                Some(reserve(fields.len(), context)?)
+            } else {
+                None
+            };
+            let mut values = if context.materializes() {
+                Some(reserve(fields.len(), context)?)
+            } else {
+                None
+            };
+            for (id, field) in fields.iter() {
+                let value = owned_arc_field(field, context)?;
+                if let Some(ids) = ids.as_mut() {
+                    ids.push(id);
+                }
+                if let Some(values) = values.as_mut() {
+                    values.push(present(value, context)?);
+                }
+                context.step()?;
+            }
+            if context.materializes() {
+                let ids = present(ids, context)?;
+                let values = present(values, context)?;
+                context.flush()?;
+                let fields = arrow_schema::UnionFields::try_new(ids, values).map_err(|_| {
                     ConnectorError::new(
                         ConnectorErrorKind::InvalidRequest,
                         "frozen schema has invalid union field identities",
                     )
-                })?,
-                *mode,
-            )
+                });
+                let fields = fields?;
+                context.step()?;
+                context.flush()?;
+                Some(DataType::Union(fields, *mode))
+            } else {
+                None
+            }
         }
         DataType::Dictionary(key, value) => {
-            DataType::Dictionary(Box::new(owned_type(key)?), Box::new(owned_type(value)?))
+            context.array::<DataType>(1, 2)?;
+            let key = owned_type_core(key, context)?;
+            let key = if context.materializes() {
+                context.flush()?;
+                let key = Box::new(present(key, context)?);
+                context.step()?;
+                context.flush()?;
+                Some(key)
+            } else {
+                None
+            };
+            let value = owned_type_core(value, context)?;
+            let value = if context.materializes() {
+                context.flush()?;
+                let value = Box::new(present(value, context)?);
+                context.step()?;
+                context.flush()?;
+                Some(value)
+            } else {
+                None
+            };
+            if context.materializes() {
+                Some(DataType::Dictionary(
+                    present(key, context)?,
+                    present(value, context)?,
+                ))
+            } else {
+                None
+            }
         }
-        DataType::Map(entries, sorted) => DataType::Map(field(entries)?, *sorted),
         DataType::RunEndEncoded(runs, values) => {
-            DataType::RunEndEncoded(field(runs)?, field(values)?)
+            let runs = owned_arc_field(runs, context)?;
+            let values = owned_arc_field(values, context)?;
+            if context.materializes() {
+                Some(DataType::RunEndEncoded(
+                    present(runs, context)?,
+                    present(values, context)?,
+                ))
+            } else {
+                None
+            }
         }
         DataType::Null
         | DataType::Boolean
@@ -114,6 +370,18 @@ fn owned_type(data_type: &DataType) -> Result<DataType, ConnectorError> {
         | DataType::Decimal32(_, _)
         | DataType::Decimal64(_, _)
         | DataType::Decimal128(_, _)
-        | DataType::Decimal256(_, _) => data_type.clone(),
-    })
+        | DataType::Decimal256(_, _) => {
+            // These closed leaves contain no owned backing.
+            context.materializes().then(|| data_type.clone())
+        }
+    };
+    context.step()?;
+    if context.materializes() {
+        Ok(copied)
+    } else {
+        Ok(None)
+    }
 }
+
+#[cfg(test)]
+mod tests;

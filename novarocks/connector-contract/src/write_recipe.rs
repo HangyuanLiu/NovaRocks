@@ -18,11 +18,13 @@
 //! Bounded pure writer recipes. Sealing proves provider-private semantics
 //! without opening a writer, resolving credentials or retaining a runtime handle.
 
+use crate::owned_copy::{ObservedCopy, OwnedCopy, PlainCopy};
 use crate::{
     ConnectorCodecCategory, ConnectorCodecContractError, ConnectorEncodedPayload, ConnectorError,
     ConnectorErrorKind, ConnectorWriteBinding, ConnectorWriteInputShape,
     MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES, PureProviderCompileError,
-    WRITE_FIELD_ALLOCATION_CHARGE, validate_write_field_schema,
+    WRITE_FIELD_ALLOCATION_CHARGE, WriteSchemaVisit, WriterOwnedResourceFacts,
+    validate_write_field_schema_events,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
@@ -50,9 +52,58 @@ impl ConnectorWriteRecipeDraft {
         payload: ConnectorEncodedPayload,
         input: ConnectorWriteInputShape,
     ) -> Result<Self, ConnectorError> {
-        if binding.descriptor().instance_id != *binding.catalog_handle().catalog_name() {
-            return Err(invalid("writer recipe catalog differs from its instance"));
+        Self::try_new_core(&binding, &payload, &input, &mut PlainCopy)
+    }
+
+    /// Construct through the original writer law and sole owned-copy grammar,
+    /// borrowing the caller's entry/footer and existing checkpoints. `admit`
+    /// must compose these contributions with all other known parent facts and
+    /// reject before any callback or next request. It is not an allocator grant.
+    /// The source invoice includes full retained backing, not visible lengths.
+    /// Source arguments are borrowed, so interruption does not destroy a raw
+    /// caller-owned graph before its original owner can observe the outcome.
+    pub fn try_new_observed(
+        binding: &ConnectorWriteBinding,
+        payload: &ConnectorEncodedPayload,
+        input: &ConnectorWriteInputShape,
+        source_retained_bytes: usize,
+        admit: &mut impl FnMut(&WriterOwnedResourceFacts) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, PureProviderCompileError<ConnectorError>> {
+        let mut observer = ObservedCopy::new(source_retained_bytes, admit, work)?;
+        Self::try_new_core(binding, payload, input, &mut observer)
+    }
+
+    fn try_new_core<O: OwnedCopy>(
+        binding: &ConnectorWriteBinding,
+        payload: &ConnectorEncodedPayload,
+        input: &ConnectorWriteInputShape,
+        observer: &mut O,
+    ) -> Result<Self, O::Error> {
+        // O(1) original-owner counts and requests before touching source fields.
+        input.preflight_owned_roles(observer)?;
+        observer.source_floor(payload.payload().len())?;
+        observer.array::<u8>(payload.payload().len(), 1)?;
+        observer.arc::<ConnectorWriteInputShape>()?;
+        if observer.source_invoice().is_some() && !payload.payload().is_empty() {
+            let shared = novarocks_type_contract::owned_resources::layout::bytes_shared_upper()
+                .map_err(|_| observer.arithmetic())?;
+            observer.array::<u8>(shared, 1)?;
         }
+        observer.work(observer.add(observer.mul(payload.payload().len(), 2)?, 128)?)?;
+        if let Some(source) = observer.source_invoice() {
+            // All identity spellings are inside the truthful source union.
+            // String equality and header validation are opaque library work.
+            observer.work(observer.add(observer.mul(source, 8)?, 128)?)?;
+        }
+        observer.flush()?;
+        let same_instance =
+            binding.descriptor().instance_id == *binding.catalog_handle().catalog_name();
+        observer.step()?;
+        if !same_instance {
+            return Err(invalid("writer recipe catalog differs from its instance").into());
+        }
+        observer.flush()?;
         payload
             .header()
             .validate_expected::<ConnectorCodecContractError>(
@@ -62,52 +113,102 @@ impl ConnectorWriteRecipeDraft {
                 payload.header().codec_revision(),
             )
             .map_err(|error| invalid(error.to_string()))?;
+        observer.step()?;
         if payload.payload().len() > MAX_CONNECTOR_WRITER_HANDLE_BYTES {
-            return Err(resource("writer recipe handle exceeds the byte limit"));
+            return Err(resource("writer recipe handle exceeds the byte limit").into());
         }
         if input.field_count() > MAX_CONNECTOR_WRITE_INPUT_FIELDS {
-            return Err(resource(
-                "writer recipe input exceeds the field count limit",
-            ));
+            return Err(resource("writer recipe input exceeds the field count limit").into());
         }
-        input.validate()?;
+        input.validate_with(observer)?;
         let mut schema_bytes = 0;
         for field in input.fields_iter() {
+            observer.work(1)?;
             if field.field().name().is_empty() {
-                return Err(invalid("writer recipe input field name is empty"));
+                return Err(invalid("writer recipe input field name is empty").into());
             }
-            validate_write_field_schema(field.field(), 1, &mut schema_bytes)?;
+            validate_write_field_schema_events::<O::Error>(
+                field.field(),
+                1,
+                &mut schema_bytes,
+                |event| {
+                    match event {
+                        WriteSchemaVisit::BeforeField(field) => {
+                            observer.work(128)?;
+                            observer.source_floor(observer.add(
+                                size_of::<arrow_schema::Field>(),
+                                field.name().capacity(),
+                            )?)?;
+                            if let Some(source) = observer.source_invoice() {
+                                let lookup = if field.metadata().is_empty() {
+                                    64
+                                } else {
+                                    let key_bytes =
+                                        novarocks_type_contract::NR_LOGICAL_TYPE_KEY.len();
+                                    novarocks_type_contract::owned_resources::hashmap::string_operations_work_upper_bound(
+                                    source, 1, key_bytes, key_bytes,
+                                ).map_err(|error| observer.hash_error(error))?
+                                };
+                                observer.work(lookup)?;
+                            }
+                            observer.metadata_iteration(field.metadata().len(), 1)?;
+                        }
+                        WriteSchemaVisit::BeforeType(_) => {
+                            observer.work(64)?;
+                            observer.flush()?;
+                        }
+                        WriteSchemaVisit::Completed => observer.step()?,
+                    }
+                    Ok(())
+                },
+            )?;
         }
-        // Field allocation accounting is shared with the existing write
-        // relations. Their aggregate schema bound remains authoritative.
+        // Preserve the original structural retained charge. Actual cumulative
+        // request/work upper bounds are a separate parent contribution.
         debug_assert!(schema_bytes <= MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES);
         let charged_bytes = schema_bytes
             .checked_add(payload.payload().len())
-            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
-            // The shared shape moved out of Self. Preserve its structural
-            // retained invoice, including the Arc counters; this is not an
-            // allocator-size or unique-ownership memory grant.
+            .and_then(|bytes| bytes.checked_add(size_of::<Self>()))
             .and_then(|bytes| {
-                bytes.checked_add(
-                    std::mem::size_of::<ConnectorWriteInputShape>()
-                        + 2 * std::mem::size_of::<usize>(),
-                )
+                bytes.checked_add(size_of::<ConnectorWriteInputShape>() + 2 * size_of::<usize>())
             })
             .and_then(|bytes| {
-                bytes.checked_add(
-                    input.field_count() * std::mem::size_of::<crate::ConnectorWriteFieldToken>(),
-                )
+                bytes
+                    .checked_add(input.field_count() * size_of::<crate::ConnectorWriteFieldToken>())
             })
             .ok_or_else(|| resource("writer recipe retained charge overflowed"))?;
-        let input = input.owned_bounded()?;
+        // Count uses the same physical grammar without constructing fields.
+        // The actual Arrow Union constructor remains the sole identity judge
+        // during materialization, after all original child copies.
+        if !observer.materializes() {
+            let counted = input.owned_bounded_core(observer)?;
+            debug_assert!(counted.is_none());
+        }
+        observer.begin_copy()?;
+        let input = input
+            .owned_bounded_core(observer)?
+            .ok_or_else(|| invalid("writer owned copy did not materialize its input"))?;
+        let mut copied_payload = Vec::new();
+        observer.flush()?;
+        let reservation = copied_payload.try_reserve_exact(payload.payload().len());
+        observer.reserve_exit(reservation)?;
+        for segment in payload.payload().chunks(256) {
+            copied_payload.extend_from_slice(segment);
+            observer.step()?;
+        }
+        observer.flush()?;
         let payload = ConnectorEncodedPayload::new(
             payload.header().clone(),
-            bytes::Bytes::copy_from_slice(payload.payload()),
+            bytes::Bytes::from(copied_payload),
         );
+        observer.step()?;
+        observer.flush()?;
+        let input = Arc::new(input);
+        observer.step()?;
         Ok(Self {
-            binding,
+            binding: binding.clone(),
             payload,
-            input: Arc::new(input),
+            input,
             charged_bytes,
         })
     }
@@ -613,3 +714,7 @@ mod tests {
         assert_eq!(control.units.lock().unwrap().as_slice(), &[0, 0, 0]);
     }
 }
+
+#[cfg(test)]
+#[path = "write_recipe/owned_tests.rs"]
+mod owned_tests;

@@ -42,5 +42,14 @@ impl<E: Error> From<CompileControlError> for PureProviderCompileError<E> {
     }
 }
 
+// Preserve original contract failures as ordinary provider failures, including
+// the writer law's ResourceExhausted diagnostics. Numeric/control refusals use
+// the separate typed From<CompileControlError> implementation above.
+impl From<crate::ConnectorError> for PureProviderCompileError<crate::ConnectorError> {
+    fn from(error: crate::ConnectorError) -> Self {
+        Self::Provider(error)
+    }
+}
+
 #[cfg(test)]
 mod tests;
