@@ -74,13 +74,13 @@ use novarocks_type_contract::{
 use sha2::{Digest, Sha256};
 
 use super::lowered_draft::{
-    AggregateRuntimeDemand, AggregateSourceTarget, EmittedOperationalCall,
-    LoweredAggregateLogicalSource, LoweredAggregateSourceEntry, LoweredExpressionLogicalSource,
-    LoweredExpressionSourceEntry, LoweredOperationalChannel, LoweredSqlPhysicalDraft,
-    LoweredTableSourceEntry, SqlExpressionCallKind, SqlLogicalSourceJournal,
-    SqlOperationalChannelRole, SqlOperationalProjectionError,
-    project_emitted_call_arguments_observed, validate_expression_source_entry_observed,
-    validate_table_source_entry_observed,
+    AggregateRuntimeDemand, AggregateSourceTarget, CanonicalAggregateOperationalRequest,
+    CapturedOperationalSource, EmittedOperationalCall, LoweredAggregateLogicalSource,
+    LoweredAggregateSourceEntry, LoweredExpressionLogicalSource, LoweredExpressionSourceEntry,
+    LoweredOperationalChannel, LoweredSqlPhysicalDraft, LoweredTableSourceEntry,
+    SqlExpressionCallKind, SqlLogicalSourceJournal, SqlOperationalChannelRole,
+    SqlOperationalProjectionError, project_emitted_call_arguments_observed,
+    validate_expression_source_entry_observed, validate_table_source_entry_observed,
 };
 use crate::analysis::cte::CteId;
 use crate::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr, UnOp};
@@ -3075,6 +3075,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     },
                     LoweredAggregateSourceEntry {
                         logical,
+                        canonical: None,
                         phase,
                         runtime: AggregateRuntimeDemand::Update,
                         target: AggregateSourceTarget::Writer(output),
@@ -3787,6 +3788,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     },
                     LoweredAggregateSourceEntry {
                         logical,
+                        canonical: None,
                         phase,
                         runtime: AggregateRuntimeDemand::WriterState(input),
                         target: AggregateSourceTarget::Writer(output),
@@ -5313,8 +5315,16 @@ impl<'a> ContractLoweringVisitor<'a> {
                     detail: "call output identity differs from the output layout".into(),
                 });
             }
-            let binding = lower_aggregate_binding(call, phase)?;
+            let original_binding = lower_aggregate_binding(call, phase)?;
             let logical_source = self.capture_aggregate_source(&call.source)?;
+            let mut channels =
+                if phase == AggregatePhase::Single && logical_source.captured().is_some() {
+                    Some(self.reserve_call_channels(
+                        call.source.arguments().len() + call.source.order_by().len(),
+                    )?)
+                } else {
+                    None
+                };
             let mut arguments = Vec::new();
             let mut order_by = Vec::new();
             if phase.consumes_logical_arguments() {
@@ -5324,13 +5334,26 @@ impl<'a> ContractLoweringVisitor<'a> {
                     .iter()
                     .enumerate()
                     .map(|(ordinal, argument)| {
-                        self.lower_captured_aggregate_argument(
+                        let emitted = self.lower_captured_aggregate_argument(
                             node,
                             argument,
                             ordinal,
                             &logical_source,
                             &child.columns,
-                        )
+                        )?;
+                        if let Some(channels) = &mut channels {
+                            channels.push(
+                                self.aggregate_operational_channel(
+                                    emitted,
+                                    ordinal,
+                                    logical_source
+                                        .captured()
+                                        .expect("Single capture checked above"),
+                                )?,
+                            );
+                            self.work.step()?;
+                        }
+                        Ok::<_, ContractLoweringError>(emitted)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 order_by = call
@@ -5340,13 +5363,29 @@ impl<'a> ContractLoweringVisitor<'a> {
                     .enumerate()
                     .map(|(ordinal, item)| {
                         Ok(SortExpr {
-                            expr: self.lower_captured_aggregate_argument(
-                                node,
-                                &item.expr,
-                                call.source.arguments().len() + ordinal,
-                                &logical_source,
-                                &child.columns,
-                            )?,
+                            expr: {
+                                let ordinal = call.source.arguments().len() + ordinal;
+                                let emitted = self.lower_captured_aggregate_argument(
+                                    node,
+                                    &item.expr,
+                                    ordinal,
+                                    &logical_source,
+                                    &child.columns,
+                                )?;
+                                if let Some(channels) = &mut channels {
+                                    channels.push(
+                                        self.aggregate_operational_channel(
+                                            emitted,
+                                            ordinal,
+                                            logical_source
+                                                .captured()
+                                                .expect("Single capture checked above"),
+                                        )?,
+                                    );
+                                    self.work.step()?;
+                                }
+                                emitted
+                            },
                             direction: if item.asc {
                                 SortDirection::Ascending
                             } else {
@@ -5387,7 +5426,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 // an ordinal that lines up against the wrong column is caught
                 // here rather than reaching the backend as a merge of another
                 // aggregate's state.
-                if state_type.data_type != binding.intermediate_type.data_type {
+                if state_type.data_type != original_binding.intermediate_type.data_type {
                     return Err(ContractLoweringError::InvalidAggregate {
                         detail: "state-consuming aggregate reads a state of another type",
                     });
@@ -5399,27 +5438,62 @@ impl<'a> ContractLoweringVisitor<'a> {
                 )?);
             }
             let call_id = self.allocate_aggregate_call()?;
-            let expected_output_type = if phase.produces_final_result() {
-                binding.function.result_type.clone()
+            let original_output_type = if phase.produces_final_result() {
+                original_binding.function.result_type.clone()
             } else {
-                binding.intermediate_type.clone()
+                original_binding.intermediate_type.clone()
             };
             // The column may admit null this phase's output never produces
             // -- a count standing where the statement types a nullable
             // integer is sound. It may not claim the reverse, and the type
             // itself must be the one this phase produces.
             let layout = value_type(column);
-            if layout.data_type != expected_output_type.data_type
-                || (expected_output_type.nullable && !layout.nullable)
+            if layout.data_type != original_output_type.data_type
+                || (original_output_type.nullable && !layout.nullable)
             {
                 return Err(ContractLoweringError::OutputColumnMismatch {
                     node: "HashAggregate",
                     ordinal: call_ordinal + aggregate.group_by.len(),
                     detail: format!(
-                        "aggregate {} phase output type {expected_output_type:?} differs from layout {layout:?}",
+                        "aggregate {} phase output type {original_output_type:?} differs from layout {layout:?}",
                         call.name
                     ),
                 });
+            }
+            // Retain the original source/layout refusal before a fresh selection
+            // can change actual root nullability. State phases still follow their
+            // existing path until their actual producer request can be loaned.
+            let canonical = match (channels, logical_source.captured()) {
+                (Some(channels), Some(captured)) => {
+                    Some(self.author_canonical_single_aggregate(node, captured, &channels)?)
+                }
+                _ => None,
+            };
+            let binding = match &canonical {
+                Some(canonical) => {
+                    lower_aggregate_binding_from_selection(call, canonical.selected(), phase)?
+                }
+                None => original_binding,
+            };
+            let expected_output_type = if phase.produces_final_result() {
+                binding.function.result_type.clone()
+            } else {
+                binding.intermediate_type.clone()
+            };
+            if canonical.is_some() {
+                let published = published_value_type(&original_output_type, &expected_output_type);
+                self.work.flush()?;
+                if !expected_output_type
+                    .exactly_equals_observed::<ContractLoweringError>(&published, || {
+                        self.work.step().map_err(ContractLoweringError::from)
+                    })?
+                {
+                    return Err(ContractLoweringError::InvalidAggregate {
+                        detail: "canonical Single result changes original logical or nested type facts",
+                    });
+                }
+                self.work.step()?;
+                self.work.flush()?;
             }
             let origin = if phase.produces_final_result() {
                 ValueOrigin::AggregateResult { call: call_id }
@@ -5454,6 +5528,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 site,
                 LoweredAggregateSourceEntry {
                     logical: logical_source,
+                    canonical,
                     phase,
                     runtime,
                     target: AggregateSourceTarget::Aggregate(call_id),
@@ -8446,7 +8521,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     _ => None,
                 },
                 kind,
-                captured,
+                captured: CapturedOperationalSource::call(captured),
                 derived,
                 arguments,
                 channels,
@@ -8455,7 +8530,20 @@ impl<'a> ContractLoweringVisitor<'a> {
         )
         .map_err(ContractLoweringError::from);
         let operational = self.completed_specialization_result(projection)?;
-        let original = captured.binding().resolved();
+        self.select_canonical_operational_request(
+            captured.binding(),
+            captured.request().logical_argument_count,
+            &operational,
+        )
+    }
+
+    fn select_canonical_operational_request(
+        &mut self,
+        binding: &SqlFunctionBinding,
+        logical_argument_count: usize,
+        arguments: &[novarocks_functions::FunctionArgument],
+    ) -> Result<Arc<novarocks_functions::FunctionBindingSelection>, ContractLoweringError> {
+        let original = binding.resolved();
         self.work.flush()?;
         let selection = self
             .functions
@@ -8464,11 +8552,9 @@ impl<'a> ContractLoweringVisitor<'a> {
                 original.kind,
                 &original.selected.overload,
                 novarocks_functions::FunctionBindingRequest {
-                    arguments: &operational,
-                    logical_argument_count: captured.request().logical_argument_count,
-                    // Only the producer-supplied target constrains this result.
-                    // An inferred selected result is never an explicit target.
-                    expected_result_type: captured.binding().result_constraint(),
+                    arguments,
+                    logical_argument_count,
+                    expected_result_type: binding.result_constraint(),
                 },
                 self.control,
             )
@@ -8481,6 +8567,92 @@ impl<'a> ContractLoweringVisitor<'a> {
                 },
             });
         self.completed_specialization_result(selection)
+    }
+
+    /// This is only the Single producer. A Partial or Merge needs an actual
+    /// state-emission association before it may borrow operational metadata.
+    fn author_canonical_single_aggregate(
+        &mut self,
+        owner: NodeId,
+        captured: &crate::binding::CapturedAggregateLogicalRequest,
+        channels: &[LoweredOperationalChannel],
+    ) -> Result<Arc<CanonicalAggregateOperationalRequest>, ContractLoweringError> {
+        self.work.flush()?;
+        let mut arguments = Vec::new();
+        arguments
+            .try_reserve_exact(channels.len())
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        self.work.step()?;
+        for channel in channels {
+            arguments.push(channel.expression);
+            self.work.step()?;
+        }
+        self.work.flush()?;
+        let projection = project_emitted_call_arguments_observed(
+            EmittedOperationalCall {
+                expressions: self.fragments[&self.current_fragment].expressions(),
+                pools: self.plan_builder.constants(),
+                owner,
+                lambda_scope: None,
+                kind: None,
+                captured: CapturedOperationalSource::aggregate(captured),
+                derived: None,
+                arguments: &arguments,
+                channels,
+            },
+            self.control,
+        )
+        .map_err(ContractLoweringError::from);
+        let operational = self.completed_specialization_result(projection)?;
+        let selected = self.select_canonical_operational_request(
+            captured.binding(),
+            captured.request().logical_argument_count,
+            &operational,
+        )?;
+        self.work.flush()?;
+        // The enclosing caller admits these real retained loans and the Arc
+        // allocation. This record is not a MEM grant or a fresh kernel proof.
+        let canonical = Arc::new(CanonicalAggregateOperationalRequest {
+            binding: captured.binding().clone(),
+            identity: captured.logical_identity().clone(),
+            arguments: operational,
+            logical_count: captured.request().logical_argument_count,
+            selected,
+        });
+        self.work.step()?;
+        self.work.flush()?;
+        Ok(canonical)
+    }
+
+    fn aggregate_operational_channel(
+        &mut self,
+        emitted: ExprId,
+        ordinal: usize,
+        captured: &crate::binding::CapturedAggregateLogicalRequest,
+    ) -> Result<LoweredOperationalChannel, ContractLoweringError> {
+        let original = captured.request().arguments.get(ordinal);
+        self.work.step()?;
+        let role = match original {
+            Some(novarocks_functions::FunctionArgument::Value {
+                constant: Some(_), ..
+            }) => SqlOperationalChannelRole::CapturedConstant,
+            Some(novarocks_functions::FunctionArgument::Value { constant: None, .. }) => {
+                SqlOperationalChannelRole::ValueWithoutConstant
+            }
+            Some(novarocks_functions::FunctionArgument::Lambda { .. }) => {
+                SqlOperationalChannelRole::Lambda
+            }
+            None => {
+                return Err(ContractLoweringError::InvalidAggregate {
+                    detail: "Single operational channel lacks its original capture ordinal",
+                });
+            }
+        };
+        self.work.step()?;
+        Ok(LoweredOperationalChannel {
+            expression: emitted,
+            role,
+        })
     }
 
     fn completed_specialization_result<T>(
@@ -10384,6 +10556,14 @@ fn lower_aggregate_binding(
     call: &crate::planner::payload::AggregateCall,
     phase: AggregatePhase,
 ) -> Result<AggregateBinding, ContractLoweringError> {
+    lower_aggregate_binding_from_selection(call, &call.source.binding().selected, phase)
+}
+
+fn lower_aggregate_binding_from_selection(
+    call: &crate::planner::payload::AggregateCall,
+    selected: &novarocks_functions::FunctionBindingSelection,
+    phase: AggregatePhase,
+) -> Result<AggregateBinding, ContractLoweringError> {
     let resolved = call.source.binding();
     if resolved.kind != novarocks_physical_plan::FunctionKind::Aggregate {
         return Err(ContractLoweringError::InvalidAggregate {
@@ -10391,50 +10571,30 @@ fn lower_aggregate_binding(
         });
     }
     if resolved.logical_argument_count != call.source.arguments().len()
-        || resolved.selected.argument_types.len()
+        || selected.argument_types.len()
             != call.source.arguments().len() + call.source.order_by().len()
     {
         return Err(ContractLoweringError::InvalidAggregate {
             detail: "binding logical/ORDER BY arity differs from the call",
         });
     }
-    let novarocks_functions::FunctionResultType::Scalar(result_type) =
-        &resolved.selected.result_type
-    else {
+    let novarocks_functions::FunctionResultType::Scalar(result_type) = &selected.result_type else {
         return Err(ContractLoweringError::InvalidAggregate {
             detail: "aggregate binding has a relation result",
         });
     };
-    let aggregate =
-        resolved
-            .selected
-            .aggregate
-            .as_ref()
-            .ok_or(ContractLoweringError::InvalidAggregate {
-                detail: "aggregate binding has no intermediate state contract",
-            })?;
+    let aggregate = selected
+        .aggregate
+        .as_ref()
+        .ok_or(ContractLoweringError::InvalidAggregate {
+            detail: "aggregate binding has no intermediate state contract",
+        })?;
     // A call's own `result_type` is the type its phase's carrier column has,
     // not the aggregate's SQL result -- a partial `avg` carries its state
     // there. The phase carrier is checked against this binding where the
     // output layout is, so there is nothing to compare here.
     Ok(AggregateBinding {
-        function: BoundFunction {
-            semantic_parameters: Box::default(),
-            function_id: resolved.function_id.clone(),
-            overload: resolved.selected.overload.clone(),
-            kind: resolved.kind,
-            argument_types: resolved
-                .selected
-                .argument_types
-                .iter()
-                .map(full_source_argument)
-                .collect(),
-            result_type: full_source_type(result_type),
-            volatility: resolved.semantics.volatility,
-            argument_evaluation: resolved.semantics.argument_evaluation,
-            failure_behavior: resolved.semantics.failure_behavior,
-            intrinsic_row_error: resolved.semantics.intrinsic_row_error,
-        },
+        function: bound_function_from_selection(resolved.resolved(), selected, result_type),
         phase,
         logical_argument_count: u32::try_from(resolved.logical_argument_count).map_err(|_| {
             ContractLoweringError::InvalidAggregate {
@@ -11853,6 +12013,10 @@ mod lowered_window_table_source_tests;
 #[cfg(test)]
 #[path = "lowered_conversion_source_tests.rs"]
 mod lowered_conversion_source_tests;
+
+#[cfg(test)]
+#[path = "lowered_single_aggregate_canonical_tests.rs"]
+mod lowered_single_aggregate_canonical_tests;
 
 #[cfg(test)]
 mod tests {

@@ -33,8 +33,8 @@ use crate::binding::{CapturedAggregateLogicalRequest, CapturedLogicalCallArgumen
 mod operational_channels;
 pub(crate) use operational_channels::SqlOperationalProjectionError;
 pub(super) use operational_channels::{
-    EmittedOperationalCall, LoweredOperationalChannel, SqlOperationalChannelRole,
-    project_emitted_call_arguments_observed,
+    CapturedOperationalSource, EmittedOperationalCall, LoweredOperationalChannel,
+    SqlOperationalChannelRole, project_emitted_call_arguments_observed,
 };
 
 /// A completed SQL source owner. Its physical view is read-only; consuming a
@@ -307,6 +307,7 @@ impl SqlAuthoredPhysicalPlan {
         work.flush()?;
         Ok(CheckedAggregateLogicalSourceEntry {
             captured,
+            canonical: entry.canonical.as_ref(),
             phase: entry.phase,
             runtime: entry.runtime,
             fragment,
@@ -509,6 +510,7 @@ impl From<CompileControlError> for SqlSourceJournalError {
 /// and actual runtime state-domain validation remain their sole owners.
 pub(crate) struct CheckedAggregateLogicalSourceEntry<'a> {
     captured: &'a CapturedAggregateLogicalRequest,
+    canonical: Option<&'a Arc<CanonicalAggregateOperationalRequest>>,
     phase: AggregatePhase,
     runtime: AggregateRuntimeDemand,
     fragment: &'a Fragment,
@@ -519,6 +521,9 @@ pub(crate) struct CheckedAggregateLogicalSourceEntry<'a> {
 impl<'a> CheckedAggregateLogicalSourceEntry<'a> {
     pub(crate) const fn captured(&self) -> &'a CapturedAggregateLogicalRequest {
         self.captured
+    }
+    pub(crate) const fn canonical(&self) -> Option<&'a Arc<CanonicalAggregateOperationalRequest>> {
+        self.canonical
     }
     pub(crate) const fn phase(&self) -> AggregatePhase {
         self.phase
@@ -569,9 +574,40 @@ impl LoweredAggregateLogicalSource {
 #[derive(Debug)]
 pub(super) struct LoweredAggregateSourceEntry {
     pub(super) logical: LoweredAggregateLogicalSource,
+    /// Single is authored from its actual emitted channels. State-consuming
+    /// families retain their existing source path until producer lending lands.
+    pub(super) canonical: Option<Arc<CanonicalAggregateOperationalRequest>>,
     pub(super) phase: AggregatePhase,
     pub(super) runtime: AggregateRuntimeDemand,
     pub(super) target: AggregateSourceTarget,
+}
+
+/// Same-emission operational metadata, independent of the original capture.
+/// Private SQL publication retains the actual request and selected Arc together;
+/// this record is not an effect, kernel, phase or runtime-state certificate.
+#[derive(Debug)]
+pub(crate) struct CanonicalAggregateOperationalRequest {
+    pub(super) binding: crate::binding::SqlFunctionBinding,
+    pub(super) identity: crate::binding::AggregateLogicalSourceIdentity,
+    pub(super) arguments: Box<[novarocks_functions::FunctionArgument]>,
+    pub(super) logical_count: usize,
+    pub(super) selected: Arc<novarocks_functions::FunctionBindingSelection>,
+}
+impl CanonicalAggregateOperationalRequest {
+    pub(crate) fn request(&self) -> novarocks_functions::FunctionBindingRequest<'_> {
+        novarocks_functions::FunctionBindingRequest {
+            arguments: &self.arguments,
+            logical_argument_count: self.logical_count,
+            expected_result_type: self.binding.result_constraint(),
+        }
+    }
+    pub(crate) const fn selected(&self) -> &Arc<novarocks_functions::FunctionBindingSelection> {
+        &self.selected
+    }
+    pub(crate) fn belongs_to(&self, captured: &CapturedAggregateLogicalRequest) -> bool {
+        self.identity.same_revision(captured.logical_identity())
+            && std::ptr::eq(self.binding.resolved(), captured.binding().resolved())
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SqlExpressionCallKind {

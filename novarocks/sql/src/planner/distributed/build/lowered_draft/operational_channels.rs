@@ -35,7 +35,36 @@ use super::{
     CheckedExpressionLogicalSourceEntry, CheckedTableLogicalSourceEntry,
     LoweredExpressionLogicalSource, SqlExpressionCallKind, SqlSourceJournalError,
 };
-use crate::{binding::CapturedLogicalCallArguments, common::variant_source::DerivedVariantSource};
+use crate::{
+    binding::{CapturedAggregateLogicalRequest, CapturedLogicalCallArguments, SqlFunctionBinding},
+    common::variant_source::DerivedVariantSource,
+};
+
+/// A borrowed view of an actual capture. Neither constructor authors channels,
+/// clones constants, selects a signature or grants a source/use capability.
+#[derive(Clone, Copy)]
+pub(in crate::planner::distributed::build) struct CapturedOperationalSource<'a> {
+    binding: &'a SqlFunctionBinding,
+    arguments: &'a [FunctionArgument],
+}
+impl<'a> CapturedOperationalSource<'a> {
+    pub(in crate::planner::distributed::build) fn call(
+        captured: &'a CapturedLogicalCallArguments,
+    ) -> Self {
+        Self {
+            binding: captured.binding(),
+            arguments: captured.request().arguments,
+        }
+    }
+    pub(in crate::planner::distributed::build) fn aggregate(
+        captured: &'a CapturedAggregateLogicalRequest,
+    ) -> Self {
+        Self {
+            binding: captured.binding(),
+            arguments: captured.request().arguments,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(in crate::planner::distributed::build) struct LoweredOperationalChannel {
@@ -143,7 +172,7 @@ impl<'a> CheckedExpressionLogicalSourceEntry<'a> {
             owner: self.entry.owner,
             lambda_scope: self.entry.lambda_scope,
             kind: Some(self.entry.kind),
-            captured: self.entry.captured.captured(),
+            captured: CapturedOperationalSource::call(self.entry.captured.captured()),
             derived: match &self.entry.captured {
                 LoweredExpressionLogicalSource::DerivedVariant(source) => Some(source.as_ref()),
                 LoweredExpressionLogicalSource::Owned(_) => None,
@@ -175,7 +204,7 @@ impl<'a> CheckedTableLogicalSourceEntry<'a> {
             owner: self.source.id,
             lambda_scope: None,
             kind: None,
-            captured: &self.entry.captured,
+            captured: CapturedOperationalSource::call(&self.entry.captured),
             derived: None,
             arguments: &self.entry.arguments,
             channels: &self.entry.channels,
@@ -194,7 +223,7 @@ pub(in crate::planner::distributed::build) struct EmittedOperationalCall<'a> {
     pub(in crate::planner::distributed::build) owner: NodeId,
     pub(in crate::planner::distributed::build) lambda_scope: Option<ExprId>,
     pub(in crate::planner::distributed::build) kind: Option<SqlExpressionCallKind>,
-    pub(in crate::planner::distributed::build) captured: &'a CapturedLogicalCallArguments,
+    pub(in crate::planner::distributed::build) captured: CapturedOperationalSource<'a>,
     pub(in crate::planner::distributed::build) derived: Option<&'a DerivedVariantSource>,
     pub(in crate::planner::distributed::build) arguments: &'a [ExprId],
     pub(in crate::planner::distributed::build) channels: &'a [LoweredOperationalChannel],
@@ -234,7 +263,7 @@ struct Projection<'a> {
     owner: NodeId,
     lambda_scope: Option<ExprId>,
     kind: Option<SqlExpressionCallKind>,
-    captured: &'a CapturedLogicalCallArguments,
+    captured: CapturedOperationalSource<'a>,
     derived: Option<&'a DerivedVariantSource>,
     arguments: &'a [ExprId],
     channels: &'a [LoweredOperationalChannel],
@@ -247,14 +276,13 @@ impl Projection<'_> {
         let count = self.channels.len();
         if count > MAX_CALL_EFFECT_ARGUMENTS
             || self.arguments.len() > MAX_CALL_EFFECT_ARGUMENTS
-            || self.captured.request().arguments.len() > MAX_CALL_EFFECT_ARGUMENTS
+            || self.captured.arguments.len() > MAX_CALL_EFFECT_ARGUMENTS
         {
             return Err(CompileControlError::ResourceExhausted.into());
         }
         Layout::array::<FunctionArgument>(count)
             .map_err(|_| CompileControlError::ResourceExhausted)?;
-        let exact =
-            count == self.arguments.len() && count == self.captured.request().arguments.len();
+        let exact = count == self.arguments.len() && count == self.captured.arguments.len();
         work.step()?;
         require(
             exact,
@@ -292,7 +320,7 @@ impl Projection<'_> {
             .channels
             .iter()
             .zip(self.arguments)
-            .zip(self.captured.request().arguments)
+            .zip(self.captured.arguments)
             .enumerate()
         {
             let same_id = channel.expression == *id;
@@ -349,7 +377,7 @@ impl Projection<'_> {
                     )?;
                     let expected = self
                         .captured
-                        .binding()
+                        .binding
                         .resolved()
                         .selected
                         .argument_types

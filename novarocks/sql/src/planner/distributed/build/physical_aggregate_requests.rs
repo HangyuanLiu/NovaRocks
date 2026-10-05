@@ -33,6 +33,7 @@ use novarocks_type_contract::{
 };
 
 use super::{
+    lowered_draft::CanonicalAggregateOperationalRequest,
     physical_call_arguments::{PhysicalArgumentError, author_physical_argument_observed},
     physical_scalar_requests::author_scalar_result_selection_observed,
 };
@@ -79,6 +80,10 @@ pub(crate) struct AuthoredPhysicalAggregateUpdateRequest<'a> {
 enum AggregateUpdateArguments<'a> {
     OwnedPhysical(Vec<FunctionArgument>),
     Captured(&'a crate::binding::CapturedAggregateLogicalRequest),
+    Canonical {
+        captured: &'a crate::binding::CapturedAggregateLogicalRequest,
+        canonical: &'a CanonicalAggregateOperationalRequest,
+    },
 }
 impl AuthoredPhysicalAggregateUpdateRequest<'_> {
     pub const fn source(&self) -> &AggregateCall {
@@ -109,6 +114,7 @@ impl AuthoredPhysicalAggregateUpdateRequest<'_> {
                 expected_result_type: Some(&self.source.binding.function.result_type),
             },
             AggregateUpdateArguments::Captured(captured) => captured.request(),
+            AggregateUpdateArguments::Canonical { canonical, .. } => canonical.request(),
         }
     }
     /// None identifies the independent direct-physical component. It supplies
@@ -118,7 +124,8 @@ impl AuthoredPhysicalAggregateUpdateRequest<'_> {
     ) -> Option<novarocks_type_contract::DecimalOverflowPolicy> {
         match &self.arguments {
             AggregateUpdateArguments::OwnedPhysical(_) => None,
-            AggregateUpdateArguments::Captured(captured) => {
+            AggregateUpdateArguments::Captured(captured)
+            | AggregateUpdateArguments::Canonical { captured, .. } => {
                 Some(captured.binding().decimal_overflow_policy())
             }
         }
@@ -126,7 +133,10 @@ impl AuthoredPhysicalAggregateUpdateRequest<'_> {
     pub fn captured_constant_policy(&self) -> Option<ConstantPolicy> {
         match &self.arguments {
             AggregateUpdateArguments::OwnedPhysical(_) => None,
-            AggregateUpdateArguments::Captured(captured) => Some(captured.constant_policy()),
+            AggregateUpdateArguments::Captured(captured)
+            | AggregateUpdateArguments::Canonical { captured, .. } => {
+                Some(captured.constant_policy())
+            }
         }
     }
     pub fn preparation(&self, arguments: ScopedExpressionEffects) -> PureCallPreparation {
@@ -290,10 +300,11 @@ pub(crate) fn author_physical_aggregate_update_request_observed<'a>(
 }
 
 /// Borrow the original admitted logical request for a producer-certified
-/// Single/Partial update. Physical expression channels identify runtime roots;
-/// they never recreate constants or logical argument provenance. ORDER flags
-/// come from the exact actual call, while the request retains the captured CV
-/// handles, nonconstant None values, Lambda types and original result loan.
+/// Single/Partial update. Single requires the same-emission operational request
+/// and selected Arc, associated with the original capture revision and binding.
+/// Partial retains its original captured request. Physical expression channels
+/// identify runtime roots; they never recreate logical source provenance. ORDER
+/// flags come from the exact actual call, and policies remain with the capture.
 ///
 /// Caller entry, ordinary footer and opaque clone/coexistence admission remain
 /// mandatory; original typed control refusals return without a footer here.
@@ -319,7 +330,27 @@ pub(crate) fn author_physical_aggregate_update_request_from_journal_observed<'so
         ));
     }
     let captured = entry.captured();
-    let request = captured.request();
+    let canonical = if phase == AggregateKernelPhase::Single {
+        let canonical = entry.canonical();
+        work.step()?;
+        let canonical = canonical.ok_or(PhysicalAggregateRequestError::InvalidSource(
+            "single aggregate journal has no same-emission operational request",
+        ))?;
+        let belongs = canonical.belongs_to(captured);
+        work.step()?;
+        if !belongs {
+            return Err(PhysicalAggregateRequestError::InvalidSource(
+                "single aggregate operational request has a different capture revision or binding",
+            ));
+        }
+        Some(canonical)
+    } else {
+        None
+    };
+    let request = match canonical {
+        Some(canonical) => canonical.request(),
+        None => captured.request(),
+    };
     let count = source
         .arguments
         .len()
@@ -342,7 +373,25 @@ pub(crate) fn author_physical_aggregate_update_request_from_journal_observed<'so
     }
     Layout::array::<AggregateOrderKey>(source.order_by.len())
         .map_err(|_| CompileControlError::ResourceExhausted)?;
-    let selected = captured_selected_correspondence_observed(captured, source, work)?;
+    let selected = match canonical {
+        Some(canonical) => {
+            selected_correspondence_observed(
+                captured,
+                canonical.selected(),
+                request.logical_argument_count,
+                source,
+                work,
+            )?;
+            // Retain the exact same-emission Arc for refinement and preparation.
+            // An Arc clone is not a second selected-signature author or host grant.
+            work.flush()?;
+            let selected = Arc::clone(canonical.selected());
+            work.step()?;
+            work.flush()?;
+            selected
+        }
+        None => captured_selected_correspondence_observed(captured, source, work)?,
+    };
     work.flush()?;
     let mut keys = Vec::new();
     keys.try_reserve_exact(source.order_by.len())
@@ -363,12 +412,19 @@ pub(crate) fn author_physical_aggregate_update_request_from_journal_observed<'so
         state_input_type: None,
     };
     work.flush()?;
+    let arguments = match canonical {
+        Some(canonical) => AggregateUpdateArguments::Canonical {
+            captured,
+            canonical: canonical.as_ref(),
+        },
+        None => AggregateUpdateArguments::Captured(captured),
+    };
     Ok(AuthoredPhysicalAggregateUpdateRequest {
         source,
         node: entry.node(),
         site: entry.site(),
         selected,
-        arguments: AggregateUpdateArguments::Captured(captured),
+        arguments,
         options,
     })
 }
@@ -489,9 +545,31 @@ fn captured_selected_correspondence_observed(
     source: &AggregateCall,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Arc<FunctionBindingSelection>, PhysicalAggregateRequestError> {
+    selected_correspondence_observed(
+        captured,
+        &captured.binding().resolved().selected,
+        captured.request().logical_argument_count,
+        source,
+        work,
+    )?;
+    // Partial and merge retain their existing physical signature projection.
+    // Only Single consumes the original same-emission selected Arc.
+    Ok(author_scalar_result_selection_observed(
+        &source.binding.function,
+        Some(&source.binding),
+        work,
+    )?)
+}
+
+fn selected_correspondence_observed(
+    captured: &crate::binding::CapturedAggregateLogicalRequest,
+    selected: &FunctionBindingSelection,
+    logical_argument_count: usize,
+    source: &AggregateCall,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), PhysicalAggregateRequestError> {
     use novarocks_functions::FunctionResultType;
     let resolved = captured.binding().resolved();
-    let selected = &resolved.selected;
     let function = &source.binding.function;
     if selected.argument_types.len() > MAX_CALL_EFFECT_ARGUMENTS
         || function.argument_types.len() > MAX_CALL_EFFECT_ARGUMENTS
@@ -502,9 +580,10 @@ fn captured_selected_correspondence_observed(
         && resolved.kind == FunctionKind::Aggregate
         && function.kind == FunctionKind::Aggregate
         && selected.overload == function.overload
+        && selected.overload == resolved.selected.overload
         && usize::try_from(source.binding.logical_argument_count).ok()
             == Some(resolved.logical_argument_count)
-        && resolved.logical_argument_count == captured.request().logical_argument_count
+        && resolved.logical_argument_count == logical_argument_count
         && selected.argument_types.len() == function.argument_types.len();
     work.step()?;
     if !identity {
@@ -565,8 +644,7 @@ fn captured_selected_correspondence_observed(
     }
     // No local state-domain/nullability inference: the original Functions owner
     // validates the actual state loan and aligns its cloned options exactly.
-    let selected = author_scalar_result_selection_observed(function, Some(&source.binding), work)?;
-    Ok(selected)
+    Ok(())
 }
 
 fn merge_argument_type_matches_observed(
