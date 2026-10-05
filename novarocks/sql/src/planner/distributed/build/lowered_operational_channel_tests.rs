@@ -318,3 +318,67 @@ fn operational_channels_success_and_ordinary_refusal_stop_at_every_original_cont
         }
     }
 }
+
+#[test]
+fn original_emission_retains_operational_request_and_selected_constant_backing_together() {
+    let (owner, pool, field) = selected_source_owner();
+    let (fragment, source) = scalar_source(&owner);
+    let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+    let canonical = receipt.canonical_operational().unwrap();
+    let request = canonical.request();
+    assert_eq!(request.logical_argument_count, 1);
+    assert_eq!(
+        request.expected_result_type,
+        receipt.captured().binding().result_constraint()
+    );
+    assert!(Arc::ptr_eq(
+        canonical.selected(),
+        receipt.canonical_selection().unwrap()
+    ));
+    let value = constant(&request.arguments[0]).unwrap();
+    assert_eq!(value.ordinal(), 1);
+    assert_eq!(value.try_utf8().unwrap(), Some("MiXeD-中国"));
+    assert!(Arc::ptr_eq(value.pool().array(), pool.array()));
+    assert!(Arc::ptr_eq(value.pool().field_ref(), &field));
+    let cloned = owner.clone();
+    let again = loan(&cloned, fragment, source, &Control::default()).unwrap();
+    assert!(Arc::ptr_eq(
+        canonical,
+        again.canonical_operational().unwrap()
+    ));
+    assert!(std::ptr::eq(
+        request.arguments,
+        again.canonical_operational().unwrap().request().arguments
+    ));
+}
+
+#[test]
+fn original_emission_retained_none_is_not_reconstructed_from_physical_constant() {
+    let argument = TypedExpr {
+        kind: ExprKind::Cast {
+            expr: Box::new(text("MiXeD")),
+            target: DataType::Utf8,
+            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+        },
+        value_type: ValueType::new(DataType::Utf8, false),
+    };
+    let owner = authored(lower_call(argument, DecimalOverflowPolicy::OutputNull));
+    let (fragment, source) = scalar_source(&owner);
+    let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+    assert_eq!(
+        physical_constant(&owner, fragment, receipt.arguments()[0])
+            .try_utf8()
+            .unwrap(),
+        Some("MiXeD")
+    );
+    let canonical = receipt.canonical_operational().unwrap();
+    assert!(constant(&canonical.request().arguments[0]).is_none());
+    assert_eq!(
+        canonical.request().expected_result_type,
+        receipt.captured().binding().result_constraint()
+    );
+    assert!(Arc::ptr_eq(
+        canonical.selected(),
+        receipt.canonical_selection().unwrap()
+    ));
+}

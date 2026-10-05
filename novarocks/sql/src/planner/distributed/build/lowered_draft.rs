@@ -487,13 +487,19 @@ impl<'a> CheckedExpressionLogicalSourceEntry<'a> {
     pub(crate) fn arguments(&self) -> &'a [ExprId] {
         &self.entry.arguments
     }
+    pub(crate) fn canonical_operational(&self) -> Option<&'a Arc<CanonicalCallOperationalRequest>> {
+        self.entry.canonical_operational.as_ref()
+    }
     /// The original owner selection obtained before this actual emission.
     /// Other lifecycles still have no canonical author receipt here. This
     /// metadata loan does not authenticate effects, uses or kernel coverage.
     pub(crate) fn canonical_selection(
         &self,
     ) -> Option<&'a Arc<novarocks_functions::FunctionBindingSelection>> {
-        self.entry.canonical_selection.as_ref()
+        self.entry
+            .canonical_operational
+            .as_ref()
+            .map(|request| request.selected())
     }
 }
 
@@ -583,6 +589,10 @@ pub(crate) struct CheckedTableLogicalSourceEntry<'a> {
     source: &'a PhysicalNode,
 }
 impl<'a> CheckedTableLogicalSourceEntry<'a> {
+    pub(crate) fn canonical_operational(&self) -> &'a Arc<CanonicalCallOperationalRequest> {
+        &self.entry.canonical_operational
+    }
+
     pub(crate) fn captured(&self) -> &'a CapturedLogicalCallArguments {
         &self.entry.captured
     }
@@ -600,7 +610,7 @@ impl<'a> CheckedTableLogicalSourceEntry<'a> {
     pub(crate) fn canonical_selection(
         &self,
     ) -> &'a Arc<novarocks_functions::FunctionBindingSelection> {
-        &self.entry.canonical_selection
+        self.entry.canonical_operational.selected()
     }
 }
 
@@ -765,6 +775,27 @@ impl CanonicalAggregateOperationalRequest {
             && std::ptr::eq(self.binding.resolved(), captured.binding().resolved())
     }
 }
+/// The exact original emitter projection and fixed selection travel together.
+/// This pure data is not a fresh capability, occurrence proof or funding grant.
+#[derive(Debug)]
+pub(crate) struct CanonicalCallOperationalRequest {
+    pub(super) binding: crate::binding::SqlFunctionBinding,
+    pub(super) arguments: Box<[novarocks_functions::FunctionArgument]>,
+    pub(super) logical_count: usize,
+    pub(super) selected: Arc<novarocks_functions::FunctionBindingSelection>,
+}
+impl CanonicalCallOperationalRequest {
+    pub(crate) fn request(&self) -> novarocks_functions::FunctionBindingRequest<'_> {
+        novarocks_functions::FunctionBindingRequest {
+            arguments: &self.arguments,
+            logical_argument_count: self.logical_count,
+            expected_result_type: self.binding.result_constraint(),
+        }
+    }
+    pub(crate) const fn selected(&self) -> &Arc<novarocks_functions::FunctionBindingSelection> {
+        &self.selected
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SqlExpressionCallKind {
     Scalar,
@@ -774,7 +805,7 @@ pub(super) enum SqlExpressionCallKind {
 }
 #[derive(Debug)]
 pub(super) struct LoweredTableSourceEntry {
-    pub(super) canonical_selection: Arc<novarocks_functions::FunctionBindingSelection>,
+    pub(super) canonical_operational: Arc<CanonicalCallOperationalRequest>,
     pub(super) captured: CapturedLogicalCallArguments,
     pub(super) arguments: Box<[ExprId]>,
     pub(super) channels: Box<[LoweredOperationalChannel]>,
@@ -805,7 +836,7 @@ impl std::fmt::Debug for LoweredExpressionLogicalSource {
 #[derive(Debug)]
 pub(super) struct LoweredExpressionSourceEntry {
     pub(super) kind: SqlExpressionCallKind,
-    pub(super) canonical_selection: Option<Arc<novarocks_functions::FunctionBindingSelection>>,
+    pub(super) canonical_operational: Option<Arc<CanonicalCallOperationalRequest>>,
     pub(super) captured: LoweredExpressionLogicalSource,
     pub(super) owner: novarocks_physical_plan::NodeId,
     pub(super) lambda_scope: Option<ExprId>,

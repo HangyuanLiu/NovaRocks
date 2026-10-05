@@ -76,13 +76,13 @@ use sha2::{Digest, Sha256};
 use super::lowered_draft::{
     AggregateRuntimeDemand, AggregateSourceTarget, AggregateStateEndpoint, AggregateStateLink,
     AggregateStateSources, AggregateStateTransport, CanonicalAggregateOperationalRequest,
-    CapturedOperationalSource, EmittedOperationalCall, LoweredAggregateLogicalSource,
-    LoweredAggregateSourceEntry, LoweredExpressionLogicalSource, LoweredExpressionSourceEntry,
-    LoweredOperationalChannel, LoweredSqlPhysicalDraft, LoweredTableSourceEntry,
-    SqlExpressionCallKind, SqlLogicalSourceJournal, SqlOperationalChannelRole,
-    SqlOperationalProjectionError, project_emitted_call_arguments_observed,
-    project_emitted_writer_value_observed, validate_expression_source_entry_observed,
-    validate_table_source_entry_observed,
+    CanonicalCallOperationalRequest, CapturedOperationalSource, EmittedOperationalCall,
+    LoweredAggregateLogicalSource, LoweredAggregateSourceEntry, LoweredExpressionLogicalSource,
+    LoweredExpressionSourceEntry, LoweredOperationalChannel, LoweredSqlPhysicalDraft,
+    LoweredTableSourceEntry, SqlExpressionCallKind, SqlLogicalSourceJournal,
+    SqlOperationalChannelRole, SqlOperationalProjectionError,
+    project_emitted_call_arguments_observed, project_emitted_writer_value_observed,
+    validate_expression_source_entry_observed, validate_table_source_entry_observed,
 };
 use crate::analysis::cte::CteId;
 use crate::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr, UnOp};
@@ -2863,7 +2863,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             let channels = channels.into_boxed_slice();
             self.work.step()?;
             let arguments = [source_expression, path_expression, type_expression];
-            let selected = self.author_canonical_call_selection(
+            let canonical = self.author_canonical_call_selection(
                 node,
                 descriptor.source().captured(),
                 Some(SqlExpressionCallKind::DerivedVariant),
@@ -2871,6 +2871,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 &arguments,
                 &channels,
             )?;
+            let selected = canonical.selected();
             let novarocks_functions::FunctionResultType::Scalar(result) = &selected.result_type
             else {
                 return Err(ContractLoweringError::InvalidFunctionBinding {
@@ -2884,7 +2885,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 });
             }
             self.work.flush()?;
-            let function = bound_function_from_selection(binding, &selected, result);
+            let function = bound_function_from_selection(binding, selected, result);
             self.work.step()?;
             self.work.flush()?;
             let result_type = result.clone();
@@ -2908,7 +2909,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 LoweredExpressionLogicalSource::DerivedVariant(source),
                 SqlExpressionCallKind::DerivedVariant,
                 channels,
-                Some(selected),
+                Some(canonical),
             )?;
             let value = self.fragment_mut().add_value(
                 result_type,
@@ -7472,8 +7473,9 @@ impl<'a> ContractLoweringVisitor<'a> {
         self.work.flush()?;
         let channels = channels.into_boxed_slice();
         self.work.step()?;
-        let selected = self
+        let canonical = self
             .author_canonical_call_selection(node, &captured, None, None, &arguments, &channels)?;
+        let selected = canonical.selected();
         let novarocks_functions::FunctionResultType::Relation(result_types) = &selected.result_type
         else {
             return Err(ContractLoweringError::InvalidTableFunction {
@@ -7603,7 +7605,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             },
         )?;
         self.work.flush()?;
-        self.record_table_source(node, captured, retained_arguments, channels, selected)?;
+        self.record_table_source(node, captured, retained_arguments, channels, canonical)?;
         let properties = self
             .fragment_mut()
             .node_output_properties(node)
@@ -8024,7 +8026,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         self.work.flush()?;
         let channels = channels.into_boxed_slice();
         self.work.step()?;
-        let selected = self.author_canonical_call_selection(
+        let canonical = self.author_canonical_call_selection(
             owner,
             &captured,
             Some(SqlExpressionCallKind::Window),
@@ -8032,6 +8034,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             &selection_arguments,
             &channels,
         )?;
+        let selected = canonical.selected();
         let novarocks_functions::FunctionResultType::Scalar(result_type) = &selected.result_type
         else {
             return Err(ContractLoweringError::InvalidWindow {
@@ -8050,7 +8053,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             .map(|aggregate| {
                 lower_resolved_aggregate_binding(
                     aggregate,
-                    &selected,
+                    selected,
                     window.args.len(),
                     window.function_order_by.len(),
                     AggregatePhase::Single,
@@ -8059,7 +8062,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             .transpose()?;
         self.work.step()?;
         self.work.flush()?;
-        let function = bound_function_from_selection(binding, &selected, result_type);
+        let function = bound_function_from_selection(binding, selected, result_type);
         self.work.step()?;
         self.work.flush()?;
         let result_type = result_type.clone();
@@ -8090,7 +8093,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             captured,
             SqlExpressionCallKind::Window,
             channels,
-            Some(selected),
+            Some(canonical),
         )?;
         Ok(emitted)
     }
@@ -8738,7 +8741,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 self.work.flush()?;
                 let channels = channels.into_boxed_slice();
                 self.work.step()?;
-                let selected = self.author_canonical_call_selection(
+                let canonical = self.author_canonical_call_selection(
                     owner,
                     &captured,
                     Some(SqlExpressionCallKind::Scalar),
@@ -8746,6 +8749,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     &lowered_args,
                     &channels,
                 )?;
+                let selected = canonical.selected();
                 let novarocks_functions::FunctionResultType::Scalar(result) = &selected.result_type
                 else {
                     return Err(ContractLoweringError::InvalidFunctionBinding {
@@ -8761,7 +8765,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 self.work.flush()?;
                 ty = result_type.clone();
                 self.work.step()?;
-                captured_call = Some((captured, channels, selected));
+                captured_call = Some((captured, channels, canonical));
                 ContractExprKind::FunctionCall {
                     function: BoundFunction {
                         semantic_parameters: Box::default(),
@@ -8878,14 +8882,14 @@ impl<'a> ContractLoweringVisitor<'a> {
             }
         }
         let emitted = self.add_scoped_expression(owner, ty, kind)?;
-        if let Some((captured, channels, selected)) = captured_call {
+        if let Some((captured, channels, canonical)) = captured_call {
             self.record_expression_source(
                 owner,
                 emitted,
                 captured,
                 SqlExpressionCallKind::Scalar,
                 channels,
-                Some(selected),
+                Some(canonical),
             )?;
         }
         Ok(emitted)
@@ -8902,7 +8906,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         derived: Option<&crate::common::variant_source::DerivedVariantSource>,
         arguments: &[ExprId],
         channels: &[LoweredOperationalChannel],
-    ) -> Result<Arc<novarocks_functions::FunctionBindingSelection>, ContractLoweringError> {
+    ) -> Result<Arc<CanonicalCallOperationalRequest>, ContractLoweringError> {
         self.work.flush()?;
         let projection = project_emitted_call_arguments_observed(
             EmittedOperationalCall {
@@ -8925,11 +8929,25 @@ impl<'a> ContractLoweringVisitor<'a> {
         )
         .map_err(ContractLoweringError::from);
         let operational = self.completed_specialization_result(projection)?;
-        self.select_canonical_operational_request(
+        let logical_count = captured.request().logical_argument_count;
+        let selected = self.select_canonical_operational_request(
             captured.binding(),
-            captured.request().logical_argument_count,
+            logical_count,
             &operational,
-        )
+        )?;
+        self.work.flush()?;
+        let binding = captured.binding().clone();
+        self.work.step()?;
+        self.work.flush()?;
+        let canonical = Arc::new(CanonicalCallOperationalRequest {
+            binding,
+            arguments: operational,
+            logical_count,
+            selected,
+        });
+        self.work.step()?;
+        self.work.flush()?;
+        Ok(canonical)
     }
 
     fn select_canonical_operational_request(
@@ -9115,7 +9133,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         captured: CapturedLogicalCallArguments,
         kind: SqlExpressionCallKind,
         channels: Box<[LoweredOperationalChannel]>,
-        canonical_selection: Option<Arc<novarocks_functions::FunctionBindingSelection>>,
+        canonical_operational: Option<Arc<CanonicalCallOperationalRequest>>,
     ) -> Result<(), ContractLoweringError> {
         self.record_expression_source_with_data(
             owner,
@@ -9123,7 +9141,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             LoweredExpressionLogicalSource::Owned(captured),
             kind,
             channels,
-            canonical_selection,
+            canonical_operational,
         )
     }
 
@@ -9134,7 +9152,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         captured: LoweredExpressionLogicalSource,
         kind: SqlExpressionCallKind,
         channels: Box<[LoweredOperationalChannel]>,
-        canonical_selection: Option<Arc<novarocks_functions::FunctionBindingSelection>>,
+        canonical_operational: Option<Arc<CanonicalCallOperationalRequest>>,
     ) -> Result<(), ContractLoweringError> {
         self.work.flush()?;
         let mut arguments = Vec::new();
@@ -9213,7 +9231,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             key,
             LoweredExpressionSourceEntry {
                 kind,
-                canonical_selection,
+                canonical_operational,
                 captured,
                 owner,
                 lambda_scope,
@@ -9363,7 +9381,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         captured: CapturedLogicalCallArguments,
         arguments: Box<[ExprId]>,
         channels: Box<[LoweredOperationalChannel]>,
-        canonical_selection: Arc<novarocks_functions::FunctionBindingSelection>,
+        canonical_operational: Arc<CanonicalCallOperationalRequest>,
     ) -> Result<(), ContractLoweringError> {
         self.work.flush()?;
         let same_count = arguments.len() == channels.len()
@@ -9394,7 +9412,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         self.call_sources.table_entries.insert(
             key,
             LoweredTableSourceEntry {
-                canonical_selection,
+                canonical_operational,
                 captured,
                 arguments,
                 channels,
@@ -9599,7 +9617,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             self.work.flush()?;
             let channels = channels.into_boxed_slice();
             self.work.step()?;
-            let selected = self.author_canonical_call_selection(
+            let canonical = self.author_canonical_call_selection(
                 owner,
                 &captured,
                 Some(SqlExpressionCallKind::ValueConversion),
@@ -9607,6 +9625,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 &[expression],
                 &channels,
             )?;
+            let selected = canonical.selected();
             let novarocks_functions::FunctionResultType::Scalar(result) = &selected.result_type
             else {
                 return Err(ContractLoweringError::InvalidFunctionBinding {
@@ -9623,7 +9642,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 });
             }
             self.work.flush()?;
-            let function = bound_function_from_selection(resolved, &selected, result);
+            let function = bound_function_from_selection(resolved, selected, result);
             self.work.step()?;
             self.work.flush()?;
             let result_type = result.clone();
@@ -9643,7 +9662,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 captured,
                 SqlExpressionCallKind::ValueConversion,
                 channels,
-                Some(selected),
+                Some(canonical),
             )?;
             emitted
         } else {

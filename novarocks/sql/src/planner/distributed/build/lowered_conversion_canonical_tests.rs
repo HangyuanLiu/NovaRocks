@@ -224,9 +224,10 @@ fn canonical_conversion_raw_lambda_uses_original_lexical_scope_and_none_request(
         matches!(&node.kind,ContractExprKind::FunctionCall {function,..} if function.function_id.as_str()==CONVERSION)
             .then_some(node)).unwrap();
     let selected = entry
-        .canonical_selection
+        .canonical_operational
         .as_ref()
-        .expect("scoped conversion canonical receipt");
+        .expect("scoped conversion canonical receipt")
+        .selected();
     assert_selection(entry.captured.captured(), selected, source);
     assert_eq!(source.owner, NodeId::new(73));
     assert_eq!(source.lambda_scope, Some(lambda));
