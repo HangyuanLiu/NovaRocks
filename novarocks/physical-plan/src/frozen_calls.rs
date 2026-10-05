@@ -94,6 +94,7 @@ pub struct FrozenFragmentCalls {
 pub enum FrozenCallError {
     MissingLegacyMetadata(crate::MissingLegacyBindingMetadata),
     Control(CompileControlError),
+    ResourceSource(&'static str),
     Roots(RootUseBindingError),
     TooManyItems,
     WrongFragment,
@@ -135,6 +136,44 @@ fn finish_frozen_calls<T>(
     result
 }
 
+type ResourceAdmission<'a> = dyn FnMut(&novarocks_type_contract::ControlOwnedResourceFacts) -> Result<(), CompileControlError>
+    + 'a;
+fn resource_error(error: novarocks_type_contract::ControlResourceError) -> FrozenCallError {
+    match error {
+        novarocks_type_contract::ControlResourceError::Control(cause) => {
+            FrozenCallError::Control(cause)
+        }
+        novarocks_type_contract::ControlResourceError::SourceModel(message) => {
+            FrozenCallError::ResourceSource(message)
+        }
+    }
+}
+fn resource_control(error: novarocks_type_contract::ControlResourceError) -> CompileControlError {
+    match error {
+        novarocks_type_contract::ControlResourceError::Control(cause) => cause,
+        // The base and child facts were already produced by locked authors;
+        // merging scalar counters cannot introduce source-model failures.
+        novarocks_type_contract::ControlResourceError::SourceModel(_) => {
+            CompileControlError::ResourceExhausted
+        }
+    }
+}
+fn root_error(error: RootUseBindingError) -> FrozenCallError {
+    match error {
+        RootUseBindingError::Control(cause) => FrozenCallError::Control(cause),
+        error => FrozenCallError::Roots(error),
+    }
+}
+fn admit_resources(
+    counter: &novarocks_type_contract::ControlResourceCounter,
+    admit: &mut Option<&mut ResourceAdmission<'_>>,
+) -> Result<(), FrozenCallError> {
+    if let Some(admit) = admit.as_mut() {
+        admit(&counter.facts())?;
+    }
+    Ok(())
+}
+
 impl FrozenFragmentCalls {
     pub fn try_new(
         fragment: &Fragment,
@@ -143,26 +182,105 @@ impl FrozenFragmentCalls {
         control: &dyn PureCompileControl,
     ) -> Result<Self, FrozenCallError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-        let result = (|| {
-            if calls.len() > MAX_CONTROL_USE_REFERENCES {
-                return Err(FrozenCallError::TooManyItems);
-            }
-            let mut entries = BTreeMap::new();
-            for call in calls {
-                if entries.insert(call.site, call).is_some() {
-                    return Err(FrozenCallError::DuplicateSite);
-                }
-                work.step()?;
-            }
-            let value = Self {
-                fragment: fragment.id(),
-                entries: Arc::new(entries),
-            };
-            work.flush()?;
-            value.validate_fragment(fragment, uses, control)?;
-            Ok(value)
-        })();
+        let result = Self::try_new_core(fragment, uses, calls, None, &mut work);
         finish_frozen_calls(work, result)
+    }
+
+    /// Numerical backing for the actual constructor containers, before any
+    /// map insertion or correspondence callback. Count is not a semantic seal.
+    pub fn construction_resources(
+        count: usize,
+    ) -> Result<novarocks_type_contract::ControlOwnedResourceFacts, FrozenCallError> {
+        if count > MAX_CONTROL_USE_REFERENCES {
+            return Err(FrozenCallError::TooManyItems);
+        }
+        let mut resources = novarocks_type_contract::ControlResourceCounter::default();
+        resources
+            .tree::<PhysicalCallSite, FrozenPhysicalCall>(count)
+            .map_err(resource_error)?;
+        resources
+            .arc::<BTreeMap<PhysicalCallSite, FrozenPhysicalCall>>(1)
+            .map_err(resource_error)?;
+        resources
+            .tree::<ExpressionUseId, ()>(count)
+            .map_err(resource_error)?;
+        Ok(resources.facts())
+    }
+
+    /// Construct using the caller's scope and cumulative owned-request observer.
+    /// Facts include this constructor and its exact nested root correspondence;
+    /// they do not authenticate effects or provide a host allocation grant.
+    pub fn try_new_in(
+        fragment: &Fragment,
+        uses: &PhysicalRootUses,
+        calls: Vec<FrozenPhysicalCall>,
+        admit: &mut impl FnMut(
+            &novarocks_type_contract::ControlOwnedResourceFacts,
+        ) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, FrozenCallError> {
+        Self::try_new_core(fragment, uses, calls, Some(admit), work)
+    }
+
+    fn try_new_core(
+        fragment: &Fragment,
+        uses: &PhysicalRootUses,
+        calls: Vec<FrozenPhysicalCall>,
+        mut admit: Option<&mut ResourceAdmission<'_>>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, FrozenCallError> {
+        if calls.len() > MAX_CONTROL_USE_REFERENCES {
+            return Err(FrozenCallError::TooManyItems);
+        }
+        let mut resources = novarocks_type_contract::ControlResourceCounter::default();
+        if admit.is_some() {
+            resources
+                .merge(Self::construction_resources(calls.len())?)
+                .map_err(resource_error)?;
+            admit_resources(&resources, &mut admit)?;
+        }
+        let mut entries = BTreeMap::new();
+        for call in calls {
+            if admit.is_some() {
+                work.flush()?;
+            }
+            if entries.insert(call.site, call).is_some() {
+                return Err(FrozenCallError::DuplicateSite);
+            }
+            work.step()?;
+            if admit.is_some() {
+                work.flush()?;
+            }
+        }
+        if admit.is_some() {
+            work.flush()?;
+        }
+        let value = Self {
+            fragment: fragment.id(),
+            entries: Arc::new(entries),
+        };
+        if admit.is_some() {
+            work.step()?;
+        }
+        work.flush()?;
+        if let Some(parent) = admit.as_mut() {
+            let base = resources.facts();
+            value.validate_fragment_core(
+                fragment,
+                uses,
+                Some(&mut |child| {
+                    let mut combined = novarocks_type_contract::ControlResourceCounter::default();
+                    combined.merge(base).map_err(resource_control)?;
+                    combined.merge(*child).map_err(resource_control)?;
+                    parent(&combined.facts())
+                }),
+                true,
+                work,
+            )?;
+        } else {
+            value.validate_fragment(fragment, uses, work.control())?;
+        }
+        Ok(value)
     }
 
     /// Recheck claims against this package's current snapshot. Changing a
@@ -175,109 +293,192 @@ impl FrozenFragmentCalls {
         control: &dyn PureCompileControl,
     ) -> Result<(), FrozenCallError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-        let result = (|| {
-            if uses.roots().fragment() != fragment.id() {
-                return Err(FrozenCallError::Roots(RootUseBindingError::WrongFragment));
-            }
-            if self.fragment != fragment.id() {
-                return Err(FrozenCallError::WrongFragment);
-            }
-            work.flush()?;
-            uses.validate_fragment(fragment, control)
-                .map_err(|error| match error {
-                    RootUseBindingError::Control(error) => FrozenCallError::Control(error),
-                    error => FrozenCallError::Roots(error),
-                })?;
-            // The same invocation budget covers scalar graph references and real
-            // relational calls. It does not multiply by an arena's maximum ID.
-            let mut references = uses.flow().use_reference_count();
-            let mut special_ids = BTreeSet::new();
-            let mut visited = 0usize;
-            visit_calls(fragment, uses, &mut work, |site, binding, work| {
-                let call = self
-                    .entries
-                    .get(&site)
-                    .ok_or(FrozenCallError::MissingSite(site))?;
-                if matches!(binding, PhysicalCallBinding::Aggregate(_))
-                    && binding.kind() != FunctionKind::Aggregate
-                {
-                    return Err(FrozenCallError::InvalidEffects(
-                        EffectContractError::KindMismatch,
-                    ));
-                }
-                match site {
-                    PhysicalCallSite::Expression(id) => {
-                        let invocation = &uses.flow().uses()[&id];
-                        if call.context != invocation.context {
-                            return Err(FrozenCallError::WrongContext);
-                        }
-                        match binding {
-                            PhysicalCallBinding::Scalar(_) => {
-                                if !call
-                                    .effects
-                                    .argument_control
-                                    .matches_scalar_shape(invocation.control)
-                                {
-                                    return Err(FrozenCallError::WrongControl);
-                                }
-                            }
-                            PhysicalCallBinding::Window { .. } => {
-                                if !matches!(
-                                    call.effects.argument_control,
-                                    ArgumentControl::Aggregate | ArgumentControl::Window
-                                ) {
-                                    return Err(FrozenCallError::WrongControl);
-                                }
-                            }
-                            PhysicalCallBinding::Aggregate(_) | PhysicalCallBinding::Table(_) => {
-                                unreachable!()
-                            }
-                        }
-                    }
-                    PhysicalCallSite::Aggregate { .. }
-                    | PhysicalCallSite::TopNState { .. }
-                    | PhysicalCallSite::WriterPartial { .. }
-                    | PhysicalCallSite::WriterFinal { .. }
-                    | PhysicalCallSite::Table { .. } => {
-                        references = references
-                            .checked_add(1)
-                            .ok_or(FrozenCallError::TooManyItems)?;
-                        if references > MAX_CONTROL_USE_REFERENCES {
-                            return Err(FrozenCallError::TooManyItems);
-                        }
-                        if call.context.demand != EvaluationDemand::Value {
-                            return Err(FrozenCallError::WrongContext);
-                        }
-                        if uses.flow().uses().contains_key(&call.context.use_id)
-                            || !special_ids.insert(call.context.use_id)
-                        {
-                            return Err(FrozenCallError::SharedUse);
-                        }
-                        let domain = uses
-                            .flow()
-                            .domains()
-                            .get(&call.context.domain)
-                            .ok_or(FrozenCallError::InvalidDomain)?;
-                        if domain.parent.is_some() || domain.guard.is_some() {
-                            return Err(FrozenCallError::InvalidDomain);
-                        }
-                    }
-                }
-                if call.effects.proof_scope != CallProofScope::Unconditional
-                    && call.effects.proof_scope != CallProofScope::Domain(call.context.domain)
-                {
-                    return Err(FrozenCallError::WrongProofScope);
-                }
-                validate_public_effect_shape(binding.kind(), &call.effects, work)?;
-                visited += 1;
-                Ok(())
-            })?;
-            if visited != self.entries.len() {
-                return Err(FrozenCallError::InvalidSite);
-            }
-            Ok(())
-        })();
+        let result = self.validate_fragment_core(fragment, uses, None, false, &mut work);
         finish_frozen_calls(work, result)
+    }
+
+    /// Validate the same immutable source without creating a nested scope.
+    pub fn validate_fragment_in(
+        &self,
+        fragment: &Fragment,
+        uses: &PhysicalRootUses,
+        admit: &mut impl FnMut(
+            &novarocks_type_contract::ControlOwnedResourceFacts,
+        ) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), FrozenCallError> {
+        self.validate_fragment_core(fragment, uses, Some(admit), false, work)
+    }
+
+    fn validate_fragment_core(
+        &self,
+        fragment: &Fragment,
+        uses: &PhysicalRootUses,
+        mut admit: Option<&mut ResourceAdmission<'_>>,
+        special_precharged: bool,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), FrozenCallError> {
+        if uses.roots().fragment() != fragment.id() {
+            return Err(FrozenCallError::Roots(RootUseBindingError::WrongFragment));
+        }
+        if self.fragment != fragment.id() {
+            return Err(FrozenCallError::WrongFragment);
+        }
+        let mut resources = novarocks_type_contract::ControlResourceCounter::default();
+        if let Some(parent) = admit.as_mut() {
+            // This is an upper bound for the actual relational-ID set. Each
+            // environment collection is charged at its captured occurrence.
+            if !special_precharged {
+                resources
+                    .tree::<ExpressionUseId, ()>(self.entries.len())
+                    .map_err(resource_error)?;
+            }
+            let lookups =
+                novarocks_type_contract::ControlResourceCounter::lookup_work(self.entries.len())
+                    .map_err(resource_error)?;
+            resources
+                .work(
+                    novarocks_type_contract::control_resource_mul(
+                        lookups,
+                        uses.flow()
+                            .uses()
+                            .len()
+                            .checked_add(fragment.nodes().len())
+                            .and_then(|n| n.checked_add(self.entries.len()))
+                            .ok_or(FrozenCallError::Control(
+                                CompileControlError::ResourceExhausted,
+                            ))?,
+                    )
+                    .map_err(resource_error)?,
+                )
+                .map_err(resource_error)?;
+            parent(&resources.facts())?;
+            let base = resources.facts();
+            let mut child = novarocks_type_contract::ControlOwnedResourceFacts::default();
+            uses.validate_fragment_in(
+                fragment,
+                &mut |next| {
+                    let mut combined = novarocks_type_contract::ControlResourceCounter::default();
+                    combined.merge(base).map_err(resource_control)?;
+                    combined.merge(*next).map_err(resource_control)?;
+                    child = *next;
+                    parent(&combined.facts())
+                },
+                work,
+            )
+            .map_err(root_error)?;
+            resources.merge(child).map_err(resource_error)?;
+        } else {
+            work.flush()?;
+            uses.validate_fragment(fragment, work.control())
+                .map_err(root_error)?;
+        }
+        // The same invocation budget covers scalar graph references and real
+        // relational calls. It does not multiply by an arena's maximum ID.
+        let mut references = uses.flow().use_reference_count();
+        let mut special_ids = BTreeSet::new();
+        let mut visited = 0usize;
+        visit_calls(fragment, uses, work, |site, binding, work| {
+            let call = self
+                .entries
+                .get(&site)
+                .ok_or(FrozenCallError::MissingSite(site))?;
+            if matches!(binding, PhysicalCallBinding::Aggregate(_))
+                && binding.kind() != FunctionKind::Aggregate
+            {
+                return Err(FrozenCallError::InvalidEffects(
+                    EffectContractError::KindMismatch,
+                ));
+            }
+            match site {
+                PhysicalCallSite::Expression(id) => {
+                    let invocation = &uses.flow().uses()[&id];
+                    if call.context != invocation.context {
+                        return Err(FrozenCallError::WrongContext);
+                    }
+                    match binding {
+                        PhysicalCallBinding::Scalar(_) => {
+                            if !call
+                                .effects
+                                .argument_control
+                                .matches_scalar_shape(invocation.control)
+                            {
+                                return Err(FrozenCallError::WrongControl);
+                            }
+                        }
+                        PhysicalCallBinding::Window { .. } => {
+                            if !matches!(
+                                call.effects.argument_control,
+                                ArgumentControl::Aggregate | ArgumentControl::Window
+                            ) {
+                                return Err(FrozenCallError::WrongControl);
+                            }
+                        }
+                        PhysicalCallBinding::Aggregate(_) | PhysicalCallBinding::Table(_) => {
+                            unreachable!()
+                        }
+                    }
+                }
+                PhysicalCallSite::Aggregate { .. }
+                | PhysicalCallSite::TopNState { .. }
+                | PhysicalCallSite::WriterPartial { .. }
+                | PhysicalCallSite::WriterFinal { .. }
+                | PhysicalCallSite::Table { .. } => {
+                    references = references
+                        .checked_add(1)
+                        .ok_or(FrozenCallError::TooManyItems)?;
+                    if references > MAX_CONTROL_USE_REFERENCES {
+                        return Err(FrozenCallError::TooManyItems);
+                    }
+                    if call.context.demand != EvaluationDemand::Value {
+                        return Err(FrozenCallError::WrongContext);
+                    }
+                    if uses.flow().uses().contains_key(&call.context.use_id)
+                        || !special_ids.insert(call.context.use_id)
+                    {
+                        return Err(FrozenCallError::SharedUse);
+                    }
+                    let domain = uses
+                        .flow()
+                        .domains()
+                        .get(&call.context.domain)
+                        .ok_or(FrozenCallError::InvalidDomain)?;
+                    if domain.parent.is_some() || domain.guard.is_some() {
+                        return Err(FrozenCallError::InvalidDomain);
+                    }
+                }
+            }
+            if call.effects.proof_scope != CallProofScope::Unconditional
+                && call.effects.proof_scope != CallProofScope::Domain(call.context.domain)
+            {
+                return Err(FrozenCallError::WrongProofScope);
+            }
+            if admit.is_some() {
+                let n = call.effects.environment.len();
+                resources
+                    .tree::<SemanticParameterRef, ()>(n)
+                    .map_err(resource_error)?;
+                resources
+                    .tree::<novarocks_type_contract::SemanticParameterKey, ()>(n)
+                    .map_err(resource_error)?;
+                // FunctionEffectDeclaration::validate constructs its original
+                // independent duplicate-key set inside the opaque law owner.
+                resources
+                    .tree::<novarocks_type_contract::SemanticParameterKey, ()>(n)
+                    .map_err(resource_error)?;
+                resources
+                    .buffer::<novarocks_type_contract::SemanticParameterKey>(n, 2)
+                    .map_err(resource_error)?;
+                admit_resources(&resources, &mut admit)?;
+            }
+            validate_public_effect_shape(binding.kind(), &call.effects, admit.is_some(), work)?;
+            visited += 1;
+            Ok(())
+        })?;
+        if visited != self.entries.len() {
+            return Err(FrozenCallError::InvalidSite);
+        }
+        Ok(())
     }
 
     pub const fn fragment(&self) -> FragmentId {
@@ -389,6 +590,7 @@ impl FrozenFragmentCalls {
 fn validate_public_effect_shape(
     kind: FunctionKind,
     effects: &CallEffects,
+    observed_resources: bool,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), FrozenCallError> {
     // At most one actual reference for each closed environment key. This is
@@ -396,12 +598,21 @@ fn validate_public_effect_shape(
     let mut references = BTreeSet::new();
     let mut keys = BTreeSet::new();
     for reference in &effects.environment {
+        if observed_resources {
+            work.flush()?;
+        }
         if !references.insert(*reference) || !keys.insert(reference.expected_key) {
             return Err(FrozenCallError::InvalidEffects(
                 EffectContractError::InvalidEnvironmentReference,
             ));
         }
         work.step()?;
+        if observed_resources {
+            work.flush()?;
+        }
+    }
+    if observed_resources {
+        work.flush()?;
     }
     let shape = FunctionEffectDeclaration {
         value_stability: effects.value_stability,
@@ -413,9 +624,19 @@ fn validate_public_effect_shape(
         observable_effects: effects.observable_effects,
         environment_dependencies: keys.into_iter().collect(),
     };
-    shape
+    if observed_resources {
+        work.step()?;
+        work.flush()?;
+    }
+    let result = shape
         .validate(kind)
-        .map_err(FrozenCallError::InvalidEffects)
+        .map_err(FrozenCallError::InvalidEffects);
+    result?;
+    if observed_resources {
+        work.step()?;
+        work.flush()?;
+    }
+    Ok(())
 }
 
 /// Visit each actual call occurrence using the caller's original work scope.

@@ -50,6 +50,47 @@ impl FrozenFragmentPruning {
         })
     }
 
+    /// Original target-set and final Arc geometry, usable before projection.
+    pub fn construction_resources(
+        count: usize,
+    ) -> Result<novarocks_type_contract::ControlOwnedResourceFacts, FrozenPruningError> {
+        let mut resources = novarocks_type_contract::ControlResourceCounter::default();
+        resources
+            .arc::<PruningDomainWitness>(count)
+            .map_err(resource_error)?;
+        resources
+            .tree::<(crate::NodeId, crate::ProviderReadOccurrenceId, u8), ()>(count)
+            .map_err(resource_error)?;
+        Ok(resources.facts())
+    }
+
+    /// Construct the same declarations in the caller's original scope. The
+    /// cumulative facts bound actual target-set and final Arc backing requests;
+    /// they do not establish implication or complete Package consumer closure.
+    pub fn try_new_in(
+        fragment: FragmentId,
+        witnesses: Vec<PruningDomainWitness>,
+        admit: &mut impl FnMut(
+            &novarocks_type_contract::ControlOwnedResourceFacts,
+        ) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, FrozenPruningError> {
+        let mut resources = novarocks_type_contract::ControlResourceCounter::default();
+        resources
+            .merge(Self::construction_resources(witnesses.len())?)
+            .map_err(resource_error)?;
+        admit(&resources.facts())?;
+        count_items_core(fragment, &witnesses, Some((&mut resources, admit)), work)?;
+        work.flush()?;
+        let value = Self {
+            fragment,
+            witnesses: witnesses.into(),
+        };
+        work.step()?;
+        work.flush()?;
+        Ok(value)
+    }
+
     pub const fn fragment(&self) -> FragmentId {
         self.fragment
     }
@@ -94,6 +135,7 @@ impl FrozenFragmentPruning {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrozenPruningError {
     Control(CompileControlError),
+    ResourceSource(&'static str),
     Structure(PruningStructureError),
     WrongFragment,
     DuplicateTarget,
@@ -126,9 +168,55 @@ fn count_items(
     control: &dyn PureCompileControl,
 ) -> Result<usize, FrozenPruningError> {
     let mut observed = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+    let items = count_items_core(fragment, witnesses, None, &mut observed)?;
+    observed.finish()?;
+    Ok(items)
+}
+
+fn resource_error(error: novarocks_type_contract::ControlResourceError) -> FrozenPruningError {
+    match error {
+        novarocks_type_contract::ControlResourceError::Control(cause) => {
+            FrozenPruningError::Control(cause)
+        }
+        novarocks_type_contract::ControlResourceError::SourceModel(message) => {
+            FrozenPruningError::ResourceSource(message)
+        }
+    }
+}
+
+type PruningAdmission<'a> = dyn FnMut(&novarocks_type_contract::ControlOwnedResourceFacts) -> Result<(), CompileControlError>
+    + 'a;
+type PruningResources<'a> = Option<(
+    &'a mut novarocks_type_contract::ControlResourceCounter,
+    &'a mut PruningAdmission<'a>,
+)>;
+fn charge_walk(
+    resources: &mut PruningResources<'_>,
+    count: usize,
+) -> Result<(), FrozenPruningError> {
+    if let Some((counter, admit)) = resources.as_mut() {
+        // Each captured header/path/value contributes a bounded allowance for
+        // this original constructor's arithmetic, local laws and completed
+        // steps. Tree movement and Arc copying are separate fixed requests.
+        counter
+            .work(novarocks_type_contract::control_resource_mul(count, 32).map_err(resource_error)?)
+            .map_err(resource_error)?;
+        admit(&counter.facts())?;
+    }
+    Ok(())
+}
+
+fn count_items_core(
+    fragment: FragmentId,
+    witnesses: &[PruningDomainWitness],
+    mut resources: PruningResources<'_>,
+    observed: &mut CompileCheckpoints<'_>,
+) -> Result<usize, FrozenPruningError> {
+    let observed_resources = resources.is_some();
     let mut items = 0usize;
     let mut targets = BTreeSet::new();
     add_items(&mut items, witnesses.len())?;
+    charge_walk(&mut resources, witnesses.len())?;
     for witness in witnesses {
         if witness.target.fragment != fragment {
             return Err(FrozenPruningError::WrongFragment);
@@ -137,8 +225,16 @@ fn count_items(
             PruningDomainField::Enforced => 0u8,
             PruningDomainField::Unenforced => 1u8,
         };
+        charge_walk(&mut resources, witness.sources.len())?;
+        if observed_resources {
+            observed.flush()?;
+        }
         if !targets.insert((witness.target.scan, witness.target.occurrence, field)) {
             return Err(FrozenPruningError::DuplicateTarget);
+        }
+        if observed_resources {
+            observed.step()?;
+            observed.flush()?;
         }
         if witness.sources.is_empty() {
             return Err(FrozenPruningError::EmptySources);
@@ -155,17 +251,24 @@ fn count_items(
             ] {
                 add_items(&mut items, size)?;
             }
+            let captured = novarocks_type_contract::control_resource_add(
+                source.conjunct_path.len(),
+                source.input_path.len(),
+            )
+            .and_then(|n| novarocks_type_contract::control_resource_add(n, source.columns.len()))
+            .map_err(resource_error)?;
+            charge_walk(&mut resources, captured)?;
             // Length gates precede traversal; every source and column has an
             // observed bounded step, including empty path/column collections.
             for column in source.columns.iter() {
                 add_items(&mut items, column.values.len())?;
+                charge_walk(&mut resources, column.values.len())?;
                 observed.step()?;
             }
             observed.step()?;
         }
         observed.step()?;
     }
-    observed.finish()?;
     Ok(items)
 }
 fn add_items(items: &mut usize, add: usize) -> Result<(), FrozenPruningError> {

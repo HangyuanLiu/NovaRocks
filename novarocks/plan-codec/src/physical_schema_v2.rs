@@ -151,11 +151,39 @@ pub struct SchemaSource<'source> {
     pub field_ids: &'source [u32],
 }
 
+type Admission<'a> = dyn FnMut(&NodeProjectionFacts) -> Result<(), CompileControlError> + 'a;
+
+// Parent admission shares the original numerical author and precedes every
+// completed gate observation. It creates neither a budget nor a scope.
+fn admit_model(
+    model: &Model,
+    source: usize,
+    fields: usize,
+    limits: NodeProjectionLimits,
+    admit: &mut Admission<'_>,
+) -> Result<NodeProjectionFacts, Error> {
+    let facts = model.numerical_facts(source, fields, limits)?;
+    admit(&facts)?;
+    Ok(facts)
+}
+fn admitted_facts(
+    model: &Model,
+    source: usize,
+    fields: usize,
+    limits: NodeProjectionLimits,
+    admit: &mut Admission<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<NodeProjectionFacts, Error> {
+    admit_model(model, source, fields, limits, admit)?;
+    Ok(model.facts(source, fields, limits, work)?)
+}
+
 fn encode_preflight(
     sources: &[SchemaSource<'_>],
     types: &EncodedTypeTable<'_>,
     source: usize,
     limits: NodeProjectionLimits,
+    admit: &mut Admission<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<NodeProjectionFacts, Error> {
     let mut model = Model {
@@ -165,7 +193,7 @@ fn encode_preflight(
     model.request::<usize>(sources.len(), 1)?;
     model.request::<wire::SchemaDefinition>(sources.len(), 1)?;
     model.delegated_work = prepare_work_upper_bound(sources.len())?;
-    model.facts(source, types.source_counts().1, limits, work)?;
+    admitted_facts(&model, source, types.source_counts().1, limits, admit, work)?;
     let source_slice = bytes::<SchemaSource<'_>>(sources.len())?;
     let types_floor = add(
         size_of::<EncodedTypeTable<'_>>(),
@@ -189,7 +217,7 @@ fn encode_preflight(
             model.delegated_work,
             mul(entry.field_ids.len(), add(types.source_counts().1, 1)?)?,
         )?;
-        model.facts(source, types.source_counts().1, limits, work)?;
+        admitted_facts(&model, source, types.source_counts().1, limits, admit, work)?;
         shape_equal(
             fields.len() == entry.field_ids.len(),
             work,
@@ -209,7 +237,7 @@ fn encode_preflight(
         let mut max_key = 0;
         let metadata_work_base = model.delegated_work;
         model.delegated_work = add(metadata_work_base, sorting_work(metadata.len(), 0)?)?;
-        model.facts(source, types.source_counts().1, limits, work)?;
+        admitted_facts(&model, source, types.source_counts().1, limits, admit, work)?;
         work.flush()?;
         let mut iter = metadata.iter();
         work.step()?;
@@ -217,20 +245,21 @@ fn encode_preflight(
         loop {
             work.flush()?;
             let next = iter.next();
+            if let Some((key, value)) = next {
+                known = add(known, add(key.capacity(), value.capacity())?)?;
+                copied = add(copied, add(key.len(), value.len())?)?;
+                max_key = max_key.max(key.len());
+                string_requests(&mut model, key, value)?;
+                model.delegated_work = add(
+                    metadata_work_base,
+                    add(sorting_work(metadata.len(), max_key)?, mul(copied, 8)?)?,
+                )?;
+                admit_model(&model, source, types.source_counts().1, limits, admit)?;
+            }
             work.step()?;
             work.flush()?;
-            let Some((key, value)) = next else { break };
-            known = add(known, add(key.capacity(), value.capacity())?)?;
-            copied = add(copied, add(key.len(), value.len())?)?;
-            max_key = max_key.max(key.len());
-            string_requests(&mut model, key, value)?;
-            // These prefix requests and work are already known. Admit the
-            // cumulative original model before any next quantum/iterator exit.
-            model.delegated_work = add(
-                metadata_work_base,
-                add(sorting_work(metadata.len(), max_key)?, mul(copied, 8)?)?,
-            )?;
-            model.facts(source, types.source_counts().1, limits, work)?;
+            let Some((_key, _value)) = next else { break };
+            admitted_facts(&model, source, types.source_counts().1, limits, admit, work)?;
             work.step()?;
         }
         max_schema_floor = max_schema_floor.max(known);
@@ -242,7 +271,7 @@ fn encode_preflight(
             source_slice.max(types_floor).max(max_schema_floor),
             work,
         )?;
-        model.facts(source, types.source_counts().1, limits, work)?;
+        admitted_facts(&model, source, types.source_counts().1, limits, admit, work)?;
         for (field, id) in fields.iter().zip(entry.field_ids) {
             let original = types.field_observed(*id, work)?;
             work.step()?;
@@ -254,7 +283,7 @@ fn encode_preflight(
             )?;
         }
     }
-    Ok(model.facts(source, types.source_counts().1, limits, work)?)
+    admitted_facts(&model, source, types.source_counts().1, limits, admit, work)
 }
 fn btree_lookup(n: usize) -> Result<usize, Error> {
     crate::btree_resources_v2::lookup_work_typed(n).map_err(|e| match e {
@@ -269,6 +298,7 @@ fn decode_preflight(
     types: &DecodedTypeTable,
     source: usize,
     limits: NodeProjectionLimits,
+    admit: &mut Admission<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<NodeProjectionFacts, Error> {
     let mut model = Model {
@@ -278,7 +308,7 @@ fn decode_preflight(
     model.request::<usize>(definitions.len(), 1)?;
     model.request::<(u32, Schema)>(definitions.len(), 2)?;
     model.delegated_work = prepare_work_upper_bound(definitions.len())?;
-    model.facts(source, types.field_count(), limits, work)?;
+    admitted_facts(&model, source, types.field_count(), limits, admit, work)?;
     let mut known = add(
         bytes::<wire::SchemaDefinition>(definitions.len())?,
         types.necessary_fields_retained_floor()?,
@@ -318,7 +348,7 @@ fn decode_preflight(
                 entry.metadata.len(),
             )?,
         )?;
-        model.facts(source, types.field_count(), limits, work)?;
+        admitted_facts(&model, source, types.field_count(), limits, admit, work)?;
         let mut key_bytes = 0;
         let mut copied = 0;
         let mut max_key = 0;
@@ -346,11 +376,11 @@ fn decode_preflight(
                     )?,
                 )?,
             )?;
-            model.facts(source, types.field_count(), limits, work)?;
+            admitted_facts(&model, source, types.field_count(), limits, admit, work)?;
             work.step()?;
         }
         resources::floor(source, known, work)?;
-        model.facts(source, types.field_count(), limits, work)?;
+        admitted_facts(&model, source, types.field_count(), limits, admit, work)?;
         let mut previous = None;
         for metadata in &entry.metadata {
             let sorted = ordered_key(previous, &metadata.key, work)?;
@@ -366,7 +396,7 @@ fn decode_preflight(
             shape_equal(found, work, "Schema Field reference is unknown")?;
         }
     }
-    Ok(model.facts(source, types.field_count(), limits, work)?)
+    admitted_facts(&model, source, types.field_count(), limits, admit, work)
 }
 fn encode_emit(
     sources: &[SchemaSource<'_>],
@@ -510,8 +540,20 @@ impl<'loan, 'source, 'control> PreparedSchemasEncode<'loan, 'source, 'control> {
     }
     pub fn emit(self) -> Result<EncodedSchemas<'loan, 'source, 'control>, Error> {
         let mut work = CompileCheckpoints::try_new(self.control, CompilePhase::Encode)?;
-        let result = encode_emit(self.sources, &mut work);
-        let definitions = finish(work, result)?;
+        let result = self.emit_observed_in(&mut |_| Ok(()), &mut work);
+        finish(work, result)
+    }
+    /// Uses the caller's original scope. The caller owns the ordinary footer.
+    pub fn emit_observed_in(
+        self,
+        admit: &mut Admission<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<EncodedSchemas<'loan, 'source, 'control>, Error> {
+        if !std::ptr::eq(work.control(), self.control) {
+            return Err(invalid("Schema emission has a different original control"));
+        }
+        admit(&self.facts)?;
+        let definitions = encode_emit(self.sources, work)?;
         Ok(EncodedSchemas {
             definitions,
             sources: self.sources,
@@ -531,16 +573,32 @@ pub fn prepare_schemas_encode<'loan, 'source, 'control>(
     control: &'control dyn PureCompileControl,
 ) -> Result<PreparedSchemasEncode<'loan, 'source, 'control>, Error> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
-    let result = (|| {
-        let facts = encode_preflight(sources, types, source_retained_bytes, limits, &mut work)?;
-        let index = BindingIndex::prepare(sources.len(), |at| sources[at].id, &mut work)?;
-        Ok((facts, index))
-    })();
-    let (facts, index) = finish(work, result)?;
+    let result = prepare_schemas_encode_observed_in(
+        sources,
+        types,
+        source_retained_bytes,
+        limits,
+        &mut |_| Ok(()),
+        &mut work,
+    );
+    finish(work, result)
+}
+/// Prepares the original schema body in an existing caller-owned scope. The
+/// synchronous parent sees cumulative contributions, with source B once.
+pub fn prepare_schemas_encode_observed_in<'loan, 'source, 'control>(
+    sources: &'loan [SchemaSource<'source>],
+    types: &'loan EncodedTypeTable<'source>,
+    source_retained_bytes: usize,
+    limits: NodeProjectionLimits,
+    admit: &mut Admission<'_>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedSchemasEncode<'loan, 'source, 'control>, Error> {
+    let facts = encode_preflight(sources, types, source_retained_bytes, limits, admit, work)?;
+    let index = BindingIndex::prepare(sources.len(), |at| sources[at].id, work)?;
     Ok(PreparedSchemasEncode {
         sources,
         types,
-        control,
+        control: work.control(),
         source_bytes: source_retained_bytes,
         index,
         facts,
@@ -608,8 +666,20 @@ impl<'loan, 'control> PreparedSchemasDecode<'loan, 'control> {
     }
     pub fn emit(self) -> Result<DecodedSchemas<'loan, 'control>, Error> {
         let mut work = CompileCheckpoints::try_new(self.control, CompilePhase::Decode)?;
-        let result = decode_emit(self.definitions, self.types, &mut work);
-        let (definitions, retained_bytes) = finish(work, result)?;
+        let result = self.emit_observed_in(&mut |_| Ok(()), &mut work);
+        finish(work, result)
+    }
+    /// Materializes in the same caller scope; no entry, reset or footer.
+    pub fn emit_observed_in(
+        self,
+        admit: &mut Admission<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<DecodedSchemas<'loan, 'control>, Error> {
+        if !std::ptr::eq(work.control(), self.control) {
+            return Err(invalid("Schema emission has a different original control"));
+        }
+        admit(&self.facts)?;
+        let (definitions, retained_bytes) = decode_emit(self.definitions, self.types, work)?;
         Ok(DecodedSchemas {
             definitions,
             retained_bytes,
@@ -629,16 +699,38 @@ pub fn prepare_schemas_decode<'loan, 'control>(
     control: &'control dyn PureCompileControl,
 ) -> Result<PreparedSchemasDecode<'loan, 'control>, Error> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
-    let result = (|| {
-        let facts = decode_preflight(definitions, types, source_retained_bytes, limits, &mut work)?;
-        let index = BindingIndex::prepare(definitions.len(), |at| definitions[at].id, &mut work)?;
-        Ok((facts, index))
-    })();
-    let (facts, index) = finish(work, result)?;
+    let result = prepare_schemas_decode_observed_in(
+        definitions,
+        types,
+        source_retained_bytes,
+        limits,
+        &mut |_| Ok(()),
+        &mut work,
+    );
+    finish(work, result)
+}
+/// Retains the exact raw definitions and decoded Field namespace loans.
+pub fn prepare_schemas_decode_observed_in<'loan, 'control>(
+    definitions: &'loan [wire::SchemaDefinition],
+    types: &'loan DecodedTypeTable,
+    source_retained_bytes: usize,
+    limits: NodeProjectionLimits,
+    admit: &mut Admission<'_>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedSchemasDecode<'loan, 'control>, Error> {
+    let facts = decode_preflight(
+        definitions,
+        types,
+        source_retained_bytes,
+        limits,
+        admit,
+        work,
+    )?;
+    let index = BindingIndex::prepare(definitions.len(), |at| definitions[at].id, work)?;
     Ok(PreparedSchemasDecode {
         definitions,
         types,
-        control,
+        control: work.control(),
         source_bytes: source_retained_bytes,
         index,
         facts,

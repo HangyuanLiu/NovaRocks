@@ -652,7 +652,7 @@ fn known_metadata_prefix_resource_refusal_precedes_late_control() {
         .unwrap()
         .facts()
         .cumulative_work_upper_bound;
-    control.arm(Some((5, CompileControlError::Cancelled)));
+    control.arm(Some((4, CompileControlError::Cancelled)));
     let late = prepare_schemas_encode(&sources, &types, SOURCE, send, &control);
     assert!(
         matches!(
@@ -670,7 +670,7 @@ fn known_metadata_prefix_resource_refusal_precedes_late_control() {
     let prefix = control.trace();
     assert_eq!(
         prefix.len(),
-        5,
+        4,
         "no callback after the first key's known refusal"
     );
     for bound in [send, send_work] {
@@ -724,7 +724,7 @@ fn known_metadata_prefix_resource_refusal_precedes_late_control() {
                 work.step().unwrap();
             }
             assert!(matches!(
-                decode_preflight(&input, &read, SOURCE, bound, &mut work),
+                decode_preflight(&input, &read, SOURCE, bound, &mut |_| Ok(()), &mut work),
                 Err(Error::Control(CompileControlError::ResourceExhausted))
             ));
             assert_eq!(control.trace(), [(CompilePhase::Decode, 0)]);
@@ -775,4 +775,314 @@ fn wide_schema_copy_has_actual_quantum_without_claiming_hashmap_internal_samplin
             }
         }
     }
+}
+
+fn observed_encode<'loan, 'source, 'control>(
+    sources: &'loan [SchemaSource<'source>],
+    types: &'loan EncodedTypeTable<'source>,
+    control: &'control Control,
+    admit: &mut Admission<'_>,
+) -> Result<EncodedSchemas<'loan, 'source, 'control>, Error> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+    let result = (|| {
+        let prepared =
+            prepare_schemas_encode_observed_in(sources, types, SOURCE, limits(), admit, &mut work)?;
+        prepared.emit_observed_in(admit, &mut work)
+    })();
+    finish(work, result)
+}
+fn observed_decode<'loan, 'control>(
+    definitions: &'loan [wire::SchemaDefinition],
+    types: &'loan DecodedTypeTable,
+    control: &'control Control,
+    admit: &mut Admission<'_>,
+) -> Result<DecodedSchemas<'loan, 'control>, Error> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+    let result = (|| {
+        let prepared = prepare_schemas_decode_observed_in(
+            definitions,
+            types,
+            SOURCE,
+            limits(),
+            admit,
+            &mut work,
+        )?;
+        prepared.emit_observed_in(admit, &mut work)
+    })();
+    finish(work, result)
+}
+
+#[test]
+fn observed_schema_composition_keeps_original_loans_and_one_caller_scope() {
+    let control = Control::default();
+    let original = field();
+    let roots = [(0, original.clone()), (u32::MAX, original.clone())];
+    let types = encode_type_table_sources(&[], &roots, type_limits(), &control).unwrap();
+    let read = decode_type_table(types.as_wire(), type_limits(), &control).unwrap();
+    let schema = Schema::new_with_metadata(vec![original.clone(), original], metadata());
+    let sources = [SchemaSource {
+        id: u32::MAX,
+        source: &schema,
+        field_ids: &[u32::MAX, 0],
+    }];
+    let original_encoded = run_encode(&sources, &types, &control).unwrap();
+    let original_decoded = run_decode(original_encoded.as_wire(), &read, &control).unwrap();
+    control.arm(None);
+    let mut contributions = Vec::new();
+    let mut admit = |facts: &NodeProjectionFacts| {
+        assert_eq!(
+            facts.coexisting_source_and_request_bytes_upper_bound,
+            SOURCE + facts.allocation_request_bytes_upper_bound,
+        );
+        contributions.push(*facts);
+        Ok(())
+    };
+    let encoded = observed_encode(&sources, &types, &control, &mut admit).unwrap();
+    assert_eq!(encoded.as_wire(), original_encoded.as_wire());
+    assert_eq!(encoded.facts(), original_encoded.facts());
+    assert!(std::ptr::eq(encoded.types(), &types));
+    assert!(std::ptr::eq(encoded.original_control(), &control));
+    let trace = control.trace();
+    assert!(
+        trace
+            .iter()
+            .all(|(phase, _)| *phase == CompilePhase::Validate)
+    );
+    assert!(trace.last().unwrap().1 > 0);
+    assert_eq!(contributions.last(), Some(encoded.facts()));
+    assert!(contributions.windows(2).all(|pair| {
+        pair[0].allocation_request_bytes_upper_bound <= pair[1].allocation_request_bytes_upper_bound
+            && pair[0].cumulative_work_upper_bound <= pair[1].cumulative_work_upper_bound
+    }));
+    control.arm(None);
+    let decoded = observed_decode(encoded.as_wire(), &read, &control, &mut |_| Ok(())).unwrap();
+    assert_eq!(decoded.facts(), original_decoded.facts());
+    assert_eq!(decoded.definitions()[0].0, u32::MAX);
+    assert_eq!(decoded.definitions()[0].1.metadata(), &metadata());
+    assert!(Arc::ptr_eq(
+        &decoded.definitions()[0].1.fields()[0],
+        read.field(u32::MAX).unwrap()
+    ));
+    assert!(Arc::ptr_eq(
+        &decoded.definitions()[0].1.fields()[1],
+        read.field(0).unwrap()
+    ));
+    assert!(std::ptr::eq(decoded.types(), &read));
+    assert!(
+        control
+            .trace()
+            .iter()
+            .all(|(phase, _)| *phase == CompilePhase::Validate)
+    );
+
+    // A sealed preparation cannot be emitted under an equal-looking control.
+    let foreign = Control::default();
+    let prepared =
+        prepare_schemas_decode(encoded.as_wire(), &read, SOURCE, limits(), &control).unwrap();
+    let mut work = CompileCheckpoints::try_new(&foreign, CompilePhase::Decode).unwrap();
+    ordinary(
+        prepared
+            .emit_observed_in(&mut |_| Ok(()), &mut work)
+            .map(|_| ()),
+    );
+    assert_eq!(foreign.trace(), [(CompilePhase::Decode, 0)]);
+}
+
+#[test]
+fn observed_schema_parent_numeric_refusal_precedes_pending_quantum_and_output_reserve() {
+    let control = Control::default();
+    let roots = [];
+    let types = encode_type_table_sources(&[], &roots, type_limits(), &control).unwrap();
+    let read = decode_type_table(types.as_wire(), type_limits(), &control).unwrap();
+    let empty = Schema::empty();
+    let sources = [SchemaSource {
+        id: 0,
+        source: &empty,
+        field_ids: &[],
+    }];
+    let definitions = [wire::SchemaDefinition {
+        id: u32::MAX,
+        field_ids: vec![],
+        metadata: vec![],
+    }];
+    let send_bytes = Layout::array::<usize>(1).unwrap().size()
+        + Layout::array::<wire::SchemaDefinition>(1).unwrap().size();
+    let receive_bytes = Layout::array::<usize>(1).unwrap().size()
+        + 2 * Layout::array::<(u32, Schema)>(1).unwrap().size();
+    for receive in [false, true] {
+        for cause in CAUSES {
+            control.arm(Some((1, cause)));
+            let phase = if receive {
+                CompilePhase::Decode
+            } else {
+                CompilePhase::Encode
+            };
+            let mut work = CompileCheckpoints::try_new(&control, phase).unwrap();
+            for _ in 0..255 {
+                work.step().unwrap();
+            }
+            let mut calls = 0;
+            let mut admit = |facts: &NodeProjectionFacts| {
+                calls += 1;
+                assert_eq!(
+                    facts.allocation_requests_upper_bound,
+                    if receive { 3 } else { 2 }
+                );
+                assert_eq!(
+                    facts.allocation_request_bytes_upper_bound,
+                    if receive { receive_bytes } else { send_bytes }
+                );
+                Err(CompileControlError::ResourceExhausted)
+            };
+            let result = if receive {
+                prepare_schemas_decode_observed_in(
+                    &definitions,
+                    &read,
+                    SOURCE,
+                    limits(),
+                    &mut admit,
+                    &mut work,
+                )
+                .map(|_| ())
+            } else {
+                prepare_schemas_encode_observed_in(
+                    &sources,
+                    &types,
+                    SOURCE,
+                    limits(),
+                    &mut admit,
+                    &mut work,
+                )
+                .map(|_| ())
+            };
+            assert!(matches!(
+                result,
+                Err(Error::Control(CompileControlError::ResourceExhausted))
+            ));
+            assert_eq!(calls, 1);
+            assert_eq!(control.trace(), [(phase, 0)]);
+        }
+    }
+    // The actual receiver discovers the first key after its three original
+    // header gates. Their 15 completed operations leave exactly 255 pending;
+    // the parent's byte refusal must precede the key's next gate callback.
+    let with_key = [wire::SchemaDefinition {
+        id: 0,
+        field_ids: vec![],
+        metadata: vec![ArrowFieldMetadataEntry {
+            key: "x".into(),
+            value: "".into(),
+        }],
+    }];
+    let header_bytes = receive_bytes
+        + Layout::new::<[usize; 2]>().size()
+        + maps::fresh_table_layout::<String, String>(1)
+            .unwrap()
+            .layout
+            .unwrap()
+            .size();
+    for cause in CAUSES {
+        control.arm(Some((1, cause)));
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        for _ in 0..240 {
+            work.step().unwrap();
+        }
+        let mut admit = |facts: &NodeProjectionFacts| {
+            if facts.allocation_request_bytes_upper_bound > header_bytes {
+                Err(CompileControlError::ResourceExhausted)
+            } else {
+                Ok(())
+            }
+        };
+        assert!(matches!(
+            prepare_schemas_decode_observed_in(
+                &with_key,
+                &read,
+                SOURCE,
+                limits(),
+                &mut admit,
+                &mut work
+            ),
+            Err(Error::Control(CompileControlError::ResourceExhausted))
+        ));
+        assert_eq!(control.trace(), [(CompilePhase::Decode, 0)]);
+    }
+    // The full prepared contribution is admitted again before its first owned
+    // output request. Preparation and its persistent index are already real.
+    control.arm(None);
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let prepared = prepare_schemas_decode_observed_in(
+        &definitions,
+        &read,
+        SOURCE,
+        limits(),
+        &mut |_| Ok(()),
+        &mut work,
+    )
+    .unwrap();
+    work.flush().unwrap();
+    let trace = control.trace();
+    control
+        .stop
+        .lock()
+        .unwrap()
+        .replace((trace.len(), CompileControlError::Cancelled));
+    assert!(matches!(
+        prepared.emit_observed_in(
+            &mut |_| Err(CompileControlError::ResourceExhausted),
+            &mut work
+        ),
+        Err(Error::Control(CompileControlError::ResourceExhausted))
+    ));
+    assert_eq!(control.trace(), trace);
+    control.arm(None);
+}
+
+#[test]
+fn observed_schema_every_actual_callback_keeps_primary_cause_and_caller_ordinary_footer() {
+    let control = Control::default();
+    let original = field();
+    let roots = [(0, original.clone())];
+    let types = encode_type_table_sources(&[], &roots, type_limits(), &control).unwrap();
+    let read = decode_type_table(types.as_wire(), type_limits(), &control).unwrap();
+    let schema = Schema::new_with_metadata(vec![original], metadata());
+    let sources = [SchemaSource {
+        id: 0,
+        source: &schema,
+        field_ids: &[0],
+    }];
+    let encoded = run_encode(&sources, &types, &control).unwrap();
+    prefixes(
+        &control,
+        || observed_encode(&sources, &types, &control, &mut |_| Ok(())).map(|_| ()),
+        true,
+    );
+    prefixes(
+        &control,
+        || observed_decode(encoded.as_wire(), &read, &control, &mut |_| Ok(())).map(|_| ()),
+        true,
+    );
+    let bad = [wire::SchemaDefinition {
+        id: 0,
+        field_ids: vec![u32::MAX],
+        metadata: vec![],
+    }];
+    control.arm(None);
+    ordinary(observed_decode(&bad, &read, &control, &mut |_| Ok(())).map(|_| ()));
+    assert!(control.trace().last().unwrap().1 > 0);
+    prefixes(
+        &control,
+        || observed_decode(&bad, &read, &control, &mut |_| Ok(())).map(|_| ()),
+        false,
+    );
+    let bad_sources = [SchemaSource {
+        id: 0,
+        source: &schema,
+        field_ids: &[],
+    }];
+    prefixes(
+        &control,
+        || observed_encode(&bad_sources, &types, &control, &mut |_| Ok(())).map(|_| ()),
+        false,
+    );
 }

@@ -36,6 +36,7 @@ use std::fmt;
 use crate::physical_control_v2::ControlCodecError;
 
 mod calls;
+mod owned_resources;
 mod parameter_resources;
 mod parameters;
 mod pruning;
@@ -43,8 +44,12 @@ mod pruning;
 pub use parameter_resources::{
     ParameterProjectionFacts, ParameterProjectionLimits, PreparedSemanticParametersDecode,
     PreparedSemanticParametersEncode, decode_semantic_parameters, encode_semantic_parameters,
-    prepare_semantic_parameters_decode, prepare_semantic_parameters_encode,
+    prepare_semantic_parameters_decode, prepare_semantic_parameters_decode_observed_in,
+    prepare_semantic_parameters_encode, prepare_semantic_parameters_encode_observed_in,
 };
+
+pub use calls::{decode_frozen_calls_observed, encode_frozen_calls_observed};
+pub use pruning::{decode_frozen_pruning_observed, encode_frozen_pruning_observed};
 
 pub(crate) use calls::{
     decode_policy as decode_decimal_policy, decode_site as decode_call_site,
@@ -56,6 +61,7 @@ pub(crate) use parameters::{decode_reference, encode_reference};
 pub enum SemanticsCodecError {
     Control(CompileControlError),
     InvalidShape(&'static str),
+    SourceModel(&'static str),
     Parameter(SemanticParameterError),
     Calls(FrozenCallError),
     Pruning(FrozenPruningError),
@@ -65,7 +71,7 @@ impl fmt::Display for SemanticsCodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Control(error) => error.fmt(f),
-            Self::InvalidShape(message) => f.write_str(message),
+            Self::InvalidShape(message) | Self::SourceModel(message) => f.write_str(message),
             Self::Parameter(error) => error.fmt(f),
             Self::Calls(error) => error.fmt(f),
             Self::Pruning(error) => error.fmt(f),

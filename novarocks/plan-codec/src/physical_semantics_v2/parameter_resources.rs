@@ -23,8 +23,9 @@ use super::{SemanticsCodecError, finish_projection, parameters};
 use crate::btree_resources_v2;
 use novarocks_proto_models::physical_semantics_v2 as wire;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, MAX_SEMANTIC_PARAMETERS, PureCompileControl,
-    SemanticParameterError, SemanticParameterId, SemanticParameterValue, SemanticParameters,
+    CompileCheckpoints, CompileControlError, CompilePhase, MAX_SEMANTIC_PARAMETERS,
+    PureCompileControl, SemanticParameterError, SemanticParameterId, SemanticParameterValue,
+    SemanticParameters,
 };
 use std::{alloc::Layout, mem::size_of};
 
@@ -86,16 +87,129 @@ fn floor(source: usize, known: usize, w: &mut CompileCheckpoints<'_>) -> Result<
         ))
     }
 }
+type ParentAdmission<'a> =
+    dyn FnMut(&ParameterProjectionFacts) -> Result<(), CompileControlError> + 'a;
+
+struct Admission<'borrow, 'callback> {
+    parent: Option<&'borrow mut ParentAdmission<'callback>>,
+    limits: ParameterProjectionLimits,
+}
+impl Admission<'_, '_> {
+    fn numeric<T>(&self, result: Result<T, Error>) -> Result<T, Error> {
+        if self.parent.is_some() {
+            result.map_err(|_| CompileControlError::ResourceExhausted.into())
+        } else {
+            result
+        }
+    }
+    fn gate(&mut self, facts: Result<ParameterProjectionFacts, Error>) -> Result<(), Error> {
+        if self.parent.is_some() {
+            let facts = self.numeric(facts)?;
+            let limits = self.limits;
+            // All prefix axes are already known. Refuse numerically before
+            // any real callback, including a caller's pending quantum.
+            if facts.parameter_count > limits.max_parameters
+                || facts.timezone_request_bytes_upper_bound > limits.max_timezone_request_bytes
+                || facts.allocation_requests_upper_bound > limits.max_allocation_requests
+                || facts.allocation_request_bytes_upper_bound > limits.max_allocation_request_bytes
+                || facts.coexisting_source_and_request_bytes_upper_bound
+                    > limits.max_coexisting_source_and_request_bytes
+                || facts.cumulative_work_upper_bound > limits.max_work
+            {
+                return Err(CompileControlError::ResourceExhausted.into());
+            }
+            if let Some(parent) = &mut self.parent {
+                parent(&facts)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+// One numerical author for both prefix admission and the final contribution.
+// These are request/work bounds, not retained BTree backing or allocator grants.
+#[derive(Clone, Copy)]
+struct Header {
+    requests: usize,
+    bytes: usize,
+    work: usize,
+    additional_work: usize,
+}
+impl Header {
+    fn facts(
+        self,
+        n: usize,
+        source: usize,
+        strings: usize,
+        string_bytes: usize,
+    ) -> Result<ParameterProjectionFacts, Error> {
+        let requested = add(self.bytes, string_bytes)?;
+        Ok(ParameterProjectionFacts {
+            parameter_count: n,
+            timezone_request_bytes_upper_bound: string_bytes,
+            allocation_requests_upper_bound: add(self.requests, strings)?,
+            allocation_request_bytes_upper_bound: requested,
+            coexisting_source_and_request_bytes_upper_bound: add(source, requested)?,
+            cumulative_work_upper_bound: add(
+                self.work,
+                add(self.additional_work, mul(string_bytes, 4)?)?,
+            )?,
+        })
+    }
+}
+fn decode_header(n: usize, admission: &Admission<'_, '_>) -> Result<Header, Error> {
+    let tree = btree_resources_v2::insertion_only::<SemanticParameterId, SemanticParameterValue>(n)
+        .map_err(|error| match error {
+            btree_resources_v2::BTreeResourceError::SourceModel(message) => invalid(message),
+            btree_resources_v2::BTreeResourceError::Arithmetic(_) if admission.parent.is_some() => {
+                CompileControlError::ResourceExhausted.into()
+            }
+            btree_resources_v2::BTreeResourceError::Arithmetic(_) => {
+                invalid("semantic parameter resource product overflow")
+            }
+        })?;
+    // Every entry is charged at every possible level of the original B=6 tree.
+    let work = admission.numeric((|| {
+        add(256, add(mul(n, 128)?, tree.cumulative_work_upper_bound)?)
+    })())?;
+    Ok(Header {
+        requests: tree.allocation_requests_upper_bound,
+        bytes: tree.request_bytes_upper_bound,
+        work,
+        additional_work: 0,
+    })
+}
+fn encode_header(n: usize, admission: &Admission<'_, '_>) -> Result<Header, Error> {
+    let lookup = btree_resources_v2::lookup_work(n).map_err(invalid)?;
+    admission.numeric((|| {
+        let array = bytes::<wire::SemanticParameter>(n)?;
+        Ok(Header {
+            requests: usize::from(n != 0),
+            bytes: array,
+            work: add(256, add(mul(n, add(64, lookup)?)?, mul(array, 4)?)?)?,
+            additional_work: mul(n, lookup)?,
+        })
+    })())
+}
+
 fn preflight(
     input: &wire::SemanticParameters,
     source: usize,
     limits: ParameterProjectionLimits,
+    admission: &mut Admission<'_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<ParameterProjectionFacts, Error> {
     let n = input.entries.len();
     // Preserve the original receiving boundary, including its precedence over
     // any per-entry duplicate or malformed-value error.
     let too_many = n > MAX_SEMANTIC_PARAMETERS;
+    let prefix = if admission.parent.is_some() && !too_many {
+        let header = decode_header(n, admission)?;
+        admission.gate(header.facts(n, source, 0, 0))?;
+        Some(header)
+    } else {
+        None
+    };
     w.step()?;
     if too_many {
         return Err(SemanticParameterError::TooManyParameters.into());
@@ -109,23 +223,11 @@ fn preflight(
     // Rust's insertion-only table has at most n node requests: every created
     // node retains at least one entry, and this owner never removes/rebuilds.
     // The locked layout author covers the actual public key/value layouts.
-    let tree = btree_resources_v2::insertion_only::<SemanticParameterId, SemanticParameterValue>(n)
-        .map_err(|error| match error {
-            btree_resources_v2::BTreeResourceError::SourceModel(message) => invalid(message),
-            btree_resources_v2::BTreeResourceError::Arithmetic(_) => {
-                invalid("semantic parameter resource product overflow")
-            }
-        })?;
-    let node_bytes = tree.request_bytes_upper_bound;
-    // At every visited B=6 level, eight node-layout byte units cover two
-    // key/value/edge array moves, both <=12-child parent-link repairs, node
-    // initialization and root headers in insert_fit/split/insert_recursing.
-    // Charge this for EVERY entry at EVERY possible level, independent of the
-    // much smaller actual split count. Search work is separately admitted.
-    let own = add(256, add(mul(n, 128)?, tree.cumulative_work_upper_bound)?)?;
-    // This prefix admission precedes the first entries walk, not only the
-    // eventual output allocations. String lengths/capacities are O(1) facts.
-    cap(own, limits.max_work, w)?;
+    let header = match prefix {
+        Some(header) => header,
+        None => decode_header(n, admission)?,
+    };
+    cap(header.work, limits.max_work, w)?;
     let mut strings = 0;
     let mut string_bytes = 0;
     for entry in &input.entries {
@@ -138,18 +240,12 @@ fn preflight(
                 string_bytes = add(string_bytes, bytes::<u8>(zone.len())?)?;
             }
         }
+        admission.gate(header.facts(n, source, strings, string_bytes))?;
         w.step()?;
     }
     floor(source, known, w)?;
-    let requested = add(node_bytes, string_bytes)?;
-    let facts = ParameterProjectionFacts {
-        parameter_count: n,
-        timezone_request_bytes_upper_bound: string_bytes,
-        allocation_requests_upper_bound: add(tree.allocation_requests_upper_bound, strings)?,
-        allocation_request_bytes_upper_bound: requested,
-        coexisting_source_and_request_bytes_upper_bound: add(source, requested)?,
-        cumulative_work_upper_bound: add(own, mul(string_bytes, 4)?)?,
-    };
+    let facts = admission.numeric(header.facts(n, source, strings, string_bytes))?;
+    admission.gate(Ok(facts))?;
     cap(
         facts.timezone_request_bytes_upper_bound,
         limits.max_timezone_request_bytes,
@@ -185,6 +281,22 @@ impl PreparedSemanticParametersDecode<'_, '_> {
     pub fn facts(&self) -> &ParameterProjectionFacts {
         &self.facts
     }
+    /// Rechecks the same cumulative contribution before the first output request.
+    /// The caller owns the phase and ordinary-success/failure footer.
+    pub fn emit_observed_in(
+        self,
+        admit: &mut ParentAdmission<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(SemanticParameters, ParameterProjectionFacts), Error> {
+        if !std::ptr::eq(work.control(), self.control) {
+            return Err(invalid(
+                "semantic parameter emission has a different original control",
+            ));
+        }
+        admit(&self.facts)?;
+        let table = parameters::decode_parameters_observed(self.input, work)?;
+        Ok((table, self.facts))
+    }
     pub fn emit(self) -> Result<(SemanticParameters, ParameterProjectionFacts), Error> {
         let mut work = CompileCheckpoints::try_new(self.control, CompilePhase::Decode)?;
         let result = parameters::decode_parameters_observed(self.input, &mut work)
@@ -200,7 +312,16 @@ pub fn prepare_semantic_parameters_decode<'source, 'control>(
     control: &'control dyn PureCompileControl,
 ) -> Result<PreparedSemanticParametersDecode<'source, 'control>, Error> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
-    let result = preflight(input, source_retained_bytes, limits, &mut work);
+    let result = preflight(
+        input,
+        source_retained_bytes,
+        limits,
+        &mut Admission {
+            parent: None,
+            limits,
+        },
+        &mut work,
+    );
     let facts = finish_projection(work, result)?;
     Ok(PreparedSemanticParametersDecode {
         input,
@@ -217,7 +338,16 @@ pub fn decode_semantic_parameters(
 ) -> Result<(SemanticParameters, ParameterProjectionFacts), Error> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
     let result = (|| {
-        let facts = preflight(input, source_retained_bytes, limits, &mut work)?;
+        let facts = preflight(
+            input,
+            source_retained_bytes,
+            limits,
+            &mut Admission {
+                parent: None,
+                limits,
+            },
+            &mut work,
+        )?;
         let table = parameters::decode_parameters_observed(input, &mut work)?;
         Ok((table, facts))
     })();
@@ -228,10 +358,18 @@ fn preflight_encode(
     input: &SemanticParameters,
     source: usize,
     limits: ParameterProjectionLimits,
+    admission: &mut Admission<'_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<ParameterProjectionFacts, Error> {
     let n = input.entries().len();
     let too_many = n > MAX_SEMANTIC_PARAMETERS;
+    let prefix = if admission.parent.is_some() && !too_many {
+        let header = encode_header(n, admission)?;
+        admission.gate(header.facts(n, source, 0, 0))?;
+        Some(header)
+    } else {
+        None
+    };
     w.step()?;
     if too_many {
         return Err(SemanticParameterError::TooManyParameters.into());
@@ -250,10 +388,11 @@ fn preflight_encode(
         )?,
     )?;
     floor(source, known, w)?;
-    let array = bytes::<wire::SemanticParameter>(n)?;
-    let lookup = btree_resources_v2::lookup_work(n).map_err(invalid)?;
-    let own = add(256, add(mul(n, add(64, lookup)?)?, mul(array, 4)?)?)?;
-    cap(own, limits.max_work, w)?;
+    let header = match prefix {
+        Some(header) => header,
+        None => encode_header(n, admission)?,
+    };
+    cap(header.work, limits.max_work, w)?;
     let mut strings = 0;
     let mut string_bytes = 0;
     // Iteration follows the original immutable table. A pull is an opaque
@@ -262,9 +401,10 @@ fn preflight_encode(
     loop {
         w.flush()?;
         let next = entries.next();
-        w.step()?;
-        w.flush()?;
         let Some((_, value)) = next else {
+            admission.gate(header.facts(n, source, strings, string_bytes))?;
+            w.step()?;
+            w.flush()?;
             break;
         };
         if let SemanticParameterValue::TimeZone(zone) = value {
@@ -276,19 +416,14 @@ fn preflight_encode(
                 string_bytes = add(string_bytes, bytes::<u8>(zone.len())?)?;
             }
         }
+        admission.gate(header.facts(n, source, strings, string_bytes))?;
+        w.step()?;
+        w.flush()?;
         w.step()?;
     }
     floor(source, known, w)?;
-    let requested = add(array, string_bytes)?;
-    let facts = ParameterProjectionFacts {
-        parameter_count: n,
-        timezone_request_bytes_upper_bound: string_bytes,
-        allocation_requests_upper_bound: add(usize::from(n != 0), strings)?,
-        allocation_request_bytes_upper_bound: requested,
-        coexisting_source_and_request_bytes_upper_bound: add(source, requested)?,
-        // Both the source-count pass and actual emission iterate the table.
-        cumulative_work_upper_bound: add(own, add(mul(n, lookup)?, mul(string_bytes, 4)?)?)?,
-    };
+    let facts = admission.numeric(header.facts(n, source, strings, string_bytes))?;
+    admission.gate(Ok(facts))?;
     cap(
         facts.timezone_request_bytes_upper_bound,
         limits.max_timezone_request_bytes,
@@ -322,6 +457,22 @@ impl PreparedSemanticParametersEncode<'_, '_> {
     pub fn facts(&self) -> &ParameterProjectionFacts {
         &self.facts
     }
+    /// Rechecks the same cumulative contribution before the first output request.
+    /// The caller owns the phase and ordinary-success/failure footer.
+    pub fn emit_observed_in(
+        self,
+        admit: &mut ParentAdmission<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(wire::SemanticParameters, ParameterProjectionFacts), Error> {
+        if !std::ptr::eq(work.control(), self.control) {
+            return Err(invalid(
+                "semantic parameter emission has a different original control",
+            ));
+        }
+        admit(&self.facts)?;
+        let table = parameters::encode_parameters_observed(self.input, work)?;
+        Ok((table, self.facts))
+    }
     pub fn emit(self) -> Result<(wire::SemanticParameters, ParameterProjectionFacts), Error> {
         let mut work = CompileCheckpoints::try_new(self.control, CompilePhase::Encode)?;
         let result = parameters::encode_parameters_observed(self.input, &mut work)
@@ -336,7 +487,16 @@ pub fn prepare_semantic_parameters_encode<'source, 'control>(
     control: &'control dyn PureCompileControl,
 ) -> Result<PreparedSemanticParametersEncode<'source, 'control>, Error> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
-    let result = preflight_encode(input, source_retained_bytes, limits, &mut work);
+    let result = preflight_encode(
+        input,
+        source_retained_bytes,
+        limits,
+        &mut Admission {
+            parent: None,
+            limits,
+        },
+        &mut work,
+    );
     let facts = finish_projection(work, result)?;
     Ok(PreparedSemanticParametersEncode {
         input,
@@ -352,11 +512,72 @@ pub fn encode_semantic_parameters(
 ) -> Result<(wire::SemanticParameters, ParameterProjectionFacts), Error> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
     let result = (|| {
-        let facts = preflight_encode(input, source_retained_bytes, limits, &mut work)?;
+        let facts = preflight_encode(
+            input,
+            source_retained_bytes,
+            limits,
+            &mut Admission {
+                parent: None,
+                limits,
+            },
+            &mut work,
+        )?;
         let wire = parameters::encode_parameters_observed(input, &mut work)?;
         Ok((wire, facts))
     })();
     finish_projection(work, result)
+}
+
+/// Prepares the original projection in the caller's existing scope.
+/// Parent admission replaces this child's cumulative prefix; B is included once.
+pub fn prepare_semantic_parameters_decode_observed_in<'source, 'control>(
+    input: &'source wire::SemanticParameters,
+    source_retained_bytes: usize,
+    limits: ParameterProjectionLimits,
+    admit: &mut ParentAdmission<'_>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedSemanticParametersDecode<'source, 'control>, Error> {
+    let facts = preflight(
+        input,
+        source_retained_bytes,
+        limits,
+        &mut Admission {
+            parent: Some(admit),
+            limits,
+        },
+        work,
+    )?;
+    Ok(PreparedSemanticParametersDecode {
+        input,
+        control: work.control(),
+        facts,
+    })
+}
+
+/// Prepares the original projection in the caller's existing scope.
+/// Parent admission replaces this child's cumulative prefix; B is included once.
+pub fn prepare_semantic_parameters_encode_observed_in<'source, 'control>(
+    input: &'source SemanticParameters,
+    source_retained_bytes: usize,
+    limits: ParameterProjectionLimits,
+    admit: &mut ParentAdmission<'_>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedSemanticParametersEncode<'source, 'control>, Error> {
+    let facts = preflight_encode(
+        input,
+        source_retained_bytes,
+        limits,
+        &mut Admission {
+            parent: Some(admit),
+            limits,
+        },
+        work,
+    )?;
+    Ok(PreparedSemanticParametersEncode {
+        input,
+        control: work.control(),
+        facts,
+    })
 }
 
 #[cfg(test)]

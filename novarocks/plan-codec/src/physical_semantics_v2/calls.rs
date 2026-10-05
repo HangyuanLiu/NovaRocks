@@ -18,9 +18,11 @@
 //! Complete frozen call DTO projection. This preserves occurrence facts;
 //! it does not authenticate an installed owner or close parameter values.
 
+use super::owned_resources::Projection;
 use super::parameters::{decode_reference, encode_reference};
 use super::{SemanticsCodecError, required_id};
 use crate::physical_control_v2::{decode_demand, encode_demand};
+use crate::physical_node_v2::{NodeProjectionFacts, NodeProjectionLimits};
 use novarocks_physical_plan::{
     Fragment, FrozenFragmentCalls, FrozenPhysicalCall, MAX_PLAN_DERIVED_CUT_ITEMS, NodeId,
     PhysicalCallSite, PhysicalRootUses,
@@ -32,6 +34,7 @@ use novarocks_type_contract::{
     FunctionInstanceState, FunctionIntrinsicRowError, FunctionNullBehavior, FunctionVolatility,
     MAX_CONTROL_USE_REFERENCES, MAX_SEMANTIC_PARAMETERS, ObservableEffects, PureCompileControl,
 };
+use novarocks_type_contract::{CompileControlError, ControlOwnedResourceFacts};
 
 type E = SemanticsCodecError;
 
@@ -272,9 +275,10 @@ pub(crate) fn decode_policy(value: i32) -> Result<DecimalOverflowPolicy, E> {
 }
 fn encode_effects(
     value: &CallEffects,
+    resources: &mut Projection<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::CallEffects, E> {
-    let mut environment = Vec::with_capacity(value.environment.len());
+    let mut environment = resources.reserve(value.environment.len(), work)?;
     for reference in &value.environment {
         environment.push(encode_reference(reference, work)?);
     }
@@ -296,6 +300,7 @@ fn encode_effects(
 }
 fn decode_effects(
     input: &wire::CallEffects,
+    resources: &mut Projection<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<CallEffects, E> {
     // All repeated-field bounds have been checked before allocating any output.
@@ -303,7 +308,7 @@ fn decode_effects(
         .observable_effects
         .as_ref()
         .ok_or(E::InvalidShape("missing observable effects"))?;
-    let mut environment = Vec::with_capacity(input.environment.len());
+    let mut environment = resources.reserve(input.environment.len(), work)?;
     for reference in &input.environment {
         environment.push(decode_reference(reference, work)?);
     }
@@ -324,7 +329,7 @@ fn decode_effects(
             warnings: observable.warnings,
             controlled_wait: observable.controlled_wait,
         },
-        environment: environment.into_boxed_slice(),
+        environment: resources.boxed(environment, work)?,
         proof_scope: decode_proof(
             input
                 .proof_scope
@@ -350,22 +355,40 @@ pub(super) fn encode_calls(
     input: &FrozenFragmentCalls,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::FrozenCalls, E> {
+    encode_calls_core(input, &mut Projection::plain(), work)
+}
+
+fn encode_calls_core(
+    input: &FrozenFragmentCalls,
+    resources: &mut Projection<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<wire::FrozenCalls, E> {
     if input.entries().len() > MAX_CONTROL_USE_REFERENCES {
         return Err(E::InvalidShape("too many call entries"));
     }
     let mut count = count_references(input.entries().len(), 0)?;
+    resources.items(input.entries().len())?;
+    resources.buffers::<wire::FrozenCall>(input.entries().len(), 1)?;
+    resources.known::<FrozenFragmentCalls>(1)?;
+    resources.known::<(PhysicalCallSite, FrozenPhysicalCall)>(input.entries().len())?;
     // Guard the cumulative component footprint before output allocation.
     for call in input.entries().values() {
         count = count_references(count, call.effects.environment.len())?;
+        resources.items(call.effects.environment.len())?;
+        resources.buffers::<wire::SemanticParameterRef>(call.effects.environment.len(), 1)?;
+        resources.known::<novarocks_type_contract::SemanticParameterRef>(
+            call.effects.environment.len(),
+        )?;
+        resources.gate()?;
         work.step()?;
     }
-    let mut entries = Vec::with_capacity(input.entries().len());
+    let mut entries = resources.reserve(input.entries().len(), work)?;
     for call in input.entries().values() {
         work.step()?;
         entries.push(wire::FrozenCall {
             site: Some(encode_site(call.site)),
             context: Some(encode_context(&call.context)),
-            effects: Some(encode_effects(&call.effects, work)?),
+            effects: Some(encode_effects(&call.effects, resources, work)?),
             decimal_overflow_policy: Some(encode_policy(call.decimal_overflow_policy)),
         });
     }
@@ -379,19 +402,56 @@ pub(super) fn decode_calls(
     work: &mut CompileCheckpoints<'_>,
     control: &dyn PureCompileControl,
 ) -> Result<FrozenFragmentCalls, E> {
+    decode_calls_core(
+        fragment,
+        uses,
+        input,
+        &mut Projection::plain(),
+        work,
+        control,
+    )
+}
+
+fn decode_calls_core(
+    fragment: &Fragment,
+    uses: &PhysicalRootUses,
+    input: &wire::FrozenCalls,
+    resources: &mut Projection<'_>,
+    work: &mut CompileCheckpoints<'_>,
+    control: &dyn PureCompileControl,
+) -> Result<FrozenFragmentCalls, E> {
     if input.entries.len() > MAX_CONTROL_USE_REFERENCES {
         return Err(E::InvalidShape("too many call entries"));
     }
     let mut count = count_references(input.entries.len(), 0)?;
+    resources.items(input.entries.len())?;
+    resources.buffers::<FrozenPhysicalCall>(input.entries.len(), 1)?;
+    resources.known::<wire::FrozenCalls>(1)?;
+    resources.known::<wire::FrozenCall>(input.entries.capacity())?;
+    let mut constructor_prefix = ControlOwnedResourceFacts::default();
+    if resources.observed_mode() {
+        resources.gate()?;
+        resources.child(
+            &FrozenFragmentCalls::construction_resources(input.entries.len())?,
+            &mut constructor_prefix,
+        )?;
+    }
     for call in &input.entries {
         let effects = call
             .effects
             .as_ref()
             .ok_or(E::InvalidShape("missing call effects"))?;
         count = count_references(count, effects.environment.len())?;
+        resources.items(effects.environment.len())?;
+        resources.buffers::<novarocks_type_contract::SemanticParameterRef>(
+            effects.environment.len(),
+            2,
+        )?;
+        resources.known::<wire::SemanticParameterRef>(effects.environment.capacity())?;
+        resources.gate()?;
         work.step()?;
     }
-    let mut entries = Vec::with_capacity(input.entries.len());
+    let mut entries = resources.reserve(input.entries.len(), work)?;
     for call in &input.entries {
         work.step()?;
         entries.push(FrozenPhysicalCall {
@@ -409,6 +469,7 @@ pub(super) fn decode_calls(
                 call.effects
                     .as_ref()
                     .ok_or(E::InvalidShape("missing call effects"))?,
+                resources,
                 work,
             )?,
             decimal_overflow_policy: decode_policy(
@@ -420,9 +481,48 @@ pub(super) fn decode_calls(
     // Flush projection work before entering the real same-snapshot validator.
     // Neither this constructor nor the projection supplies an owner proof.
     work.flush()?;
-    Ok(FrozenFragmentCalls::try_new(
-        fragment, uses, entries, control,
-    )?)
+    if resources.observed_mode() {
+        let mut previous = constructor_prefix;
+        Ok(FrozenFragmentCalls::try_new_in(
+            fragment,
+            uses,
+            entries,
+            &mut |facts| resources.child(facts, &mut previous),
+            work,
+        )?)
+    } else {
+        Ok(FrozenFragmentCalls::try_new(
+            fragment, uses, entries, control,
+        )?)
+    }
+}
+
+/// Preserve the complete original call table using one admitted caller scope.
+/// The caller owns entry/footer and the source union; facts are request/work
+/// upper bounds, not installed-owner, effect or allocator authority.
+pub fn encode_frozen_calls_observed(
+    input: &FrozenFragmentCalls,
+    source_retained_bytes: usize,
+    limits: NodeProjectionLimits,
+    admit: &mut impl FnMut(&NodeProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(wire::FrozenCalls, NodeProjectionFacts), E> {
+    let mut resources = Projection::observed(source_retained_bytes, limits, admit, 0)?;
+    let output = encode_calls_core(input, &mut resources, work)?;
+    Ok((output, resources.facts()?))
+}
+pub fn decode_frozen_calls_observed(
+    fragment: &Fragment,
+    uses: &PhysicalRootUses,
+    input: &wire::FrozenCalls,
+    source_retained_bytes: usize,
+    limits: NodeProjectionLimits,
+    admit: &mut impl FnMut(&NodeProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(FrozenFragmentCalls, NodeProjectionFacts), E> {
+    let mut resources = Projection::observed(source_retained_bytes, limits, admit, 0)?;
+    let output = decode_calls_core(fragment, uses, input, &mut resources, work, work.control())?;
+    Ok((output, resources.facts()?))
 }
 
 #[cfg(test)]
@@ -1428,5 +1528,8 @@ mod tests {
             decode_checked(&fixture, &many_refs, &TestControl::default()),
             Err(E::InvalidShape(_))
         ));
+    }
+    mod observed_resources_tests {
+        include!("owned_resources/tests.rs");
     }
 }

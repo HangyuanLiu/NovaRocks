@@ -32,8 +32,11 @@ use novarocks_type_contract::{
 };
 
 use super::calls::{decode_context, encode_context};
+use super::owned_resources::Projection;
 use super::{SemanticsCodecError, required_id};
 use crate::physical_control_v2::{decode_site, encode_site};
+use crate::physical_node_v2::{NodeProjectionFacts, NodeProjectionLimits};
+use novarocks_type_contract::{CompileControlError, ControlOwnedResourceFacts};
 
 type Error = SemanticsCodecError;
 
@@ -80,20 +83,43 @@ fn column_ordinal(column: ScanColumnId) -> Result<u32, Error> {
 // are not MEM grants; these DTOs already passed carrier resource admission.
 fn preflight_encode(
     input: &FrozenFragmentPruning,
+    resources: &mut Projection<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
     let mut items = 0;
     add_items(&mut items, input.witnesses().len())?;
+    resources.items(input.witnesses().len())?;
+    resources.buffers::<wire::PruningDomainWitness>(input.witnesses().len(), 1)?;
+    resources.known::<FrozenFragmentPruning>(1)?;
+    resources.known::<PruningDomainWitness>(input.witnesses().len())?;
     for witness in input.witnesses() {
+        resources.items(witness.sources.len())?;
+        resources.buffers::<wire::PruningSourceWitness>(witness.sources.len(), 1)?;
+        resources.known::<PruningSourceWitness>(witness.sources.len())?;
+        resources.gate()?;
         work.step()?;
         add_items(&mut items, witness.sources.len())?;
         for source in witness.sources.iter() {
+            resources.items(source.conjunct_path.len())?;
+            resources.items(source.input_path.len())?;
+            resources.items(source.columns.len())?;
+            resources.buffers::<u32>(source.conjunct_path.len(), 1)?;
+            resources.buffers::<wire::PruningInputEdge>(source.input_path.len(), 1)?;
+            resources.buffers::<wire::PruningColumnTrace>(source.columns.len(), 1)?;
+            resources.known::<u32>(source.conjunct_path.len())?;
+            resources.known::<PruningInputEdge>(source.input_path.len())?;
+            resources.known::<PruningColumnTrace>(source.columns.len())?;
+            resources.gate()?;
             work.step()?;
             check_path_depth(source.conjunct_path.len())?;
             add_items(&mut items, source.conjunct_path.len())?;
             add_items(&mut items, source.input_path.len())?;
             add_items(&mut items, source.columns.len())?;
             for column in source.columns.iter() {
+                resources.items(column.values.len())?;
+                resources.buffers::<u32>(column.values.len(), 1)?;
+                resources.known::<ValueId>(column.values.len())?;
+                resources.gate()?;
                 work.step()?;
                 add_items(&mut items, column.values.len())?;
                 column_ordinal(column.column)?;
@@ -105,20 +131,50 @@ fn preflight_encode(
 
 fn preflight_decode(
     input: &wire::FrozenPruning,
+    resources: &mut Projection<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
     let mut items = 0;
     add_items(&mut items, input.witnesses.len())?;
+    resources.items(input.witnesses.len())?;
+    resources.buffers::<PruningDomainWitness>(input.witnesses.len(), 1)?;
+    resources.known::<wire::FrozenPruning>(1)?;
+    resources.known::<wire::PruningDomainWitness>(input.witnesses.capacity())?;
+    if resources.observed_mode() {
+        resources.gate()?;
+        resources.child(
+            &FrozenFragmentPruning::construction_resources(input.witnesses.len())?,
+            &mut ControlOwnedResourceFacts::default(),
+        )?;
+    }
     for witness in &input.witnesses {
+        resources.items(witness.sources.len())?;
+        resources.buffers::<PruningSourceWitness>(witness.sources.len(), 2)?;
+        resources.known::<wire::PruningSourceWitness>(witness.sources.capacity())?;
+        resources.gate()?;
         work.step()?;
         add_items(&mut items, witness.sources.len())?;
         for source in &witness.sources {
+            resources.items(source.conjunct_path.len())?;
+            resources.items(source.input_path.len())?;
+            resources.items(source.columns.len())?;
+            resources.buffers::<u32>(source.conjunct_path.len(), 2)?;
+            resources.buffers::<PruningInputEdge>(source.input_path.len(), 2)?;
+            resources.buffers::<PruningColumnTrace>(source.columns.len(), 2)?;
+            resources.known::<u32>(source.conjunct_path.capacity())?;
+            resources.known::<wire::PruningInputEdge>(source.input_path.capacity())?;
+            resources.known::<wire::PruningColumnTrace>(source.columns.capacity())?;
+            resources.gate()?;
             work.step()?;
             check_path_depth(source.conjunct_path.len())?;
             add_items(&mut items, source.conjunct_path.len())?;
             add_items(&mut items, source.input_path.len())?;
             add_items(&mut items, source.columns.len())?;
             for column in &source.columns {
+                resources.items(column.value_ids.len())?;
+                resources.buffers::<ValueId>(column.value_ids.len(), 2)?;
+                resources.known::<u32>(column.value_ids.capacity())?;
+                resources.gate()?;
                 work.step()?;
                 add_items(&mut items, column.value_ids.len())?;
                 usize::try_from(column.column_ordinal).map_err(|_| {
@@ -134,19 +190,26 @@ pub(super) fn encode_pruning(
     input: &FrozenFragmentPruning,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::FrozenPruning, Error> {
-    preflight_encode(input, work)?;
-    let mut witnesses = Vec::with_capacity(input.witnesses().len());
+    encode_pruning_core(input, &mut Projection::plain(), work)
+}
+fn encode_pruning_core(
+    input: &FrozenFragmentPruning,
+    resources: &mut Projection<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<wire::FrozenPruning, Error> {
+    preflight_encode(input, resources, work)?;
+    let mut witnesses = resources.reserve(input.witnesses().len(), work)?;
     for witness in input.witnesses() {
         work.step()?;
-        let mut sources = Vec::with_capacity(witness.sources.len());
+        let mut sources = resources.reserve(witness.sources.len(), work)?;
         for source in witness.sources.iter() {
             work.step()?;
-            let mut conjunct_path = Vec::with_capacity(source.conjunct_path.len());
+            let mut conjunct_path = resources.reserve(source.conjunct_path.len(), work)?;
             for ordinal in source.conjunct_path.iter() {
                 work.step()?;
                 conjunct_path.push(*ordinal);
             }
-            let mut input_path = Vec::with_capacity(source.input_path.len());
+            let mut input_path = resources.reserve(source.input_path.len(), work)?;
             for edge in source.input_path.iter() {
                 work.step()?;
                 input_path.push(wire::PruningInputEdge {
@@ -155,10 +218,10 @@ pub(super) fn encode_pruning(
                     producer_id: Some(edge.producer.get()),
                 });
             }
-            let mut columns = Vec::with_capacity(source.columns.len());
+            let mut columns = resources.reserve(source.columns.len(), work)?;
             for column in source.columns.iter() {
                 work.step()?;
-                let mut value_ids = Vec::with_capacity(column.values.len());
+                let mut value_ids = resources.reserve(column.values.len(), work)?;
                 for value in column.values.iter() {
                     work.step()?;
                     value_ids.push(value.get());
@@ -199,8 +262,17 @@ pub(super) fn decode_pruning(
     work: &mut CompileCheckpoints<'_>,
     control: &dyn PureCompileControl,
 ) -> Result<FrozenFragmentPruning, Error> {
-    preflight_decode(input, work)?;
-    let mut witnesses = Vec::with_capacity(input.witnesses.len());
+    decode_pruning_core(fragment, input, &mut Projection::plain(), work, control)
+}
+fn decode_pruning_core(
+    fragment: FragmentId,
+    input: &wire::FrozenPruning,
+    resources: &mut Projection<'_>,
+    work: &mut CompileCheckpoints<'_>,
+    control: &dyn PureCompileControl,
+) -> Result<FrozenFragmentPruning, Error> {
+    preflight_decode(input, resources, work)?;
+    let mut witnesses = resources.reserve(input.witnesses.len(), work)?;
     for witness in &input.witnesses {
         work.step()?;
         let target = witness
@@ -219,7 +291,7 @@ pub(super) fn decode_pruning(
             )?),
             field: decode_field(target.field)?,
         };
-        let mut sources = Vec::with_capacity(witness.sources.len());
+        let mut sources = resources.reserve(witness.sources.len(), work)?;
         for source in &witness.sources {
             work.step()?;
             let responsibility = source.responsibility.as_ref().ok_or(Error::InvalidShape(
@@ -244,12 +316,12 @@ pub(super) fn decode_pruning(
                     .as_ref()
                     .ok_or(Error::InvalidShape("pruning source context is missing"))?,
             )?;
-            let mut conjunct_path = Vec::with_capacity(source.conjunct_path.len());
+            let mut conjunct_path = resources.reserve(source.conjunct_path.len(), work)?;
             for ordinal in &source.conjunct_path {
                 work.step()?;
                 conjunct_path.push(*ordinal);
             }
-            let mut input_path = Vec::with_capacity(source.input_path.len());
+            let mut input_path = resources.reserve(source.input_path.len(), work)?;
             for edge in &source.input_path {
                 work.step()?;
                 input_path.push(PruningInputEdge {
@@ -265,10 +337,10 @@ pub(super) fn decode_pruning(
                     )?),
                 });
             }
-            let mut columns = Vec::with_capacity(source.columns.len());
+            let mut columns = resources.reserve(source.columns.len(), work)?;
             for column in &source.columns {
                 work.step()?;
-                let mut values = Vec::with_capacity(column.value_ids.len());
+                let mut values = resources.reserve(column.value_ids.len(), work)?;
                 for value in &column.value_ids {
                     work.step()?;
                     values.push(ValueId::new(*value));
@@ -277,26 +349,64 @@ pub(super) fn decode_pruning(
                     column: ScanColumnId::new(usize::try_from(column.column_ordinal).map_err(
                         |_| Error::InvalidShape("pruning column ordinal does not fit usize"),
                     )?),
-                    values: values.into_boxed_slice(),
+                    values: resources.boxed(values, work)?,
                 });
             }
             sources.push(PruningSourceWitness {
                 responsibility,
                 context,
-                conjunct_path: conjunct_path.into_boxed_slice(),
-                input_path: input_path.into_boxed_slice(),
-                columns: columns.into_boxed_slice(),
+                conjunct_path: resources.boxed(conjunct_path, work)?,
+                input_path: resources.boxed(input_path, work)?,
+                columns: resources.boxed(columns, work)?,
             });
         }
         witnesses.push(PruningDomainWitness {
             target,
-            sources: sources.into_boxed_slice(),
+            sources: resources.boxed(sources, work)?,
         });
     }
     // Keep the original phase's tail before delegating to the real owner.
     // That owner validates declarations, not package closure or implication.
     work.flush()?;
-    FrozenFragmentPruning::try_new(fragment, witnesses, control).map_err(Error::from)
+    if resources.observed_mode() {
+        let mut previous = FrozenFragmentPruning::construction_resources(input.witnesses.len())?;
+        FrozenFragmentPruning::try_new_in(
+            fragment,
+            witnesses,
+            &mut |facts| resources.child(facts, &mut previous),
+            work,
+        )
+        .map_err(Error::from)
+    } else {
+        FrozenFragmentPruning::try_new(fragment, witnesses, control).map_err(Error::from)
+    }
+}
+
+/// Preserve original declarations in the caller's scope; no implication or
+/// Package consumer authority follows from these representation facts.
+pub fn encode_frozen_pruning_observed(
+    input: &FrozenFragmentPruning,
+    source_retained_bytes: usize,
+    limits: NodeProjectionLimits,
+    admit: &mut impl FnMut(&NodeProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(wire::FrozenPruning, NodeProjectionFacts), Error> {
+    let mut resources = Projection::observed(source_retained_bytes, limits, admit, 0)?;
+    let output = encode_pruning_core(input, &mut resources, work)?;
+    Ok((output, resources.facts()?))
+}
+pub fn decode_frozen_pruning_observed(
+    fragment: FragmentId,
+    input: &wire::FrozenPruning,
+    source_retained_bytes: usize,
+    limits: NodeProjectionLimits,
+    admit: &mut impl FnMut(&NodeProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(FrozenFragmentPruning, NodeProjectionFacts), Error> {
+    let mut resources = Projection::observed(source_retained_bytes, limits, admit, 0)?;
+    let control = work.control();
+    let output = decode_pruning_core(fragment, input, &mut resources, work, control)?;
+    Ok((output, resources.facts()?))
 }
 
 #[cfg(test)]
