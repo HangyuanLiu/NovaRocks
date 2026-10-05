@@ -64,6 +64,24 @@ fn decimal(precision: u32, scale: i32, constructor: fn(u8, i8) -> DataType) -> R
 }
 
 pub(super) fn encode_scalar(data_type: &DataType) -> Result<Option<Kind>, E> {
+    encode_scalar_core(data_type, true, None)
+}
+
+/// The selector is private to the original source encoder and contains the
+/// actual immutable recipe loan. Callers cannot supply a skip-validation flag.
+pub(super) fn encode_scalar_from_source(
+    data_type: &DataType,
+    source: super::encode::SourceLaw<'_>,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<Option<Kind>, E> {
+    encode_scalar_core(data_type, source.is_strict(), Some(work))
+}
+
+fn encode_scalar_core(
+    data_type: &DataType,
+    strict: bool,
+    work: Option<&mut novarocks_type_contract::CompileCheckpoints<'_>>,
+) -> Result<Option<Kind>, E> {
     use plan::ArrowPrimitiveType as P;
     let kind = match data_type {
         DataType::Null => Kind::Primitive(P::Null as i32),
@@ -88,15 +106,22 @@ pub(super) fn encode_scalar(data_type: &DataType) -> Result<Option<Kind>, E> {
         DataType::Utf8View => Kind::Primitive(P::Utf8View as i32),
         DataType::LargeUtf8 => Kind::Primitive(P::LargeUtf8 as i32),
         DataType::Timestamp(unit, zone) => {
-            if zone
-                .as_ref()
-                .is_some_and(|zone| zone.len() > MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES)
+            if strict
+                && zone
+                    .as_ref()
+                    .is_some_and(|zone| zone.len() > MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES)
             {
                 return Err(E::InvalidShape("timestamp timezone exceeds byte bound"));
             }
             Kind::Timestamp(plan::ArrowTimestampType {
                 unit: encode_unit(unit),
-                timezone: zone.as_ref().map(|zone| zone.to_string()),
+                timezone: match (zone, work) {
+                    (Some(zone), Some(work)) => {
+                        Some(crate::arrow_metadata_v2::copy_string(zone, work)?)
+                    }
+                    (Some(zone), None) => Some(zone.to_string()),
+                    (None, _) => None,
+                },
             })
         }
         DataType::Time32(unit) => Kind::Time32(plan::ArrowTimeType {

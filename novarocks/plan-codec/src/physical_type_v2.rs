@@ -32,6 +32,7 @@ use std::{collections::BTreeMap, fmt, sync::Arc};
 mod decode;
 mod decode_resources;
 mod encode;
+mod encode_resources;
 mod graph;
 mod graph_domains;
 mod package_graph;
@@ -212,6 +213,7 @@ pub struct EncodedTypeTable<'source> {
     table: wire::TypeTable,
     values: &'source [(u32, FunctionValueType)],
     fields: &'source [(u32, Arc<Field>)],
+    writers: &'source [WriterTypeSource<'source>],
 }
 impl<'source> EncodedTypeTable<'source> {
     pub fn as_wire(&self) -> &wire::TypeTable {
@@ -223,7 +225,15 @@ impl<'source> EncodedTypeTable<'source> {
     /// Counts for caller admission of repeated root lookups. No index, source
     /// copy or maximum-ID-indexed storage is created by this owner.
     pub(crate) fn source_counts(&self) -> (usize, usize) {
-        (self.values.len(), self.fields.len())
+        (
+            self.values.len(),
+            self.fields.len()
+                + self
+                    .writers
+                    .iter()
+                    .map(|source| source.field_ids.len())
+                    .sum::<usize>(),
+        )
     }
     /// The caller owns entry/ordinary/success tails on the original meter.
     /// Only completed ID comparisons are charged here, including a miss.
@@ -272,6 +282,32 @@ impl<'source> EncodedTypeTable<'source> {
         }
         Ok(None)
     }
+    /// Borrow the actual authored root Field. Writer fields remain inline in
+    /// their original immutable recipe; no Arc wrapper or equal-content copy
+    /// is manufactured to satisfy a later namespace consumer.
+    pub fn field_source_observed(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'source Field>, TypeCodecError> {
+        if let Some(field) = self.field_observed(id, work)? {
+            return Ok(Some(field.as_ref()));
+        }
+        for source in self.writers {
+            for (candidate, binding) in source
+                .field_ids
+                .iter()
+                .zip(source.recipe.input().fields_iter())
+            {
+                let matches = *candidate == id;
+                work.step()?;
+                if matches {
+                    return Ok(Some(binding.field()));
+                }
+            }
+        }
+        Ok(None)
+    }
     pub(crate) fn field_observed(
         &self,
         id: u32,
@@ -286,6 +322,54 @@ impl<'source> EncodedTypeTable<'source> {
         }
         Ok(None)
     }
+}
+
+/// Ordered root IDs for every actual input-field occurrence of one checked,
+/// immutable Writer recipe. IDs are a projection mapping, never type facts or
+/// proof of provider capability. Encoding checks the exact occurrence count
+/// and root namespace uniqueness before emitting any definition.
+pub struct WriterTypeSource<'source> {
+    recipe: &'source novarocks_connector_contract::ConnectorWriteRecipeDraft,
+    field_ids: &'source [u32],
+}
+impl<'source> WriterTypeSource<'source> {
+    pub fn new(
+        recipe: &'source novarocks_connector_contract::ConnectorWriteRecipeDraft,
+        field_ids: &'source [u32],
+    ) -> Self {
+        Self { recipe, field_ids }
+    }
+}
+
+/// Encode original roots under their actual source laws on the caller's
+/// existing meter. Only a checked Writer recipe can lend the Writer domain.
+/// Strict roots and Writer occurrences receive distinct definitions; the
+/// original occurrence emitter performs no structural interning.
+/// This port grants no provider capability or complete-package admission.
+pub fn encode_type_table_writer_sources_observed<'source>(
+    values: &'source [(u32, FunctionValueType)],
+    fields: &'source [(u32, Arc<Field>)],
+    writers: &'source [WriterTypeSource<'source>],
+    source_retained_bytes: usize,
+    limits: PackageTypeProjectionLimits,
+    admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<EncodedTypeTable<'source>, TypeCodecError> {
+    let table = encode::encode_writer_sources(
+        values,
+        fields,
+        writers,
+        source_retained_bytes,
+        limits,
+        admit,
+        work,
+    )?;
+    Ok(EncodedTypeTable {
+        table,
+        values,
+        fields,
+        writers,
+    })
 }
 
 /// Project source roots once and retain their original borrowed identity for
@@ -304,6 +388,7 @@ pub fn encode_type_table_sources<'source>(
         table,
         values,
         fields,
+        writers: &[],
     })
 }
 
@@ -606,3 +691,6 @@ mod package_graph_tests;
 
 #[cfg(test)]
 mod receiver_tests;
+
+#[cfg(test)]
+mod sender_tests;
