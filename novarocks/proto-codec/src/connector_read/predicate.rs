@@ -201,7 +201,9 @@ fn encode_value_set(values: &ValueSet) -> dto::ValueSet {
     }
 }
 
-fn decode_domain(raw: &dto::Domain, path: FieldPath) -> Result<Domain, ProtocolError> {
+/// Decode one domain using the same range/value author as tuple domains.
+/// Column identity is supplied by the caller's own namespace.
+pub fn decode_domain(raw: &dto::Domain, path: FieldPath) -> Result<Domain, ProtocolError> {
     let values = raw
         .values
         .as_ref()
@@ -216,7 +218,8 @@ fn decode_domain(raw: &dto::Domain, path: FieldPath) -> Result<Domain, ProtocolE
     Ok(Domain::new(values, raw.null_allowed))
 }
 
-fn encode_domain(domain: &Domain) -> dto::Domain {
+/// Encode one domain without inventing a transport column handle.
+pub fn encode_domain(domain: &Domain) -> dto::Domain {
     dto::Domain {
         values: Some(encode_value_set(domain.values())),
         null_allowed: domain.null_allowed(),

@@ -82,7 +82,7 @@ pub use recipe::{
     ConnectorReadRelationRecipeDraft, ConnectorReadRelationRecipeError, ConnectorRecipeHostAddress,
     MAX_CONNECTOR_RECIPE_ADDRESSES, MAX_CONNECTOR_RECIPE_AFFINITY_BYTES,
     MAX_CONNECTOR_RECIPE_BYTES, MAX_CONNECTOR_RECIPE_COLUMNS, MAX_CONNECTOR_RECIPE_PAYLOAD_BYTES,
-    MAX_CONNECTOR_RECIPE_SPLIT_WEIGHT,
+    MAX_CONNECTOR_RECIPE_SPLIT_WEIGHT, ReadRecipeOwnedError,
 };
 pub use type_projection::{
     connector_type_accepts_arrow, connector_type_accepts_value_type, connector_type_for_arrow,
@@ -101,8 +101,9 @@ pub use write_recipe::{
 pub use write_schema::*;
 
 pub use scan::{
-    ConnectorScan, FrozenConnectorScan, MAX_STATIC_SCAN_RETAINED_BYTES, ScanColumnId,
-    StaticConnectorScan, StaticConnectorScanError, StaticScanAssignment, StaticScanDynamicFilter,
+    ConnectorScan, FrozenConnectorScan, MAX_STATIC_SCAN_RETAINED_BYTES, ReadScanOwnedError,
+    ScanColumnId, ScanConstructionInput, StaticConnectorScan, StaticConnectorScanError,
+    StaticScanAssignment, StaticScanDynamicFilter,
 };
 
 pub use pure_compile::PureProviderCompileError;
