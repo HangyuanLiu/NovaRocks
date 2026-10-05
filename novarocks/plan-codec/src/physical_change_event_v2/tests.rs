@@ -723,7 +723,10 @@ fn change_event_independent_layout_and_every_seven_caps_apply_in_both_directions
                     )
                     .map(|_| ())
                 };
-                assert!(matches!(result, Err(Error::InvalidShape(_))));
+                assert!(matches!(
+                    result,
+                    Err(Error::Control(CompileControlError::ResourceExhausted))
+                ));
             }
         }
     });
@@ -841,7 +844,7 @@ fn change_event_inner_capacity_and_initial_work_are_admitted_before_visiting_ass
         c.arm(None);
         assert!(matches!(
             prepare_change_event_node_encode(&node, values, expressions, SOURCE, low),
-            Err(Error::InvalidShape(_))
+            Err(Error::Control(CompileControlError::ResourceExhausted))
         ));
         assert!(!c.trace().iter().any(|(_, units)| *units == 256));
         let mut wire = expected();
@@ -855,7 +858,7 @@ fn change_event_inner_capacity_and_initial_work_are_admitted_before_visiting_ass
         c.arm(None);
         assert!(matches!(
             prepare_change_event_node_decode(&wire, read, SOURCE, low),
-            Err(Error::InvalidShape(_))
+            Err(Error::Control(CompileControlError::ResourceExhausted))
         ));
         assert!(!c.trace().iter().any(|(_, units)| *units == 256));
         c.arm(None);

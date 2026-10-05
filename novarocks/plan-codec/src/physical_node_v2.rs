@@ -164,24 +164,29 @@ pub(crate) fn invalid(text: &'static str) -> Error {
 }
 pub(crate) fn add(a: usize, b: usize) -> Result<usize, Error> {
     a.checked_add(b)
-        .ok_or_else(|| invalid("Repeat resource sum overflow"))
+        .ok_or_else(|| CompileControlError::ResourceExhausted.into())
 }
 pub(crate) fn mul(a: usize, b: usize) -> Result<usize, Error> {
     a.checked_mul(b)
-        .ok_or_else(|| invalid("Repeat resource product overflow"))
+        .ok_or_else(|| CompileControlError::ResourceExhausted.into())
 }
 pub(crate) fn bytes<T>(n: usize) -> Result<usize, Error> {
     Layout::array::<T>(n)
         .map(|layout| layout.size())
-        .map_err(|_| invalid("Repeat allocation layout is unrepresentable"))
+        .map_err(|_| CompileControlError::ResourceExhausted.into())
 }
 pub(crate) fn cap(n: usize, maximum: usize, w: &mut CompileCheckpoints<'_>) -> Result<(), Error> {
-    let accepted = n <= maximum;
+    // A known numerical refusal is already the originating control cause;
+    // no later checkpoint or ordinary footer may replace it.
+    check_cap(n, maximum)?;
     w.step()?;
-    if accepted {
-        Ok(())
+    Ok(())
+}
+fn check_cap(n: usize, maximum: usize) -> Result<(), Error> {
+    if n > maximum {
+        Err(CompileControlError::ResourceExhausted.into())
     } else {
-        Err(invalid("Repeat projection envelope exceeded"))
+        Ok(())
     }
 }
 pub(crate) fn floor(
@@ -363,25 +368,32 @@ impl Model {
             coexisting_source_and_request_bytes_upper_bound: add(source, self.requested)?,
             cumulative_work_upper_bound: add(own_work, self.delegated_work)?,
         };
-        cap(facts.input_node_count, l.max_input_nodes, w)?;
-        cap(facts.value_reference_count, l.max_value_references, w)?;
-        cap(facts.list_item_count, l.max_list_items, w)?;
-        cap(
-            facts.allocation_requests_upper_bound,
-            l.max_allocation_requests,
-            w,
-        )?;
-        cap(
-            facts.allocation_request_bytes_upper_bound,
-            l.max_allocation_request_bytes,
-            w,
-        )?;
-        cap(
-            facts.coexisting_source_and_request_bytes_upper_bound,
-            l.max_coexisting_source_and_request_bytes,
-            w,
-        )?;
-        cap(facts.cumulative_work_upper_bound, l.max_work, w)?;
+        // Every numerical fact is now known. Admit all axes before observing
+        // completed gate work, so a later axis cannot lose to the next quantum.
+        let axes = [
+            (facts.input_node_count, l.max_input_nodes),
+            (facts.value_reference_count, l.max_value_references),
+            (facts.list_item_count, l.max_list_items),
+            (
+                facts.allocation_requests_upper_bound,
+                l.max_allocation_requests,
+            ),
+            (
+                facts.allocation_request_bytes_upper_bound,
+                l.max_allocation_request_bytes,
+            ),
+            (
+                facts.coexisting_source_and_request_bytes_upper_bound,
+                l.max_coexisting_source_and_request_bytes,
+            ),
+            (facts.cumulative_work_upper_bound, l.max_work),
+        ];
+        for (actual, maximum) in axes {
+            check_cap(actual, maximum)?;
+        }
+        for _ in axes {
+            w.step()?;
+        }
         Ok(facts)
     }
 }
@@ -393,10 +405,14 @@ pub(crate) fn count_prefix(
     l: NodeProjectionLimits,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
-    cap(inputs, l.max_input_nodes, w)?;
-    cap(items, l.max_list_items, w)?;
     // This lower bound precedes all variable-length numerical counting.
-    cap(add(256, mul(add(items, inputs)?, 32)?)?, l.max_work, w)?;
+    let work = add(256, mul(add(items, inputs)?, 32)?)?;
+    check_cap(inputs, l.max_input_nodes)?;
+    check_cap(items, l.max_list_items)?;
+    check_cap(work, l.max_work)?;
+    for _ in 0..3 {
+        w.step()?;
+    }
     floor(source, known, w)
 }
 

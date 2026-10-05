@@ -461,7 +461,10 @@ fn writer_independent_layout_dictionary_clone_and_seven_caps_all_four_routes() {
             for axis in 0..7 {
                 c.arm(None);
                 assert!(
-                    invoke(under(exact(f), axis)).is_err(),
+                    matches!(
+                        invoke(under(exact(f), axis)),
+                        Err(Error::Control(CompileControlError::ResourceExhausted))
+                    ),
                     "route {route} axis {axis}"
                 );
             }
@@ -631,10 +634,16 @@ fn writer_actual_capacity_source_and_count_work_prefix_are_admitted_before_outpu
             ..limits()
         };
         c.arm(None);
-        assert!(encode_writer_schema(&wide, &ids, types, SOURCE, low, &c).is_err());
+        assert!(matches!(
+            encode_writer_schema(&wide, &ids, types, SOURCE, low, &c),
+            Err(Error::Control(CompileControlError::ResourceExhausted))
+        ));
         assert!(!c.trace().iter().any(|(_, u)| *u == 256));
         c.arm(None);
-        assert!(decode_writer_schema(&wire, read, SOURCE, low, &c).is_err());
+        assert!(matches!(
+            decode_writer_schema(&wire, read, SOURCE, low, &c),
+            Err(Error::Control(CompileControlError::ResourceExhausted))
+        ));
         assert!(!c.trace().iter().any(|(_, u)| *u == 256));
         c.arm(None);
         assert!(encode_writer_schema(&small_schema(), &[0], types, 0, limits(), &c).is_err());

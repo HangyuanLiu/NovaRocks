@@ -610,7 +610,13 @@ fn whole_node_resource_caps_are_exact_and_each_one_below_refuses() {
                     5 => l.max_coexisting_source_and_request_bytes -= 1,
                     _ => l.max_work -= 1,
                 }
-                assert!(matches!(run(l), Err(Error::InvalidShape(_))), "cap {cap}");
+                assert!(
+                    matches!(
+                        run(l),
+                        Err(Error::Control(CompileControlError::ResourceExhausted))
+                    ),
+                    "cap {cap}"
+                );
             }
             assert!(
                 facts.coexisting_source_and_request_bytes_upper_bound
@@ -655,6 +661,33 @@ fn whole_node_resource_caps_are_exact_and_each_one_below_refuses() {
             + bytes::<p::ValueId>(1).unwrap();
         assert_eq!(df.allocation_request_bytes_upper_bound, 2 * receiving_own);
         assert_eq!(df.allocation_requests_upper_bound, 18);
+    });
+}
+
+#[test]
+fn repeat_known_resource_refusal_precedes_late_control_and_never_runs_footer() {
+    let control = Control::default();
+    with_namespaces(&definitions(), &control, |encoded, decoded| {
+        let original = source();
+        let wire = expected();
+        assert_eq!(original.inputs.len(), 1);
+        assert_eq!(wire.input_node_ids.len(), 1);
+        let mut cap = limits();
+        cap.max_input_nodes = 0;
+        for cause in CAUSES {
+            control.arm(Some((1, cause)));
+            assert!(matches!(
+                encode_repeat_node(&original, encoded, SOURCE, cap),
+                Err(Error::Control(CompileControlError::ResourceExhausted))
+            ));
+            assert_eq!(control.trace(), vec![(CompilePhase::Encode, 0)]);
+            control.arm(Some((1, cause)));
+            assert!(matches!(
+                decode_repeat_node(&wire, decoded, SOURCE, cap),
+                Err(Error::Control(CompileControlError::ResourceExhausted))
+            ));
+            assert_eq!(control.trace(), vec![(CompilePhase::Decode, 0)]);
+        }
     });
 }
 

@@ -396,7 +396,7 @@ fn grouped_unpivot_six_resource_axes_and_actual_wire_capacities_precede_emission
                     SOURCE,
                     under(exact(f), axis)
                 ),
-                Err(Error::InvalidShape(_))
+                Err(Error::Control(CompileControlError::ResourceExhausted))
             ));
         }
         c.arm(None);
@@ -407,7 +407,7 @@ fn grouped_unpivot_six_resource_axes_and_actual_wire_capacities_precede_emission
             c.arm(None);
             assert!(matches!(
                 decode_writer_grouped_unpivot(&expected(), read, SOURCE, under(exact(f), axis)),
-                Err(Error::InvalidShape(_))
+                Err(Error::Control(CompileControlError::ResourceExhausted))
             ));
         }
         let mut capacity = expected();
@@ -427,7 +427,7 @@ fn grouped_unpivot_six_resource_axes_and_actual_wire_capacities_precede_emission
         c.arm(None);
         assert!(matches!(
             encode_writer_grouped_unpivot(&wide, values, expressions, SOURCE, l),
-            Err(Error::InvalidShape(_))
+            Err(Error::Control(CompileControlError::ResourceExhausted))
         ));
         assert!(!c.trace().iter().any(|(_, units)| *units == 256));
         c.arm(None);

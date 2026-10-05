@@ -781,7 +781,7 @@ fn unpivot_all_seven_caps_exact_boundaries_and_actual_wire_capacity_are_gated() 
             c.arm(None);
             assert!(matches!(
                 encode_unpivot_node(&source(), values, expressions, SOURCE, cap),
-                Err(Error::InvalidShape(_))
+                Err(Error::Control(CompileControlError::ResourceExhausted))
             ));
         }
         c.arm(None);
@@ -814,7 +814,7 @@ fn unpivot_all_seven_caps_exact_boundaries_and_actual_wire_capacity_are_gated() 
             c.arm(None);
             assert!(matches!(
                 decode_unpivot_node(&expected(), read, SOURCE, cap),
-                Err(Error::InvalidShape(_))
+                Err(Error::Control(CompileControlError::ResourceExhausted))
             ));
         }
         let mut wide = source();
@@ -827,7 +827,7 @@ fn unpivot_all_seven_caps_exact_boundaries_and_actual_wire_capacity_are_gated() 
         c.arm(None);
         assert!(matches!(
             prepare_unpivot_node_encode(&wide, values, expressions, SOURCE, small_work),
-            Err(Error::InvalidShape(_))
+            Err(Error::Control(CompileControlError::ResourceExhausted))
         ));
         assert!(
             !c.trace().iter().any(|(_, units)| *units == 256),
@@ -843,7 +843,7 @@ fn unpivot_all_seven_caps_exact_boundaries_and_actual_wire_capacity_are_gated() 
         c.arm(None);
         assert!(matches!(
             prepare_unpivot_node_decode(&wide_wire, read, SOURCE, small_work),
-            Err(Error::InvalidShape(_))
+            Err(Error::Control(CompileControlError::ResourceExhausted))
         ));
         assert!(!c.trace().iter().any(|(_, units)| *units == 256));
         let mut wire = expected();

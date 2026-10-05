@@ -819,7 +819,10 @@ fn scan_independent_layout_selected_child_and_all_seven_caps_in_both_directions(
                         .map(|_| ())
                     };
                     assert!(
-                        matches!(result, Err(Error::InvalidShape(_))),
+                        matches!(
+                            result,
+                            Err(Error::Control(CompileControlError::ResourceExhausted))
+                        ),
                         "direction {decode}, axis {axis}: {result:?}"
                     );
                 }
@@ -983,7 +986,7 @@ fn scan_namespace_counts_and_wire_capacity_are_gated_before_traversal() {
             c.arm(None);
             assert!(matches!(
                 prepare_scan_node_encode(&node, relations, values, expressions, SOURCE, low),
-                Err(Error::InvalidShape(_))
+                Err(Error::Control(CompileControlError::ResourceExhausted))
             ));
             assert!(!c.trace().iter().any(|(_, u)| *u == 256));
             let mut raw = expected();
@@ -991,7 +994,7 @@ fn scan_namespace_counts_and_wire_capacity_are_gated_before_traversal() {
             c.arm(None);
             assert!(matches!(
                 prepare_scan_node_decode(&raw, rdrelations, rdexpr, SOURCE, low),
-                Err(Error::InvalidShape(_))
+                Err(Error::Control(CompileControlError::ResourceExhausted))
             ));
             assert!(!c.trace().iter().any(|(_, u)| *u == 256));
             let mut raw = expected();

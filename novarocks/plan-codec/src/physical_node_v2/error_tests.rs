@@ -110,3 +110,109 @@ fn ordinary_dependency_errors_retain_typed_details_and_completed_work() {
         assert_eq!(*control.0.lock().unwrap(), [0, 1]);
     }
 }
+
+#[test]
+fn complete_numeric_model_rejects_all_known_axes_before_pending_quantum() {
+    struct LateControl {
+        trace: Mutex<Vec<u32>>,
+        cause: CompileControlError,
+    }
+    impl PureCompileControl for LateControl {
+        fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            let mut trace = self.trace.lock().unwrap();
+            assert!(trace.len() < 2, "callback after late refusal");
+            trace.push(units);
+            if trace.len() == 1 {
+                Ok(())
+            } else {
+                Err(self.cause)
+            }
+        }
+    }
+    let model = Model {
+        inputs: 1,
+        refs: 1,
+        items: 2,
+        requests: 1,
+        requested: 8,
+        delegated_work: 0,
+    };
+    // Hand arithmetic: 256 + (1+2)*32 + (1+32) + 8*4 = 417.
+    let exact = NodeProjectionLimits {
+        max_input_nodes: 1,
+        max_value_references: 1,
+        max_list_items: 2,
+        max_allocation_requests: 1,
+        max_allocation_request_bytes: 8,
+        max_coexisting_source_and_request_bytes: 72,
+        max_work: 417,
+        properties: PhysicalPropertyProjectionLimits {
+            max_value_references: 0,
+            max_allocation_requests: 0,
+            max_allocation_request_bytes: 0,
+            max_coexisting_source_and_request_bytes: 0,
+            max_work: 0,
+        },
+    };
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        for axis in 0..12 {
+            let control = LateControl {
+                trace: Mutex::new(Vec::new()),
+                cause,
+            };
+            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+            for _ in 0..255 {
+                work.step().unwrap();
+            }
+            let mut limits = exact;
+            match axis {
+                0 => limits.max_input_nodes -= 1,
+                1 => limits.max_value_references -= 1,
+                2 => limits.max_list_items -= 1,
+                3 => limits.max_allocation_requests -= 1,
+                4 => limits.max_allocation_request_bytes -= 1,
+                5 => limits.max_coexisting_source_and_request_bytes -= 1,
+                6 => limits.max_work -= 1,
+                _ => {}
+            }
+            let result = match axis {
+                0..=6 => model.facts(64, 0, limits, &mut work).map(|_| ()),
+                7 => add(usize::MAX, 1).map(|_| ()),
+                8 => mul(usize::MAX, 2).map(|_| ()),
+                9 => bytes::<u64>(usize::MAX).map(|_| ()),
+                10 => count_prefix(1, 3, 64, 0, exact, &mut work),
+                11 => count_prefix(
+                    1,
+                    2,
+                    64,
+                    0,
+                    NodeProjectionLimits {
+                        max_work: 351,
+                        ..exact
+                    },
+                    &mut work,
+                ),
+                _ => unreachable!(),
+            };
+            assert!(
+                matches!(
+                    finish(work, result),
+                    Err(Error::Control(CompileControlError::ResourceExhausted))
+                ),
+                "axis {axis}"
+            );
+            assert_eq!(*control.trace.lock().unwrap(), [0], "axis {axis}");
+        }
+    }
+    let control = Control(Mutex::new(Vec::new()));
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let facts = model.facts(64, 0, exact, &mut work).unwrap();
+    assert_eq!(facts.cumulative_work_upper_bound, 417);
+    assert_eq!(facts.coexisting_source_and_request_bytes_upper_bound, 72);
+    finish(work, Ok(())).unwrap();
+    assert_eq!(*control.0.lock().unwrap(), [0, 7]);
+}

@@ -756,7 +756,7 @@ fn simple_nodes_both_directions_all_seven_exact_and_one_under_caps_are_required(
                 c.arm(None);
                 assert!(matches!(
                     encode_simple_node(&source(at), values, expressions, SOURCE, under(cap, which)),
-                    Err(Error::InvalidShape(_))
+                    Err(Error::Control(CompileControlError::ResourceExhausted))
                 ));
             }
             c.arm(None);
@@ -768,7 +768,7 @@ fn simple_nodes_both_directions_all_seven_exact_and_one_under_caps_are_required(
                 c.arm(None);
                 assert!(matches!(
                     decode_simple_node(&expected(at), read, SOURCE, under(cap, which)),
-                    Err(Error::InvalidShape(_))
+                    Err(Error::Control(CompileControlError::ResourceExhausted))
                 ));
             }
         }
@@ -902,9 +902,9 @@ fn simple_nodes_all_original_control_prefixes_and_nested_work_admission_are_obse
     let c = Control::default();
     fixture.with_tokens(&c,|values,expressions,read|{
         let mut node=source(2);node.kind=p::NodeKind::Values{rows:Box::from([vec![p::ExprId::new(7);320].into_boxed_slice()])};let low=SimpleNodeProjectionLimits{max_work:1024,..limits()};
-        c.arm(None);assert!(matches!(prepare_simple_node_encode(&node,values,expressions,SOURCE,low),Err(Error::InvalidShape(_))));assert!(!c.trace().iter().any(|(_,units)|*units==256));
+        c.arm(None);assert!(matches!(prepare_simple_node_encode(&node,values,expressions,SOURCE,low),Err(Error::Control(CompileControlError::ResourceExhausted))));assert!(!c.trace().iter().any(|(_,units)|*units==256));
         let mut wire=expected(2);if let Some(wire::physical_node::Kind::Values(v))=wire.kind.as_mut(){v.rows=vec![wire::ExpressionIds{expr_ids:vec![7;320]}];}
-        c.arm(None);assert!(matches!(prepare_simple_node_decode(&wire,read,SOURCE,low),Err(Error::InvalidShape(_))));assert!(!c.trace().iter().any(|(_,units)|*units==256));
+        c.arm(None);assert!(matches!(prepare_simple_node_decode(&wire,read,SOURCE,low),Err(Error::Control(CompileControlError::ResourceExhausted))));assert!(!c.trace().iter().any(|(_,units)|*units==256));
         // 320 real row headers, not a prescan or synthetic callback loop.
         node.kind=p::NodeKind::Values{rows:vec![Box::<[p::ExprId]>::default();320].into_boxed_slice()};
         c.arm(None);let(wire,_)=encode_simple_node(&node,values,expressions,SOURCE,limits()).unwrap();let trace=c.trace();let at=trace.iter().position(|(_,units)|*units==256).unwrap();

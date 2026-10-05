@@ -658,7 +658,13 @@ fn independent_owner_layout_totals_and_every_exact_resource_ceiling() {
                     6 => under.max_work -= 1,
                     _ => unreachable!(),
                 }
-                assert!(run(under).is_err(), "resource dimension {dimension}");
+                assert!(
+                    matches!(
+                        run(under),
+                        Err(Error::Control(CompileControlError::ResourceExhausted))
+                    ),
+                    "resource dimension {dimension}"
+                );
             }
         }
     });
@@ -736,9 +742,29 @@ fn every_small_success_and_ordinary_tail_callback_keeps_three_primary_causes() {
         });
         let mut l = limits();
         l.max_allocation_request_bytes = 0;
-        assert_ordinary_prefix(&control, CompilePhase::Encode, || {
-            encode_assert_rows_node(&original, encoded, SOURCE, l)
-        });
+        control.arm(None);
+        assert!(matches!(
+            encode_assert_rows_node(&original, encoded, SOURCE, l),
+            Err(Error::Control(CompileControlError::ResourceExhausted))
+        ));
+        let resource_prefix = control.trace();
+        assert_eq!(resource_prefix.first(), Some(&(CompilePhase::Encode, 0)));
+        for cause in CAUSES {
+            for at in 0..resource_prefix.len() {
+                control.arm(Some((at, cause)));
+                assert!(matches!(
+                    encode_assert_rows_node(&original, encoded, SOURCE, l),
+                    Err(Error::Control(actual)) if actual == cause
+                ));
+                assert_eq!(control.trace(), resource_prefix[..=at]);
+            }
+            control.arm(Some((resource_prefix.len(), cause)));
+            assert!(matches!(
+                encode_assert_rows_node(&original, encoded, SOURCE, l),
+                Err(Error::Control(CompileControlError::ResourceExhausted))
+            ));
+            assert_eq!(control.trace(), resource_prefix);
+        }
         let bad = expected(wire::row_count_assertion_node::Kind::Global(
             wire::GlobalRowCountAssertion {
                 subject: "valid".into(),

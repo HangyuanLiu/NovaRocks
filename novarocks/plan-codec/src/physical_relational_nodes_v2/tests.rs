@@ -1302,7 +1302,7 @@ fn relational_six_kinds_both_directions_require_all_seven_caps_and_actual_capaci
                         SOURCE,
                         under(cap, axis)
                     ),
-                    Err(Error::InvalidShape(_))
+                    Err(Error::Control(CompileControlError::ResourceExhausted))
                 ));
             }
             c.arm(None);
@@ -1314,7 +1314,7 @@ fn relational_six_kinds_both_directions_require_all_seven_caps_and_actual_capaci
                 c.arm(None);
                 assert!(matches!(
                     decode_relational_node(&expected(at), read, SOURCE, under(cap, axis)),
-                    Err(Error::InvalidShape(_))
+                    Err(Error::Control(CompileControlError::ResourceExhausted))
                 ));
             }
         }
@@ -1399,8 +1399,8 @@ fn relational_original_control_prefixes_and_nested_work_bound_are_not_replayed()
     let fixture = Fixture::new();
     let c = Control::default();
     fixture.with_tokens(&c,|values,expressions,read|{
-        let mut node=source(6);if let p::NodeKind::SetOp{input_mappings,..}=&mut node.kind{*input_mappings=vec![vec![p::ValueId::new(7);320].into_boxed_slice()].into_boxed_slice();}let low=RelationalNodeProjectionLimits{max_work:1024,..limits()};c.arm(None);assert!(matches!(prepare_relational_node_encode(&node,values,expressions,SOURCE,low),Err(Error::InvalidShape(_))));assert!(!c.trace().iter().any(|(_,units)|*units==256));
-        let mut wire=expected(6);if let Some(wire::physical_node::Kind::SetOperation(v))=wire.kind.as_mut(){v.input_mappings=vec![wire::ValueIds{value_ids:vec![7;320]}];}c.arm(None);assert!(matches!(prepare_relational_node_decode(&wire,read,SOURCE,low),Err(Error::InvalidShape(_))));assert!(!c.trace().iter().any(|(_,units)|*units==256));
+        let mut node=source(6);if let p::NodeKind::SetOp{input_mappings,..}=&mut node.kind{*input_mappings=vec![vec![p::ValueId::new(7);320].into_boxed_slice()].into_boxed_slice();}let low=RelationalNodeProjectionLimits{max_work:1024,..limits()};c.arm(None);assert!(matches!(prepare_relational_node_encode(&node,values,expressions,SOURCE,low),Err(Error::Control(CompileControlError::ResourceExhausted))));assert!(!c.trace().iter().any(|(_,units)|*units==256));
+        let mut wire=expected(6);if let Some(wire::physical_node::Kind::SetOperation(v))=wire.kind.as_mut(){v.input_mappings=vec![wire::ValueIds{value_ids:vec![7;320]}];}c.arm(None);assert!(matches!(prepare_relational_node_decode(&wire,read,SOURCE,low),Err(Error::Control(CompileControlError::ResourceExhausted))));assert!(!c.trace().iter().any(|(_,units)|*units==256));
         if let p::NodeKind::SetOp{input_mappings,..}=&mut node.kind{*input_mappings=vec![Box::<[p::ValueId]>::default();320].into_boxed_slice();}c.arm(None);let(wire,_)=encode_relational_node(&node,values,expressions,SOURCE,limits()).unwrap();let trace=c.trace();let at=trace.iter().position(|(_,units)|*units==256).unwrap();for cause in CAUSES{c.arm(Some((at,cause)));assert!(matches!(encode_relational_node(&node,values,expressions,SOURCE,limits()),Err(Error::Control(actual))if actual==cause));assert_eq!(c.trace(),trace[..=at]);}
         c.arm(None);decode_relational_node(&wire,read,SOURCE,limits()).unwrap();let trace=c.trace();let at=trace.iter().position(|(_,units)|*units==256).unwrap();for cause in CAUSES{c.arm(Some((at,cause)));assert!(matches!(decode_relational_node(&wire,read,SOURCE,limits()),Err(Error::Control(actual))if actual==cause));assert_eq!(c.trace(),trace[..=at]);}
     });
