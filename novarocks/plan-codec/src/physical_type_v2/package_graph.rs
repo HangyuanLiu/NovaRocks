@@ -65,7 +65,9 @@ pub enum PackageTypeGraphDefinition<'source> {
 
 /// Borrows the exact package and original definitions. Cycles may have been
 /// classified; acyclicity, attributes, scalar parameters and Writer/Value
-/// occurrence laws must all pass before a later owner allocates Arrow output.
+/// occurrence laws must pass before publication. A receiver must admit its
+/// topology and all Arrow requests before materialization; classification alone
+/// does not certify Writer attributes or occurrence charges.
 pub struct PreparedPackageTypeGraph<'source> {
     roots: PackageTypeRootSources<'source>,
     index: Index<'source>,
@@ -295,7 +297,13 @@ impl<'source> PreparedPackageTypeGraph<'source> {
     ) -> Result<&'source wire::TypeTable, TypeCodecError> {
         self.roots.table_for(package)
     }
-    fn domain(
+    pub(super) fn index(&self) -> &Index<'source> {
+        &self.index
+    }
+    pub(super) fn roots(&self) -> &PackageTypeRootSources<'source> {
+        &self.roots
+    }
+    pub(super) fn domain(
         &self,
         node: Node,
         work: &mut CompileCheckpoints<'_>,

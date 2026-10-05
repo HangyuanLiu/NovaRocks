@@ -30,6 +30,7 @@ use novarocks_type_contract::{
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
 mod decode;
+mod decode_resources;
 mod encode;
 mod graph;
 mod graph_domains;
@@ -53,6 +54,8 @@ pub enum TypeCodecError {
     Control(CompileControlError),
     ValueType(ValueTypeError),
     Carrier(CarrierParameterError),
+    Writer(novarocks_connector_contract::ConnectorError),
+    ResourceSource(&'static str),
 }
 impl fmt::Display for TypeCodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -61,6 +64,8 @@ impl fmt::Display for TypeCodecError {
             Self::Control(error) => error.fmt(f),
             Self::ValueType(error) => error.fmt(f),
             Self::Carrier(error) => error.fmt(f),
+            Self::Writer(error) => error.fmt(f),
+            Self::ResourceSource(message) => f.write_str(message),
         }
     }
 }
@@ -79,6 +84,52 @@ impl From<CarrierParameterError> for TypeCodecError {
     fn from(value: CarrierParameterError) -> Self {
         Self::Carrier(value)
     }
+}
+
+impl From<novarocks_connector_contract::ConnectorError> for TypeCodecError {
+    fn from(error: novarocks_connector_contract::ConnectorError) -> Self {
+        Self::Writer(error)
+    }
+}
+
+/// Explicit whole-package Type projection ceilings. These numerical bounds
+/// admit the actual original source, graph, Arrow requests and opaque work;
+/// they neither grant host memory nor validate the rest of the package.
+#[derive(Clone, Copy, Debug)]
+pub struct PackageTypeProjectionLimits {
+    pub max_definitions: usize,
+    pub max_expanded_nodes: usize,
+    pub max_string_bytes: usize,
+    pub max_allocation_requests: usize,
+    pub max_allocation_request_bytes: usize,
+    pub max_coexisting_source_and_request_bytes: usize,
+    pub max_work: usize,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PackageTypeProjectionFacts {
+    pub definition_count: usize,
+    pub expanded_node_count: usize,
+    pub string_bytes: usize,
+    pub allocation_requests_upper_bound: usize,
+    pub allocation_request_bytes_upper_bound: usize,
+    pub coexisting_source_and_request_bytes_upper_bound: usize,
+    pub cumulative_work_upper_bound: usize,
+}
+
+/// Decode the original package Type table under its actual root domains.
+/// Topology and numerical requests pass before Arrow materialization. The
+/// original Writer field law then validates each real recipe occurrence before
+/// publication; full writer/provider/package admission remains with its owners.
+/// The caller lends its existing scope and owns entry and ordinary/success
+/// tails. A control refusal returns directly without an additional callback.
+pub fn decode_package_type_table_observed(
+    package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
+    source_retained_bytes: usize,
+    limits: PackageTypeProjectionLimits,
+    admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<DecodedTypeTable, TypeCodecError> {
+    decode::decode_package(package, source_retained_bytes, limits, admit, work)
 }
 
 /// A caller-authored projection envelope. No guessed or unbounded default is
@@ -552,3 +603,6 @@ mod graph_tests;
 
 #[cfg(test)]
 mod package_graph_tests;
+
+#[cfg(test)]
+mod receiver_tests;

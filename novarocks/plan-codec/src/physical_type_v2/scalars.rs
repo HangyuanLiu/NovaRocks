@@ -146,6 +146,23 @@ pub(super) fn encode_scalar(data_type: &DataType) -> Result<Option<Kind>, E> {
 }
 
 pub(super) fn decode_scalar(kind: &Kind) -> Result<Option<DataType>, E> {
+    decode_scalar_core(kind, true)
+}
+
+/// This policy is derived only from the sealed original package graph. The
+/// primitive/decimal/unit grammar stays with the same converter below.
+pub(super) fn decode_scalar_in_package(
+    kind: &Kind,
+    graph: &super::PreparedPackageTypeGraph<'_>,
+    id: u32,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<Option<DataType>, E> {
+    let strict = graph.domain(super::graph::Node::Carrier(id), work)?
+        != super::PackageTypeRootDomain::Writer;
+    decode_scalar_core(kind, strict)
+}
+
+fn decode_scalar_core(kind: &Kind, strict: bool) -> Result<Option<DataType>, E> {
     use plan::ArrowPrimitiveType as P;
     let data_type = match kind {
         Kind::Primitive(value) => match P::try_from(*value) {
@@ -174,10 +191,11 @@ pub(super) fn decode_scalar(kind: &Kind) -> Result<Option<DataType>, E> {
         },
         Kind::Timestamp(value) => {
             let unit = decode_unit(value.unit)?;
-            if value
-                .timezone
-                .as_ref()
-                .is_some_and(|zone| zone.len() > MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES)
+            if strict
+                && value
+                    .timezone
+                    .as_ref()
+                    .is_some_and(|zone| zone.len() > MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES)
             {
                 return Err(E::InvalidShape("timestamp timezone exceeds byte bound"));
             }
