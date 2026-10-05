@@ -519,6 +519,26 @@ mod tests {
             selected.aggregate.as_ref().unwrap().state_format.as_str(),
             novarocks_connector_iceberg_functions::ICEBERG_THETA_STATE_FORMAT_IDENTITY
         );
+        for overload in declaration.overloads() {
+            let installed = catalog
+                .pure_overload_declaration_observed(
+                    declaration.function_id(),
+                    FunctionKind::Aggregate,
+                    &overload.identity,
+                    &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+                )
+                .expect("actual process installs the original Theta pure attachment");
+            assert_eq!(installed.implementation().overload, overload.identity);
+            assert_eq!(
+                installed.implementation().abi,
+                novarocks_functions::PureKernelAbi::AggregateV1,
+            );
+            assert_eq!(
+                installed.effects().own_row_error,
+                novarocks_functions::FunctionIntrinsicRowError::NotRowEvaluated,
+            );
+            assert!(installed.effects().environment_dependencies.is_empty());
+        }
         assert_ne!(catalog.digest(), [0; 32]);
         assert_ne!(function_set.implementation_manifest_digest(), [0; 32]);
     }

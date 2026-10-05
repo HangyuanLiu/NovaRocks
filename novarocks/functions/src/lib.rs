@@ -82,7 +82,8 @@ pub use higher_order_kernel::*;
 pub use kernel_control::*;
 pub use kernel_input::validate_type_observed as validate_function_value_type_observed;
 pub use kernel_input::{
-    validate_argument_observed as validate_evaluated_argument_observed, visit_selected_nulls,
+    EvaluationCheckpoints, validate_argument_observed as validate_evaluated_argument_observed,
+    visit_selected_nulls,
 };
 pub use lambda_rows::*;
 pub use novarocks_constant_contract::{
@@ -781,6 +782,66 @@ impl<F: TypedAggregateFamily> TypedAggregateRegistration<F> {
 
     pub fn implementation(&self) -> &AggregateImplementationIdentity {
         &self.implementation
+    }
+
+    /// Attach selected CPU preparation while retaining this registration's
+    /// original typed family and implementation. Only explicit effect facts
+    /// may be added: identity, overloads, patterns, state interpretation and
+    /// legacy semantics must agree with the original binding declaration.
+    pub fn try_attach_pure_aggregate<O>(mut self, owner: Arc<O>) -> Result<Self, PureCatalogError>
+    where
+        O: PureFunctionMetadataOwner
+            + PureAggregateImplementation
+            + AggregateSignatureResolver
+            + 'static,
+    {
+        let original = self
+            .definition
+            .binding_declaration()
+            .expect("typed registration authors its binding declaration");
+        let pure = owner.binding_declaration();
+        let matches = original.function_id() == pure.function_id()
+            && original.kind() == pure.kind()
+            && original.overloads().len() == pure.overloads().len()
+            && original
+                .overloads()
+                .iter()
+                .zip(pure.overloads())
+                .all(|(old, new)| {
+                    old.identity == new.identity
+                        && old.semantics == new.semantics
+                        && old.argument_pattern == new.argument_pattern
+                        && old.result_pattern == new.result_pattern
+                        && old.aggregate == new.aggregate
+                        && old
+                            .effects
+                            .as_ref()
+                            .is_none_or(|effects| new.effects.as_ref() == Some(effects))
+                });
+        if !matches {
+            return Err(FunctionBindingError::InvalidBinding(
+                "pure aggregate attachment differs from its original typed declaration".into(),
+            )
+            .into());
+        }
+        let mut definition = FunctionDefinition::try_new_pure_aggregate(
+            self.definition.canonical_name(),
+            self.definition.visibility,
+            owner,
+        )?;
+        definition
+            .binding
+            .as_mut()
+            .expect("pure attachment authors its binding")
+            .retain_resolver_from(
+                self.definition
+                    .binding
+                    .as_ref()
+                    .expect("typed registration authors its binding"),
+            );
+        definition.aggregate_resolver = self.definition.aggregate_resolver.clone();
+        self.definition = definition;
+        Ok(self)
     }
 
     pub fn into_parts(self) -> (FunctionDefinition, AggregateImplementationIdentity, Arc<F>) {

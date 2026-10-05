@@ -34,20 +34,23 @@ mod constant_tests;
 #[cfg(test)]
 mod selected_null_tests;
 
-pub(crate) struct EvaluationCheckpoints<'a> {
+/// Bounded runtime observation shared by builtins and external pure providers.
+/// The first refusal is latched through all subsequent operations. This scope
+/// observes owned work; it neither grants memory nor observes library internals.
+pub struct EvaluationCheckpoints<'a> {
     control: &'a dyn KernelEvaluationControl,
     pending: u32,
     refusal: Option<KernelFailure>,
 }
 impl<'a> EvaluationCheckpoints<'a> {
-    pub(crate) fn new(control: &'a dyn KernelEvaluationControl) -> Self {
+    pub fn new(control: &'a dyn KernelEvaluationControl) -> Self {
         Self {
             control,
             pending: 0,
             refusal: None,
         }
     }
-    pub(crate) fn step(&mut self) -> Result<(), KernelFailure> {
+    pub fn step(&mut self) -> Result<(), KernelFailure> {
         if let Some(refusal) = &self.refusal {
             return Err(refusal.clone());
         }
@@ -61,7 +64,7 @@ impl<'a> EvaluationCheckpoints<'a> {
         }
         Ok(())
     }
-    pub(crate) fn flush(&mut self) -> Result<(), KernelFailure> {
+    pub fn flush(&mut self) -> Result<(), KernelFailure> {
         if let Some(refusal) = &self.refusal {
             return Err(refusal.clone());
         }
@@ -72,11 +75,29 @@ impl<'a> EvaluationCheckpoints<'a> {
         self.pending = 0;
         Ok(())
     }
-    pub(crate) fn finish(self) -> Result<(), KernelFailure> {
+    pub fn finish(self) -> Result<(), KernelFailure> {
         if let Some(refusal) = self.refusal {
             return Err(refusal);
         }
         self.control.checkpoint(self.pending)
+    }
+
+    /// Preserve an originating observation refusal; otherwise observe the
+    /// ordinary completion or failure tail using this same work scope.
+    pub fn finish_result<T>(self, result: Result<T, KernelFailure>) -> Result<T, KernelFailure> {
+        if let Some(refusal) = self.refusal {
+            return Err(refusal);
+        }
+        if matches!(
+            result,
+            Err(KernelFailure::Cancelled
+                | KernelFailure::DeadlineExceeded
+                | KernelFailure::ResourceExhausted)
+        ) {
+            return result;
+        }
+        self.control.checkpoint(self.pending)?;
+        result
     }
 }
 

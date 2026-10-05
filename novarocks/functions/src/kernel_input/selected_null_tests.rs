@@ -72,6 +72,86 @@ fn refusals() -> [KernelFailure; 7] {
     ]
 }
 
+#[test]
+fn public_provider_work_scope_preserves_quantum_and_every_originating_refusal() {
+    use crate::{EvaluationCheckpoints, KernelControlObservation};
+    let success = Control::default();
+    let observer = KernelControlObservation::new(&success);
+    let mut work = EvaluationCheckpoints::new(&observer);
+    for _ in 0..513 {
+        work.step().unwrap();
+    }
+    assert_eq!(work.finish_result(Ok(17)), Ok(17));
+    assert_eq!(*success.checks.lock().unwrap(), [256, 256, 1]);
+
+    for failure in refusals() {
+        for at in 0..3 {
+            let control = Control {
+                refusal: Some((at, failure.clone())),
+                ..Default::default()
+            };
+            let observer = KernelControlObservation::new(&control);
+            let mut work = EvaluationCheckpoints::new(&observer);
+            let outcome = (|| {
+                for _ in 0..513 {
+                    work.step()?;
+                }
+                Ok(17)
+            })();
+            assert_eq!(work.finish_result(outcome), Err(failure.clone()));
+            let expected = [256, 256, 1];
+            assert_eq!(*control.checks.lock().unwrap(), expected[..=at]);
+            assert_eq!(observer.checkpoint(0), Err(failure.clone()));
+            assert_eq!(observer.finish(Ok(99)), Err(failure.clone()));
+            assert_eq!(control.checks.lock().unwrap().len(), at + 1);
+        }
+
+        // A nested ABI observes the same original controller. An ordinary body
+        // error cannot override its diagnostic refusal or issue a new tail.
+        let nested = Control {
+            refusal: Some((0, failure.clone())),
+            ..Default::default()
+        };
+        let observer = KernelControlObservation::new(&nested);
+        let mut work = EvaluationCheckpoints::new(&observer);
+        work.step().unwrap();
+        assert_eq!(observer.checkpoint(0), Err(failure.clone()));
+        let body: Result<(), KernelFailure> = Err(KernelFailure::Internal(KernelDiagnostic::new(
+            "ordinary body failure",
+        )));
+        assert_eq!(work.finish_result(body), Err(failure));
+        assert_eq!(*nested.checks.lock().unwrap(), [0]);
+    }
+
+    let ordinary = Control::default();
+    let mut work = EvaluationCheckpoints::new(&ordinary);
+    work.step().unwrap();
+    let body: Result<(), KernelFailure> = Err(KernelFailure::Operational(KernelDiagnostic::new(
+        "ordinary lifecycle data failure",
+    )));
+    assert_eq!(work.finish_result(body.clone()), body);
+    assert_eq!(*ordinary.checks.lock().unwrap(), [1]);
+
+    for failure in [
+        KernelFailure::Cancelled,
+        KernelFailure::DeadlineExceeded,
+        KernelFailure::ResourceExhausted,
+    ] {
+        let control = Control {
+            refusal: Some((
+                0,
+                KernelFailure::Internal(KernelDiagnostic::new("later tail")),
+            )),
+            ..Default::default()
+        };
+        let mut work = EvaluationCheckpoints::new(&control);
+        work.step().unwrap();
+        let result: Result<(), KernelFailure> = Err(failure.clone());
+        assert_eq!(work.finish_result(result), Err(failure));
+        assert!(control.checks.lock().unwrap().is_empty());
+    }
+}
+
 fn pool(array: ArrayRef) -> ConstantPool {
     let ty = FunctionValueType::new(array.data_type().clone(), true);
     ConstantPool::try_new(

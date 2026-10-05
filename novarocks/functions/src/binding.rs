@@ -480,6 +480,10 @@ pub(crate) struct FunctionBindingDefinition {
 }
 
 impl FunctionBindingDefinition {
+    pub(crate) fn retain_resolver_from(&mut self, original: &Self) {
+        self.resolver = Arc::clone(&original.resolver);
+    }
+
     pub(crate) fn new(
         declaration: FunctionBindingDeclaration,
         resolver: Arc<dyn FunctionBindingResolver>,
@@ -843,6 +847,13 @@ impl FunctionDefinition {
         self.binding
             .as_ref()
             .map(|binding| binding.declaration.as_ref())
+    }
+
+    /// Borrow the original immutable binding author. A provider can attach its
+    /// typed pure CPU to the same declaration without recreating resolution or
+    /// electing another family. This loan does not certify effects or kernels.
+    pub fn binding_resolver(&self) -> Option<&Arc<dyn FunctionBindingResolver>> {
+        self.binding.as_ref().map(|binding| &binding.resolver)
     }
 }
 

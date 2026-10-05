@@ -81,12 +81,12 @@ pub trait KernelEvaluationControl: Send + Sync {
 /// observer forwards the original units and waits, without creating a meter,
 /// budget or cancellation authority. A refusal remains primary across nested
 /// post-call checks, including diagnostic failures returned by that control.
-pub(crate) struct KernelControlObservation<'a> {
+pub struct KernelControlObservation<'a> {
     original: &'a dyn KernelEvaluationControl,
     refusal: Mutex<Option<KernelFailure>>,
 }
 impl<'a> KernelControlObservation<'a> {
-    pub(crate) fn new(original: &'a dyn KernelEvaluationControl) -> Self {
+    pub fn new(original: &'a dyn KernelEvaluationControl) -> Self {
         Self {
             original,
             refusal: Mutex::new(None),
@@ -106,7 +106,7 @@ impl<'a> KernelControlObservation<'a> {
         }
         result
     }
-    pub(crate) fn finish<T>(&self, result: Result<T, KernelFailure>) -> Result<T, KernelFailure> {
+    pub fn finish<T>(&self, result: Result<T, KernelFailure>) -> Result<T, KernelFailure> {
         match self.refusal.lock().unwrap().as_ref() {
             Some(error) => Err(error.clone()),
             None => result,

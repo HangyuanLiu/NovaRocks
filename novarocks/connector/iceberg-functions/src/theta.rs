@@ -19,7 +19,6 @@ use std::fmt;
 use std::mem::size_of;
 use std::sync::Arc;
 
-use arrow_array::builder::BinaryBuilder;
 use arrow_array::{Array, ArrayRef, BinaryArray};
 use arrow_schema::DataType;
 use datasketches::hash::value::raw_bytes;
@@ -36,6 +35,13 @@ use novarocks_functions::{
 };
 
 use crate::canonical::{CanonicalKind, PreparedCanonicalBatch, canonical_width};
+
+#[path = "theta_pure.rs"]
+mod pure;
+pub use pure::{
+    PreparedThetaKernel, THETA_EMISSION_LIBRARY_REQUEST_BYTES, ThetaOutputResourceFacts,
+    iceberg_theta_pure_definition, theta_output_resource_facts,
+};
 
 pub const ICEBERG_THETA_AGGREGATE_NAME: &str = "$iceberg_theta_stat";
 pub const ICEBERG_THETA_STATE_FORMAT_IDENTITY: &str =
@@ -77,6 +83,8 @@ pub enum IcebergThetaError {
     CompactTooLarge { actual: usize, maximum: usize },
     MixedUpdateAndMerge,
     Sketch(String),
+    OutputResourceExhausted,
+    InvalidOutputExtent,
 }
 
 impl fmt::Display for IcebergThetaError {
@@ -110,6 +118,12 @@ impl fmt::Display for IcebergThetaError {
                 "Iceberg Theta state cannot mix raw updates and compact merges in one phase",
             ),
             Self::Sketch(message) => formatter.write_str(message),
+            Self::OutputResourceExhausted => {
+                formatter.write_str("Iceberg Theta output resources were exhausted")
+            }
+            Self::InvalidOutputExtent => {
+                formatter.write_str("Iceberg Theta output iterator or Binary extent is invalid")
+            }
         }
     }
 }
@@ -468,6 +482,11 @@ impl FunctionBundleContributor for IcebergFunctionBundle {
 
 pub fn iceberg_theta_registration()
 -> Result<TypedAggregateRegistration<IcebergThetaAggregateFamily>, FunctionCatalogError> {
+    pure::attach_registration(metadata_registration()?)
+}
+
+fn metadata_registration()
+-> Result<TypedAggregateRegistration<IcebergThetaAggregateFamily>, FunctionCatalogError> {
     TypedAggregateRegistration::try_new(
         ICEBERG_THETA_AGGREGATE_NAME,
         FunctionVisibility::Hidden,
@@ -545,22 +564,12 @@ fn build_output<'state, I>(states: I) -> Result<ArrayRef, IcebergThetaError>
 where
     I: ExactSizeIterator<Item = &'state IcebergThetaState>,
 {
-    let state_count = states.len();
-    // Do not reserve the per-state worst case. Empty and sparse sketches are
-    // common, and Arrow grows this output from the actual serialized bodies.
-    let mut builder = BinaryBuilder::with_capacity(state_count, 0);
-    for state in states {
-        let compact = match &state.mode {
-            ThetaStateMode::Update(_) if !state.has_updates => {
-                builder.append_value(EMPTY_ORDERED_COMPACT_V3);
-                continue;
-            }
-            ThetaStateMode::Update(sketch) => sketch.compact(true),
-            ThetaStateMode::Merge(union) => union.to_sketch(true),
-        };
-        builder.append_value(serialize_canonical_compact(&compact));
-    }
-    Ok(Arc::new(builder.finish()))
+    pure::build_output_observed(states, None).map_err(|error| match error {
+        novarocks_functions::KernelFailure::ResourceExhausted => {
+            IcebergThetaError::OutputResourceExhausted
+        }
+        _ => IcebergThetaError::InvalidOutputExtent,
+    })
 }
 
 #[cfg(test)]

@@ -123,6 +123,51 @@ fn catalog() -> (EngineFunctionCatalog, Arc<Family>) {
     let family = Arc::new(Family::default());
     (catalog_from(family.clone()), family)
 }
+
+#[test]
+fn parametric_binding_loan_retains_the_original_fixed_author_and_control() {
+    let (catalog, family) = catalog();
+    let definition = catalog.definition_by_id(&id()).unwrap();
+    let cloned = definition.clone();
+    let author = definition.binding_resolver().unwrap();
+    assert!(Arc::ptr_eq(author, cloned.binding_resolver().unwrap()));
+    let args = [argument(DataType::Int64, true)];
+    let overload = FunctionOverloadId::try_new(LEFT).unwrap();
+    let control = Trace::default();
+    let selected = author
+        .select_at_overload_observed(&overload, request(&args), &control)
+        .unwrap();
+    author
+        .validate_selected(&selected, request(&args), &control)
+        .unwrap();
+    assert!(family.elections.lock().unwrap().is_empty());
+    assert_eq!(family.updates.lock().unwrap().len(), 2);
+
+    let successful = Trace::default();
+    author
+        .select_at_overload_observed(&overload, request(&args), &successful)
+        .unwrap();
+    let prefix = successful.calls.lock().unwrap().clone();
+    assert!(!prefix.is_empty());
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        for at in 1..=prefix.len() {
+            let stop = Trace {
+                stop: Some((at, cause)),
+                ..Default::default()
+            };
+            assert_eq!(
+                author.select_at_overload_observed(&overload, request(&args), &stop),
+                Err(FunctionBindingError::Control(cause)),
+            );
+            assert_eq!(*stop.calls.lock().unwrap(), prefix[..at]);
+        }
+    }
+    assert!(family.elections.lock().unwrap().is_empty());
+}
 fn id() -> FunctionId {
     FunctionId::try_new("parametric.aggregate/parametric_exact_fixture/v1").unwrap()
 }
