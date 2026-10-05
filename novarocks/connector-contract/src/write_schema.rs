@@ -59,46 +59,53 @@ pub fn validate_write_field_name(name: &str) -> Result<(), ConnectorError> {
     Ok(())
 }
 
-pub fn validate_write_field_schema(
-    field: &Field,
-    depth: usize,
+/// The writer owner's original per-field charge. This reads only borrowed
+/// attributes, so the flat type graph can admit the same domain before building
+/// an Arrow Field. It does not validate logical metadata or grant allocation.
+pub fn charge_write_field_header(
+    name: &str,
+    metadata_entries: usize,
     decoded_bytes: &mut usize,
 ) -> Result<(), ConnectorError> {
-    validate_write_field_name(field.name())?;
-    novarocks_type_contract::field_logical_type(field).map_err(|error| {
-        ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
-    })?;
-    if field.metadata().len() > MAX_WRITE_RELATION_METADATA_ENTRIES_PER_FIELD {
+    validate_write_field_name(name)?;
+    if metadata_entries > MAX_WRITE_RELATION_METADATA_ENTRIES_PER_FIELD {
         return Err(resource_exhausted(
             "write relation field metadata exceeds the entry limit",
         ));
     }
-    charge_write_schema(
-        decoded_bytes,
-        WRITE_FIELD_ALLOCATION_CHARGE + field.name().len(),
-    )?;
-    for (key, value) in field.metadata() {
-        if key.len() > MAX_WRITE_RELATION_METADATA_KEY_BYTES {
-            return Err(resource_exhausted(
-                "write relation field metadata key exceeds the byte limit",
-            ));
-        }
-        if value.len() > MAX_WRITE_RELATION_METADATA_VALUE_BYTES {
-            return Err(resource_exhausted(
-                "write relation field metadata value exceeds the byte limit",
-            ));
-        }
-        charge_write_schema(
-            decoded_bytes,
-            key.len() + value.len() + 2 * size_of::<String>(),
-        )?;
-    }
-    validate_write_data_type(field.data_type(), depth, decoded_bytes)
+    charge_write_schema(decoded_bytes, WRITE_FIELD_ALLOCATION_CHARGE + name.len())
 }
 
-pub fn validate_write_data_type(
-    data_type: &DataType,
+/// The same entry bounds and charge for either an Arrow metadata entry or its
+/// borrowed flat representation. Order and logical interpretation remain with
+/// their existing owners.
+pub fn charge_write_metadata_entry(
+    key: &str,
+    value: &str,
+    decoded_bytes: &mut usize,
+) -> Result<(), ConnectorError> {
+    if key.len() > MAX_WRITE_RELATION_METADATA_KEY_BYTES {
+        return Err(resource_exhausted(
+            "write relation field metadata key exceeds the byte limit",
+        ));
+    }
+    if value.len() > MAX_WRITE_RELATION_METADATA_VALUE_BYTES {
+        return Err(resource_exhausted(
+            "write relation field metadata value exceeds the byte limit",
+        ));
+    }
+    charge_write_schema(
+        decoded_bytes,
+        key.len() + value.len() + 2 * size_of::<String>(),
+    )
+}
+
+/// The writer depth and original type-node charge, including a timestamp's
+/// optional timezone bytes. This does not reinterpret the carrier, parse a
+/// timezone or impose the Value owner's unrelated unfolded-node bound.
+pub fn charge_write_type_header(
     depth: usize,
+    timestamp_timezone: Option<&str>,
     decoded_bytes: &mut usize,
 ) -> Result<(), ConnectorError> {
     if depth > MAX_WRITE_RELATION_TYPE_DEPTH {
@@ -107,35 +114,116 @@ pub fn validate_write_data_type(
         ));
     }
     charge_write_schema(decoded_bytes, TYPE_ALLOCATION_CHARGE)?;
+    if let Some(timezone) = timestamp_timezone {
+        charge_write_schema(decoded_bytes, timezone.len())?;
+    }
+    Ok(())
+}
+
+pub fn validate_write_field_schema(
+    field: &Field,
+    depth: usize,
+    decoded_bytes: &mut usize,
+) -> Result<(), ConnectorError> {
+    // The existing unobserved contract delegates the same traversal. It does
+    // not manufacture a PureCompileControl or certify a preparation budget.
+    validate_field_core(field, depth, decoded_bytes, &mut || Ok(()))
+}
+
+/// Validate the same writer domain on the caller's existing observer. The
+/// caller owns entry, ordinary/success tails and resource admission; this
+/// traversal neither creates a scope nor copies fields. HashMap iteration and
+/// logical metadata lookup remain opaque library work, not a claimed internal
+/// cooperative quantum or an allocator grant.
+pub fn validate_write_field_schema_observed<E: From<ConnectorError>>(
+    field: &Field,
+    depth: usize,
+    decoded_bytes: &mut usize,
+    mut observe: impl FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    validate_field_core(field, depth, decoded_bytes, &mut observe)
+}
+
+fn validate_field_core<E: From<ConnectorError>>(
+    field: &Field,
+    depth: usize,
+    decoded_bytes: &mut usize,
+    observe: &mut impl FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    // Preserve name, logical metadata, entry count and storage diagnostic order.
+    validate_write_field_name(field.name())?;
+    novarocks_type_contract::field_logical_type(field).map_err(|error| {
+        ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+    })?;
+    charge_write_field_header(field.name(), field.metadata().len(), decoded_bytes)?;
+    observe()?;
+    for (key, value) in field.metadata() {
+        charge_write_metadata_entry(key, value, decoded_bytes)?;
+        observe()?;
+    }
+    validate_type_core(field.data_type(), depth, decoded_bytes, observe)
+}
+
+pub fn validate_write_data_type(
+    data_type: &DataType,
+    depth: usize,
+    decoded_bytes: &mut usize,
+) -> Result<(), ConnectorError> {
+    validate_type_core(data_type, depth, decoded_bytes, &mut || Ok(()))
+}
+
+/// Borrow the caller's observer for the original type traversal. All child
+/// occurrences remain charged, including shared Arrow Field backing.
+pub fn validate_write_data_type_observed<E: From<ConnectorError>>(
+    data_type: &DataType,
+    depth: usize,
+    decoded_bytes: &mut usize,
+    mut observe: impl FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    validate_type_core(data_type, depth, decoded_bytes, &mut observe)
+}
+
+fn validate_type_core<E: From<ConnectorError>>(
+    data_type: &DataType,
+    depth: usize,
+    decoded_bytes: &mut usize,
+    observe: &mut impl FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    let timezone = match data_type {
+        DataType::Timestamp(_, timezone) => timezone.as_deref(),
+        _ => None,
+    };
+    charge_write_type_header(depth, timezone, decoded_bytes)?;
+    observe()?;
     match data_type {
-        DataType::Timestamp(_, Some(timezone)) => {
-            charge_write_schema(decoded_bytes, timezone.len())?;
-        }
         DataType::List(field)
         | DataType::ListView(field)
         | DataType::FixedSizeList(field, _)
         | DataType::LargeList(field)
         | DataType::LargeListView(field)
-        | DataType::Map(field, _) => validate_write_field_schema(field, depth + 1, decoded_bytes)?,
+        | DataType::Map(field, _) => validate_field_core(field, depth + 1, decoded_bytes, observe)?,
         DataType::Struct(fields) => {
             for field in fields {
-                validate_write_field_schema(field, depth + 1, decoded_bytes)?;
+                validate_field_core(field, depth + 1, decoded_bytes, observe)?;
             }
         }
         DataType::Union(fields, _) => {
             for (_, field) in fields.iter() {
-                validate_write_field_schema(field, depth + 1, decoded_bytes)?;
+                validate_field_core(field, depth + 1, decoded_bytes, observe)?;
             }
         }
         DataType::Dictionary(key, value) => {
-            validate_write_data_type(key, depth + 1, decoded_bytes)?;
-            validate_write_data_type(value, depth + 1, decoded_bytes)?;
+            validate_type_core(key, depth + 1, decoded_bytes, observe)?;
+            validate_type_core(value, depth + 1, decoded_bytes, observe)?;
         }
         DataType::RunEndEncoded(run_ends, values) => {
-            validate_write_field_schema(run_ends, depth + 1, decoded_bytes)?;
-            validate_write_field_schema(values, depth + 1, decoded_bytes)?;
+            validate_field_core(run_ends, depth + 1, decoded_bytes, observe)?;
+            validate_field_core(values, depth + 1, decoded_bytes, observe)?;
         }
         _ => {}
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
