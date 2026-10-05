@@ -158,6 +158,7 @@ pub(super) fn author_scalar_result_selection_observed(
         argument_types: function.argument_types.clone(),
         result_type: FunctionResultType::Scalar(function.result_type.clone()),
         aggregate: aggregate.map(|binding| novarocks_functions::AggregateBindingSelection {
+            state_argument_contract: binding.state_argument_contract,
             intermediate_type: binding.intermediate_type.clone(),
             state_format: binding.state_format.clone(),
         }),

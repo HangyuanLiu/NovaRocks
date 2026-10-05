@@ -140,6 +140,7 @@ fn definition(id: u32, phase: wire::aggregate_phase::Kind) -> wire::AggregateBin
         logical_argument_count: u32::MAX,
         intermediate_value_type_id: Some(0),
         state_format: "aggregate/state-v1".into(),
+        state_argument_contract: wire::AggregateStateArgumentContract::ExactSignature as i32,
     }
 }
 fn definitions() -> Vec<wire::AggregateBindingDefinition> {
@@ -238,6 +239,63 @@ fn receiving_aggregate_headers_borrow_all_phases_sparse_ids_and_exact_type_owner
             ValueLogicalType::Json
         );
     });
+}
+
+#[test]
+fn receiving_state_argument_contract_is_mandatory_closed_and_independent_of_phase() {
+    // Both contracts are explicit owner facts, independent of these identical
+    // function signatures, state formats and all four phase representations.
+    for (code, expected) in [
+        (1, AggregateStateArgumentContract::ExactSignature),
+        (
+            2,
+            AggregateStateArgumentContract::ValueRootNullabilityIndependent,
+        ),
+    ] {
+        let mut definitions = definitions();
+        for definition in &mut definitions {
+            definition.state_argument_contract = code;
+        }
+        let control = Control::default();
+        with_functions(&control, |functions| {
+            control.activate();
+            let token =
+                prepare_aggregate_binding_headers(&definitions, functions, SOURCE, limits())
+                    .unwrap();
+            for original in &definitions {
+                let borrowed = token.definition(original.id).unwrap().unwrap();
+                assert!(std::ptr::eq(borrowed, original));
+                assert_eq!(borrowed.state_argument_contract, code);
+                assert_eq!(decode_state_argument_contract(code).unwrap(), expected);
+            }
+        });
+        prefixes(
+            |control| check(&definitions, SOURCE, limits(), control),
+            true,
+            true,
+        );
+    }
+    for code in [0, -1, 3, i32::MAX] {
+        let mut definitions = definitions();
+        definitions[0].state_argument_contract = code;
+        assert!(matches!(
+            check(&definitions, SOURCE, limits(), &Control::default()),
+            Err(BindingCodecError::InvalidShape(
+                "aggregate header state argument contract is absent or unknown"
+            ))
+        ));
+        let baseline = Control::default();
+        assert!(check(&definitions, SOURCE, limits(), &baseline).is_err());
+        let trace = baseline.trace.lock().unwrap().clone();
+        // The completed closed-enum check reaches the ordinary footer, before
+        // any sparse-index allocation or function lookup.
+        assert!(trace.last().unwrap().1 > 0);
+        prefixes(
+            |control| check(&definitions, SOURCE, limits(), control),
+            false,
+            true,
+        );
+    }
 }
 
 #[test]

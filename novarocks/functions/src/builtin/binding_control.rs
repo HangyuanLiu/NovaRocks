@@ -194,6 +194,7 @@ pub(super) fn same_selection(
     match (&left.aggregate, &right.aggregate) {
         (None, None) => Ok(true),
         (Some(a), Some(b)) => Ok(a.state_format == b.state_format
+            && a.state_argument_contract == b.state_argument_contract
             && exact_type(&a.intermediate_type, &b.intermediate_type, work)?),
         _ => Ok(false),
     }

@@ -482,6 +482,8 @@ fn declarations_reject_duplicate_identity_ambiguous_patterns_and_wrong_state_kin
     assert!(make(vec![first.clone(), overload("other/v1", "(T)")]).is_err());
     let mut aggregate = first;
     aggregate.aggregate = Some(AggregateBindingDeclaration {
+        state_argument_contract:
+            novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
         intermediate_pattern: "binary".into(),
         state_format: AggregateStateFormatIdentity::try_new("state/v1").unwrap(),
     });
@@ -610,6 +612,8 @@ impl FunctionBindingResolver for AggregateResolver {
                 .collect(),
             result_type: FunctionResultType::Scalar(value_type(DataType::Int64, true)),
             aggregate: Some(AggregateBindingSelection {
+                state_argument_contract:
+                    novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                 intermediate_type: value_type(DataType::Binary, false),
                 state_format: AggregateStateFormatIdentity::try_new("state/v1").unwrap(),
             }),
@@ -641,6 +645,8 @@ impl FunctionBindingResolver for AggregateResolver {
 fn aggregate_binding_preserves_state_format_intermediate_nullability_and_logical_arity() {
     let mut overload = overload("test/aggregate/T/v1", "(T; order_by...)");
     overload.aggregate = Some(AggregateBindingDeclaration {
+        state_argument_contract:
+            novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
         intermediate_pattern: "binary not null".into(),
         state_format: AggregateStateFormatIdentity::try_new("state/v1").unwrap(),
     });
@@ -1161,6 +1167,8 @@ fn intrinsic_row_error_is_independent_of_catching_and_closed_by_function_kind() 
             let mut selected = overload("test/intrinsic/T/v1", "(T)");
             if kind == FunctionKind::Aggregate {
                 selected.aggregate = Some(AggregateBindingDeclaration {
+                    state_argument_contract:
+                        novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                     intermediate_pattern: "binary".into(),
                     state_format: AggregateStateFormatIdentity::try_new("test/intrinsic/state-v1")
                         .unwrap(),

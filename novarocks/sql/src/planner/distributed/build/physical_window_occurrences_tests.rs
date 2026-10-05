@@ -188,9 +188,11 @@ fn count_binding(catalog: &EngineFunctionCatalog, types: &[FunctionValueType]) -
         .resolve_aggregate_binding("count", args.len(), &args, &Control::default())
         .unwrap();
     let aggregate = resolved.selected.aggregate.as_ref().unwrap();
+    let state_argument_contract = aggregate.state_argument_contract;
     let intermediate_type = aggregate.intermediate_type.clone();
     let state_format = AggregateStateFormatId::try_new(aggregate.state_format.as_str()).unwrap();
     AggregateBinding {
+        state_argument_contract,
         function: scalar(resolved),
         phase: AggregatePhase::Single,
         logical_argument_count: args.len() as u32,

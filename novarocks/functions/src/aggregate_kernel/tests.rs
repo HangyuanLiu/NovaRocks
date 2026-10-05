@@ -159,6 +159,8 @@ impl Owner {
                     false,
                 )),
                 aggregate: Some(AggregateBindingSelection {
+                    state_argument_contract:
+                        novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                     intermediate_type: FunctionValueType::new(DataType::Int64, false),
                     state_format: AggregateStateFormatIdentity::try_new(
                         "fixture/aggregate-lifecycle/state-v1",

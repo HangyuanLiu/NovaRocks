@@ -94,6 +94,8 @@ fn overload(kind: FunctionKind, effects: FunctionEffectDeclaration) -> FunctionO
         "(T, U)",
         "T",
         (kind == FunctionKind::Aggregate).then(|| AggregateBindingDeclaration {
+            state_argument_contract:
+                novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
             intermediate_pattern: "state<T>".into(),
             state_format: AggregateStateFormatIdentity::try_new("fixture/effect-metadata/state-v1")
                 .unwrap(),
@@ -602,4 +604,27 @@ fn canonical_overload_order_does_not_merge_exact_effect_identity_or_drop_pattern
         catalog(forward).digest(),
         catalog(make(vec![first, changed])).digest()
     );
+}
+
+#[test]
+fn state_argument_contract_changes_catalog_digest_with_identical_types_and_effects() {
+    let original = declaration(FunctionKind::Aggregate, effects(FunctionKind::Aggregate));
+    let mut changed = original.clone();
+    changed.overloads[0]
+        .aggregate
+        .as_mut()
+        .unwrap()
+        .state_argument_contract =
+        novarocks_type_contract::AggregateStateArgumentContract::ValueRootNullabilityIndependent;
+    assert_eq!(original.function_id, changed.function_id);
+    assert_eq!(original.overloads[0].effects, changed.overloads[0].effects);
+    assert_eq!(
+        original.overloads[0].argument_pattern,
+        changed.overloads[0].argument_pattern
+    );
+    assert_eq!(
+        original.overloads[0].result_pattern,
+        changed.overloads[0].result_pattern
+    );
+    assert_ne!(catalog(original).digest(), catalog(changed).digest());
 }

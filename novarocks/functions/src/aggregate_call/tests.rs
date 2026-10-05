@@ -84,6 +84,8 @@ impl Fixture {
                     .collect(),
                 result_type: FunctionResultType::Scalar(i64_type(false)),
                 aggregate: Some(AggregateBindingSelection {
+                    state_argument_contract:
+                        novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                     intermediate_type: state,
                     state_format: AggregateStateFormatIdentity::try_new(
                         "fixture/aggregate/state-v1",

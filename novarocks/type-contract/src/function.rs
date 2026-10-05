@@ -93,6 +93,19 @@ impl AggregateStateFormatId {
     }
 }
 
+/// Original overload owner's constraints on the logical argument types used
+/// to interpret its intermediate state. This does not change any call's exact
+/// signature, state/result type, ORDER BY channels, or runtime failure policy.
+/// Installed binding validation must check this against the owner declaration.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AggregateStateArgumentContract {
+    /// Every complete argument type must be identical across state phases.
+    ExactSignature,
+    /// Only logical scalar arguments' root nullability may differ. Nested
+    /// nullability, field metadata, nominal domains and ORDER BY remain exact.
+    ValueRootNullabilityIndependent,
+}
+
 #[derive(Clone, Debug)]
 pub struct FunctionValueType {
     pub data_type: DataType,

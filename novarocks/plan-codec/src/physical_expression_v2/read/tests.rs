@@ -271,6 +271,7 @@ impl Fixture {
             }),
             logical_argument_count: 1,
             state_format: "actual-state/v1".into(),
+            state_argument_contract: wire::AggregateStateArgumentContract::ExactSignature as i32,
             intermediate_value_type_id: Some(1),
         }];
         let values = [(0, 0), (1, 7), (2, 10)]

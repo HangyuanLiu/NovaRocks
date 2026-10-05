@@ -539,6 +539,8 @@ mod validation_error_tests {
     #[test]
     fn aggregate_sequence_index_builds_once_for_many_distinct_lookups_and_ambiguity() {
         let binding = |sequence| crate::AggregateBinding {
+            state_argument_contract:
+                novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
             function: crate::BoundFunction {
                 semantic_parameters: Box::default(),
                 function_id: crate::FunctionId::try_new("builtin/test_sum/v1").unwrap(),

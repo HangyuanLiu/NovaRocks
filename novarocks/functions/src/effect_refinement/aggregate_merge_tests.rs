@@ -156,6 +156,8 @@ impl StaticInput {
                     .collect(),
                 result_type: FunctionResultType::Scalar(ty(false)),
                 aggregate: Some(AggregateBindingSelection {
+                    state_argument_contract:
+                        novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                     intermediate_type: state.clone(),
                     state_format: AggregateStateFormatIdentity::try_new(
                         "test.aggregate/demand/state",

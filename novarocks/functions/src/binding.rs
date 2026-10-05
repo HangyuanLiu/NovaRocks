@@ -70,6 +70,7 @@ impl FunctionSemantics {
 /// The aggregate state contract remains separate from its Arrow carrier.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AggregateBindingDeclaration {
+    pub state_argument_contract: novarocks_type_contract::AggregateStateArgumentContract,
     pub intermediate_pattern: Box<str>,
     pub state_format: AggregateStateFormatIdentity,
 }
@@ -413,6 +414,7 @@ pub enum FunctionResultType {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct AggregateBindingSelection {
+    pub state_argument_contract: novarocks_type_contract::AggregateStateArgumentContract,
     pub intermediate_type: FunctionValueType,
     pub state_format: AggregateStateFormatIdentity,
 }
@@ -527,6 +529,8 @@ pub(crate) fn parametric_aggregate_binding(
                 argument_pattern: overload.argument_pattern.clone(),
                 result_pattern: overload.output_pattern.clone(),
                 aggregate: Some(AggregateBindingDeclaration {
+                    state_argument_contract:
+                        novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                     intermediate_pattern: overload.intermediate_pattern.clone(),
                     state_format: overload.state_format.clone(),
                 }),
@@ -593,6 +597,8 @@ impl ParametricAggregateBindingResolver {
                 nullable,
             )),
             aggregate: Some(crate::AggregateBindingSelection {
+                state_argument_contract:
+                    novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                 intermediate_type: FunctionValueType::new(
                     resolved.intermediate_type.clone(),
                     nullable,
@@ -1149,9 +1155,11 @@ fn validate_selection(
     match (&overload.aggregate, &selected.aggregate) {
         (None, None) => {}
         (Some(declared), Some(resolved)) => {
-            if resolved.state_format != declared.state_format {
+            if resolved.state_format != declared.state_format
+                || resolved.state_argument_contract != declared.state_argument_contract
+            {
                 return Err(invalid(
-                    "aggregate state format differs from its declaration",
+                    "aggregate state format or argument contract differs from its declaration",
                 ));
             }
         }
@@ -1261,6 +1269,10 @@ pub(crate) fn digest_binding_definition(
             hasher.update([1]);
             digest_text(hasher, &aggregate.intermediate_pattern);
             digest_text(hasher, aggregate.state_format.as_str());
+            hasher.update([match aggregate.state_argument_contract {
+                novarocks_type_contract::AggregateStateArgumentContract::ExactSignature => 1,
+                novarocks_type_contract::AggregateStateArgumentContract::ValueRootNullabilityIndependent => 2,
+            }]);
         } else {
             hasher.update([0]);
         }

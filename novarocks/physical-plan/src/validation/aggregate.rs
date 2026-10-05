@@ -185,15 +185,121 @@ fn aggregate_outputs_reduce_into(produced: &[ValueId], expected: &[ValueId]) -> 
     produced_state == expected_state && expected_keys.iter().all(|key| produced_keys.contains(key))
 }
 
+// This comparison consumes the original owner's state argument contract;
+// it is separate from each phase's exact local function signature validation.
+#[derive(Debug)]
+enum StateSignatureComparisonError {
+    WorkExhausted,
+    InvalidType,
+}
+impl From<novarocks_type_contract::ValueTypeError> for StateSignatureComparisonError {
+    fn from(_: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::InvalidType
+    }
+}
+
+fn state_value_types_match(
+    left: &crate::ValueType,
+    right: &crate::ValueType,
+    ignore_root_nullability: bool,
+    budget: &mut SemanticTraceWorkBudget,
+) -> bool {
+    if !budget.charge(1)
+        || left.logical_type != right.logical_type
+        || (!ignore_root_nullability && left.nullable != right.nullable)
+    {
+        return false;
+    }
+    novarocks_type_contract::arrow_data_types_exact_observed::<StateSignatureComparisonError>(
+        &left.data_type,
+        &right.data_type,
+        || {
+            if budget.charge(1) {
+                Ok(())
+            } else {
+                Err(StateSignatureComparisonError::WorkExhausted)
+            }
+        },
+    )
+    .unwrap_or(false)
+}
+
 pub(crate) fn aggregate_bindings_match(
     expected: &crate::AggregateBinding,
     actual: &crate::AggregateBinding,
+    budget: &mut SemanticTraceWorkBudget,
 ) -> bool {
-    expected.function.signature_matches(&actual.function)
-        && expected.logical_argument_count == actual.logical_argument_count
-        && expected.intermediate_type == actual.intermediate_type
-        && expected.state_format == actual.state_format
-        && expected.phase.sequence() == actual.phase.sequence()
+    use novarocks_type_contract::{AggregateStateArgumentContract, FunctionArgumentType};
+    let left = &expected.function;
+    let right = &actual.function;
+    let identity_work = [
+        left.function_id.as_str().len(),
+        right.function_id.as_str().len(),
+        left.overload.as_str().len(),
+        right.overload.as_str().len(),
+        expected.state_format.as_str().len(),
+        actual.state_format.as_str().len(),
+    ]
+    .into_iter()
+    .try_fold(8usize, usize::checked_add);
+    if !identity_work.is_some_and(|work| budget.charge(work))
+        || left.function_id != right.function_id
+        || left.overload != right.overload
+        || left.kind != right.kind
+        || left.argument_types.len() != right.argument_types.len()
+        || expected.logical_argument_count != actual.logical_argument_count
+        || expected.state_argument_contract != actual.state_argument_contract
+        || expected.state_format != actual.state_format
+        || expected.phase.sequence() != actual.phase.sequence()
+        || usize::try_from(expected.logical_argument_count)
+            .map_or(true, |count| count > left.argument_types.len())
+    {
+        return false;
+    }
+    for (ordinal, (a, b)) in left
+        .argument_types
+        .iter()
+        .zip(&right.argument_types)
+        .enumerate()
+    {
+        let ignore_root = expected.state_argument_contract
+            == AggregateStateArgumentContract::ValueRootNullabilityIndependent
+            && ordinal < expected.logical_argument_count as usize;
+        let matches = match (a, b) {
+            (FunctionArgumentType::Value(a), FunctionArgumentType::Value(b)) => {
+                state_value_types_match(a, b, ignore_root, budget)
+            }
+            (
+                FunctionArgumentType::Lambda {
+                    parameter_types: ap,
+                    result_type: ar,
+                },
+                FunctionArgumentType::Lambda {
+                    parameter_types: bp,
+                    result_type: br,
+                },
+            ) => {
+                budget.charge(1)
+                    && ap.len() == bp.len()
+                    && ap
+                        .iter()
+                        .zip(bp)
+                        .all(|(a, b)| state_value_types_match(a, b, false, budget))
+                    && state_value_types_match(ar, br, false, budget)
+            }
+            _ => false,
+        };
+        if !matches {
+            return false;
+        }
+    }
+    state_value_types_match(&left.result_type, &right.result_type, false, budget)
+        && state_value_types_match(
+            &expected.intermediate_type,
+            &actual.intermediate_type,
+            false,
+            budget,
+        )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -253,7 +359,7 @@ pub(crate) fn trace_aggregate_sequence_inputs(
                 ) else {
                     return false;
                 };
-                if !aggregate_bindings_match(expected_binding, &call.binding)
+                if !aggregate_bindings_match(expected_binding, &call.binding, trace_budget)
                     || !aggregate_outputs_reduce_into(
                         &aggregate_outputs(group_by, call),
                         &expected_values,
@@ -788,3 +894,7 @@ pub(crate) fn trace_topn_reduction_inputs(
     }
     true
 }
+
+#[cfg(test)]
+#[path = "aggregate_state_argument_tests.rs"]
+mod aggregate_state_argument_tests;

@@ -628,3 +628,80 @@ fn exact_overload_installed_coalesce_preserves_control_abi_and_ordered_duplicate
     // Exact selection metadata and the declaration ABI are checked here;
     // no invocation effects, runtime preparation or short-circuit execution.
 }
+
+#[test]
+fn aggregate_state_argument_contract_is_authored_and_revalidated_by_exact_owner() {
+    use novarocks_type_contract::AggregateStateArgumentContract::{
+        ExactSignature, ValueRootNullabilityIndependent,
+    };
+    let catalog = catalog();
+    for (name, contract) in [
+        ("count", ValueRootNullabilityIndependent),
+        ("min", ValueRootNullabilityIndependent),
+        ("max", ValueRootNullabilityIndependent),
+        ("sum", ExactSignature),
+        ("avg", ExactSignature),
+        ("array_agg", ExactSignature),
+    ] {
+        for nullable in [false, true] {
+            let arguments = [FunctionArgument::Value {
+                value_type: FunctionValueType::new(DataType::Int64, nullable),
+                constant: None,
+            }];
+            let resolved = catalog
+                .resolve_bound_user(
+                    name,
+                    FunctionKind::Aggregate,
+                    request(&arguments),
+                    &Control::default(),
+                )
+                .unwrap();
+            assert_eq!(
+                resolved.selected.argument_types[0],
+                arguments[0].argument_type()
+            );
+            assert_eq!(
+                resolved
+                    .selected
+                    .aggregate
+                    .as_ref()
+                    .unwrap()
+                    .state_argument_contract,
+                contract
+            );
+            let declaration = catalog
+                .definition_by_id(&resolved.function_id)
+                .unwrap()
+                .binding_declaration()
+                .unwrap();
+            assert_eq!(
+                declaration
+                    .overloads()
+                    .iter()
+                    .find(|item| item.identity == resolved.selected.overload)
+                    .unwrap()
+                    .aggregate
+                    .as_ref()
+                    .unwrap()
+                    .state_argument_contract,
+                contract
+            );
+            let validate = |selected: &FunctionBindingSelection, control: &Control| {
+                catalog.validate_frozen_selection(
+                    &resolved.function_id,
+                    resolved.kind,
+                    selected,
+                    request(&arguments),
+                    control,
+                )
+            };
+            prefixes(|control| validate(&resolved.selected, control), true);
+            let mut forged = resolved.selected.clone();
+            forged.aggregate.as_mut().unwrap().state_argument_contract = match contract {
+                ExactSignature => ValueRootNullabilityIndependent,
+                ValueRootNullabilityIndependent => ExactSignature,
+            };
+            prefixes(|control| validate(&forged, control), false);
+        }
+    }
+}

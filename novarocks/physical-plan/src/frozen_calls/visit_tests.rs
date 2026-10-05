@@ -96,6 +96,8 @@ fn all_sites() -> (Fragment, PhysicalRootUses) {
             } => {
                 selected.kind = FunctionKind::Aggregate;
                 *aggregate_binding = Some(Box::new(AggregateBinding {
+                    state_argument_contract:
+                        novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                     function: selected.clone(),
                     phase: AggregatePhase::Single,
                     logical_argument_count: 0,

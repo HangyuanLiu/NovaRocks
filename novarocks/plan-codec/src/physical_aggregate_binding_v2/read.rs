@@ -211,6 +211,9 @@ fn validate(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
     for definition in definitions {
+        let state_contract = decode_state_argument_contract(definition.state_argument_contract);
+        work.step()?;
+        state_contract?;
         let function_id = definition
             .function_binding_id
             .ok_or_else(|| invalid("aggregate header function reference is absent"))?;

@@ -140,12 +140,14 @@ fn binding(
         .resolve_aggregate_binding(name, usize::from(t.is_some()), &types, &Control::default())
         .unwrap();
     let aggregate = r.selected.aggregate.as_ref().unwrap();
+    let state_argument_contract = aggregate.state_argument_contract;
     let intermediate_type = aggregate.intermediate_type.clone();
     let state_format = AggregateStateFormatId::try_new(aggregate.state_format.as_str()).unwrap();
     let FunctionResultType::Scalar(result_type) = r.selected.result_type else {
         panic!("scalar aggregate result")
     };
     AggregateBinding {
+        state_argument_contract,
         function: BoundFunction {
             function_id: r.function_id,
             overload: r.selected.overload,

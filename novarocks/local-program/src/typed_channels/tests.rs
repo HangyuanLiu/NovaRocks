@@ -855,6 +855,8 @@ impl OrderedOwner {
                 "Int64, Int32",
                 "Int64",
                 Some(AggregateBindingDeclaration {
+                    state_argument_contract:
+                        novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                     intermediate_pattern: "Int64".into(),
                     state_format: state.state_format.clone(),
                 }),

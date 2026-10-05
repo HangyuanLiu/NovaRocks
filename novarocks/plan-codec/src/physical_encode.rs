@@ -1916,6 +1916,7 @@ fn validate_aggregate_binding(
         Some(AggregateBindingSelection {
             intermediate_type: binding.intermediate_type.clone(),
             state_format: binding.state_format.clone(),
+            state_argument_contract: binding.state_argument_contract,
         }),
         control,
     )
@@ -1942,6 +1943,7 @@ fn validate_aggregate_binding_from_types(
         Some(AggregateBindingSelection {
             intermediate_type: binding.intermediate_type.clone(),
             state_format: binding.state_format.clone(),
+            state_argument_contract: binding.state_argument_contract,
         }),
         control,
     )

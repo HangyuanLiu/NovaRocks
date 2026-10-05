@@ -136,6 +136,8 @@ impl Owner {
                 format!("{:?}", argument.data_type),
                 "Int64",
                 (kind == FunctionKind::Aggregate).then(|| AggregateBindingDeclaration {
+                    state_argument_contract:
+                        novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                     intermediate_pattern: "Int64".into(),
                     state_format: state_format(),
                 }),
@@ -159,6 +161,8 @@ impl Owner {
                     FunctionResultType::Scalar(output)
                 },
                 aggregate: (kind == FunctionKind::Aggregate).then(|| AggregateBindingSelection {
+                    state_argument_contract:
+                        novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                     intermediate_type: value_type(DataType::Int64),
                     state_format: state_format(),
                 }),

@@ -539,6 +539,8 @@ impl TestExactAggregateBindingResolver {
                 true,
             )),
             aggregate: Some(novarocks_functions::AggregateBindingSelection {
+                state_argument_contract:
+                    novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                 intermediate_type: FunctionValueType::new(overload.intermediate_type.clone(), true),
                 state_format: overload.state_format.clone(),
             }),
@@ -601,6 +603,8 @@ pub(crate) fn test_exact_aggregate_catalog(
                 argument_pattern: format!("exact:{}:arguments", overload.identity.as_str()).into(),
                 result_pattern: format!("exact:{}:output", overload.identity.as_str()).into(),
                 aggregate: Some(AggregateBindingDeclaration {
+                    state_argument_contract:
+                        novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                     intermediate_pattern: format!(
                         "exact:{}:intermediate",
                         overload.identity.as_str()

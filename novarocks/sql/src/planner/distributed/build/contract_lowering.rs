@@ -9817,6 +9817,7 @@ fn lower_writer_aggregate_binding(
         .as_ref()
         .ok_or_else(|| invalid_write("writer aggregate has no state contract".into()))?;
     Ok(AggregateBinding {
+        state_argument_contract: aggregate.state_argument_contract,
         function: bound_function_from_resolved(resolved, result),
         phase,
         logical_argument_count: 1,
@@ -10749,6 +10750,7 @@ fn lower_resolved_aggregate_binding(
                 detail: "aggregate window binding lacks state metadata".to_string(),
             })?;
     Ok(AggregateBinding {
+        state_argument_contract: aggregate.state_argument_contract,
         function: bound_function_from_selection(resolved, selected, result_type),
         phase,
         logical_argument_count: u32::try_from(logical_argument_count).map_err(|_| {
@@ -10861,6 +10863,7 @@ fn lower_aggregate_binding_from_selection(
     // there. The phase carrier is checked against this binding where the
     // output layout is, so there is nothing to compare here.
     Ok(AggregateBinding {
+        state_argument_contract: aggregate.state_argument_contract,
         function: bound_function_from_selection(resolved.resolved(), selected, result_type),
         phase,
         logical_argument_count: u32::try_from(resolved.logical_argument_count).map_err(|_| {

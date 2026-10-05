@@ -122,6 +122,8 @@ impl Fixture {
                     .collect(),
                 result_type: FunctionResultType::Scalar(i64_type(false)),
                 aggregate: (kind == FunctionKind::Aggregate).then(|| AggregateBindingSelection {
+                    state_argument_contract:
+                        novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                     intermediate_type: i64_type(false),
                     state_format: AggregateStateFormatIdentity::try_new(
                         "fixture/window-contract/state-v1",

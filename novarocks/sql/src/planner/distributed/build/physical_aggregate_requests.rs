@@ -652,11 +652,12 @@ fn selected_correspondence_observed(
     let aggregate = aggregate.ok_or(PhysicalAggregateRequestError::InvalidSource(
         "merge logical source has no aggregate state contract",
     ))?;
-    let format = aggregate.state_format == source.binding.state_format;
+    let format = aggregate.state_format == source.binding.state_format
+        && aggregate.state_argument_contract == source.binding.state_argument_contract;
     work.step()?;
     if !format {
         return Err(PhysicalAggregateRequestError::InvalidSource(
-            "merge binding differs from its captured state format",
+            "merge binding differs from its captured state format or argument contract",
         ));
     }
     work.flush()?;

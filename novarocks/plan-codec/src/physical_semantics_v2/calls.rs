@@ -715,6 +715,8 @@ mod tests {
                     phase: AggregatePhase::Single,
                     logical_argument_count: 0,
                     intermediate_type: ValueType::new(DataType::Binary, false),
+                    state_argument_contract:
+                        novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                     state_format: AggregateStateFormatId::try_new("fixture/count/state-v1")
                         .unwrap(),
                 },

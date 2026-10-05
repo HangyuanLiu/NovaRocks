@@ -141,6 +141,8 @@ fn aggregate(function: &BoundFunction) -> AggregateBinding {
         },
         logical_argument_count: 1,
         intermediate_type: int(),
+        state_argument_contract:
+            novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
         state_format: AggregateStateFormatId::try_new("test.expression/state-v1").unwrap(),
     }
 }

@@ -121,6 +121,7 @@ impl AggregatePhase {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AggregateBinding {
+    pub state_argument_contract: novarocks_type_contract::AggregateStateArgumentContract,
     pub function: BoundFunction,
     pub phase: AggregatePhase,
     /// Number of logical SQL arguments at the front of `argument_types`.

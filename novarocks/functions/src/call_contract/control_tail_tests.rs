@@ -324,6 +324,8 @@ fn admitted_refinement_headers_still_require_call_kind_and_result_shape() {
         let selected = Arc::get_mut(&mut fixture.selected).unwrap();
         if aggregate_header {
             selected.aggregate = Some(AggregateBindingSelection {
+                state_argument_contract:
+                    novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
                 intermediate_type: FunctionValueType::new(DataType::Int64, false),
                 state_format: AggregateStateFormatIdentity::try_new("fixture/call-footer/state")
                     .unwrap(),

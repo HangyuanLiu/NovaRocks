@@ -3003,6 +3003,8 @@ fn grouped_writer_fragment_with_sources(
             shared_state_input
         },
         binding: AggregateBinding {
+            state_argument_contract:
+                novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
             function: BoundFunction {
                 semantic_parameters: Box::default(),
                 function_id: FunctionId::try_new("builtin/test_statistics/v1").unwrap(),

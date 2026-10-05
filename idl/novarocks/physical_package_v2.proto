@@ -143,6 +143,12 @@ message AggregateBindingDefinition {
   uint32 logical_argument_count = 4;
   optional uint32 intermediate_value_type_id = 5;
   string state_format = 6;
+  AggregateStateArgumentContract state_argument_contract = 7;
+}
+enum AggregateStateArgumentContract {
+  AGGREGATE_STATE_ARGUMENT_CONTRACT_UNSPECIFIED = 0;
+  AGGREGATE_STATE_ARGUMENT_CONTRACT_EXACT_SIGNATURE = 1;
+  AGGREGATE_STATE_ARGUMENT_CONTRACT_VALUE_ROOT_NULLABILITY_INDEPENDENT = 2;
 }
 message AggregatePhase {
   oneof kind {

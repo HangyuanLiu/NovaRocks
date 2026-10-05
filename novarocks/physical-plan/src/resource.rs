@@ -1680,6 +1680,8 @@ mod tests {
                 novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
         };
         let binding = AggregateBinding {
+            state_argument_contract:
+                novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
             function,
             phase: crate::AggregatePhase::Single,
             logical_argument_count: 0,

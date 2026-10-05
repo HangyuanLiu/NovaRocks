@@ -53,6 +53,8 @@ fn aggregate_binding(phase: AggregatePhase, drift: BindingDrift) -> AggregateBin
         }
     };
     AggregateBinding {
+        state_argument_contract:
+            novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
         function: BoundFunction {
             semantic_parameters: Box::default(),
             function_id: FunctionId::try_new(function_id).unwrap(),

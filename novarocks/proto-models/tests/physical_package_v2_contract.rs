@@ -27,6 +27,53 @@ fn pool() -> DescriptorPool {
     DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("canonical native descriptor set")
 }
 
+#[test]
+fn aggregate_state_argument_contract_has_explicit_nonzero_values_and_tag_seven() {
+    use novarocks_proto_models::physical_package_v2::{
+        AggregateBindingDefinition, AggregateStateArgumentContract,
+    };
+    assert_eq!(AggregateStateArgumentContract::ExactSignature as i32, 1);
+    assert_eq!(
+        AggregateStateArgumentContract::ValueRootNullabilityIndependent as i32,
+        2
+    );
+    let descriptor = pool()
+        .get_message_by_name("novarocks.physical_package_v2.AggregateBindingDefinition")
+        .unwrap();
+    let field = descriptor
+        .get_field_by_name("state_argument_contract")
+        .unwrap();
+    assert_eq!(field.number(), 7);
+    assert!(matches!(field.kind(), Kind::Enum(_)));
+    for code in [1, 2] {
+        let value = AggregateBindingDefinition {
+            state_argument_contract: code,
+            ..Default::default()
+        };
+        // Independently authored tag/type/value bytes, not an encoder roundtrip.
+        assert_eq!(value.encode_to_vec(), vec![0x38, code as u8]);
+        assert_eq!(
+            AggregateBindingDefinition::decode([0x38, code as u8].as_slice())
+                .unwrap()
+                .state_argument_contract,
+            code,
+        );
+    }
+    // DTO decode retains omission/unknown; the receiving owner rejects them.
+    assert_eq!(
+        AggregateBindingDefinition::decode([].as_slice())
+            .unwrap()
+            .state_argument_contract,
+        0
+    );
+    assert_eq!(
+        AggregateBindingDefinition::decode([0x38, 3].as_slice())
+            .unwrap()
+            .state_argument_contract,
+        3
+    );
+}
+
 fn depth(
     message: MessageDescriptor,
     path: &mut BTreeSet<String>,

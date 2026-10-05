@@ -103,6 +103,8 @@ fn aggregate(
         phase,
         logical_argument_count: 1,
         intermediate_type: intermediate.clone(),
+        state_argument_contract:
+            novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
         state_format: AggregateStateFormatId::try_new("test/state-identity-v1").unwrap(),
     }
 }
@@ -146,7 +148,11 @@ fn aggregate_emission_preserves_all_phases_sparse_ids_and_original_source_loans(
             sequence: AggregateSequenceId::new(0),
         },
     ];
-    let sources = phases.map(|phase| aggregate(&function, &values[1].1, phase));
+    let mut sources = phases.map(|phase| aggregate(&function, &values[1].1, phase));
+    for source in sources.iter_mut().skip(1).step_by(2) {
+        source.state_argument_contract =
+            AggregateStateArgumentContract::ValueRootNullabilityIndependent;
+    }
     let inputs = [0, 1, 2, u32::MAX]
         .into_iter()
         .zip(&sources)
@@ -172,7 +178,9 @@ fn aggregate_emission_preserves_all_phases_sparse_ids_and_original_source_loans(
         wire::aggregate_phase::Kind::IntermediateSequenceId(u32::MAX),
         wire::aggregate_phase::Kind::FinalSequenceId(0),
     ];
-    for ((definition, input), kind) in encoded.as_wire().iter().zip(&inputs).zip(kinds) {
+    for (ordinal, ((definition, input), kind)) in
+        encoded.as_wire().iter().zip(&inputs).zip(kinds).enumerate()
+    {
         assert_eq!(
             *definition,
             wire::AggregateBindingDefinition {
@@ -181,7 +189,8 @@ fn aggregate_emission_preserves_all_phases_sparse_ids_and_original_source_loans(
                 phase: Some(wire::AggregatePhase { kind: Some(kind) }),
                 logical_argument_count: 1,
                 intermediate_value_type_id: Some(u32::MAX),
-                state_format: "test/state-identity-v1".into()
+                state_format: "test/state-identity-v1".into(),
+                state_argument_contract: if ordinal % 2 == 0 { 1 } else { 2 },
             }
         );
     }
@@ -236,6 +245,9 @@ fn aggregate_signature_checks_complete_phase_format_function_and_nested_type() {
     right.phase = AggregatePhase::Final {
         sequence: AggregateSequenceId::new(0),
     };
+    assert!(!compare(&right));
+    right = left.clone();
+    right.state_argument_contract = AggregateStateArgumentContract::ValueRootNullabilityIndependent;
     assert!(!compare(&right));
     right = left.clone();
     right.logical_argument_count = 0;
@@ -526,7 +538,14 @@ fn aggregate_original_control_prefixes_cover_quantum_success_and_ordinary_tails(
         function_binding_id: 8,
         ..inputs[0]
     }];
-    for group in [&inputs[..1], &ordinary[..], &[][..]] {
+    let mut independent_source = source.clone();
+    independent_source.state_argument_contract =
+        AggregateStateArgumentContract::ValueRootNullabilityIndependent;
+    let independent = [AggregateBindingInput {
+        source: &independent_source,
+        ..inputs[0]
+    }];
+    for group in [&inputs[..1], &independent[..], &ordinary[..], &[][..]] {
         let success = Control::default();
         let result =
             encode_aggregate_bindings(&types, &functions, group, SOURCE, limits(), &success);

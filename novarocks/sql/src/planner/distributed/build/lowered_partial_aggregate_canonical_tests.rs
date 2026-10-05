@@ -23,7 +23,7 @@ use crate::planner::distributed::build::physical_aggregate_requests::{
     PhysicalAggregateRequestError, author_physical_aggregate_update_request_from_journal_observed,
 };
 
-fn chain(
+pub(super) fn chain(
     name: &str,
     arguments: Vec<TypedExpr>,
     order: Vec<SortItem>,
@@ -97,7 +97,10 @@ fn chain(
         probe_runtime_filters: vec![],
     }
 }
-fn entry(owner: &SqlAuthoredPhysicalPlan, partial: bool) -> CheckedAggregateLogicalSourceEntry<'_> {
+pub(super) fn entry(
+    owner: &SqlAuthoredPhysicalPlan,
+    partial: bool,
+) -> CheckedAggregateLogicalSourceEntry<'_> {
     for fragment in owner.plan().fragments().values() {
         for node in fragment.nodes().values() {
             let NodeKind::Aggregate { calls, .. } = &node.kind else {
@@ -493,8 +496,8 @@ fn partial_elided_cast_nested_constants_keep_none_in_operational_and_final_captu
 }
 
 #[test]
-fn partial_success_layout_source_and_late_nullable_sequence_refusal_keep_original_control_prefixes()
-{
+fn partial_success_layout_source_and_late_nullable_state_compatibility_keep_original_control_prefixes()
+ {
     let input = column(7, "number", DataType::Int64, false);
     let good = chain(
         "count",
@@ -531,7 +534,7 @@ fn partial_success_layout_source_and_late_nullable_sequence_refusal_keep_origina
         let baseline = Control::default();
         let result = authored(source, &baseline);
         match (case, result) {
-            (0, Ok(owner)) => verify_update_and_final(&owner),
+            (0 | 3, Ok(owner)) => verify_update_and_final(&owner),
             (
                 1,
                 Err(ContractLoweringError::OutputColumnMismatch {
@@ -545,14 +548,6 @@ fn partial_success_layout_source_and_late_nullable_sequence_refusal_keep_origina
                     detail: "binding logical/ORDER BY arity differs from the call",
                 }),
             ) => {}
-            (3, Err(ContractLoweringError::Validation(errors))) => {
-                let first = errors.errors().first().unwrap();
-                assert!(first.path().starts_with("aggregate_sequences["));
-                assert_eq!(
-                    first.message(),
-                    "aggregate state paths do not reduce exactly into their matching final"
-                );
-            }
             (_, actual) => panic!("unexpected exact outcome for case {case}: {actual:?}"),
         }
         let expected = baseline.trace.into_inner().unwrap();

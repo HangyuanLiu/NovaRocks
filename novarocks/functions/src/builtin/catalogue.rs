@@ -247,6 +247,18 @@ impl AggregateSignatureResolver for BuiltinAggregateResolver {
     }
 }
 
+// The original implementation declaration authors state interpretation facts;
+// downstream planners/codecs never infer them from names or carrier types.
+fn builtin_aggregate_state_argument_contract(
+    name: &str,
+) -> novarocks_type_contract::AggregateStateArgumentContract {
+    use novarocks_type_contract::AggregateStateArgumentContract;
+    match name {
+        "count" | "min" | "max" => AggregateStateArgumentContract::ValueRootNullabilityIndependent,
+        _ => AggregateStateArgumentContract::ExactSignature,
+    }
+}
+
 impl BuiltinAggregateResolver {
     fn bind_value_selection(
         &self,
@@ -370,6 +382,9 @@ impl BuiltinAggregateResolver {
             argument_types: binding_control::argument_types(request, work)?,
             result_type: FunctionResultType::Scalar(output),
             aggregate: Some(crate::AggregateBindingSelection {
+                state_argument_contract: builtin_aggregate_state_argument_contract(
+                    declaration.name,
+                ),
                 intermediate_type: intermediate,
                 state_format: resolved.state_format,
             }),
@@ -2895,6 +2910,9 @@ pub fn contribute_builtin_functions(
                 argument_pattern: declaration.signature.into(),
                 result_pattern: "derived".into(),
                 aggregate: Some(AggregateBindingDeclaration {
+                    state_argument_contract: builtin_aggregate_state_argument_contract(
+                        declaration.name,
+                    ),
                     intermediate_pattern: "derived".into(),
                     state_format,
                 }),

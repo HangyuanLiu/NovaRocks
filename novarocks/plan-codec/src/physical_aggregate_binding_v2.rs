@@ -29,11 +29,42 @@ use crate::{
 };
 use novarocks_physical_plan::{AggregateBinding, AggregatePhase, BoundFunction};
 use novarocks_proto_models::{physical_control_v2, physical_package_v2 as wire};
-use novarocks_type_contract::{CompileCheckpoints, CompilePhase, FunctionKind, PureCompileControl};
+use novarocks_type_contract::{
+    AggregateStateArgumentContract, CompileCheckpoints, CompilePhase, FunctionKind,
+    PureCompileControl,
+};
 use std::{alloc::Layout, mem::size_of};
 
 mod read;
 pub use read::{PreparedAggregateBindingHeaders, prepare_aggregate_binding_headers};
+
+/// Projects the explicit state owner's contract, independently of function identity.
+pub(crate) fn encode_state_argument_contract(contract: AggregateStateArgumentContract) -> i32 {
+    match contract {
+        AggregateStateArgumentContract::ExactSignature => {
+            wire::AggregateStateArgumentContract::ExactSignature as i32
+        }
+        AggregateStateArgumentContract::ValueRootNullabilityIndependent => {
+            wire::AggregateStateArgumentContract::ValueRootNullabilityIndependent as i32
+        }
+    }
+}
+
+pub(crate) fn decode_state_argument_contract(
+    contract: i32,
+) -> Result<AggregateStateArgumentContract, BindingCodecError> {
+    match wire::AggregateStateArgumentContract::try_from(contract) {
+        Ok(wire::AggregateStateArgumentContract::ExactSignature) => {
+            Ok(AggregateStateArgumentContract::ExactSignature)
+        }
+        Ok(wire::AggregateStateArgumentContract::ValueRootNullabilityIndependent) => {
+            Ok(AggregateStateArgumentContract::ValueRootNullabilityIndependent)
+        }
+        Ok(wire::AggregateStateArgumentContract::Unspecified) | Err(_) => Err(invalid(
+            "aggregate header state argument contract is absent or unknown",
+        )),
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct AggregateBindingInput<'source> {
@@ -146,6 +177,7 @@ fn verify_aggregate_inner(
     };
     let same_headers = left.phase == right.phase
         && left.logical_argument_count == right.logical_argument_count
+        && left.state_argument_contract == right.state_argument_contract
         && left.state_format.as_str() == right.state_format.as_str();
     // Stable state-format owners bound each complete comparison to 1024 bytes.
     work.step()?;
@@ -458,6 +490,9 @@ fn encode(
             logical_argument_count: input.source.logical_argument_count,
             intermediate_value_type_id: Some(input.intermediate_value_type_id),
             state_format,
+            state_argument_contract: encode_state_argument_contract(
+                input.source.state_argument_contract,
+            ),
         });
         work.step()?;
     }
