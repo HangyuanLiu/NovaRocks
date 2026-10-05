@@ -33,7 +33,7 @@ fn project_with_pools(
     result
 }
 
-fn selected_source_owner() -> (
+pub(in crate::planner::distributed::build) fn selected_source_owner() -> (
     SqlAuthoredPhysicalPlan,
     ConstantPool,
     Arc<arrow::datatypes::Field>,

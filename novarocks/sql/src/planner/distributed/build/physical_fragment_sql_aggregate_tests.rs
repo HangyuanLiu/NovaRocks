@@ -155,7 +155,7 @@ fn genuine_sql_partial_final_composer_covers_every_actual_call_from_original_jou
             author_physical_occurrences_observed(fragment, catalog, &Control::default()).unwrap();
         let (policy, scopes) = source_scopes(&owner, fragment, &occurrences);
         let expressions = BTreeMap::new();
-        let result = author_sql_aggregate_fragment_effects_observed(
+        let result = author_sql_fragment_effects_observed(
             &owner,
             input(
                 &owner,
@@ -215,7 +215,7 @@ fn genuine_sql_composer_success_and_original_policy_refusal_observe_all_real_pre
         let expressions = BTreeMap::new();
         prefixes(
             |control| {
-                author_sql_aggregate_fragment_effects_observed(
+                author_sql_fragment_effects_observed(
                     &owner,
                     input(
                         &owner,
@@ -236,7 +236,7 @@ fn genuine_sql_composer_success_and_original_policy_refusal_observe_all_real_pre
                 DecimalOverflowPolicy::OutputNull => DecimalOverflowPolicy::ReportError,
             };
         }
-        let refusal = author_sql_aggregate_fragment_effects_observed(
+        let refusal = author_sql_fragment_effects_observed(
             &owner,
             input(
                 &owner,
@@ -256,7 +256,7 @@ fn genuine_sql_composer_success_and_original_policy_refusal_observe_all_real_pre
         ));
         prefixes(
             |control| {
-                author_sql_aggregate_fragment_effects_observed(
+                author_sql_fragment_effects_observed(
                     &owner,
                     input(
                         &owner,
@@ -287,7 +287,7 @@ fn genuine_sql_composer_refuses_foreign_equal_owner_pool_parameters_and_extra_mi
         let (policy, mut scopes) = source_scopes(&owner, fragment, &occurrences);
         let expressions = BTreeMap::new();
         assert!(
-            author_sql_aggregate_fragment_effects_observed(
+            author_sql_fragment_effects_observed(
                 &cloned,
                 input(
                     &owner,
@@ -303,7 +303,7 @@ fn genuine_sql_composer_refuses_foreign_equal_owner_pool_parameters_and_extra_mi
         );
         prefixes(
             |control| {
-                author_sql_aggregate_fragment_effects_observed(
+                author_sql_fragment_effects_observed(
                     &foreign,
                     input(
                         &owner,
@@ -334,18 +334,18 @@ fn genuine_sql_composer_refuses_foreign_equal_owner_pool_parameters_and_extra_mi
                     } else {
                         source.parameters = foreign.plan().parameters();
                     }
-                    author_sql_aggregate_fragment_effects_observed(&owner, source, control)
+                    author_sql_fragment_effects_observed(&owner, source, control)
                 },
                 false,
             );
         }
         let (site, scope) = scopes.pop_first().unwrap();
         assert!(
-            matches!(author_sql_aggregate_fragment_effects_observed(&owner, input(&owner, fragment, &occurrences, policy, &scopes, &expressions), &Control::default()), Err(PhysicalFragmentEffectsError::MissingScope(actual)) if actual == site)
+            matches!(author_sql_fragment_effects_observed(&owner, input(&owner, fragment, &occurrences, policy, &scopes, &expressions), &Control::default()), Err(PhysicalFragmentEffectsError::MissingScope(actual)) if actual == site)
         );
         prefixes(
             |control| {
-                author_sql_aggregate_fragment_effects_observed(
+                author_sql_fragment_effects_observed(
                     &owner,
                     input(
                         &owner,
@@ -380,7 +380,7 @@ fn genuine_sql_composer_refuses_foreign_equal_owner_pool_parameters_and_extra_mi
         );
         prefixes(
             |control| {
-                author_sql_aggregate_fragment_effects_observed(
+                author_sql_fragment_effects_observed(
                     &owner,
                     input(
                         &owner,
@@ -412,7 +412,7 @@ fn genuine_sql_composer_refuses_captured_constant_policy_change_and_direct_merge
         changed.max_retained_buffer_bytes -= 1;
         prefixes(
             |control| {
-                author_sql_aggregate_fragment_effects_observed(
+                author_sql_fragment_effects_observed(
                     &owner,
                     input(
                         &owner,

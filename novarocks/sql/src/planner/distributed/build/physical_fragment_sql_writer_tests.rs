@@ -192,7 +192,7 @@ fn assert_fresh(owner: &SqlAuthoredPhysicalPlan, expected: (usize, usize)) {
         assert!(std::ptr::eq(occurrences.fragment(), fragment));
         let (policy, relational) = scopes(owner, fragment, &occurrences);
         let expressions = BTreeMap::new();
-        let result = author_sql_aggregate_fragment_effects_observed(
+        let result = author_sql_fragment_effects_observed(
             owner,
             input(
                 owner,
@@ -418,7 +418,7 @@ fn real_writer_fragment_all_success_and_policy_refusal_callbacks_keep_original_c
         let expressions = BTreeMap::new();
         prefixes(
             |control| {
-                author_sql_aggregate_fragment_effects_observed(
+                author_sql_fragment_effects_observed(
                     &owner,
                     input(
                         &owner,
@@ -440,7 +440,7 @@ fn real_writer_fragment_all_success_and_policy_refusal_callbacks_keep_original_c
             };
         }
         assert!(
-            author_sql_aggregate_fragment_effects_observed(
+            author_sql_fragment_effects_observed(
                 &owner,
                 input(
                     &owner,
@@ -456,7 +456,7 @@ fn real_writer_fragment_all_success_and_policy_refusal_callbacks_keep_original_c
         );
         prefixes(
             |control| {
-                author_sql_aggregate_fragment_effects_observed(
+                author_sql_fragment_effects_observed(
                     &owner,
                     input(
                         &owner,
@@ -504,10 +504,7 @@ fn real_writer_fragment_refuses_equal_foreign_occurrence_source_and_missing_scop
             &expressions,
         );
         source.occurrences = &foreign_occurrences;
-        assert!(
-            author_sql_aggregate_fragment_effects_observed(&owner, source, &Control::default())
-                .is_err()
-        );
+        assert!(author_sql_fragment_effects_observed(&owner, source, &Control::default()).is_err());
         prefixes(
             |control| {
                 let mut source = input(
@@ -519,16 +516,14 @@ fn real_writer_fragment_refuses_equal_foreign_occurrence_source_and_missing_scop
                     &expressions,
                 );
                 source.occurrences = &foreign_occurrences;
-                author_sql_aggregate_fragment_effects_observed(&owner, source, control)
+                author_sql_fragment_effects_observed(&owner, source, control)
             },
             false,
         );
         let (missing, _) = relational.pop_first().unwrap();
-        assert!(
-            matches!(author_sql_aggregate_fragment_effects_observed(&owner,
+        assert!(matches!(author_sql_fragment_effects_observed(&owner,
             input(&owner, fragment, &occurrences, policy, &relational, &expressions), &Control::default()),
-            Err(PhysicalFragmentEffectsError::MissingScope(site)) if site == missing)
-        );
+            Err(PhysicalFragmentEffectsError::MissingScope(site)) if site == missing));
     }
 }
 
@@ -760,7 +755,7 @@ fn real_writer_fragment_checks_late_contributor_state_and_publishes_no_partial_t
     let bad_request = earlier_updates + 3;
     for fault in [SelectionFault::StateFormat, SelectionFault::NominalState] {
         functions.arm(bad_request, fault);
-        let refusal = author_sql_aggregate_fragment_effects_observed(
+        let refusal = author_sql_fragment_effects_observed(
             &owner,
             input(
                 &owner,
@@ -783,7 +778,7 @@ fn real_writer_fragment_checks_late_contributor_state_and_publishes_no_partial_t
         prefixes(
             |control| {
                 functions.arm(bad_request, fault);
-                author_sql_aggregate_fragment_effects_observed(
+                author_sql_fragment_effects_observed(
                     &owner,
                     input(
                         &owner,
@@ -857,7 +852,7 @@ fn real_writer_wide_fresh_calls_sample_actual_control_quantums_without_losing_sp
         let (policy, relational) = scopes(&owner, fragment, &occurrences);
         let expressions = BTreeMap::new();
         let baseline = Control::default();
-        author_sql_aggregate_fragment_effects_observed(
+        author_sql_fragment_effects_observed(
             &owner,
             input(
                 &owner,
@@ -894,7 +889,7 @@ fn real_writer_wide_fresh_calls_sample_actual_control_quantums_without_losing_sp
                     trace: Mutex::new(Vec::new()),
                     refusal: Some((stop, cause)),
                 };
-                let result = author_sql_aggregate_fragment_effects_observed(
+                let result = author_sql_fragment_effects_observed(
                     &owner,
                     input(
                         &owner,

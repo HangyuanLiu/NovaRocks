@@ -60,7 +60,7 @@ impl PureCompileControl for Control {
         }
     }
 }
-fn policy() -> novarocks_functions::ConstantPolicy {
+pub(in crate::planner::distributed::build) fn policy() -> novarocks_functions::ConstantPolicy {
     crate::constant::test_constant_policy()
 }
 fn project(
@@ -77,7 +77,7 @@ fn project(
     work.finish()?;
     result
 }
-fn integer(value: i64) -> TypedExpr {
+pub(in crate::planner::distributed::build) fn integer(value: i64) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Literal(LiteralValue::Int(value)),
         value_type: ValueType::new(DataType::Int64, false),
@@ -93,7 +93,7 @@ fn reference(column: &OutputColumn) -> TypedExpr {
         value_type: column.value_type.clone(),
     }
 }
-fn syntax_null() -> TypedExpr {
+pub(in crate::planner::distributed::build) fn syntax_null() -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Literal(LiteralValue::Null),
         value_type: ValueType::new(
@@ -109,7 +109,9 @@ fn syntax_null() -> TypedExpr {
 fn argument(source: &TypedExpr) -> FunctionArgument {
     crate::analysis::function_argument(source, policy(), &Control::default()).unwrap()
 }
-fn finish(source: &PhysicalPlanNode) -> SqlAuthoredPhysicalPlan {
+pub(in crate::planner::distributed::build) fn finish(
+    source: &PhysicalPlanNode,
+) -> SqlAuthoredPhysicalPlan {
     let control = Control::default();
     lower_final_physical_plan(
         source,
@@ -124,7 +126,7 @@ fn finish(source: &PhysicalPlanNode) -> SqlAuthoredPhysicalPlan {
     .finish_observed(&control)
     .unwrap()
 }
-fn window_source(
+pub(in crate::planner::distributed::build) fn window_source(
     owner: &SqlAuthoredPhysicalPlan,
 ) -> (&Fragment, &novarocks_physical_plan::ExprNode) {
     owner
@@ -139,7 +141,7 @@ fn window_source(
         })
         .expect("actual window emission")
 }
-fn table_source(
+pub(in crate::planner::distributed::build) fn table_source(
     owner: &SqlAuthoredPhysicalPlan,
 ) -> (&Fragment, &novarocks_physical_plan::PhysicalNode) {
     owner
@@ -206,7 +208,7 @@ fn emitted(
     work.finish().unwrap();
     value
 }
-fn list_value(ordinal: u32) -> TypedExpr {
+pub(in crate::planner::distributed::build) fn list_value(ordinal: u32) -> TypedExpr {
     let field = Arc::new(
         arrow::datatypes::Field::new("original.element", DataType::Int64, true)
             .with_metadata(HashMap::from([("source.child".into(), "kept".into())])),
@@ -235,7 +237,10 @@ fn list_value(ordinal: u32) -> TypedExpr {
 }
 // Actual installed resolver, already-typed emitter fixture. This is not a
 // certificate of a parser, optimizer or lifecycle preparation capability.
-fn table_fixture(args: Vec<TypedExpr>, left: bool) -> (PhysicalPlanNode, SqlFunctionBinding) {
+pub(in crate::planner::distributed::build) fn table_fixture(
+    args: Vec<TypedExpr>,
+    left: bool,
+) -> (PhysicalPlanNode, SqlFunctionBinding) {
     let arguments = args.iter().map(argument).collect::<Vec<_>>();
     let resolved = crate::functions::builtin_sql_function_catalog()
         .resolve_table_binding("unnest", &arguments, &Control::default())
@@ -273,7 +278,7 @@ fn table_fixture(args: Vec<TypedExpr>, left: bool) -> (PhysicalPlanNode, SqlFunc
     };
     (source, binding)
 }
-fn window_fixture(
+pub(in crate::planner::distributed::build) fn window_fixture(
     args: Vec<TypedExpr>,
     function_order_by: Vec<SortItem>,
 ) -> (PhysicalPlanNode, SqlFunctionBinding) {

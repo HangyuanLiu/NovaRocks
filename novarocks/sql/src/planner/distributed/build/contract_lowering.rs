@@ -12471,11 +12471,11 @@ impl From<ValidationErrors> for ContractLoweringError {
 
 #[cfg(test)]
 #[path = "lowered_scalar_source_tests.rs"]
-mod lowered_scalar_source_tests;
+pub(super) mod lowered_scalar_source_tests;
 
 #[cfg(test)]
 #[path = "lowered_window_table_source_tests.rs"]
-mod lowered_window_table_source_tests;
+pub(super) mod lowered_window_table_source_tests;
 
 #[cfg(test)]
 #[path = "lowered_conversion_source_tests.rs"]

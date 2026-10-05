@@ -50,7 +50,7 @@ fn upper_call(argument: TypedExpr) -> TypedExpr {
         value_type,
     }
 }
-fn repeat_plan(nested: bool) -> PhysicalPlanNode {
+pub(in crate::planner::distributed::build) fn repeat_plan(nested: bool) -> PhysicalPlanNode {
     // Already-typed source fixture, not a claim about postjoin SQL optimizer
     // placement. The real Repeat author creates a NullExtended value from a
     // nonnullable source; the original scalar binding predates that widening.
@@ -83,7 +83,9 @@ fn repeat_plan(nested: bool) -> PhysicalPlanNode {
     project.children = vec![repeat];
     project
 }
-fn finish(plan: &PhysicalPlanNode) -> SqlAuthoredPhysicalPlan {
+pub(in crate::planner::distributed::build) fn finish(
+    plan: &PhysicalPlanNode,
+) -> SqlAuthoredPhysicalPlan {
     let control = Control::default();
     lower_final_physical_plan(
         plan,

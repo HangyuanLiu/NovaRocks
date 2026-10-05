@@ -30,7 +30,14 @@ use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType,
 };
 
-use super::physical_call_arguments::{PhysicalArgumentError, author_physical_argument_observed};
+use super::{
+    lowered_draft::{
+        CanonicalCallOperationalRequest, CheckedExpressionLogicalSourceEntry, SqlExpressionCallKind,
+    },
+    physical_call_arguments::{
+        PhysicalArgumentError, argument_types_exact_observed, author_physical_argument_observed,
+    },
+};
 
 #[derive(Debug)]
 pub(crate) enum PhysicalScalarRequestError {
@@ -43,6 +50,11 @@ pub(crate) enum PhysicalScalarRequestError {
 impl From<CompileControlError> for PhysicalScalarRequestError {
     fn from(error: CompileControlError) -> Self {
         Self::Control(error)
+    }
+}
+impl From<novarocks_type_contract::ValueTypeError> for PhysicalScalarRequestError {
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        PhysicalArgumentError::from(error).into()
     }
 }
 impl From<PhysicalArgumentError> for PhysicalScalarRequestError {
@@ -60,8 +72,18 @@ impl From<PhysicalArgumentError> for PhysicalScalarRequestError {
 pub(crate) struct AuthoredPhysicalScalarRequest<'a> {
     function: &'a BoundFunction,
     selected: Arc<FunctionBindingSelection>,
-    arguments: Vec<FunctionArgument>,
-    result_constraint: &'a FunctionValueType,
+    source: ScalarRequestSource<'a>,
+}
+#[derive(Debug)]
+enum ScalarRequestSource<'a> {
+    OwnedPhysical {
+        arguments: Vec<FunctionArgument>,
+        result_constraint: &'a FunctionValueType,
+    },
+    BorrowedCanonical {
+        captured: &'a crate::binding::CapturedLogicalCallArguments,
+        canonical: &'a CanonicalCallOperationalRequest,
+    },
 }
 impl AuthoredPhysicalScalarRequest<'_> {
     pub const fn function(&self) -> &BoundFunction {
@@ -71,12 +93,149 @@ impl AuthoredPhysicalScalarRequest<'_> {
         &self.selected
     }
     pub fn request(&self) -> FunctionBindingRequest<'_> {
-        FunctionBindingRequest {
-            arguments: &self.arguments,
-            logical_argument_count: self.arguments.len(),
-            expected_result_type: Some(self.result_constraint),
+        match &self.source {
+            ScalarRequestSource::OwnedPhysical {
+                arguments,
+                result_constraint,
+                ..
+            } => FunctionBindingRequest {
+                arguments,
+                logical_argument_count: arguments.len(),
+                expected_result_type: Some(*result_constraint),
+            },
+            ScalarRequestSource::BorrowedCanonical { canonical, .. } => canonical.request(),
         }
     }
+    /// Direct physical components have no captured SQL policy to infer.
+    pub fn captured_decimal_overflow_policy(
+        &self,
+    ) -> Option<novarocks_type_contract::DecimalOverflowPolicy> {
+        match &self.source {
+            ScalarRequestSource::OwnedPhysical { .. } => None,
+            ScalarRequestSource::BorrowedCanonical { captured, .. } => {
+                Some(captured.binding().decimal_overflow_policy())
+            }
+        }
+    }
+    pub fn captured_constant_policy(&self) -> Option<ConstantPolicy> {
+        match &self.source {
+            ScalarRequestSource::OwnedPhysical { .. } => None,
+            ScalarRequestSource::BorrowedCanonical { captured, .. } => {
+                Some(captured.constant_policy())
+            }
+        }
+    }
+}
+
+/// Borrow the sole same-emission request and selection from the checked SQL
+/// journal. Original None/CV/Lambda and the syntax result constraint travel
+/// unchanged; no physical literal is re-admitted or projected here. Exact
+/// signature checks authenticate data correspondence, not effects or a kernel.
+/// The caller owns entry, ordinary/success footer and source/type-walk admission.
+/// No new argument buffer or selected Arc is allocated by this adapter.
+pub(crate) fn author_physical_scalar_request_from_journal_observed<'source>(
+    entry: &CheckedExpressionLogicalSourceEntry<'source>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<AuthoredPhysicalScalarRequest<'source>, PhysicalScalarRequestError> {
+    let accepted = matches!(
+        entry.kind(),
+        SqlExpressionCallKind::Scalar
+            | SqlExpressionCallKind::ValueConversion
+            | SqlExpressionCallKind::DerivedVariant
+    );
+    work.step()?;
+    if !accepted {
+        return Err(PhysicalScalarRequestError::InvalidSource(
+            "scalar journal request has another lifecycle",
+        ));
+    }
+    let source = entry.source();
+    let ExprKind::FunctionCall { function, args } = &source.kind else {
+        return Err(PhysicalScalarRequestError::InvalidSource(
+            "scalar journal source is not its actual function call",
+        ));
+    };
+    let canonical = entry.canonical_operational();
+    work.step()?;
+    let canonical = canonical.ok_or(PhysicalScalarRequestError::InvalidSource(
+        "scalar journal has no same-emission operational request",
+    ))?;
+    let captured = entry.captured();
+    let belongs = canonical.belongs_to(captured);
+    work.step()?;
+    if !belongs {
+        return Err(PhysicalScalarRequestError::InvalidSource(
+            "scalar operational request loans another original binding",
+        ));
+    }
+    let request = canonical.request();
+    let selected = canonical.selected();
+    if args.len() > MAX_CALL_EFFECT_ARGUMENTS
+        || request.arguments.len() > MAX_CALL_EFFECT_ARGUMENTS
+        || selected.argument_types.len() > MAX_CALL_EFFECT_ARGUMENTS
+        || function.argument_types.len() > MAX_CALL_EFFECT_ARGUMENTS
+    {
+        return Err(CompileControlError::ResourceExhausted.into());
+    }
+    let resolved = captured.binding().resolved();
+    let matching = function.kind == FunctionKind::Scalar
+        && resolved.kind == FunctionKind::Scalar
+        && function.function_id == resolved.function_id
+        && selected.overload == function.overload
+        && selected.overload == resolved.selected.overload
+        && selected.aggregate.is_none()
+        && request.logical_argument_count == args.len()
+        && resolved.logical_argument_count == args.len()
+        && request.arguments.len() == args.len()
+        && function.argument_types.len() == args.len()
+        && selected.argument_types.len() == args.len();
+    work.step()?;
+    if !matching {
+        return Err(PhysicalScalarRequestError::InvalidSource(
+            "scalar journal identity or ordered argument count differs from its actual binding",
+        ));
+    }
+    for (expected, bound) in selected.argument_types.iter().zip(&function.argument_types) {
+        work.flush()?;
+        let matching =
+            argument_types_exact_observed::<PhysicalScalarRequestError>(expected, bound, work)?;
+        work.flush()?;
+        if !matching {
+            return Err(PhysicalScalarRequestError::InvalidSource(
+                "scalar journal selected full argument type differs from its actual binding",
+            ));
+        }
+    }
+    let FunctionResultType::Scalar(result) = &selected.result_type else {
+        return Err(PhysicalScalarRequestError::InvalidSource(
+            "scalar journal selection carries a relation result",
+        ));
+    };
+    for actual in [&function.result_type, &source.ty] {
+        work.flush()?;
+        let matching = result
+            .exactly_equals_observed::<PhysicalScalarRequestError>(actual, || {
+                work.step().map_err(PhysicalScalarRequestError::from)
+            })?;
+        work.flush()?;
+        if !matching {
+            return Err(PhysicalScalarRequestError::InvalidSource(
+                "scalar journal selected result differs from its actual complete type",
+            ));
+        }
+    }
+    work.flush()?;
+    let selected = Arc::clone(canonical.selected());
+    work.step()?;
+    work.flush()?;
+    Ok(AuthoredPhysicalScalarRequest {
+        function,
+        selected,
+        source: ScalarRequestSource::BorrowedCanonical {
+            captured,
+            canonical,
+        },
+    })
 }
 
 /// Preserve ordered actual argument definitions and the original physical
@@ -139,8 +298,10 @@ pub(crate) fn author_physical_scalar_request_observed<'a>(
     Ok(AuthoredPhysicalScalarRequest {
         function,
         selected,
-        arguments,
-        result_constraint: &source.ty,
+        source: ScalarRequestSource::OwnedPhysical {
+            arguments,
+            result_constraint: &source.ty,
+        },
     })
 }
 
@@ -170,3 +331,7 @@ pub(super) fn author_scalar_result_selection_observed(
 #[cfg(test)]
 #[path = "physical_scalar_requests_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "physical_scalar_journal_tests.rs"]
+mod journal_tests;

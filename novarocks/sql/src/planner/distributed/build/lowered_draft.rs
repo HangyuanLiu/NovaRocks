@@ -89,7 +89,7 @@ impl SqlAuthoredPhysicalPlan {
         self.checked_expression_source_observed(
             fragment,
             source,
-            SqlExpressionCallKind::Scalar,
+            Some(SqlExpressionCallKind::Scalar),
             work,
         )
     }
@@ -105,7 +105,7 @@ impl SqlAuthoredPhysicalPlan {
         self.checked_expression_source_observed(
             fragment,
             source,
-            SqlExpressionCallKind::ValueConversion,
+            Some(SqlExpressionCallKind::ValueConversion),
             work,
         )
     }
@@ -120,7 +120,7 @@ impl SqlAuthoredPhysicalPlan {
         self.checked_expression_source_observed(
             fragment,
             source,
-            SqlExpressionCallKind::DerivedVariant,
+            Some(SqlExpressionCallKind::DerivedVariant),
             work,
         )
     }
@@ -136,16 +136,27 @@ impl SqlAuthoredPhysicalPlan {
         self.checked_expression_source_observed(
             fragment,
             source,
-            SqlExpressionCallKind::Window,
+            Some(SqlExpressionCallKind::Window),
             work,
         )
+    }
+
+    /// Dispatch from the sealed original journal, never from a function name
+    /// or by trying another producer after a refusal.
+    pub(crate) fn checked_expression_call_source_observed<'a>(
+        &'a self,
+        fragment: &'a Fragment,
+        source: &'a novarocks_physical_plan::ExprNode,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<CheckedExpressionLogicalSourceEntry<'a>, SqlSourceJournalError> {
+        self.checked_expression_source_observed(fragment, source, None, work)
     }
 
     fn checked_expression_source_observed<'a>(
         &'a self,
         fragment: &'a Fragment,
         source: &'a novarocks_physical_plan::ExprNode,
-        kind: SqlExpressionCallKind,
+        kind: Option<SqlExpressionCallKind>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<CheckedExpressionLogicalSourceEntry<'a>, SqlSourceJournalError> {
         work.flush()?;
@@ -171,7 +182,7 @@ impl SqlAuthoredPhysicalPlan {
             .get(&(fragment.id(), source.id));
         work.step()?;
         let entry = entry.ok_or(SqlSourceJournalError::MissingEntry)?;
-        let same_kind = entry.kind == kind;
+        let same_kind = kind.is_none_or(|kind| entry.kind == kind);
         work.step()?;
         if !same_kind {
             return Err(SqlSourceJournalError::InvalidSource(
@@ -181,6 +192,7 @@ impl SqlAuthoredPhysicalPlan {
         validate_expression_source_entry_observed(entry, source, work)?;
         work.flush()?;
         Ok(CheckedExpressionLogicalSourceEntry {
+            owner: self,
             entry,
             fragment,
             source,
@@ -221,6 +233,7 @@ impl SqlAuthoredPhysicalPlan {
         validate_table_source_entry_observed(entry, source, work)?;
         work.flush()?;
         Ok(CheckedTableLogicalSourceEntry {
+            owner: self,
             entry,
             fragment,
             source,
@@ -470,11 +483,18 @@ impl<'a> CheckedWriterAggregateLogicalSourceEntry<'a> {
 /// Only the source owner can create this original emission loan. There is no
 /// conversion from a binding, a selected signature or captured data alone.
 pub(crate) struct CheckedExpressionLogicalSourceEntry<'a> {
+    owner: &'a SqlAuthoredPhysicalPlan,
     entry: &'a LoweredExpressionSourceEntry,
     fragment: &'a Fragment,
     source: &'a novarocks_physical_plan::ExprNode,
 }
 impl<'a> CheckedExpressionLogicalSourceEntry<'a> {
+    pub(crate) fn function_catalog(&self) -> &'a Arc<dyn crate::compiler::SqlFunctionCatalog> {
+        self.owner.function_catalog()
+    }
+    pub(super) const fn kind(&self) -> SqlExpressionCallKind {
+        self.entry.kind
+    }
     pub(crate) fn captured(&self) -> &'a CapturedLogicalCallArguments {
         self.entry.captured.captured()
     }
@@ -584,11 +604,15 @@ pub(super) fn validate_expression_source_entry_observed(
 
 /// Original table producer loan; constructors remain private to this journal.
 pub(crate) struct CheckedTableLogicalSourceEntry<'a> {
+    owner: &'a SqlAuthoredPhysicalPlan,
     entry: &'a LoweredTableSourceEntry,
     fragment: &'a Fragment,
     source: &'a PhysicalNode,
 }
 impl<'a> CheckedTableLogicalSourceEntry<'a> {
+    pub(crate) fn function_catalog(&self) -> &'a Arc<dyn crate::compiler::SqlFunctionCatalog> {
+        self.owner.function_catalog()
+    }
     pub(crate) fn canonical_operational(&self) -> &'a Arc<CanonicalCallOperationalRequest> {
         &self.entry.canonical_operational
     }
@@ -785,6 +809,9 @@ pub(crate) struct CanonicalCallOperationalRequest {
     pub(super) selected: Arc<novarocks_functions::FunctionBindingSelection>,
 }
 impl CanonicalCallOperationalRequest {
+    pub(crate) fn belongs_to(&self, captured: &CapturedLogicalCallArguments) -> bool {
+        std::ptr::eq(self.binding.resolved(), captured.binding().resolved())
+    }
     pub(crate) fn request(&self) -> novarocks_functions::FunctionBindingRequest<'_> {
         novarocks_functions::FunctionBindingRequest {
             arguments: &self.arguments,

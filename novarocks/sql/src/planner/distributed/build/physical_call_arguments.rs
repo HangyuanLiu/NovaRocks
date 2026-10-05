@@ -128,3 +128,45 @@ pub(crate) fn author_physical_argument_observed(
 #[cfg(test)]
 #[path = "physical_call_arguments_tests.rs"]
 mod tests;
+
+/// The sole borrowed exact Value/Lambda signature comparison, shared by
+/// original journal consumers. It grants neither source identity nor effects.
+pub(crate) fn argument_types_exact_observed<E>(
+    left: &novarocks_type_contract::FunctionArgumentType,
+    right: &novarocks_type_contract::FunctionArgumentType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, E>
+where
+    E: From<CompileControlError> + From<novarocks_type_contract::ValueTypeError>,
+{
+    use novarocks_type_contract::FunctionArgumentType;
+    work.step().map_err(E::from)?;
+    match (left, right) {
+        (FunctionArgumentType::Value(left), FunctionArgumentType::Value(right)) => {
+            left.exactly_equals_observed(right, || work.step().map_err(E::from))
+        }
+        (
+            FunctionArgumentType::Lambda {
+                parameter_types: left,
+                result_type: left_result,
+            },
+            FunctionArgumentType::Lambda {
+                parameter_types: right,
+                result_type: right_result,
+            },
+        ) => {
+            let same_count = left.len() == right.len();
+            work.step().map_err(E::from)?;
+            if !same_count {
+                return Ok(false);
+            }
+            for (left, right) in left.iter().zip(right) {
+                if !left.exactly_equals_observed(right, || work.step().map_err(E::from))? {
+                    return Ok(false);
+                }
+            }
+            left_result.exactly_equals_observed(right_result, || work.step().map_err(E::from))
+        }
+        _ => Ok(false),
+    }
+}

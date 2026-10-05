@@ -36,6 +36,7 @@ use novarocks_type_contract::{
 };
 
 use super::{
+    lowered_draft::{SqlAuthoredPhysicalPlan, SqlSourceJournalError},
     physical_call_arguments::{PhysicalArgumentError, author_physical_argument_observed},
     physical_scalar_occurrences::{
         PhysicalScalarOccurrenceError, PhysicalScalarOccurrenceInput,
@@ -43,6 +44,7 @@ use super::{
     },
     physical_scalar_requests::{
         AuthoredPhysicalScalarRequest, PhysicalScalarRequestError,
+        author_physical_scalar_request_from_journal_observed,
         author_physical_scalar_request_observed,
     },
     physical_window_occurrences::{
@@ -51,6 +53,7 @@ use super::{
     },
     physical_window_requests::{
         AuthoredPhysicalWindowRequest, PhysicalWindowRequestError,
+        author_physical_window_request_from_journal_observed,
         author_physical_window_request_observed,
     },
 };
@@ -93,6 +96,7 @@ pub(crate) enum PhysicalExpressionEffectsError {
     Control(CompileControlError),
     Roots(RootUseBindingError),
     Argument(PhysicalArgumentError),
+    Journal(SqlSourceJournalError),
     Request(PhysicalScalarRequestError),
     Scalar(PhysicalScalarOccurrenceError),
     WindowRequest(PhysicalWindowRequestError),
@@ -139,6 +143,7 @@ macro_rules! source_error {
         }
     };
 }
+source_error!(SqlSourceJournalError, Journal);
 source_error!(RootUseBindingError, Roots);
 source_error!(PhysicalArgumentError, Argument);
 source_error!(PhysicalScalarRequestError, Request);
@@ -181,8 +186,46 @@ pub(crate) fn author_physical_expression_effects_observed(
     functions: &dyn SqlFunctionCatalog,
     control: &dyn PureCompileControl,
 ) -> Result<AuthoredPhysicalExpressionEffects, PhysicalExpressionEffectsError> {
+    compose_expression_effects_observed(input, None, functions, control)
+}
+
+/// Production SQL borrows the original journal and immutable catalogue. Missing
+/// or foreign source facts never fall back to direct physical reconstruction.
+pub(crate) fn author_sql_expression_effects_observed(
+    owner: &SqlAuthoredPhysicalPlan,
+    input: PhysicalExpressionEffectsInput<'_>,
+    control: &dyn PureCompileControl,
+) -> Result<AuthoredPhysicalExpressionEffects, PhysicalExpressionEffectsError> {
+    compose_expression_effects_observed(
+        input,
+        Some(owner),
+        owner.function_catalog().as_ref(),
+        control,
+    )
+}
+
+fn compose_expression_effects_observed<'source>(
+    input: PhysicalExpressionEffectsInput<'source>,
+    owner: Option<&'source SqlAuthoredPhysicalPlan>,
+    functions: &dyn SqlFunctionCatalog,
+    control: &dyn PureCompileControl,
+) -> Result<AuthoredPhysicalExpressionEffects, PhysicalExpressionEffectsError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
     let result = (|| {
+        if let Some(owner) = owner {
+            let original = owner.plan().fragments().get(&input.fragment.id());
+            work.step()?;
+            let same = original.is_some_and(|fragment| std::ptr::eq(fragment, input.fragment))
+                && std::ptr::eq(owner.plan().constants(), input.constants)
+                && std::ptr::eq(owner.plan().parameters(), input.parameters)
+                && std::ptr::eq(owner.function_catalog().as_ref(), functions);
+            work.step()?;
+            if !same {
+                return Err(PhysicalExpressionEffectsError::InvalidSource(
+                    "SQL expression composition loans a foreign plan, pool, parameter or catalogue source",
+                ));
+            }
+        }
         work.flush()?;
         input.roots.validate_fragment(input.fragment, control)?;
         work.flush()?;
@@ -228,28 +271,72 @@ pub(crate) fn author_physical_expression_effects_observed(
                 if let std::collections::btree_map::Entry::Vacant(entry) = requests.entry(source.id)
                 {
                     let request = if matches!(source.kind, ExprKind::FunctionCall { .. }) {
-                        AuthoredPhysicalExpressionRequest::Scalar(
-                            author_physical_scalar_request_observed(
+                        AuthoredPhysicalExpressionRequest::Scalar(match owner {
+                            Some(owner) => {
+                                let entry = owner.checked_expression_call_source_observed(
+                                    input.fragment,
+                                    source,
+                                    &mut work,
+                                )?;
+                                author_physical_scalar_request_from_journal_observed(
+                                    &entry, &mut work,
+                                )?
+                            }
+                            None => author_physical_scalar_request_observed(
                                 source,
                                 definitions,
                                 input.constants,
                                 input.literal_policy,
                                 &mut work,
                             )?,
-                        )
+                        })
                     } else {
-                        AuthoredPhysicalExpressionRequest::Window(
-                            author_physical_window_request_observed(
+                        AuthoredPhysicalExpressionRequest::Window(match owner {
+                            Some(owner) => {
+                                let entry = owner.checked_expression_call_source_observed(
+                                    input.fragment,
+                                    source,
+                                    &mut work,
+                                )?;
+                                author_physical_window_request_from_journal_observed(
+                                    &entry,
+                                    input.constants,
+                                    &mut work,
+                                )?
+                            }
+                            None => author_physical_window_request_observed(
                                 source,
                                 input.fragment,
                                 input.constants,
                                 input.literal_policy,
                                 &mut work,
                             )?,
-                        )
+                        })
                     };
                     entry.insert(request);
                     work.step()?;
+                }
+                if owner.is_some() {
+                    let scope = &input.call_scopes[&id];
+                    let request = &requests[&source.id];
+                    let (decimal, constant) = match request {
+                        AuthoredPhysicalExpressionRequest::Scalar(request) => (
+                            request.captured_decimal_overflow_policy(),
+                            request.captured_constant_policy(),
+                        ),
+                        AuthoredPhysicalExpressionRequest::Window(request) => (
+                            request.captured_decimal_overflow_policy(),
+                            request.captured_constant_policy(),
+                        ),
+                    };
+                    let same = decimal == Some(scope.decimal_overflow_policy)
+                        && constant == Some(input.literal_policy);
+                    work.step()?;
+                    if !same {
+                        return Err(PhysicalExpressionEffectsError::InvalidSource(
+                            "SQL expression occurrence changes its original captured policy",
+                        ));
+                    }
                 }
             }
             work.step()?;

@@ -22,7 +22,7 @@ use std::sync::Arc;
 use novarocks_functions::{
     AggregateKernelPhase, AggregateOrderKey, AggregatePreparationOptions,
     AggregateWindowPreparationOptions, ConstantPolicy, FunctionArgument, FunctionBindingRequest,
-    FunctionBindingSelection, FunctionSpecializationFailure, KernelFailure,
+    FunctionBindingSelection, FunctionResultType, FunctionSpecializationFailure, KernelFailure,
     MAX_CALL_EFFECT_ARGUMENTS, PureCallPreparation, ScopedExpressionEffects, WindowCallOptions,
 };
 use novarocks_physical_plan::{
@@ -30,12 +30,18 @@ use novarocks_physical_plan::{
     NullOrdering, SortDirection, WindowBound, window_offset_observed,
 };
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, FunctionKind, FunctionValueType,
+    CompileCheckpoints, CompileControlError, CompilePhase, DecimalOverflowPolicy, FunctionKind,
+    FunctionValueType, ValueTypeError,
 };
 
 use super::{
     expression_occurrences::ExpressionOccurrenceError,
-    physical_call_arguments::{PhysicalArgumentError, author_physical_argument_observed},
+    lowered_draft::{
+        CanonicalCallOperationalRequest, CheckedExpressionLogicalSourceEntry, SqlExpressionCallKind,
+    },
+    physical_call_arguments::{
+        PhysicalArgumentError, argument_types_exact_observed, author_physical_argument_observed,
+    },
     physical_scalar_requests::author_scalar_result_selection_observed,
 };
 
@@ -71,14 +77,32 @@ impl From<KernelFailure> for PhysicalWindowRequestError {
     }
 }
 
+impl From<ValueTypeError> for PhysicalWindowRequestError {
+    fn from(error: ValueTypeError) -> Self {
+        Self::from(PhysicalArgumentError::from(error))
+    }
+}
+
+#[derive(Debug)]
+enum WindowRequestArguments<'a> {
+    OwnedPhysical {
+        arguments: Vec<FunctionArgument>,
+        logical_count: usize,
+        result_constraint: &'a FunctionValueType,
+    },
+    BorrowedCanonical {
+        request: &'a Arc<CanonicalCallOperationalRequest>,
+        decimal_policy: DecimalOverflowPolicy,
+        constant_policy: ConstantPolicy,
+    },
+}
+
 #[derive(Debug)]
 pub(crate) struct AuthoredPhysicalWindowRequest<'a> {
     source: &'a ExprNode,
     function: &'a BoundFunction,
     selected: Arc<FunctionBindingSelection>,
-    arguments: Vec<FunctionArgument>,
-    logical_count: usize,
-    result_constraint: &'a FunctionValueType,
+    arguments: WindowRequestArguments<'a>,
     window: WindowCallOptions,
     aggregate: Option<AggregatePreparationOptions>,
 }
@@ -93,10 +117,33 @@ impl AuthoredPhysicalWindowRequest<'_> {
         &self.selected
     }
     pub fn request(&self) -> FunctionBindingRequest<'_> {
-        FunctionBindingRequest {
-            arguments: &self.arguments,
-            logical_argument_count: self.logical_count,
-            expected_result_type: Some(self.result_constraint),
+        match &self.arguments {
+            WindowRequestArguments::OwnedPhysical {
+                arguments,
+                logical_count,
+                result_constraint,
+            } => FunctionBindingRequest {
+                arguments,
+                logical_argument_count: *logical_count,
+                expected_result_type: Some(result_constraint),
+            },
+            WindowRequestArguments::BorrowedCanonical { request, .. } => request.request(),
+        }
+    }
+    pub fn captured_decimal_overflow_policy(&self) -> Option<DecimalOverflowPolicy> {
+        match &self.arguments {
+            WindowRequestArguments::OwnedPhysical { .. } => None,
+            WindowRequestArguments::BorrowedCanonical { decimal_policy, .. } => {
+                Some(*decimal_policy)
+            }
+        }
+    }
+    pub fn captured_constant_policy(&self) -> Option<ConstantPolicy> {
+        match &self.arguments {
+            WindowRequestArguments::OwnedPhysical { .. } => None,
+            WindowRequestArguments::BorrowedCanonical {
+                constant_policy, ..
+            } => Some(*constant_policy),
         }
     }
     pub fn preparation(&self, arguments: ScopedExpressionEffects) -> PureCallPreparation {
@@ -155,42 +202,14 @@ pub(crate) fn author_physical_window_request_observed<'a>(
             "window channels differ from their selected signature",
         ));
     }
-    let aggregate = match (function.kind, aggregate_binding.as_deref()) {
-        (FunctionKind::Window, None) if !distinct && function_order_by.is_empty() => None,
-        (FunctionKind::Aggregate, Some(binding)) => {
-            let exact = binding.phase == AggregatePhase::Single
-                && binding.logical_argument_count as usize == args.len();
-            work.step()?;
-            if !exact {
-                return Err(PhysicalWindowRequestError::InvalidSource(
-                    "aggregate OVER requires its exact Single logical argument count",
-                ));
-            }
-            work.flush()?;
-            let mut keys = Vec::new();
-            keys.try_reserve_exact(function_order_by.len())
-                .map_err(|_| CompileControlError::ResourceExhausted)?;
-            for key in function_order_by {
-                keys.push(AggregateOrderKey {
-                    ascending: key.direction == SortDirection::Ascending,
-                    nulls_first: key.null_ordering == NullOrdering::First,
-                });
-                work.step()?;
-            }
-            work.flush()?;
-            Some(AggregatePreparationOptions {
-                phase: AggregateKernelPhase::Single,
-                distinct: *distinct,
-                order_keys: keys.into(),
-                state_input_type: None,
-            })
-        }
-        _ => {
-            return Err(PhysicalWindowRequestError::InvalidSource(
-                "window source kind and lifecycle binding differ",
-            ));
-        }
-    };
+    let aggregate = aggregate_options_observed(
+        function,
+        *distinct,
+        args.len(),
+        function_order_by,
+        aggregate_binding.as_deref(),
+        work,
+    )?;
     work.flush()?;
     let mut arguments = Vec::new();
     arguments
@@ -215,8 +234,263 @@ pub(crate) fn author_physical_window_request_observed<'a>(
     }
     let selected =
         author_scalar_result_selection_observed(function, aggregate_binding.as_deref(), work)?;
+    let window = window_options_observed(frame.as_ref(), *ignore_nulls, fragment, pools, work)?;
+    Ok(AuthoredPhysicalWindowRequest {
+        source,
+        function,
+        selected,
+        arguments: WindowRequestArguments::OwnedPhysical {
+            arguments,
+            logical_count: args.len(),
+            result_constraint: &source.ty,
+        },
+        window,
+        aggregate,
+    })
+}
+
+/// Borrow the original emitter's operational channels and the same selected
+/// Arc. Only frame offsets consult the original physical constant consumer;
+/// logical arguments are neither projected again nor admitted as literals.
+/// The caller owns immutable source/catalog/pool admission and the footer.
+pub(crate) fn author_physical_window_request_from_journal_observed<'source>(
+    entry: &CheckedExpressionLogicalSourceEntry<'source>,
+    pools: &ConstantPools,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<AuthoredPhysicalWindowRequest<'source>, PhysicalWindowRequestError> {
+    let is_window = entry.kind() == SqlExpressionCallKind::Window;
+    work.step()?;
+    if !is_window {
+        return Err(PhysicalWindowRequestError::InvalidSource(
+            "window journal has another source kind",
+        ));
+    }
+    let canonical = entry.canonical_operational();
+    work.step()?;
+    let canonical = canonical.ok_or(PhysicalWindowRequestError::InvalidSource(
+        "window journal has no canonical operational request",
+    ))?;
+    let belongs = canonical.belongs_to(entry.captured());
+    work.step()?;
+    if !belongs {
+        return Err(PhysicalWindowRequestError::InvalidSource(
+            "window canonical request has another original capture",
+        ));
+    }
+    let source = entry.source();
+    let ExprKind::WindowCall {
+        function,
+        distinct,
+        args,
+        function_order_by,
+        frame,
+        ignore_nulls,
+        aggregate_binding,
+    } = &source.kind
+    else {
+        return Err(PhysicalWindowRequestError::InvalidSource(
+            "window request is not an actual WindowCall",
+        ));
+    };
+    let count = args.len().checked_add(function_order_by.len());
+    work.step()?;
+    let count = count
+        .filter(|&count| count <= MAX_CALL_EFFECT_ARGUMENTS)
+        .ok_or(PhysicalWindowRequestError::TooManyArguments)?;
+    let request = canonical.request();
+    let selected = canonical.selected();
+    let complete_count = request.logical_argument_count == args.len()
+        && request.arguments.len() == count
+        && selected.argument_types.len() == count;
+    work.step()?;
+    if !complete_count {
+        return Err(PhysicalWindowRequestError::InvalidSource(
+            "window operational channel counts differ",
+        ));
+    }
+    work.flush()?;
+    let original = entry.captured().binding().resolved();
+    let identity = original.function_id == function.function_id
+        && original.kind == function.kind
+        && original.selected.overload == function.overload
+        && selected.overload == function.overload;
+    work.step()?;
+    work.flush()?;
+    if !identity {
+        return Err(PhysicalWindowRequestError::InvalidSource(
+            "window canonical binding has another identity",
+        ));
+    }
+    signature_observed(function, selected, work)?;
+    let FunctionResultType::Scalar(result) = &selected.result_type else {
+        return Err(PhysicalWindowRequestError::InvalidSource(
+            "window canonical result is not scalar",
+        ));
+    };
+    if !source.ty.exactly_equals_observed(result, || {
+        work.step().map_err(PhysicalWindowRequestError::from)
+    })? {
+        return Err(PhysicalWindowRequestError::InvalidSource(
+            "window source result differs from canonical result",
+        ));
+    }
+    match (&selected.aggregate, aggregate_binding.as_deref()) {
+        (None, None) => {}
+        (Some(state), Some(binding)) => {
+            signature_observed(&binding.function, selected, work)?;
+            work.flush()?;
+            let identity = binding.function.function_id == function.function_id
+                && binding.function.kind == function.kind
+                && state.state_argument_contract == binding.state_argument_contract
+                && state.state_format == binding.state_format;
+            work.step()?;
+            work.flush()?;
+            if !identity
+                || !state
+                    .intermediate_type
+                    .exactly_equals_observed(&binding.intermediate_type, || {
+                        work.step().map_err(PhysicalWindowRequestError::from)
+                    })?
+            {
+                return Err(PhysicalWindowRequestError::InvalidSource(
+                    "window aggregate canonical state metadata differs",
+                ));
+            }
+        }
+        _ => {
+            return Err(PhysicalWindowRequestError::InvalidSource(
+                "window aggregate canonical header differs",
+            ));
+        }
+    }
+    let aggregate = aggregate_options_observed(
+        function,
+        *distinct,
+        args.len(),
+        function_order_by,
+        aggregate_binding.as_deref(),
+        work,
+    )?;
+    let window =
+        window_options_observed(frame.as_ref(), *ignore_nulls, entry.fragment(), pools, work)?;
+    work.flush()?;
+    let selected = Arc::clone(selected);
+    work.step()?;
+    work.flush()?;
+    Ok(AuthoredPhysicalWindowRequest {
+        source,
+        function,
+        selected,
+        arguments: WindowRequestArguments::BorrowedCanonical {
+            request: canonical,
+            decimal_policy: entry.captured().binding().decimal_overflow_policy(),
+            constant_policy: entry.captured().constant_policy(),
+        },
+        window,
+        aggregate,
+    })
+}
+
+fn signature_observed(
+    function: &BoundFunction,
+    selected: &FunctionBindingSelection,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), PhysicalWindowRequestError> {
+    work.flush()?;
+    let header = function.overload == selected.overload
+        && function.argument_types.len() == selected.argument_types.len();
+    work.step()?;
+    work.flush()?;
+    if !header {
+        return Err(PhysicalWindowRequestError::InvalidSource(
+            "window canonical selected signature differs",
+        ));
+    }
+    for (left, right) in function
+        .argument_types
+        .iter()
+        .zip(selected.argument_types.iter())
+    {
+        if !argument_types_exact_observed::<PhysicalWindowRequestError>(left, right, work)? {
+            return Err(PhysicalWindowRequestError::InvalidSource(
+                "window canonical selected argument differs",
+            ));
+        }
+    }
+    let FunctionResultType::Scalar(result) = &selected.result_type else {
+        return Err(PhysicalWindowRequestError::InvalidSource(
+            "window canonical result is not scalar",
+        ));
+    };
+    if !function.result_type.exactly_equals_observed(result, || {
+        work.step().map_err(PhysicalWindowRequestError::from)
+    })? {
+        return Err(PhysicalWindowRequestError::InvalidSource(
+            "window canonical selected result differs",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "physical_window_journal_tests.rs"]
+mod journal_tests;
+
+fn aggregate_options_observed(
+    function: &BoundFunction,
+    distinct: bool,
+    logical_count: usize,
+    function_order_by: &[novarocks_physical_plan::SortExpr],
+    aggregate_binding: Option<&novarocks_physical_plan::AggregateBinding>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<AggregatePreparationOptions>, PhysicalWindowRequestError> {
+    let aggregate = match (function.kind, aggregate_binding) {
+        (FunctionKind::Window, None) if !distinct && function_order_by.is_empty() => None,
+        (FunctionKind::Aggregate, Some(binding)) => {
+            let exact = binding.phase == AggregatePhase::Single
+                && binding.logical_argument_count as usize == logical_count;
+            work.step()?;
+            if !exact {
+                return Err(PhysicalWindowRequestError::InvalidSource(
+                    "aggregate OVER requires its exact Single logical argument count",
+                ));
+            }
+            work.flush()?;
+            let mut keys = Vec::new();
+            keys.try_reserve_exact(function_order_by.len())
+                .map_err(|_| CompileControlError::ResourceExhausted)?;
+            for key in function_order_by {
+                keys.push(AggregateOrderKey {
+                    ascending: key.direction == SortDirection::Ascending,
+                    nulls_first: key.null_ordering == NullOrdering::First,
+                });
+                work.step()?;
+            }
+            work.flush()?;
+            Some(AggregatePreparationOptions {
+                phase: AggregateKernelPhase::Single,
+                distinct,
+                order_keys: keys.into(),
+                state_input_type: None,
+            })
+        }
+        _ => {
+            return Err(PhysicalWindowRequestError::InvalidSource(
+                "window source kind and lifecycle binding differ",
+            ));
+        }
+    };
+    Ok(aggregate)
+}
+
+fn window_options_observed(
+    frame: Option<&novarocks_physical_plan::WindowFrame>,
+    ignore_nulls: bool,
+    fragment: &Fragment,
+    pools: &ConstantPools,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<WindowCallOptions, PhysicalWindowRequestError> {
     let frame = frame
-        .as_ref()
         .map(|frame| {
             Ok::<_, PhysicalWindowRequestError>(novarocks_type_contract::WindowFrame {
                 units: frame.units,
@@ -227,18 +501,9 @@ pub(crate) fn author_physical_window_request_observed<'a>(
         })
         .transpose()?;
     work.flush()?;
-    let window = WindowCallOptions::try_new(frame, *ignore_nulls, work.control())?;
+    let window = WindowCallOptions::try_new(frame, ignore_nulls, work.control())?;
     work.flush()?;
-    Ok(AuthoredPhysicalWindowRequest {
-        source,
-        function,
-        selected,
-        arguments,
-        logical_count: args.len(),
-        result_constraint: &source.ty,
-        window,
-        aggregate,
-    })
+    Ok(window)
 }
 
 fn bound(

@@ -30,13 +30,13 @@ use novarocks_type_contract::DecimalOverflowPolicy;
 use std::sync::Mutex;
 
 #[path = "lowered_canonical_scalar_tests.rs"]
-mod lowered_canonical_scalar_tests;
+pub(in crate::planner::distributed::build) mod lowered_canonical_scalar_tests;
 
 #[path = "lowered_canonical_constraint_tests.rs"]
 mod lowered_canonical_constraint_tests;
 
 #[path = "lowered_operational_channel_tests.rs"]
-mod operational_tests;
+pub(in crate::planner::distributed::build) mod operational_tests;
 
 #[path = "lowered_operational_lambda_tests.rs"]
 mod lowered_operational_lambda_tests;
@@ -66,10 +66,10 @@ impl PureCompileControl for Control {
         }
     }
 }
-fn policy() -> novarocks_functions::ConstantPolicy {
+pub(in crate::planner::distributed::build) fn policy() -> novarocks_functions::ConstantPolicy {
     crate::constant::test_constant_policy()
 }
-fn text(text: &str) -> TypedExpr {
+pub(in crate::planner::distributed::build) fn text(text: &str) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Literal(LiteralValue::String(text.into())),
         value_type: ValueType::new(DataType::Utf8, false),
@@ -77,7 +77,10 @@ fn text(text: &str) -> TypedExpr {
 }
 // These typed fixtures exercise the actual emitter, not an optimizer or SQL
 // producer certification. The selected LOWER contract is the actual catalog's.
-fn lower_call(argument: TypedExpr, decimal: DecimalOverflowPolicy) -> TypedExpr {
+pub(in crate::planner::distributed::build) fn lower_call(
+    argument: TypedExpr,
+    decimal: DecimalOverflowPolicy,
+) -> TypedExpr {
     let arguments =
         [crate::analysis::function_argument(&argument, policy(), &Control::default()).unwrap()];
     let resolved = crate::functions::builtin_sql_function_catalog()
@@ -122,7 +125,9 @@ fn emission_plan(expression: TypedExpr) -> PhysicalPlanNode {
         probe_runtime_filters: vec![],
     }
 }
-fn authored(expression: TypedExpr) -> SqlAuthoredPhysicalPlan {
+pub(in crate::planner::distributed::build) fn authored(
+    expression: TypedExpr,
+) -> SqlAuthoredPhysicalPlan {
     let source = emission_plan(expression);
     let control = Control::default();
     lower_final_physical_plan(
@@ -138,7 +143,7 @@ fn authored(expression: TypedExpr) -> SqlAuthoredPhysicalPlan {
     .finish_observed(&control)
     .unwrap()
 }
-fn scalar_source(
+pub(in crate::planner::distributed::build) fn scalar_source(
     owner: &SqlAuthoredPhysicalPlan,
 ) -> (&Fragment, &novarocks_physical_plan::ExprNode) {
     for fragment in owner.plan().fragments().values() {

@@ -46,13 +46,16 @@ use super::{
     },
     physical_expression_effects::{
         PhysicalCallSourceScope, PhysicalExpressionEffectsError, PhysicalExpressionEffectsInput,
-        author_physical_expression_effects_observed,
+        author_physical_expression_effects_observed, author_sql_expression_effects_observed,
     },
     physical_table_occurrences::{
         PhysicalTableOccurrenceError, PhysicalTableOccurrenceInput,
         prepare_physical_table_occurrence_observed,
     },
-    physical_table_requests::{PhysicalTableRequestError, author_physical_table_request_observed},
+    physical_table_requests::{
+        PhysicalTableRequestError, author_physical_table_request_from_journal_observed,
+        author_physical_table_request_observed,
+    },
     physical_writer_occurrences::{
         PhysicalWriterOccurrenceError, PhysicalWriterOccurrenceInput,
         prepare_physical_writer_occurrence_observed,
@@ -148,43 +151,48 @@ pub(crate) fn author_physical_fragment_effects_observed(
     functions: &dyn SqlFunctionCatalog,
     control: &dyn PureCompileControl,
 ) -> Result<AuthoredPhysicalFragmentEffects, PhysicalFragmentEffectsError> {
-    compose_fragment_effects_observed(input, AggregateSources::DirectPhysical, functions, control)
+    compose_fragment_effects_observed(
+        input,
+        PhysicalCallSources::DirectPhysical,
+        functions,
+        control,
+    )
 }
 
-/// Require the actual SQL producer's journal for every aggregate lifecycle,
-/// including updates. Captured constants and true nonconstants are borrowed
+/// Require the actual SQL producer's journal for every expression, table and
+/// aggregate lifecycle. Captured constants and true nonconstants are borrowed
 /// from the original request, independently of physical expression folding.
 /// The supplied fragment, constants and parameters must loan this exact plan.
 /// Fresh preparation borrows the retained original immutable Functions Arc.
-/// Other source scopes remain caller obligations; this component is not full
-/// SQL source or Package publication.
-pub(crate) fn author_sql_aggregate_fragment_effects_observed(
+/// Per-use source scopes remain mandatory caller obligations. This composes
+/// fresh calls; it does not replace full static or Package publication gates.
+pub(crate) fn author_sql_fragment_effects_observed(
     owner: &SqlAuthoredPhysicalPlan,
     input: PhysicalFragmentEffectsInput<'_>,
     control: &dyn PureCompileControl,
 ) -> Result<AuthoredPhysicalFragmentEffects, PhysicalFragmentEffectsError> {
     compose_fragment_effects_observed(
         input,
-        AggregateSources::SqlJournal(owner),
+        PhysicalCallSources::SqlJournal(owner),
         owner.function_catalog().as_ref(),
         control,
     )
 }
 
-enum AggregateSources<'a> {
+enum PhysicalCallSources<'a> {
     DirectPhysical,
     SqlJournal(&'a SqlAuthoredPhysicalPlan),
 }
 
 fn compose_fragment_effects_observed(
     input: PhysicalFragmentEffectsInput<'_>,
-    sources: AggregateSources<'_>,
+    sources: PhysicalCallSources<'_>,
     functions: &dyn SqlFunctionCatalog,
     control: &dyn PureCompileControl,
 ) -> Result<AuthoredPhysicalFragmentEffects, PhysicalFragmentEffectsError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
     let result = (|| {
-        if let AggregateSources::SqlJournal(owner) = &sources {
+        if let PhysicalCallSources::SqlJournal(owner) = &sources {
             let original = owner.plan().fragments().get(&input.fragment.id());
             work.step()?;
             let same = original.is_some_and(|value| std::ptr::eq(value, input.fragment))
@@ -259,18 +267,22 @@ fn compose_fragment_effects_observed(
             ));
         }
         work.flush()?;
-        let expressions = author_physical_expression_effects_observed(
-            PhysicalExpressionEffectsInput {
-                fragment: input.fragment,
-                roots: &input.occurrences.root_uses,
-                constants: input.constants,
-                parameters: input.parameters,
-                literal_policy: input.literal_policy,
-                call_scopes: input.expression_scopes,
-            },
-            functions,
-            control,
-        )?;
+        let expression_input = PhysicalExpressionEffectsInput {
+            fragment: input.fragment,
+            roots: &input.occurrences.root_uses,
+            constants: input.constants,
+            parameters: input.parameters,
+            literal_policy: input.literal_policy,
+            call_scopes: input.expression_scopes,
+        };
+        let expressions = match &sources {
+            PhysicalCallSources::DirectPhysical => {
+                author_physical_expression_effects_observed(expression_input, functions, control)?
+            }
+            PhysicalCallSources::SqlJournal(owner) => {
+                author_sql_expression_effects_observed(owner, expression_input, control)?
+            }
+        };
         work.flush()?;
         let mut calls = expressions.calls;
         let total = calls
@@ -290,13 +302,37 @@ fn compose_fragment_effects_observed(
             let scope = scope.ok_or(PhysicalFragmentEffectsError::MissingScope(site))?;
             let frozen = match binding {
                 PhysicalCallBinding::Table(_) => {
-                    let request = author_physical_table_request_observed(
-                        scope.source,
-                        input.fragment,
-                        input.constants,
-                        input.literal_policy,
-                        work,
-                    )?;
+                    let request = match &sources {
+                        PhysicalCallSources::DirectPhysical => {
+                            author_physical_table_request_observed(
+                                scope.source,
+                                input.fragment,
+                                input.constants,
+                                input.literal_policy,
+                                work,
+                            )?
+                        }
+                        PhysicalCallSources::SqlJournal(owner) => {
+                            let entry = owner.checked_table_source_observed(
+                                input.fragment,
+                                scope.source,
+                                work,
+                            )?;
+                            let request =
+                                author_physical_table_request_from_journal_observed(&entry, work)?;
+                            let same = request.captured_constant_policy()
+                                == Some(input.literal_policy)
+                                && request.captured_decimal_overflow_policy()
+                                    == Some(scope.decimal_overflow_policy);
+                            work.step()?;
+                            if !same {
+                                return Err(PhysicalFragmentEffectsError::InvalidSource(
+                                    "SQL table occurrence changes its original captured policy",
+                                ));
+                            }
+                            request
+                        }
+                    };
                     let fresh = prepare_physical_table_occurrence_observed(
                         PhysicalTableOccurrenceInput {
                             fragment: input.fragment,
@@ -321,7 +357,7 @@ fn compose_fragment_effects_observed(
                             | PhysicalCallSite::WriterFinal { .. }
                     ) =>
                 {
-                    let AggregateSources::SqlJournal(owner) = &sources else {
+                    let PhysicalCallSources::SqlJournal(owner) = &sources else {
                         return Err(PhysicalFragmentEffectsError::UnsupportedLifecycle(site));
                     };
                     let source = writer_source(scope.source, site)?;
@@ -360,7 +396,7 @@ fn compose_fragment_effects_observed(
                 PhysicalCallBinding::Aggregate(_) => {
                     let source = aggregate_source(scope.source, site)?;
                     match &sources {
-                        AggregateSources::DirectPhysical => {
+                        PhysicalCallSources::DirectPhysical => {
                             let request = author_physical_aggregate_update_request_observed(
                                 source,
                                 scope.source,
@@ -388,7 +424,7 @@ fn compose_fragment_effects_observed(
                             )?
                             .frozen
                         }
-                        AggregateSources::SqlJournal(owner) => {
+                        PhysicalCallSources::SqlJournal(owner) => {
                             let entry = owner.checked_aggregate_source_observed(
                                 input.fragment,
                                 scope.source,
@@ -544,3 +580,7 @@ fn writer_source(
 #[cfg(test)]
 #[path = "physical_fragment_sql_writer_tests.rs"]
 mod sql_writer_tests;
+
+#[cfg(test)]
+#[path = "physical_fragment_sql_call_tests.rs"]
+mod sql_call_tests;

@@ -641,7 +641,9 @@ pub(crate) fn selected_binding_correspondence_observed(
     }
     for (original, actual) in selected.argument_types.iter().zip(&function.argument_types) {
         work.flush()?;
-        let matching = merge_argument_type_matches_observed(original, actual, work)?;
+        let matching = super::physical_call_arguments::argument_types_exact_observed::<
+            PhysicalAggregateRequestError,
+        >(original, actual, work)?;
         work.flush()?;
         if !matching {
             return Err(PhysicalAggregateRequestError::InvalidSource(
@@ -694,48 +696,6 @@ pub(crate) fn selected_binding_correspondence_observed(
     // No local state-domain/nullability inference: the original Functions owner
     // validates the actual state loan and aligns its cloned options exactly.
     Ok(())
-}
-
-fn merge_argument_type_matches_observed(
-    left: &novarocks_type_contract::FunctionArgumentType,
-    right: &novarocks_type_contract::FunctionArgumentType,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<bool, PhysicalAggregateRequestError> {
-    use novarocks_type_contract::FunctionArgumentType;
-    work.step()?;
-    match (left, right) {
-        (FunctionArgumentType::Value(left), FunctionArgumentType::Value(right)) => left
-            .exactly_equals_observed(right, || {
-                work.step().map_err(PhysicalAggregateRequestError::from)
-            }),
-        (
-            FunctionArgumentType::Lambda {
-                parameter_types: left,
-                result_type: left_result,
-            },
-            FunctionArgumentType::Lambda {
-                parameter_types: right,
-                result_type: right_result,
-            },
-        ) => {
-            let same_count = left.len() == right.len();
-            work.step()?;
-            if !same_count {
-                return Ok(false);
-            }
-            for (left, right) in left.iter().zip(right) {
-                if !left.exactly_equals_observed(right, || {
-                    work.step().map_err(PhysicalAggregateRequestError::from)
-                })? {
-                    return Ok(false);
-                }
-            }
-            left_result.exactly_equals_observed(right_result, || {
-                work.step().map_err(PhysicalAggregateRequestError::from)
-            })
-        }
-        _ => Ok(false),
-    }
 }
 
 #[cfg(test)]
