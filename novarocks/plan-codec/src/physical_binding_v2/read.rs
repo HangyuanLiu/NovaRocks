@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::owner_admission::{Admit, Policy};
 use super::*;
 use crate::{binding_index_v2::BindingIndex, physical_type_v2::DecodedTypeTable};
 use novarocks_type_contract::{FunctionId, FunctionOverloadId, FunctionValueType};
@@ -55,6 +56,26 @@ impl<'loan> PreparedFunctionBindingHeaders<'loan> {
         work.finish()?;
         Ok(result)
     }
+    /// Borrow the same receiving namespace/control using the parent's scope.
+    pub fn definition_in(
+        &self,
+        id: u32,
+        admit: &mut impl FnMut(&BindingProjectionFacts) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'loan wire::FunctionBindingDefinition>, BindingCodecError> {
+        admit(&super::owner_admission::lookup_facts(
+            self.definitions.len(),
+            crate::binding_index_v2::lookup_work_upper_bound(self.definitions.len()),
+        )?)?;
+        let same = std::ptr::addr_eq(work.control(), self.control);
+        work.step()?;
+        if !same {
+            return Err(invalid(
+                "binding header lookup has a different original control",
+            ));
+        }
+        self.definition_observed(id, work)
+    }
     pub(crate) fn definition_observed(
         &self,
         id: u32,
@@ -84,10 +105,6 @@ fn add(a: usize, b: usize) -> Result<usize, BindingCodecError> {
     a.checked_add(b)
         .ok_or_else(|| invalid("binding header arithmetic overflow"))
 }
-fn mul(a: usize, b: usize) -> Result<usize, BindingCodecError> {
-    a.checked_mul(b)
-        .ok_or_else(|| invalid("binding header arithmetic overflow"))
-}
 fn bytes<T>(count: usize) -> Result<usize, BindingCodecError> {
     Layout::array::<T>(count)
         .map(|layout| layout.size())
@@ -102,11 +119,20 @@ fn admit_work(
     arguments: usize,
     type_lookup_work: usize,
     limits: BindingProjectionLimits,
+    policy: Policy,
+    admit: &mut Admit<'_>,
 ) -> Result<(), BindingCodecError> {
+    let add = |a, b| policy.add(a, b, "binding header arithmetic overflow");
+    let mul = |a, b| policy.mul(a, b, "binding header arithmetic overflow");
     // All owned passes, index initialization/sort/duplicate checks, and each
     // original type-map lookup are admitted before their expansion loops.
     // Index capacity and allocator internals remain opaque host obligations.
     let definitions = mul(count, add(32, mul(add(height(count), 1)?, 16)?)?)?;
+    let definitions = if policy.0 {
+        definitions.max(crate::binding_index_v2::prepare_work_upper_bound(count)?)
+    } else {
+        definitions
+    };
     let references = mul(facts.type_reference_count, add(type_lookup_work, 8)?)?;
     facts.cumulative_work_upper_bound = add(
         add(128, definitions)?,
@@ -115,6 +141,7 @@ fn admit_work(
             add(references, mul(facts.request_bytes_upper_bound, 4)?)?,
         )?,
     )?;
+    policy.gate(facts, limits, admit)?;
     if facts.cumulative_work_upper_bound > limits.max_work {
         return Err(invalid("binding header work exceeds its envelope"));
     }
@@ -138,14 +165,21 @@ fn preflight(
     types: &DecodedTypeTable,
     source: usize,
     limits: BindingProjectionLimits,
+    policy: Policy,
+    admit: &mut Admit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<BindingProjectionFacts, BindingCodecError> {
-    if definitions.len() > limits.max_definitions {
+    let add = |a, b| policy.add(a, b, "binding header arithmetic overflow");
+    let mul = |a, b| policy.mul(a, b, "binding header arithmetic overflow");
+    if !policy.0 && definitions.len() > limits.max_definitions {
         return Err(invalid(
             "binding header definition count exceeds its envelope",
         ));
     }
-    let request_bytes = bytes::<usize>(definitions.len())?;
+    let request_bytes = policy.bytes::<usize>(
+        definitions.len(),
+        "binding header layout is unrepresentable",
+    )?;
     let mut facts = BindingProjectionFacts {
         definition_count: definitions.len(),
         type_reference_count: 0,
@@ -154,6 +188,17 @@ fn preflight(
         coexisting_source_and_request_bytes_upper_bound: add(source, request_bytes)?,
         cumulative_work_upper_bound: 0,
     };
+    if policy.0 {
+        admit_work(
+            &mut facts,
+            definitions.len(),
+            0,
+            add(types.value_types().len(), 1)?,
+            limits,
+            policy,
+            admit,
+        )?;
+    }
     if request_bytes > limits.max_request_bytes
         || facts.allocation_requests_upper_bound > limits.max_allocation_requests
         || facts.coexisting_source_and_request_bytes_upper_bound
@@ -177,9 +222,22 @@ fn preflight(
             )?,
         )?,
     )?;
-    source_floor(source, known)?;
+    if !policy.0 {
+        source_floor(source, known)?;
+    }
     let mut argument_count = 0;
-    admit_work(&mut facts, definitions.len(), 0, type_lookup_work, limits)?;
+    admit_work(
+        &mut facts,
+        definitions.len(),
+        0,
+        type_lookup_work,
+        limits,
+        policy,
+        admit,
+    )?;
+    if policy.0 {
+        source_floor(source, known)?;
+    }
     for definition in definitions {
         argument_count = add(argument_count, definition.arguments.len())?;
         known = add(
@@ -192,14 +250,21 @@ fn preflight(
                 bytes::<wire::FunctionArgumentType>(definition.arguments.capacity())?,
             )?,
         )?;
-        source_floor(source, known)?;
+        if !policy.0 {
+            source_floor(source, known)?;
+        }
         admit_work(
             &mut facts,
             definitions.len(),
             argument_count,
             type_lookup_work,
             limits,
+            policy,
+            admit,
         )?;
+        if policy.0 {
+            source_floor(source, known)?;
+        }
         work.step()?;
         for argument in &definition.arguments {
             let references = match &argument.kind {
@@ -214,14 +279,21 @@ fn preflight(
                 None => return Err(invalid("binding header argument kind is absent")),
             };
             facts.type_reference_count = add(facts.type_reference_count, references)?;
-            source_floor(source, known)?;
+            if !policy.0 {
+                source_floor(source, known)?;
+            }
             admit_work(
                 &mut facts,
                 definitions.len(),
                 argument_count,
                 type_lookup_work,
                 limits,
+                policy,
+                admit,
             )?;
+            if policy.0 {
+                source_floor(source, known)?;
+            }
             work.step()?;
         }
         let result_count = match &definition.result {
@@ -233,14 +305,21 @@ fn preflight(
             None => return Err(invalid("binding header result kind is absent")),
         };
         facts.type_reference_count = add(facts.type_reference_count, result_count)?;
-        source_floor(source, known)?;
+        if !policy.0 {
+            source_floor(source, known)?;
+        }
         admit_work(
             &mut facts,
             definitions.len(),
             argument_count,
             type_lookup_work,
             limits,
+            policy,
+            admit,
         )?;
+        if policy.0 {
+            source_floor(source, known)?;
+        }
         work.step()?;
     }
     Ok(facts)
@@ -314,14 +393,16 @@ fn validate(
     }
     Ok(())
 }
-fn prepare<'loan>(
+fn prepare<'loan, 'control: 'loan>(
     definitions: &'loan [wire::FunctionBindingDefinition],
     types: &'loan DecodedTypeTable,
     source: usize,
     limits: BindingProjectionLimits,
-    work: &mut CompileCheckpoints<'loan>,
+    policy: Policy,
+    admit: &mut Admit<'_>,
+    work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedFunctionBindingHeaders<'loan>, BindingCodecError> {
-    let facts = preflight(definitions, types, source, limits, work)?;
+    let facts = preflight(definitions, types, source, limits, policy, admit, work)?;
     validate(definitions, types, work)?;
     let indices = BindingIndex::prepare(definitions.len(), |at| definitions[at].id, work)?;
     Ok(PreparedFunctionBindingHeaders {
@@ -347,12 +428,40 @@ pub fn prepare_function_binding_headers<'loan>(
     control: &'loan dyn PureCompileControl,
 ) -> Result<PreparedFunctionBindingHeaders<'loan>, BindingCodecError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
-    let result = prepare(definitions, types, source_retained_bytes, limits, &mut work);
+    let result = prepare(
+        definitions,
+        types,
+        source_retained_bytes,
+        limits,
+        Policy(false),
+        &mut |_| Ok(()),
+        &mut work,
+    );
     if matches!(&result, Err(BindingCodecError::Control(_))) {
         return result;
     }
     work.finish()?;
     result
+}
+
+/// Same full header/index author, without entry/footer or replacement control.
+pub fn prepare_function_binding_headers_in<'loan, 'control: 'loan>(
+    definitions: &'loan [wire::FunctionBindingDefinition],
+    types: &'loan DecodedTypeTable,
+    source_retained_bytes: usize,
+    limits: BindingProjectionLimits,
+    admit: &mut impl FnMut(&BindingProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedFunctionBindingHeaders<'loan>, BindingCodecError> {
+    prepare(
+        definitions,
+        types,
+        source_retained_bytes,
+        limits,
+        Policy(true),
+        admit,
+        work,
+    )
 }
 
 #[cfg(test)]

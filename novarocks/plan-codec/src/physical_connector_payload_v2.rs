@@ -300,16 +300,25 @@ impl<'source, 'control> EncodedConnectorPayloads<'source, 'control> {
 
     /// This lower floor counts the original invoice once and current owned
     /// backing. It is not an allocator-capacity upper bound or a host grant.
+    // This is the necessary known header floor, not the original source B
+    // again and not a host grant. All operations are pure layout/arithmetic.
+    fn retained_floor_header(&self) -> Result<usize, Error> {
+        let mut floor = add(self.original_source_bytes, size_of::<Self>())?;
+        floor = add(floor, self.indices.backing_bytes()?)?;
+        add(
+            floor,
+            bytes::<wire::ConnectorPayloadDefinition>(self.wire.capacity())?,
+        )
+    }
+    pub(crate) fn retained_floor_header_admitted(&self) -> Result<usize, CompileControlError> {
+        self.retained_floor_header()
+            .map_err(|_| CompileControlError::ResourceExhausted)
+    }
     pub(crate) fn retained_floor_observed(
         &self,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<usize, Error> {
-        let mut floor = add(self.original_source_bytes, size_of::<Self>())?;
-        floor = add(floor, self.indices.backing_bytes()?)?;
-        floor = add(
-            floor,
-            bytes::<wire::ConnectorPayloadDefinition>(self.wire.capacity())?,
-        )?;
+        let mut floor = self.retained_floor_header()?;
         work.step()?;
         for definition in &self.wire {
             let payload = definition
@@ -393,16 +402,25 @@ impl<'wire, 'control> DecodedConnectorPayloads<'wire, 'control> {
     pub fn source_count(&self) -> usize {
         self.wire.len()
     }
+    // This is the necessary known header floor, not the original source B
+    // again and not a host grant. All operations are pure layout/arithmetic.
+    fn retained_floor_header(&self) -> Result<usize, Error> {
+        let mut floor = add(self.original_source_bytes, size_of::<Self>())?;
+        floor = add(floor, self.indices.backing_bytes()?)?;
+        add(
+            floor,
+            bytes::<ConnectorEncodedPayload>(self.payloads.capacity())?,
+        )
+    }
+    pub(crate) fn retained_floor_header_admitted(&self) -> Result<usize, CompileControlError> {
+        self.retained_floor_header()
+            .map_err(|_| CompileControlError::ResourceExhausted)
+    }
     pub(crate) fn retained_floor_observed(
         &self,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<usize, Error> {
-        let mut floor = add(self.original_source_bytes, size_of::<Self>())?;
-        floor = add(floor, self.indices.backing_bytes()?)?;
-        floor = add(
-            floor,
-            bytes::<ConnectorEncodedPayload>(self.payloads.capacity())?,
-        )?;
+        let mut floor = self.retained_floor_header()?;
         work.step()?;
         for payload in &self.payloads {
             let header = payload.header();

@@ -25,7 +25,7 @@
 use crate::{
     allocation_exit_v2::reserve_exit,
     binding_index_v2::BindingIndex,
-    borrowed_type_resources::verify_type_binding,
+    borrowed_type_resources::{verify_type_binding, verify_type_binding_admitted},
     physical_binding_v2::BindingCodecError,
     physical_connector_payload_v2::{
         ConnectorPayloadCodecError, DecodedConnectorPayloads, EncodedConnectorPayloads,
@@ -231,15 +231,45 @@ impl Model {
         self.work = add(self.work, mul(facts.cumulative_work_upper_bound, 2)?)?;
         Ok(())
     }
+    fn clone_requests(&mut self, requests: usize, bytes: usize) -> Result<(), Error> {
+        self.requests = add(self.requests, requests)?;
+        self.bytes = add(self.bytes, bytes)?;
+        self.dictionary_bytes = add(self.dictionary_bytes, bytes)?;
+        Ok(())
+    }
     fn clone_type(&mut self, facts: physical_type_v2::ValueTypeCloneFacts) -> Result<(), Error> {
-        self.requests = add(self.requests, facts.allocation_requests_upper_bound())?;
-        self.bytes = add(self.bytes, facts.allocation_request_bytes_upper_bound())?;
-        self.dictionary_bytes = add(
-            self.dictionary_bytes,
+        self.clone_requests(
+            facts.allocation_requests_upper_bound(),
             facts.allocation_request_bytes_upper_bound(),
         )?;
         self.work = add(self.work, mul(facts.work_upper_bound(), 2)?)?;
         Ok(())
+    }
+    fn numerical_facts(
+        &self,
+        n: usize,
+        source: usize,
+        l: ValueProjectionLimits,
+    ) -> Result<ValueProjectionFacts, Error> {
+        let coexist = add(source, self.bytes)?;
+        let work = add(self.work, add(mul(self.bytes, 4)?, self.requests)?)?;
+        if n > l.max_definitions
+            || self.references > l.max_origin_references
+            || self.requests > l.max_allocation_requests
+            || self.bytes > l.max_allocation_request_bytes
+            || coexist > l.max_coexisting_source_and_request_bytes
+            || work > l.max_work
+        {
+            return Err(CompileControlError::ResourceExhausted.into());
+        }
+        Ok(ValueProjectionFacts {
+            definition_count: n,
+            origin_reference_count: self.references,
+            allocation_requests_upper_bound: self.requests,
+            allocation_request_bytes_upper_bound: self.bytes,
+            coexisting_source_and_request_bytes_upper_bound: coexist,
+            cumulative_work_upper_bound: work,
+        })
     }
     fn gate(
         &self,
@@ -265,6 +295,129 @@ impl Model {
         })
     }
 }
+type ParentAdmission<'a> = dyn FnMut(&ValueProjectionFacts) -> Result<(), CompileControlError> + 'a;
+struct Admission<'borrow, 'callback> {
+    parent: Option<&'borrow mut ParentAdmission<'callback>>,
+}
+impl Admission<'_, '_> {
+    fn observed(&self) -> bool {
+        self.parent.is_some()
+    }
+    // Only arithmetic/Layout/model operations use this adapter. Ordinary
+    // source/type/origin errors retain their original author and category.
+    fn numeric<T>(&self, result: Result<T, Error>) -> Result<T, Error> {
+        if self.observed() {
+            result.map_err(|_| CompileControlError::ResourceExhausted.into())
+        } else {
+            result
+        }
+    }
+    fn gate(
+        &mut self,
+        model: &Model,
+        n: usize,
+        source: usize,
+        limits: ValueProjectionLimits,
+    ) -> Result<(), Error> {
+        if self.observed() {
+            let facts = self.numeric(model.numerical_facts(n, source, limits))?;
+            if let Some(parent) = &mut self.parent {
+                parent(&facts)?;
+            }
+        }
+        Ok(())
+    }
+    fn origin_prefix(
+        &mut self,
+        model: &mut Model,
+        next: &ValueOriginProjectionFacts,
+        previous: &mut Option<ValueOriginProjectionFacts>,
+        n: usize,
+        source: usize,
+        limits: ValueProjectionLimits,
+    ) -> Result<(), CompileControlError> {
+        let delta = |next: usize, previous: usize| {
+            next.checked_sub(previous)
+                .ok_or(CompileControlError::ResourceExhausted)
+        };
+        let prev = *previous;
+        let result = (|| -> Result<(), Error> {
+            model.references = self.numeric(add(
+                model.references,
+                delta(next.reference_count, prev.map_or(0, |f| f.reference_count))?,
+            ))?;
+            model.requests = self.numeric(add(
+                model.requests,
+                delta(
+                    next.allocation_requests_upper_bound,
+                    prev.map_or(0, |f| f.allocation_requests_upper_bound),
+                )?,
+            ))?;
+            model.bytes = self.numeric(add(
+                model.bytes,
+                delta(
+                    next.allocation_request_bytes_upper_bound,
+                    prev.map_or(0, |f| f.allocation_request_bytes_upper_bound),
+                )?,
+            ))?;
+            // One original numerical/decision pass and one later emission;
+            // only emission allocates, so its requests are accumulated once.
+            model.work = self.numeric(add(
+                model.work,
+                self.numeric(mul(
+                    delta(
+                        next.cumulative_work_upper_bound,
+                        prev.map_or(0, |f| f.cumulative_work_upper_bound),
+                    )?,
+                    2,
+                ))?,
+            ))?;
+            self.gate(model, n, source, limits)
+        })();
+        match result {
+            Ok(()) => {
+                *previous = Some(*next);
+                Ok(())
+            }
+            Err(Error::Control(cause)) => Err(cause),
+            Err(_) => unreachable!("only numerical origin contribution enters admission"),
+        }
+    }
+    fn gate_control(
+        &mut self,
+        model: &Model,
+        n: usize,
+        source: usize,
+        limits: ValueProjectionLimits,
+    ) -> Result<(), CompileControlError> {
+        match self.gate(model, n, source, limits) {
+            Ok(()) => Ok(()),
+            Err(Error::Control(cause)) => Err(cause),
+            Err(_) => unreachable!("pure admission preserves the typed numerical cause"),
+        }
+    }
+    fn complete(
+        &mut self,
+        model: &Model,
+        n: usize,
+        source: usize,
+        limits: ValueProjectionLimits,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<ValueProjectionFacts, Error> {
+        self.gate(model, n, source, limits)?;
+        model.gate(n, source, limits, work)
+    }
+}
+fn same_control(
+    expected: &dyn PureCompileControl,
+    work: &CompileCheckpoints<'_>,
+) -> Result<(), Error> {
+    if !std::ptr::addr_eq(expected, work.control()) {
+        return Err(invalid("value namespace belongs to another control"));
+    }
+    Ok(())
+}
+
 fn own_work(n: usize, payloads: usize, types: usize) -> Result<usize, Error> {
     let height = (usize::BITS - n.leading_zeros()) as usize;
     // Original source/count loops, two value-root lookup passes, and the sole
@@ -339,6 +492,7 @@ impl<'loan, 'source, 'control> EncodedValues<'loan, 'source, 'control> {
         id: u32,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<Option<&'source p::ValueDef>, Error> {
+        same_control(self.original_control(), w)?;
         Ok(self
             .indices
             .find(id, |at| self.inputs[at].source.id.get(), w)?
@@ -354,6 +508,7 @@ impl<'loan, 'source, 'control> EncodedValues<'loan, 'source, 'control> {
         value: &p::ValueDef,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<u32, Error> {
+        same_control(self.original_control(), w)?;
         let mut found = None;
         for input in self.inputs {
             let same = std::ptr::eq(input.source, value);
@@ -376,6 +531,7 @@ impl<'loan, 'source, 'control> EncodedValues<'loan, 'source, 'control> {
         &self,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<usize, Error> {
+        same_control(self.original_control(), w)?;
         let known = add(
             self.original_source_bytes,
             add(
@@ -430,6 +586,7 @@ impl<'loan, 'wire, 'control> DecodedValues<'loan, 'wire, 'control> {
         id: u32,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<Option<&p::ValueDef>, Error> {
+        same_control(self.original_control(), w)?;
         Ok(self
             .indices
             .find(id, |at| self.wire[at].id, w)?
@@ -447,6 +604,7 @@ impl<'loan, 'wire, 'control> DecodedValues<'loan, 'wire, 'control> {
         &self,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<usize, Error> {
+        same_control(self.original_control(), w)?;
         let known = add(
             self.original_source_bytes,
             add(
@@ -473,27 +631,87 @@ pub fn encode_values<'loan, 'source, 'control>(
     limits: ValueProjectionLimits,
 ) -> Result<EncodedValues<'loan, 'source, 'control>, Error> {
     let mut w = CompileCheckpoints::try_new(payloads.original_control(), CompilePhase::Encode)?;
-    let result = encode_core(inputs, payloads, types, source, limits, &mut w);
+    let result = encode_core(
+        inputs,
+        payloads,
+        types,
+        source,
+        limits,
+        &mut Admission { parent: None },
+        &mut w,
+    );
     finish(result, w)
 }
+/// Project the original Value sources on the caller's exact payload meter.
+/// The caller owns entry/footer and the truthful union source invoice. Prefix
+/// facts replace this child's prior contribution; they are not allocation grants.
+pub fn encode_values_observed_in<'loan, 'source, 'control>(
+    inputs: &'loan [ValueSource<'source>],
+    payloads: &'loan EncodedConnectorPayloads<'source, 'control>,
+    types: &'loan EncodedTypeTable<'source>,
+    source: usize,
+    limits: ValueProjectionLimits,
+    admit: &mut ParentAdmission<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<EncodedValues<'loan, 'source, 'control>, Error> {
+    encode_core(
+        inputs,
+        payloads,
+        types,
+        source,
+        limits,
+        &mut Admission {
+            parent: Some(admit),
+        },
+        work,
+    )
+}
+
 fn encode_core<'loan, 'source, 'control>(
     inputs: &'loan [ValueSource<'source>],
     payloads: &'loan EncodedConnectorPayloads<'source, 'control>,
     types: &'loan EncodedTypeTable<'source>,
     source: usize,
     l: ValueProjectionLimits,
+    admission: &mut Admission<'_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<EncodedValues<'loan, 'source, 'control>, Error> {
-    cap(inputs.len(), l.max_definitions, w)?;
-    let root = bytes::<ValueSource<'_>>(inputs.len())?;
+    same_control(payloads.original_control(), w)?;
+    if admission.observed() && inputs.len() > l.max_definitions {
+        return Err(CompileControlError::ResourceExhausted.into());
+    }
+    if !admission.observed() {
+        cap(inputs.len(), l.max_definitions, w)?;
+    }
+    let root = admission.numeric(bytes::<ValueSource<'_>>(inputs.len()))?;
     let mut model = Model::default();
-    model.request(bytes::<usize>(inputs.len())?)?;
-    model.request(bytes::<wire::ValueDefinition>(inputs.len())?)?;
-    model.work = own_work(
+    admission.numeric(model.request(admission.numeric(bytes::<usize>(inputs.len()))?))?;
+    admission
+        .numeric(model.request(admission.numeric(bytes::<wire::ValueDefinition>(inputs.len()))?))?;
+    model.work = admission.numeric(own_work(
         inputs.len(),
         payloads.source_count(),
         types.source_counts().0,
-    )?;
+    ))?;
+    if admission.observed() {
+        model.work = admission.numeric(add(
+            model
+                .work
+                .max(crate::binding_index_v2::prepare_work_upper_bound(
+                    inputs.len(),
+                )?),
+            admission.numeric(mul(
+                inputs.len(),
+                physical_type_v2::value_type_clone_preflight_work_upper_bound(),
+            ))?,
+        ))?;
+        admission.gate(&model, inputs.len(), source, l)?;
+        let payload_header = payloads.retained_floor_header_admitted()?;
+        if source < payload_header {
+            return Err(invalid("value source invoice omits original backing"));
+        }
+        cap(inputs.len(), l.max_definitions, w)?;
+    }
     cap(model.work, l.max_work, w)?;
     floor(source, root, w)?;
     floor(source, payloads.retained_floor_observed(w)?, w)?;
@@ -501,45 +719,100 @@ fn encode_core<'loan, 'source, 'control>(
     for input in inputs {
         let original = input.source;
         let source_clone = physical_type_v2::preflight_value_type_clone(&original.ty, w)?;
+        if admission.observed()
+            && source_clone.work_upper_bound()
+                > physical_type_v2::value_type_clone_preflight_work_upper_bound()
+        {
+            return Err(CompileControlError::ResourceExhausted.into());
+        }
         individual = individual.max(individual_floor(
             original,
             source_clone.allocation_request_bytes_upper_bound(),
             w,
         )?);
-        model.work = add(model.work, source_clone.work_upper_bound())?;
+        if !admission.observed() {
+            model.work = add(model.work, source_clone.work_upper_bound())?;
+        }
         floor(source, add(root, individual)?, w)?;
         let bound = types
             .value_type_observed(input.value_type_id, w)?
             .ok_or_else(|| invalid("value type ID is unknown"))?;
-        let checked = verify_type_binding(
-            &original.ty,
-            bound,
-            source,
-            l.max_work
-                .checked_sub(model.work)
-                .ok_or_else(|| invalid("value work envelope exhausted"))?,
-            w,
-        )?;
-        model.work = add(model.work, checked.work_upper_bound())?;
+        let remaining = l.max_work.checked_sub(model.work).ok_or_else(|| {
+            if admission.observed() {
+                CompileControlError::ResourceExhausted.into()
+            } else {
+                invalid("value work envelope exhausted")
+            }
+        })?;
+        let checked = if admission.observed() {
+            let base = model.work;
+            verify_type_binding_admitted::<Error>(
+                &original.ty,
+                bound,
+                source,
+                remaining,
+                &mut |facts| {
+                    model.work = admission.numeric(add(base, facts.work_upper_bound()))?;
+                    admission.gate(&model, inputs.len(), source, l)
+                },
+                w,
+            )?
+        } else {
+            let checked = verify_type_binding(&original.ty, bound, source, remaining, w)?;
+            model.work = add(model.work, checked.work_upper_bound())?;
+            checked
+        };
         if !checked.matches() {
             return Err(invalid("value full source type differs"));
         }
-        model.origin(origins::preflight_encode_observed(
-            &original.origin,
-            payloads,
-            source,
-            l.origins,
-            w,
-        )?)?;
+        if admission.observed() {
+            let mut previous = None;
+            origins::preflight_encode_admitted(
+                &original.origin,
+                payloads,
+                source,
+                l.origins,
+                &mut |facts| {
+                    admission.origin_prefix(
+                        &mut model,
+                        facts,
+                        &mut previous,
+                        inputs.len(),
+                        source,
+                        l,
+                    )
+                },
+                w,
+            )?;
+        } else {
+            model.origin(origins::preflight_encode_observed(
+                &original.origin,
+                payloads,
+                source,
+                l.origins,
+                w,
+            )?)?;
+        }
+        admission.gate(&model, inputs.len(), source, l)?;
         cap(model.work, l.max_work, w)?;
         w.step()?;
     }
-    let facts = model.gate(inputs.len(), source, l, w)?;
+    let facts = admission.complete(&model, inputs.len(), source, l, w)?;
     let indices = BindingIndex::prepare(inputs.len(), |at| inputs[at].source.id.get(), w)?;
     let mut output = reserve(inputs.len(), w)?;
     for input in inputs {
-        let (origin, _) =
-            origins::encode_observed(&input.source.origin, payloads, source, l.origins, w)?;
+        let (origin, _) = if admission.observed() {
+            origins::encode_admitted(
+                &input.source.origin,
+                payloads,
+                source,
+                l.origins,
+                &mut |_| admission.gate_control(&model, inputs.len(), source, l),
+                w,
+            )?
+        } else {
+            origins::encode_observed(&input.source.origin, payloads, source, l.origins, w)?
+        };
         output.push(wire::ValueDefinition {
             id: input.source.id.get(),
             value_type_id: Some(input.value_type_id),
@@ -565,44 +838,152 @@ pub fn decode_values<'loan, 'wire, 'control>(
     limits: ValueProjectionLimits,
 ) -> Result<DecodedValues<'loan, 'wire, 'control>, Error> {
     let mut w = CompileCheckpoints::try_new(payloads.original_control(), CompilePhase::Decode)?;
-    let result = decode_core(defs, payloads, types, source, limits, &mut w);
+    let result = decode_core(
+        defs,
+        payloads,
+        types,
+        source,
+        limits,
+        &mut Admission { parent: None },
+        &mut w,
+    );
     finish(result, w)
 }
+/// Materialize through the original type/origin owners without a private scope.
+/// This namespace is not a certified Fragment or Package.
+pub fn decode_values_observed_in<'loan, 'wire, 'control>(
+    defs: &'wire [wire::ValueDefinition],
+    payloads: &'loan DecodedConnectorPayloads<'wire, 'control>,
+    types: &'loan DecodedTypeTable,
+    source: usize,
+    limits: ValueProjectionLimits,
+    admit: &mut ParentAdmission<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<DecodedValues<'loan, 'wire, 'control>, Error> {
+    decode_core(
+        defs,
+        payloads,
+        types,
+        source,
+        limits,
+        &mut Admission {
+            parent: Some(admit),
+        },
+        work,
+    )
+}
+
 fn decode_core<'loan, 'wire, 'control>(
     defs: &'wire [wire::ValueDefinition],
     payloads: &'loan DecodedConnectorPayloads<'wire, 'control>,
     types: &'loan DecodedTypeTable,
     source: usize,
     l: ValueProjectionLimits,
+    admission: &mut Admission<'_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedValues<'loan, 'wire, 'control>, Error> {
-    cap(defs.len(), l.max_definitions, w)?;
+    same_control(payloads.original_control(), w)?;
+    if admission.observed() && defs.len() > l.max_definitions {
+        return Err(CompileControlError::ResourceExhausted.into());
+    }
+    if !admission.observed() {
+        cap(defs.len(), l.max_definitions, w)?;
+    }
     let mut model = Model::default();
-    model.request(bytes::<usize>(defs.len())?)?;
-    model.request(bytes::<p::ValueDef>(defs.len())?)?;
-    model.work = own_work(
+    admission.numeric(model.request(admission.numeric(bytes::<usize>(defs.len()))?))?;
+    admission.numeric(model.request(admission.numeric(bytes::<p::ValueDef>(defs.len()))?))?;
+    model.work = admission.numeric(own_work(
         defs.len(),
         payloads.source_count(),
         types.value_types().len(),
-    )?;
+    ))?;
+    if admission.observed() {
+        let clone_work = admission.numeric(mul(
+            defs.len(),
+            admission.numeric(mul(
+                physical_type_v2::value_type_clone_preflight_work_upper_bound(),
+                2,
+            ))?,
+        ))?;
+        model.work = admission.numeric(add(
+            model
+                .work
+                .max(crate::binding_index_v2::prepare_work_upper_bound(
+                    defs.len(),
+                )?),
+            clone_work,
+        ))?;
+        admission.gate(&model, defs.len(), source, l)?;
+        let payload_header = payloads.retained_floor_header_admitted()?;
+        if source < payload_header {
+            return Err(invalid("value source invoice omits original backing"));
+        }
+        cap(defs.len(), l.max_definitions, w)?;
+    }
     cap(model.work, l.max_work, w)?;
     floor(source, bytes::<wire::ValueDefinition>(defs.len())?, w)?;
     floor(source, payloads.retained_floor_observed(w)?, w)?;
     for def in defs {
         let value = typed(types, required(def.value_type_id, w)?, w)?;
-        let clone = physical_type_v2::preflight_value_type_clone(value, w)?;
-        model.clone_type(clone)?;
-        model.origin(origins::preflight_decode_observed(
-            origin(def, w)?,
-            payloads,
-            source,
-            l.origins,
-            w,
-        )?)?;
+        if admission.observed() {
+            let mut previous_requests = 0;
+            let mut previous_bytes = 0;
+            physical_type_v2::preflight_value_type_clone_admitted::<Error>(
+                value,
+                &mut |facts, _work| {
+                    if facts.work_upper_bound()
+                        > physical_type_v2::value_type_clone_preflight_work_upper_bound()
+                    {
+                        return Err(CompileControlError::ResourceExhausted.into());
+                    }
+                    let requests = facts
+                        .allocation_requests_upper_bound()
+                        .checked_sub(previous_requests)
+                        .ok_or(CompileControlError::ResourceExhausted)?;
+                    let bytes = facts
+                        .allocation_request_bytes_upper_bound()
+                        .checked_sub(previous_bytes)
+                        .ok_or(CompileControlError::ResourceExhausted)?;
+                    admission.numeric(model.clone_requests(requests, bytes))?;
+                    previous_requests = facts.allocation_requests_upper_bound();
+                    previous_bytes = facts.allocation_request_bytes_upper_bound();
+                    // Dictionary output requests are known now. Admission
+                    // precedes the sole clone walk's completed operation.
+                    admission.gate(&model, defs.len(), source, l)
+                },
+                w,
+            )?;
+        } else {
+            let clone = physical_type_v2::preflight_value_type_clone(value, w)?;
+            model.clone_type(clone)?;
+        }
+        if admission.observed() {
+            let original = origin(def, w)?;
+            let mut previous = None;
+            origins::preflight_decode_admitted(
+                original,
+                payloads,
+                source,
+                l.origins,
+                &mut |facts| {
+                    admission.origin_prefix(&mut model, facts, &mut previous, defs.len(), source, l)
+                },
+                w,
+            )?;
+        } else {
+            model.origin(origins::preflight_decode_observed(
+                origin(def, w)?,
+                payloads,
+                source,
+                l.origins,
+                w,
+            )?)?;
+        }
+        admission.gate(&model, defs.len(), source, l)?;
         cap(model.work, l.max_work, w)?;
         w.step()?;
     }
-    let facts = model.gate(defs.len(), source, l, w)?;
+    let facts = admission.complete(&model, defs.len(), source, l, w)?;
     let indices = BindingIndex::prepare(defs.len(), |at| defs[at].id, w)?;
     let mut output = reserve(defs.len(), w)?;
     for def in defs {
@@ -610,8 +991,18 @@ fn decode_core<'loan, 'wire, 'control>(
             typed(types, required(def.value_type_id, w)?, w)?,
             w,
         )?;
-        let (origin, _) =
-            origins::decode_observed(origin(def, w)?, payloads, source, l.origins, w)?;
+        let (origin, _) = if admission.observed() {
+            origins::decode_admitted(
+                origin(def, w)?,
+                payloads,
+                source,
+                l.origins,
+                &mut |_| admission.gate_control(&model, defs.len(), source, l),
+                w,
+            )?
+        } else {
+            origins::decode_observed(origin(def, w)?, payloads, source, l.origins, w)?
+        };
         output.push(p::ValueDef {
             id: p::ValueId::new(def.id),
             ty,

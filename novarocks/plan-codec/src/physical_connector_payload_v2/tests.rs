@@ -467,3 +467,40 @@ fn payload_namespace_bytes_and_arc_request_formulas_cover_exact_independent_layo
         1 + bytes_shared_upper().unwrap()
     );
 }
+
+#[test]
+fn original_namespace_header_resource_floor_uses_actual_layout_without_observation() {
+    let control = Control::default();
+    let encoded = encode_connector_payloads(&[], SOURCE, limits(), &control).unwrap();
+    let decoded = decode_connector_payloads(&[], SOURCE, limits(), &control).unwrap();
+    let before = trace(&control);
+    assert_eq!(
+        encoded.retained_floor_header_admitted().unwrap(),
+        SOURCE + std::mem::size_of_val(&encoded)
+    );
+    assert_eq!(
+        decoded.retained_floor_header_admitted().unwrap(),
+        SOURCE + std::mem::size_of_val(&decoded)
+    );
+    assert_eq!(trace(&control), before);
+    let unlimited = ConnectorPayloadProjectionLimits {
+        max_definitions: usize::MAX,
+        max_payload_bytes: usize::MAX,
+        max_allocation_requests: usize::MAX,
+        max_allocation_request_bytes: usize::MAX,
+        max_coexisting_source_and_request_bytes: usize::MAX,
+        max_work: usize::MAX,
+    };
+    let encoded = encode_connector_payloads(&[], usize::MAX, unlimited, &control).unwrap();
+    let decoded = decode_connector_payloads(&[], usize::MAX, unlimited, &control).unwrap();
+    let before = trace(&control);
+    assert_eq!(
+        encoded.retained_floor_header_admitted(),
+        Err(CompileControlError::ResourceExhausted)
+    );
+    assert_eq!(
+        decoded.retained_floor_header_admitted(),
+        Err(CompileControlError::ResourceExhausted)
+    );
+    assert_eq!(trace(&control), before);
+}

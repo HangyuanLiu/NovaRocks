@@ -809,3 +809,6 @@ fn value_origin_composing_original_meter_keeps_all_preflight_and_emission_contro
         );
     }
 }
+
+#[path = "owned_tests.rs"]
+mod owned_tests;

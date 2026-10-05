@@ -138,33 +138,114 @@ fn work_bound(sources: usize, potential_clone: bool) -> Result<usize, Error> {
         )?,
     )
 }
+type OriginAdmit<'a> =
+    dyn FnMut(&ValueOriginProjectionFacts) -> Result<(), CompileControlError> + 'a;
+
+// Plain keeps the historical standalone trace; Admitted borrows the parent's
+// scope and exposes the same numerical author before its completed callbacks.
+struct Admission<'a, 'callback> {
+    parent: Option<&'a mut OriginAdmit<'callback>>,
+}
+impl Admission<'_, '_> {
+    fn numeric<T>(&self, result: Result<T, Error>) -> Result<T, Error> {
+        match result {
+            Err(Error::InvalidShape(_)) if self.parent.is_some() => {
+                Err(CompileControlError::ResourceExhausted.into())
+            }
+            result => result,
+        }
+    }
+    fn gate(
+        &mut self,
+        references: usize,
+        source: usize,
+        clone_bytes: usize,
+        bound: usize,
+        limits: ValueOriginProjectionLimits,
+    ) -> Result<(), Error> {
+        if self.parent.is_none() {
+            return Ok(());
+        }
+        let facts = self.numeric(snapshot(references, source, clone_bytes, bound))?;
+        if facts.allocation_requests_upper_bound > limits.max_allocation_requests
+            || facts.allocation_request_bytes_upper_bound > limits.max_allocation_request_bytes
+            || facts.coexisting_source_and_request_bytes_upper_bound
+                > limits.max_coexisting_source_and_request_bytes
+            || facts.cumulative_work_upper_bound > limits.max_work
+        {
+            return Err(CompileControlError::ResourceExhausted.into());
+        }
+        if let Some(parent) = &mut self.parent {
+            parent(&facts)?;
+        }
+        Ok(())
+    }
+    fn floor(
+        &self,
+        source: usize,
+        known: usize,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), Error> {
+        if self.parent.is_some() && source < known {
+            return Err(invalid(
+                "value origin source invoice omits original namespace backing",
+            ));
+        }
+        floor(source, known, work)
+    }
+}
+fn snapshot(
+    references: usize,
+    source: usize,
+    clone_bytes: usize,
+    bound: usize,
+) -> Result<ValueOriginProjectionFacts, Error> {
+    Ok(ValueOriginProjectionFacts {
+        reference_count: references,
+        allocation_requests_upper_bound: usize::from(clone_bytes != 0),
+        allocation_request_bytes_upper_bound: clone_bytes,
+        coexisting_source_and_request_bytes_upper_bound: add(source, clone_bytes)?,
+        cumulative_work_upper_bound: bound,
+    })
+}
 fn facts(
     references: usize,
     source: usize,
     clone_bytes: usize,
     work_bound: usize,
     limits: ValueOriginProjectionLimits,
+    admission: &mut Admission<'_, '_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ValueOriginProjectionFacts, Error> {
-    let result = ValueOriginProjectionFacts {
-        reference_count: references,
-        allocation_requests_upper_bound: usize::from(clone_bytes != 0),
-        allocation_request_bytes_upper_bound: clone_bytes,
-        coexisting_source_and_request_bytes_upper_bound: add(source, clone_bytes)?,
-        cumulative_work_upper_bound: work_bound,
-    };
-    cap(
-        result.allocation_requests_upper_bound,
-        limits.max_allocation_requests,
-        work,
-    )?;
-    cap(clone_bytes, limits.max_allocation_request_bytes, work)?;
-    cap(
-        result.coexisting_source_and_request_bytes_upper_bound,
-        limits.max_coexisting_source_and_request_bytes,
-        work,
-    )?;
+    let result = admission.numeric(snapshot(references, source, clone_bytes, work_bound))?;
+    if admission.parent.is_some() {
+        admission.gate(references, source, clone_bytes, work_bound, limits)?;
+    } else {
+        cap(
+            result.allocation_requests_upper_bound,
+            limits.max_allocation_requests,
+            work,
+        )?;
+        cap(clone_bytes, limits.max_allocation_request_bytes, work)?;
+        cap(
+            result.coexisting_source_and_request_bytes_upper_bound,
+            limits.max_coexisting_source_and_request_bytes,
+            work,
+        )?;
+    }
     Ok(result)
+}
+fn same_control(
+    expected: &dyn novarocks_type_contract::PureCompileControl,
+    work: &CompileCheckpoints<'_>,
+) -> Result<(), Error> {
+    if std::ptr::addr_eq(expected, work.control()) {
+        Ok(())
+    } else {
+        Err(invalid(
+            "value origin caller work uses a different namespace control",
+        ))
+    }
 }
 fn required(id: Option<u32>) -> Result<u32, Error> {
     id.ok_or_else(|| invalid("value origin required reference is absent"))
@@ -284,15 +365,64 @@ pub(crate) fn encode_observed(
     limits: ValueOriginProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(wire::ValueOrigin, ValueOriginProjectionFacts), Error> {
-    let bound = work_bound(payloads.source_count(), false)?;
-    cap(bound, limits.max_work, work)?;
-    floor(source_bytes, size_of::<physical::ValueOrigin>(), work)?;
+    encode_core(
+        source,
+        payloads,
+        source_bytes,
+        limits,
+        &mut Admission { parent: None },
+        work,
+    )
+}
+
+pub(crate) fn encode_admitted(
+    source: &physical::ValueOrigin,
+    payloads: &EncodedConnectorPayloads<'_, '_>,
+    source_bytes: usize,
+    limits: ValueOriginProjectionLimits,
+    admit: &mut OriginAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(wire::ValueOrigin, ValueOriginProjectionFacts), Error> {
+    same_control(payloads.original_control(), work)?;
+    encode_core(
+        source,
+        payloads,
+        source_bytes,
+        limits,
+        &mut Admission {
+            parent: Some(admit),
+        },
+        work,
+    )
+}
+fn encode_core(
+    source: &physical::ValueOrigin,
+    payloads: &EncodedConnectorPayloads<'_, '_>,
+    source_bytes: usize,
+    limits: ValueOriginProjectionLimits,
+    admission: &mut Admission<'_, '_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(wire::ValueOrigin, ValueOriginProjectionFacts), Error> {
+    let bound = admission.numeric(work_bound(payloads.source_count(), false))?;
+    admission.gate(0, source_bytes, 0, bound, limits)?;
+    if admission.parent.is_some() {
+        let known = payloads.retained_floor_header_admitted()?;
+        if source_bytes < known {
+            return Err(invalid(
+                "value origin source invoice omits original namespace backing",
+            ));
+        }
+    }
+    if admission.parent.is_none() {
+        cap(bound, limits.max_work, work)?;
+    }
+    admission.floor(source_bytes, size_of::<physical::ValueOrigin>(), work)?;
     let retained = payloads.retained_floor_observed(work)?;
     // The original source can itself own the payload lent to this namespace:
     // summing the root and prior source invoice would double-count that owner.
     // This is a lower floor; the caller's complete coexistence invoice remains
     // mandatory and includes both source roots when independently retained.
-    floor(
+    admission.floor(
         source_bytes,
         retained.max(size_of::<physical::ValueOrigin>()),
         work,
@@ -370,8 +500,9 @@ pub(crate) fn encode_observed(
             1,
         ),
     };
+    admission.gate(references, source_bytes, 0, bound, limits)?;
     work.step()?;
-    let facts = facts(references, source_bytes, 0, bound, limits, work)?;
+    let facts = facts(references, source_bytes, 0, bound, limits, admission, work)?;
     Ok((wire::ValueOrigin { kind: Some(kind) }, facts))
 }
 
@@ -386,6 +517,19 @@ pub(crate) fn preflight_encode_observed(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ValueOriginProjectionFacts, Error> {
     encode_observed(source, payloads, source_bytes, limits, work).map(|(_, facts)| facts)
+}
+
+/// Validate with the original grammar and growing caller admission, without
+/// creating a control scope or requesting provider backing.
+pub(crate) fn preflight_encode_admitted(
+    source: &physical::ValueOrigin,
+    payloads: &EncodedConnectorPayloads<'_, '_>,
+    source_bytes: usize,
+    limits: ValueOriginProjectionLimits,
+    admit: &mut OriginAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ValueOriginProjectionFacts, Error> {
+    encode_admitted(source, payloads, source_bytes, limits, admit, work).map(|(_, facts)| facts)
 }
 
 /// Materialize the complete typed origin with the original namespace control.
@@ -416,17 +560,37 @@ fn decode_decision<'a>(
     payloads: &'a DecodedConnectorPayloads<'_, '_>,
     source_bytes: usize,
     limits: ValueOriginProjectionLimits,
+    admission: &mut Admission<'_, '_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(DecodedOriginDecision<'a>, ValueOriginProjectionFacts), Error> {
     let kind = source.kind.as_ref();
+    let early_bound = if admission.parent.is_some() {
+        let provider = matches!(kind, Some(wire::value_origin::Kind::ProviderField(_)));
+        let bound = admission.numeric(work_bound(payloads.source_count(), provider))?;
+        admission.gate(0, source_bytes, 0, bound, limits)?;
+        let known = payloads.retained_floor_header_admitted()?;
+        if source_bytes < known {
+            return Err(invalid(
+                "value origin source invoice omits original namespace backing",
+            ));
+        }
+        Some(bound)
+    } else {
+        None
+    };
     work.step()?;
     let kind = kind.ok_or_else(|| invalid("value origin kind is absent"))?;
     let provider = matches!(kind, wire::value_origin::Kind::ProviderField(_));
-    let bound = work_bound(payloads.source_count(), provider)?;
-    cap(bound, limits.max_work, work)?;
-    floor(source_bytes, size_of::<wire::ValueOrigin>(), work)?;
+    let bound = match early_bound {
+        Some(bound) => bound,
+        None => work_bound(payloads.source_count(), provider)?,
+    };
+    if admission.parent.is_none() {
+        cap(bound, limits.max_work, work)?;
+    }
+    admission.floor(source_bytes, size_of::<wire::ValueOrigin>(), work)?;
     let retained = payloads.retained_floor_observed(work)?;
-    floor(
+    admission.floor(
         source_bytes,
         retained.max(size_of::<wire::ValueOrigin>()),
         work,
@@ -443,8 +607,9 @@ fn decode_decision<'a>(
         } else {
             bytes_shared_upper()?
         };
+        admission.gate(2, source_bytes, clone_bytes, bound, limits)?;
         work.step()?;
-        let facts = facts(2, source_bytes, clone_bytes, bound, limits, work)?;
+        let facts = facts(2, source_bytes, clone_bytes, bound, limits, admission, work)?;
         return Ok((
             DecodedOriginDecision::Provider { scan_node, payload },
             facts,
@@ -517,8 +682,9 @@ fn decode_decision<'a>(
             1,
         ),
     };
+    admission.gate(references, source_bytes, 0, bound, limits)?;
     work.step()?;
-    let facts = facts(references, source_bytes, 0, bound, limits, work)?;
+    let facts = facts(references, source_bytes, 0, bound, limits, admission, work)?;
     Ok((DecodedOriginDecision::Inline(origin), facts))
 }
 
@@ -531,7 +697,37 @@ pub(crate) fn preflight_decode_observed(
     limits: ValueOriginProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ValueOriginProjectionFacts, Error> {
-    decode_decision(source, payloads, source_bytes, limits, work).map(|(_, facts)| facts)
+    decode_decision(
+        source,
+        payloads,
+        source_bytes,
+        limits,
+        &mut Admission { parent: None },
+        work,
+    )
+    .map(|(_, facts)| facts)
+}
+
+pub(crate) fn preflight_decode_admitted(
+    source: &wire::ValueOrigin,
+    payloads: &DecodedConnectorPayloads<'_, '_>,
+    source_bytes: usize,
+    limits: ValueOriginProjectionLimits,
+    admit: &mut OriginAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ValueOriginProjectionFacts, Error> {
+    same_control(payloads.original_control(), work)?;
+    decode_decision(
+        source,
+        payloads,
+        source_bytes,
+        limits,
+        &mut Admission {
+            parent: Some(admit),
+        },
+        work,
+    )
+    .map(|(_, facts)| facts)
 }
 
 pub(crate) fn decode_observed(
@@ -541,7 +737,45 @@ pub(crate) fn decode_observed(
     limits: ValueOriginProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(physical::ValueOrigin, ValueOriginProjectionFacts), Error> {
-    let (decision, facts) = decode_decision(source, payloads, source_bytes, limits, work)?;
+    decode_core(
+        source,
+        payloads,
+        source_bytes,
+        limits,
+        &mut Admission { parent: None },
+        work,
+    )
+}
+pub(crate) fn decode_admitted(
+    source: &wire::ValueOrigin,
+    payloads: &DecodedConnectorPayloads<'_, '_>,
+    source_bytes: usize,
+    limits: ValueOriginProjectionLimits,
+    admit: &mut OriginAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(physical::ValueOrigin, ValueOriginProjectionFacts), Error> {
+    same_control(payloads.original_control(), work)?;
+    decode_core(
+        source,
+        payloads,
+        source_bytes,
+        limits,
+        &mut Admission {
+            parent: Some(admit),
+        },
+        work,
+    )
+}
+fn decode_core(
+    source: &wire::ValueOrigin,
+    payloads: &DecodedConnectorPayloads<'_, '_>,
+    source_bytes: usize,
+    limits: ValueOriginProjectionLimits,
+    admission: &mut Admission<'_, '_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(physical::ValueOrigin, ValueOriginProjectionFacts), Error> {
+    let (decision, facts) =
+        decode_decision(source, payloads, source_bytes, limits, admission, work)?;
     let origin = match decision {
         DecodedOriginDecision::Inline(origin) => origin,
         DecodedOriginDecision::Provider { scan_node, payload } => {

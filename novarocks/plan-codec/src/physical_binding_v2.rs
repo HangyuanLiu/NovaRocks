@@ -29,6 +29,7 @@ use std::fmt;
 
 mod encode;
 mod materialize;
+mod owner_admission;
 pub(crate) use materialize::{
     Model as MaterializationModel, add, boxed, cap, completed, finish, mul, reserve,
 };
@@ -37,14 +38,17 @@ mod signature_copy;
 pub use materialize::{
     MaterializedFunctionBinding, MaterializedFunctionBindings,
     PreparedFunctionBindingsMaterialization, materialize_function_bindings,
-    prepare_function_bindings_materialization,
+    materialize_function_bindings_in, prepare_function_bindings_materialization,
+    prepare_function_bindings_materialization_in,
 };
-pub use read::{PreparedFunctionBindingHeaders, prepare_function_binding_headers};
+pub use read::{
+    PreparedFunctionBindingHeaders, prepare_function_binding_headers,
+    prepare_function_binding_headers_in,
+};
 pub(crate) use signature_copy::{
     copy_scalar_signature_observed, copy_table_signature_observed, preflight_scalar_signature_copy,
     preflight_scalar_signature_copy_counts, preflight_scalar_signature_copy_types,
-    preflight_table_signature_copy, preflight_table_signature_copy_counts,
-    preflight_table_signature_copy_types,
+    preflight_table_signature_copy_counts, preflight_table_signature_copy_types,
 };
 
 #[derive(Debug)]
@@ -156,6 +160,44 @@ impl<'loan, 'source> EncodedFunctionBindings<'loan, 'source> {
     pub fn facts(&self) -> &BindingProjectionFacts {
         &self.facts
     }
+    /// Borrow one actual source in this namespace after synchronous lookup
+    /// admission. No scope entry/footer, copied metadata or new source proof.
+    pub fn scalar_binding_in(
+        &self,
+        id: u32,
+        admit: &mut impl FnMut(&BindingProjectionFacts) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'source BoundFunction>, BindingCodecError> {
+        admit(&owner_admission::lookup_facts(
+            self.inputs.len(),
+            self.inputs.len(),
+        )?)?;
+        self.scalar_binding_observed(id, work)
+    }
+    pub fn table_binding_in(
+        &self,
+        id: u32,
+        admit: &mut impl FnMut(&BindingProjectionFacts) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'source BoundTableFunction>, BindingCodecError> {
+        admit(&owner_admission::lookup_facts(
+            self.inputs.len(),
+            self.inputs.len(),
+        )?)?;
+        self.table_binding_observed(id, work)
+    }
+    pub fn table_source_id_in(
+        &self,
+        source: &BoundTableFunction,
+        admit: &mut impl FnMut(&BindingProjectionFacts) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<u32, BindingCodecError> {
+        admit(&owner_admission::lookup_facts(
+            self.inputs.len(),
+            self.inputs.len(),
+        )?)?;
+        self.table_source_id_observed(source, work)
+    }
     pub(crate) fn type_sources(&self) -> &'loan EncodedTypeTable<'source> {
         self.types
     }
@@ -227,7 +269,15 @@ pub fn encode_function_bindings<'loan, 'source>(
     control: &dyn PureCompileControl,
 ) -> Result<EncodedFunctionBindings<'loan, 'source>, BindingCodecError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
-    let result = encode::encode(types, inputs, source_retained_bytes, limits, &mut work);
+    let result = encode::encode(
+        types,
+        inputs,
+        source_retained_bytes,
+        limits,
+        owner_admission::Policy(false),
+        &mut |_| Ok(()),
+        &mut work,
+    );
     if let Err(BindingCodecError::Control(cause)) = &result {
         return Err(BindingCodecError::Control(*cause));
     }
@@ -241,5 +291,36 @@ pub fn encode_function_bindings<'loan, 'source>(
     })
 }
 
+/// Same sender and original typed source loans, borrowing the parent's scope.
+/// Facts replace this call's previous prefix; source B is a single union.
+pub fn encode_function_bindings_in<'loan, 'source>(
+    types: &'loan EncodedTypeTable<'source>,
+    inputs: &'loan [FunctionBindingInput<'source>],
+    source_retained_bytes: usize,
+    limits: BindingProjectionLimits,
+    admit: &mut impl FnMut(&BindingProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<EncodedFunctionBindings<'loan, 'source>, BindingCodecError> {
+    let (definitions, facts) = encode::encode(
+        types,
+        inputs,
+        source_retained_bytes,
+        limits,
+        owner_admission::Policy(true),
+        admit,
+        work,
+    )?;
+    Ok(EncodedFunctionBindings {
+        definitions,
+        inputs,
+        types,
+        facts,
+    })
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "physical_binding_v2/owner_tests.rs"]
+mod owner_tests;

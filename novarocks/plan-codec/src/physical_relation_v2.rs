@@ -195,8 +195,16 @@ fn floor(source: usize, known: usize, w: &mut CompileCheckpoints<'_>) -> Result<
 // other source owners remain in the caller's complete invoice. Distinct IDs
 // can borrow the same relation, so the namespace uses the maximum individual
 // footprint rather than charging these allocations per occurrence.
+#[cfg(test)]
 fn individual_relation_floor(
     relation: &p::Relation,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<(usize, usize), Error> {
+    individual_relation_floor_in(relation, &mut Model::default(), w)
+}
+fn individual_relation_floor_in(
+    relation: &p::Relation,
+    model: &mut Model<'_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(usize, usize), Error> {
     let properties = relation.provided_properties();
@@ -237,7 +245,11 @@ fn individual_relation_floor(
         // The same topology author describes the already retained root-owned
         // Dictionary Boxes here. FieldRef descendants remain shared; encoding
         // does not clone this source or add these bytes to output requests.
-        let topology = physical_type_v2::preflight_value_type_clone(&field.ty, w)?;
+        let topology = if model.observed() {
+            model.clone_prefix(&field.ty, w, false)?
+        } else {
+            physical_type_v2::preflight_value_type_clone(&field.ty, w)?
+        };
         known = add(known, topology.allocation_request_bytes_upper_bound())?;
         extra_work = add(extra_work, topology.work_upper_bound())?;
         w.step()?;
@@ -314,7 +326,8 @@ fn decode_guarantee(v: i32) -> Result<p::PredicateGuaranteeKind, Error> {
     )
 }
 #[derive(Default)]
-struct Model {
+struct Model<'a> {
+    admission: Option<Admission<'a>>,
     fields: usize,
     guarantees: usize,
     kinds: usize,
@@ -322,28 +335,204 @@ struct Model {
     requests: usize,
     bytes: usize,
     work: usize,
+    base_work: usize,
 }
-impl Model {
-    fn request(&mut self, n: usize) -> Result<(), Error> {
-        if n != 0 {
-            self.requests = add(self.requests, 1)?;
-            self.bytes = add(self.bytes, n)?;
+type Admit<'a> = dyn FnMut(&RelationProjectionFacts) -> Result<(), CompileControlError> + 'a;
+struct Admission<'a> {
+    definitions: usize,
+    source: usize,
+    limits: RelationProjectionLimits,
+    callback: &'a mut Admit<'a>,
+}
+impl Model<'_> {
+    fn sum(&self, left: usize, right: usize) -> Result<usize, Error> {
+        if self.observed() {
+            left.checked_add(right)
+                .ok_or_else(|| CompileControlError::ResourceExhausted.into())
+        } else {
+            add(left, right)
+        }
+    }
+    fn product(&self, left: usize, right: usize) -> Result<usize, Error> {
+        if self.observed() {
+            left.checked_mul(right)
+                .ok_or_else(|| CompileControlError::ResourceExhausted.into())
+        } else {
+            mul(left, right)
+        }
+    }
+    fn buffer_bytes<T>(&self, count: usize) -> Result<usize, Error> {
+        if self.observed() {
+            Layout::array::<T>(count)
+                .map(|layout| layout.size())
+                .map_err(|_| Error::Control(CompileControlError::ResourceExhausted))
+        } else {
+            bytes::<T>(count)
+        }
+    }
+    fn prefix(&mut self) -> Result<(), Error> {
+        if let Some(admission) = self.admission.as_ref() {
+            let facts = self.numerical_facts(admission.definitions, admission.source)?;
+            let l = admission.limits;
+            for (value, maximum) in [
+                (facts.definition_count, l.max_definitions),
+                (facts.schema_field_count, l.max_schema_fields),
+                (facts.predicate_guarantee_count, l.max_predicate_guarantees),
+                (facts.metadata_kind_bytes, l.max_metadata_kind_bytes),
+                (facts.coverage_bytes, l.max_coverage_bytes),
+                (
+                    facts.allocation_requests_upper_bound,
+                    l.max_allocation_requests,
+                ),
+                (
+                    facts.allocation_request_bytes_upper_bound,
+                    l.max_allocation_request_bytes,
+                ),
+                (
+                    facts.coexisting_source_and_request_bytes_upper_bound,
+                    l.max_coexisting_source_and_request_bytes,
+                ),
+                (facts.cumulative_work_upper_bound, l.max_work),
+            ] {
+                if value > maximum {
+                    return Err(CompileControlError::ResourceExhausted.into());
+                }
+            }
+            (self.admission.as_mut().expect("admission exists").callback)(&facts)?;
         }
         Ok(())
     }
+    fn observed(&self) -> bool {
+        self.admission.is_some()
+    }
+    fn numerical_facts(&self, n: usize, source: usize) -> Result<RelationProjectionFacts, Error> {
+        Ok(RelationProjectionFacts {
+            definition_count: n,
+            schema_field_count: self.fields,
+            predicate_guarantee_count: self.guarantees,
+            metadata_kind_bytes: self.kinds,
+            coverage_bytes: self.coverage,
+            allocation_requests_upper_bound: self.requests,
+            allocation_request_bytes_upper_bound: self.bytes,
+            coexisting_source_and_request_bytes_upper_bound: self.sum(source, self.bytes)?,
+            cumulative_work_upper_bound: self.sum(
+                self.work,
+                self.sum(self.product(self.bytes, 4)?, self.requests)?,
+            )?,
+        })
+    }
+
+    fn own_prefix(
+        &mut self,
+        n: usize,
+        reads: usize,
+        payloads: usize,
+        types: usize,
+    ) -> Result<(), Error> {
+        if self.observed() {
+            let next = own_work_mode(
+                n,
+                self.fields,
+                self.guarantees,
+                reads,
+                payloads,
+                types,
+                true,
+            )?;
+            self.work = self.sum(
+                self.work,
+                next.checked_sub(self.base_work)
+                    .ok_or_else(|| invalid("relation work prefix decreased"))?,
+            )?;
+            self.base_work = next;
+            self.prefix()?;
+        }
+        Ok(())
+    }
+    fn clone_prefix(
+        &mut self,
+        ty: &novarocks_type_contract::FunctionValueType,
+        w: &mut CompileCheckpoints<'_>,
+        copying: bool,
+    ) -> Result<physical_type_v2::ValueTypeCloneFacts, Error> {
+        let mut previous = (0, 0, 0);
+        physical_type_v2::preflight_value_type_clone_admitted(
+            ty,
+            &mut |facts, _| {
+                let next = (
+                    facts.allocation_requests_upper_bound(),
+                    facts.allocation_request_bytes_upper_bound(),
+                    facts.work_upper_bound(),
+                );
+                if copying {
+                    self.requests = self.sum(
+                        self.requests,
+                        next.0
+                            .checked_sub(previous.0)
+                            .ok_or_else(|| invalid("relation clone requests decreased"))?,
+                    )?;
+                    self.bytes = self.sum(
+                        self.bytes,
+                        next.1
+                            .checked_sub(previous.1)
+                            .ok_or_else(|| invalid("relation clone bytes decreased"))?,
+                    )?;
+                }
+                self.work = self.sum(
+                    self.work,
+                    self.product(
+                        next.2
+                            .checked_sub(previous.2)
+                            .ok_or_else(|| invalid("relation clone work decreased"))?,
+                        if copying { 2 } else { 1 },
+                    )?,
+                )?;
+                previous = next;
+                self.prefix()
+            },
+            w,
+        )
+    }
+    fn request(&mut self, n: usize) -> Result<(), Error> {
+        if n != 0 {
+            self.requests = self.sum(self.requests, 1)?;
+            self.bytes = self.sum(self.bytes, n)?;
+        }
+        self.prefix()
+    }
     fn twice<T>(&mut self, n: usize) -> Result<(), Error> {
-        self.request(bytes::<T>(n)?)?;
-        self.request(bytes::<T>(n)?)?;
+        self.request(self.buffer_bytes::<T>(n)?)?;
+        self.request(self.buffer_bytes::<T>(n)?)?;
         Ok(())
     }
     fn properties(
         &mut self,
         f: physical_properties_v2::PhysicalPropertyProjectionFacts,
     ) -> Result<(), Error> {
-        self.requests = add(self.requests, f.allocation_requests_upper_bound)?;
-        self.bytes = add(self.bytes, f.allocation_request_bytes_upper_bound)?;
-        self.work = add(self.work, mul(f.cumulative_work_upper_bound, 2)?)?;
-        Ok(())
+        if let Some(admission) = self.admission.as_ref() {
+            let l = admission.limits.properties;
+            for (value, maximum) in [
+                (f.value_reference_count, l.max_value_references),
+                (f.allocation_requests_upper_bound, l.max_allocation_requests),
+                (
+                    f.allocation_request_bytes_upper_bound,
+                    l.max_allocation_request_bytes,
+                ),
+                (
+                    f.coexisting_source_and_request_bytes_upper_bound,
+                    l.max_coexisting_source_and_request_bytes,
+                ),
+                (f.cumulative_work_upper_bound, l.max_work),
+            ] {
+                if value > maximum {
+                    return Err(CompileControlError::ResourceExhausted.into());
+                }
+            }
+        }
+        self.requests = self.sum(self.requests, f.allocation_requests_upper_bound)?;
+        self.bytes = self.sum(self.bytes, f.allocation_request_bytes_upper_bound)?;
+        self.work = self.sum(self.work, self.product(f.cumulative_work_upper_bound, 2)?)?;
+        self.prefix()
     }
     fn gate(
         &self,
@@ -352,15 +541,26 @@ impl Model {
         l: RelationProjectionLimits,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<RelationProjectionFacts, Error> {
+        if self.observed() {
+            // All known axes have already been synchronously admitted. These
+            // are the original completed facts checks, not another scope.
+            for _ in 0..8 {
+                w.step()?;
+            }
+            return self.numerical_facts(n, source);
+        }
         cap(self.fields, l.max_schema_fields, w)?;
         cap(self.guarantees, l.max_predicate_guarantees, w)?;
         cap(self.kinds, l.max_metadata_kind_bytes, w)?;
         cap(self.coverage, l.max_coverage_bytes, w)?;
         cap(self.requests, l.max_allocation_requests, w)?;
         cap(self.bytes, l.max_allocation_request_bytes, w)?;
-        let coexist = add(source, self.bytes)?;
+        let coexist = self.sum(source, self.bytes)?;
         cap(coexist, l.max_coexisting_source_and_request_bytes, w)?;
-        let work = add(self.work, add(mul(self.bytes, 4)?, self.requests)?)?;
+        let work = self.sum(
+            self.work,
+            self.sum(self.product(self.bytes, 4)?, self.requests)?,
+        )?;
         cap(work, l.max_work, w)?;
         Ok(RelationProjectionFacts {
             definition_count: n,
@@ -383,17 +583,58 @@ fn own_work(
     payload_count: usize,
     type_count: usize,
 ) -> Result<usize, Error> {
+    own_work_mode(
+        n,
+        fields,
+        guarantees,
+        read_count,
+        payload_count,
+        type_count,
+        false,
+    )
+}
+fn own_work_mode(
+    n: usize,
+    fields: usize,
+    guarantees: usize,
+    read_count: usize,
+    payload_count: usize,
+    type_count: usize,
+    observed: bool,
+) -> Result<usize, Error> {
+    let sum = |left: usize, right: usize| {
+        if observed {
+            left.checked_add(right)
+                .ok_or_else(|| CompileControlError::ResourceExhausted.into())
+        } else {
+            add(left, right)
+        }
+    };
+    let product = |left: usize, right: usize| {
+        if observed {
+            left.checked_mul(right)
+                .ok_or_else(|| CompileControlError::ResourceExhausted.into())
+        } else {
+            mul(left, right)
+        }
+    };
     let h = (usize::BITS - n.leading_zeros()) as usize;
     // Two source/ref lookup passes (preflight + emission), prior read floor,
     // and the sole index sort. Linear source-count bounds also conservatively
     // cover opaque decoded BTreeMap lookups; no inside-library quantum claim.
-    add(
+    sum(
         1024,
-        add(
-            mul(n, add(128, add(mul(h + 1, 16)?, mul(read_count, 4)?)?)?)?,
-            add(
-                mul(fields, add(128, mul(add(payload_count, type_count)?, 4)?)?)?,
-                add(mul(guarantees, 16)?, mul(read_count, 16)?)?,
+        sum(
+            product(
+                n,
+                sum(128, sum(product(h + 1, 16)?, product(read_count, 4)?)?)?,
+            )?,
+            sum(
+                product(
+                    fields,
+                    sum(128, product(sum(payload_count, type_count)?, 4)?)?,
+                )?,
+                sum(product(guarantees, 16)?, product(read_count, 16)?)?,
             )?,
         )?,
     )
@@ -434,6 +675,29 @@ impl<'loan, 'source, 'control> EncodedRelations<'loan, 'source, 'control> {
         let mut w = CompileCheckpoints::try_new(self.original_control(), CompilePhase::Encode)?;
         let r = self.relation_observed(id, &mut w);
         finish(r, w)
+    }
+    pub fn relation_in(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'source p::Relation>, Error> {
+        check_control(self.original_control(), work)?;
+        self.relation_observed(id, work)
+    }
+    pub fn source_id_in(
+        &self,
+        source: &p::Relation,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<u32, Error> {
+        check_control(self.original_control(), work)?;
+        self.source_id_observed(source, work)
+    }
+    pub fn retained_invoice_floor_in(
+        &self,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<usize, Error> {
+        check_control(self.original_control(), work)?;
+        self.retained_floor_observed(work)
     }
     pub(crate) fn relation_observed(
         &self,
@@ -529,6 +793,21 @@ impl<'loan, 'wire, 'control> DecodedRelations<'loan, 'wire, 'control> {
         let r = self.relation_observed(id, &mut w);
         finish(r, w)
     }
+    pub fn relation_in(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&p::Relation>, Error> {
+        check_control(self.original_control(), work)?;
+        self.relation_observed(id, work)
+    }
+    pub fn retained_invoice_floor_in(
+        &self,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<usize, Error> {
+        check_control(self.original_control(), work)?;
+        self.retained_floor_observed(work)
+    }
     pub(crate) fn relation_observed(
         &self,
         id: u32,
@@ -607,9 +886,16 @@ fn raw<'a>(
     d: &'a wire::RelationDefinition,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<Raw<'a>, Error> {
-    let k = d.kind.as_ref();
+    let result = raw_source(d);
     w.step()?;
-    Ok(match k.ok_or_else(|| invalid("relation kind is absent"))? {
+    result
+}
+fn raw_source(d: &wire::RelationDefinition) -> Result<Raw<'_>, Error> {
+    let k = d
+        .kind
+        .as_ref()
+        .ok_or_else(|| invalid("relation kind is absent"))?;
+    Ok(match k {
         wire::relation_definition::Kind::Data(v) => Raw {
             read: v.read_reference_id,
             work: v.work_source,
@@ -653,6 +939,51 @@ fn typed<'a>(
     t.ok_or_else(|| invalid("relation value type ID is unknown"))
 }
 
+fn check_control(
+    original: &dyn PureCompileControl,
+    work: &CompileCheckpoints<'_>,
+) -> Result<(), Error> {
+    // The same owner may have distinct trait vtables in different codegen
+    // units. Its retained object address, not the vtable address, is identity.
+    if std::ptr::addr_eq(original, work.control()) {
+        Ok(())
+    } else {
+        Err(invalid("relation control loan differs"))
+    }
+}
+/// Compose the original relation author in the caller's scope. Each callback
+/// replaces this component's previous cumulative facts; source is the complete
+/// original union once. Allocation/host execution admission remains external.
+pub fn encode_relations_in<'loan, 'source, 'control>(
+    inputs: &'loan [RelationSource<'source>],
+    reads: &'loan EncodedProviderReads<'source, 'control>,
+    types: &'loan EncodedTypeTable<'source>,
+    source: usize,
+    limits: RelationProjectionLimits,
+    admit: &mut impl FnMut(&RelationProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<EncodedRelations<'loan, 'source, 'control>, Error> {
+    if !std::ptr::addr_eq(work.control(), reads.original_control()) {
+        return Err(invalid("relation control loan differs"));
+    }
+    encode_core(inputs, reads, types, source, limits, Some(admit), work)
+}
+/// Receiving uses the same mapper and checked namespaces, without a private
+/// entry/footer, guessed provider facts, or reconstruction of type authority.
+pub fn decode_relations_in<'loan, 'wire, 'control>(
+    definitions: &'wire [wire::RelationDefinition],
+    reads: &'loan DecodedProviderReads<'wire, 'control>,
+    types: &'loan DecodedTypeTable,
+    source: usize,
+    limits: RelationProjectionLimits,
+    admit: &mut impl FnMut(&RelationProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<DecodedRelations<'loan, 'wire, 'control>, Error> {
+    if !std::ptr::addr_eq(work.control(), reads.original_control()) {
+        return Err(invalid("relation control loan differs"));
+    }
+    decode_core(definitions, reads, types, source, limits, Some(admit), work)
+}
 pub fn encode_relations<'loan, 'source, 'control>(
     inputs: &'loan [RelationSource<'source>],
     reads: &'loan EncodedProviderReads<'source, 'control>,
@@ -661,63 +992,100 @@ pub fn encode_relations<'loan, 'source, 'control>(
     limits: RelationProjectionLimits,
 ) -> Result<EncodedRelations<'loan, 'source, 'control>, Error> {
     let mut w = CompileCheckpoints::try_new(reads.original_control(), CompilePhase::Encode)?;
-    let r = encode_core(inputs, reads, types, source, limits, &mut w);
+    let r = encode_core(inputs, reads, types, source, limits, None, &mut w);
     finish(r, w)
 }
-fn encode_core<'loan, 'source, 'control>(
+fn encode_core<'loan, 'source, 'control, 'admit>(
     inputs: &'loan [RelationSource<'source>],
     reads: &'loan EncodedProviderReads<'source, 'control>,
     types: &'loan EncodedTypeTable<'source>,
     source: usize,
     l: RelationProjectionLimits,
+    admit: Option<&'admit mut Admit<'admit>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<EncodedRelations<'loan, 'source, 'control>, Error> {
-    cap(inputs.len(), l.max_definitions, w)?;
     let mut m = Model::default();
-    let root = bytes::<RelationSource<'_>>(inputs.len())?;
-    let mut largest_ids = 0;
-    let mut largest_relation = 0;
-    m.request(bytes::<usize>(inputs.len())?)?;
-    m.request(bytes::<wire::RelationDefinition>(inputs.len())?)?;
-    for input in inputs {
-        let r = input.relation;
-        let valid = r.schema().len() == input.value_type_ids.len();
-        w.step()?;
-        if !valid {
-            return Err(invalid("relation schema type ID count differs"));
-        }
-        m.fields = add(m.fields, r.schema().len())?;
-        m.guarantees = add(m.guarantees, r.predicate_guarantees().len())?;
-        // Different root entries may borrow the SAME ID slice. This is a
-        // known lower floor, not a per-occurrence source backing charge.
-        largest_ids = largest_ids.max(bytes::<u32>(input.value_type_ids.len())?);
-        let (known_relation, extra_work) = individual_relation_floor(r, w)?;
-        largest_relation = largest_relation.max(known_relation);
-        m.work = add(m.work, extra_work)?;
-        m.request(bytes::<wire::RelationField>(r.schema().len())?)?;
-        m.request(bytes::<wire::PredicateGuarantee>(
-            r.predicate_guarantees().len(),
-        )?)?;
-        m.request(32)?;
-        if let p::Relation::Metadata(v) = r {
-            m.kinds = add(m.kinds, v.kind.as_str().len())?;
-            m.coverage = add(m.coverage, v.coverage_evidence.len())?;
-            m.request(bytes::<u8>(v.kind.as_str().len())?)?;
-            m.request(bytes::<u8>(v.coverage_evidence.len())?)?;
-        }
-        w.step()?;
-    }
-    m.work = add(
-        m.work,
-        own_work(
+    if let Some(callback) = admit {
+        m.admission = Some(Admission {
+            definitions: inputs.len(),
+            source,
+            limits: l,
+            callback,
+        });
+        m.own_prefix(
             inputs.len(),
-            m.fields,
-            m.guarantees,
             reads.source_count(),
             reads.payloads().source_count(),
             types.source_counts().0,
-        )?,
-    )?;
+        )?;
+        m.prefix()?;
+    }
+    let root = bytes::<RelationSource<'_>>(inputs.len())?;
+    let mut largest_ids = 0;
+    let mut largest_relation = 0;
+    m.request(m.buffer_bytes::<usize>(inputs.len())?)?;
+    m.request(m.buffer_bytes::<wire::RelationDefinition>(inputs.len())?)?;
+    cap(inputs.len(), l.max_definitions, w)?;
+    for input in inputs {
+        let r = input.relation;
+        let valid = r.schema().len() == input.value_type_ids.len();
+        if !m.observed() || !valid {
+            w.step()?;
+        }
+        if !valid {
+            return Err(invalid("relation schema type ID count differs"));
+        }
+        m.fields = m.sum(m.fields, r.schema().len())?;
+        m.guarantees = m.sum(m.guarantees, r.predicate_guarantees().len())?;
+        // Different root entries may borrow the SAME ID slice. This is a
+        // known lower floor, not a per-occurrence source backing charge.
+        largest_ids = largest_ids.max(bytes::<u32>(input.value_type_ids.len())?);
+        m.request(m.buffer_bytes::<wire::RelationField>(r.schema().len())?)?;
+        m.request(m.buffer_bytes::<wire::PredicateGuarantee>(r.predicate_guarantees().len())?)?;
+        m.request(32)?;
+        if let p::Relation::Metadata(v) = r {
+            m.kinds = m.sum(m.kinds, v.kind.as_str().len())?;
+            m.coverage = m.sum(m.coverage, v.coverage_evidence.len())?;
+            m.request(m.buffer_bytes::<u8>(v.kind.as_str().len())?)?;
+            m.request(m.buffer_bytes::<u8>(v.coverage_evidence.len())?)?;
+        }
+        if m.observed() {
+            m.properties(physical_properties_v2::properties_encode_numerical_facts(
+                r.provided_properties(),
+                source,
+            )?)?;
+        }
+        m.own_prefix(
+            inputs.len(),
+            reads.source_count(),
+            reads.payloads().source_count(),
+            types.source_counts().0,
+        )?;
+        if m.observed() {
+            w.step()?;
+        }
+        let (known_relation, extra_work) = individual_relation_floor_in(r, &mut m, w)?;
+        largest_relation = largest_relation.max(known_relation);
+        if !m.observed() {
+            m.work = m.sum(m.work, extra_work)?;
+        }
+        m.prefix()?;
+        w.step()?;
+    }
+    if !m.observed() {
+        m.work = m.sum(
+            m.work,
+            own_work(
+                inputs.len(),
+                m.fields,
+                m.guarantees,
+                reads.source_count(),
+                reads.payloads().source_count(),
+                types.source_counts().0,
+            )?,
+        )?;
+    }
+    m.prefix()?;
     cap(m.work, l.max_work, w)?;
     floor(source, add(root, largest_ids)?, w)?;
     floor(source, largest_relation, w)?;
@@ -732,16 +1100,38 @@ fn encode_core<'loan, 'source, 'control>(
             let ty = types
                 .value_type_observed(*id, w)?
                 .ok_or_else(|| invalid("relation value type ID is unknown"))?;
-            let checked = verify_type_binding(
-                &field.ty,
-                ty,
-                source,
-                l.max_work
-                    .checked_sub(m.work)
-                    .ok_or_else(|| invalid("relation work envelope exhausted"))?,
-                w,
-            )?;
-            m.work = add(m.work, checked.work_upper_bound())?;
+            let checked = if m.observed() {
+                let mut previous = 0usize;
+                crate::borrowed_type_resources::verify_type_binding_admitted(
+                    &field.ty,
+                    ty,
+                    source,
+                    l.max_work,
+                    &mut |facts| {
+                        let next = facts.work_upper_bound();
+                        m.work = m.sum(
+                            m.work,
+                            next.checked_sub(previous)
+                                .ok_or_else(|| invalid("relation comparison work decreased"))?,
+                        )?;
+                        previous = next;
+                        m.prefix()
+                    },
+                    w,
+                )?
+            } else {
+                let checked = verify_type_binding(
+                    &field.ty,
+                    ty,
+                    source,
+                    l.max_work
+                        .checked_sub(m.work)
+                        .ok_or_else(|| invalid("relation work envelope exhausted"))?,
+                    w,
+                )?;
+                m.work = m.sum(m.work, checked.work_upper_bound())?;
+                checked
+            };
             if !checked.matches() {
                 return Err(invalid("relation full source value type differs"));
             }
@@ -753,7 +1143,9 @@ fn encode_core<'loan, 'source, 'control>(
             l.properties,
             w,
         )?;
-        m.properties(pf)?;
+        if !m.observed() {
+            m.properties(pf)?;
+        }
         cap(m.work, l.max_work, w)?;
         w.step()?;
     }
@@ -842,45 +1234,107 @@ pub fn decode_relations<'loan, 'wire, 'control>(
     limits: RelationProjectionLimits,
 ) -> Result<DecodedRelations<'loan, 'wire, 'control>, Error> {
     let mut w = CompileCheckpoints::try_new(reads.original_control(), CompilePhase::Decode)?;
-    let r = decode_core(defs, reads, types, source, limits, &mut w);
+    let r = decode_core(defs, reads, types, source, limits, None, &mut w);
     finish(r, w)
 }
-fn preflight_decode_observed(
+fn preflight_decode_observed<'admit>(
     defs: &[wire::RelationDefinition],
     reads: &DecodedProviderReads<'_, '_>,
     types: &DecodedTypeTable,
     source: usize,
     l: RelationProjectionLimits,
+    admit: Option<&'admit mut Admit<'admit>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<RelationProjectionFacts, Error> {
-    cap(defs.len(), l.max_definitions, w)?;
+    let observed = admit.is_some();
+    if observed && defs.len() > l.max_definitions {
+        return Err(CompileControlError::ResourceExhausted.into());
+    }
     let mut m = Model::default();
+    if let Some(callback) = admit {
+        m.admission = Some(Admission {
+            definitions: defs.len(),
+            source,
+            limits: l,
+            callback,
+        });
+        m.own_prefix(
+            defs.len(),
+            reads.source_count(),
+            reads.payloads().source_count(),
+            types.value_types().len(),
+        )?;
+    }
     let mut known = bytes::<wire::RelationDefinition>(defs.len())?;
-    m.request(bytes::<usize>(defs.len())?)?;
-    m.request(bytes::<p::Relation>(defs.len())?)?;
+    m.request(m.buffer_bytes::<usize>(defs.len())?)?;
+    m.request(m.buffer_bytes::<p::Relation>(defs.len())?)?;
+    cap(defs.len(), l.max_definitions, w)?;
     for def in defs {
-        let r = raw(def, w)?;
-        m.fields = add(m.fields, r.schema.len())?;
-        m.guarantees = add(m.guarantees, r.guarantees.len())?;
+        let result = raw_source(def);
+        if !m.observed() {
+            w.step()?;
+        }
+        let r = result?;
+        m.fields = m.sum(m.fields, r.schema.len())?;
+        m.guarantees = m.sum(m.guarantees, r.guarantees.len())?;
         known = add(known, r.known_backing()?)?;
         m.twice::<p::RelationField>(r.schema.len())?;
         m.twice::<p::PredicateGuarantee>(r.guarantees.len())?;
+        if m.observed() {
+            // Promotable Bytes sharing is bounded before namespace lookup:
+            // each column plus table/view can request at most one Shared.
+            // Empty payloads need no request, but this conservative bound
+            // avoids moving an already-known ceiling past a lookup callback.
+            for _ in 0..m.sum(r.schema.len(), 2)? {
+                m.request(bytes_shared_upper()?)?;
+            }
+        }
         if let Some((kind, cov)) = r.metadata {
-            m.kinds = add(m.kinds, kind.len())?;
-            m.coverage = add(m.coverage, cov.len())?;
-            m.request(bytes::<u8>(kind.len())?)?;
+            m.kinds = m.sum(m.kinds, kind.len())?;
+            m.coverage = m.sum(m.coverage, cov.len())?;
+            m.request(m.buffer_bytes::<u8>(kind.len())?)?;
             m.twice::<u8>(cov.len())?;
+        }
+        m.own_prefix(
+            defs.len(),
+            reads.source_count(),
+            reads.payloads().source_count(),
+            types.value_types().len(),
+        )?;
+        if m.observed() {
+            if let Some(props) = r.properties.as_ref() {
+                m.properties(physical_properties_v2::properties_decode_numerical_facts(
+                    props, source,
+                )?)?;
+            }
+            for field in r.schema {
+                if let Some(id) = field.value_type_id {
+                    // std BTree lookup is already covered by own_prefix. A
+                    // captured type's requests are admitted before its first
+                    // clone-preflight callback, never after lookup completion.
+                    w.flush()?;
+                    let found = types.value_type(id);
+                    if let Some(ty) = found {
+                        m.clone_prefix(ty, w, true)?;
+                    }
+                    w.flush()?;
+                }
+            }
+            w.step()?;
         }
         w.step()?;
     }
-    m.work = own_work(
-        defs.len(),
-        m.fields,
-        m.guarantees,
-        reads.source_count(),
-        reads.payloads().source_count(),
-        types.value_types().len(),
-    )?;
+    if !m.observed() {
+        m.work = own_work(
+            defs.len(),
+            m.fields,
+            m.guarantees,
+            reads.source_count(),
+            reads.payloads().source_count(),
+            types.value_types().len(),
+        )?;
+    }
+    m.prefix()?;
     cap(m.work, l.max_work, w)?;
     floor(source, known, w)?;
     floor(source, reads.retained_floor_observed(w)?, w)?;
@@ -903,21 +1357,23 @@ fn preflight_decode_observed(
                 .payloads()
                 .payload_observed(id, w)?
                 .ok_or_else(|| invalid("relation column payload ID is unknown"))?;
-            if !payload.payload().is_empty() {
+            if !m.observed() && !payload.payload().is_empty() {
                 m.request(bytes_shared_upper()?)?;
             }
             let id = required(f.value_type_id, w)?;
             let ty = typed(types, id, w)?;
-            let clone = physical_type_v2::preflight_value_type_clone(ty, w)?;
-            m.requests = add(m.requests, clone.allocation_requests_upper_bound())?;
-            m.bytes = add(m.bytes, clone.allocation_request_bytes_upper_bound())?;
-            m.work = add(m.work, mul(clone.work_upper_bound(), 2)?)?;
+            if !m.observed() {
+                let clone = physical_type_v2::preflight_value_type_clone(ty, w)?;
+                m.requests = m.sum(m.requests, clone.allocation_requests_upper_bound())?;
+                m.bytes = m.sum(m.bytes, clone.allocation_request_bytes_upper_bound())?;
+                m.work = m.sum(m.work, mul(clone.work_upper_bound(), 2)?)?;
+            }
             w.step()?;
         }
         // Cloning a checked read shares its version Arc and binding Arcs. Only
         // two promotable Bytes clones can request new Shared blocks.
         for payload in [read.relation.table(), read.relation.view()] {
-            if !payload.payload().is_empty() {
+            if !m.observed() && !payload.payload().is_empty() {
                 m.request(bytes_shared_upper()?)?;
             }
             w.step()?;
@@ -928,26 +1384,30 @@ fn preflight_decode_observed(
             w.step()?;
             kind?;
         }
-        m.properties(physical_properties_v2::preflight_decode_observed(
+        let pf = physical_properties_v2::preflight_decode_observed(
             properties(&r, w)?,
             source,
             l.properties,
             w,
-        )?)?;
+        )?;
+        if !m.observed() {
+            m.properties(pf)?;
+        }
         cap(m.work, l.max_work, w)?;
         w.step()?;
     }
     m.gate(defs.len(), source, l, w)
 }
-fn decode_core<'loan, 'wire, 'control>(
+fn decode_core<'loan, 'wire, 'control, 'admit>(
     defs: &'wire [wire::RelationDefinition],
     reads: &'loan DecodedProviderReads<'wire, 'control>,
     types: &'loan DecodedTypeTable,
     source: usize,
     l: RelationProjectionLimits,
+    admit: Option<&'admit mut Admit<'admit>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedRelations<'loan, 'wire, 'control>, Error> {
-    let facts = preflight_decode_observed(defs, reads, types, source, l, w)?;
+    let facts = preflight_decode_observed(defs, reads, types, source, l, admit, w)?;
     let indices = BindingIndex::prepare(defs.len(), |at| defs[at].id, w)?;
     let mut output = reserve(defs.len(), w)?;
     for def in defs {
@@ -1039,4 +1499,5 @@ mod materialization;
 pub(crate) use materialization::prepare_observed as prepare_relation_materialization_observed;
 pub use materialization::{
     PreparedRelationMaterialization, materialize_relation, prepare_relation_materialization,
+    prepare_relation_materialization_in,
 };

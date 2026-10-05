@@ -111,7 +111,7 @@ impl<'loan, 'source> MaterializedFunctionBindings<'loan, 'source> {
         id: u32,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<Option<&MaterializedFunctionBinding>, Error> {
-        let same = std::ptr::eq(w.control(), self.headers.original_control());
+        let same = std::ptr::addr_eq(w.control(), self.headers.original_control());
         w.step()?;
         if !same {
             return Err(shape(
@@ -126,6 +126,19 @@ impl<'loan, 'source> MaterializedFunctionBindings<'loan, 'source> {
             }
         }
         Ok(None)
+    }
+    /// Same owned namespace lookup, prefunded in the consuming parent.
+    pub fn definition_in(
+        &self,
+        id: u32,
+        admit: &mut impl FnMut(&BindingProjectionFacts) -> Result<(), CompileControlError>,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&MaterializedFunctionBinding>, Error> {
+        admit(&super::owner_admission::lookup_facts(
+            self.definitions.len(),
+            self.definitions.len(),
+        )?)?;
+        self.definition_observed(id, w)
     }
     pub fn into_definitions(self) -> Box<[(u32, MaterializedFunctionBinding)]> {
         self.definitions
@@ -380,6 +393,15 @@ impl Model {
         self.extra_work = add(self.extra_work, work)?;
         Ok(())
     }
+    pub(crate) fn check_admitted(
+        &mut self,
+        limits: BindingProjectionLimits,
+        admit: &mut super::owner_admission::Admit<'_>,
+    ) -> Result<(), Error> {
+        self.check(limits)?;
+        admit(&self.facts)?;
+        Ok(())
+    }
     pub(crate) fn check(&mut self, limits: BindingProjectionLimits) -> Result<(), Error> {
         cap(self.facts.definition_count, limits.max_definitions)?;
         cap(self.facts.type_reference_count, limits.max_type_references)?;
@@ -431,8 +453,21 @@ fn value<'a>(
     id: u32,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<&'a FunctionValueType, Error> {
+    value_captured(types, id, &mut |_, _| Ok(()), w)
+}
+/// The captured loan is admitted before observing the completed lookup.
+/// Plain callers use the same body with an empty capture hook.
+pub(super) fn value_captured<'a>(
+    types: &'a DecodedTypeTable,
+    id: u32,
+    capture: &mut impl FnMut(&'a FunctionValueType, &mut CompileCheckpoints<'_>) -> Result<(), Error>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<&'a FunctionValueType, Error> {
     w.flush()?;
     let found = types.value_type(id);
+    if let Some(source) = found {
+        capture(source, w)?;
+    }
     w.step()?;
     w.flush()?;
     found.ok_or_else(|| shape("materialized binding value type is absent"))
@@ -442,12 +477,28 @@ fn count_clone(
     id: u32,
     model: &mut Model,
     limits: BindingProjectionLimits,
+    observed: bool,
+    admit: &mut super::owner_admission::Admit<'_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
     // Coarse bounded-type work was included before entering the sole grammar.
-    model.check(limits)?;
-    let source = value(types, id, w)?;
-    model.count_owned_type_clone(source, limits, w)
+    if observed {
+        model.check_admitted(limits, admit)?;
+    } else {
+        model.check(limits)?;
+    }
+    if observed {
+        value_captured(
+            types,
+            id,
+            &mut |source, work| model.count_owned_type_clone_in(source, limits, admit, work),
+            w,
+        )?;
+        Ok(())
+    } else {
+        let source = value(types, id, w)?;
+        model.count_owned_type_clone(source, limits, w)
+    }
 }
 impl Model {
     /// Caller admits this occurrence's reference count before visiting the sole
@@ -487,8 +538,43 @@ impl Model {
         admit: &mut impl FnMut(&resources::NodeProjectionFacts) -> Result<(), CompileControlError>,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
+        self.count_owned_type_clone_core(
+            source,
+            limits,
+            &mut |model| {
+                admit(&model.node_numerical_facts(model.node_work_peak())?)?;
+                Ok(())
+            },
+            w,
+        )
+    }
+    /// Synchronous binding-parent admission for the sole clone-prefix author.
+    pub(crate) fn count_owned_type_clone_in(
+        &mut self,
+        source: &FunctionValueType,
+        limits: BindingProjectionLimits,
+        admit: &mut super::owner_admission::Admit<'_>,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), Error> {
+        self.count_owned_type_clone_core(
+            source,
+            limits,
+            &mut |model| {
+                admit(&model.facts)?;
+                Ok(())
+            },
+            w,
+        )
+    }
+    fn count_owned_type_clone_core(
+        &mut self,
+        source: &FunctionValueType,
+        limits: BindingProjectionLimits,
+        admit: &mut impl FnMut(&mut Self) -> Result<(), Error>,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), Error> {
         self.check(limits)?;
-        admit(&self.node_numerical_facts(self.node_work_peak())?)?;
+        admit(self)?;
         let mut first_prefix = true;
         let mut previous_requests = 0;
         let mut previous_bytes = 0;
@@ -505,7 +591,7 @@ impl Model {
                     value_type_clone_preflight_work_upper_bound(),
                 )?;
                 self.check(limits)?;
-                admit(&self.node_numerical_facts(self.node_work_peak())?)?;
+                admit(self)?;
                 if first_prefix {
                     first_prefix = false;
                     work.flush()?;
@@ -515,7 +601,7 @@ impl Model {
             w,
         )?;
         self.check(limits)?;
-        admit(&self.node_numerical_facts(self.node_work_peak())?)?;
+        admit(self)?;
         w.step()?;
         w.flush()?;
         Ok(())
@@ -531,19 +617,27 @@ impl Model {
 
 fn preflight(
     headers: &PreparedFunctionBindingHeaders<'_>,
-    source: usize,
+    mut model: Model,
     limits: BindingProjectionLimits,
+    observed: bool,
+    admit: &mut super::owner_admission::Admit<'_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(BindingProjectionFacts, usize), Error> {
-    let mut model = Model::new(headers, source)?;
-    model.request::<(u32, MaterializedFunctionBinding)>(headers.as_wire().len(), 2)?;
-    model.check(limits)?;
+    if observed {
+        model.check_admitted(limits, admit)?;
+    } else {
+        model.check(limits)?;
+    }
     for definition in headers.as_wire() {
         model.items = add(model.items, definition.arguments.len())?;
         model.request::<FunctionArgumentType>(definition.arguments.len(), 2)?;
         model.request::<u8>(definition.function_id.len(), 1)?;
         model.request::<u8>(definition.overload_id.len(), 1)?;
-        model.check(limits)?;
+        if observed {
+            model.check_admitted(limits, admit)?;
+        } else {
+            model.check(limits)?;
+        }
         for argument in &definition.arguments {
             match &argument.kind {
                 Some(wire::function_argument_type::Kind::ValueTypeId(_)) => {
@@ -562,7 +656,11 @@ fn preflight(
                     return Err(shape("materialized binding argument is absent"));
                 }
             }
-            model.check(limits)?;
+            if observed {
+                model.check_admitted(limits, admit)?;
+            } else {
+                model.check(limits)?;
+            }
             w.step()?;
         }
         match &definition.result {
@@ -582,7 +680,11 @@ fn preflight(
                 return Err(shape("materialized binding result is absent"));
             }
         }
-        model.check(limits)?;
+        if observed {
+            model.check_admitted(limits, admit)?;
+        } else {
+            model.check(limits)?;
+        }
         w.step()?;
     }
     // Full cumulative own/delegate/output requests precede every clone walk
@@ -590,12 +692,26 @@ fn preflight(
     for definition in headers.as_wire() {
         for argument in &definition.arguments {
             match &argument.kind {
-                Some(wire::function_argument_type::Kind::ValueTypeId(id)) => {
-                    count_clone(headers.type_table(), *id, &mut model, limits, w)?
-                }
+                Some(wire::function_argument_type::Kind::ValueTypeId(id)) => count_clone(
+                    headers.type_table(),
+                    *id,
+                    &mut model,
+                    limits,
+                    observed,
+                    admit,
+                    w,
+                )?,
                 Some(wire::function_argument_type::Kind::Lambda(lambda)) => {
                     for id in &lambda.parameter_value_type_ids {
-                        count_clone(headers.type_table(), *id, &mut model, limits, w)?;
+                        count_clone(
+                            headers.type_table(),
+                            *id,
+                            &mut model,
+                            limits,
+                            observed,
+                            admit,
+                            w,
+                        )?;
                         w.step()?;
                     }
                     count_clone(
@@ -605,6 +721,8 @@ fn preflight(
                             .ok_or_else(|| shape("materialized Lambda result is absent"))?,
                         &mut model,
                         limits,
+                        observed,
+                        admit,
                         w,
                     )?;
                 }
@@ -613,12 +731,26 @@ fn preflight(
             w.step()?;
         }
         match &definition.result {
-            Some(wire::function_binding_definition::Result::ScalarValueTypeId(id)) => {
-                count_clone(headers.type_table(), *id, &mut model, limits, w)?
-            }
+            Some(wire::function_binding_definition::Result::ScalarValueTypeId(id)) => count_clone(
+                headers.type_table(),
+                *id,
+                &mut model,
+                limits,
+                observed,
+                admit,
+                w,
+            )?,
             Some(wire::function_binding_definition::Result::Relation(relation)) => {
                 for id in &relation.value_type_ids {
-                    count_clone(headers.type_table(), *id, &mut model, limits, w)?;
+                    count_clone(
+                        headers.type_table(),
+                        *id,
+                        &mut model,
+                        limits,
+                        observed,
+                        admit,
+                        w,
+                    )?;
                     w.step()?;
                 }
             }
@@ -634,15 +766,19 @@ pub fn prepare_function_bindings_materialization<'loan, 'source>(
     limits: BindingProjectionLimits,
 ) -> Result<PreparedFunctionBindingsMaterialization<'loan, 'source>, Error> {
     let mut w = CompileCheckpoints::try_new(headers.original_control(), CompilePhase::Decode)?;
-    let result =
-        preflight(headers, source_retained_bytes, limits, &mut w).map(|(facts, retained_bytes)| {
-            PreparedFunctionBindingsMaterialization {
-                headers,
-                source_invoice: source_retained_bytes,
-                retained_bytes,
-                facts,
-            }
-        });
+    let result = (|| {
+        let mut model = Model::new(headers, source_retained_bytes)?;
+        model.request::<(u32, MaterializedFunctionBinding)>(headers.as_wire().len(), 2)?;
+        preflight(headers, model, limits, false, &mut |_| Ok(()), &mut w)
+    })()
+    .map(
+        |(facts, retained_bytes)| PreparedFunctionBindingsMaterialization {
+            headers,
+            source_invoice: source_retained_bytes,
+            retained_bytes,
+            facts,
+        },
+    );
     finish(w, result)
 }
 pub(crate) fn reserve<T>(count: usize, w: &mut CompileCheckpoints<'_>) -> Result<Vec<T>, Error> {
@@ -678,8 +814,15 @@ pub fn materialize_function_bindings<'loan, 'source>(
 ) -> Result<MaterializedFunctionBindings<'loan, 'source>, Error> {
     let mut w =
         CompileCheckpoints::try_new(token.headers.original_control(), CompilePhase::Decode)?;
-    let result = (|| {
-        let mut definitions = reserve(token.headers.as_wire().len(), &mut w)?;
+    let result = materialize_in(token, &mut w);
+    finish(w, result)
+}
+fn materialize_in<'loan, 'source>(
+    token: PreparedFunctionBindingsMaterialization<'loan, 'source>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<MaterializedFunctionBindings<'loan, 'source>, Error> {
+    (|| {
+        let mut definitions = reserve(token.headers.as_wire().len(), w)?;
         for raw in token.headers.as_wire() {
             // These original constructors own exact identity validation/copy.
             // Header bounds guarantee at most 1024 trusted UTF8 bytes each.
@@ -687,41 +830,36 @@ pub fn materialize_function_bindings<'loan, 'source>(
             let function = completed(
                 FunctionId::try_new(&raw.function_id)
                     .map_err(|_| shape("materialized function identity is invalid")),
-                &mut w,
+                w,
             )?;
             w.flush()?;
             w.flush()?;
             let overload = completed(
                 FunctionOverloadId::try_new(&raw.overload_id)
                     .map_err(|_| shape("materialized overload identity is invalid")),
-                &mut w,
+                w,
             )?;
             w.flush()?;
-            let mut arguments = reserve(raw.arguments.len(), &mut w)?;
+            let mut arguments = reserve(raw.arguments.len(), w)?;
             for argument in &raw.arguments {
                 let value = match &argument.kind {
                     Some(wire::function_argument_type::Kind::ValueTypeId(id)) => {
-                        FunctionArgumentType::Value(clone_type(
-                            token.headers.type_table(),
-                            *id,
-                            &mut w,
-                        )?)
+                        FunctionArgumentType::Value(clone_type(token.headers.type_table(), *id, w)?)
                     }
                     Some(wire::function_argument_type::Kind::Lambda(lambda)) => {
-                        let mut parameters =
-                            reserve(lambda.parameter_value_type_ids.len(), &mut w)?;
+                        let mut parameters = reserve(lambda.parameter_value_type_ids.len(), w)?;
                         for id in &lambda.parameter_value_type_ids {
-                            parameters.push(clone_type(token.headers.type_table(), *id, &mut w)?);
+                            parameters.push(clone_type(token.headers.type_table(), *id, w)?);
                             w.step()?;
                         }
                         FunctionArgumentType::Lambda {
-                            parameter_types: boxed(parameters, &mut w)?,
+                            parameter_types: boxed(parameters, w)?,
                             result_type: clone_type(
                                 token.headers.type_table(),
                                 lambda
                                     .result_value_type_id
                                     .ok_or_else(|| shape("materialized Lambda result is absent"))?,
-                                &mut w,
+                                w,
                             )?,
                         }
                     }
@@ -730,7 +868,7 @@ pub fn materialize_function_bindings<'loan, 'source>(
                 arguments.push(value);
                 w.step()?;
             }
-            let arguments = boxed(arguments, &mut w)?;
+            let arguments = boxed(arguments, w)?;
             let binding = match (&raw.result, wire::FunctionKind::try_from(raw.kind)) {
                 (
                     Some(wire::function_binding_definition::Result::ScalarValueTypeId(id)),
@@ -747,23 +885,23 @@ pub fn materialize_function_bindings<'loan, 'source>(
                         overload,
                         kind,
                         arguments,
-                        clone_type(token.headers.type_table(), *id, &mut w)?,
+                        clone_type(token.headers.type_table(), *id, w)?,
                     ))
                 }
                 (
                     Some(wire::function_binding_definition::Result::Relation(relation)),
                     Ok(wire::FunctionKind::Table),
                 ) => {
-                    let mut result = reserve(relation.value_type_ids.len(), &mut w)?;
+                    let mut result = reserve(relation.value_type_ids.len(), w)?;
                     for id in &relation.value_type_ids {
-                        result.push(clone_type(token.headers.type_table(), *id, &mut w)?);
+                        result.push(clone_type(token.headers.type_table(), *id, w)?);
                         w.step()?;
                     }
                     MaterializedFunctionBinding::Table(BoundTableFunction::from_exact_signature(
                         function,
                         overload,
                         arguments,
-                        boxed(result, &mut w)?,
+                        boxed(result, w)?,
                     ))
                 }
                 _ => return Err(shape("materialized binding kind and result differ")),
@@ -772,15 +910,60 @@ pub fn materialize_function_bindings<'loan, 'source>(
             w.step()?;
         }
         Ok(MaterializedFunctionBindings {
-            definitions: boxed(definitions, &mut w)?,
+            definitions: boxed(definitions, w)?,
             headers: token.headers,
             source_invoice: token.source_invoice,
             retained_bytes: token.retained_bytes,
             facts: token.facts,
         })
-    })();
-    finish(w, result)
+    })()
 }
+
+/// Original preparation with growing binding facts and no scope entry/footer.
+pub fn prepare_function_bindings_materialization_in<'loan, 'source>(
+    headers: &'loan PreparedFunctionBindingHeaders<'source>,
+    source_retained_bytes: usize,
+    limits: BindingProjectionLimits,
+    admit: &mut impl FnMut(&BindingProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedFunctionBindingsMaterialization<'loan, 'source>, Error> {
+    // Pure initial geometry wins before the first identity observation.
+    let mut model = Model::new(headers, source_retained_bytes)?;
+    model.request::<(u32, MaterializedFunctionBinding)>(headers.as_wire().len(), 2)?;
+    model.check_admitted(limits, admit)?;
+    let same = std::ptr::addr_eq(work.control(), headers.original_control());
+    work.step()?;
+    if !same {
+        return Err(shape(
+            "binding materialization has a different original control",
+        ));
+    }
+    let (facts, retained_bytes) = preflight(headers, model, limits, true, admit, work)?;
+    Ok(PreparedFunctionBindingsMaterialization {
+        headers,
+        source_invoice: source_retained_bytes,
+        retained_bytes,
+        facts,
+    })
+}
+/// Consume the original prepared namespace using its already admitted complete
+/// inventory. The callback replaces this operation's previous snapshot.
+pub fn materialize_function_bindings_in<'loan, 'source>(
+    token: PreparedFunctionBindingsMaterialization<'loan, 'source>,
+    admit: &mut impl FnMut(&BindingProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<MaterializedFunctionBindings<'loan, 'source>, Error> {
+    admit(&token.facts)?;
+    let same = std::ptr::addr_eq(work.control(), token.headers.original_control());
+    work.step()?;
+    if !same {
+        return Err(shape(
+            "binding materialization has a different original control",
+        ));
+    }
+    materialize_in(token, work)
+}
+
 #[cfg(test)]
 #[path = "materialize_tests.rs"]
 mod tests;

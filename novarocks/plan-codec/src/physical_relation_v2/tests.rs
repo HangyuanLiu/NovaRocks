@@ -891,3 +891,7 @@ fn relation_namespace_original_dictionary_boxes_are_required_without_output_clon
 }
 
 mod materialization_tests;
+
+mod caller_owned_tests {
+    include!("caller_owned_tests.rs");
+}

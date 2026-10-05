@@ -877,3 +877,6 @@ fn value_namespace_empty_and_full_fvt_receiving_do_not_guess_source_metadata() {
     }
     assert_eq!(decoded.facts().allocation_requests_upper_bound, 2); // shared nested FieldRef, no Dictionary box.
 }
+
+#[path = "owned_tests.rs"]
+mod owned_tests;
