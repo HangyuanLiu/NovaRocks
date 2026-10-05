@@ -27,9 +27,14 @@ use novarocks_type_contract::CompileControlError;
 use std::fmt;
 
 mod kind;
+mod materialize;
 mod namespace;
 mod read;
 mod receiving_grammar;
+pub use materialize::{
+    MaterializedExpressions, PreparedExpressionMaterialization, materialize_expressions,
+    prepare_expression_materialization,
+};
 
 pub use namespace::{
     EncodedExpressions, ExpressionNamespaceWriteFacts, ExpressionProjectionLimits,

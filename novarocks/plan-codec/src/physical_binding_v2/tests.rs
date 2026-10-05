@@ -626,3 +626,67 @@ fn actual_source_lookup_observes_long_roots_missing_ids_and_exact_original_owner
         .is_none()
     );
 }
+
+#[test]
+fn table_source_identity_uses_actual_sparse_aliases_and_rejects_equal_foreign_owners() {
+    let values = [(0, FunctionValueType::new(DataType::Int64, true))];
+    let types =
+        encode_type_table_sources(&values, &[], type_limits(), &Control::default()).unwrap();
+    let source = table(vec![], vec![values[0].1.clone()]);
+    let foreign = source.clone();
+    let result = [0];
+    let aliases = [
+        FunctionBindingInput {
+            id: 0,
+            source: BindingSource::Table(&source),
+            arguments: &[],
+            result: ResultTypeIds::Relation(&result),
+        },
+        FunctionBindingInput {
+            id: u32::MAX,
+            source: BindingSource::Table(&source),
+            arguments: &[],
+            result: ResultTypeIds::Relation(&result),
+        },
+    ];
+    let encoded =
+        encode_function_bindings(&types, &aliases, SOURCE, limits(), &Control::default()).unwrap();
+    check_prefix(
+        |control| {
+            finish(control, |work| {
+                let id = encoded.table_source_id_observed(&source, work)?;
+                assert_eq!(id, 0);
+                assert!(std::ptr::eq(
+                    encoded.table_binding_observed(id, work)?.unwrap(),
+                    &source
+                ));
+                Ok(id)
+            })
+        },
+        true,
+    );
+    check_prefix(
+        |control| {
+            finish(control, |work| {
+                encoded.table_source_id_observed(&foreign, work)
+            })
+        },
+        false,
+    );
+    let last = &aliases[1..];
+    let encoded =
+        encode_function_bindings(&types, last, SOURCE, limits(), &Control::default()).unwrap();
+    assert_eq!(
+        finish(&Control::default(), |work| encoded
+            .table_source_id_observed(&source, work))
+        .unwrap(),
+        u32::MAX
+    );
+    let encoded =
+        encode_function_bindings(&types, &[], SOURCE, limits(), &Control::default()).unwrap();
+    assert!(matches!(
+        finish(&Control::default(), |work| encoded
+            .table_source_id_observed(&source, work)),
+        Err(BindingCodecError::InvalidShape(_))
+    ));
+}

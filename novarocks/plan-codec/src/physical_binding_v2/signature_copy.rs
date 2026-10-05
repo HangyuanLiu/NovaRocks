@@ -20,7 +20,7 @@ use super::{
     reserve,
 };
 use crate::physical_type_v2::clone_value_type_observed;
-use novarocks_physical_plan::BoundFunction;
+use novarocks_physical_plan::{BoundFunction, BoundTableFunction};
 use novarocks_type_contract::{
     CompileCheckpoints, FunctionArgumentType, FunctionId, FunctionKind, FunctionOverloadId,
     FunctionValueType,
@@ -68,8 +68,29 @@ pub(crate) fn preflight_scalar_signature_copy(
     model.request::<u8>(source.overload.as_str().len(), 1)?;
     model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
     model.check(limits)?;
+    preflight_arguments(&source.argument_types, model, limits, work)?;
+    model.count_owned_type_clone(&source.result_type, limits, work)?;
+    work.step()?;
+    Ok(())
+}
+
+fn preflight_arguments(
+    arguments: &[FunctionArgumentType],
+    model: &mut MaterializationModel,
+    limits: BindingProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), BindingCodecError> {
+    preflight_argument_counts(arguments, model, limits, work)?;
+    preflight_argument_types(arguments, model, limits, work)
+}
+fn preflight_argument_counts(
+    arguments: &[FunctionArgumentType],
+    model: &mut MaterializationModel,
+    limits: BindingProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), BindingCodecError> {
     // Admit all references and collection requests before the sole type walk.
-    for argument in &source.argument_types {
+    for argument in arguments {
         match argument {
             FunctionArgumentType::Value(_) => {
                 model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
@@ -88,7 +109,15 @@ pub(crate) fn preflight_scalar_signature_copy(
         model.check(limits)?;
         work.step()?;
     }
-    for argument in &source.argument_types {
+    Ok(())
+}
+fn preflight_argument_types(
+    arguments: &[FunctionArgumentType],
+    model: &mut MaterializationModel,
+    limits: BindingProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), BindingCodecError> {
+    for argument in arguments {
         match argument {
             FunctionArgumentType::Value(value) => {
                 model.count_owned_type_clone(value, limits, work)?;
@@ -106,8 +135,6 @@ pub(crate) fn preflight_scalar_signature_copy(
         }
         work.step()?;
     }
-    model.count_owned_type_clone(&source.result_type, limits, work)?;
-    work.step()?;
     Ok(())
 }
 
@@ -130,21 +157,47 @@ pub(crate) fn copy_scalar_signature_observed(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<BoundFunction, BindingCodecError> {
     header(source, work)?;
+    let (function_id, overload) = copy_identity(&source.function_id, &source.overload, work)?;
+    let argument_types = copy_arguments(&source.argument_types, work)?;
+    let result_type = copy_type(&source.result_type, work)?;
+    let output = BoundFunction::from_exact_signature(
+        function_id,
+        overload,
+        source.kind,
+        argument_types,
+        result_type,
+    );
+    work.step()?;
+    Ok(output)
+}
+
+fn copy_identity(
+    function: &FunctionId,
+    overload: &FunctionOverloadId,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(FunctionId, FunctionOverloadId), BindingCodecError> {
     work.flush()?;
     let function_id = completed(
-        FunctionId::try_new(source.function_id.as_str())
+        FunctionId::try_new(function.as_str())
             .map_err(|_| BindingCodecError::InvalidShape("copied function identity is invalid")),
         work,
     )?;
     work.flush()?;
     let overload = completed(
-        FunctionOverloadId::try_new(source.overload.as_str())
+        FunctionOverloadId::try_new(overload.as_str())
             .map_err(|_| BindingCodecError::InvalidShape("copied overload identity is invalid")),
         work,
     )?;
     work.flush()?;
-    let mut arguments = reserve(source.argument_types.len(), work)?;
-    for argument in &source.argument_types {
+    Ok((function_id, overload))
+}
+
+fn copy_arguments(
+    source: &[FunctionArgumentType],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Box<[FunctionArgumentType]>, BindingCodecError> {
+    let mut arguments = reserve(source.len(), work)?;
+    for argument in source {
         let copied = match argument {
             FunctionArgumentType::Value(value) => {
                 FunctionArgumentType::Value(copy_type(value, work)?)
@@ -167,14 +220,94 @@ pub(crate) fn copy_scalar_signature_observed(
         arguments.push(copied);
         work.step()?;
     }
-    let argument_types = boxed(arguments, work)?;
-    let result_type = copy_type(&source.result_type, work)?;
-    let output = BoundFunction::from_exact_signature(
+    boxed(arguments, work)
+}
+
+fn table_header(
+    source: &BoundTableFunction,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), BindingCodecError> {
+    let exact = source.legacy_metadata.is_none();
+    work.step()?;
+    if !exact {
+        return Err(BindingCodecError::InvalidShape(
+            "table signature copy requires an exact binding without legacy metadata",
+        ));
+    }
+    Ok(())
+}
+
+/// Admit an actual relation signature occurrence into the same caller model.
+/// Its original namespace and output membership remain caller-owned facts.
+pub(crate) fn preflight_table_signature_copy(
+    source: &BoundTableFunction,
+    model: &mut MaterializationModel,
+    limits: BindingProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), BindingCodecError> {
+    preflight_table_signature_copy_counts(source, model, limits, work)?;
+    preflight_table_signature_copy_types(source, model, limits, work)
+}
+/// Count-only original pass lets an encompassing owner admit cumulative work
+/// and requests before this signature's nested clone preflight starts.
+pub(crate) fn preflight_table_signature_copy_counts(
+    source: &BoundTableFunction,
+    model: &mut MaterializationModel,
+    limits: BindingProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), BindingCodecError> {
+    model.check(limits)?;
+    table_header(source, work)?;
+    model.items = add(
+        model.items,
+        add(source.argument_types.len(), source.result_types.len())?,
+    )?;
+    model.request::<FunctionArgumentType>(source.argument_types.len(), 2)?;
+    model.request::<FunctionValueType>(source.result_types.len(), 2)?;
+    model.request::<u8>(source.function_id.as_str().len(), 1)?;
+    model.request::<u8>(source.overload.as_str().len(), 1)?;
+    model.facts.type_reference_count =
+        add(model.facts.type_reference_count, source.result_types.len())?;
+    model.check(limits)?;
+    preflight_argument_counts(&source.argument_types, model, limits, work)?;
+    Ok(())
+}
+/// Continue the already counted occurrence in the same model and scope.
+/// The caller must not add a second collection count or reset the model.
+pub(crate) fn preflight_table_signature_copy_types(
+    source: &BoundTableFunction,
+    model: &mut MaterializationModel,
+    limits: BindingProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), BindingCodecError> {
+    preflight_argument_types(&source.argument_types, model, limits, work)?;
+    for value in &source.result_types {
+        model.count_owned_type_clone(value, limits, work)?;
+        work.step()?;
+    }
+    Ok(())
+}
+
+/// Copy an admitted table occurrence through the sole argument/FVT authors.
+/// No entry/footer, implicit legacy metadata or installed capability is added.
+pub(crate) fn copy_table_signature_observed(
+    source: &BoundTableFunction,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<BoundTableFunction, BindingCodecError> {
+    table_header(source, work)?;
+    let (function_id, overload) = copy_identity(&source.function_id, &source.overload, work)?;
+    let argument_types = copy_arguments(&source.argument_types, work)?;
+    let mut results = reserve(source.result_types.len(), work)?;
+    for value in &source.result_types {
+        results.push(copy_type(value, work)?);
+        work.step()?;
+    }
+    let result_types = boxed(results, work)?;
+    let output = BoundTableFunction::from_exact_signature(
         function_id,
         overload,
-        source.kind,
         argument_types,
-        result_type,
+        result_types,
     );
     work.step()?;
     Ok(output)

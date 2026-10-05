@@ -40,7 +40,11 @@ pub use materialize::{
     prepare_function_bindings_materialization,
 };
 pub use read::{PreparedFunctionBindingHeaders, prepare_function_binding_headers};
-pub(crate) use signature_copy::{copy_scalar_signature_observed, preflight_scalar_signature_copy};
+pub(crate) use signature_copy::{
+    copy_scalar_signature_observed, copy_table_signature_observed, preflight_scalar_signature_copy,
+    preflight_table_signature_copy, preflight_table_signature_copy_counts,
+    preflight_table_signature_copy_types,
+};
 
 #[derive(Debug)]
 pub enum BindingCodecError {
@@ -173,6 +177,26 @@ impl<'loan, 'source> EncodedFunctionBindings<'loan, 'source> {
             }
         }
         Ok(None)
+    }
+    /// Resolve only an actual borrowed source in this emitted namespace.
+    /// If the source is intentionally aliased by multiple definitions, the
+    /// first original ascending ID is sufficient for the same exact signature.
+    /// The caller admits count-sized work and owns this scope's entry/tail.
+    pub(crate) fn table_source_id_observed(
+        &self,
+        source: &BoundTableFunction,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<u32, BindingCodecError> {
+        for input in self.inputs {
+            let same = matches!(input.source, BindingSource::Table(actual) if std::ptr::eq(actual, source));
+            work.step()?;
+            if same {
+                return Ok(input.id);
+            }
+        }
+        Err(BindingCodecError::InvalidShape(
+            "table signature is not an original emitted source",
+        ))
     }
     /// Borrow an original relational signature. The caller admits the linear
     /// work from facts().definition_count and owns this meter's entry/tail.

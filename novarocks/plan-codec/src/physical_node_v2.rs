@@ -20,6 +20,7 @@
 
 use crate::{
     allocation_exit_v2::reserve_exit,
+    physical_binding_v2::BindingCodecError,
     physical_connector_payload_v2::ConnectorPayloadCodecError,
     physical_expression_v2::ExpressionCodecError,
     physical_properties_v2::{
@@ -62,6 +63,7 @@ pub enum NodeCodecError {
     Properties(PhysicalPropertyCodecError),
     Value(ValueCodecError),
     Expression(ExpressionCodecError),
+    Binding(BindingCodecError),
     Relation(RelationCodecError),
     Payload(ConnectorPayloadCodecError),
     Constant(p::ConstantReferenceError),
@@ -94,6 +96,14 @@ impl From<ExpressionCodecError> for NodeCodecError {
         match error {
             ExpressionCodecError::Control(cause) => Self::Control(cause),
             error => Self::Expression(error),
+        }
+    }
+}
+impl From<BindingCodecError> for NodeCodecError {
+    fn from(error: BindingCodecError) -> Self {
+        match error {
+            BindingCodecError::Control(cause) => Self::Control(cause),
+            error => Self::Binding(error),
         }
     }
 }
@@ -135,6 +145,7 @@ impl fmt::Display for NodeCodecError {
             Self::Properties(e) => e.fmt(f),
             Self::Value(e) => e.fmt(f),
             Self::Expression(e) => e.fmt(f),
+            Self::Binding(e) => e.fmt(f),
             Self::Relation(e) => e.fmt(f),
             Self::Payload(e) => e.fmt(f),
             Self::Constant(e) => e.fmt(f),
@@ -150,6 +161,7 @@ impl std::error::Error for NodeCodecError {
             Self::Properties(e) => Some(e),
             Self::Value(e) => Some(e),
             Self::Expression(e) => Some(e),
+            Self::Binding(e) => Some(e),
             Self::Relation(e) => Some(e),
             Self::Payload(e) => Some(e),
             Self::Constant(e) => Some(e),

@@ -410,3 +410,159 @@ fn wide_lambda_reference_gate_precedes_clone_and_keeps_ordered_full_parameters()
         FunctionValueType::new(DataType::Utf8, false)
     );
 }
+
+fn table_fixture() -> BoundTableFunction {
+    let scalar = fixture(FunctionKind::Scalar);
+    BoundTableFunction::from_exact_signature(
+        scalar.function_id,
+        scalar.overload,
+        scalar.argument_types,
+        vec![
+            FunctionValueType::new(
+                DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+                true,
+            ),
+            FunctionValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                false,
+                ValueLogicalType::LargeInt,
+            )
+            .unwrap(),
+        ]
+        .into_boxed_slice(),
+    )
+}
+fn run_table(
+    source: &BoundTableFunction,
+    control: &Control,
+) -> Result<BoundTableFunction, BindingCodecError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+    let result = (|| {
+        let mut model = MaterializationModel::for_composition(1, 0, 4096, 4096);
+        preflight_table_signature_copy(source, &mut model, limits(), &mut work)?;
+        copy_table_signature_observed(source, &mut work)
+    })();
+    finish(work, result)
+}
+
+#[test]
+fn table_signature_copy_preserves_relation_roots_with_independent_layout_invoice() {
+    let source = table_fixture();
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let mut model = MaterializationModel::for_composition(1, 0, 4096, 4096);
+    preflight_table_signature_copy(&source, &mut model, limits(), &mut work).unwrap();
+    let bytes = 12
+        + 2 * Layout::array::<FunctionArgumentType>(2).unwrap().size()
+        + 4 * Layout::array::<FunctionValueType>(2).unwrap().size()
+        + 4 * Layout::new::<DataType>().size();
+    let retained = 12
+        + Layout::array::<FunctionArgumentType>(2).unwrap().size()
+        + 2 * Layout::array::<FunctionValueType>(2).unwrap().size()
+        + 4 * Layout::new::<DataType>().size();
+    assert_eq!(model.facts.type_reference_count, 6);
+    assert_eq!(model.facts.allocation_requests_upper_bound, 12);
+    assert_eq!(model.facts.request_bytes_upper_bound, bytes);
+    assert_eq!(model.retained, retained);
+    assert_eq!(
+        model.facts.coexisting_source_and_request_bytes_upper_bound,
+        4096 + bytes
+    );
+    assert_eq!(
+        model.facts.cumulative_work_upper_bound,
+        128 + 32 * 7 + 6 * (16 + 8 * MAX_VALUE_TYPE_NODES) + 4 * bytes + 12
+    );
+    let copied = copy_table_signature_observed(&source, &mut work).unwrap();
+    finish(work, Ok::<_, BindingCodecError>(())).unwrap();
+    assert_eq!(copied.function_id.as_str(), "test/f");
+    assert_eq!(copied.overload.as_str(), "test/o");
+    assert!(copied.legacy_metadata.is_none());
+    assert_eq!(copied.result_types.len(), 2);
+    assert_eq!(
+        copied.result_types[0],
+        FunctionValueType::new(
+            DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+            true
+        )
+    );
+    assert_eq!(
+        copied.result_types[1].logical_type,
+        ValueLogicalType::LargeInt
+    );
+    assert_eq!(
+        copied.result_types[1].data_type,
+        DataType::FixedSizeBinary(16)
+    );
+    assert!(!copied.result_types[1].nullable);
+    assert_eq!(copied.argument_types, source.argument_types);
+    assert!(!std::ptr::eq(
+        copied.result_types.as_ptr(),
+        source.result_types.as_ptr()
+    ));
+    let DataType::Dictionary(source_key, source_value) = &source.result_types[0].data_type else {
+        panic!("source dictionary")
+    };
+    let DataType::Dictionary(copied_key, copied_value) = &copied.result_types[0].data_type else {
+        panic!("copied dictionary")
+    };
+    assert!(!std::ptr::eq(source_key.as_ref(), copied_key.as_ref()));
+    assert!(!std::ptr::eq(source_value.as_ref(), copied_value.as_ref()));
+}
+
+#[test]
+fn table_signature_copy_empty_roots_and_all_actual_refusal_prefixes() {
+    let full = table_fixture();
+    let empty = BoundTableFunction::from_exact_signature(
+        FunctionId::try_new("test/f").unwrap(),
+        FunctionOverloadId::try_new("test/o").unwrap(),
+        Box::new([]),
+        Box::new([]),
+    );
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let mut model = MaterializationModel::for_composition(1, 0, 4096, 4096);
+    preflight_table_signature_copy(&empty, &mut model, limits(), &mut work).unwrap();
+    assert_eq!(model.facts.type_reference_count, 0);
+    assert_eq!(model.facts.allocation_requests_upper_bound, 2);
+    assert_eq!(model.facts.request_bytes_upper_bound, 12);
+    assert_eq!(model.retained, 12);
+    finish(work, Ok::<_, BindingCodecError>(())).unwrap();
+    for source in [&full, &empty] {
+        let control = Control::default();
+        let actual = run_table(source, &control).unwrap();
+        assert_eq!(&actual, source);
+        let trace = control.trace();
+        for at in 0..trace.len() {
+            for cause in CAUSES {
+                let control = Control::rejecting(at, cause);
+                assert!(
+                    matches!(run_table(source, &control), Err(BindingCodecError::Control(actual)) if actual == cause)
+                );
+                assert_eq!(control.trace(), trace[..=at]);
+            }
+        }
+    }
+    let mut legacy = full;
+    legacy.legacy_metadata = Some(LegacyBindingMetadata {
+        argument_evaluation: FunctionArgumentEvaluation::Eager,
+        volatility: FunctionVolatility::Immutable,
+        intrinsic_row_error: FunctionIntrinsicRowError::NotRowEvaluated,
+        failure_behavior: FunctionFailureBehavior::Propagate,
+        semantic_parameters: Box::new([]),
+    });
+    let control = Control::default();
+    assert!(matches!(
+        run_table(&legacy, &control),
+        Err(BindingCodecError::InvalidShape(_))
+    ));
+    let trace = control.trace();
+    for at in 0..trace.len() {
+        for cause in CAUSES {
+            let control = Control::rejecting(at, cause);
+            assert!(
+                matches!(run_table(&legacy, &control), Err(BindingCodecError::Control(actual)) if actual == cause)
+            );
+            assert_eq!(control.trace(), trace[..=at]);
+        }
+    }
+}

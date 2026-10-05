@@ -38,6 +38,7 @@ fn dependency_refusals_preserve_the_first_cause_without_an_enclosing_tail() {
     ] {
         for error in [
             NodeCodecError::from(ExpressionCodecError::Control(cause)),
+            NodeCodecError::from(BindingCodecError::Control(cause)),
             NodeCodecError::from(RelationCodecError::Control(cause)),
             NodeCodecError::from(ConnectorPayloadCodecError::Control(cause)),
             NodeCodecError::from(RelationCodecError::from(
@@ -76,6 +77,7 @@ fn dependency_refusals_preserve_the_first_cause_without_an_enclosing_tail() {
 #[test]
 fn ordinary_dependency_errors_retain_typed_details_and_completed_work() {
     for error in [
+        NodeCodecError::from(BindingCodecError::InvalidShape("missing table signature")),
         NodeCodecError::from(ExpressionCodecError::InvalidShape(
             "missing scalar expression",
         )),
@@ -92,6 +94,9 @@ fn ordinary_dependency_errors_retain_typed_details_and_completed_work() {
         let actual = finish::<()>(work, Err(error)).unwrap_err();
         assert!(std::error::Error::source(&actual).is_some());
         match actual {
+            NodeCodecError::Binding(BindingCodecError::InvalidShape(message)) => {
+                assert_eq!(message, "missing table signature")
+            }
             NodeCodecError::Expression(ExpressionCodecError::InvalidShape(message)) => {
                 assert_eq!(message, "missing scalar expression")
             }
