@@ -31,7 +31,13 @@ use std::{collections::BTreeMap, fmt, sync::Arc};
 
 mod decode;
 mod encode;
+mod root_sources;
 mod scalars;
+
+pub use root_sources::{
+    PackageTypeRootSource, PackageTypeRootSourceFacts, PackageTypeRootSources, WriterTypeRootRole,
+    prepare_package_type_root_sources,
+};
 
 #[derive(Debug)]
 pub enum TypeCodecError {
