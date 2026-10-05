@@ -47,6 +47,7 @@ pub(crate) struct AggregateStateLink {
 #[derive(Debug)]
 enum StateOrigin {
     Emission(PhysicalCallSite),
+    WriterNoContribution { auxiliary_ordinal: u32 },
     Transport(AggregateStateTransport, Box<[AggregateStateLink]>),
 }
 #[derive(Debug)]
@@ -112,6 +113,19 @@ impl AggregateStateSources {
     ) -> Result<(), SqlSourceJournalError> {
         self.insert_observed(endpoint, StateOrigin::Emission(site), work)
     }
+    /// The ordinal is the original full output-schema field position.
+    pub fn writer_no_contribution_observed(
+        &mut self,
+        endpoint: AggregateStateEndpoint,
+        auxiliary_ordinal: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), SqlSourceJournalError> {
+        self.insert_observed(
+            endpoint,
+            StateOrigin::WriterNoContribution { auxiliary_ordinal },
+            work,
+        )
+    }
     pub fn transport_observed(
         &mut self,
         endpoint: AggregateStateEndpoint,
@@ -176,9 +190,6 @@ impl<'a> CheckedAggregateStateInputs<'a> {
     pub const fn root(&self) -> AggregateStateEndpoint {
         self.root
     }
-    /// Visit each actual graph node once. Ordered links, including repeated
-    /// occurrences, remain in the original graph and are separately visited.
-    /// Reconvergent paths never cause exponential request clones or traversal.
     pub fn visit_observed(
         &self,
         work: &mut CompileCheckpoints<'_>,
@@ -187,97 +198,331 @@ impl<'a> CheckedAggregateStateInputs<'a> {
             AggregateStateEndpoint,
             &mut CompileCheckpoints<'_>,
         ) -> Result<(), SqlSourceJournalError>,
-        mut transport: impl FnMut(
+        transport: impl FnMut(
             AggregateStateEndpoint,
             AggregateStateTransport,
             &[AggregateStateLink],
             &mut CompileCheckpoints<'_>,
         ) -> Result<(), SqlSourceJournalError>,
     ) -> Result<(), SqlSourceJournalError> {
-        let sources = &self.owner.call_sources.state_sources;
-        if !sources.contains_observed(self.root, work)? {
-            return Err(SqlSourceJournalError::InvalidSource(
-                "aggregate state input has no original emitted route",
-            ));
-        }
-        // Dense scratch is bounded by actual stored emissions/transport nodes.
-        // It is caller-owned invoice scratch, not a formal allocation grant.
+        visit_state_sources_observed(
+            self.owner,
+            self.root,
+            work,
+            |source, endpoint, work| match source {
+                CheckedStateEmission::Aggregate(source) => emission(source, endpoint, work),
+                CheckedStateEmission::Writer(_) => Err(SqlSourceJournalError::InvalidSource(
+                    "ordinary aggregate state route contains a Writer emission",
+                )),
+            },
+            transport,
+            |_, _| {
+                Err(SqlSourceJournalError::InvalidSource(
+                    "ordinary aggregate state route contains a Writer non-contribution",
+                ))
+            },
+        )
+    }
+}
+
+/// A Writer merge borrows its own logical request and every actual input route.
+#[derive(Clone, Copy)]
+pub(crate) struct CheckedWriterAggregateStateInputs<'a> {
+    owner: &'a SqlAuthoredPhysicalPlan,
+    root: AggregateStateEndpoint,
+}
+impl<'a> CheckedWriterAggregateStateInputs<'a> {
+    pub const fn root(&self) -> AggregateStateEndpoint {
+        self.root
+    }
+    pub fn visit_observed(
+        &self,
+        work: &mut CompileCheckpoints<'_>,
+        mut emission: impl FnMut(
+            CheckedWriterAggregateLogicalSourceEntry<'a>,
+            AggregateStateEndpoint,
+            &mut CompileCheckpoints<'_>,
+        ) -> Result<(), SqlSourceJournalError>,
+        transport: impl FnMut(
+            AggregateStateEndpoint,
+            AggregateStateTransport,
+            &[AggregateStateLink],
+            &mut CompileCheckpoints<'_>,
+        ) -> Result<(), SqlSourceJournalError>,
+        no_contribution: impl FnMut(
+            AggregateStateEndpoint,
+            &mut CompileCheckpoints<'_>,
+        ) -> Result<(), SqlSourceJournalError>,
+    ) -> Result<(), SqlSourceJournalError> {
+        visit_state_sources_observed(
+            self.owner,
+            self.root,
+            work,
+            |source, endpoint, work| match source {
+                CheckedStateEmission::Writer(source) => emission(source, endpoint, work),
+                CheckedStateEmission::Aggregate(_) => Err(SqlSourceJournalError::InvalidSource(
+                    "Writer aggregate state route contains an ordinary emission",
+                )),
+            },
+            transport,
+            no_contribution,
+        )
+    }
+}
+
+enum CheckedStateEmission<'a> {
+    Aggregate(CheckedAggregateLogicalSourceEntry<'a>),
+    Writer(CheckedWriterAggregateLogicalSourceEntry<'a>),
+}
+
+/// The sole walk visits each endpoint once while retaining ordered, repeated
+/// links. Writer terminals add no calls or cross-phase compatibility proof.
+fn visit_state_sources_observed<'a>(
+    owner: &'a SqlAuthoredPhysicalPlan,
+    root: AggregateStateEndpoint,
+    work: &mut CompileCheckpoints<'_>,
+    mut emission: impl FnMut(
+        CheckedStateEmission<'a>,
+        AggregateStateEndpoint,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<(), SqlSourceJournalError>,
+    mut transport: impl FnMut(
+        AggregateStateEndpoint,
+        AggregateStateTransport,
+        &[AggregateStateLink],
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<(), SqlSourceJournalError>,
+    mut no_contribution: impl FnMut(
+        AggregateStateEndpoint,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<(), SqlSourceJournalError>,
+) -> Result<(), SqlSourceJournalError> {
+    let sources = &owner.call_sources.state_sources;
+    if !sources.contains_observed(root, work)? {
+        return Err(SqlSourceJournalError::InvalidSource(
+            "aggregate state input has no original emitted route",
+        ));
+    }
+    // Dense scratch and BTree membership remain caller-admitted storage. The
+    // Writer output set is prepared once per actual Writer, not per channel.
+    work.flush()?;
+    let mut pending = Vec::new();
+    pending
+        .try_reserve(sources.sources.len())
+        .map_err(|_| CompileControlError::ResourceExhausted)?;
+    let mut queued = BTreeSet::new();
+    let mut writer_outputs = BTreeMap::new();
+    pending.push(root);
+    work.step()?;
+    work.flush()?;
+    queued.insert(root);
+    work.step()?;
+    while let Some(endpoint) = pending.pop() {
         work.flush()?;
-        let mut pending = Vec::new();
-        pending
-            .try_reserve(sources.sources.len())
-            .map_err(|_| CompileControlError::ResourceExhausted)?;
-        let mut queued = BTreeSet::new();
-        pending.push(self.root);
+        let index = sources.index.get(&endpoint).copied();
         work.step()?;
-        work.flush()?;
-        queued.insert(self.root);
+        let source = index.and_then(|index| sources.sources.get(index));
         work.step()?;
-        while let Some(endpoint) = pending.pop() {
-            work.flush()?;
-            let index = sources.index.get(&endpoint).copied();
-            work.step()?;
-            let source = index.and_then(|index| sources.sources.get(index));
-            work.step()?;
-            let source = source.ok_or(SqlSourceJournalError::InvalidSource(
-                "aggregate state input has no original emitted route",
-            ))?;
-            match &source.origin {
-                StateOrigin::Emission(site) => {
-                    work.flush()?;
-                    let fragment = self.owner.plan.fragments().get(&endpoint.fragment);
-                    work.step()?;
-                    let fragment = fragment.ok_or(SqlSourceJournalError::MissingEntry)?;
-                    work.flush()?;
-                    let node = fragment.nodes().get(&endpoint.node);
-                    work.step()?;
-                    let node = node.ok_or(SqlSourceJournalError::MissingEntry)?;
-                    let call = match (site, &node.kind) {
-                        (
-                            PhysicalCallSite::Aggregate { node: id, call },
-                            NodeKind::Aggregate { calls, .. },
-                        ) if *id == node.id => calls.get(*call as usize),
-                        _ => None,
-                    };
-                    work.step()?;
-                    let call = call.ok_or(SqlSourceJournalError::InvalidSource(
-                        "aggregate state route differs from its actual emission",
-                    ))?;
-                    let same_output = call.output == source.endpoint.value
-                        && !call.binding.phase.produces_final_result();
-                    work.step()?;
-                    if !same_output {
-                        return Err(SqlSourceJournalError::InvalidSource(
-                            "aggregate state route loans a result or foreign output",
-                        ));
+        let source = source.ok_or(SqlSourceJournalError::InvalidSource(
+            "aggregate state input has no original emitted route",
+        ))?;
+        match &source.origin {
+            StateOrigin::Emission(site) => {
+                work.flush()?;
+                let fragment = owner.plan.fragments().get(&endpoint.fragment);
+                work.step()?;
+                let fragment = fragment.ok_or(SqlSourceJournalError::MissingEntry)?;
+                work.flush()?;
+                let node = fragment.nodes().get(&endpoint.node);
+                work.step()?;
+                let node = node.ok_or(SqlSourceJournalError::MissingEntry)?;
+                let (entry, input) = match (site, &node.kind) {
+                    (
+                        PhysicalCallSite::WriterPartial { node: id, call },
+                        NodeKind::TableWriter { target },
+                    ) if *id == node.id => {
+                        let call = target.partial_aggregates.get(*call as usize);
+                        work.step()?;
+                        let call = call.ok_or(SqlSourceJournalError::InvalidSource(
+                            "Writer state route differs from its actual emission",
+                        ))?;
+                        let same_output = call.output == source.endpoint.value
+                            && matches!(call.binding.phase, AggregatePhase::Partial { .. });
+                        work.step()?;
+                        if !same_output {
+                            return Err(SqlSourceJournalError::InvalidSource(
+                                "Writer state route loans a result or foreign output",
+                            ));
+                        }
+                        let entry = owner.checked_writer_aggregate_source_observed(
+                            fragment, node, *site, call, work,
+                        )?;
+                        (CheckedStateEmission::Writer(entry), None)
                     }
-                    let entry = self
-                        .owner
-                        .checked_aggregate_source_observed(fragment, node, *site, call, work)?;
-                    let input = if entry.phase().consumes_logical_arguments() {
-                        None
-                    } else {
-                        Some(check_state_inputs_observed(&entry, work)?.root)
-                    };
-                    emission(entry, endpoint, work)?;
-                    if let Some(input) = input {
-                        enqueue_observed(sources, input, &mut queued, &mut pending, work)?;
+                    _ => {
+                        let call = match (site, &node.kind) {
+                            (
+                                PhysicalCallSite::Aggregate { node: id, call },
+                                NodeKind::Aggregate { calls, .. },
+                            ) if *id == node.id => calls.get(*call as usize),
+                            _ => None,
+                        };
+                        work.step()?;
+                        let call = call.ok_or(SqlSourceJournalError::InvalidSource(
+                            "aggregate state route differs from its actual emission",
+                        ))?;
+                        let same_output = call.output == source.endpoint.value
+                            && !call.binding.phase.produces_final_result();
+                        work.step()?;
+                        if !same_output {
+                            return Err(SqlSourceJournalError::InvalidSource(
+                                "aggregate state route loans a result or foreign output",
+                            ));
+                        }
+                        let entry = owner
+                            .checked_aggregate_source_observed(fragment, node, *site, call, work)?;
+                        let input = if entry.phase().consumes_logical_arguments() {
+                            None
+                        } else {
+                            Some(check_state_inputs_observed(&entry, work)?.root)
+                        };
+                        (CheckedStateEmission::Aggregate(entry), input)
                     }
+                };
+                emission(entry, endpoint, work)?;
+                if let Some(input) = input {
+                    enqueue_observed(sources, input, &mut queued, &mut pending, work)?;
                 }
-                StateOrigin::Transport(kind, links) => {
-                    // Exact ordinals and repeated links are borrowed rather
-                    // than deduplicated into a set of logical requests.
-                    check_transport_observed(self.owner, endpoint, *kind, links, work)?;
-                    transport(endpoint, *kind, links, work)?;
-                    for link in links.iter().rev() {
-                        enqueue_observed(sources, link.source, &mut queued, &mut pending, work)?;
-                    }
+            }
+            StateOrigin::WriterNoContribution { auxiliary_ordinal } => {
+                check_writer_no_contribution_observed(
+                    owner,
+                    endpoint,
+                    *auxiliary_ordinal,
+                    &mut writer_outputs,
+                    work,
+                )?;
+                no_contribution(endpoint, work)?;
+            }
+            StateOrigin::Transport(kind, links) => {
+                check_transport_observed(owner, endpoint, *kind, links, work)?;
+                transport(endpoint, *kind, links, work)?;
+                for link in links.iter().rev() {
+                    enqueue_observed(sources, link.source, &mut queued, &mut pending, work)?;
                 }
             }
         }
-        Ok(())
     }
+    Ok(())
 }
+
+fn check_writer_no_contribution_observed(
+    owner: &SqlAuthoredPhysicalPlan,
+    endpoint: AggregateStateEndpoint,
+    auxiliary_ordinal: u32,
+    writer_outputs: &mut BTreeMap<(FragmentId, NodeId), BTreeSet<ValueId>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), SqlSourceJournalError> {
+    use novarocks_physical_plan::{ValueOrigin, WriterDerivedKind, WriterRelationFieldRole};
+
+    work.flush()?;
+    let fragment = owner.plan.fragments().get(&endpoint.fragment);
+    work.step()?;
+    let fragment = fragment.ok_or(SqlSourceJournalError::MissingEntry)?;
+    work.flush()?;
+    let node = fragment.nodes().get(&endpoint.node);
+    work.step()?;
+    let node = node.ok_or(SqlSourceJournalError::MissingEntry)?;
+    let target = match &node.kind {
+        NodeKind::TableWriter { target } => Some(target),
+        _ => None,
+    };
+    work.step()?;
+    let target = target.ok_or(SqlSourceJournalError::InvalidSource(
+        "Writer non-contribution has no original Writer",
+    ))?;
+    let field = target.output_schema.fields.get(auxiliary_ordinal as usize);
+    work.step()?;
+    let field = field.ok_or(SqlSourceJournalError::InvalidSource(
+        "Writer non-contribution has no original auxiliary field",
+    ))?;
+    let same_field = field.role == WriterRelationFieldRole::Auxiliary
+        && field.value == endpoint.value
+        && field.ty.nullable
+        && node.output.columns.get(auxiliary_ordinal as usize) == Some(&endpoint.value);
+    work.step()?;
+    if !same_field {
+        return Err(SqlSourceJournalError::InvalidSource(
+            "Writer non-contribution differs from its original auxiliary field",
+        ));
+    }
+    work.flush()?;
+    let value = fragment.values().get(&endpoint.value);
+    work.step()?;
+    let value = value.ok_or(SqlSourceJournalError::MissingEntry)?;
+    let same_origin = matches!(value.origin, ValueOrigin::WriterDerived {
+        writer_node, kind: WriterDerivedKind::RelationAuxiliary,
+    } if writer_node == node.id);
+    work.step()?;
+    if !same_origin {
+        return Err(SqlSourceJournalError::InvalidSource(
+            "Writer non-contribution has a foreign value origin",
+        ));
+    }
+    work.flush()?;
+    let exact = field.ty.exactly_equals_observed(&value.ty, || {
+        work.step().map_err(SqlOperationalProjectionError::from)
+    });
+    let exact = exact.map_err(|error| match error {
+        SqlOperationalProjectionError::Control(cause) => SqlSourceJournalError::Control(cause),
+        _ => SqlSourceJournalError::InvalidSource(
+            "Writer non-contribution has an invalid declared type",
+        ),
+    });
+    let exact = match exact {
+        Err(SqlSourceJournalError::Control(cause)) => {
+            return Err(SqlSourceJournalError::Control(cause));
+        }
+        result => {
+            work.flush()?;
+            result?
+        }
+    };
+    if !exact {
+        return Err(SqlSourceJournalError::InvalidSource(
+            "Writer non-contribution differs from its complete declared type",
+        ));
+    }
+    let key = (endpoint.fragment, endpoint.node);
+    work.flush()?;
+    let prepared = writer_outputs.contains_key(&key);
+    work.step()?;
+    if !prepared {
+        let mut outputs = BTreeSet::new();
+        for call in target.partial_aggregates.iter() {
+            work.flush()?;
+            outputs.insert(call.output);
+            work.step()?;
+        }
+        work.flush()?;
+        writer_outputs.insert(key, outputs);
+        work.step()?;
+    }
+    work.flush()?;
+    let outputs = writer_outputs.get(&key);
+    work.step()?;
+    let outputs = outputs.ok_or(SqlSourceJournalError::MissingEntry)?;
+    work.flush()?;
+    let emitted = outputs.contains(&endpoint.value);
+    work.step()?;
+    if emitted {
+        return Err(SqlSourceJournalError::InvalidSource(
+            "Writer non-contribution is an actual Partial output",
+        ));
+    }
+    Ok(())
+}
+
 /// Check the retained record against this immutable emission, not against a
 /// separately inferred state grammar or implementation compatibility rule.
 fn check_transport_observed(
@@ -442,6 +687,62 @@ pub(super) fn check_state_inputs_observed<'a>(
         ));
     }
     Ok(CheckedAggregateStateInputs {
+        owner: entry.owner,
+        root: endpoint,
+    })
+}
+
+/// Check the actual Writer ValueId demand without fabricating an expression.
+pub(super) fn check_writer_state_inputs_observed<'a>(
+    entry: &CheckedWriterAggregateLogicalSourceEntry<'a>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<CheckedWriterAggregateStateInputs<'a>, SqlSourceJournalError> {
+    let demand = match entry.runtime {
+        AggregateRuntimeDemand::WriterState(value) => Some(value),
+        _ => None,
+    };
+    work.step()?;
+    let demand = demand.ok_or(SqlSourceJournalError::InvalidSource(
+        "Writer update has no merge state inputs",
+    ))?;
+    work.flush()?;
+    let endpoint = entry
+        .owner
+        .call_sources
+        .state_sources
+        .inputs
+        .get(&(entry.fragment.id(), entry.site))
+        .copied();
+    work.step()?;
+    let endpoint = endpoint.ok_or(SqlSourceJournalError::InvalidSource(
+        "Writer merge has no original state input association",
+    ))?;
+    let same = endpoint.fragment == entry.fragment.id()
+        && entry.node.inputs.as_ref() == [endpoint.node]
+        && endpoint.value == demand
+        && demand == entry.source.input;
+    work.step()?;
+    if !same {
+        return Err(SqlSourceJournalError::InvalidSource(
+            "Writer state association differs from its actual merge channel",
+        ));
+    }
+    work.flush()?;
+    let child = entry.fragment.nodes().get(&endpoint.node);
+    work.step()?;
+    let child = child.ok_or(SqlSourceJournalError::MissingEntry)?;
+    let mut present = false;
+    for value in &child.output.columns {
+        let same = *value == demand;
+        work.step()?;
+        present |= same;
+    }
+    if !present {
+        return Err(SqlSourceJournalError::InvalidSource(
+            "Writer state input is absent from its original child port",
+        ));
+    }
+    Ok(CheckedWriterAggregateStateInputs {
         owner: entry.owner,
         root: endpoint,
     })

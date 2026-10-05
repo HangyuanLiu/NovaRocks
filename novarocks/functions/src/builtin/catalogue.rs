@@ -193,6 +193,21 @@ impl AggregateSignatureResolver for BuiltinAggregateResolver {
         builtin_supports_ordered_update_channels(self.declaration.name)
     }
 
+    fn state_argument_contract(
+        &self,
+        selected_overload: &AggregateOverloadIdentity,
+    ) -> Result<novarocks_type_contract::AggregateStateArgumentContract, FunctionResolutionError>
+    {
+        if selected_overload != &builtin_overload_identity(self.declaration)? {
+            return Err(FunctionResolutionError::BadSignature(
+                "builtin aggregate state contract references a foreign overload".into(),
+            ));
+        }
+        Ok(builtin_aggregate_state_argument_contract(
+            self.declaration.name,
+        ))
+    }
+
     fn resolve_update_signature(
         &self,
         selected_overload: &AggregateOverloadIdentity,
@@ -3030,6 +3045,75 @@ pub fn builtin_function_volatility(name: &str) -> FunctionVolatility {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn original_builtin_state_law_matches_signature_port_declaration_and_selection() {
+        use novarocks_type_contract::AggregateStateArgumentContract;
+
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        for (name, expected) in [
+            (
+                "count",
+                AggregateStateArgumentContract::ValueRootNullabilityIndependent,
+            ),
+            (
+                "min",
+                AggregateStateArgumentContract::ValueRootNullabilityIndependent,
+            ),
+            (
+                "max",
+                AggregateStateArgumentContract::ValueRootNullabilityIndependent,
+            ),
+            ("sum", AggregateStateArgumentContract::ExactSignature),
+        ] {
+            let args = [value_argument(DataType::Int64, true, None)];
+            let binding = catalog
+                .resolve_bound_user(
+                    name,
+                    FunctionKind::Aggregate,
+                    FunctionBindingRequest {
+                        expected_result_type: None,
+                        arguments: &args,
+                        logical_argument_count: 1,
+                    },
+                    crate::binding_test_control(),
+                )
+                .unwrap();
+            let definition = catalog.definition_by_id(&binding.function_id).unwrap();
+            let overload =
+                AggregateOverloadIdentity::try_new(binding.selected.overload.as_str()).unwrap();
+            let original = definition.aggregate_resolver.as_ref().unwrap();
+            assert_eq!(
+                original.state_argument_contract(&overload).unwrap(),
+                expected
+            );
+            assert_eq!(
+                binding
+                    .selected
+                    .aggregate
+                    .as_ref()
+                    .unwrap()
+                    .state_argument_contract,
+                expected
+            );
+            let declared = definition
+                .binding_declaration()
+                .unwrap()
+                .overloads()
+                .iter()
+                .find(|candidate| candidate.identity == binding.selected.overload)
+                .unwrap();
+            assert_eq!(
+                declared.aggregate.as_ref().unwrap().state_argument_contract,
+                expected
+            );
+            let foreign = AggregateOverloadIdentity::try_new("test/foreign-state-law/v1").unwrap();
+            assert!(matches!(
+                original.state_argument_contract(&foreign),
+                Err(FunctionResolutionError::BadSignature(_))
+            ));
+        }
+    }
 
     fn value_argument(
         data_type: DataType,

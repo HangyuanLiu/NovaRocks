@@ -3190,12 +3190,13 @@ impl<'a> ContractLoweringVisitor<'a> {
                     .ok_or_else(|| invalid_write("writer aggregate sequence is missing".into()))?;
                 let phase = AggregatePhase::Partial { sequence };
                 let logical = self.capture_aggregate_source(&call.source)?;
-                let captured =
-                    logical
-                        .captured()
-                        .ok_or(ContractLoweringError::InvalidAggregate {
-                            detail: "writer update lacks its original logical request",
-                        })?;
+                let captured = logical
+                    .captured()
+                    .ok_or(ContractLoweringError::InvalidAggregate {
+                        detail: "writer update lacks its original logical request",
+                    });
+                self.work.step()?;
+                let captured = captured?;
                 let canonical = self.author_canonical_writer_update(captured, input)?;
                 let binding = lower_writer_aggregate_binding_from_selection(
                     call.resolved(),
@@ -3215,12 +3216,12 @@ impl<'a> ContractLoweringVisitor<'a> {
                         "canonical writer state differs from its original auxiliary slot".into(),
                     ));
                 }
+                let site = novarocks_physical_plan::PhysicalCallSite::WriterPartial {
+                    node,
+                    call: checked_ordinal("writer partial call", call_ordinal)?,
+                };
                 self.record_aggregate_source(
-                    novarocks_physical_plan::PhysicalCallSite::WriterPartial {
-                        node,
-                        call: u32::try_from(call_ordinal)
-                            .map_err(|_| CompileControlError::ResourceExhausted)?,
-                    },
+                    site,
                     LoweredAggregateSourceEntry {
                         logical,
                         canonical: Some(canonical),
@@ -3229,6 +3230,11 @@ impl<'a> ContractLoweringVisitor<'a> {
                         target: AggregateSourceTarget::Writer(output),
                     },
                 )?;
+                let endpoint = self.state_endpoint(node, output);
+                self.call_sources
+                    .state_sources
+                    .emission_observed(endpoint, site, &mut self.work)
+                    .map_err(Self::state_source_error)?;
                 Ok(WriterAggregateCall {
                     input,
                     binding,
@@ -3236,6 +3242,33 @@ impl<'a> ContractLoweringVisitor<'a> {
                 })
             })
             .collect::<Result<Vec<_>, ContractLoweringError>>()?;
+
+        // A writer publishes the complete shared auxiliary schema, including
+        // channels for which this target has no original partial call. Record
+        // that exact omission separately from an unknown state source.
+        for (ordinal, field) in output_schema.fields.iter().enumerate() {
+            let auxiliary = field.role == WriterRelationFieldRole::Auxiliary;
+            self.work.step()?;
+            if !auxiliary {
+                continue;
+            }
+            let endpoint = self.state_endpoint(node, field.value);
+            if !self
+                .call_sources
+                .state_sources
+                .contains_observed(endpoint, &mut self.work)
+                .map_err(Self::state_source_error)?
+            {
+                self.call_sources
+                    .state_sources
+                    .writer_no_contribution_observed(
+                        endpoint,
+                        checked_ordinal("writer auxiliary schema field", ordinal)?,
+                        &mut self.work,
+                    )
+                    .map_err(Self::state_source_error)?;
+            }
+        }
 
         self.fragment_mut().add_row_consuming(
             node,
@@ -3812,6 +3845,38 @@ impl<'a> ContractLoweringVisitor<'a> {
                 Distribution::Singleton,
                 RowMultiplicity::SingleCopy,
             )?;
+            for (ordinal, (sent, received)) in imports.iter().enumerate() {
+                let mut links = Vec::new();
+                let present = self.record_state_link(
+                    &mut links,
+                    AggregateStateEndpoint {
+                        fragment: writer.fragment,
+                        node: writer.node,
+                        value: *sent,
+                    },
+                    0,
+                    ordinal,
+                )?;
+                if !present
+                    && ordinal >= novarocks_spi::connector::write_stack::WRITE_RELATION_COLUMN_COUNT
+                {
+                    return Err(invalid_write(
+                        "writer auxiliary stream has no original contribution fact".into(),
+                    ));
+                }
+                if present {
+                    let endpoint = self.state_endpoint(exchange, *received);
+                    self.call_sources
+                        .state_sources
+                        .transport_observed(
+                            endpoint,
+                            AggregateStateTransport::Stream(edge),
+                            links,
+                            &mut self.work,
+                        )
+                        .map_err(Self::state_source_error)?;
+                }
+            }
             self.plan_builder.add_edge(Edge {
                 id: edge,
                 kind: EdgeKind::Stream,
@@ -3856,6 +3921,39 @@ impl<'a> ContractLoweringVisitor<'a> {
                         output_ordinal: checked_ordinal("writer UnionAll output", output_ordinal)?,
                     },
                 )?);
+            }
+            for (ordinal, value) in output.iter().enumerate() {
+                let mut links = Vec::new();
+                let mut complete = true;
+                for (input_ordinal, (input, mapping)) in
+                    exchange_nodes.iter().zip(&exchange_outputs).enumerate()
+                {
+                    complete &= self.record_state_link(
+                        &mut links,
+                        self.state_endpoint(*input, mapping[ordinal]),
+                        input_ordinal,
+                        ordinal,
+                    )?;
+                }
+                if !complete
+                    && ordinal >= novarocks_spi::connector::write_stack::WRITE_RELATION_COLUMN_COUNT
+                {
+                    return Err(invalid_write(
+                        "writer auxiliary union lacks an original branch fact".into(),
+                    ));
+                }
+                if complete {
+                    let endpoint = self.state_endpoint(union, *value);
+                    self.call_sources
+                        .state_sources
+                        .transport_observed(
+                            endpoint,
+                            AggregateStateTransport::UnionAll,
+                            links,
+                            &mut self.work,
+                        )
+                        .map_err(Self::state_source_error)?;
+                }
             }
             self.fragment_mut().add_row_consuming(
                 union,
@@ -3929,12 +4027,12 @@ impl<'a> ContractLoweringVisitor<'a> {
                 let phase = AggregatePhase::Final { sequence };
                 let binding = lower_writer_aggregate_binding(call.resolved(), phase)?;
                 let logical = self.capture_aggregate_source(&call.source)?;
+                let site = novarocks_physical_plan::PhysicalCallSite::WriterFinal {
+                    node: finish,
+                    call: checked_ordinal("writer final call", call_ordinal)?,
+                };
                 self.record_aggregate_source(
-                    novarocks_physical_plan::PhysicalCallSite::WriterFinal {
-                        node: finish,
-                        call: u32::try_from(call_ordinal)
-                            .map_err(|_| CompileControlError::ResourceExhausted)?,
-                    },
+                    site,
                     LoweredAggregateSourceEntry {
                         logical,
                         canonical: None,
@@ -3943,6 +4041,11 @@ impl<'a> ContractLoweringVisitor<'a> {
                         target: AggregateSourceTarget::Writer(output),
                     },
                 )?;
+                let endpoint = self.state_endpoint(finish_input, input);
+                self.call_sources
+                    .state_sources
+                    .input_observed(self.current_fragment, site, endpoint, &mut self.work)
+                    .map_err(Self::state_source_error)?;
                 Ok(WriterAggregateCall {
                     input,
                     binding,
@@ -12366,6 +12469,10 @@ mod lowered_single_aggregate_canonical_tests;
 #[cfg(test)]
 #[path = "lowered_writer_canonical_tests.rs"]
 mod lowered_writer_canonical_tests;
+
+#[cfg(test)]
+#[path = "lowered_writer_state_tests.rs"]
+mod lowered_writer_state_tests;
 
 #[cfg(test)]
 mod tests {

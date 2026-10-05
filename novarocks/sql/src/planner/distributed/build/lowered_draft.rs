@@ -38,10 +38,10 @@ pub(super) use operational_channels::{
     SqlOperationalChannelRole, project_emitted_call_arguments_observed,
     project_emitted_writer_value_observed,
 };
-pub(crate) use state_sources::CheckedAggregateStateInputs;
 pub(super) use state_sources::{
     AggregateStateEndpoint, AggregateStateLink, AggregateStateSources, AggregateStateTransport,
 };
+pub(crate) use state_sources::{CheckedAggregateStateInputs, CheckedWriterAggregateStateInputs};
 
 /// A completed SQL source owner. Its physical view is read-only; consuming a
 /// statement or DML result transfers this entire owner, including its original
@@ -403,6 +403,7 @@ impl SqlAuthoredPhysicalPlan {
         let captured = captured?;
         work.flush()?;
         Ok(CheckedWriterAggregateLogicalSourceEntry {
+            owner: self,
             captured,
             canonical: entry.canonical.as_ref(),
             phase: entry.phase,
@@ -418,6 +419,7 @@ impl SqlAuthoredPhysicalPlan {
 /// A loan from the original Writer call; an ordinary AggregateCall cannot
 /// stand in for this ValueId-based lifecycle.
 pub(crate) struct CheckedWriterAggregateLogicalSourceEntry<'a> {
+    owner: &'a SqlAuthoredPhysicalPlan,
     captured: &'a CapturedAggregateLogicalRequest,
     canonical: Option<&'a Arc<CanonicalAggregateOperationalRequest>>,
     phase: AggregatePhase,
@@ -428,6 +430,12 @@ pub(crate) struct CheckedWriterAggregateLogicalSourceEntry<'a> {
     source: &'a WriterAggregateCall,
 }
 impl<'a> CheckedWriterAggregateLogicalSourceEntry<'a> {
+    pub(crate) fn state_inputs_observed(
+        &self,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<CheckedWriterAggregateStateInputs<'a>, SqlSourceJournalError> {
+        state_sources::check_writer_state_inputs_observed(self, work)
+    }
     pub(crate) const fn captured(&self) -> &'a CapturedAggregateLogicalRequest {
         self.captured
     }

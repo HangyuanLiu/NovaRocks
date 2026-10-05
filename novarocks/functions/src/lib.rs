@@ -89,9 +89,10 @@ pub use novarocks_constant_contract::{
     ConstantError, ConstantPolicy, ConstantPool, ConstantResourceFacts, ConstantValue,
 };
 pub use novarocks_type_contract::{
-    AggregateStateFormatId as AggregateStateFormatIdentity, FunctionArgumentEvaluation,
-    FunctionArgumentType, FunctionFailureBehavior, FunctionId, FunctionIntrinsicRowError,
-    FunctionKind, FunctionOverloadId, FunctionValueType, FunctionVolatility, ValueLogicalType,
+    AggregateStateArgumentContract, AggregateStateFormatId as AggregateStateFormatIdentity,
+    FunctionArgumentEvaluation, FunctionArgumentType, FunctionFailureBehavior, FunctionId,
+    FunctionIntrinsicRowError, FunctionKind, FunctionOverloadId, FunctionValueType,
+    FunctionVolatility, ValueLogicalType,
 };
 pub use pure_catalogue::*;
 pub use scalar_kernel::*;
@@ -327,6 +328,17 @@ pub trait AggregateSignatureResolver: Send + Sync {
     /// expressions as additional executable update channels.
     fn supports_ordered_update_channels(&self) -> bool {
         false
+    }
+
+    /// The original owner declares how this exact overload compares logical
+    /// argument metadata across state-producing and state-consuming phases.
+    /// This is not a runtime-success, value-equality or source-lineage proof.
+    fn state_argument_contract(
+        &self,
+        _selected_overload: &AggregateOverloadIdentity,
+    ) -> Result<novarocks_type_contract::AggregateStateArgumentContract, FunctionResolutionError>
+    {
+        Ok(novarocks_type_contract::AggregateStateArgumentContract::ExactSignature)
     }
 
     /// Whether this aggregate can produce NULL.
@@ -690,6 +702,17 @@ pub trait TypedAggregateFamily: Send + Sync + 'static {
         false
     }
 
+    /// The original family declares how this exact overload compares logical
+    /// argument metadata across state-producing and state-consuming phases.
+    /// This is not a runtime-success, value-equality or source-lineage proof.
+    fn state_argument_contract(
+        &self,
+        _selected_overload: &AggregateOverloadIdentity,
+    ) -> Result<novarocks_type_contract::AggregateStateArgumentContract, FunctionResolutionError>
+    {
+        Ok(novarocks_type_contract::AggregateStateArgumentContract::ExactSignature)
+    }
+
     /// Whether this family can produce NULL. See
     /// [`AggregateSignatureResolver::produces_null`].
     fn produces_null(&self) -> bool {
@@ -786,6 +809,14 @@ impl<F: TypedAggregateFamily> AggregateSignatureResolver for TypedFamilySignatur
 
     fn supports_ordered_update_channels(&self) -> bool {
         self.family.supports_ordered_update_channels()
+    }
+
+    fn state_argument_contract(
+        &self,
+        selected_overload: &AggregateOverloadIdentity,
+    ) -> Result<novarocks_type_contract::AggregateStateArgumentContract, FunctionResolutionError>
+    {
+        self.family.state_argument_contract(selected_overload)
     }
 
     fn produces_null(&self) -> bool {

@@ -177,6 +177,14 @@ impl AggregateSignatureResolver for CountOwner {
     fn supports_ordered_update_channels(&self) -> bool {
         self.resolver.supports_ordered_update_channels()
     }
+
+    fn state_argument_contract(
+        &self,
+        selected_overload: &crate::AggregateOverloadIdentity,
+    ) -> Result<novarocks_type_contract::AggregateStateArgumentContract, FunctionResolutionError>
+    {
+        self.resolver.state_argument_contract(selected_overload)
+    }
 }
 impl PureFunctionMetadataOwner for CountOwner {
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {

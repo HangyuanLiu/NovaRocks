@@ -201,6 +201,18 @@ fn every_prefix<T>(call: impl Fn(&Trace) -> Result<T, FunctionBindingError>) {
 #[test]
 fn parametric_exact_identity_uses_only_the_original_fixed_overload_author() {
     let (catalog, family) = catalog();
+    for overload in catalog
+        .definition(NAME, FunctionKind::Aggregate)
+        .unwrap()
+        .binding_declaration()
+        .unwrap()
+        .overloads()
+    {
+        assert_eq!(
+            overload.aggregate.as_ref().unwrap().state_argument_contract,
+            AggregateStateArgumentContract::ExactSignature
+        );
+    }
     let integer = [argument(DataType::Int64, true)];
     let text = [argument(DataType::Utf8, false)];
     let resolved = catalog
@@ -667,4 +679,221 @@ fn parametric_returned_channels_cannot_be_hidden_by_the_supplied_overload_identi
         assert!(!updates.is_empty());
         assert!(updates.iter().all(|(overload, _)| overload == LEFT));
     }
+}
+
+#[derive(Default)]
+struct StateLawFamily {
+    family: Family,
+    mode: std::sync::atomic::AtomicU8,
+    laws: Mutex<Vec<String>>,
+    observation: Mutex<Option<Arc<Trace>>>,
+    last_author_entry: std::sync::atomic::AtomicUsize,
+}
+impl AggregateSignatureResolver for StateLawFamily {
+    fn resolve_aggregate(
+        &self,
+        types: &[DataType],
+    ) -> Result<ResolvedAggregateSignature, crate::FunctionResolutionError> {
+        self.family.resolve_aggregate(types)
+    }
+    fn resolve_update_signature(
+        &self,
+        overload: &AggregateOverloadIdentity,
+        types: &[DataType],
+    ) -> Result<ResolvedAggregateSignature, crate::FunctionResolutionError> {
+        self.family.resolve_update_signature(overload, types)
+    }
+    fn produces_null(&self) -> bool {
+        false
+    }
+    fn state_argument_contract(
+        &self,
+        overload: &AggregateOverloadIdentity,
+    ) -> Result<AggregateStateArgumentContract, crate::FunctionResolutionError> {
+        self.laws.lock().unwrap().push(overload.as_str().to_owned());
+        if let Some(trace) = self.observation.lock().unwrap().as_ref() {
+            self.last_author_entry.store(
+                trace.calls.lock().unwrap().len(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+        match self.mode.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => return Ok(AggregateStateArgumentContract::ExactSignature),
+            2 => {
+                return Err(crate::FunctionResolutionError::BadSignature(
+                    "state-law author rejected selected overload".into(),
+                ));
+            }
+            3 => {
+                return Err(crate::FunctionResolutionError::Control(
+                    CompileControlError::Cancelled,
+                ));
+            }
+            4 => {
+                return Err(crate::FunctionResolutionError::Control(
+                    CompileControlError::DeadlineExceeded,
+                ));
+            }
+            5 => {
+                return Err(crate::FunctionResolutionError::Control(
+                    CompileControlError::ResourceExhausted,
+                ));
+            }
+            _ => {}
+        }
+        match overload.as_str() {
+            LEFT => Ok(AggregateStateArgumentContract::ValueRootNullabilityIndependent),
+            RIGHT => Ok(AggregateStateArgumentContract::ExactSignature),
+            _ => Err(crate::FunctionResolutionError::BadSignature(
+                "foreign state-law overload".into(),
+            )),
+        }
+    }
+}
+#[test]
+fn parametric_state_law_is_authored_per_overload_in_declaration_and_every_selection() {
+    let family = Arc::new(StateLawFamily::default());
+    let catalog = catalog_from(family.clone());
+    assert_eq!(*family.laws.lock().unwrap(), [LEFT, RIGHT]);
+    let declaration = catalog
+        .definition(NAME, FunctionKind::Aggregate)
+        .unwrap()
+        .binding_declaration()
+        .unwrap();
+    for (overload, ty, expected) in [
+        (
+            LEFT,
+            DataType::Int64,
+            AggregateStateArgumentContract::ValueRootNullabilityIndependent,
+        ),
+        (
+            RIGHT,
+            DataType::Utf8,
+            AggregateStateArgumentContract::ExactSignature,
+        ),
+    ] {
+        assert_eq!(
+            declaration
+                .overload(&FunctionOverloadId::try_new(overload).unwrap())
+                .unwrap()
+                .aggregate
+                .as_ref()
+                .unwrap()
+                .state_argument_contract,
+            expected
+        );
+        for nullable in [false, true] {
+            let args = [argument(ty.clone(), nullable)];
+            let initial = catalog
+                .resolve_bound_user(
+                    NAME,
+                    FunctionKind::Aggregate,
+                    request(&args),
+                    &Trace::default(),
+                )
+                .unwrap();
+            let exact = select(&catalog, overload, &args, &Trace::default()).unwrap();
+            assert_eq!(initial.selected, *exact);
+            assert_eq!(exact.argument_types.as_ref(), &[args[0].argument_type()]);
+            let state = exact.aggregate.as_ref().unwrap();
+            assert_eq!(state.state_argument_contract, expected);
+            assert_eq!(
+                state.intermediate_type,
+                FunctionValueType::new(DataType::Binary, false)
+            );
+            every_prefix(|control| select(&catalog, overload, &args, control));
+            every_prefix(|control| {
+                catalog.validate_frozen_selection(
+                    &id(),
+                    FunctionKind::Aggregate,
+                    &exact,
+                    request(&args),
+                    control,
+                )
+            });
+            let mut forged = exact.as_ref().clone();
+            forged.aggregate.as_mut().unwrap().state_argument_contract =
+                if expected == AggregateStateArgumentContract::ExactSignature {
+                    AggregateStateArgumentContract::ValueRootNullabilityIndependent
+                } else {
+                    AggregateStateArgumentContract::ExactSignature
+                };
+            assert!(
+                catalog
+                    .validate_frozen_selection(
+                        &id(),
+                        FunctionKind::Aggregate,
+                        &forged,
+                        request(&args),
+                        &Trace::default()
+                    )
+                    .is_err()
+            );
+        }
+    }
+    let args = [argument(DataType::Int64, true)];
+    family.family.elections.lock().unwrap().clear();
+    family.mode.store(1, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(
+        select(&catalog, LEFT, &args, &Trace::default()),
+        Err(FunctionBindingError::InvalidBinding(_))
+    ));
+    every_prefix(|control| select(&catalog, LEFT, &args, control));
+    assert!(
+        family.family.elections.lock().unwrap().is_empty(),
+        "a changed state-law author must not re-elect a candidate"
+    );
+}
+
+#[test]
+fn parametric_state_law_preserves_ordinary_tail_and_original_author_control_without_after() {
+    let family = Arc::new(StateLawFamily::default());
+    let catalog = catalog_from(family.clone());
+    let args = [argument(DataType::Int64, true)];
+    family.mode.store(2, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(
+        select(&catalog, LEFT, &args, &Trace::default()),
+        Err(FunctionBindingError::InvalidBinding(_))
+    ));
+    every_prefix(|control| select(&catalog, LEFT, &args, control));
+    for (mode, cause) in [
+        (3, CompileControlError::Cancelled),
+        (4, CompileControlError::DeadlineExceeded),
+        (5, CompileControlError::ResourceExhausted),
+    ] {
+        family.mode.store(mode, std::sync::atomic::Ordering::SeqCst);
+        let trace = Arc::new(Trace::default());
+        *family.observation.lock().unwrap() = Some(trace.clone());
+        assert!(
+            matches!(select(&catalog, LEFT, &args, trace.as_ref()), Err(FunctionBindingError::Control(actual)) if actual == cause)
+        );
+        assert_eq!(
+            trace.calls.lock().unwrap().len(),
+            family
+                .last_author_entry
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "no completed observation or footer may follow the owner's primary Control"
+        );
+        *family.observation.lock().unwrap() = None;
+    }
+    // A declaration constructor has no compile-control scope to impersonate.
+    // Its original catalogue error owns a failed declaration author.
+    let invalid = FunctionDefinition::try_new_parametric_aggregate(
+        NAME,
+        FunctionVisibility::Public,
+        FunctionVolatility::Immutable,
+        [AggregateOverloadDeclaration::try_new(
+            LEFT,
+            "int64",
+            "binary",
+            "int64",
+            "test/left/state-v1",
+        )
+        .unwrap()],
+        family,
+    );
+    assert!(matches!(
+        invalid,
+        Err(FunctionCatalogError::InvalidStableIdentity { .. })
+    ));
 }

@@ -204,6 +204,25 @@ impl TypedAggregateFamily for IcebergThetaAggregateFamily {
         &self.overloads
     }
 
+    fn state_argument_contract(
+        &self,
+        selected_overload: &AggregateOverloadIdentity,
+    ) -> Result<novarocks_functions::AggregateStateArgumentContract, FunctionResolutionError> {
+        if !self
+            .overloads
+            .iter()
+            .any(|overload| overload.identity == *selected_overload)
+        {
+            return Err(FunctionResolutionError::BadSignature(
+                "Iceberg Theta state contract references a foreign overload".into(),
+            ));
+        }
+        // Canonical update and compact merge skip physical NULL roots. Only
+        // logical Value root nullability is independent; all other metadata
+        // and the original state format remain exact.
+        Ok(novarocks_functions::AggregateStateArgumentContract::ValueRootNullabilityIndependent)
+    }
+
     /// A Theta sketch always has an answer: a group with no rows produces the
     /// canonical empty sketch, not the absence of one.
     fn produces_null(&self) -> bool {
@@ -1234,5 +1253,169 @@ mod tests {
         let output = output.as_any().downcast_ref::<BinaryArray>().unwrap();
         let estimate = estimate_compact_theta(output.value(0)).unwrap();
         assert!((90_000.0..110_000.0).contains(&estimate));
+    }
+
+    #[test]
+    fn theta_state_law_is_owned_by_every_registered_overload_and_exact_selection() {
+        use novarocks_functions::AggregateStateArgumentContract;
+        use novarocks_functions::{FunctionArgumentType, FunctionKind, FunctionResultType};
+        let registration = iceberg_theta_registration().unwrap();
+        let family = registration.family().clone();
+        let declaration = registration.definition().binding_declaration().unwrap();
+        assert_eq!(declaration.overloads().len(), 17);
+        for overload in declaration.overloads() {
+            let identity = AggregateOverloadIdentity::try_new(overload.identity.as_str()).unwrap();
+            assert_eq!(
+                family.state_argument_contract(&identity).unwrap(),
+                AggregateStateArgumentContract::ValueRootNullabilityIndependent
+            );
+            assert_eq!(
+                overload.aggregate.as_ref().unwrap().state_argument_contract,
+                AggregateStateArgumentContract::ValueRootNullabilityIndependent
+            );
+        }
+        let foreign = AggregateOverloadIdentity::try_new("foreign/theta-state/v1").unwrap();
+        assert!(
+            matches!(family.state_argument_contract(&foreign), Err(FunctionResolutionError::BadSignature(message)) if message == "Iceberg Theta state contract references a foreign overload")
+        );
+        let mut builder = EngineFunctionCatalogBuilder::new();
+        builder.register(registration.definition().clone()).unwrap();
+        let catalog = builder.seal_bound().unwrap();
+        let carriers = [
+            DataType::Boolean,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Decimal128(18, 2),
+            DataType::Date32,
+            DataType::Time64(arrow_schema::TimeUnit::Microsecond),
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+            DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::FixedSizeBinary(16),
+        ];
+        for carrier in carriers {
+            for nullable in [false, true] {
+                let value_type = FunctionValueType::new(carrier.clone(), nullable);
+                let arguments = [theta_value_argument(value_type.clone())];
+                let request = theta_value_request(&arguments);
+                let original = catalog
+                    .resolve_bound_trusted(
+                        ICEBERG_THETA_AGGREGATE_NAME,
+                        FunctionKind::Aggregate,
+                        request,
+                        compile_control(),
+                    )
+                    .unwrap();
+                let selected = catalog
+                    .select_exact_overload_observed(
+                        &original.function_id,
+                        FunctionKind::Aggregate,
+                        &original.selected.overload,
+                        request,
+                        compile_control(),
+                    )
+                    .unwrap();
+                assert_eq!(selected.as_ref(), &original.selected);
+                assert_eq!(
+                    selected.argument_types.as_ref(),
+                    &[FunctionArgumentType::Value(value_type)]
+                );
+                assert_eq!(
+                    selected.result_type,
+                    FunctionResultType::Scalar(FunctionValueType::new(DataType::Binary, false))
+                );
+                let state = selected.aggregate.as_ref().unwrap();
+                assert_eq!(
+                    state.state_argument_contract,
+                    AggregateStateArgumentContract::ValueRootNullabilityIndependent
+                );
+                assert_eq!(
+                    state.intermediate_type,
+                    FunctionValueType::new(DataType::Binary, false)
+                );
+                assert_eq!(
+                    state.state_format.as_str(),
+                    ICEBERG_THETA_STATE_FORMAT_IDENTITY
+                );
+                let mut forged = selected.as_ref().clone();
+                forged.aggregate.as_mut().unwrap().state_argument_contract =
+                    AggregateStateArgumentContract::ExactSignature;
+                assert!(
+                    catalog
+                        .validate_frozen_selection(
+                            &original.function_id,
+                            FunctionKind::Aggregate,
+                            &forged,
+                            request,
+                            compile_control()
+                        )
+                        .is_err()
+                );
+            }
+        }
+        assert!(
+            Arc::ptr_eq(&family, registration.family()),
+            "declaration and selections keep the original family owner"
+        );
+    }
+
+    #[test]
+    fn theta_null_update_and_merge_preserve_original_nonnull_compact_bytes() {
+        let nonnull = run_update(Arc::new(Int64Array::from(vec![7, 11])));
+        let nullable = run_update(Arc::new(Int64Array::from(vec![
+            None,
+            Some(7),
+            None,
+            Some(11),
+            Some(7),
+            None,
+        ])));
+        assert_eq!(nullable, nonnull);
+        assert_eq!(estimate_compact_theta(&nullable).unwrap(), 2.0);
+        assert_eq!(
+            run_update(Arc::new(Int64Array::from(vec![None, None]))),
+            EMPTY_ORDERED_COMPACT_V3
+        );
+        let kernel = IcebergThetaKernel;
+        for rows in [
+            vec![Some(nonnull.as_slice())],
+            vec![None, Some(nonnull.as_slice()), None],
+        ] {
+            let array: ArrayRef = Arc::new(BinaryArray::from(rows));
+            let batch = AggregateInputBatch::try_new(Some(&array), array.len()).unwrap();
+            let prepared = kernel.prepare_merge(&batch).unwrap();
+            let mut state = kernel.create_state().unwrap();
+            for row in 0..array.len() {
+                kernel.merge_row(&mut state, &prepared, row).unwrap();
+            }
+            let output = kernel.build_final(std::iter::once(&state)).unwrap();
+            let output = output.as_any().downcast_ref::<BinaryArray>().unwrap();
+            assert_eq!(output.len(), 1);
+            assert!(!output.is_null(0));
+            assert_eq!(output.value(0), nonnull);
+        }
+        let nulls: ArrayRef = Arc::new(BinaryArray::from(vec![None::<&[u8]>, None]));
+        let batch = AggregateInputBatch::try_new(Some(&nulls), nulls.len()).unwrap();
+        let prepared = kernel.prepare_merge(&batch).unwrap();
+        let mut state = kernel.create_state().unwrap();
+        for row in 0..nulls.len() {
+            kernel.merge_row(&mut state, &prepared, row).unwrap();
+        }
+        let output = kernel.build_final(std::iter::once(&state)).unwrap();
+        assert_eq!(
+            output
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .value(0),
+            EMPTY_ORDERED_COMPACT_V3
+        );
     }
 }

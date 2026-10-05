@@ -515,6 +515,9 @@ pub(crate) fn parametric_aggregate_binding(
     let declared = overloads
         .iter()
         .map(|overload| {
+            let state_argument_contract = aggregate_resolver
+                .state_argument_contract(&overload.identity)
+                .map_err(|error| invalid_identity(&error))?;
             Ok(FunctionOverloadDeclaration {
                 effects: None,
                 semantics: FunctionSemantics {
@@ -529,8 +532,7 @@ pub(crate) fn parametric_aggregate_binding(
                 argument_pattern: overload.argument_pattern.clone(),
                 result_pattern: overload.output_pattern.clone(),
                 aggregate: Some(AggregateBindingDeclaration {
-                    state_argument_contract:
-                        novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
+                    state_argument_contract,
                     intermediate_pattern: overload.intermediate_pattern.clone(),
                     state_format: overload.state_format.clone(),
                 }),
@@ -624,7 +626,10 @@ impl ParametricAggregateBindingResolver {
             work.step()?;
         }
         work.flush()?;
-        let selection = self.selection(request, &resolved);
+        let selection = self.selection(request, &resolved, work);
+        if matches!(&selection, Err(FunctionBindingError::Control(_))) {
+            return selection;
+        }
         work.step()?;
         selection
     }
@@ -633,7 +638,19 @@ impl ParametricAggregateBindingResolver {
         &self,
         request: FunctionBindingRequest<'_>,
         resolved: &crate::ResolvedAggregateSignature,
+        work: &mut CompileCheckpoints<'_>,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        work.flush()?;
+        let state_argument_contract = self
+            .aggregate_resolver
+            .state_argument_contract(&resolved.overload)
+            .map_err(FunctionBindingError::from);
+        if let Err(FunctionBindingError::Control(cause)) = state_argument_contract {
+            return Err(FunctionBindingError::Control(cause));
+        }
+        work.step()?;
+        let state_argument_contract = state_argument_contract?;
+        work.flush()?;
         let nullable = self.aggregate_resolver.produces_null();
         Ok(FunctionBindingSelection {
             overload: FunctionOverloadId::try_new(resolved.overload.as_str())
@@ -648,8 +665,7 @@ impl ParametricAggregateBindingResolver {
                 nullable,
             )),
             aggregate: Some(crate::AggregateBindingSelection {
-                state_argument_contract:
-                    novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
+                state_argument_contract,
                 intermediate_type: FunctionValueType::new(
                     resolved.intermediate_type.clone(),
                     nullable,
@@ -686,7 +702,7 @@ impl FunctionBindingResolver for ParametricAggregateBindingResolver {
             for _ in request.arguments {
                 work.step()?;
             }
-            self.selection(request, &resolved)
+            self.selection(request, &resolved, &mut work)
         })();
         finish_binding_work(result, work)
     }
