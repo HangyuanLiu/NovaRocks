@@ -628,7 +628,7 @@ fn relation_fields(
         })
         .collect()
 }
-fn checked_writer_package(recipe: c::ConnectorWriteRecipeDraft) -> p::FragmentPackage {
+pub(crate) fn checked_writer_package(recipe: c::ConnectorWriteRecipeDraft) -> p::FragmentPackage {
     // A real producer/stream/finisher plan, with original cut derivation and
     // full Package publication. There are no aggregate or function calls.
     let ordinal = c::WriteTargetOrdinal::try_new(0).unwrap();

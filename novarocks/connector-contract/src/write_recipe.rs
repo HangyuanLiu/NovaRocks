@@ -21,7 +21,7 @@
 use crate::owned_copy::{ObservedCopy, OwnedCopy, PlainCopy};
 use crate::{
     ConnectorCodecCategory, ConnectorCodecContractError, ConnectorEncodedPayload, ConnectorError,
-    ConnectorErrorKind, ConnectorWriteBinding, ConnectorWriteInputShape,
+    ConnectorErrorKind, ConnectorWriteBinding, ConnectorWriteInputRef, ConnectorWriteInputShape,
     MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES, PureProviderCompileError,
     WRITE_FIELD_ALLOCATION_CHARGE, WriteSchemaVisit, WriterOwnedResourceFacts,
     validate_write_field_schema_events,
@@ -74,10 +74,27 @@ impl ConnectorWriteRecipeDraft {
         Self::try_new_core(binding, payload, input, &mut observer)
     }
 
-    fn try_new_core<O: OwnedCopy>(
+    /// Resolve original borrowed field loans through the same writer law and
+    /// single owned-copy body as the owned-input entrypoint. No intermediate
+    /// owned fields, entry/footer scope, or provider-private seal is created.
+    /// The source invoice covers the live loan slices as well as their complete
+    /// original Arrow backing and all other retained caller sources.
+    pub fn try_new_from_borrowed_input_observed(
         binding: &ConnectorWriteBinding,
         payload: &ConnectorEncodedPayload,
-        input: &ConnectorWriteInputShape,
+        input: &ConnectorWriteInputRef<'_>,
+        source_retained_bytes: usize,
+        admit: &mut impl FnMut(&WriterOwnedResourceFacts) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, PureProviderCompileError<ConnectorError>> {
+        let mut observer = ObservedCopy::new(source_retained_bytes, admit, work)?;
+        Self::try_new_core(binding, payload, input, &mut observer)
+    }
+
+    fn try_new_core<F: crate::write_input::WriteInputFields, O: OwnedCopy>(
+        binding: &ConnectorWriteBinding,
+        payload: &ConnectorEncodedPayload,
+        input: &crate::write_input::ConnectorWriteInput<F>,
         observer: &mut O,
     ) -> Result<Self, O::Error> {
         // O(1) original-owner counts and requests before touching source fields.
@@ -117,12 +134,12 @@ impl ConnectorWriteRecipeDraft {
         if payload.payload().len() > MAX_CONNECTOR_WRITER_HANDLE_BYTES {
             return Err(resource("writer recipe handle exceeds the byte limit").into());
         }
-        if input.field_count() > MAX_CONNECTOR_WRITE_INPUT_FIELDS {
+        if input.source_field_count() > MAX_CONNECTOR_WRITE_INPUT_FIELDS {
             return Err(resource("writer recipe input exceeds the field count limit").into());
         }
         input.validate_with(observer)?;
         let mut schema_bytes = 0;
-        for field in input.fields_iter() {
+        for field in input.field_refs() {
             observer.work(1)?;
             if field.field().name().is_empty() {
                 return Err(invalid("writer recipe input field name is empty").into());
@@ -173,8 +190,9 @@ impl ConnectorWriteRecipeDraft {
                 bytes.checked_add(size_of::<ConnectorWriteInputShape>() + 2 * size_of::<usize>())
             })
             .and_then(|bytes| {
-                bytes
-                    .checked_add(input.field_count() * size_of::<crate::ConnectorWriteFieldToken>())
+                bytes.checked_add(
+                    input.source_field_count() * size_of::<crate::ConnectorWriteFieldToken>(),
+                )
             })
             .ok_or_else(|| resource("writer recipe retained charge overflowed"))?;
         // Count uses the same physical grammar without constructing fields.
@@ -718,3 +736,7 @@ mod tests {
 #[cfg(test)]
 #[path = "write_recipe/owned_tests.rs"]
 mod owned_tests;
+
+#[cfg(test)]
+#[path = "write_recipe/borrowed_tests.rs"]
+mod borrowed_tests;

@@ -693,4 +693,4 @@ mod package_graph_tests;
 mod receiver_tests;
 
 #[cfg(test)]
-mod sender_tests;
+pub(crate) mod sender_tests;

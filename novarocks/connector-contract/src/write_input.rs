@@ -79,28 +79,53 @@ impl ConnectorWriteFieldBinding {
     }
 }
 
+/// One original field loan and its exact provider token. Constructing a loan
+/// neither copies the Arrow field nor validates or seals provider semantics.
+#[derive(Clone, Copy, Debug)]
+pub struct ConnectorWriteFieldRef<'a> {
+    token: ConnectorWriteFieldToken,
+    field: &'a Field,
+}
+
+impl<'a> ConnectorWriteFieldRef<'a> {
+    pub const fn new(token: ConnectorWriteFieldToken, field: &'a Field) -> Self {
+        Self { token, field }
+    }
+
+    pub const fn token(&self) -> ConnectorWriteFieldToken {
+        self.token
+    }
+
+    pub const fn field(&self) -> &'a Field {
+        self.field
+    }
+}
+
 /// Provider-signed counterpart to the SQL admission input request.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ConnectorWriteInputShape {
+pub enum ConnectorWriteInput<Fields> {
     Data {
-        fields: Vec<ConnectorWriteFieldBinding>,
+        fields: Fields,
     },
     RowLineage {
-        data_fields: Vec<ConnectorWriteFieldBinding>,
-        row_identity_fields: Vec<ConnectorWriteFieldBinding>,
+        data_fields: Fields,
+        row_identity_fields: Fields,
     },
     PositionDelete {
-        identity_fields: Vec<ConnectorWriteFieldBinding>,
-        partition_source_fields: Vec<ConnectorWriteFieldBinding>,
+        identity_fields: Fields,
+        partition_source_fields: Fields,
     },
     DeletionVector {
-        identity_fields: Vec<ConnectorWriteFieldBinding>,
-        partition_source_fields: Vec<ConnectorWriteFieldBinding>,
+        identity_fields: Fields,
+        partition_source_fields: Fields,
     },
     EqualityDelete {
-        equality_fields: Vec<ConnectorWriteFieldBinding>,
+        equality_fields: Fields,
     },
 }
+
+/// Owned provider input with the original concrete construction/inference API.
+pub type ConnectorWriteInputShape = ConnectorWriteInput<Vec<ConnectorWriteFieldBinding>>;
 
 impl ConnectorWriteInputShape {
     /// Exact roles, order, field tokens and complete Arrow fields, with observed
@@ -175,7 +200,84 @@ impl ConnectorWriteInputShape {
         Ok(true)
     }
 
-    fn role_vectors(&self) -> [Option<&Vec<ConnectorWriteFieldBinding>>; 2] {
+    pub fn field_count(&self) -> usize {
+        self.source_field_count()
+    }
+
+    pub fn fields_iter(&self) -> impl Iterator<Item = &ConnectorWriteFieldBinding> {
+        self.role_vectors()
+            .into_iter()
+            .flatten()
+            .flat_map(|role| role.iter())
+    }
+
+    pub fn validate(&self) -> Result<(), ConnectorError> {
+        self.validate_with(&mut PlainCopy)
+    }
+
+    pub fn fields(&self) -> Vec<&ConnectorWriteFieldBinding> {
+        self.fields_iter().collect()
+    }
+}
+
+/// The borrowed form retains the same closed role vocabulary as owned input.
+/// The original writer constructor validates every loan and copies each field
+/// through its sole observed schema author before publishing owned output.
+pub type ConnectorWriteInputRef<'a> = ConnectorWriteInput<&'a [ConnectorWriteFieldRef<'a>]>;
+
+// Only the two original source carriers enter the common law/copy body. This
+// private trait is not a provider extension point or a schema grammar.
+pub(crate) trait WriteInputFields {
+    fn len(&self) -> usize;
+    fn field_refs(&self) -> impl Iterator<Item = ConnectorWriteFieldRef<'_>>;
+    fn accumulate_source_backing<O: OwnedCopy>(
+        &self,
+        previous: usize,
+        context: &O,
+    ) -> Result<usize, O::Error>;
+}
+
+impl WriteInputFields for Vec<ConnectorWriteFieldBinding> {
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+    fn field_refs(&self) -> impl Iterator<Item = ConnectorWriteFieldRef<'_>> {
+        self.iter()
+            .map(|field| ConnectorWriteFieldRef::new(field.token(), field.field()))
+    }
+    fn accumulate_source_backing<O: OwnedCopy>(
+        &self,
+        previous: usize,
+        context: &O,
+    ) -> Result<usize, O::Error> {
+        // Owned role Vecs retain independent allocations.
+        context.add(
+            previous,
+            context.mul(self.capacity(), size_of::<ConnectorWriteFieldBinding>())?,
+        )
+    }
+}
+
+impl WriteInputFields for &[ConnectorWriteFieldRef<'_>] {
+    fn len(&self) -> usize {
+        <[ConnectorWriteFieldRef<'_>]>::len(self)
+    }
+    fn field_refs(&self) -> impl Iterator<Item = ConnectorWriteFieldRef<'_>> {
+        self.iter().copied()
+    }
+    fn accumulate_source_backing<O: OwnedCopy>(
+        &self,
+        previous: usize,
+        context: &O,
+    ) -> Result<usize, O::Error> {
+        // Borrowed roles can overlap. A necessary floor must not count the
+        // same source allocation twice; the caller still invoices full backing.
+        Ok(previous.max(context.mul(self.len(), size_of::<ConnectorWriteFieldRef<'_>>())?))
+    }
+}
+
+impl<F> ConnectorWriteInput<F> {
+    fn role_vectors(&self) -> [Option<&F>; 2] {
         match self {
             Self::Data { fields } => [Some(fields), None],
             Self::RowLineage {
@@ -194,28 +296,49 @@ impl ConnectorWriteInputShape {
         }
     }
 
+    pub(crate) fn source_field_count(&self) -> usize
+    where
+        F: WriteInputFields,
+    {
+        let [first, second] = self.role_vectors();
+        first
+            .expect("first role exists")
+            .len()
+            .saturating_add(second.map_or(0, WriteInputFields::len))
+    }
+
+    pub(crate) fn field_refs(&self) -> impl Iterator<Item = ConnectorWriteFieldRef<'_>>
+    where
+        F: WriteInputFields,
+    {
+        self.role_vectors()
+            .into_iter()
+            .flatten()
+            .flat_map(|role| role.field_refs())
+    }
+
     /// Admit each original role's reserve and possible Vec-to-Box shrink before
     /// validation. Role Vec backings are independently owned; nested shared
     /// fields are deliberately absent from this necessary source lower floor.
     pub(crate) fn preflight_owned_roles<O: OwnedCopy>(
         &self,
         context: &mut O,
-    ) -> Result<(), O::Error> {
-        let mut floor = size_of::<Self>();
+    ) -> Result<(), O::Error>
+    where
+        F: WriteInputFields,
+    {
+        let mut backing = 0;
         let mut fields = 0;
         for role in self.role_vectors().into_iter().flatten() {
-            floor = context.add(
-                floor,
-                context.mul(role.capacity(), size_of::<ConnectorWriteFieldBinding>())?,
-            )?;
+            backing = role.accumulate_source_backing(backing, context)?;
             fields = context.add(fields, role.len())?;
             context.array::<ConnectorWriteFieldBinding>(role.len(), 2)?;
         }
-        context.source_floor(floor)?;
+        context.source_floor(context.add(size_of::<Self>(), backing)?)?;
         // The two passes move inline outputs and the materializing pass may
         // also move each retained binding during the original trim operation.
         context.work(context.add(
-            size_of::<Self>(),
+            size_of::<ConnectorWriteInputShape>(),
             context.mul(
                 context.mul(fields, size_of::<ConnectorWriteFieldBinding>())?,
                 3,
@@ -228,9 +351,12 @@ impl ConnectorWriteInputShape {
     pub(crate) fn owned_bounded_core<O: OwnedCopy>(
         &self,
         context: &mut O,
-    ) -> Result<Option<Self>, O::Error> {
-        fn role<O: OwnedCopy>(
-            fields: &[ConnectorWriteFieldBinding],
+    ) -> Result<Option<ConnectorWriteInputShape>, O::Error>
+    where
+        F: WriteInputFields,
+    {
+        fn role<F: WriteInputFields, O: OwnedCopy>(
+            fields: &F,
             context: &mut O,
         ) -> Result<Option<Vec<ConnectorWriteFieldBinding>>, O::Error> {
             let materializes = context.materializes();
@@ -240,7 +366,7 @@ impl ConnectorWriteInputShape {
                 let reserved = output.try_reserve_exact(fields.len());
                 context.reserve_exit(reserved)?;
             }
-            for binding in fields {
+            for binding in fields.field_refs() {
                 let field = crate::schema::owned_field_core(binding.field(), context)?;
                 if materializes {
                     let field = field.ok_or_else(|| {
@@ -277,19 +403,19 @@ impl ConnectorWriteInputShape {
             return Ok(None);
         };
         let result = match self {
-            Self::Data { .. } => Self::Data { fields: first },
-            Self::EqualityDelete { .. } => Self::EqualityDelete {
+            Self::Data { .. } => ConnectorWriteInputShape::Data { fields: first },
+            Self::EqualityDelete { .. } => ConnectorWriteInputShape::EqualityDelete {
                 equality_fields: first,
             },
-            Self::RowLineage { .. } => Self::RowLineage {
+            Self::RowLineage { .. } => ConnectorWriteInputShape::RowLineage {
                 data_fields: first,
                 row_identity_fields: second.expect("second role was copied"),
             },
-            Self::PositionDelete { .. } => Self::PositionDelete {
+            Self::PositionDelete { .. } => ConnectorWriteInputShape::PositionDelete {
                 identity_fields: first,
                 partition_source_fields: second.expect("second role was copied"),
             },
-            Self::DeletionVector { .. } => Self::DeletionVector {
+            Self::DeletionVector { .. } => ConnectorWriteInputShape::DeletionVector {
                 identity_fields: first,
                 partition_source_fields: second.expect("second role was copied"),
             },
@@ -298,56 +424,14 @@ impl ConnectorWriteInputShape {
         Ok(Some(result))
     }
 
-    pub fn field_count(&self) -> usize {
-        match self {
-            Self::Data { fields } => fields.len(),
-            Self::RowLineage {
-                data_fields,
-                row_identity_fields,
-            } => data_fields.len().saturating_add(row_identity_fields.len()),
-            Self::PositionDelete {
-                identity_fields,
-                partition_source_fields,
-            }
-            | Self::DeletionVector {
-                identity_fields,
-                partition_source_fields,
-            } => identity_fields
-                .len()
-                .saturating_add(partition_source_fields.len()),
-            Self::EqualityDelete { equality_fields } => equality_fields.len(),
-        }
-    }
-
-    pub fn fields_iter(&self) -> impl Iterator<Item = &ConnectorWriteFieldBinding> {
-        let groups: [&[ConnectorWriteFieldBinding]; 2] = match self {
-            Self::Data { fields } => [fields, &[]],
-            Self::RowLineage {
-                data_fields,
-                row_identity_fields,
-            } => [data_fields, row_identity_fields],
-            Self::PositionDelete {
-                identity_fields,
-                partition_source_fields,
-            }
-            | Self::DeletionVector {
-                identity_fields,
-                partition_source_fields,
-            } => [identity_fields, partition_source_fields],
-            Self::EqualityDelete { equality_fields } => [equality_fields, &[]],
-        };
-        groups.into_iter().flatten()
-    }
-
-    pub fn validate(&self) -> Result<(), ConnectorError> {
-        self.validate_with(&mut PlainCopy)
-    }
-
-    pub(crate) fn validate_with<O: OwnedCopy>(&self, context: &mut O) -> Result<(), O::Error> {
+    pub(crate) fn validate_with<O: OwnedCopy>(&self, context: &mut O) -> Result<(), O::Error>
+    where
+        F: WriteInputFields,
+    {
         let [first, second] = self.role_vectors();
         let count = context.add(
             first.expect("first role exists").len(),
-            second.map_or(0, Vec::len),
+            second.map_or(0, WriteInputFields::len),
         )?;
         if count == 0 {
             return Err(ConnectorError::new(
@@ -372,7 +456,7 @@ impl ConnectorWriteInputShape {
         let reserved = names.try_reserve(count);
         context.reserve_exit(reserved)?;
         let mut longest_name = 0;
-        for binding in self.fields_iter() {
+        for binding in self.field_refs() {
             // Token Hash is the derived transparent [u8;32] body. Each table
             // had one fresh reserve, so its admitted bucket bound stays valid.
             if context.source_invoice().is_some() {
@@ -382,7 +466,7 @@ impl ConnectorWriteInputShape {
                 context.work(token_work)?;
             }
             context.flush()?;
-            let unique_token = tokens.insert(binding.token);
+            let unique_token = tokens.insert(binding.token());
             context.step()?;
             context.flush()?;
             // Preserve the original short circuit: a duplicate token never
@@ -394,7 +478,7 @@ impl ConnectorWriteInputShape {
                 )
                 .into());
             }
-            let name = binding.field.name();
+            let name = binding.field().name();
             longest_name = longest_name.max(name.len());
             if context.source_invoice().is_some() {
                 let name_work = hashmap::string_operations_work_upper_bound(
@@ -420,10 +504,6 @@ impl ConnectorWriteInputShape {
             }
         }
         Ok(())
-    }
-
-    pub fn fields(&self) -> Vec<&ConnectorWriteFieldBinding> {
-        self.fields_iter().collect()
     }
 }
 

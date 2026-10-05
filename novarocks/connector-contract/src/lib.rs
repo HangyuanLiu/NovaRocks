@@ -91,7 +91,8 @@ pub use type_projection::{
 pub use value::{ConnectorValue, ConnectorValueType, MAX_CONNECTOR_DECIMAL_PRECISION};
 pub use write::{ConnectorWriteFieldToken, MAX_CONNECTOR_WRITE_TARGETS, WriteTargetOrdinal};
 pub use write_input::{
-    ConnectorWriteBinding, ConnectorWriteFieldBinding, ConnectorWriteInputShape,
+    ConnectorWriteBinding, ConnectorWriteFieldBinding, ConnectorWriteFieldRef,
+    ConnectorWriteInputRef, ConnectorWriteInputShape,
 };
 pub use write_recipe::{
     ConnectorWriteRecipe, ConnectorWriteRecipeCompileError, ConnectorWriteRecipeCompiler,
