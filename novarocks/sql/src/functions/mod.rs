@@ -525,6 +525,14 @@ impl TestExactAggregateBindingResolver {
             .iter()
             .find(|overload| overload.argument_types.as_ref() == argument_types.as_slice())
             .ok_or(FunctionBindingError::NoMatchingOverload)?;
+        self.selection(request, overload)
+    }
+
+    fn selection(
+        &self,
+        request: FunctionBindingRequest<'_>,
+        overload: &AggregateOverloadMetadata,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         Ok(FunctionBindingSelection {
             overload: FunctionOverloadId::try_new(overload.identity.as_str())
                 .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?,
@@ -558,13 +566,63 @@ impl FunctionBindingResolver for TestExactAggregateBindingResolver {
         self.resolve_exact(request)
     }
 
+    fn select_at_overload_observed(
+        &self,
+        supplied: &FunctionOverloadId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        let result = (|| {
+            let mut exact = None;
+            for overload in &self.overloads {
+                let matches = overload.identity.as_str() == supplied.as_str();
+                work.step()?;
+                if matches {
+                    exact = Some(overload);
+                    break;
+                }
+            }
+            let overload = exact.ok_or(FunctionBindingError::NoMatchingOverload)?;
+            let same_arity = request.logical_argument_count == request.arguments.len()
+                && request.arguments.len() == overload.argument_types.len();
+            work.step()?;
+            if !same_arity {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+            for (argument, expected) in request.arguments.iter().zip(&overload.argument_types) {
+                let FunctionArgument::Value { value_type, .. } = argument else {
+                    return Err(FunctionBindingError::NoMatchingOverload);
+                };
+                let exact = novarocks_type_contract::arrow_data_types_exact_observed(
+                    &value_type.data_type,
+                    expected,
+                    || work.step().map_err(FunctionBindingError::from),
+                )?;
+                if !exact {
+                    return Err(FunctionBindingError::NoMatchingOverload);
+                }
+            }
+            work.flush()?;
+            let selected = self.selection(request, overload);
+            work.step()?;
+            selected
+        })();
+        if matches!(&result, Err(FunctionBindingError::Control(_))) {
+            return result;
+        }
+        work.finish()?;
+        result
+    }
+
     fn validate_selected(
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
         _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
-        if &self.resolve_exact(request)? == selected {
+        if &self.select_at_overload_observed(&selected.overload, request, _control)? == selected {
             Ok(())
         } else {
             Err(FunctionBindingError::InvalidBinding(

@@ -251,6 +251,31 @@ pub(in crate::planner::distributed::build) fn project_emitted_call_arguments_obs
         context.check_extent(&mut work)?;
         context.project(input.pools, &mut work)
     })();
+    finish_projection_work(result, work)
+}
+
+/// A Writer's row argument is the actual ValueId carrier, with no expression
+/// root. The original nonconstant projection remains the sole type author.
+pub(in crate::planner::distributed::build) fn project_emitted_writer_value_observed(
+    original: &FunctionArgument,
+    actual: &FunctionValueType,
+    control: &dyn PureCompileControl,
+) -> Result<Box<[FunctionArgument]>, SqlOperationalProjectionError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+    let result = (|| {
+        let argument = project_nonconstant_value_observed(original, actual, &mut work)?;
+        work.flush()?;
+        let arguments = Box::from([argument]);
+        work.step()?;
+        Ok(arguments)
+    })();
+    finish_projection_work(result, work)
+}
+
+fn finish_projection_work<T>(
+    result: Result<T, SqlOperationalProjectionError>,
+    work: CompileCheckpoints<'_>,
+) -> Result<T, SqlOperationalProjectionError> {
     if matches!(&result, Err(SqlOperationalProjectionError::Control(_))) {
         return result;
     }
@@ -345,10 +370,7 @@ impl Projection<'_> {
                     let scalar = !matches!(expression.kind, ExprKind::Lambda { .. });
                     work.step()?;
                     require(scalar, "nonconstant Value role refers to a Lambda")?;
-                    FunctionArgument::Value {
-                        value_type: clone_type(&expression.ty, work)?,
-                        constant: None,
-                    }
+                    project_nonconstant_value_observed(original, &expression.ty, work)?
                 }
                 (
                     SqlOperationalChannelRole::CapturedConstant,
@@ -537,6 +559,25 @@ fn require(condition: bool, detail: &'static str) -> Result<(), SqlOperationalPr
         Err(SqlOperationalProjectionError::InvalidSource(detail))
     }
 }
+/// Project only an original nonconstant Value onto its actual emitted type.
+/// The caller retains source ownership and supplies the original work scope.
+pub(in crate::planner::distributed::build) fn project_nonconstant_value_observed(
+    original: &FunctionArgument,
+    actual: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FunctionArgument, SqlOperationalProjectionError> {
+    let nonconstant = matches!(original, FunctionArgument::Value { constant: None, .. });
+    work.step()?;
+    require(
+        nonconstant,
+        "nonconstant Value projection has a different original argument role",
+    )?;
+    Ok(FunctionArgument::Value {
+        value_type: clone_type(actual, work)?,
+        constant: None,
+    })
+}
+
 fn clone_type(
     value: &FunctionValueType,
     work: &mut CompileCheckpoints<'_>,

@@ -22,7 +22,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use novarocks_physical_plan::{
     AggregateCall, AggregateCallId, AggregatePhase, ExprId, Fragment, FragmentId, NodeKind,
     PhysicalCallSite, PhysicalNode, PhysicalPlan, PlanAnnotation, PlanBuilder,
-    PlanConstructionError, ValueId,
+    PlanConstructionError, ValueId, WriterAggregateCall,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
@@ -36,6 +36,7 @@ pub(crate) use operational_channels::SqlOperationalProjectionError;
 pub(super) use operational_channels::{
     CapturedOperationalSource, EmittedOperationalCall, LoweredOperationalChannel,
     SqlOperationalChannelRole, project_emitted_call_arguments_observed,
+    project_emitted_writer_value_observed,
 };
 pub(crate) use state_sources::CheckedAggregateStateInputs;
 pub(super) use state_sources::{
@@ -226,16 +227,12 @@ impl SqlAuthoredPhysicalPlan {
         })
     }
 
-    /// Only an entry sealed by the actual lowering producer can loan an
-    /// authenticated request. Same-signature foreign plans cannot supply it.
-    pub(crate) fn checked_aggregate_source_observed<'a>(
-        &'a self,
-        fragment: &'a Fragment,
-        node: &'a PhysicalNode,
-        site: PhysicalCallSite,
-        source: &'a AggregateCall,
+    fn check_aggregate_owner_observed(
+        &self,
+        fragment: &Fragment,
+        node: &PhysicalNode,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<CheckedAggregateLogicalSourceEntry<'a>, SqlSourceJournalError> {
+    ) -> Result<(), SqlSourceJournalError> {
         work.flush()?;
         let original_fragment = self.plan.fragments().get(&fragment.id());
         let same_fragment = original_fragment.is_some_and(|value| std::ptr::eq(value, fragment));
@@ -250,6 +247,20 @@ impl SqlAuthoredPhysicalPlan {
                 "aggregate journal loans a foreign plan or node",
             ));
         }
+        Ok(())
+    }
+
+    /// Only an entry sealed by the actual lowering producer can loan an
+    /// authenticated request. Same-signature foreign plans cannot supply it.
+    pub(crate) fn checked_aggregate_source_observed<'a>(
+        &'a self,
+        fragment: &'a Fragment,
+        node: &'a PhysicalNode,
+        site: PhysicalCallSite,
+        source: &'a AggregateCall,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<CheckedAggregateLogicalSourceEntry<'a>, SqlSourceJournalError> {
+        self.check_aggregate_owner_observed(fragment, node, work)?;
         let actual = match (site, &node.kind) {
             (PhysicalCallSite::Aggregate { node: id, call }, NodeKind::Aggregate { calls, .. })
                 if id == node.id =>
@@ -321,6 +332,125 @@ impl SqlAuthoredPhysicalPlan {
             site,
             source,
         })
+    }
+
+    /// A Writer loans its actual ValueId input and original request directly.
+    /// This authenticates the emission; it grants no state-contribution proof.
+    pub(crate) fn checked_writer_aggregate_source_observed<'a>(
+        &'a self,
+        fragment: &'a Fragment,
+        node: &'a PhysicalNode,
+        site: PhysicalCallSite,
+        source: &'a WriterAggregateCall,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<CheckedWriterAggregateLogicalSourceEntry<'a>, SqlSourceJournalError> {
+        self.check_aggregate_owner_observed(fragment, node, work)?;
+        let actual = match (site, &node.kind) {
+            (
+                PhysicalCallSite::WriterPartial { node: id, call },
+                NodeKind::TableWriter { target },
+            ) if id == node.id => target.partial_aggregates.get(call as usize),
+            (PhysicalCallSite::WriterFinal { node: id, call }, NodeKind::TableFinish(finish))
+                if id == node.id =>
+            {
+                finish.final_aggregates.get(call as usize)
+            }
+            _ => None,
+        };
+        let same_call = actual.is_some_and(|value| std::ptr::eq(value, source));
+        work.step()?;
+        if !same_call {
+            return Err(SqlSourceJournalError::InvalidSource(
+                "writer journal call differs from its original site",
+            ));
+        }
+        let entry = self.call_sources.entries.get(&(fragment.id(), site));
+        work.step()?;
+        let entry = entry.ok_or(SqlSourceJournalError::MissingEntry)?;
+        let same_target = entry.target == AggregateSourceTarget::Writer(source.output)
+            && entry.phase == source.binding.phase;
+        work.step()?;
+        if !same_target {
+            return Err(SqlSourceJournalError::InvalidSource(
+                "writer journal phase or output association differs",
+            ));
+        }
+        let runtime = match (site, entry.phase) {
+            (PhysicalCallSite::WriterPartial { .. }, AggregatePhase::Partial { .. }) => {
+                Ok(AggregateRuntimeDemand::Update)
+            }
+            (PhysicalCallSite::WriterFinal { .. }, AggregatePhase::Final { .. }) => {
+                Ok(AggregateRuntimeDemand::WriterState(source.input))
+            }
+            _ => Err(SqlSourceJournalError::InvalidSource(
+                "writer journal phase differs from its original lifecycle",
+            )),
+        };
+        work.step()?;
+        let runtime = runtime?;
+        let same_runtime = entry.runtime == runtime;
+        work.step()?;
+        if !same_runtime {
+            return Err(SqlSourceJournalError::InvalidSource(
+                "writer journal runtime differs from its original input",
+            ));
+        }
+        let captured = entry
+            .logical
+            .captured()
+            .ok_or(SqlSourceJournalError::MissingLogicalSource);
+        work.step()?;
+        let captured = captured?;
+        work.flush()?;
+        Ok(CheckedWriterAggregateLogicalSourceEntry {
+            captured,
+            canonical: entry.canonical.as_ref(),
+            phase: entry.phase,
+            runtime,
+            fragment,
+            node,
+            site,
+            source,
+        })
+    }
+}
+
+/// A loan from the original Writer call; an ordinary AggregateCall cannot
+/// stand in for this ValueId-based lifecycle.
+pub(crate) struct CheckedWriterAggregateLogicalSourceEntry<'a> {
+    captured: &'a CapturedAggregateLogicalRequest,
+    canonical: Option<&'a Arc<CanonicalAggregateOperationalRequest>>,
+    phase: AggregatePhase,
+    runtime: AggregateRuntimeDemand,
+    fragment: &'a Fragment,
+    node: &'a PhysicalNode,
+    site: PhysicalCallSite,
+    source: &'a WriterAggregateCall,
+}
+impl<'a> CheckedWriterAggregateLogicalSourceEntry<'a> {
+    pub(crate) const fn captured(&self) -> &'a CapturedAggregateLogicalRequest {
+        self.captured
+    }
+    pub(crate) const fn canonical(&self) -> Option<&'a Arc<CanonicalAggregateOperationalRequest>> {
+        self.canonical
+    }
+    pub(crate) const fn phase(&self) -> AggregatePhase {
+        self.phase
+    }
+    pub(crate) const fn runtime(&self) -> AggregateRuntimeDemand {
+        self.runtime
+    }
+    pub(crate) const fn fragment(&self) -> &'a Fragment {
+        self.fragment
+    }
+    pub(crate) const fn node(&self) -> &'a PhysicalNode {
+        self.node
+    }
+    pub(crate) const fn site(&self) -> PhysicalCallSite {
+        self.site
+    }
+    pub(crate) const fn source(&self) -> &'a WriterAggregateCall {
+        self.source
     }
 }
 

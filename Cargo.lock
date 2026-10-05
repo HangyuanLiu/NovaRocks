@@ -4352,6 +4352,7 @@ dependencies = [
  "hex",
  "md-5 0.10.6",
  "novarocks-connector-contract",
+ "novarocks-connector-iceberg-functions",
  "novarocks-constant-contract",
  "novarocks-functions",
  "novarocks-parser",

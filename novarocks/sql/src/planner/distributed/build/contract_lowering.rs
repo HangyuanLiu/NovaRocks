@@ -81,7 +81,8 @@ use super::lowered_draft::{
     LoweredOperationalChannel, LoweredSqlPhysicalDraft, LoweredTableSourceEntry,
     SqlExpressionCallKind, SqlLogicalSourceJournal, SqlOperationalChannelRole,
     SqlOperationalProjectionError, project_emitted_call_arguments_observed,
-    validate_expression_source_entry_observed, validate_table_source_entry_observed,
+    project_emitted_writer_value_observed, validate_expression_source_entry_observed,
+    validate_table_source_entry_observed,
 };
 use crate::analysis::cte::CteId;
 use crate::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr, UnOp};
@@ -3188,8 +3189,32 @@ impl<'a> ContractLoweringVisitor<'a> {
                     .copied()
                     .ok_or_else(|| invalid_write("writer aggregate sequence is missing".into()))?;
                 let phase = AggregatePhase::Partial { sequence };
-                let binding = lower_writer_aggregate_binding(call.resolved(), phase)?;
                 let logical = self.capture_aggregate_source(&call.source)?;
+                let captured =
+                    logical
+                        .captured()
+                        .ok_or(ContractLoweringError::InvalidAggregate {
+                            detail: "writer update lacks its original logical request",
+                        })?;
+                let canonical = self.author_canonical_writer_update(captured, input)?;
+                let binding = lower_writer_aggregate_binding_from_selection(
+                    call.resolved(),
+                    canonical.selected(),
+                    phase,
+                )?;
+                let output_type = self.value_declared_type_in(self.current_fragment, output)?;
+                let domain_matches = binding
+                    .intermediate_type
+                    .same_value_domain_observed(&output_type, || {
+                        self.work.step().map_err(ContractLoweringError::from)
+                    })?;
+                let nullable_matches = !binding.intermediate_type.nullable || output_type.nullable;
+                self.work.step()?;
+                if !domain_matches || !nullable_matches {
+                    return Err(invalid_write(
+                        "canonical writer state differs from its original auxiliary slot".into(),
+                    ));
+                }
                 self.record_aggregate_source(
                     novarocks_physical_plan::PhysicalCallSite::WriterPartial {
                         node,
@@ -3198,7 +3223,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     },
                     LoweredAggregateSourceEntry {
                         logical,
-                        canonical: None,
+                        canonical: Some(canonical),
                         phase,
                         runtime: AggregateRuntimeDemand::Update,
                         target: AggregateSourceTarget::Writer(output),
@@ -8891,6 +8916,50 @@ impl<'a> ContractLoweringVisitor<'a> {
         Ok(canonical)
     }
 
+    fn author_canonical_writer_update(
+        &mut self,
+        captured: &crate::binding::CapturedAggregateLogicalRequest,
+        input: ValueId,
+    ) -> Result<Arc<CanonicalAggregateOperationalRequest>, ContractLoweringError> {
+        let request = captured.request();
+        let original = match request.arguments {
+            [original] => Ok(original),
+            _ => Err(invalid_write(
+                "writer update lacks one original argument".into(),
+            )),
+        };
+        self.work.step()?;
+        let original = original?;
+        let unary = request.logical_argument_count == 1;
+        self.work.step()?;
+        if !unary {
+            return Err(invalid_write(
+                "writer update is not an original unary request".into(),
+            ));
+        }
+        self.work.flush()?;
+        let actual = self.value_declared_type_in(self.current_fragment, input);
+        self.work.step()?;
+        let actual = actual?;
+        self.work.flush()?;
+        let projection = project_emitted_writer_value_observed(original, &actual, self.control)
+            .map_err(ContractLoweringError::from);
+        let arguments = self.completed_specialization_result(projection)?;
+        let selected =
+            self.select_canonical_operational_request(captured.binding(), 1, &arguments)?;
+        self.work.flush()?;
+        let canonical = Arc::new(CanonicalAggregateOperationalRequest {
+            binding: captured.binding().clone(),
+            identity: captured.logical_identity().clone(),
+            arguments,
+            logical_count: 1,
+            selected,
+        });
+        self.work.step()?;
+        self.work.flush()?;
+        Ok(canonical)
+    }
+
     fn aggregate_operational_channel(
         &mut self,
         emitted: ExprId,
@@ -9800,6 +9869,14 @@ fn lower_writer_aggregate_binding(
     resolved: &novarocks_functions::ResolvedFunctionBinding,
     phase: AggregatePhase,
 ) -> Result<AggregateBinding, ContractLoweringError> {
+    lower_writer_aggregate_binding_from_selection(resolved, &resolved.selected, phase)
+}
+
+fn lower_writer_aggregate_binding_from_selection(
+    resolved: &novarocks_functions::ResolvedFunctionBinding,
+    selected: &novarocks_functions::FunctionBindingSelection,
+    phase: AggregatePhase,
+) -> Result<AggregateBinding, ContractLoweringError> {
     if resolved.kind != novarocks_physical_plan::FunctionKind::Aggregate
         || resolved.logical_argument_count != 1
     {
@@ -9807,18 +9884,16 @@ fn lower_writer_aggregate_binding(
             "writer aggregate binding is not an exact unary aggregate".into(),
         ));
     }
-    let novarocks_functions::FunctionResultType::Scalar(result) = &resolved.selected.result_type
-    else {
+    let novarocks_functions::FunctionResultType::Scalar(result) = &selected.result_type else {
         return Err(invalid_write("writer aggregate returns a relation".into()));
     };
-    let aggregate = resolved
-        .selected
+    let aggregate = selected
         .aggregate
         .as_ref()
         .ok_or_else(|| invalid_write("writer aggregate has no state contract".into()))?;
     Ok(AggregateBinding {
         state_argument_contract: aggregate.state_argument_contract,
-        function: bound_function_from_resolved(resolved, result),
+        function: bound_function_from_selection(resolved, selected, result),
         phase,
         logical_argument_count: 1,
         intermediate_type: aggregate.intermediate_type.clone(),
@@ -12289,6 +12364,10 @@ mod lowered_conversion_source_tests;
 mod lowered_single_aggregate_canonical_tests;
 
 #[cfg(test)]
+#[path = "lowered_writer_canonical_tests.rs"]
+mod lowered_writer_canonical_tests;
+
+#[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
@@ -12829,7 +12908,7 @@ mod tests {
         }
     }
 
-    fn literal_int(value: i64) -> TypedExpr {
+    pub(super) fn literal_int(value: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(value)),
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
@@ -13127,7 +13206,7 @@ mod tests {
         .clone())
     }
 
-    fn write_handle() -> ConnectorEncodedPayload {
+    pub(super) fn write_handle() -> ConnectorEncodedPayload {
         let provider = ConnectorProviderId::parse("iceberg").unwrap();
         let instance = ConnectorInstanceId::parse("warehouse").unwrap();
         ConnectorEncodedPayload::new(
@@ -13312,7 +13391,7 @@ mod tests {
                 auxiliary: &auxiliary,
                 targets: FinalizedWriteTargetSet::try_new([(ordinal, write_handle())]).unwrap(),
             },
-            crate::functions::builtin_sql_function_catalog().snapshot(),
+            crate::compiler::SqlFunctionCatalog::snapshot(&functions),
             false,
             crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
