@@ -22,8 +22,8 @@
 use crate::physical_type_v2::TypeCodecError;
 use arrow::datatypes::DataType;
 use novarocks_type_contract::{
-    CompileCheckpoints, FunctionValueType, MAX_VALUE_TYPE_NODES, NR_LOGICAL_TYPE_KEY,
-    ValueTypeVisit, arrow_data_types_exact_borrowed_observed,
+    CompileCheckpoints, CompileControlError, FunctionValueType, MAX_VALUE_TYPE_NODES,
+    NR_LOGICAL_TYPE_KEY, ValueTypeVisit, arrow_data_types_exact_borrowed_observed,
     validate_value_type_structure_with_scratch_observed,
 };
 use std::mem;
@@ -71,7 +71,9 @@ fn mul(left: usize, right: usize) -> Result<usize, TypeCodecError> {
 }
 fn cap(bound: usize, maximum: usize) -> Result<(), TypeCodecError> {
     if bound > maximum {
-        return Err(shape("borrowed type comparison work envelope exceeded"));
+        return Err(TypeCodecError::Control(
+            CompileControlError::ResourceExhausted,
+        ));
     }
     Ok(())
 }
@@ -140,9 +142,8 @@ impl Metrics {
             }
         }
         self.model_visits = add(self.model_visits, 1)?;
-        let admitted = cap(self.bound(source, prefix)?, maximum);
+        cap(self.bound(source, prefix)?, maximum)?;
         work.step()?;
-        admitted?;
         if opaque_boundary {
             // Field: entry before the grammar's actual metadata probe.
             // ChildEdge: exit after that completed probe. No predicted-byte
@@ -182,9 +183,8 @@ pub(crate) fn preflight_type_binding(
     // datatype. No scratch is initialized and no metadata is inspected then.
     if !flags_match {
         let work_upper_bound = add(source_retained_bytes, 2)?;
-        let admitted = cap(work_upper_bound, max_work);
+        cap(work_upper_bound, max_work)?;
         work.step()?;
-        admitted?;
         work.flush()?;
         return Ok(BoundTypeComparisonFacts {
             work_upper_bound,
@@ -193,9 +193,8 @@ pub(crate) fn preflight_type_binding(
     }
     let scratch_bytes = mem::size_of::<[Option<(&DataType, usize)>; MAX_VALUE_TYPE_NODES]>();
     let prefix = add(add(source_retained_bytes, scratch_bytes)?, 2)?;
-    let admitted = cap(prefix, max_work);
+    cap(prefix, max_work)?;
     work.step()?;
-    admitted?;
     work.flush()?;
     let mut scratch = [None; MAX_VALUE_TYPE_NODES];
     work.flush()?;

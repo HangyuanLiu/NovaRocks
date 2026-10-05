@@ -70,6 +70,50 @@ message Fragment {
   FragmentSink sink = 6;
   PipelineDopDomain dop_domain = 7;
   repeated uint32 runtime_filter_ids = 8;
+  // Required even for a call-free fragment: absent is not an empty table.
+  FragmentCallRequests call_requests = 9;
+}
+// Definition requests retain original binding inputs independently of runtime
+// occurrences and selected signatures. The outer Fragment owns their identity.
+message FragmentCallRequests { repeated OriginalCallRequest entries = 1; }
+message OriginalCallRequest {
+  CallRequestDefinition definition = 1;
+  repeated OriginalFunctionArgument arguments = 2;
+  optional uint32 logical_argument_count = 3; // Required; zero is valid.
+  optional uint32 expected_result_value_type_id = 4; // Absent retains None.
+  SourceConstantPolicy constant_policy = 5; // Required source data, not a grant.
+}
+message CallRequestDefinition {
+  oneof kind {
+    uint32 expression_definition_id = 1; // ExprId, never ExpressionUseId.
+    // Only relational variants are legal; ExpressionUseId must be refused.
+    novarocks.physical_semantics_v2.CallSite relational = 2;
+  }
+}
+message OriginalFunctionArgument {
+  oneof kind {
+    OriginalValueArgument value = 1;
+    LambdaArgumentType lambda = 2;
+  }
+}
+message OriginalValueArgument {
+  optional uint32 value_type_id = 1; // Required complete FVT; zero/MAX are valid.
+  // Absent is nonconstant; a present reference to a NULL row remains Some.
+  ConstantReference constant = 2;
+}
+// Every field requires presence; all numeric zero values are preserved. These
+// original sender facts cannot replace receiving limits or memory admission.
+message SourceConstantPolicy {
+  optional uint64 max_rows = 1;
+  optional uint64 max_array_nodes = 2;
+  optional uint64 max_logical_elements = 3;
+  optional uint64 max_retained_buffer_bytes = 4;
+  optional uint32 max_type_depth = 5;
+  optional uint64 max_type_nodes = 6;
+  optional uint32 max_dictionary_depth = 7;
+  optional uint64 max_metadata_bytes = 8;
+  optional uint64 max_library_validation_work = 9;
+  optional uint64 max_library_validation_bytes = 10;
 }
 message PipelineDopDomain {
   uint32 min = 1;

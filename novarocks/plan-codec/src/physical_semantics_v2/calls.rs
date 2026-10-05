@@ -49,7 +49,7 @@ pub(super) fn decode_context(input: &wire::EffectContext) -> Result<ExpressionEf
         demand: decode_demand(input.demand)?,
     })
 }
-fn encode_site(site: PhysicalCallSite) -> wire::CallSite {
+pub(crate) fn encode_site(site: PhysicalCallSite) -> wire::CallSite {
     use wire::call_site::Kind;
     let node_call = |node: NodeId, call| wire::NodeCallSite {
         node_id: Some(node.get()),
@@ -70,7 +70,7 @@ fn encode_site(site: PhysicalCallSite) -> wire::CallSite {
         }),
     }
 }
-fn decode_site(input: &wire::CallSite) -> Result<PhysicalCallSite, E> {
+pub(crate) fn decode_site(input: &wire::CallSite) -> Result<PhysicalCallSite, E> {
     use wire::call_site::Kind;
     let node = |value: &wire::NodeCallSite| -> Result<NodeId, E> {
         Ok(NodeId::new(required_id(

@@ -433,3 +433,63 @@ fn intrinsic_scoped_refs_and_false_true_parameters_survive_one_package_carrier()
     assert_eq!(decoded.parameters, Some(parameters));
     // Deliberately carrier-only: no fake full FragmentPackage validation claim.
 }
+
+#[test]
+fn original_requests_keep_missing_distinct_from_explicit_empty_and_present_zero() {
+    use novarocks_proto_models::physical_package_v2 as v2;
+    // Independent bytes: Fragment.call_requests tag 9, explicit empty message.
+    let missing = v2::Fragment::decode([].as_slice()).unwrap();
+    let empty = v2::Fragment::decode([0x4a, 0x00].as_slice()).unwrap();
+    assert!(missing.call_requests.is_none());
+    assert!(empty.call_requests.as_ref().unwrap().entries.is_empty());
+    assert_eq!(empty.encode_to_vec(), [0x4a, 0x00]);
+    // Ten explicit zero fields are original source policy data. Omission is
+    // retained by Prost and is rejected by the separate typed receiving owner.
+    let bytes = [
+        0x08, 0, 0x10, 0, 0x18, 0, 0x20, 0, 0x28, 0, 0x30, 0, 0x38, 0, 0x40, 0, 0x48, 0, 0x50, 0,
+    ];
+    let zeros = v2::SourceConstantPolicy::decode(bytes.as_slice()).unwrap();
+    assert_eq!(zeros.max_rows, Some(0));
+    assert_eq!(zeros.max_array_nodes, Some(0));
+    assert_eq!(zeros.max_logical_elements, Some(0));
+    assert_eq!(zeros.max_retained_buffer_bytes, Some(0));
+    assert_eq!(zeros.max_type_depth, Some(0));
+    assert_eq!(zeros.max_type_nodes, Some(0));
+    assert_eq!(zeros.max_dictionary_depth, Some(0));
+    assert_eq!(zeros.max_metadata_bytes, Some(0));
+    assert_eq!(zeros.max_library_validation_work, Some(0));
+    assert_eq!(zeros.max_library_validation_bytes, Some(0));
+    assert_eq!(zeros.encode_to_vec(), bytes);
+    assert_ne!(zeros, v2::SourceConstantPolicy::default());
+    let request = v2::OriginalCallRequest::decode([0x18, 0, 0x20, 0].as_slice()).unwrap();
+    assert_eq!(request.logical_argument_count, Some(0));
+    assert_eq!(request.expected_result_value_type_id, Some(0));
+    let no_constraint = v2::OriginalCallRequest::decode([0x18, 0].as_slice()).unwrap();
+    assert_eq!(no_constraint.logical_argument_count, Some(0));
+    assert_eq!(no_constraint.expected_result_value_type_id, None);
+}
+
+#[test]
+fn original_request_definition_does_not_alias_expression_occurrence_namespace() {
+    use novarocks_proto_models::{physical_package_v2 as v2, physical_semantics_v2 as sem};
+    // Both contain numeric zero, but their outer oneof alternatives differ.
+    // The relational ExpressionUseId is represented faithfully here; only
+    // the typed request decoder has authority to refuse that alternative.
+    let definition = v2::CallRequestDefinition::decode([0x08, 0].as_slice()).unwrap();
+    let occurrence = v2::CallRequestDefinition::decode([0x12, 2, 0x08, 0].as_slice()).unwrap();
+    assert_eq!(
+        definition.kind,
+        Some(v2::call_request_definition::Kind::ExpressionDefinitionId(0))
+    );
+    assert_eq!(
+        occurrence.kind,
+        Some(v2::call_request_definition::Kind::Relational(
+            sem::CallSite {
+                kind: Some(sem::call_site::Kind::ExpressionUseId(0)),
+            }
+        ))
+    );
+    assert_ne!(definition, occurrence);
+    assert_eq!(definition.encode_to_vec(), [0x08, 0]);
+    assert_eq!(occurrence.encode_to_vec(), [0x12, 2, 0x08, 0]);
+}

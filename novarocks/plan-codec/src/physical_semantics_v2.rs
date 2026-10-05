@@ -47,7 +47,8 @@ pub use parameter_resources::{
 };
 
 pub(crate) use calls::{
-    decode_policy as decode_decimal_policy, encode_policy as encode_decimal_policy,
+    decode_policy as decode_decimal_policy, decode_site as decode_call_site,
+    encode_policy as encode_decimal_policy, encode_site as encode_call_site,
 };
 pub(crate) use parameters::{decode_reference, encode_reference};
 

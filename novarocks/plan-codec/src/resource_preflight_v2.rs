@@ -161,3 +161,6 @@ mod schema_tests;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod request_tests;

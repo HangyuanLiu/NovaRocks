@@ -159,7 +159,9 @@ fn borrowed_type_binding_flags_stop_before_scratch_without_skipping_equal_pointe
     assert_eq!(early.work_upper_bound(), SOURCE + 2);
     assert!(matches!(
         run(&left, &left, SOURCE, SOURCE + 2, &Control::default()),
-        Err(TypeCodecError::InvalidShape(_))
+        Err(TypeCodecError::Control(
+            CompileControlError::ResourceExhausted
+        ))
     ));
     let same = run(&left, &left, SOURCE, WORK, &Control::default()).unwrap();
     assert!(same.matches());
@@ -201,7 +203,9 @@ fn borrowed_type_binding_deleted_map_invoice_and_work_limits_remain_mandatory() 
             facts.work_upper_bound() - 1,
             &Control::default()
         ),
-        Err(TypeCodecError::InvalidShape(_))
+        Err(TypeCodecError::Control(
+            CompileControlError::ResourceExhausted
+        ))
     ));
     let larger = run(&left, &right, SOURCE + 4096, WORK, &Control::default()).unwrap();
     assert!(larger.work_upper_bound() > facts.work_upper_bound());
@@ -246,7 +250,6 @@ fn borrowed_type_binding_success_mismatch_and_ordinary_tails_preserve_every_cont
     let left = nested(false);
     every_boundary(&left, &nested(false), SOURCE, WORK, Some(true));
     every_boundary(&left, &nested(true), SOURCE, WORK, Some(false));
-    every_boundary(&left, &nested(false), SOURCE, 0, None);
     every_boundary(&left, &nested(false), 0, WORK, None);
 }
 
@@ -269,4 +272,50 @@ fn borrowed_type_binding_wide_real_comparison_observes_quantum_and_every_control
         trace.contains(&256),
         "actual comparison must reach its quantum"
     );
+}
+
+#[test]
+fn numeric_work_refusal_preserves_resource_before_later_controller_or_footer() {
+    let left = nested(false);
+    let right = nested(false);
+    let upper = run(&left, &right, SOURCE, WORK, &Control::default())
+        .unwrap()
+        .work_upper_bound();
+    for maximum in [0, SOURCE + 2, upper - 1] {
+        let baseline = Control::default();
+        assert!(matches!(
+            run(&left, &right, SOURCE, maximum, &baseline),
+            Err(TypeCodecError::Control(
+                CompileControlError::ResourceExhausted
+            ))
+        ));
+        let trace = baseline.trace.into_inner().unwrap();
+        assert_eq!(trace.first(), Some(&0));
+        // A later callback would introduce a second cause after numerical
+        // admission already refused. It must never execute, including finish.
+        for cause in CAUSES {
+            let forbidden = Control {
+                refusal: Some((trace.len(), cause)),
+                ..Control::default()
+            };
+            assert!(matches!(
+                run(&left, &right, SOURCE, maximum, &forbidden),
+                Err(TypeCodecError::Control(
+                    CompileControlError::ResourceExhausted
+                ))
+            ));
+            assert_eq!(*forbidden.trace.lock().unwrap(), trace);
+        }
+        for stop in 0..trace.len() {
+            for cause in CAUSES {
+                let refusing = Control {
+                    refusal: Some((stop, cause)),
+                    ..Control::default()
+                };
+                assert!(matches!(run(&left, &right, SOURCE, maximum, &refusing),
+                    Err(TypeCodecError::Control(actual)) if actual == cause));
+                assert_eq!(*refusing.trace.lock().unwrap(), trace[..=stop]);
+            }
+        }
+    }
 }
