@@ -413,12 +413,16 @@ pub(crate) fn author_physical_aggregate_update_request_from_journal_observed<'so
 /// The one authored selected Arc is shared by refinement and fresh preparation.
 pub(crate) struct AuthoredPhysicalAggregateMergeRequest<'entry, 'source> {
     entry: &'entry super::lowered_draft::CheckedAggregateLogicalSourceEntry<'source>,
+    state_inputs: super::lowered_draft::CheckedAggregateStateInputs<'source>,
     state_id: ExprId,
     state: &'source novarocks_physical_plan::ExprNode,
     phase: AggregateKernelPhase,
     selected: Arc<FunctionBindingSelection>,
 }
 impl AuthoredPhysicalAggregateMergeRequest<'_, '_> {
+    pub const fn state_inputs(&self) -> &super::lowered_draft::CheckedAggregateStateInputs<'_> {
+        &self.state_inputs
+    }
     pub fn source(&self) -> &AggregateCall {
         self.entry.source()
     }
@@ -506,8 +510,55 @@ pub(crate) fn author_physical_aggregate_merge_request_observed<'entry, 'source>(
     work.step()?;
     let state = state.ok_or(PhysicalAggregateRequestError::MissingArgument(state_id))?;
     let selected = captured_selected_correspondence_observed(entry.captured(), source, work)?;
+    // The original source graph lends every actual producer. This validates
+    // each producer against its own request; cross-phase interpretation is
+    // still the aggregate implementation/state owner's separate obligation.
+    let source_error = |error| match error {
+        super::lowered_draft::SqlSourceJournalError::Control(cause) => {
+            PhysicalAggregateRequestError::Control(cause)
+        }
+        super::lowered_draft::SqlSourceJournalError::MissingLogicalSource => {
+            PhysicalAggregateRequestError::MissingLogicalSource(entry.phase())
+        }
+        super::lowered_draft::SqlSourceJournalError::InvalidSource(detail) => {
+            PhysicalAggregateRequestError::InvalidSource(detail)
+        }
+        _ => {
+            PhysicalAggregateRequestError::InvalidSource("aggregate state journal entry is absent")
+        }
+    };
+    let state_inputs = entry.state_inputs_observed(work).map_err(source_error)?;
+    state_inputs
+        .visit_observed(
+            work,
+            |producer, _, work| {
+                let result = if producer.phase().consumes_logical_arguments() {
+                    author_physical_aggregate_update_request_from_journal_observed(&producer, work)
+                        .map(|_| ())
+                } else {
+                    selected_correspondence_observed(
+                        producer.captured(),
+                        &producer.captured().binding().resolved().selected,
+                        producer.captured().request().logical_argument_count,
+                        producer.source(),
+                        work,
+                    )
+                };
+                result.map_err(|error| match error {
+                    PhysicalAggregateRequestError::Control(cause) => {
+                        super::lowered_draft::SqlSourceJournalError::Control(cause)
+                    }
+                    _ => super::lowered_draft::SqlSourceJournalError::InvalidSource(
+                        "aggregate state producer differs from its own selected request",
+                    ),
+                })
+            },
+            |_, _, _, _| Ok(()),
+        )
+        .map_err(source_error)?;
     Ok(AuthoredPhysicalAggregateMergeRequest {
         entry,
+        state_inputs,
         state_id,
         state,
         phase,

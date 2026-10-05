@@ -31,10 +31,15 @@ use novarocks_type_contract::{
 use crate::binding::{CapturedAggregateLogicalRequest, CapturedLogicalCallArguments};
 
 mod operational_channels;
+mod state_sources;
 pub(crate) use operational_channels::SqlOperationalProjectionError;
 pub(super) use operational_channels::{
     CapturedOperationalSource, EmittedOperationalCall, LoweredOperationalChannel,
     SqlOperationalChannelRole, project_emitted_call_arguments_observed,
+};
+pub(crate) use state_sources::CheckedAggregateStateInputs;
+pub(super) use state_sources::{
+    AggregateStateEndpoint, AggregateStateLink, AggregateStateSources, AggregateStateTransport,
 };
 
 /// A completed SQL source owner. Its physical view is read-only; consuming a
@@ -306,6 +311,7 @@ impl SqlAuthoredPhysicalPlan {
         work.step()?;
         work.flush()?;
         Ok(CheckedAggregateLogicalSourceEntry {
+            owner: self,
             captured,
             canonical: entry.canonical.as_ref(),
             phase: entry.phase,
@@ -509,6 +515,7 @@ impl From<CompileControlError> for SqlSourceJournalError {
 /// journal; type/signature equality never creates one. Selected correspondence
 /// and actual runtime state-domain validation remain their sole owners.
 pub(crate) struct CheckedAggregateLogicalSourceEntry<'a> {
+    owner: &'a SqlAuthoredPhysicalPlan,
     captured: &'a CapturedAggregateLogicalRequest,
     canonical: Option<&'a Arc<CanonicalAggregateOperationalRequest>>,
     phase: AggregatePhase,
@@ -519,6 +526,12 @@ pub(crate) struct CheckedAggregateLogicalSourceEntry<'a> {
     source: &'a AggregateCall,
 }
 impl<'a> CheckedAggregateLogicalSourceEntry<'a> {
+    pub(crate) fn state_inputs_observed(
+        &self,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<CheckedAggregateStateInputs<'a>, SqlSourceJournalError> {
+        state_sources::check_state_inputs_observed(self, work)
+    }
     pub(crate) const fn captured(&self) -> &'a CapturedAggregateLogicalRequest {
         self.captured
     }
@@ -658,6 +671,7 @@ pub(super) struct LoweredExpressionSourceEntry {
 }
 #[derive(Debug)]
 pub(super) struct SqlLogicalSourceJournal {
+    pub(super) state_sources: AggregateStateSources,
     // Original ordinary, Window, conversion and derived descriptor emissions.
     // Retained source validation does not certify fresh effects or full coverage.
     pub(super) expression_entries: BTreeMap<(FragmentId, ExprId), LoweredExpressionSourceEntry>,

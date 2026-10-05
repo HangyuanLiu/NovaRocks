@@ -331,10 +331,14 @@ pub(crate) fn prepare_physical_aggregate_merge_occurrence_observed(
     functions: &dyn SqlFunctionCatalog,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<FreshPhysicalAggregateOccurrence, PhysicalAggregateOccurrenceError> {
+    let state_root = input.request.state_inputs().root();
     let same = std::ptr::eq(input.fragment, input.request.fragment())
         && std::ptr::eq(input.node, input.request.node())
         && std::ptr::eq(input.source, input.request.source())
-        && input.occurrences.root_uses.roots().fragment() == input.fragment.id();
+        && input.occurrences.root_uses.roots().fragment() == input.fragment.id()
+        && state_root.fragment == input.fragment.id()
+        && input.node.inputs.as_ref() == [state_root.node]
+        && matches!(input.request.state().kind, novarocks_physical_plan::ExprKind::Value(value) if value == state_root.value);
     work.step()?;
     if !same {
         return Err(PhysicalAggregateOccurrenceError::InvalidSource(

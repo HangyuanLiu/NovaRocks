@@ -74,7 +74,8 @@ use novarocks_type_contract::{
 use sha2::{Digest, Sha256};
 
 use super::lowered_draft::{
-    AggregateRuntimeDemand, AggregateSourceTarget, CanonicalAggregateOperationalRequest,
+    AggregateRuntimeDemand, AggregateSourceTarget, AggregateStateEndpoint, AggregateStateLink,
+    AggregateStateSources, AggregateStateTransport, CanonicalAggregateOperationalRequest,
     CapturedOperationalSource, EmittedOperationalCall, LoweredAggregateLogicalSource,
     LoweredAggregateSourceEntry, LoweredExpressionLogicalSource, LoweredExpressionSourceEntry,
     LoweredOperationalChannel, LoweredSqlPhysicalDraft, LoweredTableSourceEntry,
@@ -1415,6 +1416,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             plan_version: version,
             plan_builder: PlanBuilder::new(version),
             call_sources: SqlLogicalSourceJournal {
+                state_sources: AggregateStateSources::default(),
                 expression_entries: BTreeMap::new(),
                 table_entries: BTreeMap::new(),
                 entries: BTreeMap::new(),
@@ -1725,6 +1727,127 @@ impl<'a> ContractLoweringVisitor<'a> {
         // caller admission obligations, not an allocation grant.
         self.call_sources.entries.insert(key, entry);
         self.work.step()?;
+        Ok(())
+    }
+
+    fn state_source_error(
+        error: super::lowered_draft::SqlSourceJournalError,
+    ) -> ContractLoweringError {
+        match error {
+            super::lowered_draft::SqlSourceJournalError::Control(cause) => cause.into(),
+            super::lowered_draft::SqlSourceJournalError::InvalidSource(detail) => {
+                ContractLoweringError::InvalidAggregate { detail }
+            }
+            _ => ContractLoweringError::InvalidAggregate {
+                detail: "aggregate state source is absent",
+            },
+        }
+    }
+
+    fn state_endpoint(&self, node: NodeId, value: ValueId) -> AggregateStateEndpoint {
+        AggregateStateEndpoint {
+            fragment: self.current_fragment,
+            node,
+            value,
+        }
+    }
+
+    fn record_state_link(
+        &mut self,
+        links: &mut Vec<AggregateStateLink>,
+        source: AggregateStateEndpoint,
+        input_ordinal: usize,
+        mapping_ordinal: usize,
+    ) -> Result<bool, ContractLoweringError> {
+        let present = self
+            .call_sources
+            .state_sources
+            .contains_observed(source, &mut self.work)
+            .map_err(Self::state_source_error)?;
+        if !present {
+            return Ok(false);
+        }
+        let input_ordinal = checked_ordinal("aggregate state input", input_ordinal)?;
+        let mapping_ordinal = checked_ordinal("aggregate state mapping", mapping_ordinal)?;
+        links
+            .len()
+            .checked_add(1)
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        self.work.flush()?;
+        links
+            .try_reserve(1)
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        links.push(AggregateStateLink {
+            input_ordinal,
+            mapping_ordinal,
+            source,
+        });
+        self.work.step()?;
+        Ok(true)
+    }
+
+    fn record_state_projection(
+        &mut self,
+        node: NodeId,
+        child: &LoweredNode,
+        expressions: &[(ExprId, ValueId)],
+    ) -> Result<(), ContractLoweringError> {
+        let mut grouped: BTreeMap<ValueId, Vec<AggregateStateLink>> = BTreeMap::new();
+        for (ordinal, (expression, output)) in expressions.iter().enumerate() {
+            self.work.flush()?;
+            let source = self
+                .fragment_mut()
+                .expressions()
+                .get(*expression)
+                .map(|actual| match actual.kind {
+                    ContractExprKind::Value(value) => Some(value),
+                    _ => None,
+                });
+            self.work.step()?;
+            let source = source.ok_or(ContractLoweringError::InvalidAggregate {
+                detail: "aggregate state projection expression is absent",
+            })?;
+            if let Some(value) = source {
+                let endpoint = AggregateStateEndpoint {
+                    fragment: child.fragment,
+                    node: child.node,
+                    value,
+                };
+                if !self
+                    .call_sources
+                    .state_sources
+                    .contains_observed(endpoint, &mut self.work)
+                    .map_err(Self::state_source_error)?
+                {
+                    continue;
+                }
+                self.work.flush()?;
+                let links = grouped.entry(*output).or_default();
+                self.work.step()?;
+                self.record_state_link(
+                    links,
+                    AggregateStateEndpoint {
+                        fragment: child.fragment,
+                        node: child.node,
+                        value,
+                    },
+                    0,
+                    ordinal,
+                )?;
+            }
+        }
+        for (value, links) in grouped {
+            let endpoint = self.state_endpoint(node, value);
+            self.call_sources
+                .state_sources
+                .transport_observed(
+                    endpoint,
+                    AggregateStateTransport::Project,
+                    links,
+                    &mut self.work,
+                )
+                .map_err(Self::state_source_error)?;
+        }
         Ok(())
     }
 
@@ -3281,6 +3404,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 }
             }
         }
+        self.record_state_projection(node, &source, &expressions)?;
         self.fragment_mut().add_project(
             node,
             source.node,
@@ -4138,6 +4262,47 @@ impl<'a> ContractLoweringVisitor<'a> {
             .node_output_properties(receiver)
             .expect("the exchange source was just inserted")
             .clone();
+        let mut state_imports: BTreeMap<ValueId, Vec<AggregateStateLink>> = BTreeMap::new();
+        for (ordinal, (sent, imported)) in receive_mapping.iter().enumerate() {
+            let source_endpoint = AggregateStateEndpoint {
+                fragment: source.fragment,
+                node: source.node,
+                value: *sent,
+            };
+            if !self
+                .call_sources
+                .state_sources
+                .contains_observed(source_endpoint, &mut self.work)
+                .map_err(Self::state_source_error)?
+            {
+                continue;
+            }
+            self.work.flush()?;
+            let links = state_imports.entry(*imported).or_default();
+            self.work.step()?;
+            self.record_state_link(
+                links,
+                AggregateStateEndpoint {
+                    fragment: source.fragment,
+                    node: source.node,
+                    value: *sent,
+                },
+                0,
+                ordinal,
+            )?;
+        }
+        for (value, links) in state_imports {
+            let endpoint = self.state_endpoint(receiver, value);
+            self.call_sources
+                .state_sources
+                .transport_observed(
+                    endpoint,
+                    AggregateStateTransport::Stream(edge),
+                    links,
+                    &mut self.work,
+                )
+                .map_err(Self::state_source_error)?;
+        }
         let edge_contract = Edge {
             id: edge,
             kind: EdgeKind::Stream,
@@ -4984,6 +5149,42 @@ impl<'a> ContractLoweringVisitor<'a> {
                 )
             }
         };
+        if kind == SetOperationKind::UnionAll {
+            let mut grouped: BTreeMap<ValueId, (bool, Vec<AggregateStateLink>)> = BTreeMap::new();
+            for (ordinal, value) in output.iter().enumerate() {
+                self.work.flush()?;
+                let (complete, links) = grouped.entry(*value).or_insert_with(|| (true, Vec::new()));
+                self.work.step()?;
+                for (input_ordinal, (input, mapping)) in
+                    inputs.iter().zip(mappings.iter()).enumerate()
+                {
+                    *complete &= self.record_state_link(
+                        links,
+                        AggregateStateEndpoint {
+                            fragment: input.fragment,
+                            node: input.node,
+                            value: mapping[ordinal],
+                        },
+                        input_ordinal,
+                        ordinal,
+                    )?;
+                }
+            }
+            for (value, (complete, links)) in grouped {
+                if complete {
+                    let endpoint = self.state_endpoint(node, value);
+                    self.call_sources
+                        .state_sources
+                        .transport_observed(
+                            endpoint,
+                            AggregateStateTransport::UnionAll,
+                            links,
+                            &mut self.work,
+                        )
+                        .map_err(Self::state_source_error)?;
+                }
+            }
+        }
         self.fragment_mut().add_row_consuming(
             node,
             inputs.iter().map(|input| input.node).collect(),
@@ -5327,6 +5528,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 };
             let mut arguments = Vec::new();
             let mut order_by = Vec::new();
+            let mut state_input = None;
             if phase.consumes_logical_arguments() {
                 arguments = call
                     .source
@@ -5421,6 +5623,11 @@ impl<'a> ContractLoweringVisitor<'a> {
                 let state = child.columns.get(&state_column.column_id).copied().ok_or(
                     ContractLoweringError::UnknownColumnReference(state_column.column_id),
                 )?;
+                state_input = Some(AggregateStateEndpoint {
+                    fragment: child.fragment,
+                    node: child.node,
+                    value: state,
+                });
                 let state_type = self.value_declared_type(state)?;
                 // The state must be the one this very aggregate produces, so
                 // an ordinal that lines up against the wrong column is caught
@@ -5534,6 +5741,19 @@ impl<'a> ContractLoweringVisitor<'a> {
                     target: AggregateSourceTarget::Aggregate(call_id),
                 },
             )?;
+            if let Some(input) = state_input {
+                self.call_sources
+                    .state_sources
+                    .input_observed(self.current_fragment, site, input, &mut self.work)
+                    .map_err(Self::state_source_error)?;
+            }
+            if !phase.produces_final_result() {
+                let endpoint = self.state_endpoint(node, value);
+                self.call_sources
+                    .state_sources
+                    .emission_observed(endpoint, site, &mut self.work)
+                    .map_err(Self::state_source_error)?;
+            }
             calls.push(ContractAggregateCall {
                 id: call_id,
                 binding,
@@ -5873,6 +6093,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             output.push(value);
             columns.insert(column.column_id, value);
         }
+        self.record_state_projection(node, &branch, &expressions)?;
         self.fragment_mut().add_project(
             node,
             branch.node,
@@ -5954,6 +6175,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             materialized.push(Some(value));
         }
 
+        self.record_state_projection(node, &child, &expressions)?;
         self.fragment_mut().add_project(
             node,
             child.node,
@@ -6055,6 +6277,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             output.push(value);
         }
 
+        self.record_state_projection(node, &child, &expressions)?;
         self.fragment_mut().add_project(
             node,
             child.node,
@@ -6518,6 +6741,49 @@ impl<'a> ContractLoweringVisitor<'a> {
             expressions: order_by,
             ..
         } = self.lower_ordering(node, items, &child.columns)?;
+        if matches!(phase, ContractTopNPhase::Partial { .. }) {
+            let mut grouped: BTreeMap<ValueId, Vec<AggregateStateLink>> = BTreeMap::new();
+            for (ordinal, value) in child.output.iter().enumerate() {
+                let source_endpoint = AggregateStateEndpoint {
+                    fragment: child.fragment,
+                    node: child.node,
+                    value: *value,
+                };
+                if !self
+                    .call_sources
+                    .state_sources
+                    .contains_observed(source_endpoint, &mut self.work)
+                    .map_err(Self::state_source_error)?
+                {
+                    continue;
+                }
+                self.work.flush()?;
+                let links = grouped.entry(*value).or_default();
+                self.work.step()?;
+                self.record_state_link(
+                    links,
+                    AggregateStateEndpoint {
+                        fragment: child.fragment,
+                        node: child.node,
+                        value: *value,
+                    },
+                    0,
+                    ordinal,
+                )?;
+            }
+            for (value, links) in grouped {
+                let endpoint = self.state_endpoint(node, value);
+                self.call_sources
+                    .state_sources
+                    .transport_observed(
+                        endpoint,
+                        AggregateStateTransport::PartialTopN,
+                        links,
+                        &mut self.work,
+                    )
+                    .map_err(Self::state_source_error)?;
+            }
+        }
         self.fragment_mut()
             .add_top_n(node, child.node, order_by, limit, offset, phase)?;
         let properties = self
@@ -6703,6 +6969,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             expressions.push((expression, value));
             output.push(value);
         }
+        self.record_state_projection(node, &child, &expressions)?;
         self.fragment_mut().add_project(
             node,
             child.node,

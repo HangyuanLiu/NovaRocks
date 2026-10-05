@@ -33,6 +33,9 @@ use std::sync::Mutex;
 #[path = "lowered_partial_aggregate_canonical_tests.rs"]
 mod lowered_partial_aggregate_canonical_tests;
 
+#[path = "lowered_aggregate_state_sources_tests.rs"]
+mod lowered_aggregate_state_sources_tests;
+
 #[derive(Default)]
 struct Control {
     trace: Mutex<Vec<(CompilePhase, u32)>>,
