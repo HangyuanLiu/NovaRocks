@@ -109,18 +109,20 @@ fn preflight(
     // Rust's insertion-only table has at most n node requests: every created
     // node retains at least one entry, and this owner never removes/rebuilds.
     // The locked layout author covers the actual public key/value layouts.
-    let node = btree_resources_v2::node_layout::<SemanticParameterId, SemanticParameterValue>()
-        .map_err(invalid)?;
-    let lookup = btree_resources_v2::lookup_work(n).map_err(invalid)?;
-    let node_bytes = mul(n, node.size())?;
+    let tree = btree_resources_v2::insertion_only::<SemanticParameterId, SemanticParameterValue>(n)
+        .map_err(|error| match error {
+            btree_resources_v2::BTreeResourceError::SourceModel(message) => invalid(message),
+            btree_resources_v2::BTreeResourceError::Arithmetic(_) => {
+                invalid("semantic parameter resource product overflow")
+            }
+        })?;
+    let node_bytes = tree.request_bytes_upper_bound;
     // At every visited B=6 level, eight node-layout byte units cover two
     // key/value/edge array moves, both <=12-child parent-link repairs, node
     // initialization and root headers in insert_fit/split/insert_recursing.
     // Charge this for EVERY entry at EVERY possible level, independent of the
     // much smaller actual split count. Search work is separately admitted.
-    let levels = lookup / 16;
-    let movement = mul(mul(n, levels)?, mul(node.size(), 8)?)?;
-    let own = add(256, add(mul(n, add(128, mul(lookup, 4)?)?)?, movement)?)?;
+    let own = add(256, add(mul(n, 128)?, tree.cumulative_work_upper_bound)?)?;
     // This prefix admission precedes the first entries walk, not only the
     // eventual output allocations. String lengths/capacities are O(1) facts.
     cap(own, limits.max_work, w)?;
@@ -143,7 +145,7 @@ fn preflight(
     let facts = ParameterProjectionFacts {
         parameter_count: n,
         timezone_request_bytes_upper_bound: string_bytes,
-        allocation_requests_upper_bound: add(n, strings)?,
+        allocation_requests_upper_bound: add(tree.allocation_requests_upper_bound, strings)?,
         allocation_request_bytes_upper_bound: requested,
         coexisting_source_and_request_bytes_upper_bound: add(source, requested)?,
         cumulative_work_upper_bound: add(own, mul(string_bytes, 4)?)?,

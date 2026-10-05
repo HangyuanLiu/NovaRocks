@@ -506,3 +506,83 @@ fn materialization_wide_actual_argument_loop_has_256_unit_sample() {
         });
     }
 }
+
+#[test]
+fn composition_requests_admit_temporary_layout_work_without_inventing_retained_backing() {
+    let mut model = Model::for_composition(2, 0, 1000, 1000);
+    model.request::<u32>(4, 2).unwrap();
+    model.temporary_request::<u64>(3, 1).unwrap();
+    model
+        .request_layouts(Layout::from_size_align(64, 8).unwrap(), 3)
+        .unwrap();
+    model.add_work(17).unwrap();
+    model.check(limits()).unwrap();
+    // Independent request invoice: two 16-byte buffers, a temporary 24-byte
+    // buffer and three actual 64-byte layouts. Only one final 16-byte buffer
+    // is a necessary retained floor; private tree maxima are not measurements.
+    assert_eq!(model.facts.allocation_requests_upper_bound, 6);
+    assert_eq!(model.facts.request_bytes_upper_bound, 248);
+    assert_eq!(
+        model.facts.coexisting_source_and_request_bytes_upper_bound,
+        1248
+    );
+    assert_eq!(model.retained, 16);
+    assert_eq!(model.facts.cumulative_work_upper_bound, 1207);
+    let exact = BindingProjectionLimits {
+        max_definitions: 2,
+        max_type_references: 0,
+        max_request_bytes: 248,
+        max_allocation_requests: 6,
+        max_coexisting_source_and_request_bytes: 1248,
+        max_work: 1207,
+    };
+    model.check(exact).unwrap();
+    for cause in CAUSES {
+        let c = Control::default();
+        c.arm(Some((1, cause)));
+        let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Decode).unwrap();
+        for _ in 0..255 {
+            work.step().unwrap();
+        }
+        let small = BindingProjectionLimits {
+            max_work: 1206,
+            ..exact
+        };
+        assert!(matches!(
+            finish::<()>(work, model.check(small)),
+            Err(Error::Control(CompileControlError::ResourceExhausted))
+        ));
+        assert_eq!(c.trace(), [0]);
+    }
+    // Delegated work remains cumulative across later checks, rather than
+    // being overwritten by the original model's recomputed own-work invoice.
+    model.add_work(1).unwrap();
+    assert!(matches!(
+        model.check(exact),
+        Err(Error::Control(CompileControlError::ResourceExhausted))
+    ));
+    assert_eq!(model.retained, 16);
+}
+
+#[test]
+fn composition_empty_and_overflow_requests_preserve_typed_refusal() {
+    let mut model = Model::for_composition(0, 0, 1000, 1000);
+    model.temporary_request::<u8>(0, 2).unwrap();
+    model.temporary_request::<()>(usize::MAX, 2).unwrap();
+    model
+        .request_layouts(Layout::new::<()>(), usize::MAX)
+        .unwrap();
+    model.check(limits()).unwrap();
+    assert_eq!(model.facts.allocation_requests_upper_bound, 0);
+    assert_eq!(model.facts.request_bytes_upper_bound, 0);
+    assert_eq!(model.retained, 0);
+    assert!(matches!(
+        model.request_layouts(Layout::new::<u64>(), usize::MAX),
+        Err(Error::Control(CompileControlError::ResourceExhausted))
+    ));
+    model.add_work(usize::MAX).unwrap();
+    assert!(matches!(
+        model.add_work(1),
+        Err(Error::Control(CompileControlError::ResourceExhausted))
+    ));
+}

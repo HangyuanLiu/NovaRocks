@@ -39,6 +39,9 @@ fn receiving_dependency_refusals_never_reobserve_an_originating_cause() {
     ] {
         for lifted in [
             ExpressionCodecError::from(ValueCodecError::Control(cause)),
+            ExpressionCodecError::from(
+                novarocks_physical_plan::ExprArenaConstructionError::Control(cause),
+            ),
             ExpressionCodecError::from(ConstantReferenceError::Control(cause)),
             ExpressionCodecError::from(ConstantReferenceError::Constant(ConstantError::Control(
                 cause,
@@ -78,5 +81,19 @@ fn receiving_ordinary_dependency_errors_keep_the_completed_tail_and_typed_detail
     assert!(matches!(namespace::finish::<()>(work, Err(error.into())),
         Err(ExpressionCodecError::Constant(ConstantReferenceError::MissingPool(id)))
         if id.get() == u32::MAX));
+    assert_eq!(*control.0.lock().unwrap(), [0, 1]);
+}
+
+#[test]
+fn receiving_sparse_arena_structure_error_keeps_original_detail_and_ordinary_tail() {
+    let control = Control(Mutex::new(Vec::new()));
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    work.step().unwrap();
+    let error = novarocks_physical_plan::ExprArenaConstructionError::DuplicateDefinition(
+        novarocks_physical_plan::ExprId::new(u32::MAX),
+    );
+    assert!(
+        matches!(namespace::finish::<()>(work,Err(error.into())),Err(ExpressionCodecError::Arena(novarocks_physical_plan::ExprArenaConstructionError::DuplicateDefinition(id))) if id.get()==u32::MAX)
+    );
     assert_eq!(*control.0.lock().unwrap(), [0, 1]);
 }

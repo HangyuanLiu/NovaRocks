@@ -32,10 +32,11 @@ const CAUSES: [CompileControlError; 3] = [
 struct Control {
     trace: Mutex<Vec<u32>>,
     refusal: Option<(usize, CompileControlError)>,
+    phase: Option<CompilePhase>,
 }
 impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
-        assert_eq!(phase, CompilePhase::Validate);
+        assert_eq!(phase, self.phase.unwrap_or(CompilePhase::Validate));
         let mut trace = self.trace.lock().unwrap();
         let index = trace.len();
         if let Some((at, _)) = self.refusal {
@@ -72,11 +73,21 @@ fn check_prefixes(
     let trace = control.trace.lock().unwrap().clone();
     assert!(!trace.is_empty());
     assert!(trace.iter().all(|units| *units <= 256));
-    for at in 0..trace.len() {
+    // Wide trees contain opaque std operations. Sample their real boundaries
+    // without turning one wide acceptance case into quadratic replay work.
+    let mut samples: Vec<_> = if definitions.len() <= 64 {
+        (0..trace.len()).collect()
+    } else {
+        vec![0, 1, 2, trace.len() / 2, trace.len() - 2, trace.len() - 1]
+    };
+    samples.sort_unstable();
+    samples.dedup();
+    for at in samples {
         for cause in CAUSES {
             let refusal = Control {
                 trace: Mutex::new(Vec::new()),
                 refusal: Some((at, cause)),
+                phase: None,
             };
             let error = ExprArena::try_from_definitions_observed(
                 definitions.iter().cloned(),
@@ -140,13 +151,18 @@ fn sparse_definition_constructor_preserves_zero_max_full_source_and_ordered_occu
 }
 
 #[test]
-fn sparse_definition_constructor_observes_real_256_quantums_and_success_tail() {
+fn sparse_definition_constructor_observes_real_opaque_boundaries_and_success_tail() {
     let mut definitions: Vec<_> = (0..319).map(definition).collect();
     definitions.push(definition(u32::MAX));
     let trace = check_prefixes(&definitions, &PlanLimits::FROZEN, None);
-    // One length access and two completed bounded operations per definition:
-    // iterator pull/count followed by entry lookup/insertion.
-    assert_eq!(trace, [0, 256, 256, 129]);
+    // Count and actual iterator pulls contribute the same completed units;
+    // std entry/insertion is now observed before and after every operation.
+    // No callback represents cooperative work inside that opaque library.
+    assert_eq!(trace.iter().sum::<u32>(), 641);
+    assert_eq!(trace[0], 0);
+    assert_eq!(trace[1], 2);
+    assert_eq!(trace.last(), Some(&0));
+    assert!(trace[2..trace.len() - 1].iter().all(|units| *units == 1));
     assert_eq!(check_prefixes(&[], &PlanLimits::FROZEN, None), [0, 1]);
 }
 
@@ -163,8 +179,10 @@ fn sparse_definition_duplicate_refusal_keeps_first_id_and_ordinary_tail() {
             Some(ExprArenaConstructionError::DuplicateDefinition(
                 ExprId::new(1)
             )),
-        ),
-        [0, 256, 5]
+        )
+        .iter()
+        .sum::<u32>(),
+        261
     );
     assert_eq!(
         check_prefixes(
@@ -173,8 +191,10 @@ fn sparse_definition_duplicate_refusal_keeps_first_id_and_ordinary_tail() {
             Some(ExprArenaConstructionError::DuplicateDefinition(
                 ExprId::new(u32::MAX)
             )),
-        ),
-        [0, 5]
+        )
+        .iter()
+        .sum::<u32>(),
+        5
     );
 }
 
@@ -248,12 +268,12 @@ fn sparse_definition_constructor_rejects_lying_lengths_before_excess_insertion_o
             self.declared
         }
     }
-    for (declared, actual, expected_pulls, expected_trace) in [
-        (0, 320, 1, vec![0, 2]),
-        (1, 320, 2, vec![0, 4]),
-        (128, 320, 129, vec![0, 256, 2]),
-        (321, 320, 320, vec![0, 256, 256, 129]),
-        (1, 0, 0, vec![0, 1]),
+    for (declared, actual, expected_pulls, expected_units) in [
+        (0, 320, 1, 2),
+        (1, 320, 2, 4),
+        (128, 320, 129, 258),
+        (321, 320, 320, 641),
+        (1, 0, 0, 1),
     ] {
         let pulls = Cell::new(0);
         let control = Control::default();
@@ -277,13 +297,21 @@ fn sparse_definition_constructor_rejects_lying_lengths_before_excess_insertion_o
         // The first excess source object may be produced by the caller, but
         // its map entry is never allocated or inserted. No partial arena exits.
         assert_eq!(pulls.get(), expected_pulls);
-        assert_eq!(*control.trace.lock().unwrap(), expected_trace);
-        for at in 0..expected_trace.len() {
+        let expected_trace = control.trace.lock().unwrap().clone();
+        assert_eq!(expected_trace.iter().sum::<u32>(), expected_units);
+        let mut samples = vec![0, expected_trace.len() / 2, expected_trace.len() - 1];
+        if expected_pulls <= 64 {
+            samples = (0..expected_trace.len()).collect();
+        }
+        samples.sort_unstable();
+        samples.dedup();
+        for at in samples {
             for cause in CAUSES {
                 let pulls = Cell::new(0);
                 let refusal = Control {
                     trace: Mutex::new(Vec::new()),
                     refusal: Some((at, cause)),
+                    phase: None,
                 };
                 assert_eq!(
                     ExprArena::try_from_definitions_observed(
@@ -300,6 +328,70 @@ fn sparse_definition_constructor_rejects_lying_lengths_before_excess_insertion_o
                 );
                 assert_eq!(*refusal.trace.lock().unwrap(), expected_trace[..=at]);
                 assert!(pulls.get() <= expected_pulls);
+            }
+        }
+    }
+}
+
+#[test]
+fn sparse_definition_composition_lends_original_decode_scope_without_entry_or_footer() {
+    for duplicate in [false, true] {
+        let definitions = vec![
+            definition(0),
+            definition(if duplicate { 0 } else { u32::MAX }),
+        ];
+        let run = |c: &Control| -> Result<ExprArena, ExprArenaConstructionError> {
+            let mut work = CompileCheckpoints::try_new(c, CompilePhase::Decode)?;
+            work.step()?;
+            let result = ExprArena::try_from_definitions_in(
+                definitions.clone().into_iter(),
+                &PlanLimits::FROZEN,
+                &mut work,
+            );
+            if matches!(&result, Err(ExprArenaConstructionError::Control(_))) {
+                return result;
+            }
+            let before = c.trace.lock().unwrap().clone();
+            // The delegated constructor did not open another phase or finish.
+            assert_eq!(before.iter().filter(|u| **u == 0).count(), 1);
+            assert_eq!(before.iter().sum::<u32>(), 6);
+            work.finish()?;
+            result
+        };
+        let c = Control {
+            phase: Some(CompilePhase::Decode),
+            ..Control::default()
+        };
+        let result = run(&c);
+        if duplicate {
+            assert_eq!(
+                result.unwrap_err(),
+                ExprArenaConstructionError::DuplicateDefinition(ExprId::new(0))
+            );
+        } else {
+            assert_eq!(
+                result
+                    .unwrap()
+                    .iter()
+                    .map(|(id, _)| id.get())
+                    .collect::<Vec<_>>(),
+                [0, u32::MAX]
+            );
+        }
+        let trace = c.trace.lock().unwrap().clone();
+        assert_eq!(trace.last(), Some(&0));
+        for at in 0..trace.len() {
+            for cause in CAUSES {
+                let c = Control {
+                    phase: Some(CompilePhase::Decode),
+                    refusal: Some((at, cause)),
+                    ..Control::default()
+                };
+                assert_eq!(
+                    run(&c).unwrap_err(),
+                    ExprArenaConstructionError::Control(cause)
+                );
+                assert_eq!(*c.trace.lock().unwrap(), trace[..=at]);
             }
         }
     }

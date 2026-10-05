@@ -41,11 +41,15 @@ use std::{alloc::Layout, mem::size_of};
 
 mod materialize;
 mod read;
+mod signature_copy;
 pub use materialize::{
     MaterializedAggregateBindings, PreparedAggregateBindingsMaterialization,
     materialize_aggregate_bindings, prepare_aggregate_bindings_materialization,
 };
 pub use read::{PreparedAggregateBindingHeaders, prepare_aggregate_binding_headers};
+pub(crate) use signature_copy::{
+    copy_aggregate_binding_observed, preflight_aggregate_binding_copy,
+};
 
 /// Projects the explicit state owner's contract, independently of function identity.
 pub(crate) fn encode_state_argument_contract(contract: AggregateStateArgumentContract) -> i32 {

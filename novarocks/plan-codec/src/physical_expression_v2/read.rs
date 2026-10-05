@@ -312,16 +312,12 @@ fn references(
                     let bound = bound
                         .as_ref()
                         .ok_or_else(|| shape("window frame bound is absent"))?;
-                    match bound
-                        .kind
-                        .as_ref()
-                        .ok_or_else(|| shape("window bound kind is absent"))?
-                    {
-                        wire::window_bound::Kind::PrecedingExprId(id)
-                        | wire::window_bound::Kind::FollowingExprId(id) => visit(*id)?,
-                        wire::window_bound::Kind::UnboundedPreceding(_)
-                        | wire::window_bound::Kind::CurrentRow(_)
-                        | wire::window_bound::Kind::UnboundedFollowing(_) => {}
+                    match super::receiving_grammar::decode_window_bound(bound)? {
+                        novarocks_physical_plan::WindowBound::Preceding(id)
+                        | novarocks_physical_plan::WindowBound::Following(id) => visit(id.get())?,
+                        novarocks_physical_plan::WindowBound::UnboundedPreceding
+                        | novarocks_physical_plan::WindowBound::CurrentRow
+                        | novarocks_physical_plan::WindowBound::UnboundedFollowing => {}
                     }
                 }
             }
@@ -592,30 +588,11 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                 self.match_types(header, expected, limits, work)?;
             }
             K::Unary(value) => {
-                if !matches!(
-                    wire::UnaryOperator::try_from(value.op),
-                    Ok(wire::UnaryOperator::Plus
-                        | wire::UnaryOperator::Minus
-                        | wire::UnaryOperator::Not
-                        | wire::UnaryOperator::BitwiseNot)
-                ) {
-                    return Err(shape("unary operator is unknown or unspecified"));
-                }
+                super::receiving_grammar::decode_unary(value.op)?;
             }
             K::Binary(value) => {
-                let op = wire::BinaryOperator::try_from(value.op)
-                    .map_err(|_| shape("binary operator is unknown"))?;
-                if op == wire::BinaryOperator::Unspecified {
-                    return Err(shape("binary operator is unspecified"));
-                }
-                let arithmetic = matches!(
-                    op,
-                    wire::BinaryOperator::Add
-                        | wire::BinaryOperator::Subtract
-                        | wire::BinaryOperator::Multiply
-                        | wire::BinaryOperator::Divide
-                        | wire::BinaryOperator::Modulo
-                );
+                let op = super::receiving_grammar::decode_binary(value.op)?;
+                let arithmetic = op.arithmetic_operator().is_some();
                 decode_decimal_policy(value.decimal_overflow_policy)?;
                 let same_presence = arithmetic == value.allow_throw_exception.is_some();
                 work.step()?;
@@ -1073,13 +1050,8 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
         }
         self.charge(mul(value.function_order_by.len(), 8)?, limits, work)?;
         for sort in &value.function_order_by {
-            let closed = matches!(
-                wire::SortDirection::try_from(sort.direction),
-                Ok(wire::SortDirection::Ascending | wire::SortDirection::Descending)
-            ) && matches!(
-                wire::NullOrdering::try_from(sort.null_ordering),
-                Ok(wire::NullOrdering::First | wire::NullOrdering::Last)
-            );
+            let closed = crate::physical_properties_v2::decode_direction(sort.direction).is_ok()
+                && crate::physical_properties_v2::decode_nulls(sort.null_ordering).is_ok();
             work.step()?;
             if !closed {
                 return Err(shape(
@@ -1088,18 +1060,8 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
             }
         }
         if let Some(frame) = &value.frame {
-            let closed = matches!(
-                wire::WindowFrameUnits::try_from(frame.units),
-                Ok(wire::WindowFrameUnits::Rows
-                    | wire::WindowFrameUnits::Range
-                    | wire::WindowFrameUnits::Groups)
-            ) && matches!(
-                wire::WindowFrameExclusion::try_from(frame.exclusion),
-                Ok(wire::WindowFrameExclusion::NoOthers
-                    | wire::WindowFrameExclusion::CurrentRow
-                    | wire::WindowFrameExclusion::Group
-                    | wire::WindowFrameExclusion::Ties)
-            );
+            let closed = super::receiving_grammar::decode_window_units(frame.units).is_ok()
+                && super::receiving_grammar::decode_window_exclusion(frame.exclusion).is_ok();
             work.step()?;
             if !closed {
                 return Err(shape(

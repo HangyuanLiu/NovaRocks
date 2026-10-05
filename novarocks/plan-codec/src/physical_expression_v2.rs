@@ -29,6 +29,7 @@ use std::fmt;
 mod kind;
 mod namespace;
 mod read;
+mod receiving_grammar;
 
 pub use namespace::{
     EncodedExpressions, ExpressionNamespaceWriteFacts, ExpressionProjectionLimits,
@@ -48,6 +49,7 @@ pub enum ExpressionCodecError {
     Binding(BindingCodecError),
     Value(ValueCodecError),
     Constant(novarocks_physical_plan::ConstantReferenceError),
+    Arena(novarocks_physical_plan::ExprArenaConstructionError),
 }
 impl fmt::Display for ExpressionCodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -59,10 +61,21 @@ impl fmt::Display for ExpressionCodecError {
             Self::Binding(error) => error.fmt(f),
             Self::Value(error) => error.fmt(f),
             Self::Constant(error) => error.fmt(f),
+            Self::Arena(error) => error.fmt(f),
         }
     }
 }
 impl std::error::Error for ExpressionCodecError {}
+impl From<novarocks_physical_plan::ExprArenaConstructionError> for ExpressionCodecError {
+    fn from(value: novarocks_physical_plan::ExprArenaConstructionError) -> Self {
+        match value {
+            novarocks_physical_plan::ExprArenaConstructionError::Control(error) => {
+                Self::Control(error)
+            }
+            value => Self::Arena(value),
+        }
+    }
+}
 impl From<CompileControlError> for ExpressionCodecError {
     fn from(value: CompileControlError) -> Self {
         Self::Control(value)

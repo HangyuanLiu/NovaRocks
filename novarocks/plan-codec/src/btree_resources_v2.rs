@@ -16,27 +16,54 @@
 // under the License.
 
 //! One locked Rust BTree node request bound for the actual key/value layouts.
-//! Private Rust field order is not mirrored. This covers an individual node
-//! request, not node counts, retained capacity, a host grant or library work.
+//! Private Rust field order is not mirrored. Insertion-only cumulative bounds
+//! cover opaque library movement, not measured retained capacity, cooperative
+//! internal callbacks or a host allocation grant.
 
 use crate::resource_source_model::LOCKED_TOOLCHAIN;
 use std::alloc::Layout;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BTreeResourceError {
+    SourceModel(&'static str),
+    Arithmetic(&'static str),
+}
+impl BTreeResourceError {
+    pub(crate) const fn message(self) -> &'static str {
+        match self {
+            Self::SourceModel(message) | Self::Arithmetic(message) => message,
+        }
+    }
+}
 
 /// Conservative lookup work for the locked B=6 source. Even binary fanout
 /// bounds visited levels by bit-length+1; sixteen units cover each node's
 /// keys, edges and header. Allocation/insert movement is accounted separately.
 pub(crate) fn lookup_work(entries: usize) -> Result<usize, &'static str> {
-    let levels = usize::try_from(usize::BITS - entries.leading_zeros())
-        .map_err(|_| "expression lookup depth is unrepresentable")?;
+    lookup_work_typed(entries).map_err(BTreeResourceError::message)
+}
+
+pub(crate) fn lookup_work_typed(entries: usize) -> Result<usize, BTreeResourceError> {
+    let levels = usize::try_from(usize::BITS - entries.leading_zeros()).map_err(|_| {
+        BTreeResourceError::Arithmetic("expression lookup depth is unrepresentable")
+    })?;
     levels
         .checked_add(1)
         .and_then(|n| n.checked_mul(16))
-        .ok_or("expression resource product overflow")
+        .ok_or(BTreeResourceError::Arithmetic(
+            "expression resource product overflow",
+        ))
 }
 
 pub(crate) fn node_layout<K, V>() -> Result<Layout, &'static str> {
+    node_layout_typed::<K, V>().map_err(BTreeResourceError::message)
+}
+
+pub(crate) fn node_layout_typed<K, V>() -> Result<Layout, BTreeResourceError> {
     if !LOCKED_TOOLCHAIN {
-        return Err("BTree allocation source model drift");
+        return Err(BTreeResourceError::SourceModel(
+            "BTree allocation source model drift",
+        ));
     }
     let key = Layout::new::<K>();
     let value = Layout::new::<V>();
@@ -44,11 +71,19 @@ pub(crate) fn node_layout<K, V>() -> Result<Layout, &'static str> {
     // Both existing consumers used the target's usize layout. Require that
     // it is the actual thin parent/edge layout before retaining their bound.
     if pointer != Layout::new::<usize>() || pointer.align() < Layout::new::<u16>().align() {
-        return Err("BTree node target layout source model drift");
+        return Err(BTreeResourceError::SourceModel(
+            "BTree node target layout source model drift",
+        ));
     }
     let align = key.align().max(value.align()).max(pointer.align());
-    let add = |a: usize, b: usize| a.checked_add(b).ok_or("BTree node size overflow");
-    let mul = |a: usize, b: usize| a.checked_mul(b).ok_or("BTree node size overflow");
+    let add = |a: usize, b: usize| {
+        a.checked_add(b)
+            .ok_or(BTreeResourceError::Arithmetic("BTree node size overflow"))
+    };
+    let mul = |a: usize, b: usize| {
+        a.checked_mul(b)
+            .ok_or(BTreeResourceError::Arithmetic("BTree node size overflow"))
+    };
     // Rust 1.92 alloc/btree/node.rs: B=6, eleven keys/values, twelve
     // edges. LeafNode contains five members: parent pointer, two u16,
     // key array and value array. Each member can add at most align-1
@@ -61,7 +96,46 @@ pub(crate) fn node_layout<K, V>() -> Result<Layout, &'static str> {
     let internal = add(add(leaf, mul(12, pointer.size())?)?, align - 1)?;
     Layout::from_size_align(internal, align)
         .map(|layout| layout.pad_to_align())
-        .map_err(|_| "BTree node layout is unrepresentable")
+        .map_err(|_| BTreeResourceError::Arithmetic("BTree node layout is unrepresentable"))
+}
+
+/// The insertion-only source never removes or rebuilds nodes: at most one
+/// retained node request per entry. These are cumulative request/work bounds,
+/// not a measurement or necessary floor of the final private tree backing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct InsertionOnlyFacts {
+    pub(crate) allocation_requests_upper_bound: usize,
+    pub(crate) request_bytes_upper_bound: usize,
+    pub(crate) cumulative_work_upper_bound: usize,
+}
+
+pub(crate) fn insertion_only<K, V>(
+    entries: usize,
+) -> Result<InsertionOnlyFacts, BTreeResourceError> {
+    let node = node_layout_typed::<K, V>()?;
+    let lookup = lookup_work_typed(entries)?;
+    let mul = |a: usize, b: usize| {
+        a.checked_mul(b).ok_or(BTreeResourceError::Arithmetic(
+            "BTree insertion product overflow",
+        ))
+    };
+    let request_bytes_upper_bound = mul(entries, node.size())?;
+    // At every visited B=6 level, eight node-layout byte units cover moves,
+    // split/root initialization and parent-link repairs. Search is charged
+    // separately for every possible level, not only actual split locations.
+    let movement = mul(mul(entries, lookup / 16)?, mul(node.size(), 8)?)?;
+    let search = mul(entries, mul(lookup, 4)?)?;
+    let cumulative_work_upper_bound =
+        search
+            .checked_add(movement)
+            .ok_or(BTreeResourceError::Arithmetic(
+                "BTree insertion sum overflow",
+            ))?;
+    Ok(InsertionOnlyFacts {
+        allocation_requests_upper_bound: entries,
+        request_bytes_upper_bound,
+        cumulative_work_upper_bound,
+    })
 }
 
 #[cfg(test)]
@@ -72,6 +146,52 @@ mod tests {
     struct WideKey([u8; 65]);
     #[repr(align(128))]
     struct AlignedZero;
+
+    #[test]
+    fn insertion_only_bounds_charge_all_requests_and_opaque_levels_before_allocation() {
+        // Independent small target-layout invoice, including worst-case
+        // padding for every private field order rather than a packed leaf.
+        let pointer = std::mem::size_of::<usize>();
+        let align = std::mem::align_of::<u64>().max(std::mem::align_of::<usize>());
+        let unpadded = pointer + 4 + 11 * (4 + 8) + 5 * (align - 1) + 12 * pointer + (align - 1);
+        let node = unpadded.div_ceil(align) * align;
+        let four = insertion_only::<u32, u64>(4).unwrap();
+        assert_eq!(four.allocation_requests_upper_bound, 4);
+        assert_eq!(four.request_bytes_upper_bound, 4 * node);
+        // Four possible levels, 64 lookup units per search. Charge eight
+        // node extents at every level of every insertion, not split count.
+        assert_eq!(
+            four.cumulative_work_upper_bound,
+            4 * 64 * 4 + 4 * 4 * 8 * node
+        );
+        let empty = insertion_only::<u32, u64>(0).unwrap();
+        assert_eq!(
+            empty,
+            InsertionOnlyFacts {
+                allocation_requests_upper_bound: 0,
+                request_bytes_upper_bound: 0,
+                cumulative_work_upper_bound: 0
+            }
+        );
+        // Existing ordinary-string consumers keep the same original owner.
+        assert_eq!(
+            node_layout::<u32, u64>().unwrap(),
+            node_layout_typed::<u32, u64>().unwrap()
+        );
+        assert_eq!(lookup_work(4).unwrap(), lookup_work_typed(4).unwrap());
+    }
+
+    #[test]
+    fn insertion_only_arithmetic_refusals_have_typed_origin() {
+        assert!(matches!(
+            insertion_only::<u32, u64>(usize::MAX),
+            Err(BTreeResourceError::Arithmetic(_))
+        ));
+        assert!(matches!(
+            insertion_only::<u32, u64>(usize::MAX / 288),
+            Err(BTreeResourceError::Arithmetic(_))
+        ));
+    }
 
     fn all_private_orders<K, V>() {
         let members = [

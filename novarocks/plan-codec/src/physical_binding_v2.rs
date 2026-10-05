@@ -30,7 +30,7 @@ use std::fmt;
 mod encode;
 mod materialize;
 pub(crate) use materialize::{
-    Model as MaterializationModel, add, boxed, completed, finish, mul, reserve,
+    Model as MaterializationModel, add, boxed, cap, completed, finish, mul, reserve,
 };
 mod read;
 mod signature_copy;

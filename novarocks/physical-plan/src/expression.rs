@@ -631,55 +631,68 @@ impl ExprArena {
     /// The declared length is checked against actual pulls before inserting an
     /// excess entry, and short iterators are rejected before publication.
     pub fn try_from_definitions_observed(
-        mut definitions: impl ExactSizeIterator<Item = ExprNode>,
+        definitions: impl ExactSizeIterator<Item = ExprNode>,
         limits: &crate::PlanLimits,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ExprArenaConstructionError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-        let result = (|| {
-            let count = definitions.len();
-            work.step()?;
-            if count > limits.fragment_expressions {
-                return Err(ExprArenaConstructionError::TooManyDefinitions);
-            }
-            let mut nodes = BTreeMap::new();
-            let mut actual_count = 0usize;
-            for definition in &mut definitions {
-                let next_count = actual_count.checked_add(1);
-                // The source iterator has completed its pull. Count it even
-                // when the actual count check is about to reject the source.
-                work.step()?;
-                actual_count = next_count.ok_or(ExprArenaConstructionError::TooManyDefinitions)?;
-                if actual_count > count {
-                    return Err(ExprArenaConstructionError::DefinitionCountMismatch {
-                        declared: count,
-                        actual: actual_count,
-                    });
-                }
-                let id = definition.id;
-                let inserted = match nodes.entry(id) {
-                    Entry::Vacant(entry) => {
-                        entry.insert(definition);
-                        Ok(())
-                    }
-                    Entry::Occupied(_) => Err(ExprArenaConstructionError::DuplicateDefinition(id)),
-                };
-                work.step()?;
-                inserted?;
-            }
-            if actual_count != count {
-                return Err(ExprArenaConstructionError::DefinitionCountMismatch {
-                    declared: count,
-                    actual: actual_count,
-                });
-            }
-            Ok(Self { nodes })
-        })();
+        let result = Self::try_from_definitions_in(definitions, limits, &mut work);
         if matches!(&result, Err(ExprArenaConstructionError::Control(_))) {
             return result;
         }
         work.finish()?;
         result
+    }
+
+    /// Compose the same checked sparse construction in the caller's original
+    /// phase and checkpoint scope. The caller owns entry, ordinary/success
+    /// finish, and prior admission of iterator production and tree allocations.
+    /// Standard-library entry/insertion is an opaque operation bracketed by
+    /// actual checkpoints; its internal movement is not cooperative work.
+    pub fn try_from_definitions_in(
+        mut definitions: impl ExactSizeIterator<Item = ExprNode>,
+        limits: &crate::PlanLimits,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, ExprArenaConstructionError> {
+        let count = definitions.len();
+        work.step()?;
+        if count > limits.fragment_expressions {
+            return Err(ExprArenaConstructionError::TooManyDefinitions);
+        }
+        let mut nodes = BTreeMap::new();
+        let mut actual_count = 0usize;
+        for definition in &mut definitions {
+            let next_count = actual_count.checked_add(1);
+            // The source iterator has completed its pull. Count it even
+            // when the actual count check is about to reject the source.
+            work.step()?;
+            actual_count = next_count.ok_or(ExprArenaConstructionError::TooManyDefinitions)?;
+            if actual_count > count {
+                return Err(ExprArenaConstructionError::DefinitionCountMismatch {
+                    declared: count,
+                    actual: actual_count,
+                });
+            }
+            let id = definition.id;
+            work.flush()?;
+            let inserted = match nodes.entry(id) {
+                Entry::Vacant(entry) => {
+                    entry.insert(definition);
+                    Ok(())
+                }
+                Entry::Occupied(_) => Err(ExprArenaConstructionError::DuplicateDefinition(id)),
+            };
+            work.step()?;
+            work.flush()?;
+            inserted?;
+        }
+        if actual_count != count {
+            return Err(ExprArenaConstructionError::DefinitionCountMismatch {
+                declared: count,
+                actual: actual_count,
+            });
+        }
+        Ok(Self { nodes })
     }
     pub fn get(&self, id: ExprId) -> Option<&ExprNode> {
         self.nodes.get(&id)

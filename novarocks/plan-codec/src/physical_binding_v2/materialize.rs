@@ -27,7 +27,7 @@ use crate::{
 use novarocks_type_contract::{
     FunctionArgumentType, FunctionId, FunctionKind, FunctionOverloadId, FunctionValueType,
 };
-use std::mem::size_of;
+use std::{alloc::Layout, mem::size_of};
 
 type Error = BindingCodecError;
 fn shape(message: &'static str) -> Error {
@@ -163,6 +163,7 @@ pub(crate) struct Model {
     source: usize,
     known: usize,
     pub(crate) retained: usize,
+    extra_work: usize,
 }
 impl Model {
     fn new(headers: &PreparedFunctionBindingHeaders<'_>, source: usize) -> Result<Self, Error> {
@@ -195,17 +196,44 @@ impl Model {
             source,
             known,
             retained: 0,
+            extra_work: 0,
         }
     }
     pub(crate) fn request<T>(&mut self, count: usize, times: usize) -> Result<(), Error> {
         let size = bytes::<T>(count)?;
-        self.retained = add(self.retained, size)?;
-        self.facts.request_bytes_upper_bound =
-            add(self.facts.request_bytes_upper_bound, mul(size, times)?)?;
-        if size != 0 {
-            self.facts.allocation_requests_upper_bound =
-                add(self.facts.allocation_requests_upper_bound, times)?;
-        }
+        self.charge_requests(usize::from(size != 0) * times, mul(size, times)?, size)
+    }
+    /// Temporary requests coexist during construction but are not backing of
+    /// the published output. They use the same cumulative admission model.
+    pub(crate) fn temporary_request<T>(&mut self, count: usize, times: usize) -> Result<(), Error> {
+        let size = bytes::<T>(count)?;
+        self.charge_requests(usize::from(size != 0) * times, mul(size, times)?, 0)
+    }
+    /// Charge actual layout requests without treating their conservative
+    /// upper bound as a measured necessary floor of retained private storage.
+    pub(crate) fn request_layouts(&mut self, layout: Layout, requests: usize) -> Result<(), Error> {
+        self.charge_requests(
+            usize::from(layout.size() != 0) * requests,
+            mul(layout.size(), requests)?,
+            0,
+        )
+    }
+    fn charge_requests(
+        &mut self,
+        requests: usize,
+        bytes: usize,
+        retained: usize,
+    ) -> Result<(), Error> {
+        self.retained = add(self.retained, retained)?;
+        self.facts.request_bytes_upper_bound = add(self.facts.request_bytes_upper_bound, bytes)?;
+        self.facts.allocation_requests_upper_bound =
+            add(self.facts.allocation_requests_upper_bound, requests)?;
+        Ok(())
+    }
+    /// Delegated work is admitted here; this numerical ceiling does not
+    /// synthesize observer callbacks or reset the caller's resource budget.
+    pub(crate) fn add_work(&mut self, work: usize) -> Result<(), Error> {
+        self.extra_work = add(self.extra_work, work)?;
         Ok(())
     }
     pub(crate) fn check(&mut self, limits: BindingProjectionLimits) -> Result<(), Error> {
@@ -238,7 +266,7 @@ impl Model {
                 )?,
                 add(
                     mul(self.facts.request_bytes_upper_bound, 4)?,
-                    self.facts.allocation_requests_upper_bound,
+                    add(self.facts.allocation_requests_upper_bound, self.extra_work)?,
                 )?,
             )?,
         )?;
