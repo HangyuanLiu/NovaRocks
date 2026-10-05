@@ -701,7 +701,7 @@ fn prepare_decode(
     }
     Ok(facts)
 }
-fn encode_sorts(
+pub(crate) fn encode_sorts(
     input: &[p::SortExpr],
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<Vec<wire::SortExpression>, Error> {
@@ -716,7 +716,7 @@ fn encode_sorts(
     }
     Ok(output)
 }
-fn decode_sorts(
+pub(crate) fn decode_sorts(
     input: &[wire::SortExpression],
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<Box<[p::SortExpr]>, Error> {

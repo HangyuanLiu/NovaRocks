@@ -42,6 +42,7 @@ pub use materialize::{
 pub use read::{PreparedFunctionBindingHeaders, prepare_function_binding_headers};
 pub(crate) use signature_copy::{
     copy_scalar_signature_observed, copy_table_signature_observed, preflight_scalar_signature_copy,
+    preflight_scalar_signature_copy_counts, preflight_scalar_signature_copy_types,
     preflight_table_signature_copy, preflight_table_signature_copy_counts,
     preflight_table_signature_copy_types,
 };

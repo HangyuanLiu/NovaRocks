@@ -477,3 +477,36 @@ fn wide_aggregate_copy_has_real_prepare_quantum_and_sampled_emit_prefixes() {
         assert_eq!(control.trace(), [0]);
     }
 }
+
+#[test]
+fn staged_aggregate_counts_preserve_state_and_scalar_roots_before_type_walk() {
+    let source = fixture(AggregatePhase::Single);
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let mut model = MaterializationModel::for_composition(1, 0, SOURCE, SOURCE);
+    preflight_aggregate_binding_copy_counts(&source, &mut model, limits(), &mut work).unwrap();
+    let prefix_bytes = 20
+        + 2 * Layout::array::<FunctionArgumentType>(2).unwrap().size()
+        + 2 * Layout::array::<FunctionValueType>(2).unwrap().size();
+    assert_eq!(model.facts.type_reference_count, 6);
+    assert_eq!(model.facts.allocation_requests_upper_bound, 7);
+    assert_eq!(model.facts.request_bytes_upper_bound, prefix_bytes);
+    assert_eq!(model.items, 4);
+    preflight_aggregate_binding_copy_types(&source, &mut model, limits(), &mut work).unwrap();
+    assert_eq!(model.facts.allocation_requests_upper_bound, 11);
+    assert_eq!(
+        model.facts.request_bytes_upper_bound,
+        prefix_bytes + 4 * Layout::new::<DataType>().size()
+    );
+    work.finish().unwrap();
+    let full = Control::default();
+    let mut work = CompileCheckpoints::try_new(&full, CompilePhase::Decode).unwrap();
+    let mut original = MaterializationModel::for_composition(1, 0, SOURCE, SOURCE);
+    preflight_aggregate_binding_copy(&source, &mut original, limits(), &mut work).unwrap();
+    work.finish().unwrap();
+    assert_eq!(full.trace(), control.trace());
+    assert_eq!(
+        original.facts.request_bytes_upper_bound,
+        model.facts.request_bytes_upper_bound
+    );
+}

@@ -60,6 +60,19 @@ pub(crate) fn preflight_scalar_signature_copy(
     limits: BindingProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
+    preflight_scalar_signature_copy_counts(source, model, limits, work)?;
+    preflight_scalar_signature_copy_types(source, model, limits, work)
+}
+
+/// Admit all owned collections and root occurrences before visiting types.
+/// A containing node can gate its complete cumulative model between these
+/// two stages; the complete helper preserves this original operation order.
+pub(crate) fn preflight_scalar_signature_copy_counts(
+    source: &BoundFunction,
+    model: &mut MaterializationModel,
+    limits: BindingProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), BindingCodecError> {
     model.check(limits)?;
     header(source, work)?;
     model.items = add(model.items, source.argument_types.len())?;
@@ -68,20 +81,19 @@ pub(crate) fn preflight_scalar_signature_copy(
     model.request::<u8>(source.overload.as_str().len(), 1)?;
     model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
     model.check(limits)?;
-    preflight_arguments(&source.argument_types, model, limits, work)?;
-    model.count_owned_type_clone(&source.result_type, limits, work)?;
-    work.step()?;
-    Ok(())
+    preflight_argument_counts(&source.argument_types, model, limits, work)
 }
 
-fn preflight_arguments(
-    arguments: &[FunctionArgumentType],
+pub(crate) fn preflight_scalar_signature_copy_types(
+    source: &BoundFunction,
     model: &mut MaterializationModel,
     limits: BindingProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
-    preflight_argument_counts(arguments, model, limits, work)?;
-    preflight_argument_types(arguments, model, limits, work)
+    preflight_argument_types(&source.argument_types, model, limits, work)?;
+    model.count_owned_type_clone(&source.result_type, limits, work)?;
+    work.step()?;
+    Ok(())
 }
 fn preflight_argument_counts(
     arguments: &[FunctionArgumentType],

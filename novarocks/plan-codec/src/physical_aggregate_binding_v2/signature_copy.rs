@@ -18,7 +18,8 @@
 use crate::{
     physical_binding_v2::{
         BindingCodecError, BindingProjectionLimits, MaterializationModel, add, completed,
-        copy_scalar_signature_observed, preflight_scalar_signature_copy,
+        copy_scalar_signature_observed, preflight_scalar_signature_copy_counts,
+        preflight_scalar_signature_copy_types,
     },
     physical_type_v2::clone_value_type_observed,
 };
@@ -55,6 +56,16 @@ pub(crate) fn preflight_aggregate_binding_copy(
     limits: BindingProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
+    preflight_aggregate_binding_copy_counts(source, model, limits, work)?;
+    preflight_aggregate_binding_copy_types(source, model, limits, work)
+}
+
+pub(crate) fn preflight_aggregate_binding_copy_counts(
+    source: &AggregateBinding,
+    model: &mut MaterializationModel,
+    limits: BindingProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), BindingCodecError> {
     model.check(limits)?;
     header(source, work)?;
     // Admit the intermediate root and state identity before any clone grammar.
@@ -62,7 +73,16 @@ pub(crate) fn preflight_aggregate_binding_copy(
     model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
     model.request::<u8>(source.state_format.as_str().len(), 1)?;
     model.check(limits)?;
-    preflight_scalar_signature_copy(&source.function, model, limits, work)?;
+    preflight_scalar_signature_copy_counts(&source.function, model, limits, work)
+}
+
+pub(crate) fn preflight_aggregate_binding_copy_types(
+    source: &AggregateBinding,
+    model: &mut MaterializationModel,
+    limits: BindingProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), BindingCodecError> {
+    preflight_scalar_signature_copy_types(&source.function, model, limits, work)?;
     model.count_owned_type_clone(&source.intermediate_type, limits, work)?;
     work.step()?;
     model.check(limits)

@@ -49,6 +49,7 @@ pub use materialize::{
 pub use read::{PreparedAggregateBindingHeaders, prepare_aggregate_binding_headers};
 pub(crate) use signature_copy::{
     copy_aggregate_binding_observed, preflight_aggregate_binding_copy,
+    preflight_aggregate_binding_copy_counts, preflight_aggregate_binding_copy_types,
 };
 
 /// Projects the explicit state owner's contract, independently of function identity.
@@ -114,6 +115,24 @@ impl<'loan, 'source> EncodedAggregateBindings<'loan, 'source> {
     }
     pub(crate) fn source_counts(&self) -> usize {
         self.inputs.len()
+    }
+    /// Resolve only the actual borrowed aggregate occurrence. Intentional
+    /// aliases use the first ID in the original ascending namespace.
+    pub(crate) fn source_id_observed(
+        &self,
+        source: &AggregateBinding,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<u32, BindingCodecError> {
+        for input in self.inputs {
+            let same = std::ptr::eq(input.source, source);
+            work.step()?;
+            if same {
+                return Ok(input.id);
+            }
+        }
+        Err(BindingCodecError::InvalidShape(
+            "aggregate signature is not an original emitted source",
+        ))
     }
     pub(crate) fn binding_observed(
         &self,

@@ -593,3 +593,39 @@ fn aggregate_original_control_prefixes_cover_quantum_success_and_ordinary_tails(
         }
     }
 }
+
+#[test]
+fn aggregate_source_identity_uses_original_pointer_and_first_sparse_alias() {
+    let values = values();
+    let control = Control::default();
+    let types = encode_type_table_sources(&values, &[], type_limits(), &control).unwrap();
+    let function = function(&values[0].1);
+    let args = [ArgumentTypeIds::Value(0)];
+    let function_inputs = [FunctionBindingInput {
+        id: 0,
+        source: BindingSource::Scalar(&function),
+        arguments: &args,
+        result: ResultTypeIds::Scalar(0),
+    }];
+    let functions =
+        encode_function_bindings(&types, &function_inputs, SOURCE, limits(), &control).unwrap();
+    let source = aggregate(&function, &values[1].1, AggregatePhase::Single);
+    let inputs = [0, u32::MAX].map(|id| AggregateBindingInput {
+        id,
+        source: &source,
+        function_binding_id: 0,
+        intermediate_value_type_id: u32::MAX,
+    });
+    let encoded =
+        encode_aggregate_bindings(&types, &functions, &inputs, SOURCE, limits(), &control).unwrap();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+    assert_eq!(encoded.source_id_observed(&source, &mut work).unwrap(), 0);
+    let foreign = source.clone();
+    assert!(matches!(
+        encoded.source_id_observed(&foreign, &mut work),
+        Err(BindingCodecError::InvalidShape(
+            "aggregate signature is not an original emitted source"
+        ))
+    ));
+    work.finish().unwrap();
+}
