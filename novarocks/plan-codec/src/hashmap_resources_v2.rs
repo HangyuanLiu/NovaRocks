@@ -1,0 +1,240 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Locked std HashMap request geometry and opaque string-operation work.
+//! This is a numerical source projection, never an allocator or CPU grant.
+
+use crate::resource_source_model::LOCKED_TOOLCHAIN;
+use std::alloc::Layout;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HashMapResourceError {
+    SourceModel(&'static str),
+    Arithmetic(&'static str),
+}
+use HashMapResourceError::{Arithmetic, SourceModel};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FreshTableFacts {
+    pub(crate) layout: Option<Layout>,
+    pub(crate) buckets: usize,
+    pub(crate) allocation_requests_upper_bound: usize,
+    pub(crate) request_bytes_upper_bound: usize,
+}
+fn add(a: usize, b: usize) -> Result<usize, HashMapResourceError> {
+    a.checked_add(b)
+        .ok_or(Arithmetic("HashMap resource sum overflow"))
+}
+fn mul(a: usize, b: usize) -> Result<usize, HashMapResourceError> {
+    a.checked_mul(b)
+        .ok_or(Arithmetic("HashMap resource product overflow"))
+}
+
+/// Rust 1.92 std Cargo.lock selects hashbrown 0.15.5 with
+/// rustc-dep-of-std/nightly. control/group/mod.rs selects these public
+/// intrinsic carriers, or the actual generic u64 word on the proven targets.
+/// No private Group repr is recreated. Other targets need a source review.
+fn group_layout() -> Result<Layout, HashMapResourceError> {
+    if !LOCKED_TOOLCHAIN {
+        return Err(SourceModel(
+            "HashMap allocation toolchain source model drift",
+        ));
+    }
+    if std::mem::size_of::<usize>() != 8
+        || Layout::new::<usize>() != Layout::new::<Option<std::ptr::NonNull<()>>>()
+    {
+        return Err(SourceModel("HashMap pointer target source model drift"));
+    }
+    #[cfg(all(not(miri), target_arch = "x86_64", target_feature = "sse2"))]
+    {
+        Ok(Layout::new::<core::arch::x86_64::__m128i>())
+    }
+    #[cfg(all(
+        not(miri),
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    ))]
+    {
+        Ok(Layout::new::<core::arch::aarch64::uint8x8_t>())
+    }
+    #[cfg(all(
+        any(target_arch = "aarch64", all(miri, target_arch = "x86_64")),
+        not(any(
+            all(not(miri), target_arch = "x86_64", target_feature = "sse2"),
+            all(
+                not(miri),
+                target_arch = "aarch64",
+                target_feature = "neon",
+                target_endian = "little"
+            )
+        ))
+    ))]
+    {
+        Ok(Layout::new::<u64>())
+    }
+    // A consumer disabling SSE2 does not rebuild its precompiled sysroot.
+    // Without a build-std source loan its std table can still use Group16.
+    #[cfg(all(not(miri), target_arch = "x86_64", not(target_feature = "sse2")))]
+    {
+        Err(SourceModel(
+            "HashMap precompiled x86_64 Group source model is unsupported",
+        ))
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        Err(SourceModel(
+            "HashMap Group target source model is unsupported",
+        ))
+    }
+}
+
+/// Only HashMap::new(), one try_reserve(unique_count), and no more than that
+/// many unique inserts. No removals, prior allocation, or second growth.
+/// raw/mod.rs capacity_to_buckets/TableLayout are the sole source formula.
+/// RandomState construction/OS seed acquisition is separately caller-owned.
+pub(crate) fn fresh_table_layout<K, V>(
+    unique_count: usize,
+) -> Result<FreshTableFacts, HashMapResourceError> {
+    let group = group_layout()?;
+    if unique_count == 0 {
+        return Ok(FreshTableFacts {
+            layout: None,
+            buckets: 0,
+            allocation_requests_upper_bound: 0,
+            request_bytes_upper_bound: 0,
+        });
+    }
+    let pair = Layout::new::<(K, V)>();
+    let width = group.size();
+    if !matches!(width, 8 | 16) || group.align() > width {
+        return Err(SourceModel(
+            "HashMap Group intrinsic layout source model drift",
+        ));
+    }
+    let buckets = if unique_count < 15 {
+        let min_cap = match (width, pair.size()) {
+            (16, 0..=1) => 14,
+            (16, 2..=3) | (8, 0..=1) => 7,
+            _ => 3,
+        };
+        let capacity = unique_count.max(min_cap);
+        if capacity < 4 {
+            4
+        } else if capacity < 8 {
+            8
+        } else {
+            16
+        }
+    } else {
+        (mul(unique_count, 8)? / 7)
+            .checked_next_power_of_two()
+            .ok_or(Arithmetic("HashMap bucket count overflow"))?
+    };
+    let align = pair.align().max(width);
+    let ctrl_offset = add(mul(pair.size(), buckets)?, align - 1)? & !(align - 1);
+    let size = add(ctrl_offset, add(buckets, width)?)?;
+    // hashbrown requires this strict margin before its unchecked Layout.
+    if size
+        > (isize::MAX as usize)
+            .checked_sub(align - 1)
+            .ok_or(Arithmetic("HashMap alignment extent overflow"))?
+    {
+        return Err(Arithmetic("HashMap allocation layout is unrepresentable"));
+    }
+    let layout = Layout::from_size_align(size, align)
+        .map_err(|_| Arithmetic("HashMap allocation layout is unrepresentable"))?;
+    // The real raw table request is not padded to Layout alignment.
+    Ok(FreshTableFacts {
+        layout: Some(layout),
+        buckets,
+        allocation_requests_upper_bound: 1,
+        request_bytes_upper_bound: size,
+    })
+}
+
+/// Only std String/&str keys and std RandomState/SipHasher13, not arbitrary
+/// user Hash/Eq/BuildHasher code. bucket_upper_bound may be a truthful whole
+/// retained source invoice for an existing table, never public capacity().
+///
+/// Sip13 hashes bytes plus a prefix-free sentinel and four final rounds.
+/// 64 units/byte and 256/operation conservatively cover its bounded ordinary
+/// word/tail/round source. A triangular probe visits every group; allowing
+/// every bucket plus a whole Group and a longest-key comparison per candidate
+/// covers total collisions, including small-table replicated control tags.
+/// These are source operation units, not cooperative callbacks or wall time.
+pub(crate) fn string_operations_work_upper_bound(
+    bucket_upper_bound: usize,
+    operations: usize,
+    total_key_bytes: usize,
+    max_key_bytes: usize,
+) -> Result<usize, HashMapResourceError> {
+    let group = group_layout()?.size();
+    let hash = add(
+        mul(256, operations)?,
+        mul(64, add(total_key_bytes, operations)?)?,
+    )?;
+    let candidates = mul(operations, add(bucket_upper_bound, group)?)?;
+    let comparisons = mul(candidates, add(32, mul(2, max_key_bytes)?)?)?;
+    add(hash, comparisons)
+}
+
+/// Fresh String/String tables initialize actual control bytes and move each
+/// actual inline pair once. String payload copying has its own caller author.
+pub(crate) fn fresh_string_table_work_upper_bound(
+    unique_count: usize,
+    total_key_bytes: usize,
+    max_key_bytes: usize,
+) -> Result<usize, HashMapResourceError> {
+    let table = fresh_table_layout::<String, String>(unique_count)?;
+    if unique_count == 0 {
+        return Ok(0);
+    }
+    let initialization = add(table.buckets, group_layout()?.size())?;
+    add(
+        add(
+            initialization,
+            mul(unique_count, std::mem::size_of::<(String, String)>())?,
+        )?,
+        string_operations_work_upper_bound(
+            table.buckets,
+            unique_count,
+            total_key_bytes,
+            max_key_bytes,
+        )?,
+    )
+}
+
+/// HashMap iteration scans control tags for empty and deleted buckets too.
+/// The truthful whole retained invoice includes at least one byte/raw bucket;
+/// visible len or public capacity() does not bound a retained deleted table.
+/// This also admits the final None and visible-entry bookkeeping. Caller must
+/// bracket the real iterator operations; there is no simulated byte loop here.
+pub(crate) fn source_iterator_work_upper_bound(
+    source_retained_bytes: usize,
+    visible_entries: usize,
+) -> Result<usize, HashMapResourceError> {
+    let group = group_layout()?.size();
+    add(
+        mul(32, add(source_retained_bytes, group)?)?,
+        mul(16, add(visible_entries, 1)?)?,
+    )
+}
+
+#[cfg(test)]
+#[path = "hashmap_resources_v2/tests.rs"]
+mod tests;
