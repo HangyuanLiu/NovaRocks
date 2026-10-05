@@ -29,7 +29,7 @@ use std::fmt;
 
 mod encode;
 mod materialize;
-mod owner_admission;
+pub(crate) mod owner_admission;
 pub(crate) use materialize::{
     Model as MaterializationModel, add, boxed, cap, completed, finish, mul, reserve,
 };
@@ -47,8 +47,10 @@ pub use read::{
 };
 pub(crate) use signature_copy::{
     copy_scalar_signature_observed, copy_table_signature_observed, preflight_scalar_signature_copy,
-    preflight_scalar_signature_copy_counts, preflight_scalar_signature_copy_types,
-    preflight_table_signature_copy_counts, preflight_table_signature_copy_types,
+    preflight_scalar_signature_copy_counts, preflight_scalar_signature_copy_counts_in,
+    preflight_scalar_signature_copy_in, preflight_scalar_signature_copy_types,
+    preflight_scalar_signature_copy_types_in, preflight_table_signature_copy_counts,
+    preflight_table_signature_copy_types,
 };
 
 #[derive(Debug)]
@@ -100,7 +102,7 @@ impl VerifiedSignature {
         self.work
     }
 }
-pub(crate) use encode::verify_scalar_signature;
+pub(crate) use encode::{verify_scalar_signature, verify_scalar_signature_admitted};
 
 #[derive(Clone, Copy)]
 pub enum BindingSource<'a> {
@@ -209,14 +211,29 @@ impl<'loan, 'source> EncodedFunctionBindings<'loan, 'source> {
         id: u32,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Option<&'source BoundFunction>, BindingCodecError> {
+        self.scalar_binding_captured(id, &mut |_, _| Ok(()), work)
+    }
+    pub(crate) fn scalar_binding_captured(
+        &self,
+        id: u32,
+        capture: &mut impl FnMut(
+            &'source BoundFunction,
+            &mut CompileCheckpoints<'_>,
+        ) -> Result<(), BindingCodecError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'source BoundFunction>, BindingCodecError> {
         for input in self.inputs {
             let matches = input.id == id;
+            let source = match input.source {
+                BindingSource::Scalar(source) if matches => Some(source),
+                _ => None,
+            };
+            if let Some(source) = source {
+                capture(source, work)?;
+            }
             work.step()?;
             if matches {
-                return Ok(match input.source {
-                    BindingSource::Scalar(source) => Some(source),
-                    BindingSource::Table(_) => None,
-                });
+                return Ok(source);
             }
         }
         Ok(None)

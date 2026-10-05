@@ -26,7 +26,7 @@ use crate::{
     physical_binding_v2::BindingCodecError,
     physical_connector_payload_v2::{
         ConnectorPayloadCodecError, DecodedConnectorPayloads, EncodedConnectorPayloads,
-        arc_u8_slice_bytes, bytes_shared_upper,
+        arc_u8_slice_bytes, arc_u8_slice_bytes_for_mode, bytes_shared_upper_for_mode,
     },
     physical_provider_binding_v2::{
         DecodedProviderBindings, EncodedProviderBindings, ProviderBindingCodecError,
@@ -131,6 +131,7 @@ fn add(a: usize, b: usize) -> Result<usize, Error> {
     a.checked_add(b)
         .ok_or_else(|| invalid("provider read resource sum overflow"))
 }
+#[cfg(test)]
 fn mul(a: usize, b: usize) -> Result<usize, Error> {
     a.checked_mul(b)
         .ok_or_else(|| invalid("provider read resource product overflow"))
@@ -139,6 +140,33 @@ fn bytes<T>(n: usize) -> Result<usize, Error> {
     Layout::array::<T>(n)
         .map(|v| v.size())
         .map_err(|_| invalid("provider read allocation layout is unrepresentable"))
+}
+type Admit<'a> = dyn FnMut(&ProviderReadProjectionFacts) -> Result<(), CompileControlError> + 'a;
+fn numerical<T>(value: Option<T>, observed: bool, message: &'static str) -> Result<T, Error> {
+    value.ok_or_else(|| {
+        if observed {
+            Error::Control(CompileControlError::ResourceExhausted)
+        } else {
+            invalid(message)
+        }
+    })
+}
+fn numerical_bytes<T>(n: usize, observed: bool) -> Result<usize, Error> {
+    numerical(
+        Layout::array::<T>(n).ok().map(|layout| layout.size()),
+        observed,
+        "provider read allocation layout is unrepresentable",
+    )
+}
+fn check_control(
+    original: &dyn PureCompileControl,
+    work: &CompileCheckpoints<'_>,
+) -> Result<(), Error> {
+    if std::ptr::addr_eq(original, work.control()) {
+        Ok(())
+    } else {
+        Err(invalid("provider read control loan differs"))
+    }
 }
 fn cap(n: usize, max: usize, work: &mut CompileCheckpoints<'_>) -> Result<(), Error> {
     let allowed = n <= max;
@@ -188,7 +216,7 @@ fn same_control(
     right: &dyn PureCompileControl,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
-    let same = std::ptr::eq(left, right);
+    let same = std::ptr::addr_eq(left, right);
     work.step()?;
     if same {
         Ok(())
@@ -233,14 +261,23 @@ fn required(value: Option<u32>, work: &mut CompileCheckpoints<'_>) -> Result<u32
 }
 #[derive(Default)]
 struct Requests {
+    observed: bool,
     count: usize,
     bytes: usize,
 }
 impl Requests {
     fn record(&mut self, n: usize) -> Result<(), Error> {
         if n != 0 {
-            self.count = add(self.count, 1)?;
-            self.bytes = add(self.bytes, n)?;
+            self.count = numerical(
+                self.count.checked_add(1),
+                self.observed,
+                "provider read resource sum overflow",
+            )?;
+            self.bytes = numerical(
+                self.bytes.checked_add(n),
+                self.observed,
+                "provider read resource sum overflow",
+            )?;
         }
         Ok(())
     }
@@ -252,6 +289,20 @@ fn bound(
     input: usize,
     requests: &Requests,
 ) -> Result<usize, Error> {
+    let add = |a: usize, b: usize| {
+        numerical(
+            a.checked_add(b),
+            requests.observed,
+            "provider read resource sum overflow",
+        )
+    };
+    let mul = |a: usize, b: usize| {
+        numerical(
+            a.checked_mul(b),
+            requests.observed,
+            "provider read resource product overflow",
+        )
+    };
     let height = (usize::BITS - n.leading_zeros()) as usize;
     // Index sort is <=4 operations/heap level. Encoding visits every source
     // once in preflight and again while emitting to preserve pointer identity;
@@ -277,35 +328,81 @@ fn bound(
         )?,
     )
 }
-fn facts(
+fn numerical_facts(
     n: usize,
     input: usize,
-    requests: Requests,
+    requests: &Requests,
     source: usize,
     namespace_counts: (usize, usize),
-    limits: ProviderReadProjectionLimits,
-    work: &mut CompileCheckpoints<'_>,
 ) -> Result<ProviderReadProjectionFacts, Error> {
     let (bindings, payloads) = namespace_counts;
-    let bound = bound(n, bindings, payloads, input, &requests)?;
+    let bound = bound(n, bindings, payloads, input, requests)?;
     let facts = ProviderReadProjectionFacts {
         definition_count: n,
         input_version_bytes: input,
         allocation_requests_upper_bound: requests.count,
         allocation_request_bytes_upper_bound: requests.bytes,
-        coexisting_source_and_request_bytes_upper_bound: add(source, requests.bytes)?,
+        coexisting_source_and_request_bytes_upper_bound: numerical(
+            source.checked_add(requests.bytes),
+            requests.observed,
+            "provider read resource sum overflow",
+        )?,
         cumulative_work_upper_bound: bound,
     };
+    Ok(facts)
+}
+fn prefix(
+    n: usize,
+    input: usize,
+    requests: &Requests,
+    envelope: (usize, (usize, usize), ProviderReadProjectionLimits),
+    admit: &mut Option<&mut Admit<'_>>,
+) -> Result<ProviderReadProjectionFacts, Error> {
+    let result = numerical_facts(n, input, requests, envelope.0, envelope.1)?;
+    if let Some(callback) = admit.as_mut() {
+        let limits = envelope.2;
+        if result.definition_count > limits.max_definitions
+            || result.input_version_bytes > limits.max_input_version_bytes
+            || result.allocation_requests_upper_bound > limits.max_allocation_requests
+            || result.allocation_request_bytes_upper_bound > limits.max_allocation_request_bytes
+            || result.coexisting_source_and_request_bytes_upper_bound
+                > limits.max_coexisting_source_and_request_bytes
+            || result.cumulative_work_upper_bound > limits.max_work
+        {
+            return Err(CompileControlError::ResourceExhausted.into());
+        }
+        callback(&result)?;
+    }
+    Ok(result)
+}
+fn facts(
+    n: usize,
+    input: usize,
+    requests: Requests,
+    envelope: (usize, (usize, usize), ProviderReadProjectionLimits),
+    admit: &mut Option<&mut Admit<'_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ProviderReadProjectionFacts, Error> {
+    let result = prefix(n, input, &requests, envelope, admit)?;
+    let limits = envelope.2;
     cap(input, limits.max_input_version_bytes, work)?;
-    cap(requests.count, limits.max_allocation_requests, work)?;
-    cap(requests.bytes, limits.max_allocation_request_bytes, work)?;
     cap(
-        facts.coexisting_source_and_request_bytes_upper_bound,
+        result.allocation_requests_upper_bound,
+        limits.max_allocation_requests,
+        work,
+    )?;
+    cap(
+        result.allocation_request_bytes_upper_bound,
+        limits.max_allocation_request_bytes,
+        work,
+    )?;
+    cap(
+        result.coexisting_source_and_request_bytes_upper_bound,
         limits.max_coexisting_source_and_request_bytes,
         work,
     )?;
-    cap(bound, limits.max_work, work)?;
-    Ok(facts)
+    cap(result.cumulative_work_upper_bound, limits.max_work, work)?;
+    Ok(result)
 }
 fn prior_work(
     n: usize,
@@ -414,6 +511,30 @@ impl<'source, 'control> EncodedProviderReads<'source, 'control> {
         }
         Ok(n)
     }
+    /// Borrow the same original namespace and caller scope; no entry/footer.
+    pub fn read_in(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'source ProviderReadReference>, Error> {
+        check_control(self.original_control(), work)?;
+        self.read_observed(id, work)
+    }
+    pub fn retained_invoice_floor_in(
+        &self,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<usize, Error> {
+        check_control(self.original_control(), work)?;
+        self.retained_floor_observed(work)
+    }
+    pub fn source_id_in(
+        &self,
+        source: &ProviderReadReference,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<u32, Error> {
+        check_control(self.original_control(), work)?;
+        self.source_id_observed(source, work)
+    }
 }
 pub struct DecodedProviderReads<'wire, 'control> {
     wire: &'wire [wire::ProviderReadReferenceDefinition],
@@ -480,6 +601,22 @@ impl<'wire, 'control> DecodedProviderReads<'wire, 'control> {
         // upper bounds, not observable retained lower floors.
         Ok(n)
     }
+    /// Borrow the same original namespace and caller scope; no entry/footer.
+    pub fn read_in(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&ProviderReadReference>, Error> {
+        check_control(self.original_control(), work)?;
+        self.read_observed(id, work)
+    }
+    pub fn retained_invoice_floor_in(
+        &self,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<usize, Error> {
+        check_control(self.original_control(), work)?;
+        self.retained_floor_observed(work)
+    }
 }
 
 pub fn encode_provider_reads<'source, 'control>(
@@ -495,8 +632,8 @@ pub fn encode_provider_reads<'source, 'control>(
         inputs,
         bindings,
         payloads,
-        source_retained_bytes,
-        limits,
+        (source_retained_bytes, limits),
+        None,
         &mut work,
     );
     finish(result, work)
@@ -505,10 +642,37 @@ fn encode_core<'source, 'control>(
     inputs: &'source [(u32, &'source ProviderReadReference)],
     bindings: &'source EncodedProviderBindings<'source, 'control>,
     payloads: &'source EncodedConnectorPayloads<'source, 'control>,
-    source: usize,
-    limits: ProviderReadProjectionLimits,
+    envelope: (usize, ProviderReadProjectionLimits),
+    mut admit: Option<&mut Admit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<EncodedProviderReads<'source, 'control>, Error> {
+    let (source, limits) = envelope;
+    let observed = admit.is_some();
+    let add = |a: usize, b: usize| {
+        numerical(
+            a.checked_add(b),
+            observed,
+            "provider read resource sum overflow",
+        )
+    };
+    let envelope = (
+        source,
+        (bindings.source_count(), payloads.source_count()),
+        limits,
+    );
+    let mut req = Requests {
+        observed,
+        ..Requests::default()
+    };
+    if observed {
+        req.record(numerical_bytes::<usize>(inputs.len(), true)?)?;
+        req.record(numerical_bytes::<wire::ProviderReadReferenceDefinition>(
+            inputs.len(),
+            true,
+        )?)?;
+        prefix(inputs.len(), 0, &req, envelope, &mut admit)?;
+    }
+
     same_control(
         bindings.original_control(),
         payloads.original_control(),
@@ -528,11 +692,13 @@ fn encode_core<'source, 'control>(
     floor(source, known, work)?;
     let roots = bytes::<(u32, &ProviderReadReference)>(inputs.len())?;
     floor(source, roots, work)?;
-    let mut req = Requests::default();
-    req.record(bytes::<usize>(inputs.len())?)?;
-    req.record(bytes::<wire::ProviderReadReferenceDefinition>(
-        inputs.len(),
-    )?)?;
+
+    if !observed {
+        req.record(bytes::<usize>(inputs.len())?)?;
+        req.record(bytes::<wire::ProviderReadReferenceDefinition>(
+            inputs.len(),
+        )?)?;
+    }
     let mut input = 0;
     let mut individual = 0;
     for (_, read) in inputs {
@@ -540,24 +706,19 @@ fn encode_core<'source, 'control>(
         input = add(input, n)?;
         individual = individual.max(add(
             size_of::<ProviderReadReference>(),
-            arc_u8_slice_bytes(n)?,
+            arc_u8_slice_bytes_for_mode(n, observed)?,
         )?);
-        req.record(bytes::<u8>(n)?)?;
+        req.record(numerical_bytes::<u8>(n, observed)?)?;
+        if observed {
+            prefix(inputs.len(), input, &req, envelope, &mut admit)?;
+        }
         work.step()?;
         bindings.source_id_observed(&read.binding, work)?;
         payloads.source_id_observed(read.relation.table(), work)?;
         payloads.source_id_observed(read.relation.view(), work)?;
     }
     floor(source, add(roots, individual)?, work)?;
-    let facts = facts(
-        inputs.len(),
-        input,
-        req,
-        source,
-        (bindings.source_count(), payloads.source_count()),
-        limits,
-        work,
-    )?;
+    let facts = facts(inputs.len(), input, req, envelope, &mut admit, work)?;
     let indices = BindingIndex::prepare(inputs.len(), |at| inputs[at].0, work)?;
     let mut output = reserve(inputs.len(), work)?;
     for (id, read) in inputs {
@@ -581,10 +742,16 @@ fn encode_core<'source, 'control>(
         original_source_bytes: source,
     })
 }
+type PayloadCapture<'a> = dyn FnMut(
+        &novarocks_connector_contract::ConnectorEncodedPayload,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<(), Error>
+    + 'a;
 fn decode_refs<'a>(
     def: &wire::ProviderReadReferenceDefinition,
     bindings: &'a DecodedProviderBindings<'_, '_>,
     payloads: &'a DecodedConnectorPayloads<'_, '_>,
+    mut capture: Option<&mut PayloadCapture<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<
     (
@@ -599,13 +766,19 @@ fn decode_refs<'a>(
         .binding_observed(id, work)?
         .ok_or_else(|| invalid("provider read binding ID is unknown"))?;
     let id = required(def.table_payload_id, work)?;
-    let table = payloads
-        .payload_observed(id, work)?
-        .ok_or_else(|| invalid("provider read table payload ID is unknown"))?;
+    let table = if let Some(callback) = capture.as_mut() {
+        payloads.payload_captured_in(id, &mut **callback, work)?
+    } else {
+        payloads.payload_observed(id, work)?
+    }
+    .ok_or_else(|| invalid("provider read table payload ID is unknown"))?;
     let id = required(def.view_payload_id, work)?;
-    let view = payloads
-        .payload_observed(id, work)?
-        .ok_or_else(|| invalid("provider read view payload ID is unknown"))?;
+    let view = if let Some(callback) = capture.as_mut() {
+        payloads.payload_captured_in(id, &mut **callback, work)?
+    } else {
+        payloads.payload_observed(id, work)?
+    }
+    .ok_or_else(|| invalid("provider read view payload ID is unknown"))?;
     Ok((binding, table, view))
 }
 pub fn decode_provider_reads<'wire, 'control>(
@@ -620,8 +793,8 @@ pub fn decode_provider_reads<'wire, 'control>(
         definitions,
         bindings,
         payloads,
-        source_retained_bytes,
-        limits,
+        (source_retained_bytes, limits),
+        None,
         &mut work,
     );
     finish(result, work)
@@ -630,10 +803,43 @@ fn decode_core<'wire, 'control>(
     definitions: &'wire [wire::ProviderReadReferenceDefinition],
     bindings: &'wire DecodedProviderBindings<'wire, 'control>,
     payloads: &'wire DecodedConnectorPayloads<'wire, 'control>,
-    source: usize,
-    limits: ProviderReadProjectionLimits,
+    envelope: (usize, ProviderReadProjectionLimits),
+    mut admit: Option<&mut Admit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedProviderReads<'wire, 'control>, Error> {
+    let (source, limits) = envelope;
+    let observed = admit.is_some();
+    let add = |a: usize, b: usize| {
+        numerical(
+            a.checked_add(b),
+            observed,
+            "provider read resource sum overflow",
+        )
+    };
+    let envelope = (
+        source,
+        (bindings.source_count(), payloads.source_count()),
+        limits,
+    );
+    let mut req = Requests {
+        observed,
+        ..Requests::default()
+    };
+    if observed {
+        req.record(numerical_bytes::<usize>(definitions.len(), true)?)?;
+        req.record(numerical_bytes::<ProviderReadReference>(
+            definitions.len(),
+            true,
+        )?)?;
+        if !definitions.is_empty() {
+            req.record(numerical_bytes::<u8>(
+                ConnectorReadInputVersion::invalid_length_diagnostic().len(),
+                true,
+            )?)?;
+        }
+        prefix(definitions.len(), 0, &req, envelope, &mut admit)?;
+    }
+
     same_control(
         bindings.original_control(),
         payloads.original_control(),
@@ -653,23 +859,53 @@ fn decode_core<'wire, 'control>(
     floor(source, known, work)?;
     let mut known = bytes::<wire::ProviderReadReferenceDefinition>(definitions.len())?;
     floor(source, known, work)?;
-    let mut req = Requests::default();
-    req.record(bytes::<usize>(definitions.len())?)?;
-    req.record(bytes::<ProviderReadReference>(definitions.len())?)?;
+
+    if !observed {
+        req.record(bytes::<usize>(definitions.len())?)?;
+        req.record(bytes::<ProviderReadReference>(definitions.len())?)?;
+    }
     let mut input = 0;
     for def in definitions {
+        if observed {
+            input = add(input, def.input_version.len())?;
+            known = add(known, def.input_version.capacity())?;
+            req.record(arc_u8_slice_bytes_for_mode(
+                def.input_version.len(),
+                observed,
+            )?)?;
+            prefix(definitions.len(), input, &req, envelope, &mut admit)?;
+        }
         let kind = decode_relation_kind(def.kind);
         work.step()?;
         kind?;
-        let (_, table, view) = decode_refs(def, bindings, payloads, work)?;
-        input = add(input, def.input_version.len())?;
-        known = add(known, def.input_version.capacity())?;
-        req.record(arc_u8_slice_bytes(def.input_version.len())?)?;
-        for payload in [table, view] {
-            if !payload.payload().is_empty() {
-                req.record(bytes_shared_upper()?)?;
-            }
+        if observed {
+            let mut capture = |payload: &novarocks_connector_contract::ConnectorEncodedPayload,
+                               _: &mut CompileCheckpoints<'_>| {
+                if !payload.payload().is_empty() {
+                    req.record(bytes_shared_upper_for_mode(observed)?)?;
+                }
+                prefix(definitions.len(), input, &req, envelope, &mut admit)?;
+                Ok(())
+            };
+            decode_refs(def, bindings, payloads, Some(&mut capture), work)?;
+            // Original table/view completed observations remain after the
+            // successful lookup captures, without charging its requests again.
             work.step()?;
+            work.step()?;
+        } else {
+            let (_, table, view) = decode_refs(def, bindings, payloads, None, work)?;
+            input = add(input, def.input_version.len())?;
+            known = add(known, def.input_version.capacity())?;
+            req.record(arc_u8_slice_bytes_for_mode(
+                def.input_version.len(),
+                observed,
+            )?)?;
+            for payload in [table, view] {
+                if !payload.payload().is_empty() {
+                    req.record(bytes_shared_upper_for_mode(observed)?)?;
+                }
+                work.step()?;
+            }
         }
         work.step()?;
     }
@@ -677,26 +913,18 @@ fn decode_core<'wire, 'control>(
     // possible error is ConnectorError::new with this exact owned String;
     // cleanup_context is None and no other fields allocate (read_facts.rs).
     // Reserve ONE possible terminal diagnostic, not one per successful input.
-    if !definitions.is_empty() {
+    if !observed && !definitions.is_empty() {
         req.record(bytes::<u8>(
             ConnectorReadInputVersion::invalid_length_diagnostic().len(),
         )?)?;
     }
     floor(source, known, work)?;
-    let facts = facts(
-        definitions.len(),
-        input,
-        req,
-        source,
-        (bindings.source_count(), payloads.source_count()),
-        limits,
-        work,
-    )?;
+    let facts = facts(definitions.len(), input, req, envelope, &mut admit, work)?;
     let indices = BindingIndex::prepare(definitions.len(), |at| definitions[at].id, work)?;
     let mut output = reserve(definitions.len(), work)?;
     for def in definitions {
         let kind = decode_relation_kind(def.kind)?;
-        let (binding, table, view) = decode_refs(def, bindings, payloads, work)?;
+        let (binding, table, view) = decode_refs(def, bindings, payloads, None, work)?;
         work.flush()?;
         let version =
             ConnectorReadInputVersion::try_new(Arc::<[u8]>::from(def.input_version.as_slice()));
@@ -721,6 +949,47 @@ fn decode_core<'wire, 'control>(
         facts,
         original_source_bytes: source,
     })
+}
+
+/// Same original reference mapper on one borrowed scope, with synchronous
+/// cumulative admission. The exact read/payload/type owners remain borrowed.
+pub fn encode_provider_reads_in<'source, 'control>(
+    inputs: &'source [(u32, &'source ProviderReadReference)],
+    bindings: &'source EncodedProviderBindings<'source, 'control>,
+    payloads: &'source EncodedConnectorPayloads<'source, 'control>,
+    source: usize,
+    limits: ProviderReadProjectionLimits,
+    admit: &mut impl FnMut(&ProviderReadProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<EncodedProviderReads<'source, 'control>, Error> {
+    check_control(bindings.original_control(), work)?;
+    encode_core(
+        inputs,
+        bindings,
+        payloads,
+        (source, limits),
+        Some(admit),
+        work,
+    )
+}
+pub fn decode_provider_reads_in<'wire, 'control>(
+    definitions: &'wire [wire::ProviderReadReferenceDefinition],
+    bindings: &'wire DecodedProviderBindings<'wire, 'control>,
+    payloads: &'wire DecodedConnectorPayloads<'wire, 'control>,
+    source: usize,
+    limits: ProviderReadProjectionLimits,
+    admit: &mut impl FnMut(&ProviderReadProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<DecodedProviderReads<'wire, 'control>, Error> {
+    check_control(bindings.original_control(), work)?;
+    decode_core(
+        definitions,
+        bindings,
+        payloads,
+        (source, limits),
+        Some(admit),
+        work,
+    )
 }
 
 #[cfg(test)]

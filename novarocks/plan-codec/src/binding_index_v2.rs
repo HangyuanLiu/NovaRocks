@@ -81,12 +81,30 @@ impl BindingIndex {
         id: impl Fn(usize) -> u32,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Option<usize>, BindingCodecError> {
+        self.find_captured(sought, id, &mut |_, _| Ok(()), work)
+    }
+    /// Borrow the actual matched position before observing its completed
+    /// comparison. The consuming namespace admits requests made possible by
+    /// this captured source; this index neither clones nor bills that source.
+    pub(crate) fn find_captured<E>(
+        &self,
+        sought: u32,
+        id: impl Fn(usize) -> u32,
+        capture: &mut impl FnMut(usize, &mut CompileCheckpoints<'_>) -> Result<(), E>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<usize>, E>
+    where
+        E: From<BindingCodecError> + From<CompileControlError>,
+    {
         let mut lower = 0;
         let mut upper = self.indices.len();
         while lower < upper {
             let middle = lower + (upper - lower) / 2;
             let index = self.indices[middle];
             let order = id(index).cmp(&sought);
+            if order == std::cmp::Ordering::Equal {
+                capture(index, work)?;
+            }
             work.step()?;
             match order {
                 std::cmp::Ordering::Less => lower = middle + 1,
@@ -208,5 +226,109 @@ mod work_tests {
             ))
         ));
         assert_eq!(*control.0.lock().unwrap(), [0]);
+    }
+
+    #[test]
+    fn captured_search_preserves_original_sparse_positions_and_control_trace() {
+        let ids = [u32::MAX, 0, 7, 42];
+        let preparation = Control::default();
+        let mut work = CompileCheckpoints::try_new(&preparation, CompilePhase::Decode).unwrap();
+        let index = BindingIndex::prepare(ids.len(), |at| ids[at], &mut work).unwrap();
+        work.finish().unwrap();
+        for sought in [0, 7, 42, u32::MAX, 1, u32::MAX - 1] {
+            let plain = Control::default();
+            let mut work = CompileCheckpoints::try_new(&plain, CompilePhase::Decode).unwrap();
+            let expected = index.find(sought, |at| ids[at], &mut work).unwrap();
+            work.finish().unwrap();
+            let captured = Control::default();
+            let mut work = CompileCheckpoints::try_new(&captured, CompilePhase::Decode).unwrap();
+            let mut positions = Vec::new();
+            let actual = index
+                .find_captured::<BindingCodecError>(
+                    sought,
+                    |at| ids[at],
+                    &mut |at, _| {
+                        positions.push(at);
+                        Ok(())
+                    },
+                    &mut work,
+                )
+                .unwrap();
+            work.finish().unwrap();
+            assert_eq!(actual, ids.iter().position(|id| *id == sought));
+            assert_eq!(actual, expected);
+            assert_eq!(positions, actual.into_iter().collect::<Vec<_>>());
+            assert_eq!(*captured.0.lock().unwrap(), *plain.0.lock().unwrap());
+        }
+    }
+
+    #[test]
+    fn matched_source_admission_precedes_its_pending_completed_comparison() {
+        struct LateControl {
+            trace: Mutex<Vec<u32>>,
+            cause: CompileControlError,
+        }
+        impl PureCompileControl for LateControl {
+            fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+                self.trace.lock().unwrap().push(units);
+                if units == 256 {
+                    Err(self.cause)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let preparation = Control::default();
+        let mut work = CompileCheckpoints::try_new(&preparation, CompilePhase::Decode).unwrap();
+        let index = BindingIndex::prepare(1, |_| u32::MAX, &mut work).unwrap();
+        work.finish().unwrap();
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = LateControl {
+                trace: Mutex::new(Vec::new()),
+                cause,
+            };
+            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+            // Load the caller's pending meter seam; this is not a claim about
+            // cooperative work inside a library lookup or allocation.
+            for _ in 0..255 {
+                work.step().unwrap();
+            }
+            let mut captured = 0;
+            let outcome = index.find_captured::<BindingCodecError>(
+                u32::MAX,
+                |_| u32::MAX,
+                &mut |at, _| {
+                    assert_eq!(at, 0);
+                    captured += 1;
+                    Err(CompileControlError::ResourceExhausted.into())
+                },
+                &mut work,
+            );
+            assert!(matches!(
+                outcome,
+                Err(BindingCodecError::Control(
+                    CompileControlError::ResourceExhausted
+                ))
+            ));
+            assert_eq!(captured, 1);
+            assert_eq!(*control.trace.lock().unwrap(), [0]);
+
+            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+            for _ in 0..255 {
+                work.step().unwrap();
+            }
+            let missing = index.find_captured::<BindingCodecError>(
+                0,
+                |_| u32::MAX,
+                &mut |_, _| panic!("missing source must not be captured"),
+                &mut work,
+            );
+            assert!(matches!(missing, Err(BindingCodecError::Control(actual)) if actual == cause));
+            assert_eq!(*control.trace.lock().unwrap(), [0, 0, 256]);
+        }
     }
 }

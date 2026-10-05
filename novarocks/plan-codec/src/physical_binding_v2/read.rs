@@ -81,8 +81,24 @@ impl<'loan> PreparedFunctionBindingHeaders<'loan> {
         id: u32,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Option<&'loan wire::FunctionBindingDefinition>, BindingCodecError> {
+        self.definition_captured(id, &mut |_, _| Ok(()), work)
+    }
+    pub(crate) fn definition_captured(
+        &self,
+        id: u32,
+        capture: &mut impl FnMut(
+            &'loan wire::FunctionBindingDefinition,
+            &mut CompileCheckpoints<'_>,
+        ) -> Result<(), BindingCodecError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'loan wire::FunctionBindingDefinition>, BindingCodecError> {
         self.indices
-            .find(id, |at| self.definitions[at].id, work)
+            .find_captured(
+                id,
+                |at| self.definitions[at].id,
+                &mut |at, work| capture(&self.definitions[at], work),
+                work,
+            )
             .map(|index| index.map(|at| &self.definitions[at]))
     }
     pub(crate) fn original_control(&self) -> &'loan dyn PureCompileControl {

@@ -19,13 +19,13 @@ use super::{BindingCodecError, BindingProjectionFacts, BindingProjectionLimits};
 use novarocks_type_contract::CompileControlError;
 use std::alloc::Layout;
 
-pub(super) type Admit<'a> =
+pub(crate) type Admit<'a> =
     dyn FnMut(&BindingProjectionFacts) -> Result<(), CompileControlError> + 'a;
 
 /// Only the callback/numerical error policy differs. The original facts and
 /// mapper remain the single author for both entry policies.
 #[derive(Clone, Copy)]
-pub(super) struct Policy(pub bool);
+pub(crate) struct Policy(pub bool);
 impl Policy {
     fn overflow(self, message: &'static str) -> BindingCodecError {
         if self.0 {
@@ -34,7 +34,7 @@ impl Policy {
             BindingCodecError::InvalidShape(message)
         }
     }
-    pub(super) fn add(
+    pub(crate) fn add(
         self,
         a: usize,
         b: usize,
@@ -42,7 +42,7 @@ impl Policy {
     ) -> Result<usize, BindingCodecError> {
         a.checked_add(b).ok_or_else(|| self.overflow(message))
     }
-    pub(super) fn mul(
+    pub(crate) fn mul(
         self,
         a: usize,
         b: usize,
@@ -50,7 +50,7 @@ impl Policy {
     ) -> Result<usize, BindingCodecError> {
         a.checked_mul(b).ok_or_else(|| self.overflow(message))
     }
-    pub(super) fn bytes<T>(
+    pub(crate) fn bytes<T>(
         self,
         n: usize,
         message: &'static str,
@@ -59,7 +59,7 @@ impl Policy {
             .map(|l| l.size())
             .map_err(|_| self.overflow(message))
     }
-    pub(super) fn gate(
+    pub(crate) fn gate(
         self,
         facts: &BindingProjectionFacts,
         limits: BindingProjectionLimits,
@@ -93,7 +93,7 @@ impl Policy {
 
 /// No allocation or output: one actual consuming lookup contribution. A
 /// caller adds repeated operations; this is not the namespace's prior B again.
-pub(super) fn lookup_facts(
+pub(crate) fn lookup_facts(
     count: usize,
     work: usize,
 ) -> Result<BindingProjectionFacts, BindingCodecError> {

@@ -21,13 +21,13 @@
 //! effects remain with their original checked owners.
 
 use super::namespace::{
-    ExpressionNamespaceWriteFacts, add, bytes, cap, charge, check, finish, mul, shape,
+    ExpressionNamespaceWriteFacts, add, cap, compare_types, finish, mul, preflight_types, shape,
     tree_lookup_work, vector,
 };
+use super::owner_admission::{Admission, Admit, Arithmetic, lookup_facts, same_control};
 use super::{ExpressionCodecError as Error, ExpressionProjectionLimits};
 use crate::{
     binding_index_v2::BindingIndex,
-    borrowed_type_resources::{preflight_type_binding, verify_type_binding},
     physical_aggregate_binding_v2::PreparedAggregateBindingHeaders,
     physical_binding_v2::PreparedFunctionBindingHeaders,
     physical_semantics_v2::{SemanticsCodecError, decode_decimal_policy, decode_reference},
@@ -110,6 +110,51 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
             .find(id, |at| self.definitions[at].id, work)?
             .map(|at| &self.definitions[at]))
     }
+    pub fn definition_in(
+        &self,
+        id: u32,
+        admit: &mut Admit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'wire wire::ExpressionDefinition>, Error> {
+        same_control(self.original_control(), work)?;
+        admit(&lookup_facts(self.lookup_work_upper_bound()?))?;
+        self.definition_observed(id, work)
+    }
+    pub fn source_id_in(
+        &self,
+        source: &wire::ExpressionDefinition,
+        admit: &mut Admit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<u32, Error> {
+        same_control(self.original_control(), work)?;
+        admit(&lookup_facts(add(self.lookup_work_upper_bound()?, 1)?))?;
+        let actual = self.definition_observed(source.id, work)?;
+        let same = actual.is_some_and(|actual| std::ptr::eq(actual, source));
+        work.step()?;
+        if !same {
+            return Err(shape("expression DTO is not from this receiving namespace"));
+        }
+        Ok(source.id)
+    }
+    pub fn retained_floor_in(
+        &self,
+        admit: &mut Admit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<usize, Error> {
+        same_control(self.original_control(), work)?;
+        let floor = self.retained_floor_header_in()?;
+        admit(&lookup_facts(1))?;
+        work.step()?;
+        Ok(floor)
+    }
+    pub(crate) fn retained_floor_header_in(
+        &self,
+    ) -> Result<usize, novarocks_type_contract::CompileControlError> {
+        self.source_retained_bytes
+            .checked_add(size_of::<Self>())
+            .and_then(|n| n.checked_add(self.indices.backing_bytes().ok()?))
+            .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)
+    }
     pub fn source_id(&self, source: &wire::ExpressionDefinition) -> Result<u32, Error> {
         let mut work = CompileCheckpoints::try_new(self.original_control(), CompilePhase::Decode)?;
         let result = (|| {
@@ -178,12 +223,80 @@ pub fn decode_expression_definitions<'loan, 'wire, 'control>(
     source_retained_bytes: usize,
     limits: ExpressionProjectionLimits,
 ) -> Result<DecodedExpressions<'loan, 'wire, 'control>, Error> {
+    let mut work = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Decode)?;
+    let result = decode_core(
+        definitions,
+        values,
+        functions,
+        aggregates,
+        parameters,
+        pools,
+        source_retained_bytes,
+        limits,
+        None,
+        &mut work,
+    );
+    finish(work, result)
+}
+#[allow(clippy::too_many_arguments)]
+pub fn decode_expression_definitions_in<'loan, 'wire, 'control>(
+    definitions: &'wire [wire::ExpressionDefinition],
+    values: &'loan DecodedValues<'loan, 'wire, 'control>,
+    functions: &'loan PreparedFunctionBindingHeaders<'wire>,
+    aggregates: &'loan PreparedAggregateBindingHeaders<'loan, 'wire>,
+    parameters: &'loan SemanticParameters,
+    pools: &'loan ConstantPools,
+    source_retained_bytes: usize,
+    limits: ExpressionProjectionLimits,
+    admit: &mut Admit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<DecodedExpressions<'loan, 'wire, 'control>, Error> {
+    same_control(values.original_control(), work)?;
+    decode_core(
+        definitions,
+        values,
+        functions,
+        aggregates,
+        parameters,
+        pools,
+        source_retained_bytes,
+        limits,
+        Some(admit),
+        work,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn decode_core<'loan, 'wire, 'control>(
+    definitions: &'wire [wire::ExpressionDefinition],
+    values: &'loan DecodedValues<'loan, 'wire, 'control>,
+    functions: &'loan PreparedFunctionBindingHeaders<'wire>,
+    aggregates: &'loan PreparedAggregateBindingHeaders<'loan, 'wire>,
+    parameters: &'loan SemanticParameters,
+    pools: &'loan ConstantPools,
+    source_retained_bytes: usize,
+    limits: ExpressionProjectionLimits,
+    parent: Option<&mut Admit<'_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<DecodedExpressions<'loan, 'wire, 'control>, Error> {
     let control = values.original_control();
-    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
-    let result = (|| {
+    let mut admission = Admission {
+        parent,
+        source: source_retained_bytes,
+        limits,
+    };
+    (|| {
+        if admission.observed() {
+            let mut initial = admission.numeric(initial_facts(definitions.len()))?;
+            admission.gate(&mut initial)?;
+            // Pure captured headers share the original numerical authors;
+            // no source invoice is charged again and ordinary floor law stays below.
+            values.retained_floor_header_admitted()?;
+            admission.numeric(functions.retained_invoice_floor().map_err(Error::from))?;
+            admission.numeric(aggregates.retained_invoice_floor().map_err(Error::from))?;
+        }
         let same = std::ptr::eq(values.types(), functions.type_table())
             && std::ptr::eq(functions, aggregates.functions())
-            && std::ptr::eq(control, functions.original_control());
+            && std::ptr::addr_eq(control, functions.original_control());
         work.step()?;
         if !same {
             return Err(shape(
@@ -196,10 +309,10 @@ pub fn decode_expression_definitions<'loan, 'wire, 'control>(
             functions,
             aggregates,
             source_retained_bytes,
-            limits,
-            &mut work,
+            &mut admission,
+            work,
         )?;
-        let indices = BindingIndex::prepare(definitions.len(), |at| definitions[at].id, &mut work)?;
+        let indices = BindingIndex::prepare(definitions.len(), |at| definitions[at].id, work)?;
         let mut output = DecodedExpressions {
             definitions,
             values,
@@ -212,10 +325,9 @@ pub fn decode_expression_definitions<'loan, 'wire, 'control>(
             source_retained_bytes,
             control,
         };
-        output.validate(limits, &mut work)?;
+        output.validate(&mut admission, work)?;
         Ok(output)
-    })();
-    finish(work, result)
+    })()
 }
 
 fn required(id: Option<u32>, message: &'static str) -> Result<u32, Error> {
@@ -326,19 +438,7 @@ fn references(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn preflight(
-    definitions: &[wire::ExpressionDefinition],
-    values: &DecodedValues<'_, '_, '_>,
-    functions: &PreparedFunctionBindingHeaders<'_>,
-    aggregates: &PreparedAggregateBindingHeaders<'_, '_>,
-    source: usize,
-    limits: ExpressionProjectionLimits,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<ExpressionNamespaceReadFacts, Error> {
-    let count = definitions.len();
-    cap(count, limits.max_definitions, work)?;
-    // Admit the count walk and index build before any source traversal/reserve.
+fn initial_facts(count: usize) -> Result<ExpressionNamespaceReadFacts, Error> {
     let mut facts = ExpressionNamespaceReadFacts {
         definition_count: count,
         type_reference_count: count,
@@ -346,10 +446,32 @@ fn preflight(
         ..Default::default()
     };
     vector::<usize>(&mut facts, count)?;
+    Ok(facts)
+}
+#[allow(clippy::too_many_arguments)]
+fn preflight(
+    definitions: &[wire::ExpressionDefinition],
+    values: &DecodedValues<'_, '_, '_>,
+    functions: &PreparedFunctionBindingHeaders<'_>,
+    aggregates: &PreparedAggregateBindingHeaders<'_, '_>,
+    source: usize,
+    admission: &mut Admission<'_, '_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ExpressionNamespaceReadFacts, Error> {
+    let numeric = Arithmetic(admission.observed());
+    let count = definitions.len();
+    let limits = admission.limits;
+    if admission.observed() {
+        let mut initial = admission.numeric(initial_facts(count))?;
+        admission.gate(&mut initial)?;
+    }
+    cap(count, limits.max_definitions, work)?;
+    // Admit the count walk and index build before any source traversal/reserve.
+    let mut facts = admission.numeric(initial_facts(count))?;
     facts.coexisting_source_and_request_bytes_upper_bound =
-        add(source, facts.new_allocation_request_bytes_upper_bound)?;
-    check(&facts, limits, work)?;
-    let mut floor = bytes::<wire::ExpressionDefinition>(count)?;
+        numeric.add(source, facts.new_allocation_request_bytes_upper_bound)?;
+    admission.complete(&mut facts, work)?;
+    let mut floor = numeric.bytes::<wire::ExpressionDefinition>(count)?;
     // These are lower floors of one declared whole-source invoice. The caller
     // must include independent backings too; max does not invent that proof.
     let dependency_floor = values
@@ -366,23 +488,27 @@ fn preflight(
             .ok_or_else(|| shape("expression kind is absent"))?;
         let owned = match kind {
             K::Conjunction(value) | K::Disjunction(value) => {
-                bytes::<u32>(value.expr_ids.capacity())?
+                numeric.bytes::<u32>(value.expr_ids.capacity())?
             }
-            K::FunctionCall(value) => bytes::<u32>(value.argument_expr_ids.capacity())?,
-            K::Lambda(value) => bytes::<u32>(value.parameter_value_type_ids.capacity())?,
-            K::InList(value) => bytes::<u32>(value.list_expr_ids.capacity())?,
-            K::CaseExpression(value) => bytes::<wire::WhenThen>(value.arms.capacity())?,
-            K::WindowCall(value) => add(
-                bytes::<u32>(value.argument_expr_ids.capacity())?,
-                bytes::<wire::SortExpression>(value.function_order_by.capacity())?,
+            K::FunctionCall(value) => numeric.bytes::<u32>(value.argument_expr_ids.capacity())?,
+            K::Lambda(value) => numeric.bytes::<u32>(value.parameter_value_type_ids.capacity())?,
+            K::InList(value) => numeric.bytes::<u32>(value.list_expr_ids.capacity())?,
+            K::CaseExpression(value) => numeric.bytes::<wire::WhenThen>(value.arms.capacity())?,
+            K::WindowCall(value) => numeric.add(
+                numeric.bytes::<u32>(value.argument_expr_ids.capacity())?,
+                numeric.bytes::<wire::SortExpression>(value.function_order_by.capacity())?,
             )?,
             _ => 0,
         };
-        floor = add(floor, owned)?;
+        floor = numeric.add(floor, owned)?;
         cap(floor, source, work)?;
         references(definition, |_| {
-            facts.expression_reference_count = add(facts.expression_reference_count, 1)?;
-            charge(&mut facts, add(16, tree_lookup_work(count)?)?, limits, work)?;
+            facts.expression_reference_count = numeric.add(facts.expression_reference_count, 1)?;
+            admission.charge(
+                &mut facts,
+                admission.numeric(numeric.add(16, tree_lookup_work(count)?))?,
+                work,
+            )?;
             cap(
                 facts.expression_reference_count,
                 limits.max_expression_references,
@@ -391,32 +517,34 @@ fn preflight(
         })?;
         match kind {
             K::Lambda(value) => {
-                facts.type_reference_count = add(
+                facts.type_reference_count = numeric.add(
                     facts.type_reference_count,
                     value.parameter_value_type_ids.len(),
                 )?;
-                charge(
+                admission.charge(
                     &mut facts,
-                    mul(value.parameter_value_type_ids.len(), 16)?,
-                    limits,
+                    admission.numeric(numeric.mul(value.parameter_value_type_ids.len(), 16))?,
                     work,
                 )?;
             }
-            K::Cast(_) => facts.type_reference_count = add(facts.type_reference_count, 1)?,
+            K::Cast(_) => {
+                facts.type_reference_count = numeric.add(facts.type_reference_count, 1)?
+            }
             _ => {}
         }
+        admission.gate(&mut facts)?;
         work.step()?;
         cap(facts.type_reference_count, limits.max_type_references, work)?;
     }
     // Header and lambda carrier lookups use the original BTree owner. The
     // reference count measures source IDs; repeated delegate costs accumulate
     // before each ensuing operation on this same numerical author.
-    let type_lookup_work = mul(
+    let type_lookup_work = numeric.mul(
         facts.type_reference_count,
         tree_lookup_work(values.types().value_types().len())?,
     )?;
-    charge(&mut facts, type_lookup_work, limits, work)?;
-    check(&facts, limits, work)?;
+    admission.charge(&mut facts, type_lookup_work, work)?;
+    admission.complete(&mut facts, work)?;
     Ok(facts)
 }
 
@@ -424,19 +552,19 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
     fn charge(
         &mut self,
         amount: usize,
-        limits: ExpressionProjectionLimits,
+        admission: &mut Admission<'_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
-        charge(&mut self.facts, amount, limits, work)
+        admission.charge(&mut self.facts, amount, work)
     }
     fn type_root(
         &mut self,
         id: u32,
-        limits: ExpressionProjectionLimits,
+        admission: &mut Admission<'_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<&'loan FunctionValueType, Error> {
         let lookup_work = tree_lookup_work(self.types().value_types().len())?;
-        self.charge(lookup_work, limits, work)?;
+        self.charge(lookup_work, admission, work)?;
         work.flush()?;
         let values = self.values;
         let root = values.types().value_type(id);
@@ -448,21 +576,60 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
         &mut self,
         left: &FunctionValueType,
         right: &FunctionValueType,
-        limits: ExpressionProjectionLimits,
+        admission: &mut Admission<'_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
-        let verified = verify_type_binding(
-            left,
-            right,
-            self.source_retained_bytes,
-            limits.max_cumulative_work - self.facts.cumulative_work_upper_bound,
-            work,
-        )?;
-        self.charge(verified.work_upper_bound(), limits, work)?;
+        let verified = compare_types(left, right, &mut self.facts, admission, work)?;
         if !verified.matches() {
             return Err(shape("expression full value type differs from its source"));
         }
         Ok(())
+    }
+    // The actual borrowed pair is available before the lookup's completed
+    // observation. Admit its sole comparer contribution at that boundary.
+    // Ordinary failures still complete the original lookup observation.
+    fn match_captured_types(
+        &mut self,
+        pair: Result<(&FunctionValueType, &FunctionValueType), Error>,
+        admission: &mut Admission<'_, '_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), Error> {
+        if admission.observed() {
+            let result =
+                pair.and_then(|(left, right)| self.match_types(left, right, admission, work));
+            if matches!(&result, Err(Error::Control(_))) {
+                return result;
+            }
+            work.step()?;
+            work.flush()?;
+            result
+        } else {
+            work.step()?;
+            work.flush()?;
+            let (left, right) = pair?;
+            self.match_types(left, right, admission, work)
+        }
+    }
+    fn match_type_root(
+        &mut self,
+        left: &FunctionValueType,
+        id: u32,
+        admission: &mut Admission<'_, '_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), Error> {
+        if !admission.observed() {
+            let right = self.type_root(id, admission, work)?;
+            return self.match_types(left, right, admission, work);
+        }
+        let lookup_work = tree_lookup_work(self.types().value_types().len())?;
+        self.charge(lookup_work, admission, work)?;
+        work.flush()?;
+        let types = self.values.types();
+        let pair = types
+            .value_type(id)
+            .ok_or_else(|| shape("expression value type is unknown"))
+            .map(|right| (left, right));
+        self.match_captured_types(pair, admission, work)
     }
     fn required_expression(
         &self,
@@ -474,35 +641,36 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
     }
     fn validate(
         &mut self,
-        limits: ExpressionProjectionLimits,
+        admission: &mut Admission<'_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
         let definitions = self.definitions;
         for definition in definitions {
             required(definition.owner_node_id, "expression owner node is absent")?;
             let type_id = required(definition.value_type_id, "expression value type is absent")?;
-            self.type_root(type_id, limits, work)?;
+            self.type_root(type_id, admission, work)?;
             references(definition, |id| {
                 self.required_expression(id, work)?;
                 Ok(())
             })?;
-            self.validate_kind(definition, limits, work)?;
+            self.validate_kind(definition, admission, work)?;
             work.step()?;
         }
-        check(&self.facts, limits, work)
+        admission.complete(&mut self.facts, work)
     }
     fn validate_kind(
         &mut self,
         definition: &wire::ExpressionDefinition,
-        limits: ExpressionProjectionLimits,
+        admission: &mut Admission<'_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
+        let numeric = Arithmetic(admission.observed());
         use wire::expression_definition::Kind as K;
         let values = self.values;
         let types = values.types();
         let header = self.type_root(
             required(definition.value_type_id, "expression value type is absent")?,
-            limits,
+            admission,
             work,
         )?;
         match definition
@@ -511,12 +679,25 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
             .ok_or_else(|| shape("expression kind is absent"))?
         {
             K::ValueId(id) => {
-                self.charge(tree_lookup_work(self.values.source_count())?, limits, work)?;
-                let value = self
-                    .values
-                    .value_observed(*id, work)?
-                    .ok_or_else(|| shape("expression value reference is unknown"))?;
-                self.match_types(header, &value.ty, limits, work)?;
+                self.charge(
+                    tree_lookup_work(self.values.source_count())?,
+                    admission,
+                    work,
+                )?;
+                if admission.observed() {
+                    values
+                        .value_captured(
+                            *id,
+                            &mut |value, work| self.match_types(header, &value.ty, admission, work),
+                            work,
+                        )?
+                        .ok_or_else(|| shape("expression value reference is unknown"))?;
+                } else {
+                    let value = values
+                        .value_observed(*id, work)?
+                        .ok_or_else(|| shape("expression value reference is unknown"))?;
+                    self.match_types(header, &value.ty, admission, work)?;
+                }
             }
             K::Literal(reference) => {
                 let reference = ConstantReference {
@@ -527,12 +708,31 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                     ordinal: reference.row_ordinal,
                 };
                 self.charge(
-                    mul(2, tree_lookup_work(self.pools.entries().len())?)?,
-                    limits,
+                    numeric.mul(2, tree_lookup_work(self.pools.entries().len())?)?,
+                    admission,
                     work,
                 )?;
                 work.flush()?;
                 let pool = self.pools.entries().get(&reference.pool);
+                let captured = if admission.observed() {
+                    let result = pool
+                        .map(|pool| {
+                            compare_types(
+                                header,
+                                pool.value_type(),
+                                &mut self.facts,
+                                admission,
+                                work,
+                            )
+                        })
+                        .transpose();
+                    if matches!(&result, Err(Error::Control(_))) {
+                        return result.map(|_| ());
+                    }
+                    Some(result)
+                } else {
+                    None
+                };
                 work.step()?;
                 work.flush()?;
                 let pool = pool.ok_or_else(|| shape("expression constant pool is unknown"))?;
@@ -540,14 +740,11 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                     usize::try_from(pool.resource_facts().retained_buffer_capacity_bytes)
                         .map_err(|_| shape("constant retained extent is unrepresentable"))?;
                 cap(retained, self.source_retained_bytes, work)?;
-                let verified = verify_type_binding(
-                    header,
-                    pool.value_type(),
-                    self.source_retained_bytes,
-                    limits.max_cumulative_work - self.facts.cumulative_work_upper_bound,
-                    work,
-                )?;
-                self.charge(verified.work_upper_bound(), limits, work)?;
+                let verified = if let Some(captured) = captured {
+                    captured?.ok_or_else(|| shape("expression constant pool is unknown"))?
+                } else {
+                    compare_types(header, pool.value_type(), &mut self.facts, admission, work)?
+                };
                 if !verified.matches() {
                     return Err(
                         novarocks_physical_plan::ConstantReferenceError::SourceTypeMismatch(
@@ -584,8 +781,7 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                     .parameter_value_type_ids
                     .get(ordinal)
                     .ok_or_else(|| shape("lambda parameter ordinal is out of bounds"))?;
-                let expected = self.type_root(parameter, limits, work)?;
-                self.match_types(header, expected, limits, work)?;
+                self.match_type_root(header, parameter, admission, work)?;
             }
             K::Unary(value) => {
                 super::receiving_grammar::decode_unary(value.op)?;
@@ -602,7 +798,7 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                     ));
                 }
                 if let Some(reference) = &value.allow_throw_exception {
-                    self.allow_throw(reference, limits, work)?;
+                    self.allow_throw(reference, admission, work)?;
                 }
             }
             K::Conjunction(_) | K::Disjunction(_) => {}
@@ -612,25 +808,25 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                     required(value.function_binding_id, "function binding ID is absent")?,
                     &value.argument_expr_ids,
                     wire::FunctionKind::Scalar,
-                    limits,
+                    admission,
                     work,
                 )?;
             }
             K::Lambda(value) => {
                 for id in &value.parameter_value_type_ids {
-                    self.type_root(*id, limits, work)?;
+                    self.type_root(*id, admission, work)?;
                     work.step()?;
                 }
                 let body = self.required_expression(
                     required(value.body_expr_id, "lambda body is absent")?,
                     work,
                 )?;
-                let body_type = self.type_root(
+                self.match_type_root(
+                    header,
                     required(body.value_type_id, "lambda body type is absent")?,
-                    limits,
+                    admission,
                     work,
                 )?;
-                self.match_types(header, body_type, limits, work)?;
             }
             K::Cast(value) => {
                 decode_decimal_policy(value.decimal_overflow_policy)?;
@@ -639,27 +835,33 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                         .allow_throw_exception
                         .as_ref()
                         .ok_or_else(|| shape("cast ALLOW reference is absent"))?,
-                    limits,
+                    admission,
                     work,
                 )?;
                 let carrier_id =
                     required(value.target_carrier_type_id, "cast carrier ID is absent")?;
-                self.charge(tree_lookup_work(types.carriers.len())?, limits, work)?;
+                self.charge(tree_lookup_work(types.carriers.len())?, admission, work)?;
                 work.flush()?;
                 let carrier = types.carrier(carrier_id);
+                let captured = if admission.observed() && carrier.is_some() {
+                    let result = preflight_types(header, header, &mut self.facts, admission, work);
+                    if matches!(&result, Err(Error::Control(_))) {
+                        return result.map(|_| ());
+                    }
+                    Some(result)
+                } else {
+                    None
+                };
                 work.step()?;
                 work.flush()?;
                 let carrier = carrier.ok_or_else(|| shape("cast carrier type is unknown"))?;
                 // Raw carriers have no independent root flags. The same
                 // complete-type numerical author bounds this datatype walk.
-                let proof = preflight_type_binding(
-                    header,
-                    header,
-                    self.source_retained_bytes,
-                    limits.max_cumulative_work - self.facts.cumulative_work_upper_bound,
-                    work,
-                )?;
-                self.charge(proof.work_upper_bound(), limits, work)?;
+                let _proof = if let Some(captured) = captured {
+                    captured?
+                } else {
+                    preflight_types(header, header, &mut self.facts, admission, work)?
+                };
                 work.flush()?;
                 let same =
                     arrow_data_types_exact_borrowed_observed(&header.data_type, carrier, || {
@@ -677,7 +879,7 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
             | K::Like(_)
             | K::CaseExpression(_)
             | K::IsTruthValue(_) => {}
-            K::WindowCall(value) => self.window(definition, value, limits, work)?,
+            K::WindowCall(value) => self.window(definition, value, admission, work)?,
         }
         work.step()?;
         Ok(())
@@ -685,12 +887,12 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
     fn allow_throw(
         &mut self,
         reference: &semantics::SemanticParameterRef,
-        limits: ExpressionProjectionLimits,
+        admission: &mut Admission<'_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
         self.charge(
             tree_lookup_work(self.parameters.entries().len())?,
-            limits,
+            admission,
             work,
         )?;
         let reference = decode_reference(reference, work)?;
@@ -714,12 +916,12 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
     fn function_header(
         &mut self,
         id: u32,
-        limits: ExpressionProjectionLimits,
+        admission: &mut Admission<'_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<&'wire wire::FunctionBindingDefinition, Error> {
         self.charge(
             tree_lookup_work(self.functions.as_wire().len())?,
-            limits,
+            admission,
             work,
         )?;
         self.functions
@@ -730,9 +932,10 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
         &mut self,
         definition: &wire::ExpressionDefinition,
         function: &wire::FunctionBindingDefinition,
-        limits: ExpressionProjectionLimits,
+        admission: &mut Admission<'_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
+        let numeric = Arithmetic(admission.observed());
         let Some(wire::function_binding_definition::Result::ScalarValueTypeId(result_id)) =
             function.result.as_ref()
         else {
@@ -740,8 +943,8 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
         };
         let types = self.values.types();
         self.charge(
-            mul(2, tree_lookup_work(types.value_types().len())?)?,
-            limits,
+            numeric.mul(2, tree_lookup_work(types.value_types().len())?)?,
+            admission,
             work,
         )?;
         work.flush()?;
@@ -750,12 +953,14 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
             definition.value_type_id,
             "call result type is absent",
         )?);
-        work.step()?;
-        work.flush()?;
-        self.match_types(
-            header.ok_or_else(|| shape("call result header type is unknown"))?,
-            result.ok_or_else(|| shape("function result type is unknown"))?,
-            limits,
+        self.match_captured_types(
+            (|| {
+                Ok((
+                    header.ok_or_else(|| shape("call result header type is unknown"))?,
+                    result.ok_or_else(|| shape("function result type is unknown"))?,
+                ))
+            })(),
+            admission,
             work,
         )
     }
@@ -763,9 +968,10 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
         &mut self,
         expected: &[wire::FunctionArgumentType],
         arguments: &[u32],
-        limits: ExpressionProjectionLimits,
+        admission: &mut Admission<'_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
+        let numeric = Arithmetic(admission.observed());
         let same_count = expected.len() == arguments.len();
         work.step()?;
         if !same_count {
@@ -774,11 +980,11 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
             ));
         }
         self.charge(
-            mul(
+            numeric.mul(
                 expected.len(),
-                add(16, tree_lookup_work(self.definitions.len())?)?,
+                numeric.add(16, tree_lookup_work(self.definitions.len())?)?,
             )?,
-            limits,
+            admission,
             work,
         )?;
         let types = self.values.types();
@@ -815,11 +1021,11 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                         ));
                     }
                     self.charge(
-                        mul(
-                            add(expected.parameter_value_type_ids.len(), 1)?,
-                            mul(2, tree_lookup_work(types.value_types().len())?)?,
+                        numeric.mul(
+                            numeric.add(expected.parameter_value_type_ids.len(), 1)?,
+                            numeric.mul(2, tree_lookup_work(types.value_types().len())?)?,
                         )?,
-                        limits,
+                        admission,
                         work,
                     )?;
                     for (left, right) in actual_lambda
@@ -830,14 +1036,18 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                         work.flush()?;
                         let left = types.value_type(*left);
                         let right = types.value_type(*right);
-                        work.step()?;
-                        work.flush()?;
-                        self.match_types(
-                            left.ok_or_else(|| shape("lambda actual parameter type is unknown"))?,
-                            right.ok_or_else(|| {
-                                shape("lambda expected parameter type is unknown")
-                            })?,
-                            limits,
+                        self.match_captured_types(
+                            (|| {
+                                Ok((
+                                    left.ok_or_else(|| {
+                                        shape("lambda actual parameter type is unknown")
+                                    })?,
+                                    right.ok_or_else(|| {
+                                        shape("lambda expected parameter type is unknown")
+                                    })?,
+                                ))
+                            })(),
+                            admission,
                             work,
                         )?;
                     }
@@ -850,12 +1060,16 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                         expected.result_value_type_id,
                         "lambda signature result is absent",
                     )?);
-                    work.step()?;
-                    work.flush()?;
-                    self.match_types(
-                        left.ok_or_else(|| shape("lambda actual result type is unknown"))?,
-                        right.ok_or_else(|| shape("lambda expected result type is unknown"))?,
-                        limits,
+                    self.match_captured_types(
+                        (|| {
+                            Ok((
+                                left.ok_or_else(|| shape("lambda actual result type is unknown"))?,
+                                right.ok_or_else(|| {
+                                    shape("lambda expected result type is unknown")
+                                })?,
+                            ))
+                        })(),
+                        admission,
                         work,
                     )?;
                 }
@@ -870,34 +1084,35 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
         id: u32,
         arguments: &[u32],
         kind: wire::FunctionKind,
-        limits: ExpressionProjectionLimits,
+        admission: &mut Admission<'_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
-        let function = self.function_header(id, limits, work)?;
+        let function = self.function_header(id, admission, work)?;
         let valid_kind = function.kind == kind as i32;
         work.step()?;
         if !valid_kind {
             return Err(shape("expression function binding has the wrong kind"));
         }
-        self.call_result(definition, function, limits, work)?;
-        self.arguments(&function.arguments, arguments, limits, work)
+        self.call_result(definition, function, admission, work)?;
+        self.arguments(&function.arguments, arguments, admission, work)
     }
     fn signatures(
         &mut self,
         left: &wire::FunctionBindingDefinition,
         right: &wire::FunctionBindingDefinition,
-        limits: ExpressionProjectionLimits,
+        admission: &mut Admission<'_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
+        let numeric = Arithmetic(admission.observed());
         // Header identities have already passed the sole <=1024-byte grammar.
         // Compare the actual strings at an honest opaque boundary; IDs in the
         // sparse namespace may alias one exact selected signature.
         self.charge(
-            add(
-                add(left.function_id.len(), right.function_id.len())?,
-                add(left.overload_id.len(), right.overload_id.len())?,
+            numeric.add(
+                numeric.add(left.function_id.len(), right.function_id.len())?,
+                numeric.add(left.overload_id.len(), right.overload_id.len())?,
             )?,
-            limits,
+            admission,
             work,
         )?;
         work.flush()?;
@@ -912,11 +1127,14 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
         }
         let types = self.values.types();
         self.charge(
-            mul(
-                add(left.arguments.len(), 1)?,
-                add(16, mul(2, tree_lookup_work(types.value_types().len())?)?)?,
+            numeric.mul(
+                numeric.add(left.arguments.len(), 1)?,
+                numeric.add(
+                    16,
+                    numeric.mul(2, tree_lookup_work(types.value_types().len())?)?,
+                )?,
             )?,
-            limits,
+            admission,
             work,
         )?;
         for (left, right) in left.arguments.iter().zip(&right.arguments) {
@@ -924,7 +1142,7 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                 (
                     Some(wire::function_argument_type::Kind::ValueTypeId(left)),
                     Some(wire::function_argument_type::Kind::ValueTypeId(right)),
-                ) => self.signature_types(*left, *right, limits, work)?,
+                ) => self.signature_types(*left, *right, admission, work)?,
                 (
                     Some(wire::function_argument_type::Kind::Lambda(left)),
                     Some(wire::function_argument_type::Kind::Lambda(right)),
@@ -936,11 +1154,11 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                         return Err(shape("aggregate lambda signature arity differs"));
                     }
                     self.charge(
-                        mul(
+                        numeric.mul(
                             left.parameter_value_type_ids.len(),
-                            mul(2, tree_lookup_work(types.value_types().len())?)?,
+                            numeric.mul(2, tree_lookup_work(types.value_types().len())?)?,
                         )?,
-                        limits,
+                        admission,
                         work,
                     )?;
                     for (left, right) in left
@@ -948,7 +1166,7 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                         .iter()
                         .zip(&right.parameter_value_type_ids)
                     {
-                        self.signature_types(*left, *right, limits, work)?;
+                        self.signature_types(*left, *right, admission, work)?;
                     }
                     self.signature_types(
                         required(
@@ -956,7 +1174,7 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                             "aggregate lambda result is absent",
                         )?,
                         required(right.result_value_type_id, "window lambda result is absent")?,
-                        limits,
+                        admission,
                         work,
                     )?;
                 }
@@ -968,7 +1186,7 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
             (
                 Some(wire::function_binding_definition::Result::ScalarValueTypeId(left)),
                 Some(wire::function_binding_definition::Result::ScalarValueTypeId(right)),
-            ) => self.signature_types(*left, *right, limits, work)?,
+            ) => self.signature_types(*left, *right, admission, work)?,
             _ => return Err(shape("window aggregate result is not scalar")),
         }
         Ok(())
@@ -977,19 +1195,21 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
         &mut self,
         left: u32,
         right: u32,
-        limits: ExpressionProjectionLimits,
+        admission: &mut Admission<'_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
         let types = self.values.types();
         work.flush()?;
         let left = types.value_type(left);
         let right = types.value_type(right);
-        work.step()?;
-        work.flush()?;
-        self.match_types(
-            left.ok_or_else(|| shape("signature type is unknown"))?,
-            right.ok_or_else(|| shape("signature type is unknown"))?,
-            limits,
+        self.match_captured_types(
+            (|| {
+                Ok((
+                    left.ok_or_else(|| shape("signature type is unknown"))?,
+                    right.ok_or_else(|| shape("signature type is unknown"))?,
+                ))
+            })(),
+            admission,
             work,
         )
     }
@@ -997,15 +1217,16 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
         &mut self,
         definition: &wire::ExpressionDefinition,
         value: &wire::WindowCall,
-        limits: ExpressionProjectionLimits,
+        admission: &mut Admission<'_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
+        let numeric = Arithmetic(admission.observed());
         let id = required(
             value.function_binding_id,
             "window function binding ID is absent",
         )?;
-        let function = self.function_header(id, limits, work)?;
-        self.call_result(definition, function, limits, work)?;
+        let function = self.function_header(id, admission, work)?;
+        self.call_result(definition, function, admission, work)?;
         match wire::FunctionKind::try_from(function.kind) {
             Ok(wire::FunctionKind::Window) => {
                 let ordinary = value.aggregate_binding_id.is_none()
@@ -1015,12 +1236,17 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                 if !ordinary {
                     return Err(shape("window function carries aggregate-only fields"));
                 }
-                self.arguments(&function.arguments, &value.argument_expr_ids, limits, work)?;
+                self.arguments(
+                    &function.arguments,
+                    &value.argument_expr_ids,
+                    admission,
+                    work,
+                )?;
             }
             Ok(wire::FunctionKind::Aggregate) => {
                 self.charge(
                     tree_lookup_work(self.aggregates.as_wire().len())?,
-                    limits,
+                    admission,
                     work,
                 )?;
                 let aggregate = self
@@ -1038,17 +1264,21 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                         aggregate.function_binding_id,
                         "aggregate function ID is absent",
                     )?,
-                    limits,
+                    admission,
                     work,
                 )?;
-                self.signatures(function, aggregate_function, limits, work)?;
+                self.signatures(function, aggregate_function, admission, work)?;
                 // Phase/channel and logical arguments plus ORDER BY inputs
                 // are validated by the sole Fragment aggregate author. This
                 // borrowed component preserves them without a scalar zip.
             }
             _ => return Err(shape("window binding is neither Window nor Aggregate")),
         }
-        self.charge(mul(value.function_order_by.len(), 8)?, limits, work)?;
+        self.charge(
+            numeric.mul(value.function_order_by.len(), 8)?,
+            admission,
+            work,
+        )?;
         for sort in &value.function_order_by {
             let closed = crate::physical_properties_v2::decode_direction(sort.direction).is_ok()
                 && crate::physical_properties_v2::decode_nulls(sort.null_ordering).is_ok();

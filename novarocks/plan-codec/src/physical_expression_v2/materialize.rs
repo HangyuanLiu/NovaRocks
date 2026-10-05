@@ -18,6 +18,7 @@
 //! Owned projection from the original checked expression namespace.
 //! Original Fragment validation still owns graph, lexical and call semantics.
 
+use super::owner_admission::{Admission, Admit, lookup_facts, same_control};
 use super::{
     DecodedExpressions, ExpressionCodecError as Error, ExpressionNamespaceWriteFacts as Facts,
     ExpressionProjectionLimits as Limits,
@@ -27,12 +28,12 @@ use crate::{
     btree_resources_v2::{self, BTreeResourceError},
     physical_aggregate_binding_v2::{
         MaterializedAggregateBindings, copy_aggregate_binding_observed,
-        preflight_aggregate_binding_copy,
+        preflight_aggregate_binding_copy, preflight_aggregate_binding_copy_in,
     },
     physical_binding_v2::{
         BindingProjectionLimits, MaterializationModel, MaterializedFunctionBinding,
         MaterializedFunctionBindings, add, boxed, cap, copy_scalar_signature_observed, mul,
-        preflight_scalar_signature_copy, reserve,
+        preflight_scalar_signature_copy, preflight_scalar_signature_copy_in, reserve,
     },
     physical_properties_v2::{PhysicalPropertyCodecError, decode_direction, decode_nulls},
     physical_semantics_v2::{decode_decimal_policy, decode_reference},
@@ -85,7 +86,9 @@ fn binding_limits(l: Limits) -> BindingProjectionLimits {
     }
 }
 fn facts(model: &MaterializationModel, refs: usize) -> Facts {
-    let f = model.facts;
+    binding_facts(&model.facts, refs)
+}
+fn binding_facts(f: &crate::physical_binding_v2::BindingProjectionFacts, refs: usize) -> Facts {
     Facts {
         definition_count: f.definition_count,
         type_reference_count: f.type_reference_count,
@@ -142,7 +145,7 @@ impl<'loan, 'headers, 'wire, 'control> MaterializedExpressions<'loan, 'headers, 
         id: u32,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<Option<&p::ExprNode>, Error> {
-        let same = std::ptr::eq(w.control(), self.original_control());
+        let same = std::ptr::addr_eq(w.control(), self.original_control());
         w.step()?;
         if !same {
             return Err(shape(
@@ -154,6 +157,20 @@ impl<'loan, 'headers, 'wire, 'control> MaterializedExpressions<'loan, 'headers, 
         w.step()?;
         w.flush()?;
         Ok(found)
+    }
+    pub fn definition_in(
+        &self,
+        id: u32,
+        admit: &mut Admit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&p::ExprNode>, Error> {
+        same_control(self.original_control(), work)?;
+        admit(&lookup_facts(
+            self.lookup_work_upper_bound()?
+                .checked_add(1)
+                .ok_or(CompileControlError::ResourceExhausted)?,
+        ))?;
+        self.definition_observed(id, work)
     }
     /// Necessary owned output floor; no private BTree capacity is guessed.
     pub(crate) fn retained_output_floor(&self) -> Result<usize, Error> {
@@ -170,6 +187,7 @@ pub struct PreparedExpressionMaterialization<'loan, 'headers, 'wire, 'control> {
     aggregates: &'loan MaterializedAggregateBindings<'loan, 'headers, 'wire>,
     plan_limits: &'loan p::PlanLimits,
     facts: Facts,
+    limits: Limits,
     source_invoice: usize,
     retained_bytes: usize,
 }
@@ -220,39 +238,111 @@ fn list<T>(
     Ok(())
 }
 
+fn check_model(
+    model: &mut MaterializationModel,
+    refs: usize,
+    limits: BindingProjectionLimits,
+    admission: &mut Admission<'_, '_>,
+) -> Result<(), Error> {
+    model.check(limits)?;
+    admission.fixed(&facts(model, refs))
+}
+fn parent_gate(
+    admission: &mut Admission<'_, '_>,
+    prefix: &crate::physical_binding_v2::BindingProjectionFacts,
+    refs: usize,
+) -> Result<(), CompileControlError> {
+    match admission.fixed(&binding_facts(prefix, refs)) {
+        Ok(()) => Ok(()),
+        Err(Error::Control(cause)) => Err(cause),
+        _ => unreachable!("the synchronous numerical gate has only typed control errors"),
+    }
+}
+fn clone_preflight(
+    source: &FunctionValueType,
+    model: &mut MaterializationModel,
+    limits: BindingProjectionLimits,
+    refs: usize,
+    admission: &mut Admission<'_, '_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), crate::physical_binding_v2::BindingCodecError> {
+    if admission.observed() {
+        model.count_owned_type_clone_in(
+            source,
+            limits,
+            &mut |prefix| parent_gate(admission, prefix, refs),
+            work,
+        )
+    } else {
+        model.count_owned_type_clone(source, limits, work)
+    }
+}
+fn type_root_preflight(
+    types: &DecodedTypeTable,
+    id: u32,
+    model: &mut MaterializationModel,
+    limits: BindingProjectionLimits,
+    refs: usize,
+    admission: &mut Admission<'_, '_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), Error> {
+    if !admission.observed() {
+        return Ok(model.count_owned_type_clone(type_root(types, id, work)?, limits, work)?);
+    }
+    work.flush()?;
+    let found = types.value_type(id);
+    if let Some(source) = found {
+        clone_preflight(source, model, limits, refs, admission, work)?;
+    }
+    work.step()?;
+    work.flush()?;
+    found.ok_or_else(|| shape("owned expression value type is absent"))?;
+    Ok(())
+}
 fn preflight(
     expressions: &DecodedExpressions<'_, '_, '_>,
     functions: &MaterializedFunctionBindings<'_, '_>,
     aggregates: &MaterializedAggregateBindings<'_, '_, '_>,
     plan_limits: &p::PlanLimits,
-    source: usize,
-    limits: Limits,
+    admission: &mut Admission<'_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(Facts, usize), Error> {
+    let source = admission.source;
+    let limits = admission.limits;
     let same = std::ptr::eq(functions.headers(), expressions.functions())
         && std::ptr::eq(aggregates.headers(), expressions.aggregates())
         && std::ptr::eq(aggregates.functions(), functions)
-        && std::ptr::eq(w.control(), expressions.original_control())
-        && std::ptr::eq(w.control(), functions.headers().original_control())
-        && std::ptr::eq(w.control(), aggregates.original_control());
-    w.step()?;
-    if !same {
-        return Err(shape(
-            "expression materialization has different original namespaces or control",
-        ));
+        && std::ptr::addr_eq(w.control(), expressions.original_control())
+        && std::ptr::addr_eq(w.control(), functions.headers().original_control())
+        && std::ptr::addr_eq(w.control(), aggregates.original_control());
+    if !admission.observed() {
+        w.step()?;
+        if !same {
+            return Err(shape(
+                "expression materialization has different original namespaces or control",
+            ));
+        }
     }
     let n = expressions.source_count();
     // Count and the original Fragment limit are known before any output walk.
     cap(n, plan_limits.fragment_expressions)?;
     let refs = expressions.facts().expression_reference_count;
     cap(refs, limits.max_expression_references)?;
-    let known = add(
-        expressions.retained_floor_observed(w)?,
-        add(
-            functions.retained_output_floor()?,
-            aggregates.retained_output_floor()?,
-        )?,
-    )?;
+    // These three floor authors contain only checked numerical operations.
+    // The caller-owned path must lift their known overflow before any later
+    // namespace observation; Plain keeps its original error and trace.
+    let expression_floor = if admission.observed() {
+        expressions.retained_floor_header_in()?
+    } else {
+        expressions.retained_floor_observed(w)?
+    };
+    let function_floor =
+        admission.numeric(functions.retained_output_floor().map_err(Error::from))?;
+    let aggregate_floor =
+        admission.numeric(aggregates.retained_output_floor().map_err(Error::from))?;
+    let output_floor =
+        admission.numeric(add(function_floor, aggregate_floor).map_err(Error::from))?;
+    let known = admission.numeric(add(expression_floor, output_floor).map_err(Error::from))?;
     let lookup = mul(
         2,
         btree_resources_v2::lookup_work_typed(expressions.types().value_types().len())
@@ -278,17 +368,33 @@ fn preflight(
         )?,
     )?)?;
     let bl = binding_limits(limits);
-    model.check(bl)?;
+    check_model(&mut model, refs, bl, admission)?;
+    if admission.observed() {
+        w.step()?;
+        if !same {
+            return Err(shape(
+                "expression materialization has different original namespaces or control",
+            ));
+        }
+        // The old receiving-floor observation still accounts its completed lookup.
+        w.step()?;
+    }
     // The count-only pass gates all source-owned list requests and type roots
     // before either the first nested clone walk or the first output allocation.
     for raw in expressions.as_wire() {
         use wire::expression_definition::Kind as K;
-        let kind = completed(
-            raw.kind
-                .as_ref()
-                .ok_or_else(|| shape("owned expression kind is absent")),
-            w,
-        )?;
+        let captured = raw
+            .kind
+            .as_ref()
+            .ok_or_else(|| shape("owned expression kind is absent"));
+        let kind = if admission.observed() {
+            match captured {
+                Ok(kind) => kind,
+                Err(error) => return completed(Err(error), w),
+            }
+        } else {
+            completed(captured, w)?
+        };
         match kind {
             K::Conjunction(v) | K::Disjunction(v) => {
                 list::<p::ExprId>(&mut model, v.expr_ids.len(), bl)?
@@ -323,7 +429,10 @@ fn preflight(
             | K::Like(_)
             | K::IsTruthValue(_) => {}
         }
-        model.check(bl)?;
+        check_model(&mut model, refs, bl, admission)?;
+        if admission.observed() {
+            w.step()?;
+        }
         w.step()?;
     }
     for raw in expressions.as_wire() {
@@ -332,7 +441,7 @@ fn preflight(
             "owned expression value type is absent",
             w,
         )?;
-        model.count_owned_type_clone(type_root(expressions.types(), id, w)?, bl, w)?;
+        type_root_preflight(expressions.types(), id, &mut model, bl, refs, admission, w)?;
         use wire::expression_definition::Kind as K;
         match completed(
             raw.kind
@@ -342,29 +451,109 @@ fn preflight(
         )? {
             K::Lambda(v) => {
                 for id in &v.parameter_value_type_ids {
-                    model.count_owned_type_clone(type_root(expressions.types(), *id, w)?, bl, w)?;
+                    type_root_preflight(
+                        expressions.types(),
+                        *id,
+                        &mut model,
+                        bl,
+                        refs,
+                        admission,
+                        w,
+                    )?;
                     w.step()?;
                 }
             }
             K::Cast(_) => {
                 // The borrowed receiver proved header carrier == independent
                 // target. Clone the actual proved header carrier a second time.
-                model.count_owned_type_clone(type_root(expressions.types(), id, w)?, bl, w)?;
+                type_root_preflight(expressions.types(), id, &mut model, bl, refs, admission, w)?;
             }
             K::FunctionCall(v) => {
                 let id = required(v.function_binding_id, "owned call binding is absent", w)?;
-                preflight_scalar_signature_copy(function(functions, id, w)?, &mut model, bl, w)?;
-            }
-            K::WindowCall(v) => {
-                let id = required(v.function_binding_id, "owned window binding is absent", w)?;
-                preflight_scalar_signature_copy(function(functions, id, w)?, &mut model, bl, w)?;
-                if let Some(id) = v.aggregate_binding_id {
-                    preflight_aggregate_binding_copy(
-                        aggregate(aggregates, id, w)?,
+                if admission.observed() {
+                    let found = functions.definition_captured(
+                        id,
+                        &mut |binding, work| {
+                            if let MaterializedFunctionBinding::Scalar(source) = binding {
+                                preflight_scalar_signature_copy_in(
+                                    source,
+                                    &mut model,
+                                    bl,
+                                    &mut |prefix| parent_gate(admission, prefix, refs),
+                                    work,
+                                )?;
+                            }
+                            Ok(())
+                        },
+                        w,
+                    )?;
+                    if !matches!(found, Some(MaterializedFunctionBinding::Scalar(_))) {
+                        return Err(shape("owned expression scalar-result binding is absent"));
+                    }
+                } else {
+                    preflight_scalar_signature_copy(
+                        function(functions, id, w)?,
                         &mut model,
                         bl,
                         w,
                     )?;
+                }
+            }
+            K::WindowCall(v) => {
+                let id = required(v.function_binding_id, "owned window binding is absent", w)?;
+                if admission.observed() {
+                    let found = functions.definition_captured(
+                        id,
+                        &mut |binding, work| {
+                            if let MaterializedFunctionBinding::Scalar(source) = binding {
+                                preflight_scalar_signature_copy_in(
+                                    source,
+                                    &mut model,
+                                    bl,
+                                    &mut |prefix| parent_gate(admission, prefix, refs),
+                                    work,
+                                )?;
+                            }
+                            Ok(())
+                        },
+                        w,
+                    )?;
+                    if !matches!(found, Some(MaterializedFunctionBinding::Scalar(_))) {
+                        return Err(shape("owned expression scalar-result binding is absent"));
+                    }
+                } else {
+                    preflight_scalar_signature_copy(
+                        function(functions, id, w)?,
+                        &mut model,
+                        bl,
+                        w,
+                    )?;
+                }
+                if let Some(id) = v.aggregate_binding_id {
+                    if admission.observed() {
+                        let found = aggregates.definition_captured(
+                            id,
+                            &mut |source, work| {
+                                preflight_aggregate_binding_copy_in(
+                                    source,
+                                    &mut model,
+                                    bl,
+                                    &mut |prefix| parent_gate(admission, prefix, refs),
+                                    work,
+                                )
+                            },
+                            w,
+                        )?;
+                        found
+                            .ok_or_else(|| shape("owned expression aggregate binding is absent"))?;
+                    } else {
+                        preflight_aggregate_binding_copy(
+                            aggregate(aggregates, id, w)?,
+                            &mut model,
+                            bl,
+                            w,
+                        )?;
+                    }
                 }
             }
             K::ValueId(_)
@@ -381,7 +570,7 @@ fn preflight(
             | K::CaseExpression(_)
             | K::IsTruthValue(_) => {}
         }
-        model.check(bl)?;
+        check_model(&mut model, refs, bl, admission)?;
         w.step()?;
     }
     // Occupied K/V bytes are a necessary floor, not the maximal private node
@@ -402,14 +591,63 @@ pub fn prepare_expression_materialization<'loan, 'headers, 'wire, 'control>(
     limits: Limits,
 ) -> Result<PreparedExpressionMaterialization<'loan, 'headers, 'wire, 'control>, Error> {
     let mut w = CompileCheckpoints::try_new(expressions.original_control(), CompilePhase::Decode)?;
-    let result = preflight(
+    let mut admission = Admission {
+        parent: None,
+        source: source_retained_bytes,
+        limits,
+    };
+    let result = prepare_core(
         expressions,
         functions,
         aggregates,
         plan_limits,
-        source_retained_bytes,
-        limits,
+        &mut admission,
         &mut w,
+    );
+    finish(w, result)
+}
+pub fn prepare_expression_materialization_in<'loan, 'headers, 'wire, 'control>(
+    expressions: &'loan DecodedExpressions<'headers, 'wire, 'control>,
+    functions: &'loan MaterializedFunctionBindings<'headers, 'wire>,
+    aggregates: &'loan MaterializedAggregateBindings<'loan, 'headers, 'wire>,
+    plan_limits: &'loan p::PlanLimits,
+    source_retained_bytes: usize,
+    limits: Limits,
+    admit: &mut Admit<'_>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedExpressionMaterialization<'loan, 'headers, 'wire, 'control>, Error> {
+    same_control(expressions.original_control(), w)?;
+    let mut admission = Admission {
+        parent: Some(admit),
+        source: source_retained_bytes,
+        limits,
+    };
+    prepare_core(
+        expressions,
+        functions,
+        aggregates,
+        plan_limits,
+        &mut admission,
+        w,
+    )
+}
+fn prepare_core<'loan, 'headers, 'wire, 'control>(
+    expressions: &'loan DecodedExpressions<'headers, 'wire, 'control>,
+    functions: &'loan MaterializedFunctionBindings<'headers, 'wire>,
+    aggregates: &'loan MaterializedAggregateBindings<'loan, 'headers, 'wire>,
+    plan_limits: &'loan p::PlanLimits,
+    admission: &mut Admission<'_, '_>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedExpressionMaterialization<'loan, 'headers, 'wire, 'control>, Error> {
+    let source_retained_bytes = admission.source;
+    let limits = admission.limits;
+    preflight(
+        expressions,
+        functions,
+        aggregates,
+        plan_limits,
+        admission,
+        w,
     )
     .map(
         |(facts, retained_bytes)| PreparedExpressionMaterialization {
@@ -418,11 +656,11 @@ pub fn prepare_expression_materialization<'loan, 'headers, 'wire, 'control>(
             aggregates,
             plan_limits,
             facts,
+            limits,
             source_invoice: source_retained_bytes,
             retained_bytes,
         },
-    );
-    finish(w, result)
+    )
 }
 
 fn clone_type(
@@ -621,29 +859,51 @@ pub fn materialize_expressions<'loan, 'headers, 'wire, 'control>(
 ) -> Result<MaterializedExpressions<'loan, 'headers, 'wire, 'control>, Error> {
     let mut w =
         CompileCheckpoints::try_new(token.expressions.original_control(), CompilePhase::Decode)?;
-    let result = (|| {
-        let mut definitions = reserve(token.expressions.source_count(), &mut w)?;
+    let result = materialize_core(token, None, &mut w);
+    finish(w, result)
+}
+pub fn materialize_expressions_in<'loan, 'headers, 'wire, 'control>(
+    token: PreparedExpressionMaterialization<'loan, 'headers, 'wire, 'control>,
+    admit: &mut Admit<'_>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<MaterializedExpressions<'loan, 'headers, 'wire, 'control>, Error> {
+    same_control(token.expressions.original_control(), w)?;
+    materialize_core(token, Some(admit), w)
+}
+fn materialize_core<'loan, 'headers, 'wire, 'control>(
+    token: PreparedExpressionMaterialization<'loan, 'headers, 'wire, 'control>,
+    parent: Option<&mut Admit<'_>>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<MaterializedExpressions<'loan, 'headers, 'wire, 'control>, Error> {
+    let mut admission = Admission {
+        parent,
+        source: token.source_invoice,
+        limits: token.limits,
+    };
+    admission.fixed(&token.facts)?;
+    (|| {
+        let mut definitions = reserve(token.expressions.source_count(), w)?;
         for raw in token.expressions.as_wire() {
             let id = required(
                 raw.value_type_id,
                 "owned expression value type is absent",
-                &mut w,
+                w,
             )?;
-            let ty = clone_type(type_root(token.expressions.types(), id, &mut w)?, &mut w)?;
+            let ty = clone_type(type_root(token.expressions.types(), id, w)?, w)?;
             let kind = owned_kind(
                 raw,
                 &ty,
                 token.expressions,
                 token.functions,
                 token.aggregates,
-                &mut w,
+                w,
             )?;
             definitions.push(p::ExprNode {
                 id: p::ExprId::new(raw.id),
                 owner: p::NodeId::new(required(
                     raw.owner_node_id,
                     "expression owner is absent",
-                    &mut w,
+                    w,
                 )?),
                 lambda_scope: raw.lambda_scope_expr_id.map(p::ExprId::new),
                 ty,
@@ -651,11 +911,8 @@ pub fn materialize_expressions<'loan, 'headers, 'wire, 'control>(
             });
             w.step()?;
         }
-        let arena = p::ExprArena::try_from_definitions_in(
-            definitions.into_iter(),
-            token.plan_limits,
-            &mut w,
-        )?;
+        let arena =
+            p::ExprArena::try_from_definitions_in(definitions.into_iter(), token.plan_limits, w)?;
         Ok(MaterializedExpressions {
             arena,
             expressions: token.expressions,
@@ -665,8 +922,7 @@ pub fn materialize_expressions<'loan, 'headers, 'wire, 'control>(
             source_invoice: token.source_invoice,
             retained_bytes: token.retained_bytes,
         })
-    })();
-    finish(w, result)
+    })()
 }
 
 #[cfg(test)]

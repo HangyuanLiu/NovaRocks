@@ -245,6 +245,24 @@ impl<'source> EncodedTypeTable<'source> {
         self.root_value_binding_observed(id, work)
             .map(|binding| binding.map(|(_, value)| value))
     }
+    /// Capture an original root FVT before the matched lookup's completed
+    /// observation. The consumer synchronously admits its own comparison or
+    /// clone requests; the type namespace creates no replacement source.
+    pub(crate) fn value_type_captured<E>(
+        &self,
+        id: u32,
+        capture: &mut impl FnMut(
+            &'source FunctionValueType,
+            &mut CompileCheckpoints<'_>,
+        ) -> Result<(), E>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'source FunctionValueType>, E>
+    where
+        E: From<TypeCodecError>,
+    {
+        self.root_value_binding_captured(id, capture, work)
+            .map(|binding| binding.map(|(_, value)| value))
+    }
     /// Bind an authored value root to the carrier occurrence assigned by the
     /// same emission. This is not a lookup of arbitrary nested carriers, and
     /// the carrier ID does not replace the complete source value type.
@@ -255,9 +273,26 @@ impl<'source> EncodedTypeTable<'source> {
         id: u32,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Option<(u32, &'source FunctionValueType)>, TypeCodecError> {
+        self.root_value_binding_captured(id, &mut |_, _| Ok(()), work)
+    }
+    fn root_value_binding_captured<E>(
+        &self,
+        id: u32,
+        capture: &mut impl FnMut(
+            &'source FunctionValueType,
+            &mut CompileCheckpoints<'_>,
+        ) -> Result<(), E>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<(u32, &'source FunctionValueType)>, E>
+    where
+        E: From<TypeCodecError>,
+    {
         for (position, (candidate, value)) in self.values.iter().enumerate() {
             let matches = *candidate == id;
-            work.step()?;
+            if matches {
+                capture(value, work)?;
+            }
+            work.step().map_err(TypeCodecError::from)?;
             if matches {
                 // Root value definitions are emitted one-for-one in source
                 // order. These constant-time defensive checks neither build
@@ -272,7 +307,8 @@ impl<'source> EncodedTypeTable<'source> {
                 if emitted.id != *candidate {
                     return Err(TypeCodecError::InvalidShape(
                         "encoded root value definition differs from its source",
-                    ));
+                    )
+                    .into());
                 }
                 let carrier = emitted.carrier_type_id.ok_or(TypeCodecError::InvalidShape(
                     "encoded root value carrier is absent",

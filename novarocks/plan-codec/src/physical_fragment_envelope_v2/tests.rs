@@ -627,3 +627,319 @@ fn envelope_real_wide_320_reference_emission_samples_256_and_original_first_caus
     );
     prefixes(|c| decode(&raw, limits(), c), true, true);
 }
+
+fn caller_encode(
+    source: &p::Fragment,
+    l: FragmentEnvelopeProjectionLimits,
+    control: &Control,
+) -> Result<(EncodedFragmentEnvelope, FragmentEnvelopeProjectionFacts), Error> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let result = prepare_fragment_envelope_encode_in(source, SOURCE, l, &mut |_| Ok(()), &mut work)
+        .and_then(|prepared| prepared.emit_in(&mut |_| Ok(()), &mut work));
+    finish(work, result)
+}
+fn caller_decode(
+    source: &wire::Fragment,
+    l: FragmentEnvelopeProjectionLimits,
+    control: &Control,
+) -> Result<(DecodedFragmentEnvelope, FragmentEnvelopeProjectionFacts), Error> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let result = prepare_fragment_envelope_decode_in(source, SOURCE, l, &mut |_| Ok(()), &mut work)
+        .and_then(|prepared| prepared.emit_in(&mut |_| Ok(()), &mut work));
+    finish(work, result)
+}
+#[test]
+fn caller_envelope_all_sinks_use_original_mapper_and_independent_layouts() {
+    for sink in [
+        p::FragmentSink::Result,
+        p::FragmentSink::Noop,
+        p::FragmentSink::Stream {
+            edge: p::EdgeId::new(0),
+        },
+        p::FragmentSink::Multicast {
+            edges: Box::from([p::EdgeId::new(u32::MAX), p::EdgeId::new(0)]),
+        },
+        router(),
+    ] {
+        let source = fragment(sink.clone(), false);
+        let (plain, plain_facts) = encoded(&source);
+        let control = Control::default();
+        let (sent, sent_facts) = caller_encode(&source, limits(), &control).unwrap();
+        assert_eq!(raw(sent), plain);
+        assert_eq!(sent_facts, plain_facts);
+        assert!(
+            control
+                .trace()
+                .iter()
+                .all(|(phase, _)| *phase == CompilePhase::LowerProgram)
+        );
+        let received = caller_decode(&plain, limits(), &Control::default()).unwrap();
+        assert_eq!(received.0.sink, sink);
+        assert_eq!(received.0.id, p::FragmentId::new(u32::MAX));
+        assert_eq!(received.0.dop_domain, dop());
+        assert_eq!(
+            &*received.0.runtime_filters,
+            &[
+                p::RuntimeFilterId::new(0),
+                p::RuntimeFilterId::new(u32::MAX)
+            ]
+        );
+        if matches!(source.sink(), p::FragmentSink::Router { .. }) {
+            let sent_bytes = layout::<u32>(2)
+                + layout::<wire::ChangeStreamRoute>(2)
+                + 2 * 32
+                + layout::<i32>(3)
+                + 2 * layout::<wire::WriteInputMapping>(2)
+                + 2 * layout::<u32>(1)
+                + 4 * 32;
+            let received_bytes = 2
+                * (layout::<p::RuntimeFilterId>(2)
+                    + layout::<p::ChangeStreamRoute>(2)
+                    + layout::<ConnectorRowMutationEffect>(3)
+                    + 2 * layout::<(ConnectorWriteFieldToken, p::ValueId)>(2)
+                    + 2 * layout::<p::ValueId>(1));
+            assert_eq!(sent_facts.allocation_requests_upper_bound, 14);
+            assert_eq!(sent_facts.allocation_request_bytes_upper_bound, sent_bytes);
+            assert_eq!(received.1.allocation_requests_upper_bound, 16);
+            assert_eq!(
+                received.1.allocation_request_bytes_upper_bound,
+                received_bytes
+            );
+            assert_eq!(received.1.value_reference_count, 7);
+            assert_eq!(received.1.list_item_count, 13);
+        }
+    }
+}
+#[test]
+fn caller_envelope_every_actual_success_and_ordinary_footer_prefix_keeps_first_cause() {
+    let source = fragment(router(), false);
+    let input = encoded(&source).0;
+    prefixes(|c| caller_encode(&source, limits(), c), true, false);
+    prefixes(|c| caller_decode(&input, limits(), c), true, false);
+    let mut malformed = input;
+    raw_router(&mut malformed).routes[0].input_mapping[0]
+        .field_token
+        .pop();
+    prefixes(|c| caller_decode(&malformed, limits(), c), false, false);
+    assert!(matches!(
+        caller_decode(&malformed, limits(), &Control::default()),
+        Err(Error::InvalidShape(_))
+    ));
+}
+#[test]
+fn caller_envelope_known_root_requests_and_source_overflow_precede_pending_control() {
+    let source = fragment(router(), false);
+    let input = encoded(&source).0;
+    for pending in [0, 254, 255] {
+        for cause in CAUSES {
+            for receiving in [false, true] {
+                for overflow in [false, true] {
+                    let control = Control {
+                        events: Mutex::new(Vec::new()),
+                        stop: Some((1, cause)),
+                    };
+                    let mut work =
+                        CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+                    for _ in 0..pending {
+                        work.step().unwrap();
+                    }
+                    let mut l = limits();
+                    let source_bytes = if overflow { usize::MAX } else { SOURCE };
+                    if overflow {
+                        l.max_coexisting_source_and_request_bytes = usize::MAX;
+                    } else {
+                        l.max_allocation_requests = 0;
+                    }
+                    let result = if receiving {
+                        prepare_fragment_envelope_decode_in(
+                            &input,
+                            source_bytes,
+                            l,
+                            &mut |_| Ok(()),
+                            &mut work,
+                        )
+                        .map(|_| ())
+                    } else {
+                        prepare_fragment_envelope_encode_in(
+                            &source,
+                            source_bytes,
+                            l,
+                            &mut |_| Ok(()),
+                            &mut work,
+                        )
+                        .map(|_| ())
+                    };
+                    assert!(matches!(
+                        result,
+                        Err(Error::Control(CompileControlError::ResourceExhausted))
+                    ));
+                    assert_eq!(control.trace(), [(CompilePhase::LowerProgram, 0)]);
+                }
+            }
+        }
+    }
+}
+#[test]
+fn caller_envelope_captured_route_requests_are_admitted_before_the_next_callback() {
+    let source = fragment(router(), false);
+    let input = encoded(&source).0;
+    for receiving in [false, true] {
+        let root_requests = if receiving { 4 } else { 2 };
+        let expected_requests = if receiving { 10 } else { 8 };
+        let baseline = Control::default();
+        let mut work = CompileCheckpoints::try_new(&baseline, CompilePhase::LowerProgram).unwrap();
+        let mut capture = None;
+        let mut admit = |facts: &FragmentEnvelopeProjectionFacts| {
+            if capture.is_none() && facts.allocation_requests_upper_bound > root_requests {
+                capture = Some((*facts, baseline.trace().len()));
+            }
+            Ok(())
+        };
+        let result = if receiving {
+            prepare_fragment_envelope_decode_in(&input, SOURCE, limits(), &mut admit, &mut work)
+                .and_then(|token| token.emit_in(&mut admit, &mut work))
+                .map(|_| ())
+        } else {
+            prepare_fragment_envelope_encode_in(&source, SOURCE, limits(), &mut admit, &mut work)
+                .and_then(|token| token.emit_in(&mut admit, &mut work))
+                .map(|_| ())
+        };
+        finish(work, result).unwrap();
+        let (expected, at) = capture.unwrap();
+        assert_eq!(expected.allocation_requests_upper_bound, expected_requests);
+        assert_eq!(expected.value_reference_count, 4);
+        assert_eq!(expected.list_item_count, 9);
+        let events = baseline.trace();
+        for cause in CAUSES {
+            let control = Control {
+                events: Mutex::new(Vec::new()),
+                stop: Some((at, cause)),
+            };
+            let mut work =
+                CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+            let mut refused = None;
+            let mut admit = |facts: &FragmentEnvelopeProjectionFacts| {
+                if facts.allocation_requests_upper_bound > root_requests {
+                    refused = Some(*facts);
+                    Err(CompileControlError::ResourceExhausted)
+                } else {
+                    Ok(())
+                }
+            };
+            let result = if receiving {
+                prepare_fragment_envelope_decode_in(&input, SOURCE, limits(), &mut admit, &mut work)
+                    .map(|_| ())
+            } else {
+                prepare_fragment_envelope_encode_in(
+                    &source,
+                    SOURCE,
+                    limits(),
+                    &mut admit,
+                    &mut work,
+                )
+                .map(|_| ())
+            };
+            assert!(matches!(
+                result,
+                Err(Error::Control(CompileControlError::ResourceExhausted))
+            ));
+            assert_eq!(refused, Some(expected));
+            assert_eq!(control.trace(), events[..at]);
+        }
+    }
+}
+#[test]
+fn caller_envelope_exact_axes_and_each_positive_one_under_preserve_numeric_policy() {
+    let source = fragment(router(), false);
+    let input = encoded(&source).0;
+    for receiving in [false, true] {
+        let f = if receiving {
+            caller_decode(&input, limits(), &Control::default())
+                .unwrap()
+                .1
+        } else {
+            caller_encode(&source, limits(), &Control::default())
+                .unwrap()
+                .1
+        };
+        let mut exact = limits();
+        exact.max_input_nodes = 0; // No input-node namespace is projected by an envelope.
+        exact.max_value_references = f.value_reference_count;
+        exact.max_list_items = f.list_item_count;
+        exact.max_allocation_requests = f.allocation_requests_upper_bound;
+        exact.max_allocation_request_bytes = f.allocation_request_bytes_upper_bound;
+        exact.max_coexisting_source_and_request_bytes =
+            f.coexisting_source_and_request_bytes_upper_bound;
+        exact.max_work = f.cumulative_work_upper_bound;
+        for under in 0..=6 {
+            let mut l = exact;
+            match under {
+                0 => {}
+                1 => l.max_value_references -= 1,
+                2 => l.max_list_items -= 1,
+                3 => l.max_allocation_requests -= 1,
+                4 => l.max_allocation_request_bytes -= 1,
+                5 => l.max_coexisting_source_and_request_bytes -= 1,
+                6 => l.max_work -= 1,
+                _ => unreachable!(),
+            }
+            let result = if receiving {
+                caller_decode(&input, l, &Control::default()).map(|x| x.1)
+            } else {
+                caller_encode(&source, l, &Control::default()).map(|x| x.1)
+            };
+            if under == 0 {
+                assert_eq!(result.unwrap(), f);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(Error::Control(CompileControlError::ResourceExhausted))
+                ));
+            }
+        }
+    }
+}
+#[test]
+fn caller_envelope_original_token_control_and_wide_source_quantum_are_exact() {
+    let source = fragment(router(), true);
+    let input = encoded(&source).0;
+    prefixes(|c| caller_encode(&source, limits(), c), true, true);
+    prefixes(|c| caller_decode(&input, limits(), c), true, true);
+    for receiving in [false, true] {
+        let original = Control::default();
+        let foreign = Control::default();
+        let mut owner_work =
+            CompileCheckpoints::try_new(&original, CompilePhase::LowerProgram).unwrap();
+        let mut foreign_work =
+            CompileCheckpoints::try_new(&foreign, CompilePhase::LowerProgram).unwrap();
+        let before = foreign.trace();
+        let mut parent = |_: &FragmentEnvelopeProjectionFacts| -> Result<(), CompileControlError> {
+            panic!("foreign token must not replace the parent's contribution");
+        };
+        let result = if receiving {
+            prepare_fragment_envelope_decode_in(
+                &input,
+                SOURCE,
+                limits(),
+                &mut |_| Ok(()),
+                &mut owner_work,
+            )
+            .unwrap()
+            .emit_in(&mut parent, &mut foreign_work)
+            .map(|_| ())
+        } else {
+            prepare_fragment_envelope_encode_in(
+                &source,
+                SOURCE,
+                limits(),
+                &mut |_| Ok(()),
+                &mut owner_work,
+            )
+            .unwrap()
+            .emit_in(&mut parent, &mut foreign_work)
+            .map(|_| ())
+        };
+        assert!(matches!(result, Err(Error::InvalidShape(_))));
+        assert_eq!(foreign.trace(), before);
+    }
+}

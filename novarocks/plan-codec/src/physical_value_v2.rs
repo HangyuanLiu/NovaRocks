@@ -492,11 +492,28 @@ impl<'loan, 'source, 'control> EncodedValues<'loan, 'source, 'control> {
         id: u32,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<Option<&'source p::ValueDef>, Error> {
-        same_control(self.original_control(), w)?;
-        Ok(self
-            .indices
-            .find(id, |at| self.inputs[at].source.id.get(), w)?
-            .map(|at| self.inputs[at].source))
+        self.value_captured(id, &mut |_, _| Ok(()), w)
+    }
+    /// Capture the original value loan before its matched comparison callback.
+    /// The consumer admits its own comparison/copy contribution here.
+    pub(crate) fn value_captured<E>(
+        &self,
+        id: u32,
+        capture: &mut impl FnMut(&'source p::ValueDef, &mut CompileCheckpoints<'_>) -> Result<(), E>,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'source p::ValueDef>, E>
+    where
+        E: From<Error> + From<BindingCodecError> + From<CompileControlError>,
+    {
+        same_control(self.original_control(), w).map_err(E::from)?;
+        self.indices
+            .find_captured(
+                id,
+                |at| self.inputs[at].source.id.get(),
+                &mut |at, work| capture(self.inputs[at].source, work),
+                w,
+            )
+            .map(|found| found.map(|at| self.inputs[at].source))
     }
     pub fn source_id(&self, value: &p::ValueDef) -> Result<u32, Error> {
         let mut w = CompileCheckpoints::try_new(self.original_control(), CompilePhase::Encode)?;
@@ -586,11 +603,27 @@ impl<'loan, 'wire, 'control> DecodedValues<'loan, 'wire, 'control> {
         id: u32,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<Option<&p::ValueDef>, Error> {
-        same_control(self.original_control(), w)?;
-        Ok(self
-            .indices
-            .find(id, |at| self.wire[at].id, w)?
-            .map(|at| &self.values[at]))
+        self.value_captured(id, &mut |_, _| Ok(()), w)
+    }
+    /// Capture the actual owned value before observing the matched lookup.
+    pub(crate) fn value_captured<'a, E>(
+        &'a self,
+        id: u32,
+        capture: &mut impl FnMut(&'a p::ValueDef, &mut CompileCheckpoints<'_>) -> Result<(), E>,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'a p::ValueDef>, E>
+    where
+        E: From<Error> + From<BindingCodecError> + From<CompileControlError>,
+    {
+        same_control(self.original_control(), w).map_err(E::from)?;
+        self.indices
+            .find_captured(
+                id,
+                |at| self.wire[at].id,
+                &mut |at, work| capture(&self.values[at], work),
+                w,
+            )
+            .map(|found| found.map(|at| &self.values[at]))
     }
     pub fn into_values(self) -> Vec<p::ValueDef> {
         self.values
@@ -600,11 +633,9 @@ impl<'loan, 'wire, 'control> DecodedValues<'loan, 'wire, 'control> {
         let result = self.retained_floor_observed(&mut w);
         finish(result, w)
     }
-    pub(crate) fn retained_floor_observed(
-        &self,
-        w: &mut CompileCheckpoints<'_>,
-    ) -> Result<usize, Error> {
-        same_control(self.original_control(), w)?;
+    // Pure original header arithmetic: no control callback, source walk or
+    // allocation. The returned necessary floor is not another source invoice.
+    fn retained_floor_header(&self) -> Result<usize, Error> {
         let known = add(
             self.original_source_bytes,
             add(
@@ -615,7 +646,18 @@ impl<'loan, 'wire, 'control> DecodedValues<'loan, 'wire, 'control> {
                 )?,
             )?,
         )?;
-        let known = add(known, self.owned_dictionary_bytes)?;
+        add(known, self.owned_dictionary_bytes)
+    }
+    pub(crate) fn retained_floor_header_admitted(&self) -> Result<usize, CompileControlError> {
+        self.retained_floor_header()
+            .map_err(|_| CompileControlError::ResourceExhausted)
+    }
+    pub(crate) fn retained_floor_observed(
+        &self,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<usize, Error> {
+        same_control(self.original_control(), w)?;
+        let known = self.retained_floor_header()?;
         w.step()?;
         // Shared payload/Field/metadata backing stays in the original invoice;
         // only independently owned output Dictionary boxes are added here.

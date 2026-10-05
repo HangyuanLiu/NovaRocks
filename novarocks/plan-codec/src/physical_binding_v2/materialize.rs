@@ -111,6 +111,18 @@ impl<'loan, 'source> MaterializedFunctionBindings<'loan, 'source> {
         id: u32,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<Option<&MaterializedFunctionBinding>, Error> {
+        self.definition_captured(id, &mut |_, _| Ok(()), w)
+    }
+    /// Admit an actually captured source before the lookup's completed step.
+    pub(crate) fn definition_captured<'a>(
+        &'a self,
+        id: u32,
+        capture: &mut impl FnMut(
+            &'a MaterializedFunctionBinding,
+            &mut CompileCheckpoints<'_>,
+        ) -> Result<(), Error>,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'a MaterializedFunctionBinding>, Error> {
         let same = std::ptr::addr_eq(w.control(), self.headers.original_control());
         w.step()?;
         if !same {
@@ -120,6 +132,9 @@ impl<'loan, 'source> MaterializedFunctionBindings<'loan, 'source> {
         }
         for (candidate, definition) in &self.definitions {
             let matches = *candidate == id;
+            if matches {
+                capture(definition, w)?;
+            }
             w.step()?;
             if matches {
                 return Ok(Some(definition));

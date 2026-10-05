@@ -26,7 +26,9 @@ use novarocks_connector_contract::{
 };
 use novarocks_physical_plan as p;
 use novarocks_proto_models::{physical_control_v2::Empty, physical_package_v2 as wire};
-use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
+use novarocks_type_contract::{
+    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+};
 use std::mem::size_of;
 
 pub(crate) use crate::physical_node_v2::{
@@ -130,13 +132,127 @@ fn wire_outer(input: &wire::Fragment, kind: &wire::fragment_sink::Kind) -> Resul
         },
     )
 }
+type EnvelopeAdmit<'a> =
+    dyn FnMut(&FragmentEnvelopeProjectionFacts) -> Result<(), CompileControlError> + 'a;
+struct EnvelopeAdmission<'a, 'callback> {
+    parent: Option<&'a mut EnvelopeAdmit<'callback>>,
+}
+impl EnvelopeAdmission<'_, '_> {
+    fn observed(&self) -> bool {
+        self.parent.is_some()
+    }
+    fn numeric<T>(&self, result: Result<T, Error>) -> Result<T, Error> {
+        match result {
+            Err(Error::InvalidShape(_)) if self.observed() => {
+                Err(CompileControlError::ResourceExhausted.into())
+            }
+            result => result,
+        }
+    }
+    fn sum(&self, left: usize, right: usize) -> Result<usize, Error> {
+        self.numeric(add(left, right))
+    }
+    fn request<T>(&self, model: &mut Model, n: usize, copies: usize) -> Result<(), Error> {
+        self.numeric(model.request::<T>(n, copies))
+    }
+    fn gate(
+        &mut self,
+        model: &Model,
+        source: usize,
+        limits: FragmentEnvelopeProjectionLimits,
+    ) -> Result<(), Error> {
+        if self.observed() {
+            let facts = self.numeric(model.numerical_facts(source, 0, limits))?;
+            (self.parent.as_mut().expect("observed parent"))(&facts)?;
+        }
+        Ok(())
+    }
+    fn facts(
+        &mut self,
+        model: &Model,
+        source: usize,
+        limits: FragmentEnvelopeProjectionLimits,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<FragmentEnvelopeProjectionFacts, Error> {
+        self.gate(model, source, limits)?;
+        self.numeric(model.facts(source, 0, limits, work))
+    }
+}
+// These are the original root request authors. Observed preparation consumes
+// them before its first completed callback; Plain keeps its original order.
+fn encode_sink_requests(
+    sink: &p::FragmentSink,
+    model: &mut Model,
+    admission: &EnvelopeAdmission<'_, '_>,
+) -> Result<(), Error> {
+    match sink {
+        p::FragmentSink::Multicast { edges } => admission.request::<u32>(model, edges.len(), 1)?,
+        p::FragmentSink::Router { routes, .. } => {
+            model.refs = 1;
+            admission.request::<wire::ChangeStreamRoute>(model, routes.len(), 1)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+fn decode_sink_requests(
+    kind: Option<&wire::fragment_sink::Kind>,
+    model: &mut Model,
+    admission: &EnvelopeAdmission<'_, '_>,
+) -> Result<(), Error> {
+    match kind {
+        Some(wire::fragment_sink::Kind::Multicast(v)) => {
+            admission.request::<p::EdgeId>(model, v.edge_ids.len(), 2)?;
+        }
+        Some(wire::fragment_sink::Kind::Router(v)) => {
+            model.refs = 1;
+            admission.request::<p::ChangeStreamRoute>(model, v.routes.len(), 2)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+fn encode_route_requests(
+    route: &p::ChangeStreamRoute,
+    model: &mut Model,
+    admission: &EnvelopeAdmission<'_, '_>,
+) -> Result<(), Error> {
+    admission.request::<u8>(model, 32, 1)?;
+    admission.request::<i32>(model, route.accepted_effects.len(), 1)?;
+    admission.request::<wire::WriteInputMapping>(model, route.input_mapping.len(), 1)?;
+    admission.request::<u32>(model, route.partition_by.len(), 1)?;
+    admission.request::<u8>(model, 32, route.input_mapping.len())
+}
+fn decode_route_requests(
+    route: &wire::ChangeStreamRoute,
+    model: &mut Model,
+    admission: &EnvelopeAdmission<'_, '_>,
+) -> Result<(), Error> {
+    admission.request::<ConnectorRowMutationEffect>(model, route.accepted_effects.len(), 2)?;
+    admission.request::<(ConnectorWriteFieldToken, p::ValueId)>(
+        model,
+        route.input_mapping.len(),
+        2,
+    )?;
+    admission.request::<p::ValueId>(model, route.partition_value_ids.len(), 2)
+}
 fn preflight_encode(
     input: &p::Fragment,
     source: usize,
     l: FragmentEnvelopeProjectionLimits,
+    admission: &mut EnvelopeAdmission<'_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<FragmentEnvelopeProjectionFacts, Error> {
-    let outer = physical_outer(input)?;
+    let outer = admission.numeric(physical_outer(input))?;
+    let mut model = Model {
+        items: outer,
+        ..Model::default()
+    };
+    if admission.observed() {
+        admission.request::<u32>(&mut model, input.runtime_filters().len(), 1)?;
+        encode_sink_requests(input.sink(), &mut model, admission)?;
+        admission.gate(&model, source, l)?;
+    }
     let mut known = add(
         size_of::<p::Fragment>(),
         bytes::<p::RuntimeFilterId>(input.runtime_filters().len())?,
@@ -150,67 +266,88 @@ fn preflight_encode(
         },
     )?;
     count_prefix(0, outer, source, known, l, w)?;
-    let mut model = Model {
-        items: outer,
-        ..Model::default()
-    };
-    model.request::<u32>(input.runtime_filters().len(), 1)?;
-    model.facts(source, 0, l, w)?;
-    match input.sink() {
-        p::FragmentSink::Multicast { edges } => model.request::<u32>(edges.len(), 1)?,
-        p::FragmentSink::Router { routes, .. } => {
-            model.refs = 1;
-            model.request::<wire::ChangeStreamRoute>(routes.len(), 1)?;
-            model.facts(source, 0, l, w)?;
-            for route in routes {
-                let inner = add(
-                    route.accepted_effects.len(),
-                    add(route.input_mapping.len(), route.partition_by.len())?,
-                )?;
-                model.items = add(model.items, inner)?;
-                count_prefix(0, model.items, source, known, l, w)?;
-                model.refs = add(
+    if !admission.observed() {
+        admission.request::<u32>(&mut model, input.runtime_filters().len(), 1)?;
+    }
+    admission.facts(&model, source, l, w)?;
+    if !admission.observed() {
+        encode_sink_requests(input.sink(), &mut model, admission)?;
+    }
+    if let p::FragmentSink::Router { routes, .. } = input.sink() {
+        admission.facts(&model, source, l, w)?;
+        for route in routes {
+            let inner = admission.sum(
+                route.accepted_effects.len(),
+                admission.sum(route.input_mapping.len(), route.partition_by.len())?,
+            )?;
+            model.items = admission.sum(model.items, inner)?;
+            let references = || {
+                admission.sum(
                     model.refs,
-                    add(route.input_mapping.len(), route.partition_by.len())?,
-                )?;
-                cap(model.refs, l.max_value_references, w)?;
-                known = add(
-                    known,
-                    add(
-                        bytes::<ConnectorRowMutationEffect>(route.accepted_effects.len())?,
-                        add(
-                            bytes::<(ConnectorWriteFieldToken, p::ValueId)>(
-                                route.input_mapping.len(),
-                            )?,
-                            bytes::<p::ValueId>(route.partition_by.len())?,
-                        )?,
-                    )?,
-                )?;
-                model.request::<u8>(32, 1)?;
-                model.request::<i32>(route.accepted_effects.len(), 1)?;
-                model.request::<wire::WriteInputMapping>(route.input_mapping.len(), 1)?;
-                model.request::<u32>(route.partition_by.len(), 1)?;
-                // Each field token is an independent generated Vec allocation;
-                // copies counts these requests through the sole Model author.
-                model.request::<u8>(32, route.input_mapping.len())?;
-                model.facts(source, 0, l, w)?;
-                floor(source, known, w)?;
-                w.step()?;
+                    admission.sum(route.input_mapping.len(), route.partition_by.len())?,
+                )
+            };
+            if admission.observed() {
+                model.refs = references()?;
+                encode_route_requests(route, &mut model, admission)?;
+                admission.gate(&model, source, l)?;
             }
+            count_prefix(0, model.items, source, known, l, w)?;
+            if !admission.observed() {
+                model.refs = admission.sum(
+                    model.refs,
+                    admission.sum(route.input_mapping.len(), route.partition_by.len())?,
+                )?;
+            }
+            cap(model.refs, l.max_value_references, w)?;
+            known = add(
+                known,
+                add(
+                    bytes::<ConnectorRowMutationEffect>(route.accepted_effects.len())?,
+                    add(
+                        bytes::<(ConnectorWriteFieldToken, p::ValueId)>(route.input_mapping.len())?,
+                        bytes::<p::ValueId>(route.partition_by.len())?,
+                    )?,
+                )?,
+            )?;
+            if !admission.observed() {
+                encode_route_requests(route, &mut model, admission)?;
+            }
+            admission.facts(&model, source, l, w)?;
+            floor(source, known, w)?;
+            w.step()?;
         }
-        _ => {}
     }
     floor(source, known, w)?;
-    model.facts(source, 0, l, w)
+    admission.facts(&model, source, l, w)
 }
 fn preflight_decode(
     input: &wire::Fragment,
     source: usize,
     l: FragmentEnvelopeProjectionLimits,
+    admission: &mut EnvelopeAdmission<'_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<FragmentEnvelopeProjectionFacts, Error> {
+    let mut initial = None;
+    if admission.observed() {
+        // Presence belongs to raw_kind below. These are only requests already
+        // exposed by the actual borrowed raw header; no sink is synthesized.
+        let captured = input.sink.as_ref().and_then(|sink| sink.kind.as_ref());
+        let outer = match captured {
+            Some(kind) => admission.numeric(wire_outer(input, kind))?,
+            None => input.runtime_filter_ids.len(),
+        };
+        let mut model = Model {
+            items: outer,
+            ..Model::default()
+        };
+        admission.request::<p::RuntimeFilterId>(&mut model, input.runtime_filter_ids.len(), 2)?;
+        decode_sink_requests(captured, &mut model, admission)?;
+        admission.gate(&model, source, l)?;
+        initial = Some(model);
+    }
     let kind = raw_kind(input, w)?;
-    let outer = wire_outer(input, kind)?;
+    let outer = admission.numeric(wire_outer(input, kind))?;
     let mut known = add(
         size_of::<wire::Fragment>(),
         bytes::<u32>(input.runtime_filter_ids.capacity())?,
@@ -226,32 +363,52 @@ fn preflight_decode(
         },
     )?;
     count_prefix(0, outer, source, known, l, w)?;
-    let mut model = Model {
+    let mut model = initial.unwrap_or(Model {
         items: outer,
         ..Model::default()
-    };
-    model.request::<p::RuntimeFilterId>(input.runtime_filter_ids.len(), 2)?;
-    model.facts(source, 0, l, w)?;
+    });
+    if !admission.observed() {
+        admission.request::<p::RuntimeFilterId>(&mut model, input.runtime_filter_ids.len(), 2)?;
+    }
+    admission.facts(&model, source, l, w)?;
     match kind {
-        wire::fragment_sink::Kind::Multicast(v) => {
-            model.request::<p::EdgeId>(v.edge_ids.len(), 2)?
+        wire::fragment_sink::Kind::Multicast(_) => {
+            if !admission.observed() {
+                decode_sink_requests(Some(kind), &mut model, admission)?;
+            }
         }
         wire::fragment_sink::Kind::Router(v) => {
             required(v.effect_value_id, "router effect ValueId is absent", w)?;
-            model.refs = 1;
-            model.request::<p::ChangeStreamRoute>(v.routes.len(), 2)?;
-            model.facts(source, 0, l, w)?;
+            if !admission.observed() {
+                decode_sink_requests(Some(kind), &mut model, admission)?;
+            }
+            admission.facts(&model, source, l, w)?;
             for route in &v.routes {
-                let inner = add(
+                let inner = admission.sum(
                     route.accepted_effects.len(),
-                    add(route.input_mapping.len(), route.partition_value_ids.len())?,
+                    admission.sum(route.input_mapping.len(), route.partition_value_ids.len())?,
                 )?;
-                model.items = add(model.items, inner)?;
+                model.items = admission.sum(model.items, inner)?;
+                let references = || {
+                    admission.sum(
+                        model.refs,
+                        admission
+                            .sum(route.input_mapping.len(), route.partition_value_ids.len())?,
+                    )
+                };
+                if admission.observed() {
+                    model.refs = references()?;
+                    decode_route_requests(route, &mut model, admission)?;
+                    admission.gate(&model, source, l)?;
+                }
                 count_prefix(0, model.items, source, known, l, w)?;
-                model.refs = add(
-                    model.refs,
-                    add(route.input_mapping.len(), route.partition_value_ids.len())?,
-                )?;
+                if !admission.observed() {
+                    model.refs = admission.sum(
+                        model.refs,
+                        admission
+                            .sum(route.input_mapping.len(), route.partition_value_ids.len())?,
+                    )?;
+                }
                 cap(model.refs, l.max_value_references, w)?;
                 known = add(
                     known,
@@ -266,13 +423,10 @@ fn preflight_decode(
                         )?,
                     )?,
                 )?;
-                model.request::<ConnectorRowMutationEffect>(route.accepted_effects.len(), 2)?;
-                model.request::<(ConnectorWriteFieldToken, p::ValueId)>(
-                    route.input_mapping.len(),
-                    2,
-                )?;
-                model.request::<p::ValueId>(route.partition_value_ids.len(), 2)?;
-                model.facts(source, 0, l, w)?;
+                if !admission.observed() {
+                    decode_route_requests(route, &mut model, admission)?;
+                }
+                admission.facts(&model, source, l, w)?;
                 floor(source, known, w)?;
                 token32(&route.route_id, w)?;
                 ordinal(route.write_target_ordinal, w)?;
@@ -293,7 +447,7 @@ fn preflight_decode(
         _ => {}
     }
     floor(source, known, w)?;
-    model.facts(source, 0, l, w)
+    admission.facts(&model, source, l, w)
 }
 fn emit_encode(
     input: &p::Fragment,
@@ -453,6 +607,22 @@ impl PreparedFragmentEnvelopeEncode<'_> {
         let result = emit_encode(self.input, &mut w).map(|output| (output, self.facts));
         finish(w, result)
     }
+
+    /// Consume this exact token in the caller's scope. Preparation and emission
+    /// replace one contribution; the source invoice and requests are not added twice.
+    pub(crate) fn emit_in(
+        self,
+        admit: &mut impl FnMut(&FragmentEnvelopeProjectionFacts) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(EncodedFragmentEnvelope, FragmentEnvelopeProjectionFacts), Error> {
+        if !std::ptr::addr_eq(self.control, work.control()) {
+            return Err(invalid(
+                "fragment envelope emission has a different original control",
+            ));
+        }
+        admit(&self.facts)?;
+        emit_encode(self.input, work).map(|output| (output, self.facts))
+    }
 }
 pub(crate) fn prepare_fragment_envelope_encode<'a>(
     input: &'a p::Fragment,
@@ -461,12 +631,17 @@ pub(crate) fn prepare_fragment_envelope_encode<'a>(
     control: &'a dyn PureCompileControl,
 ) -> Result<PreparedFragmentEnvelopeEncode<'a>, Error> {
     let mut w = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
-    let result = preflight_encode(input, source_retained_bytes, limits, &mut w).map(|facts| {
-        PreparedFragmentEnvelopeEncode {
-            input,
-            control,
-            facts,
-        }
+    let result = preflight_encode(
+        input,
+        source_retained_bytes,
+        limits,
+        &mut EnvelopeAdmission { parent: None },
+        &mut w,
+    )
+    .map(|facts| PreparedFragmentEnvelopeEncode {
+        input,
+        control,
+        facts,
     });
     finish(w, result)
 }
@@ -486,6 +661,22 @@ impl PreparedFragmentEnvelopeDecode<'_> {
         let result = emit_decode(self.input, &mut w).map(|output| (output, self.facts));
         finish(w, result)
     }
+
+    /// Consume this exact token in the caller's scope. Preparation and emission
+    /// replace one contribution; the source invoice and requests are not added twice.
+    pub(crate) fn emit_in(
+        self,
+        admit: &mut impl FnMut(&FragmentEnvelopeProjectionFacts) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(DecodedFragmentEnvelope, FragmentEnvelopeProjectionFacts), Error> {
+        if !std::ptr::addr_eq(self.control, work.control()) {
+            return Err(invalid(
+                "fragment envelope emission has a different original control",
+            ));
+        }
+        admit(&self.facts)?;
+        emit_decode(self.input, work).map(|output| (output, self.facts))
+    }
 }
 pub(crate) fn prepare_fragment_envelope_decode<'a>(
     input: &'a wire::Fragment,
@@ -494,14 +685,67 @@ pub(crate) fn prepare_fragment_envelope_decode<'a>(
     control: &'a dyn PureCompileControl,
 ) -> Result<PreparedFragmentEnvelopeDecode<'a>, Error> {
     let mut w = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
-    let result = preflight_decode(input, source_retained_bytes, limits, &mut w).map(|facts| {
-        PreparedFragmentEnvelopeDecode {
-            input,
-            control,
-            facts,
-        }
+    let result = preflight_decode(
+        input,
+        source_retained_bytes,
+        limits,
+        &mut EnvelopeAdmission { parent: None },
+        &mut w,
+    )
+    .map(|facts| PreparedFragmentEnvelopeDecode {
+        input,
+        control,
+        facts,
     });
     finish(w, result)
+}
+
+/// Borrow the exact original header and the caller's control/work owner.
+pub(crate) fn prepare_fragment_envelope_encode_in<'a, 'control: 'a>(
+    input: &'a p::Fragment,
+    source_retained_bytes: usize,
+    limits: FragmentEnvelopeProjectionLimits,
+    admit: &mut impl FnMut(&FragmentEnvelopeProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedFragmentEnvelopeEncode<'a>, Error> {
+    let facts = preflight_encode(
+        input,
+        source_retained_bytes,
+        limits,
+        &mut EnvelopeAdmission {
+            parent: Some(admit),
+        },
+        work,
+    )?;
+    Ok(PreparedFragmentEnvelopeEncode {
+        input,
+        control: work.control(),
+        facts,
+    })
+}
+
+/// Borrow the exact original header and the caller's control/work owner.
+pub(crate) fn prepare_fragment_envelope_decode_in<'a, 'control: 'a>(
+    input: &'a wire::Fragment,
+    source_retained_bytes: usize,
+    limits: FragmentEnvelopeProjectionLimits,
+    admit: &mut impl FnMut(&FragmentEnvelopeProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedFragmentEnvelopeDecode<'a>, Error> {
+    let facts = preflight_decode(
+        input,
+        source_retained_bytes,
+        limits,
+        &mut EnvelopeAdmission {
+            parent: Some(admit),
+        },
+        work,
+    )?;
+    Ok(PreparedFragmentEnvelopeDecode {
+        input,
+        control: work.control(),
+        facts,
+    })
 }
 #[cfg(test)]
 #[path = "physical_fragment_envelope_v2/tests.rs"]

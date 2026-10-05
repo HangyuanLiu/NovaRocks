@@ -1158,3 +1158,6 @@ fn owned_expression_arena_enters_actual_sparse_fragment_construction() {
         })
     );
 }
+
+#[path = "materialize_owned_tests.rs"]
+mod caller_owned_tests;

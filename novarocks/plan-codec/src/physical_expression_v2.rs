@@ -29,21 +29,26 @@ use std::fmt;
 mod kind;
 mod materialize;
 mod namespace;
+mod owner_admission;
 mod read;
 mod receiving_grammar;
 pub use materialize::{
     MaterializedExpressions, PreparedExpressionMaterialization, materialize_expressions,
-    prepare_expression_materialization,
+    materialize_expressions_in, prepare_expression_materialization,
+    prepare_expression_materialization_in,
 };
 
 pub use namespace::{
     EncodedExpressions, ExpressionNamespaceWriteFacts, ExpressionProjectionLimits,
     ExpressionTypeIds, PreparedExpressionNamespaceWrite, encode_expression_definitions,
-    prepare_expression_definitions,
+    prepare_expression_definitions, prepare_expression_definitions_in,
 };
 
 pub(crate) use namespace::tree_lookup_work as expression_tree_lookup_work;
-pub use read::{DecodedExpressions, ExpressionNamespaceReadFacts, decode_expression_definitions};
+pub use read::{
+    DecodedExpressions, ExpressionNamespaceReadFacts, decode_expression_definitions,
+    decode_expression_definitions_in,
+};
 
 #[derive(Debug)]
 pub enum ExpressionCodecError {

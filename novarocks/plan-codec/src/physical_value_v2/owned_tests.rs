@@ -720,3 +720,140 @@ fn observed_nested_dictionary_requests_are_admitted_at_the_original_clone_prefix
         assert_eq!(control.trace(), at_refusal);
     }
 }
+
+#[test]
+fn original_decoded_values_header_floor_has_no_observer_and_keeps_dictionary_backing() {
+    fixture(
+        |control, _, inputs, payloads, decoded_payloads, types, decoded_types| {
+            let encoded = encode_values(inputs, payloads, types, SOURCE, limits()).unwrap();
+            let decoded = decode_values(
+                encoded.as_wire(),
+                decoded_payloads,
+                decoded_types,
+                SOURCE,
+                limits(),
+            )
+            .unwrap();
+            let expected = decoded.retained_invoice_floor().unwrap();
+            assert!(
+                expected
+                    >= SOURCE
+                        + size_of::<DecodedValues<'_, '_, '_>>()
+                        + size_of::<usize>()
+                        + size_of::<p::ValueDef>()
+                        + 2 * size_of::<DataType>()
+            );
+            for cause in CAUSES {
+                control.arm(Some((1, cause)));
+                let mut work =
+                    CompileCheckpoints::try_new(control, CompilePhase::Validate).unwrap();
+                for _ in 0..255 {
+                    work.step().unwrap();
+                }
+                let before = control.trace();
+                assert_eq!(decoded.retained_floor_header_admitted().unwrap(), expected);
+                assert_eq!(control.trace(), before);
+                assert!(
+                    matches!(decoded.retained_floor_observed(&mut work), Err(Error::Control(actual)) if actual == cause)
+                );
+                assert_eq!(
+                    control.trace(),
+                    [(CompilePhase::Validate, 0), (CompilePhase::Validate, 256)]
+                );
+            }
+        },
+    );
+}
+
+#[test]
+fn actual_value_capture_keeps_original_loans_and_admits_before_matched_quantum() {
+    fixture(
+        |control, value, inputs, payloads, decoded_payloads, types, decoded_types| {
+            let encoded = encode_values(inputs, payloads, types, SOURCE, limits()).unwrap();
+            let decoded = decode_values(
+                encoded.as_wire(),
+                decoded_payloads,
+                decoded_types,
+                SOURCE,
+                limits(),
+            )
+            .unwrap();
+            for receiving in [false, true] {
+                for id in [u32::MAX, 0] {
+                    control.arm(None);
+                    let mut work =
+                        CompileCheckpoints::try_new(control, CompilePhase::Validate).unwrap();
+                    let plain = if receiving {
+                        decoded.value_observed(id, &mut work)
+                    } else {
+                        encoded.value_observed(id, &mut work)
+                    };
+                    let expected = finish(plain, work).unwrap();
+                    let trace = control.trace();
+                    control.arm(None);
+                    let mut work =
+                        CompileCheckpoints::try_new(control, CompilePhase::Validate).unwrap();
+                    let mut captured = Vec::new();
+                    let mut capture = |actual: &p::ValueDef,
+                                       _: &mut CompileCheckpoints<'_>|
+                     -> Result<(), Error> {
+                        let original = if receiving { &decoded.values[0] } else { value };
+                        assert!(std::ptr::eq(actual, original));
+                        captured.push(actual.id.get());
+                        Ok(())
+                    };
+                    let result = if receiving {
+                        decoded.value_captured(id, &mut capture, &mut work)
+                    } else {
+                        encoded.value_captured(id, &mut capture, &mut work)
+                    };
+                    assert_eq!(finish(result, work).unwrap(), expected);
+                    assert_eq!(
+                        captured,
+                        if id == u32::MAX {
+                            vec![u32::MAX]
+                        } else {
+                            vec![]
+                        }
+                    );
+                    assert_eq!(control.trace(), trace);
+                }
+                for cause in CAUSES {
+                    for id in [u32::MAX, 0] {
+                        control.arm(Some((1, cause)));
+                        let mut work =
+                            CompileCheckpoints::try_new(control, CompilePhase::Validate).unwrap();
+                        for _ in 0..255 {
+                            work.step().unwrap();
+                        }
+                        let mut capture = |actual: &p::ValueDef,
+                                           _: &mut CompileCheckpoints<'_>|
+                         -> Result<(), Error> {
+                            assert_eq!(actual.id.get(), u32::MAX);
+                            Err(CompileControlError::ResourceExhausted.into())
+                        };
+                        let result = if receiving {
+                            decoded.value_captured(id, &mut capture, &mut work)
+                        } else {
+                            encoded.value_captured(id, &mut capture, &mut work)
+                        };
+                        let expected = if id == u32::MAX {
+                            CompileControlError::ResourceExhausted
+                        } else {
+                            cause
+                        };
+                        assert!(
+                            matches!(finish(result, work), Err(Error::Control(actual)) if actual == expected)
+                        );
+                        let expected_trace = if id == u32::MAX {
+                            vec![(CompilePhase::Validate, 0)]
+                        } else {
+                            vec![(CompilePhase::Validate, 0), (CompilePhase::Validate, 256)]
+                        };
+                        assert_eq!(control.trace(), expected_trace);
+                    }
+                }
+            }
+        },
+    );
+}

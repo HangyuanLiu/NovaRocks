@@ -30,10 +30,6 @@ pub(super) fn add(left: usize, right: usize) -> Result<usize, BindingCodecError>
     left.checked_add(right)
         .ok_or_else(|| invalid("binding projection arithmetic overflow"))
 }
-fn mul(left: usize, right: usize) -> Result<usize, BindingCodecError> {
-    left.checked_mul(right)
-        .ok_or_else(|| invalid("binding projection arithmetic overflow"))
-}
 fn names<'a>(source: BindingSource<'a>) -> (&'a str, &'a str) {
     match source {
         BindingSource::Scalar(value) => (value.function_id.as_str(), value.overload.as_str()),
@@ -502,7 +498,23 @@ pub(crate) fn verify_scalar_signature(
     max_work: usize,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<VerifiedSignature, BindingCodecError> {
-    let result = verify_signature_inner(left, right, source, max_work, work);
+    let result = verify_signature_inner(left, right, source, max_work, None, work);
+    if matches!(&result, Err(BindingCodecError::Control(_))) {
+        return result;
+    }
+    work.flush()?;
+    result
+}
+/// Cumulative same-signature comparison facts before each original observation.
+pub(crate) fn verify_scalar_signature_admitted(
+    left: &BoundFunction,
+    right: &BoundFunction,
+    source: usize,
+    max_work: usize,
+    admit: &mut dyn FnMut(usize) -> Result<(), BindingCodecError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<VerifiedSignature, BindingCodecError> {
+    let result = verify_signature_inner(left, right, source, max_work, Some(admit), work);
     if matches!(&result, Err(BindingCodecError::Control(_))) {
         return result;
     }
@@ -514,9 +526,37 @@ fn verify_signature_inner(
     right: &BoundFunction,
     source: usize,
     max_work: usize,
+    mut admit: Option<&mut dyn FnMut(usize) -> Result<(), BindingCodecError>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<VerifiedSignature, BindingCodecError> {
+    let observed = admit.is_some();
+    let policy = Policy(observed);
+    let add = |a, b| policy.add(a, b, "binding projection arithmetic overflow");
+    let mul = |a, b| policy.mul(a, b, "binding projection arithmetic overflow");
+    let gate =
+        |bound: usize,
+         parent: &mut Option<&mut dyn FnMut(usize) -> Result<(), BindingCodecError>>| {
+            if let Some(parent) = parent.as_mut() {
+                if bound > max_work {
+                    return Err(CompileControlError::ResourceExhausted.into());
+                }
+                parent(bound)?;
+            }
+            Ok::<_, BindingCodecError>(())
+        };
     let same = std::ptr::eq(left, right);
+    let mut bound = 8usize;
+    if observed {
+        for name in [
+            left.function_id.as_str(),
+            right.function_id.as_str(),
+            left.overload.as_str(),
+            right.overload.as_str(),
+        ] {
+            bound = add(bound, name.len())?;
+        }
+        gate(if same { 1 } else { bound }, &mut admit)?;
+    }
     work.step()?;
     let headers = if same {
         size_of::<BoundFunction>()
@@ -537,14 +577,15 @@ fn verify_signature_inner(
             work: 1,
         });
     }
-    let mut bound = 8usize;
-    for name in [
-        left.function_id.as_str(),
-        right.function_id.as_str(),
-        left.overload.as_str(),
-        right.overload.as_str(),
-    ] {
-        bound = add(bound, name.len())?;
+    if !observed {
+        for name in [
+            left.function_id.as_str(),
+            right.function_id.as_str(),
+            left.overload.as_str(),
+            right.overload.as_str(),
+        ] {
+            bound = add(bound, name.len())?;
+        }
     }
     for argument in left
         .argument_types
@@ -558,6 +599,7 @@ fn verify_signature_inner(
             } => add(parameter_types.len(), 1)?,
         };
         bound = add(bound, mul(count, 4)?)?;
+        gate(bound, &mut admit)?;
         work.step()?;
     }
     if bound > max_work {
@@ -590,8 +632,26 @@ fn verify_signature_inner(
             let remaining = max_work
                 .checked_sub(facts.work)
                 .ok_or_else(|| invalid("binding signature work exceeds its envelope"))?;
-            let compared = verify_type_binding(left, right, source, remaining, work)?;
-            facts.work = add(facts.work, compared.work_upper_bound())?;
+            let base = facts.work;
+            let compared = if let Some(parent) = admit.as_mut() {
+                crate::borrowed_type_resources::verify_type_binding_admitted(
+                    left,
+                    right,
+                    source,
+                    remaining,
+                    &mut |prefix| {
+                        let total = add(base, prefix.work_upper_bound())?;
+                        if total > max_work {
+                            return Err(CompileControlError::ResourceExhausted.into());
+                        }
+                        parent(total)
+                    },
+                    work,
+                )?
+            } else {
+                verify_type_binding(left, right, source, remaining, work)?
+            };
+            facts.work = add(base, compared.work_upper_bound())?;
             Ok(compared.matches())
         };
     for (left, right) in left.argument_types.iter().zip(&right.argument_types) {

@@ -691,3 +691,6 @@ fn provider_read_namespace_consumes_joint_read_write_ids_without_rebinding_read_
         );
     }
 }
+
+#[path = "tests/caller_owned_tests.rs"]
+mod caller_owned_tests;

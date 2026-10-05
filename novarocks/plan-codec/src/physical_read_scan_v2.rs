@@ -1405,7 +1405,7 @@ fn same_control(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), E> {
     observed(
-        if std::ptr::eq(actual, work.control()) {
+        if std::ptr::addr_eq(actual, work.control()) {
             Ok(())
         } else {
             Err(E::InvalidShape(

@@ -653,3 +653,7 @@ fn aggregate_materialization_wide_actual_320_arguments_and_consumed_emit_prefixe
         }
     }
 }
+
+mod owner_tests {
+    include!("owner_tests.rs");
+}

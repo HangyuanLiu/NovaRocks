@@ -582,6 +582,7 @@ fn joint_provider_known_facts_gate_precedes_pending_quantum_and_read_facade_trac
     // This isolates the numerical author's known-facts boundary, not a forged
     // source namespace or a claim about callbacks inside standard libraries.
     let requests = Requests {
+        observed: false,
         count: 10,
         bytes: 256,
     };
@@ -600,11 +601,13 @@ fn joint_provider_known_facts_gate_precedes_pending_quantum_and_read_facade_trac
                 2,
                 30,
                 Requests {
+                    observed: false,
                     count: 10,
                     bytes: 256,
                 },
                 SOURCE,
                 under(exact(known), axis),
+                &mut None,
                 &mut work,
             );
             assert!(matches!(
@@ -624,11 +627,13 @@ fn joint_provider_known_facts_gate_precedes_pending_quantum_and_read_facade_trac
             2,
             30,
             Requests {
+                observed: false,
                 count: 10,
                 bytes: 256
             },
             SOURCE,
             exact(known),
+            &mut None,
             &mut work
         )
         .unwrap(),

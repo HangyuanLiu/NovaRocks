@@ -75,6 +75,35 @@ pub(crate) fn preflight_scalar_signature_copy_counts(
 ) -> Result<(), BindingCodecError> {
     preflight_scalar_signature_copy_counts_core(source, model, limits, None, work)
 }
+/// Same collection/type authors, borrowing a containing binding admission.
+pub(crate) fn preflight_scalar_signature_copy_in(
+    source: &BoundFunction,
+    model: &mut MaterializationModel,
+    limits: BindingProjectionLimits,
+    admit: &mut super::owner_admission::Admit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), BindingCodecError> {
+    preflight_scalar_signature_copy_counts_in(source, model, limits, admit, work)?;
+    preflight_scalar_signature_copy_types_in(source, model, limits, admit, work)
+}
+pub(crate) fn preflight_scalar_signature_copy_counts_in(
+    source: &BoundFunction,
+    model: &mut MaterializationModel,
+    limits: BindingProjectionLimits,
+    admit: &mut super::owner_admission::Admit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), BindingCodecError> {
+    preflight_scalar_signature_copy_counts_core(source, model, limits, Some(admit), work)
+}
+pub(crate) fn preflight_scalar_signature_copy_types_in(
+    source: &BoundFunction,
+    model: &mut MaterializationModel,
+    limits: BindingProjectionLimits,
+    admit: &mut super::owner_admission::Admit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), BindingCodecError> {
+    preflight_scalar_signature_copy_types_core(source, model, limits, Some(admit), work)
+}
 fn preflight_scalar_signature_copy_counts_core(
     source: &BoundFunction,
     model: &mut MaterializationModel,

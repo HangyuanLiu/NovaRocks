@@ -501,8 +501,8 @@ pub fn encode_writer_recipes_observed(
     let mut model = Model::new::<wire::FrozenWriterRecipe>(sources.len(), source)?;
     model.gate(limits, admit)?;
     observed(
-        if std::ptr::eq(work.control(), context.bindings.original_control())
-            && std::ptr::eq(work.control(), context.payloads.original_control())
+        if std::ptr::addr_eq(work.control(), context.bindings.original_control())
+            && std::ptr::addr_eq(work.control(), context.payloads.original_control())
         {
             Ok(())
         } else {
@@ -654,8 +654,8 @@ pub fn decode_writer_recipes_observed(
     let mut model = Model::new::<(NodeId, ConnectorWriteRecipeDraft)>(definitions.len(), source)?;
     model.gate(limits, admit)?;
     observed(
-        if std::ptr::eq(work.control(), context.bindings.original_control())
-            && std::ptr::eq(work.control(), context.payloads.original_control())
+        if std::ptr::addr_eq(work.control(), context.bindings.original_control())
+            && std::ptr::addr_eq(work.control(), context.payloads.original_control())
         {
             Ok(())
         } else {

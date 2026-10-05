@@ -987,3 +987,121 @@ fn schema_field_lookup_preserves_every_actual_opaque_boundary_control_cause() {
         }
     }
 }
+
+#[test]
+fn captured_original_root_lookup_keeps_sparse_identity_and_plain_control_trace() {
+    let roots = [
+        (
+            u32::MAX,
+            FunctionValueType::new(
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int64)),
+                true,
+            ),
+        ),
+        (0, FunctionValueType::new(DataType::Int64, true)),
+    ];
+    let table = encode_type_table_sources(&roots, &[], limits(), &Control::default()).unwrap();
+    for id in [0, u32::MAX, 3] {
+        let plain = Control::default();
+        let mut work = CompileCheckpoints::try_new(&plain, CompilePhase::LowerProgram).unwrap();
+        let expected = table.value_type_observed(id, &mut work).unwrap();
+        work.finish().unwrap();
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+        let mut captured = None;
+        let actual = table
+            .value_type_captured::<TypeCodecError>(
+                id,
+                &mut |value, _| {
+                    captured = Some(value);
+                    Ok(())
+                },
+                &mut work,
+            )
+            .unwrap();
+        work.finish().unwrap();
+        let source = roots
+            .iter()
+            .find(|(candidate, _)| *candidate == id)
+            .map(|(_, value)| value);
+        assert!(match (actual, source) {
+            (Some(actual), Some(source)) => std::ptr::eq(actual, source),
+            (None, None) => true,
+            _ => false,
+        });
+        assert!(match (actual, expected, captured) {
+            (Some(a), Some(b), Some(c)) => std::ptr::eq(a, b) && std::ptr::eq(a, c),
+            (None, None, None) => true,
+            _ => false,
+        });
+        assert_eq!(
+            *control.events.lock().unwrap(),
+            *plain.events.lock().unwrap()
+        );
+    }
+}
+#[test]
+fn captured_root_known_refusal_precedes_matched_completed_quantum() {
+    let roots = [(
+        u32::MAX,
+        FunctionValueType::new(
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int64)),
+            true,
+        ),
+    )];
+    let table = encode_type_table_sources(&roots, &[], limits(), &Control::default()).unwrap();
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        let control = Control {
+            fail: Some((2, cause)),
+            ..Control::default()
+        };
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+        // A pending caller seam, not synthetic completed type-comparison work.
+        for _ in 0..255 {
+            work.step().unwrap();
+        }
+        let result = table.value_type_captured::<TypeCodecError>(
+            u32::MAX,
+            &mut |value, _| {
+                assert!(std::ptr::eq(value, &roots[0].1));
+                Err(CompileControlError::ResourceExhausted.into())
+            },
+            &mut work,
+        );
+        assert!(matches!(
+            result,
+            Err(TypeCodecError::Control(
+                CompileControlError::ResourceExhausted
+            ))
+        ));
+        assert_eq!(
+            *control.events.lock().unwrap(),
+            [(CompilePhase::LowerProgram, 0)]
+        );
+        let control = Control {
+            fail: Some((2, cause)),
+            ..Control::default()
+        };
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+        for _ in 0..255 {
+            work.step().unwrap();
+        }
+        let missing = table.value_type_captured::<TypeCodecError>(
+            0,
+            &mut |_, _| panic!("unmatched root must not be captured"),
+            &mut work,
+        );
+        assert!(matches!(missing, Err(TypeCodecError::Control(actual)) if actual == cause));
+        assert_eq!(
+            *control.events.lock().unwrap(),
+            [
+                (CompilePhase::LowerProgram, 0),
+                (CompilePhase::LowerProgram, 256)
+            ]
+        );
+    }
+}

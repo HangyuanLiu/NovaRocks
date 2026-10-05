@@ -15,11 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::physical_binding_v2::owner_admission::Admit;
 use crate::{
     physical_binding_v2::{
         BindingCodecError, BindingProjectionLimits, MaterializationModel, add, completed,
         copy_scalar_signature_observed, preflight_scalar_signature_copy_counts,
-        preflight_scalar_signature_copy_types,
+        preflight_scalar_signature_copy_counts_in, preflight_scalar_signature_copy_types,
+        preflight_scalar_signature_copy_types_in,
     },
     physical_type_v2::clone_value_type_observed,
 };
@@ -66,24 +68,87 @@ pub(crate) fn preflight_aggregate_binding_copy_counts(
     limits: BindingProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
-    model.check(limits)?;
-    header(source, work)?;
-    // Admit the intermediate root and state identity before any clone grammar.
-    // The original signature helper admits all of its own argument/result roots.
-    model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
-    model.request::<u8>(source.state_format.as_str().len(), 1)?;
-    model.check(limits)?;
-    preflight_scalar_signature_copy_counts(&source.function, model, limits, work)
+    counts_core(source, model, limits, None, work)
 }
-
+pub(crate) fn preflight_aggregate_binding_copy_in(
+    source: &AggregateBinding,
+    model: &mut MaterializationModel,
+    limits: BindingProjectionLimits,
+    admit: &mut Admit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), BindingCodecError> {
+    preflight_aggregate_binding_copy_counts_in(source, model, limits, admit, work)?;
+    preflight_aggregate_binding_copy_types_in(source, model, limits, admit, work)
+}
+pub(crate) fn preflight_aggregate_binding_copy_counts_in(
+    source: &AggregateBinding,
+    model: &mut MaterializationModel,
+    limits: BindingProjectionLimits,
+    admit: &mut Admit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), BindingCodecError> {
+    counts_core(source, model, limits, Some(admit), work)
+}
+fn counts_core(
+    source: &AggregateBinding,
+    model: &mut MaterializationModel,
+    limits: BindingProjectionLimits,
+    mut admit: Option<&mut Admit<'_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), BindingCodecError> {
+    if admit.is_some() {
+        model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
+        model.request::<u8>(source.state_format.as_str().len(), 1)?;
+    }
+    model.check(limits)?;
+    if let Some(parent) = admit.as_mut() {
+        parent(&model.facts)?;
+    }
+    header(source, work)?;
+    if admit.is_none() {
+        model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
+        model.request::<u8>(source.state_format.as_str().len(), 1)?;
+    }
+    model.check(limits)?;
+    if let Some(parent) = admit {
+        parent(&model.facts)?;
+        preflight_scalar_signature_copy_counts_in(&source.function, model, limits, parent, work)
+    } else {
+        preflight_scalar_signature_copy_counts(&source.function, model, limits, work)
+    }
+}
 pub(crate) fn preflight_aggregate_binding_copy_types(
     source: &AggregateBinding,
     model: &mut MaterializationModel,
     limits: BindingProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
-    preflight_scalar_signature_copy_types(&source.function, model, limits, work)?;
-    model.count_owned_type_clone(&source.intermediate_type, limits, work)?;
+    types_core(source, model, limits, None, work)
+}
+pub(crate) fn preflight_aggregate_binding_copy_types_in(
+    source: &AggregateBinding,
+    model: &mut MaterializationModel,
+    limits: BindingProjectionLimits,
+    admit: &mut Admit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), BindingCodecError> {
+    types_core(source, model, limits, Some(admit), work)
+}
+fn types_core(
+    source: &AggregateBinding,
+    model: &mut MaterializationModel,
+    limits: BindingProjectionLimits,
+    admit: Option<&mut Admit<'_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), BindingCodecError> {
+    if let Some(parent) = admit {
+        preflight_scalar_signature_copy_types_in(&source.function, model, limits, parent, work)?;
+        model.count_owned_type_clone_in(&source.intermediate_type, limits, parent, work)?;
+        model.check_admitted(limits, parent)?;
+    } else {
+        preflight_scalar_signature_copy_types(&source.function, model, limits, work)?;
+        model.count_owned_type_clone(&source.intermediate_type, limits, work)?;
+    }
     work.step()?;
     model.check(limits)
 }

@@ -303,6 +303,31 @@ impl Fixture {
         caps: ExpressionProjectionLimits,
         consume: impl FnOnce(PreparedExpressionNamespaceWrite<'_, '_, '_>) -> Result<T, Error>,
     ) -> Result<T, Error> {
+        self.with_sources(|types, functions, aggregates, input| {
+            let prepared = prepare_expression_definitions(
+                &self.arena,
+                input,
+                types,
+                functions,
+                aggregates,
+                &self.parameters,
+                &self.pools,
+                source,
+                caps,
+                control,
+            )?;
+            consume(prepared)
+        })
+    }
+    fn with_sources<T>(
+        &self,
+        consume: impl FnOnce(
+            &EncodedTypeTable<'_>,
+            &EncodedFunctionBindings<'_, '_>,
+            &EncodedAggregateBindings<'_, '_>,
+            &[ExpressionTypeIds<'_>],
+        ) -> T,
+    ) -> T {
         // These original namespace owners are constructed on a separate setup
         // control. Only the actual expression prepare/emit trace is replayed.
         let types = encode_type_table_sources(&self.roots, &[], type_limits(), &Setup).unwrap();
@@ -369,19 +394,12 @@ impl Fixture {
                 aggregate_binding_id: x.aggregate,
             })
             .collect::<Vec<_>>();
-        let prepared = prepare_expression_definitions(
-            &self.arena,
-            &input,
+        consume(
             other_types.as_ref().unwrap_or(&types),
             other_functions.as_ref().unwrap_or(&functions),
             &aggregates,
-            &self.parameters,
-            &self.pools,
-            source,
-            caps,
-            control,
-        )?;
-        consume(prepared)
+            &input,
+        )
     }
 }
 fn policy() -> ConstantPolicy {
@@ -1518,3 +1536,6 @@ fn namespace_real_wide_lists_and_definitions_reject_original_quantum_without_rep
         }
     }
 }
+
+#[path = "namespace_owned_tests.rs"]
+mod caller_owned_tests;
