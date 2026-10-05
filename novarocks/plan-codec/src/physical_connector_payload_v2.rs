@@ -33,12 +33,7 @@ use novarocks_proto_models::{catalog, connector_common as dto, physical_package_
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
 };
-use std::{
-    alloc::Layout,
-    fmt,
-    mem::{align_of, size_of},
-    sync::atomic::AtomicUsize,
-};
+use std::{alloc::Layout, fmt, mem::size_of};
 
 #[derive(Clone, Copy, Debug)]
 pub struct ConnectorPayloadProjectionLimits {
@@ -182,26 +177,12 @@ pub(crate) fn arc_u8_slice_bytes(n: usize) -> Result<usize, Error> {
     // followed by byte-aligned str/[u8] data. From<&str>/From<&[u8]>
     // allocate once, without an intermediate String or Vec.
     let data = Layout::array::<u8>(n).map_err(|_| invalid("connector identity layout overflow"))?;
-    Layout::new::<[AtomicUsize; 2]>()
-        .extend(data)
-        .map(|(layout, _)| layout.pad_to_align().size())
+    novarocks_type_contract::owned_resources::layout::arc_layout(data)
+        .map(|layout| layout.size())
         .map_err(|_| invalid("connector identity Arc layout overflow"))
 }
 pub(crate) fn bytes_shared_upper() -> Result<usize, Error> {
-    // bytes 1.11.0 bytes.rs From<Vec> reuses the payload allocation. If
-    // allocator capacity exceeds length it additionally boxes Shared. Shared
-    // is repr(Rust), so field sizes plus per-field padding are an UPPER bound,
-    // never an exact private-layout mirror. Equal-capacity/empty paths allocate
-    // no Shared. No later clone of the produced Bytes occurs in this author.
-    let alignment = align_of::<*mut u8>()
-        .max(align_of::<usize>())
-        .max(align_of::<AtomicUsize>());
-    let fields = add(
-        add(size_of::<*mut u8>(), size_of::<usize>())?,
-        size_of::<AtomicUsize>(),
-    )?;
-    Layout::from_size_align(add(fields, mul(alignment - 1, 3)?)?, alignment)
-        .map(|layout| layout.pad_to_align().size())
+    novarocks_type_contract::owned_resources::layout::bytes_shared_upper()
         .map_err(|_| invalid("connector Bytes shared layout overflow"))
 }
 #[derive(Default)]

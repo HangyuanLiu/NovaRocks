@@ -15,8 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The build owner validates the actual locked bytes source before admitting
-//! this request model. Runtime hooks inspect only its fixed-size build receipt;
-//! they never scan Cargo metadata or claim live bytes, allocator cost or MEM.
+//! Shared numerical request projections and borrowed compile-work copying.
+//! These source models provide no allocator, live-byte, CPU or MEM grant.
+//! Admission and truthful retained-source invoices belong to each caller.
 
-pub(crate) use novarocks_type_contract::owned_resources::profile::require_locked_bytes_request_model;
+#[cfg(test)]
+mod bytes_profile;
+pub mod copy;
+pub mod hashmap;
+pub mod layout;
+pub mod profile;

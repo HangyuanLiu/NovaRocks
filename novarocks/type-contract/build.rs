@@ -16,30 +16,30 @@
 // under the License.
 
 use std::{env, process::Command};
-#[path = "src/byte_request_model_profile.rs"]
+#[path = "src/owned_resources/bytes_profile.rs"]
 mod byte_request_model_profile;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=RUSTC");
     println!("cargo:rerun-if-changed=../../rust-toolchain.toml");
     println!("cargo:rerun-if-changed=../../Cargo.lock");
-    println!("cargo:rerun-if-changed=src/byte_request_model_profile.rs");
+    println!("cargo:rerun-if-changed=src/owned_resources/bytes_profile.rs");
     assert!(
         byte_request_model_profile::locked_bytes_matches(include_bytes!("../../Cargo.lock")),
-        "plan-codec bytes request model requires re-audit after a locked source change"
+        "owned-resource bytes request model requires re-audit after a locked source change"
     );
-    println!("cargo:rustc-env=NOVAROCKS_PLAN_CODEC_RESOURCE_BYTES=1.11.0");
+    println!("cargo:rustc-env=NOVAROCKS_OWNED_RESOURCE_BYTES=1.11.0");
     let compiler = env::var_os("RUSTC").expect("Cargo must provide RUSTC");
     let result = Command::new(compiler)
         .arg("--version")
         .output()
-        .expect("failed to inspect the actual plan-codec compiler");
+        .expect("failed to inspect the actual owned-resource compiler");
     // Arc allocation layout and Vec/String growth requests in the supported
     // resource model are derived from this exact standard-library source.
     // A +toolchain override must not silently compile an unreviewed model.
     assert!(
         result.status.success() && result.stdout.starts_with(b"rustc 1.92.0 "),
-        "plan-codec resource allocation model requires the audited Rust 1.92.0 compiler"
+        "owned-resource allocation model requires the audited Rust 1.92.0 compiler"
     );
-    println!("cargo:rustc-env=NOVAROCKS_PLAN_CODEC_RESOURCE_RUST=1.92.0");
+    println!("cargo:rustc-env=NOVAROCKS_OWNED_RESOURCE_RUST=1.92.0");
 }

@@ -19,7 +19,7 @@ use super::*;
 #[path = "source_reference_tests.rs"]
 mod source_reference_tests;
 use novarocks_connector_contract::ConnectorCodecCategory;
-use std::sync::Mutex;
+use std::sync::{Mutex, atomic::AtomicUsize};
 const SOURCE: usize = 1024 * 1024;
 const CAUSES: [CompileControlError; 3] = [
     CompileControlError::Cancelled,

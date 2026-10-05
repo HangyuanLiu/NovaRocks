@@ -224,3 +224,133 @@ fn string_work_has_independent_collision_oracle_and_deleted_source_invoice_bound
     // Public capacity is deliberately not an input; neither iterator output
     // length nor an empty table licenses omitting retained bucket scan work.
 }
+
+#[derive(Debug, Eq, PartialEq)]
+enum HashEvent {
+    Length(usize),
+    Bytes(Vec<u8>),
+}
+#[derive(Default)]
+struct RecordingHasher {
+    events: Vec<HashEvent>,
+}
+impl Hasher for RecordingHasher {
+    fn finish(&self) -> u64 {
+        0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        self.events.push(HashEvent::Bytes(bytes.to_vec()));
+    }
+    fn write_usize(&mut self, value: usize) {
+        self.events.push(HashEvent::Length(value));
+    }
+}
+#[test]
+fn fixed_array_hash_uses_actual_length_32_and_bytes_without_string_sentinel() {
+    use std::hash::{BuildHasher, Hash};
+    let key: [u8; 32] = std::array::from_fn(|i| i as u8);
+    let mut hasher = RecordingHasher::default();
+    key.hash(&mut hasher);
+    assert_eq!(
+        hasher.events,
+        [HashEvent::Length(32), HashEvent::Bytes((0..32).collect())]
+    );
+    // Actual RandomState delegates the same array and slice Hash bodies. This
+    // is a value oracle, not observation inside SipHasher or a seed grant.
+    let state = std::collections::hash_map::RandomState::new();
+    assert_eq!(state.hash_one(key), state.hash_one(key.as_slice()));
+    let mut other = key;
+    other[31] = 255;
+    assert_ne!(key, other);
+    assert_eq!(key, std::array::from_fn(|i| i as u8));
+}
+
+#[test]
+fn fixed_array_geometry_and_total_collision_unique_inserts_have_independent_goldens() {
+    let group = group_layout().unwrap().size();
+    assert_eq!(Layout::new::<([u8; 32], usize)>().size(), 40);
+    assert_eq!(Layout::new::<([u8; 32], usize)>().align(), 8);
+    for (count, buckets) in [(3, 4), (14, 16), (15, 32), (29, 64)] {
+        let table = fresh_table_layout::<[u8; 32], usize>(count).unwrap();
+        let align = group.max(8);
+        let pairs = (40 * buckets + align - 1) & !(align - 1);
+        let golden = Layout::from_size_align(pairs + buckets + group, align).unwrap();
+        assert_eq!(table.buckets, buckets);
+        assert_eq!(table.layout, Some(golden));
+        assert_eq!(table.request_bytes_upper_bound, golden.size());
+        assert_eq!(table.allocation_requests_upper_bound, 1);
+        let mut ordinary = HashMap::<[u8; 32], usize>::new();
+        let mut collisions =
+            HashMap::<[u8; 32], usize, BuildHasherDefault<CollisionHasher>>::default();
+        ordinary.try_reserve(count).unwrap();
+        collisions.try_reserve(count).unwrap();
+        let capacity = ordinary.capacity();
+        assert_eq!(collisions.capacity(), capacity);
+        for i in 0..count {
+            let mut key = [0; 32];
+            key[31] = i as u8;
+            assert_eq!(ordinary.insert(key, i), None);
+            assert_eq!(collisions.insert(key, i), None);
+            assert_eq!(ordinary.capacity(), capacity);
+            assert_eq!(collisions.capacity(), capacity);
+        }
+        for i in 0..count {
+            let mut key = [0; 32];
+            key[31] = i as u8;
+            assert_eq!(ordinary.get(&key), Some(&i));
+            assert_eq!(collisions.get(&key), Some(&i));
+        }
+        let hash = count * (256 + 64 * (8 + 32));
+        let comparisons = count * (buckets + group) * (32 + 2 * 32);
+        assert_eq!(
+            fresh_byte_array32_table_work_upper_bound::<usize>(count).unwrap(),
+            buckets + group + count * 40 + hash + comparisons
+        );
+        assert!(comparisons >= count * (count - 1) / 2 * 32);
+        // The custom hasher witnesses collisions/table growth only; none of
+        // its user code is admitted by the RandomState operation work author.
+    }
+    assert_eq!(
+        fresh_table_layout::<[u8; 32], usize>(0).unwrap(),
+        FreshTableFacts {
+            layout: None,
+            buckets: 0,
+            allocation_requests_upper_bound: 0,
+            request_bytes_upper_bound: 0,
+        }
+    );
+    assert_eq!(
+        fresh_byte_array32_table_work_upper_bound::<usize>(0).unwrap(),
+        0
+    );
+}
+
+#[test]
+fn fixed_array_work_exact_extent_one_over_monotonicity_and_overflows_are_pure_arithmetic() {
+    let group = group_layout().unwrap().size();
+    let golden = 3 * (256 + 64 * 40) + 3 * (4 + group) * 96;
+    assert_eq!(
+        byte_array32_operations_work_upper_bound(4, 3).unwrap(),
+        golden
+    );
+    assert_eq!(byte_array32_operations_work_upper_bound(4, 0).unwrap(), 0);
+    assert!(byte_array32_operations_work_upper_bound(5, 3).unwrap() > golden);
+    assert!(byte_array32_operations_work_upper_bound(4, 4).unwrap() > golden);
+    // No huge table is allocated: this is the checked numerical extent of the
+    // actual one-operation formula, including all potential collision probes.
+    let hash = 256 + 64 * 40;
+    let exact_buckets = (usize::MAX - hash) / 96 - group;
+    assert_eq!(
+        byte_array32_operations_work_upper_bound(exact_buckets, 1).unwrap(),
+        hash + (exact_buckets + group) * 96
+    );
+    for result in [
+        byte_array32_operations_work_upper_bound(exact_buckets + 1, 1),
+        byte_array32_operations_work_upper_bound(usize::MAX, 1),
+        byte_array32_operations_work_upper_bound(4, usize::MAX),
+        fresh_byte_array32_table_work_upper_bound::<usize>(usize::MAX),
+        fresh_byte_array32_table_work_upper_bound::<[u8; 1024]>(isize::MAX as usize / 1024),
+    ] {
+        assert!(matches!(result, Err(Arithmetic(_))));
+    }
+}

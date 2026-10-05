@@ -35,7 +35,7 @@ use arrow::{
 use arrow_buffer::{Buffer, MutableBuffer};
 use novarocks_constant_contract::ConstantPool;
 use novarocks_type_contract::CompileCheckpoints;
-use std::{alloc::Layout, mem, ptr::NonNull, sync::atomic::AtomicUsize};
+use std::{alloc::Layout, mem, ptr::NonNull};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ReaderAllocationRequests {
@@ -59,17 +59,16 @@ fn array_layout<T>(count: usize) -> Result<Layout, FlatPoolResourceError> {
         .map_err(|_| invalid("flat reader container layout is not representable"))
 }
 pub(crate) fn arc_layout(payload: Layout) -> Result<Layout, FlatPoolResourceError> {
-    // Rust 1.92 alloc/sync.rs: ArcInner is repr(C, align(2)), with exactly
-    // strong/weak AtomicUsize counters followed by the actual payload.
-    let counters = Layout::new::<[AtomicUsize; 2]>();
-    let header = counters
-        .align_to(counters.align().max(2))
-        .map_err(|_| invalid("flat reader Arc header layout is not representable"))?
-        .pad_to_align();
-    header
-        .extend(payload)
-        .map(|(layout, _)| layout.pad_to_align())
-        .map_err(|_| invalid("flat reader Arc backing layout is not representable"))
+    use novarocks_type_contract::owned_resources::layout::{self, LayoutResourceError};
+    layout::arc_layout(payload).map_err(|error| match error {
+        LayoutResourceError::ArcHeader => {
+            invalid("flat reader Arc header layout is not representable")
+        }
+        LayoutResourceError::ArcBacking => {
+            invalid("flat reader Arc backing layout is not representable")
+        }
+        _ => invalid("flat reader Arc source model drift"),
+    })
 }
 
 // These fields are the locked no-pool public MutableBuffer source layout, not
@@ -113,8 +112,8 @@ pub(crate) fn environment(
             "flat reader allocation source or feature model changed",
         ));
     }
-    // The checked-in toolchain contract is not runtime introspection of a
-    // rustc +toolchain override. Build composition must enforce that contract.
+    // LOCKED_TOOLCHAIN is the common source owner's actual compiler build
+    // receipt; an unreviewed +toolchain override fails before this code builds.
     Ok(bytes)
 }
 
@@ -350,6 +349,7 @@ mod tests {
     use super::*;
     use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
 
     struct Control(Mutex<Vec<u32>>);
     impl PureCompileControl for Control {

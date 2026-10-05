@@ -56,7 +56,7 @@ mod tests {
 
     #[test]
     fn byte_request_profile_rejects_missing_upgraded_forked_and_mixed_dependencies() {
-        let lock = include_str!("../../../Cargo.lock");
+        let lock = include_str!("../../../../Cargo.lock");
         assert!(locked_bytes_matches(lock.as_bytes()));
         for (from, to) in [
             ("name = \"bytes\"", "name = \"other-bytes\""),

@@ -32,6 +32,7 @@ mod effects;
 mod function;
 mod largeint;
 mod logical;
+pub mod owned_resources;
 mod partition;
 mod schema;
 mod semantics;

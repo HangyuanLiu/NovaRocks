@@ -30,16 +30,6 @@ const fn at(source: &[u8], position: usize, needle: &[u8]) -> bool {
     }
     true
 }
-const fn contains(source: &[u8], needle: &[u8]) -> bool {
-    let mut index = 0;
-    while index < source.len() {
-        if at(source, index, needle) {
-            return true;
-        }
-        index += 1;
-    }
-    false
-}
 pub(crate) const fn locked_family(source: &[u8]) -> bool {
     let names: [&[u8]; 8] = [
         b"\nname = \"arrow\"\n",
@@ -88,10 +78,7 @@ pub(crate) const fn locked_family(source: &[u8]) -> bool {
     true
 }
 pub(crate) const LOCKED_FAMILY: bool = locked_family(include_bytes!("../../../Cargo.lock"));
-pub(crate) const LOCKED_TOOLCHAIN: bool = contains(
-    include_bytes!("../../../rust-toolchain.toml"),
-    b"\nchannel = \"1.92.0\"\n",
-);
+pub(crate) use novarocks_type_contract::owned_resources::profile::LOCKED_TOOLCHAIN;
 
 #[cfg(test)]
 mod tests {

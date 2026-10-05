@@ -36,36 +36,11 @@ fn reserve<T>(n: usize, work: &mut CompileCheckpoints<'_>) -> Result<Vec<T>, Typ
     Ok(output)
 }
 
-/// Copy actual spelling without a clone followed by estimated work. Source
-/// segments are at most 256 bytes with UTF-8 boundaries. Each actual append
-/// copies one character (at most four bytes), followed by its completed step.
-/// A step is a bounded character operation, not a promise of one byte/step.
 pub(crate) fn copy_string(
     input: &str,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<String, TypeCodecError> {
-    let mut output = String::new();
-    work.flush()?;
-    let result = output.try_reserve_exact(input.len());
-    if result.is_ok() {
-        work.step()?;
-    }
-    reserve_exit::<TypeCodecError>(result, work)?;
-    let mut start = 0;
-    while start < input.len() {
-        let mut end = start.saturating_add(256).min(input.len());
-        // UTF-8 requires at most three boundary adjustments.
-        while !input.is_char_boundary(end) {
-            end -= 1;
-            work.step()?;
-        }
-        for character in input[start..end].chars() {
-            output.push(character);
-            work.step()?;
-        }
-        start = end;
-    }
-    Ok(output)
+    novarocks_type_contract::owned_resources::copy::copy_string(input, work)
 }
 
 /// Exact UTF-8 byte lexical order, including prefix length and embedded NUL.
