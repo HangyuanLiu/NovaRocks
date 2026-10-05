@@ -1585,3 +1585,43 @@ fn argument_observed_comparison_keeps_full_lambda_and_nominal_types() {
         false,
     );
 }
+
+#[test]
+fn catalog_nonconstant_argument_keeps_concrete_neutral_carrier() {
+    let arg = FunctionArgument::Value {
+        value_type: value_type(DataType::Int64, false),
+        constant: None,
+    };
+    assert_eq!(
+        arg.argument_type(),
+        FunctionArgumentType::Value(value_type(DataType::Int64, false))
+    );
+    let args = [arg];
+    let request = FunctionBindingRequest {
+        arguments: &args,
+        logical_argument_count: 1,
+        expected_result_type: None,
+    };
+    // Both paths borrow the same concrete neutral data; no adapter or clone.
+    let neutral: novarocks_function_contract::FunctionBindingRequest<'_> = request;
+    let copied = neutral;
+    assert!(std::ptr::eq(request.arguments, copied.arguments));
+    assert!(copied.expected_result_type.is_none());
+    let resolver = Arc::new(EchoResolver::default());
+    let catalog = catalog(
+        resolver.clone(),
+        declaration(FunctionKind::Scalar, vec![overload("test/echo/T/v1", "T")]),
+    );
+    let binding = catalog
+        .resolve_bound_user(
+            "echo",
+            FunctionKind::Scalar,
+            request,
+            crate::binding_test_control(),
+        )
+        .unwrap();
+    catalog
+        .validate_bound(&binding, request, crate::binding_test_control())
+        .unwrap();
+    assert_eq!(resolver.resolutions.load(Ordering::Relaxed), 1);
+}

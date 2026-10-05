@@ -3983,6 +3983,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-function-contract"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "novarocks-constant-contract",
+ "novarocks-type-contract",
+]
+
+[[package]]
 name = "novarocks-functions"
 version = "0.1.0"
 dependencies = [
@@ -3997,6 +4007,7 @@ dependencies = [
  "chrono",
  "md-5 0.10.6",
  "novarocks-constant-contract",
+ "novarocks-function-contract",
  "novarocks-type-contract",
  "num-traits",
  "rand 0.8.5",
