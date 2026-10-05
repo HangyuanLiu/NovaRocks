@@ -478,6 +478,35 @@ pub(crate) fn validate_field(
     Ok(())
 }
 
+/// Validate this carrier's own parameters without traversing child fields.
+/// Root-domain traversal stays with its owner: a writer root must not inherit
+/// the Value owner's unfolded-node or field-metadata limits.
+pub(crate) fn validate_type_node(
+    ty: &DataType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), TypeCodecError> {
+    validate_arrow_carrier_parameters_observed(ty, || work.step().map_err(TypeCodecError::from))?;
+    match ty {
+        DataType::FixedSizeBinary(size) | DataType::FixedSizeList(_, size)
+            if *size > novarocks_physical_plan::MAX_FIXED_SIZE_LENGTH =>
+        {
+            return Err(TypeCodecError::InvalidShape(
+                "Arrow fixed size exceeds its owner bound",
+            ));
+        }
+        DataType::Timestamp(_, Some(zone)) => {
+            if zone.len() > novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES {
+                return Err(TypeCodecError::InvalidShape(
+                    "Arrow timestamp zone exceeds its owner bound",
+                ));
+            }
+            observe_bytes(zone.as_bytes(), work)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_type(
     ty: &DataType,
     work: &mut CompileCheckpoints<'_>,
@@ -485,31 +514,7 @@ pub(crate) fn validate_type(
     validate_value_type_structure_observed(ty, |visit| {
         work.step()?;
         match visit {
-            ValueTypeVisit::TypeNode(ty) => {
-                validate_arrow_carrier_parameters_observed(ty, || {
-                    work.step().map_err(TypeCodecError::from)
-                })?;
-                match ty {
-                    DataType::FixedSizeBinary(size) | DataType::FixedSizeList(_, size)
-                        if *size > novarocks_physical_plan::MAX_FIXED_SIZE_LENGTH =>
-                    {
-                        return Err(TypeCodecError::InvalidShape(
-                            "Arrow fixed size exceeds its owner bound",
-                        ));
-                    }
-                    DataType::Timestamp(_, Some(zone)) => {
-                        if zone.len() > novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES
-                        {
-                            return Err(TypeCodecError::InvalidShape(
-                                "Arrow timestamp zone exceeds its owner bound",
-                            ));
-                        }
-                        observe_bytes(zone.as_bytes(), work)?;
-                    }
-                    _ => {}
-                }
-                Ok(())
-            }
+            ValueTypeVisit::TypeNode(ty) => validate_type_node(ty, work),
             ValueTypeVisit::Field(field) => validate_field(field, work),
             ValueTypeVisit::ChildEdge(_) => Ok(()),
         }
@@ -524,3 +529,6 @@ mod fields_tests;
 
 #[cfg(test)]
 mod sources_tests;
+
+#[cfg(test)]
+mod node_tests;
