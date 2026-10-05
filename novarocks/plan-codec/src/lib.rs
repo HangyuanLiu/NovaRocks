@@ -56,6 +56,7 @@ pub mod physical_relational_nodes_v2;
 pub mod physical_repeat_v2;
 pub(crate) mod physical_result_v2;
 pub mod physical_scan_v2;
+pub mod physical_schema_v2;
 pub mod physical_semantics_v2;
 pub mod physical_simple_nodes_v2;
 pub mod physical_table_function_node_v2;
