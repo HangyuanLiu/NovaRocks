@@ -757,3 +757,275 @@ fn writer_all_small_callback_prefixes_and_wide_actual_name_copy_preserve_primary
         }
     });
 }
+
+#[test]
+fn writer_known_name_limit_precedes_next_real_public_quantum_for_both_directions() {
+    let c = Control::default();
+    with_types(&c, |_, types, read| {
+        // Before the final field, the original sender has completed 510 units:
+        // its ten-unit header/count prefix and fifty ten-unit field prefixes.
+        let mut schema = small_schema();
+        schema.fields = vec![schema.fields[0].clone(); 51].into_boxed_slice();
+        let ids = vec![0; 51];
+        let send_limits = WriterSchemaProjectionLimits {
+            max_name_bytes: 50,
+            ..limits()
+        };
+        let send_prefix = vec![(CompilePhase::Encode, 0), (CompilePhase::Encode, 256)];
+        c.arm(None);
+        assert!(matches!(
+            prepare_writer_schema_encode(&schema, &ids, types, SOURCE, send_limits, &c),
+            Err(Error::Control(CompileControlError::ResourceExhausted))
+        ));
+        assert_eq!(c.trace(), send_prefix);
+        for cause in CAUSES {
+            // A later refusal must never be requested after the known limit.
+            c.arm(Some((send_prefix.len(), cause)));
+            assert!(matches!(
+                prepare_writer_schema_encode(&schema, &ids, types, SOURCE, send_limits, &c),
+                Err(Error::Control(CompileControlError::ResourceExhausted))
+            ));
+            assert_eq!(c.trace(), send_prefix);
+        }
+
+        // The receiver completes nine initial units plus 78 * 13 field units
+        // before the last name is known to exceed the original name budget.
+        let mut raw = small_raw();
+        raw.fields = vec![raw.fields[0].clone(); 79];
+        let receive_limits = WriterSchemaProjectionLimits {
+            max_name_bytes: 78,
+            ..limits()
+        };
+        let receive_prefix = vec![
+            (CompilePhase::Decode, 0),
+            (CompilePhase::Decode, 256),
+            (CompilePhase::Decode, 256),
+            (CompilePhase::Decode, 256),
+        ];
+        c.arm(None);
+        assert!(matches!(
+            prepare_writer_schema_decode(&raw, read, SOURCE, receive_limits, &c),
+            Err(Error::Control(CompileControlError::ResourceExhausted))
+        ));
+        assert_eq!(c.trace(), receive_prefix);
+        for cause in CAUSES {
+            c.arm(Some((receive_prefix.len(), cause)));
+            assert!(matches!(
+                prepare_writer_schema_decode(&raw, read, SOURCE, receive_limits, &c),
+                Err(Error::Control(CompileControlError::ResourceExhausted))
+            ));
+            assert_eq!(c.trace(), receive_prefix);
+        }
+    });
+}
+
+#[test]
+fn writer_count_all_known_non_name_limits_precede_pending_255_callback() {
+    let c = Control::default();
+    let mut count = Count::new(1);
+    count.model.request::<u8>(1, 1).unwrap();
+    let original = count
+        .model
+        .numerical_facts(128, 1, limits().resources())
+        .unwrap();
+    let admitted = WriterSchemaProjectionLimits {
+        max_fields: original.list_item_count,
+        max_name_bytes: 0,
+        max_type_references: original.value_reference_count,
+        max_allocation_requests: original.allocation_requests_upper_bound,
+        max_allocation_request_bytes: original.allocation_request_bytes_upper_bound,
+        max_coexisting_source_and_request_bytes: original
+            .coexisting_source_and_request_bytes_upper_bound,
+        max_work: original.cumulative_work_upper_bound,
+    };
+    for axis in [0, 2, 3, 4, 5, 6] {
+        for cause in CAUSES {
+            c.arm(Some((1, cause)));
+            let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Encode).unwrap();
+            // This is a private numeric-gate unit test, not a public source
+            // traversal claim. Each comparison is completed on the real meter.
+            for value in 0..255usize {
+                assert!(value < 255);
+                work.step().unwrap();
+            }
+            assert!(matches!(
+                count.facts(128, 1, under(admitted, axis), &mut work),
+                Err(Error::Control(CompileControlError::ResourceExhausted))
+            ));
+            assert_eq!(c.trace(), vec![(CompilePhase::Encode, 0)], "axis {axis}");
+            // Direct primary errors do not receive an ordinary/success footer.
+        }
+    }
+}
+
+#[test]
+fn writer_sole_clone_ceiling_is_admitted_before_walk_and_retained_for_exact_replay() {
+    let c = Control::default();
+    with_types(&c, |roots, types, read| {
+        let ceiling = physical_type_v2::value_type_clone_preflight_work_upper_bound();
+        assert_eq!(ceiling, 32784);
+        // Plain, root-owned Dictionary, and shared List FieldRef each use the
+        // same clone author, while only the root Dictionary owns two Boxes.
+        for id in [0, 9, 11] {
+            let ty = &roots
+                .iter()
+                .find(|(candidate, _)| *candidate == id)
+                .unwrap()
+                .1;
+            let schema = p::WriterRelationSchema {
+                revision: 0,
+                fields: vec![p::WriterRelationField {
+                    value: p::ValueId::new(0),
+                    name: "a".into(),
+                    ty: ty.clone(),
+                    role: p::WriterRelationFieldRole::Auxiliary,
+                }]
+                .into_boxed_slice(),
+            };
+            let raw = wire::WriterRelationSchema {
+                revision: 0,
+                fields: vec![wire::WriterRelationField {
+                    value_id: Some(0),
+                    name: "a".into(),
+                    value_type_id: Some(id),
+                    role: wire::WriterRelationFieldRole::Auxiliary as i32,
+                }],
+            };
+            let roots_count = types.source_counts().0;
+            let mut send_initial = Count::new(1);
+            send_initial.model.delegated_work = roots_count + 8 + ceiling;
+            let send_floor = send_initial
+                .model
+                .numerical_facts(SOURCE, roots_count, limits().resources())
+                .unwrap()
+                .cumulative_work_upper_bound;
+            let mut receive_initial = Count::new(1);
+            receive_initial.model.delegated_work =
+                2 * crate::btree_resources_v2::lookup_work(read.value_types().len()).unwrap()
+                    + 2 * ceiling;
+            let receive_floor = receive_initial
+                .model
+                .numerical_facts(SOURCE, read.value_types().len(), limits().resources())
+                .unwrap()
+                .cumulative_work_upper_bound;
+            for (decode, early_floor) in [(false, send_floor), (true, receive_floor)] {
+                let low = WriterSchemaProjectionLimits {
+                    max_work: early_floor - 1,
+                    ..limits()
+                };
+                for cause in CAUSES {
+                    c.arm(Some((1, cause)));
+                    let refused = if decode {
+                        prepare_writer_schema_decode(&raw, read, SOURCE, low, &c).map(|_| ())
+                    } else {
+                        prepare_writer_schema_encode(&schema, &[id], types, SOURCE, low, &c)
+                            .map(|_| ())
+                    };
+                    assert!(matches!(
+                        refused,
+                        Err(Error::Control(CompileControlError::ResourceExhausted))
+                    ));
+                    assert_eq!(
+                        c.trace(),
+                        vec![(
+                            if decode {
+                                CompilePhase::Decode
+                            } else {
+                                CompilePhase::Encode
+                            },
+                            0
+                        )],
+                        "id {id}, decode {decode}: rejected before type walk"
+                    );
+                }
+            }
+
+            // The expected final work is independently assembled with the
+            // original numeric and borrowed-type authors. The clone ceiling
+            // must remain in it even when the actual clone topology is small.
+            c.arm(None);
+            let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Encode).unwrap();
+            let encoded_ty = types.value_type_observed(id, &mut work).unwrap().unwrap();
+            let compared = verify_type_binding(
+                &schema.fields[0].ty,
+                encoded_ty,
+                SOURCE,
+                limits().max_work,
+                &mut work,
+            )
+            .unwrap();
+            assert!(compared.matches());
+            send_initial
+                .model
+                .request::<wire::WriterRelationField>(1, 1)
+                .unwrap();
+            send_initial.model.request::<u8>(1, 1).unwrap();
+            send_initial.model.delegated_work += compared.work_upper_bound();
+            let expected_send = send_initial
+                .model
+                .numerical_facts(SOURCE, roots_count, limits().resources())
+                .unwrap()
+                .cumulative_work_upper_bound;
+
+            c.arm(None);
+            let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Decode).unwrap();
+            let decoded_ty = read.value_type(id).unwrap();
+            let compared = preflight_type_binding(
+                decoded_ty,
+                decoded_ty,
+                SOURCE,
+                limits().max_work,
+                &mut work,
+            )
+            .unwrap();
+            let clone =
+                physical_type_v2::preflight_value_type_clone(decoded_ty, &mut work).unwrap();
+            assert!(clone.work_upper_bound() < ceiling);
+            assert_eq!(
+                clone.allocation_requests_upper_bound(),
+                if id == 9 { 2 } else { 0 }
+            );
+            receive_initial
+                .model
+                .request::<p::WriterRelationField>(1, 2)
+                .unwrap();
+            receive_initial.model.request::<u8>(1, 2).unwrap();
+            receive_initial.model.requests += clone.allocation_requests_upper_bound();
+            receive_initial.model.requested += clone.allocation_request_bytes_upper_bound();
+            receive_initial.model.delegated_work += compared.work_upper_bound();
+            let expected_receive = receive_initial
+                .model
+                .numerical_facts(SOURCE, read.value_types().len(), limits().resources())
+                .unwrap()
+                .cumulative_work_upper_bound;
+
+            c.arm(None);
+            let send = encode_writer_schema(&schema, &[id], types, SOURCE, limits(), &c).unwrap();
+            assert_eq!(send.1.cumulative_work_upper_bound, expected_send);
+            c.arm(None);
+            let receive = decode_writer_schema(&raw, read, SOURCE, limits(), &c).unwrap();
+            assert_eq!(receive.1.cumulative_work_upper_bound, expected_receive);
+            assert_eq!(receive.0, schema);
+            c.arm(None);
+            assert_eq!(
+                encode_writer_schema(&schema, &[id], types, SOURCE, exact(send.1), &c).unwrap(),
+                send
+            );
+            c.arm(None);
+            assert_eq!(
+                decode_writer_schema(&raw, read, SOURCE, exact(receive.1), &c).unwrap(),
+                receive
+            );
+            c.arm(None);
+            assert!(matches!(
+                encode_writer_schema(&schema, &[id], types, SOURCE, under(exact(send.1), 6), &c),
+                Err(Error::Control(CompileControlError::ResourceExhausted))
+            ));
+            c.arm(None);
+            assert!(matches!(
+                decode_writer_schema(&raw, read, SOURCE, under(exact(receive.1), 6), &c),
+                Err(Error::Control(CompileControlError::ResourceExhausted))
+            ));
+        }
+    });
+}

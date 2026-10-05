@@ -176,15 +176,18 @@ impl Count {
             names: 0,
         }
     }
-    fn facts(
+    fn numerical_facts(
         &self,
         source: usize,
         types: usize,
         limits: WriterSchemaProjectionLimits,
-        w: &mut CompileCheckpoints<'_>,
     ) -> Result<WriterSchemaProjectionFacts, Error> {
-        resources::cap(self.names, limits.max_name_bytes, w)?;
-        let f = self.model.facts(source, types, limits.resources(), w)?;
+        if self.names > limits.max_name_bytes {
+            return Err(CompileControlError::ResourceExhausted.into());
+        }
+        let f = self
+            .model
+            .numerical_facts(source, types, limits.resources())?;
         Ok(WriterSchemaProjectionFacts {
             field_count: f.list_item_count,
             name_bytes: self.names,
@@ -195,6 +198,20 @@ impl Count {
                 .coexisting_source_and_request_bytes_upper_bound,
             cumulative_work_upper_bound: f.cumulative_work_upper_bound,
         })
+    }
+    fn facts(
+        &self,
+        source: usize,
+        types: usize,
+        limits: WriterSchemaProjectionLimits,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<WriterSchemaProjectionFacts, Error> {
+        // All originating numerical facts precede any completed gate work.
+        // Keep the original successful name step and seven node steps.
+        let facts = self.numerical_facts(source, types, limits)?;
+        resources::cap(self.names, limits.max_name_bytes, w)?;
+        self.model.facts(source, types, limits.resources(), w)?;
+        Ok(facts)
     }
     fn remaining(
         &self,
@@ -207,7 +224,7 @@ impl Count {
         limits
             .max_work
             .checked_sub(f.cumulative_work_upper_bound)
-            .ok_or_else(|| shape("writer type has no remaining work envelope"))
+            .ok_or_else(|| CompileControlError::ResourceExhausted.into())
     }
 }
 #[derive(Clone, Copy)]
@@ -307,7 +324,14 @@ fn preflight_encode(
     let roots = types.source_counts().0;
     let mut c = Count::new(n);
     // Original linear root lookups run once here; emitted IDs need no lookup.
-    c.model.delegated_work = resources::mul(n, resources::add(roots, 8)?)?;
+    // Admit the sole clone preflight for every actual source occurrence.
+    c.model.delegated_work = resources::mul(
+        n,
+        resources::add(
+            resources::add(roots, 8)?,
+            physical_type_v2::value_type_clone_preflight_work_upper_bound(),
+        )?,
+    )?;
     c.facts(invoice, roots, l, w)?;
     let mut known = resources::add(source.floor()?, resources::bytes::<u32>(ids.len())?)?;
     resources::floor(
@@ -326,6 +350,7 @@ fn preflight_encode(
         Source::Schema(_) => c.model.request::<wire::WriterRelationField>(n, 1)?,
         Source::Targets(_) => c.model.request::<wire::WriterTargetField>(n, 1)?,
     }
+    c.numerical_facts(invoice, roots, l)?;
     for i in 0..n {
         let bytes = source.name(i).len();
         c.names = resources::add(c.names, bytes)?;
@@ -334,6 +359,7 @@ fn preflight_encode(
         if let Source::Targets(_) = source {
             c.model.request::<u8>(32, 1)?;
         }
+        c.numerical_facts(invoice, roots, l)?;
         w.step()?;
         resources::floor(invoice, known, w)?;
         c.facts(invoice, roots, l, w)?;
@@ -350,6 +376,7 @@ fn preflight_encode(
             w,
         )?;
         c.model.delegated_work = resources::add(c.model.delegated_work, bound.work_upper_bound())?;
+        c.numerical_facts(invoice, roots, l)?;
         w.step()?;
         if !bound.matches() {
             return Err(shape(
@@ -360,7 +387,14 @@ fn preflight_encode(
         // the sole clone topology for their necessary source backing floor.
         let clone = physical_type_v2::preflight_value_type_clone(source.ty(i), w)?;
         known = resources::add(known, clone.allocation_request_bytes_upper_bound())?;
-        c.model.delegated_work = resources::add(c.model.delegated_work, clone.work_upper_bound())?;
+        // The sole grammar's ceiling was admitted for every occurrence before
+        // any type walk, and remains in final facts for exact-envelope replay.
+        if clone.work_upper_bound()
+            > physical_type_v2::value_type_clone_preflight_work_upper_bound()
+        {
+            return Err(CompileControlError::ResourceExhausted.into());
+        }
+        c.numerical_facts(invoice, roots, l)?;
         resources::floor(invoice, known, w)?;
         c.facts(invoice, roots, l, w)?;
     }
@@ -377,7 +411,18 @@ fn preflight_decode(
     let roots = types.value_types().len();
     let mut c = Count::new(n);
     let lookups = crate::btree_resources_v2::lookup_work(roots).map_err(shape)?;
-    c.model.delegated_work = resources::mul(n, resources::mul(lookups, 2)?)?;
+    // Each actual occurrence has a lookup and clone in prepare and in emit.
+    // Keep both original clone ceilings rather than narrowing final facts.
+    c.model.delegated_work = resources::mul(
+        n,
+        resources::mul(
+            resources::add(
+                lookups,
+                physical_type_v2::value_type_clone_preflight_work_upper_bound(),
+            )?,
+            2,
+        )?,
+    )?;
     c.facts(invoice, roots, l, w)?;
     let mut known = raw.floor()?;
     resources::floor(
@@ -389,11 +434,13 @@ fn preflight_decode(
         Raw::Schema(_) => c.model.request::<p::WriterRelationField>(n, 2)?,
         Raw::Targets(_) => c.model.request::<p::WriterTargetField>(n, 2)?,
     }
+    c.numerical_facts(invoice, roots, l)?;
     for i in 0..n {
         let name = raw.name(i);
         c.names = resources::add(c.names, name.len())?;
         known = resources::add(known, name.capacity())?;
         c.model.request::<u8>(name.len(), 2)?;
+        c.numerical_facts(invoice, roots, l)?;
         match raw {
             Raw::Schema(s) => {
                 required(s.fields[i].value_id, w)?;
@@ -422,6 +469,7 @@ fn preflight_decode(
         // numerical bound before the sole owned-Dictionary clone topology.
         let bound = preflight_type_binding(ty, ty, invoice, c.remaining(invoice, roots, l, w)?, w)?;
         c.model.delegated_work = resources::add(c.model.delegated_work, bound.work_upper_bound())?;
+        c.numerical_facts(invoice, roots, l)?;
         let clone = physical_type_v2::preflight_value_type_clone(ty, w)?;
         c.model.requests =
             resources::add(c.model.requests, clone.allocation_requests_upper_bound())?;
@@ -429,10 +477,12 @@ fn preflight_decode(
             c.model.requested,
             clone.allocation_request_bytes_upper_bound(),
         )?;
-        c.model.delegated_work = resources::add(
-            c.model.delegated_work,
-            resources::mul(clone.work_upper_bound(), 2)?,
-        )?;
+        if clone.work_upper_bound()
+            > physical_type_v2::value_type_clone_preflight_work_upper_bound()
+        {
+            return Err(CompileControlError::ResourceExhausted.into());
+        }
+        c.numerical_facts(invoice, roots, l)?;
         w.step()?;
         c.facts(invoice, roots, l, w)?;
     }

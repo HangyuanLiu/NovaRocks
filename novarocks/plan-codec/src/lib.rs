@@ -36,6 +36,7 @@ mod library_profile_v2;
 pub mod native_type;
 mod native_type_encode;
 pub mod physical_aggregate_binding_v2;
+pub mod physical_aggregate_node_v2;
 pub mod physical_assert_rows_v2;
 pub mod physical_binding_v2;
 pub mod physical_call_requests_v2;
