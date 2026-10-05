@@ -28,6 +28,7 @@ use crate::{
         PhysicalPropertyProjectionLimits,
     },
     physical_relation_v2::RelationCodecError,
+    physical_type_v2::TypeCodecError,
     physical_value_v2::{DecodedValues, EncodedValues, ValueCodecError},
 };
 use novarocks_connector_contract::ConnectorIdentityError;
@@ -61,6 +62,7 @@ pub struct NodeProjectionFacts {
 pub enum NodeCodecError {
     Control(CompileControlError),
     Properties(PhysicalPropertyCodecError),
+    Type(TypeCodecError),
     Value(ValueCodecError),
     Expression(ExpressionCodecError),
     Binding(BindingCodecError),
@@ -80,6 +82,14 @@ impl From<PhysicalPropertyCodecError> for NodeCodecError {
         match error {
             PhysicalPropertyCodecError::Control(cause) => Self::Control(cause),
             error => Self::Properties(error),
+        }
+    }
+}
+impl From<TypeCodecError> for NodeCodecError {
+    fn from(error: TypeCodecError) -> Self {
+        match error {
+            TypeCodecError::Control(cause) => Self::Control(cause),
+            error => Self::Type(error),
         }
     }
 }
@@ -143,6 +153,7 @@ impl fmt::Display for NodeCodecError {
         match self {
             Self::Control(e) => e.fmt(f),
             Self::Properties(e) => e.fmt(f),
+            Self::Type(e) => e.fmt(f),
             Self::Value(e) => e.fmt(f),
             Self::Expression(e) => e.fmt(f),
             Self::Binding(e) => e.fmt(f),
@@ -159,6 +170,7 @@ impl std::error::Error for NodeCodecError {
         match self {
             Self::Control(e) => Some(e),
             Self::Properties(e) => Some(e),
+            Self::Type(e) => Some(e),
             Self::Value(e) => Some(e),
             Self::Expression(e) => Some(e),
             Self::Binding(e) => Some(e),

@@ -154,6 +154,27 @@ impl Metrics {
     }
 }
 
+/// The sole closed-root prefix bound, without observations or scratch setup.
+/// This does not prove datatype equality or authorize a logical/carrier domain.
+pub(crate) fn type_binding_prefix_work_upper_bound(
+    left: &FunctionValueType,
+    right: &FunctionValueType,
+    source_retained_bytes: usize,
+) -> Result<BoundTypeComparisonFacts, TypeCodecError> {
+    // Only closed root flags are inspected. No datatype walk, metadata probe
+    // or scratch initialization precedes this numerical admission.
+    let flags_match = left.nullable == right.nullable && left.logical_type == right.logical_type;
+    let scratch_bytes = if flags_match {
+        mem::size_of::<[Option<(&DataType, usize)>; MAX_VALUE_TYPE_NODES]>()
+    } else {
+        0
+    };
+    Ok(BoundTypeComparisonFacts {
+        work_upper_bound: add(add(source_retained_bytes, scratch_bytes)?, 2)?,
+        flags_match,
+    })
+}
+
 /// Admit one exact FVT relation. The caller owns entry/ordinary/success finish
 /// on this original meter. This only returns numerical facts and flag equality;
 /// it does not prove datatype equality or root logical/carrier authorization.
@@ -164,51 +185,51 @@ pub(crate) fn preflight_type_binding(
     max_work: usize,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<BoundTypeComparisonFacts, TypeCodecError> {
-    work.flush()?;
     // Distinct immutable source roots occupy distinct inline storage, even
     // when their nested Field/type allocations alias. This is only a known
     // floor; it cannot prove the trusted invoice's complete retained backing.
     let roots = if std::ptr::eq(left, right) { 1 } else { 2 };
     let minimum = mul(roots, mem::size_of::<FunctionValueType>())?;
     let source_covers_roots = source_retained_bytes >= minimum;
+    let prefix = type_binding_prefix_work_upper_bound(left, right, source_retained_bytes);
+    // An ordinary missing-source floor keeps its original precedence and
+    // observations. For a valid source, already known work exhaustion must
+    // precede the first opaque boundary, including a caller's pending tail.
+    if source_covers_roots && let Ok(prefix) = &prefix {
+        cap(prefix.work_upper_bound(), max_work)?;
+    }
+    work.flush()?;
     work.step()?;
     if !source_covers_roots {
         return Err(shape(
             "borrowed type source invoice omits original inline roots",
         ));
     }
-    let flags_match = left.nullable == right.nullable && left.logical_type == right.logical_type;
     work.step()?;
-    // The sole FVT equality rule stops on these flags before traversing a
-    // datatype. No scratch is initialized and no metadata is inspected then.
-    if !flags_match {
-        let work_upper_bound = add(source_retained_bytes, 2)?;
-        cap(work_upper_bound, max_work)?;
-        work.step()?;
-        work.flush()?;
-        return Ok(BoundTypeComparisonFacts {
-            work_upper_bound,
-            flags_match,
-        });
-    }
-    let scratch_bytes = mem::size_of::<[Option<(&DataType, usize)>; MAX_VALUE_TYPE_NODES]>();
-    let prefix = add(add(source_retained_bytes, scratch_bytes)?, 2)?;
-    cap(prefix, max_work)?;
+    // Preserve an ordinary arithmetic error's original completed root steps.
+    let prefix = prefix?;
+    cap(prefix.work_upper_bound(), max_work)?;
     work.step()?;
     work.flush()?;
+    // The sole FVT equality rule stops on these flags before traversing a
+    // datatype. No scratch is initialized and no metadata is inspected then.
+    if !prefix.flags_match() {
+        return Ok(prefix);
+    }
+    let prefix_work = prefix.work_upper_bound();
     let mut scratch = [None; MAX_VALUE_TYPE_NODES];
     work.flush()?;
     let mut metrics = Metrics::default();
     validate_value_type_structure_with_scratch_observed::<TypeCodecError>(
         &left.data_type,
         &mut scratch,
-        |event| metrics.observe(event, source_retained_bytes, prefix, max_work, work),
+        |event| metrics.observe(event, source_retained_bytes, prefix_work, max_work, work),
     )?;
-    let work_upper_bound = metrics.bound(source_retained_bytes, prefix)?;
+    let work_upper_bound = metrics.bound(source_retained_bytes, prefix_work)?;
     work.flush()?;
     Ok(BoundTypeComparisonFacts {
         work_upper_bound,
-        flags_match,
+        flags_match: prefix.flags_match(),
     })
 }
 

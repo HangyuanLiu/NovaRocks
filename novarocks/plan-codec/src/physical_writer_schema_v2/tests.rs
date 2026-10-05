@@ -1029,3 +1029,412 @@ fn writer_sole_clone_ceiling_is_admitted_before_walk_and_retained_for_exact_repl
         }
     });
 }
+
+fn parent_limits() -> NodeProjectionLimits {
+    NodeProjectionLimits {
+        max_input_nodes: 64,
+        max_value_references: 4096,
+        max_list_items: 8192,
+        max_allocation_requests: 32768,
+        max_allocation_request_bytes: 32 << 20,
+        max_coexisting_source_and_request_bytes: 64 << 20,
+        max_work: 1 << 32,
+        properties: limits().resources().properties,
+    }
+}
+fn parent_base() -> Model {
+    Model {
+        inputs: 1,
+        refs: 2,
+        items: 3,
+        requests: 1,
+        requested: 8,
+        delegated_work: 19,
+    }
+}
+fn projection(base: Model, node: NodeProjectionLimits) -> WriterSchemaProjection {
+    WriterSchemaProjection {
+        source: SOURCE,
+        limits: limits(),
+        parent: WriterSchemaNodeAdmission {
+            base,
+            values: 2,
+            limits: node,
+        },
+    }
+}
+
+#[test]
+fn writer_observed_two_schemas_accumulate_same_node_without_type_value_or_source_duplication() {
+    let c = Control::default();
+    with_types(&c, |roots, types, read| {
+        let schema = source_schema(roots);
+        let raw = expected_schema();
+        let ids = [0, u32::MAX, 7, 9, 11];
+        let targets = source_targets(roots);
+        let rawtargets = expected_targets();
+        for decode in [false, true] {
+            c.arm(None);
+            let standalone = if decode {
+                prepare_writer_schema_decode(&raw, read, SOURCE, limits(), &c)
+                    .unwrap()
+                    .facts
+            } else {
+                prepare_writer_schema_encode(&schema, &ids, types, SOURCE, limits(), &c)
+                    .unwrap()
+                    .facts
+            };
+            let original_trace = c.trace();
+            c.arm(None);
+            let phase = if decode {
+                CompilePhase::Decode
+            } else {
+                CompilePhase::Encode
+            };
+            let mut w = CompileCheckpoints::try_new(&c, phase).unwrap();
+            let first = if decode {
+                preflight_schema_decode_observed(
+                    &raw,
+                    read,
+                    projection(parent_base(), parent_limits()),
+                    &mut w,
+                )
+                .unwrap()
+            } else {
+                preflight_schema_encode_observed(
+                    &schema,
+                    &ids,
+                    types,
+                    projection(parent_base(), parent_limits()),
+                    &mut w,
+                )
+                .unwrap()
+            };
+            finish(w, Ok(())).unwrap();
+            assert_eq!(first, standalone);
+            assert_eq!(
+                c.trace(),
+                original_trace,
+                "same original meter, no nested entry/footer"
+            );
+            let admission = WriterSchemaNodeAdmission {
+                base: parent_base(),
+                values: 2,
+                limits: parent_limits(),
+            };
+            let after_first = admission.merge(first).unwrap();
+            c.arm(None);
+            let mut w = CompileCheckpoints::try_new(&c, phase).unwrap();
+            let second = if decode {
+                preflight_targets_decode_observed(
+                    &rawtargets,
+                    read,
+                    projection(after_first, parent_limits()),
+                    &mut w,
+                )
+                .unwrap()
+            } else {
+                preflight_targets_encode_observed(
+                    &targets,
+                    &[9, u32::MAX],
+                    types,
+                    projection(after_first, parent_limits()),
+                    &mut w,
+                )
+                .unwrap()
+            };
+            let merged = WriterSchemaNodeAdmission {
+                base: after_first,
+                ..admission
+            }
+            .merge(second)
+            .unwrap();
+            let f = merged.numerical_facts(SOURCE, 2, parent_limits()).unwrap();
+            // Actual Value occurrences belong to the caller; seven type references
+            // are not seven additional Value lookups. B occurs exactly once.
+            assert_eq!(
+                (
+                    f.input_node_count,
+                    f.value_reference_count,
+                    f.list_item_count
+                ),
+                (1, 2, 10)
+            );
+            assert_eq!(
+                f.allocation_requests_upper_bound,
+                1 + first.allocation_requests_upper_bound + second.allocation_requests_upper_bound
+            );
+            let bytes = 8
+                + first.allocation_request_bytes_upper_bound
+                + second.allocation_request_bytes_upper_bound;
+            assert_eq!(f.allocation_request_bytes_upper_bound, bytes);
+            assert_eq!(
+                f.coexisting_source_and_request_bytes_upper_bound,
+                SOURCE + bytes
+            );
+            assert_eq!(
+                f.cumulative_work_upper_bound,
+                256 + 32 * 11
+                    + 2 * 35
+                    + 4 * bytes
+                    + 19
+                    + first.cumulative_work_upper_bound
+                    + second.cumulative_work_upper_bound
+            );
+            finish(w, Ok(())).unwrap();
+            let exact = NodeProjectionLimits {
+                max_list_items: 10,
+                max_allocation_requests: f.allocation_requests_upper_bound,
+                max_allocation_request_bytes: bytes,
+                max_coexisting_source_and_request_bytes: SOURCE + bytes,
+                max_work: f.cumulative_work_upper_bound,
+                ..parent_limits()
+            };
+            c.arm(None);
+            let mut w = CompileCheckpoints::try_new(&c, phase).unwrap();
+            let result = if decode {
+                preflight_targets_decode_observed(
+                    &rawtargets,
+                    read,
+                    projection(after_first, exact),
+                    &mut w,
+                )
+            } else {
+                preflight_targets_encode_observed(
+                    &targets,
+                    &[9, u32::MAX],
+                    types,
+                    projection(after_first, exact),
+                    &mut w,
+                )
+            };
+            assert_eq!(finish(w, result).unwrap(), second);
+            c.arm(None);
+            let mut w = CompileCheckpoints::try_new(&c, phase).unwrap();
+            let under = NodeProjectionLimits {
+                max_work: exact.max_work - 1,
+                ..exact
+            };
+            let result = if decode {
+                preflight_targets_decode_observed(
+                    &rawtargets,
+                    read,
+                    projection(after_first, under),
+                    &mut w,
+                )
+            } else {
+                preflight_targets_encode_observed(
+                    &targets,
+                    &[9, u32::MAX],
+                    types,
+                    projection(after_first, under),
+                    &mut w,
+                )
+            };
+            assert!(matches!(
+                finish(w, result),
+                Err(Error::Control(CompileControlError::ResourceExhausted))
+            ));
+        }
+    });
+}
+
+#[test]
+fn writer_observed_name_requests_gate_containing_node_before_late_three_causes() {
+    let c = Control::default();
+    with_types(&c, |_, types, read| {
+        let schema = p::WriterRelationSchema {
+            revision: 0,
+            fields: Box::from([p::WriterRelationField {
+                value: p::ValueId::new(0),
+                name: "x".repeat(300).into(),
+                ty: FunctionValueType::new(DataType::Int64, false),
+                role: p::WriterRelationFieldRole::Kind,
+            }]),
+        };
+        let raw = wire::WriterRelationSchema {
+            revision: 0,
+            fields: vec![wire::WriterRelationField {
+                value_id: Some(0),
+                name: "x".repeat(300),
+                value_type_id: Some(0),
+                role: wire::WriterRelationFieldRole::Kind as i32,
+            }],
+        };
+        for decode in [false, true] {
+            let copies = if decode { 2 } else { 1 };
+            let field_bytes = if decode {
+                size_of::<p::WriterRelationField>()
+            } else {
+                size_of::<wire::WriterRelationField>()
+            };
+            let bytes = 8 + copies * (field_bytes + 300);
+            let requests = 1 + copies * 2;
+            let roots = if decode {
+                read.value_types().len()
+            } else {
+                types.source_counts().0
+            };
+            let lookup = if decode {
+                2 * crate::btree_resources_v2::lookup_work(roots).unwrap()
+            } else {
+                roots + 8
+            };
+            let ceiling = copies * physical_type_v2::value_type_clone_preflight_work_upper_bound();
+            let height = (usize::BITS - roots.leading_zeros()) as usize + 1;
+            let childwork =
+                256 + 32 + height + 32 + 4 * copies * (field_bytes + 300) + lookup + ceiling;
+            let parentwork = 256 + 32 * 5 + 2 * 35 + 4 * bytes + 19 + childwork;
+            for axis in 0..4 {
+                let mut low = parent_limits();
+                match axis {
+                    0 => low.max_allocation_requests = requests - 1,
+                    1 => low.max_allocation_request_bytes = bytes - 1,
+                    2 => low.max_coexisting_source_and_request_bytes = SOURCE + bytes - 1,
+                    3 => low.max_work = parentwork - 1,
+                    _ => unreachable!(),
+                }
+                for cause in CAUSES {
+                    c.arm(Some((1, cause)));
+                    let phase = if decode {
+                        CompilePhase::Decode
+                    } else {
+                        CompilePhase::Encode
+                    };
+                    let mut w = CompileCheckpoints::try_new(&c, phase).unwrap();
+                    let result = if decode {
+                        preflight_schema_decode_observed(
+                            &raw,
+                            read,
+                            projection(parent_base(), low),
+                            &mut w,
+                        )
+                    } else {
+                        preflight_schema_encode_observed(
+                            &schema,
+                            &[0],
+                            types,
+                            projection(parent_base(), low),
+                            &mut w,
+                        )
+                    };
+                    assert!(
+                        matches!(
+                            finish(w, result),
+                            Err(Error::Control(CompileControlError::ResourceExhausted))
+                        ),
+                        "decode{decode} axis{axis}"
+                    );
+                    assert_eq!(
+                        c.trace(),
+                        vec![(phase, 0)],
+                        "real name update, before next observer"
+                    );
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn writer_observed_parent_remaining_limits_original_borrowed_metadata_visits() {
+    let c = Control::default();
+    // Use the original actual metadata source and both original type namespaces.
+    with_types(&c, |roots, types, read| {
+        let schema = source_schema(roots);
+        let raw = expected_schema();
+        let ids = [0, u32::MAX, 7, 9, 11];
+        for decode in [false, true] {
+            let phase = if decode {
+                CompilePhase::Decode
+            } else {
+                CompilePhase::Encode
+            };
+            c.arm(None);
+            let mut w = CompileCheckpoints::try_new(&c, phase).unwrap();
+            let first = if decode {
+                preflight_schema_decode_observed(
+                    &raw,
+                    read,
+                    projection(parent_base(), parent_limits()),
+                    &mut w,
+                )
+            } else {
+                preflight_schema_encode_observed(
+                    &schema,
+                    &ids,
+                    types,
+                    projection(parent_base(), parent_limits()),
+                    &mut w,
+                )
+            };
+            let first = finish(w, first).unwrap();
+            let success = c.trace();
+            let whole = WriterSchemaNodeAdmission {
+                base: parent_base(),
+                values: 2,
+                limits: parent_limits(),
+            }
+            .merge(first)
+            .unwrap()
+            .numerical_facts(SOURCE, 2, parent_limits())
+            .unwrap();
+            let low = NodeProjectionLimits {
+                max_work: whole.cumulative_work_upper_bound - 1,
+                ..parent_limits()
+            };
+            c.arm(None);
+            let mut w = CompileCheckpoints::try_new(&c, phase).unwrap();
+            let result = if decode {
+                preflight_schema_decode_observed(&raw, read, projection(parent_base(), low), &mut w)
+            } else {
+                preflight_schema_encode_observed(
+                    &schema,
+                    &ids,
+                    types,
+                    projection(parent_base(), low),
+                    &mut w,
+                )
+            };
+            assert!(matches!(
+                finish(w, result),
+                Err(Error::Control(CompileControlError::ResourceExhausted))
+            ));
+            let prefix = c.trace();
+            assert!(
+                prefix.len() > 4,
+                "not merely entry/initial-ceiling admission"
+            );
+            assert!(
+                prefix.len() < success.len(),
+                "original walk stops before complete successful trace"
+            );
+            assert_eq!(prefix, success[..prefix.len()]);
+            for cause in CAUSES {
+                c.arm(Some((prefix.len(), cause)));
+                let mut w = CompileCheckpoints::try_new(&c, phase).unwrap();
+                let result = if decode {
+                    preflight_schema_decode_observed(
+                        &raw,
+                        read,
+                        projection(parent_base(), low),
+                        &mut w,
+                    )
+                } else {
+                    preflight_schema_encode_observed(
+                        &schema,
+                        &ids,
+                        types,
+                        projection(parent_base(), low),
+                        &mut w,
+                    )
+                };
+                assert!(matches!(
+                    finish(w, result),
+                    Err(Error::Control(CompileControlError::ResourceExhausted))
+                ));
+                assert_eq!(c.trace(), prefix);
+            }
+        }
+    });
+}

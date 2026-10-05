@@ -319,3 +319,184 @@ fn numeric_work_refusal_preserves_resource_before_later_controller_or_footer() {
         }
     }
 }
+
+fn preflight_with_pending(
+    left: &FunctionValueType,
+    right: &FunctionValueType,
+    source: usize,
+    maximum: usize,
+    pending: usize,
+    control: &Control,
+) -> Result<BoundTypeComparisonFacts, TypeCodecError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
+    // This unit-level priming exercises the actual borrowed owner's first
+    // flush; the original caller's pending work is not a new type traversal.
+    for _ in 0..pending {
+        work.step()?;
+    }
+    let result = preflight_type_binding(left, right, source, maximum, &mut work);
+    if matches!(&result, Err(TypeCodecError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+
+#[test]
+fn borrowed_type_known_prefix_refusal_precedes_pending_255_for_all_root_flags() {
+    let physical = FunctionValueType::new(DataType::FixedSizeBinary(16), false);
+    let same_flags_other_carrier = FunctionValueType::new(DataType::Int64, false);
+    let nullable = FunctionValueType::new(DataType::FixedSizeBinary(16), true);
+    let uuid = FunctionValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        false,
+        ValueLogicalType::Uuid,
+    )
+    .unwrap();
+    let scratch = mem::size_of::<[Option<(&DataType, usize)>; MAX_VALUE_TYPE_NODES]>();
+    for (right, matching_flags) in [
+        (&physical, true),
+        (&same_flags_other_carrier, true),
+        (&nullable, false),
+        (&uuid, false),
+    ] {
+        let expected_prefix = SOURCE + if matching_flags { scratch } else { 0 } + 2;
+        let bound = type_binding_prefix_work_upper_bound(&physical, right, SOURCE).unwrap();
+        assert_eq!(bound.work_upper_bound(), expected_prefix);
+        assert_eq!(bound.flags_match(), matching_flags);
+        for cause in CAUSES {
+            let control = Control {
+                refusal: Some((1, cause)),
+                ..Control::default()
+            };
+            assert!(matches!(
+                preflight_with_pending(
+                    &physical,
+                    right,
+                    SOURCE,
+                    expected_prefix - 1,
+                    255,
+                    &control,
+                ),
+                Err(TypeCodecError::Control(
+                    CompileControlError::ResourceExhausted
+                ))
+            ));
+            assert_eq!(*control.trace.lock().unwrap(), [0]);
+        }
+    }
+}
+
+#[test]
+fn borrowed_type_exact_prefix_deep_gate_and_original_success_tails_keep_their_trace() {
+    let left = FunctionValueType::new(DataType::Int64, false);
+    let nullable = FunctionValueType::new(DataType::Int64, true);
+    let scratch = mem::size_of::<[Option<(&DataType, usize)>; MAX_VALUE_TYPE_NODES]>();
+    let prefix = SOURCE + scratch + 2;
+    // The plain root has one TypeNode: its original model contributes B,
+    // four closed header units and one completed numerical visit.
+    let full = prefix + SOURCE + 5;
+    for pending in [0, 255] {
+        for (right, maximum, expected_bound, expected_flags, expected_trace) in [
+            (
+                &left,
+                full,
+                full,
+                true,
+                vec![0, u32::try_from(pending).unwrap(), 3, 0, 1, 0],
+            ),
+            (
+                &nullable,
+                SOURCE + 2,
+                SOURCE + 2,
+                false,
+                vec![0, u32::try_from(pending).unwrap(), 3, 0],
+            ),
+        ] {
+            let control = Control::default();
+            let result =
+                preflight_with_pending(&left, right, SOURCE, maximum, pending, &control).unwrap();
+            assert_eq!(result.work_upper_bound(), expected_bound);
+            assert_eq!(result.flags_match(), expected_flags);
+            assert_eq!(*control.trace.lock().unwrap(), expected_trace);
+            for at in 0..expected_trace.len() {
+                for cause in CAUSES {
+                    let control = Control {
+                        refusal: Some((at, cause)),
+                        ..Control::default()
+                    };
+                    assert!(matches!(
+                        preflight_with_pending(&left, right, SOURCE, maximum, pending, &control),
+                        Err(TypeCodecError::Control(actual)) if actual == cause
+                    ));
+                    assert_eq!(*control.trace.lock().unwrap(), expected_trace[..=at]);
+                }
+            }
+        }
+
+        // An admitted exact prefix does not authorize the later datatype walk.
+        // The first real TypeNode increases the bound and refuses before its
+        // completed step; no opaque exit or ordinary footer follows it.
+        let expected_trace = vec![0, u32::try_from(pending).unwrap(), 3, 0];
+        let control = Control::default();
+        assert!(matches!(
+            preflight_with_pending(&left, &left, SOURCE, prefix, pending, &control),
+            Err(TypeCodecError::Control(
+                CompileControlError::ResourceExhausted
+            ))
+        ));
+        assert_eq!(*control.trace.lock().unwrap(), expected_trace);
+        for cause in CAUSES {
+            let control = Control {
+                refusal: Some((expected_trace.len(), cause)),
+                ..Control::default()
+            };
+            assert!(matches!(
+                preflight_with_pending(&left, &left, SOURCE, prefix, pending, &control),
+                Err(TypeCodecError::Control(
+                    CompileControlError::ResourceExhausted
+                ))
+            ));
+            assert_eq!(*control.trace.lock().unwrap(), expected_trace);
+        }
+    }
+}
+
+#[test]
+fn borrowed_type_pure_prefix_keeps_ordinary_source_and_arithmetic_error_observations() {
+    let left = FunctionValueType::new(DataType::Int64, false);
+    for (source, maximum, expected_message, expected_trace) in [
+        (
+            0,
+            0,
+            "borrowed type source invoice omits original inline roots",
+            vec![0, 255, 1],
+        ),
+        (
+            usize::MAX,
+            usize::MAX,
+            "borrowed type comparison work sum overflow",
+            vec![0, 255, 2],
+        ),
+    ] {
+        let control = Control::default();
+        assert!(matches!(
+            preflight_with_pending(&left, &left, source, maximum, 255, &control),
+            Err(TypeCodecError::InvalidShape(message)) if message == expected_message
+        ));
+        assert_eq!(*control.trace.lock().unwrap(), expected_trace);
+        for at in 0..expected_trace.len() {
+            for cause in CAUSES {
+                let control = Control {
+                    refusal: Some((at, cause)),
+                    ..Control::default()
+                };
+                assert!(matches!(
+                    preflight_with_pending(&left, &left, source, maximum, 255, &control),
+                    Err(TypeCodecError::Control(actual)) if actual == cause
+                ));
+                assert_eq!(*control.trace.lock().unwrap(), expected_trace[..=at]);
+            }
+        }
+    }
+}

@@ -39,6 +39,17 @@ fn dependency_refusals_preserve_the_first_cause_without_an_enclosing_tail() {
         for error in [
             NodeCodecError::from(ExpressionCodecError::Control(cause)),
             NodeCodecError::from(BindingCodecError::Control(cause)),
+            NodeCodecError::from(TypeCodecError::Control(cause)),
+            NodeCodecError::from(
+                crate::physical_writer_schema_v2::WriterSchemaCodecError::Type(
+                    TypeCodecError::Control(cause),
+                ),
+            ),
+            NodeCodecError::from(
+                crate::physical_writer_schema_v2::WriterSchemaCodecError::Resources(
+                    NodeCodecError::Control(cause),
+                ),
+            ),
             NodeCodecError::from(RelationCodecError::Control(cause)),
             NodeCodecError::from(ConnectorPayloadCodecError::Control(cause)),
             NodeCodecError::from(RelationCodecError::from(
@@ -85,6 +96,16 @@ fn ordinary_dependency_errors_retain_typed_details_and_completed_work() {
             p::ConstantPoolId::new(u32::MAX),
         )),
         NodeCodecError::from(RelationCodecError::InvalidShape("missing relation")),
+        NodeCodecError::from(
+            crate::physical_writer_schema_v2::WriterSchemaCodecError::Type(
+                TypeCodecError::InvalidShape("missing writer type"),
+            ),
+        ),
+        NodeCodecError::from(
+            crate::physical_writer_schema_v2::WriterSchemaCodecError::Resources(
+                NodeCodecError::Relation(RelationCodecError::InvalidShape("missing relation")),
+            ),
+        ),
         NodeCodecError::from(ConnectorPayloadCodecError::InvalidShape("missing payload")),
         NodeCodecError::Identity(ConnectorIdentityError::InvalidWriteTargetOrdinal),
     ] {
@@ -105,6 +126,9 @@ fn ordinary_dependency_errors_retain_typed_details_and_completed_work() {
             }
             NodeCodecError::Relation(RelationCodecError::InvalidShape(message)) => {
                 assert_eq!(message, "missing relation")
+            }
+            NodeCodecError::Type(TypeCodecError::InvalidShape(message)) => {
+                assert_eq!(message, "missing writer type")
             }
             NodeCodecError::Payload(ConnectorPayloadCodecError::InvalidShape(message)) => {
                 assert_eq!(message, "missing payload")

@@ -1227,3 +1227,331 @@ fn aggregate_known_container_layouts_precede_nested_quantum_and_late_three_cause
         c.disarm();
     });
 }
+
+#[test]
+fn aggregate_collection_counts_preserve_parent_work_once_across_batches() {
+    const PARENT_WORK: usize = 137;
+    let mut n = node();
+    calls(&mut n)[1].arguments = Box::from([p::ExprId::new(u32::MAX)]);
+    let mut raw = expected();
+    body(&mut raw).calls[1].argument_expr_ids = vec![u32::MAX];
+    let c = Control::default();
+    Fixture::new().with(&n, &c, |v, e, d, a| {
+        let (groups, source_calls, _) = physical(&n).unwrap();
+        let raw_calls = &match &raw.kind {
+            Some(wire::physical_node::Kind::Aggregate(b)) => b,
+            _ => unreachable!(),
+        }
+        .calls;
+        assert_eq!(e.aggregates().source_counts(), 3);
+        assert_eq!(a.definitions().len(), 3);
+        for receiving in [false, true] {
+            let lookup = if receiving {
+                d.lookup_work_upper_bound().unwrap()
+            } else {
+                e.lookup_work_upper_bound().unwrap()
+            };
+            let binding_work = if receiving { 30 } else { 12 };
+            let roots = if receiving {
+                decode_collection_lookup_work(
+                    &match &raw.kind {
+                        Some(wire::physical_node::Kind::Aggregate(b)) => b,
+                        _ => unreachable!(),
+                    }
+                    .group_by,
+                    raw_calls,
+                    d,
+                    a,
+                )
+                .unwrap()
+            } else {
+                encode_collection_lookup_work(groups, source_calls, e).unwrap()
+            };
+            assert_eq!(roots, binding_work + 3 * lookup);
+            let root_bytes = layout::<usize>(3)
+                + if receiving {
+                    2 * (layout::<p::NodeId>(1)
+                        + layout::<p::PhysicalProperties>(1)
+                        + layout::<p::ValueId>(3)
+                        + layout::<(p::ExprId, p::ValueId)>(3)
+                        + layout::<p::AggregateCall>(2))
+                } else {
+                    layout::<u32>(1)
+                        + layout::<wire::PhysicalProperties>(1)
+                        + layout::<u32>(3)
+                        + layout::<wire::ExpressionOutput>(3)
+                        + layout::<wire::AggregateCall>(2)
+                };
+            let nested_bytes = if receiving {
+                2 * (layout::<p::ExprId>(3) + layout::<p::SortExpr>(2) + layout::<p::ExprId>(1))
+            } else {
+                layout::<u32>(3) + layout::<wire::SortExpression>(2) + layout::<u32>(1)
+            };
+            let initial = Model {
+                inputs: 1,
+                refs: 8,
+                items: 9,
+                requests: if receiving { 11 } else { 6 },
+                requested: root_bytes,
+                delegated_work: PARENT_WORK + roots,
+            };
+            let known = if receiving {
+                wire_header_floor(&raw, raw.output.as_ref().unwrap()).unwrap()
+                    + layout::<wire::ExpressionOutput>(3)
+                    + layout::<wire::AggregateCall>(2)
+            } else {
+                physical_header_floor(&n).unwrap()
+                    + layout::<(p::ExprId, p::ValueId)>(3)
+                    + layout::<p::AggregateCall>(2)
+            };
+            let run = |split: bool| -> Result<Model, Error> {
+                let mut w = CompileCheckpoints::try_new(
+                    &c,
+                    if receiving {
+                        CompilePhase::Decode
+                    } else {
+                        CompilePhase::Encode
+                    },
+                )?;
+                let result = (|| {
+                    let mut model = initial;
+                    model.numerical_facts(SOURCE, v.count(), limits().node)?;
+                    if split {
+                        let mut known = known;
+                        for i in 0..2 {
+                            let parent = CollectionProjection {
+                                model: &mut model,
+                                known,
+                                source: SOURCE,
+                                values: v.count(),
+                                limits: limits().node,
+                            };
+                            if receiving {
+                                parent.count_decode(&raw_calls[i..i + 1], d, &mut w)?;
+                                known += layout::<u32>(raw_calls[i].argument_expr_ids.capacity())
+                                    + layout::<wire::SortExpression>(
+                                        raw_calls[i].order_by.capacity(),
+                                    );
+                            } else {
+                                parent.count_encode(&source_calls[i..i + 1], e, &mut w)?;
+                                known += layout::<p::ExprId>(source_calls[i].arguments.len())
+                                    + layout::<p::SortExpr>(source_calls[i].order_by.len());
+                            }
+                        }
+                    } else {
+                        let parent = CollectionProjection {
+                            model: &mut model,
+                            known,
+                            source: SOURCE,
+                            values: v.count(),
+                            limits: limits().node,
+                        };
+                        if receiving {
+                            parent.count_decode(raw_calls, d, &mut w)?;
+                        } else {
+                            parent.count_encode(source_calls, e, &mut w)?;
+                        }
+                    }
+                    Ok(model)
+                })();
+                finish(w, result)
+            };
+            c.arm(None);
+            let whole = run(false).unwrap();
+            let baseline = c.trace();
+            c.arm(None);
+            let batched = run(true).unwrap();
+            assert_eq!(c.trace(), baseline);
+            for actual in [whole, batched] {
+                assert_eq!(
+                    actual.delegated_work,
+                    PARENT_WORK + binding_work + 9 * lookup
+                );
+                assert_eq!(actual.items, 15);
+                assert_eq!(actual.requests, if receiving { 17 } else { 9 });
+                assert_eq!(actual.requested, root_bytes + nested_bytes);
+                assert_eq!(actual.refs, 8);
+                assert_eq!(actual.inputs, 1);
+                let facts = actual
+                    .numerical_facts(SOURCE, v.count(), limits().node)
+                    .unwrap();
+                let work = 256
+                    + 32 * (15 + 1)
+                    + 8 * 35
+                    + 4 * (root_bytes + nested_bytes)
+                    + PARENT_WORK
+                    + binding_work
+                    + 9 * lookup;
+                assert_eq!(facts.cumulative_work_upper_bound, work);
+                assert_eq!(
+                    facts.coexisting_source_and_request_bytes_upper_bound,
+                    SOURCE + root_bytes + nested_bytes
+                );
+            }
+        }
+        c.disarm();
+    });
+}
+
+#[test]
+fn aggregate_collection_parent_tighter_gates_preserve_work_and_nested_capacity_errors() {
+    const PARENT_WORK: usize = 137;
+    let n = node();
+    let raw = expected();
+    let c = Control::default();
+    Fixture::new().with(&n, &c, |v, e, d, a| {
+        let (groups, source_calls, _) = physical(&n).unwrap();
+        let b = match &raw.kind {
+            Some(wire::physical_node::Kind::Aggregate(b)) => b,
+            _ => unreachable!(),
+        };
+        for receiving in [false, true] {
+            let lookup = if receiving {
+                d.lookup_work_upper_bound().unwrap()
+            } else {
+                e.lookup_work_upper_bound().unwrap()
+            };
+            let binding_work = if receiving { 30 } else { 12 };
+            let delegated = PARENT_WORK + binding_work + 3 * lookup;
+            let root_bytes = layout::<usize>(3)
+                + if receiving {
+                    2 * (layout::<p::NodeId>(1)
+                        + layout::<p::PhysicalProperties>(1)
+                        + layout::<p::ValueId>(3)
+                        + layout::<(p::ExprId, p::ValueId)>(3)
+                        + layout::<p::AggregateCall>(2))
+                } else {
+                    layout::<u32>(1)
+                        + layout::<wire::PhysicalProperties>(1)
+                        + layout::<u32>(3)
+                        + layout::<wire::ExpressionOutput>(3)
+                        + layout::<wire::AggregateCall>(2)
+                };
+            let first_bytes = if receiving {
+                2 * (layout::<p::ExprId>(3) + layout::<p::SortExpr>(2))
+            } else {
+                layout::<u32>(3) + layout::<wire::SortExpression>(2)
+            };
+            let initial = Model {
+                inputs: 1,
+                refs: 8,
+                items: 9,
+                requests: if receiving { 11 } else { 6 },
+                requested: root_bytes,
+                delegated_work: delegated,
+            };
+            let known = if receiving {
+                wire_header_floor(&raw, raw.output.as_ref().unwrap()).unwrap()
+                    + layout::<wire::ExpressionOutput>(3)
+                    + layout::<wire::AggregateCall>(2)
+            } else {
+                physical_header_floor(&n).unwrap()
+                    + layout::<(p::ExprId, p::ValueId)>(3)
+                    + layout::<p::AggregateCall>(2)
+            };
+            let action = |l: NodeProjectionLimits| -> Result<(), Error> {
+                let mut w = CompileCheckpoints::try_new(
+                    &c,
+                    if receiving {
+                        CompilePhase::Decode
+                    } else {
+                        CompilePhase::Encode
+                    },
+                )?;
+                let result = (|| {
+                    let mut model = initial;
+                    model.numerical_facts(SOURCE, v.count(), l)?;
+                    let parent = CollectionProjection {
+                        model: &mut model,
+                        known,
+                        source: SOURCE,
+                        values: v.count(),
+                        limits: l,
+                    };
+                    if receiving {
+                        parent.count_decode(&b.calls, d, &mut w)?;
+                    } else {
+                        parent.count_encode(source_calls, e, &mut w)?;
+                    }
+                    Ok(())
+                })();
+                finish(w, result)
+            };
+            c.arm(None);
+            action(limits().node).unwrap();
+            let success = c.trace();
+            assert_eq!(success.len(), 2);
+            assert_eq!(success[0].1, 0);
+            assert_eq!(success[1].1, 10);
+            for axis in 0..4 {
+                let mut l = limits().node;
+                match axis {
+                    0 => {
+                        l.max_allocation_requests =
+                            initial.requests + if receiving { 4 } else { 2 } - 1
+                    }
+                    1 => l.max_allocation_request_bytes = root_bytes + first_bytes - 1,
+                    2 => {
+                        l.max_coexisting_source_and_request_bytes =
+                            SOURCE + root_bytes + first_bytes - 1
+                    }
+                    3 => {
+                        l.max_work = 256
+                            + 32 * (14 + 1)
+                            + 8 * 35
+                            + 4 * (root_bytes + first_bytes)
+                            + delegated
+                            + 5 * lookup
+                            - 1
+                    }
+                    _ => unreachable!(),
+                }
+                for cause in CAUSES {
+                    c.arm(Some((1, cause)));
+                    assert!(matches!(
+                        action(l),
+                        Err(Error::Control(CompileControlError::ResourceExhausted))
+                    ));
+                    assert_eq!(c.trace(), success[..1]);
+                }
+            }
+        }
+        // Actual receiving Vec capacity belongs to the source invoice. Its
+        // omission remains an ordinary floor error, not a numeric cap failure.
+        let mut over = b.calls.clone();
+        over[0].argument_expr_ids.reserve(SOURCE);
+        let known = wire_header_floor(&raw, raw.output.as_ref().unwrap()).unwrap()
+            + layout::<wire::ExpressionOutput>(b.group_by.capacity())
+            + layout::<wire::AggregateCall>(over.capacity());
+        assert!(known + layout::<u32>(over[0].argument_expr_ids.capacity()) > SOURCE);
+        let omitted_capacity = || {
+            let mut w = CompileCheckpoints::try_new(&c, CompilePhase::Decode)?;
+            let mut model = Model {
+                inputs: 1,
+                refs: 8,
+                items: 9,
+                delegated_work: PARENT_WORK
+                    + decode_collection_lookup_work(&b.group_by, &over, d, a)?,
+                ..Model::default()
+            };
+            let result = CollectionProjection {
+                model: &mut model,
+                known,
+                source: SOURCE,
+                values: v.count(),
+                limits: limits().node,
+            }
+            .count_decode(&over, d, &mut w);
+            finish(w, result)
+        };
+        c.arm(None);
+        assert!(matches!(omitted_capacity(), Err(Error::InvalidShape(_))));
+        prefixes(&c, omitted_capacity);
+        // The same root/group lookup author remains in the encoded direction.
+        assert_eq!(
+            encode_collection_lookup_work(groups, source_calls, e).unwrap(),
+            12 + 3 * e.lookup_work_upper_bound().unwrap()
+        );
+        c.disarm();
+    });
+}

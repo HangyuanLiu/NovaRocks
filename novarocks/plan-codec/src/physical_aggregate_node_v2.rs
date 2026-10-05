@@ -39,6 +39,13 @@ use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
 type Error = AggregateNodeCodecError;
 
+mod collections;
+pub(crate) use collections::{
+    CollectionProjection, decode_collection_lookup_work, decode_collection_references,
+    decode_collections, encode_collection_lookup_work, encode_collection_references,
+    encode_collections, preflight_collection_binding_copies,
+};
+
 #[derive(Clone, Copy, Debug)]
 pub struct AggregateNodeProjectionLimits {
     pub node: NodeProjectionLimits,
@@ -176,7 +183,7 @@ fn prepare_encode(
         groups.len(),
         calls.len(),
     )?;
-    let mut known = add(
+    let known = add(
         physical_header_floor(input)?,
         add(
             bytes::<(p::ExprId, p::ValueId)>(groups.len())?,
@@ -185,10 +192,7 @@ fn prepare_encode(
     )?;
     // This namespace count is admitted before its source lookup loop. The
     // original expression invoice includes the same aggregate source owners.
-    let binding_work = mul(mul(2, calls.len())?, e.aggregates().source_counts())?;
-    let expression_lookup = e.lookup_work_upper_bound()?;
-    let mut exprs = groups.len();
-    model.delegated_work = add(binding_work, mul(exprs, expression_lookup)?)?;
+    model.delegated_work = encode_collection_lookup_work(groups, calls, e)?;
     model.numerical_facts(source, values.count(), l.node)?;
     count_prefix(model.inputs, model.items, source, known, l.node, w)?;
     model.facts(source, values.count(), l.node, w)?;
@@ -198,24 +202,14 @@ fn prepare_encode(
     model.request::<wire::ExpressionOutput>(groups.len(), 1)?;
     model.request::<wire::AggregateCall>(calls.len(), 1)?;
     model.numerical_facts(source, values.count(), l.node)?;
-    for call in calls {
-        let nested = add(call.arguments.len(), call.order_by.len())?;
-        model.items = add(model.items, nested)?;
-        known = add(
-            known,
-            add(
-                bytes::<p::ExprId>(call.arguments.len())?,
-                bytes::<p::SortExpr>(call.order_by.len())?,
-            )?,
-        )?;
-        exprs = add(exprs, nested)?;
-        model.request::<u32>(call.arguments.len(), 1)?;
-        model.request::<wire::SortExpression>(call.order_by.len(), 1)?;
-        model.delegated_work = add(binding_work, mul(exprs, expression_lookup)?)?;
-        model.numerical_facts(source, values.count(), l.node)?;
-        count_prefix(model.inputs, model.items, source, known, l.node, w)?;
-        w.step()?;
+    CollectionProjection {
+        model: &mut model,
+        known,
+        source,
+        values: values.count(),
+        limits: l.node,
     }
+    .count_encode(calls, e, w)?;
     model.facts(source, values.count(), l.node, w)?;
     for property in input
         .required_inputs
@@ -232,24 +226,7 @@ fn prepare_encode(
         w.step()?;
     }
     let facts = model.facts(source, values.count(), l.node, w)?;
-    for (expr, value) in groups {
-        encoded_expr(expr.get(), e, w)?;
-        reference(value.get(), values, w)?;
-        w.step()?;
-    }
-    for call in calls {
-        e.aggregates().source_id_observed(&call.binding, w)?;
-        for arg in &call.arguments {
-            encoded_expr(arg.get(), e, w)?;
-            w.step()?;
-        }
-        for sort in &call.order_by {
-            encoded_expr(sort.expr.get(), e, w)?;
-            w.step()?;
-        }
-        reference(call.output.get(), values, w)?;
-        w.step()?;
-    }
+    encode_collection_references(groups, calls, values, e, w)?;
     for value in &input.output.columns {
         reference(value.get(), values, w)?;
         w.step()?;
@@ -308,7 +285,7 @@ fn prepare_decode(
         body.group_by.len(),
         body.calls.len(),
     )?;
-    let mut known = add(
+    let known = add(
         wire_header_floor(input, port)?,
         add(
             bytes::<wire::ExpressionOutput>(body.group_by.capacity())?,
@@ -317,10 +294,7 @@ fn prepare_decode(
     )?;
     // Counts, types and emit each use the same actual count-sized lookup.
     // Admit all three passes before lending this immutable base to the child.
-    let binding_work = mul(mul(3, body.calls.len())?, add(a.definitions().len(), 2)?)?;
-    let expression_lookup = e.lookup_work_upper_bound()?;
-    let mut exprs = body.group_by.len();
-    base.delegated_work = add(binding_work, mul(exprs, expression_lookup)?)?;
+    base.delegated_work = decode_collection_lookup_work(&body.group_by, &body.calls, e, a)?;
     base.numerical_facts(source, e.values().count(), l.node)?;
     count_prefix(base.inputs, base.items, source, known, l.node, w)?;
     base.facts(source, e.values().count(), l.node, w)?;
@@ -335,24 +309,14 @@ fn prepare_decode(
     base.request::<(p::ExprId, p::ValueId)>(body.group_by.len(), 2)?;
     base.request::<p::AggregateCall>(body.calls.len(), 2)?;
     base.numerical_facts(source, e.values().count(), l.node)?;
-    for call in &body.calls {
-        let nested = add(call.argument_expr_ids.len(), call.order_by.len())?;
-        base.items = add(base.items, nested)?;
-        known = add(
-            known,
-            add(
-                bytes::<u32>(call.argument_expr_ids.capacity())?,
-                bytes::<wire::SortExpression>(call.order_by.capacity())?,
-            )?,
-        )?;
-        exprs = add(exprs, nested)?;
-        base.request::<p::ExprId>(call.argument_expr_ids.len(), 2)?;
-        base.request::<p::SortExpr>(call.order_by.len(), 2)?;
-        base.delegated_work = add(binding_work, mul(exprs, expression_lookup)?)?;
-        base.numerical_facts(source, e.values().count(), l.node)?;
-        count_prefix(base.inputs, base.items, source, known, l.node, w)?;
-        w.step()?;
+    CollectionProjection {
+        model: &mut base,
+        known,
+        source,
+        values: e.values().count(),
+        limits: l.node,
     }
+    .count_decode(&body.calls, e, w)?;
     base.facts(source, e.values().count(), l.node, w)?;
     for property in input.required_inputs.iter().chain(std::iter::once(props)) {
         base.property(properties::preflight_decode_observed(
@@ -364,53 +328,22 @@ fn prepare_decode(
         base.numerical_facts(source, e.values().count(), l.node)?;
         w.step()?;
     }
-    let mut child = MaterializationModel::for_composition(
-        body.calls.len(),
-        add(e.types().value_types().len(), 1)?,
-        source,
+    let facts = preflight_collection_binding_copies(
+        &body.calls,
+        e,
+        a,
+        CollectionProjection {
+            model: &mut base,
+            known,
+            source,
+            values: e.values().count(),
+            limits: l.node,
+        },
         dependency,
-    );
-    child.compose_in_node(base, e.values().count(), l.node, l.binding)?;
-    // Every delegated count/type check gates the same containing node before
-    // its next observer. All signatures are counted before any full type walk.
-    for call in &body.calls {
-        let source_binding = binding(required(call.aggregate_binding_id, w)?, a, w)?;
-        preflight_aggregate_binding_copy_counts(source_binding, &mut child, l.binding, w)?;
-        w.step()?;
-    }
-    child.node_facts(0, w)?;
-    for call in &body.calls {
-        let source_binding = binding(required(call.aggregate_binding_id, w)?, a, w)?;
-        preflight_aggregate_binding_copy_types(source_binding, &mut child, l.binding, w)?;
-        w.step()?;
-    }
-    let copy_work = mul(2, child.facts.cumulative_work_upper_bound)?;
-    let facts = child.node_facts(copy_work, w)?;
-    for group in &body.group_by {
-        decoded_expr(required(group.expr_id, w)?, e, w)?;
-        reference(required(group.value_id, w)?, e.values(), w)?;
-        w.step()?;
-    }
-    for call in &body.calls {
-        for arg in &call.argument_expr_ids {
-            decoded_expr(*arg, e, w)?;
-            w.step()?;
-        }
-        for sort in &call.order_by {
-            decoded_expr(required(sort.expr_id, w)?, e, w)?;
-            completed(
-                properties::decode_direction(sort.direction).map_err(Error::from),
-                w,
-            )?;
-            completed(
-                properties::decode_nulls(sort.null_ordering).map_err(Error::from),
-                w,
-            )?;
-            w.step()?;
-        }
-        reference(required(call.output_value_id, w)?, e.values(), w)?;
-        w.step()?;
-    }
+        l.binding,
+        w,
+    )?;
+    decode_collection_references(&body.group_by, &body.calls, e, w)?;
     for value in &port.value_ids {
         reference(*value, e.values(), w)?;
         w.step()?;
@@ -430,32 +363,7 @@ fn emit_encode(
     let (inputs, required_inputs, output_properties, output) =
         encode_header(input, source, l.node, w)?;
     let (groups, calls, grouping) = physical(input)?;
-    let mut group_by = reserve(groups.len(), w)?;
-    for (expr, value) in groups {
-        group_by.push(wire::ExpressionOutput {
-            expr_id: Some(expr.get()),
-            value_id: Some(value.get()),
-        });
-        w.step()?;
-    }
-    let mut emitted = reserve(calls.len(), w)?;
-    for call in calls {
-        let id = e.aggregates().source_id_observed(&call.binding, w)?;
-        let mut args = reserve(call.arguments.len(), w)?;
-        for arg in &call.arguments {
-            args.push(arg.get());
-            w.step()?;
-        }
-        emitted.push(wire::AggregateCall {
-            id: call.id.get(),
-            aggregate_binding_id: Some(id),
-            argument_expr_ids: args,
-            distinct: call.distinct,
-            order_by: encode_sorts(&call.order_by, w)?,
-            output_value_id: Some(call.output.get()),
-        });
-        w.step()?;
-    }
+    let (group_by, emitted) = encode_collections(groups, calls, e, w)?;
     let output = wire::PhysicalNode {
         id: input.id.get(),
         input_node_ids: inputs,
@@ -482,35 +390,7 @@ fn emit_decode(
     let (inputs, required_inputs, output_properties, output) =
         decode_header(input, source, l.node, w)?;
     let body = raw(input)?;
-    let mut group_by = reserve(body.group_by.len(), w)?;
-    for group in &body.group_by {
-        group_by.push((
-            p::ExprId::new(required(group.expr_id, w)?),
-            p::ValueId::new(required(group.value_id, w)?),
-        ));
-        w.step()?;
-    }
-    let mut calls = reserve(body.calls.len(), w)?;
-    for call in &body.calls {
-        let binding = copy_aggregate_binding_observed(
-            binding(required(call.aggregate_binding_id, w)?, a, w)?,
-            w,
-        )?;
-        let mut args = reserve(call.argument_expr_ids.len(), w)?;
-        for id in &call.argument_expr_ids {
-            args.push(p::ExprId::new(*id));
-            w.step()?;
-        }
-        calls.push(p::AggregateCall {
-            id: p::AggregateCallId::new(call.id),
-            binding,
-            arguments: boxed(args, w)?,
-            distinct: call.distinct,
-            order_by: decode_sorts(&call.order_by, w)?,
-            output: p::ValueId::new(required(call.output_value_id, w)?),
-        });
-        w.step()?;
-    }
+    let (group_by, calls) = decode_collections(&body.group_by, &body.calls, a, w)?;
     let output = p::PhysicalNode {
         id: p::NodeId::new(input.id),
         inputs,

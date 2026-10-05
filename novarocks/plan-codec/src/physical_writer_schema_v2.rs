@@ -81,6 +81,16 @@ impl From<resources::NodeCodecError> for WriterSchemaCodecError {
         }
     }
 }
+impl From<WriterSchemaCodecError> for resources::NodeCodecError {
+    fn from(error: WriterSchemaCodecError) -> Self {
+        match error {
+            WriterSchemaCodecError::Control(cause) => Self::Control(cause),
+            WriterSchemaCodecError::Type(error) => error.into(),
+            WriterSchemaCodecError::Resources(error) => error,
+            WriterSchemaCodecError::InvalidShape(message) => Self::InvalidShape(message),
+        }
+    }
+}
 impl fmt::Display for WriterSchemaCodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -161,9 +171,49 @@ impl WriterSchemaProjectionLimits {
         }
     }
 }
+/// The original containing node before this schema's contribution. Type IDs
+/// stay on the schema axis; the caller charges actual Value occurrences in base.
+#[derive(Clone, Copy)]
+pub(crate) struct WriterSchemaNodeAdmission {
+    pub(crate) base: Model,
+    pub(crate) values: usize,
+    pub(crate) limits: NodeProjectionLimits,
+}
+impl WriterSchemaNodeAdmission {
+    /// Commit one completed contribution before lending this same node to the
+    /// next schema. Source bytes are supplied once to the original node model.
+    pub(crate) fn merge(
+        self,
+        child: WriterSchemaProjectionFacts,
+    ) -> Result<Model, resources::NodeCodecError> {
+        let mut merged = self.base;
+        merged.items = resources::add(merged.items, child.field_count)?;
+        merged.requests = resources::add(merged.requests, child.allocation_requests_upper_bound)?;
+        merged.requested =
+            resources::add(merged.requested, child.allocation_request_bytes_upper_bound)?;
+        merged.delegated_work =
+            resources::add(merged.delegated_work, child.cumulative_work_upper_bound)?;
+        Ok(merged)
+    }
+    fn remaining(self, source: usize, child: WriterSchemaProjectionFacts) -> Result<usize, Error> {
+        let merged = self.merge(child)?;
+        let facts = merged.numerical_facts(source, self.values, self.limits)?;
+        self.limits
+            .max_work
+            .checked_sub(facts.cumulative_work_upper_bound)
+            .ok_or_else(|| CompileControlError::ResourceExhausted.into())
+    }
+}
+#[derive(Clone, Copy)]
+struct ProjectionContext {
+    source: usize,
+    limits: WriterSchemaProjectionLimits,
+    parent: Option<WriterSchemaNodeAdmission>,
+}
 struct Count {
     model: Model,
     names: usize,
+    parent: Option<WriterSchemaNodeAdmission>,
 }
 impl Count {
     fn new(n: usize) -> Self {
@@ -174,6 +224,7 @@ impl Count {
                 ..Model::default()
             },
             names: 0,
+            parent: None,
         }
     }
     fn numerical_facts(
@@ -188,7 +239,7 @@ impl Count {
         let f = self
             .model
             .numerical_facts(source, types, limits.resources())?;
-        Ok(WriterSchemaProjectionFacts {
+        let facts = WriterSchemaProjectionFacts {
             field_count: f.list_item_count,
             name_bytes: self.names,
             type_reference_count: f.value_reference_count,
@@ -197,7 +248,11 @@ impl Count {
             coexisting_source_and_request_bytes_upper_bound: f
                 .coexisting_source_and_request_bytes_upper_bound,
             cumulative_work_upper_bound: f.cumulative_work_upper_bound,
-        })
+        };
+        if let Some(parent) = self.parent {
+            parent.remaining(source, facts)?;
+        }
+        Ok(facts)
     }
     fn facts(
         &self,
@@ -221,10 +276,14 @@ impl Count {
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<usize, Error> {
         let f = self.facts(source, types, limits, w)?;
-        limits
+        let child = limits
             .max_work
             .checked_sub(f.cumulative_work_upper_bound)
-            .ok_or_else(|| CompileControlError::ResourceExhausted.into())
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        Ok(match self.parent {
+            Some(parent) => child.min(parent.remaining(source, f)?),
+            None => child,
+        })
     }
 }
 #[derive(Clone, Copy)]
@@ -320,9 +379,34 @@ fn preflight_encode(
     l: WriterSchemaProjectionLimits,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<WriterSchemaProjectionFacts, Error> {
+    preflight_encode_context(
+        source,
+        ids,
+        types,
+        ProjectionContext {
+            source: invoice,
+            limits: l,
+            parent: None,
+        },
+        w,
+    )
+}
+fn preflight_encode_context(
+    source: Source<'_>,
+    ids: &[u32],
+    types: &EncodedTypeTable<'_>,
+    context: ProjectionContext,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<WriterSchemaProjectionFacts, Error> {
+    let ProjectionContext {
+        source: invoice,
+        limits: l,
+        parent,
+    } = context;
     let n = source.len();
     let roots = types.source_counts().0;
     let mut c = Count::new(n);
+    c.parent = parent;
     // Original linear root lookups run once here; emitted IDs need no lookup.
     // Admit the sole clone preflight for every actual source occurrence.
     c.model.delegated_work = resources::mul(
@@ -407,9 +491,32 @@ fn preflight_decode(
     l: WriterSchemaProjectionLimits,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<WriterSchemaProjectionFacts, Error> {
+    preflight_decode_context(
+        raw,
+        types,
+        ProjectionContext {
+            source: invoice,
+            limits: l,
+            parent: None,
+        },
+        w,
+    )
+}
+fn preflight_decode_context(
+    raw: Raw<'_>,
+    types: &DecodedTypeTable,
+    context: ProjectionContext,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<WriterSchemaProjectionFacts, Error> {
+    let ProjectionContext {
+        source: invoice,
+        limits: l,
+        parent,
+    } = context;
     let n = raw.len();
     let roots = types.value_types().len();
     let mut c = Count::new(n);
+    c.parent = parent;
     let lookups = crate::btree_resources_v2::lookup_work(roots).map_err(shape)?;
     // Each actual occurrence has a lookup and clone in prepare and in emit.
     // Keep both original clone ceilings rather than narrowing final facts.
@@ -506,7 +613,7 @@ fn name(input: &str, w: &mut CompileCheckpoints<'_>) -> Result<Box<str>, Error> 
     w.flush()?;
     Ok(output)
 }
-fn emit_schema(
+pub(crate) fn emit_schema(
     source: &p::WriterRelationSchema,
     ids: &[u32],
     w: &mut CompileCheckpoints<'_>,
@@ -526,7 +633,7 @@ fn emit_schema(
         fields,
     })
 }
-fn emit_targets(
+pub(crate) fn emit_targets(
     source: &[p::WriterTargetField],
     ids: &[u32],
     w: &mut CompileCheckpoints<'_>,
@@ -549,7 +656,7 @@ fn emit_targets(
     }
     Ok(fields)
 }
-fn read_schema(
+pub(crate) fn read_schema(
     raw: &wire::WriterRelationSchema,
     types: &DecodedTypeTable,
     w: &mut CompileCheckpoints<'_>,
@@ -572,7 +679,7 @@ fn read_schema(
         fields: resources::boxed(fields, w)?,
     })
 }
-fn read_targets(
+pub(crate) fn read_targets(
     raw: &[wire::WriterTargetField],
     types: &DecodedTypeTable,
     w: &mut CompileCheckpoints<'_>,
@@ -600,6 +707,56 @@ fn read_targets(
     Ok(resources::boxed(fields, w)?)
 }
 
+/// Same-meter schema projection. The caller retains the exact type/source loan
+/// and owns entry, header admission and final publication.
+pub(crate) struct WriterSchemaProjection {
+    pub(crate) source: usize,
+    pub(crate) limits: WriterSchemaProjectionLimits,
+    pub(crate) parent: WriterSchemaNodeAdmission,
+}
+impl WriterSchemaProjection {
+    fn context(self) -> ProjectionContext {
+        ProjectionContext {
+            source: self.source,
+            limits: self.limits,
+            parent: Some(self.parent),
+        }
+    }
+}
+pub(crate) fn preflight_schema_encode_observed(
+    input: &p::WriterRelationSchema,
+    ids: &[u32],
+    types: &EncodedTypeTable<'_>,
+    projection: WriterSchemaProjection,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<WriterSchemaProjectionFacts, Error> {
+    preflight_encode_context(Source::Schema(input), ids, types, projection.context(), w)
+}
+pub(crate) fn preflight_targets_encode_observed(
+    input: &[p::WriterTargetField],
+    ids: &[u32],
+    types: &EncodedTypeTable<'_>,
+    projection: WriterSchemaProjection,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<WriterSchemaProjectionFacts, Error> {
+    preflight_encode_context(Source::Targets(input), ids, types, projection.context(), w)
+}
+pub(crate) fn preflight_schema_decode_observed(
+    input: &wire::WriterRelationSchema,
+    types: &DecodedTypeTable,
+    projection: WriterSchemaProjection,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<WriterSchemaProjectionFacts, Error> {
+    preflight_decode_context(Raw::Schema(input), types, projection.context(), w)
+}
+pub(crate) fn preflight_targets_decode_observed(
+    input: &Vec<wire::WriterTargetField>,
+    types: &DecodedTypeTable,
+    projection: WriterSchemaProjection,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<WriterSchemaProjectionFacts, Error> {
+    preflight_decode_context(Raw::Targets(input), types, projection.context(), w)
+}
 macro_rules! encoding_api {
     ($token:ident,$prepare:ident,$encode:ident,$input:ty,$output:ty,$variant:ident,$emit:ident) => {
         pub struct $token<'input, 'loan, 'source, 'control> {
