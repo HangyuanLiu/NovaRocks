@@ -164,6 +164,82 @@ pub(crate) struct Model {
     known: usize,
     pub(crate) retained: usize,
     extra_work: usize,
+    node_admission: Option<NodeAdmission>,
+}
+/// A containing node's original numerical facts, not a child budget reset.
+/// Only the sole Node model authors the composed axes and work formula.
+struct NodeAdmission {
+    base: resources::Model,
+    limits: resources::NodeProjectionLimits,
+    values: usize,
+    peak: usize,
+}
+impl NodeAdmission {
+    fn accepts_update(
+        &self,
+        base: resources::Model,
+        values: usize,
+        limits: resources::NodeProjectionLimits,
+    ) -> bool {
+        let counts = |model: resources::Model| {
+            [
+                model.inputs,
+                model.refs,
+                model.items,
+                model.requests,
+                model.requested,
+                model.delegated_work,
+            ]
+        };
+        let envelope = |l: resources::NodeProjectionLimits| {
+            [
+                l.max_input_nodes,
+                l.max_value_references,
+                l.max_list_items,
+                l.max_allocation_requests,
+                l.max_allocation_request_bytes,
+                l.max_coexisting_source_and_request_bytes,
+                l.max_work,
+                l.properties.max_value_references,
+                l.properties.max_allocation_requests,
+                l.properties.max_allocation_request_bytes,
+                l.properties.max_coexisting_source_and_request_bytes,
+                l.properties.max_work,
+            ]
+        };
+        self.values == values
+            && envelope(self.limits) == envelope(limits)
+            && counts(base)
+                .into_iter()
+                .zip(counts(self.base))
+                .all(|(new, old)| new >= old)
+    }
+    fn composed(
+        &self,
+        items: usize,
+        child: BindingProjectionFacts,
+    ) -> Result<resources::Model, Error> {
+        Ok(resources::Model {
+            inputs: self.base.inputs,
+            refs: self.base.refs,
+            items: add(self.base.items, items)?,
+            requests: add(self.base.requests, child.allocation_requests_upper_bound)?,
+            requested: add(self.base.requested, child.request_bytes_upper_bound)?,
+            delegated_work: add(self.base.delegated_work, self.peak)?,
+        })
+    }
+    fn check(
+        &mut self,
+        items: usize,
+        child: BindingProjectionFacts,
+        source: usize,
+    ) -> Result<(), Error> {
+        self.peak = self.peak.max(child.cumulative_work_upper_bound);
+        self.composed(items, child)?
+            .numerical_facts(source, self.values, self.limits)
+            .map_err(numeric)?;
+        Ok(())
+    }
 }
 impl Model {
     fn new(headers: &PreparedFunctionBindingHeaders<'_>, source: usize) -> Result<Self, Error> {
@@ -197,7 +273,54 @@ impl Model {
             known,
             retained: 0,
             extra_work: 0,
+            node_admission: None,
         }
+    }
+    /// Bind or update the containing node before a delegated walk. An update
+    /// keeps the already admitted peak; callbacks still belong to the caller.
+    pub(crate) fn compose_in_node(
+        &mut self,
+        base: resources::Model,
+        values: usize,
+        node_limits: resources::NodeProjectionLimits,
+        binding_limits: BindingProjectionLimits,
+    ) -> Result<(), Error> {
+        if self
+            .node_admission
+            .as_ref()
+            .is_some_and(|parent| !parent.accepts_update(base, values, node_limits))
+        {
+            return Err(shape(
+                "containing node envelope changed or cumulative facts decreased",
+            ));
+        }
+        let peak = self.node_work_peak();
+        self.node_admission = Some(NodeAdmission {
+            base,
+            limits: node_limits,
+            values,
+            peak,
+        });
+        self.check(binding_limits)
+    }
+    pub(crate) fn node_work_peak(&self) -> usize {
+        self.node_admission.as_ref().map_or(0, |parent| parent.peak)
+    }
+    /// Complete the same composition, retaining any earlier coarse work gate.
+    pub(crate) fn node_facts(
+        &mut self,
+        work_ceiling: usize,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<resources::NodeProjectionFacts, Error> {
+        let parent = self
+            .node_admission
+            .as_mut()
+            .ok_or_else(|| shape("binding model has no containing node admission"))?;
+        parent.peak = parent.peak.max(work_ceiling);
+        parent
+            .composed(self.items, self.facts)?
+            .facts(self.source, parent.values, parent.limits, work)
+            .map_err(numeric)
     }
     pub(crate) fn request<T>(&mut self, count: usize, times: usize) -> Result<(), Error> {
         let size = bytes::<T>(count)?;
@@ -271,6 +394,9 @@ impl Model {
             )?,
         )?;
         cap(self.facts.cumulative_work_upper_bound, limits.max_work)?;
+        if let Some(parent) = &mut self.node_admission {
+            parent.check(self.items, self.facts, self.source)?;
+        }
         if self.source < self.known {
             return Err(shape(
                 "binding materialization source invoice omits original namespace",
@@ -314,8 +440,6 @@ impl Model {
         self.check(limits)?;
         w.flush()?;
         let clone = preflight_value_type_clone(source, w)?;
-        w.step()?;
-        w.flush()?;
         self.facts.allocation_requests_upper_bound = add(
             self.facts.allocation_requests_upper_bound,
             clone.allocation_requests_upper_bound(),
@@ -331,7 +455,12 @@ impl Model {
             clone.work_upper_bound(),
             value_type_clone_preflight_work_upper_bound(),
         )?;
-        self.check(limits)
+        // The clone counts are now known. Their originating refusal must win
+        // before a post-delegate quantum or flush can observe later control.
+        self.check(limits)?;
+        w.step()?;
+        w.flush()?;
+        Ok(())
     }
 }
 

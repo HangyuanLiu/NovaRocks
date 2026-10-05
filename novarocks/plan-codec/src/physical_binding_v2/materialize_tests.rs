@@ -586,3 +586,258 @@ fn composition_empty_and_overflow_requests_preserve_typed_refusal() {
         Err(Error::Control(CompileControlError::ResourceExhausted))
     ));
 }
+
+fn node_limits() -> resources::NodeProjectionLimits {
+    resources::NodeProjectionLimits {
+        max_input_nodes: usize::MAX,
+        max_value_references: usize::MAX,
+        max_list_items: usize::MAX,
+        max_allocation_requests: usize::MAX,
+        max_allocation_request_bytes: usize::MAX,
+        max_coexisting_source_and_request_bytes: usize::MAX,
+        max_work: usize::MAX,
+        properties: crate::physical_properties_v2::PhysicalPropertyProjectionLimits {
+            max_value_references: usize::MAX,
+            max_allocation_requests: usize::MAX,
+            max_allocation_request_bytes: usize::MAX,
+            max_coexisting_source_and_request_bytes: usize::MAX,
+            max_work: usize::MAX,
+        },
+    }
+}
+fn composed_model() -> Model {
+    let mut model = Model::for_composition(1, 0, SOURCE, 0);
+    model.items = 3;
+    model.request::<u64>(2, 2).unwrap();
+    model
+}
+#[test]
+fn containing_node_all_known_axes_are_checked_without_late_observation() {
+    let base = resources::Model {
+        inputs: 1,
+        refs: 1,
+        items: 2,
+        requests: 1,
+        requested: 8,
+        delegated_work: 7,
+    };
+    let mut model = composed_model();
+    model
+        .compose_in_node(base, 1, node_limits(), limits())
+        .unwrap();
+    let control = Control::default();
+    control.arm(None);
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let facts = model
+        .node_facts(model.facts.cumulative_work_upper_bound, &mut work)
+        .unwrap();
+    assert_eq!(facts.input_node_count, 1);
+    assert_eq!(facts.value_reference_count, 1);
+    assert_eq!(facts.list_item_count, 5);
+    assert_eq!(facts.allocation_requests_upper_bound, 3);
+    assert_eq!(facts.allocation_request_bytes_upper_bound, 40);
+    assert_eq!(
+        facts.coexisting_source_and_request_bytes_upper_bound,
+        SOURCE + 40
+    );
+    // Independent hand sum: original Node own work + original child coarse work.
+    assert_eq!(
+        facts.cumulative_work_upper_bound,
+        256 + 32 * 6 + 34 + 4 * 40 + 7 + 128 + 32 * 4 + 4 * 32 + 2
+    );
+    let mut exact = node_limits();
+    exact.max_input_nodes = facts.input_node_count;
+    exact.max_value_references = facts.value_reference_count;
+    exact.max_list_items = facts.list_item_count;
+    exact.max_allocation_requests = facts.allocation_requests_upper_bound;
+    exact.max_allocation_request_bytes = facts.allocation_request_bytes_upper_bound;
+    exact.max_coexisting_source_and_request_bytes =
+        facts.coexisting_source_and_request_bytes_upper_bound;
+    exact.max_work = facts.cumulative_work_upper_bound;
+    composed_model()
+        .compose_in_node(base, 1, exact, limits())
+        .unwrap();
+    for axis in 0..7 {
+        let mut l = exact;
+        let maximum = match axis {
+            0 => &mut l.max_input_nodes,
+            1 => &mut l.max_value_references,
+            2 => &mut l.max_list_items,
+            3 => &mut l.max_allocation_requests,
+            4 => &mut l.max_allocation_request_bytes,
+            5 => &mut l.max_coexisting_source_and_request_bytes,
+            6 => &mut l.max_work,
+            _ => unreachable!(),
+        };
+        *maximum -= 1;
+        for cause in CAUSES {
+            control.arm(Some((1, cause)));
+            let mut pending = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+            for _ in 0..255 {
+                pending.step().unwrap();
+            }
+            assert!(matches!(
+                composed_model().compose_in_node(base, 1, l, limits()),
+                Err(Error::Control(CompileControlError::ResourceExhausted))
+            ));
+            assert_eq!(control.trace(), [0]);
+        }
+    }
+    let peak = model.node_work_peak();
+    let mut updated = base;
+    updated.delegated_work += 17;
+    model
+        .compose_in_node(updated, 1, node_limits(), limits())
+        .unwrap();
+    assert!(model.node_work_peak() >= peak);
+    control.arm(None);
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    assert_eq!(
+        model
+            .node_facts(peak, &mut work)
+            .unwrap()
+            .cumulative_work_upper_bound,
+        facts.cumulative_work_upper_bound + 17
+    );
+}
+#[test]
+fn real_signature_collections_cannot_bypass_tighter_containing_node_items() {
+    let ty = FunctionValueType::new(DataType::Int64, false);
+    for lambda in [false, true] {
+        let args = if lambda {
+            vec![FunctionArgumentType::Lambda {
+                parameter_types: vec![ty.clone(); 320].into_boxed_slice(),
+                result_type: ty.clone(),
+            }]
+        } else {
+            vec![FunctionArgumentType::Value(ty.clone()); 320]
+        };
+        let signature = BoundFunction::from_exact_signature(
+            FunctionId::try_new("test/f").unwrap(),
+            FunctionOverloadId::try_new("test/o").unwrap(),
+            FunctionKind::Scalar,
+            args.into_boxed_slice(),
+            ty.clone(),
+        );
+        let mut l = node_limits();
+        l.max_list_items = if lambda { 320 } else { 319 };
+        let mut child_limits = limits();
+        child_limits.max_work = usize::MAX;
+        for cause in CAUSES {
+            let control = Control::default();
+            control.arm(Some((1, cause)));
+            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+            let mut model = Model::for_composition(1, 0, SOURCE, 0);
+            model
+                .compose_in_node(resources::Model::default(), 0, l, child_limits)
+                .unwrap();
+            assert!(matches!(
+                crate::physical_binding_v2::preflight_scalar_signature_copy_counts(
+                    &signature,
+                    &mut model,
+                    child_limits,
+                    &mut work
+                ),
+                Err(Error::Control(CompileControlError::ResourceExhausted))
+            ));
+            assert_eq!(control.trace(), [0]);
+        }
+    }
+}
+#[test]
+fn known_dictionary_clone_requests_precede_post_delegate_control() {
+    let source = FunctionValueType::new(
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        true,
+    );
+    let control = Control::default();
+    let run = |binding_limits, node_limits| {
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode)?;
+        let mut model = Model::for_composition(1, 0, SOURCE, 0);
+        model.facts.type_reference_count = 1;
+        model.compose_in_node(resources::Model::default(), 0, node_limits, binding_limits)?;
+        model.count_owned_type_clone(&source, binding_limits, &mut work)
+    };
+    let mut child_limits = limits();
+    child_limits.max_work = usize::MAX;
+    control.arm(None);
+    run(child_limits, node_limits()).unwrap();
+    let success = control.trace();
+    assert!(success.len() > 1);
+    let prefix = &success[..success.len() - 1];
+    for parent in [false, true] {
+        let mut child = child_limits;
+        let mut node = node_limits();
+        if parent {
+            node.max_allocation_requests = 1;
+        } else {
+            child.max_allocation_requests = 1;
+        }
+        for cause in CAUSES {
+            control.arm(Some((prefix.len(), cause)));
+            assert!(matches!(
+                run(child, node),
+                Err(Error::Control(CompileControlError::ResourceExhausted))
+            ));
+            assert_eq!(control.trace(), prefix);
+        }
+    }
+}
+
+#[test]
+fn containing_node_updates_keep_original_envelope_and_monotone_base() {
+    let base = resources::Model {
+        inputs: 1,
+        refs: 1,
+        items: 2,
+        requests: 1,
+        requested: 8,
+        delegated_work: 7,
+    };
+    let mut original_limits = node_limits();
+    original_limits.max_input_nodes = 16;
+    let mut model = composed_model();
+    model
+        .compose_in_node(base, 1, original_limits, limits())
+        .unwrap();
+    let peak = model.node_work_peak();
+    for axis in 0..6 {
+        let mut smaller = base;
+        *match axis {
+            0 => &mut smaller.inputs,
+            1 => &mut smaller.refs,
+            2 => &mut smaller.items,
+            3 => &mut smaller.requests,
+            4 => &mut smaller.requested,
+            5 => &mut smaller.delegated_work,
+            _ => unreachable!(),
+        } -= 1;
+        assert!(matches!(
+            model.compose_in_node(smaller, 1, original_limits, limits()),
+            Err(Error::InvalidShape(_))
+        ));
+        assert_eq!(model.node_work_peak(), peak);
+    }
+    assert!(matches!(
+        model.compose_in_node(base, 2, original_limits, limits()),
+        Err(Error::InvalidShape(_))
+    ));
+    let mut changed = original_limits;
+    changed.max_input_nodes = 15;
+    assert!(matches!(
+        model.compose_in_node(base, 1, changed, limits()),
+        Err(Error::InvalidShape(_))
+    ));
+    changed = original_limits;
+    changed.properties.max_work -= 1;
+    assert!(matches!(
+        model.compose_in_node(base, 1, changed, limits()),
+        Err(Error::InvalidShape(_))
+    ));
+    let mut grown = base;
+    grown.delegated_work += 1;
+    model
+        .compose_in_node(grown, 1, original_limits, limits())
+        .unwrap();
+    assert_eq!(model.node_work_peak(), peak);
+}

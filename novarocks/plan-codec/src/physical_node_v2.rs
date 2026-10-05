@@ -319,7 +319,7 @@ pub(crate) fn wire_property_refs(
     Ok(())
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct Model {
     pub(crate) inputs: usize,
     pub(crate) refs: usize,
@@ -364,6 +364,29 @@ impl Model {
         l: NodeProjectionLimits,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<NodeProjectionFacts, Error> {
+        let (facts, axes) = self.checked_facts(source, values, l)?;
+        for _ in 0..axes {
+            w.step()?;
+        }
+        Ok(facts)
+    }
+    /// The same numerical author for a nested model's synchronous admission.
+    /// This adds neither an observation nor another budget/source invoice.
+    pub(crate) fn numerical_facts(
+        &self,
+        source: usize,
+        values: usize,
+        l: NodeProjectionLimits,
+    ) -> Result<NodeProjectionFacts, Error> {
+        self.checked_facts(source, values, l)
+            .map(|(facts, _)| facts)
+    }
+    fn checked_facts(
+        &self,
+        source: usize,
+        values: usize,
+        l: NodeProjectionLimits,
+    ) -> Result<(NodeProjectionFacts, usize), Error> {
         let search_height = (usize::BITS - values.leading_zeros()) as usize + 1;
         // Each original list/reference has a bounded count/shape pass, exact
         // namespace lookup and emission pass. The multiplier covers their
@@ -412,10 +435,7 @@ impl Model {
         for (actual, maximum) in axes {
             check_cap(actual, maximum)?;
         }
-        for _ in axes {
-            w.step()?;
-        }
-        Ok(facts)
+        Ok((facts, axes.len()))
     }
 }
 pub(crate) fn count_prefix(
