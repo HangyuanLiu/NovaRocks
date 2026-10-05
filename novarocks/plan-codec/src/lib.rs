@@ -20,6 +20,7 @@
 //! provider facts. It has no SQL compiler or Frontend runtime dependency.
 
 mod allocation_exit_v2;
+mod arrow_metadata_v2;
 mod binding_index_v2;
 mod borrowed_type_resources;
 mod btree_resources_v2;

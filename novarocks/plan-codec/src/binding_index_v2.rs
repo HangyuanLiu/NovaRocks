@@ -20,8 +20,24 @@
 //! before entering this allocation owner. IDs never size an allocation.
 
 use crate::{allocation_exit_v2::reserve_exit, physical_binding_v2::BindingCodecError};
-use novarocks_type_contract::CompileCheckpoints;
+use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
 use std::alloc::Layout;
+
+/// The actual count-sized heap-sort owner below admits its construction once.
+/// Each sift level performs bounded identity reads, comparisons and movement;
+/// the conservative multiplier includes fill, both heap passes and duplicates.
+pub(crate) fn prepare_work_upper_bound(count: usize) -> Result<usize, BindingCodecError> {
+    let height = (usize::BITS - count.leading_zeros()) as usize + 1;
+    count
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(32))
+        .and_then(|n| n.checked_add(64))
+        .ok_or_else(|| CompileControlError::ResourceExhausted.into())
+}
+
+pub(crate) fn lookup_work_upper_bound(count: usize) -> usize {
+    (usize::BITS - count.leading_zeros()) as usize + 1
+}
 
 pub(crate) struct BindingIndex {
     indices: Vec<usize>,
@@ -123,5 +139,74 @@ fn sift(
         indices.swap(root, child);
         root = child;
         work.step()?;
+    }
+}
+
+#[cfg(test)]
+mod work_tests {
+    use super::*;
+    use novarocks_type_contract::{CompilePhase, PureCompileControl};
+    use std::sync::Mutex;
+    #[derive(Default)]
+    struct Control(Mutex<Vec<u32>>);
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            self.0.lock().unwrap().push(units);
+            Ok(())
+        }
+    }
+    #[test]
+    fn numerical_bounds_cover_actual_sparse_heap_sort_and_binary_lookup() {
+        for count in [0, 1, 2, 3, 15, 64, 320] {
+            let ids: Vec<u32> = (0..count)
+                .map(|at| {
+                    if at + 1 == count {
+                        0
+                    } else {
+                        u32::MAX - at as u32
+                    }
+                })
+                .collect();
+            let control = Control::default();
+            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+            let index = BindingIndex::prepare(count, |at| ids[at], &mut work).unwrap();
+            work.finish().unwrap();
+            let units = control
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|x| *x as usize)
+                .sum::<usize>();
+            assert!(units <= prepare_work_upper_bound(count).unwrap());
+            for sought in [0, u32::MAX, 1] {
+                let lookup = Control::default();
+                let mut work = CompileCheckpoints::try_new(&lookup, CompilePhase::Decode).unwrap();
+                let actual = index.find(sought, |at| ids[at], &mut work).unwrap();
+                work.finish().unwrap();
+                assert_eq!(actual, ids.iter().position(|id| *id == sought));
+                let units = lookup
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|x| *x as usize)
+                    .sum::<usize>();
+                assert!(units <= lookup_work_upper_bound(count));
+            }
+        }
+    }
+    #[test]
+    fn unrepresentable_index_work_is_typed_resource_without_observer_calls() {
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        work.step().unwrap();
+        assert!(matches!(
+            prepare_work_upper_bound(usize::MAX),
+            Err(BindingCodecError::Control(
+                CompileControlError::ResourceExhausted
+            ))
+        ));
+        assert_eq!(*control.0.lock().unwrap(), [0]);
     }
 }

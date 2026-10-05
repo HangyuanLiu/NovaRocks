@@ -91,6 +91,36 @@ impl DecodedTypeTable {
     pub fn field(&self, id: u32) -> Option<&Arc<Field>> {
         self.fields.get(&id)
     }
+    /// Actual sparse Field namespace size for admission of opaque lookups.
+    pub(crate) fn field_count(&self) -> usize {
+        self.fields.len()
+    }
+    /// Necessary inline table and occupied Field key/handle bytes only. This
+    /// is not a private BTree capacity estimate or a complete shared backing
+    /// invoice; the caller owns the truthful original-source union.
+    pub(crate) fn necessary_fields_retained_floor(&self) -> Result<usize, TypeCodecError> {
+        let entry = std::mem::size_of::<u32>()
+            .checked_add(std::mem::size_of::<Arc<Field>>())
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        self.fields
+            .len()
+            .checked_mul(entry)
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
+            .ok_or_else(|| CompileControlError::ResourceExhausted.into())
+    }
+    /// The caller first admits the sole BTree lookup bound using field_count,
+    /// and lends its existing scope. Types own no fabricated control loan.
+    pub(crate) fn field_observed(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&Arc<Field>>, TypeCodecError> {
+        work.flush()?;
+        let field = self.fields.get(&id);
+        work.step()?;
+        work.flush()?;
+        Ok(field)
+    }
     pub fn value_type(&self, id: u32) -> Option<&FunctionValueType> {
         self.values.get(&id)
     }

@@ -255,9 +255,9 @@ fn preflight<'a>(
             add(&mut bytes, entry.value.len(), limits.max_string_bytes)?;
             observe_bytes(entry.key.as_bytes(), work)?;
             observe_bytes(entry.value.as_bytes(), work)?;
-            // Keys are individually at most 1024 bytes, so this exact ordering
-            // comparison is one bounded operation after its observed bytes.
-            if previous.is_some_and(|key| key >= entry.key.as_str()) {
+            // Keep the original owner bounds and diagnostic order; strict
+            // metadata order is supplied by the sole observed key author.
+            if !crate::arrow_metadata_v2::ordered_key(previous, &entry.key, work)? {
                 return Err(E::InvalidShape("field metadata must be sorted and unique"));
             }
             previous = Some(&entry.key);

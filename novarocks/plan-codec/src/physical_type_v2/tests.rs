@@ -937,3 +937,53 @@ fn composing_value_clone_observes_each_original_dictionary_request_boundary() {
         }
     }
 }
+
+#[test]
+fn schema_field_ports_use_actual_sparse_namespace_and_necessary_inline_floor() {
+    let mut raw = sparse_list();
+    raw.fields.push(f(u32::MAX, 0));
+    let decoded = decode_type_table(&raw, limits(), &Control::default()).unwrap();
+    assert_eq!(decoded.field_count(), 2);
+    let independent_floor = std::mem::size_of::<DecodedTypeTable>()
+        + 2 * (std::mem::size_of::<u32>() + std::mem::size_of::<Arc<Field>>());
+    assert_eq!(
+        decoded.necessary_fields_retained_floor().unwrap(),
+        independent_floor
+    );
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    for id in [0, u32::MAX, 0] {
+        let found = decoded.field_observed(id, &mut work).unwrap().unwrap();
+        assert!(Arc::ptr_eq(found, decoded.field(id).unwrap()));
+    }
+    assert!(decoded.field_observed(1, &mut work).unwrap().is_none());
+    work.finish().unwrap();
+    let trace = control.events.lock().unwrap();
+    assert_eq!(
+        trace.iter().map(|(_, units)| *units).collect::<Vec<_>>(),
+        [0, 0, 1, 0, 1, 0, 1, 0, 1, 0]
+    );
+}
+
+#[test]
+fn schema_field_lookup_preserves_every_actual_opaque_boundary_control_cause() {
+    let decoded = decode_type_table(&sparse_list(), limits(), &Control::default()).unwrap();
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        for at in [2, 3] {
+            let control = Control {
+                fail: Some((at, cause)),
+                ..Default::default()
+            };
+            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+            assert!(
+                matches!(decoded.field_observed(0, &mut work), Err(TypeCodecError::Control(actual)) if actual==cause)
+            );
+            assert!(matches!(work.finish(), Err(actual) if actual==cause));
+            assert_eq!(control.events.lock().unwrap().len(), at);
+        }
+    }
+}

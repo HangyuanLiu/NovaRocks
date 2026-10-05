@@ -329,6 +329,15 @@ pub(crate) struct Model {
     pub(crate) delegated_work: usize,
 }
 impl Model {
+    /// An actual nonzero request Layout supplied by its sole source author.
+    /// Arc slice headers remain requests even when their payload is empty.
+    pub(crate) fn layout_request(&mut self, layout: Layout, copies: usize) -> Result<(), Error> {
+        self.requested = add(self.requested, mul(layout.size(), copies)?)?;
+        if layout.size() != 0 {
+            self.requests = add(self.requests, copies)?;
+        }
+        Ok(())
+    }
     pub(crate) fn request<T>(&mut self, n: usize, copies: usize) -> Result<(), Error> {
         self.requested = add(self.requested, mul(bytes::<T>(n)?, copies)?)?;
         if n != 0 {

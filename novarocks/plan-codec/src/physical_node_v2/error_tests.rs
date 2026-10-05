@@ -221,3 +221,27 @@ fn complete_numeric_model_rejects_all_known_axes_before_pending_quantum() {
     finish(work, Ok(())).unwrap();
     assert_eq!(*control.0.lock().unwrap(), [0, 7]);
 }
+
+#[test]
+fn authored_layout_requests_keep_empty_arc_header_and_checked_numeric_first_cause() {
+    use crate::ipc_flat_stream_v2::reader_allocations::arc_layout;
+    use arrow::datatypes::Field;
+    use std::{alloc::Layout, sync::Arc};
+    let mut model = Model::default();
+    let payload = Layout::array::<Arc<Field>>(0).unwrap();
+    let arc = arc_layout(payload).unwrap();
+    // Independent pinned Arc header: two usize counters, empty aligned slice.
+    assert_eq!(arc.size(), 2 * std::mem::size_of::<usize>());
+    model.layout_request(arc, 1).unwrap();
+    assert_eq!((model.requests, model.requested), (1, arc.size()));
+    model
+        .layout_request(Layout::array::<u8>(0).unwrap(), 1)
+        .unwrap();
+    assert_eq!((model.requests, model.requested), (1, arc.size()));
+    assert!(matches!(
+        model.layout_request(arc, usize::MAX),
+        Err(NodeCodecError::Control(
+            CompileControlError::ResourceExhausted
+        ))
+    ));
+}

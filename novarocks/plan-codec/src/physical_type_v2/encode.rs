@@ -20,10 +20,11 @@
 //! output definitions or copying strings. Scratch work is not a MEM grant.
 
 use super::{TypeCodecError, TypeProjectionLimits, encode_logical, validate_field, validate_type};
+use crate::arrow_metadata_v2::{copy_string, encode_metadata};
 use arrow::datatypes::{DataType, Field, UnionMode};
 use novarocks_proto_models::{physical_type_v2 as wire, plan};
 use novarocks_type_contract::{CompileCheckpoints, FunctionValueType, field_logical_type};
-use std::{cmp::Ordering, collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc};
 use wire::carrier_type_definition::Kind;
 
 type Error = TypeCodecError;
@@ -213,73 +214,6 @@ fn preflight(
     Ok((counts, reserved_fields))
 }
 
-fn copy_string(input: &str, work: &mut CompileCheckpoints<'_>) -> Result<String, Error> {
-    let mut output = String::with_capacity(input.len());
-    let mut start = 0usize;
-    while start < input.len() {
-        let mut end = start.saturating_add(1024).min(input.len());
-        // A validated UTF-8 spelling needs at most three boundary adjustments.
-        while !input.is_char_boundary(end) {
-            end -= 1;
-        }
-        work.step()?;
-        output.push_str(&input[start..end]);
-        start = end;
-    }
-    Ok(output)
-}
-
-fn compare_keys(
-    left: &str,
-    right: &str,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<Ordering, Error> {
-    work.step()?;
-    for (left, right) in left
-        .as_bytes()
-        .chunks(1024)
-        .zip(right.as_bytes().chunks(1024))
-    {
-        work.step()?;
-        let order = left.cmp(right);
-        if order != Ordering::Equal {
-            return Ok(order);
-        }
-    }
-    Ok(left.len().cmp(&right.len()))
-}
-
-fn metadata(
-    field: &Field,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<Vec<plan::ArrowFieldMetadataEntry>, Error> {
-    // Fallible sorting observes each comparison and movement. The real field
-    // owner has already bounded this borrowed scratch to 256 entries.
-    let mut sorted: Vec<(&str, &str)> = Vec::with_capacity(field.metadata().len());
-    for (key, value) in field.metadata() {
-        work.step()?;
-        sorted.push((key.as_str(), value.as_str()));
-        let mut index = sorted.len() - 1;
-        while index > 0 {
-            if compare_keys(sorted[index - 1].0, sorted[index].0, work)? != Ordering::Greater {
-                break;
-            }
-            work.step()?;
-            sorted.swap(index - 1, index);
-            index -= 1;
-        }
-    }
-    let mut output = Vec::with_capacity(sorted.len());
-    for (key, value) in sorted {
-        work.step()?;
-        output.push(plan::ArrowFieldMetadataEntry {
-            key: copy_string(key, work)?,
-            value: copy_string(value, work)?,
-        });
-    }
-    Ok(output)
-}
-
 struct FieldIds {
     reserved: BTreeSet<u32>,
     cursor: u64,
@@ -321,7 +255,7 @@ fn emit_field(
         name: copy_string(field.name(), work)?,
         nullable: field.is_nullable(),
         carrier_type_id: Some(carrier_type_id),
-        metadata: metadata(field, work)?,
+        metadata: encode_metadata(field.metadata(), work)?,
         dictionary_id,
         dictionary_is_ordered: field.dict_is_ordered(),
     });
