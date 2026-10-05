@@ -574,7 +574,7 @@ impl LoweredAggregateLogicalSource {
 #[derive(Debug)]
 pub(super) struct LoweredAggregateSourceEntry {
     pub(super) logical: LoweredAggregateLogicalSource,
-    /// Single is authored from its actual emitted channels. State-consuming
+    /// Updates are authored from their actual emitted channels. State-consuming
     /// families retain their existing source path until producer lending lands.
     pub(super) canonical: Option<Arc<CanonicalAggregateOperationalRequest>>,
     pub(super) phase: AggregatePhase,

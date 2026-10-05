@@ -79,7 +79,6 @@ pub(crate) struct AuthoredPhysicalAggregateUpdateRequest<'a> {
 #[derive(Debug)]
 enum AggregateUpdateArguments<'a> {
     OwnedPhysical(Vec<FunctionArgument>),
-    Captured(&'a crate::binding::CapturedAggregateLogicalRequest),
     Canonical {
         captured: &'a crate::binding::CapturedAggregateLogicalRequest,
         canonical: &'a CanonicalAggregateOperationalRequest,
@@ -113,7 +112,6 @@ impl AuthoredPhysicalAggregateUpdateRequest<'_> {
                 // the binding's final result, independently of the output layout.
                 expected_result_type: Some(&self.source.binding.function.result_type),
             },
-            AggregateUpdateArguments::Captured(captured) => captured.request(),
             AggregateUpdateArguments::Canonical { canonical, .. } => canonical.request(),
         }
     }
@@ -124,8 +122,7 @@ impl AuthoredPhysicalAggregateUpdateRequest<'_> {
     ) -> Option<novarocks_type_contract::DecimalOverflowPolicy> {
         match &self.arguments {
             AggregateUpdateArguments::OwnedPhysical(_) => None,
-            AggregateUpdateArguments::Captured(captured)
-            | AggregateUpdateArguments::Canonical { captured, .. } => {
+            AggregateUpdateArguments::Canonical { captured, .. } => {
                 Some(captured.binding().decimal_overflow_policy())
             }
         }
@@ -133,8 +130,7 @@ impl AuthoredPhysicalAggregateUpdateRequest<'_> {
     pub fn captured_constant_policy(&self) -> Option<ConstantPolicy> {
         match &self.arguments {
             AggregateUpdateArguments::OwnedPhysical(_) => None,
-            AggregateUpdateArguments::Captured(captured)
-            | AggregateUpdateArguments::Canonical { captured, .. } => {
+            AggregateUpdateArguments::Canonical { captured, .. } => {
                 Some(captured.constant_policy())
             }
         }
@@ -300,9 +296,9 @@ pub(crate) fn author_physical_aggregate_update_request_observed<'a>(
 }
 
 /// Borrow the original admitted logical request for a producer-certified
-/// Single/Partial update. Single requires the same-emission operational request
+/// Single/Partial update. Both require the same-emission operational request
 /// and selected Arc, associated with the original capture revision and binding.
-/// Partial retains its original captured request. Physical expression channels
+/// The original capture retains source and policy. Physical expression channels
 /// identify runtime roots; they never recreate logical source provenance. ORDER
 /// flags come from the exact actual call, and policies remain with the capture.
 ///
@@ -330,27 +326,19 @@ pub(crate) fn author_physical_aggregate_update_request_from_journal_observed<'so
         ));
     }
     let captured = entry.captured();
-    let canonical = if phase == AggregateKernelPhase::Single {
-        let canonical = entry.canonical();
-        work.step()?;
-        let canonical = canonical.ok_or(PhysicalAggregateRequestError::InvalidSource(
-            "single aggregate journal has no same-emission operational request",
-        ))?;
-        let belongs = canonical.belongs_to(captured);
-        work.step()?;
-        if !belongs {
-            return Err(PhysicalAggregateRequestError::InvalidSource(
-                "single aggregate operational request has a different capture revision or binding",
-            ));
-        }
-        Some(canonical)
-    } else {
-        None
-    };
-    let request = match canonical {
-        Some(canonical) => canonical.request(),
-        None => captured.request(),
-    };
+    let canonical = entry.canonical();
+    work.step()?;
+    let canonical = canonical.ok_or(PhysicalAggregateRequestError::InvalidSource(
+        "aggregate update journal has no same-emission operational request",
+    ))?;
+    let belongs = canonical.belongs_to(captured);
+    work.step()?;
+    if !belongs {
+        return Err(PhysicalAggregateRequestError::InvalidSource(
+            "aggregate update operational request has a different capture revision or binding",
+        ));
+    }
+    let request = canonical.request();
     let count = source
         .arguments
         .len()
@@ -373,25 +361,19 @@ pub(crate) fn author_physical_aggregate_update_request_from_journal_observed<'so
     }
     Layout::array::<AggregateOrderKey>(source.order_by.len())
         .map_err(|_| CompileControlError::ResourceExhausted)?;
-    let selected = match canonical {
-        Some(canonical) => {
-            selected_correspondence_observed(
-                captured,
-                canonical.selected(),
-                request.logical_argument_count,
-                source,
-                work,
-            )?;
-            // Retain the exact same-emission Arc for refinement and preparation.
-            // An Arc clone is not a second selected-signature author or host grant.
-            work.flush()?;
-            let selected = Arc::clone(canonical.selected());
-            work.step()?;
-            work.flush()?;
-            selected
-        }
-        None => captured_selected_correspondence_observed(captured, source, work)?,
-    };
+    selected_correspondence_observed(
+        captured,
+        canonical.selected(),
+        request.logical_argument_count,
+        source,
+        work,
+    )?;
+    // Retain the exact same-emission Arc for refinement and preparation.
+    // An Arc clone is not a second selected-signature author or host grant.
+    work.flush()?;
+    let selected = Arc::clone(canonical.selected());
+    work.step()?;
+    work.flush()?;
     work.flush()?;
     let mut keys = Vec::new();
     keys.try_reserve_exact(source.order_by.len())
@@ -412,12 +394,9 @@ pub(crate) fn author_physical_aggregate_update_request_from_journal_observed<'so
         state_input_type: None,
     };
     work.flush()?;
-    let arguments = match canonical {
-        Some(canonical) => AggregateUpdateArguments::Canonical {
-            captured,
-            canonical: canonical.as_ref(),
-        },
-        None => AggregateUpdateArguments::Captured(captured),
+    let arguments = AggregateUpdateArguments::Canonical {
+        captured,
+        canonical: canonical.as_ref(),
     };
     Ok(AuthoredPhysicalAggregateUpdateRequest {
         source,
@@ -552,8 +531,8 @@ fn captured_selected_correspondence_observed(
         source,
         work,
     )?;
-    // Partial and merge retain their existing physical signature projection.
-    // Only Single consumes the original same-emission selected Arc.
+    // Merge retains its original physical signature projection until actual
+    // state-producer provenance is integrated. Updates borrow their exact Arc.
     Ok(author_scalar_result_selection_observed(
         &source.binding.function,
         Some(&source.binding),

@@ -21,6 +21,7 @@ use super::super::lowered_draft::{
     AggregateRuntimeDemand, CheckedAggregateLogicalSourceEntry, SqlSourceJournalError,
 };
 use super::*;
+use novarocks_functions::FunctionResultType;
 use novarocks_type_contract::{
     ExpressionEffects, FunctionArgumentEvaluation, FunctionFailureBehavior,
     FunctionIntrinsicRowError, FunctionVolatility, PureCompileControl,
@@ -146,7 +147,7 @@ fn effects() -> ScopedExpressionEffects {
 }
 
 #[test]
-fn journal_update_partial_count_min_max_borrow_original_request_and_final_result() {
+fn journal_update_partial_count_min_max_borrow_canonical_request_and_selected_arc() {
     for sql in [
         "SELECT COUNT(*) FROM orders",
         "SELECT COUNT(order_key) FROM orders",
@@ -161,12 +162,26 @@ fn journal_update_partial_count_min_max_borrow_original_request_and_final_result
         assert!(std::ptr::eq(request.node(), entry.node()));
         assert_eq!(request.site(), entry.site());
         let original = entry.captured().request();
+        let canonical = entry
+            .canonical()
+            .expect("actual Partial canonical emission");
+        assert!(canonical.belongs_to(entry.captured()));
+        let operational = canonical.request();
         let actual = request.request();
-        assert!(std::ptr::eq(actual.arguments, original.arguments));
+        assert!(std::ptr::eq(actual.arguments, operational.arguments));
+        assert!(actual.expected_result_type.is_none());
+        assert!(operational.expected_result_type.is_none());
+        assert!(entry.captured().binding().result_constraint().is_none());
+        let FunctionResultType::Scalar(original_result) =
+            &entry.captured().binding().resolved().selected.result_type
+        else {
+            panic!("original aggregate scalar result")
+        };
         assert!(std::ptr::eq(
-            actual.expected_result_type.unwrap(),
-            original.expected_result_type.unwrap()
+            original.expected_result_type.unwrap(),
+            original_result
         ));
+        assert!(Arc::ptr_eq(request.selected(), canonical.selected()));
         let logical_count = if sql.contains("COUNT(*)") { 0 } else { 1 };
         assert_eq!(actual.logical_argument_count, logical_count);
         assert_eq!(actual.arguments.len(), logical_count);
@@ -226,8 +241,19 @@ fn journal_update_literal_keeps_original_captured_constant_and_physical_pool_bac
     else {
         panic!("journal request must not discard the constant")
     };
-    assert!(std::ptr::eq(value, original_value));
-    assert!(std::ptr::eq(actual_type, value_type));
+    let canonical = entry
+        .canonical()
+        .expect("actual Partial canonical emission");
+    assert!(canonical.belongs_to(entry.captured()));
+    assert!(std::ptr::eq(
+        request.request().arguments,
+        canonical.request().arguments
+    ));
+    assert!(Arc::ptr_eq(request.selected(), canonical.selected()));
+    assert!(request.request().expected_result_type.is_none());
+    // Operational projection owns a cloned CV handle, never a fresh admission.
+    // The original capture and physical pool retain the same backing and Field.
+    assert_eq!(actual_type, value_type);
     assert_eq!(value.ordinal(), original_value.ordinal());
     assert!(Arc::ptr_eq(
         value.pool().array(),
@@ -296,11 +322,23 @@ fn journal_update_computed_and_cast_arguments_remain_original_nonconstant_none()
             panic!("actual scalar argument")
         };
         assert!(actual.is_none());
-        assert!(std::ptr::eq(actual_type, value_type));
+        assert_eq!(actual_type, value_type);
+        let canonical = entry
+            .canonical()
+            .expect("actual Partial canonical emission");
+        assert!(canonical.belongs_to(entry.captured()));
         assert!(std::ptr::eq(
             request.request().arguments,
-            entry.captured().request().arguments
+            canonical.request().arguments
         ));
+        assert!(Arc::ptr_eq(request.selected(), canonical.selected()));
+        assert!(request.request().expected_result_type.is_none());
+        let expression = entry
+            .fragment()
+            .expressions()
+            .get(entry.source().arguments[0])
+            .unwrap();
+        assert_eq!(&expression.ty, actual_type);
     }
 }
 
@@ -415,7 +453,11 @@ fn journal_update_direct_physical_component_stays_explicit_and_has_no_capture_po
     assert_eq!(direct.selected(), journal.selected());
     assert!(matches!(
         journal.arguments,
-        AggregateUpdateArguments::Captured(_)
+        AggregateUpdateArguments::Canonical { .. }
+    ));
+    assert!(Arc::ptr_eq(
+        journal.selected(),
+        entry.canonical().unwrap().selected()
     ));
 }
 

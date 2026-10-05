@@ -5318,7 +5318,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             let original_binding = lower_aggregate_binding(call, phase)?;
             let logical_source = self.capture_aggregate_source(&call.source)?;
             let mut channels =
-                if phase == AggregatePhase::Single && logical_source.captured().is_some() {
+                if phase.consumes_logical_arguments() && logical_source.captured().is_some() {
                     Some(self.reserve_call_channels(
                         call.source.arguments().len() + call.source.order_by().len(),
                     )?)
@@ -5348,7 +5348,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                                     ordinal,
                                     logical_source
                                         .captured()
-                                        .expect("Single capture checked above"),
+                                        .expect("Update capture checked above"),
                                 )?,
                             );
                             self.work.step()?;
@@ -5379,7 +5379,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                                             ordinal,
                                             logical_source
                                                 .captured()
-                                                .expect("Single capture checked above"),
+                                                .expect("Update capture checked above"),
                                         )?,
                                     );
                                     self.work.step()?;
@@ -5461,11 +5461,11 @@ impl<'a> ContractLoweringVisitor<'a> {
                 });
             }
             // Retain the original source/layout refusal before a fresh selection
-            // can change actual root nullability. State phases still follow their
+            // can change actual root nullability. Merge phases still follow their
             // existing path until their actual producer request can be loaned.
             let canonical = match (channels, logical_source.captured()) {
                 (Some(channels), Some(captured)) => {
-                    Some(self.author_canonical_single_aggregate(node, captured, &channels)?)
+                    Some(self.author_canonical_update_aggregate(node, captured, &channels)?)
                 }
                 _ => None,
             };
@@ -5489,7 +5489,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     })?
                 {
                     return Err(ContractLoweringError::InvalidAggregate {
-                        detail: "canonical Single result changes original logical or nested type facts",
+                        detail: "canonical aggregate update changes original logical or nested type facts",
                     });
                 }
                 self.work.step()?;
@@ -8569,9 +8569,9 @@ impl<'a> ContractLoweringVisitor<'a> {
         self.completed_specialization_result(selection)
     }
 
-    /// This is only the Single producer. A Partial or Merge needs an actual
-    /// state-emission association before it may borrow operational metadata.
-    fn author_canonical_single_aggregate(
+    /// Single and Partial author their own actual update channels. A Merge
+    /// still requires a separate actual state-emission association.
+    fn author_canonical_update_aggregate(
         &mut self,
         owner: NodeId,
         captured: &crate::binding::CapturedAggregateLogicalRequest,

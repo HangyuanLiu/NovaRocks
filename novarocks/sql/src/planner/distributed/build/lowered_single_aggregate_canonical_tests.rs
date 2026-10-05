@@ -30,6 +30,9 @@ use novarocks_functions::{FunctionArgument, FunctionResultType};
 use novarocks_type_contract::DecimalOverflowPolicy;
 use std::sync::Mutex;
 
+#[path = "lowered_partial_aggregate_canonical_tests.rs"]
+mod lowered_partial_aggregate_canonical_tests;
+
 #[derive(Default)]
 struct Control {
     trace: Mutex<Vec<(CompilePhase, u32)>>,
