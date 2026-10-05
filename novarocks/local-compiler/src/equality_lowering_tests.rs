@@ -18,9 +18,9 @@
 use super::*;
 use arrow_schema::DataType;
 use novarocks_functions::{
-    CallEffectInput, ConstantPolicy, EngineFunctionCatalogBuilder, FunctionBindingRequest,
-    FunctionBindingSelection, FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType,
-    InstalledPureKernel, PureCallPreparation, PureEngineFunctionCatalog,
+    CallEffectInput, ConstantPolicy, EngineFunctionCatalogBuilder, FunctionArgument,
+    FunctionBindingRequest, FunctionBindingSelection, FunctionId, FunctionKind, FunctionOverloadId,
+    FunctionResultType, InstalledPureKernel, PureCallPreparation, PureEngineFunctionCatalog,
     PureImplementationDeclaration, PureImplementationId, PureKernelAbi, ScopedExpressionEffects,
 };
 use novarocks_local_program::{
@@ -125,6 +125,9 @@ struct Fixture {
     expression: ExprId,
     ordered: Vec<ExprId>,
     rand_selected: Option<Arc<FunctionBindingSelection>>,
+    rand_request: Option<FunctionBindingRequest<'static>>,
+    rand_definitions: Vec<ExprId>,
+    constant_policy: ConstantPolicy,
 }
 fn input_literal(ty: &FunctionValueType, floating_bits: Option<u64>) -> LiteralValue {
     if ty.nullable {
@@ -193,6 +196,8 @@ fn fixture(
         .add_expression(NodeId::new(0), right.clone(), ExprKind::Value(inputs[1].1))
         .unwrap();
     let mut rand_selected = None;
+    let mut rand_request = None;
+    let mut rand_definitions = vec![];
     let (kind, result, ordered) = match shape {
         Shape::Binary(op) => {
             let ty = match output {
@@ -220,6 +225,7 @@ fn fixture(
                 logical_argument_count: 0,
                 expected_result_type: None,
             };
+            rand_request = Some(request);
             let rand = functions
                 .metadata()
                 .resolve_bound_user("rand", FunctionKind::Scalar, request, &Control)
@@ -262,6 +268,7 @@ fn fixture(
                     },
                 )
                 .unwrap();
+            rand_definitions.extend([first, second]);
             let otherwise = builder
                 .add_expression(
                     NodeId::new(0),
@@ -323,6 +330,9 @@ fn fixture(
         expression,
         ordered,
         rand_selected,
+        rand_request,
+        rand_definitions,
+        constant_policy: options().constants,
     })
 }
 fn uses(fixture: &Fixture) -> PhysicalRootUses {
@@ -429,6 +439,73 @@ fn uses(fixture: &Fixture) -> PhysicalRootUses {
     PhysicalRootUses::try_new(&fixture.fragment, flow, bindings, &Control).unwrap()
 }
 fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<FragmentPackage> {
+    use novarocks_physical_plan::{
+        PhysicalCallDefinition, PhysicalCallRequest, StaticFunctionArgument,
+    };
+    let Fixture {
+        fragment,
+        expression,
+        ordered,
+        rand_selected,
+        rand_request,
+        rand_definitions,
+        constant_policy,
+    } = fixture;
+    // Both emitted RAND definitions use the same genuine initial zero-argument request.
+    let entries = rand_definitions
+        .iter()
+        .map(|&definition| {
+            let original = rand_request.as_ref().unwrap();
+            let arguments = original
+                .arguments
+                .iter()
+                .map(|argument| match argument {
+                    FunctionArgument::Value {
+                        value_type,
+                        constant,
+                    } => {
+                        assert!(
+                            constant.is_none(),
+                            "RAND fixture has no original CV arguments"
+                        );
+                        StaticFunctionArgument::Value {
+                            value_type: value_type.clone(),
+                            constant: None,
+                        }
+                    }
+                    FunctionArgument::Lambda {
+                        parameter_types,
+                        result_type,
+                    } => StaticFunctionArgument::Lambda {
+                        parameter_types: parameter_types.clone(),
+                        result_type: result_type.clone(),
+                    },
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            (
+                PhysicalCallDefinition::Expression(definition),
+                PhysicalCallRequest {
+                    arguments,
+                    logical_argument_count: original.logical_argument_count,
+                    expected_result_type: original.expected_result_type.cloned(),
+                    constant_policy,
+                },
+            )
+        })
+        .collect();
+    let fragment = fragment
+        .with_call_requests_observed(entries, &Control)
+        .unwrap();
+    let fixture = Fixture {
+        fragment,
+        expression,
+        ordered,
+        rand_selected,
+        rand_request,
+        rand_definitions,
+        constant_policy,
+    };
     let expression_uses = uses(&fixture);
     let parameters = SemanticParameters::try_new([]).unwrap();
     let mut frozen = vec![];
@@ -442,11 +519,7 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
         else {
             continue;
         };
-        let request = FunctionBindingRequest {
-            arguments: &[],
-            logical_argument_count: 0,
-            expected_result_type: None,
-        };
+        let request = fixture.rand_request.unwrap();
         let selected = fixture.rand_selected.as_ref().unwrap().clone();
         let token = functions
             .prepare_fresh(

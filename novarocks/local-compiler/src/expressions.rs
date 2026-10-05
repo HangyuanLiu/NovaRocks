@@ -27,17 +27,19 @@ use std::{
 };
 
 use novarocks_functions::{
-    CallEffectInput, ConstantError, ConstantPolicy, ConstantValue, FunctionArgument,
-    FunctionBindingError, FunctionBindingRequest, FunctionBindingSelection, FunctionResultType,
-    FunctionSpecializationFailure, KernelFailure, PureCallPreparation, PureCallSpecialization,
-    PureEngineFunctionCatalog, ScopedExpressionEffects,
+    CallEffectInput, ConstantError, ConstantPolicy, ConstantValue, FunctionBindingError,
+    FunctionBindingSelection, FunctionResultType, FunctionSpecializationFailure, KernelFailure,
+    PureCallPreparation, PureCallSpecialization, PureEngineFunctionCatalog,
+    ScopedExpressionEffects,
 };
 use novarocks_local_program::{
     ExpressionsCompileError, ImmutableExpressions, ProgramCallSite, ProgramExprId,
     ProgramExpressionArena, ProgramUseRef, StaticExprKind, StaticExprNode,
 };
+#[cfg(test)]
+use novarocks_physical_plan::LiteralValue;
 use novarocks_physical_plan::{
-    ConstantReferenceError, ExprId, ExprKind, ExprNode, FragmentPackage, LiteralValue,
+    ConstantReferenceError, ExprId, ExprKind, ExprNode, FragmentPackage, PhysicalCallDefinition,
     PhysicalCallSite,
 };
 use novarocks_type_contract::{
@@ -866,7 +868,7 @@ fn prepare_core(
     // and TypeOnly children. It uses no effects or invocation demand, and must
     // not prepare a stateful implementation merely to validate its signature.
     let mut selected = BTreeMap::<ExprId, Arc<FunctionBindingSelection>>::new();
-    let mut requests = BTreeMap::<ExprId, Vec<FunctionArgument>>::new();
+    let mut requests = BTreeMap::new();
     for (&id, definition) in package.fragment().expressions().iter() {
         if let ExprKind::FunctionCall { function, args } = &definition.kind {
             if args.len() > novarocks_functions::MAX_CALL_EFFECT_ARGUMENTS {
@@ -907,7 +909,6 @@ fn prepare_core(
                     "static call result differs from its definition",
                 ));
             }
-            let mut arguments = Vec::with_capacity(args.len());
             for (ordinal, child) in args.iter().enumerate() {
                 let child_id = *lowered
                     .ids
@@ -931,15 +932,25 @@ fn prepare_core(
                             "missing local static argument",
                         ))?;
                 work.flush()?;
-                let constant = literal_argument(child_source, child_node, control)?;
-                work.flush()?;
-                arguments.push(FunctionArgument::Value {
-                    value_type: child_source.ty.clone(),
-                    constant,
-                });
+                // Check the independent physical/local projection. It cannot
+                // supply the original binding request's constant channel.
+                literal_argument(child_source, child_node, control)?;
                 work.flush()?;
                 work.step()?;
             }
+            let source_request = package
+                .fragment()
+                .call_requests()
+                .get(PhysicalCallDefinition::Expression(id));
+            work.step()?;
+            let source_request = source_request.ok_or(ExpressionLoweringError::Invalid(
+                "missing original static call request",
+            ))?;
+            let request = crate::original_requests::materialize_call_request_observed(
+                source_request,
+                package.constants(),
+                work,
+            )?;
             work.flush()?;
             let selection = Arc::new(FunctionBindingSelection {
                 overload: function.overload.clone(),
@@ -952,16 +963,16 @@ fn prepare_core(
                 &function.function_id,
                 function.kind,
                 selection.as_ref(),
-                FunctionBindingRequest {
-                    arguments: &arguments,
-                    logical_argument_count: arguments.len(),
-                    expected_result_type: Some(&definition.ty),
-                },
+                request.request(),
                 control,
             )?;
             work.flush()?;
             selected.insert(id, selection);
-            requests.insert(id, arguments);
+            work.step()?;
+            work.flush()?;
+            requests.insert(id, request);
+            work.step()?;
+            work.flush()?;
         }
         work.step()?;
     }
@@ -1465,7 +1476,7 @@ fn prepare_core(
                             "call argument arity differs",
                         ));
                     }
-                    let arguments =
+                    let request =
                         requests
                             .get(&source.id)
                             .ok_or(ExpressionLoweringError::Invalid(
@@ -1515,11 +1526,7 @@ fn prepare_core(
                         function_id: &function.function_id,
                         kind: function.kind,
                         selected: selection.as_ref(),
-                        request: FunctionBindingRequest {
-                            arguments,
-                            logical_argument_count: arguments.len(),
-                            expected_result_type: Some(&source.ty),
-                        },
+                        request: request.request(),
                         environment: &frozen.effects.environment,
                         parameters: package.parameters(),
                         decimal_overflow_policy: frozen.decimal_overflow_policy,

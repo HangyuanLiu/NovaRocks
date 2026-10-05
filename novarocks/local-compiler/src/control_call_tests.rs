@@ -356,6 +356,49 @@ fn package(
                 requires_power_of_two: false,
             },
         )
+        .unwrap()
+        .with_call_requests_observed(
+            vec![
+                (
+                    novarocks_physical_plan::PhysicalCallDefinition::Expression(rng_expr),
+                    novarocks_physical_plan::PhysicalCallRequest {
+                        arguments: Box::default(),
+                        logical_argument_count: rng_request.logical_argument_count,
+                        expected_result_type: rng_request.expected_result_type.cloned(),
+                        constant_policy: options().constants,
+                    },
+                ),
+                (
+                    novarocks_physical_plan::PhysicalCallDefinition::Expression(root),
+                    novarocks_physical_plan::PhysicalCallRequest {
+                        arguments: request
+                            .arguments
+                            .iter()
+                            .map(|argument| {
+                                let FunctionArgument::Value {
+                                    value_type,
+                                    constant: None,
+                                } = argument
+                                else {
+                                    panic!(
+                                        "original control fixture has nonconstant Value channels"
+                                    )
+                                };
+                                novarocks_physical_plan::StaticFunctionArgument::Value {
+                                    value_type: value_type.clone(),
+                                    constant: None,
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .into_boxed_slice(),
+                        logical_argument_count: request.logical_argument_count,
+                        expected_result_type: request.expected_result_type.cloned(),
+                        constant_policy: options().constants,
+                    },
+                ),
+            ],
+            &Control,
+        )
         .unwrap();
     uses.push(invocation(
         parent_context,

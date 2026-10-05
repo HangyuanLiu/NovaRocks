@@ -122,13 +122,15 @@ struct Author {
     function: BoundFunction,
     selected: Arc<FunctionBindingSelection>,
     arguments: Vec<FunctionArgument>,
+    logical_argument_count: usize,
+    constant_policy: ConstantPolicy,
     shape: ControlShape,
 }
 impl Author {
     fn request(&self) -> FunctionBindingRequest<'_> {
         FunctionBindingRequest {
             arguments: &self.arguments,
-            logical_argument_count: self.arguments.len(),
+            logical_argument_count: self.logical_argument_count,
             expected_result_type: None,
         }
     }
@@ -138,6 +140,73 @@ impl Author {
         };
         result.clone()
     }
+}
+// Transfer the first resolver request; physical child shapes are not request sources.
+fn original_request_sources(
+    fragment: Fragment,
+    authors: &BTreeMap<ExprId, Author>,
+) -> (Fragment, novarocks_physical_plan::ConstantPools) {
+    use novarocks_physical_plan::{
+        ConstantPoolId, ConstantPools, ConstantReference, PhysicalCallDefinition,
+        PhysicalCallRequest, StaticFunctionArgument,
+    };
+    let mut pools = ConstantPools::empty();
+    let mut backing_ids = BTreeMap::new();
+    let mut entries = vec![];
+    for (&definition, owner) in authors {
+        let original = owner.request();
+        let arguments = original
+            .arguments
+            .iter()
+            .map(|argument| match argument {
+                FunctionArgument::Value {
+                    value_type,
+                    constant,
+                } => {
+                    let constant = constant.as_ref().map(|value| {
+                        let identity = value.pool().backing_identity();
+                        let pool = *backing_ids.entry(identity).or_insert_with(|| {
+                            let id =
+                                ConstantPoolId::new(u32::try_from(pools.entries().len()).unwrap());
+                            pools.insert(id, value.pool().clone()).unwrap();
+                            id
+                        });
+                        ConstantReference {
+                            pool,
+                            ordinal: value.ordinal(),
+                        }
+                    });
+                    StaticFunctionArgument::Value {
+                        value_type: value_type.clone(),
+                        constant,
+                    }
+                }
+                FunctionArgument::Lambda {
+                    parameter_types,
+                    result_type,
+                } => StaticFunctionArgument::Lambda {
+                    parameter_types: parameter_types.clone(),
+                    result_type: result_type.clone(),
+                },
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        entries.push((
+            PhysicalCallDefinition::Expression(definition),
+            PhysicalCallRequest {
+                arguments,
+                logical_argument_count: original.logical_argument_count,
+                expected_result_type: original.expected_result_type.cloned(),
+                constant_policy: owner.constant_policy,
+            },
+        ));
+    }
+    (
+        fragment
+            .with_call_requests_observed(entries, &Control)
+            .unwrap(),
+        pools,
+    )
 }
 fn integer_constant(ty: &FunctionValueType, value: i64) -> ConstantValue {
     ConstantValue::from_i64(
@@ -166,9 +235,10 @@ fn author(
     arguments: Vec<FunctionArgument>,
     shape: ControlShape,
 ) -> Author {
+    let logical_argument_count = arguments.len();
     let request = FunctionBindingRequest {
         arguments: &arguments,
-        logical_argument_count: arguments.len(),
+        logical_argument_count,
         expected_result_type: None,
     };
     let bound = functions
@@ -195,6 +265,8 @@ fn author(
         function,
         selected,
         arguments,
+        logical_argument_count,
+        constant_policy: options().constants,
         shape,
     }
 }
@@ -668,6 +740,19 @@ fn uses(fixture: &Fixture, claim: FlowClaim) -> Result<PhysicalRootUses, FlowErr
     PhysicalRootUses::try_new(&fixture.fragment, flow, bindings, &Control).map_err(FlowError::Roots)
 }
 fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<FragmentPackage> {
+    let Fixture {
+        fragment,
+        authors,
+        case,
+        ordered,
+    } = fixture;
+    let (fragment, constants) = original_request_sources(fragment, &authors);
+    let fixture = Fixture {
+        fragment,
+        authors,
+        case,
+        ordered,
+    };
     let expression_uses = uses(&fixture, FlowClaim::Accurate).unwrap();
     let flow = expression_uses.flow();
     let parameters = SemanticParameters::try_new([]).unwrap();
@@ -785,7 +870,7 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
             FragmentPackageInput {
                 version: PlanVersionId::try_new([97; 16]).unwrap(),
                 required: RequiredContracts::default(),
-                constants: novarocks_physical_plan::ConstantPools::empty(),
+                constants,
                 fragment: fixture.fragment,
                 expression_uses,
                 calls,

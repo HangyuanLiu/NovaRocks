@@ -117,6 +117,7 @@ fn options(dop: usize) -> LocalCompileOptions {
 enum SeedMode {
     Input,
     DirectConstant,
+    LiteralWithoutConstant,
 }
 
 fn invocation(
@@ -191,6 +192,41 @@ fn package_with_outputs(
         .metadata()
         .resolve_bound_user("rand", FunctionKind::Scalar, request, &FixtureControl)
         .unwrap();
+    // Retain the actual first-resolution request independently of the later
+    // physical Literal/Value shape. Existing CVs loan their original backing;
+    // no literal factory or admission policy is replayed for this table.
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
+    let original_arguments = request
+        .arguments
+        .iter()
+        .map(|argument| {
+            let FunctionArgument::Value {
+                value_type,
+                constant,
+            } = argument
+            else {
+                panic!("RAND fixture has one actual Value argument");
+            };
+            let constant = constant.as_ref().map(|value| {
+                let pool = novarocks_physical_plan::ConstantPoolId::new(u32::MAX);
+                constants.insert(pool, value.pool().clone()).unwrap();
+                novarocks_physical_plan::ConstantReference {
+                    pool,
+                    ordinal: value.ordinal(),
+                }
+            });
+            novarocks_physical_plan::StaticFunctionArgument::Value {
+                value_type: value_type.clone(),
+                constant,
+            }
+        })
+        .collect::<Box<[_]>>();
+    let original_request = novarocks_physical_plan::PhysicalCallRequest {
+        arguments: original_arguments,
+        logical_argument_count: request.logical_argument_count,
+        expected_result_type: request.expected_result_type.cloned(),
+        constant_policy: options(1).constants,
+    };
     let selected = Arc::new(bound.selected.clone());
     let FunctionResultType::Scalar(result_type) = &selected.result_type else {
         panic!("RAND result")
@@ -277,7 +313,9 @@ fn package_with_outputs(
             seed_type.clone(),
             match mode {
                 SeedMode::Input => ExprKind::Value(seed_value),
-                SeedMode::DirectConstant => ExprKind::Literal(LiteralValue::Int64(42)),
+                SeedMode::DirectConstant | SeedMode::LiteralWithoutConstant => {
+                    ExprKind::Literal(LiteralValue::Int64(42))
+                }
             },
         )
         .unwrap();
@@ -371,6 +409,14 @@ fn package_with_outputs(
                 max: 1,
                 requires_power_of_two: false,
             },
+        )
+        .unwrap()
+        .with_call_requests_observed(
+            vec![(
+                novarocks_physical_plan::PhysicalCallDefinition::Expression(call),
+                original_request,
+            )],
+            &FixtureControl,
         )
         .unwrap();
     let actual_roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();
@@ -490,7 +536,7 @@ fn package_with_outputs(
             FragmentPackageInput {
                 version: PlanVersionId::try_new([72; 16]).unwrap(),
                 required: RequiredContracts::default(),
-                constants: novarocks_physical_plan::ConstantPools::empty(),
+                constants,
                 pruning: FrozenFragmentPruning::try_new(fragment_id, vec![], &FixtureControl)
                     .unwrap(),
                 fragment,
@@ -974,6 +1020,54 @@ fn compiled_value_seed_rand_uses_actual_sparse_rows_and_is_invariant_across_batc
             .unwrap(),
     );
     assert_eq!([first, second].concat(), vec![S42, S7, S42, S0]);
+}
+
+#[test]
+fn original_nonconstant_seed_is_not_promoted_by_its_physical_literal() {
+    let functions = rng_subset();
+    let source = package(&functions, SeedMode::LiteralWithoutConstant);
+    let (&definition, request) = source
+        .fragment()
+        .call_requests()
+        .entries()
+        .iter()
+        .next()
+        .unwrap();
+    let novarocks_physical_plan::PhysicalCallDefinition::Expression(id) = definition else {
+        panic!("actual RAND definition");
+    };
+    assert!(request.expected_result_type.is_none());
+    assert_eq!(request.logical_argument_count, 1);
+    assert!(matches!(
+        request.arguments[0],
+        novarocks_physical_plan::StaticFunctionArgument::Value { constant: None, .. }
+    ));
+    assert!(source.constants().entries().is_empty());
+    let ExprKind::FunctionCall { args, .. } =
+        &source.fragment().expressions().get(id).unwrap().kind
+    else {
+        panic!("actual RAND call");
+    };
+    assert!(matches!(
+        source.fragment().expressions().get(args[0]).unwrap().kind,
+        ExprKind::Literal(LiteralValue::Int64(42))
+    ));
+    let program = compile(source, &functions);
+    let mut instance = instance(&program);
+    let seed: ArrayRef = Arc::new(Int64Array::from(vec![42]));
+    let arguments = [EvaluatedArgument::Scalar(&seed)];
+    // Original None selects the original per-row recipe: equal row seeds each
+    // produce the first draw, rather than a constant recipe's advancing state.
+    for _ in 0..2 {
+        assert_eq!(
+            bits(
+                instance
+                    .evaluate(Selection::all(2), &arguments, &EvaluationControl)
+                    .unwrap()
+            ),
+            vec![0x3fe0d98eec6444e4, 0x3fe0d98eec6444e4]
+        );
+    }
 }
 
 #[test]

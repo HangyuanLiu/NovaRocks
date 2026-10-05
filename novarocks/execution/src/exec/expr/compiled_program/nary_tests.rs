@@ -869,6 +869,36 @@ fn dual_demand_program() -> Arc<LocalProgram> {
                     requires_power_of_two: false,
                 },
             )
+            .unwrap()
+            .with_call_requests_observed(
+                vec![(
+                    novarocks_physical_plan::PhysicalCallDefinition::Expression(result),
+                    novarocks_physical_plan::PhysicalCallRequest {
+                        arguments: request
+                            .arguments
+                            .iter()
+                            .map(|argument| {
+                                let FunctionArgument::Value {
+                                    value_type,
+                                    constant: None,
+                                } = argument
+                                else {
+                                    panic!("original IF fixture has nonconstant Value channels")
+                                };
+                                novarocks_physical_plan::StaticFunctionArgument::Value {
+                                    value_type: value_type.clone(),
+                                    constant: None,
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .into_boxed_slice(),
+                        logical_argument_count: request.logical_argument_count,
+                        expected_result_type: request.expected_result_type.cloned(),
+                        constant_policy: options().constants,
+                    },
+                )],
+                &Control,
+            )
             .unwrap(),
     };
     let expression_uses = uses(&fixture).unwrap();

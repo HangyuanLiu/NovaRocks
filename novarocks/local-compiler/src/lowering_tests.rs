@@ -175,6 +175,7 @@ fn package_with_case(
     builder
         .add_filter(filter_node, values_node, Box::from([predicate]))
         .unwrap();
+    let mut original_requests = Vec::new();
     let mut projected = Vec::new();
     let mut output = Vec::new();
     for _ in 0..projections {
@@ -204,6 +205,15 @@ fn package_with_case(
                 },
             )
             .unwrap();
+        original_requests.push((
+            novarocks_physical_plan::PhysicalCallDefinition::Expression(expr),
+            novarocks_physical_plan::PhysicalCallRequest {
+                arguments: Box::default(),
+                logical_argument_count: request.logical_argument_count,
+                expected_result_type: request.expected_result_type.cloned(),
+                constant_policy: options(1).constants,
+            },
+        ));
         let value = builder
             .add_value(
                 result_type.clone(),
@@ -247,6 +257,8 @@ fn package_with_case(
                 requires_power_of_two: matches!(case, PackageCase::PowerOfTwoDomain),
             },
         )
+        .unwrap()
+        .with_call_requests_observed(original_requests, &FixtureControl)
         .unwrap();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();
     let domain = EvaluationDomainId::new(u32::MAX);

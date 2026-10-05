@@ -459,6 +459,9 @@ fn rand_operand_fixture(
         expression,
         ordered: vec![call, value],
         rand_selected: Some(selected),
+        rand_request: Some(request),
+        rand_definitions: vec![call],
+        constant_policy: options().constants,
     }
 }
 

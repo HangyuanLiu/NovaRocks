@@ -88,6 +88,7 @@ fn compile_arithmetic(
     result: ResultPort,
     allow: bool,
 ) -> Arc<LocalProgram> {
+    let (fragment, constants) = original_request_sources(fragment, authors);
     let fragment_id = fragment.id();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
     let mut author = FlowAuthor::new();
@@ -209,7 +210,7 @@ fn compile_arithmetic(
             FragmentPackageInput {
                 version: PlanVersionId::try_new([213; 16]).unwrap(),
                 required: RequiredContracts::default(),
-                constants: novarocks_physical_plan::ConstantPools::empty(),
+                constants,
                 fragment,
                 expression_uses: uses,
                 calls,

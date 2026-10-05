@@ -27,6 +27,7 @@ fn checked_package(
     authors: &BTreeMap<ExprId, Author>,
     result: ResultPort,
 ) -> Arc<FragmentPackage> {
+    let (fragment, constants) = original_request_sources(fragment, authors);
     let fragment_id = fragment.id();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
     let mut flow_author = FlowAuthor::new();
@@ -126,7 +127,7 @@ fn checked_package(
             FragmentPackageInput {
                 version: PlanVersionId::try_new([193; 16]).unwrap(),
                 required: RequiredContracts::default(),
-                constants: novarocks_physical_plan::ConstantPools::empty(),
+                constants,
                 fragment,
                 expression_uses: uses,
                 calls,

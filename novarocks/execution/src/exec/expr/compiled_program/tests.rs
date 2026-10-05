@@ -200,6 +200,41 @@ fn package_with_dictionary(
         .metadata()
         .resolve_bound_user("rand", FunctionKind::Scalar, request, &FixtureControl)
         .unwrap();
+    // Retain the actual first-resolution request independently of the later
+    // physical Literal/Value shape. Existing CVs loan their original backing;
+    // no literal factory or admission policy is replayed for this table.
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
+    let original_arguments = request
+        .arguments
+        .iter()
+        .map(|argument| {
+            let FunctionArgument::Value {
+                value_type,
+                constant,
+            } = argument
+            else {
+                panic!("RAND fixture has one actual Value argument");
+            };
+            let constant = constant.as_ref().map(|value| {
+                let pool = novarocks_physical_plan::ConstantPoolId::new(u32::MAX);
+                constants.insert(pool, value.pool().clone()).unwrap();
+                novarocks_physical_plan::ConstantReference {
+                    pool,
+                    ordinal: value.ordinal(),
+                }
+            });
+            novarocks_physical_plan::StaticFunctionArgument::Value {
+                value_type: value_type.clone(),
+                constant,
+            }
+        })
+        .collect::<Box<[_]>>();
+    let original_request = novarocks_physical_plan::PhysicalCallRequest {
+        arguments: original_arguments,
+        logical_argument_count: request.logical_argument_count,
+        expected_result_type: request.expected_result_type.cloned(),
+        constant_policy: options(1).constants,
+    };
     let selected = Arc::new(bound.selected.clone());
     let FunctionResultType::Scalar(result_type) = &selected.result_type else {
         panic!("RAND result")
@@ -395,6 +430,14 @@ fn package_with_dictionary(
                 requires_power_of_two: false,
             },
         )
+        .unwrap()
+        .with_call_requests_observed(
+            vec![(
+                novarocks_physical_plan::PhysicalCallDefinition::Expression(call),
+                original_request,
+            )],
+            &FixtureControl,
+        )
         .unwrap();
     let actual_roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();
     let mut next = 4096;
@@ -502,7 +545,7 @@ fn package_with_dictionary(
             FragmentPackageInput {
                 version: PlanVersionId::try_new([72; 16]).unwrap(),
                 required: RequiredContracts::default(),
-                constants: novarocks_physical_plan::ConstantPools::empty(),
+                constants,
                 pruning: FrozenFragmentPruning::try_new(fragment_id, vec![], &FixtureControl)
                     .unwrap(),
                 fragment,
