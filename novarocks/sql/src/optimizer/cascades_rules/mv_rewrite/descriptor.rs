@@ -584,7 +584,7 @@ fn substitute_aggregate(
         output_column_id: call.output_column_id,
         name: call.name.clone(),
         distinct: call.distinct,
-        source: call.source.try_map_parts(
+        source: call.source.try_rewrite_parts(
             |arguments| {
                 arguments
                     .iter()
@@ -1986,5 +1986,223 @@ mod tests {
             .unwrap()
             .is_none()
         );
+    }
+
+    #[test]
+    fn aggregate_mv_substitution_renews_actual_source_revision_without_upgrading_uncertified() {
+        let control = crate::optimizer::test_optimizer_control();
+        let mut arena = ScalarArena::new();
+        let column = col(71, "original_input");
+        let input = crate::planner::optimizer_bridge::scalar::intern_exprs(
+            &mut arena,
+            &[col_ref(&column)],
+            control,
+        )
+        .unwrap()[0];
+        let authored =
+            crate::analysis::function_argument(&int_lit(7), arena.constant_policy(), control)
+                .unwrap();
+        let novarocks_functions::FunctionArgument::Value {
+            value_type,
+            constant: Some(value),
+        } = authored
+        else {
+            panic!("sole literal author must retain its real constant")
+        };
+        let replacement = arena
+            .intern_observed(ScalarNode::Constant(value.clone()), value_type, control)
+            .unwrap();
+        let defs = HashMap::from([(column.column_id, replacement)]);
+        for certified in [true, false] {
+            let binding =
+                crate::functions::test_resolved_aggregate("count", &[DataType::Int64], false);
+            let source = if certified {
+                crate::binding::AggregateArgumentSource::logical_update(
+                    vec![input],
+                    vec![],
+                    binding,
+                )
+            } else {
+                crate::binding::AggregateArgumentSource::uncertified(vec![input], vec![], binding)
+            };
+            let call = ScalarAggregateSpec {
+                name: "count".into(),
+                output_column_id: ColumnId(72),
+                distinct: false,
+                source,
+            };
+            let before = call.source.clone();
+            let rewritten = substitute_aggregate(&mut arena, &call, &defs, control)
+                .unwrap()
+                .expect("actual projection substitution");
+            assert_eq!(rewritten.source.arguments(), &[replacement]);
+            assert_eq!(call.source.arguments(), &[input]);
+            assert!(std::ptr::eq(
+                call.source.binding().resolved(),
+                rewritten.source.binding().resolved()
+            ));
+            assert!(std::ptr::eq(
+                before.binding().resolved(),
+                call.source.binding().resolved()
+            ));
+            match (
+                before.logical_identity(),
+                rewritten.source.logical_identity(),
+            ) {
+                (Some(old), Some(new)) => {
+                    assert!(old.same_revision(call.source.logical_identity().unwrap()));
+                    assert!(old.same_lineage(new));
+                    assert!(!old.same_revision(new));
+                }
+                (None, None) => assert!(rewritten.source.logical_parts().is_none()),
+                _ => panic!("actual substitution cannot change certification"),
+            }
+            assert!(matches!(
+                crate::optimizer::scalar::function_argument(&arena, input, control).unwrap(),
+                novarocks_functions::FunctionArgument::Value { constant: None, .. }
+            ));
+            let actual =
+                crate::optimizer::scalar::function_argument(&arena, replacement, control).unwrap();
+            let novarocks_functions::FunctionArgument::Value {
+                constant: Some(actual),
+                ..
+            } = actual
+            else {
+                panic!("replacement is an actual constant source")
+            };
+            assert_eq!(actual.ordinal(), value.ordinal());
+            assert!(std::sync::Arc::ptr_eq(
+                actual.pool().array(),
+                value.pool().array()
+            ));
+            assert!(std::sync::Arc::ptr_eq(
+                actual.pool().field_ref(),
+                value.pool().field_ref()
+            ));
+        }
+    }
+
+    #[test]
+    fn aggregate_mv_substitution_ordinary_and_control_refusal_leave_original_revision() {
+        use crate::compiler::SqlFunctionCatalog;
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Refuse {
+            cause: CompileControlError,
+            calls: AtomicUsize,
+        }
+        impl PureCompileControl for Refuse {
+            fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                assert_eq!(
+                    self.calls.fetch_add(1, Ordering::SeqCst),
+                    0,
+                    "callback after first cause"
+                );
+                Err(self.cause)
+            }
+        }
+        let control = crate::optimizer::test_optimizer_control();
+        let mut arena = ScalarArena::new();
+        let column = col(81, "original_input");
+        let ids = crate::planner::optimizer_bridge::scalar::intern_exprs(
+            &mut arena,
+            &[
+                col_ref(&column),
+                int_lit(9),
+                cmp(col_ref(&column), BinOp::Eq, int_lit(9)),
+            ],
+            control,
+        )
+        .unwrap();
+        let arguments = [
+            crate::optimizer::scalar::function_argument(&arena, ids[0], control).unwrap(),
+            crate::optimizer::scalar::function_argument(&arena, ids[0], control).unwrap(),
+        ];
+        let selected = crate::functions::builtin_engine_function_catalog()
+            .resolve_aggregate_binding("array_agg", 1, &arguments, control)
+            .unwrap();
+        let ordered = ScalarAggregateSpec {
+            name: "array_agg".into(),
+            output_column_id: ColumnId(82),
+            distinct: false,
+            source: crate::binding::AggregateArgumentSource::logical_update(
+                vec![ids[0]],
+                vec![SortKey {
+                    expr: ids[0],
+                    asc: false,
+                    nulls_first: true,
+                    display: None,
+                }],
+                crate::binding::SqlFunctionBinding::new(
+                    selected,
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                ),
+            ),
+        };
+        let original = ordered.source.clone();
+        assert!(
+            substitute_aggregate(
+                &mut arena,
+                &ordered,
+                &HashMap::from([(column.column_id, ids[1])]),
+                control
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            original
+                .logical_identity()
+                .unwrap()
+                .same_revision(ordered.source.logical_identity().unwrap())
+        );
+        assert_eq!(ordered.source.arguments(), &[ids[0]]);
+        assert_eq!(ordered.source.order_by()[0].expr, ids[0]);
+
+        // A real compound argument reaches the original scalar interner's
+        // controlled reconstruction, rather than a direct leaf replacement.
+        let call = ScalarAggregateSpec {
+            name: "count".into(),
+            output_column_id: ColumnId(83),
+            distinct: false,
+            source: crate::binding::AggregateArgumentSource::logical_update(
+                vec![ids[2]],
+                vec![],
+                crate::functions::test_resolved_aggregate("count", &[DataType::Boolean], false),
+            ),
+        };
+        let before = call.source.clone();
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let refusal = Refuse {
+                cause,
+                calls: AtomicUsize::new(0),
+            };
+            assert_eq!(
+                substitute_aggregate(
+                    &mut arena,
+                    &call,
+                    &HashMap::from([(column.column_id, ids[1])]),
+                    &refusal
+                )
+                .unwrap_err(),
+                crate::compiler::SqlCompileError::from(cause)
+            );
+            assert_eq!(refusal.calls.load(Ordering::SeqCst), 1);
+            assert!(
+                before
+                    .logical_identity()
+                    .unwrap()
+                    .same_revision(call.source.logical_identity().unwrap())
+            );
+            assert_eq!(call.source.arguments(), &[ids[2]]);
+            assert!(std::ptr::eq(
+                before.binding().resolved(),
+                call.source.binding().resolved()
+            ));
+        }
     }
 }

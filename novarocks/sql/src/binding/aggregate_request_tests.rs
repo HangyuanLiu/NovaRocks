@@ -107,7 +107,7 @@ fn capture_refuses_uncertified_same_signature_and_observes_every_control_prefix(
         }
         let baseline = control.trace.into_inner().unwrap();
         if arguments != 1 || !certified {
-            assert_eq!(baseline, vec![0, 0]);
+            assert_eq!(baseline, vec![0, u32::from(certified)]);
         }
         for stop in 0..baseline.len() {
             for cause in [
@@ -139,7 +139,7 @@ fn static_capture_argument_bound_precedes_request_allocation_and_shape_check() {
         capture_aggregate_logical_request(&near, policy, &control),
         Err(AggregateRequestCaptureError::InvalidSource(_))
     ));
-    assert_eq!(control.trace.into_inner().unwrap(), vec![0, 0]);
+    assert_eq!(control.trace.into_inner().unwrap(), vec![0, 1]);
     let over = source(true, MAX_CALL_EFFECT_ARGUMENTS + 1);
     let control = Control::default();
     assert!(matches!(

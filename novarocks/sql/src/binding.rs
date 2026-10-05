@@ -36,7 +36,7 @@ pub(crate) use aggregate_request::{
     capture_aggregate_logical_request,
 };
 pub(crate) mod observed;
-pub(crate) use aggregate_source::AggregateArgumentSource;
+pub(crate) use aggregate_source::{AggregateArgumentSource, AggregateLogicalSourceIdentity};
 
 use std::{
     num::{NonZeroU32, NonZeroU64},
@@ -262,3 +262,6 @@ mod tests {
         assert_eq!(first_scope.get(), NonZeroU64::new(17).unwrap());
     }
 }
+
+#[cfg(test)]
+mod aggregate_identity_tests;

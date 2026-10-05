@@ -18,11 +18,40 @@
 //! Authored logical aggregate channels, independent of runtime merge state.
 
 use super::SqlFunctionBinding;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Origin {
     LogicalUpdate,
     Uncertified,
+}
+
+/// Private source receipts identify a producer lineage and its exact channel
+/// revision. Pointer identity is intentional: equal bindings or token values
+/// establish neither relation. These receipts grant no phase or kernel proof.
+#[derive(Clone, Debug)]
+pub(crate) struct AggregateLogicalSourceIdentity {
+    lineage: Arc<()>,
+    revision: Arc<()>,
+}
+impl AggregateLogicalSourceIdentity {
+    fn new() -> Self {
+        // Fixed opaque metadata requests remain the original caller's source
+        // admission obligation; this constructor is not an allocation grant.
+        Self {
+            lineage: Arc::new(()),
+            revision: Arc::new(()),
+        }
+    }
+    fn renew_revision(&mut self) {
+        self.revision = Arc::new(());
+    }
+    pub(crate) fn same_lineage(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.lineage, &other.lineage)
+    }
+    pub(crate) fn same_revision(&self, other: &Self) -> bool {
+        self.same_lineage(other) && Arc::ptr_eq(&self.revision, &other.revision)
+    }
 }
 
 /// SQL source authors mint the logical origin at an actual update definition.
@@ -33,6 +62,7 @@ enum Origin {
 #[derive(Clone, Debug)]
 pub(crate) struct AggregateArgumentSource<A, O> {
     origin: Origin,
+    identity: Option<AggregateLogicalSourceIdentity>,
     arguments: Vec<A>,
     order_by: Vec<O>,
     binding: SqlFunctionBinding,
@@ -48,6 +78,7 @@ impl<A, O> AggregateArgumentSource<A, O> {
     ) -> Self {
         Self {
             origin: Origin::LogicalUpdate,
+            identity: Some(AggregateLogicalSourceIdentity::new()),
             arguments,
             order_by,
             binding,
@@ -63,10 +94,15 @@ impl<A, O> AggregateArgumentSource<A, O> {
     ) -> Self {
         Self {
             origin: Origin::Uncertified,
+            identity: None,
             arguments,
             order_by,
             binding,
         }
+    }
+
+    pub(crate) fn logical_identity(&self) -> Option<&AggregateLogicalSourceIdentity> {
+        self.identity.as_ref()
     }
 
     pub(crate) fn arguments(&self) -> &[A] {
@@ -96,10 +132,26 @@ impl<A, O> AggregateArgumentSource<A, O> {
     ) -> Result<AggregateArgumentSource<B, P>, E> {
         Ok(AggregateArgumentSource {
             origin: self.origin,
+            identity: self.identity.clone(),
             arguments: arguments(&self.arguments)?,
             order_by: order_by(&self.order_by)?,
             binding: self.binding.clone(),
         })
+    }
+
+    /// A genuine channel substitution preserves lineage while minting a new
+    /// revision. Failed projections return no new source and leave this source
+    /// unchanged. Representation-only IR transport uses try_map_parts instead.
+    pub(crate) fn try_rewrite_parts<B, P, E>(
+        &self,
+        arguments: impl FnOnce(&[A]) -> Result<Vec<B>, E>,
+        order_by: impl FnOnce(&[O]) -> Result<Vec<P>, E>,
+    ) -> Result<AggregateArgumentSource<B, P>, E> {
+        let mut mapped = self.try_map_parts(arguments, order_by)?;
+        if let Some(identity) = &mut mapped.identity {
+            identity.renew_revision();
+        }
+        Ok(mapped)
     }
 
     /// Only an already-authorized logical rewrite may change these canonical
@@ -109,6 +161,11 @@ impl<A, O> AggregateArgumentSource<A, O> {
         &mut self,
         rewrite: impl FnOnce(&mut Vec<A>, &mut Vec<O>) -> R,
     ) -> R {
+        // Renew before lending either mutable channel, including no-op and
+        // partially completed failed rewrites. An old capture stays old.
+        if let Some(identity) = &mut self.identity {
+            identity.renew_revision();
+        }
         rewrite(&mut self.arguments, &mut self.order_by)
     }
 }

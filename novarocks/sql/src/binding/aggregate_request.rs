@@ -79,11 +79,15 @@ impl std::error::Error for AggregateRequestCaptureError {
 #[derive(Debug)]
 pub(crate) struct CapturedAggregateLogicalRequest {
     binding: SqlFunctionBinding,
+    identity: super::AggregateLogicalSourceIdentity,
     arguments: Box<[FunctionArgument]>,
     logical_count: usize,
     constant_policy: ConstantPolicy,
 }
 impl CapturedAggregateLogicalRequest {
+    pub(crate) fn logical_identity(&self) -> &super::AggregateLogicalSourceIdentity {
+        &self.identity
+    }
     pub(crate) fn binding(&self) -> &SqlFunctionBinding {
         &self.binding
     }
@@ -120,6 +124,10 @@ pub(crate) fn capture_aggregate_logical_request(
         let (arguments, order_by, binding) = source
             .logical_parts()
             .ok_or(AggregateRequestCaptureError::MissingLogicalSource)?;
+        let identity = source
+            .logical_identity()
+            .ok_or(AggregateRequestCaptureError::MissingLogicalSource)?;
+        work.step()?;
         let count = arguments
             .len()
             .checked_add(order_by.len())
@@ -155,7 +163,12 @@ pub(crate) fn capture_aggregate_logical_request(
             captured.push(argument);
         }
         work.flush()?;
+        work.flush()?;
+        let identity = identity.clone();
+        work.step()?;
+        work.flush()?;
         Ok(CapturedAggregateLogicalRequest {
+            identity,
             binding: binding.clone(),
             arguments: captured.into_boxed_slice(),
             logical_count: arguments.len(),

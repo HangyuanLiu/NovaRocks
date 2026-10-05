@@ -897,7 +897,7 @@ fn rewrite_aggregate_to_mv(
         output_column_id: call.output_column_id,
         name: call.name.clone(),
         distinct: call.distinct,
-        source: call.source.try_map_parts(
+        source: call.source.try_rewrite_parts(
             |_| Ok::<_, crate::compiler::SqlCompileError>(arguments),
             |_| Ok::<_, crate::compiler::SqlCompileError>(order_by),
         )?,
@@ -2413,4 +2413,150 @@ mod tests {
 
     // These tests share the real logical-plan and catalogue fixture authors.
     include!("rule_output_type_tests.rs");
+
+    #[test]
+    fn aggregate_mv_column_mapping_renews_actual_revision_and_keeps_original_binding() {
+        let control = crate::optimizer::test_optimizer_control();
+        let mut arena = ScalarArena::new();
+        let column = col(91, "original_input");
+        let input = crate::planner::optimizer_bridge::scalar::intern_exprs(
+            &mut arena,
+            &[col_ref(&column)],
+            control,
+        )
+        .unwrap()[0];
+        let names = std::collections::HashMap::from([(column.column_id, column.name.clone())]);
+        let key = normalize(&arena, input, &names, control).unwrap().unwrap();
+        let mv_column = col(901, "actual_mv_input");
+        let map = MvColumnMap::try_new(vec![(key, mv_column.clone())], control)
+            .unwrap()
+            .unwrap();
+        for certified in [true, false] {
+            let binding =
+                crate::functions::test_resolved_aggregate("count", &[DataType::Int64], false);
+            let source = if certified {
+                crate::binding::AggregateArgumentSource::logical_update(
+                    vec![input],
+                    vec![],
+                    binding,
+                )
+            } else {
+                crate::binding::AggregateArgumentSource::uncertified(vec![input], vec![], binding)
+            };
+            let call = ScalarAggregateSpec {
+                name: "count".into(),
+                output_column_id: ColumnId(92),
+                distinct: false,
+                source,
+            };
+            let before = call.source.clone();
+            let rewritten = rewrite_aggregate_to_mv(&mut arena, &call, &map, &names, control)
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(arena.node(rewritten.source.arguments()[0]), ScalarNode::ColumnRef(id) if *id == mv_column.column_id)
+            );
+            assert_eq!(
+                arena.value_type(rewritten.source.arguments()[0]),
+                &mv_column.value_type
+            );
+            assert_eq!(call.source.arguments(), &[input]);
+            assert_eq!(rewritten.output_column_id, call.output_column_id);
+            assert!(std::ptr::eq(
+                before.binding().resolved(),
+                rewritten.source.binding().resolved()
+            ));
+            match (
+                before.logical_identity(),
+                rewritten.source.logical_identity(),
+            ) {
+                (Some(old), Some(new)) => {
+                    assert!(old.same_revision(call.source.logical_identity().unwrap()));
+                    assert!(old.same_lineage(new));
+                    assert!(!old.same_revision(new));
+                }
+                (None, None) => assert!(rewritten.source.logical_parts().is_none()),
+                _ => panic!("MV mapping cannot upgrade source certification"),
+            }
+        }
+    }
+
+    #[test]
+    fn aggregate_mv_column_mapping_refusal_preserves_original_revision_and_first_control_cause() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Refuse {
+            cause: CompileControlError,
+            calls: AtomicUsize,
+        }
+        impl PureCompileControl for Refuse {
+            fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                assert_eq!(
+                    self.calls.fetch_add(1, Ordering::SeqCst),
+                    0,
+                    "callback after first cause"
+                );
+                Err(self.cause)
+            }
+        }
+        let control = crate::optimizer::test_optimizer_control();
+        let mut arena = ScalarArena::new();
+        let column = col(101, "original_input");
+        let input = crate::planner::optimizer_bridge::scalar::intern_exprs(
+            &mut arena,
+            &[col_ref(&column)],
+            control,
+        )
+        .unwrap()[0];
+        let names = std::collections::HashMap::from([(column.column_id, column.name.clone())]);
+        let map = MvColumnMap::try_new(vec![], control).unwrap().unwrap();
+        let call = ScalarAggregateSpec {
+            name: "count".into(),
+            output_column_id: ColumnId(102),
+            distinct: false,
+            source: crate::binding::AggregateArgumentSource::logical_update(
+                vec![input],
+                vec![],
+                crate::functions::test_resolved_aggregate("count", &[DataType::Int64], false),
+            ),
+        };
+        let before = call.source.clone();
+        assert!(
+            rewrite_aggregate_to_mv(&mut arena, &call, &map, &names, control)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            before
+                .logical_identity()
+                .unwrap()
+                .same_revision(call.source.logical_identity().unwrap())
+        );
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let refusal = Refuse {
+                cause,
+                calls: AtomicUsize::new(0),
+            };
+            assert_eq!(
+                rewrite_aggregate_to_mv(&mut arena, &call, &map, &names, &refusal).unwrap_err(),
+                crate::compiler::SqlCompileError::from(cause)
+            );
+            assert_eq!(refusal.calls.load(Ordering::SeqCst), 1);
+            assert!(
+                before
+                    .logical_identity()
+                    .unwrap()
+                    .same_revision(call.source.logical_identity().unwrap())
+            );
+            assert_eq!(call.source.arguments(), &[input]);
+            assert!(std::ptr::eq(
+                before.binding().resolved(),
+                call.source.binding().resolved()
+            ));
+        }
+    }
 }

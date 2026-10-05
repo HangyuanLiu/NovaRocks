@@ -1660,6 +1660,15 @@ impl<'a> ContractLoweringVisitor<'a> {
         let captured =
             capture_aggregate_logical_request(source, self.constant_policy, self.control)?;
         self.work.flush()?;
+        let same_revision = source
+            .logical_identity()
+            .is_some_and(|original| original.same_revision(captured.logical_identity()));
+        self.work.step()?;
+        if !same_revision {
+            return Err(ContractLoweringError::InvalidAggregate {
+                detail: "aggregate capture belongs to a different source revision",
+            });
+        }
         Ok(LoweredAggregateLogicalSource::Captured(captured))
     }
 
