@@ -340,22 +340,18 @@ pub trait AggregateSignatureResolver: Send + Sync {
     }
 
     /// Materialize the exact execution signature for an already-selected
-    /// logical overload. The default admits no extra update channels; ordered
-    /// aggregate families must opt in explicitly.
+    /// logical overload. The default refuses missing fixed-overload authors;
+    /// it never runs candidate resolution as a substitute. Ordered aggregate
+    /// families must declare their complete update channels explicitly.
     fn resolve_update_signature(
         &self,
         selected_overload: &AggregateOverloadIdentity,
         update_argument_types: &[DataType],
     ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
-        let resolved = self.resolve_aggregate(update_argument_types)?;
-        if &resolved.overload != selected_overload {
-            return Err(FunctionResolutionError::BadSignature(format!(
-                "aggregate update resolver selected overload `{}` instead of `{}`",
-                resolved.overload.as_str(),
-                selected_overload.as_str()
-            )));
-        }
-        Ok(resolved)
+        let _ = (selected_overload, update_argument_types);
+        Err(FunctionResolutionError::BadSignature(
+            "aggregate family does not declare fixed-overload update binding".into(),
+        ))
     }
 }
 
@@ -705,15 +701,10 @@ pub trait TypedAggregateFamily: Send + Sync + 'static {
         selected_overload: &AggregateOverloadIdentity,
         update_argument_types: &[DataType],
     ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
-        let resolved = self.resolve_signature(update_argument_types)?;
-        if &resolved.overload != selected_overload {
-            return Err(FunctionResolutionError::BadSignature(format!(
-                "aggregate update resolver selected overload `{}` instead of `{}`",
-                resolved.overload.as_str(),
-                selected_overload.as_str()
-            )));
-        }
-        Ok(resolved)
+        let _ = (selected_overload, update_argument_types);
+        Err(FunctionResolutionError::BadSignature(
+            "typed aggregate family does not declare fixed-overload update binding".into(),
+        ))
     }
 
     fn prepare(
@@ -1031,6 +1022,36 @@ impl AggregateSignatureResolver for ExactAggregateResolver {
         argument_types: &[DataType],
     ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
         select_exact_aggregate_overload(&self.overloads, argument_types).map(Into::into)
+    }
+    fn resolve_update_signature(
+        &self,
+        selected_overload: &AggregateOverloadIdentity,
+        argument_types: &[DataType],
+    ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
+        let selected = self
+            .overloads
+            .iter()
+            .find(|entry| &entry.identity == selected_overload)
+            .ok_or_else(|| {
+                FunctionResolutionError::BadSignature(
+                    "exact aggregate overload is not declared by this family".into(),
+                )
+            })?;
+        if selected.argument_types.len() != argument_types.len()
+            || !selected
+                .argument_types
+                .iter()
+                .zip(argument_types)
+                .all(|(expected, actual)| {
+                    novarocks_type_contract::arrow_data_types_exact(expected, actual)
+                })
+        {
+            return Err(FunctionResolutionError::NoMatchingSignature {
+                candidates: 1,
+                binding_enforced: true,
+            });
+        }
+        Ok(selected.into())
     }
 }
 
@@ -2063,6 +2084,37 @@ mod tests {
         assert_eq!(resolved.intermediate_type, DataType::Int64);
         assert_eq!(resolved.output_type, DataType::Int64);
         assert_eq!(resolved.state_format.as_str(), "sum-int64-state/v1");
+        assert_eq!(
+            catalog
+                .resolve_selected_aggregate_update_trusted(
+                    "typed_sum",
+                    &resolved.overload,
+                    &[DataType::Int64],
+                )
+                .unwrap(),
+            resolved,
+        );
+        // FLOAT64 is a declared candidate, but cannot replace the chosen I64
+        // overload at the update boundary.
+        assert!(
+            catalog
+                .resolve_selected_aggregate_update_trusted(
+                    "typed_sum",
+                    &resolved.overload,
+                    &[DataType::Float64],
+                )
+                .is_err()
+        );
+        let foreign = AggregateOverloadIdentity::try_new("foreign/int64/v1").unwrap();
+        assert!(
+            catalog
+                .resolve_selected_aggregate_update_trusted(
+                    "typed_sum",
+                    &foreign,
+                    &[DataType::Int64],
+                )
+                .is_err()
+        );
         assert!(matches!(
             catalog.resolve_aggregate_user("typed_sum", &[DataType::UInt64]),
             Err(FunctionResolutionError::NoMatchingSignature {
@@ -2414,6 +2466,13 @@ mod tests {
         let selected = catalog
             .resolve_aggregate_user("typed_sum", &[DataType::Int64])
             .unwrap();
+        assert!(
+            matches!(
+                family.resolve_update_signature(&selected.overload, &[DataType::Int64]),
+                Err(FunctionResolutionError::BadSignature(_)),
+            ),
+            "a working typed election author grants no default fixed capability"
+        );
         let kernel = family
             .prepare(&selected, &AggregateBindOptions::default())
             .unwrap();

@@ -572,10 +572,61 @@ impl ParametricAggregateBindingResolver {
             })
             .collect::<Result<Vec<_>, _>>()?;
         work.flush()?;
-        self.aggregate_resolver
+        let validation = self
+            .aggregate_resolver
             .validate_value_arguments(&values)
-            .map_err(FunctionBindingError::from)?;
+            .map_err(FunctionBindingError::from);
+        work.step()?;
+        validation?;
         Ok(values.into_iter().map(|value| value.data_type).collect())
+    }
+
+    // Both exact instantiation and selected-binding validation use the same
+    // original family author. Missing authors refuse; candidate resolution is
+    // reserved for the first FE name-based admission.
+    fn select_exact_observed(
+        &self,
+        overload: &FunctionOverloadId,
+        request: FunctionBindingRequest<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        let argument_types = self.argument_types(request, work)?;
+        let selected_overload = crate::AggregateOverloadIdentity::try_new(overload.as_str())
+            .map_err(|error| invalid(&error.to_string()));
+        work.step()?;
+        let selected_overload = selected_overload?;
+        work.flush()?;
+        let resolved = self
+            .aggregate_resolver
+            .resolve_update_signature(&selected_overload, &argument_types)
+            .map_err(FunctionBindingError::from);
+        work.step()?;
+        let resolved = resolved?;
+        let same_arity = resolved.argument_types.len() == argument_types.len();
+        work.step()?;
+        if !same_arity {
+            return Err(invalid(
+                "aggregate update author returned a different channel count",
+            ));
+        }
+        for (actual, returned) in argument_types.iter().zip(&resolved.argument_types) {
+            let exact =
+                novarocks_type_contract::arrow_data_types_exact_observed(actual, returned, || {
+                    work.step().map_err(FunctionBindingError::from)
+                })?;
+            if !exact {
+                return Err(invalid(
+                    "aggregate update author returned a different channel type",
+                ));
+            }
+        }
+        for _ in request.arguments {
+            work.step()?;
+        }
+        work.flush()?;
+        let selection = self.selection(request, &resolved);
+        work.step()?;
+        selection
     }
 
     fn selection(
@@ -640,6 +691,17 @@ impl FunctionBindingResolver for ParametricAggregateBindingResolver {
         finish_binding_work(result, work)
     }
 
+    fn select_at_overload_observed(
+        &self,
+        overload: &FunctionOverloadId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        let result = self.select_exact_observed(overload, request, &mut work);
+        finish_binding_work(result, work)
+    }
+
     fn validate_selected(
         &self,
         selected: &FunctionBindingSelection,
@@ -648,19 +710,8 @@ impl FunctionBindingResolver for ParametricAggregateBindingResolver {
     ) -> Result<(), FunctionBindingError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
         let result = (|| {
-            let argument_types = self.argument_types(request, &mut work)?;
-            let selected_overload =
-                crate::AggregateOverloadIdentity::try_new(selected.overload.as_str())
-                    .map_err(|error| invalid(&error.to_string()))?;
-            work.flush()?;
-            let resolved = self
-                .aggregate_resolver
-                .resolve_update_signature(&selected_overload, &argument_types)
-                .map_err(FunctionBindingError::from)?;
-            for _ in request.arguments {
-                work.step()?;
-            }
-            if &self.selection(request, &resolved)? == selected {
+            let expected = self.select_exact_observed(&selected.overload, request, &mut work)?;
+            if crate::builtin::binding_control::same_selection(&expected, selected, &mut work)? {
                 Ok(())
             } else {
                 Err(invalid(
@@ -1405,3 +1456,7 @@ pub(crate) fn arguments_equal_for_test(
     })();
     finish_binding_work(result, work)
 }
+
+#[cfg(test)]
+#[path = "binding/parametric_exact_selection_tests.rs"]
+mod parametric_exact_selection_tests;

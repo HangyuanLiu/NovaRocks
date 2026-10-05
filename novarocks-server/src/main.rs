@@ -487,6 +487,38 @@ mod tests {
             .expect("Iceberg hidden aggregate metadata");
 
         assert_eq!(definition.visibility(), FunctionVisibility::Hidden);
+        let declaration = definition
+            .binding_declaration()
+            .expect("Theta binding owner");
+        assert!(std::ptr::eq(
+            catalog.definition_by_id(declaration.function_id()).unwrap(),
+            definition,
+        ));
+        let arguments = [novarocks_functions::FunctionArgument::Value {
+            value_type: novarocks_functions::FunctionValueType::new(
+                arrow_schema::DataType::Int64,
+                false,
+            ),
+            constant: None,
+        }];
+        let selected = catalog
+            .select_exact_overload_observed(
+                declaration.function_id(),
+                FunctionKind::Aggregate,
+                &novarocks_functions::FunctionOverloadId::try_new("iceberg/theta-stat/long/v1")
+                    .unwrap(),
+                novarocks_functions::FunctionBindingRequest {
+                    arguments: &arguments,
+                    logical_argument_count: 1,
+                    expected_result_type: None,
+                },
+                &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+            )
+            .expect("original installed fixed Theta author");
+        assert_eq!(
+            selected.aggregate.as_ref().unwrap().state_format.as_str(),
+            novarocks_connector_iceberg_functions::ICEBERG_THETA_STATE_FORMAT_IDENTITY
+        );
         assert_ne!(catalog.digest(), [0; 32]);
         assert_ne!(function_set.implementation_manifest_digest(), [0; 32]);
     }

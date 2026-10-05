@@ -160,7 +160,7 @@ fn exact_argument(
     }
 }
 
-pub(super) fn same_selection(
+pub(crate) fn same_selection(
     left: &FunctionBindingSelection,
     right: &FunctionBindingSelection,
     work: &mut CompileCheckpoints<'_>,

@@ -73,6 +73,7 @@ mv-first-refresh-staging-test-support = []
 native-compatibility-test-fixture = ["novarocks-version/native-compatibility-test-fixture"]
 
 [dev-dependencies]
+arrow-schema.workspace = true
 # `server_binary_smoke` spawns the real `novarocks` binary and drives it over
 # MySQL; `state_store_app_config` asserts config/composition by direct call.
 # Domain behaviour belongs to its owner crate, the SQL suites or the system

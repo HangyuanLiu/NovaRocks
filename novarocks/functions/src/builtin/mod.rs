@@ -29,7 +29,7 @@ pub mod value_conversion;
 mod value_conversion_kernel;
 mod value_conversion_owner;
 
-mod binding_control;
+pub(crate) mod binding_control;
 
 #[cfg(test)]
 mod binding_control_tests;

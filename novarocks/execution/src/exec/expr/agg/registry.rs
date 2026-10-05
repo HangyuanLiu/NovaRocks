@@ -1292,6 +1292,20 @@ mod tests {
             Ok(resolved_signature())
         }
 
+        fn resolve_update_signature(
+            &self,
+            selected_overload: &AggregateOverloadIdentity,
+            argument_types: &[DataType],
+        ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
+            if selected_overload != &overload_identity() || argument_types != [DataType::Int64] {
+                return Err(FunctionResolutionError::NoMatchingSignature {
+                    candidates: 1,
+                    binding_enforced: true,
+                });
+            }
+            Ok(resolved_signature())
+        }
+
         fn prepare(
             &self,
             _selected: &ResolvedAggregateSignature,

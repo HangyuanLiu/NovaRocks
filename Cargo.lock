@@ -4275,6 +4275,7 @@ name = "novarocks-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow-schema",
  "atty",
  "bytes",
  "chrono",

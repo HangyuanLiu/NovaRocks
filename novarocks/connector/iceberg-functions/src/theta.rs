@@ -157,6 +157,43 @@ impl IcebergThetaAggregateFamily {
             overloads: overloads.into_boxed_slice(),
         })
     }
+
+    fn canonical_argument<'a>(
+        &self,
+        argument_types: &'a [DataType],
+    ) -> Result<(&'a DataType, CanonicalKind), FunctionResolutionError> {
+        let [argument_type] = argument_types else {
+            return Err(FunctionResolutionError::NoMatchingSignature {
+                candidates: self.overloads.len(),
+                binding_enforced: true,
+            });
+        };
+        let kind = CanonicalKind::from_data_type(argument_type).map_err(|_| {
+            FunctionResolutionError::NoMatchingSignature {
+                candidates: self.overloads.len(),
+                binding_enforced: true,
+            }
+        })?;
+        Ok((argument_type, kind))
+    }
+
+    fn materialize_signature(
+        &self,
+        argument_type: &DataType,
+        kind: CanonicalKind,
+    ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
+        Ok(ResolvedAggregateSignature {
+            overload: AggregateOverloadIdentity::try_new(overload_identity(kind))
+                .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))?,
+            argument_types: vec![argument_type.clone()],
+            intermediate_type: DataType::Binary,
+            output_type: DataType::Binary,
+            state_format: AggregateStateFormatIdentity::try_new(
+                ICEBERG_THETA_STATE_FORMAT_IDENTITY,
+            )
+            .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))?,
+        })
+    }
 }
 
 impl TypedAggregateFamily for IcebergThetaAggregateFamily {
@@ -209,7 +246,7 @@ impl TypedAggregateFamily for IcebergThetaAggregateFamily {
         }
         // The original canonical family remains the sole carrier admission
         // rule, including fixed width, decimal shape, and temporal units.
-        self.resolve_signature(std::slice::from_ref(&argument.data_type))
+        self.canonical_argument(std::slice::from_ref(&argument.data_type))
             .map(|_| ())
     }
 
@@ -217,29 +254,22 @@ impl TypedAggregateFamily for IcebergThetaAggregateFamily {
         &self,
         argument_types: &[DataType],
     ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
-        let [argument_type] = argument_types else {
-            return Err(FunctionResolutionError::NoMatchingSignature {
-                candidates: self.overloads.len(),
-                binding_enforced: true,
-            });
-        };
-        let kind = CanonicalKind::from_data_type(argument_type).map_err(|_| {
-            FunctionResolutionError::NoMatchingSignature {
-                candidates: self.overloads.len(),
-                binding_enforced: true,
-            }
-        })?;
-        Ok(ResolvedAggregateSignature {
-            overload: AggregateOverloadIdentity::try_new(overload_identity(kind))
-                .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))?,
-            argument_types: vec![argument_type.clone()],
-            intermediate_type: DataType::Binary,
-            output_type: DataType::Binary,
-            state_format: AggregateStateFormatIdentity::try_new(
-                ICEBERG_THETA_STATE_FORMAT_IDENTITY,
-            )
-            .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))?,
-        })
+        let (argument_type, kind) = self.canonical_argument(argument_types)?;
+        self.materialize_signature(argument_type, kind)
+    }
+
+    fn resolve_update_signature(
+        &self,
+        selected_overload: &AggregateOverloadIdentity,
+        argument_types: &[DataType],
+    ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
+        let (argument_type, kind) = self.canonical_argument(argument_types)?;
+        if selected_overload.as_str() != overload_identity(kind) {
+            return Err(FunctionResolutionError::BadSignature(
+                "Iceberg Theta update carrier differs from the selected overload".into(),
+            ));
+        }
+        self.materialize_signature(argument_type, kind)
     }
 
     fn prepare(
@@ -248,7 +278,7 @@ impl TypedAggregateFamily for IcebergThetaAggregateFamily {
         options: &AggregateBindOptions,
     ) -> Result<Self::Kernel, Self::PrepareError> {
         let expected = self
-            .resolve_signature(&selected.argument_types)
+            .resolve_update_signature(&selected.overload, &selected.argument_types)
             .map_err(|_| IcebergThetaError::InvalidResolvedSignature)?;
         if expected != *selected {
             return Err(IcebergThetaError::InvalidResolvedSignature);
@@ -760,6 +790,16 @@ mod tests {
                 catalog
                     .validate_bound(&bound, request, compile_control())
                     .unwrap();
+                let exact = catalog
+                    .select_exact_overload_observed(
+                        &bound.function_id,
+                        FunctionKind::Aggregate,
+                        &bound.selected.overload,
+                        request,
+                        compile_control(),
+                    )
+                    .unwrap();
+                assert_eq!(exact.as_ref(), &bound.selected);
                 assert_eq!(
                     bound.selected.argument_types.as_ref(),
                     &[FunctionArgumentType::Value(value_type)]
@@ -792,6 +832,46 @@ mod tests {
         assert_java_oracle(
             "uuid",
             Arc::new(FixedSizeBinaryArray::try_from_iter([raw].into_iter()).unwrap()),
+        );
+    }
+
+    #[test]
+    fn theta_fixed_update_refuses_carrier_reselection_and_forged_preparation() {
+        let family = IcebergThetaAggregateFamily::try_new().unwrap();
+        let int = AggregateOverloadIdentity::try_new("iceberg/theta-stat/int/v1").unwrap();
+        let selected = family
+            .resolve_update_signature(&int, &[DataType::Int32])
+            .unwrap();
+        assert_eq!(
+            selected,
+            family.resolve_signature(&[DataType::Int32]).unwrap()
+        );
+        for actual in [
+            vec![],
+            vec![DataType::Int64],
+            vec![DataType::Int32, DataType::Int32],
+        ] {
+            assert!(family.resolve_update_signature(&int, &actual).is_err());
+        }
+        let foreign = AggregateOverloadIdentity::try_new("foreign/theta-stat/int/v1").unwrap();
+        assert!(
+            family
+                .resolve_update_signature(&foreign, &[DataType::Int32])
+                .is_err()
+        );
+        let mut forged = selected.clone();
+        forged.argument_types = vec![DataType::Int64];
+        assert!(matches!(
+            family.prepare(&forged, &AggregateBindOptions::default()),
+            Err(IcebergThetaError::InvalidResolvedSignature)
+        ));
+        let kernel = family
+            .prepare(&selected, &AggregateBindOptions::default())
+            .unwrap();
+        let state = kernel.create_state().unwrap();
+        assert_eq!(
+            kernel.build_final(std::iter::once(&state)).unwrap().len(),
+            1
         );
     }
 
