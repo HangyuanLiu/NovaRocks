@@ -16,27 +16,24 @@
 // under the License.
 
 use super::*;
-use crate::physical_aggregate_binding_v2;
-use crate::physical_binding_v2::{self, BindingCodecError, BindingProjectionLimits};
-use crate::physical_call_requests_v2::{self, CallRequestCodecError, CallRequestProjectionLimits};
-use crate::physical_connector_payload_v2::{
-    self, ConnectorPayloadCodecError, ConnectorPayloadProjectionLimits,
+use crate::physical_binding_v2::BindingProjectionLimits;
+use crate::physical_call_requests_v2::{
+    CallRequestCodecError, CallRequestProjectionLimits, encode_call_requests,
+    prepare_call_requests_encode,
 };
-use crate::physical_constant_v2::{
-    self, ConstantNamespaceProjectionLimits, ConstantWriteProjectionLimits,
-    PhysicalConstantCodecError,
+use crate::physical_cuts_v2::{
+    CutsProjectionLimits, EncodedCutsContext, encode_fragment_cuts_observed,
 };
-use crate::physical_expression_v2::{self, ExpressionCodecError, ExpressionProjectionLimits};
 use crate::physical_node_v2::{NodeCodecError, NodeProjectionFacts, NodeProjectionLimits};
-use crate::physical_package_v2::{
-    binding_sources::{self, BindingSourceLimits},
-    type_views::{TypeViewBudget, TypeViewFacts, TypeViewLimits, collect_package_type_views_in},
+use crate::physical_package_v2::binding_sources::{
+    BindingSourceLimits, collect_binding_sources_in,
 };
+use crate::physical_package_v2::type_views::{TypeViewLimits, collect_package_type_views_in};
 use crate::physical_properties_v2::PhysicalPropertyProjectionLimits;
-use crate::physical_result_v2;
-use crate::physical_type_v2::{self, PackageTypeProjectionLimits, TypeCodecError};
-use crate::physical_value_origin_v2::ValueOriginProjectionLimits;
-use crate::physical_value_v2::{self, ValueCodecError, ValueProjectionLimits};
+use crate::physical_type_v2::{
+    EncodedTypeTable, PackageTypeProjectionLimits, TypeCodecError,
+    encode_borrowed_type_table_writer_sources_in,
+};
 use arrow::{
     array::{Array, Int64Array},
     datatypes::{DataType, Field},
@@ -662,7 +659,7 @@ fn cv_package() -> p::FragmentPackage {
     )
     .unwrap();
     let mut some_request = request(Box::from([p::StaticFunctionArgument::Value {
-        ty: nullable.clone(),
+        value_type: nullable.clone(),
         constant: Some(reference),
     }]));
     some_request.expected_result_type = Some(int());
@@ -672,7 +669,7 @@ fn cv_package() -> p::FragmentPackage {
                 (
                     p::PhysicalCallDefinition::Expression(none),
                     request(Box::from([p::StaticFunctionArgument::Value {
-                        ty: nullable.clone(),
+                        value_type: nullable.clone(),
                         constant: None,
                     }])),
                 ),
@@ -767,6 +764,8 @@ fn cv_package() -> p::FragmentPackage {
         nullable,
         Int64Array::from(vec![Some(42), None]).to_data(),
         policy,
+        CompilePhase::Validate,
+        &Setup,
     )
     .unwrap();
     pools.insert(pool_id, pool).unwrap();
@@ -848,4 +847,903 @@ fn writer_package() -> p::FragmentPackage {
     )
     .unwrap();
     crate::physical_type_v2::sender_tests::checked_writer_package(recipe)
+}
+
+fn view_limits() -> TypeViewLimits {
+    TypeViewLimits {
+        max_occurrences: 100_000,
+        max_value_roots: 100_000,
+        max_field_roots: 100_000,
+        max_writer_recipes: 1000,
+        max_allocation_requests: 1_000_000,
+        max_allocation_request_bytes: REQUEST_BYTES,
+        max_coexisting_source_and_request_bytes: SOURCE + REQUEST_BYTES,
+        max_work: usize::MAX / 4,
+    }
+}
+fn type_limits() -> PackageTypeProjectionLimits {
+    PackageTypeProjectionLimits {
+        max_definitions: 100_000,
+        max_expanded_nodes: 1_000_000,
+        max_string_bytes: 64 * 1024 * 1024,
+        max_allocation_requests: 1_000_000,
+        max_allocation_request_bytes: REQUEST_BYTES,
+        max_coexisting_source_and_request_bytes: SOURCE + REQUEST_BYTES,
+        max_work: usize::MAX / 4,
+    }
+}
+fn binding_source_limits() -> BindingSourceLimits {
+    BindingSourceLimits {
+        max_functions: 64,
+        max_aggregates: 64,
+        max_arguments: 64,
+        max_lambda_parameters: 64,
+        max_relation_results: 64,
+    }
+}
+fn wide() -> DefinitionSourceLimits {
+    DefinitionSourceLimits {
+        max_constants: 100_000,
+        max_values: 100_000,
+        max_expressions: 100_000,
+        max_expression_lambda_parameters: 100_000,
+        max_requests: 100_000,
+        max_request_arguments: 100_000,
+        max_request_lambda_parameters: 100_000,
+        max_cut_type_occurrences: 100_000,
+        max_result_fields: 100_000,
+        max_writer_nodes: 100_000,
+        max_writer_node_fields: 100_000,
+    }
+}
+fn binding_limits() -> BindingProjectionLimits {
+    BindingProjectionLimits {
+        max_definitions: 1000,
+        max_type_references: 10_000,
+        max_request_bytes: REQUEST_BYTES,
+        max_allocation_requests: 100_000,
+        max_coexisting_source_and_request_bytes: SOURCE + REQUEST_BYTES,
+        max_work: usize::MAX / 4,
+    }
+}
+fn node_limits() -> NodeProjectionLimits {
+    NodeProjectionLimits {
+        max_input_nodes: 1000,
+        max_value_references: 1000,
+        max_list_items: 100_000,
+        max_allocation_requests: 100_000,
+        max_allocation_request_bytes: REQUEST_BYTES,
+        max_coexisting_source_and_request_bytes: SOURCE + REQUEST_BYTES,
+        max_work: usize::MAX / 4,
+        properties: PhysicalPropertyProjectionLimits {
+            max_value_references: 1000,
+            max_allocation_requests: 100_000,
+            max_allocation_request_bytes: REQUEST_BYTES,
+            max_coexisting_source_and_request_bytes: SOURCE + REQUEST_BYTES,
+            max_work: usize::MAX / 4,
+        },
+    }
+}
+fn request_limits() -> CallRequestProjectionLimits {
+    CallRequestProjectionLimits {
+        max_definitions: 1000,
+        max_type_references: 10_000,
+        max_request_bytes: REQUEST_BYTES,
+        max_allocation_requests: 100_000,
+        max_coexisting_source_and_request_bytes: SOURCE + REQUEST_BYTES,
+        max_work: usize::MAX / 4,
+    }
+}
+
+// Independent header oracle over the checked package surface, in the
+// DefinitionSources buffer order. It is not derived from the collector.
+fn expected_counts(package: &p::FragmentPackage) -> [usize; 11] {
+    let fragment = package.fragment();
+    let lambda = |kind: &p::ExprKind| match kind {
+        p::ExprKind::Lambda {
+            parameter_types, ..
+        } => parameter_types.len(),
+        _ => 0,
+    };
+    let requests = fragment.call_requests().entries();
+    let request_parameters = requests
+        .values()
+        .flat_map(|r| r.arguments.iter())
+        .map(|a| match a {
+            p::StaticFunctionArgument::Lambda {
+                parameter_types, ..
+            } => parameter_types.len(),
+            _ => 0,
+        })
+        .sum();
+    let cuts = cut_types(package.cuts()).len();
+    let (mut writers, mut writer_fields) = (0, 0);
+    for node in fragment.nodes().values() {
+        match &node.kind {
+            p::NodeKind::TableWriter { target } => {
+                writers += 1;
+                writer_fields += target.target_fields.len() + target.output_schema.fields.len();
+            }
+            p::NodeKind::TableFinish(finish) => {
+                writers += 1;
+                writer_fields +=
+                    finish.input_schema.fields.len() + finish.output_schema.fields.len();
+            }
+            _ => {}
+        }
+    }
+    [
+        package.constants().entries().len(),
+        fragment.values().len(),
+        fragment.expressions().len(),
+        fragment
+            .expressions()
+            .iter()
+            .map(|(_, e)| lambda(&e.kind))
+            .sum(),
+        requests.len(),
+        requests.values().map(|r| r.arguments.len()).sum(),
+        request_parameters,
+        cuts,
+        package.result().map_or(0, |r| r.fields.len()),
+        writers,
+        writer_fields,
+    ]
+}
+// The documented cut occurrence order: inbound imports/results, outbound
+// projection/destination imports/results, then runtime filter domains.
+fn cut_types(cuts: &p::FragmentCuts) -> Vec<&FunctionValueType> {
+    let mut out = Vec::new();
+    for cut in cuts.inbound.iter() {
+        out.extend(cut.imports.iter().map(|v| &v.source.ty));
+        out.extend(
+            cut.writer_result
+                .iter()
+                .flat_map(|r| r.fields.iter().map(|f| &f.ty)),
+        );
+    }
+    for cut in cuts.outbound.iter() {
+        out.extend(cut.projection.iter().map(|v| &v.ty));
+        out.extend(cut.destination_imports.iter().map(|v| &v.source.ty));
+        out.extend(
+            cut.writer_result
+                .iter()
+                .flat_map(|r| r.fields.iter().map(|f| &f.ty)),
+        );
+    }
+    for filter in cuts.runtime_filters.iter() {
+        out.push(match &filter.domain {
+            p::RuntimeFilterDomain::Membership { ty, .. } => ty,
+            p::RuntimeFilterDomain::Ordered { key, .. } => &key.ty,
+        });
+    }
+    out
+}
+fn lengths(sources: &DefinitionSources<'_>) -> [usize; 11] {
+    [
+        sources.constants.len(),
+        sources.values.len(),
+        sources.expressions.len(),
+        sources.expression_parameters.len(),
+        sources.requests.len(),
+        sources.arguments.len(),
+        sources.request_parameters.len(),
+        sources.cuts.len(),
+        sources.result.len(),
+        sources.writers.len(),
+        sources.writer_fields.len(),
+    ]
+}
+fn exact_limits(n: [usize; 11]) -> DefinitionSourceLimits {
+    DefinitionSourceLimits {
+        max_constants: n[0],
+        max_values: n[1],
+        max_expressions: n[2],
+        max_expression_lambda_parameters: n[3],
+        max_requests: n[4],
+        max_request_arguments: n[5],
+        max_request_lambda_parameters: n[6],
+        max_cut_type_occurrences: n[7],
+        max_result_fields: n[8],
+        max_writer_nodes: n[9],
+        max_writer_node_fields: n[10],
+    }
+}
+fn one_under(limits: DefinitionSourceLimits, axis: usize) -> DefinitionSourceLimits {
+    let mut l = limits;
+    let slot = match axis {
+        0 => &mut l.max_constants,
+        1 => &mut l.max_values,
+        2 => &mut l.max_expressions,
+        3 => &mut l.max_expression_lambda_parameters,
+        4 => &mut l.max_requests,
+        5 => &mut l.max_request_arguments,
+        6 => &mut l.max_request_lambda_parameters,
+        7 => &mut l.max_cut_type_occurrences,
+        8 => &mut l.max_result_fields,
+        9 => &mut l.max_writer_nodes,
+        _ => &mut l.max_writer_node_fields,
+    };
+    *slot -= 1;
+    l
+}
+
+#[derive(Debug)]
+enum Failure {
+    Control(CompileControlError),
+    Source(TypeViewError),
+    Ordinary(String),
+}
+impl From<CompileControlError> for Failure {
+    fn from(e: CompileControlError) -> Self {
+        Self::Control(e)
+    }
+}
+impl From<TypeViewError> for Failure {
+    fn from(e: TypeViewError) -> Self {
+        match e {
+            TypeViewError::Control(c) => Self::Control(c),
+            other => Self::Source(other),
+        }
+    }
+}
+macro_rules! ordinary_from {($($t:ident),+)=>{$(impl From<$t> for Failure {fn from(e:$t)->Self {match e {$t::Control(c)=>Self::Control(c),other=>Self::Ordinary(format!("{other:?}"))}}})+};}
+ordinary_from!(TypeCodecError, CallRequestCodecError, NodeCodecError);
+fn finish<T>(result: Result<T, Failure>, work: CompileCheckpoints<'_>) -> Result<T, Failure> {
+    if matches!(result, Err(Failure::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+fn axes(f: &TypeViewFacts) {
+    assert_eq!(
+        f.coexisting_source_and_request_bytes_upper_bound,
+        SOURCE + f.allocation_request_bytes_upper_bound
+    );
+}
+fn root<'s>(
+    types: &EncodedTypeTable<'s>,
+    id: u32,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<&'s FunctionValueType, Failure> {
+    Ok(types
+        .value_type_observed(id, work)?
+        .expect("definition source names an encoded root"))
+}
+fn same(
+    types: &EncodedTypeTable<'_>,
+    id: u32,
+    original: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), Failure> {
+    assert!(
+        std::ptr::eq(root(types, id, work)?, original),
+        "type ID {id} must lend the original occurrence"
+    );
+    Ok(())
+}
+
+// Every stored ID resolves through the original encoded type table to the
+// exact original occurrence; bindings resolve to the original owner rows.
+#[allow(clippy::too_many_arguments)]
+fn verify_roots(
+    package: &p::FragmentPackage,
+    bindings: &BindingSources<'_>,
+    sources: &DefinitionSources<'_>,
+    expressions: &[ExpressionTypeIds<'_>],
+    requests: &[CallRequestTypeIds<'_>],
+    writers: &[(&p::PhysicalNode, TableWriteTypeIds<'_>)],
+    types: &EncodedTypeTable<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), Failure> {
+    let fragment = package.fragment();
+    let constants = sources.constant_type_ids();
+    assert_eq!(constants.len(), package.constants().entries().len());
+    for (record, (id, pool)) in constants.iter().zip(package.constants().entries()) {
+        assert_eq!(record.pool, *id);
+        same(types, record.value_type_id, pool.value_type(), work)?;
+        let field = types
+            .field_observed(record.field_id, work)?
+            .expect("constant Field root");
+        assert!(std::ptr::eq(field, pool.field_ref()));
+    }
+    assert_eq!(sources.values().len(), fragment.values().len());
+    for (value, (_, original)) in sources.values().iter().zip(fragment.values()) {
+        assert!(std::ptr::eq(value.source, original));
+        same(types, value.value_type_id, &original.ty, work)?;
+    }
+    assert_eq!(expressions.len(), fragment.expressions().len());
+    for (input, (id, original)) in expressions.iter().zip(fragment.expressions().iter()) {
+        assert_eq!(input.expr, *id);
+        same(types, input.value_type_id, &original.ty, work)?;
+        match &original.kind {
+            p::ExprKind::Lambda {
+                parameter_types, ..
+            } => {
+                assert_eq!(input.lambda_parameter_type_ids.len(), parameter_types.len());
+                for (id, ty) in input.lambda_parameter_type_ids.iter().zip(parameter_types) {
+                    same(types, *id, ty, work)?;
+                }
+            }
+            _ => assert!(input.lambda_parameter_type_ids.is_empty()),
+        }
+        match &original.kind {
+            p::ExprKind::FunctionCall { function, .. } => {
+                let row = &bindings.functions()[input.function_binding_id.unwrap() as usize];
+                assert!(
+                    matches!(row.source, BindingSource::Scalar(f) if std::ptr::eq(f, function))
+                );
+                assert!(input.aggregate_binding_id.is_none());
+            }
+            p::ExprKind::WindowCall { .. } => assert!(input.function_binding_id.is_some()),
+            _ => {
+                assert!(input.function_binding_id.is_none());
+                assert!(input.aggregate_binding_id.is_none());
+            }
+        }
+    }
+    let entries = fragment.call_requests().entries();
+    assert_eq!(requests.len(), entries.len());
+    for (input, (definition, request)) in requests.iter().zip(entries) {
+        assert_eq!(input.definition, *definition);
+        assert_eq!(input.arguments.len(), request.arguments.len());
+        for (ids, argument) in input.arguments.iter().zip(&request.arguments) {
+            match (ids, argument) {
+                (
+                    ArgumentTypeIds::Value(id),
+                    p::StaticFunctionArgument::Value { value_type, .. },
+                ) => same(types, *id, value_type, work)?,
+                (
+                    ArgumentTypeIds::Lambda { parameters, result },
+                    p::StaticFunctionArgument::Lambda {
+                        parameter_types,
+                        result_type,
+                    },
+                ) => {
+                    assert_eq!(parameters.len(), parameter_types.len());
+                    for (id, ty) in parameters.iter().zip(parameter_types) {
+                        same(types, *id, ty, work)?;
+                    }
+                    same(types, *result, result_type, work)?;
+                }
+                _ => panic!("request argument shape changed"),
+            }
+        }
+        match (input.expected_result_type, &request.expected_result_type) {
+            (Some(id), Some(ty)) => same(types, id, ty, work)?,
+            (None, None) => {}
+            _ => panic!("expected result presence changed"),
+        }
+    }
+    let cut_types = cut_types(package.cuts());
+    assert_eq!(sources.cuts.len(), cut_types.len());
+    for (id, ty) in sources.cuts.iter().zip(cut_types) {
+        same(types, *id, ty, work)?;
+    }
+    let result_fields = package.result().map_or(&[][..], |r| &r.fields[..]);
+    assert_eq!(sources.result_type_ids().len(), result_fields.len());
+    for (id, field) in sources.result_type_ids().iter().zip(result_fields) {
+        same(types, *id, &field.ty, work)?;
+    }
+    for (node, ids) in writers {
+        match (ids, &node.kind) {
+            (
+                TableWriteTypeIds::Writer {
+                    target_fields,
+                    output_schema,
+                },
+                p::NodeKind::TableWriter { target },
+            ) => {
+                assert_eq!(target_fields.len(), target.target_fields.len());
+                for (id, field) in target_fields.iter().zip(target.target_fields.iter()) {
+                    same(types, *id, &field.ty, work)?;
+                }
+                assert_eq!(output_schema.len(), target.output_schema.fields.len());
+                for (id, field) in output_schema.iter().zip(target.output_schema.fields.iter()) {
+                    same(types, *id, &field.ty, work)?;
+                }
+            }
+            (
+                TableWriteTypeIds::Finish {
+                    input_schema,
+                    output_schema,
+                },
+                p::NodeKind::TableFinish(finish),
+            ) => {
+                for (id, field) in input_schema.iter().zip(finish.input_schema.fields.iter()) {
+                    same(types, *id, &field.ty, work)?;
+                }
+                for (id, field) in output_schema.iter().zip(finish.output_schema.fields.iter()) {
+                    same(types, *id, &field.ty, work)?;
+                }
+            }
+            _ => panic!("writer node shape changed"),
+        }
+    }
+    Ok(())
+}
+
+struct Projected {
+    facts: TypeViewFacts,
+    counts: [usize; 11],
+    requests: wire::FragmentCallRequests,
+    cuts: wire::FragmentCuts,
+}
+fn project(
+    package: &p::FragmentPackage,
+    control: &Control,
+    budget_limits: TypeViewLimits,
+    limits: DefinitionSourceLimits,
+) -> Result<Projected, Failure> {
+    let original: &dyn PureCompileControl = control;
+    let mut work = CompileCheckpoints::try_new(original, CompilePhase::Encode)?;
+    let result = (|| {
+        let mut previous = None::<TypeViewFacts>;
+        let mut parent = |f: &TypeViewFacts| {
+            axes(f);
+            if let Some(old) = previous {
+                assert!(f.allocation_requests_upper_bound >= old.allocation_requests_upper_bound);
+                assert!(
+                    f.allocation_request_bytes_upper_bound
+                        >= old.allocation_request_bytes_upper_bound
+                );
+                assert!(f.cumulative_work_upper_bound >= old.cumulative_work_upper_bound);
+            }
+            previous = Some(*f);
+            Ok(())
+        };
+        let mut budget =
+            TypeViewBudget::new_in(package, SOURCE, budget_limits, &mut parent, &work)?;
+        let views = collect_package_type_views_in(&mut budget, &mut work)?;
+        let bindings = collect_binding_sources_in(
+            package,
+            &views,
+            binding_source_limits(),
+            &mut budget,
+            &mut work,
+        )?;
+        let sources = collect_definition_sources_in(
+            package,
+            &views,
+            &bindings,
+            limits,
+            &mut budget,
+            &mut work,
+        )?;
+        let counts = lengths(&sources);
+        assert_eq!(counts, expected_counts(package));
+        let expressions = sources.expressions_in(&mut budget, &mut work)?;
+        let arguments = sources.request_arguments_in(&mut budget, &mut work)?;
+        let requests = arguments.request_type_ids_in(&mut budget, &mut work)?;
+        let mut writers = Vec::new();
+        for node in package.fragment().nodes().values() {
+            let ids = sources.writer_type_ids_in(node, &mut budget, &mut work)?;
+            assert_eq!(
+                ids.is_some(),
+                matches!(
+                    node.kind,
+                    p::NodeKind::TableWriter { .. } | p::NodeKind::TableFinish(_)
+                )
+            );
+            if let Some(ids) = ids {
+                writers.push((node, ids));
+            }
+        }
+        let writer_types = views.writer_sources_in(&mut budget, &mut work)?;
+        let types = encode_borrowed_type_table_writer_sources_in(
+            views.values(),
+            views.fields(),
+            &writer_types,
+            SOURCE,
+            type_limits(),
+            &mut |_| Ok(()),
+            &mut work,
+        )?;
+        verify_roots(
+            package,
+            &bindings,
+            &sources,
+            &expressions,
+            &requests,
+            &writers,
+            &types,
+            &mut work,
+        )?;
+        let cut_ids = sources.cuts_type_ids();
+        let (cuts, _) = encode_fragment_cuts_observed(
+            package.cuts(),
+            EncodedCutsContext {
+                types: &types,
+                type_ids: &cut_ids,
+                source_retained_bytes: SOURCE,
+                limits: CutsProjectionLimits {
+                    node: node_limits(),
+                    binding: binding_limits(),
+                },
+            },
+            &mut |f: &NodeProjectionFacts| {
+                assert!(f.allocation_request_bytes_upper_bound <= REQUEST_BYTES);
+                Ok(())
+            },
+            &mut work,
+        )?;
+        let token = prepare_call_requests_encode(
+            package.fragment().call_requests(),
+            &types,
+            &requests,
+            package.constants(),
+            SOURCE,
+            request_limits(),
+            original,
+        )?;
+        let requests = encode_call_requests(token)?;
+        Ok(Projected {
+            facts: budget.facts(),
+            counts,
+            requests,
+            cuts,
+        })
+    })();
+    finish(result, work)
+}
+
+#[test]
+fn actual_scalar_lambda_aggregate_table_and_result_sources_lend_original_roots() {
+    let package = rich_package();
+    let out = project(&package, &Control::default(), view_limits(), wide()).unwrap();
+    // Two Lambda parameters are recorded once per original definition even
+    // though two control-flow invocations use that definition.
+    assert_eq!(out.counts, [0, 5, 3, 2, 4, 1, 2, 0, 4, 0, 0]);
+    assert_eq!(out.requests.entries.len(), 4);
+    assert!(out.cuts.inbound.is_empty() && out.cuts.outbound.is_empty());
+    let result = package.result().unwrap();
+    assert_eq!(&*result.fields[0].name, "out0\0");
+    assert!(out.facts.allocation_requests_upper_bound > 0);
+}
+
+#[test]
+fn actual_sparse_constant_pool_typed_null_and_expected_result_reach_original_request_encoder() {
+    let package = cv_package();
+    let out = project(&package, &Control::default(), view_limits(), wide()).unwrap();
+    assert_eq!(out.counts, [1, 2, 3, 0, 2, 2, 0, 0, 2, 0, 0]);
+    let pools: Vec<_> = package.constants().entries().keys().copied().collect();
+    assert_eq!(pools, vec![p::ConstantPoolId::new(u32::MAX)]);
+    // The None argument and the typed constant argument keep distinct
+    // request entries; the second carries the expected result root.
+    assert_eq!(out.requests.entries.len(), 2);
+}
+
+#[test]
+fn actual_writer_target_output_schema_and_outbound_cut_types_reach_original_cut_encoder() {
+    let package = writer_package();
+    let out = project(&package, &Control::default(), view_limits(), wide()).unwrap();
+    let n = expected_counts(&package);
+    assert_eq!(n[9], 1, "producer fragment has one TableWriter");
+    assert!(n[10] > 1);
+    assert!(n[7] > 0, "stream sink has an outbound cut projection");
+    assert_eq!(out.cuts.outbound.len(), package.cuts().outbound.len());
+}
+
+#[test]
+fn every_actual_callback_preserves_three_primary_causes_without_footer() {
+    for package in [rich_package(), cv_package(), writer_package()] {
+        let control = Control::default();
+        project(&package, &control, view_limits(), wide()).unwrap();
+        let trace = control.trace.into_inner().unwrap();
+        assert!(trace.len() > 2);
+        for at in 0..trace.len() {
+            for cause in CAUSES {
+                let c = Control {
+                    stop: Mutex::new(Some((at, cause))),
+                    ..Default::default()
+                };
+                assert!(
+                    matches!(project(&package, &c, view_limits(), wide()), Err(Failure::Control(actual)) if actual == cause),
+                    "position {at}"
+                );
+                assert_eq!(c.trace.into_inner().unwrap(), trace[..=at]);
+            }
+        }
+    }
+}
+
+#[test]
+fn exact_header_limits_replay_and_each_nonzero_axis_one_under_refuses() {
+    for package in [rich_package(), cv_package(), writer_package()] {
+        let n = expected_counts(&package);
+        project(
+            &package,
+            &Control::default(),
+            view_limits(),
+            exact_limits(n),
+        )
+        .unwrap();
+        for axis in 0..11 {
+            if n[axis] == 0 {
+                continue;
+            }
+            assert!(
+                matches!(
+                    project(
+                        &package,
+                        &Control::default(),
+                        view_limits(),
+                        one_under(exact_limits(n), axis)
+                    ),
+                    Err(Failure::Control(CompileControlError::ResourceExhausted))
+                ),
+                "axis {axis}"
+            );
+        }
+    }
+}
+
+fn exact_budget(f: TypeViewFacts) -> TypeViewLimits {
+    TypeViewLimits {
+        max_occurrences: f.occurrence_count,
+        max_value_roots: f.value_root_count,
+        max_field_roots: f.field_root_count,
+        max_writer_recipes: f.writer_recipe_count,
+        max_allocation_requests: f.allocation_requests_upper_bound,
+        max_allocation_request_bytes: f.allocation_request_bytes_upper_bound,
+        max_coexisting_source_and_request_bytes: f.coexisting_source_and_request_bytes_upper_bound,
+        max_work: f.cumulative_work_upper_bound,
+    }
+}
+#[test]
+fn cumulative_budget_exact_replay_and_each_growing_axis_one_under_refuses() {
+    for package in [rich_package(), cv_package()] {
+        let f = project(&package, &Control::default(), view_limits(), wide())
+            .unwrap()
+            .facts;
+        project(&package, &Control::default(), exact_budget(f), wide()).unwrap();
+        for axis in 0..4 {
+            let mut cap = exact_budget(f);
+            match axis {
+                0 => cap.max_allocation_requests -= 1,
+                1 => cap.max_allocation_request_bytes -= 1,
+                2 => cap.max_coexisting_source_and_request_bytes -= 1,
+                _ => cap.max_work -= 1,
+            }
+            assert!(
+                matches!(
+                    project(&package, &Control::default(), cap, wide()),
+                    Err(Failure::Control(CompileControlError::ResourceExhausted))
+                ),
+                "axis {axis}"
+            );
+        }
+    }
+}
+
+fn foreign_run(
+    original: &p::FragmentPackage,
+    foreign: &p::FragmentPackage,
+    control: &Control,
+) -> Result<(), Failure> {
+    let original_control: &dyn PureCompileControl = control;
+    let mut work = CompileCheckpoints::try_new(original_control, CompilePhase::Encode)?;
+    let result = (|| {
+        let mut parent = |f: &TypeViewFacts| {
+            axes(f);
+            Ok(())
+        };
+        let mut budget =
+            TypeViewBudget::new_in(original, SOURCE, view_limits(), &mut parent, &work)?;
+        let views = collect_package_type_views_in(&mut budget, &mut work)?;
+        let bindings = collect_binding_sources_in(
+            original,
+            &views,
+            binding_source_limits(),
+            &mut budget,
+            &mut work,
+        )?;
+        let _ = collect_definition_sources_in(
+            foreign,
+            &views,
+            &bindings,
+            wide(),
+            &mut budget,
+            &mut work,
+        )?;
+        Ok(())
+    })();
+    finish(result, work)
+}
+#[test]
+fn equal_foreign_package_is_ordinary_and_keeps_each_prior_callback_cause() {
+    let original = rich_package();
+    let foreign = rich_package();
+    let c = Control::default();
+    assert!(matches!(
+        foreign_run(&original, &foreign, &c),
+        Err(Failure::Source(TypeViewError::InvalidSource(_)))
+    ));
+    let trace = c.trace.into_inner().unwrap();
+    for at in 0..trace.len() {
+        for cause in CAUSES {
+            let c = Control {
+                stop: Mutex::new(Some((at, cause))),
+                ..Default::default()
+            };
+            assert!(
+                matches!(foreign_run(&original, &foreign, &c), Err(Failure::Control(actual)) if actual == cause)
+            );
+            assert_eq!(c.trace.into_inner().unwrap(), trace[..=at]);
+        }
+    }
+}
+
+#[test]
+fn later_inputs_require_original_package_control_and_collection_contribution() {
+    let original = rich_package();
+    let foreign = rich_package();
+    let c = Control::default();
+    let other = Control::default();
+    let calls = Cell::new(0usize);
+    let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Encode).unwrap();
+    let mut parent = |f: &TypeViewFacts| {
+        axes(f);
+        calls.set(calls.get() + 1);
+        Ok(())
+    };
+    let mut budget =
+        TypeViewBudget::new_in(&original, SOURCE, view_limits(), &mut parent, &work).unwrap();
+    let views = collect_package_type_views_in(&mut budget, &mut work).unwrap();
+    let bindings = collect_binding_sources_in(
+        &original,
+        &views,
+        binding_source_limits(),
+        &mut budget,
+        &mut work,
+    )
+    .unwrap();
+    let sources =
+        collect_definition_sources_in(&original, &views, &bindings, wide(), &mut budget, &mut work)
+            .unwrap();
+    let before = c.trace.lock().unwrap().clone();
+    // A fresh budget on the same package lacks the collection contribution.
+    let mut reset_parent = |_: &TypeViewFacts| {
+        calls.set(calls.get() + 1);
+        Ok(())
+    };
+    let mut reset =
+        TypeViewBudget::new_in(&original, SOURCE, view_limits(), &mut reset_parent, &work).unwrap();
+    calls.set(0);
+    assert!(matches!(
+        sources.expressions_in(&mut reset, &mut work),
+        Err(TypeViewError::InvalidSource(_))
+    ));
+    assert!(matches!(
+        sources.request_arguments_in(&mut reset, &mut work),
+        Err(TypeViewError::InvalidSource(_))
+    ));
+    assert_eq!(calls.get(), 0);
+    assert_eq!(*c.trace.lock().unwrap(), before);
+    let mut foreign_parent = |_: &TypeViewFacts| {
+        calls.set(calls.get() + 1);
+        Ok(())
+    };
+    let mut wrong =
+        TypeViewBudget::new_in(&foreign, SOURCE, view_limits(), &mut foreign_parent, &work)
+            .unwrap();
+    calls.set(0);
+    let node = original.fragment().nodes().values().next().unwrap();
+    assert!(matches!(
+        sources.writer_type_ids_in(node, &mut wrong, &mut work),
+        Err(TypeViewError::InvalidSource(_))
+    ));
+    assert_eq!(calls.get(), 0);
+    assert_eq!(*c.trace.lock().unwrap(), before);
+    let mut foreign_work = CompileCheckpoints::try_new(&other, CompilePhase::Encode).unwrap();
+    assert!(matches!(
+        sources.expressions_in(&mut budget, &mut foreign_work),
+        Err(TypeViewError::InvalidSource(_))
+    ));
+    assert_eq!(calls.get(), 0);
+    assert_eq!(*c.trace.lock().unwrap(), before);
+    assert_eq!(*other.trace.lock().unwrap(), vec![0]);
+    // The local second layer also keeps its own captured floor.
+    let arguments = sources
+        .request_arguments_in(&mut budget, &mut work)
+        .unwrap();
+    assert!(matches!(
+        arguments.request_type_ids_in(&mut reset, &mut work),
+        Err(TypeViewError::InvalidSource(_))
+    ));
+    let requests = arguments
+        .request_type_ids_in(&mut budget, &mut work)
+        .unwrap();
+    assert_eq!(requests.len(), 4);
+    // A Writer lookup for a non-Writer node is a successful absence.
+    assert!(
+        sources
+            .writer_type_ids_in(node, &mut budget, &mut work)
+            .unwrap()
+            .is_none()
+    );
+    work.finish().unwrap();
+}
+
+// The complete root row buffers are known from closed headers. They are
+// admitted with the initial work before any completed observation.
+#[test]
+fn first_known_root_buffers_refuse_before_any_new_callback() {
+    let package = cv_package();
+    let n = expected_counts(&package);
+    let bytes = std::alloc::Layout::array::<ConstantRecordTypeIds>(n[0])
+        .unwrap()
+        .size()
+        + std::alloc::Layout::array::<ValueSource<'_>>(n[1])
+            .unwrap()
+            .size()
+        + std::alloc::Layout::array::<ExpressionRow>(n[2])
+            .unwrap()
+            .size()
+        + std::alloc::Layout::array::<RequestRow>(n[4])
+            .unwrap()
+            .size()
+        + std::alloc::Layout::array::<u32>(n[8]).unwrap().size();
+    let requests = [n[0], n[1], n[2], n[4], n[8]]
+        .iter()
+        .filter(|n| **n > 0)
+        .count();
+    for request_axis in [true, false] {
+        for cause in CAUSES {
+            let control = Control::default();
+            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+            let ceiling = Cell::new(None::<(usize, usize)>);
+            let mut parent = |f: &TypeViewFacts| {
+                if let Some((r, b)) = ceiling.get()
+                    && (f.allocation_requests_upper_bound > r
+                        || f.allocation_request_bytes_upper_bound > b)
+                {
+                    return Err(CompileControlError::ResourceExhausted);
+                }
+                Ok(())
+            };
+            let mut budget =
+                TypeViewBudget::new_in(&package, SOURCE, view_limits(), &mut parent, &work)
+                    .unwrap();
+            let views = collect_package_type_views_in(&mut budget, &mut work).unwrap();
+            let bindings = collect_binding_sources_in(
+                &package,
+                &views,
+                binding_source_limits(),
+                &mut budget,
+                &mut work,
+            )
+            .unwrap();
+            work.flush().unwrap();
+            let trace = control.trace.lock().unwrap().clone();
+            *control.stop.lock().unwrap() = Some((trace.len(), cause));
+            let prefix = budget.facts();
+            ceiling.set(Some(if request_axis {
+                (
+                    prefix.allocation_requests_upper_bound + requests - 1,
+                    usize::MAX,
+                )
+            } else {
+                (
+                    usize::MAX,
+                    prefix.allocation_request_bytes_upper_bound + bytes - 1,
+                )
+            }));
+            assert!(matches!(
+                collect_definition_sources_in(
+                    &package,
+                    &views,
+                    &bindings,
+                    wide(),
+                    &mut budget,
+                    &mut work
+                ),
+                Err(TypeViewError::Control(
+                    CompileControlError::ResourceExhausted
+                ))
+            ));
+            assert_eq!(*control.trace.lock().unwrap(), trace);
+        }
+    }
 }
