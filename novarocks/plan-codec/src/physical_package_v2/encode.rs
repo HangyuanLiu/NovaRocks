@@ -628,4 +628,4 @@ fn grow<T>(
 
 #[cfg(test)]
 #[path = "encode/tests.rs"]
-mod tests;
+pub(super) mod tests;

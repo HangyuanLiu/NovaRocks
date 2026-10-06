@@ -29,6 +29,7 @@ use prost::Message;
 use std::fmt;
 
 mod binding_sources;
+mod decode;
 mod definition_sources;
 mod encode;
 mod nodes;
