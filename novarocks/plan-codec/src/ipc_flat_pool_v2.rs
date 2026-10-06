@@ -63,9 +63,12 @@ pub struct FlatPoolWriteFacts {
     pub coexisting_source_and_request_bytes_upper_bound: usize,
     pub cumulative_library_work_upper_bound: usize,
 }
-struct Prepared {
+pub(crate) mod progress;
+
+struct Prepared<'pool> {
     geometry: Geometry,
     facts: FlatPoolWriteFacts,
+    schema: Option<ipc_schema_v2::PreparedSchemaWriter<'pool>>,
 }
 fn shape(message: &'static str) -> TypeCodecError {
     TypeCodecError::InvalidShape(message)
@@ -128,12 +131,33 @@ fn work_bound(
         add(storage, elements)?,
     )
 }
-fn prepare(
-    pool: &ConstantPool,
+fn prepare<'pool>(
+    pool: &'pool ConstantPool,
     source: usize,
     limits: FlatPoolWriteLimits,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Prepared, TypeCodecError> {
+) -> Result<Prepared<'pool>, TypeCodecError> {
+    prepare_core(pool, source, limits, None, work)
+}
+
+fn prepare_core<'pool>(
+    pool: &'pool ConstantPool,
+    source: usize,
+    limits: FlatPoolWriteLimits,
+    mut admission: Option<&mut progress::Admission<'_, '_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Prepared<'pool>, TypeCodecError> {
+    let policy = ipc_schema_v2::owner_admission::Policy(admission.is_some());
+    let add = |a, b| policy.numeric(add(a, b));
+    let cap = |a, b, c| policy.cap(a, b, c);
+    if let Some(admission) = admission.as_deref_mut() {
+        admission.gate()?;
+        admission.schema(&ipc_schema_v2::initial_writer_request_facts(
+            pool.field(),
+            source,
+            limits.schema,
+        )?)?;
+    }
     if !(LOCKED_FAMILY
         && LOCKED_TOOLCHAIN
         && arrow::ARROW_VERSION == "58.2.0"
@@ -143,24 +167,35 @@ fn prepare(
     }
     let retained = usize::try_from(pool.resource_facts().retained_buffer_capacity_bytes)
         .map_err(|_| shape("flat pool source retention is not representable"))?;
-    cap(
+    self::cap(
         retained,
         source,
         "flat pool source retention is below original buffer backing",
     )?;
     work.step()?;
-    let geometry = geometry::inspect(
-        pool,
-        limits.max_rows,
-        limits.max_buffer_descriptors,
-        limits.max_body_bytes,
-        work,
-    )?;
+    let geometry = if let Some(admission) = admission.as_deref_mut() {
+        geometry::inspect_in(
+            pool,
+            limits.max_rows,
+            limits.max_buffer_descriptors,
+            limits.max_body_bytes,
+            &mut |g| admission.geometry(g),
+            work,
+        )?
+    } else {
+        geometry::inspect(
+            pool,
+            limits.max_rows,
+            limits.max_buffer_descriptors,
+            limits.max_body_bytes,
+            work,
+        )?
+    };
     if geometry.buffers > u32::MAX as usize {
         return Err(shape("flat pool buffer vector is not representable"));
     }
     cap(
-        source_work(source, pool.field().metadata().len())?,
+        policy.numeric(source_work(source, pool.field().metadata().len()))?,
         limits.max_cumulative_library_work,
         "flat pool source metadata work envelope exceeded",
     )?;
@@ -178,13 +213,28 @@ fn prepare(
         "flat pool source preflight coexistence envelope exceeded",
     )?;
     work.flush()?;
-    let schema = ipc_schema_v2::preflight_writer(pool.field(), limits.schema, work)?;
-    let batch = header::backing(&geometry)?;
+    let schema_token = if let Some(admission) = admission.as_deref_mut() {
+        Some(ipc_schema_v2::prepare_schema_writer_in(
+            pool.field(),
+            source,
+            limits.schema,
+            limits.max_cumulative_library_work,
+            &mut |facts| admission.schema(facts),
+            work,
+        )?)
+    } else {
+        None
+    };
+    let schema = match &schema_token {
+        Some(token) => token.schema(),
+        None => ipc_schema_v2::preflight_writer(pool.field(), limits.schema, work)?,
+    };
+    let batch = policy.numeric(header::backing(&geometry))?;
     let capacity = add(
         add(
             add(
-                metadata_capacity(schema.backing)?,
-                metadata_capacity(batch)?,
+                policy.numeric(metadata_capacity(schema.backing))?,
+                policy.numeric(metadata_capacity(batch))?,
             )?,
             geometry.body_bytes,
         )?,
@@ -195,11 +245,30 @@ fn prepare(
         limits.max_encoded_stream_bytes,
         "flat pool encoded stream envelope exceeded",
     )?;
-    Layout::array::<u8>(capacity)
-        .map_err(|_| shape("flat pool output layout is not representable"))?;
+    policy.numeric(
+        Layout::array::<u8>(capacity)
+            .map_err(|_| shape("flat pool output layout is not representable")),
+    )?;
+    let pure_requests = if admission.is_some() {
+        Some(policy.numeric(allocations::preflight_core(&schema, batch, capacity, None))?)
+    } else {
+        None
+    };
+    if let (Some(admission), Some(requests)) = (admission.as_deref_mut(), pure_requests.as_ref()) {
+        let bound = policy.numeric(work_bound(source, &schema, &geometry, requests))?;
+        admission.schema(&ipc_schema_v2::SchemaWriterRequestFacts {
+            request_bytes: requests.bytes,
+            request_count: requests.count,
+            work_upper_bound: bound,
+        })?;
+        admission.facts.schema_backing_bytes_upper_bound = schema.backing;
+        admission.facts.batch_backing_bytes_upper_bound = batch;
+        admission.facts.encoded_stream_bytes_upper_bound = capacity;
+        admission.gate()?;
+    }
     let requests = allocations::preflight(&schema, batch, capacity, work)?;
     let coexisting = add(source, requests.bytes)?;
-    let library_work = work_bound(source, &schema, &geometry, &requests)?;
+    let library_work = policy.numeric(work_bound(source, &schema, &geometry, &requests))?;
     cap(
         requests.bytes,
         limits.max_new_allocation_request_bytes,
@@ -215,7 +284,9 @@ fn prepare(
         limits.max_cumulative_library_work,
         "flat pool cumulative library work envelope exceeded",
     )?;
-    work.step()?;
+    if admission.is_none() {
+        work.step()?;
+    }
     let facts = FlatPoolWriteFacts {
         source_retained_bytes: source,
         rows: geometry.rows,
@@ -230,21 +301,56 @@ fn prepare(
         coexisting_source_and_request_bytes_upper_bound: coexisting,
         cumulative_library_work_upper_bound: library_work,
     };
-    Ok(Prepared { geometry, facts })
+    let facts = if let Some(admission) = admission {
+        let facts = admission.complete(facts)?;
+        work.step()?;
+        facts
+    } else {
+        facts
+    };
+    Ok(Prepared {
+        geometry,
+        facts,
+        schema: schema_token,
+    })
 }
 
 /// Sealed geometry/model preparation bound to the original checked pool.
 /// The preparation scratch and host authorization remain earlier obligations.
-pub(crate) struct PreparedFlatPoolWriter<'p> {
+type PoolAdmit<'callback> =
+    dyn FnMut(&FlatPoolWriteFacts) -> Result<(), CompileControlError> + 'callback;
+
+pub(crate) struct PreparedFlatPoolWriter<'p, 'control> {
     pool: &'p ConstantPool,
     limits: FlatPoolWriteLimits,
-    prepared: Prepared,
+    prepared: Prepared<'p>,
+    control: Option<&'control dyn PureCompileControl>,
 }
-impl PreparedFlatPoolWriter<'_> {
+impl PreparedFlatPoolWriter<'_, '_> {
     pub(crate) fn facts(&self) -> &FlatPoolWriteFacts {
         &self.prepared.facts
     }
+    pub(crate) fn emit_in(
+        self,
+        admit: &mut dyn FnMut(&FlatPoolWriteFacts) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Vec<u8>, TypeCodecError> {
+        if !self
+            .control
+            .is_some_and(|control| std::ptr::addr_eq(control, work.control()))
+        {
+            return Err(shape("flat pool writer belongs to another control"));
+        }
+        admit(&self.prepared.facts)?;
+        emit_prepared_core(self.pool, self.prepared, self.limits, Some(admit), work)
+    }
     pub(crate) fn emit(self, control: &dyn PureCompileControl) -> Result<Vec<u8>, TypeCodecError> {
+        if self
+            .control
+            .is_some_and(|original| !std::ptr::addr_eq(original, control))
+        {
+            return Err(shape("flat pool writer belongs to another control"));
+        }
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
         let result = emit_prepared(self.pool, self.prepared, self.limits, &mut work);
         finish_writer(work, result)
@@ -267,7 +373,7 @@ pub(crate) fn prepare_flat_pool_write<'p>(
     source_retained_bytes: usize,
     limits: FlatPoolWriteLimits,
     control: &dyn PureCompileControl,
-) -> Result<PreparedFlatPoolWriter<'p>, TypeCodecError> {
+) -> Result<PreparedFlatPoolWriter<'p, 'static>, TypeCodecError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
     let prepared = prepare(pool, source_retained_bytes, limits, &mut work);
     let prepared = finish_writer(work, prepared)?;
@@ -275,6 +381,29 @@ pub(crate) fn prepare_flat_pool_write<'p>(
         pool,
         limits,
         prepared,
+        control: None,
+    })
+}
+
+pub(crate) fn prepare_flat_pool_write_in<'pool, 'control>(
+    pool: &'pool ConstantPool,
+    source: usize,
+    limits: FlatPoolWriteLimits,
+    admit: &mut dyn FnMut(&FlatPoolWriteFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedFlatPoolWriter<'pool, 'control>, TypeCodecError> {
+    let facts = progress::Admission::initial(source, pool.data().len(), limits)?;
+    let mut admission = progress::Admission {
+        parent: admit,
+        limits,
+        facts,
+    };
+    let prepared = prepare_core(pool, source, limits, Some(&mut admission), work)?;
+    Ok(PreparedFlatPoolWriter {
+        pool,
+        limits,
+        prepared,
+        control: Some(work.control()),
     })
 }
 
@@ -369,13 +498,34 @@ pub fn encode_flat_pool(
 
 fn emit_prepared(
     pool: &ConstantPool,
-    prepared: Prepared,
+    prepared: Prepared<'_>,
     limits: FlatPoolWriteLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Vec<u8>, TypeCodecError> {
+    emit_prepared_core(pool, prepared, limits, None, work)
+}
+
+fn emit_prepared_core(
+    pool: &ConstantPool,
+    prepared: Prepared<'_>,
+    limits: FlatPoolWriteLimits,
+    mut admit: Option<&mut PoolAdmit<'_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<u8>, TypeCodecError> {
     work.flush()?;
-    let schema =
-        ipc_schema_v2::encode_single_field_schema(pool.field(), limits.schema, work.control())?;
+    let schema = if let Some(schema) = &prepared.schema {
+        schema.emit_in(
+            &mut |_| {
+                if let Some(admit) = admit.as_deref_mut() {
+                    admit(&prepared.facts)?;
+                }
+                Ok(())
+            },
+            work,
+        )?
+    } else {
+        ipc_schema_v2::encode_single_field_schema(pool.field(), limits.schema, work.control())?
+    };
     work.flush()?;
     let mut batch = reserve(prepared.facts.batch_backing_bytes_upper_bound, work)?;
     initialize_to(

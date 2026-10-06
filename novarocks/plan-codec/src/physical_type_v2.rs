@@ -349,9 +349,25 @@ impl<'source> EncodedTypeTable<'source> {
         id: u32,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Option<&'source Arc<Field>>, TypeCodecError> {
+        self.field_captured(id, &mut |_, _| Ok(()), work)
+    }
+    /// Synchronously admit a consumer's known requests while retaining the
+    /// actual Field loan, before the matched comparison's completed callback.
+    pub(crate) fn field_captured<E>(
+        &self,
+        id: u32,
+        capture: &mut impl FnMut(&'source Arc<Field>, &mut CompileCheckpoints<'_>) -> Result<(), E>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'source Arc<Field>>, E>
+    where
+        E: From<TypeCodecError>,
+    {
         for (candidate, field) in self.fields {
             let matches = *candidate == id;
-            work.step()?;
+            if matches {
+                capture(field, work)?;
+            }
+            work.step().map_err(TypeCodecError::from)?;
             if matches {
                 return Ok(Some(field));
             }
@@ -721,18 +737,47 @@ pub(crate) fn validate_type_node(
     Ok(())
 }
 
+fn validate_type_visit(
+    visit: ValueTypeVisit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), TypeCodecError> {
+    work.step()?;
+    match visit {
+        ValueTypeVisit::TypeNode(ty) => validate_type_node(ty, work),
+        ValueTypeVisit::Field(field) => validate_field(field, work),
+        ValueTypeVisit::ChildEdge(_) => Ok(()),
+    }
+}
+
 pub(crate) fn validate_type(
     ty: &DataType,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), TypeCodecError> {
-    validate_value_type_structure_observed(ty, |visit| {
-        work.step()?;
-        match visit {
-            ValueTypeVisit::TypeNode(ty) => validate_type_node(ty, work),
-            ValueTypeVisit::Field(field) => validate_field(field, work),
-            ValueTypeVisit::ChildEdge(_) => Ok(()),
-        }
-    })
+    validate_value_type_structure_observed(ty, |visit| validate_type_visit(visit, work))
+}
+
+/// The same carrier and Field author on the sole shared grammar. The caller
+/// admits initialization and captured source work before any later observation;
+/// the fixed scratch has no heap request, control scope or namespace authority.
+pub(crate) fn validate_type_with_scratch_observed<'source>(
+    ty: &'source DataType,
+    admit_scratch: &mut impl FnMut(std::alloc::Layout) -> Result<(), CompileControlError>,
+    capture: &mut impl FnMut(ValueTypeVisit<'source>) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), TypeCodecError> {
+    let layout = std::alloc::Layout::new::<
+        [Option<(&DataType, usize)>; novarocks_type_contract::MAX_VALUE_TYPE_NODES],
+    >();
+    admit_scratch(layout)?;
+    let mut scratch = [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
+    novarocks_type_contract::validate_value_type_structure_with_scratch_observed(
+        ty,
+        &mut scratch,
+        |visit| {
+            capture(visit)?;
+            validate_type_visit(visit, work)
+        },
+    )
 }
 
 #[cfg(test)]
@@ -758,3 +803,6 @@ mod receiver_tests;
 
 #[cfg(test)]
 pub(crate) mod sender_tests;
+
+#[cfg(test)]
+mod constant_source_tests;

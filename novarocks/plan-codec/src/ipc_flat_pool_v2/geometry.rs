@@ -27,6 +27,7 @@ use arrow::array::ArrayData;
 use novarocks_constant_contract::ConstantPool;
 use novarocks_type_contract::CompileCheckpoints;
 
+#[derive(Clone, Copy)]
 pub(crate) struct Geometry {
     pub rows: usize,
     pub buffers: usize,
@@ -95,14 +96,45 @@ pub(crate) fn inspect_span(
     max_body_bytes: usize,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Geometry, TypeCodecError> {
+    inspect_span_core(
+        data,
+        start,
+        rows,
+        max_rows,
+        max_buffers,
+        max_body_bytes,
+        None,
+        work,
+    )
+}
+
+type GeometryCapture<'callback> = dyn FnMut(&Geometry) -> Result<(), TypeCodecError> + 'callback;
+
+pub(crate) fn inspect_span_core(
+    data: &ArrayData,
+    start: usize,
+    rows: usize,
+    max_rows: usize,
+    max_buffers: usize,
+    max_body_bytes: usize,
+    mut capture: Option<&mut GeometryCapture<'_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Geometry, TypeCodecError> {
+    let policy = crate::ipc_schema_v2::owner_admission::Policy(capture.is_some());
+    let add = |a, b| policy.numeric(add(a, b));
+    let aligned = |a| policy.numeric(aligned(a));
+    let mul = |a, b| policy.numeric(mul(a, b));
+    let bit_bytes = |a| policy.numeric(bit_bytes(a));
     if add(start, rows)? > data.len() {
         return Err(invalid());
     }
     let offset = add(data.offset(), start)?;
     if rows > max_rows || i64::try_from(rows).is_err() {
-        return Err(TypeCodecError::InvalidShape(
-            "flat pool writer row envelope exceeded",
-        ));
+        return Err(if policy.0 {
+            novarocks_type_contract::CompileControlError::ResourceExhausted.into()
+        } else {
+            TypeCodecError::InvalidShape("flat pool writer row envelope exceeded")
+        });
     }
     let kind = layout(data.data_type())?;
     let variadic = if matches!(kind, Layout::Views) {
@@ -117,11 +149,15 @@ pub(crate) fn inspect_span(
         _ => 2,
     };
     if buffers > max_buffers || i64::try_from(variadic).is_err() {
-        return Err(TypeCodecError::InvalidShape(
-            "flat pool writer buffer envelope exceeded",
-        ));
+        return Err(if policy.0 {
+            novarocks_type_contract::CompileControlError::ResourceExhausted.into()
+        } else {
+            TypeCodecError::InvalidShape("flat pool writer buffer envelope exceeded")
+        });
     }
-    work.step()?;
+    if capture.is_none() {
+        work.step()?;
+    }
     let mut result = Geometry {
         rows,
         buffers,
@@ -133,13 +169,22 @@ pub(crate) fn inspect_span(
         values_bytes: 0,
         offset_base: 0,
     };
+    if let Some(capture) = capture.as_deref_mut() {
+        capture(&result)?;
+        work.step()?;
+    }
     let mut charge = |bytes: usize| -> Result<(), TypeCodecError> {
         result.body_bytes = add(result.body_bytes, aligned(bytes)?)?;
         result.payload_bytes = add(result.payload_bytes, bytes)?;
         if result.body_bytes > max_body_bytes || i64::try_from(result.body_bytes).is_err() {
-            return Err(TypeCodecError::InvalidShape(
-                "flat pool writer body envelope exceeded",
-            ));
+            return Err(if policy.0 {
+                novarocks_type_contract::CompileControlError::ResourceExhausted.into()
+            } else {
+                TypeCodecError::InvalidShape("flat pool writer body envelope exceeded")
+            });
+        }
+        if let Some(capture) = capture.as_deref_mut() {
+            capture(&result)?;
         }
         work.step()?;
         Ok(())
@@ -207,4 +252,24 @@ pub(crate) fn inspect_span(
     }
     work.step()?;
     Ok(result)
+}
+
+pub(crate) fn inspect_in(
+    pool: &ConstantPool,
+    max_rows: usize,
+    max_buffers: usize,
+    max_body_bytes: usize,
+    capture: &mut dyn FnMut(&Geometry) -> Result<(), TypeCodecError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Geometry, TypeCodecError> {
+    inspect_span_core(
+        pool.data(),
+        0,
+        pool.data().len(),
+        max_rows,
+        max_buffers,
+        max_body_bytes,
+        Some(capture),
+        work,
+    )
 }

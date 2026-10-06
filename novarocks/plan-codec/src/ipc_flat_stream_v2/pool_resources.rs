@@ -20,7 +20,7 @@
 //! at most one full typed-buffer alignment copy, then zero-row empty offsets.
 //! This is not total reader/container/error allocation or work admission.
 
-use super::FlatConstantStream;
+use super::{FlatConstantStream, progress::Admission};
 use crate::ipc_flat_batch_v2::{Layout as FlatLayout, layout};
 use crate::physical_type_v2::TypeCodecError;
 use arrow::datatypes::DataType;
@@ -96,7 +96,7 @@ fn payload_layout(bytes: usize) -> Result<(), FlatPoolResourceError> {
         .map(|_| ())
         .map_err(|_| shape("constant payload allocation layout is not representable"))
 }
-fn rounded_capacity(bytes: usize) -> Result<usize, FlatPoolResourceError> {
+pub(super) fn rounded_capacity(bytes: usize) -> Result<usize, FlatPoolResourceError> {
     let rounded = add(bytes, 63)? & !63;
     payload_layout(rounded)?;
     Ok(rounded)
@@ -129,10 +129,39 @@ impl FlatConstantStream<'_, '_> {
         policy: ConstantPolicy,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<FlatPoolResourceProjection, FlatPoolResourceError> {
+        self.pool_resources_core(value_type, policy, None, work)
+    }
+    pub(super) fn pool_resources_in(
+        &self,
+        value_type: &FunctionValueType,
+        policy: ConstantPolicy,
+        admission: &mut Admission<'_, '_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<FlatPoolResourceProjection, FlatPoolResourceError> {
+        self.pool_resources_core(value_type, policy, Some(admission), work)
+    }
+    fn pool_resources_core(
+        &self,
+        value_type: &FunctionValueType,
+        policy: ConstantPolicy,
+        mut admission: Option<&mut Admission<'_, '_>>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<FlatPoolResourceProjection, FlatPoolResourceError> {
+        let parent = admission.is_some();
+        let numeric = |r: Result<usize, FlatPoolResourceError>| {
+            if parent {
+                r.map_err(|_| CompileControlError::ResourceExhausted.into())
+            } else {
+                r
+            }
+        };
         let geometry = self.geometry();
         let flat = layout(self.field().data_type())?;
         work.step()?;
-        let body_capacity = rounded_capacity(geometry.body_bytes)?;
+        let body_capacity = numeric(rounded_capacity(geometry.body_bytes))?;
+        if let Some(a) = admission.as_deref_mut() {
+            a.requests(1, body_capacity, usize::from(body_capacity != 0))?;
+        }
         work.step()?;
         let descriptors = self
             .record_batch()
@@ -164,7 +193,7 @@ impl FlatConstantStream<'_, '_> {
             repair_possible = !arrow_buffer::alloc::ALIGNMENT.is_multiple_of(width)
                 || !offset.is_multiple_of(width);
             if repair_possible {
-                repair_capacity = rounded_capacity(length)?;
+                repair_capacity = numeric(rounded_capacity(length))?;
             }
             if let Some(width) = offsets
                 && geometry.rows == 0
@@ -172,6 +201,19 @@ impl FlatConstantStream<'_, '_> {
             {
                 empty_offsets = width;
                 payload_layout(width)?; // from_len_zeroed uses exact width, not round64
+            }
+            if let Some(a) = admission.as_deref_mut() {
+                let bytes = a.numeric(add(
+                    a.numeric(add(body_capacity, repair_capacity))?,
+                    empty_offsets,
+                ))?;
+                a.requests(
+                    1,
+                    bytes,
+                    usize::from(body_capacity != 0)
+                        + usize::from(repair_capacity != 0)
+                        + usize::from(empty_offsets != 0),
+                )?;
             }
             work.step()?;
         }
@@ -198,14 +240,32 @@ impl FlatConstantStream<'_, '_> {
             view_validation_bytes_upper_bound: u64_extent(geometry.view_validation_bytes)?,
         };
         work.flush()?;
-        let constant = preflight_flat_pool_resources(
-            self.field(),
-            value_type,
-            input,
-            policy,
-            CompilePhase::Decode,
-            work.control(),
-        )?;
+        let constant = if let Some(a) = admission {
+            let mut capture = |facts: &novarocks_constant_contract::ConstantOwnerResourceFacts| {
+                a.constant(
+                    facts.allocation_request_bytes_upper_bound,
+                    facts.allocation_requests_upper_bound,
+                    facts.cumulative_work_upper_bound,
+                )
+            };
+            novarocks_constant_contract::preflight_flat_pool_resources_in(
+                self.field(),
+                value_type,
+                input,
+                policy,
+                &mut capture,
+                work,
+            )?
+        } else {
+            preflight_flat_pool_resources(
+                self.field(),
+                value_type,
+                input,
+                policy,
+                CompilePhase::Decode,
+                work.control(),
+            )?
+        };
         Ok(FlatPoolResourceProjection {
             owned_body_capacity_bytes: body_capacity,
             alignment_repair_possible: repair_possible,

@@ -523,3 +523,6 @@ fn actual_success_callbacks_and_wide_metadata_quantums_keep_all_primary_control_
     // covers every actual positive quantum, entry, output exit and final tail.
     assert_refusals(&wide, limits(), &baseline, positions);
 }
+
+#[path = "owned_tests.rs"]
+mod owned_tests;

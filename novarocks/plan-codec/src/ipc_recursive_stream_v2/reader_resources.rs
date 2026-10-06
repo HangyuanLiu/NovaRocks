@@ -20,6 +20,10 @@
 //! remains in this cumulative projection. These facts do not grant memory.
 
 use super::{reader_allocations, reader_diagnostics, reader_work};
+use crate::ipc_flat_stream_v2::{
+    progress::Admission,
+    resource_work::{CapturedWork, ResourceCountFacts, ResourceWork},
+};
 use crate::{
     ipc_flat_batch_v2::{Layout as FlatLayout, layout},
     ipc_flat_stream_v2::FlatPoolResourceError,
@@ -90,7 +94,7 @@ pub(super) fn mul(a: usize, b: usize) -> Result<usize, FlatPoolResourceError> {
 fn u64_extent(n: usize) -> Result<u64, FlatPoolResourceError> {
     u64::try_from(n).map_err(|_| invalid("recursive reader resource extent exceeds u64"))
 }
-fn capacity(bytes: usize) -> Result<usize, FlatPoolResourceError> {
+pub(super) fn capacity(bytes: usize) -> Result<usize, FlatPoolResourceError> {
     let rounded = add(bytes, 63)? & !63;
     Layout::from_size_align(rounded, arrow_buffer::alloc::ALIGNMENT)
         .map_err(|_| invalid("recursive reader payload layout is not representable"))?;
@@ -128,12 +132,24 @@ pub(super) fn descriptor(
 
 pub(super) fn payload(
     input: &ReaderInput<'_, '_>,
-    work: &mut CompileCheckpoints<'_>,
+    work: &mut impl ResourceWork,
 ) -> Result<PayloadRequests, FlatPoolResourceError> {
     let mut requests = PayloadRequests {
-        body_capacity: capacity(input.body.len())?,
+        body_capacity: work.numeric(capacity(input.body.len()))?,
         ..Default::default()
     };
+    let bytes = work.numeric(add(
+        work.numeric(add(requests.body_capacity, requests.repair_capacity))?,
+        requests.empty_offsets_capacity,
+    ))?;
+    let count = work.numeric(add(
+        work.numeric(add(
+            usize::from(requests.body_capacity != 0),
+            requests.repair_count,
+        ))?,
+        requests.empty_offsets_count,
+    ))?;
+    work.requests(bytes, count)?;
     work.step()?;
     for node in input.nodes {
         let ty = node.field.data_type();
@@ -163,12 +179,15 @@ pub(super) fn payload(
             }
         };
         if let Some(width) = typed_width {
-            let (offset, length) = descriptor(input, add(node.buffer_start, 1)?)?;
+            let (offset, length) = descriptor(input, work.numeric(add(node.buffer_start, 1))?)?;
             if !arrow_buffer::alloc::ALIGNMENT.is_multiple_of(width)
                 || !offset.is_multiple_of(width)
             {
-                requests.repair_capacity = add(requests.repair_capacity, capacity(length)?)?;
-                requests.repair_count = add(requests.repair_count, 1)?;
+                requests.repair_capacity = work.numeric(add(
+                    requests.repair_capacity,
+                    work.numeric(capacity(length))?,
+                ))?;
+                requests.repair_count = work.numeric(add(requests.repair_count, 1))?;
             }
             if let Some(width) = offsets
                 && node.rows == 0
@@ -176,16 +195,30 @@ pub(super) fn payload(
             {
                 Layout::from_size_align(width, arrow_buffer::alloc::ALIGNMENT)
                     .map_err(|_| invalid("recursive reader empty offset layout"))?;
-                requests.empty_offsets_capacity = add(requests.empty_offsets_capacity, width)?;
-                requests.empty_offsets_count = add(requests.empty_offsets_count, 1)?;
+                requests.empty_offsets_capacity =
+                    work.numeric(add(requests.empty_offsets_capacity, width))?;
+                requests.empty_offsets_count =
+                    work.numeric(add(requests.empty_offsets_count, 1))?;
             }
         }
         if matches!(ty, DataType::Utf8 | DataType::LargeUtf8) {
-            requests.utf8_fallback = add(
+            requests.utf8_fallback = work.numeric(add(
                 requests.utf8_fallback,
-                descriptor(input, add(node.buffer_start, 2)?)?.1,
-            )?;
+                descriptor(input, work.numeric(add(node.buffer_start, 2))?)?.1,
+            ))?;
         }
+        let bytes = work.numeric(add(
+            work.numeric(add(requests.body_capacity, requests.repair_capacity))?,
+            requests.empty_offsets_capacity,
+        ))?;
+        let count = work.numeric(add(
+            work.numeric(add(
+                usize::from(requests.body_capacity != 0),
+                requests.repair_count,
+            ))?,
+            requests.empty_offsets_count,
+        ))?;
+        work.requests(bytes, count)?;
         work.step()?;
     }
     Ok(requests)
@@ -201,18 +234,92 @@ pub(crate) fn preflight(
     limits: RecursiveReaderProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<RecursiveReaderResourceFacts, FlatPoolResourceError> {
+    preflight_core(
+        input,
+        value_type,
+        source_retained_bytes,
+        policy,
+        limits,
+        None,
+        work,
+    )
+}
+pub(crate) fn preflight_in(
+    input: &ReaderInput<'_, '_>,
+    value_type: &FunctionValueType,
+    source_retained_bytes: usize,
+    policy: ConstantPolicy,
+    limits: RecursiveReaderProjectionLimits,
+    admission: &mut Admission<'_, '_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<RecursiveReaderResourceFacts, FlatPoolResourceError> {
+    preflight_core(
+        input,
+        value_type,
+        source_retained_bytes,
+        policy,
+        limits,
+        Some(admission),
+        work,
+    )
+}
+fn preflight_core(
+    input: &ReaderInput<'_, '_>,
+    value_type: &FunctionValueType,
+    source_retained_bytes: usize,
+    policy: ConstantPolicy,
+    limits: RecursiveReaderProjectionLimits,
+    mut admission: Option<&mut Admission<'_, '_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<RecursiveReaderResourceFacts, FlatPoolResourceError> {
     cap(
         input.body.len(),
         source_retained_bytes,
         "recursive reader source retention below body",
     )?;
-    let source_work = reader_work::source_metadata_work(input.nodes, source_retained_bytes, work)?;
+    if let Some(a) = admission.as_deref_mut() {
+        a.limits(
+            limits.max_new_allocation_request_bytes,
+            limits.max_coexisting_source_and_request_bytes,
+            limits.max_cumulative_library_work,
+        )?;
+        a.requests(
+            0,
+            input.geometry_scratch_request_bytes,
+            input.geometry_scratch_request_count,
+        )?;
+    }
+    let source_work = if let Some(a) = admission.as_deref_mut() {
+        let mut observed = CapturedWork {
+            work,
+            facts: ResourceCountFacts::default(),
+            capture: |f: ResourceCountFacts| {
+                a.count_work(0, f.observed_work)?;
+                a.reader_work(f.work)
+            },
+        };
+        reader_work::source_metadata_work(input.nodes, source_retained_bytes, &mut observed)?
+    } else {
+        reader_work::source_metadata_work(input.nodes, source_retained_bytes, work)?
+    };
     cap(
         source_work.total,
         limits.max_cumulative_library_work,
         "recursive reader source metadata work envelope exceeded",
     )?;
-    let payload = payload(input, work)?;
+    let payload = if let Some(a) = admission.as_deref_mut() {
+        let mut observed = CapturedWork {
+            work,
+            facts: ResourceCountFacts::default(),
+            capture: |f: ResourceCountFacts| {
+                a.count_work(1, f.observed_work)?;
+                a.requests(1, f.bytes, f.count)
+            },
+        };
+        payload(input, &mut observed)?
+    } else {
+        payload(input, work)?
+    };
     let requested_payload = add(
         add(payload.body_capacity, payload.repair_capacity)?,
         payload.empty_offsets_capacity,
@@ -233,23 +340,67 @@ pub(crate) fn preflight(
         work.step()?;
     }
     work.flush()?;
-    let pool = preflight_recursive_pool_resources(
-        input.field,
-        value_type,
-        input.nodes.iter().map(|node| node.rows as u64),
-        RecursiveConstantResourceInput {
-            buffer_count_upper_bound: u64_extent(input.geometry.buffer_descriptors)?,
-            buffer_visits_bytes_upper_bound: u64_extent(visits)?,
-            retained_buffer_capacity_bytes_upper_bound: u64_extent(retained)?,
-            view_validation_bytes_upper_bound: u64_extent(input.geometry.view_validation_bytes)?,
-            utf8_fallback_validation_bytes_upper_bound: u64_extent(payload.utf8_fallback)?,
-        },
-        policy,
-        CompilePhase::Decode,
-        work.control(),
-    )?;
-    let structures = reader_allocations::preflight(input, &payload, work)?;
-    let diagnostics = reader_diagnostics::preflight(input, work)?;
+    let constant_input = RecursiveConstantResourceInput {
+        buffer_count_upper_bound: u64_extent(input.geometry.buffer_descriptors)?,
+        buffer_visits_bytes_upper_bound: u64_extent(visits)?,
+        retained_buffer_capacity_bytes_upper_bound: u64_extent(retained)?,
+        view_validation_bytes_upper_bound: u64_extent(input.geometry.view_validation_bytes)?,
+        utf8_fallback_validation_bytes_upper_bound: u64_extent(payload.utf8_fallback)?,
+    };
+    let pool = if let Some(a) = admission.as_deref_mut() {
+        let mut capture = |f: &novarocks_constant_contract::ConstantOwnerResourceFacts| {
+            a.constant(
+                f.allocation_request_bytes_upper_bound,
+                f.allocation_requests_upper_bound,
+                f.cumulative_work_upper_bound,
+            )
+        };
+        novarocks_constant_contract::preflight_recursive_pool_resources_in(
+            input.field,
+            value_type,
+            input.nodes.iter().map(|node| node.rows as u64),
+            constant_input,
+            policy,
+            &mut capture,
+            work,
+        )?
+    } else {
+        preflight_recursive_pool_resources(
+            input.field,
+            value_type,
+            input.nodes.iter().map(|node| node.rows as u64),
+            constant_input,
+            policy,
+            CompilePhase::Decode,
+            work.control(),
+        )?
+    };
+    let structures = if let Some(a) = admission.as_deref_mut() {
+        let mut observed = CapturedWork {
+            work,
+            facts: ResourceCountFacts::default(),
+            capture: |f: ResourceCountFacts| {
+                a.count_work(2, f.observed_work)?;
+                a.requests(2, f.bytes, f.count)
+            },
+        };
+        reader_allocations::preflight(input, &payload, &mut observed)?
+    } else {
+        reader_allocations::preflight(input, &payload, work)?
+    };
+    let diagnostics = if let Some(a) = admission.as_deref_mut() {
+        let mut observed = CapturedWork {
+            work,
+            facts: ResourceCountFacts::default(),
+            capture: |f: ResourceCountFacts| {
+                a.count_work(3, f.observed_work)?;
+                a.requests(3, f.bytes, f.count)
+            },
+        };
+        reader_diagnostics::preflight(input, &mut observed)?
+    } else {
+        reader_diagnostics::preflight(input, work)?
+    };
     let structural = add(
         structures.structural_request_bytes_upper_bound,
         input.geometry_scratch_request_bytes,
@@ -273,15 +424,47 @@ pub(crate) fn preflight(
         diagnostics.request_bytes_upper_bound,
     )?;
     let coexisting = add(source_retained_bytes, requested)?;
-    let cumulative = reader_work::preflight(
-        input,
-        &payload,
-        &pool,
-        &structures,
-        &diagnostics,
-        &source_work,
-        work,
-    )?;
+    let cumulative = if let Some(a) = admission {
+        let mut observed = CapturedWork {
+            work,
+            facts: ResourceCountFacts::default(),
+            capture: |f: ResourceCountFacts| {
+                a.count_work(4, f.observed_work)?;
+                a.reader_work(f.work)
+            },
+        };
+        let original = reader_work::preflight(
+            input,
+            &payload,
+            &pool,
+            &structures,
+            &diagnostics,
+            &source_work,
+            &mut observed,
+        )?;
+        let scratch =
+            novarocks_constant_contract::ConstantPool::type_validation_scratch_work_upper_bound();
+        let upper = a.numeric(add(
+            original,
+            a.numeric(
+                scratch
+                    .checked_mul(3)
+                    .ok_or_else(|| invalid("recursive reader source scratch work overflow")),
+            )?,
+        ))?;
+        a.reader_work(upper)?;
+        upper
+    } else {
+        reader_work::preflight(
+            input,
+            &payload,
+            &pool,
+            &structures,
+            &diagnostics,
+            &source_work,
+            work,
+        )?
+    };
     cap(
         requested,
         limits.max_new_allocation_request_bytes,

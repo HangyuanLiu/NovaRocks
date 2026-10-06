@@ -20,6 +20,7 @@
 //! coexistence limits before the full helper begins its two type walks.
 //! These numbers neither admit memory nor cover batch metadata/body/output.
 
+use super::owner_admission::{Admission, SchemaAdmit, SchemaWriterRequestFacts};
 use super::{IpcSchemaProjectionLimits, SchemaPreflight, checked_add as add, checked_mul as mul};
 use crate::{
     ipc_flat_batch_v2,
@@ -90,7 +91,7 @@ impl Requests {
         &mut self,
         layout: Layout,
         copies: usize,
-        work: &mut CompileCheckpoints<'_>,
+        work: Option<&mut CompileCheckpoints<'_>>,
     ) -> Result<(), TypeCodecError> {
         let result = (|| {
             if layout.size() != 0 && copies != 0 {
@@ -99,14 +100,16 @@ impl Requests {
             }
             Ok(())
         })();
-        work.step()?;
+        if let Some(work) = work {
+            work.step()?;
+        }
         result
     }
     fn exact<T>(
         &mut self,
         capacity: usize,
         copies: usize,
-        work: &mut CompileCheckpoints<'_>,
+        work: Option<&mut CompileCheckpoints<'_>>,
     ) -> Result<(), TypeCodecError> {
         let result = (|| {
             let layout = Layout::array::<T>(capacity).map_err(|_| invalid())?;
@@ -117,7 +120,9 @@ impl Requests {
             self.count = add(self.count, copies)?;
             Ok(())
         })();
-        work.step()?;
+        if let Some(work) = work {
+            work.step()?;
+        }
         result
     }
     fn geometric<T>(
@@ -125,22 +130,24 @@ impl Requests {
         target: usize,
         initial: usize,
         copies: usize,
-        work: &mut CompileCheckpoints<'_>,
+        mut work: Option<&mut CompileCheckpoints<'_>>,
     ) -> Result<(), TypeCodecError> {
         if target == 0 {
             return Ok(());
         }
         let mut capacity = initial;
-        self.exact::<T>(capacity, copies, work)?;
+        self.exact::<T>(capacity, copies, work.as_deref_mut())?;
         while capacity < target {
             let next = if capacity < 4 {
                 Ok(4)
             } else {
                 mul(capacity, 2)
             };
-            work.step()?;
+            if let Some(work) = work.as_deref_mut() {
+                work.step()?;
+            }
             capacity = next?;
-            self.exact::<T>(capacity, copies, work)?;
+            self.exact::<T>(capacity, copies, work.as_deref_mut())?;
         }
         Ok(())
     }
@@ -155,7 +162,7 @@ fn walkers(
     requests: &mut Requests,
     flat: bool,
     copies: usize,
-    work: &mut CompileCheckpoints<'_>,
+    work: Option<&mut CompileCheckpoints<'_>>,
 ) -> Result<(), TypeCodecError> {
     if flat {
         requests.exact::<WalkerEntry<'_>>(1, copies, work)
@@ -210,11 +217,47 @@ pub(crate) fn schema_writer_prefix_resources(
     max_preflight_library_work: usize,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<SchemaWriterPrefixFacts, TypeCodecError> {
+    schema_writer_prefix_core(
+        field,
+        source_retained_bytes,
+        _limits,
+        max_preflight_library_work,
+        None,
+        work,
+    )
+}
+
+fn schema_writer_prefix_core(
+    field: &Field,
+    source_retained_bytes: usize,
+    _limits: IpcSchemaProjectionLimits,
+    max_preflight_library_work: usize,
+    mut admission: Option<&mut Admission<'_, '_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<SchemaWriterPrefixFacts, TypeCodecError> {
     let result = (|| {
+        let policy = super::owner_admission::Policy(admission.is_some());
+        let add = |a, b| policy.numeric(add(a, b));
+        let mul = |a, b| policy.numeric(mul(a, b));
+        if let Some(admission) = admission.as_deref_mut() {
+            let initial = policy.numeric(prefix_initial(field, source_retained_bytes))?;
+            let mut requests = Requests::default();
+            walkers(&mut requests, initial.is_flat, 2, None)?;
+            admission.update(SchemaWriterRequestFacts {
+                request_bytes: initial.request_bytes,
+                request_count: requests.count,
+                work_upper_bound: initial.work_upper_bound,
+            })?;
+            admission.update(super::initial_writer_request_facts(
+                field,
+                source_retained_bytes,
+                _limits,
+            )?)?;
+        }
         environment(work)?;
         let is_flat = flat(field, work)?;
         let mut requests = Requests::default();
-        walkers(&mut requests, is_flat, 2, work)?;
+        walkers(&mut requests, is_flat, 2, Some(work))?;
         let mut fields = 1usize;
         let mut entries = field.metadata().len();
         let storage = add(mul(4, requests.bytes)?, requests.count)?;
@@ -224,6 +267,18 @@ pub(crate) fn schema_writer_prefix_resources(
                 source_work(source_retained_bytes, fields, entries)?,
                 storage,
             )?;
+            if let Some(admission) = admission.as_deref_mut() {
+                policy.cap(
+                    bound,
+                    max_preflight_library_work,
+                    "schema writer prefix work envelope exceeded",
+                )?;
+                admission.update(SchemaWriterRequestFacts {
+                    request_bytes: requests.bytes,
+                    request_count: requests.count,
+                    work_upper_bound: bound,
+                })?;
+            }
             work.step()?;
             admit_prefix_work(bound, max_preflight_library_work)?;
             bound
@@ -239,6 +294,18 @@ pub(crate) fn schema_writer_prefix_resources(
                 add(prefix_source_work(source_retained_bytes, fields)?, storage)?,
                 scratch_work,
             )?;
+            if let Some(admission) = admission.as_deref_mut() {
+                policy.cap(
+                    initial,
+                    max_preflight_library_work,
+                    "schema writer prefix work envelope exceeded",
+                )?;
+                admission.update(SchemaWriterRequestFacts {
+                    request_bytes: requests.bytes,
+                    request_count: requests.count,
+                    work_upper_bound: initial,
+                })?;
+            }
             work.step()?;
             admit_prefix_work(initial, max_preflight_library_work)?;
             work.flush()?;
@@ -260,6 +327,18 @@ pub(crate) fn schema_writer_prefix_resources(
                         add(prefix_source_work(source_retained_bytes, fields)?, storage)?,
                         scratch_work,
                     )?;
+                    if let Some(admission) = admission.as_deref_mut() {
+                        policy.cap(
+                            bound,
+                            max_preflight_library_work,
+                            "schema writer prefix work envelope exceeded",
+                        )?;
+                        admission.update(SchemaWriterRequestFacts {
+                            request_bytes: requests.bytes,
+                            request_count: requests.count,
+                            work_upper_bound: bound,
+                        })?;
+                    }
                     work.step()?;
                     admit_prefix_work(bound, max_preflight_library_work)?;
                     // Field is immediately before the sole owner's logical
@@ -321,102 +400,253 @@ pub(crate) fn preflight_schema_writer_resources(
                 "schema writer prefix differs from source",
             ));
         }
-        let flat = prefix.is_flat;
-        let mut requests = Requests::default();
-        requests.exact::<u8>(schema.backing, 2, work)?; // builder + finished copy
-        walkers(&mut requests, flat, 4, work)?;
-        requests.exact::<(&str, &str)>(schema.metadata_entries, 1, work)?;
-        requests.exact::<MetadataOffset>(schema.metadata_entries, 1, work)?;
-        // The byte total is summed arities/K; request counts are per actual
-        // nonempty Vec. Each independently checked request fits that total.
-        let metadata_requests = mul(2, schema.metadata_nonempty_fields)?;
-        let metadata_count = if schema.metadata_entries == 0 { 0 } else { 2 };
-        requests.count = add(
-            requests.count,
-            metadata_requests
-                .checked_sub(metadata_count)
-                .ok_or_else(invalid)?,
-        )?;
-        requests.exact::<ChildOffset>(schema.child_offset_items, 1, work)?;
-        let child_count = usize::from(schema.child_offset_items != 0);
-        requests.count = add(
-            requests.count,
-            schema
-                .child_offset_requests
-                .checked_sub(child_count)
-                .ok_or_else(invalid)?,
-        )?;
-        requests.exact::<i32>(schema.union_id_items, 1, work)?;
-        let union_count = usize::from(schema.union_id_items != 0);
-        requests.count = add(
-            requests.count,
-            schema
-                .union_id_requests
-                .checked_sub(union_count)
-                .ok_or_else(invalid)?,
-        )?;
-        let field_location = field_location_layout();
-        for capacity in [4, 8] {
-            let layout = Layout::from_size_align(
-                mul(field_location.size(), capacity)?,
-                field_location.align(),
-            )
-            .map_err(|_| invalid())?;
-            requests.layout(layout, 1, work)?;
-        }
-        requests.geometric::<u32>(schema.tables, 4, 1, work)?;
-        let associations = mul(
-            mul(4, mul(schema.metadata_entries, schema.metadata_entries)?)?,
-            add(schema.string_bytes, 1)?,
-        )?;
-        let vtables = mul(40, mul(schema.tables, schema.tables)?)?;
-        let storage = add(mul(4, requests.bytes)?, requests.count)?;
-        let mut source = source_work(
-            source_retained_bytes,
-            schema.field_occurrences,
-            schema.metadata_entries,
-        )?;
-        if !flat {
-            // The prefix scratch pass is additional to the four Vec passes.
-            let probes = schema
-                .field_occurrences
-                .checked_sub(1)
-                .ok_or_else(invalid)?;
-            source = add(
-                source,
-                mul(
-                    probes,
-                    add(source_retained_bytes, NR_LOGICAL_TYPE_KEY.len())?,
-                )?,
-            )?;
-        }
-        // Four shared walks each visit type/field/edge, emission and borrowed
-        // verification visit those same facts. The source backing and storage
-        // terms additionally cover byte/header construction and teardown.
-        // Per occurrence: four Vec passes contribute <=3 events each,
-        // emission <=4 fixed operations, verification <=16 field/type/header
-        // checks. Their sum is <=32; metadata/slots/bytes are separate terms.
-        let structural = add(
-            mul(32, add(schema.field_occurrences, schema.type_occurrences)?)?,
-            prefix.scratch_work,
-        )?;
-        let work_upper_bound = add(
-            add(add(source, associations)?, vtables)?,
-            add(storage, structural)?,
-        )?;
+        let facts = allocation_facts(schema, prefix, Some(work))?;
         work.step()?;
-        Ok(SchemaWriterAllocationFacts {
-            schema,
-            request_bytes: requests.bytes,
-            request_count: requests.count,
-            work_upper_bound,
-        })
+        Ok(facts)
     })();
     if matches!(&result, Err(TypeCodecError::Control(_))) {
         return result;
     }
     work.flush()?;
     result
+}
+
+pub(super) fn allocation_facts(
+    schema: SchemaPreflight,
+    prefix: SchemaWriterPrefixFacts,
+    mut work: Option<&mut CompileCheckpoints<'_>>,
+) -> Result<SchemaWriterAllocationFacts, TypeCodecError> {
+    let flat = prefix.is_flat;
+    let mut requests = Requests::default();
+    requests.exact::<u8>(schema.backing, 2, work.as_deref_mut())?; // builder + finished copy
+    walkers(&mut requests, flat, 4, work.as_deref_mut())?;
+    requests.exact::<(&str, &str)>(schema.metadata_entries, 1, work.as_deref_mut())?;
+    requests.exact::<MetadataOffset>(schema.metadata_entries, 1, work.as_deref_mut())?;
+    // The byte total is summed arities/K; request counts are per actual
+    // nonempty Vec. Each independently checked request fits that total.
+    let metadata_requests = mul(2, schema.metadata_nonempty_fields)?;
+    let metadata_count = if schema.metadata_entries == 0 { 0 } else { 2 };
+    requests.count = add(
+        requests.count,
+        metadata_requests
+            .checked_sub(metadata_count)
+            .ok_or_else(invalid)?,
+    )?;
+    requests.exact::<ChildOffset>(schema.child_offset_items, 1, work.as_deref_mut())?;
+    let child_count = usize::from(schema.child_offset_items != 0);
+    requests.count = add(
+        requests.count,
+        schema
+            .child_offset_requests
+            .checked_sub(child_count)
+            .ok_or_else(invalid)?,
+    )?;
+    requests.exact::<i32>(schema.union_id_items, 1, work.as_deref_mut())?;
+    let union_count = usize::from(schema.union_id_items != 0);
+    requests.count = add(
+        requests.count,
+        schema
+            .union_id_requests
+            .checked_sub(union_count)
+            .ok_or_else(invalid)?,
+    )?;
+    let field_location = field_location_layout();
+    for capacity in [4, 8] {
+        let layout = Layout::from_size_align(
+            mul(field_location.size(), capacity)?,
+            field_location.align(),
+        )
+        .map_err(|_| invalid())?;
+        requests.layout(layout, 1, work.as_deref_mut())?;
+    }
+    requests.geometric::<u32>(schema.tables, 4, 1, work)?;
+    let associations = mul(
+        mul(4, mul(schema.metadata_entries, schema.metadata_entries)?)?,
+        add(schema.string_bytes, 1)?,
+    )?;
+    let vtables = mul(40, mul(schema.tables, schema.tables)?)?;
+    let storage = add(mul(4, requests.bytes)?, requests.count)?;
+    let mut source = source_work(
+        prefix.source_retained_bytes,
+        schema.field_occurrences,
+        schema.metadata_entries,
+    )?;
+    if !flat {
+        // The prefix scratch pass is additional to the four Vec passes.
+        let probes = schema
+            .field_occurrences
+            .checked_sub(1)
+            .ok_or_else(invalid)?;
+        source = add(
+            source,
+            mul(
+                probes,
+                add(prefix.source_retained_bytes, NR_LOGICAL_TYPE_KEY.len())?,
+            )?,
+        )?;
+    }
+    // Four shared walks each visit type/field/edge, emission and borrowed
+    // verification visit those same facts. The source backing and storage
+    // terms additionally cover byte/header construction and teardown.
+    // Per occurrence: four Vec passes contribute <=3 events each,
+    // emission <=4 fixed operations, verification <=16 field/type/header
+    // checks. Their sum is <=32; metadata/slots/bytes are separate terms.
+    let structural = add(
+        mul(32, add(schema.field_occurrences, schema.type_occurrences)?)?,
+        prefix.scratch_work,
+    )?;
+    let work_upper_bound = add(
+        add(add(source, associations)?, vtables)?,
+        add(storage, structural)?,
+    )?;
+    Ok(SchemaWriterAllocationFacts {
+        schema,
+        request_bytes: requests.bytes,
+        request_count: requests.count,
+        work_upper_bound,
+    })
+}
+
+pub(super) fn prefix_initial(
+    field: &Field,
+    source: usize,
+) -> Result<SchemaWriterPrefixFacts, TypeCodecError> {
+    let is_flat = ipc_flat_batch_v2::layout(field.data_type()).is_ok();
+    let mut requests = Requests::default();
+    walkers(&mut requests, is_flat, 2, None)?;
+    let scratch_work = if is_flat {
+        0
+    } else {
+        mul(
+            4,
+            Layout::array::<Option<WalkerEntry<'_>>>(MAX_VALUE_TYPE_NODES)
+                .map_err(|_| invalid())?
+                .size(),
+        )?
+    };
+    let fields = 1;
+    let entries = field.metadata().len();
+    let storage = add(mul(4, requests.bytes)?, requests.count)?;
+    let work_upper_bound = if is_flat {
+        add(source_work(source, fields, entries)?, storage)?
+    } else {
+        add(
+            add(prefix_source_work(source, fields)?, storage)?,
+            scratch_work,
+        )?
+    };
+    Ok(SchemaWriterPrefixFacts {
+        request_bytes: requests.bytes,
+        work_upper_bound,
+        field_occurrences: fields,
+        metadata_entries: entries,
+        source_retained_bytes: source,
+        scratch_work,
+        is_flat,
+    })
+}
+pub(super) fn counts_prefix(
+    schema: SchemaPreflight,
+    prefix: SchemaWriterPrefixFacts,
+    admission: &mut Admission<'_, '_>,
+) -> Result<(), TypeCodecError> {
+    if admission.reader {
+        let facts = admission.policy().numeric(reader_facts(schema, prefix))?;
+        return admission.update(facts);
+    }
+    let facts = admission
+        .policy()
+        .numeric(allocation_facts(schema, prefix, None))?;
+    admission.update(SchemaWriterRequestFacts {
+        request_bytes: facts.request_bytes,
+        request_count: facts.request_count,
+        work_upper_bound: facts.work_upper_bound,
+    })
+}
+pub(super) fn reader_facts(
+    schema: SchemaPreflight,
+    prefix: SchemaWriterPrefixFacts,
+) -> Result<SchemaWriterRequestFacts, TypeCodecError> {
+    let mut requests = Requests::default();
+    // The observed strict pass uses fixed scratch. The following source count
+    // still uses the original sole structural Vec walker, bounded here.
+    walkers(&mut requests, prefix.is_flat, 1, None)?;
+    let scratch = Layout::new::<[Option<WalkerEntry<'_>>; MAX_VALUE_TYPE_NODES]>().size();
+    let associations = mul(
+        mul(4, mul(schema.metadata_entries, schema.metadata_entries)?)?,
+        add(schema.string_bytes, 1)?,
+    )?;
+    let storage = add(mul(4, requests.bytes)?, requests.count)?;
+    let structural = mul(32, add(schema.field_occurrences, schema.type_occurrences)?)?;
+    let work = add(
+        add(
+            source_work(
+                prefix.source_retained_bytes,
+                schema.field_occurrences,
+                schema.metadata_entries,
+            )?,
+            associations,
+        )?,
+        add(mul(4, scratch)?, add(storage, structural)?)?,
+    )?;
+    Ok(SchemaWriterRequestFacts {
+        request_bytes: requests.bytes,
+        request_count: requests.count,
+        work_upper_bound: work,
+    })
+}
+
+pub(crate) fn schema_writer_prefix_resources_in(
+    field: &Field,
+    source: usize,
+    limits: IpcSchemaProjectionLimits,
+    max_work: usize,
+    admit: &mut SchemaAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<SchemaWriterPrefixFacts, TypeCodecError> {
+    let mut admission = Admission {
+        parent: Some(admit),
+        source,
+        reader: false,
+        max_work,
+        facts: SchemaWriterRequestFacts::default(),
+    };
+    schema_writer_prefix_core(field, source, limits, max_work, Some(&mut admission), work)
+}
+pub(super) fn preflight_schema_writer_resources_in(
+    field: &Field,
+    source: usize,
+    limits: IpcSchemaProjectionLimits,
+    prefix: SchemaWriterPrefixFacts,
+    admission: &mut Admission<'_, '_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<SchemaWriterAllocationFacts, TypeCodecError> {
+    let schema =
+        super::preflight_writer_core(field, limits, Some((prefix, &mut *admission)), work)?;
+    let actual_flat = ipc_flat_batch_v2::layout(field.data_type()).is_ok();
+    let same = prefix.field_occurrences == schema.field_occurrences
+        && prefix.metadata_entries == schema.metadata_entries
+        && prefix.source_retained_bytes == source
+        && prefix.is_flat == actual_flat;
+    work.step()?; // original flat classification
+    work.step()?; // original source-prefix comparison
+    if !same {
+        return Err(TypeCodecError::InvalidShape(
+            "schema writer prefix differs from source",
+        ));
+    }
+    let facts = admission
+        .policy()
+        .numeric(allocation_facts(schema, prefix, None))?;
+    admission.update(SchemaWriterRequestFacts {
+        request_bytes: facts.request_bytes,
+        request_count: facts.request_count,
+        work_upper_bound: facts.work_upper_bound,
+    })?;
+    let result = allocation_facts(schema, prefix, Some(work))?;
+    work.step()?;
+    work.flush()?;
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -709,7 +939,11 @@ mod tests {
         let control = Control::good();
         let mut work = CompileCheckpoints::try_new(&control, PHASE).unwrap();
         let mut requests = Requests::default();
-        assert!(requests.exact::<u64>(usize::MAX, 1, &mut work).is_err());
+        assert!(
+            requests
+                .exact::<u64>(usize::MAX, 1, Some(&mut work))
+                .is_err()
+        );
         work.finish().unwrap();
         assert!(control.trace().last().unwrap().1 > 0);
     }

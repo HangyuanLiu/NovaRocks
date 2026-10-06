@@ -21,6 +21,7 @@
 
 use super::reader_resources::{ReaderInput, add, invalid, mul};
 use crate::ipc_flat_batch_v2::layout;
+use crate::ipc_flat_stream_v2::resource_work::ResourceWork;
 use crate::ipc_flat_stream_v2::{
     FlatPoolResourceError,
     reader_allocations::Requests,
@@ -29,7 +30,7 @@ use crate::ipc_flat_stream_v2::{
     },
 };
 use arrow::datatypes::{DataType, Field};
-use novarocks_type_contract::{CompileCheckpoints, MAX_VALUE_TYPE_DEPTH};
+use novarocks_type_contract::MAX_VALUE_TYPE_DEPTH;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Render {
@@ -52,7 +53,7 @@ fn quoted(bytes: usize) -> Result<usize, FlatPoolResourceError> {
 }
 fn vectors<T>(
     count: usize,
-    work: &mut CompileCheckpoints<'_>,
+    work: &mut impl ResourceWork,
 ) -> Result<ReaderDiagnosticRequests, FlatPoolResourceError> {
     let mut requests = Requests::default();
     requests.growing_vec::<T>(count, work)?;
@@ -61,10 +62,7 @@ fn vectors<T>(
         allocation_requests_upper_bound: requests.count,
     })
 }
-fn metadata(
-    field: &Field,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<Render, FlatPoolResourceError> {
+fn metadata(field: &Field, work: &mut impl ResourceWork) -> Result<Render, FlatPoolResourceError> {
     if field.metadata().is_empty() {
         work.step()?;
         return Ok(Render::default());
@@ -74,10 +72,16 @@ fn metadata(
     // source invoice in reader_work, not by this successful-entry loop.
     work.flush()?;
     for (key, value) in field.metadata() {
-        length = add(
+        length = work.numeric(add(
             length,
-            add(add(quoted(key.len())?, quoted(value.len())?)?, ": , ".len())?,
-        )?;
+            work.numeric(add(
+                work.numeric(add(
+                    work.numeric(quoted(key.len()))?,
+                    work.numeric(quoted(value.len()))?,
+                ))?,
+                ": , ".len(),
+            ))?,
+        ))?;
         work.step()?;
     }
     work.flush()?;
@@ -88,31 +92,38 @@ fn metadata(
 fn field_render(
     field: &Field,
     depth: usize,
-    work: &mut CompileCheckpoints<'_>,
+    work: &mut impl ResourceWork,
 ) -> Result<Render, FlatPoolResourceError> {
     let ty = type_render(field.data_type(), depth, work)?;
     let meta = metadata(field, work)?;
     // Covers both FormatField Display and the larger optional Field Debug
     // representation, including private dict facts even on a non-Dict field.
     let literal = "Field { name: , data_type: , nullable: false, dict_id: , dict_is_ordered: false, metadata: {} }".len();
-    let length = add(
-        add(
-            add(add(literal, quoted(field.name().len())?)?, ty.length)?,
+    let length = work.numeric(add(
+        work.numeric(add(
+            work.numeric(add(
+                work.numeric(add(literal, work.numeric(quoted(field.name().len()))?))?,
+                ty.length,
+            ))?,
             meta.length,
-        )?,
+        ))?,
         20,
-    )?;
+    ))?;
     let requests = ty
         .requests
         .plus(meta.requests)?
         .plus(string_requests(length, work)?)?;
+    work.requests(
+        requests.request_bytes_upper_bound,
+        requests.allocation_requests_upper_bound,
+    )?;
     work.step()?;
     Ok(Render { length, requests })
 }
 fn type_render(
     ty: &DataType,
     depth: usize,
-    work: &mut CompileCheckpoints<'_>,
+    work: &mut impl ResourceWork,
 ) -> Result<Render, FlatPoolResourceError> {
     if depth > MAX_VALUE_TYPE_DEPTH {
         return Err(invalid("recursive reader diagnostic type depth"));
@@ -123,7 +134,7 @@ fn type_render(
             let mut requests = ReaderDiagnosticRequests::default();
             for field in fields {
                 let child = field_render(field, depth + 1, work)?;
-                length = add(length, add(child.length, ", ".len())?)?;
+                length = work.numeric(add(length, work.numeric(add(child.length, ", ".len()))?))?;
                 requests = requests.plus(child.requests)?;
                 work.step()?;
             }
@@ -135,10 +146,10 @@ fn type_render(
         }
         DataType::List(field) | DataType::LargeList(field) | DataType::Map(field, _) => {
             let child = field_render(field, depth + 1, work)?;
-            let length = add(
+            let length = work.numeric(add(
                 "LargeList(non-null , field: '', unsorted)".len(),
                 child.length,
-            )?;
+            ))?;
             // Display's named List field String and Map format_field are
             // covered by the field_render String. Debug allocates neither.
             Render {
@@ -156,7 +167,7 @@ fn type_render(
                 .max("Timestamp(Nanosecond, )".len())
                 .max("Interval(MonthDayNano)".len());
             let length = if let DataType::Timestamp(_, Some(zone)) = ty {
-                add(length, quoted(zone.len())?)?
+                work.numeric(add(length, work.numeric(quoted(zone.len()))?))?
             } else {
                 length
             };
@@ -199,7 +210,7 @@ const CONTAINER_LITERALS: &str = concat!(
 
 pub(super) fn preflight(
     input: &ReaderInput<'_, '_>,
-    work: &mut CompileCheckpoints<'_>,
+    work: &mut impl ResourceWork,
 ) -> Result<ReaderDiagnosticRequests, FlatPoolResourceError> {
     let digits = decimal_digits(usize::MAX, work)?;
     let mut path: [Option<Render>; MAX_VALUE_TYPE_DEPTH] = [None; MAX_VALUE_TYPE_DEPTH];
@@ -215,27 +226,38 @@ pub(super) fn preflight(
         // branches, but include their finite formatting anyway. Four complete
         // carrier/Field argument renderings and eight integer slots dominate
         // the largest actual closed constructor/validate_data branch above.
-        let description = add(
-            add(CONTAINER_LITERALS.len(), mul(4, render.length)?)?,
-            mul(8, digits)?,
-        )?;
+        let description = work.numeric(add(
+            work.numeric(add(
+                CONTAINER_LITERALS.len(),
+                work.numeric(mul(4, render.length))?,
+            ))?,
+            work.numeric(mul(8, digits))?,
+        ))?;
         let mut candidate = shared
             .maximum(arrow_error(description, work)?)
-            .plus(repeat(render.requests, 4)?)?;
+            .plus(work.numeric(repeat(render.requests, 4))?)?;
         // The shared request covers its longest rendered branch. Requested
         // bytes >= rendered bytes, including all decimal scaled/BigInt text.
         let mut wrapped_length = description.max(shared.request_bytes_upper_bound);
         for ancestor in path[..node.depth - 1].iter().flatten() {
-            wrapped_length = add(
-                add(add(wrapped_length, ancestor.length)?, digits)?,
+            wrapped_length = work.numeric(add(
+                work.numeric(add(
+                    work.numeric(add(wrapped_length, ancestor.length))?,
+                    digits,
+                ))?,
                 " child # invalid: Invalid argument error: ".len(),
-            )?;
+            ))?;
             candidate = candidate
                 .plus(arrow_error(wrapped_length, work)?)?
                 .plus(ancestor.requests)?;
             work.step()?;
         }
         largest = largest.maximum(candidate);
+        let current = work.numeric(largest.plus(eager))?;
+        work.requests(
+            current.request_bytes_upper_bound,
+            current.allocation_requests_upper_bound,
+        )?;
         path[node.depth - 1] = Some(render);
         if matches!(
             node.field.data_type(),
@@ -248,5 +270,10 @@ pub(super) fn preflight(
         }
         work.step()?;
     }
-    largest.plus(eager)
+    let complete = work.numeric(largest.plus(eager))?;
+    work.requests(
+        complete.request_bytes_upper_bound,
+        complete.allocation_requests_upper_bound,
+    )?;
+    Ok(complete)
 }

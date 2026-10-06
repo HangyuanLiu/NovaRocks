@@ -179,139 +179,21 @@ fn child(
     verify_field(expected, children.get(index), work)
 }
 
+macro_rules! payload {
+    ($actual:ident, $work:ident, $kind:ident, $accessor:ident) => {{
+        require($actual.type_type() == ipc::Type::$kind, $work)?;
+        require($actual.$accessor().is_some(), $work)?;
+        $actual.$accessor().ok_or(E::InvalidShape(MISMATCH))?
+    }};
+}
+// Keep nonrecursive payload temporaries out of each live recursive frame.
+// The original child checks and their completed observations stay in order.
 fn verify_type(
     expected: &DataType,
     actual: ipc::Field<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), E> {
-    macro_rules! payload {
-        ($kind:ident, $accessor:ident) => {{
-            require(actual.type_type() == ipc::Type::$kind, work)?;
-            require(actual.$accessor().is_some(), work)?;
-            actual.$accessor().ok_or(E::InvalidShape(MISMATCH))?
-        }};
-    }
     match expected {
-        DataType::Null => {
-            payload!(Null, type_as_null);
-        }
-        DataType::Boolean => {
-            payload!(Bool, type_as_bool);
-        }
-        DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::UInt8
-        | DataType::UInt16
-        | DataType::UInt32
-        | DataType::UInt64 => {
-            let integer_payload = payload!(Int, type_as_int);
-            let (width, signed) = integer(expected).ok_or(E::InvalidShape(MISMATCH))?;
-            require(
-                integer_payload.bitWidth() == width && integer_payload.is_signed() == signed,
-                work,
-            )?;
-        }
-        DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-            let floating = payload!(FloatingPoint, type_as_floating_point);
-            let precision = match expected {
-                DataType::Float16 => ipc::Precision::HALF,
-                DataType::Float32 => ipc::Precision::SINGLE,
-                _ => ipc::Precision::DOUBLE,
-            };
-            require(floating.precision() == precision, work)?;
-        }
-        DataType::Binary => {
-            payload!(Binary, type_as_binary);
-        }
-        DataType::LargeBinary => {
-            payload!(LargeBinary, type_as_large_binary);
-        }
-        DataType::BinaryView => {
-            payload!(BinaryView, type_as_binary_view);
-        }
-        DataType::Utf8 => {
-            payload!(Utf8, type_as_utf_8);
-        }
-        DataType::LargeUtf8 => {
-            payload!(LargeUtf8, type_as_large_utf_8);
-        }
-        DataType::Utf8View => {
-            payload!(Utf8View, type_as_utf_8_view);
-        }
-        DataType::FixedSizeBinary(width) => {
-            let binary = payload!(FixedSizeBinary, type_as_fixed_size_binary);
-            require(binary.byteWidth() == *width, work)?;
-        }
-        DataType::Date32 | DataType::Date64 => {
-            let date = payload!(Date, type_as_date);
-            let unit = if matches!(expected, DataType::Date32) {
-                ipc::DateUnit::DAY
-            } else {
-                ipc::DateUnit::MILLISECOND
-            };
-            require(date.unit() == unit, work)?;
-        }
-        DataType::Time32(time_unit) | DataType::Time64(time_unit) => {
-            let time = payload!(Time, type_as_time);
-            let width = if matches!(expected, DataType::Time32(_)) {
-                32
-            } else {
-                64
-            };
-            require(
-                time.unit() == unit(time_unit) && time.bitWidth() == width,
-                work,
-            )?;
-        }
-        DataType::Timestamp(time_unit, timezone) => {
-            let timestamp = payload!(Timestamp, type_as_timestamp);
-            require(timestamp.unit() == unit(time_unit), work)?;
-            match (timezone.as_deref(), timestamp.timezone()) {
-                (None, None) => {
-                    work.step()?;
-                }
-                (Some(expected), Some(actual)) => {
-                    let equal = strings_equal(expected, actual, work)?;
-                    require(equal, work)?;
-                }
-                _ => {
-                    require(false, work)?;
-                }
-            }
-        }
-        DataType::Duration(time_unit) => {
-            let duration = payload!(Duration, type_as_duration);
-            require(duration.unit() == unit(time_unit), work)?;
-        }
-        DataType::Interval(interval) => {
-            let value = payload!(Interval, type_as_interval);
-            let unit = match interval {
-                IntervalUnit::YearMonth => ipc::IntervalUnit::YEAR_MONTH,
-                IntervalUnit::DayTime => ipc::IntervalUnit::DAY_TIME,
-                IntervalUnit::MonthDayNano => ipc::IntervalUnit::MONTH_DAY_NANO,
-            };
-            require(value.unit() == unit, work)?;
-        }
-        DataType::Decimal32(precision, scale)
-        | DataType::Decimal64(precision, scale)
-        | DataType::Decimal128(precision, scale)
-        | DataType::Decimal256(precision, scale) => {
-            let decimal = payload!(Decimal, type_as_decimal);
-            let width = match expected {
-                DataType::Decimal32(..) => 32,
-                DataType::Decimal64(..) => 64,
-                DataType::Decimal128(..) => 128,
-                _ => 256,
-            };
-            require(
-                decimal.precision() == i32::from(*precision)
-                    && decimal.scale() == i32::from(*scale)
-                    && decimal.bitWidth() == width,
-                work,
-            )?;
-        }
         DataType::List(field)
         | DataType::LargeList(field)
         | DataType::ListView(field)
@@ -320,23 +202,23 @@ fn verify_type(
         | DataType::Map(field, _) => {
             match expected {
                 DataType::List(_) => {
-                    payload!(List, type_as_list);
+                    payload!(actual, work, List, type_as_list);
                 }
                 DataType::LargeList(_) => {
-                    payload!(LargeList, type_as_large_list);
+                    payload!(actual, work, LargeList, type_as_large_list);
                 }
                 DataType::ListView(_) => {
-                    payload!(ListView, type_as_list_view);
+                    payload!(actual, work, ListView, type_as_list_view);
                 }
                 DataType::LargeListView(_) => {
-                    payload!(LargeListView, type_as_large_list_view);
+                    payload!(actual, work, LargeListView, type_as_large_list_view);
                 }
                 DataType::FixedSizeList(_, size) => {
-                    let value = payload!(FixedSizeList, type_as_fixed_size_list);
+                    let value = payload!(actual, work, FixedSizeList, type_as_fixed_size_list);
                     require(value.listSize() == *size, work)?;
                 }
                 DataType::Map(_, sorted) => {
-                    let value = payload!(Map, type_as_map);
+                    let value = payload!(actual, work, Map, type_as_map);
                     require(value.keysSorted() == *sorted, work)?;
                 }
                 _ => return Err(E::InvalidShape(MISMATCH)),
@@ -346,7 +228,7 @@ fn verify_type(
             return Ok(());
         }
         DataType::Struct(fields) => {
-            payload!(Struct_, type_as_struct_);
+            payload!(actual, work, Struct_, type_as_struct_);
             child_count(actual, fields.len(), false, work)?;
             for (index, field) in fields.iter().enumerate() {
                 child(field, actual, index, work)?;
@@ -355,14 +237,14 @@ fn verify_type(
             return Ok(());
         }
         DataType::RunEndEncoded(run_ends, values) => {
-            payload!(RunEndEncoded, type_as_run_end_encoded);
+            payload!(actual, work, RunEndEncoded, type_as_run_end_encoded);
             child_count(actual, 2, true, work)?;
             child(run_ends, actual, 0, work)?;
             child(values, actual, 1, work)?;
             return Ok(());
         }
         DataType::Union(fields, mode) => {
-            let union = payload!(Union, type_as_union);
+            let union = payload!(actual, work, Union, type_as_union);
             let mode = match mode {
                 UnionMode::Sparse => ipc::UnionMode::Sparse,
                 UnionMode::Dense => ipc::UnionMode::Dense,
@@ -384,6 +266,140 @@ fn verify_type(
                 "bare dictionary-of-dictionary IPC representation is pending",
             ));
         }
+        _ => verify_leaf_type(expected, actual, work)?,
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn verify_leaf_type(
+    expected: &DataType,
+    actual: ipc::Field<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), E> {
+    match expected {
+        DataType::Null => {
+            payload!(actual, work, Null, type_as_null);
+        }
+        DataType::Boolean => {
+            payload!(actual, work, Bool, type_as_bool);
+        }
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => {
+            let integer_payload = payload!(actual, work, Int, type_as_int);
+            let (width, signed) = integer(expected).ok_or(E::InvalidShape(MISMATCH))?;
+            require(
+                integer_payload.bitWidth() == width && integer_payload.is_signed() == signed,
+                work,
+            )?;
+        }
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+            let floating = payload!(actual, work, FloatingPoint, type_as_floating_point);
+            let precision = match expected {
+                DataType::Float16 => ipc::Precision::HALF,
+                DataType::Float32 => ipc::Precision::SINGLE,
+                _ => ipc::Precision::DOUBLE,
+            };
+            require(floating.precision() == precision, work)?;
+        }
+        DataType::Binary => {
+            payload!(actual, work, Binary, type_as_binary);
+        }
+        DataType::LargeBinary => {
+            payload!(actual, work, LargeBinary, type_as_large_binary);
+        }
+        DataType::BinaryView => {
+            payload!(actual, work, BinaryView, type_as_binary_view);
+        }
+        DataType::Utf8 => {
+            payload!(actual, work, Utf8, type_as_utf_8);
+        }
+        DataType::LargeUtf8 => {
+            payload!(actual, work, LargeUtf8, type_as_large_utf_8);
+        }
+        DataType::Utf8View => {
+            payload!(actual, work, Utf8View, type_as_utf_8_view);
+        }
+        DataType::FixedSizeBinary(width) => {
+            let binary = payload!(actual, work, FixedSizeBinary, type_as_fixed_size_binary);
+            require(binary.byteWidth() == *width, work)?;
+        }
+        DataType::Date32 | DataType::Date64 => {
+            let date = payload!(actual, work, Date, type_as_date);
+            let unit = if matches!(expected, DataType::Date32) {
+                ipc::DateUnit::DAY
+            } else {
+                ipc::DateUnit::MILLISECOND
+            };
+            require(date.unit() == unit, work)?;
+        }
+        DataType::Time32(time_unit) | DataType::Time64(time_unit) => {
+            let time = payload!(actual, work, Time, type_as_time);
+            let width = if matches!(expected, DataType::Time32(_)) {
+                32
+            } else {
+                64
+            };
+            require(
+                time.unit() == unit(time_unit) && time.bitWidth() == width,
+                work,
+            )?;
+        }
+        DataType::Timestamp(time_unit, timezone) => {
+            let timestamp = payload!(actual, work, Timestamp, type_as_timestamp);
+            require(timestamp.unit() == unit(time_unit), work)?;
+            match (timezone.as_deref(), timestamp.timezone()) {
+                (None, None) => {
+                    work.step()?;
+                }
+                (Some(expected), Some(actual)) => {
+                    let equal = strings_equal(expected, actual, work)?;
+                    require(equal, work)?;
+                }
+                _ => {
+                    require(false, work)?;
+                }
+            }
+        }
+        DataType::Duration(time_unit) => {
+            let duration = payload!(actual, work, Duration, type_as_duration);
+            require(duration.unit() == unit(time_unit), work)?;
+        }
+        DataType::Interval(interval) => {
+            let value = payload!(actual, work, Interval, type_as_interval);
+            let unit = match interval {
+                IntervalUnit::YearMonth => ipc::IntervalUnit::YEAR_MONTH,
+                IntervalUnit::DayTime => ipc::IntervalUnit::DAY_TIME,
+                IntervalUnit::MonthDayNano => ipc::IntervalUnit::MONTH_DAY_NANO,
+            };
+            require(value.unit() == unit, work)?;
+        }
+        DataType::Decimal32(precision, scale)
+        | DataType::Decimal64(precision, scale)
+        | DataType::Decimal128(precision, scale)
+        | DataType::Decimal256(precision, scale) => {
+            let decimal = payload!(actual, work, Decimal, type_as_decimal);
+            let width = match expected {
+                DataType::Decimal32(..) => 32,
+                DataType::Decimal64(..) => 64,
+                DataType::Decimal128(..) => 128,
+                _ => 256,
+            };
+            require(
+                decimal.precision() == i32::from(*precision)
+                    && decimal.scale() == i32::from(*scale)
+                    && decimal.bitWidth() == width,
+                work,
+            )?;
+        }
+        // Only verify_type calls this helper, after handling recursive carriers.
+        _ => return Err(E::InvalidShape(MISMATCH)),
     }
     child_count(actual, 0, false, work)
 }

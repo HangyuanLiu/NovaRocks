@@ -22,6 +22,7 @@
 use crate::{
     ipc_flat_pool_v2::{
         FlatPoolWriteFacts, FlatPoolWriteLimits, PreparedFlatPoolWriter, prepare_flat_pool_write,
+        prepare_flat_pool_write_in,
     },
     ipc_flat_stream_v2::{
         FlatPoolResourceError, FlatReaderError, FlatReaderProjectionLimits,
@@ -29,6 +30,7 @@ use crate::{
     },
     ipc_recursive_pool_v2::{
         PreparedRecursivePoolWriter, RecursivePoolWriteLimits, prepare_recursive_pool_write,
+        prepare_recursive_pool_write_in,
     },
     ipc_recursive_stream_v2::{
         RecursiveReaderProjectionLimits, RecursiveStreamProjectionLimits,
@@ -139,6 +141,28 @@ fn record_sources<'t>(
     source_retained_bytes: usize,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(&'t FunctionValueType, &'t Arc<Field>), PhysicalConstantCodecError> {
+    record_sources_captured(
+        record,
+        types,
+        source_retained_bytes,
+        &mut |_, _, _| Ok(()),
+        work,
+    )
+}
+
+/// Retain the actual two source loans through the captured consumer's known
+/// resource gate, before the matched Field lookup's completed observation.
+fn record_sources_captured<'t, 'control>(
+    record: &wire::IpcConstantPool,
+    types: &'t DecodedTypeTable,
+    source_retained_bytes: usize,
+    capture: &mut impl FnMut(
+        &'t FunctionValueType,
+        &'t Arc<Field>,
+        &mut CompileCheckpoints<'control>,
+    ) -> Result<(), PhysicalConstantCodecError>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<(&'t FunctionValueType, &'t Arc<Field>), PhysicalConstantCodecError> {
     work.step()?;
     if record.compression != wire::IpcCompression::Uncompressed as i32 {
         return Err(PhysicalConstantCodecError::InvalidShape(
@@ -161,6 +185,11 @@ fn record_sources<'t>(
         "constant record references an unknown value type",
     ))?;
     let field = types.field(field_id);
+    if source_retained_bytes >= record.arrow_ipc.capacity()
+        && let Some(field) = field
+    {
+        capture(value_type, field, work)?;
+    }
     work.step()?;
     let field = field.ok_or(PhysicalConstantCodecError::InvalidShape(
         "constant record references an unknown Field",
@@ -259,9 +288,11 @@ pub fn encode_constant_record(
     .emit()
 }
 
-enum PreparedWriter<'pool> {
-    Flat(PreparedFlatPoolWriter<'pool>),
-    Recursive(PreparedRecursivePoolWriter<'pool>),
+type WriterAdmit<'a> = dyn FnMut(&FlatPoolWriteFacts) -> Result<(), CompileControlError> + 'a;
+
+enum PreparedWriter<'pool, 'control> {
+    Flat(PreparedFlatPoolWriter<'pool, 'control>),
+    Recursive(PreparedRecursivePoolWriter<'pool, 'control>),
 }
 /// One original checked pool and its sealed writer model. Table-ID binding
 /// still belongs to the sole whole-package type author, as for record encode.
@@ -269,7 +300,7 @@ pub struct PreparedConstantRecordWrite<'pool, 'control> {
     id: ConstantPoolId,
     value_type_id: u32,
     field_id: u32,
-    writer: PreparedWriter<'pool>,
+    writer: PreparedWriter<'pool, 'control>,
     control: &'control dyn PureCompileControl,
 }
 impl PreparedConstantRecordWrite<'_, '_> {
@@ -283,11 +314,38 @@ impl PreparedConstantRecordWrite<'_, '_> {
     }
     pub fn emit(self) -> Result<wire::IpcConstantPool, PhysicalConstantCodecError> {
         let mut work = CompileCheckpoints::try_new(self.control, CompilePhase::Encode)?;
-        let result = (|| {
+        let result = self.emit_core(None, &mut work);
+        finish(work, result)
+    }
+    pub(crate) fn emit_in(
+        self,
+        admit: &mut dyn FnMut(&FlatPoolWriteFacts) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<wire::IpcConstantPool, PhysicalConstantCodecError> {
+        if !std::ptr::addr_eq(self.control, work.control()) {
+            return Err(PhysicalConstantCodecError::InvalidShape(
+                "constant record caller work has a different original control",
+            ));
+        }
+        admit(self.facts())?;
+        self.emit_core(Some(admit), work)
+    }
+    fn emit_core(
+        self,
+        mut admit: Option<&mut WriterAdmit<'_>>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<wire::IpcConstantPool, PhysicalConstantCodecError> {
+        (|| {
             work.flush()?;
             let arrow_ipc = match self.writer {
-                PreparedWriter::Flat(writer) => writer.emit(work.control())?,
-                PreparedWriter::Recursive(writer) => writer.emit(work.control())?,
+                PreparedWriter::Flat(writer) => match &mut admit {
+                    Some(parent) => writer.emit_in(*parent, work)?,
+                    None => writer.emit(work.control())?,
+                },
+                PreparedWriter::Recursive(writer) => match &mut admit {
+                    Some(parent) => writer.emit_in(&mut |facts| parent(&facts.flat), work)?,
+                    None => writer.emit(work.control())?,
+                },
             };
             work.step()?;
             Ok(wire::IpcConstantPool {
@@ -297,8 +355,7 @@ impl PreparedConstantRecordWrite<'_, '_> {
                 compression: wire::IpcCompression::Uncompressed as i32,
                 arrow_ipc,
             })
-        })();
-        finish(work, result)
+        })()
     }
 }
 
@@ -314,41 +371,109 @@ pub fn prepare_constant_record_write<'pool, 'control>(
     control: &'control dyn PureCompileControl,
 ) -> Result<PreparedConstantRecordWrite<'pool, 'control>, PhysicalConstantCodecError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
-    let result = (|| {
-        work.flush()?;
+    let result = prepare_record_core(
+        id,
+        value_type_id,
+        field_id,
+        pool,
+        source_retained_bytes,
+        limits,
+        None,
+        &mut work,
+    );
+    finish(work, result)
+}
+
+pub(crate) fn prepare_constant_record_write_in<'pool, 'control>(
+    id: ConstantPoolId,
+    value_type_id: u32,
+    field_id: u32,
+    pool: &'pool ConstantPool,
+    source_retained_bytes: usize,
+    limits: ConstantWriteProjectionLimits,
+    admit: &mut dyn FnMut(&FlatPoolWriteFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedConstantRecordWrite<'pool, 'control>, PhysicalConstantCodecError> {
+    prepare_record_core(
+        id,
+        value_type_id,
+        field_id,
+        pool,
+        source_retained_bytes,
+        limits,
+        Some(admit),
+        work,
+    )
+}
+
+fn prepare_record_core<'pool, 'control>(
+    id: ConstantPoolId,
+    value_type_id: u32,
+    field_id: u32,
+    pool: &'pool ConstantPool,
+    source_retained_bytes: usize,
+    limits: ConstantWriteProjectionLimits,
+    mut admit: Option<&mut WriterAdmit<'_>>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedConstantRecordWrite<'pool, 'control>, PhysicalConstantCodecError> {
+    (|| {
+        if admit.is_none() {
+            work.flush()?;
+        }
         let writer = if recursive(pool.field().data_type()) {
-            PreparedWriter::Recursive(prepare_recursive_pool_write(
-                pool,
-                source_retained_bytes,
-                limits.recursive,
-                work.control(),
-            )?)
+            PreparedWriter::Recursive(match &mut admit {
+                Some(parent) => prepare_recursive_pool_write_in(
+                    pool,
+                    source_retained_bytes,
+                    limits.recursive,
+                    &mut |facts| parent(&facts.flat),
+                    work,
+                )?,
+                None => prepare_recursive_pool_write(
+                    pool,
+                    source_retained_bytes,
+                    limits.recursive,
+                    work.control(),
+                )?,
+            })
         } else {
-            PreparedWriter::Flat(prepare_flat_pool_write(
-                pool,
-                source_retained_bytes,
-                limits.flat,
-                work.control(),
-            )?)
+            PreparedWriter::Flat(match &mut admit {
+                Some(parent) => prepare_flat_pool_write_in(
+                    pool,
+                    source_retained_bytes,
+                    limits.flat,
+                    *parent,
+                    work,
+                )?,
+                None => prepare_flat_pool_write(
+                    pool,
+                    source_retained_bytes,
+                    limits.flat,
+                    work.control(),
+                )?,
+            })
         };
         Ok(PreparedConstantRecordWrite {
             id,
             value_type_id,
             field_id,
             writer,
-            control,
+            control: work.control(),
         })
-    })();
-    finish(work, result)
+    })()
 }
 
 mod binding_resources;
 mod namespace;
 mod write_namespace;
+pub(crate) use namespace::prepare_constant_namespace_in;
 pub use namespace::{
     ConstantNamespaceProjectionLimits, ConstantNamespaceResourceFacts, PreparedConstantNamespace,
     decode_constant_namespace, prepare_constant_namespace,
 };
+
+pub(crate) use write_namespace::prepare_constant_namespace_write_in;
+
 pub use write_namespace::{
     ConstantNamespaceWriteFacts, ConstantRecordTypeIds, PreparedConstantNamespaceWrite,
     encode_constant_namespace, prepare_constant_namespace_write,

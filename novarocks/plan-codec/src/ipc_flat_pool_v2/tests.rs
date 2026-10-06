@@ -1056,3 +1056,6 @@ fn actual_flat_writer_original_control_and_unsupported_tails_never_publish_parti
 
 #[path = "prepared_tests.rs"]
 mod prepared_tests;
+
+#[path = "owned_tests.rs"]
+mod owned_tests;

@@ -23,13 +23,14 @@ use super::{
     reader_allocations::ReaderAllocationRequests,
     reader_resources::{PayloadRequests, ReaderInput, add, invalid, mul},
 };
+use crate::ipc_flat_stream_v2::resource_work::ResourceWork;
 use crate::ipc_flat_stream_v2::{
     FlatPoolResourceError, reader_diagnostics::ReaderDiagnosticRequests,
 };
 use crate::ipc_recursive_batch_v2::RecursiveNodeGeometry;
 use arrow::datatypes::DataType;
 use novarocks_constant_contract::ConstantResourceFacts;
-use novarocks_type_contract::{CompileCheckpoints, MAX_VALUE_TYPE_NODES, NR_LOGICAL_TYPE_KEY};
+use novarocks_type_contract::{MAX_VALUE_TYPE_NODES, NR_LOGICAL_TYPE_KEY};
 use std::cmp::Ordering;
 
 #[derive(Clone, Copy, Debug)]
@@ -64,18 +65,24 @@ fn compare_names(
     left: &[u8],
     right: &[u8],
     model_work: &mut usize,
-    work: &mut CompileCheckpoints<'_>,
+    original: usize,
+    work: &mut impl ResourceWork,
 ) -> Result<Ordering, FlatPoolResourceError> {
     for (left, right) in left.chunks(1024).zip(right.chunks(1024)) {
         let ordering = left.cmp(right);
-        *model_work = add(*model_work, add(add(left.len(), right.len())?, 1)?)?;
+        *model_work = work.numeric(add(
+            *model_work,
+            work.numeric(add(work.numeric(add(left.len(), right.len()))?, 1))?,
+        ))?;
+        work.library_work(work.numeric(add(original, *model_work))?)?;
         work.step()?;
         if ordering != Ordering::Equal {
             return Ok(ordering);
         }
     }
     let ordering = left.len().cmp(&right.len());
-    *model_work = add(*model_work, 1)?;
+    *model_work = work.numeric(add(*model_work, 1))?;
+    work.library_work(work.numeric(add(original, *model_work))?)?;
     work.step()?;
     Ok(ordering)
 }
@@ -85,22 +92,25 @@ fn sift_down(
     mut root: usize,
     nodes: &[RecursiveNodeGeometry<'_>],
     model_work: &mut usize,
-    work: &mut CompileCheckpoints<'_>,
+    original: usize,
+    work: &mut impl ResourceWork,
 ) -> Result<(), FlatPoolResourceError> {
     loop {
-        let left = add(mul(2, root)?, 1)?;
-        *model_work = add(*model_work, 1)?;
+        let left = work.numeric(add(work.numeric(mul(2, root))?, 1))?;
+        *model_work = work.numeric(add(*model_work, 1))?;
+        work.library_work(work.numeric(add(original, *model_work))?)?;
         work.step()?;
         if left >= indices.len() {
             return Ok(());
         }
-        let right = add(left, 1)?;
+        let right = work.numeric(add(left, 1))?;
         let mut child = left;
         if right < indices.len()
             && compare_names(
                 nodes[indices[left]].field.name().as_bytes(),
                 nodes[indices[right]].field.name().as_bytes(),
                 model_work,
+                original,
                 work,
             )? == Ordering::Less
         {
@@ -110,6 +120,7 @@ fn sift_down(
             nodes[indices[root]].field.name().as_bytes(),
             nodes[indices[child]].field.name().as_bytes(),
             model_work,
+            original,
             work,
         )? != Ordering::Less
         {
@@ -117,7 +128,8 @@ fn sift_down(
         }
         indices.swap(root, child);
         root = child;
-        *model_work = add(*model_work, 1)?;
+        *model_work = work.numeric(add(*model_work, 1))?;
+        work.library_work(work.numeric(add(original, *model_work))?)?;
         work.step()?;
     }
 }
@@ -126,19 +138,21 @@ fn sort_indices(
     indices: &mut [usize],
     nodes: &[RecursiveNodeGeometry<'_>],
     model_work: &mut usize,
-    work: &mut CompileCheckpoints<'_>,
+    original: usize,
+    work: &mut impl ResourceWork,
 ) -> Result<(), FlatPoolResourceError> {
     // In-place heapsort is O(N log N) and its comparator remains fallible.
     // A refusing comparison immediately returns the original error; there is
     // no standard-sort comparator fallback or retry with a fabricated order.
     for root in (0..indices.len() / 2).rev() {
-        sift_down(indices, root, nodes, model_work, work)?;
+        sift_down(indices, root, nodes, model_work, original, work)?;
     }
     for end in (1..indices.len()).rev() {
         indices.swap(0, end);
-        *model_work = add(*model_work, 1)?;
+        *model_work = work.numeric(add(*model_work, 1))?;
+        work.library_work(work.numeric(add(original, *model_work))?)?;
         work.step()?;
-        sift_down(&mut indices[..end], 0, nodes, model_work, work)?;
+        sift_down(&mut indices[..end], 0, nodes, model_work, original, work)?;
     }
     Ok(())
 }
@@ -163,15 +177,22 @@ pub(super) fn native_metadata_frequency(
 pub(super) fn source_metadata_work(
     nodes: &[RecursiveNodeGeometry<'_>],
     source_retained_bytes: usize,
-    work: &mut CompileCheckpoints<'_>,
+    work: &mut impl ResourceWork,
 ) -> Result<SourceMetadataWork, FlatPoolResourceError> {
     // The invoice includes both original Field and supplied FVT backing,
     // including strings and every HashMap bucket/control byte (also deleted
     // buckets). Source walks and nominal-key probes keep their original term.
-    let original = add(
-        mul(source_retained_bytes, add(mul(6, nodes.len())?, 2)?)?,
-        mul(mul(4, nodes.len())?, NR_LOGICAL_TYPE_KEY.len())?,
-    )?;
+    let original = work.numeric(add(
+        work.numeric(mul(
+            source_retained_bytes,
+            work.numeric(add(work.numeric(mul(6, nodes.len()))?, 2))?,
+        ))?,
+        work.numeric(mul(
+            work.numeric(mul(4, nodes.len()))?,
+            NR_LOGICAL_TYPE_KEY.len(),
+        ))?,
+    ))?;
+    work.library_work(original)?;
     work.step()?;
     // The actual geometry author calls the sole type grammar validator before
     // its DFS, enforcing MAX_VALUE_TYPE_NODES, and checks exact node coverage.
@@ -189,12 +210,13 @@ pub(super) fn source_metadata_work(
     let mut native_candidates = 0;
     for node in nodes.iter().skip(1) {
         let (_, candidate_count) = metadata_parameters(node.field.metadata().len())?;
-        candidates = add(candidates, candidate_count)?;
-        native_candidates = add(
+        candidates = work.numeric(add(candidates, candidate_count))?;
+        native_candidates = work.numeric(add(
             native_candidates,
-            mul(candidate_count, native_metadata_frequency(node)?)?,
-        )?;
-        model_work = add(model_work, 1)?;
+            work.numeric(mul(candidate_count, native_metadata_frequency(node)?))?,
+        ))?;
+        model_work = work.numeric(add(model_work, 1))?;
+        work.library_work(work.numeric(add(original, model_work))?)?;
         work.step()?;
     }
     if candidates == 0 {
@@ -202,16 +224,25 @@ pub(super) fn source_metadata_work(
         // The actual O(1)-per-node length scan is still counted and observed.
         return Ok(SourceMetadataWork {
             source_retained_bytes,
-            total: add(original, model_work)?,
+            total: work.numeric(add(original, model_work))?,
             #[cfg(test)]
             one_comparison: 0,
             native_comparisons: 0,
         });
     }
+    if work.parent() {
+        model_work = work.numeric(add(
+            model_work,
+            std::mem::size_of::<[usize; MAX_VALUE_TYPE_NODES]>(),
+        ))?;
+        work.library_work(work.numeric(add(original, model_work))?)?;
+    }
     work.flush()?;
     let mut indices = [0usize; MAX_VALUE_TYPE_NODES];
     work.flush()?;
-    model_work = add(model_work, std::mem::size_of_val(&indices))?;
+    if !work.parent() {
+        model_work = work.numeric(add(model_work, std::mem::size_of_val(&indices)))?;
+    }
     let mut count = 0;
     // DataType comparison excludes the root Field's metadata. For each nested
     // Field K entries need <=1 left scan + K right scans, <=K squared key
@@ -230,13 +261,14 @@ pub(super) fn source_metadata_work(
     for (index, node) in nodes.iter().enumerate().skip(1) {
         if !node.field.metadata().is_empty() {
             indices[count] = index;
-            count = add(count, 1)?;
+            count = work.numeric(add(count, 1))?;
         }
-        model_work = add(model_work, 1)?;
+        model_work = work.numeric(add(model_work, 1))?;
+        work.library_work(work.numeric(add(original, model_work))?)?;
         work.step()?;
     }
     let indices = &mut indices[..count];
-    sort_indices(indices, nodes, &mut model_work, work)?;
+    sort_indices(indices, nodes, &mut model_work, original, work)?;
     let mut maximum_weight = 0;
     let mut maximum_native_weight = 0;
     let mut previous_name: Option<&[u8]> = None;
@@ -247,7 +279,7 @@ pub(super) fn source_metadata_work(
         let name = node.field.name().as_bytes();
         let same_group = match previous_name {
             Some(previous) => {
-                compare_names(previous, name, &mut model_work, work)? == Ordering::Equal
+                compare_names(previous, name, &mut model_work, original, work)? == Ordering::Equal
             }
             None => false,
         };
@@ -258,28 +290,37 @@ pub(super) fn source_metadata_work(
             native_weight = 0;
         }
         let (weight, _) = metadata_parameters(node.field.metadata().len())?;
-        group_weight = add(group_weight, weight)?;
-        native_weight = add(
+        group_weight = work.numeric(add(group_weight, weight))?;
+        native_weight = work.numeric(add(
             native_weight,
-            mul(weight, native_metadata_frequency(node)?)?,
-        )?;
+            work.numeric(mul(weight, native_metadata_frequency(node)?))?,
+        ))?;
         previous_name = Some(name);
-        model_work = add(model_work, 1)?;
+        model_work = work.numeric(add(model_work, 1))?;
+        work.library_work(work.numeric(add(original, model_work))?)?;
         work.step()?;
     }
     maximum_weight = maximum_weight.max(group_weight);
     maximum_native_weight = maximum_native_weight.max(native_weight);
-    let one_comparison = add(mul(source_retained_bytes, maximum_weight)?, candidates)?;
-    let native_comparisons = add(
-        mul(source_retained_bytes, maximum_native_weight)?,
+    let one_comparison = work.numeric(add(
+        work.numeric(mul(source_retained_bytes, maximum_weight))?,
+        candidates,
+    ))?;
+    let native_comparisons = work.numeric(add(
+        work.numeric(mul(source_retained_bytes, maximum_native_weight))?,
         native_candidates,
-    )?;
+    ))?;
     // Three Constant type passes: one before arrays, two in try_new. This
     // already-executed numerical grouping work is counted exactly once, and
     // its facts are reused by the final envelope without another grouping walk.
+    let total = work.numeric(add(
+        work.numeric(add(original, work.numeric(mul(3, one_comparison))?))?,
+        model_work,
+    ))?;
+    work.library_work(total)?;
     Ok(SourceMetadataWork {
         source_retained_bytes,
-        total: add(add(original, mul(3, one_comparison)?)?, model_work)?,
+        total,
         #[cfg(test)]
         one_comparison,
         native_comparisons,
@@ -296,26 +337,26 @@ pub(super) fn preflight(
     structures: &ReaderAllocationRequests,
     diagnostics: &ReaderDiagnosticRequests,
     source: &SourceMetadataWork,
-    work: &mut CompileCheckpoints<'_>,
+    work: &mut impl ResourceWork,
 ) -> Result<usize, FlatPoolResourceError> {
     let source_retained_bytes = source.source_retained_bytes;
     // The shared recursive envelope covers full descendant type/NULL/value
     // validation, including unused storage, whole UTF8 fallback and repeated
     // view references. Reader build, final two force_validate projections and
     // pool.validate_full are four applications of that same sole author.
-    let mut total = mul(4, extent(pool.library_validation_work_upper_bound)?)?;
-    total = add(
+    let mut total = work.numeric(mul(4, extent(pool.library_validation_work_upper_bound)?))?;
+    total = work.numeric(add(
         total,
-        add(
-            add(input.body.len(), payload.repair_capacity)?,
+        work.numeric(add(
+            work.numeric(add(input.body.len(), payload.repair_capacity))?,
             payload.empty_offsets_capacity,
-        )?,
-    )?;
+        ))?,
+    ))?;
     let mut source_projections = 0;
     let mut headers = 0;
     let mut metadata_pairs = 0;
     for node in input.nodes {
-        let projections = add(2, node.list_map_ancestors)?;
+        let projections = work.numeric(add(2, node.list_map_ancestors))?;
         // datatype_display::format_metadata collects and sorts existing keys.
         // K² comparisons bounds the locked sort even for adversarial order;
         // every comparison can inspect <= the longest authored key.
@@ -324,48 +365,64 @@ pub(super) fn preflight(
         work.flush()?;
         for key in node.field.metadata().keys() {
             longest_key = longest_key.max(key.len());
+            work.library_work(total)?;
             work.step()?;
         }
         work.flush()?;
-        metadata_pairs = add(
+        metadata_pairs = work.numeric(add(
             metadata_pairs,
-            mul(mul(entries, entries)?, add(longest_key, 1)?)?,
-        )?;
+            work.numeric(mul(
+                work.numeric(mul(entries, entries))?,
+                work.numeric(add(longest_key, 1))?,
+            ))?,
+        ))?;
         // Extra list/map ancestor to_data validation: actual subtree type
         // correspondence and this node's own row/buffer-value inspection.
-        let local = add(
-            add(
-                add(mul(node.subtree_nodes, node.subtree_nodes)?, node.rows)?,
+        let local = work.numeric(add(
+            work.numeric(add(
+                work.numeric(add(
+                    work.numeric(mul(node.subtree_nodes, node.subtree_nodes))?,
+                    node.rows,
+                ))?,
                 node.buffer_count,
-            )?,
-            add(node.described_buffer_bytes, node.view_validation_bytes)?,
-        )?;
+            ))?,
+            work.numeric(add(node.described_buffer_bytes, node.view_validation_bytes))?,
+        ))?;
         let local = if matches!(node.field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
-            add(local, node.described_buffer_bytes)? // full values fallback <= descriptors
+            work.numeric(add(local, node.described_buffer_bytes))? // full values fallback <= descriptors
         } else {
             local
         };
-        total = add(total, mul(node.list_map_ancestors, local)?)?;
-        source_projections = add(source_projections, mul(projections, node.subtree_nodes)?)?;
+        total = work.numeric(add(
+            total,
+            work.numeric(mul(node.list_map_ancestors, local))?,
+        ))?;
+        source_projections = work.numeric(add(
+            source_projections,
+            work.numeric(mul(projections, node.subtree_nodes))?,
+        ))?;
         // Each projection/canonical reconstruction clones and eventually drops
         // only header owners, not payload bytes. Initial reader slicing and
         // alignment also visit these exact local descriptor/header counts.
-        let local_headers = add(
-            mul(add(mul(2, projections)?, 3)?, node.buffer_count)?,
-            add(
-                mul(projections, node.variadic_buffers)?,
-                mul(mul(2, projections)?, node.children)?,
-            )?,
-        )?;
-        headers = add(headers, local_headers)?;
+        let local_headers = work.numeric(add(
+            work.numeric(mul(
+                work.numeric(add(work.numeric(mul(2, projections))?, 3))?,
+                node.buffer_count,
+            ))?,
+            work.numeric(add(
+                work.numeric(mul(projections, node.variadic_buffers))?,
+                work.numeric(mul(work.numeric(mul(2, projections))?, node.children))?,
+            ))?,
+        ))?;
+        headers = work.numeric(add(headers, local_headers))?;
         // The post-array constant scan revisits raw headers/buffers plus every
         // view row. RequiredFrame semantic visits are bounded by the original
         // logical-elements author, not the root's row count alone.
-        total = add(
+        total = work.numeric(add(
             total,
-            add(
-                add(node.buffer_count, node.described_buffer_bytes)?,
-                add(
+            work.numeric(add(
+                work.numeric(add(node.buffer_count, node.described_buffer_bytes))?,
+                work.numeric(add(
                     1,
                     if matches!(
                         node.field.data_type(),
@@ -375,18 +432,22 @@ pub(super) fn preflight(
                     } else {
                         0
                     },
-                )?,
-            )?,
-        )?;
+                ))?,
+            ))?,
+        ))?;
         if matches!(
             node.field.data_type(),
             DataType::Utf8View | DataType::BinaryView
         ) {
-            total = add(
+            total = work.numeric(add(
                 total,
-                mul(mul(add(4, node.list_map_ancestors)?, 4)?, node.rows)?,
-            )?;
+                work.numeric(mul(
+                    work.numeric(mul(work.numeric(add(4, node.list_map_ancestors))?, 4))?,
+                    node.rows,
+                ))?,
+            ))?;
         }
+        work.library_work(total)?;
         work.step()?;
     }
     // Native recursive comparisons inspect only actual nested child-type
@@ -396,68 +457,79 @@ pub(super) fn preflight(
     // Arc equality short-circuits those identical Field/Fields owners. Arrays
     // in this reader are built solely from that source, without reauthoring
     // Fields; supplied FVT is used only by the three Constant comparisons.
-    total = add(total, source.native_comparisons)?;
+    total = work.numeric(add(total, source.native_comparisons))?;
     // Formatting visits
     // complete descendant types once per candidate and ancestor wrapper;
     // metadata sorting has its own key-pair term, independent of type width.
-    total = add(total, source.total)?;
-    let diagnostic_type_visits = mul(
-        mul(input.nodes.len(), input.nodes.len())?,
-        add(input.geometry.maximum_depth, 4)?,
-    )?;
-    total = add(
+    total = work.numeric(add(total, source.total))?;
+    let diagnostic_type_visits = work.numeric(mul(
+        work.numeric(mul(input.nodes.len(), input.nodes.len()))?,
+        work.numeric(add(input.geometry.maximum_depth, 4))?,
+    ))?;
+    total = work.numeric(add(
         total,
-        mul(
+        work.numeric(mul(
             source_retained_bytes,
-            add(source_projections, diagnostic_type_visits)?,
-        )?,
-    )?;
-    let render_passes = mul(
-        mul(4, input.nodes.len())?,
-        add(input.geometry.maximum_depth, 4)?,
-    )?;
+            work.numeric(add(source_projections, diagnostic_type_visits))?,
+        ))?,
+    ))?;
+    let render_passes = work.numeric(mul(
+        work.numeric(mul(4, input.nodes.len()))?,
+        work.numeric(add(input.geometry.maximum_depth, 4))?,
+    ))?;
     // Four format arguments per failing candidate plus each ancestor wrapper.
     // The factor six also covers Debug escaping of the visited source bytes.
-    let sorted_metadata = mul(mul(6, render_passes)?, metadata_pairs)?;
-    total = add(total, sorted_metadata)?;
-    total = add(total, mul(2, headers)?)?;
-    total = add(
+    let sorted_metadata =
+        work.numeric(mul(work.numeric(mul(6, render_passes))?, metadata_pairs))?;
+    total = work.numeric(add(total, sorted_metadata))?;
+    total = work.numeric(add(total, work.numeric(mul(2, headers))?))?;
+    total = work.numeric(add(
         total,
-        mul(
+        work.numeric(mul(
             4,
-            add(
+            work.numeric(add(
                 extent(pool.logical_elements_upper_bound)?,
                 input.nodes.len(),
-            )?,
-        )?,
-    )?;
-    let requests = add(
-        add(
+            ))?,
+        ))?,
+    ))?;
+    let requests = work.numeric(add(
+        work.numeric(add(
             structures.structural_request_bytes_upper_bound,
             diagnostics.request_bytes_upper_bound,
-        )?,
+        ))?,
         input.geometry_scratch_request_bytes,
-    )?;
-    let payload_count = add(
-        add(
+    ))?;
+    let payload_count = work.numeric(add(
+        work.numeric(add(
             usize::from(payload.body_capacity != 0),
             payload.repair_count,
-        )?,
+        ))?,
         payload.empty_offsets_count,
-    )?;
-    let request_count = add(
-        add(
-            add(structures.allocation_requests_upper_bound, payload_count)?,
+    ))?;
+    let request_count = work.numeric(add(
+        work.numeric(add(
+            work.numeric(add(
+                structures.allocation_requests_upper_bound,
+                payload_count,
+            ))?,
             diagnostics.allocation_requests_upper_bound,
-        )?,
+        ))?,
         input.geometry_scratch_request_count,
-    )?;
+    ))?;
     // Allocation initialization, text/growing-container moves, and teardown.
-    total = add(total, add(mul(4, requests)?, request_count)?)?;
-    let owners = add(add(1, payload.repair_count)?, payload.empty_offsets_count)?;
+    total = work.numeric(add(
+        total,
+        work.numeric(add(work.numeric(mul(4, requests))?, request_count))?,
+    ))?;
+    let owners = work.numeric(add(
+        work.numeric(add(1, payload.repair_count))?,
+        payload.empty_offsets_count,
+    ))?;
     if owners > 3 {
-        total = add(total, mul(owners, owners)?)?;
+        total = work.numeric(add(total, work.numeric(mul(owners, owners))?))?;
     }
+    work.library_work(total)?;
     work.step()?;
     Ok(total)
 }

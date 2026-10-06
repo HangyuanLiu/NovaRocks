@@ -19,8 +19,9 @@
 //! The numerical request/work projection precedes the public safe reader;
 //! preparation hosts retain grant, allocation-origin and free ownership.
 
+use crate::ipc_flat_stream_v2::progress::{Admission, IpcReaderProgressFacts};
 use crate::{
-    ipc_flat_stream_v2::{FlatPoolResourceError, metadata, require},
+    ipc_flat_stream_v2::{FlatPoolResourceError, require},
     ipc_recursive_batch_v2::{CheckedRecursiveBatch, preflight_verified_recursive_record_batch},
     ipc_schema_v2::{
         IpcSchemaProjectionLimits, verified_message_observed, verify_single_field_schema_with_work,
@@ -65,6 +66,7 @@ pub struct RecursiveConstantStream<'a, 'f> {
     batch: arrow::ipc::RecordBatch<'a>,
     version: arrow::ipc::MetadataVersion,
     checked: CheckedRecursiveBatch<'f>,
+    progress: Option<IpcReaderProgressFacts>,
 }
 
 struct PreparedRecursiveParts<'v> {
@@ -72,14 +74,16 @@ struct PreparedRecursiveParts<'v> {
     value_type: Cow<'v, FunctionValueType>,
     policy: ConstantPolicy,
     facts: RecursiveReaderResourceFacts,
+    progress: Option<IpcReaderProgressFacts>,
 }
 /// Owns the original checked stream and its already admitted geometry scratch.
 /// No caller can construct a receipt detached from that immutable snapshot.
-pub(crate) struct PreparedRecursiveReader<'a, 'f, 'v> {
+pub(crate) struct PreparedRecursiveReader<'a, 'f, 'v, 'c> {
+    original_control: Option<&'c dyn PureCompileControl>,
     stream: RecursiveConstantStream<'a, 'f>,
     parts: PreparedRecursiveParts<'v>,
 }
-impl PreparedRecursiveReader<'_, '_, '_> {
+impl PreparedRecursiveReader<'_, '_, '_, '_> {
     pub(crate) fn facts(&self) -> &RecursiveReaderResourceFacts {
         &self.parts.facts
     }
@@ -89,6 +93,33 @@ impl PreparedRecursiveReader<'_, '_, '_> {
     pub(crate) fn geometry_scratch_request_count(&self) -> usize {
         self.stream.checked.scratch_request_count
     }
+    pub(crate) fn materialize_in(
+        self,
+        admit: &mut crate::ipc_flat_stream_v2::progress::ReaderAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<ConstantPool, RecursiveReaderError> {
+        let Some(original) = self.original_control else {
+            return Err(FlatPoolResourceError::from(TypeCodecError::InvalidShape(
+                "recursive reader requires caller-owned preparation",
+            ))
+            .into());
+        };
+        if !std::ptr::addr_eq(original, work.control()) {
+            return Err(FlatPoolResourceError::from(TypeCodecError::InvalidShape(
+                "recursive reader belongs to another original control",
+            ))
+            .into());
+        }
+        let mut admission = Admission::new(self.parts.facts.source_retained_bytes, admit);
+        admission.seed(self.parts.progress.ok_or_else(|| {
+            FlatPoolResourceError::from(TypeCodecError::InvalidShape(
+                "recursive reader is missing caller-owned facts",
+            ))
+        })?)?;
+        self.stream
+            .materialize_parts_core(self.parts, Some(&mut admission), work)
+    }
+
     pub(crate) fn materialize(
         self,
         control: &dyn PureCompileControl,
@@ -130,6 +161,32 @@ pub fn preflight_recursive_constant_stream<'a, 'f>(
     result
 }
 
+pub(crate) fn preflight_recursive_constant_stream_in<'a, 'f>(
+    input: &'a [u8],
+    expected: &'f Field,
+    limits: RecursiveStreamProjectionLimits,
+    verifier: &VerifierOptions,
+    source_retained_bytes: usize,
+    admit: &mut crate::ipc_flat_stream_v2::progress::ReaderAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<RecursiveConstantStream<'a, 'f>, TypeCodecError> {
+    if input.len() > source_retained_bytes {
+        return Err(TypeCodecError::InvalidShape(
+            "recursive stream source retention is below visible input",
+        ));
+    }
+    let mut admission = Admission::new(source_retained_bytes, admit);
+    admission.check()?;
+    preflight_core(
+        input,
+        expected,
+        limits,
+        verifier,
+        Some(&mut admission),
+        work,
+    )
+}
+
 fn preflight<'a, 'f>(
     input: &'a [u8],
     expected: &'f Field,
@@ -137,46 +194,108 @@ fn preflight<'a, 'f>(
     verifier: &VerifierOptions,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<RecursiveConstantStream<'a, 'f>, TypeCodecError> {
-    require(
-        input.len() <= limits.max_input_bytes,
-        "recursive IPC input envelope exceeded",
+    preflight_core(input, expected, limits, verifier, None, work)
+}
+fn preflight_core<'a, 'f>(
+    input: &'a [u8],
+    expected: &'f Field,
+    limits: RecursiveStreamProjectionLimits,
+    verifier: &VerifierOptions,
+    mut admission: Option<&mut Admission<'_, '_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<RecursiveConstantStream<'a, 'f>, TypeCodecError> {
+    if admission.is_some() {
+        if input.len() > limits.max_input_bytes {
+            return Err(novarocks_type_contract::CompileControlError::ResourceExhausted.into());
+        }
+    } else {
+        require(
+            input.len() <= limits.max_input_bytes,
+            "recursive IPC input envelope exceeded",
+            work,
+        )?;
+    }
+    let (schema, schema_end) = crate::ipc_flat_stream_v2::metadata_in(
+        input,
+        0,
+        limits.schema.max_flatbuffer_bytes,
+        Some(verifier.max_apparent_size),
+        admission.as_deref_mut(),
         work,
     )?;
-    let (schema, schema_end) = metadata(input, 0, limits.schema.max_flatbuffer_bytes, work)?;
-    verify_single_field_schema_with_work(schema, expected, limits.schema, verifier, work)?;
-    let (batch_metadata, body_start) = metadata(
+    if admission.is_some() {
+        crate::ipc_flat_stream_v2::framing_step(&mut admission, work)?;
+    }
+    if let Some(a) = admission.as_deref_mut() {
+        let source = a.source();
+        let mut capture = |f: &crate::ipc_schema_v2::SchemaWriterRequestFacts| {
+            a.requests(4, f.request_bytes, f.request_count)?;
+            a.schema_work(f.work_upper_bound)
+        };
+        crate::ipc_schema_v2::verify_single_field_schema_in(
+            schema,
+            expected,
+            limits.schema,
+            verifier,
+            source,
+            usize::MAX,
+            &mut capture,
+            work,
+        )?;
+    } else {
+        verify_single_field_schema_with_work(schema, expected, limits.schema, verifier, work)?;
+    }
+    let (batch_metadata, body_start) = crate::ipc_flat_stream_v2::metadata_in(
         input,
         schema_end,
         limits.batch.flat.max_metadata_bytes,
+        Some(verifier.max_apparent_size),
+        admission.as_deref_mut(),
         work,
     )?;
     let message = verified_message_observed(batch_metadata, verifier, work)?;
-    require(
+    crate::ipc_flat_stream_v2::framing_require(
         message.header_type() == arrow::ipc::MessageHeader::RecordBatch,
         "recursive IPC schema must precede exactly one RecordBatch",
+        admission.as_deref_mut(),
         work,
     )?;
     let body_length = nonnegative_length(message.bodyLength()).map_err(|_| {
         TypeCodecError::InvalidShape("recursive IPC body length is negative or unrepresentable")
     })?;
-    require(
+    if admission.is_some() && body_length > limits.batch.flat.max_body_bytes {
+        return Err(novarocks_type_contract::CompileControlError::ResourceExhausted.into());
+    }
+    crate::ipc_flat_stream_v2::framing_require(
         body_length <= limits.batch.flat.max_body_bytes && body_length % 8 == 0,
         "recursive IPC body framing exceeds its aligned envelope",
+        admission.as_deref_mut(),
         work,
     )?;
     let range = checked_range(input.len(), body_start, body_length)
         .map_err(|_| TypeCodecError::InvalidShape("recursive IPC body is truncated"))?;
-    work.step()?;
+    crate::ipc_flat_stream_v2::framing_step(&mut admission, work)?;
     let body_end = range.end;
     let body = &input[range];
-    let checked =
-        preflight_verified_recursive_record_batch(message, body, expected, limits.batch, work)?;
+    let checked = if let Some(a) = admission.as_deref_mut() {
+        crate::ipc_recursive_batch_v2::preflight_verified_recursive_record_batch_in(
+            message,
+            body,
+            expected,
+            limits.batch,
+            a,
+            work,
+        )?
+    } else {
+        preflight_verified_recursive_record_batch(message, body, expected, limits.batch, work)?
+    };
     let end = continuation_prefix(input, body_end);
-    work.step()?;
+    crate::ipc_flat_stream_v2::framing_step(&mut admission, work)?;
     let end = end.map_err(|_| TypeCodecError::InvalidShape("recursive IPC EOS is missing"))?;
-    require(
+    crate::ipc_flat_stream_v2::framing_require(
         matches!(end, ContinuationPrefix::End { next_offset } if next_offset == input.len()),
         "recursive IPC EOS has extra messages or trailing data",
+        admission.as_deref_mut(),
         work,
     )?;
     let batch = message
@@ -191,6 +310,7 @@ fn preflight<'a, 'f>(
         batch,
         version: message.version(),
         checked,
+        progress: admission.as_deref().map(Admission::facts),
     })
 }
 
@@ -328,7 +448,7 @@ impl<'a, 'f> RecursiveConstantStream<'a, 'f> {
         policy: ConstantPolicy,
         limits: RecursiveReaderProjectionLimits,
         control: &dyn PureCompileControl,
-    ) -> Result<PreparedRecursiveReader<'a, 'f, 'v>, RecursiveReaderError> {
+    ) -> Result<PreparedRecursiveReader<'a, 'f, 'v, 'static>, RecursiveReaderError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
         let parts = self.prepare_parts(
             field,
@@ -340,6 +460,42 @@ impl<'a, 'f> RecursiveConstantStream<'a, 'f> {
         );
         let parts = finish_prepared_reader(work, parts)?;
         Ok(PreparedRecursiveReader {
+            original_control: None,
+            stream: self,
+            parts,
+        })
+    }
+
+    pub(crate) fn prepare_pool_borrowed_in<'v, 'c>(
+        self,
+        field: Arc<Field>,
+        value_type: &'v FunctionValueType,
+        source_retained_bytes: usize,
+        policy: ConstantPolicy,
+        limits: RecursiveReaderProjectionLimits,
+        admit: &mut crate::ipc_flat_stream_v2::progress::ReaderAdmit<'_>,
+        work: &mut CompileCheckpoints<'c>,
+    ) -> Result<PreparedRecursiveReader<'a, 'f, 'v, 'c>, RecursiveReaderError> {
+        let mut admission = Admission::new(source_retained_bytes, admit);
+        admission.limits(
+            limits.max_new_allocation_request_bytes,
+            limits.max_coexisting_source_and_request_bytes,
+            limits.max_cumulative_library_work,
+        )?;
+        if let Some(prefix) = self.progress {
+            admission.seed_prefix(prefix)?;
+        }
+        let parts = self.prepare_parts_core(
+            field,
+            Cow::Borrowed(value_type),
+            source_retained_bytes,
+            policy,
+            limits,
+            Some(&mut admission),
+            work,
+        )?;
+        Ok(PreparedRecursiveReader {
+            original_control: Some(work.control()),
             stream: self,
             parts,
         })
@@ -354,24 +510,123 @@ impl<'a, 'f> RecursiveConstantStream<'a, 'f> {
         limits: RecursiveReaderProjectionLimits,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<PreparedRecursiveParts<'v>, RecursiveReaderError> {
-        require(
-            std::ptr::eq(self.field, field.as_ref()),
-            "recursive reader requires the original source Field Arc",
-            work,
-        )
-        .map_err(FlatPoolResourceError::from)?;
-        let facts = self.reader_resources(
-            value_type.as_ref(),
+        self.prepare_parts_core(
+            field,
+            value_type,
             source_retained_bytes,
             policy,
             limits,
+            None,
             work,
-        )?;
+        )
+    }
+    fn prepare_parts_core<'v>(
+        &self,
+        field: Arc<Field>,
+        value_type: Cow<'v, FunctionValueType>,
+        source_retained_bytes: usize,
+        policy: ConstantPolicy,
+        limits: RecursiveReaderProjectionLimits,
+        mut admission: Option<&mut Admission<'_, '_>>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<PreparedRecursiveParts<'v>, RecursiveReaderError> {
+        if admission.is_some() {
+            if !std::ptr::eq(self.field, field.as_ref()) {
+                return Err(FlatPoolResourceError::from(TypeCodecError::InvalidShape(
+                    "recursive reader requires the original source Field Arc",
+                ))
+                .into());
+            }
+            if let Some(a) = admission.as_deref_mut() {
+                let scratch = novarocks_constant_contract::ConstantPool::type_validation_scratch_work_upper_bound();
+                let header = reader_allocations::initial_header(&field)?;
+                a.requests(
+                    2,
+                    header.structural_request_bytes_upper_bound,
+                    header.allocation_requests_upper_bound,
+                )?;
+                let body_len = self.body.len();
+                let rounded = a.numeric(reader_resources::capacity(body_len))?;
+                a.requests(1, rounded, usize::from(rounded != 0))?;
+                a.reader_work(
+                    scratch
+                        .checked_mul(3)
+                        .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?,
+                )?;
+                a.clone_work(
+                    crate::physical_type_v2::value_type_clone_preflight_work_upper_bound(),
+                )?;
+                crate::physical_type_v2::preflight_value_type_clone_admitted::<
+                    FlatPoolResourceError,
+                >(
+                    value_type.as_ref(),
+                    &mut |f, _| {
+                        a.requests(
+                            5,
+                            f.allocation_request_bytes_upper_bound(),
+                            f.allocation_requests_upper_bound(),
+                        )?;
+                        a.clone_work(f.work_upper_bound())?;
+                        Ok(())
+                    },
+                    work,
+                )?;
+            }
+            work.step()?;
+        } else {
+            require(
+                std::ptr::eq(self.field, field.as_ref()),
+                "recursive reader requires the original source Field Arc",
+                work,
+            )
+            .map_err(FlatPoolResourceError::from)?;
+        }
+        let mut facts = if let Some(a) = admission.as_deref_mut() {
+            if self.input.len() > source_retained_bytes {
+                return Err(FlatPoolResourceError::from(TypeCodecError::InvalidShape(
+                    "recursive reader source retention below visible input",
+                ))
+                .into());
+            }
+            reader_resources::preflight_in(
+                &self.reader_input(),
+                value_type.as_ref(),
+                source_retained_bytes,
+                policy,
+                limits,
+                a,
+                work,
+            )?
+        } else {
+            self.reader_resources(
+                value_type.as_ref(),
+                source_retained_bytes,
+                policy,
+                limits,
+                work,
+            )?
+        };
+        let progress = admission.as_deref().map(Admission::facts);
+        if let Some(p) = progress {
+            facts.new_allocation_request_bytes_upper_bound =
+                p.new_allocation_request_bytes_upper_bound;
+            facts.allocation_request_count_upper_bound = p.allocation_request_count_upper_bound;
+            facts.coexisting_source_and_request_bytes_upper_bound = source_retained_bytes
+                .checked_add(p.new_allocation_request_bytes_upper_bound)
+                .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
+            facts.cumulative_library_work_upper_bound = p.cumulative_library_work_upper_bound;
+            facts.structural_request_bytes_upper_bound = p
+                .new_allocation_request_bytes_upper_bound
+                .checked_sub(facts.payload_request_bytes_upper_bound)
+                .and_then(|n| n.checked_sub(facts.diagnostic_request_bytes_upper_bound))
+                .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
+        }
         Ok(PreparedRecursiveParts {
             field,
             value_type,
             policy,
             facts,
+            progress,
         })
     }
 
@@ -380,16 +635,31 @@ impl<'a, 'f> RecursiveConstantStream<'a, 'f> {
         parts: PreparedRecursiveParts<'_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<ConstantPool, RecursiveReaderError> {
+        self.materialize_parts_core(parts, None, work)
+    }
+    fn materialize_parts_core(
+        &self,
+        parts: PreparedRecursiveParts<'_>,
+        admission: Option<&mut Admission<'_, '_>>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<ConstantPool, RecursiveReaderError> {
         let PreparedRecursiveParts {
             field,
             value_type,
             policy,
             facts: _,
+            progress: _,
         } = parts;
         work.flush()?;
         let schema = Arc::new(Schema::new([Arc::clone(&field)]));
+        if admission.is_some() {
+            work.step()?;
+        }
         work.flush()?;
         let body = Buffer::from_slice_ref(self.body);
+        if admission.is_some() {
+            work.step()?;
+        }
         work.flush()?;
         let decoded = read_record_batch(
             &body,
@@ -402,17 +672,42 @@ impl<'a, 'f> RecursiveConstantStream<'a, 'f> {
         .map_err(|error| RecursiveReaderError::Arrow(error.to_string()));
         work.flush()?;
         let decoded = decoded?;
+        if admission.is_some() {
+            work.step()?;
+            work.flush()?;
+        }
         let data = decoded.column(0).to_data();
+        if admission.is_some() {
+            work.step()?;
+        }
         work.flush()?;
-        let pool = ConstantPool::try_new(
-            field,
-            value_type.into_owned(),
-            data,
-            policy,
-            CompilePhase::Decode,
-            work.control(),
-        )
-        .map_err(FlatPoolResourceError::from)?;
+        let value_type = if admission.is_some() {
+            crate::physical_type_v2::clone_value_type_observed(value_type.as_ref(), work)
+                .map_err(FlatPoolResourceError::from)?
+        } else {
+            value_type.into_owned()
+        };
+        let pool = if let Some(a) = admission {
+            let mut capture = |f: &novarocks_constant_contract::ConstantOwnerResourceFacts| {
+                a.constant(
+                    f.allocation_request_bytes_upper_bound,
+                    f.allocation_requests_upper_bound,
+                    f.cumulative_work_upper_bound,
+                )
+            };
+            ConstantPool::try_new_in(field, value_type, data, policy, &mut capture, work)
+                .map_err(FlatPoolResourceError::from)?
+        } else {
+            ConstantPool::try_new(
+                field,
+                value_type,
+                data,
+                policy,
+                CompilePhase::Decode,
+                work.control(),
+            )
+            .map_err(FlatPoolResourceError::from)?
+        };
         Ok(pool)
     }
 }

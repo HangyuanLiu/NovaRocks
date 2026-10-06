@@ -31,7 +31,9 @@ use crate::{
 };
 use flatbuffers::FlatBufferBuilder;
 use novarocks_constant_contract::ConstantPool;
-use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
+use novarocks_type_contract::{
+    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+};
 
 mod body;
 mod geometry;
@@ -54,24 +56,46 @@ pub struct RecursivePoolWriteFacts {
     pub view_fields: usize,
 }
 
-struct Prepared {
+struct Prepared<'pool> {
     geometry: geometry::Geometry,
     facts: RecursivePoolWriteFacts,
+    schema: Option<ipc_schema_v2::PreparedSchemaWriter<'pool>>,
 }
 
 /// One immutable checked pool paired with the admitted geometry and limits.
 /// Consumption emits that snapshot without repeating resource preparation.
-pub(crate) struct PreparedRecursivePoolWriter<'pool> {
+pub(crate) struct PreparedRecursivePoolWriter<'pool, 'control> {
     pool: &'pool ConstantPool,
     limits: RecursivePoolWriteLimits,
-    prepared: Prepared,
+    prepared: Prepared<'pool>,
+    control: Option<&'control dyn PureCompileControl>,
 }
-impl PreparedRecursivePoolWriter<'_> {
+impl PreparedRecursivePoolWriter<'_, '_> {
     pub(crate) const fn facts(&self) -> &RecursivePoolWriteFacts {
         &self.prepared.facts
     }
 
+    pub(crate) fn emit_in(
+        self,
+        admit: &mut dyn FnMut(&RecursivePoolWriteFacts) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Vec<u8>, TypeCodecError> {
+        if !self
+            .control
+            .is_some_and(|c| std::ptr::addr_eq(c, work.control()))
+        {
+            return Err(shape("recursive writer belongs to another control"));
+        }
+        admit(&self.prepared.facts)?;
+        emit_prepared_core(self.pool, &self.prepared, self.limits, Some(admit), work)
+    }
     pub(crate) fn emit(self, control: &dyn PureCompileControl) -> Result<Vec<u8>, TypeCodecError> {
+        if self
+            .control
+            .is_some_and(|original| !std::ptr::addr_eq(original, control))
+        {
+            return Err(shape("recursive writer belongs to another control"));
+        }
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
         let result = emit_prepared(self.pool, &self.prepared, self.limits, &mut work);
         finish(work, result)
@@ -108,69 +132,20 @@ fn gate_requests(
     Ok(coexist)
 }
 
-fn prepare(
-    pool: &ConstantPool,
+fn prepare<'pool>(
+    pool: &'pool ConstantPool,
     source: usize,
     limits: RecursivePoolWriteLimits,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Prepared, TypeCodecError> {
-    if !LOCKED_FAMILY
-        || !LOCKED_TOOLCHAIN
-        || arrow::ARROW_VERSION != "58.2.0"
-        || !cfg!(target_endian = "little")
-    {
-        return Err(shape(
-            "recursive writer source model does not match this target",
-        ));
-    }
-    if source
-        < usize::try_from(pool.resource_facts().retained_buffer_capacity_bytes)
-            .map_err(|_| shape("source retention is not representable"))?
-    {
-        return Err(shape(
-            "recursive writer source retention omits checked backing",
-        ));
-    }
-    work.step()?;
-    // This O(1) source-owner bound precedes its first type-walker allocation.
-    let prefix = schema_writer_prefix_resources(
-        pool.field(),
-        source,
-        limits.flat.schema,
-        limits.flat.max_cumulative_library_work,
-        work,
-    )?;
-    gate_requests(
-        prefix.request_bytes,
-        source,
-        prefix.work_upper_bound,
-        limits.flat,
-    )?;
-    work.step()?;
-    let geometry = geometry::inspect(pool.data(), limits, work)?;
-    let schema_resources =
-        preflight_schema_writer_resources(pool.field(), source, limits.flat.schema, prefix, work)?;
-    let schema = &schema_resources.schema;
-    let batch_backing = ipc_flat_pool_v2::header::backing_counts(
-        geometry.nodes,
-        geometry.buffers,
-        geometry.view_fields,
-    )?;
-    let schema_capacity = ipc_flat_pool_v2::metadata_capacity(schema.backing)?;
-    let batch_capacity = ipc_flat_pool_v2::metadata_capacity(batch_backing)?;
-    let stream_capacity = add(
-        add(add(schema_capacity, batch_capacity)?, geometry.body_bytes)?,
-        24,
-    )?;
-    if stream_capacity > limits.flat.max_encoded_stream_bytes {
-        return Err(shape("recursive writer stream envelope exceeded"));
-    }
-    std::alloc::Layout::array::<u8>(stream_capacity)
-        .map_err(|_| shape("recursive writer stream request is not representable"))?;
-    work.step()?;
-    let batch_requests = batch_and_stream_requests(batch_backing, stream_capacity, work)?;
-    let request_bytes = add(schema_resources.request_bytes, batch_requests.bytes)?;
-    let request_count = add(schema_resources.request_count, batch_requests.count)?;
+) -> Result<Prepared<'pool>, TypeCodecError> {
+    prepare_core(pool, source, limits, None, work)
+}
+
+fn own_work(
+    geometry: &geometry::Geometry,
+    request_bytes: usize,
+    request_count: usize,
+) -> Result<usize, TypeCodecError> {
     // There are at most five complete borrowed data walks: geometry, buffers,
     // nodes, optional variadic counts, and final body. Per walk a node performs
     // four node checks, one edge check, and at most two flat-leaf checks plus
@@ -194,9 +169,276 @@ fn prepare(
         add(add(visits, profile)?, add(summary, header_pushes)?)?,
         add(body_checks, storage)?,
     )?;
-    let cumulative_work = add(schema_resources.work_upper_bound, own_work)?;
-    let coexist = gate_requests(request_bytes, source, cumulative_work, limits.flat)?;
+    Ok(own_work)
+}
+
+type PoolAdmit<'callback> =
+    dyn FnMut(&RecursivePoolWriteFacts) -> Result<(), CompileControlError> + 'callback;
+
+fn prepare_core<'pool>(
+    pool: &'pool ConstantPool,
+    source: usize,
+    limits: RecursivePoolWriteLimits,
+    mut parent: Option<&mut PoolAdmit<'_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Prepared<'pool>, TypeCodecError> {
+    let policy = ipc_schema_v2::owner_admission::Policy(parent.is_some());
+    let add = |a, b| policy.numeric(add(a, b));
+    let mut growing = RecursivePoolWriteFacts {
+        flat: if parent.is_some() {
+            ipc_flat_pool_v2::progress::Admission::initial(source, pool.data().len(), limits.flat)?
+        } else {
+            FlatPoolWriteFacts {
+                source_retained_bytes: source,
+                rows: pool.data().len(),
+                buffer_descriptors: 0,
+                variadic_buffers: 0,
+                body_bytes: 0,
+                schema_backing_bytes_upper_bound: 0,
+                batch_backing_bytes_upper_bound: 0,
+                encoded_stream_bytes_upper_bound: 0,
+                new_allocation_request_bytes_upper_bound: 0,
+                allocation_request_count_upper_bound: 0,
+                coexisting_source_and_request_bytes_upper_bound: source,
+                cumulative_library_work_upper_bound: 0,
+            }
+        },
+        field_nodes: 0,
+        total_rows: 0,
+        view_fields: 0,
+    };
+    if parent.is_some() {
+        growing.field_nodes = 1;
+        growing.total_rows = pool.data().len();
+        publish(&mut parent, &growing, limits)?;
+        merge_schema(
+            &mut growing,
+            &ipc_schema_v2::initial_writer_request_facts(pool.field(), source, limits.flat.schema)?,
+        )?;
+        publish(&mut parent, &growing, limits)?;
+    }
+    if !LOCKED_FAMILY
+        || !LOCKED_TOOLCHAIN
+        || arrow::ARROW_VERSION != "58.2.0"
+        || !cfg!(target_endian = "little")
+    {
+        return Err(shape(
+            "recursive writer source model does not match this target",
+        ));
+    }
+    if source
+        < usize::try_from(pool.resource_facts().retained_buffer_capacity_bytes)
+            .map_err(|_| shape("source retention is not representable"))?
+    {
+        return Err(shape(
+            "recursive writer source retention omits checked backing",
+        ));
+    }
     work.step()?;
+    // This O(1) source-owner bound precedes its first type-walker allocation.
+    let prefix = if parent.is_some() {
+        ipc_schema_v2::schema_writer_prefix_resources_in(
+            pool.field(),
+            source,
+            limits.flat.schema,
+            limits.flat.max_cumulative_library_work,
+            &mut |facts| {
+                merge_schema(&mut growing, facts)?;
+                publish(&mut parent, &growing, limits)
+            },
+            work,
+        )?
+    } else {
+        schema_writer_prefix_resources(
+            pool.field(),
+            source,
+            limits.flat.schema,
+            limits.flat.max_cumulative_library_work,
+            work,
+        )?
+    };
+    gate_requests(
+        prefix.request_bytes,
+        source,
+        prefix.work_upper_bound,
+        limits.flat,
+    )?;
+    work.step()?;
+    let schema_prefix = growing.flat;
+    let geometry = if parent.is_some() {
+        geometry::inspect_in(
+            pool.data(),
+            limits,
+            &mut |geometry| {
+                growing.field_nodes = geometry.nodes;
+                growing.total_rows = geometry.total_rows;
+                growing.view_fields = geometry.view_fields;
+                growing.flat.buffer_descriptors = geometry.buffers;
+                growing.flat.variadic_buffers = geometry.variadic;
+                growing.flat.body_bytes = geometry.body_bytes;
+                let batch = policy.numeric(ipc_flat_pool_v2::header::backing_counts(
+                    geometry.nodes,
+                    geometry.buffers,
+                    geometry.view_fields,
+                ))?;
+                let capacity = add(
+                    add(
+                        policy.numeric(ipc_flat_pool_v2::metadata_capacity(batch))?,
+                        geometry.body_bytes,
+                    )?,
+                    24,
+                )?;
+                let req = ipc_flat_pool_v2::allocations::batch_and_stream_requests_core(
+                    batch, capacity, None,
+                )?;
+                growing.flat.new_allocation_request_bytes_upper_bound = growing
+                    .flat
+                    .new_allocation_request_bytes_upper_bound
+                    .max(add(
+                        schema_prefix.new_allocation_request_bytes_upper_bound,
+                        req.bytes,
+                    )?);
+                growing.flat.allocation_request_count_upper_bound =
+                    growing.flat.allocation_request_count_upper_bound.max(add(
+                        schema_prefix.allocation_request_count_upper_bound,
+                        req.count,
+                    )?);
+                growing.flat.coexisting_source_and_request_bytes_upper_bound = add(
+                    source,
+                    growing.flat.new_allocation_request_bytes_upper_bound,
+                )?;
+                growing.flat.encoded_stream_bytes_upper_bound =
+                    growing.flat.encoded_stream_bytes_upper_bound.max(capacity);
+                growing.flat.cumulative_library_work_upper_bound =
+                    growing.flat.cumulative_library_work_upper_bound.max(add(
+                        schema_prefix.cumulative_library_work_upper_bound,
+                        policy.numeric(own_work(
+                            geometry,
+                            add(
+                                schema_prefix.new_allocation_request_bytes_upper_bound,
+                                req.bytes,
+                            )?,
+                            add(
+                                schema_prefix.allocation_request_count_upper_bound,
+                                req.count,
+                            )?,
+                        ))?,
+                    )?);
+                publish(&mut parent, &growing, limits)?;
+                Ok(())
+            },
+            work,
+        )?
+    } else {
+        geometry::inspect(pool.data(), limits, work)?
+    };
+    let schema_token = if parent.is_some() {
+        Some(ipc_schema_v2::prepare_schema_writer_with_prefix_in(
+            pool.field(),
+            source,
+            limits.flat.schema,
+            limits.flat.max_cumulative_library_work,
+            prefix,
+            &mut |facts| {
+                merge_schema(&mut growing, facts)?;
+                publish(&mut parent, &growing, limits)
+            },
+            work,
+        )?)
+    } else {
+        None
+    };
+    let legacy_resources = if schema_token.is_none() {
+        Some(preflight_schema_writer_resources(
+            pool.field(),
+            source,
+            limits.flat.schema,
+            prefix,
+            work,
+        )?)
+    } else {
+        None
+    };
+    let (schema, schema_facts) = if let Some(token) = &schema_token {
+        (token.schema(), token.facts())
+    } else {
+        let resources = legacy_resources.as_ref().expect("legacy schema resources");
+        (
+            resources.schema,
+            ipc_schema_v2::SchemaWriterRequestFacts {
+                request_bytes: resources.request_bytes,
+                request_count: resources.request_count,
+                work_upper_bound: resources.work_upper_bound,
+            },
+        )
+    };
+    let schema_resources = schema_facts;
+    let batch_backing = policy.numeric(ipc_flat_pool_v2::header::backing_counts(
+        geometry.nodes,
+        geometry.buffers,
+        geometry.view_fields,
+    ))?;
+    let schema_capacity = policy.numeric(ipc_flat_pool_v2::metadata_capacity(schema.backing))?;
+    let batch_capacity = policy.numeric(ipc_flat_pool_v2::metadata_capacity(batch_backing))?;
+    let stream_capacity = add(
+        add(add(schema_capacity, batch_capacity)?, geometry.body_bytes)?,
+        24,
+    )?;
+    if stream_capacity > limits.flat.max_encoded_stream_bytes {
+        return Err(if policy.0 {
+            CompileControlError::ResourceExhausted.into()
+        } else {
+            shape("recursive writer stream envelope exceeded")
+        });
+    }
+    policy.numeric(
+        std::alloc::Layout::array::<u8>(stream_capacity)
+            .map_err(|_| shape("recursive writer stream request is not representable")),
+    )?;
+    if parent.is_some() {
+        let req = ipc_flat_pool_v2::allocations::batch_and_stream_requests_core(
+            batch_backing,
+            stream_capacity,
+            None,
+        )?;
+        growing.flat.schema_backing_bytes_upper_bound = schema.backing;
+        growing.flat.batch_backing_bytes_upper_bound = batch_backing;
+        growing.flat.encoded_stream_bytes_upper_bound = stream_capacity;
+        growing.flat.new_allocation_request_bytes_upper_bound =
+            add(schema_resources.request_bytes, req.bytes)?;
+        growing.flat.allocation_request_count_upper_bound =
+            add(schema_resources.request_count, req.count)?;
+        growing.flat.coexisting_source_and_request_bytes_upper_bound = add(
+            source,
+            growing.flat.new_allocation_request_bytes_upper_bound,
+        )?;
+        // The exact same final own-work author below is evaluated purely before
+        // its request counter's first completed callback.
+        growing.flat.cumulative_library_work_upper_bound = add(
+            schema_resources.work_upper_bound,
+            policy.numeric(own_work(
+                &geometry,
+                growing.flat.new_allocation_request_bytes_upper_bound,
+                growing.flat.allocation_request_count_upper_bound,
+            ))?,
+        )?;
+        publish(&mut parent, &growing, limits)?;
+    }
+    work.step()?;
+    let batch_requests = batch_and_stream_requests(batch_backing, stream_capacity, work)?;
+    let request_bytes = add(schema_resources.request_bytes, batch_requests.bytes)?;
+    let request_count = add(schema_resources.request_count, batch_requests.count)?;
+    let own_work = policy.numeric(own_work(&geometry, request_bytes, request_count))?;
+    let cumulative_work = add(schema_resources.work_upper_bound, own_work)?;
+    let coexist = policy.numeric(gate_requests(
+        request_bytes,
+        source,
+        cumulative_work,
+        limits.flat,
+    ))?;
+    if parent.is_none() {
+        work.step()?;
+    }
     let facts = RecursivePoolWriteFacts {
         flat: FlatPoolWriteFacts {
             source_retained_bytes: source,
@@ -216,7 +458,94 @@ fn prepare(
         total_rows: geometry.total_rows,
         view_fields: geometry.view_fields,
     };
-    Ok(Prepared { geometry, facts })
+    let mut facts = facts;
+    if parent.is_some() {
+        facts.flat.new_allocation_request_bytes_upper_bound = facts
+            .flat
+            .new_allocation_request_bytes_upper_bound
+            .max(growing.flat.new_allocation_request_bytes_upper_bound);
+        facts.flat.allocation_request_count_upper_bound = facts
+            .flat
+            .allocation_request_count_upper_bound
+            .max(growing.flat.allocation_request_count_upper_bound);
+        facts.flat.cumulative_library_work_upper_bound = facts
+            .flat
+            .cumulative_library_work_upper_bound
+            .max(growing.flat.cumulative_library_work_upper_bound);
+        facts.flat.coexisting_source_and_request_bytes_upper_bound =
+            add(source, facts.flat.new_allocation_request_bytes_upper_bound)?;
+        publish(&mut parent, &facts, limits)?;
+        work.step()?;
+    }
+    Ok(Prepared {
+        geometry,
+        facts,
+        schema: schema_token,
+    })
+}
+
+fn merge_schema(
+    facts: &mut RecursivePoolWriteFacts,
+    schema: &ipc_schema_v2::SchemaWriterRequestFacts,
+) -> Result<(), CompileControlError> {
+    facts.flat.new_allocation_request_bytes_upper_bound = facts
+        .flat
+        .new_allocation_request_bytes_upper_bound
+        .max(schema.request_bytes);
+    facts.flat.allocation_request_count_upper_bound = facts
+        .flat
+        .allocation_request_count_upper_bound
+        .max(schema.request_count);
+    facts.flat.cumulative_library_work_upper_bound = facts
+        .flat
+        .cumulative_library_work_upper_bound
+        .max(schema.work_upper_bound);
+    facts.flat.coexisting_source_and_request_bytes_upper_bound = add(
+        facts.flat.source_retained_bytes,
+        facts.flat.new_allocation_request_bytes_upper_bound,
+    )
+    .map_err(|_| CompileControlError::ResourceExhausted)?;
+    Ok(())
+}
+fn publish(
+    parent: &mut Option<&mut PoolAdmit<'_>>,
+    facts: &RecursivePoolWriteFacts,
+    limits: RecursivePoolWriteLimits,
+) -> Result<(), CompileControlError> {
+    let f = &facts.flat;
+    let l = limits.flat;
+    if facts.field_nodes > limits.max_field_nodes
+        || facts.total_rows > limits.max_total_rows
+        || f.rows > l.max_rows
+        || f.buffer_descriptors > l.max_buffer_descriptors
+        || f.body_bytes > l.max_body_bytes
+        || f.encoded_stream_bytes_upper_bound > l.max_encoded_stream_bytes
+        || f.new_allocation_request_bytes_upper_bound > l.max_new_allocation_request_bytes
+        || f.coexisting_source_and_request_bytes_upper_bound
+            > l.max_coexisting_source_and_request_bytes
+        || f.cumulative_library_work_upper_bound > l.max_cumulative_library_work
+    {
+        return Err(CompileControlError::ResourceExhausted);
+    }
+    if let Some(parent) = parent.as_deref_mut() {
+        parent(facts)?;
+    }
+    Ok(())
+}
+pub(crate) fn prepare_recursive_pool_write_in<'pool, 'control>(
+    pool: &'pool ConstantPool,
+    source: usize,
+    limits: RecursivePoolWriteLimits,
+    admit: &mut dyn FnMut(&RecursivePoolWriteFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedRecursivePoolWriter<'pool, 'control>, TypeCodecError> {
+    let prepared = prepare_core(pool, source, limits, Some(admit), work)?;
+    Ok(PreparedRecursivePoolWriter {
+        pool,
+        limits,
+        prepared,
+        control: Some(work.control()),
+    })
 }
 
 pub fn preflight_recursive_pool_write(
@@ -236,13 +565,14 @@ pub(crate) fn prepare_recursive_pool_write<'pool>(
     source_retained_bytes: usize,
     limits: RecursivePoolWriteLimits,
     control: &dyn PureCompileControl,
-) -> Result<PreparedRecursivePoolWriter<'pool>, TypeCodecError> {
+) -> Result<PreparedRecursivePoolWriter<'pool, 'static>, TypeCodecError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
     let result = prepare(pool, source_retained_bytes, limits, &mut work).map(|prepared| {
         PreparedRecursivePoolWriter {
             pool,
             limits,
             prepared,
+            control: None,
         }
     });
     finish(work, result)
@@ -264,16 +594,34 @@ pub fn encode_recursive_pool(
 
 fn emit_prepared(
     pool: &ConstantPool,
-    prepared: &Prepared,
+    prepared: &Prepared<'_>,
     limits: RecursivePoolWriteLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Vec<u8>, TypeCodecError> {
+    emit_prepared_core(pool, prepared, limits, None, work)
+}
+
+fn emit_prepared_core(
+    pool: &ConstantPool,
+    prepared: &Prepared<'_>,
+    limits: RecursivePoolWriteLimits,
+    mut parent: Option<&mut PoolAdmit<'_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<u8>, TypeCodecError> {
     work.flush()?;
-    let schema = ipc_schema_v2::encode_single_field_schema(
-        pool.field(),
-        limits.flat.schema,
-        work.control(),
-    )?;
+    let schema = if let Some(schema) = &prepared.schema {
+        schema.emit_in(
+            &mut |_| {
+                if let Some(parent) = parent.as_deref_mut() {
+                    parent(&prepared.facts)?;
+                }
+                Ok(())
+            },
+            work,
+        )?
+    } else {
+        ipc_schema_v2::encode_single_field_schema(pool.field(), limits.flat.schema, work.control())?
+    };
     work.flush()?;
     let mut batch =
         ipc_flat_pool_v2::reserve(prepared.facts.flat.batch_backing_bytes_upper_bound, work)?;

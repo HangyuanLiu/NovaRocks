@@ -53,70 +53,112 @@ pub fn preflight_recursive_pool_resources(
     control: &dyn PureCompileControl,
 ) -> Result<ConstantResourceFacts, ConstantError> {
     let mut work = CompileCheckpoints::try_new(control, phase)?;
-    let result = (|| {
-        let metadata_bytes = validate_type(field, value_type, policy, &mut work)?;
-        let mut lengths = node_lengths.into_iter();
-        let mut scanned = ScanFacts::default();
-        let root = scan_nodes(
-            field.data_type(),
-            1,
-            &mut lengths,
-            policy,
-            &mut scanned,
-            &mut work,
-        )?;
-        let extra = lengths.next();
-        work.step()?;
-        if extra.is_some() {
-            return Err(ConstantError::Invalid(
-                "constant resource projection has extra nodes",
-            ));
-        }
-        let logical = logical_elements_observed(
-            root.len,
-            scanned.storage_elements,
-            root.max_value,
-            &mut work,
-        )?;
-        limit(
-            logical,
-            policy.max_logical_elements,
-            "constant logical element limit exceeded",
-        )?;
-        limit(
-            input.retained_buffer_capacity_bytes_upper_bound,
-            policy.max_retained_buffer_bytes,
-            "constant retained buffer limit exceeded",
-        )?;
-        scanned.buffer_count = input.buffer_count_upper_bound;
-        scanned.buffer_visits = input.buffer_visits_bytes_upper_bound;
-        scanned.retained = input.retained_buffer_capacity_bytes_upper_bound;
-        scanned.view_validation_bytes = input.view_validation_bytes_upper_bound;
-        scanned.utf8_fallback_validation_bytes = input.utf8_fallback_validation_bytes_upper_bound;
-        work.step()?;
-        let envelope = validation_envelope(
-            ValidationCounts::from(&scanned),
-            metadata_bytes,
-            policy,
-            &mut work,
-        )?;
-        Ok(ConstantResourceFacts {
-            rows: root.len,
-            array_nodes: scanned.nodes,
-            buffer_count: scanned.buffer_count,
-            logical_elements_upper_bound: logical,
-            retained_buffer_capacity_bytes: scanned.retained,
-            metadata_bytes,
-            library_validation_work_upper_bound: envelope.work,
-            library_validation_temporary_bytes_upper_bound: envelope.temporary,
-            library_validation_bytes_upper_bound: envelope.bytes,
-        })
-    })();
+    let result = preflight_recursive_pool_resources_core(
+        field,
+        value_type,
+        node_lengths,
+        input,
+        policy,
+        &mut PoolObserver::plain(),
+        &mut work,
+    );
     if matches!(&result, Err(ConstantError::Control(_))) {
         return result;
     }
     work.finish()?;
     result
+}
+
+/// Same original lazy-node pre-array author, on the caller's work and growing
+/// owned-resource contribution. Entry/footer remain entirely with the caller.
+pub fn preflight_recursive_pool_resources_in(
+    field: &Field,
+    value_type: &FunctionValueType,
+    node_lengths: impl IntoIterator<Item = u64>,
+    input: RecursiveConstantResourceInput,
+    policy: ConstantPolicy,
+    admit: &mut impl FnMut(&ConstantOwnerResourceFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ConstantResourceFacts, ConstantError> {
+    preflight_recursive_pool_resources_core(
+        field,
+        value_type,
+        node_lengths,
+        input,
+        policy,
+        &mut PoolObserver::parent(admit),
+        work,
+    )
+}
+fn preflight_recursive_pool_resources_core(
+    field: &Field,
+    value_type: &FunctionValueType,
+    node_lengths: impl IntoIterator<Item = u64>,
+    input: RecursiveConstantResourceInput,
+    policy: ConstantPolicy,
+    observer: &mut PoolObserver<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ConstantResourceFacts, ConstantError> {
+    let metadata_bytes = validate_type_owned(field, value_type, policy, observer, work)?;
+    let mut lengths = node_lengths.into_iter();
+    let mut scanned = ScanFacts::default();
+    let root = scan_nodes(
+        field.data_type(),
+        1,
+        &mut lengths,
+        policy,
+        &mut scanned,
+        observer,
+        work,
+    )?;
+    let extra = lengths.next();
+    observer.step(work)?;
+    if extra.is_some() {
+        return Err(ConstantError::Invalid(
+            "constant resource projection has extra nodes",
+        ));
+    }
+    let logical = logical_elements_observed_owned(
+        root.len,
+        scanned.storage_elements,
+        root.max_value,
+        observer,
+        work,
+    )?;
+    limit(
+        logical,
+        policy.max_logical_elements,
+        "constant logical element limit exceeded",
+    )?;
+    limit(
+        input.retained_buffer_capacity_bytes_upper_bound,
+        policy.max_retained_buffer_bytes,
+        "constant retained buffer limit exceeded",
+    )?;
+    scanned.buffer_count = input.buffer_count_upper_bound;
+    scanned.buffer_visits = input.buffer_visits_bytes_upper_bound;
+    scanned.retained = input.retained_buffer_capacity_bytes_upper_bound;
+    scanned.view_validation_bytes = input.view_validation_bytes_upper_bound;
+    scanned.utf8_fallback_validation_bytes = input.utf8_fallback_validation_bytes_upper_bound;
+    observer.step(work)?;
+    let envelope = validation_envelope_owned(
+        ValidationCounts::from(&scanned),
+        metadata_bytes,
+        policy,
+        observer,
+        work,
+    )?;
+    Ok(ConstantResourceFacts {
+        rows: root.len,
+        array_nodes: scanned.nodes,
+        buffer_count: scanned.buffer_count,
+        logical_elements_upper_bound: logical,
+        retained_buffer_capacity_bytes: scanned.retained,
+        metadata_bytes,
+        library_validation_work_upper_bound: envelope.work,
+        library_validation_temporary_bytes_upper_bound: envelope.temporary,
+        library_validation_bytes_upper_bound: envelope.bytes,
+    })
 }
 
 fn scan_nodes(
@@ -125,6 +167,7 @@ fn scan_nodes(
     lengths: &mut impl Iterator<Item = u64>,
     policy: ConstantPolicy,
     scanned: &mut ScanFacts,
+    observer: &mut PoolObserver<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ElementMetric, ConstantError> {
     limit(
@@ -138,7 +181,7 @@ fn scan_nodes(
         "constant array exceeds intrinsic Arrow type depth",
     )?;
     let next = lengths.next();
-    work.step()?;
+    observer.step(work)?;
     let len = next.ok_or(ConstantError::Invalid(
         "constant resource projection lacks an expected node",
     ))?;
@@ -158,19 +201,35 @@ fn scan_nodes(
         policy.max_logical_elements,
         "constant stored element limit exceeded",
     )?;
-    work.step()?;
+    observer.step(work)?;
     let max_value = match ty {
         DataType::Struct(fields) => value_elements(
             ty,
             fields.iter().map(|field| {
-                scan_nodes(field.data_type(), depth + 1, lengths, policy, scanned, work)
+                scan_nodes(
+                    field.data_type(),
+                    depth + 1,
+                    lengths,
+                    policy,
+                    scanned,
+                    observer,
+                    work,
+                )
             }),
         ),
         DataType::List(field) | DataType::LargeList(field) | DataType::Map(field, _) => {
             value_elements(
                 ty,
                 std::iter::once_with(|| {
-                    scan_nodes(field.data_type(), depth + 1, lengths, policy, scanned, work)
+                    scan_nodes(
+                        field.data_type(),
+                        depth + 1,
+                        lengths,
+                        policy,
+                        scanned,
+                        observer,
+                        work,
+                    )
                 }),
             )
         }
@@ -184,7 +243,7 @@ fn scan_nodes(
     if matches!(&max_value, Err(ConstantError::Control(_))) {
         return max_value.map(|max_value| ElementMetric { len, max_value });
     }
-    work.step()?;
+    observer.step(work)?;
     Ok(ElementMetric {
         len,
         max_value: max_value?,

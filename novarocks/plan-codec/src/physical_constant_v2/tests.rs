@@ -928,3 +928,5 @@ mod write_namespace_tests {
     use crate::physical_type_v2::encode_type_table_sources;
     include!("write_namespace_tests.rs");
 }
+
+mod caller_owned_tests;

@@ -45,7 +45,7 @@ pub(super) struct Node<'a> {
     pub null_count: usize,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub(super) struct Geometry {
     pub rows: usize,
     pub nodes: usize,
@@ -88,11 +88,21 @@ fn profile(
     Ok(())
 }
 
-pub(super) fn node<'a>(
+type NodeCapture<'node, 'callback> =
+    dyn FnMut(&Node<'node>, bool) -> Result<(), TypeCodecError> + 'callback;
+type GeometryCapture<'callback> = dyn FnMut(&Geometry) -> Result<(), TypeCodecError> + 'callback;
+
+pub(super) fn node_core<'a>(
     span: Span<'a>,
     count_nulls: bool,
+    capture: &mut Option<&mut NodeCapture<'a, '_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Node<'a>, TypeCodecError> {
+    let policy = crate::ipc_schema_v2::owner_admission::Policy(capture.is_some());
+    let add = |a, b| policy.numeric(add(a, b));
+    let mul = |a, b| policy.numeric(mul(a, b));
+    let aligned = |a| policy.numeric(aligned(a));
+    let bit_bytes = |a| policy.numeric(bit_bytes(a));
     if add(span.start, span.len)? > span.data.len() || i64::try_from(span.len).is_err() {
         return Err(invalid());
     }
@@ -159,20 +169,47 @@ pub(super) fn node<'a>(
             result.offset = Some((width, base, extent));
         }
         _ => {
-            let leaf = geometry::inspect_span(
-                span.data,
-                span.start,
-                span.len,
-                usize::MAX,
-                usize::MAX,
-                usize::MAX,
-                work,
-            )?;
+            let leaf = if let Some(capture) = capture.as_mut() {
+                geometry::inspect_span_core(
+                    span.data,
+                    span.start,
+                    span.len,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                    Some(&mut |leaf| {
+                        let partial = Node {
+                            span,
+                            leaf: Some(*leaf),
+                            offset: None,
+                            buffers: leaf.buffers,
+                            body_bytes: leaf.body_bytes,
+                            payload_bytes: leaf.payload_bytes,
+                            null_count,
+                        };
+                        capture(&partial, false)
+                    }),
+                    work,
+                )?
+            } else {
+                geometry::inspect_span(
+                    span.data,
+                    span.start,
+                    span.len,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                    work,
+                )?
+            };
             result.buffers = leaf.buffers;
             result.body_bytes = leaf.body_bytes;
             result.payload_bytes = leaf.payload_bytes;
             result.leaf = Some(leaf);
         }
+    }
+    if let Some(capture) = capture.as_mut() {
+        capture(&result, true)?;
     }
     work.step()?;
     Ok(result)
@@ -208,10 +245,22 @@ pub(super) fn walk<'a>(
     work: &mut CompileCheckpoints<'_>,
     visit: &mut impl FnMut(&Node<'a>, &mut CompileCheckpoints<'_>) -> Result<(), TypeCodecError>,
 ) -> Result<(), TypeCodecError> {
+    walk_core(span, reverse, count_nulls, depth, &mut None, work, visit)
+}
+
+pub(super) fn walk_core<'a>(
+    span: Span<'a>,
+    reverse: bool,
+    count_nulls: bool,
+    depth: usize,
+    capture: &mut Option<&mut NodeCapture<'a, '_>>,
+    work: &mut CompileCheckpoints<'_>,
+    visit: &mut impl FnMut(&Node<'a>, &mut CompileCheckpoints<'_>) -> Result<(), TypeCodecError>,
+) -> Result<(), TypeCodecError> {
     if depth > MAX_VALUE_TYPE_DEPTH {
         return Err(invalid());
     }
-    let current = node(span, count_nulls, work)?;
+    let current = node_core(span, count_nulls, capture, work)?;
     let children = match span.data.data_type() {
         DataType::Struct(fields) => fields.len(),
         DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) => 1,
@@ -223,11 +272,12 @@ pub(super) fn walk<'a>(
     work.step()?;
     if reverse {
         for index in (0..children).rev() {
-            walk(
+            walk_core(
                 child(&current, index)?,
                 true,
                 count_nulls,
                 depth + 1,
+                capture,
                 work,
                 visit,
             )?;
@@ -237,11 +287,12 @@ pub(super) fn walk<'a>(
     } else {
         visit(&current, work)?;
         for index in 0..children {
-            walk(
+            walk_core(
                 child(&current, index)?,
                 false,
                 count_nulls,
                 depth + 1,
+                capture,
                 work,
                 visit,
             )?;
@@ -256,8 +307,32 @@ pub(super) fn inspect(
     limits: RecursivePoolWriteLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Geometry, TypeCodecError> {
+    inspect_core(data, limits, None, work)
+}
+
+pub(super) fn inspect_in(
+    data: &ArrayData,
+    limits: RecursivePoolWriteLimits,
+    capture: &mut dyn FnMut(&Geometry) -> Result<(), TypeCodecError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Geometry, TypeCodecError> {
+    inspect_core(data, limits, Some(capture), work)
+}
+
+pub(super) fn inspect_core(
+    data: &ArrayData,
+    limits: RecursivePoolWriteLimits,
+    mut capture: Option<&mut GeometryCapture<'_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Geometry, TypeCodecError> {
+    let policy = crate::ipc_schema_v2::owner_admission::Policy(capture.is_some());
+    let add = |a, b| policy.numeric(add(a, b));
     if data.len() > limits.flat.max_rows {
-        return Err(invalid());
+        return Err(if policy.0 {
+            novarocks_type_contract::CompileControlError::ResourceExhausted.into()
+        } else {
+            invalid()
+        });
     }
     work.step()?;
     profile(data.data_type(), 1, work)?;
@@ -265,39 +340,78 @@ pub(super) fn inspect(
         rows: data.len(),
         ..Default::default()
     };
-    walk(
-        Span {
-            data,
-            start: 0,
-            len: data.len(),
-        },
-        false,
-        false,
-        1,
-        work,
-        &mut |node, work| {
-            result.nodes = add(result.nodes, 1)?;
-            result.total_rows = add(result.total_rows, node.span.len)?;
-            result.buffers = add(result.buffers, node.buffers)?;
-            result.body_bytes = add(result.body_bytes, node.body_bytes)?;
-            result.payload_bytes = add(result.payload_bytes, node.payload_bytes)?;
-            if let Some(leaf) = &node.leaf {
-                result.variadic = add(result.variadic, leaf.variadic)?;
-                result.view_fields = add(result.view_fields, usize::from(leaf.views))?;
-            }
+    let observed = capture.is_some();
+    let mut committed = result;
+    let mut summarize = |node: &Node<'_>,
+                         complete: bool,
+                         mut step: Option<&mut CompileCheckpoints<'_>>|
+     -> Result<(), TypeCodecError> {
+        result = committed;
+        result.nodes = add(result.nodes, 1)?;
+        result.total_rows = add(result.total_rows, node.span.len)?;
+        result.buffers = add(result.buffers, node.buffers)?;
+        result.body_bytes = add(result.body_bytes, node.body_bytes)?;
+        result.payload_bytes = add(result.payload_bytes, node.payload_bytes)?;
+        if let Some(leaf) = &node.leaf {
+            result.variadic = add(result.variadic, leaf.variadic)?;
+            result.view_fields = add(result.view_fields, usize::from(leaf.views))?;
+        }
+
+        if let Some(work) = step.as_deref_mut() {
             work.step()?;
-            if result.nodes > limits.max_field_nodes
-                || result.total_rows > limits.max_total_rows
-                || result.buffers > limits.flat.max_buffer_descriptors
-                || result.body_bytes > limits.flat.max_body_bytes
-                || i64::try_from(result.body_bytes).is_err()
-                || u32::try_from(result.nodes).is_err()
-                || u32::try_from(result.buffers).is_err()
-            {
-                return Err(invalid());
-            }
-            Ok(())
-        },
-    )?;
+        }
+        if result.nodes > limits.max_field_nodes
+            || result.total_rows > limits.max_total_rows
+            || result.buffers > limits.flat.max_buffer_descriptors
+            || result.body_bytes > limits.flat.max_body_bytes
+            || i64::try_from(result.body_bytes).is_err()
+            || u32::try_from(result.nodes).is_err()
+            || u32::try_from(result.buffers).is_err()
+        {
+            return Err(if policy.0 {
+                novarocks_type_contract::CompileControlError::ResourceExhausted.into()
+            } else {
+                invalid()
+            });
+        }
+        if let Some(capture) = capture.as_deref_mut() {
+            capture(&result)?;
+        }
+        if complete {
+            committed = result;
+        }
+        Ok(())
+    };
+    if observed {
+        walk_core(
+            Span {
+                data,
+                start: 0,
+                len: data.len(),
+            },
+            false,
+            false,
+            1,
+            &mut Some(&mut |node, complete| summarize(node, complete, None)),
+            work,
+            &mut |_, work| {
+                work.step()?;
+                Ok(())
+            },
+        )?;
+    } else {
+        walk(
+            Span {
+                data,
+                start: 0,
+                len: data.len(),
+            },
+            false,
+            false,
+            1,
+            work,
+            &mut |node, work| summarize(node, true, Some(work)),
+        )?;
+    }
     Ok(result)
 }

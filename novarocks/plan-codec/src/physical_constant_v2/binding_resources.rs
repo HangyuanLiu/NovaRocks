@@ -24,8 +24,8 @@ use crate::physical_type_v2::TypeCodecError;
 use arrow::datatypes::{DataType, Field};
 use novarocks_constant_contract::ConstantPool;
 use novarocks_type_contract::{
-    CompileCheckpoints, MAX_VALUE_TYPE_NODES, NR_LOGICAL_TYPE_KEY, ValueTypeVisit,
-    validate_value_type_structure_with_scratch_observed,
+    CompileCheckpoints, CompileControlError, MAX_VALUE_TYPE_NODES, NR_LOGICAL_TYPE_KEY,
+    ValueTypeVisit, validate_value_type_structure_with_scratch_observed,
 };
 use std::{mem, sync::Arc};
 
@@ -58,6 +58,31 @@ fn cap(bound: usize, limit: usize) -> Result<(), TypeCodecError> {
         return Err(shape("constant binding work envelope exceeded"));
     }
     Ok(())
+}
+
+// One numerical contribution on the original caller meter. Plain retains its
+// completed-operation error order; the caller path gates known work first.
+type Admit<'a> = dyn FnMut(usize) -> Result<(), CompileControlError> + 'a;
+struct Admission<'borrow, 'callback> {
+    parent: Option<&'borrow mut Admit<'callback>>,
+}
+impl Admission<'_, '_> {
+    fn numeric<T>(&self, result: Result<T, TypeCodecError>) -> Result<T, TypeCodecError> {
+        if self.parent.is_some() {
+            result.map_err(|_| CompileControlError::ResourceExhausted.into())
+        } else {
+            result
+        }
+    }
+    fn known(&mut self, bound: usize, limit: usize) -> Result<(), TypeCodecError> {
+        if let Some(parent) = &mut self.parent {
+            if bound > limit {
+                return Err(CompileControlError::ResourceExhausted.into());
+            }
+            parent(bound)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -120,6 +145,7 @@ impl Metrics {
         source: usize,
         prefix: usize,
         limit: usize,
+        admission: &mut Admission<'_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), TypeCodecError> {
         let opaque_boundary = matches!(
@@ -127,12 +153,14 @@ impl Metrics {
             ValueTypeVisit::Field(_) | ValueTypeVisit::ChildEdge(_)
         );
         match event {
-            ValueTypeVisit::TypeNode(_) => self.types = add(self.types, 1)?,
-            ValueTypeVisit::ChildEdge(_) => self.edges = add(self.edges, 1)?,
-            ValueTypeVisit::Field(field) => self.field(field, true)?,
+            ValueTypeVisit::TypeNode(_) => self.types = admission.numeric(add(self.types, 1))?,
+            ValueTypeVisit::ChildEdge(_) => self.edges = admission.numeric(add(self.edges, 1))?,
+            ValueTypeVisit::Field(field) => admission.numeric(self.field(field, true))?,
         }
-        self.model_visits = add(self.model_visits, 1)?;
-        let admitted = cap(self.bound(source, prefix)?, limit);
+        self.model_visits = admission.numeric(add(self.model_visits, 1))?;
+        let bound = admission.numeric(self.bound(source, prefix))?;
+        admission.known(bound, limit)?;
+        let admitted = cap(bound, limit);
         // One completed constant-size numerical/event operation. This is not
         // a synthetic loop representing predicted bytes or future library work.
         work.step()?;
@@ -158,6 +186,51 @@ pub(super) fn preflight_constant_binding_resources(
     max_work: usize,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ConstantBindingResourceFacts, PhysicalConstantCodecError> {
+    preflight_core(
+        pool,
+        expected_field,
+        source_retained_bytes,
+        max_work,
+        &mut Admission { parent: None },
+        work,
+    )
+}
+
+pub(super) fn preflight_constant_binding_resources_in(
+    pool: &ConstantPool,
+    expected_field: &Arc<Field>,
+    source_retained_bytes: usize,
+    max_work: usize,
+    admit: &mut Admit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ConstantBindingResourceFacts, PhysicalConstantCodecError> {
+    preflight_core(
+        pool,
+        expected_field,
+        source_retained_bytes,
+        max_work,
+        &mut Admission {
+            parent: Some(admit),
+        },
+        work,
+    )
+}
+
+fn preflight_core(
+    pool: &ConstantPool,
+    expected_field: &Arc<Field>,
+    source_retained_bytes: usize,
+    max_work: usize,
+    admission: &mut Admission<'_, '_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ConstantBindingResourceFacts, PhysicalConstantCodecError> {
+    // The fixed scratch request is known without inspecting source metadata.
+    // Its numerical refusal precedes a pending original observation.
+    if admission.parent.is_some() {
+        let scratch_bytes = mem::size_of::<[Option<(&DataType, usize)>; MAX_VALUE_TYPE_NODES]>();
+        let prefix = admission.numeric(add(source_retained_bytes, scratch_bytes))?;
+        admission.known(prefix, max_work)?;
+    }
     work.flush()?;
     let retained = usize::try_from(pool.resource_facts().retained_buffer_capacity_bytes)
         .map_err(|_| shape("constant binding source retention is not representable"))?;
@@ -167,7 +240,8 @@ pub(super) fn preflight_constant_binding_resources(
         return Err(shape("constant binding source invoice omits checked pool backing").into());
     }
     let scratch_bytes = mem::size_of::<[Option<(&DataType, usize)>; MAX_VALUE_TYPE_NODES]>();
-    let prefix = add(source_retained_bytes, scratch_bytes)?;
+    let prefix = admission.numeric(add(source_retained_bytes, scratch_bytes))?;
+    admission.known(prefix, max_work)?;
     let admitted = cap(prefix, max_work);
     work.step()?;
     admitted?;
@@ -178,23 +252,52 @@ pub(super) fn preflight_constant_binding_resources(
     validate_value_type_structure_with_scratch_observed::<TypeCodecError>(
         &pool.value_type().data_type,
         &mut scratch,
-        |event| metrics.observe(event, source_retained_bytes, prefix, max_work, work),
+        |event| {
+            metrics.observe(
+                event,
+                source_retained_bytes,
+                prefix,
+                max_work,
+                admission,
+                work,
+            )
+        },
     )?;
     let compare_full_field = !Arc::ptr_eq(pool.field_ref(), expected_field);
-    work.step()?;
+    if admission.parent.is_none() {
+        work.step()?;
+    }
     if compare_full_field {
-        metrics.field(pool.field(), false)?;
-        metrics.model_visits = add(metrics.model_visits, 1)?;
-        let admitted = cap(metrics.bound(source_retained_bytes, prefix)?, max_work);
+        admission.numeric(metrics.field(pool.field(), false))?;
+        metrics.model_visits = admission.numeric(add(metrics.model_visits, 1))?;
+        let bound = admission.numeric(metrics.bound(source_retained_bytes, prefix))?;
+        admission.known(bound, max_work)?;
+        let admitted = cap(bound, max_work);
+        if admission.parent.is_some() {
+            work.step()?;
+        }
         work.step()?;
         admitted?;
         validate_value_type_structure_with_scratch_observed::<TypeCodecError>(
             pool.field().data_type(),
             &mut scratch,
-            |event| metrics.observe(event, source_retained_bytes, prefix, max_work, work),
+            |event| {
+                metrics.observe(
+                    event,
+                    source_retained_bytes,
+                    prefix,
+                    max_work,
+                    admission,
+                    work,
+                )
+            },
         )?;
     }
-    let work_upper_bound = metrics.bound(source_retained_bytes, prefix)?;
+    if admission.parent.is_some() && !compare_full_field {
+        work.step()?;
+    }
+    let work_upper_bound = admission.numeric(metrics.bound(source_retained_bytes, prefix))?;
+    admission.known(work_upper_bound, max_work)?;
     work.flush()?;
     Ok(ConstantBindingResourceFacts {
         work_upper_bound,
@@ -369,5 +472,81 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn caller_binding_known_scratch_work_refuses_before_pending_late_control() {
+        let pool = pool();
+        for pending in [0, 254, 255] {
+            for cause in CAUSES {
+                let control = Control {
+                    refusal: Some((1, cause)),
+                    ..Control::default()
+                };
+                let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+                for _ in 0..pending {
+                    work.step().unwrap();
+                }
+                let result = preflight_constant_binding_resources_in(
+                    &pool,
+                    pool.field_ref(),
+                    SOURCE,
+                    0,
+                    &mut |_| panic!("parent called after known local scratch refusal"),
+                    &mut work,
+                );
+                assert!(matches!(
+                    result,
+                    Err(PhysicalConstantCodecError::Control(
+                        CompileControlError::ResourceExhausted
+                    ))
+                ));
+                assert_eq!(*control.trace.lock().unwrap(), vec![0]);
+            }
+        }
+    }
+
+    #[test]
+    fn caller_binding_snapshot_replays_exact_work_and_source_floor_stays_ordinary() {
+        let pool = pool();
+        let copied = Arc::new(pool.field().clone());
+        let plain = run(&pool, &copied, SOURCE, WORK, &Control::default()).unwrap();
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+        let mut last = 0;
+        let actual = preflight_constant_binding_resources_in(
+            &pool,
+            &copied,
+            SOURCE,
+            plain.work_upper_bound(),
+            &mut |prefix| {
+                assert!(prefix >= last);
+                last = prefix;
+                Ok(())
+            },
+            &mut work,
+        )
+        .unwrap();
+        work.finish().unwrap();
+        assert_eq!(last, plain.work_upper_bound());
+        assert_eq!(actual.work_upper_bound(), plain.work_upper_bound());
+        assert!(actual.compare_full_field);
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+        let result = preflight_constant_binding_resources_in(
+            &pool,
+            &copied,
+            0,
+            WORK,
+            &mut |_| Ok(()),
+            &mut work,
+        );
+        assert!(matches!(
+            result,
+            Err(PhysicalConstantCodecError::Type(
+                TypeCodecError::InvalidShape(_)
+            ))
+        ));
+        work.finish().unwrap();
     }
 }

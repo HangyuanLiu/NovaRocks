@@ -966,3 +966,6 @@ mod borrowed_tests {
 
 #[path = "prepared_tests.rs"]
 mod prepared_tests;
+
+#[path = "reader_tests/owner_ports.rs"]
+mod owner_ports;

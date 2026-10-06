@@ -31,7 +31,10 @@ mod scalar_factory_tests;
 mod tests;
 
 mod recursive_resources;
-pub use recursive_resources::{RecursiveConstantResourceInput, preflight_recursive_pool_resources};
+pub use recursive_resources::{
+    RecursiveConstantResourceInput, preflight_recursive_pool_resources,
+    preflight_recursive_pool_resources_in,
+};
 
 mod semantic_key;
 pub use semantic_key::ConstantSemanticKey;
@@ -127,60 +130,95 @@ pub fn preflight_flat_pool_resources(
     control: &dyn PureCompileControl,
 ) -> Result<FlatConstantResourceBounds, ConstantError> {
     let mut work = CompileCheckpoints::try_new(control, phase)?;
-    let checked = (|| {
-        let metadata_bytes = validate_type(field, value_type, policy, &mut work)?;
-        work.step()?;
-        let flat = is_flat_resource_carrier(field.data_type());
-        if !flat {
-            return Err(ConstantError::Invalid(
-                "constant resource projection is not flat",
-            ));
-        }
-        limit(input.rows, policy.max_rows, "constant row limit exceeded")?;
-        limit(
-            1,
-            policy.max_array_nodes,
-            "constant array node limit exceeded",
-        )?;
-        limit(
-            1,
-            u64::from(policy.max_type_depth),
-            "constant array depth limit exceeded",
-        )?;
-        limit(
-            input.rows,
-            policy.max_logical_elements,
-            "constant stored element limit exceeded",
-        )?;
-        limit(
-            input.retained_buffer_capacity_bytes_upper_bound,
-            policy.max_retained_buffer_bytes,
-            "constant retained buffer limit exceeded",
-        )?;
-        logical_elements_observed(input.rows, input.rows, 1, &mut work)?;
-        let counts = ValidationCounts {
-            nodes: 1,
-            storage_elements: input.rows,
-            buffer_count: input.buffer_count_upper_bound,
-            buffer_visits: input.buffer_visits_bytes_upper_bound,
-            view_validation_bytes: input.view_validation_bytes_upper_bound,
-            utf8_fallback_validation_bytes: 0,
-            masks: 0,
-            depth: 1,
-        };
-        let envelope = validation_envelope(counts, metadata_bytes, policy, &mut work)?;
-        Ok(FlatConstantResourceBounds {
-            metadata_bytes,
-            library_validation_work_upper_bound: envelope.work,
-            library_validation_temporary_bytes_upper_bound: envelope.temporary,
-            library_validation_bytes_upper_bound: envelope.bytes,
-        })
-    })();
+    let checked = preflight_flat_pool_resources_core(
+        field,
+        value_type,
+        input,
+        policy,
+        &mut PoolObserver::plain(),
+        &mut work,
+    );
     if matches!(&checked, Err(ConstantError::Control(_))) {
         return checked;
     }
     work.finish()?;
     checked
+}
+
+/// The same pre-array law on the caller's meter, with synchronous owned
+/// request/work prefixes. The caller owns entry and all ordinary/success tails.
+pub fn preflight_flat_pool_resources_in(
+    field: &Field,
+    value_type: &FunctionValueType,
+    input: FlatConstantResourceInput,
+    policy: ConstantPolicy,
+    admit: &mut impl FnMut(&ConstantOwnerResourceFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FlatConstantResourceBounds, ConstantError> {
+    preflight_flat_pool_resources_core(
+        field,
+        value_type,
+        input,
+        policy,
+        &mut PoolObserver::parent(admit),
+        work,
+    )
+}
+fn preflight_flat_pool_resources_core(
+    field: &Field,
+    value_type: &FunctionValueType,
+    input: FlatConstantResourceInput,
+    policy: ConstantPolicy,
+    observer: &mut PoolObserver<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FlatConstantResourceBounds, ConstantError> {
+    let metadata_bytes = validate_type_owned(field, value_type, policy, observer, work)?;
+    observer.step(work)?;
+    let flat = is_flat_resource_carrier(field.data_type());
+    if !flat {
+        return Err(ConstantError::Invalid(
+            "constant resource projection is not flat",
+        ));
+    }
+    limit(input.rows, policy.max_rows, "constant row limit exceeded")?;
+    limit(
+        1,
+        policy.max_array_nodes,
+        "constant array node limit exceeded",
+    )?;
+    limit(
+        1,
+        u64::from(policy.max_type_depth),
+        "constant array depth limit exceeded",
+    )?;
+    limit(
+        input.rows,
+        policy.max_logical_elements,
+        "constant stored element limit exceeded",
+    )?;
+    limit(
+        input.retained_buffer_capacity_bytes_upper_bound,
+        policy.max_retained_buffer_bytes,
+        "constant retained buffer limit exceeded",
+    )?;
+    logical_elements_observed_owned(input.rows, input.rows, 1, observer, work)?;
+    let counts = ValidationCounts {
+        nodes: 1,
+        storage_elements: input.rows,
+        buffer_count: input.buffer_count_upper_bound,
+        buffer_visits: input.buffer_visits_bytes_upper_bound,
+        view_validation_bytes: input.view_validation_bytes_upper_bound,
+        utf8_fallback_validation_bytes: 0,
+        masks: 0,
+        depth: 1,
+    };
+    let envelope = validation_envelope_owned(counts, metadata_bytes, policy, observer, work)?;
+    Ok(FlatConstantResourceBounds {
+        metadata_bytes,
+        library_validation_work_upper_bound: envelope.work,
+        library_validation_temporary_bytes_upper_bound: envelope.temporary,
+        library_validation_bytes_upper_bound: envelope.bytes,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -220,6 +258,148 @@ impl fmt::Display for ConstantError {
     }
 }
 impl std::error::Error for ConstantError {}
+
+/// Cumulative requests and work of one constant-owner invocation. Source B,
+/// retained input buffers, and IPC reader output requests are excluded. The
+/// caller merges this same contribution with its previously admitted future
+/// bound; these facts are not a second ledger or an allocation grant.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ConstantOwnerResourceFacts {
+    pub allocation_requests_upper_bound: usize,
+    pub allocation_request_bytes_upper_bound: usize,
+    pub cumulative_work_upper_bound: usize,
+}
+
+type ConstantOwnerAdmit<'a> =
+    dyn FnMut(&ConstantOwnerResourceFacts) -> Result<(), CompileControlError> + 'a;
+struct PoolObserver<'a> {
+    admit: Option<&'a mut ConstantOwnerAdmit<'a>>,
+    facts: ConstantOwnerResourceFacts,
+    required_root_prefunded: bool,
+    tree: novarocks_type_contract::owned_resources::btree::InsertionOnlyFacts,
+}
+impl<'a> PoolObserver<'a> {
+    fn plain() -> Self {
+        Self {
+            admit: None,
+            facts: ConstantOwnerResourceFacts::default(),
+            required_root_prefunded: false,
+            tree: novarocks_type_contract::owned_resources::btree::InsertionOnlyFacts {
+                allocation_requests_upper_bound: 0,
+                request_bytes_upper_bound: 0,
+                cumulative_work_upper_bound: 0,
+            },
+        }
+    }
+    fn parent(admit: &'a mut ConstantOwnerAdmit<'a>) -> Self {
+        Self {
+            admit: Some(admit),
+            ..Self::plain()
+        }
+    }
+    fn is_parent(&self) -> bool {
+        self.admit.is_some()
+    }
+    fn sum(a: usize, b: usize) -> Result<usize, ConstantError> {
+        a.checked_add(b)
+            .ok_or_else(|| CompileControlError::ResourceExhausted.into())
+    }
+    fn gate(&mut self) -> Result<(), ConstantError> {
+        if let Some(admit) = &mut self.admit {
+            admit(&self.facts)?;
+        }
+        Ok(())
+    }
+    fn work(&mut self, n: usize) -> Result<(), ConstantError> {
+        if self.is_parent() {
+            self.facts.cumulative_work_upper_bound =
+                Self::sum(self.facts.cumulative_work_upper_bound, n)?;
+            self.gate()?;
+        }
+        Ok(())
+    }
+    fn step(&mut self, work: &mut CompileCheckpoints<'_>) -> Result<(), ConstantError> {
+        self.work(1)?;
+        work.step()?;
+        Ok(())
+    }
+    fn request(&mut self, layout: std::alloc::Layout) -> Result<(), ConstantError> {
+        if self.is_parent() && layout.size() != 0 {
+            if !novarocks_type_contract::owned_resources::profile::LOCKED_TOOLCHAIN {
+                return Err(ConstantError::Invalid(
+                    "constant owned request source model drift",
+                ));
+            }
+            self.facts.allocation_requests_upper_bound =
+                Self::sum(self.facts.allocation_requests_upper_bound, 1)?;
+            self.facts.allocation_request_bytes_upper_bound = Self::sum(
+                self.facts.allocation_request_bytes_upper_bound,
+                layout.size(),
+            )?;
+            self.work(layout.size())?;
+        }
+        Ok(())
+    }
+    fn reserve<T>(
+        &mut self,
+        values: &mut Vec<T>,
+        additional: usize,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), ConstantError> {
+        if !self.is_parent() {
+            return Ok(());
+        }
+        let needed = Self::sum(values.len(), additional)?;
+        if needed <= values.capacity() || std::mem::size_of::<T>() == 0 {
+            return Ok(());
+        }
+        // The original locked RawVec growth: actual capacity doubles and the
+        // initial allocation uses its element-size-dependent minimum.
+        let minimum = if std::mem::size_of::<T>() == 1 {
+            8
+        } else if std::mem::size_of::<T>() <= 1024 {
+            4
+        } else {
+            1
+        };
+        let capacity = values
+            .capacity()
+            .checked_mul(2)
+            .ok_or(CompileControlError::ResourceExhausted)?
+            .max(needed)
+            .max(minimum);
+        let layout = std::alloc::Layout::array::<T>(capacity)
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        self.request(layout)?;
+        work.flush()?;
+        let result = values.try_reserve_exact(capacity - values.len());
+        result.map_err(|_| CompileControlError::ResourceExhausted)?;
+        self.step(work)?;
+        work.flush()?;
+        Ok(())
+    }
+    fn tree_entries(&mut self, entries: usize) -> Result<(), ConstantError> {
+        if !self.is_parent() {
+            return Ok(());
+        }
+        use novarocks_type_contract::owned_resources::btree::{BTreeResourceError, insertion_only};
+        let next = insertion_only::<(usize, usize), ()>(entries).map_err(|error| match error {
+            BTreeResourceError::SourceModel(message) => ConstantError::Invalid(message),
+            BTreeResourceError::Arithmetic(_) => CompileControlError::ResourceExhausted.into(),
+        })?;
+        self.facts.allocation_requests_upper_bound = Self::sum(
+            self.facts.allocation_requests_upper_bound,
+            next.allocation_requests_upper_bound - self.tree.allocation_requests_upper_bound,
+        )?;
+        self.facts.allocation_request_bytes_upper_bound = Self::sum(
+            self.facts.allocation_request_bytes_upper_bound,
+            next.request_bytes_upper_bound - self.tree.request_bytes_upper_bound,
+        )?;
+        self.work(next.cumulative_work_upper_bound - self.tree.cumulative_work_upper_bound)?;
+        self.tree = next;
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 struct PoolBacking {
@@ -277,6 +457,20 @@ impl ConstantPool {
         std::alloc::Layout::new::<ElementMetric>()
     }
 
+    /// Actual caller-owned fixed scratch of the sole borrowed type grammar.
+    /// This stack layout is not a heap request or an allocation grant.
+    pub fn type_validation_scratch_layout() -> std::alloc::Layout {
+        std::alloc::Layout::new::<
+            [Option<(&DataType, usize)>; novarocks_type_contract::MAX_VALUE_TYPE_NODES],
+        >()
+    }
+    /// One opaque initialization writes the complete fixed scratch backing.
+    /// Byte work, rather than slot count, covers the actual original layout;
+    /// Parent callers admit it before the first source observation.
+    pub fn type_validation_scratch_work_upper_bound() -> usize {
+        Self::type_validation_scratch_layout().size()
+    }
+
     pub fn try_new(
         field: Arc<Field>,
         value_type: FunctionValueType,
@@ -286,45 +480,35 @@ impl ConstantPool {
         control: &dyn PureCompileControl,
     ) -> Result<Self, ConstantError> {
         let mut work = CompileCheckpoints::try_new(control, phase)?;
-        let checked = (|| {
-            let metadata_bytes = validate_type(&field, &value_type, policy, &mut work)?;
-            if !arrow_data_types_exact_borrowed_observed::<ConstantError>(
-                field.data_type(),
-                data.data_type(),
-                || {
-                    work.step()?;
-                    Ok(())
-                },
-            )? {
-                return Err(ConstantError::Invalid(
-                    "constant ArrayData differs from exact field carrier",
-                ));
-            }
-            let facts = preflight(&data, metadata_bytes, policy, &mut work)?;
-            Ok(facts)
-        })();
+        let checked = validate_pool_source(
+            &field,
+            &value_type,
+            &data,
+            policy,
+            &mut PoolObserver::plain(),
+            &mut work,
+        );
         if let Err(ConstantError::Control(error)) = &checked {
             return Err(ConstantError::Control(*error));
         }
         work.finish()?;
         let facts = checked?;
         control.checkpoint(phase, 0)?;
-        let validated = data
-            .validate_full()
-            .map_err(|e| ConstantError::Arrow(e.to_string()));
+        let validated = validate_arrow_data(&data);
         control.checkpoint(phase, 0)?;
         validated?;
         let mut work = CompileCheckpoints::try_new(control, phase)?;
-        let canonical = make_array(data);
-        // Standard Arrow canonicalization applies parent offsets to Struct and
-        // FixedSizeList children. All semantic reads use that same backing.
-        let data = canonical.to_data();
-        let validated = validate_values(&data, field.is_nullable(), &mut work);
+        let validated = canonical_pool_data(
+            data,
+            field.is_nullable(),
+            &mut PoolObserver::plain(),
+            &mut work,
+        );
         if let Err(ConstantError::Control(error)) = &validated {
             return Err(ConstantError::Control(*error));
         }
         work.finish()?;
-        validated?;
+        let (canonical, data) = validated?;
         Ok(Self(Arc::new(PoolBacking {
             field,
             value_type,
@@ -333,6 +517,50 @@ impl ConstantPool {
             facts,
         })))
     }
+    /// Same constant owner on the caller's meter. The caller admits original
+    /// Arrow opaque requests separately and merges this owned contribution
+    /// with that future bound once; entry and all tails belong to the caller.
+    pub fn try_new_in(
+        field: Arc<Field>,
+        value_type: FunctionValueType,
+        data: ArrayData,
+        policy: ConstantPolicy,
+        admit: &mut impl FnMut(&ConstantOwnerResourceFacts) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, ConstantError> {
+        let mut observer = PoolObserver::parent(admit);
+        observer.request(Self::backing_allocation_layout())?;
+        if !matches!(data.data_type(), DataType::Null) {
+            observer.request(Self::flat_value_validation_stack_layout())?;
+            observer.required_root_prefunded = true;
+        }
+        if !data.child_data().is_empty() {
+            observer.request(
+                std::alloc::Layout::array::<ElementMetric>(data.child_data().len())
+                    .map_err(|_| CompileControlError::ResourceExhausted)?,
+            )?;
+        }
+        let facts = validate_pool_source(&field, &value_type, &data, policy, &mut observer, work)?;
+        work.flush()?;
+        let validated = validate_arrow_data(&data);
+        validated?;
+        observer.step(work)?;
+        work.flush()?;
+        let (canonical, data) =
+            canonical_pool_data(data, field.is_nullable(), &mut observer, work)?;
+        observer.gate()?;
+        work.flush()?;
+        let pool = Self(Arc::new(PoolBacking {
+            field,
+            value_type,
+            array: canonical,
+            data,
+            facts,
+        }));
+        observer.step(work)?;
+        Ok(pool)
+    }
+
     pub fn field(&self) -> &Field {
         &self.0.field
     }
@@ -486,20 +714,29 @@ fn limit(actual: u64, maximum: u64, message: &'static str) -> Result<(), Constan
         Ok(())
     }
 }
-fn observe_bytes(bytes: &[u8], work: &mut CompileCheckpoints<'_>) -> Result<(), ConstantError> {
+fn observe_bytes_owned(
+    bytes: &[u8],
+    observer: &mut PoolObserver<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ConstantError> {
     for _ in bytes.chunks(1024) {
-        work.step()?;
+        observer.step(work)?;
     }
     Ok(())
 }
-fn field_bytes(field: &Field, work: &mut CompileCheckpoints<'_>) -> Result<u64, ConstantError> {
-    work.step()?;
-    observe_bytes(field.name().as_bytes(), work)?;
+
+fn field_bytes_owned(
+    field: &Field,
+    observer: &mut PoolObserver<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<u64, ConstantError> {
+    observer.step(work)?;
+    observe_bytes_owned(field.name().as_bytes(), observer, work)?;
     let mut bytes = field.name().len() as u64;
     for (k, v) in field.metadata() {
-        work.step()?;
-        observe_bytes(k.as_bytes(), work)?;
-        observe_bytes(v.as_bytes(), work)?;
+        observer.step(work)?;
+        observe_bytes_owned(k.as_bytes(), observer, work)?;
+        observe_bytes_owned(v.as_bytes(), observer, work)?;
         bytes = checked_add(bytes, checked_add(k.len() as u64, v.len() as u64)?)?;
     }
     Ok(bytes)
@@ -510,7 +747,20 @@ fn validate_type(
     policy: ConstantPolicy,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<u64, ConstantError> {
-    work.step()?;
+    validate_type_owned(field, ty, policy, &mut PoolObserver::plain(), work)
+}
+
+fn validate_type_owned(
+    field: &Field,
+    ty: &FunctionValueType,
+    policy: ConstantPolicy,
+    observer: &mut PoolObserver<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<u64, ConstantError> {
+    if observer.is_parent() {
+        observer.work(ConstantPool::type_validation_scratch_work_upper_bound())?;
+    }
+    observer.step(work)?;
     if field.is_nullable() != ty.nullable {
         return Err(ConstantError::Invalid(
             "constant field differs from exact value nullability",
@@ -530,7 +780,7 @@ fn validate_type(
         field.data_type(),
         &ty.data_type,
         || {
-            work.step()?;
+            observer.step(work)?;
             Ok(())
         },
     )? {
@@ -538,40 +788,63 @@ fn validate_type(
             "constant field differs from exact value carrier",
         ));
     }
-    let mut bytes = field_bytes(field, work)?;
+    let mut bytes = field_bytes_owned(field, observer, work)?;
     let mut nodes = 0u64;
-    novarocks_type_contract::validate_value_type_structure_observed::<ConstantError>(
-        &ty.data_type,
-        |visit| {
-            work.step()?;
-            match visit {
-                ValueTypeVisit::TypeNode(t) => {
-                    validate_arrow_carrier_parameters_observed::<ConstantError>(t, || {
-                        work.step().map_err(Into::into)
-                    })?;
-                    nodes = checked_add(nodes, 1)?;
-                    limit(
-                        nodes,
-                        policy.max_type_nodes,
-                        "constant type node limit exceeded",
-                    )?;
-                    if let DataType::Timestamp(_, Some(zone)) = t {
-                        observe_bytes(zone.as_bytes(), work)?;
-                        bytes = checked_add(bytes, zone.len() as u64)?;
-                    }
+    let parent = observer.is_parent();
+    let mut scratch = if parent {
+        work.flush()?;
+        // Fixed stack initialization is opaque; its actual layout and full
+        // work were admitted before the first source-validation callback.
+        let scratch = [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
+        observer.step(work)?;
+        work.flush()?;
+        Some(scratch)
+    } else {
+        None
+    };
+    let mut observe = |visit| {
+        observer.step(work)?;
+        match visit {
+            ValueTypeVisit::TypeNode(t) => {
+                validate_arrow_carrier_parameters_observed::<ConstantError>(t, || {
+                    observer.step(work)
+                })?;
+                nodes = checked_add(nodes, 1)?;
+                limit(
+                    nodes,
+                    policy.max_type_nodes,
+                    "constant type node limit exceeded",
+                )?;
+                if let DataType::Timestamp(_, Some(zone)) = t {
+                    observe_bytes_owned(zone.as_bytes(), observer, work)?;
+                    bytes = checked_add(bytes, zone.len() as u64)?;
                 }
-                ValueTypeVisit::Field(f) => {
-                    bytes = checked_add(bytes, field_bytes(f, work)?)?;
-                }
-                ValueTypeVisit::ChildEdge(_) => {}
             }
-            limit(
-                bytes,
-                policy.max_metadata_bytes,
-                "constant metadata byte limit exceeded",
-            )
-        },
-    )?;
+            ValueTypeVisit::Field(f) => {
+                bytes = checked_add(bytes, field_bytes_owned(f, observer, work)?)?;
+            }
+            ValueTypeVisit::ChildEdge(_) => {}
+        }
+        limit(
+            bytes,
+            policy.max_metadata_bytes,
+            "constant metadata byte limit exceeded",
+        )
+    };
+    if parent {
+        novarocks_type_contract::validate_value_type_structure_with_scratch_observed::<
+            ConstantError,
+        >(
+            &ty.data_type,
+            scratch.as_mut().expect("parent scratch is initialized"),
+            &mut observe,
+        )?;
+    } else {
+        novarocks_type_contract::validate_value_type_structure_observed::<ConstantError>(
+            &ty.data_type,
+            &mut observe,
+        )?;
+    }
     Ok(bytes)
 }
 
@@ -584,6 +857,42 @@ struct AllocationSet {
     spill: BTreeSet<(usize, usize)>,
 }
 impl AllocationSet {
+    fn prefund_owned(
+        &self,
+        allocation: (usize, usize),
+        observer: &mut PoolObserver<'_>,
+    ) -> Result<(), ConstantError> {
+        if !observer.is_parent() {
+            return Ok(());
+        }
+        if !self.spill.is_empty() {
+            observer.tree_entries(PoolObserver::sum(self.spill.len(), 1)?)?;
+        } else if !self.inline.contains(&Some(allocation))
+            && self.inline.iter().all(Option::is_some)
+        {
+            observer.tree_entries(4)?;
+        }
+        Ok(())
+    }
+    fn insert_owned(
+        &mut self,
+        allocation: (usize, usize),
+        observer: &mut PoolObserver<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<bool, ConstantError> {
+        if !observer.is_parent() {
+            return Ok(self.insert(allocation));
+        }
+        self.prefund_owned(allocation, observer)?;
+        // At most the first three inline entries migrate on this insertion.
+        // This finite original std BTree operation is opaque, not a promise
+        // of cooperative callbacks inside the library.
+        work.flush()?;
+        let inserted = self.insert(allocation);
+        observer.step(work)?;
+        work.flush()?;
+        Ok(inserted)
+    }
     fn insert(&mut self, allocation: (usize, usize)) -> bool {
         if !self.spill.is_empty() {
             return self.spill.insert(allocation);
@@ -656,46 +965,82 @@ fn validation_envelope(
     work.step()?;
     result
 }
+fn validation_envelope_owned(
+    scanned: ValidationCounts,
+    metadata: u64,
+    policy: ConstantPolicy,
+    observer: &mut PoolObserver<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ValidationEnvelope, ConstantError> {
+    if !observer.is_parent() {
+        return validation_envelope(scanned, metadata, policy, work);
+    }
+    let envelope = validation_envelope_core_policy(scanned, metadata, policy, true)?;
+    observer.work(
+        usize::try_from(envelope.work).map_err(|_| CompileControlError::ResourceExhausted)?,
+    )?;
+    observer.step(work)?;
+    Ok(envelope)
+}
+
 fn validation_envelope_core(
     scanned: ValidationCounts,
     metadata: u64,
     policy: ConstantPolicy,
 ) -> Result<ValidationEnvelope, ConstantError> {
+    validation_envelope_core_policy(scanned, metadata, policy, false)
+}
+fn validation_envelope_core_policy(
+    scanned: ValidationCounts,
+    metadata: u64,
+    policy: ConstantPolicy,
+    parent: bool,
+) -> Result<ValidationEnvelope, ConstantError> {
+    let add = |a: u64, b: u64| {
+        if parent {
+            a.checked_add(b)
+                .ok_or_else(|| ConstantError::from(CompileControlError::ResourceExhausted))
+        } else {
+            checked_add(a, b)
+        }
+    };
+    let mul = |a: u64, b: u64| {
+        if parent {
+            a.checked_mul(b)
+                .ok_or_else(|| ConstantError::from(CompileControlError::ResourceExhausted))
+        } else {
+            checked_mul(a, b)
+        }
+    };
     // This is the sole numerical author for both actual ArrayData facts and
     // raw pre-reader upper bounds. It does not model reader allocations.
-    let structural = checked_mul(checked_mul(scanned.nodes, scanned.nodes)?, scanned.depth)?;
-    let rows = checked_mul(
-        checked_add(scanned.storage_elements, scanned.buffer_count)?,
+    let structural = mul(mul(scanned.nodes, scanned.nodes)?, scanned.depth)?;
+    let rows = mul(
+        add(scanned.storage_elements, scanned.buffer_count)?,
         scanned.depth,
     )?;
     // Arrow first scans the whole UTF8 values descriptor. An invalid unused
     // suffix triggers a successful scan of all monotone referenced ranges,
     // totaling at most one more complete descriptor, including NULL rows.
-    let inspected = checked_add(
-        checked_add(scanned.buffer_visits, scanned.view_validation_bytes)?,
+    let inspected = add(
+        add(scanned.buffer_visits, scanned.view_validation_bytes)?,
         scanned.utf8_fallback_validation_bytes,
     )?;
-    let bytes = checked_mul(checked_add(inspected, metadata)?, scanned.depth)?;
-    let library_work = checked_add(
-        checked_add(structural, rows)?,
-        checked_add(bytes, scanned.masks)?,
-    )?;
-    let headers = checked_add(
-        checked_mul(scanned.nodes, std::mem::size_of::<ArrayData>() as u64)?,
-        checked_mul(
+    let bytes = mul(add(inspected, metadata)?, scanned.depth)?;
+    let library_work = add(add(structural, rows)?, add(bytes, scanned.masks)?)?;
+    let headers = add(
+        mul(scanned.nodes, std::mem::size_of::<ArrayData>() as u64)?,
+        mul(
             scanned.buffer_count,
             std::mem::size_of::<arrow_buffer::Buffer>() as u64,
         )?,
     )?;
-    let diagnostics = checked_mul(
-        checked_mul(
-            checked_add(metadata, checked_mul(scanned.nodes, 256)?)?,
-            scanned.depth,
-        )?,
+    let diagnostics = mul(
+        mul(add(metadata, mul(scanned.nodes, 256)?)?, scanned.depth)?,
         16,
     )?;
-    let temporary = checked_add(scanned.masks, checked_add(headers, diagnostics)?)?;
-    let library_bytes = checked_add(inspected, temporary)?;
+    let temporary = add(scanned.masks, add(headers, diagnostics)?)?;
+    let library_bytes = add(inspected, temporary)?;
     limit(
         library_work,
         policy.max_library_validation_work,
@@ -712,10 +1057,60 @@ fn validation_envelope_core(
         bytes: library_bytes,
     })
 }
-fn preflight(
+fn validate_pool_source(
+    field: &Field,
+    value_type: &FunctionValueType,
+    data: &ArrayData,
+    policy: ConstantPolicy,
+    observer: &mut PoolObserver<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ConstantResourceFacts, ConstantError> {
+    let metadata_bytes = validate_type_owned(field, value_type, policy, observer, work)?;
+    if !arrow_data_types_exact_borrowed_observed::<ConstantError>(
+        field.data_type(),
+        data.data_type(),
+        || observer.step(work),
+    )? {
+        return Err(ConstantError::Invalid(
+            "constant ArrayData differs from exact field carrier",
+        ));
+    }
+    preflight_owned(data, metadata_bytes, policy, observer, work)
+}
+fn validate_arrow_data(data: &ArrayData) -> Result<(), ConstantError> {
+    data.validate_full()
+        .map_err(|error| ConstantError::Arrow(error.to_string()))
+}
+fn canonical_pool_data(
+    data: ArrayData,
+    nullable: bool,
+    observer: &mut PoolObserver<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(ArrayRef, ArrayData), ConstantError> {
+    if observer.is_parent() {
+        work.flush()?;
+    }
+    let canonical = make_array(data);
+    if observer.is_parent() {
+        observer.step(work)?;
+        work.flush()?;
+    }
+    // Standard Arrow canonicalization applies parent offsets to Struct and
+    // FixedSizeList children. All semantic reads use that same backing.
+    let data = canonical.to_data();
+    if observer.is_parent() {
+        observer.step(work)?;
+        work.flush()?;
+    }
+    validate_values_owned(&data, nullable, observer, work)?;
+    Ok((canonical, data))
+}
+
+fn preflight_owned(
     data: &ArrayData,
     metadata: u64,
     policy: ConstantPolicy,
+    observer: &mut PoolObserver<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ConstantResourceFacts, ConstantError> {
     limit(
@@ -724,9 +1119,14 @@ fn preflight(
         "constant row limit exceeded",
     )?;
     let mut scanned = ScanFacts::default();
-    let max_value = scan_data(data, 1, 0, policy, &mut scanned, work)?;
-    let logical =
-        logical_elements_observed(data.len() as u64, scanned.storage_elements, max_value, work)?;
+    let max_value = scan_data(data, 1, 0, policy, &mut scanned, observer, work)?;
+    let logical = logical_elements_observed_owned(
+        data.len() as u64,
+        scanned.storage_elements,
+        max_value,
+        observer,
+        work,
+    )?;
     limit(
         logical,
         policy.max_logical_elements,
@@ -735,7 +1135,13 @@ fn preflight(
     // validate_full calls validate_data at every node; validate itself revisits
     // descendants and exact child types. Include repeated ancestor/fanout work,
     // bytes inspected and FixedSizeList's expanded parent-null masks.
-    let envelope = validation_envelope(ValidationCounts::from(&scanned), metadata, policy, work)?;
+    let envelope = validation_envelope_owned(
+        ValidationCounts::from(&scanned),
+        metadata,
+        policy,
+        observer,
+        work,
+    )?;
     Ok(ConstantResourceFacts {
         rows: data.len() as u64,
         array_nodes: scanned.nodes,
@@ -754,9 +1160,10 @@ fn scan_data(
     dict_depth: u32,
     policy: ConstantPolicy,
     facts: &mut ScanFacts,
+    observer: &mut PoolObserver<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<u64, ConstantError> {
-    work.step()?;
+    observer.step(work)?;
     limit(
         u64::from(depth),
         u64::from(policy.max_type_depth),
@@ -768,7 +1175,7 @@ fn scan_data(
         "constant array exceeds intrinsic Arrow type depth",
     )?;
     validate_arrow_carrier_parameters_observed::<ConstantError>(data.data_type(), || {
-        work.step().map_err(Into::into)
+        observer.step(work)
     })?;
     let expected_children = match data.data_type() {
         DataType::Struct(fields) => fields.len(),
@@ -792,7 +1199,7 @@ fn scan_data(
     match data.data_type() {
         DataType::Struct(_) => {
             for child in data.child_data() {
-                work.step()?;
+                observer.step(work)?;
                 if extent > child.len() as u64 {
                     return Err(ConstantError::Invalid(
                         "constant Struct offset exceeds child extent",
@@ -823,7 +1230,7 @@ fn scan_data(
             ..usize::try_from(extent)
                 .map_err(|_| ConstantError::Invalid("constant view extent overflows usize"))?
         {
-            work.step()?;
+            observer.step(work)?;
             let start = index * 16;
             let length = u128::from_ne_bytes(
                 views[start..start + 16]
@@ -867,13 +1274,17 @@ fn scan_data(
         .iter()
         .chain(data.nulls().map(|n| n.buffer()))
     {
-        work.step()?;
-        facts.buffer_count = checked_add(facts.buffer_count, 1)?;
         let capacity = buffer.capacity().max(buffer.len());
-        if facts
+        facts
             .allocations
-            .insert((buffer.data_ptr().as_ptr() as usize, capacity))
-        {
+            .prefund_owned((buffer.data_ptr().as_ptr() as usize, capacity), observer)?;
+        observer.step(work)?;
+        facts.buffer_count = checked_add(facts.buffer_count, 1)?;
+        if facts.allocations.insert_owned(
+            (buffer.data_ptr().as_ptr() as usize, capacity),
+            observer,
+            work,
+        )? {
             facts.retained = checked_add(facts.retained, capacity as u64)?;
             limit(
                 facts.retained,
@@ -882,15 +1293,28 @@ fn scan_data(
             )?;
         }
         facts.buffer_visits = checked_add(facts.buffer_visits, buffer.len() as u64)?;
-        observe_bytes(buffer.as_slice(), work)?;
+        observe_bytes_owned(buffer.as_slice(), observer, work)?;
     }
     let mut children = Vec::new();
+    if observer.is_parent() && !data.child_data().is_empty() {
+        work.flush()?;
+        children
+            .try_reserve_exact(data.child_data().len())
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        observer.step(work)?;
+        work.flush()?;
+    }
     for child in data.child_data() {
-        work.step()?;
-        children.push(ElementMetric {
-            len: child.len() as u64,
-            max_value: scan_data(child, depth + 1, dict_depth, policy, facts, work)?,
-        });
+        observer.reserve(&mut children, 1, work)?;
+        children.push(scan_child(
+            child,
+            depth + 1,
+            dict_depth,
+            policy,
+            facts,
+            observer,
+            work,
+        )?);
     }
     if let DataType::FixedSizeList(field, width) = data.data_type() {
         let width = u64::try_from(*width)
@@ -901,8 +1325,33 @@ fn scan_data(
         }
     }
     let elements = value_elements(data.data_type(), children.into_iter().map(Ok));
-    work.step()?;
+    observer.step(work)?;
     elements
+}
+
+fn scan_child(
+    child: &ArrayData,
+    depth: u32,
+    dict_depth: u32,
+    policy: ConstantPolicy,
+    facts: &mut ScanFacts,
+    observer: &mut PoolObserver<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ElementMetric, ConstantError> {
+    // The original loop has captured this child's complete header. Its metric
+    // Vec request is known before the capture's completed observation; the
+    // recursive node entry must not charge the same request a second time.
+    if observer.is_parent() && !child.child_data().is_empty() {
+        observer.request(
+            std::alloc::Layout::array::<ElementMetric>(child.child_data().len())
+                .map_err(|_| CompileControlError::ResourceExhausted)?,
+        )?;
+    }
+    observer.step(work)?;
+    Ok(ElementMetric {
+        len: child.len() as u64,
+        max_value: scan_data(child, depth, dict_depth, policy, facts, observer, work)?,
+    })
 }
 
 fn is_flat_resource_carrier(ty: &DataType) -> bool {
@@ -966,14 +1415,15 @@ fn value_elements(
     }
 }
 
-fn logical_elements_observed(
+fn logical_elements_observed_owned(
     rows: u64,
     storage_elements: u64,
     max_value: u64,
+    observer: &mut PoolObserver<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<u64, ConstantError> {
     let result = checked_mul(rows, max_value).map(|expanded| storage_elements.max(expanded));
-    work.step()?;
+    observer.step(work)?;
     result
 }
 
@@ -1011,12 +1461,21 @@ fn run_index(
     index: usize,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<usize, ConstantError> {
+    run_index_owned(data, index, &mut PoolObserver::plain(), work)
+}
+
+fn run_index_owned(
+    data: &ArrayData,
+    index: usize,
+    observer: &mut PoolObserver<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<usize, ConstantError> {
     let ends = &data.child_data()[0];
     let logical = data.offset() + index;
     let mut low = 0usize;
     let mut high = ends.len();
     while low < high {
-        work.step()?;
+        observer.step(work)?;
         let mid = low + (high - low) / 2;
         let end = match ends.data_type() {
             DataType::Int16 => ends.buffer::<i16>(0)[mid] as i64,
@@ -1044,13 +1503,22 @@ fn union_row<'a>(
     index: usize,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(i8, Row<'a>, bool), ConstantError> {
+    union_row_owned(data, index, &mut PoolObserver::plain(), work)
+}
+
+fn union_row_owned<'a>(
+    data: &'a ArrayData,
+    index: usize,
+    observer: &mut PoolObserver<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(i8, Row<'a>, bool), ConstantError> {
     let DataType::Union(fields, mode) = data.data_type() else {
         return Err(ConstantError::Invalid("expected union"));
     };
     let id = data.buffer::<i8>(0)[index];
     let mut selected = None;
     for (index, (tag, field)) in fields.iter().enumerate() {
-        work.step()?;
+        observer.step(work)?;
         if tag == id {
             selected = Some((index, field.is_nullable()));
             break;
@@ -1167,9 +1635,10 @@ enum RequiredFrame<'a> {
     Row(Row<'a>, bool),
     Range(&'a ArrayData, usize, usize, bool),
 }
-fn validate_values(
+fn validate_values_owned(
     data: &ArrayData,
     nullable: bool,
+    observer: &mut PoolObserver<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ConstantError> {
     // Compact Null retains its logical size, with no per-row allocation/walk.
@@ -1182,9 +1651,66 @@ fn validate_values(
             ))
         };
     }
-    let mut pending = vec![RequiredFrame::Range(data, 0, data.len(), !nullable)];
+    let mut pending = if observer.is_parent() {
+        let mut values = Vec::new();
+        if !observer.required_root_prefunded {
+            observer.request(ConstantPool::flat_value_validation_stack_layout())?;
+        }
+        work.flush()?;
+        values
+            .try_reserve_exact(1)
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        observer.step(work)?;
+        work.flush()?;
+        values.push(RequiredFrame::Range(data, 0, data.len(), !nullable));
+        values
+    } else {
+        vec![RequiredFrame::Range(data, 0, data.len(), !nullable)]
+    };
     while let Some(frame) = pending.pop() {
-        work.step()?;
+        if observer.is_parent() {
+            // A captured, validated row already fixes this original frame's
+            // push fanout. Admit/reserve that actual Vec growth before the
+            // pop's completed observation, rather than after a late callback.
+            let (row, continuation) = match &frame {
+                RequiredFrame::Range(data, start, end, _)
+                    if start != end && !matches!(data.data_type(), DataType::Null) =>
+                {
+                    (
+                        Some(Row {
+                            data,
+                            index: *start,
+                        }),
+                        1,
+                    )
+                }
+                RequiredFrame::Row(row, _) => (Some(*row), 0),
+                _ => (None, 0),
+            };
+            let children = row
+                .filter(|row| {
+                    !matches!(row.data.data_type(), DataType::Null) && !row.data.is_null(row.index)
+                })
+                .map_or(0, |row| match row.data.data_type() {
+                    DataType::Struct(fields) => fields.len(),
+                    DataType::Dictionary(_, _)
+                    | DataType::RunEndEncoded(_, _)
+                    | DataType::List(_)
+                    | DataType::LargeList(_)
+                    | DataType::ListView(_)
+                    | DataType::LargeListView(_)
+                    | DataType::FixedSizeList(_, _)
+                    | DataType::Map(_, _)
+                    | DataType::Union(_, _) => 1,
+                    _ => 0,
+                });
+            observer.reserve(
+                &mut pending,
+                PoolObserver::sum(continuation, children)?,
+                work,
+            )?;
+        }
+        observer.step(work)?;
         let (row, required) = match frame {
             RequiredFrame::Range(data, start, end, required) => {
                 if start == end {
@@ -1196,6 +1722,7 @@ fn validate_values(
                     }
                     continue;
                 }
+                observer.reserve(&mut pending, 1, work)?;
                 pending.push(RequiredFrame::Range(data, start + 1, end, required));
                 (Row { data, index: start }, required)
             }
@@ -1213,6 +1740,7 @@ fn validate_values(
         // nullable outer values cannot erase a non-null selected child.
         match row.data.data_type() {
             DataType::Dictionary(_, _) => {
+                observer.reserve(&mut pending, 1, work)?;
                 pending.push(RequiredFrame::Row(
                     Row {
                         data: &row.data.child_data()[0],
@@ -1223,10 +1751,11 @@ fn validate_values(
                 continue;
             }
             DataType::RunEndEncoded(_, values) => {
+                observer.reserve(&mut pending, 1, work)?;
                 pending.push(RequiredFrame::Row(
                     Row {
                         data: &row.data.child_data()[1],
-                        index: run_index(row.data, row.index, work)?,
+                        index: run_index_owned(row.data, row.index, observer, work)?,
                     },
                     required || !values.is_nullable(),
                 ));
@@ -1237,8 +1766,10 @@ fn validate_values(
         validate_decimal_value(row)?;
         match row.data.data_type() {
             DataType::Struct(fields) => {
+                observer.reserve(&mut pending, fields.len(), work)?;
                 for (field, child) in fields.iter().zip(row.data.child_data()).rev() {
-                    work.step()?;
+                    observer.step(work)?;
+                    observer.reserve(&mut pending, 1, work)?;
                     pending.push(RequiredFrame::Row(
                         Row {
                             data: child,
@@ -1255,6 +1786,7 @@ fn validate_values(
             | DataType::FixedSizeList(field, _)
             | DataType::Map(field, _) => {
                 let (start, end) = list_range(row)?;
+                observer.reserve(&mut pending, 1, work)?;
                 pending.push(RequiredFrame::Range(
                     &row.data.child_data()[0],
                     start,
@@ -1263,7 +1795,8 @@ fn validate_values(
                 ));
             }
             DataType::Union(_, _) => {
-                let (_, child, nullable) = union_row(row.data, row.index, work)?;
+                let (_, child, nullable) = union_row_owned(row.data, row.index, observer, work)?;
+                observer.reserve(&mut pending, 1, work)?;
                 pending.push(RequiredFrame::Row(child, required || !nullable));
             }
             _ => {}
@@ -2466,3 +2999,7 @@ fn validate_decimal_value(row: Row<'_>) -> Result<(), ConstantError> {
 #[cfg(test)]
 #[path = "failure_tail_tests.rs"]
 mod failure_tail_tests;
+
+#[cfg(test)]
+#[path = "owner_ports_tests.rs"]
+mod owner_ports_tests;

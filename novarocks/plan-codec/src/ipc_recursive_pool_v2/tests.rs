@@ -569,3 +569,6 @@ fn actual_recursive_writer_original_controls_stop_at_entry_quantum_and_publicati
     positions.dedup();
     assert_prefixes(&wide, limits(), &trace, positions);
 }
+
+#[path = "owned_tests.rs"]
+mod owned_tests;

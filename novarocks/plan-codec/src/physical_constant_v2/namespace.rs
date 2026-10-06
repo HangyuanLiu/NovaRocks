@@ -21,11 +21,17 @@
 
 use super::{
     ConstantDecodeProjectionLimits, PhysicalConstantCodecError as Error, finish, record_sources,
-    recursive,
+    record_sources_captured, recursive,
 };
 use crate::{
-    ipc_flat_stream_v2::{PreparedFlatReader, preflight_flat_constant_stream},
-    ipc_recursive_stream_v2::{PreparedRecursiveReader, preflight_recursive_constant_stream},
+    ipc_flat_stream_v2::{
+        PreparedFlatReader, preflight_flat_constant_stream, preflight_flat_constant_stream_in,
+        progress::IpcReaderProgressFacts,
+    },
+    ipc_recursive_stream_v2::{
+        PreparedRecursiveReader, preflight_recursive_constant_stream,
+        preflight_recursive_constant_stream_in,
+    },
     physical_type_v2::DecodedTypeTable,
     resource_source_model::{LOCKED_FAMILY, LOCKED_TOOLCHAIN},
 };
@@ -33,7 +39,9 @@ use novarocks_arrow_ipc_frame::VerifierOptions;
 use novarocks_constant_contract::{ConstantError, ConstantPolicy, ConstantPool};
 use novarocks_physical_plan::{ConstantPoolId, ConstantPools, ConstantReferenceError};
 use novarocks_proto_models::physical_package_v2 as wire;
-use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
+use novarocks_type_contract::{
+    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+};
 use std::{alloc::Layout, mem, sync::Arc};
 
 /// The caller allocates a share of its whole-fragment envelope to this stage.
@@ -62,11 +70,87 @@ pub struct ConstantNamespaceResourceFacts {
     pub cumulative_library_work_upper_bound: usize,
 }
 
-enum PreparedReader<'raw, 'table> {
-    Flat(PreparedFlatReader<'raw, 'table, 'table>),
-    Recursive(PreparedRecursiveReader<'raw, 'table, 'table>),
+type Admit<'a> = dyn FnMut(&ConstantNamespaceResourceFacts) -> Result<(), CompileControlError> + 'a;
+fn gate_parent(
+    facts: &ConstantNamespaceResourceFacts,
+    limits: ConstantNamespaceProjectionLimits,
+    admit: &mut Admit<'_>,
+) -> Result<(), CompileControlError> {
+    for (actual, maximum) in [
+        (facts.record_count, limits.max_records),
+        (
+            facts.preparation_request_bytes,
+            limits.max_preparation_request_bytes,
+        ),
+        (
+            facts.new_allocation_request_bytes_upper_bound,
+            limits.max_new_allocation_request_bytes,
+        ),
+        (
+            facts.coexisting_source_and_request_bytes_upper_bound,
+            limits.max_coexisting_source_and_request_bytes,
+        ),
+        (
+            facts.cumulative_library_work_upper_bound,
+            limits.max_cumulative_library_work,
+        ),
+    ] {
+        if actual > maximum {
+            return Err(CompileControlError::ResourceExhausted);
+        }
+    }
+    admit(facts)
 }
-impl PreparedReader<'_, '_> {
+// One child snapshot replaces its previous contribution. Its complete reader
+// requests already contain geometry; the preparation sublimit views it once.
+fn with_child(
+    base: ConstantNamespaceResourceFacts,
+    child: &IpcReaderProgressFacts,
+) -> Result<ConstantNamespaceResourceFacts, CompileControlError> {
+    let sum = |a: usize, b: usize| {
+        a.checked_add(b)
+            .ok_or(CompileControlError::ResourceExhausted)
+    };
+    let mut facts = base;
+    facts.geometry_scratch_request_bytes = sum(
+        base.geometry_scratch_request_bytes,
+        child.geometry_scratch_request_bytes,
+    )?;
+    facts.preparation_request_bytes = sum(
+        facts.prepared_storage_request_bytes,
+        facts.geometry_scratch_request_bytes,
+    )?;
+    facts.reader_request_bytes_upper_bound = sum(
+        base.reader_request_bytes_upper_bound,
+        child.new_allocation_request_bytes_upper_bound,
+    )?;
+    facts.allocation_request_count_upper_bound = sum(
+        base.allocation_request_count_upper_bound,
+        child.allocation_request_count_upper_bound,
+    )?;
+    facts.new_allocation_request_bytes_upper_bound = sum(
+        sum(
+            facts.prepared_storage_request_bytes,
+            facts.pool_table_request_bytes_upper_bound,
+        )?,
+        facts.reader_request_bytes_upper_bound,
+    )?;
+    facts.coexisting_source_and_request_bytes_upper_bound = sum(
+        facts.source_retained_bytes,
+        facts.new_allocation_request_bytes_upper_bound,
+    )?;
+    facts.cumulative_library_work_upper_bound = sum(
+        base.cumulative_library_work_upper_bound,
+        child.cumulative_library_work_upper_bound,
+    )?;
+    Ok(facts)
+}
+
+enum PreparedReader<'raw, 'table, 'control> {
+    Flat(PreparedFlatReader<'raw, 'table, 'table, 'control>),
+    Recursive(PreparedRecursiveReader<'raw, 'table, 'table, 'control>),
+}
+impl PreparedReader<'_, '_, '_> {
     fn geometry_requests(&self) -> (usize, usize) {
         match self {
             Self::Flat(value) => (
@@ -105,16 +189,26 @@ impl PreparedReader<'_, '_> {
             Self::Recursive(value) => value.materialize(control)?,
         })
     }
+    fn materialize_in(
+        self,
+        admit: &mut dyn FnMut(&IpcReaderProgressFacts) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<ConstantPool, Error> {
+        Ok(match self {
+            Self::Flat(value) => value.materialize_in(admit, work)?,
+            Self::Recursive(value) => value.materialize_in(admit, work)?,
+        })
+    }
 }
-struct PreparedRecord<'raw, 'table> {
+struct PreparedRecord<'raw, 'table, 'control> {
     id: ConstantPoolId,
-    reader: PreparedReader<'raw, 'table>,
+    reader: PreparedReader<'raw, 'table, 'control>,
 }
 
 /// Private construction freezes the same checked stream, type, policy and
 /// numeric model. The original control is retained through consumption.
 pub struct PreparedConstantNamespace<'raw, 'table, 'control> {
-    records: Vec<PreparedRecord<'raw, 'table>>,
+    records: Vec<PreparedRecord<'raw, 'table, 'control>>,
     facts: ConstantNamespaceResourceFacts,
     control: &'control dyn PureCompileControl,
 }
@@ -127,20 +221,59 @@ impl PreparedConstantNamespace<'_, '_, '_> {
     /// or byte-based backing deduplication exists. Package closure is later.
     pub fn materialize(self) -> Result<ConstantPools, Error> {
         let mut work = CompileCheckpoints::try_new(self.control, CompilePhase::Decode)?;
-        let result = (|| {
+        let result = self.materialize_core(None, &mut work);
+        finish(work, result)
+    }
+    pub(crate) fn materialize_in(
+        self,
+        admit: &mut Admit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<ConstantPools, Error> {
+        if !std::ptr::addr_eq(self.control, work.control()) {
+            return Err(shape(
+                "constant namespace caller work has a different original control",
+            ));
+        }
+        admit(&self.facts)?;
+        self.materialize_core(Some(admit), work)
+    }
+    fn materialize_core(
+        self,
+        mut admit: Option<&mut Admit<'_>>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<ConstantPools, Error> {
+        (|| {
             let mut pools = ConstantPools::empty();
             for record in self.records {
                 work.step()?;
                 work.flush()?;
-                let pool = record.reader.materialize(work.control())?;
+                let pool = if let Some(parent) = &mut admit {
+                    let (geometry_bytes, geometry_count) = record.reader.geometry_requests();
+                    let (reader_bytes, reader_count, reader_work) = record.reader.reader_requests();
+                    record.reader.materialize_in(
+                        &mut |progress| {
+                            if progress.geometry_scratch_request_bytes > geometry_bytes
+                                || progress.geometry_scratch_request_count > geometry_count
+                                || progress.new_allocation_request_bytes_upper_bound > reader_bytes
+                                || progress.allocation_request_count_upper_bound > reader_count
+                                || progress.cumulative_library_work_upper_bound > reader_work
+                            {
+                                return Err(CompileControlError::ResourceExhausted);
+                            }
+                            parent(&self.facts)
+                        },
+                        work,
+                    )?
+                } else {
+                    record.reader.materialize(work.control())?
+                };
                 work.flush()?;
                 let inserted = pools.insert(record.id, pool);
                 work.step()?;
                 inserted?;
             }
             Ok(pools)
-        })();
-        finish(work, result)
+        })()
     }
 }
 
@@ -201,30 +334,7 @@ fn initial_facts(
     if !model_locked {
         return Err(shape("constant namespace source model drift"));
     }
-    let storage = Layout::array::<PreparedRecord<'_, '_>>(count)
-        .map_err(|_| shape("constant namespace prepared storage layout is unrepresentable"))?
-        .size();
-    // Only insertion occurs. Every retained node has at least one entry; no
-    // node is removed or reallocated. Cumulative node requests <= input count.
-    let table = mul(table_node_layout()?.size(), count)?;
-    let requests = add(storage, table)?;
-    let levels = if count == 0 {
-        0
-    } else {
-        (usize::BITS - count.leading_zeros()) as usize + 1
-    };
-    let per_level = add(
-        mul(
-            11,
-            add(
-                mem::size_of::<ConstantPoolId>(),
-                mem::size_of::<ConstantPool>(),
-            )?,
-        )?,
-        12 * mem::size_of::<usize>() + 11,
-    )?;
-    let table_work = mul(count, mul(levels, per_level)?)?;
-    let bookkeeping = add(requests, add(table_work, mul(count, 32)?)?)?;
+    let (storage, table, requests, bookkeeping) = initial_parts(count)?;
     cap(
         storage,
         limits.max_preparation_request_bytes,
@@ -249,6 +359,47 @@ fn initial_facts(
         "constant namespace work envelope exceeded",
         work,
     )?;
+    initial_header(count, source, storage, table, requests, bookkeeping)
+}
+
+// Pure extraction of the original numerical author. Neither the caller nor
+// the old facade duplicates the table-layout or insertion-work model.
+fn initial_parts(count: usize) -> Result<(usize, usize, usize, usize), Error> {
+    let storage = Layout::array::<PreparedRecord<'_, '_, '_>>(count)
+        .map_err(|_| shape("constant namespace prepared storage layout is unrepresentable"))?
+        .size();
+    // Only insertion occurs. Every retained node has at least one entry; no
+    // node is removed or reallocated. Cumulative node requests <= input count.
+    let table = mul(table_node_layout()?.size(), count)?;
+    let requests = add(storage, table)?;
+    let levels = if count == 0 {
+        0
+    } else {
+        (usize::BITS - count.leading_zeros()) as usize + 1
+    };
+    let per_level = add(
+        mul(
+            11,
+            add(
+                mem::size_of::<ConstantPoolId>(),
+                mem::size_of::<ConstantPool>(),
+            )?,
+        )?,
+        12 * mem::size_of::<usize>() + 11,
+    )?;
+    let table_work = mul(count, mul(levels, per_level)?)?;
+    let bookkeeping = add(requests, add(table_work, mul(count, 32)?)?)?;
+    Ok((storage, table, requests, bookkeeping))
+}
+
+fn initial_header(
+    count: usize,
+    source: usize,
+    storage: usize,
+    table: usize,
+    requests: usize,
+    bookkeeping: usize,
+) -> Result<ConstantNamespaceResourceFacts, Error> {
     Ok(ConstantNamespaceResourceFacts {
         record_count: count,
         source_retained_bytes: source,
@@ -284,8 +435,76 @@ pub fn prepare_constant_namespace<'raw, 'table, 'control>(
     control: &'control dyn PureCompileControl,
 ) -> Result<PreparedConstantNamespace<'raw, 'table, 'control>, Error> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
-    let result = (|| {
-        let mut facts = initial_facts(records.len(), source_retained_bytes, limits, &mut work)?;
+    let result = prepare_core(
+        records,
+        types,
+        source_retained_bytes,
+        policy,
+        record_limits,
+        limits,
+        verifier,
+        None,
+        &mut work,
+    );
+    finish(work, result)
+}
+
+pub(crate) fn prepare_constant_namespace_in<'raw, 'table, 'control>(
+    records: &'raw [wire::IpcConstantPool],
+    types: &'table DecodedTypeTable,
+    source_retained_bytes: usize,
+    policy: ConstantPolicy,
+    record_limits: ConstantDecodeProjectionLimits,
+    limits: ConstantNamespaceProjectionLimits,
+    verifier: &VerifierOptions,
+    admit: &mut Admit<'_>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedConstantNamespace<'raw, 'table, 'control>, Error> {
+    prepare_core(
+        records,
+        types,
+        source_retained_bytes,
+        policy,
+        record_limits,
+        limits,
+        verifier,
+        Some(admit),
+        work,
+    )
+}
+
+fn prepare_core<'raw, 'table, 'control>(
+    records: &'raw [wire::IpcConstantPool],
+    types: &'table DecodedTypeTable,
+    source_retained_bytes: usize,
+    policy: ConstantPolicy,
+    record_limits: ConstantDecodeProjectionLimits,
+    limits: ConstantNamespaceProjectionLimits,
+    verifier: &VerifierOptions,
+    mut admit: Option<&mut Admit<'_>>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedConstantNamespace<'raw, 'table, 'control>, Error> {
+    (|| {
+        let mut facts = if let Some(parent) = &mut admit {
+            if !LOCKED_FAMILY || !LOCKED_TOOLCHAIN {
+                return Err(shape("constant namespace source model drift"));
+            }
+            let parts =
+                initial_parts(records.len()).map_err(|_| CompileControlError::ResourceExhausted)?;
+            let known = initial_header(
+                records.len(),
+                source_retained_bytes,
+                parts.0,
+                parts.1,
+                parts.2,
+                parts.3,
+            )
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+            gate_parent(&known, limits, *parent)?;
+            known
+        } else {
+            initial_facts(records.len(), source_retained_bytes, limits, work)?
+        };
         let mut visible_source = Layout::array::<wire::IpcConstantPool>(records.len())
             .map_err(|_| shape("constant namespace source layout is unrepresentable"))?
             .size();
@@ -297,15 +516,74 @@ pub fn prepare_constant_namespace<'raw, 'table, 'control>(
             visible_source,
             source_retained_bytes,
             "constant namespace source invoice excludes retained record storage",
-            &mut work,
+            work,
         )?;
         work.flush()?;
         let mut prepared = Vec::new();
         let reserved = prepared.try_reserve_exact(records.len());
-        crate::allocation_exit_v2::reserve_exit::<Error>(reserved, &mut work)?;
+        crate::allocation_exit_v2::reserve_exit::<Error>(reserved, work)?;
         for record in records {
-            let (value_type, field) =
-                record_sources(record, types, source_retained_bytes, &mut work)?;
+            if let Some(parent) = &mut admit {
+                let base = facts;
+                let live_source = add(source_retained_bytes, facts.preparation_request_bytes)
+                    .map_err(|_| CompileControlError::ResourceExhausted)?;
+                let mut snapshot = IpcReaderProgressFacts::default();
+                let reader = prepare_record_reader_in(
+                    record,
+                    types,
+                    source_retained_bytes,
+                    live_source,
+                    policy,
+                    record_limits,
+                    verifier,
+                    &mut |progress| {
+                        snapshot.geometry_scratch_request_bytes = snapshot
+                            .geometry_scratch_request_bytes
+                            .max(progress.geometry_scratch_request_bytes);
+                        snapshot.geometry_scratch_request_count = snapshot
+                            .geometry_scratch_request_count
+                            .max(progress.geometry_scratch_request_count);
+                        snapshot.allocation_request_count_upper_bound = snapshot
+                            .allocation_request_count_upper_bound
+                            .max(progress.allocation_request_count_upper_bound);
+                        snapshot.new_allocation_request_bytes_upper_bound = snapshot
+                            .new_allocation_request_bytes_upper_bound
+                            .max(progress.new_allocation_request_bytes_upper_bound);
+                        snapshot.cumulative_library_work_upper_bound = snapshot
+                            .cumulative_library_work_upper_bound
+                            .max(progress.cumulative_library_work_upper_bound);
+                        gate_parent(&with_child(base, &snapshot)?, limits, *parent)
+                    },
+                    work,
+                )?;
+                let (geometry_bytes, geometry_count) = reader.geometry_requests();
+                let (reader_bytes, reader_count, reader_work) = reader.reader_requests();
+                // The original complete author must cover every prepared prefix.
+                if snapshot.geometry_scratch_request_bytes > geometry_bytes
+                    || snapshot.geometry_scratch_request_count > geometry_count
+                    || snapshot.new_allocation_request_bytes_upper_bound > reader_bytes
+                    || snapshot.allocation_request_count_upper_bound > reader_count
+                    || snapshot.cumulative_library_work_upper_bound > reader_work
+                {
+                    return Err(shape(
+                        "constant reader complete projection omits an admitted preparation prefix",
+                    ));
+                }
+                snapshot.geometry_scratch_request_bytes = geometry_bytes;
+                snapshot.geometry_scratch_request_count = geometry_count;
+                snapshot.new_allocation_request_bytes_upper_bound = reader_bytes;
+                snapshot.allocation_request_count_upper_bound = reader_count;
+                snapshot.cumulative_library_work_upper_bound = reader_work;
+                facts = with_child(base, &snapshot)?;
+                gate_parent(&facts, limits, *parent)?;
+                prepared.push(PreparedRecord {
+                    id: ConstantPoolId::new(record.id),
+                    reader,
+                });
+                work.step()?;
+                continue;
+            }
+            let (value_type, field) = record_sources(record, types, source_retained_bytes, work)?;
             let live_source = add(source_retained_bytes, facts.preparation_request_bytes)?;
             work.flush()?;
             let reader = if recursive(field.data_type()) {
@@ -389,25 +667,25 @@ pub fn prepare_constant_namespace<'raw, 'table, 'control>(
                 facts.preparation_request_bytes,
                 limits.max_preparation_request_bytes,
                 "constant namespace preparation envelope exceeded",
-                &mut work,
+                work,
             )?;
             cap(
                 facts.new_allocation_request_bytes_upper_bound,
                 limits.max_new_allocation_request_bytes,
                 "constant namespace request envelope exceeded",
-                &mut work,
+                work,
             )?;
             cap(
                 facts.coexisting_source_and_request_bytes_upper_bound,
                 limits.max_coexisting_source_and_request_bytes,
                 "constant namespace coexistence envelope exceeded",
-                &mut work,
+                work,
             )?;
             cap(
                 facts.cumulative_library_work_upper_bound,
                 limits.max_cumulative_library_work,
                 "constant namespace work envelope exceeded",
-                &mut work,
+                work,
             )?;
             prepared.push(PreparedRecord {
                 id: ConstantPoolId::new(record.id),
@@ -418,10 +696,9 @@ pub fn prepare_constant_namespace<'raw, 'table, 'control>(
         Ok(PreparedConstantNamespace {
             records: prepared,
             facts,
-            control,
+            control: work.control(),
         })
-    })();
-    finish(work, result)
+    })()
 }
 
 #[expect(
@@ -449,4 +726,68 @@ pub fn decode_constant_namespace(
         control,
     )?
     .materialize()
+}
+
+fn prepare_record_reader_in<'raw, 'table, 'control>(
+    record: &'raw wire::IpcConstantPool,
+    types: &'table DecodedTypeTable,
+    original_source: usize,
+    live_source: usize,
+    policy: ConstantPolicy,
+    limits: ConstantDecodeProjectionLimits,
+    verifier: &VerifierOptions,
+    admit: &mut dyn FnMut(&IpcReaderProgressFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedReader<'raw, 'table, 'control>, Error> {
+    let mut reader = None;
+    record_sources_captured(
+        record,
+        types,
+        original_source,
+        &mut |value_type, field, work| {
+            reader = Some(if recursive(field.data_type()) {
+                let stream = preflight_recursive_constant_stream_in(
+                    &record.arrow_ipc,
+                    field,
+                    limits.recursive_stream,
+                    verifier,
+                    live_source,
+                    admit,
+                    work,
+                )?;
+                PreparedReader::Recursive(stream.prepare_pool_borrowed_in(
+                    Arc::clone(field),
+                    value_type,
+                    live_source,
+                    policy,
+                    limits.recursive_reader,
+                    admit,
+                    work,
+                )?)
+            } else {
+                let stream = preflight_flat_constant_stream_in(
+                    &record.arrow_ipc,
+                    field,
+                    limits.flat_stream,
+                    verifier,
+                    live_source,
+                    admit,
+                    work,
+                )?;
+                PreparedReader::Flat(stream.prepare_pool_borrowed_in(
+                    Arc::clone(field),
+                    value_type,
+                    live_source,
+                    policy,
+                    limits.flat_reader,
+                    admit,
+                    work,
+                )?)
+            });
+            Ok(())
+        },
+        work,
+    )?;
+    reader
+        .ok_or_else(|| shape("constant reader was not prepared from its captured original sources"))
 }

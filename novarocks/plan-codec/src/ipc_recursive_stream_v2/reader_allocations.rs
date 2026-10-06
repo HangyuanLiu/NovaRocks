@@ -21,6 +21,7 @@
 
 use super::reader_resources::{PayloadRequests, ReaderInput, add, invalid, mul};
 use crate::ipc_flat_batch_v2::{Layout as FlatLayout, layout};
+use crate::ipc_flat_stream_v2::resource_work::ResourceWork;
 use crate::ipc_flat_stream_v2::{
     FlatPoolResourceError,
     reader_allocations::{Requests, concrete_array_layout, environment},
@@ -31,7 +32,7 @@ use arrow::{
 };
 use arrow_buffer::Buffer;
 use novarocks_constant_contract::ConstantPool;
-use novarocks_type_contract::CompileCheckpoints;
+
 use std::alloc::Layout;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,7 +50,7 @@ fn growing_layout(
     requests: &mut Requests,
     element: Layout,
     count: usize,
-    work: &mut CompileCheckpoints<'_>,
+    work: &mut impl ResourceWork,
 ) -> Result<(), FlatPoolResourceError> {
     if count == 0 || element.size() == 0 {
         work.step()?;
@@ -62,18 +63,34 @@ fn growing_layout(
     } else {
         1
     };
-    let maximum = minimum.max(mul(count, 2)?);
-    let layout = Layout::from_size_align(mul(element.size(), maximum)?, element.align())
-        .map_err(|_| invalid("recursive reader growing layout"))?;
+    let maximum = minimum.max(work.numeric(mul(count, 2))?);
+    let layout = work.numeric(
+        Layout::from_size_align(work.numeric(mul(element.size(), maximum))?, element.align())
+            .map_err(|_| invalid("recursive reader growing layout")),
+    )?;
+    let additional_bytes = work.numeric(mul(layout.size(), 2))?;
+    if work.parent() {
+        work.requests(
+            work.numeric(add(requests.bytes, additional_bytes))?,
+            work.numeric(add(requests.count, 2))?,
+        )?;
+    }
     let mut capacity = minimum;
     let mut number = 2usize; // also covers an initial vec![one] request
     while capacity < count {
-        capacity = mul(capacity, 2)?;
-        number = add(number, 1)?;
+        capacity = work.numeric(mul(capacity, 2))?;
+        number = work.numeric(add(number, 1))?;
+        if work.parent() {
+            work.requests(
+                work.numeric(add(requests.bytes, additional_bytes))?,
+                work.numeric(add(requests.count, number))?,
+            )?;
+        }
         work.step()?;
     }
-    requests.bytes = add(requests.bytes, mul(layout.size(), 2)?)?;
-    requests.count = add(requests.count, number)?;
+    requests.bytes = work.numeric(add(requests.bytes, work.numeric(mul(layout.size(), 2))?))?;
+    requests.count = work.numeric(add(requests.count, number))?;
+    work.requests(requests.bytes, requests.count)?;
     work.step()?;
     Ok(())
 }
@@ -81,7 +98,7 @@ fn growing_layout(
 fn allocation_set(
     requests: &mut Requests,
     owners: usize,
-    work: &mut CompileCheckpoints<'_>,
+    work: &mut impl ResourceWork,
 ) -> Result<(), FlatPoolResourceError> {
     if owners <= 3 {
         work.step()?;
@@ -94,23 +111,47 @@ fn allocation_set(
     requests.record(layout, owners, work)
 }
 
+fn header_requests(
+    bytes: Layout,
+    owners: usize,
+    work: &mut impl ResourceWork,
+) -> Result<Requests, FlatPoolResourceError> {
+    let mut requests = Requests::default();
+    requests.arc(work.numeric(array::<FieldRef>(1))?, 1, work)?;
+    requests.arc(Layout::new::<Schema>(), 1, work)?;
+    requests.arc(bytes, owners, work)?;
+    requests.exact_vec::<ArrayRef>(4, 1, work)?;
+    Ok(requests)
+}
+pub(super) fn initial_header(
+    field: &arrow::datatypes::Field,
+) -> Result<ReaderAllocationRequests, FlatPoolResourceError> {
+    let mut work = crate::ipc_flat_stream_v2::resource_work::HeaderWork;
+    let bytes = environment(&mut work)?;
+    let mut requests = header_requests(bytes, 1, &mut work)?;
+    requests.arc(concrete_array_layout(field.data_type())?, 2, &mut work)?;
+    Ok(ReaderAllocationRequests {
+        structural_request_bytes_upper_bound: requests.bytes,
+        allocation_requests_upper_bound: requests.count,
+    })
+}
+
 pub(super) fn preflight(
     input: &ReaderInput<'_, '_>,
     payload: &PayloadRequests,
-    work: &mut CompileCheckpoints<'_>,
+    work: &mut impl ResourceWork,
 ) -> Result<ReaderAllocationRequests, FlatPoolResourceError> {
     let bytes = environment(work)?;
-    let mut requests = Requests::default();
-    requests.arc(array::<FieldRef>(1)?, 1, work)?;
-    requests.arc(Layout::new::<Schema>(), 1, work)?;
-    let owners = add(add(1, payload.repair_count)?, payload.empty_offsets_count)?;
-    requests.arc(bytes, owners, work)?;
-    requests.exact_vec::<ArrayRef>(4, 1, work)?; // one RecordBatch column push
+    let owners = work.numeric(add(
+        work.numeric(add(1, payload.repair_count))?,
+        payload.empty_offsets_count,
+    ))?;
+    let mut requests = header_requests(bytes, owners, work)?;
     if input.geometry.view_fields != 0 {
         requests.growing_vec::<i64>(input.geometry.view_fields, work)?; // variadic VecDeque
     }
     for node in input.nodes {
-        let projections = add(2, node.list_map_ancestors)?;
+        let projections = work.numeric(add(2, node.list_map_ancestors))?;
         requests.arc(
             concrete_array_layout(node.field.data_type())?,
             projections,
@@ -139,15 +180,23 @@ pub(super) fn preflight(
                 }
                 FlatLayout::Views => {
                     requests.growing_vec::<Buffer>(node.buffer_count, work)?;
-                    requests.exact_vec::<Buffer>(add(node.variadic_buffers, 1)?, 1, work)?;
-                    requests.arc(array::<Buffer>(node.variadic_buffers)?, projections, work)?;
+                    requests.exact_vec::<Buffer>(
+                        work.numeric(add(node.variadic_buffers, 1))?,
+                        1,
+                        work,
+                    )?;
+                    requests.arc(
+                        work.numeric(array::<Buffer>(node.variadic_buffers))?,
+                        projections,
+                        work,
+                    )?;
                     for _ in 0..projections {
                         requests.view_to_data(node.variadic_buffers, work)?;
                     }
                     specs = 1;
                 }
                 FlatLayout::Offsets(_) => {
-                    requests.exact_vec::<Buffer>(2, add(projections, 1)?, work)?;
+                    requests.exact_vec::<Buffer>(2, work.numeric(add(projections, 1))?, work)?;
                     specs = 2;
                 }
                 FlatLayout::Bits | FlatLayout::Fixed(_) => {
@@ -161,7 +210,11 @@ pub(super) fn preflight(
         // scratch only) and creates one force_validate to_data projection.
         // Own read build, two final projections and pool.validate_full give
         // the existing five flat layout requests at ancestor count zero.
-        requests.exact_vec::<BufferSpec>(specs, add(5, mul(2, node.list_map_ancestors)?)?, work)?;
+        requests.exact_vec::<BufferSpec>(
+            specs,
+            work.numeric(add(5, work.numeric(mul(2, node.list_map_ancestors))?))?,
+            work,
+        )?;
         // scan_data accumulates actual child metrics once at this occurrence.
         growing_layout(
             &mut requests,
@@ -173,15 +226,20 @@ pub(super) fn preflight(
     }
     // Prefix shape/type stacks and both pool source validations use the same
     // bounded DFS pending vector. Conservatively include every source walk.
-    for _ in 0..5 {
-        requests.growing_vec::<(&DataType, usize)>(input.nodes.len(), work)?;
+    if !work.parent() {
+        for _ in 0..5 {
+            requests.growing_vec::<(&DataType, usize)>(input.nodes.len(), work)?;
+        }
     }
     if !matches!(input.field.data_type(), DataType::Null) {
         // RequiredFrame is the owner's actual Layout, not a mirrored enum.
         // Active DFS keeps at most all pending Struct siblings plus one Range
         // per ancestor and the current row: <= T + D + 1 frames, independent
         // of list storage row count (ranges resume one row at a time).
-        let frames = add(add(input.nodes.len(), input.geometry.maximum_depth)?, 1)?;
+        let frames = work.numeric(add(
+            work.numeric(add(input.nodes.len(), input.geometry.maximum_depth))?,
+            1,
+        ))?;
         growing_layout(
             &mut requests,
             ConstantPool::flat_value_validation_stack_layout(),

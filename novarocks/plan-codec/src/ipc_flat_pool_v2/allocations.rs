@@ -58,20 +58,26 @@ impl Requests {
     fn request<T>(
         &mut self,
         capacity: usize,
-        work: &mut CompileCheckpoints<'_>,
+        mut work: Option<&mut CompileCheckpoints<'_>>,
     ) -> Result<(), TypeCodecError> {
-        let layout = Layout::array::<T>(capacity).map_err(|_| invalid());
-        work.step()?;
+        let policy = crate::ipc_schema_v2::owner_admission::Policy(work.is_none());
+        let layout = policy.numeric(Layout::array::<T>(capacity).map_err(|_| invalid()));
+        if let Some(work) = work.as_deref_mut() {
+            work.step()?;
+        }
         let layout = layout?;
         if layout.size() == 0 {
             return Ok(());
         }
-        let next = self
-            .bytes
-            .checked_add(layout.size())
-            .zip(self.count.checked_add(1))
-            .ok_or_else(invalid);
-        work.step()?;
+        let next = policy.numeric(
+            self.bytes
+                .checked_add(layout.size())
+                .zip(self.count.checked_add(1))
+                .ok_or_else(invalid),
+        );
+        if let Some(work) = work {
+            work.step()?;
+        }
         let (bytes, count) = next?;
         self.bytes = bytes;
         self.count = count;
@@ -81,7 +87,7 @@ impl Requests {
     fn vtable_requests(
         &mut self,
         tables: usize,
-        work: &mut CompileCheckpoints<'_>,
+        mut work: Option<&mut CompileCheckpoints<'_>>,
     ) -> Result<(), TypeCodecError> {
         if tables == 0 {
             return Ok(());
@@ -91,12 +97,15 @@ impl Requests {
         // only the final backing, even if some vtables deduplicate.
         let mut capacity = 4usize;
         loop {
-            self.request::<u32>(capacity, work)?;
+            self.request::<u32>(capacity, work.as_deref_mut())?;
             if capacity >= tables {
                 break;
             }
-            let next = capacity.checked_mul(2).ok_or_else(invalid);
-            work.step()?;
+            let next = crate::ipc_schema_v2::owner_admission::Policy(work.is_none())
+                .numeric(capacity.checked_mul(2).ok_or_else(invalid));
+            if let Some(work) = work.as_deref_mut() {
+                work.step()?;
+            }
             capacity = next?;
         }
         Ok(())
@@ -116,10 +125,21 @@ pub(super) fn preflight(
     stream_capacity: usize,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Requests, TypeCodecError> {
+    preflight_core(schema, batch_backing, stream_capacity, Some(work))
+}
+
+pub(super) fn preflight_core(
+    schema: &SchemaPreflight,
+    batch_backing: usize,
+    stream_capacity: usize,
+    mut work: Option<&mut CompileCheckpoints<'_>>,
+) -> Result<Requests, TypeCodecError> {
     let result = (|| {
         let field_location = Layout::new::<FieldLocation>();
         let matches_source = field_location.size() == 8 && field_location.align() == 4;
-        work.step()?;
+        if let Some(work) = work.as_deref_mut() {
+            work.step()?;
+        }
         if !matches_source {
             return Err(TypeCodecError::InvalidShape(
                 "flat writer FieldLoc allocation source layout changed",
@@ -128,32 +148,32 @@ pub(super) fn preflight(
         let mut requests = Requests { bytes: 0, count: 0 };
         // Schema primary backing and its finished metadata copy coexist.
         // The actual finished copy is no larger than the admitted backing.
-        requests.request::<u8>(schema.backing, work)?;
-        requests.request::<u8>(schema.backing, work)?;
-        requests.request::<u8>(batch_backing, work)?;
-        requests.request::<u8>(stream_capacity, work)?;
+        requests.request::<u8>(schema.backing, work.as_deref_mut())?;
+        requests.request::<u8>(schema.backing, work.as_deref_mut())?;
+        requests.request::<u8>(batch_backing, work.as_deref_mut())?;
+        requests.request::<u8>(stream_capacity, work.as_deref_mut())?;
 
         // The resource helper performs two flat walks and the exact schema
         // encoder performs two more. The list macro has exact capacity one.
         for _ in 0..4 {
-            requests.request::<TypeWalkerEntry<'_>>(1, work)?;
+            requests.request::<TypeWalkerEntry<'_>>(1, work.as_deref_mut())?;
         }
         // emit_field reserves these exact metadata capacities. An empty Vec
         // makes no request, and the lexical-sort and offsets Vecs coexist.
-        requests.request::<(&str, &str)>(schema.metadata_entries, work)?;
-        requests.request::<MetadataOffset>(schema.metadata_entries, work)?;
+        requests.request::<(&str, &str)>(schema.metadata_entries, work.as_deref_mut())?;
+        requests.request::<MetadataOffset>(schema.metadata_entries, work.as_deref_mut())?;
 
         // Schema tables can insert up to seven slots: first FieldLoc capacity
         // four, then eight. Count both requests. All actual candidate schema
         // vtables are bounded by the existing schema author's table count.
-        requests.request::<FieldLocation>(4, work)?;
-        requests.request::<FieldLocation>(8, work)?;
-        requests.vtable_requests(schema.tables, work)?;
+        requests.request::<FieldLocation>(4, work.as_deref_mut())?;
+        requests.request::<FieldLocation>(8, work.as_deref_mut())?;
+        requests.vtable_requests(schema.tables, work.as_deref_mut())?;
 
         // The uncompressed batch Message/RecordBatch each insert at most
         // four slots. Two candidate vtables fit the first u32 capacity four.
-        requests.request::<FieldLocation>(4, work)?;
-        requests.request::<u32>(4, work)?;
+        requests.request::<FieldLocation>(4, work.as_deref_mut())?;
+        requests.request::<u32>(4, work.as_deref_mut())?;
         Ok(requests)
     })();
     if matches!(&result, Err(TypeCodecError::Control(_))) {
@@ -161,8 +181,43 @@ pub(super) fn preflight(
     }
     // This borrowed owner retains the same pending work and failure latch.
     // An ordinary layout/overflow error must also observe its completed tail.
-    work.flush()?;
+    if let Some(work) = work {
+        work.flush()?;
+    }
     result
+}
+
+/// Batch/output requests shared by flat and recursive writers. Schema requests
+/// belong to their sole schema allocation author and are not counted here.
+pub(crate) fn batch_and_stream_requests(
+    batch_backing: usize,
+    stream_capacity: usize,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Requests, TypeCodecError> {
+    batch_and_stream_requests_core(batch_backing, stream_capacity, Some(work))
+}
+
+pub(crate) fn batch_and_stream_requests_core(
+    batch_backing: usize,
+    stream_capacity: usize,
+    mut work: Option<&mut CompileCheckpoints<'_>>,
+) -> Result<Requests, TypeCodecError> {
+    let field_location = Layout::new::<FieldLocation>();
+    let matches_source = field_location.size() == 8 && field_location.align() == 4;
+    if let Some(work) = work.as_deref_mut() {
+        work.step()?;
+    }
+    if !matches_source {
+        return Err(TypeCodecError::InvalidShape(
+            "flat writer FieldLoc allocation source layout changed",
+        ));
+    }
+    let mut requests = Requests { bytes: 0, count: 0 };
+    requests.request::<u8>(batch_backing, work.as_deref_mut())?;
+    requests.request::<FieldLocation>(4, work.as_deref_mut())?;
+    requests.request::<u32>(4, work.as_deref_mut())?;
+    requests.request::<u8>(stream_capacity, work)?;
+    Ok(requests)
 }
 
 #[cfg(test)]
@@ -247,7 +302,7 @@ mod tests {
             let control = OriginalControl::default();
             let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
             let mut requests = Requests { bytes: 0, count: 0 };
-            requests.vtable_requests(tables, &mut work).unwrap();
+            requests.vtable_requests(tables, Some(&mut work)).unwrap();
             assert_eq!(requests.bytes, expected_bytes);
             assert_eq!(requests.count, expected_count);
         }
@@ -298,27 +353,4 @@ mod tests {
             assert_eq!(*control.calls.lock().unwrap(), first);
         }
     }
-}
-
-/// Batch/output requests shared by flat and recursive writers. Schema requests
-/// belong to their sole schema allocation author and are not counted here.
-pub(crate) fn batch_and_stream_requests(
-    batch_backing: usize,
-    stream_capacity: usize,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<Requests, TypeCodecError> {
-    let field_location = Layout::new::<FieldLocation>();
-    let matches_source = field_location.size() == 8 && field_location.align() == 4;
-    work.step()?;
-    if !matches_source {
-        return Err(TypeCodecError::InvalidShape(
-            "flat writer FieldLoc allocation source layout changed",
-        ));
-    }
-    let mut requests = Requests { bytes: 0, count: 0 };
-    requests.request::<u8>(batch_backing, work)?;
-    requests.request::<FieldLocation>(4, work)?;
-    requests.request::<u32>(4, work)?;
-    requests.request::<u8>(stream_capacity, work)?;
-    Ok(requests)
 }

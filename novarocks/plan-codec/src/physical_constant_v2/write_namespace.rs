@@ -18,14 +18,17 @@
 use super::{
     ConstantNamespaceProjectionLimits, ConstantWriteProjectionLimits,
     PhysicalConstantCodecError as Error, PreparedConstantRecordWrite,
-    binding_resources::preflight_constant_binding_resources, finish, prepare_constant_record_write,
+    binding_resources::{
+        preflight_constant_binding_resources, preflight_constant_binding_resources_in,
+    },
+    finish, prepare_constant_record_write, prepare_constant_record_write_in,
 };
 use crate::physical_type_v2::EncodedTypeTable;
 use arrow::datatypes::Field;
 use novarocks_physical_plan::{ConstantPoolId, ConstantPools};
 use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, FunctionValueType, PureCompileControl,
+    CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
     arrow_data_types_exact_borrowed_observed, arrow_fields_exact_borrowed_observed,
 };
 use std::{alloc::Layout, sync::Arc};
@@ -51,6 +54,38 @@ pub struct ConstantNamespaceWriteFacts {
     pub binding_work_upper_bound: usize,
     pub cumulative_library_work_upper_bound: usize,
 }
+type Admit<'a> = dyn FnMut(&ConstantNamespaceWriteFacts) -> Result<(), CompileControlError> + 'a;
+fn gate_parent(
+    facts: &ConstantNamespaceWriteFacts,
+    limits: ConstantNamespaceProjectionLimits,
+    admit: &mut Admit<'_>,
+) -> Result<(), CompileControlError> {
+    for (actual, maximum) in [
+        (facts.record_count, limits.max_records),
+        (
+            facts.prepared_storage_request_bytes,
+            limits.max_preparation_request_bytes,
+        ),
+        (
+            facts.new_allocation_request_bytes_upper_bound,
+            limits.max_new_allocation_request_bytes,
+        ),
+        (
+            facts.coexisting_source_and_request_bytes_upper_bound,
+            limits.max_coexisting_source_and_request_bytes,
+        ),
+        (
+            facts.cumulative_library_work_upper_bound,
+            limits.max_cumulative_library_work,
+        ),
+    ] {
+        if actual > maximum {
+            return Err(CompileControlError::ResourceExhausted);
+        }
+    }
+    admit(facts)
+}
+
 /// Retaining the immutable table loan prevents changing its DTO between the
 /// exact source binding and emission. Source roots and pools also stay borrowed.
 pub struct PreparedConstantNamespaceWrite<'pool, 'table, 'control> {
@@ -65,22 +100,61 @@ impl PreparedConstantNamespaceWrite<'_, '_, '_> {
     }
     pub fn emit(self) -> Result<Vec<wire::IpcConstantPool>, Error> {
         let mut work = CompileCheckpoints::try_new(self.control, CompilePhase::Encode)?;
-        let result = (|| {
+        let result = self.emit_core(None, &mut work);
+        finish(work, result)
+    }
+    pub(crate) fn emit_in(
+        self,
+        admit: &mut Admit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Vec<wire::IpcConstantPool>, Error> {
+        if !std::ptr::addr_eq(self.control, work.control()) {
+            return Err(shape(
+                "constant writer namespace caller work has a different original control",
+            ));
+        }
+        admit(&self.facts)?;
+        self.emit_core(Some(admit), work)
+    }
+    fn emit_core(
+        self,
+        mut admit: Option<&mut Admit<'_>>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Vec<wire::IpcConstantPool>, Error> {
+        (|| {
             work.flush()?;
             let mut output = Vec::new();
             let reserved = output.try_reserve_exact(self.records.len());
-            crate::allocation_exit_v2::reserve_exit::<Error>(reserved, &mut work)?;
+            crate::allocation_exit_v2::reserve_exit::<Error>(reserved, work)?;
             for record in self.records {
                 work.step()?;
                 work.flush()?;
-                let encoded = record.emit()?;
+                let encoded = if let Some(parent) = &mut admit {
+                    let known = *record.facts();
+                    record.emit_in(
+                        &mut |progress| {
+                            if progress.new_allocation_request_bytes_upper_bound
+                                > known.new_allocation_request_bytes_upper_bound
+                                || progress.allocation_request_count_upper_bound
+                                    > known.allocation_request_count_upper_bound
+                                || progress.cumulative_library_work_upper_bound
+                                    > known.cumulative_library_work_upper_bound
+                            {
+                                return Err(CompileControlError::ResourceExhausted);
+                            }
+                            parent(&self.facts)
+                        },
+                        work,
+                    )?
+                } else {
+                    record.emit()?
+                };
                 work.flush()?;
                 output.push(encoded);
                 work.step()?;
             }
             Ok(output)
-        })();
-        finish(work, result)
+        })()
     }
 }
 fn shape(message: &'static str) -> Error {
@@ -142,6 +216,35 @@ fn check(
     )
 }
 
+fn initial_header(
+    count: usize,
+    types: &EncodedTypeTable<'_>,
+    source_retained_bytes: usize,
+) -> Result<ConstantNamespaceWriteFacts, Error> {
+    let storage = Layout::array::<PreparedConstantRecordWrite<'_, '_>>(count)
+        .map_err(|_| shape("constant namespace writer preparation layout is unrepresentable"))?
+        .size();
+    let output = Layout::array::<wire::IpcConstantPool>(count)
+        .map_err(|_| shape("constant namespace writer record layout is unrepresentable"))?
+        .size();
+    let (values, fields) = types.source_counts();
+    let lookups = mul(count, add(values, fields)?)?;
+    let own_work = add(add(storage, output)?, add(lookups, mul(count, 32)?)?)?;
+    let requests = add(storage, output)?;
+    let facts = ConstantNamespaceWriteFacts {
+        record_count: count,
+        source_retained_bytes,
+        prepared_storage_request_bytes: storage,
+        record_storage_request_bytes: output,
+        allocation_request_count_upper_bound: if count == 0 { 0 } else { 2 },
+        new_allocation_request_bytes_upper_bound: requests,
+        coexisting_source_and_request_bytes_upper_bound: add(source_retained_bytes, requests)?,
+        cumulative_library_work_upper_bound: own_work,
+        ..Default::default()
+    };
+    Ok(facts)
+}
+
 /// All retained type DTO/root/pool/binding backing belongs in the mandatory
 /// source invoice. Existing type/schema scratch stages retain their own prior
 /// gates; these aggregate output request facts do not retroactively grant them.
@@ -155,13 +258,63 @@ pub fn prepare_constant_namespace_write<'pool, 'table, 'control>(
     control: &'control dyn PureCompileControl,
 ) -> Result<PreparedConstantNamespaceWrite<'pool, 'table, 'control>, Error> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
-    let result = (|| {
+    let result = prepare_core(
+        pools,
+        bindings,
+        types,
+        source_retained_bytes,
+        record_limits,
+        limits,
+        None,
+        &mut work,
+    );
+    finish(work, result)
+}
+
+pub(crate) fn prepare_constant_namespace_write_in<'pool, 'table, 'control>(
+    pools: &'pool ConstantPools,
+    bindings: &[ConstantRecordTypeIds],
+    types: &'table EncodedTypeTable<'table>,
+    source_retained_bytes: usize,
+    record_limits: ConstantWriteProjectionLimits,
+    limits: ConstantNamespaceProjectionLimits,
+    admit: &mut Admit<'_>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedConstantNamespaceWrite<'pool, 'table, 'control>, Error> {
+    prepare_core(
+        pools,
+        bindings,
+        types,
+        source_retained_bytes,
+        record_limits,
+        limits,
+        Some(admit),
+        work,
+    )
+}
+
+fn prepare_core<'pool, 'table, 'control>(
+    pools: &'pool ConstantPools,
+    bindings: &[ConstantRecordTypeIds],
+    types: &'table EncodedTypeTable<'table>,
+    source_retained_bytes: usize,
+    record_limits: ConstantWriteProjectionLimits,
+    limits: ConstantNamespaceProjectionLimits,
+    mut admit: Option<&mut Admit<'_>>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedConstantNamespaceWrite<'pool, 'table, 'control>, Error> {
+    (|| {
         let count = pools.entries().len();
+        if let Some(parent) = &mut admit {
+            let known = initial_header(count, types, source_retained_bytes)
+                .map_err(|_| CompileControlError::ResourceExhausted)?;
+            gate_parent(&known, limits, *parent)?;
+        }
         cap(
             count,
             limits.max_records,
             "constant namespace writer count envelope exceeded",
-            &mut work,
+            work,
         )?;
         let lengths_match = bindings.len() == count;
         work.step()?;
@@ -170,28 +323,11 @@ pub fn prepare_constant_namespace_write<'pool, 'table, 'control>(
                 "constant namespace writer requires one binding per original pool",
             ));
         }
-        let storage = Layout::array::<PreparedConstantRecordWrite<'_, '_>>(count)
-            .map_err(|_| shape("constant namespace writer preparation layout is unrepresentable"))?
-            .size();
-        let output = Layout::array::<wire::IpcConstantPool>(count)
-            .map_err(|_| shape("constant namespace writer record layout is unrepresentable"))?
-            .size();
+        let mut facts = initial_header(count, types, source_retained_bytes)?;
+        let storage = facts.prepared_storage_request_bytes;
+        let requests = facts.new_allocation_request_bytes_upper_bound;
         let (values, fields) = types.source_counts();
-        let lookups = mul(count, add(values, fields)?)?;
-        let own_work = add(add(storage, output)?, add(lookups, mul(count, 32)?)?)?;
-        let requests = add(storage, output)?;
-        let mut facts = ConstantNamespaceWriteFacts {
-            record_count: count,
-            source_retained_bytes,
-            prepared_storage_request_bytes: storage,
-            record_storage_request_bytes: output,
-            allocation_request_count_upper_bound: if count == 0 { 0 } else { 2 },
-            new_allocation_request_bytes_upper_bound: requests,
-            coexisting_source_and_request_bytes_upper_bound: add(source_retained_bytes, requests)?,
-            cumulative_library_work_upper_bound: own_work,
-            ..Default::default()
-        };
-        check(&facts, limits, &mut work)?;
+        check(&facts, limits, work)?;
         // Known retained source lower bounds must use the ORIGINAL invoice.
         // Adding our new prepared storage would mask a missing input charge.
         // This top-level floor is not a complete invoice for nested strings,
@@ -225,7 +361,7 @@ pub fn prepare_constant_namespace_write<'pool, 'table, 'control>(
             source_floor,
             source_retained_bytes,
             "constant namespace writer source invoice excludes type and binding storage",
-            &mut work,
+            work,
         )?;
         for pool in pools.entries().values() {
             let retained = usize::try_from(pool.resource_facts().retained_buffer_capacity_bytes)
@@ -237,13 +373,13 @@ pub fn prepare_constant_namespace_write<'pool, 'table, 'control>(
                 retained?,
                 source_retained_bytes,
                 "constant namespace writer source invoice excludes original pool backing",
-                &mut work,
+                work,
             )?;
         }
         work.flush()?;
         let mut prepared = Vec::new();
         let reserved = prepared.try_reserve_exact(count);
-        crate::allocation_exit_v2::reserve_exit::<Error>(reserved, &mut work)?;
+        crate::allocation_exit_v2::reserve_exit::<Error>(reserved, work)?;
         for ((id, pool), binding) in pools.entries().iter().zip(bindings) {
             let id_matches = *id == binding.pool;
             work.step()?;
@@ -253,15 +389,61 @@ pub fn prepare_constant_namespace_write<'pool, 'table, 'control>(
                 ));
             }
             let ty = types
-                .value_type_observed(binding.value_type_id, &mut work)?
+                .value_type_observed(binding.value_type_id, work)?
                 .ok_or_else(|| {
                     shape("constant namespace writer references an unknown source value type")
                 })?;
-            let field = types
-                .field_observed(binding.field_id, &mut work)?
-                .ok_or_else(|| {
-                    shape("constant namespace writer references an unknown source Field")
-                })?;
+            let mut captured_binding = None;
+            let binding_base = facts;
+            let captured_source = if admit.is_some() {
+                Some(
+                    add(source_retained_bytes, storage)
+                        .map_err(|_| CompileControlError::ResourceExhausted)?,
+                )
+            } else {
+                None
+            };
+            let field = if let Some(parent) = &mut admit {
+                types.field_captured(
+                    binding.field_id,
+                    &mut |field, work| {
+                        // Invalid semantic flags still belong to the original author.
+                        if ty.nullable == pool.value_type().nullable
+                            && ty.logical_type == pool.value_type().logical_type
+                        {
+                            captured_binding = Some(preflight_constant_binding_resources_in(
+                                pool,
+                                field,
+                                captured_source.ok_or_else(|| {
+                                    shape("constant caller binding source is absent")
+                                })?,
+                                limits
+                                    .max_cumulative_library_work
+                                    .checked_sub(binding_base.cumulative_library_work_upper_bound)
+                                    .ok_or(CompileControlError::ResourceExhausted)?,
+                                &mut |prefix| {
+                                    let mut current = binding_base;
+                                    current.binding_work_upper_bound = binding_base
+                                        .binding_work_upper_bound
+                                        .checked_add(prefix)
+                                        .ok_or(CompileControlError::ResourceExhausted)?;
+                                    current.cumulative_library_work_upper_bound = binding_base
+                                        .cumulative_library_work_upper_bound
+                                        .checked_add(prefix)
+                                        .ok_or(CompileControlError::ResourceExhausted)?;
+                                    gate_parent(&current, limits, *parent)
+                                },
+                                work,
+                            )?);
+                        }
+                        Ok::<_, Error>(())
+                    },
+                    work,
+                )?
+            } else {
+                types.field_observed(binding.field_id, work)?
+            }
+            .ok_or_else(|| shape("constant namespace writer references an unknown source Field"))?;
             let flags_match = ty.nullable == pool.value_type().nullable
                 && ty.logical_type == pool.value_type().logical_type;
             work.step()?;
@@ -270,14 +452,21 @@ pub fn prepare_constant_namespace_write<'pool, 'table, 'control>(
                     "constant namespace writer source value type differs from original pool",
                 ));
             }
-            let live_source = add(source_retained_bytes, storage)?;
-            let binding_facts = preflight_constant_binding_resources(
-                pool,
-                field,
-                live_source,
-                limits.max_cumulative_library_work - facts.cumulative_library_work_upper_bound,
-                &mut work,
-            )?;
+            let live_source = match captured_source {
+                Some(source) => source,
+                None => add(source_retained_bytes, storage)?,
+            };
+            let binding_facts = if let Some(captured) = captured_binding {
+                captured
+            } else {
+                preflight_constant_binding_resources(
+                    pool,
+                    field,
+                    live_source,
+                    limits.max_cumulative_library_work - facts.cumulative_library_work_upper_bound,
+                    work,
+                )?
+            };
             facts.binding_work_upper_bound = add(
                 facts.binding_work_upper_bound,
                 binding_facts.work_upper_bound(),
@@ -286,7 +475,10 @@ pub fn prepare_constant_namespace_write<'pool, 'table, 'control>(
                 facts.cumulative_library_work_upper_bound,
                 binding_facts.work_upper_bound(),
             )?;
-            check(&facts, limits, &mut work)?;
+            if let Some(parent) = &mut admit {
+                gate_parent(&facts, limits, *parent)?;
+            }
+            check(&facts, limits, work)?;
             work.flush()?;
             let types_match = arrow_data_types_exact_borrowed_observed(
                 &pool.value_type().data_type,
@@ -312,16 +504,35 @@ pub fn prepare_constant_namespace_write<'pool, 'table, 'control>(
                     "constant namespace writer source Field differs from original pool",
                 ));
             }
-            work.flush()?;
-            let writer = prepare_constant_record_write(
-                *id,
-                binding.value_type_id,
-                binding.field_id,
-                pool,
-                live_source,
-                record_limits,
-                work.control(),
-            )?;
+            if admit.is_none() {
+                work.flush()?;
+            }
+            let writer_base = facts;
+            let writer = if let Some(parent) = &mut admit {
+                prepare_constant_record_write_in(
+                    *id,
+                    binding.value_type_id,
+                    binding.field_id,
+                    pool,
+                    live_source,
+                    record_limits,
+                    &mut |prefix| {
+                        let current = with_writer(writer_base, prefix)?;
+                        gate_parent(&current, limits, *parent)
+                    },
+                    work,
+                )?
+            } else {
+                prepare_constant_record_write(
+                    *id,
+                    binding.value_type_id,
+                    binding.field_id,
+                    pool,
+                    live_source,
+                    record_limits,
+                    work.control(),
+                )?
+            };
             work.flush()?;
             let writer_facts = writer.facts();
             facts.writer_request_bytes_upper_bound = add(
@@ -342,7 +553,10 @@ pub fn prepare_constant_namespace_write<'pool, 'table, 'control>(
                 source_retained_bytes,
                 facts.new_allocation_request_bytes_upper_bound,
             )?;
-            check(&facts, limits, &mut work)?;
+            if let Some(parent) = &mut admit {
+                gate_parent(&facts, limits, *parent)?;
+            }
+            check(&facts, limits, work)?;
             prepared.push(writer);
             work.step()?;
         }
@@ -350,10 +564,9 @@ pub fn prepare_constant_namespace_write<'pool, 'table, 'control>(
             records: prepared,
             facts,
             _types: types,
-            control,
+            control: work.control(),
         })
-    })();
-    finish(work, result)
+    })()
 }
 
 pub fn encode_constant_namespace(
@@ -375,4 +588,39 @@ pub fn encode_constant_namespace(
         control,
     )?
     .emit()
+}
+
+fn with_writer(
+    base: ConstantNamespaceWriteFacts,
+    writer: &crate::ipc_flat_pool_v2::FlatPoolWriteFacts,
+) -> Result<ConstantNamespaceWriteFacts, CompileControlError> {
+    let sum = |a: usize, b: usize| {
+        a.checked_add(b)
+            .ok_or(CompileControlError::ResourceExhausted)
+    };
+    let mut facts = base;
+    facts.writer_request_bytes_upper_bound = sum(
+        base.writer_request_bytes_upper_bound,
+        writer.new_allocation_request_bytes_upper_bound,
+    )?;
+    facts.allocation_request_count_upper_bound = sum(
+        base.allocation_request_count_upper_bound,
+        writer.allocation_request_count_upper_bound,
+    )?;
+    facts.cumulative_library_work_upper_bound = sum(
+        base.cumulative_library_work_upper_bound,
+        writer.cumulative_library_work_upper_bound,
+    )?;
+    facts.new_allocation_request_bytes_upper_bound = sum(
+        sum(
+            facts.prepared_storage_request_bytes,
+            facts.record_storage_request_bytes,
+        )?,
+        facts.writer_request_bytes_upper_bound,
+    )?;
+    facts.coexisting_source_and_request_bytes_upper_bound = sum(
+        facts.source_retained_bytes,
+        facts.new_allocation_request_bytes_upper_bound,
+    )?;
+    Ok(facts)
 }

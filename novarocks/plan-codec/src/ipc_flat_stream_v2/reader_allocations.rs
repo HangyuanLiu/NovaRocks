@@ -21,6 +21,7 @@
 //! error formatting and opaque reader work have separate owners.
 
 use super::{FlatConstantStream, FlatPoolResourceError, FlatPoolResourceProjection};
+use crate::ipc_flat_stream_v2::resource_work::ResourceWork;
 #[cfg(test)]
 use crate::resource_source_model::locked_family;
 use crate::resource_source_model::{LOCKED_FAMILY, LOCKED_TOOLCHAIN};
@@ -34,7 +35,7 @@ use arrow::{
 };
 use arrow_buffer::{Buffer, MutableBuffer};
 use novarocks_constant_contract::ConstantPool;
-use novarocks_type_contract::CompileCheckpoints;
+
 use std::{alloc::Layout, mem, ptr::NonNull};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,9 +97,7 @@ fn bytes_layout() -> Layout {
     argument_layout(Buffer::from_bytes)
 }
 
-pub(crate) fn environment(
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<Layout, FlatPoolResourceError> {
+pub(crate) fn environment(work: &mut impl ResourceWork) -> Result<Layout, FlatPoolResourceError> {
     let bytes = bytes_layout();
     let supported = LOCKED_FAMILY
         && LOCKED_TOOLCHAIN
@@ -127,41 +126,60 @@ impl Requests {
         &mut self,
         layout: Layout,
         copies: usize,
-        work: &mut CompileCheckpoints<'_>,
+        work: &mut impl ResourceWork,
     ) -> Result<(), FlatPoolResourceError> {
         let result = (|| {
-            self.bytes = add(self.bytes, mul(layout.size(), copies)?)?;
-            self.count = add(self.count, copies)?;
+            self.bytes =
+                work.numeric(add(self.bytes, work.numeric(mul(layout.size(), copies))?))?;
+            self.count = work.numeric(add(self.count, copies))?;
             Ok(())
         })();
-        work.step()?;
-        result
+        if work.parent() {
+            result?;
+            work.requests(self.bytes, self.count)?;
+            work.step()?;
+            Ok(())
+        } else {
+            work.step()?;
+            result
+        }
     }
     pub(crate) fn exact_vec<T>(
         &mut self,
         count: usize,
         copies: usize,
-        work: &mut CompileCheckpoints<'_>,
+        work: &mut impl ResourceWork,
     ) -> Result<(), FlatPoolResourceError> {
         if count == 0 || mem::size_of::<T>() == 0 {
             work.step()?;
             return Ok(());
         }
-        let layout = array_layout::<T>(count)?;
+        let layout = work.numeric(array_layout::<T>(count))?;
         self.record(layout, copies, work)
     }
     pub(crate) fn arc(
         &mut self,
         payload: Layout,
         copies: usize,
-        work: &mut CompileCheckpoints<'_>,
+        work: &mut impl ResourceWork,
     ) -> Result<(), FlatPoolResourceError> {
-        self.record(arc_layout(payload)?, copies, work)
+        let layout = if work.parent() {
+            use novarocks_type_contract::owned_resources::layout::{self, LayoutResourceError};
+            layout::arc_layout(payload).map_err(|error| match error {
+                LayoutResourceError::ArcHeader | LayoutResourceError::ArcBacking => {
+                    novarocks_type_contract::CompileControlError::ResourceExhausted.into()
+                }
+                _ => invalid("flat reader Arc source model drift"),
+            })?
+        } else {
+            arc_layout(payload)?
+        };
+        self.record(layout, copies, work)
     }
     pub(crate) fn growing_vec<T>(
         &mut self,
         count: usize,
-        work: &mut CompileCheckpoints<'_>,
+        work: &mut impl ResourceWork,
     ) -> Result<(), FlatPoolResourceError> {
         if count == 0 || mem::size_of::<T>() == 0 {
             work.step()?;
@@ -178,32 +196,50 @@ impl Requests {
         } else {
             1
         };
-        let maximum = minimum.max(mul(count, 2)?);
+        let maximum = minimum.max(work.numeric(mul(count, 2))?);
         let mut capacity = minimum;
         let mut requests = 1;
+        if work.parent() {
+            let per_request = work.numeric(array_layout::<T>(maximum))?;
+            self.bytes =
+                work.numeric(add(self.bytes, work.numeric(mul(per_request.size(), 2))?))?;
+            self.count = work.numeric(add(self.count, 1))?;
+            work.requests(self.bytes, self.count)?;
+        }
         while capacity < count {
-            capacity = mul(capacity, 2)?;
-            requests = add(requests, 1)?;
+            capacity = work.numeric(mul(capacity, 2))?;
+            requests = work.numeric(add(requests, 1))?;
+            if work.parent() {
+                self.count = work.numeric(add(self.count, 1))?;
+                work.requests(self.bytes, self.count)?;
+            }
             work.step()?;
         }
-        let per_request = array_layout::<T>(maximum)?;
-        let result = (|| {
-            self.bytes = add(self.bytes, mul(per_request.size(), 2)?)?;
-            self.count = add(self.count, requests)?;
+        let result = if work.parent() {
             Ok(())
-        })();
+        } else {
+            let per_request = work.numeric(array_layout::<T>(maximum))?;
+            (|| {
+                self.bytes =
+                    work.numeric(add(self.bytes, work.numeric(mul(per_request.size(), 2))?))?;
+                self.count = work.numeric(add(self.count, requests))?;
+                Ok(())
+            })()
+        };
         work.step()?;
         result
     }
     pub(crate) fn view_to_data(
         &mut self,
         variadic: usize,
-        work: &mut CompileCheckpoints<'_>,
+        work: &mut impl ResourceWork,
     ) -> Result<(), FlatPoolResourceError> {
         // GenericByteViewArray::into ArrayData first to_vec(V), then insert(0).
         // The existing V-header Vec and its grow request can coexist.
         self.exact_vec::<Buffer>(variadic, 1, work)?;
-        let grown = 4usize.max(mul(variadic, 2)?).max(add(variadic, 1)?);
+        let grown = 4usize
+            .max(work.numeric(mul(variadic, 2))?)
+            .max(work.numeric(add(variadic, 1))?);
         self.exact_vec::<Buffer>(grown, 1, work)
     }
 }
@@ -273,28 +309,48 @@ pub(crate) fn concrete_array_layout(ty: &DataType) -> Result<Layout, FlatPoolRes
 /// Requires the pool projection computed for this same checked stream. This
 /// private helper borrows the parent's original checkpoints; parent owns its
 /// success/ordinary tail and primary refusal handling. It makes no allocations.
+fn header_requests(
+    field: &arrow::datatypes::Field,
+    bytes: Layout,
+    owners: usize,
+    work: &mut impl ResourceWork,
+) -> Result<Requests, FlatPoolResourceError> {
+    let mut requests = Requests::default();
+    requests.arc(work.numeric(array_layout::<FieldRef>(1))?, 1, work)?;
+    requests.arc(Layout::new::<Schema>(), 1, work)?;
+    requests.arc(bytes, owners, work)?;
+    requests.arc(concrete_array_layout(field.data_type())?, 2, work)?;
+    requests.exact_vec::<ArrayRef>(4, 1, work)?;
+    Ok(requests)
+}
+pub(super) fn initial_header(
+    field: &arrow::datatypes::Field,
+) -> Result<ReaderAllocationRequests, FlatPoolResourceError> {
+    let mut work = super::resource_work::HeaderWork;
+    let bytes = environment(&mut work)?;
+    let requests = header_requests(field, bytes, 1, &mut work)?;
+    Ok(ReaderAllocationRequests {
+        structural_request_bytes_upper_bound: requests.bytes,
+        allocation_requests_upper_bound: requests.count,
+    })
+}
+
 pub(super) fn preflight(
     stream: &FlatConstantStream<'_, '_>,
     pool: &FlatPoolResourceProjection,
-    work: &mut CompileCheckpoints<'_>,
+    work: &mut impl ResourceWork,
 ) -> Result<ReaderAllocationRequests, FlatPoolResourceError> {
     let bytes = environment(work)?;
     let flat = layout(stream.field().data_type())?;
     work.step()?;
     let geometry = stream.geometry();
     let variadic = geometry.variadic_buffers;
-    let mut requests = Requests::default();
-    requests.arc(array_layout::<FieldRef>(1)?, 1, work)?;
-    requests.arc(Layout::new::<Schema>(), 1, work)?;
     // Buffer::from_slice_ref always constructs a Bytes Arc, even at capacity 0.
-    let owners = add(
-        add(1, usize::from(pool.alignment_repair_possible))?,
+    let owners = work.numeric(add(
+        work.numeric(add(1, usize::from(pool.alignment_repair_possible)))?,
         usize::from(pool.empty_offset_capacity_bytes != 0),
-    )?;
-    requests.arc(bytes, owners, work)?;
-    requests.arc(concrete_array_layout(stream.field().data_type())?, 2, work)?;
-    // read_record_batch's one-column Vec push reserves RawVec's minimum four.
-    requests.exact_vec::<ArrayRef>(4, 1, work)?;
+    ))?;
+    let mut requests = header_requests(stream.field(), bytes, owners, work)?;
     match flat {
         FlatLayout::Null => {}
         FlatLayout::Views => {
@@ -302,8 +358,8 @@ pub(super) fn preflight(
             requests.exact_vec::<i64>(4, 1, work)?;
             // Result collection of D read Buffer headers, then builder to_vec.
             requests.growing_vec::<Buffer>(geometry.buffer_descriptors, work)?;
-            requests.exact_vec::<Buffer>(add(variadic, 1)?, 1, work)?;
-            requests.arc(array_layout::<Buffer>(variadic)?, 2, work)?;
+            requests.exact_vec::<Buffer>(work.numeric(add(variadic, 1))?, 1, work)?;
+            requests.arc(work.numeric(array_layout::<Buffer>(variadic))?, 2, work)?;
             requests.view_to_data(variadic, work)?;
             requests.view_to_data(variadic, work)?;
         }
@@ -331,7 +387,9 @@ pub(super) fn preflight(
     // batch walk, one pool bridge and one post-array validate_type. Each runs
     // the same flat walker vec![(&DataType,1)] with no children. Prefix
     // admission and its actual lifetime remain separately owned by the host.
-    requests.exact_vec::<(&DataType, usize)>(1, 5, work)?;
+    if !work.parent() {
+        requests.exact_vec::<(&DataType, usize)>(1, 5, work)?;
+    }
     if !matches!(flat, FlatLayout::Null) {
         // Sole semantic validator's exact private frame layout, no enum mirror.
         // Flat Range processing pop/push retains capacity one, even for N=0.
@@ -347,6 +405,7 @@ pub(super) fn preflight(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_type_contract::CompileCheckpoints;
     use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;

@@ -22,9 +22,10 @@
 //! observations and combines this with all successful reader allocations.
 
 use super::{FlatConstantStream, FlatPoolResourceError};
+use crate::ipc_flat_stream_v2::resource_work::ResourceWork;
 use crate::physical_type_v2::TypeCodecError;
 use arrow::datatypes::{DataType, Field};
-use novarocks_type_contract::CompileCheckpoints;
+
 use std::alloc::Layout;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -81,15 +82,16 @@ impl ReaderDiagnosticRequests {
 /// themselves describe one allocation Layout.
 pub(crate) fn string_requests(
     length: usize,
-    work: &mut CompileCheckpoints<'_>,
+    work: &mut impl ResourceWork,
 ) -> Result<ReaderDiagnosticRequests, FlatPoolResourceError> {
     if length == 0 {
         work.step()?;
         return Ok(ReaderDiagnosticRequests::default());
     }
-    let capacity = mul(length, 2)?.max(8);
-    byte_layout(capacity)?;
-    let bytes = add(8, mul(length, 4)?)?;
+    let capacity = work.numeric(mul(length, 2))?.max(8);
+    work.numeric(byte_layout(capacity))?;
+    let bytes = work.numeric(add(8, work.numeric(mul(length, 4))?))?;
+    work.requests(bytes, 1)?;
     work.step()?;
     // Every growth at least doubles (or jumps to eight). This bit-length
     // bound also allows the initial allocation, including initial capacities
@@ -98,7 +100,8 @@ pub(crate) fn string_requests(
     let mut requests = 1usize;
     while remaining != 0 {
         remaining >>= 1;
-        requests = add(requests, 1)?;
+        requests = work.numeric(add(requests, 1))?;
+        work.requests(bytes, requests)?;
         work.step()?;
     }
     Ok(ReaderDiagnosticRequests {
@@ -110,39 +113,46 @@ pub(crate) fn string_requests(
 fn length(
     literal: &'static str,
     arguments: &[usize],
-    work: &mut CompileCheckpoints<'_>,
+    work: &mut impl ResourceWork,
 ) -> Result<usize, FlatPoolResourceError> {
     let mut result = literal.len();
     for &argument in arguments {
-        result = add(result, argument)?;
+        result = work.numeric(add(result, argument))?;
         work.step()?;
     }
     Ok(result)
 }
 pub(crate) fn arrow_error(
     description: usize,
-    work: &mut CompileCheckpoints<'_>,
+    work: &mut impl ResourceWork,
 ) -> Result<ReaderDiagnosticRequests, FlatPoolResourceError> {
     let original = string_requests(description, work)?;
     // ArrowError::InvalidArgumentError Display, followed by the actual
     // caller's to_string. Both requests occur, even though the original drops.
-    let converted = string_requests(add("Invalid argument error: ".len(), description)?, work)?;
+    let converted = string_requests(
+        work.numeric(add("Invalid argument error: ".len(), description))?,
+        work,
+    )?;
     original.plus(converted)
 }
 fn candidate(
     largest: &mut ReaderDiagnosticRequests,
     literal: &'static str,
     arguments: &[usize],
-    work: &mut CompileCheckpoints<'_>,
+    work: &mut impl ResourceWork,
 ) -> Result<(), FlatPoolResourceError> {
     let description = length(literal, arguments, work)?;
     *largest = largest.maximum(arrow_error(description, work)?);
+    work.requests(
+        largest.request_bytes_upper_bound,
+        largest.allocation_requests_upper_bound,
+    )?;
     work.step()?;
     Ok(())
 }
 pub(crate) fn decimal_digits(
     mut value: usize,
-    work: &mut CompileCheckpoints<'_>,
+    work: &mut impl ResourceWork,
 ) -> Result<usize, FlatPoolResourceError> {
     let mut digits = 1;
     while value >= 10 {
@@ -154,7 +164,7 @@ pub(crate) fn decimal_digits(
 }
 fn utf8_error_length(
     index_digits: usize,
-    work: &mut CompileCheckpoints<'_>,
+    work: &mut impl ResourceWork,
 ) -> Result<usize, FlatPoolResourceError> {
     // Utf8Error::error_len is u8; its valid_up_to is usize. The two original
     // Display alternatives write directly into the containing String.
@@ -189,12 +199,12 @@ fn scaled_length(coefficient: usize, scale: i8) -> Result<usize, FlatPoolResourc
 /// conservatively covered by the same u8 RawVec rule for <=78 decimal digits.
 /// The >=64-limb big-number branch cannot be entered by this 256-bit source.
 fn bigint_display_requests(
-    work: &mut CompileCheckpoints<'_>,
+    work: &mut impl ResourceWork,
 ) -> Result<ReaderDiagnosticRequests, FlatPoolResourceError> {
     let representation_bytes = 256usize / 8;
     let maximum_limbs = 256usize / 32;
-    byte_layout(representation_bytes)?;
-    byte_layout(256)?;
+    work.numeric(byte_layout(representation_bytes))?;
+    work.numeric(byte_layout(256))?;
     // Both possible num-bigint native limb layouts have the same 32-byte
     // representation bound; verify their actual element alignment as well.
     Layout::array::<u32>(maximum_limbs).map_err(|_| invalid())?;
@@ -202,8 +212,10 @@ fn bigint_display_requests(
     let mut result = ReaderDiagnosticRequests {
         // Negative byte copy, original limbs + shrink, cloned limbs + shrink,
         // and initial radix byte Vec. These are cumulative requested payloads.
-        request_bytes_upper_bound: add(mul(representation_bytes, 5)?, 256)?,
-        allocation_requests_upper_bound: add(4, mul(maximum_limbs, 2)?)?,
+        request_bytes_upper_bound: work
+            .numeric(add(work.numeric(mul(representation_bytes, 5))?, 256))?,
+        allocation_requests_upper_bound: work
+            .numeric(add(4, work.numeric(mul(maximum_limbs, 2))?))?,
     };
     work.step()?;
     result = result.plus(string_requests(78, work)?)?;
@@ -216,9 +228,9 @@ fn decimal_error(
     precision: u8,
     scale: i8,
     bigint: bool,
-    work: &mut CompileCheckpoints<'_>,
+    work: &mut impl ResourceWork,
 ) -> Result<ReaderDiagnosticRequests, FlatPoolResourceError> {
-    let bound_length = add(usize::from(precision), 1)?; // includes a possible minus
+    let bound_length = work.numeric(add(usize::from(precision), 1))?; // includes a possible minus
     let coefficient_scaled = scaled_length(coefficient_length, scale)?;
     let bound_scaled = scaled_length(bound_length, scale)?;
     work.step()?;
@@ -246,7 +258,7 @@ fn decimal_error(
 
 pub(super) fn preflight(
     stream: &FlatConstantStream<'_, '_>,
-    work: &mut CompileCheckpoints<'_>,
+    work: &mut impl ResourceWork,
 ) -> Result<ReaderDiagnosticRequests, FlatPoolResourceError> {
     preflight_field(stream.field(), work)
 }
@@ -254,7 +266,7 @@ pub(super) fn preflight(
 /// Shared per-field leaf diagnostic author; container wrapping is additional.
 pub(crate) fn preflight_field(
     field: &Field,
-    work: &mut CompileCheckpoints<'_>,
+    work: &mut impl ResourceWork,
 ) -> Result<ReaderDiagnosticRequests, FlatPoolResourceError> {
     let ty = field.data_type();
     let digits = decimal_digits(usize::MAX, work)?;
@@ -321,7 +333,7 @@ pub(crate) fn preflight_field(
         }
         if matches!(ty, DataType::Utf8 | DataType::LargeUtf8) {
             let utf8 = utf8_error_length(digits, work)?;
-            let range = add(mul(digits, 2)?, "..".len())?;
+            let range = work.numeric(add(work.numeric(mul(digits, 2))?, "..".len()))?;
             candidate(
                 &mut largest,
                 "incomplete utf-8 byte sequence from index ",
@@ -386,7 +398,11 @@ pub(crate) fn preflight_field(
     }
     // Only the first semantic failure is formatted. All successful-prefix
     // allocations belong to the parent's other envelopes, not this maximum.
-    let result = largest.plus(eager)?;
+    let result = work.numeric(largest.plus(eager))?;
+    work.requests(
+        result.request_bytes_upper_bound,
+        result.allocation_requests_upper_bound,
+    )?;
     work.step()?;
     Ok(result)
 }
@@ -394,6 +410,7 @@ pub(crate) fn preflight_field(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_type_contract::CompileCheckpoints;
     use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
     use std::sync::Mutex;
 
