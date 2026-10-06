@@ -21,3 +21,5 @@ pub mod bitmap;
 pub mod hll;
 pub mod variant;
 pub mod variant_encode;
+
+pub mod variant_json_cursor;

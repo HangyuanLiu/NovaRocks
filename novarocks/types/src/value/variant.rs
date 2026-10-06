@@ -1348,7 +1348,9 @@ fn variant_to_json(
             }
             VariantPrimitiveType::Date => {
                 let days = variant.get_date()?;
-                let date = NaiveDate::from_num_days_from_ce_opt(719163 + days)
+                let date = 719163i32
+                    .checked_add(days)
+                    .and_then(NaiveDate::from_num_days_from_ce_opt)
                     .unwrap_or_else(|| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
                 out.push('"');
                 out.push_str(&date.format("%Y-%m-%d").to_string());
@@ -1440,7 +1442,7 @@ fn decimal_to_string(value: i128, scale: u8) -> String {
         return value.to_string();
     }
     let negative = value < 0;
-    let abs = value.abs();
+    let abs = value.unsigned_abs();
     let digits = abs.to_string();
     let scale_usize = scale as usize;
     let mut out = String::new();
@@ -1674,6 +1676,25 @@ mod tests {
         );
         assert!(variant_get_target_type("decimal(10,2)").is_err());
         assert!(variant_get_target_type("variant").is_err());
+    }
+
+    #[test]
+    fn variant_date_out_of_range_retains_epoch_fallback() {
+        for days in [i32::MIN, i32::MAX] {
+            let mut raw = vec![11u8 << 2];
+            raw.extend_from_slice(&days.to_le_bytes());
+            let value = VariantValue::create(VariantMetadata::empty().raw(), &raw).unwrap();
+            assert_eq!(value.to_json_local().unwrap(), "\"1970-01-01\"");
+        }
+    }
+
+    #[test]
+    fn variant_decimal_minimum_preserves_sign_and_scale() {
+        assert_eq!(
+            decimal_to_string(i128::MIN, 2),
+            "-1701411834604692317316873037158841057.28"
+        );
+        assert_eq!(decimal_to_string(i128::MIN, 0), i128::MIN.to_string());
     }
 
     #[test]
