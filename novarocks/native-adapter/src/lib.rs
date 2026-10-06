@@ -75,6 +75,7 @@ pub mod root_result_unary;
 pub mod root_scalar_container_codec;
 pub mod root_scalar_leaf_codec;
 pub mod root_statistics_codec;
+pub mod root_write_commit_codec;
 pub use native_client::NativeRpcClient;
 pub mod native_codec;
 pub mod native_control_executor;

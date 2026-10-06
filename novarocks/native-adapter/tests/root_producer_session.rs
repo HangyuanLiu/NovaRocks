@@ -908,6 +908,156 @@ async fn statistics_record_can_cross_segments_and_cancel_releases_its_original_b
     shutdown(&fixture.pool).await;
 }
 
+/// Fixed Root write result rows: (target, fragment) pairs plus an optional
+/// SUMMARY, with the schema decoded through the Native layout like a BE task.
+fn write_chunk(fragments: &[(i32, &[u8])], summary: Option<i64>) -> Chunk {
+    use arrow::array::{Int8Array, ListArray, MapArray, StructArray};
+    use arrow::buffer::OffsetBuffer;
+    use novarocks_proto_codec::{FieldPath, arrow_physical};
+    use novarocks_spi::connector::write_stack::root_write_result_schema;
+    let schema = root_write_result_schema();
+    let (wire, metadata) = arrow_physical::encode_schema(
+        &schema,
+        &[1, 2, 3, 4, 5, 6, 7, 8],
+        false,
+        FieldPath::root("schema"),
+    )
+    .unwrap();
+    let decoded =
+        arrow_physical::decode_schema(&wire, &metadata, FieldPath::root("schema")).unwrap();
+    let slots = (1..=8).map(SlotId::new).collect::<Vec<_>>();
+    let chunk_schema = ChunkSchema::try_ref_from_owned_schema_and_slot_ids(
+        decoded.schema_metadata_origin(),
+        decoded.field_metadata_origins(),
+        &slots,
+    )
+    .unwrap();
+    let DataType::List(item) = decoded.schema().field(4).data_type() else {
+        panic!("list");
+    };
+    let DataType::Map(entries, false) = decoded.schema().field(7).data_type() else {
+        panic!("map");
+    };
+    let DataType::Struct(entry_fields) = entries.data_type() else {
+        panic!("entries");
+    };
+    let rows = fragments.len() + usize::from(summary.is_some());
+    let mut kinds = vec![2_i8; fragments.len()];
+    let mut targets = fragments
+        .iter()
+        .map(|(target, _)| Some(*target))
+        .collect::<Vec<_>>();
+    let mut counts = vec![None; fragments.len()];
+    let mut bodies = fragments
+        .iter()
+        .map(|(_, bytes)| Some(*bytes))
+        .collect::<Vec<_>>();
+    if let Some(count) = summary {
+        kinds.push(1);
+        targets.push(None);
+        counts.push(Some(count));
+        bodies.push(None);
+    }
+    let none_strings = || Arc::new(StringArray::from(vec![None::<&str>; rows])) as ArrayRef;
+    let empty = || Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef;
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int8Array::from(kinds)),
+        Arc::new(Int32Array::from(targets)),
+        Arc::new(Int64Array::from(counts)),
+        Arc::new(BinaryArray::from(bodies)),
+        Arc::new(ListArray::new(
+            item.clone(),
+            OffsetBuffer::from_lengths(vec![0; rows]),
+            Arc::new(Int32Array::from(Vec::<i32>::new())),
+            Some(vec![false; rows].into()),
+        )),
+        none_strings(),
+        Arc::new(BinaryArray::from(vec![None::<&[u8]>; rows])),
+        Arc::new(MapArray::new(
+            entries.clone(),
+            OffsetBuffer::from_lengths(vec![0; rows]),
+            StructArray::new(entry_fields.clone(), vec![empty(), empty()], None),
+            Some(vec![false; rows].into()),
+            false,
+        )),
+    ];
+    let batch = RecordBatch::try_new(chunk_schema.arrow_schema_ref(), columns).unwrap();
+    Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap()
+}
+
+#[tokio::test]
+async fn write_commit_records_cross_inputs_and_end_after_their_summary() {
+    use novarocks_native_adapter::root_write_commit_codec::WriteCommitRecordHeader;
+    use novarocks_result_contract::InternalResultDomain;
+    use novarocks_spi::connector::write_stack::RootRowKind;
+    let fixture = Fixture::new(FrozenRootOutput::InternalFacts(
+        InternalResultDomain::PreparedWriteCommitV1,
+    ));
+    fixture
+        .session
+        .submit_input(
+            write_chunk(&[(0, b"a"), (1, b"bc")], None),
+            input(&fixture.session).await,
+        )
+        .unwrap();
+    fixture
+        .session
+        .submit_input(write_chunk(&[], Some(3)), input(&fixture.session).await)
+        .unwrap();
+    fixture.session.finish_input().unwrap();
+    wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
+    let mut bytes = Vec::new();
+    let mut sequence = 1;
+    let rows = loop {
+        let delivery = read(&fixture.channel, Some(sequence), sequence - 1).await;
+        match &delivery.reply().outcome {
+            RootReadOutcome::Data(data) => bytes.extend_from_slice(data.body().as_ref()),
+            RootReadOutcome::End(end) => break end.output_rows,
+            other => panic!("unexpected root outcome {other:?}"),
+        }
+        sequence += 1;
+    };
+    assert_eq!(rows, 3);
+    let mut kinds = Vec::new();
+    let mut rest = bytes.as_slice();
+    while !rest.is_empty() {
+        let header = WriteCommitRecordHeader::parse(rest).unwrap();
+        kinds.push(header.kind());
+        rest = &rest[header.record_bytes()..];
+    }
+    assert_eq!(
+        kinds,
+        [
+            RootRowKind::PreparedFragment,
+            RootRowKind::PreparedFragment,
+            RootRowKind::Summary
+        ]
+    );
+    shutdown(&fixture.pool).await;
+}
+
+#[tokio::test]
+async fn write_commit_without_summary_fails_instead_of_a_success_end() {
+    use novarocks_result_contract::InternalResultDomain;
+    let fixture = Fixture::new(FrozenRootOutput::InternalFacts(
+        InternalResultDomain::PreparedWriteCommitV1,
+    ));
+    fixture
+        .session
+        .submit_input(
+            write_chunk(&[(0, b"a")], None),
+            input(&fixture.session).await,
+        )
+        .unwrap();
+    fixture.session.finish_input().unwrap();
+    wait_until(|| fixture.session.producer_exited()).await;
+    assert!(matches!(
+        fixture.session.producer_state(),
+        RootProducerState::Failed(ref message) if message.contains("SUMMARY")
+    ));
+    shutdown(&fixture.pool).await;
+}
+
 #[tokio::test]
 async fn uninstalled_internal_domain_and_untyped_scalar_identity_stay_closed() {
     use novarocks_result_contract::InternalResultDomain;
@@ -935,10 +1085,9 @@ async fn uninstalled_internal_domain_and_untyped_scalar_identity_stay_closed() {
         )
         .is_err()
     );
-    for output in [
-        FrozenRootOutput::InternalFacts(InternalResultDomain::PreparedWriteCommitV1),
-        FrozenRootOutput::InternalFacts(InternalResultDomain::CowSelectionArrowV1),
-    ] {
+    for output in [FrozenRootOutput::InternalFacts(
+        InternalResultDomain::CowSelectionArrowV1,
+    )] {
         let channel = RootResultChannel::try_open(
             RootResultWriteSpec {
                 task: task(),

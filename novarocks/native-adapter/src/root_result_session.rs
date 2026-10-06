@@ -54,6 +54,7 @@ use crate::root_scalar_leaf_codec::{NativeScalarLeafEncoder, ScalarSchemaOwner};
 use crate::root_statistics_codec::{
     StatisticsArtifactEncoder, StatisticsCodecStatus, StatisticsCodecTotals,
 };
+use crate::root_write_commit_codec::{WriteCommitEncoder, WriteCommitTotals};
 
 /// Whether this BE has the producer codec for a root purpose. Host admission
 /// and session opening share this one decision, so a purpose is admitted only
@@ -63,7 +64,9 @@ pub fn root_output_producer_installed(kind: RootOutputKind) -> bool {
         RootOutputKind::ClientRows | RootOutputKind::CountOnly => true,
         RootOutputKind::InternalFacts(domain) => matches!(
             domain,
-            InternalResultDomain::StatisticsArtifactV1 | InternalResultDomain::ScalarValueV1
+            InternalResultDomain::StatisticsArtifactV1
+                | InternalResultDomain::ScalarValueV1
+                | InternalResultDomain::PreparedWriteCommitV1
         ),
     }
 }
@@ -71,6 +74,7 @@ pub fn root_output_producer_installed(kind: RootOutputKind) -> bool {
 enum InputEncoder {
     Client(Box<ArrowMysqlTextEncoder>),
     Statistics(Box<StatisticsArtifactEncoder>),
+    WriteCommit(Box<WriteCommitEncoder>),
     ScalarLeaf(Box<NativeScalarLeafEncoder>),
     ScalarContainer(Box<NativeScalarContainerEncoder>),
     /// A schema-validated empty container batch: no record, no row.
@@ -80,6 +84,7 @@ impl InputEncoder {
     fn step(&mut self, output: &mut [u8]) -> Result<RenderTurn, ()> {
         match self {
             Self::Client(encoder) => encoder.step(output).map_err(|_| ()),
+            Self::WriteCommit(encoder) => encoder.step(output).map_err(|_| ()),
             Self::ScalarLeaf(encoder) => encoder.step(output).map_err(|_| ()),
             Self::ScalarContainer(encoder) => Ok(encoder.step(output)),
             Self::ScalarEmpty => Ok(RenderTurn {
@@ -111,6 +116,12 @@ impl InputEncoder {
             _ => None,
         }
     }
+    fn write_commit_totals(&self) -> Option<WriteCommitTotals> {
+        match self {
+            Self::WriteCommit(encoder) => Some(encoder.totals()),
+            _ => None,
+        }
+    }
 }
 
 // Destruction order is deliberate: original/cursor Arrow owners are gone
@@ -126,6 +137,8 @@ struct ProducerState {
     builder: Option<RootSegmentBuilder>,
     used: usize,
     statistics_totals: StatisticsCodecTotals,
+    /// PreparedWriteCommitV1 records completed across every input batch.
+    write_totals: WriteCommitTotals,
     /// ScalarValueV1 rows accepted across every input batch: 0 or 1. Its
     /// record stays in the unpublished segment until the sealed normal End.
     scalar_rows: u8,
@@ -226,6 +239,7 @@ impl NativeRootResultSession {
                 builder: None,
                 used: 0,
                 statistics_totals: StatisticsCodecTotals::default(),
+                write_totals: WriteCommitTotals::default(),
                 scalar_rows: 0,
                 sealed: false,
                 failed: None,
@@ -378,6 +392,26 @@ impl NativeRootResultSession {
                                 .fail(state, "statistics input differs from its frozen domain");
                         }
                     }
+                } else if self.spec().contract.kind()
+                    == RootOutputKind::InternalFacts(InternalResultDomain::PreparedWriteCommitV1)
+                {
+                    // Fixed cursor storage plus the finite columns Vec clone,
+                    // both prepaid before creation, as for statistics.
+                    if WriteCommitEncoder::inline_capacity_bytes()
+                        .checked_add(cloning)
+                        .is_none_or(|n| n > capacity)
+                    {
+                        return self
+                            .fail(state, "write commit cursor scratch exceeds its pregrant");
+                    }
+                    match WriteCommitEncoder::try_new(input.chunk.batch.clone(), state.write_totals)
+                    {
+                        Ok(encoder) => InputEncoder::WriteCommit(Box::new(encoder)),
+                        Err(_) => {
+                            return self
+                                .fail(state, "write commit input differs from its fixed contract");
+                        }
+                    }
                 } else if let FrozenRootOutput::ScalarValue(schema) = self.spec().contract.output()
                 {
                     // Cumulative cardinality is decided before any cursor:
@@ -487,12 +521,19 @@ impl NativeRootResultSession {
                 return RootProducerTurn::Yielded;
             }
             if input_complete {
-                if let Some(totals) = input.encoder.as_ref().unwrap().statistics_totals() {
+                let encoder = input.encoder.as_ref().unwrap();
+                if let Some(totals) = encoder.statistics_totals() {
                     state.statistics_totals = totals;
+                }
+                if let Some(totals) = encoder.write_commit_totals() {
+                    state.write_totals = totals;
                 }
                 drop(state.input.take());
             }
             let finishing = input_complete && state.sealed;
+            if finishing && let Err(message) = self.sealed_domain_complete(state) {
+                return self.fail(state, message);
+            }
             if finishing && self.channel.request_finish().is_err() {
                 return self.fail(state, "root finish request was rejected");
             }
@@ -525,6 +566,9 @@ impl NativeRootResultSession {
             if self.scalar() {
                 return self.finish_scalar(state);
             }
+            if let Err(message) = self.sealed_domain_complete(state) {
+                return self.fail(state, message);
+            }
             if self
                 .channel
                 .request_finish()
@@ -536,6 +580,19 @@ impl NativeRootResultSession {
             return RootProducerTurn::Complete;
         }
         RootProducerTurn::Idle
+    }
+    /// Domain facts a normal sealed End must already hold. A write root
+    /// without its SUMMARY fails instead of publishing a success End.
+    fn sealed_domain_complete(&self, state: &ProducerState) -> Result<(), &'static str> {
+        if self.spec().contract.kind()
+            == RootOutputKind::InternalFacts(InternalResultDomain::PreparedWriteCommitV1)
+        {
+            state
+                .write_totals
+                .finish()
+                .map_err(|_| "write commit stream ended without its SUMMARY")?;
+        }
+        Ok(())
     }
     fn scalar(&self) -> bool {
         matches!(

@@ -5299,7 +5299,7 @@ mod tests {
         let descriptor = consistent_descriptor(root, UniqueId::new(91_004, 1));
         let body = Body::bounded_root(
             novarocks_result_contract::FrozenRootOutput::InternalFacts(
-                novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
+                novarocks_result_contract::InternalResultDomain::CowSelectionArrowV1,
             ),
             &[],
         );
