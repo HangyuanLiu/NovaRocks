@@ -52,6 +52,8 @@ pub struct TransferReceipt {
     pub transferred_metadata: u64,
     pub returned_idle: u64,
     pub retired_records: u64,
+    /// Direct membership nodes visited, independent of unrelated process lanes.
+    pub visited_members: usize,
 }
 impl TeardownEvidence<'_> {
     fn validate(&self) -> Result<(), TeardownError> {
@@ -86,22 +88,22 @@ impl AccountHandle {
         if self.0.control.load(crate::sync::Ordering::Acquire) != 0 {
             return Err(TeardownError::ProtectedControlOwner);
         }
-        self.close_to_growth();
+        let members = self.close_members();
         evidence.validate()?;
-        let upper = self.0.shared.domains.lock().unwrap().upper;
-        // Preflight before any handoff. Closing has sealed all issuing lanes;
-        // remote free can continue and cannot create a new producer.
-        for index in 0..upper {
-            let record = self.0.shared.domains.lock().unwrap().records[index].clone();
-            let Some(record) = record else { continue };
-            let s = record.state.lock().unwrap();
-            if s.account.is_descendant_of(self) {
-                if s.active {
-                    return Err(TeardownError::ActiveScope);
-                }
-                if s.external != 0 {
-                    return Err(TeardownError::ExternalResponsibility);
-                }
+        // Closed membership cannot admit a new producer. Preflight every
+        // captured issuing lane before any responsibility or funding handoff.
+        for lane in &members.lanes {
+            if lane.record().scope_active() {
+                return Err(TeardownError::ActiveScope);
+            }
+        }
+        for domain in &members.domains {
+            let s = domain.0.state.lock().unwrap();
+            if s.active {
+                return Err(TeardownError::ActiveScope);
+            }
+            if s.external != 0 {
+                return Err(TeardownError::ExternalResponsibility);
             }
         }
         let mut receipt = TransferReceipt {
@@ -109,11 +111,9 @@ impl AccountHandle {
             transferred_metadata: 0,
             returned_idle: 0,
             retired_records: 0,
+            visited_members: members.visited,
         };
-        for index in 0..upper {
-            let record = self.0.shared.domains.lock().unwrap().records[index].clone();
-            let Some(record) = record else { continue };
-            let domain = FundingDomain(record);
+        for domain in &members.domains {
             if domain.affiliation().is_descendant_of(self) {
                 let (payload, metadata, idle) = domain.transfer_residual(self);
                 receipt.transferred_payload += payload;
@@ -122,32 +122,48 @@ impl AccountHandle {
                 receipt.retired_records += 1;
             }
         }
-        // Revoke the entire retired subtree's undistributed slack, bottom up.
-        let account_upper = self.0.shared.accounts.lock().unwrap().upper;
-        for index in 0..account_upper {
-            let account = self.0.shared.accounts.lock().unwrap().records[index]
-                .as_ref()
-                .and_then(|a| a.upgrade())
-                .map(AccountHandle);
-            let Some(account) = account else { continue };
-            if account.is_descendant_of(self) {
-                receipt.returned_idle += account.return_slack(u64::MAX);
-                let path = Path::new(&account);
-                let _gates = path.exclusive_gates();
-                account.0.ledger.lock().unwrap().retired = true;
-                // A retired but externally held handle is closed, not an
-                // active registry slot. It cannot reenter work admission.
-                let slot = account.0.slot.swap(u64::MAX, crate::sync::Ordering::AcqRel);
-                if slot != u64::MAX {
-                    let mut registry = account.0.shared.accounts.lock().unwrap();
-                    registry.records[slot as usize] = None;
-                    account
-                        .0
-                        .shared
-                        .membership_revision
-                        .fetch_add(1, crate::sync::Ordering::Release);
-                    registry.free_slots.push(slot as usize);
-                }
+        for lane in &members.lanes {
+            let source = lane.affiliation();
+            if !source.is_descendant_of(self) {
+                continue;
+            }
+            let path = Path::new(&source);
+            let _gates = path.exclusive_gates();
+            // Another retirement may already have accepted this lane.
+            if !lane.affiliation().is_descendant_of(self) {
+                continue;
+            }
+            let receiver = (1..path.len)
+                .find(|&i| {
+                    !path.node(i).is_descendant_of(self) && !path.node(i).is_closed_to_growth()
+                })
+                .unwrap_or(path.len - 1);
+            lane.set_affiliation(path.node(receiver).clone());
+            lane.record().stop();
+        }
+        // Reverse preorder revokes child slack before parent slack. Registry
+        // slots and direct child links are retired without global scanning.
+        for account in members.accounts.iter().rev() {
+            receipt.returned_idle += account.return_slack(u64::MAX);
+            let path = Path::new(account);
+            let _gates = path.exclusive_gates();
+            account.0.ledger.lock().unwrap().retired = true;
+            account.0.retired.store(1, crate::sync::Ordering::Release);
+            if let Some(parent) = &account.0.parent
+                && let Some(member) = account.0.membership.lock().unwrap().take()
+            {
+                parent.0.members.remove(&member);
+            }
+            let slot = account.0.slot.swap(u64::MAX, crate::sync::Ordering::AcqRel);
+            if slot != u64::MAX {
+                let mut registry = account.0.shared.accounts.lock().unwrap();
+                registry.records[slot as usize] = None;
+                account
+                    .0
+                    .shared
+                    .membership_revision
+                    .fetch_add(1, crate::sync::Ordering::Release);
+                registry.free_slots.push(slot as usize);
             }
         }
         Ok(receipt)
@@ -173,7 +189,7 @@ impl FundingDomain {
             let path = Path::new(&source);
             let _gates = path.exclusive_gates();
             let mut s = self.0.state.lock().unwrap();
-            if s.account.id() != source.id() {
+            if self.affiliation().id() != source.id() {
                 continue;
             }
             // A concurrent ancestor retirement may already have transferred it.
@@ -181,7 +197,7 @@ impl FundingDomain {
                 return (0, 0, 0);
             }
             let mut states = path.locks();
-            let live = self.0.owner.live();
+            let live = self.0.lane.live_bytes();
             crate::settlement::adjust_commitment(&path, &mut states, s.committed, live);
             let idle = s.authorized.saturating_sub(live);
             s.authorized = s.authorized.min(live);
@@ -202,11 +218,11 @@ impl FundingDomain {
                 state.revision += 1;
                 node_publish(path.node(i), state.committed);
             }
-            s.account = path.node(receiver).clone();
-            let was_residual = s.residual;
-            s.residual = true;
-            s.sealed = true;
-            if !was_residual {
+            self.0.lane.set_affiliation(path.node(receiver).clone());
+            let was_active = s.registered_active;
+            s.registered_active = false;
+            self.0.lane.record().stop();
+            if was_active {
                 source.0.shared.domains.lock().unwrap().active -= 1;
             }
             return (live, self.0.metadata, idle);
@@ -215,10 +231,10 @@ impl FundingDomain {
 }
 
 impl FundingDomain {
-    /// Retire a leaf lane after its own producers and external obligations
-    /// have exited. Its execution account continues; the residual stays in
-    /// that exact branch until account teardown or the real final release.
-    pub fn retire_lane(&self) -> Result<(), TeardownError> {
+    /// Stop this lane after its producers and external obligations have exited.
+    /// Liability classification follows the executing account, so retained
+    /// payload remains Query until the Work account itself is torn down.
+    pub fn stop_producing(&self) -> Result<(), TeardownError> {
         self.seal();
         self.settle();
         loop {
@@ -226,17 +242,17 @@ impl FundingDomain {
             let path = Path::new(&account);
             let _gates = path.exclusive_gates();
             let mut s = self.0.state.lock().unwrap();
-            if s.account.id() != account.id() {
+            if self.affiliation().id() != account.id() {
                 continue;
             }
-            if s.active {
+            if s.active || self.0.lane.record().scope_active() {
                 return Err(TeardownError::ActiveScope);
             }
             if s.external != 0 {
                 return Err(TeardownError::ExternalResponsibility);
             }
             let mut states = path.locks();
-            let live = self.0.owner.live();
+            let live = self.0.lane.live_bytes();
             let retained_backing = s.authorized.min(live);
             let idle = s.authorized - retained_backing;
             if account.0.control.load(crate::sync::Ordering::Acquire) != 0 {
@@ -253,10 +269,11 @@ impl FundingDomain {
             s.committed = live;
             s.authorized = retained_backing;
             s.settled_live = live;
-            if !s.residual {
+            if s.registered_active {
                 account.0.shared.domains.lock().unwrap().active -= 1;
             }
-            s.residual = true;
+            s.registered_active = false;
+            self.0.lane.record().stop();
             return Ok(());
         }
     }

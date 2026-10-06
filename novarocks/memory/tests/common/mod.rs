@@ -37,6 +37,6 @@ pub fn exited() -> TeardownEvidence<'static> {
         now_ns: 1,
     }
 }
-pub fn free(origin: AllocationOrigin, bytes: u64) {
+pub fn free(origin: FactToken, bytes: u64) {
     unsafe { origin.record_deallocation(bytes) }
 }

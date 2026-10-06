@@ -354,3 +354,15 @@ and coherence events supported by that exact CPU/PMU, plus event scaling,
 permissions and unavailable-event errors. Never substitute a guessed raw
 PMU code or software acquisition count for measured hardware traffic. This
 manual hardware receipt remains outside this protocol runner's acceptance.
+
+## Allocation attribution 的独立测量
+
+全局 allocator 的尺寸分段、尾部、TLS 和 R1 helper 成本入口位于
+[`tools/memory-attribution-bench`](../../../tools/memory-attribution-bench/README.md)，
+不是本页的 stock 原语计时。四个独立二进制 raw/counting/attributing/attributing-system
+使用冻结 `manifest.json`；阈值 512 B、尾部 8 B 与 Q=1 MiB 不能在看到结果后调节。
+
+requested/usable、jemalloc allocated/active/resident、current/peak RSS 与责任事实分列；
+held pass 不证明并发或 realloc 瞬态峰值。worker warmup 在计时前完成并排空远端释放，
+同一线程的 tcache/TLS 保留到计时。所有输出 `formal_acceptance=false`，入口 smoke
+不能代替用户手动 Linux 正式成本结论；G1 仍须独立收据。

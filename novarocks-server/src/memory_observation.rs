@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The shipping process's allocation observer (MEM-1 wave-1 T07).
+//! The shipping process's allocation observer (MEM-1 allocation observation).
 //!
-//! Installs [`CountingAllocator`] as this process's `#[global_allocator]` and
+//! Installs [`AttributingAllocator`] as this process's `#[global_allocator]` and
 //! states, once at startup, what that observation covers and what it
 //! structurally cannot see.
 //!
@@ -35,23 +35,20 @@
 //!
 //! # What a reading here is, and is not
 //!
-//! It measures requested bytes routed through the Rust global allocator and
-//! attributes nothing to any query, task, operator or session: this module
-//! keeps no per-work state and asks no owner who a byte belongs to. Only the
-//! accounts in the governance tier own attribution.
+//! It measures inner requested layouts, including the eight-byte source token
+//! for user requests at or above the frozen threshold. Lane attribution is
+//! observation only: it neither qualifies funding nor changes SQL admission.
+//! Small ambient allocations stay process-visible without a query source.
 //!
-//! The difference between this reading and the governance tier's known `L` is
-//! therefore a diagnostic — "this much of the process is unaccounted" — never
-//! an attribution and never an accusation against a particular account. It is
-//! also a lower bound: the counters are request sizes rather than physical
-//! memory, and the sources they cannot reach at all are enumerated as typed
-//! data by [`CoverageDescriptor::blind_spots`] and logged beside the bytes
-//! rather than folded into them.
+//! Counts and lane facts are independently sampled requested bytes, not physical
+//! memory or a settlement proof. The unreachable sources remain typed data in
+//! [`CoverageDescriptor::blind_spots`] and are never folded into lane facts.
 //!
 //! # Startup line, and wave 2
 //!
 //! [`log_installed`] emits exactly one line, whose field names are frozen:
-//! `live_bytes`, `allocations`, `covers`, `blind_spots`. It is a statement of
+//! `live_bytes`, `allocations`, `covers`, `blind_spots`; frozen attribution
+//! threshold, token, batch and record-capacity fields are appended. It is a statement of
 //! coverage at a moment when nothing interesting has been allocated yet, not a
 //! measurement — its value is that an operator reading the log knows which
 //! sources the process can account for before any query runs.
@@ -80,30 +77,34 @@
 //! effect.
 
 use novarocks_memory::observe::{
-    AllocatorInternalsReading, AllocatorSnapshot, CountingAllocator, CoverageDescriptor,
-    PhysicalMemoryReading,
+    AllocatorInternalsReading, AllocatorSnapshot, CoverageDescriptor, PhysicalMemoryReading,
 };
 
 use crate::cgroup_memory;
 use crate::memory_limit::{self, CgroupFinding};
+use novarocks_memory::attribution::readout::AttributionSnapshot;
+use novarocks_memory::attribution::{
+    ATTRIBUTION_THRESHOLD_BYTES, ATTRIBUTION_TOKEN_BYTES, AttributingAllocator,
+};
+use novarocks_memory::lane::{MAX_RECORDS, SLOT_QUANTUM_BYTES, global_store};
 
 /// This process's allocator: jemalloc, counted.
 ///
-/// jemalloc serves the memory; the wrapper only adds relaxed atomic arithmetic
-/// on a sharded counter array around each call, so the counters keep their
-/// meaning whichever allocator sits inside.
+/// jemalloc serves memory; the wrapper records request counters and source
+/// facts with the same frozen format used by the System baseline build.
 // Design: ADR-0148 (docs/adr/ADR-0148-process-memory-capacity-authority.md)
 // Design: ADR-0163 (docs/adr/ADR-0163-jemalloc-process-allocator-and-cgroup-memory-bound.md)
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
-static GLOBAL: CountingAllocator<tikv_jemallocator::Jemalloc> =
-    CountingAllocator::new(tikv_jemallocator::Jemalloc);
+static GLOBAL: AttributingAllocator<tikv_jemallocator::Jemalloc> =
+    AttributingAllocator::new(tikv_jemallocator::Jemalloc);
 
 /// This process's allocator in a build without the `jemalloc` feature: the
 /// system allocator, counted.
 #[cfg(not(feature = "jemalloc"))]
 #[global_allocator]
-static GLOBAL: CountingAllocator<std::alloc::System> = CountingAllocator::new(std::alloc::System);
+static GLOBAL: AttributingAllocator<std::alloc::System> =
+    AttributingAllocator::new(std::alloc::System);
 
 /// The allocator that actually serves this process's memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,6 +227,12 @@ pub fn snapshot() -> AllocatorSnapshot {
     GLOBAL.snapshot()
 }
 
+/// Samples bounded lane facts beside the process bands. This may read the
+/// hook-external drain queue lock; it is never called from allocator callbacks.
+pub fn attribution_snapshot() -> AttributionSnapshot {
+    AttributionSnapshot::sample(global_store(), GLOBAL.band_snapshot())
+}
+
 /// Returns what a [`snapshot`] of this process covers, and what it cannot see.
 ///
 /// Constant data, not a measurement: the blind spots are a property of
@@ -335,6 +342,10 @@ pub fn log_installed() {
         allocations = snapshot.allocations,
         covers = coverage.covered_description(),
         blind_spots = %blind_spots,
+        attribution_threshold_bytes = ATTRIBUTION_THRESHOLD_BYTES,
+        token_bytes = ATTRIBUTION_TOKEN_BYTES,
+        batch_threshold_bytes = SLOT_QUANTUM_BYTES,
+        lane_record_capacity = MAX_RECORDS,
         "process allocator observation installed"
     );
 }
@@ -343,7 +354,7 @@ pub fn log_installed() {
 /// for jemalloc, the configuration that took effect.
 ///
 /// A line of its own rather than extra fields on [`log_installed`], whose
-/// field set is frozen. An unreadable jemalloc option is logged as a warning
+/// original fields remain frozen. An unreadable jemalloc option is logged as a warning
 /// with its reason, not filled in.
 pub fn log_allocator_configuration() {
     let allocator = process_allocator().label();
@@ -410,6 +421,149 @@ mod tests {
             "installed wrapper missed a 1 MiB request: {before:?} then {after:?}"
         );
         drop(held);
+    }
+
+    #[test]
+    fn the_installed_allocator_preserves_tail_format_and_alignment() {
+        use novarocks_memory::attribution::binding;
+        use novarocks_memory::lane::{RecordRef, ResponsibilityClass, StoreHandle};
+        use std::alloc::{GlobalAlloc, Layout};
+        let owner = StoreHandle::global()
+            .acquire(7, ResponsibilityClass::Service)
+            .unwrap();
+        for align in [1, 8, 64, 4096] {
+            for size in [511, 512, 513, 4096] {
+                let layout = Layout::from_size_align(size, align).unwrap();
+                let previous = unsafe { binding::install_ambient(owner.reference()) };
+                let pointer = unsafe { GLOBAL.alloc_zeroed(layout) };
+                unsafe { binding::restore_ambient(previous) };
+                assert!(!pointer.is_null());
+                assert_eq!(pointer.addr() % align, 0);
+                assert!(
+                    unsafe { std::slice::from_raw_parts(pointer, size) }
+                        .iter()
+                        .all(|b| *b == 0)
+                );
+                if size >= ATTRIBUTION_THRESHOLD_BYTES {
+                    assert_eq!(
+                        unsafe { RecordRef::read(pointer.add(size)) },
+                        owner.reference()
+                    );
+                }
+                unsafe { GLOBAL.dealloc(pointer, layout) };
+                assert_eq!(
+                    global_store()
+                        .snapshot_ref(owner.reference())
+                        .unwrap()
+                        .tagged_bytes,
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_installed_allocator_resize_keeps_source_and_handles_threshold_crossings() {
+        use novarocks_memory::attribution::binding;
+        use novarocks_memory::lane::{RecordRef, ResponsibilityClass, StoreHandle};
+        use std::alloc::{GlobalAlloc, Layout};
+        let first = StoreHandle::global()
+            .acquire(7, ResponsibilityClass::Service)
+            .unwrap();
+        let second = StoreHandle::global()
+            .acquire(8, ResponsibilityClass::Service)
+            .unwrap();
+        let small = Layout::from_size_align(128, 8).unwrap();
+        let pointer = unsafe { GLOBAL.alloc(small) };
+        assert!(!pointer.is_null());
+        let previous = unsafe { binding::install_ambient(first.reference()) };
+        let pointer = unsafe { GLOBAL.realloc(pointer, small, 512) };
+        unsafe { binding::restore_ambient(previous) };
+        assert!(!pointer.is_null());
+        let tagged = Layout::from_size_align(512, 8).unwrap();
+        let previous = unsafe { binding::install_ambient(second.reference()) };
+        let pointer = unsafe { GLOBAL.realloc(pointer, tagged, 4097) };
+        unsafe { binding::restore_ambient(previous) };
+        assert!(!pointer.is_null());
+        assert_eq!(
+            unsafe { RecordRef::read(pointer.add(4097)) },
+            first.reference()
+        );
+        assert_eq!(
+            global_store()
+                .snapshot_ref(first.reference())
+                .unwrap()
+                .tagged_bytes,
+            4105
+        );
+        assert_eq!(
+            global_store()
+                .snapshot_ref(second.reference())
+                .unwrap()
+                .tagged_bytes,
+            0
+        );
+        let grown = Layout::from_size_align(4097, 8).unwrap();
+        assert!(unsafe { GLOBAL.realloc(pointer, grown, isize::MAX as usize - 7) }.is_null());
+        assert_eq!(
+            unsafe { RecordRef::read(pointer.add(4097)) },
+            first.reference()
+        );
+        assert_eq!(
+            global_store()
+                .snapshot_ref(first.reference())
+                .unwrap()
+                .tagged_bytes,
+            4105
+        );
+        let pointer = unsafe { GLOBAL.realloc(pointer, grown, 128) };
+        assert!(!pointer.is_null());
+        assert_eq!(
+            global_store()
+                .snapshot_ref(first.reference())
+                .unwrap()
+                .tagged_bytes,
+            0
+        );
+        unsafe { GLOBAL.dealloc(pointer, small) };
+    }
+
+    #[test]
+    fn startup_preserves_frozen_fields_and_appends_the_attribution_format() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Recorder(Arc<Mutex<Vec<u8>>>);
+        impl Write for Recorder {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || Recorder(Arc::clone(&captured)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, log_installed);
+        let rendered = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        for field in [
+            "live_bytes=",
+            "allocations=",
+            "covers=",
+            "blind_spots=",
+            "attribution_threshold_bytes=512",
+            "token_bytes=8",
+            "batch_threshold_bytes=1048576",
+            "lane_record_capacity=262144",
+        ] {
+            assert!(rendered.contains(field), "missing {field} in {rendered}");
+        }
     }
 
     #[test]

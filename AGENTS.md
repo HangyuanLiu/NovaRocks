@@ -302,7 +302,34 @@ Execution, and do not recreate a Backend facade around it.
 - `novarocks/execution/src/runtime/runtime_state.rs`
   Runtime state for cache, runtime filters, and execution context.
 
-### 4.7 Connectors / Catalog Backends / Filesystem
+### 4.7 Memory attribution and funding
+
+- `novarocks/memory/src/lane/**` owns stable 64 B records, pointer-free 8 B
+  `RecordRef`/`FactToken`, signed allocation count + unique slot pin lifetime,
+  exact reclamation. Identity alone grants no access right.
+- `novarocks/memory/src/membership.rs` owns direct account members used by
+  lifecycle/control traversal; membership is not stored in allocation tails.
+- `novarocks/memory/src/attribution/**` owns the 512 B size band, 8 B tail,
+  destructor-free one-slot TLS (Q=1 MiB), synchronous `LaneHandle::run`,
+  per-poll `AttributedFuture` and R1 `ExplicitOwner` helpers. Observation grants
+  no capacity; publish one fact per actual block, never both manually and through
+  wrapper/helper. R1 zero-sized requests publish no physical fact.
+- `novarocks-server/src/memory_observation.rs` installs
+  `AttributingAllocator<Jemalloc>` (System without default features). Process
+  request counts, responsibility, allocator/cgroup/RSS and metadata estimates
+  remain separate. Q×sampled pins excludes in-flight work and is not a physical
+  upper bound. S1 production query/R1 integration remains follow-up work.
+- `stop_producing` does not reclassify executing Work. U=ΣC_query; genuine Work
+  teardown transfers residual responsibility without lowering root C or N by
+  reclassification. Timeout/terminal never substitutes for actual exit.
+- Read ADR-0167 and `docs/guides/development/memory-boundary.md` before changing
+  these contracts. `tools/ci/memory-model-checks.sh` runs local Loom/Miri only;
+  Miri uses Tree Borrows because Stacked Borrows rejects any in-band allocator
+  tail read through the narrowed pointers std Box/Arc pass to `dealloc`. The
+  attribution benchmark has a separate frozen manifest and user-run Linux
+  acceptance gate; smoke runs never prove cost acceptance.
+
+### 4.8 Connectors / Catalog Backends / Filesystem
 
 - `novarocks/types/src/{naming,schema}.rs`
   Neutral catalog naming and schema vocabulary. It contains no catalog runtime

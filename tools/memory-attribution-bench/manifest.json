@@ -1,0 +1,178 @@
+{
+  "schema_version": 1,
+  "attribution_threshold_bytes": 512,
+  "token_bytes": 8,
+  "variants": [
+    "raw",
+    "counting",
+    "attributing",
+    "attributing-system"
+  ],
+  "modes": {
+    "smoke": {
+      "warmup_iterations": 2,
+      "throughput_iterations_per_worker": 20,
+      "latency_iterations_per_worker": 20,
+      "live_hold_iterations": 2
+    },
+    "formal": {
+      "warmup_iterations": 4096,
+      "throughput_iterations_per_worker": 262144,
+      "latency_iterations_per_worker": 16384,
+      "live_hold_iterations": 256
+    }
+  },
+  "alignment_bytes": [
+    8,
+    64
+  ],
+  "workloads": {
+    "W1": {
+      "sizes_bytes": [
+        16,
+        32,
+        64,
+        128,
+        256,
+        504,
+        511,
+        512,
+        513,
+        632,
+        640,
+        641,
+        1016,
+        1023,
+        1024,
+        1025,
+        4088,
+        4095,
+        4096,
+        4097,
+        8191,
+        8192,
+        8193,
+        16383,
+        16384,
+        16385,
+        32767,
+        32768,
+        32769,
+        65535,
+        65536,
+        65537
+      ]
+    },
+    "W2": {
+      "rows": 4096,
+      "buffer_sizes_bytes": [
+        512,
+        16384,
+        32768,
+        16388,
+        49152
+      ],
+      "small_objects": 48,
+      "small_sizes_bytes": [
+        24,
+        40,
+        64,
+        96
+      ]
+    },
+    "W3": {
+      "worker_counts": [
+        1,
+        4,
+        8,
+        16
+      ],
+      "release_threads": 1,
+      "remote_release_every": 5,
+      "sizes_bytes": [
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+        4096,
+        16384,
+        32768
+      ]
+    },
+    "W4": {
+      "vec_initial_capacity": 128,
+      "vec_grow_len": 4096,
+      "vec_shrink_len": 64,
+      "r1_resize_sizes_bytes": [
+        128,
+        256,
+        512,
+        1024,
+        4096,
+        256,
+        128
+      ]
+    },
+    "W5": {
+      "worker_counts": [
+        1,
+        4,
+        8,
+        16
+      ],
+      "sizes_bytes": [
+        8,
+        16,
+        24,
+        32,
+        48,
+        64,
+        96,
+        128,
+        256,
+        504,
+        511
+      ]
+    }
+  },
+  "methodology": {
+    "timing_passes": [
+      "throughput",
+      "individual_operation_latency"
+    ],
+    "latency_timer_overhead_subtracted": false,
+    "space_pass": "baseline-held-released, separate from timing; no transient peak claim",
+    "remote_completion": "acknowledged after actual release",
+    "remote_channel_capacity": 1024,
+    "memory_touch": "first and last byte for timing; every system page for held-space",
+    "w5_ambient_scope": false,
+    "formal_acceptance": false,
+    "formal_build_profile": "release",
+    "malloc_conf_policy": "actual build configuration and effective runtime options must be recorded and identical across compared runs",
+    "formal_comparison_order": [
+      [
+        "raw",
+        "counting",
+        "attributing"
+      ],
+      [
+        "counting",
+        "attributing",
+        "raw"
+      ],
+      [
+        "attributing",
+        "raw",
+        "counting"
+      ]
+    ],
+    "space_workers": "sequential construction by main thread under each worker lane; remote cases release all retained objects on one release thread; not a concurrent peak"
+  },
+  "allocator_crates": {
+    "tikv-jemallocator": "0.7.0",
+    "tikv-jemalloc-ctl": "0.7.0",
+    "tikv-jemalloc-sys": "0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8"
+  }
+}

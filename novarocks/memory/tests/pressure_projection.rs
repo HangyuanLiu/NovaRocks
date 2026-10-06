@@ -20,7 +20,7 @@ use common::*;
 use novarocks_memory::*;
 
 #[test]
-fn query_handoff_reclassifies_payload_and_metadata_without_lowering_u_or_n() {
+fn query_handoff_reclassifies_payload_and_metadata_lowers_u_while_preserving_root_and_n() {
     let a = authority(65_536);
     let group = a
         .create_account(AccountKind::ResourceGroup, ExternalRef::NONE)
@@ -50,7 +50,7 @@ fn query_handoff_reclassifies_payload_and_metadata_without_lowering_u_or_n() {
     assert_eq!(after.residual_metadata, OWNER_METADATA_BYTES);
     assert_eq!(after.storage_metadata, before.storage_metadata);
     assert_eq!(after.root_committed, before.root_committed);
-    assert_eq!(after.query_pressure(), before.query_pressure());
+    assert_eq!(after.query_pressure(), 0);
     assert_eq!(after.non_evictable(0), before.non_evictable(0));
     assert_eq!(
         after.root_committed,
@@ -94,7 +94,7 @@ fn service_residual_is_disjoint_from_query_origin_subset() {
     assert_eq!(after.residual_query_committed, 512 + OWNER_METADATA_BYTES);
     assert_eq!(after.residual_committed, 768 + 2 * OWNER_METADATA_BYTES);
     assert_eq!(after.residual_metadata, 2 * OWNER_METADATA_BYTES);
-    assert_eq!(after.query_pressure(), before.query_pressure());
+    assert_eq!(after.query_pressure(), 0);
     assert_eq!(after.root_committed, before.root_committed);
     assert_eq!(after.non_evictable(after.root_committed + 1), None);
     free(service_origin, 256);

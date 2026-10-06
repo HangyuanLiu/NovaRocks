@@ -17,8 +17,7 @@
 
 //! Explicit allocation authorization obtained before the bounded operation.
 use crate::{
-    AccountHandle, domain::FundingDomain, error::CapacityError, owner::AllocationOrigin,
-    stock::ScopeLease,
+    AccountHandle, domain::FundingDomain, error::CapacityError, lane::FactToken, stock::ScopeLease,
 };
 #[derive(Debug)]
 pub struct ExplicitGrant {
@@ -39,7 +38,7 @@ impl ExplicitGrant {
     pub fn remaining_bytes(&self) -> u64 {
         self.scope.as_ref().unwrap().stock_bytes()
     }
-    pub fn record_success(&mut self, bytes: u64) -> Result<AllocationOrigin, CapacityError> {
+    pub fn record_success(&mut self, bytes: u64) -> Result<FactToken, CapacityError> {
         if bytes > self.remaining_bytes() {
             return Err(CapacityError::Invalid {
                 detail: "explicit allocation exceeds granted remainder",
@@ -52,7 +51,7 @@ impl Drop for ExplicitGrant {
     fn drop(&mut self) {
         self.scope.take().unwrap().finish();
         self.lane
-            .retire_lane()
+            .stop_producing()
             .expect("explicit lane has no active publisher or external bound");
     }
 }

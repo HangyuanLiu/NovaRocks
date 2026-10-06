@@ -572,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn management_separates_dirty_samples_and_preserves_residual_pressure_after_handoff() {
+    fn management_separates_dirty_samples_and_excludes_residual_from_query_pressure() {
         use novarocks_memory::{AccountKind, ExternalRef, OWNER_METADATA_BYTES, TeardownEvidence};
         let authority = test_memory_authority();
         let query = authority
@@ -602,10 +602,8 @@ mod tests {
         let after =
             serde_json::to_value(super::MemoryAuthorityManagementSnapshot::of(&authority)).unwrap();
         assert_eq!(after["committed_bytes"], before.committed_bytes);
-        assert_eq!(
-            after["query_pressure_bytes"],
-            before.query_pressure_bytes.unwrap()
-        );
+        assert!(before.query_pressure_bytes.unwrap() > 0);
+        assert_eq!(after["query_pressure_bytes"], 0);
         assert_eq!(after["query_committed_bytes"], 0);
         assert_eq!(
             after["residual_query_committed_bytes"],

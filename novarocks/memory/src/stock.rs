@@ -18,7 +18,7 @@
 //! Thread-local stock. A lease must leave before await or thread migration.
 use crate::sync::Ordering;
 use crate::{
-    domain::FundingDomain, error::CapacityError, owner::AllocationOrigin, settlement::StepReceipt,
+    domain::FundingDomain, error::CapacityError, lane::FactToken, settlement::StepReceipt,
 };
 use std::{marker::PhantomData, rc::Rc};
 #[derive(Debug)]
@@ -38,9 +38,9 @@ impl FundingDomain {
         threshold_bytes: u64,
     ) -> Result<ScopeLease, CapacityError> {
         let mut s = self.0.state.lock().unwrap();
-        if s.sealed || s.residual {
+        if self.0.lane.production_state() != crate::lane::ProductionState::Producing {
             return Err(CapacityError::Closed {
-                account: s.account.id(),
+                account: self.affiliation().id(),
             });
         }
         if s.drain_requested {
@@ -55,16 +55,24 @@ impl FundingDomain {
         }
         let available = s
             .authorized
-            .saturating_sub(self.0.owner.live().saturating_add(s.external));
+            .saturating_sub(self.0.lane.live_bytes().saturating_add(s.external));
         if stock_bytes > available {
             return Err(CapacityError::Invalid {
                 detail: "stock exceeds domain workset",
             });
         }
+        if !self.0.lane.enter() {
+            return Err(CapacityError::Closed {
+                account: self.affiliation().id(),
+            });
+        }
         s.active = true;
         s.generation += 1;
-        self.0.owner.sequence.fetch_add(1, Ordering::Release);
-        self.0.owner.scopes.fetch_add(1, Ordering::Release);
+        self.0
+            .lane
+            .record()
+            .sequence
+            .fetch_add(1, Ordering::Release);
         Ok(ScopeLease {
             domain: self.clone(),
             stock: stock_bytes,
@@ -79,15 +87,14 @@ impl FundingDomain {
 impl ScopeLease {
     /// Call only for a successful underlying allocation. Failure records no
     /// live bytes. The origin/length must accompany exactly one later free.
-    pub fn record_allocation(&mut self, bytes: u64) -> AllocationOrigin {
+    pub fn record_allocation(&mut self, bytes: u64) -> FactToken {
         let shortfall = bytes.saturating_sub(self.stock);
         self.stock = self.stock.saturating_sub(bytes);
         self.miss = self.miss.saturating_add(shortfall);
         if self.miss > self.threshold {
             self.sticky = true;
         }
-        self.domain.0.owner.publish(bytes);
-        self.domain.origin()
+        self.domain.0.lane.publish_fact(bytes)
     }
     pub fn stock_bytes(&self) -> u64 {
         self.stock
@@ -104,8 +111,13 @@ impl ScopeLease {
     fn detach(&mut self) {
         let mut s = self.domain.0.state.lock().unwrap();
         s.active = false;
-        self.domain.0.owner.sequence.fetch_add(1, Ordering::Release);
-        self.domain.0.owner.scopes.fetch_sub(1, Ordering::Release);
+        self.domain.0.lane.leave();
+        self.domain
+            .0
+            .lane
+            .record()
+            .sequence
+            .fetch_add(1, Ordering::Release);
         let drain = s.drain_requested;
         drop(s);
         if drain {

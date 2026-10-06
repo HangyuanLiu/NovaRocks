@@ -80,7 +80,7 @@ pub fn test_process_memory() -> crate::backend_metrics::ProcessMemoryObservation
         visible_memory: None,
         sample: Arc::new(|| {
             (
-                novarocks_memory::observe::AllocatorSnapshot::default(),
+                novarocks_memory::attribution::readout::AttributionSnapshot::default(),
                 novarocks_memory::observe::PhysicalMemoryReading::default(),
             )
         }),

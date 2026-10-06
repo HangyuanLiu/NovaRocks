@@ -46,9 +46,17 @@ INSERT INTO statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advance_
 ANALYZE TABLE statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advance_${uuid0};
 
 -- query 5
+-- Wait for this case's own job. SHOW ANALYZE JOBS lists every job the
+-- frontend holds, so any SUCCEEDED job left by another case would otherwise
+-- end the wait before this table has been measured. The table is unique to
+-- this case and analyzed exactly once, so its one row is that job.
 -- @retry_count=60
 -- @retry_interval_ms=1000
--- @result_contains=SUCCEEDED
+-- @result_rows_where=catalog=statistics_hadoop_${suite_uuid0}
+-- @result_rows_where=namespace=nr_ancestor_${suite_uuid0}
+-- @result_rows_where=table=advance_${uuid0}
+-- @result_rows_count=1
+-- @result_rows_expect=state=SUCCEEDED
 -- @skip_result_check=true
 SHOW ANALYZE JOBS;
 

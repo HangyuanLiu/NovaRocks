@@ -14,19 +14,19 @@ F = max(A - L - O, 0)
 C = A + E = L + O + F
 ```
 
-正常 funded 步只结算本域事实。量化 refill、新承诺、真实责任归还和债务变更才进入账户路径。`ScopeLease` 是当前线程的独占发布能力，其 stock 来自同一域，stock miss 不等于域越界。lease 必须在 await 或迁移线程前退出；free 可以来自其他线程。hook 只发布成功分配或真实释放事实、更新局部阈值信号，处置在安全边界进行。
+正常 funded 步只结算本域事实。量化 refill、新承诺、真实责任归还和债务变更才进入账户路径。资金 `ScopeLease` 是当前线程的独占 stock writer，其 stock 来自同一域，stock miss 不等于域越界。lease 必须在 await 或迁移线程前退出；free 可以来自其他线程。allocator hook 只发布成功分配或真实释放事实，处置在安全边界进行。独立的观测 lane 与 `LaneHandle::run` 不取得资金资格，也不消费 stock；资金结算读取同一份事实，不能再发布一份。
 
 `ExplicitGrant` 为可知的大分配提供操作前授权，成功分配不得超过剩余额度。`ExternalBound` 表示尚未能表达为 L 的责任上界，转换成功分配时同步扣 O、加 L；它不建立第二份承诺。`HolderPin` 保活稳定记录并提供曝光样本，不因为增加 holder 或 clone 而再次计 payload。
 
 ## 稳定 owner 与退役
 
-allocation origin 指向地址稳定的小记录，保存不可变来源身份。当前责任归属可以变化，free 始终更新同一记录。raw origin 的使用要求配对：每次成功发布对应一次、长度匹配的真实 free；复制 origin 不创造新分配，也不能在匹配 free 之后再次访问。
+生产来源以 8 B `RecordRef`（u32 下标 + u32 代次）标识；`FactToken` 也只有这份身份，不含 query/账户指针。稳定 `LaneRecord` 为 64 B，事实、来源、生产状态与当前责任分类分开。来源不变，责任可以在控制面交接。generation 只验证身份；访问必须由强 owner、真实未释放 allocation count 或唯一槽 pin 保活。复制 token 不增加义务，最终释放只做一次，最后减量之后不得再访问。手工 `FactToken` 发布不得与同一物理块的 wrapper/R1 helper 重复发布。
 
-账户关闭先封口新增生产。真实 teardown 要求任务退出、算子销毁、自有 I/O 实际退出，且不存在活动发布 scope 或未交接的外部责任。timeout、Task terminal 或一次 L=0 快照均不能替代这些证据。只有完成上述过程，才能把被动残留交给同分支存活祖先并让执行账户退役；祖先接收与关闭使用同一生命周期门。
+`stop_producing` 封口并结清闲置授权，不改责任分类。仍执行中的 Work 继续承担 Query；子 Task 退出交给同一仍执行的 Work 时也继续属于 Query。真正 Work teardown 才把责任交给同分支存活祖先并转为 Residual。teardown 要求任务退出、算子销毁、自有 I/O 实际退出，且没有活动 scope 或未交接外部责任；timeout、Task terminal 或一次 L=0 不能替代证据。
 
-残留保留 payload 和稳定记录 metadata 的容量责任。移交沿用已有记录及 backing，不新申请 owner 位置或容量；共同祖先 C、query 来源压力 U 和不可逐出责任 N 不因重分类而降低。只有真实 free 或无人可兑现的授权归还才减少责任。
+U=ΣC_query，只统计当前执行责任；`residual_query_committed` 只诊断来源。handoff 的重分类部分保持共同祖先/root C 与不可逐出责任 N，U 可以下降。归还闲置授权另行降低 C；真实 free 才降低残留 payload。换 sponsor 仍须在目标作用域复制，本机制不授予任意零复制迁账。
 
-`max_active_owners` 限制并发活动域，历史 residual 不占活动名额。稳定记录按 metadata 字节预算与实际存储能力准入；记录回收之后仍保留的公共索引 backing 继续归存储 owner 计费。free hook 不销毁记录，hook 外维护在 live、发布及访问责任归零后回收。一般业务改变 sponsor 时仍须在目标作用域复制，退役例外不提供任意零复制迁账能力。
+直接成员节点在账户事务外预分配，关闭/退役访问目标子树的成员，收集期间持祖先读 gate。`max_active_owners` 限制资金活动域，历史 residual 不占活动名额。记录存放在 process-lifetime、System-backed 稳定 segments；生产容量 2^18，16 个 immortal unattributed 分片，代次耗尽隔离不回绕。hook 不销毁记录，有预算控制面维护在 draining、count/pin/强句柄责任归零后 exact reclaim。metadata 责任仅在 exact reclaim 完成后退回；retained segment backing 另报。S1 纯观测控制 metadata 是诊断估计，不加入资金 C，也不代表物理驻留。
 
 ## 控制容量与结清
 
@@ -38,9 +38,19 @@ allocation origin 指向地址稳定的小记录，保存不可变来源身份�
 
 ## 观察与后续接线
 
-现有 `observe` 模块继续提供 `CountingAllocator`、allocator snapshot、物理来源质量与覆盖描述。allocator/RSS 观察和责任账本是不同口径，不能直接相加；现有 authority 装配、query 上限与管理指标消费者继续使用中立接口。
+Server 的 `GLOBAL` 已安装 `AttributingAllocator<Jemalloc>`；`--no-default-features` 使用同一协议的 `AttributingAllocator<System>` 诊断构建。`CountingAllocator` 保留为进程计数对照，`AllocatorSnapshot` 原字段继续有效。选择在链接期固定，jemalloc 配置、RSS/cgroup 和读数质量由 [ADR-0163](../../adr/ADR-0163-jemalloc-process-allocator-and-cgroup-memory-bound.md) 保持独立。
 
-M02a 交付分层原语和当前消费者收敛。生产 allocation header/TLS、realloc、size class 与全局 allocator 的归属接线由 M02b 交付；driver 安全边界及 query 内存强制由后续子任务接入。核心测试通过不等于全部 RSS 已受约束，也不证明下游 I/O 的真实退出上界。
+请求 <512 B 只计进程 small 段，不读 TLS；≥512 B 保持原对齐，在用户请求尾部增加 8 B token，tagged 请求事实含 token。底层 allocate/free/realloc 使用匹配的原始或扩展 Layout；失败保留旧块与事实。普通小对象跨入 tagged 时选择 explicit > ambient > unattributed，tagged 内部 resize 保留原来源。
+
+TLS 是无需析构的 const `Cell`，线程只有一个 Q=1 MiB 槽。切槽、同步作用域退出、没有 outer ambient 的显式 helper 退出及达到 Q 时直接发布或 flush。hook 返回后余额 <Q；在途的一笔操作没有先验大小上界。`Q × sampled pins` 排除了在途项，又是独立采样，不能当作瞬时物理峰值上界或结清证明。字节/序号先发布，count/unpin 合成最后一次状态更新。
+
+`LaneHandle::run` 只暴露同步闭包，私有同线程 guard 在正常返回及 unwind flush 并恢复 outer；同 lane 可嵌套/并发观察，资金 writer 仍独占。`AttributedFuture` 持有同一 lane，在每次 poll 安装，Pending/Ready/unwind 都恢复；Drop 没有未退出的 poll 绑定，spawn 不隐式继承。不能用跨 await 的公开 TLS guard。
+
+`ExplicitOwner` 持有 R1 容器 lane。成功 small 分配后补一份事实，tagged 只由 wrapper 发布；grow/grow_zeroed/shrink 底层不能递归调用同一 helper。失败不变，跨阈值的强 owner 保活整个两段发布，allocator-api 零尺寸没有物理块、不发布。对同一份 L 另取 A 是授权，不是第二份分配。
+
+进程 small/tagged 计数、三类 tagged/R1 small、unattributed、signed 盲区和对账、metadata 估计、批量估计分列。RSS/cgroup/jemalloc 与请求/责任事实不能相加。S1 尚未把生产 query/R1 调用面接线，零 query lane 指标不能证明查询已被硬治理；driver 安全点与 query 强制属于后续工作。
+
+完整合同见 [ADR-0167](../../adr/ADR-0167-size-banded-allocation-attribution.md)，验证入口见 [memory tests](../../../novarocks/memory/tests/README.md)，成本入口见 [attribution harness](../../../tools/memory-attribution-bench/README.md)。本地 smoke、模型完成和文档检查均不代替 Miri 地址验证或用户的 Linux 成本结论。
 
 ## CI 依赖门
 

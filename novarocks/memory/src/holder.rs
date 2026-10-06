@@ -30,6 +30,6 @@ impl FundingDomain {
 }
 impl HolderPin {
     pub fn sampled_live_bytes(&self) -> u64 {
-        self.domain.0.owner.live()
+        self.domain.0.lane.live_bytes()
     }
 }

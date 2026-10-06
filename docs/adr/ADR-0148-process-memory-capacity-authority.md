@@ -5,6 +5,7 @@ domain: [memory-governance]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by: [ADR-0167]
 date: 2026-09-10
 provenance:
   - "discussion: 2026-09-09 内存计量与容量控制底座 review"

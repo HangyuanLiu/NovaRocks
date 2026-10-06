@@ -3973,9 +3973,24 @@ dependencies = [
 name = "novarocks-memory"
 version = "0.1.0"
 dependencies = [
+ "allocator-api2",
+ "hashbrown 0.14.5",
  "loom",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "novarocks-memory-attribution-bench"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "novarocks-memory",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tikv-jemalloc-ctl",
+ "tikv-jemallocator",
 ]
 
 [[package]]

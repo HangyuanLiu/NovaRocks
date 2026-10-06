@@ -1682,7 +1682,14 @@ mod tests {
             management_response
                 .contains("novarocks_backend_process_allocator_info{allocator=\"test\"} 1")
         );
-        assert!(management_response.contains("novarocks_backend_process_counted_live_bytes 0"));
+        assert!(
+            management_response
+                .contains("novarocks_backend_process_counted_live_bytes{band=\"small\"} 0")
+        );
+        assert!(
+            management_response
+                .contains("novarocks_backend_process_counted_live_bytes{band=\"tagged\"} 0")
+        );
         assert!(management_response.contains(
             "novarocks_backend_task_preparation{dimension=\"used\",resource=\"positions\"} 0"
         ));

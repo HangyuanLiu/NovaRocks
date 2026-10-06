@@ -255,8 +255,10 @@ pub struct CoverageDescriptor {
 }
 
 impl CoverageDescriptor {
-    /// The descriptor of [`super::allocator::CountingAllocator`]: what a
-    /// wrapper around the Rust global allocator can and cannot see.
+    /// What a wrapper around the Rust global allocator can and cannot see.
+    /// CountingAllocator retains caller-requested sizes for baselines; the
+    /// Server's AttributingAllocator includes its reserved source-token bytes.
+    /// Neither request-size convention is an allocator/OS physical reading.
     pub const RUST_GLOBAL_ALLOCATOR: Self = Self {
         source: MeasuredSource::RustGlobalAllocator,
         covered_description: "Requested bytes of every allocation, reallocation and release \
