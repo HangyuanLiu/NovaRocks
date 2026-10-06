@@ -98,9 +98,13 @@ if [[ "$mode" == --loom || "$mode" == --all ]]; then
   done
 fi
 if [[ "$mode" == --miri || "$mode" == --all ]]; then
+  # Tree Borrows: Stacked Borrows confines a pointer derived from a reference to
+  # size_of::<T>(), and std's Box/Arc hand such pointers to dealloc, so it rejects
+  # any allocator that reads in-band metadata past Layout::size through the
+  # caller's pointer (even libtest's own Box). See ADR-0167.
   # Attribution readouts stamp samples with SystemTime. Isolation only gates host
   # access (clocks, environment, files); it does not relax any UB check.
-  export MIRIFLAGS="${MIRIFLAGS:+$MIRIFLAGS }-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-disable-isolation"
+  export MIRIFLAGS="${MIRIFLAGS:+$MIRIFLAGS }-Zmiri-tree-borrows -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-disable-isolation"
   for module in lane:: attribution::; do
     printf 'Running System-backend Miri library checks: %s\n' "$module"
     rustup run "$miri_toolchain" cargo miri test -p novarocks-memory \

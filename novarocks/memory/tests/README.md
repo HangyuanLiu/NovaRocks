@@ -198,6 +198,6 @@ tools/ci/memory-model-checks.sh --all
 MIRI_TOOLCHAIN=nightly-YYYY-MM-DD tools/ci/memory-model-checks.sh --miri
 ```
 
-脚本以 `--locked --offline` 执行 Cargo，Miri 预检已安装 nightly、miri、rust-src；缺项非零退出并报告，`--all` 在缺项时不先跑 Loom。Miri 使用 System 后端与 strict provenance/symbolic alignment，覆盖 lib lane/TLS/readout、全部 `attribution_*` 和旧 allocator observation；验证非对齐 token、realloc/受控失败、System segment、TLS 及最终访问。token 不含指针，不提供 provenance 豁免。独立 `attribution_reconcile` 避免 libtest 后台分配污染对账；压力测试不代替 Loom/Miri。
+脚本以 `--locked --offline` 执行 Cargo，Miri 预检已安装 nightly、miri、rust-src；缺项非零退出并报告，`--all` 在缺项时不先跑 Loom。Miri sysroot 在 rust-src 的 `library/` 内准备，使用其随附的 vendored std 依赖，不联网。Miri 使用 System 后端、Tree Borrows 与 strict provenance/symbolic alignment，并关闭 isolation（readout 读取 SystemTime；isolation 只限制宿主访问，不放宽 UB 检查）。选择 Tree Borrows 的原因见 ADR-0167：Stacked Borrows 把 std Box/Arc 交给 `dealloc` 的指针权限收窄到 `size_of::<T>()`，任何经该指针读取请求长度之后带内元数据的 allocator 都会被拒绝。Miri 覆盖 lib lane/TLS/readout、全部 `attribution_*` 和旧 allocator observation；验证非对齐 token、realloc/受控失败、System segment、TLS 及最终访问。token 不含指针，不提供 provenance 豁免。独立 `attribution_reconcile` 避免 libtest 后台分配污染对账；压力测试不代替 Loom/Miri。
 
-收敛边界：Miri 组件安装确认尚未取得，C3 未完成；正式 Linux 成本由用户手动执行，G1 待验证。P00 同一 33 套件选择集记录 822 cases /806 PASS /16 FAIL /0 SKIP，最终 SQL 必须与该失败集合比较，不能声称 all 全通过。当前指标/模型/定向测试不能证明所有生产 query/R1 已接线或硬内存治理交付。
+收敛边界：Miri 结论以 Tree Borrows 为别名模型，不等于 Rust 最终别名模型下的证明；正式 Linux 成本由用户手动执行，G1 待验证。P00 同一 33 套件选择集记录 822 cases /806 PASS /16 FAIL /0 SKIP，最终 SQL 必须与该失败集合比较，不能声称 all 全通过。当前指标/模型/定向测试不能证明所有生产 query/R1 已接线或硬内存治理交付。

@@ -69,6 +69,7 @@ Rust 普通不可失败分配不能通过 SQL 错误恢复。因此 hook 只观�
 - 带来源请求多 8 B，可跨 size class；请求字节、usable 与 resident 放大须分别测量。小释放增加真实释放事件计数，额外原子成本待正式 Linux 门，不用 smoke 代替结论。
 - 静态存储容量、保留 segments、无代次回绕和预算维护以固定资源换审查简单性；耗尽记覆盖错误。其 metadata 含观察控制估计与 retained backing，不冒充瞬时物理账本。
 - 有界并发模型验证的是有限操作/抢占下真实协议；它不替代 Miri 的地址验证。Miri 与 Linux 正式成本有独立收敛门，未完成不得声称 unsafe/性能验收完成。
+- **unsafe 验证以 Tree Borrows 为别名模型。** Stacked Borrows 把引用派生指针的权限限制在 `size_of::<T>()`，std 的 Box/Arc 把这样收窄的指针交给 `dealloc`。因此只要 allocator 经调用方指针读取请求长度之后的带内元数据，就会被 SB 判为 UB，std 自身的 Box 即可触发，与本条的协议实现无关。Miri 以 Tree Borrows 加 strict provenance 与 symbolic alignment 覆盖全部归属目标；在 SB 下，不经收窄指针的 resize、失败、跨线程释放、TLS 与 scope 路径同样通过。Tree Borrows 比 SB 更新，也更实验性，Rust 最终的别名模型可能更严格。exposed provenance 需要放弃 strict provenance，并在热路径暴露指针；带外索引违背裁决 2。两者均未采用。
 - 读数按字段/分片独立采样，不存在全堆一致快照；Q×sampled pins 排除在途项，无法用它证明严格峰值。
 
 ## 何时重新评估
@@ -77,4 +78,5 @@ Rust 普通不可失败分配不能通过 SQL 错误恢复。因此 hook 只观�
 - 小对象来源缺失成为实际治理缺口：评估全 header 的覆盖收益及空间/CPU 成本；它是成本取舍，非永久设计禁区。
 - 2^18 容量、high-water 扫描、retained segments 或 observation registry 在真实长运行成为可用性问题：在保持 token 路由、存活证明及退出责任的前提下重评估分段/回收结构。
 - 要把观测 metadata、R1、driver 安全点接入硬治理：先明确资金消费者、flush/结算顺序及 metadata capacity owner，不能重复发布或假定本条已交付全部 query 覆盖。
+- Rust 采纳的别名模型拒绝 allocator 经 `dealloc`/`realloc` 收到的指针访问同一块内请求长度之外的字节：在保持 token 路由与存活证明的前提下，重评估尾部读取的 provenance 来源。
 - 需要跨 sponsor 移动活跃分配或 native C 来源：先定义精确对象集合、原 Layout 与转移协议，不能以改 TLS、改单个 token 或 timeout 冒充交接。

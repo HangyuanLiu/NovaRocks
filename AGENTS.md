@@ -324,8 +324,10 @@ Execution, and do not recreate a Backend facade around it.
   reclassification. Timeout/terminal never substitutes for actual exit.
 - Read ADR-0167 and `docs/guides/development/memory-boundary.md` before changing
   these contracts. `tools/ci/memory-model-checks.sh` runs local Loom/Miri only;
-  the attribution benchmark has a separate frozen manifest and user-run Linux
-  acceptance gate. Neither smoke nor pending unsafe checks proves acceptance.
+  Miri uses Tree Borrows because Stacked Borrows rejects any in-band allocator
+  tail read through the narrowed pointers std Box/Arc pass to `dealloc`. The
+  attribution benchmark has a separate frozen manifest and user-run Linux
+  acceptance gate; smoke runs never prove cost acceptance.
 
 ### 4.8 Connectors / Catalog Backends / Filesystem
 
