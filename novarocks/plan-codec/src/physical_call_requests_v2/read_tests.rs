@@ -784,3 +784,7 @@ fn original_request_decode_new_argument_resource_at_real_pending_256_never_obser
         );
     }
 }
+
+mod receiver_owned_tests {
+    include!("receiver_owned_tests.rs");
+}

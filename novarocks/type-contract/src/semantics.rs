@@ -91,6 +91,29 @@ pub struct SemanticParameters {
     entries: BTreeMap<SemanticParameterId, SemanticParameterValue>,
 }
 
+/// Actual immutable projection operations lent to a caller's resource author.
+/// These borrowed facts contain no limits, allocation grant or control scope.
+#[derive(Clone, Copy, Debug)]
+pub enum SemanticParameterProjectionVisit<'source> {
+    /// Counts available before the source lookup and output entry search.
+    BeforeLookup {
+        reference: SemanticParameterRef,
+        source_definition_count: usize,
+        output_definition_count: usize,
+    },
+    /// The original require/key-checked value and actual output entry state,
+    /// before its completed observation and any unique clone or insertion.
+    CapturedValue {
+        reference: SemanticParameterRef,
+        value: &'source SemanticParameterValue,
+        is_new: bool,
+        output_definition_count: usize,
+    },
+}
+
+type ParameterProjectionCapture<'capture, E> =
+    dyn FnMut(SemanticParameterProjectionVisit<'_>) -> Result<(), E> + 'capture;
+
 impl SemanticParameters {
     pub fn try_new(
         entries: impl IntoIterator<Item = (SemanticParameterId, SemanticParameterValue)>,
@@ -237,17 +260,84 @@ impl SemanticParameters {
     ) -> Result<Self, SemanticParameterProjectionError> {
         let mut work = CompileCheckpoints::try_new(control, phase)
             .map_err(SemanticParameterProjectionError::Control)?;
+        let output =
+            self.project_core::<SemanticParameterProjectionError>(required, None, &mut work)?;
+        work.finish()
+            .map_err(SemanticParameterProjectionError::Control)?;
+        Ok(output)
+    }
+
+    /// Project the same validated immutable subset in the caller's scope.
+    /// The resource hook borrows actual source values and entry state; it must
+    /// admit their library operations before they execute. Ordinary and success
+    /// tails, iterator ownership, and complete source admission remain callers'.
+    pub fn project_in<E: From<SemanticParameterProjectionError>>(
+        &self,
+        required: impl IntoIterator<Item = SemanticParameterRef>,
+        capture: &mut dyn FnMut(SemanticParameterProjectionVisit<'_>) -> Result<(), E>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, E> {
+        self.project_core(required, Some(capture), work)
+    }
+
+    fn project_core<E: From<SemanticParameterProjectionError>>(
+        &self,
+        required: impl IntoIterator<Item = SemanticParameterRef>,
+        mut capture: Option<&mut ParameterProjectionCapture<'_, E>>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, E> {
         let mut entries = BTreeMap::new();
         for reference in required {
+            if let Some(capture) = capture.as_mut() {
+                capture(SemanticParameterProjectionVisit::BeforeLookup {
+                    reference,
+                    source_definition_count: self.entries.len(),
+                    output_definition_count: entries.len(),
+                })?;
+                work.flush()
+                    .map_err(SemanticParameterProjectionError::Control)?;
+            }
             let value = self
                 .require(reference)
                 .map_err(SemanticParameterProjectionError::Parameter)?;
-            entries.entry(reference.id).or_insert_with(|| value.clone());
+            if let Some(capture) = capture.as_mut() {
+                let output_definition_count = entries.len();
+                let entry = entries.entry(reference.id);
+                let is_new = matches!(&entry, std::collections::btree_map::Entry::Vacant(_));
+                capture(SemanticParameterProjectionVisit::CapturedValue {
+                    reference,
+                    value,
+                    is_new,
+                    output_definition_count,
+                })?;
+                // Both original lookups have completed; admit the captured
+                // clone/insertion before observing either completed operation.
+                work.step()
+                    .map_err(SemanticParameterProjectionError::Control)?;
+                work.flush()
+                    .map_err(SemanticParameterProjectionError::Control)?;
+                work.step()
+                    .map_err(SemanticParameterProjectionError::Control)?;
+                work.flush()
+                    .map_err(SemanticParameterProjectionError::Control)?;
+                if let std::collections::btree_map::Entry::Vacant(entry) = entry {
+                    let owned = value.clone();
+                    work.step()
+                        .map_err(SemanticParameterProjectionError::Control)?;
+                    work.flush()
+                        .map_err(SemanticParameterProjectionError::Control)?;
+                    entry.insert(owned);
+                    work.step()
+                        .map_err(SemanticParameterProjectionError::Control)?;
+                    work.flush()
+                        .map_err(SemanticParameterProjectionError::Control)?;
+                }
+            } else {
+                entries.entry(reference.id).or_insert_with(|| value.clone());
+            }
             work.step()
                 .map_err(SemanticParameterProjectionError::Control)?;
         }
-        work.finish()
-            .map_err(SemanticParameterProjectionError::Control)?;
         Ok(Self { entries })
     }
 }
@@ -543,3 +633,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "semantics/projection_owned_tests.rs"]
+mod projection_owned_tests;

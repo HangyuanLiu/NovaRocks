@@ -192,7 +192,7 @@ fn collection_sparse_closure_keeps_each_used_alias_and_selected_nonzero_ordinal(
     assert_eq!(bare_error.errors()[0].path(), "constants");
     assert_eq!(
         bare_error.errors()[0].message(),
-        "constant references require caller-observed plan publication"
+        "checked constants and original call requests require caller-observed plan publication"
     );
     assert_eq!(
         gate(&fragment, &pools, PlanLimits::FROZEN, &Control::good()),

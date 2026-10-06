@@ -17,9 +17,15 @@
 
 use super::*;
 use crate::{
-    allocation_exit_v2::reserve_exit, borrowed_type_resources::verify_type_binding,
-    physical_expression_v2::expression_tree_lookup_work, physical_node_v2 as resources,
-    physical_semantics_v2::encode_call_site, physical_type_v2::EncodedTypeTable,
+    allocation_exit_v2::reserve_exit,
+    borrowed_type_resources::{
+        type_binding_prefix_work_upper_bound_in, verify_type_binding,
+        verify_type_binding_admitted_in,
+    },
+    physical_expression_v2::expression_tree_lookup_work,
+    physical_node_v2 as resources,
+    physical_semantics_v2::encode_call_site,
+    physical_type_v2::EncodedTypeTable,
 };
 use novarocks_physical_plan::{
     ConstantPools, FragmentCallRequests, PhysicalCallRequest, PhysicalCallSite,
@@ -69,7 +75,9 @@ fn checked_shape(
 
 // This uses the shared checked numerical/layout algebra. The source floor is
 // necessary storage only, not a full backing invoice or allocator grant.
-struct Model {
+struct Model<'parent, 'callback> {
+    parent: Option<&'parent mut CallRequestAdmit<'callback>>,
+    work_peak: usize,
     facts: CallRequestProjectionFacts,
     items: usize,
     constants: usize,
@@ -79,11 +87,12 @@ struct Model {
     source: usize,
     known: usize,
 }
-impl Model {
+impl<'parent, 'callback> Model<'parent, 'callback> {
     fn new(
         source: usize,
         types: &EncodedTypeTable<'_>,
         pools: &ConstantPools,
+        parent: Option<&'parent mut CallRequestAdmit<'callback>>,
     ) -> Result<Self, Error> {
         let (roots, fields) = types.source_counts();
         let type_floor = add(
@@ -94,6 +103,8 @@ impl Model {
             )?,
         )?;
         Ok(Self {
+            parent,
+            work_peak: 0,
             facts: CallRequestProjectionFacts {
                 definition_count: 0,
                 type_reference_count: 0,
@@ -153,6 +164,29 @@ impl Model {
         if self.source < self.known {
             return Err(shape("request source invoice omits original backing"));
         }
+        if let Some(parent) = self.parent.as_deref_mut() {
+            self.work_peak = self.work_peak.max(self.facts.cumulative_work_upper_bound);
+            admitted(self.work_peak, limits.max_work)?;
+            let mut prefix = self.facts;
+            prefix.cumulative_work_upper_bound = self.work_peak;
+            parent(&prefix)?;
+        }
+        Ok(())
+    }
+    fn comparison_prefix(
+        &mut self,
+        left: &FunctionValueType,
+        right: &FunctionValueType,
+        limits: CallRequestProjectionLimits,
+    ) -> Result<(), Error> {
+        if self.parent.is_some() {
+            let prefix = type_binding_prefix_work_upper_bound_in(left, right, self.source)?;
+            let base = self.delegated;
+            self.delegated = add(base, prefix.work_upper_bound())?;
+            let result = self.check(limits);
+            self.delegated = base;
+            result?;
+        }
         Ok(())
     }
     fn compare(
@@ -162,13 +196,32 @@ impl Model {
         limits: CallRequestProjectionLimits,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<bool, Error> {
+        self.comparison_prefix(left, right, limits)?;
         self.check(limits)?;
+        // Subtract actual accumulated work, not the replacement peak for this
+        // same comparison. Retain that peak in the final prepared facts.
         let remaining = limits
             .max_work
             .checked_sub(self.facts.cumulative_work_upper_bound)
             .ok_or_else(resource)?;
-        let compared = verify_type_binding(left, right, self.source, remaining, w)?;
-        self.delegated = add(self.delegated, compared.work_upper_bound())?;
+        let compared = if self.parent.is_some() {
+            let base = self.delegated;
+            verify_type_binding_admitted_in::<Error>(
+                left,
+                right,
+                self.source,
+                remaining,
+                &mut |prefix| {
+                    self.delegated = add(base, prefix.work_upper_bound())?;
+                    self.check(limits)
+                },
+                w,
+            )?
+        } else {
+            let compared = verify_type_binding(left, right, self.source, remaining, w)?;
+            self.delegated = add(self.delegated, compared.work_upper_bound())?;
+            compared
+        };
         self.check(limits)?;
         w.step()?;
         Ok(compared.matches())
@@ -194,13 +247,28 @@ fn verify_id(
     types: &EncodedTypeTable<'_>,
     id: u32,
     expected: &FunctionValueType,
-    model: &mut Model,
+    model: &mut Model<'_, '_>,
     limits: CallRequestProjectionLimits,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
-    // Linear source lookup is admitted by Model before delegating.
-    w.flush()?;
-    let actual = types.value_type_observed(id, w)?;
+    // Linear source lookup is admitted by Model before delegating. The
+    // captured branch admits the actual selected root before the old flush.
+    if model.parent.is_none() {
+        w.flush()?;
+    }
+    let actual = if model.parent.is_some() {
+        types.value_type_captured::<Error>(
+            id,
+            &mut |actual, work| {
+                model.comparison_prefix(expected, actual, limits)?;
+                work.flush()?;
+                Ok(())
+            },
+            w,
+        )?
+    } else {
+        types.value_type_observed(id, w)?
+    };
     w.step()?;
     w.flush()?;
     let actual = actual.ok_or_else(|| shape("request supplied value type ID is absent"))?;
@@ -215,17 +283,33 @@ fn validate_constant(
     reference: novarocks_physical_plan::ConstantReference,
     expected: &FunctionValueType,
     pools: &ConstantPools,
-    model: &mut Model,
+    model: &mut Model<'_, '_>,
     limits: CallRequestProjectionLimits,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
     // Address-only selection keeps original Field/backing/ordinal and avoids
     // the bucketed metadata comparator's unaccounted heap scratch.
     model.check(limits)?;
-    w.flush()?;
-    let selected = pools.resolve_source_observed(reference, w);
+    if model.parent.is_none() {
+        w.flush()?;
+    }
+    let selected = if model.parent.is_some() {
+        pools.resolve_source_captured_observed::<Error>(
+            reference,
+            &mut |selected, work| {
+                capture_constant(selected, expected, model, limits)?;
+                work.flush()?;
+                Ok(())
+            },
+            w,
+        )
+    } else {
+        pools
+            .resolve_source_observed(reference, w)
+            .map_err(Error::from)
+    };
     let selected = match selected {
-        Err(novarocks_physical_plan::ConstantReferenceError::Control(cause)) => {
+        Err(Error::Control(cause)) => {
             return Err(Error::Control(cause));
         }
         outcome => {
@@ -234,6 +318,21 @@ fn validate_constant(
             outcome?
         }
     };
+    capture_constant(&selected, expected, model, limits)?;
+    if !model.compare(expected, selected.value_type(), limits, w)? {
+        return Err(Error::Constant(
+            novarocks_physical_plan::ConstantReferenceError::SourceTypeMismatch(reference),
+        ));
+    }
+    w.step()?;
+    Ok(())
+}
+fn capture_constant(
+    selected: &novarocks_physical_plan::ConstantValue,
+    expected: &FunctionValueType,
+    model: &mut Model<'_, '_>,
+    limits: CallRequestProjectionLimits,
+) -> Result<(), Error> {
     let backing = usize::try_from(
         selected
             .pool()
@@ -243,13 +342,49 @@ fn validate_constant(
     .map_err(|_| shape("request constant backing floor is unrepresentable"))?;
     model.known = model.known.max(add(size_of::<ConstantPools>(), backing)?);
     model.check(limits)?;
-    if !model.compare(expected, selected.value_type(), limits, w)? {
-        return Err(Error::Constant(
-            novarocks_physical_plan::ConstantReferenceError::SourceTypeMismatch(reference),
-        ));
-    }
-    w.step()?;
-    Ok(())
+    model.comparison_prefix(expected, selected.value_type(), limits)
+}
+fn count_request_header(
+    request: &PhysicalCallRequest,
+    ids: &CallRequestTypeIds<'_>,
+    model: &mut Model<'_, '_>,
+    owned_source: &mut usize,
+    limits: CallRequestProjectionLimits,
+) -> Result<(), Error> {
+    model.items = add(model.items, request.arguments.len())?;
+    *owned_source = add(
+        *owned_source,
+        bytes::<Argument<novarocks_physical_plan::ConstantReference>>(request.arguments.len())?,
+    )?;
+    model.known = model.known.max(*owned_source).max(add(
+        size_of::<CallRequestTypeIds<'_>>(),
+        bytes::<ArgumentTypeIds<'_>>(ids.arguments.len())?,
+    )?);
+    model.request::<wire::OriginalFunctionArgument>(request.arguments.len())?;
+    model.check(limits)
+}
+fn count_lambda_header(
+    parameter_types: &[FunctionValueType],
+    parameters: &[u32],
+    model: &mut Model<'_, '_>,
+    owned_source: &mut usize,
+    limits: CallRequestProjectionLimits,
+) -> Result<(), Error> {
+    model.facts.type_reference_count = add(
+        model.facts.type_reference_count,
+        add(parameter_types.len(), 1)?,
+    )?;
+    model.items = add(model.items, parameter_types.len())?;
+    *owned_source = add(
+        *owned_source,
+        bytes::<FunctionValueType>(parameter_types.len())?,
+    )?;
+    model.known = model.known.max(*owned_source).max(add(
+        size_of::<ArgumentTypeIds<'_>>(),
+        bytes::<u32>(parameters.len())?,
+    )?);
+    model.request::<u32>(parameter_types.len())?;
+    model.check(limits)
 }
 fn preflight(
     source: &FragmentCallRequests,
@@ -258,9 +393,10 @@ fn preflight(
     pools: &ConstantPools,
     invoice: usize,
     limits: CallRequestProjectionLimits,
+    parent: Option<&mut CallRequestAdmit<'_>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<CallRequestProjectionFacts, Error> {
-    let mut model = Model::new(invoice, types, pools)?;
+    let mut model = Model::new(invoice, types, pools, parent)?;
     model.facts.definition_count = source.entries().len();
     model.known = model.known.max(add(
         size_of::<FragmentCallRequests>(),
@@ -278,6 +414,9 @@ fn preflight(
     )?;
     let mut owned_source = model.known;
     for ((definition, request), ids) in source.entries().iter().zip(ids) {
+        if model.parent.is_some() {
+            count_request_header(request, ids, &mut model, &mut owned_source, limits)?;
+        }
         checked_shape(
             *definition == ids.definition,
             "request type bindings differ from original ordered definitions",
@@ -304,17 +443,9 @@ fn preflight(
         let count = u32::try_from(request.logical_argument_count);
         w.step()?;
         count.map_err(|_| shape("request logical argument count is unrepresentable"))?;
-        model.items = add(model.items, request.arguments.len())?;
-        owned_source = add(
-            owned_source,
-            bytes::<Argument<novarocks_physical_plan::ConstantReference>>(request.arguments.len())?,
-        )?;
-        model.known = model.known.max(owned_source).max(add(
-            size_of::<CallRequestTypeIds<'_>>(),
-            bytes::<ArgumentTypeIds<'_>>(ids.arguments.len())?,
-        )?);
-        model.request::<wire::OriginalFunctionArgument>(request.arguments.len())?;
-        model.check(limits)?; // Before classifying every actual argument.
+        if model.parent.is_none() {
+            count_request_header(request, ids, &mut model, &mut owned_source, limits)?;
+        }
         for (argument, ids) in request.arguments.iter().zip(ids.arguments) {
             match (argument, ids) {
                 (Argument::Value { .. }, ArgumentTypeIds::Value(_)) => {
@@ -335,25 +466,29 @@ fn preflight(
                     },
                     ArgumentTypeIds::Lambda { parameters, .. },
                 ) => {
+                    if model.parent.is_some() {
+                        count_lambda_header(
+                            parameter_types,
+                            parameters,
+                            &mut model,
+                            &mut owned_source,
+                            limits,
+                        )?;
+                    }
                     checked_shape(
                         parameter_types.len() == parameters.len(),
                         "request Lambda parameter ID shape differs from source",
                         w,
                     )?;
-                    model.facts.type_reference_count = add(
-                        model.facts.type_reference_count,
-                        add(parameter_types.len(), 1)?,
-                    )?;
-                    model.items = add(model.items, parameter_types.len())?;
-                    owned_source = add(
-                        owned_source,
-                        bytes::<FunctionValueType>(parameter_types.len())?,
-                    )?;
-                    model.known = model.known.max(owned_source).max(add(
-                        size_of::<ArgumentTypeIds<'_>>(),
-                        bytes::<u32>(parameters.len())?,
-                    )?);
-                    model.request::<u32>(parameter_types.len())?;
+                    if model.parent.is_none() {
+                        count_lambda_header(
+                            parameter_types,
+                            parameters,
+                            &mut model,
+                            &mut owned_source,
+                            limits,
+                        )?;
+                    }
                 }
                 _ => {
                     w.step()?;
@@ -363,12 +498,16 @@ fn preflight(
             model.check(limits)?;
             w.step()?;
         }
+        if model.parent.is_some() && request.expected_result_type.is_some() {
+            model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
+            model.check(limits)?;
+        }
         checked_shape(
             request.expected_result_type.is_some() == ids.expected_result_type.is_some(),
             "request expected constraint presence differs from source",
             w,
         )?;
-        if request.expected_result_type.is_some() {
+        if model.parent.is_none() && request.expected_result_type.is_some() {
             model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
         }
         model.check(limits)?;
@@ -412,6 +551,9 @@ fn preflight(
         }
         w.step()?;
     }
+    if model.parent.is_some() {
+        model.facts.cumulative_work_upper_bound = model.work_peak;
+    }
     Ok(model.facts)
 }
 
@@ -432,6 +574,7 @@ pub fn prepare_call_requests_encode<'loan, 'source>(
         pools,
         source_retained_bytes,
         limits,
+        None,
         &mut w,
     )
     .map(|facts| PreparedCallRequestsEncode {
@@ -471,12 +614,18 @@ pub fn encode_call_requests(
     token: PreparedCallRequestsEncode<'_, '_>,
 ) -> Result<wire::FragmentCallRequests, Error> {
     let mut w = CompileCheckpoints::try_new(token.control, CompilePhase::Encode)?;
-    let result = (|| {
+    let result = emit_core(token, &mut w);
+    finish(w, result)
+}
+fn emit_core(
+    token: PreparedCallRequestsEncode<'_, '_>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<wire::FragmentCallRequests, Error> {
+    (|| {
         // These loans remain live through emission; nothing is re-resolved or
         // re-admitted after the immutable prepared correspondence was checked.
         let _loans = (token.types, token.pools);
-        let mut entries =
-            reserve::<wire::OriginalCallRequest>(token.source.entries().len(), &mut w)?;
+        let mut entries = reserve::<wire::OriginalCallRequest>(token.source.entries().len(), w)?;
         for ((definition, request), ids) in token.source.entries().iter().zip(token.type_ids) {
             let kind = match definition {
                 PhysicalCallDefinition::Expression(id) => {
@@ -488,7 +637,7 @@ pub fn encode_call_requests(
             };
             w.step()?;
             let mut arguments =
-                reserve::<wire::OriginalFunctionArgument>(request.arguments.len(), &mut w)?;
+                reserve::<wire::OriginalFunctionArgument>(request.arguments.len(), w)?;
             for (argument, ids) in request.arguments.iter().zip(ids.arguments) {
                 let kind = match (argument, ids) {
                     (Argument::Value { constant, .. }, ArgumentTypeIds::Value(id)) => {
@@ -501,8 +650,7 @@ pub fn encode_call_requests(
                         })
                     }
                     (Argument::Lambda { .. }, ArgumentTypeIds::Lambda { parameters, result }) => {
-                        let mut parameter_value_type_ids =
-                            reserve::<u32>(parameters.len(), &mut w)?;
+                        let mut parameter_value_type_ids = reserve::<u32>(parameters.len(), w)?;
                         for id in *parameters {
                             parameter_value_type_ids.push(*id);
                             w.step()?;
@@ -530,8 +678,59 @@ pub fn encode_call_requests(
             w.step()?;
         }
         Ok(wire::FragmentCallRequests { entries })
-    })();
-    finish(w, result)
+    })()
+}
+
+/// Prepare on the caller's original meter, replacing this child contribution.
+/// No scope, entry, finish, type reconstruction or constant admission is added.
+pub(crate) fn prepare_call_requests_encode_in<'loan, 'source>(
+    source: &'loan FragmentCallRequests,
+    types: &'loan EncodedTypeTable<'source>,
+    type_ids: &'loan [CallRequestTypeIds<'loan>],
+    pools: &'loan ConstantPools,
+    source_retained_bytes: usize,
+    limits: CallRequestProjectionLimits,
+    admit: &mut CallRequestAdmit<'_>,
+    work: &mut CompileCheckpoints<'loan>,
+) -> Result<PreparedCallRequestsEncode<'loan, 'source>, Error> {
+    let facts = preflight(
+        source,
+        types,
+        type_ids,
+        pools,
+        source_retained_bytes,
+        limits,
+        Some(admit),
+        work,
+    )?;
+    Ok(PreparedCallRequestsEncode {
+        source,
+        types,
+        type_ids,
+        pools,
+        control: work.control(),
+        facts,
+    })
+}
+pub(crate) fn encode_call_requests_in(
+    token: PreparedCallRequestsEncode<'_, '_>,
+    admit: &mut CallRequestAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<wire::FragmentCallRequests, Error> {
+    if !std::ptr::addr_eq(token.control, work.control()) {
+        return Err(shape("request encoder belongs to another controller"));
+    }
+    admit(&token.facts)?;
+    emit_core(token, work)
+}
+impl PreparedCallRequestsEncode<'_, '_> {
+    pub(crate) fn emit_in(
+        self,
+        admit: &mut CallRequestAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<wire::FragmentCallRequests, Error> {
+        encode_call_requests_in(self, admit, work)
+    }
 }
 
 #[cfg(test)]

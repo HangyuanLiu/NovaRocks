@@ -16,13 +16,20 @@
 // under the License.
 
 use super::{
-    CallRequestCodecError as E, CallRequestProjectionFacts as Facts,
+    CallRequestAdmit, CallRequestCodecError as E, CallRequestProjectionFacts as Facts,
     CallRequestProjectionLimits as Limits, finish,
 };
 use crate::{
     allocation_exit_v2::reserve_exit,
-    borrowed_type_resources::verify_type_binding,
-    physical_type_v2::{DecodedTypeTable, clone_value_type_observed, preflight_value_type_clone},
+    borrowed_type_resources::{
+        type_binding_prefix_work_upper_bound_in, verify_type_binding,
+        verify_type_binding_admitted_in,
+    },
+    physical_type_v2::{
+        DecodedTypeTable, ValueTypeCloneFacts, clone_value_type_observed,
+        preflight_value_type_clone, preflight_value_type_clone_admitted,
+        value_type_clone_root_facts,
+    },
 };
 use novarocks_physical_plan::{
     ConstantPolicy, ConstantPoolId, ConstantPools, ConstantReference, ExprId,
@@ -200,6 +207,8 @@ struct Model {
     source: usize,
     types: usize,
     pools: usize,
+    raw_work: usize,
+    peak_work: usize,
 }
 impl Model {
     fn request<T>(&mut self, n: usize, copies: usize) -> Result<(), E> {
@@ -212,7 +221,11 @@ impl Model {
         }
         Ok(())
     }
-    fn admit(&mut self, limits: Limits) -> Result<(), E> {
+    fn admit(
+        &mut self,
+        limits: Limits,
+        parent: &mut Option<&mut CallRequestAdmit<'_>>,
+    ) -> Result<(), E> {
         // Original checked clone grammar bounds its fixed borrowed scratch and
         // all possible visited owned Dictionary nodes BEFORE that helper runs.
         // This deliberately conservative per-reference envelope is not an
@@ -237,7 +250,12 @@ impl Model {
         let total = add(index, source_visits)?;
         let total = add(total, add(arguments, parameters)?)?;
         let total = add(total, add(references, self.comparisons)?)?;
-        self.facts.cumulative_work_upper_bound = add(128, add(total, movement)?)?;
+        self.raw_work = add(128, add(total, movement)?)?;
+        self.facts.cumulative_work_upper_bound = self.raw_work;
+        if parent.is_some() {
+            self.peak_work = self.peak_work.max(self.raw_work);
+            self.facts.cumulative_work_upper_bound = self.peak_work;
+        }
         self.facts.coexisting_source_and_request_bytes_upper_bound = add(
             add(self.source, size_of::<PreparedCallRequestsDecode<'_>>())?,
             self.facts.request_bytes_upper_bound,
@@ -257,14 +275,36 @@ impl Model {
             limits.max_coexisting_source_and_request_bytes,
         )?;
         gate(self.facts.cumulative_work_upper_bound, limits.max_work)?;
-        source_gate(self.source, add(self.known, self.maximum_type_backing)?)
+        source_gate(self.source, add(self.known, self.maximum_type_backing)?)?;
+        if let Some(parent) = parent.as_deref_mut() {
+            parent(&self.facts)?;
+        }
+        Ok(())
     }
     fn type_reference(
         &mut self,
         ty: &FunctionValueType,
         limits: Limits,
+        parent: &mut Option<&mut CallRequestAdmit<'_>>,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<(), E> {
+        if parent.is_some() {
+            let requests = self.facts.allocation_requests_upper_bound;
+            let bytes = self.facts.request_bytes_upper_bound;
+            let mut capture = |facts: ValueTypeCloneFacts, _: &mut CompileCheckpoints<'_>| {
+                self.facts.allocation_requests_upper_bound =
+                    add(requests, facts.allocation_requests_upper_bound())?;
+                self.facts.request_bytes_upper_bound =
+                    add(bytes, facts.allocation_request_bytes_upper_bound())?;
+                self.maximum_type_backing = self
+                    .maximum_type_backing
+                    .max(facts.allocation_request_bytes_upper_bound());
+                self.admit(limits, parent)
+            };
+            capture(value_type_clone_root_facts(ty)?, w)?;
+            preflight_value_type_clone_admitted(ty, &mut capture, w)?;
+            return observed(self.admit(limits, parent), w);
+        }
         let facts = preflight_value_type_clone(ty, w)?;
         self.facts.allocation_requests_upper_bound = add(
             self.facts.allocation_requests_upper_bound,
@@ -279,8 +319,80 @@ impl Model {
             .max(facts.allocation_request_bytes_upper_bound());
         // The numerical helper also describes the ensuing sole clone. The
         // admitted grammar envelope above covers its complete own walk.
-        observed(self.admit(limits), w)
+        observed(self.admit(limits, parent), w)
     }
+    fn value<'a>(
+        &mut self,
+        types: &'a DecodedTypeTable,
+        id: u32,
+        limits: Limits,
+        parent: &mut Option<&mut CallRequestAdmit<'_>>,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<&'a FunctionValueType, E> {
+        if parent.is_none() {
+            let ty = value(types, id, w)?;
+            self.type_reference(ty, limits, parent, w)?;
+            return Ok(ty);
+        }
+        // The model has admitted the opaque lookup work. Capture its actual
+        // root and admit the sole clone before any pending observation; Plain
+        // retains its original pre-lookup flush in value() above.
+        let ty = types.value_type(id);
+        if let Some(ty) = ty {
+            self.type_reference(ty, limits, parent, w)?;
+        }
+        w.step()?;
+        w.flush()?;
+        ty.ok_or_else(|| invalid("request value type ID is absent from the original table"))
+    }
+    fn compare(
+        &mut self,
+        left: &FunctionValueType,
+        right: &FunctionValueType,
+        limits: Limits,
+        parent: &mut Option<&mut CallRequestAdmit<'_>>,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<bool, E> {
+        let remaining = limits
+            .max_work
+            .checked_sub(self.raw_work)
+            .ok_or_else(resource)?;
+        let baseline = self.comparisons;
+        let prefix = type_binding_prefix_work_upper_bound_in(left, right, self.source)?;
+        self.comparisons = add(baseline, prefix.work_upper_bound())?;
+        self.admit(limits, parent)?;
+        let compared = verify_type_binding_admitted_in(
+            left,
+            right,
+            self.source,
+            remaining,
+            &mut |facts| {
+                self.comparisons = add(baseline, facts.work_upper_bound())?;
+                self.admit(limits, parent)
+            },
+            w,
+        )?;
+        self.comparisons = add(baseline, compared.work_upper_bound())?;
+        self.admit(limits, parent)?;
+        Ok(compared.matches())
+    }
+}
+fn capture_arguments(
+    entry: &wire::OriginalCallRequest,
+    model: &mut Model,
+    limits: Limits,
+    parent: &mut Option<&mut CallRequestAdmit<'_>>,
+) -> Result<(), E> {
+    model.arguments = add(model.arguments, entry.arguments.len())?;
+    model.known = add(
+        model.known,
+        bytes::<wire::OriginalFunctionArgument>(entry.arguments.capacity())?,
+    )?;
+    model.request::<StaticFunctionArgument>(entry.arguments.len(), 2)?;
+    if parent.is_some() {
+        model.admit(limits, parent)?;
+    }
+    Ok(())
 }
 fn preflight(
     source: &wire::FragmentCallRequests,
@@ -288,6 +400,7 @@ fn preflight(
     pools: &ConstantPools,
     invoice: usize,
     limits: Limits,
+    parent: &mut Option<&mut CallRequestAdmit<'_>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<Facts, E> {
     let n = source.entries.len();
@@ -328,10 +441,12 @@ fn preflight(
         source: invoice,
         types: type_count,
         pools: pool_count,
+        raw_work: 0,
+        peak_work: 0,
     };
     model.request::<PhysicalCallDefinition>(n, 1)?;
     model.request::<(PhysicalCallDefinition, PhysicalCallRequest)>(n, 1)?;
-    observed(model.admit(limits), w)?;
+    observed(model.admit(limits, parent), w)?;
     // Visit the loaned pool namespace once. Maximum individual backing is an
     // alias-safe NECESSARY floor, not a complete host invoice or dedup upper.
     let mut maximum_pool_backing = 0;
@@ -349,6 +464,9 @@ fn preflight(
     }
     model.known = add(model.known, maximum_pool_backing)?;
     for entry in &source.entries {
+        if parent.is_some() {
+            capture_arguments(entry, &mut model, limits, parent)?;
+        }
         let key = definition(entry);
         w.step()?;
         key?;
@@ -368,44 +486,61 @@ fn preflight(
         let p = policy(entry.constant_policy.as_ref());
         w.step()?;
         p?;
-        model.arguments = add(model.arguments, entry.arguments.len())?;
-        model.known = add(
-            model.known,
-            bytes::<wire::OriginalFunctionArgument>(entry.arguments.capacity())?,
-        )?;
-        model.request::<StaticFunctionArgument>(entry.arguments.len(), 2)?;
-        observed(model.admit(limits), w)?;
+        if parent.is_none() {
+            capture_arguments(entry, &mut model, limits, parent)?;
+        }
+        observed(model.admit(limits, parent), w)?;
         for argument in &entry.arguments {
             match argument.kind.as_ref() {
                 Some(wire::original_function_argument::Kind::Value(input)) => {
                     model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
-                    observed(model.admit(limits), w)?;
+                    observed(model.admit(limits, parent), w)?;
                     let id = required(
                         input.value_type_id,
                         "request argument value type ID is absent",
                     );
                     w.step()?;
-                    let ty = value(types, id?, w)?;
-                    model.type_reference(ty, limits, w)?;
+                    let ty = model.value(types, id?, limits, parent, w)?;
                     if let Some(input) = &input.constant {
                         let address = observed(reference(input), w)?;
-                        w.flush()?;
-                        let found = pools.resolve_source_observed(address, w).map_err(E::from);
-                        let found = observed(found, w);
-                        if matches!(&found, Err(E::Control(_))) {
-                            return found.map(|_| model.facts);
-                        }
-                        w.flush()?;
-                        let found = found?;
-                        let remaining = limits
-                            .max_work
-                            .checked_sub(model.facts.cumulative_work_upper_bound)
-                            .ok_or_else(resource)?;
-                        let compared =
-                            verify_type_binding(ty, found.value_type(), invoice, remaining, w)?;
-                        model.comparisons = add(model.comparisons, compared.work_upper_bound())?;
-                        observed(model.admit(limits), w)?;
-                        let matches = compared.matches();
+                        let matches = if parent.is_some() {
+                            w.flush()?;
+                            let mut matches = false;
+                            let found = pools.resolve_source_captured_observed(
+                                address,
+                                &mut |found, w| {
+                                    matches =
+                                        model.compare(ty, found.value_type(), limits, parent, w)?;
+                                    Ok::<_, E>(())
+                                },
+                                w,
+                            );
+                            let found = observed(found, w)?;
+                            w.flush()?;
+                            // Selected handles share the admitted original pool.
+                            // No literal factory or replacement backing is used.
+                            let _ = found;
+                            matches
+                        } else {
+                            w.flush()?;
+                            let found = pools.resolve_source_observed(address, w).map_err(E::from);
+                            let found = observed(found, w);
+                            if matches!(&found, Err(E::Control(_))) {
+                                return found.map(|_| model.facts);
+                            }
+                            w.flush()?;
+                            let found = found?;
+                            let remaining = limits
+                                .max_work
+                                .checked_sub(model.facts.cumulative_work_upper_bound)
+                                .ok_or_else(resource)?;
+                            let compared =
+                                verify_type_binding(ty, found.value_type(), invoice, remaining, w)?;
+                            model.comparisons =
+                                add(model.comparisons, compared.work_upper_bound())?;
+                            observed(model.admit(limits, parent), w)?;
+                            compared.matches()
+                        };
                         w.step()?;
                         if !matches {
                             return Err(novarocks_physical_plan::ConstantReferenceError::SourceTypeMismatch(address).into());
@@ -422,10 +557,9 @@ fn preflight(
                         bytes::<u32>(input.parameter_value_type_ids.capacity())?,
                     )?;
                     model.request::<FunctionValueType>(input.parameter_value_type_ids.len(), 2)?;
-                    observed(model.admit(limits), w)?;
+                    observed(model.admit(limits, parent), w)?;
                     for &id in &input.parameter_value_type_ids {
-                        let ty = value(types, id, w)?;
-                        model.type_reference(ty, limits, w)?;
+                        model.value(types, id, limits, parent, w)?;
                         w.step()?;
                     }
                     let id = required(
@@ -433,8 +567,7 @@ fn preflight(
                         "request lambda result type ID is absent",
                     );
                     w.step()?;
-                    let ty = value(types, id?, w)?;
-                    model.type_reference(ty, limits, w)?;
+                    model.value(types, id?, limits, parent, w)?;
                 }
                 None => {
                     w.step()?;
@@ -445,9 +578,8 @@ fn preflight(
         }
         if let Some(id) = entry.expected_result_value_type_id {
             model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
-            observed(model.admit(limits), w)?;
-            let ty = value(types, id, w)?;
-            model.type_reference(ty, limits, w)?;
+            observed(model.admit(limits, parent), w)?;
+            model.value(types, id, limits, parent, w)?;
         }
         w.step()?;
     }
@@ -514,6 +646,37 @@ fn index(
     }
     Ok(keys)
 }
+fn prepare_core<'loan>(
+    source: Option<&'loan wire::FragmentCallRequests>,
+    types: &'loan DecodedTypeTable,
+    pools: &'loan ConstantPools,
+    source_retained_bytes: usize,
+    limits: Limits,
+    parent: &mut Option<&mut CallRequestAdmit<'_>>,
+    work: &mut CompileCheckpoints<'loan>,
+) -> Result<PreparedCallRequestsDecode<'loan>, E> {
+    let source = source.ok_or_else(|| invalid("fragment call request table is absent"))?;
+    let facts = preflight(
+        source,
+        types,
+        pools,
+        source_retained_bytes,
+        limits,
+        parent,
+        work,
+    )?;
+    let keys = index(source, work)?;
+    work.step()?;
+    Ok(PreparedCallRequestsDecode {
+        source,
+        types,
+        _pools: pools,
+        control: work.control(),
+        facts,
+        _keys: keys,
+    })
+}
+
 pub fn prepare_call_requests_decode<'loan>(
     source: Option<&'loan wire::FragmentCallRequests>,
     types: &'loan DecodedTypeTable,
@@ -523,126 +686,151 @@ pub fn prepare_call_requests_decode<'loan>(
     control: &'loan dyn PureCompileControl,
 ) -> Result<PreparedCallRequestsDecode<'loan>, E> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
-    let result = (|| {
-        let source = source.ok_or_else(|| invalid("fragment call request table is absent"))?;
-        let facts = preflight(
-            source,
-            types,
-            pools,
-            source_retained_bytes,
-            limits,
-            &mut work,
-        )?;
-        let keys = index(source, &mut work)?;
-        work.step()?;
-        Ok(PreparedCallRequestsDecode {
-            source,
-            types,
-            _pools: pools,
-            control,
-            facts,
-            _keys: keys,
-        })
-    })();
+    let result = prepare_core(
+        source,
+        types,
+        pools,
+        source_retained_bytes,
+        limits,
+        &mut None,
+        &mut work,
+    );
     finish(work, result)
+}
+
+/// Same receiver author on the caller's original meter. The parent replaces
+/// the complete child contribution; its source invoice is included once.
+pub(crate) fn prepare_call_requests_decode_in<'loan>(
+    source: Option<&'loan wire::FragmentCallRequests>,
+    types: &'loan DecodedTypeTable,
+    pools: &'loan ConstantPools,
+    source_retained_bytes: usize,
+    limits: Limits,
+    admit: &mut CallRequestAdmit<'_>,
+    work: &mut CompileCheckpoints<'loan>,
+) -> Result<PreparedCallRequestsDecode<'loan>, E> {
+    prepare_core(
+        source,
+        types,
+        pools,
+        source_retained_bytes,
+        limits,
+        &mut Some(admit),
+        work,
+    )
+}
+
+fn decode_core(
+    token: PreparedCallRequestsDecode<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<(PhysicalCallDefinition, PhysicalCallRequest)>, E> {
+    let mut output = reserve(token.source.entries.len(), work)?;
+    for entry in &token.source.entries {
+        let key = definition(entry);
+        work.step()?;
+        let mut arguments = reserve(entry.arguments.len(), work)?;
+        for argument in &entry.arguments {
+            let argument = match argument.kind.as_ref() {
+                Some(wire::original_function_argument::Kind::Value(input)) => {
+                    let id = required(
+                        input.value_type_id,
+                        "request argument value type ID is absent",
+                    );
+                    work.step()?;
+                    let ty = clone_value_type_observed(value(token.types, id?, work)?, work)?;
+                    let constant = match &input.constant {
+                        Some(input) => {
+                            let address = reference(input);
+                            work.step()?;
+                            Some(address?)
+                        }
+                        None => None,
+                    };
+                    StaticFunctionArgument::Value {
+                        value_type: ty,
+                        constant,
+                    }
+                }
+                Some(wire::original_function_argument::Kind::Lambda(input)) => {
+                    let mut parameters = reserve(input.parameter_value_type_ids.len(), work)?;
+                    for &id in &input.parameter_value_type_ids {
+                        parameters.push(clone_value_type_observed(
+                            value(token.types, id, work)?,
+                            work,
+                        )?);
+                        work.step()?;
+                    }
+                    let id = required(
+                        input.result_value_type_id,
+                        "request lambda result type ID is absent",
+                    );
+                    work.step()?;
+                    let result_type =
+                        clone_value_type_observed(value(token.types, id?, work)?, work)?;
+                    StaticFunctionArgument::Lambda {
+                        parameter_types: boxed(parameters, work)?,
+                        result_type,
+                    }
+                }
+                None => {
+                    work.step()?;
+                    return Err(invalid("request argument kind is absent"));
+                }
+            };
+            arguments.push(argument);
+            work.step()?;
+        }
+        let expected_result_type = match entry.expected_result_value_type_id {
+            Some(id) => Some(clone_value_type_observed(
+                value(token.types, id, work)?,
+                work,
+            )?),
+            None => None,
+        };
+        let logical = required(
+            entry.logical_argument_count,
+            "request logical argument count is absent",
+        );
+        work.step()?;
+        let logical_argument_count = usize::try_from(logical?).map_err(|_| resource())?;
+        let constant_policy = policy(entry.constant_policy.as_ref());
+        work.step()?;
+        output.push((
+            key?,
+            PhysicalCallRequest {
+                arguments: boxed(arguments, work)?,
+                logical_argument_count,
+                expected_result_type,
+                constant_policy: constant_policy?,
+            },
+        ));
+        work.step()?;
+    }
+    work.step()?;
+    Ok(output)
 }
 pub fn decode_call_requests(
     token: PreparedCallRequestsDecode<'_>,
 ) -> Result<Vec<(PhysicalCallDefinition, PhysicalCallRequest)>, E> {
     let mut work = CompileCheckpoints::try_new(token.control, CompilePhase::Decode)?;
-    let result = (|| {
-        let mut output = reserve(token.source.entries.len(), &mut work)?;
-        for entry in &token.source.entries {
-            let key = definition(entry);
-            work.step()?;
-            let mut arguments = reserve(entry.arguments.len(), &mut work)?;
-            for argument in &entry.arguments {
-                let argument = match argument.kind.as_ref() {
-                    Some(wire::original_function_argument::Kind::Value(input)) => {
-                        let id = required(
-                            input.value_type_id,
-                            "request argument value type ID is absent",
-                        );
-                        work.step()?;
-                        let ty = clone_value_type_observed(
-                            value(token.types, id?, &mut work)?,
-                            &mut work,
-                        )?;
-                        let constant = match &input.constant {
-                            Some(input) => {
-                                let address = reference(input);
-                                work.step()?;
-                                Some(address?)
-                            }
-                            None => None,
-                        };
-                        StaticFunctionArgument::Value {
-                            value_type: ty,
-                            constant,
-                        }
-                    }
-                    Some(wire::original_function_argument::Kind::Lambda(input)) => {
-                        let mut parameters =
-                            reserve(input.parameter_value_type_ids.len(), &mut work)?;
-                        for &id in &input.parameter_value_type_ids {
-                            parameters.push(clone_value_type_observed(
-                                value(token.types, id, &mut work)?,
-                                &mut work,
-                            )?);
-                            work.step()?;
-                        }
-                        let id = required(
-                            input.result_value_type_id,
-                            "request lambda result type ID is absent",
-                        );
-                        work.step()?;
-                        let result_type = clone_value_type_observed(
-                            value(token.types, id?, &mut work)?,
-                            &mut work,
-                        )?;
-                        StaticFunctionArgument::Lambda {
-                            parameter_types: boxed(parameters, &mut work)?,
-                            result_type,
-                        }
-                    }
-                    None => {
-                        work.step()?;
-                        return Err(invalid("request argument kind is absent"));
-                    }
-                };
-                arguments.push(argument);
-                work.step()?;
-            }
-            let expected_result_type = match entry.expected_result_value_type_id {
-                Some(id) => Some(clone_value_type_observed(
-                    value(token.types, id, &mut work)?,
-                    &mut work,
-                )?),
-                None => None,
-            };
-            let logical = required(
-                entry.logical_argument_count,
-                "request logical argument count is absent",
-            );
-            work.step()?;
-            let logical_argument_count = usize::try_from(logical?).map_err(|_| resource())?;
-            let constant_policy = policy(entry.constant_policy.as_ref());
-            work.step()?;
-            output.push((
-                key?,
-                PhysicalCallRequest {
-                    arguments: boxed(arguments, &mut work)?,
-                    logical_argument_count,
-                    expected_result_type,
-                    constant_policy: constant_policy?,
-                },
-            ));
-            work.step()?;
-        }
-        work.step()?;
-        Ok(output)
-    })();
+    let result = decode_core(token, &mut work);
     finish(work, result)
+}
+
+pub(crate) fn decode_call_requests_in(
+    token: PreparedCallRequestsDecode<'_>,
+    admit: &mut CallRequestAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<(PhysicalCallDefinition, PhysicalCallRequest)>, E> {
+    if !std::ptr::addr_eq(token.control, work.control()) {
+        return Err(invalid(
+            "call request prepared controller differs from caller",
+        ));
+    }
+    // Immutable preparation bills every ensuing copy. The complete parent
+    // gate precedes the first real output reserve or opaque clone boundary.
+    admit(&token.facts)?;
+    decode_core(token, work)
 }
 #[cfg(test)]
 #[path = "read_tests.rs"]

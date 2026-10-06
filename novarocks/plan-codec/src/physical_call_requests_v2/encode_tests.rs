@@ -812,3 +812,6 @@ fn two_way_request_component_returns_to_original_fragment_coverage_and_pool_name
         );
     }
 }
+
+#[path = "sender_owned_tests.rs"]
+mod owned;

@@ -162,10 +162,59 @@ impl ConstantPools {
         reference: ConstantReference,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<ConstantValue, ConstantReferenceError> {
-        let pool = self.pool_observed(reference.pool, work)?;
-        work.step()?;
-        pool.value(reference.ordinal)
+        self.resolve_source_core::<ConstantReferenceError>(
+            reference,
+            false,
+            &mut |_, _| Ok(()),
+            work,
+        )
+    }
+    /// Capture the actual selected source before its completed lookup steps.
+    /// The caller has admitted lookup work and owns entry and finish. The
+    /// original pool author creates only its Arc-backed ordinal handle; no
+    /// type, Field, array or scalar is reconstructed and no grant is minted.
+    pub fn resolve_source_captured_observed<E: From<ConstantReferenceError>>(
+        &self,
+        reference: ConstantReference,
+        capture: &mut impl FnMut(&ConstantValue, &mut CompileCheckpoints<'_>) -> Result<(), E>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<ConstantValue, E> {
+        self.resolve_source_core(reference, true, capture, work)
+    }
+    fn resolve_source_core<E: From<ConstantReferenceError>>(
+        &self,
+        reference: ConstantReference,
+        captured: bool,
+        capture: &mut impl FnMut(&ConstantValue, &mut CompileCheckpoints<'_>) -> Result<(), E>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<ConstantValue, E> {
+        if !captured {
+            work.step().map_err(ConstantReferenceError::from)?;
+        }
+        let pool = self.entries.get(&reference.pool);
+        let Some(pool) = pool else {
+            if captured {
+                work.step().map_err(ConstantReferenceError::from)?;
+            }
+            return Err(ConstantReferenceError::MissingPool(reference.pool).into());
+        };
+        // Only the caller-owned path selects before completed observations.
+        // An invalid ordinal has no source capture and keeps both old steps.
+        let selected = if captured {
+            let selected = pool.value(reference.ordinal);
+            if let Ok(value) = &selected {
+                capture(value, work)?;
+            }
+            work.step().map_err(ConstantReferenceError::from)?;
+            Some(selected)
+        } else {
+            None
+        };
+        work.step().map_err(ConstantReferenceError::from)?;
+        selected
+            .unwrap_or_else(|| pool.value(reference.ordinal))
             .map_err(ConstantReferenceError::from)
+            .map_err(E::from)
     }
     /// Project only the already admitted backings referenced by this closure.
     /// All references are checked, including repeat ordinals and full types;

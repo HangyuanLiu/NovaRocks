@@ -92,7 +92,8 @@ pub use schema::{
 pub use semantics::{
     BooleanValue, EvaluationDemand, MAX_SEMANTIC_PARAMETERS, SemanticParameterError,
     SemanticParameterId, SemanticParameterKey, SemanticParameterProjectionError,
-    SemanticParameterRef, SemanticParameterValue, SemanticParameters,
+    SemanticParameterProjectionVisit, SemanticParameterRef, SemanticParameterValue,
+    SemanticParameters,
 };
 pub use value_arithmetic::{
     arithmetic_result_value_type_with_op, is_integer_value_type, is_numeric_value_type,

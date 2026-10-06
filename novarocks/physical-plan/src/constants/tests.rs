@@ -1077,3 +1077,138 @@ fn package_admissions(
 
 #[path = "collection_reference_tests.rs"]
 mod collection_reference_tests;
+
+#[test]
+fn captured_source_preserves_sparse_address_null_and_original_field_backing() {
+    let original = plain(Arc::new(Int64Array::from(vec![Some(7), None])), true);
+    let mut table = ConstantPools::empty();
+    for id in [0, u32::MAX] {
+        table
+            .insert(ConstantPoolId::new(id), original.clone())
+            .unwrap();
+        for ordinal in [0, 1] {
+            let c = Control::good();
+            let mut calls = 0;
+            let value = completed(&c, |work| {
+                table.resolve_source_captured_observed(
+                    reference(id, ordinal),
+                    &mut |value, _| {
+                        calls += 1;
+                        assert_eq!(value.ordinal(), ordinal);
+                        assert!(Arc::ptr_eq(value.pool().field_ref(), original.field_ref()));
+                        assert!(std::ptr::eq(value.value_type(), original.value_type()));
+                        assert_eq!(c.trace(), [(CompilePhase::Validate, 0)]);
+                        Ok::<_, ConstantReferenceError>(())
+                    },
+                    work,
+                )
+            })
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(value.ordinal(), ordinal);
+            assert!(Arc::ptr_eq(value.pool().field_ref(), original.field_ref()));
+            let plain_control = Control::good();
+            completed(&plain_control, |work| {
+                table.resolve_source_observed(reference(id, ordinal), work)
+            })
+            .unwrap();
+            assert_eq!(c.trace(), plain_control.trace());
+        }
+    }
+}
+
+#[test]
+fn captured_source_refusal_precedes_pending_completed_lookup_and_has_no_footer() {
+    let mut table = ConstantPools::empty();
+    table
+        .insert(
+            ConstantPoolId::new(0),
+            plain(Arc::new(Int64Array::from(vec![8, 9])), false),
+        )
+        .unwrap();
+    for pending in [0, 254, 255] {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let c = Control::at(Some((1, cause)));
+            let result = completed(&c, |work| {
+                for _ in 0..pending {
+                    work.step()?;
+                }
+                table.resolve_source_captured_observed(
+                    reference(0, 1),
+                    &mut |value, _| {
+                        assert_eq!(value.ordinal(), 1);
+                        Err::<(), _>(ConstantReferenceError::Control(
+                            CompileControlError::ResourceExhausted,
+                        ))
+                    },
+                    work,
+                )
+            });
+            assert!(matches!(
+                result,
+                Err(ConstantReferenceError::Control(
+                    CompileControlError::ResourceExhausted
+                ))
+            ));
+            assert_eq!(c.trace(), [(CompilePhase::Validate, 0)]);
+        }
+    }
+}
+
+#[test]
+fn captured_source_missing_and_ordinal_errors_keep_plain_observations_and_control_causes() {
+    let mut table = ConstantPools::empty();
+    table
+        .insert(
+            ConstantPoolId::new(0),
+            plain(Arc::new(Int64Array::from(vec![8, 9])), false),
+        )
+        .unwrap();
+    for address in [reference(0, 1), reference(0, 2), reference(u32::MAX, 0)] {
+        let old = Control::good();
+        let plain = completed(&old, |work| table.resolve_source_observed(address, work));
+        let new = Control::good();
+        let mut captures = 0;
+        let received = completed(&new, |work| {
+            table.resolve_source_captured_observed(
+                address,
+                &mut |_, _| {
+                    captures += 1;
+                    Ok::<_, ConstantReferenceError>(())
+                },
+                work,
+            )
+        });
+        assert_eq!(plain.is_ok(), received.is_ok());
+        if let (Err(left), Err(right)) = (&plain, &received) {
+            assert_eq!(left, right);
+        }
+        assert_eq!(captures, usize::from(plain.is_ok()));
+        assert_eq!(old.trace(), new.trace());
+        let trace = new.trace();
+        for stop in 0..trace.len() {
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let c = Control::at(Some((stop, cause)));
+                let result = completed(&c, |work| {
+                    table.resolve_source_captured_observed(
+                        address,
+                        &mut |_, _| Ok::<_, ConstantReferenceError>(()),
+                        work,
+                    )
+                });
+                assert!(
+                    matches!(result, Err(ConstantReferenceError::Control(actual)) if actual == cause)
+                );
+                assert_eq!(c.trace(), trace[..=stop]);
+            }
+        }
+    }
+}

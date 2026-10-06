@@ -31,7 +31,9 @@ use std::fmt;
 mod encode;
 mod read;
 pub use encode::{PreparedCallRequestsEncode, encode_call_requests, prepare_call_requests_encode};
+pub(crate) use encode::{encode_call_requests_in, prepare_call_requests_encode_in};
 pub use read::{PreparedCallRequestsDecode, decode_call_requests, prepare_call_requests_decode};
+pub(crate) use read::{decode_call_requests_in, prepare_call_requests_decode_in};
 
 /// IDs name exact complete FVT roots in the same emitted type table. They are
 /// a projection loan, not another author of the original request.
@@ -60,6 +62,10 @@ pub struct CallRequestProjectionFacts {
     pub coexisting_source_and_request_bytes_upper_bound: usize,
     pub cumulative_work_upper_bound: usize,
 }
+
+/// Replace this child contribution on the caller's original package meter.
+pub(crate) type CallRequestAdmit<'a> =
+    dyn FnMut(&CallRequestProjectionFacts) -> Result<(), CompileControlError> + 'a;
 
 #[derive(Debug)]
 pub enum CallRequestCodecError {
