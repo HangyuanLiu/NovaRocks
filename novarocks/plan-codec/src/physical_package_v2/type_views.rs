@@ -33,7 +33,7 @@ use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, ControlResourceError, PureCompileControl,
     owned_resources::vec::{self as growth, VecPushGrowthFacts},
 };
-use std::{fmt, mem::size_of, ops::Range, sync::Arc};
+use std::{alloc::Layout, fmt, mem::size_of, ops::Range, sync::Arc};
 
 #[derive(Debug)]
 pub(crate) enum TypeViewError {
@@ -73,6 +73,183 @@ fn mul(a: usize, b: usize) -> Result<usize, TypeViewError> {
 }
 fn id(position: usize) -> Result<u32, TypeViewError> {
     u32::try_from(position).map_err(|_| CompileControlError::ResourceExhausted.into())
+}
+
+/// Exact extension of an actual input Vec. Capturing this layout requests
+/// nothing; all buffers for one source header are admitted together first.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SourceInputReserve<'source> {
+    element: Layout,
+    len: usize,
+    capacity: usize,
+    additional: usize,
+    next_len: usize,
+    old_backing: Option<Layout>,
+    requested_backing: Option<Layout>,
+    admitted_floor: Option<TypeViewFacts>,
+    admitted_package: Option<&'source p::FragmentPackage>,
+}
+pub(crate) fn capture_source_input_reserve<'source, T>(
+    source: &Vec<T>,
+    additional: usize,
+) -> Result<SourceInputReserve<'source>, TypeViewError> {
+    if !novarocks_type_contract::owned_resources::profile::LOCKED_TOOLCHAIN {
+        return Err(TypeViewError::SourceModel(
+            "source input Vec reserve model drift",
+        ));
+    }
+    let next_len = add(source.len(), additional)?;
+    let capacity = source.capacity();
+    let old_backing = if size_of::<T>() == 0 || capacity == 0 {
+        None
+    } else {
+        Some(Layout::array::<T>(capacity).map_err(|_| CompileControlError::ResourceExhausted)?)
+    };
+    let requested_backing = if size_of::<T>() == 0 || next_len <= capacity {
+        None
+    } else {
+        Some(Layout::array::<T>(next_len).map_err(|_| CompileControlError::ResourceExhausted)?)
+    };
+    Ok(SourceInputReserve {
+        element: Layout::new::<T>(),
+        len: source.len(),
+        capacity,
+        additional,
+        next_len,
+        old_backing,
+        requested_backing,
+        admitted_floor: None,
+        admitted_package: None,
+    })
+}
+
+/// The same future exact reserves, extended as source headers become known.
+/// Each extension replaces this batch's contribution by its checked delta;
+/// final reserves consume the admitted records without billing them again.
+pub(crate) struct SourceInputPrefix<'source, 'control, const N: usize> {
+    requests: [SourceInputReserve<'source>; N],
+    package: &'source p::FragmentPackage,
+    control: &'control dyn PureCompileControl,
+    floor: TypeViewFacts,
+}
+fn input_contribution(
+    old_backing: Option<Layout>,
+    requested_backing: Option<Layout>,
+) -> Result<(usize, usize, usize), TypeViewError> {
+    match requested_backing {
+        None => Ok((0, 0, 0)),
+        Some(layout) => {
+            let bytes = layout.size();
+            let old = old_backing.map_or(0, |layout| layout.size());
+            Ok((1, bytes, add(128, mul(add(bytes, old)?, 4)?)?))
+        }
+    }
+}
+impl<'source, 'control, const N: usize> SourceInputPrefix<'source, 'control, N> {
+    pub(crate) fn new_in(
+        requests: [SourceInputReserve<'source>; N],
+        budget: &mut TypeViewBudget<'source, 'control, '_>,
+        work: &CompileCheckpoints<'control>,
+    ) -> Result<Self, TypeViewError> {
+        Self::new_with_work_in(requests, 0, budget, work)
+    }
+    pub(crate) fn new_with_work_in(
+        mut requests: [SourceInputReserve<'source>; N],
+        completed_work_upper_bound: usize,
+        budget: &mut TypeViewBudget<'source, 'control, '_>,
+        work: &CompileCheckpoints<'control>,
+    ) -> Result<Self, TypeViewError> {
+        budget.check(budget.package, work)?;
+        budget.admit_input_reserves_in(&mut requests, completed_work_upper_bound)?;
+        Ok(Self {
+            requests,
+            package: budget.package,
+            control: work.control(),
+            floor: budget.facts(),
+        })
+    }
+    fn check(
+        &self,
+        budget: &TypeViewBudget<'source, '_, '_>,
+        work: &CompileCheckpoints<'_>,
+    ) -> Result<(), TypeViewError> {
+        budget.check(self.package, work)?;
+        if !std::ptr::addr_eq(self.control, work.control()) {
+            return Err(TypeViewError::InvalidSource(
+                "source input prefix uses a different caller control",
+            ));
+        }
+        budget.require_collection_floor(self.floor)
+    }
+    pub(crate) fn extend_in(
+        &mut self,
+        requests: [SourceInputReserve<'source>; N],
+        budget: &mut TypeViewBudget<'source, '_, '_>,
+        work: &CompileCheckpoints<'_>,
+    ) -> Result<(), TypeViewError> {
+        self.extend_with_work_in(requests, 0, budget, work)
+    }
+    pub(crate) fn extend_with_work_in(
+        &mut self,
+        mut requests: [SourceInputReserve<'source>; N],
+        additional_completed_work_upper_bound: usize,
+        budget: &mut TypeViewBudget<'source, '_, '_>,
+        work: &CompileCheckpoints<'_>,
+    ) -> Result<(), TypeViewError> {
+        self.check(budget, work)?;
+        let mut delta = (0, 0, 0);
+        for (old, new) in self.requests.iter().zip(&requests) {
+            if new.admitted_floor.is_some()
+                || old.element != new.element
+                || old.len != new.len
+                || old.capacity != new.capacity
+                || old.old_backing != new.old_backing
+                || new.additional < old.additional
+            {
+                return Err(TypeViewError::InvalidSource(
+                    "source input prefix changed its original Vec geometry",
+                ));
+            }
+            let before = input_contribution(old.old_backing, old.requested_backing)?;
+            let after = input_contribution(new.old_backing, new.requested_backing)?;
+            let difference = |a: usize, b: usize| {
+                a.checked_sub(b).ok_or(TypeViewError::InvalidSource(
+                    "source input prefix contribution decreased",
+                ))
+            };
+            delta.0 = add(delta.0, difference(after.0, before.0)?)?;
+            delta.1 = add(delta.1, difference(after.1, before.1)?)?;
+            delta.2 = add(delta.2, difference(after.2, before.2)?)?;
+        }
+        budget.facts.allocation_requests_upper_bound =
+            add(budget.facts.allocation_requests_upper_bound, delta.0)?;
+        budget.facts.allocation_request_bytes_upper_bound =
+            add(budget.facts.allocation_request_bytes_upper_bound, delta.1)?;
+        budget.facts.cumulative_work_upper_bound = add(
+            budget.facts.cumulative_work_upper_bound,
+            add(delta.2, additional_completed_work_upper_bound)?,
+        )?;
+        budget.facts.coexisting_source_and_request_bytes_upper_bound = add(
+            budget.source,
+            budget.facts.allocation_request_bytes_upper_bound,
+        )?;
+        budget.gate()?;
+        for request in &mut requests {
+            request.admitted_floor = Some(budget.facts());
+            request.admitted_package = Some(budget.package);
+        }
+        self.requests = requests;
+        self.floor = budget.facts();
+        Ok(())
+    }
+    pub(crate) fn finish_in(
+        self,
+        budget: &TypeViewBudget<'source, '_, '_>,
+        work: &CompileCheckpoints<'_>,
+    ) -> Result<[SourceInputReserve<'source>; N], TypeViewError> {
+        self.check(budget, work)?;
+        Ok(self.requests)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -174,7 +351,7 @@ impl<'source, 'control, 'parent> TypeViewBudget<'source, 'control, 'parent> {
         (self.admit)(&f)?;
         Ok(())
     }
-    fn check(
+    pub(crate) fn check(
         &self,
         package: &p::FragmentPackage,
         work: &CompileCheckpoints<'_>,
@@ -188,29 +365,94 @@ impl<'source, 'control, 'parent> TypeViewBudget<'source, 'control, 'parent> {
         Ok(())
     }
     fn request(&mut self, facts: VecPushGrowthFacts) -> Result<(), TypeViewError> {
-        if let Some(layout) = facts.requested_backing {
-            let bytes = layout.size();
-            self.facts.allocation_requests_upper_bound =
-                add(self.facts.allocation_requests_upper_bound, 1)?;
-            self.facts.allocation_request_bytes_upper_bound =
-                add(self.facts.allocation_request_bytes_upper_bound, bytes)?;
-            // Each real grow may move the old buffer. The new request, its
-            // initialization/movement and borrowed-element cleanup are captured
-            // before reserve. All these view elements have no owned Drop body.
-            let old = facts.old_backing.map_or(0, |layout| layout.size());
-            self.facts.cumulative_work_upper_bound = add(
-                self.facts.cumulative_work_upper_bound,
-                add(128, mul(add(bytes, old)?, 4)?)?,
-            )?;
-        }
+        // Actual grows and future exact batches share one contribution author.
+        // These closed loan/ID elements have no arbitrary owned Drop body.
+        let (requests, bytes, work) =
+            input_contribution(facts.old_backing, facts.requested_backing)?;
+        self.facts.allocation_requests_upper_bound =
+            add(self.facts.allocation_requests_upper_bound, requests)?;
+        self.facts.allocation_request_bytes_upper_bound =
+            add(self.facts.allocation_request_bytes_upper_bound, bytes)?;
+        self.facts.cumulative_work_upper_bound = add(self.facts.cumulative_work_upper_bound, work)?;
         self.facts.coexisting_source_and_request_bytes_upper_bound =
             add(self.source, self.facts.allocation_request_bytes_upper_bound)?;
         Ok(())
     }
-    fn before_steps(&mut self, count: usize) -> Result<(), TypeViewError> {
+    pub(crate) fn before_steps(&mut self, count: usize) -> Result<(), TypeViewError> {
         self.facts.cumulative_work_upper_bound =
             add(self.facts.cumulative_work_upper_bound, count)?;
         self.gate()
+    }
+    /// Charge all exact buffers captured for this original source header
+    /// before the first reserve or completed lookup. No element is copied.
+    pub(crate) fn admit_input_reserves_in(
+        &mut self,
+        requests: &mut [SourceInputReserve<'source>],
+        completed_work_upper_bound: usize,
+    ) -> Result<(), TypeViewError> {
+        for request in requests.iter() {
+            if request.admitted_floor.is_some() {
+                return Err(TypeViewError::InvalidSource(
+                    "source input request is already admitted",
+                ));
+            }
+            self.request(VecPushGrowthFacts {
+                next_len: request.next_len,
+                requested_capacity: request.next_len.max(request.capacity),
+                old_backing: request.old_backing,
+                requested_backing: request.requested_backing,
+            })?;
+        }
+        self.before_steps(completed_work_upper_bound)?;
+        for request in requests {
+            request.admitted_floor = Some(self.facts);
+            request.admitted_package = Some(self.package);
+        }
+        Ok(())
+    }
+    /// Perform an already admitted exact reserve on the same actual Vec
+    /// geometry. Closed borrowed/ID elements stay with their source author.
+    pub(crate) fn reserve_input_in<T>(
+        &mut self,
+        source: &mut Vec<T>,
+        captured: SourceInputReserve<'source>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), TypeViewError> {
+        self.check(self.package, work)?;
+        let floor = captured.admitted_floor.ok_or(TypeViewError::InvalidSource(
+            "source input reserve was not admitted",
+        ))?;
+        if !captured
+            .admitted_package
+            .is_some_and(|package| std::ptr::eq(package, self.package))
+        {
+            return Err(TypeViewError::InvalidSource(
+                "source input reserve belongs to another package",
+            ));
+        }
+        self.require_collection_floor(floor)?;
+        let actual = capture_source_input_reserve(source, captured.additional)?;
+        if actual.len != captured.len
+            || actual.element != captured.element
+            || actual.capacity != captured.capacity
+            || actual.next_len != captured.next_len
+            || actual.old_backing != captured.old_backing
+            || actual.requested_backing != captured.requested_backing
+        {
+            return Err(TypeViewError::InvalidSource(
+                "source input Vec changed after its request capture",
+            ));
+        }
+        self.gate()?;
+        if captured.requested_backing.is_some() {
+            work.flush()?;
+            let reserved = source.try_reserve_exact(captured.additional);
+            if reserved.is_ok() {
+                work.step()?;
+            }
+            crate::allocation_exit_v2::reserve_exit::<TypeViewError>(reserved, work)?;
+        }
+        Ok(())
     }
     fn reserve<T>(
         &mut self,
@@ -266,6 +508,63 @@ impl<'source> PackageTypeViews<'source> {
     }
     pub(crate) fn fields(&self) -> &[(u32, &'source Arc<Field>)] {
         &self.fields
+    }
+    pub(crate) fn check_package_in(
+        &self,
+        package: &p::FragmentPackage,
+        budget: &TypeViewBudget<'source, '_, '_>,
+        work: &CompileCheckpoints<'_>,
+    ) -> Result<(), TypeViewError> {
+        budget.check(package, work)?;
+        if !std::ptr::eq(self.package, package) || !std::ptr::addr_eq(self.control, work.control())
+        {
+            return Err(TypeViewError::InvalidSource(
+                "type source views belong to another package or caller control",
+            ));
+        }
+        budget.require_collection_floor(self.collection_floor)
+    }
+    /// Find a full root by the exact stored occurrence and original FVT
+    /// address. Equal types and repeated pointers cannot choose another ID.
+    /// Lookup comparisons acquire their whole numerical contribution before
+    /// the first completed observation, without an index or dense-ID scratch.
+    pub(crate) fn value_root_for_in(
+        &self,
+        occurrence: PackageTypeOccurrence,
+        expected_original: &p::ValueType,
+        budget: &mut TypeViewBudget<'source, '_, '_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<u32, TypeViewError> {
+        self.check_package_in(self.package, budget, work)?;
+        budget.before_steps(mul(self.occurrences.len(), 2)?)?;
+        let mut found = None;
+        for row in &self.occurrences {
+            let matches = row.occurrence == occurrence;
+            work.step()?;
+            if matches {
+                let (TypeRootReference::Value(id), PackageTypeSource::Value(original)) =
+                    (row.root, row.source)
+                else {
+                    return Err(TypeViewError::InvalidSource(
+                        "type occurrence is not a complete Value root",
+                    ));
+                };
+                if !std::ptr::eq(original, expected_original) {
+                    return Err(TypeViewError::InvalidSource(
+                        "type occurrence uses a different original Value type",
+                    ));
+                }
+                if found.replace(id).is_some() {
+                    return Err(TypeViewError::InvalidSource(
+                        "type occurrence root is ambiguous",
+                    ));
+                }
+                work.step()?;
+            }
+        }
+        found.ok_or(TypeViewError::InvalidSource(
+            "type occurrence root is absent",
+        ))
     }
     /// A separate owned input Vec borrows stable ID slices from these views.
     /// It is a local compose input, never stored back in its borrowed owner.
@@ -580,6 +879,416 @@ mod tests {
         )
         .unwrap();
         crate::physical_type_v2::sender_tests::checked_writer_package(recipe)
+    }
+    #[test]
+    fn occurrence_lookup_retains_independent_ids_and_refuses_equal_foreign_types_and_field_roots() {
+        let package = package();
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+        let mut admit = |_: &TypeViewFacts| Ok(());
+        let mut budget =
+            TypeViewBudget::new_in(&package, SOURCE, limits(), &mut admit, &work).unwrap();
+        let views = collect_package_type_views_in(&mut budget, &mut work).unwrap();
+        for row in views.occurrences() {
+            if let (TypeRootReference::Value(id), PackageTypeSource::Value(original)) =
+                (row.root, row.source)
+            {
+                assert_eq!(
+                    views
+                        .value_root_for_in(row.occurrence, original, &mut budget, &mut work)
+                        .unwrap(),
+                    id
+                );
+                let equal_copy = original.clone();
+                assert!(matches!(
+                    views.value_root_for_in(row.occurrence, &equal_copy, &mut budget, &mut work),
+                    Err(TypeViewError::InvalidSource(_))
+                ));
+            }
+        }
+        let first = &views.occurrences()[0];
+        let PackageTypeSource::Value(original) = first.source else {
+            panic!("original Value");
+        };
+        let field = views.occurrences().last().unwrap();
+        assert!(matches!(
+            views.value_root_for_in(field.occurrence, original, &mut budget, &mut work),
+            Err(TypeViewError::InvalidSource(_))
+        ));
+        let mut missing = first.occurrence;
+        missing.fragment = p::FragmentId::new(u32::MAX);
+        assert!(matches!(
+            views.value_root_for_in(missing, original, &mut budget, &mut work),
+            Err(TypeViewError::InvalidSource(_))
+        ));
+        let foreign = package.clone();
+        assert!(matches!(
+            views.check_package_in(&foreign, &budget, &work),
+            Err(TypeViewError::InvalidSource(_))
+        ));
+        work.finish().unwrap();
+    }
+    #[test]
+    fn occurrence_lookup_all_actual_callbacks_keep_primary_causes_and_known_work_precedes_pending_copy()
+     {
+        let package = package();
+        let run = |stop| {
+            let control = Control {
+                stop,
+                ..Default::default()
+            };
+            let result = (|| {
+                let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode)?;
+                let mut admit = |_: &TypeViewFacts| Ok(());
+                let mut budget =
+                    TypeViewBudget::new_in(&package, SOURCE, limits(), &mut admit, &work)?;
+                let views = collect_package_type_views_in(&mut budget, &mut work)?;
+                for row in views.occurrences() {
+                    if let PackageTypeSource::Value(original) = row.source {
+                        views.value_root_for_in(
+                            row.occurrence,
+                            original,
+                            &mut budget,
+                            &mut work,
+                        )?;
+                    }
+                }
+                work.finish()?;
+                Ok::<_, TypeViewError>(())
+            })();
+            (result, control.events.into_inner().unwrap())
+        };
+        let (result, trace) = run(None);
+        assert!(result.is_ok());
+        for at in 0..trace.len() {
+            for cause in CAUSES {
+                let (result, actual) = run(Some((at, cause)));
+                assert!(matches!(result, Err(TypeViewError::Control(actual)) if actual == cause));
+                assert_eq!(actual, trace[..=at]);
+            }
+        }
+        let prelude = |control: &Control, reject: bool| {
+            let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode).unwrap();
+            let mut admit = |_: &TypeViewFacts| Ok(());
+            let mut budget =
+                TypeViewBudget::new_in(&package, SOURCE, limits(), &mut admit, &work).unwrap();
+            let views = collect_package_type_views_in(&mut budget, &mut work).unwrap();
+            work.flush().unwrap();
+            let spelling = "x".repeat(255);
+            assert_eq!(
+                novarocks_type_contract::owned_resources::copy::copy_string::<CompileControlError>(
+                    &spelling, &mut work
+                )
+                .unwrap(),
+                spelling
+            );
+            let prefix = control.events.lock().unwrap().clone();
+            if reject {
+                // A real lookup contributes a full known linear comparison
+                // upper bound before its first completed observation.
+                budget.limits.max_work =
+                    budget.facts().cumulative_work_upper_bound + views.occurrences().len() * 2 - 1;
+                let first = &views.occurrences()[0];
+                let PackageTypeSource::Value(original) = first.source else {
+                    panic!("original Value");
+                };
+                assert!(matches!(
+                    views.value_root_for_in(first.occurrence, original, &mut budget, &mut work),
+                    Err(TypeViewError::Control(
+                        CompileControlError::ResourceExhausted
+                    ))
+                ));
+                assert_eq!(control.events.lock().unwrap().as_slice(), prefix);
+            }
+            prefix
+        };
+        let prefix = prelude(&Control::default(), false);
+        for cause in CAUSES {
+            let actual = prelude(
+                &Control {
+                    stop: Some((prefix.len(), cause)),
+                    ..Default::default()
+                },
+                true,
+            );
+            assert_eq!(actual, prefix);
+        }
+    }
+    #[test]
+    fn exact_input_batch_requires_admission_and_original_budget_control_and_geometry() {
+        let package = package();
+        let control = Control::default();
+        let foreign_control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+        let mut admit = |_: &TypeViewFacts| Ok(());
+        let mut budget =
+            TypeViewBudget::new_in(&package, SOURCE, limits(), &mut admit, &work).unwrap();
+        let mut ids: Vec<u32> = Vec::new();
+        let mut names = vec![1u8, 2];
+        let mut requests = [
+            capture_source_input_reserve(&ids, 3).unwrap(),
+            capture_source_input_reserve(&names, 5).unwrap(),
+        ];
+        let initial = budget.facts();
+        assert!(matches!(
+            budget.reserve_input_in(&mut ids, requests[0], &mut work),
+            Err(TypeViewError::InvalidSource(_))
+        ));
+        assert_eq!(budget.facts(), initial);
+        assert_eq!(ids.capacity(), 0);
+        assert_eq!(control.events.lock().unwrap().as_slice(), &[0]);
+        let exact_bytes = std::alloc::Layout::array::<u32>(3).unwrap().size()
+            + std::alloc::Layout::array::<u8>(7).unwrap().size();
+        budget.admit_input_reserves_in(&mut requests, 12).unwrap();
+        assert_eq!(budget.facts().allocation_requests_upper_bound, 2);
+        assert_eq!(
+            budget.facts().allocation_request_bytes_upper_bound,
+            exact_bytes
+        );
+        assert!(matches!(
+            budget.admit_input_reserves_in(&mut requests, 12),
+            Err(TypeViewError::InvalidSource(_))
+        ));
+        let mut foreign_work =
+            CompileCheckpoints::try_new(&foreign_control, CompilePhase::Encode).unwrap();
+        assert!(matches!(
+            budget.reserve_input_in(&mut ids, requests[0], &mut foreign_work),
+            Err(TypeViewError::InvalidSource(_))
+        ));
+        assert_eq!(foreign_control.events.lock().unwrap().as_slice(), &[0]);
+        let mut reset_admit = |_: &TypeViewFacts| Ok(());
+        let mut reset =
+            TypeViewBudget::new_in(&package, SOURCE, limits(), &mut reset_admit, &work).unwrap();
+        assert!(matches!(
+            reset.reserve_input_in(&mut ids, requests[0], &mut work),
+            Err(TypeViewError::InvalidSource(_))
+        ));
+        budget
+            .reserve_input_in(&mut ids, requests[0], &mut work)
+            .unwrap();
+        assert!(ids.capacity() >= 3);
+        // Actual next contents remain owned by the same buffer author.
+        ids.extend([4, 5, 6]);
+        names.push(3);
+        let prefix = control.events.lock().unwrap().clone();
+        assert!(matches!(
+            budget.reserve_input_in(&mut names, requests[1], &mut work),
+            Err(TypeViewError::InvalidSource(_))
+        ));
+        assert_eq!(control.events.lock().unwrap().as_slice(), prefix);
+        assert_eq!(ids, [4, 5, 6]);
+        let mut empty: Vec<u64> = Vec::new();
+        let mut zero = [capture_source_input_reserve(&empty, 0).unwrap()];
+        let before = budget.facts();
+        budget.admit_input_reserves_in(&mut zero, 1).unwrap();
+        budget
+            .reserve_input_in(&mut empty, zero[0], &mut work)
+            .unwrap();
+        assert_eq!(
+            budget.facts().allocation_requests_upper_bound,
+            before.allocation_requests_upper_bound
+        );
+        assert_eq!(empty.capacity(), 0);
+        work.finish().unwrap();
+    }
+    #[test]
+    fn future_exact_inputs_keep_one_final_request_and_refuse_changed_source_geometry() {
+        let package = package();
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+        let mut admit = |_: &TypeViewFacts| Ok(());
+        let mut budget =
+            TypeViewBudget::new_in(&package, SOURCE, limits(), &mut admit, &work).unwrap();
+        let mut ids: Vec<u32> = Vec::new();
+        let mut names = vec![1u8, 2];
+        let old_bytes = Layout::array::<u8>(names.capacity()).unwrap().size();
+        let mut prefix = SourceInputPrefix::new_in(
+            [
+                capture_source_input_reserve(&ids, 0).unwrap(),
+                capture_source_input_reserve(&names, 0).unwrap(),
+            ],
+            &mut budget,
+            &work,
+        )
+        .unwrap();
+        assert_eq!(budget.facts().allocation_requests_upper_bound, 0);
+        prefix
+            .extend_in(
+                [
+                    capture_source_input_reserve(&ids, 1).unwrap(),
+                    capture_source_input_reserve(&names, 1).unwrap(),
+                ],
+                &mut budget,
+                &work,
+            )
+            .unwrap();
+        assert_eq!(budget.facts().allocation_requests_upper_bound, 2);
+        prefix
+            .extend_in(
+                [
+                    capture_source_input_reserve(&ids, 320).unwrap(),
+                    capture_source_input_reserve(&names, 5).unwrap(),
+                ],
+                &mut budget,
+                &work,
+            )
+            .unwrap();
+        let bytes =
+            Layout::array::<u32>(320).unwrap().size() + Layout::array::<u8>(7).unwrap().size();
+        let expected = TypeViewFacts {
+            allocation_requests_upper_bound: 2,
+            allocation_request_bytes_upper_bound: bytes,
+            coexisting_source_and_request_bytes_upper_bound: SOURCE + bytes,
+            cumulative_work_upper_bound: 2 * 128 + 4 * (bytes + old_bytes),
+            ..Default::default()
+        };
+        assert_eq!(budget.facts(), expected);
+        let original_trace = control.events.lock().unwrap().clone();
+        assert!(matches!(
+            prefix.extend_in(
+                [
+                    capture_source_input_reserve(&ids, 319).unwrap(),
+                    capture_source_input_reserve(&names, 5).unwrap(),
+                ],
+                &mut budget,
+                &work,
+            ),
+            Err(TypeViewError::InvalidSource(_))
+        ));
+        let mut reset_admit = |_: &TypeViewFacts| Ok(());
+        let reset =
+            TypeViewBudget::new_in(&package, SOURCE, limits(), &mut reset_admit, &work).unwrap();
+        assert!(matches!(
+            prefix.check(&reset, &work),
+            Err(TypeViewError::InvalidSource(_))
+        ));
+        let foreign_control = Control::default();
+        let foreign_work =
+            CompileCheckpoints::try_new(&foreign_control, CompilePhase::Encode).unwrap();
+        assert!(matches!(
+            prefix.check(&budget, &foreign_work),
+            Err(TypeViewError::InvalidSource(_))
+        ));
+        assert_eq!(control.events.lock().unwrap().as_slice(), original_trace);
+        let final_requests = prefix.finish_in(&budget, &work).unwrap();
+        budget
+            .reserve_input_in(&mut ids, final_requests[0], &mut work)
+            .unwrap();
+        budget
+            .reserve_input_in(&mut names, final_requests[1], &mut work)
+            .unwrap();
+        assert!(ids.capacity() >= 320);
+        assert!(names.capacity() >= 7);
+        assert_eq!(
+            budget.facts(),
+            expected,
+            "final reserve must not bill again"
+        );
+        let mut changed = SourceInputPrefix::new_in(
+            [capture_source_input_reserve(&names, 0).unwrap()],
+            &mut budget,
+            &work,
+        )
+        .unwrap();
+        names.push(3);
+        let before = control.events.lock().unwrap().clone();
+        assert!(matches!(
+            changed.extend_in(
+                [capture_source_input_reserve(&names, 1).unwrap()],
+                &mut budget,
+                &work,
+            ),
+            Err(TypeViewError::InvalidSource(_))
+        ));
+        assert_eq!(budget.facts(), expected);
+        assert_eq!(control.events.lock().unwrap().as_slice(), before);
+        work.finish().unwrap();
+    }
+    #[test]
+    fn exact_batch_and_future_prefix_gate_known_growth_before_pending_copy_control() {
+        let package = package();
+        let run = |stop, axis: Option<usize>, future| {
+            let control = Control {
+                stop,
+                ..Default::default()
+            };
+            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+            let request_hooks = std::cell::Cell::new(0);
+            let mut admit = |facts: &TypeViewFacts| {
+                if facts.allocation_requests_upper_bound > 0 {
+                    request_hooks.set(request_hooks.get() + 1);
+                    if let Some((_, cause)) = stop {
+                        return Err(cause);
+                    }
+                }
+                Ok(())
+            };
+            let mut budget =
+                TypeViewBudget::new_in(&package, SOURCE, limits(), &mut admit, &work).unwrap();
+            let ids: Vec<u32> = Vec::new();
+            let names: Vec<u8> = Vec::new();
+            let mut prefix = SourceInputPrefix::new_in(
+                [
+                    capture_source_input_reserve(&ids, 0).unwrap(),
+                    capture_source_input_reserve(&names, 0).unwrap(),
+                ],
+                &mut budget,
+                &work,
+            )
+            .unwrap();
+            let text = "x".repeat(255);
+            assert_eq!(
+                novarocks_type_contract::owned_resources::copy::copy_string::<CompileControlError>(
+                    &text, &mut work,
+                )
+                .unwrap(),
+                text
+            );
+            let trace = control.events.lock().unwrap().clone();
+            if let Some(axis) = axis {
+                let bytes = Layout::array::<u32>(3).unwrap().size()
+                    + Layout::array::<u8>(5).unwrap().size();
+                match axis {
+                    0 => budget.limits.max_allocation_requests = 1,
+                    1 => budget.limits.max_allocation_request_bytes = bytes - 1,
+                    2 => budget.limits.max_coexisting_source_and_request_bytes = SOURCE + bytes - 1,
+                    3 => budget.limits.max_work = 2 * 128 + 4 * bytes + 11 - 1,
+                    _ => unreachable!(),
+                }
+                let mut requests = [
+                    capture_source_input_reserve(&ids, 3).unwrap(),
+                    capture_source_input_reserve(&names, 5).unwrap(),
+                ];
+                let result = if future {
+                    prefix.extend_with_work_in(requests, 11, &mut budget, &work)
+                } else {
+                    budget.admit_input_reserves_in(&mut requests, 11)
+                };
+                assert!(matches!(
+                    result,
+                    Err(TypeViewError::Control(
+                        CompileControlError::ResourceExhausted
+                    ))
+                ));
+                assert_eq!(ids.capacity(), 0);
+                assert_eq!(names.capacity(), 0);
+                assert_eq!(
+                    request_hooks.get(),
+                    0,
+                    "known work must precede the parent hook too"
+                );
+                assert_eq!(control.events.lock().unwrap().as_slice(), trace);
+            }
+            trace
+        };
+        let trace = run(None, None, false);
+        for future in [false, true] {
+            for axis in 0..4 {
+                for cause in CAUSES {
+                    assert_eq!(run(Some((trace.len(), cause)), Some(axis), future), trace);
+                }
+            }
+        }
     }
     #[test]
     fn checked_package_views_feed_original_borrowed_type_emitter_without_rebuilding_roots() {

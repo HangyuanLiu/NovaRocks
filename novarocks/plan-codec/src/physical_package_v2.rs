@@ -28,6 +28,7 @@ use novarocks_type_contract::{CompileCheckpoints, CompileControlError, PureCompi
 use prost::Message;
 use std::fmt;
 
+mod binding_sources;
 mod nodes;
 mod type_sources;
 mod type_views;
