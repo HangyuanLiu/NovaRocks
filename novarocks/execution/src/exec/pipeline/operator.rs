@@ -245,8 +245,13 @@ pub trait ProcessorOperator: Operator {
     }
 
     /// Borrow the unique original grant while producing the final batch.
-    /// Ordinary upstream owners retain their own source responsibility;
-    /// a protected materializer can yield without returning this coverage.
+    /// Only a root-owned materializer constructs its output under this grant
+    /// and can yield without returning the coverage. An ordinary upstream
+    /// operator's output belongs to that operator's own admitted memory owner;
+    /// the root permit is never extended to cover it. The root boundary
+    /// instead reserves one input allowance before this pull and checks the
+    /// actual backing against it after the pull, refusing the input explicitly
+    /// when it does not fit.
     fn pull_chunk_with_root_input(
         &mut self,
         state: &RuntimeState,

@@ -809,10 +809,9 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         // channel under its existing creation/context fence below.
         let root_session = match submission.program().local_program().sink() {
             Some(novarocks_local_program::StaticSinkProgram::RootResult(contract)) => {
-                if matches!(
-                    contract.kind(),
-                    novarocks_result_contract::RootOutputKind::InternalFacts(domain) if domain != novarocks_result_contract::InternalResultDomain::StatisticsArtifactV1
-                ) {
+                if !crate::root_result_session::root_output_producer_installed(contract.kind())
+                    || contract.validate_purpose().is_err()
+                {
                     return Err(protocol("explicit internal root codec is not installed"));
                 }
                 let local_program = submission.program().local_program();
@@ -5299,6 +5298,28 @@ mod tests {
         let root = identity(91_004, 1, 1);
         let descriptor = consistent_descriptor(root, UniqueId::new(91_004, 1));
         let body = Body::bounded_root(
+            novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
+            ),
+            &[],
+        );
+        let rejected = host
+            .install_receiver(&descriptor, body.input(&descriptor))
+            .unwrap_err();
+        assert_eq!(rejected.category(), TaskFailureCategory::Protocol);
+        assert_eq!(
+            rejected.detail().as_str(),
+            "explicit internal root codec is not installed"
+        );
+        assert!(host.task_runtime(root).is_none());
+        host.root_producer_pool.shutdown().unwrap();
+    }
+    #[test]
+    fn bounded_root_installed_scalar_domain_admits_its_typed_producer() {
+        let (host, _) = isolated_resource_host();
+        let root = identity(91_005, 1, 1);
+        let descriptor = consistent_descriptor(root, UniqueId::new(91_005, 1));
+        let body = Body::bounded_root(
             novarocks_result_contract::FrozenRootOutput::ScalarValue(
                 novarocks_result_contract::ScalarSchema::try_new(
                     novarocks_result_contract::ScalarField {
@@ -5312,15 +5333,10 @@ mod tests {
             ),
             &[],
         );
-        let rejected = host
-            .install_receiver(&descriptor, body.input(&descriptor))
-            .unwrap_err();
-        assert_eq!(rejected.category(), TaskFailureCategory::Protocol);
-        assert_eq!(
-            rejected.detail().as_str(),
-            "explicit internal root codec is not installed"
-        );
-        assert!(host.task_runtime(root).is_none());
+        host.install_receiver(&descriptor, body.input(&descriptor))
+            .expect("an installed scalar producer admits its typed root");
+        assert!(host.task_runtime(root).is_some());
+        host.remove_receiver(&descriptor);
         host.root_producer_pool.shutdown().unwrap();
     }
     #[test]

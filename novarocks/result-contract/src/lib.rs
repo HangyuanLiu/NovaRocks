@@ -44,6 +44,9 @@ pub use scalar_leaf::{
     ScalarLeafHeader, ScalarLeafTurn,
 };
 
+mod scalar_record;
+pub use scalar_record::{SCALAR_RECORD_MAX_BYTES, ScalarRecord, ScalarRecordWriter, ScalarValue};
+
 mod render_schema;
 pub use render_schema::{
     ClientRenderSchema, NamedRenderField, NativeRenderType, OpaqueRenderType, RenderColumn,

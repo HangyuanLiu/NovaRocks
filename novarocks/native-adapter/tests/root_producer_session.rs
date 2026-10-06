@@ -24,8 +24,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, Decimal256Array, DictionaryArray, Int32Array, RecordBatch,
-    StringArray,
+    Array, ArrayRef, BinaryArray, Decimal256Array, DictionaryArray, Int32Array, Int64Array,
+    RecordBatch, StringArray,
 };
 use arrow::datatypes::{DataType, Field, Int32Type, Schema};
 use arrow_buffer::i256;
@@ -40,10 +40,11 @@ use novarocks_execution_contract::root_result::{RootReadOutcome, RootResultRead}
 use novarocks_native_adapter::root_result_session::{NativeRootResultSession, RootProducerPool};
 use novarocks_result_contract::{
     ClientRenderSchema, FrozenRootOutput, NativeRenderType, RenderColumn, RenderField,
-    RenderPresentation, RootOutputContract, RootProfileId,
+    RenderPresentation, RootOutputContract, RootProfileId, ScalarField, ScalarRecord, ScalarSchema,
+    ScalarValue, ScalarValueType,
 };
 use novarocks_types::arrow_metadata_owner::{
-    ArrowMetadataOwner, FieldMetadataOrigins, MetadataOwnerLimits,
+    ArrowMetadataOwner, FieldMetadataOrigins, MetadataOwnedField, MetadataOwnerLimits,
 };
 use novarocks_types::{
     AttemptId, BackendProcessId, QueryExecutionId, QueryId, SlotId, StageId, TaskId,
@@ -186,8 +187,8 @@ async fn read(
         .expect("root read failed")
 }
 
-fn owned_chunk(array: ArrayRef) -> Chunk {
-    let field = ArrowMetadataOwner::try_new(
+fn owned_field(name: &str, data_type: DataType, nullable: bool) -> MetadataOwnedField {
+    ArrowMetadataOwner::try_new(
         Vec::new(),
         MetadataOwnerLimits {
             entries: 0,
@@ -195,8 +196,20 @@ fn owned_chunk(array: ArrayRef) -> Chunk {
         },
     )
     .unwrap()
-    .into_field("value".into(), array.data_type().clone(), true);
-    let origins = FieldMetadataOrigins::try_new(vec![field.clone()], 1).unwrap();
+    .into_field(name.into(), data_type, nullable)
+}
+
+fn owned_chunk(array: ArrayRef) -> Chunk {
+    owned_nested_chunk(array, Vec::new())
+}
+
+/// Nested child fields must come from known metadata owners too.
+fn owned_nested_chunk(array: ArrayRef, children: Vec<MetadataOwnedField>) -> Chunk {
+    let field = owned_field("value", array.data_type().clone(), true);
+    let mut owners = vec![field.clone()];
+    owners.extend(children);
+    let nodes = owners.len();
+    let origins = FieldMetadataOrigins::try_new(owners, nodes).unwrap();
     let slot = ChunkSlotSchema::try_new_with_metadata_origins(
         SlotId::new(7),
         field.field().clone(),
@@ -379,6 +392,33 @@ async fn empty_finish_has_end_without_a_prior_input_or_data_item() {
         assert_end(&read(&fixture.channel, Some(1), 0).await, 1, 0);
         shutdown(&fixture.pool).await;
     }
+}
+
+#[tokio::test]
+async fn ordinary_upstream_output_beyond_the_input_allowance_fails_after_pull() {
+    use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
+    let fixture = Fixture::new(client(1));
+    // The upstream owner materialized this batch under its own scope. Its
+    // standard allocation reserves more than one root input allowance even
+    // though only one byte is visible; the root never extends its permit.
+    let mut bytes = Vec::<u8>::with_capacity(97 << 20);
+    bytes.push(b'x');
+    let array = StringArray::try_new(
+        OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 1])),
+        Buffer::from_vec(bytes),
+        None,
+    )
+    .unwrap();
+    let error = fixture
+        .session
+        .submit_input(owned_chunk(Arc::new(array)), input(&fixture.session).await)
+        .unwrap_err();
+    assert!(error.to_string().contains("exceeds its profile"));
+    // The refused input exits with its position; nothing was published.
+    drop(input(&fixture.session).await);
+    assert_eq!(fixture.channel.snapshot().produced_through, 0);
+    assert_eq!(fixture.channel.snapshot().data_positions, 0);
+    shutdown(&fixture.pool).await;
 }
 
 #[tokio::test]
@@ -869,8 +909,8 @@ async fn statistics_record_can_cross_segments_and_cancel_releases_its_original_b
 }
 
 #[tokio::test]
-async fn typed_scalar_session_stays_closed_until_the_complete_domain_producer_is_installed() {
-    use novarocks_result_contract::{ScalarField, ScalarSchema, ScalarValueType};
+async fn uninstalled_internal_domain_and_untyped_scalar_identity_stay_closed() {
+    use novarocks_result_contract::InternalResultDomain;
     let limits = WorkerResultRetainedLimits::try_new(256 << 20, 512 << 20).unwrap();
     let budget = ResultRetainedBudget::new(limits.per_process());
     let pool = RootProducerPool::try_new(
@@ -880,33 +920,253 @@ async fn typed_scalar_session_stays_closed_until_the_complete_domain_producer_is
         Arc::clone(&budget),
     )
     .unwrap();
-    let schema = ScalarSchema::try_new(ScalarField {
-        nullable: false,
+    // A scalar domain identity without its typed schema has no channel.
+    assert!(
+        RootResultChannel::try_open(
+            RootResultWriteSpec {
+                task: task(),
+                contract: Arc::new(RootOutputContract::new(
+                    RootProfileId::V1,
+                    FrozenRootOutput::InternalFacts(InternalResultDomain::ScalarValueV1),
+                )),
+            },
+            Arc::clone(&budget),
+            limits,
+        )
+        .is_err()
+    );
+    for output in [
+        FrozenRootOutput::InternalFacts(InternalResultDomain::PreparedWriteCommitV1),
+        FrozenRootOutput::InternalFacts(InternalResultDomain::CowSelectionArrowV1),
+    ] {
+        let channel = RootResultChannel::try_open(
+            RootResultWriteSpec {
+                task: task(),
+                contract: Arc::new(RootOutputContract::new(RootProfileId::V1, output)),
+            },
+            Arc::clone(&budget),
+            limits,
+        )
+        .unwrap();
+        channel.mark_context_owned().unwrap();
+        let rejected = NativeRootResultSession::try_open(Arc::clone(&channel), &pool);
+        assert!(
+            matches!(rejected, Err(ref error) if error.to_string().contains("explicit internal root codec is not installed"))
+        );
+        assert_eq!(channel.snapshot().produced_through, 0);
+        assert!(channel.physical_idle());
+        channel.close(RootRetentionClose::ContextReleased);
+    }
+    shutdown(&pool).await;
+}
+
+fn scalar(field: ScalarField) -> (FrozenRootOutput, ScalarSchema) {
+    let schema = ScalarSchema::try_new(field)
+        .unwrap()
+        .bind_native_slots(&[7])
+        .unwrap();
+    (FrozenRootOutput::ScalarValue(schema.clone()), schema)
+}
+fn nullable_i64() -> ScalarField {
+    ScalarField {
+        nullable: true,
         value_type: ScalarValueType::SignedInteger(64),
-    })
-    .unwrap()
-    .bind_native_slots(&[7])
-    .unwrap();
-    let channel = RootResultChannel::try_open(
-        RootResultWriteSpec {
-            task: task(),
-            contract: Arc::new(RootOutputContract::new(
-                RootProfileId::V1,
-                FrozenRootOutput::ScalarValue(schema),
-            )),
-        },
-        Arc::clone(&budget),
-        limits,
+    }
+}
+fn longs(values: Vec<Option<i64>>) -> Chunk {
+    owned_chunk(Arc::new(Int64Array::from(values)))
+}
+async fn scalar_record(fixture: &Fixture, schema: &ScalarSchema, rows: u64) -> ScalarRecord {
+    wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
+    assert!(fixture.session.producer_exited());
+    assert_eq!(fixture.channel.snapshot().data_positions, 1);
+    let data = read(&fixture.channel, Some(1), 0).await;
+    let record = ScalarRecord::decode(schema, body(&data)).unwrap();
+    drop(data);
+    assert_end(&read(&fixture.channel, Some(2), 1).await, 2, rows);
+    record
+}
+
+#[tokio::test]
+async fn scalar_value_is_published_once_at_sealed_end_after_empty_batches() {
+    let (output, schema) = scalar(nullable_i64());
+    let fixture = Fixture::new(output);
+    for chunk in [longs(vec![]), longs(vec![Some(42)]), longs(vec![])] {
+        fixture
+            .session
+            .submit_input(chunk, input(&fixture.session).await)
+            .unwrap();
+    }
+    // The next permit proves every earlier input exited; the accepted row is
+    // still unpublished until the sealed normal End.
+    let held = input(&fixture.session).await;
+    assert_eq!(fixture.channel.snapshot().produced_through, 0);
+    drop(held);
+    fixture.session.finish_input().unwrap();
+    assert_eq!(
+        scalar_record(&fixture, &schema, 1).await,
+        ScalarRecord::Value(ScalarValue::SignedInteger {
+            bits: 64,
+            value: 42
+        })
+    );
+    shutdown(&fixture.pool).await;
+}
+
+#[tokio::test]
+async fn scalar_zero_rows_is_unique_no_rows_and_one_null_row_is_a_value() {
+    let (output, schema) = scalar(nullable_i64());
+    let no_input = Fixture::new(output.clone());
+    no_input.session.finish_input().unwrap();
+    assert_eq!(
+        scalar_record(&no_input, &schema, 0).await,
+        ScalarRecord::NoRows
+    );
+    shutdown(&no_input.pool).await;
+
+    let empty_batches = Fixture::new(output.clone());
+    for _ in 0..2 {
+        empty_batches
+            .session
+            .submit_input(longs(vec![]), input(&empty_batches.session).await)
+            .unwrap();
+    }
+    empty_batches.session.finish_input().unwrap();
+    assert_eq!(
+        scalar_record(&empty_batches, &schema, 0).await,
+        ScalarRecord::NoRows
+    );
+    shutdown(&empty_batches.pool).await;
+
+    let null_row = Fixture::new(output);
+    null_row
+        .session
+        .submit_input(longs(vec![None]), input(&null_row.session).await)
+        .unwrap();
+    null_row.session.finish_input().unwrap();
+    assert_eq!(
+        scalar_record(&null_row, &schema, 1).await,
+        ScalarRecord::Value(ScalarValue::Null)
+    );
+    shutdown(&null_row.pool).await;
+}
+
+#[tokio::test]
+async fn scalar_second_row_fails_before_any_record_is_published() {
+    let (output, _) = scalar(nullable_i64());
+    let across_batches = Fixture::new(output.clone());
+    across_batches
+        .session
+        .submit_input(longs(vec![Some(1)]), input(&across_batches.session).await)
+        .unwrap();
+    across_batches
+        .session
+        .submit_input(longs(vec![Some(2)]), input(&across_batches.session).await)
+        .unwrap();
+    wait_until(|| across_batches.session.producer_exited()).await;
+    assert!(matches!(
+        across_batches.session.producer_state(),
+        RootProducerState::Failed(_)
+    ));
+    assert_eq!(across_batches.channel.snapshot().produced_through, 0);
+    assert_eq!(across_batches.channel.snapshot().data_positions, 0);
+    shutdown(&across_batches.pool).await;
+
+    let one_batch = Fixture::new(output);
+    one_batch
+        .session
+        .submit_input(
+            longs(vec![Some(1), Some(2)]),
+            input(&one_batch.session).await,
+        )
+        .unwrap();
+    wait_until(|| one_batch.session.producer_exited()).await;
+    assert!(matches!(
+        one_batch.session.producer_state(),
+        RootProducerState::Failed(_)
+    ));
+    assert_eq!(one_batch.channel.snapshot().produced_through, 0);
+    shutdown(&one_batch.pool).await;
+}
+
+#[tokio::test]
+async fn scalar_cancel_after_an_accepted_row_publishes_neither_value_nor_no_rows() {
+    let (output, _) = scalar(nullable_i64());
+    let fixture = Fixture::new(output);
+    fixture
+        .session
+        .submit_input(longs(vec![Some(7)]), input(&fixture.session).await)
+        .unwrap();
+    let held = input(&fixture.session).await;
+    drop(held);
+    fixture
+        .session
+        .abort(ResultAbort::Cancelled("cancel scalar root".into()));
+    wait_until(|| fixture.session.producer_exited()).await;
+    assert!(matches!(
+        fixture.session.producer_state(),
+        RootProducerState::Failed(_)
+    ));
+    assert_eq!(fixture.channel.snapshot().produced_through, 0);
+    assert_eq!(fixture.channel.snapshot().data_positions, 0);
+    shutdown(&fixture.pool).await;
+}
+
+#[tokio::test]
+async fn scalar_nested_list_record_is_published_whole() {
+    use arrow::array::ListArray;
+    use arrow::buffer::OffsetBuffer;
+    let (output, schema) = scalar(ScalarField {
+        nullable: true,
+        value_type: ScalarValueType::List(Box::new(ScalarField {
+            nullable: true,
+            value_type: ScalarValueType::String,
+        })),
+    });
+    let fixture = Fixture::new(output);
+    let item = owned_field("item", DataType::Utf8, true);
+    let list = ListArray::try_new(
+        Arc::clone(item.field()),
+        OffsetBuffer::from_lengths([3]),
+        Arc::new(StringArray::from(vec![Some("a"), None, Some("bc")])),
+        None,
     )
     .unwrap();
-    channel.mark_context_owned().unwrap();
-    let rejected = NativeRootResultSession::try_open(Arc::clone(&channel), &pool);
-    assert!(
-        matches!(rejected, Err(ref error) if error.to_string().contains("explicit internal root codec is not installed"))
+    fixture
+        .session
+        .submit_input(
+            owned_nested_chunk(Arc::new(list), vec![item]),
+            input(&fixture.session).await,
+        )
+        .unwrap();
+    fixture.session.finish_input().unwrap();
+    assert_eq!(
+        scalar_record(&fixture, &schema, 1).await,
+        ScalarRecord::Value(ScalarValue::List(vec![
+            ScalarValue::String("a".into()),
+            ScalarValue::Null,
+            ScalarValue::String("bc".into()),
+        ]))
     );
-    assert_eq!(channel.snapshot().produced_through, 0);
-    assert_eq!(channel.snapshot().consumed_through, 0);
-    assert!(channel.physical_idle());
-    channel.close(RootRetentionClose::ContextReleased);
-    shutdown(&pool).await;
+    shutdown(&fixture.pool).await;
+}
+
+#[tokio::test]
+async fn scalar_type_mismatch_fails_without_a_record() {
+    let (output, _) = scalar(ScalarField {
+        nullable: true,
+        value_type: ScalarValueType::SignedInteger(32),
+    });
+    let fixture = Fixture::new(output);
+    fixture
+        .session
+        .submit_input(longs(vec![Some(1)]), input(&fixture.session).await)
+        .unwrap();
+    wait_until(|| fixture.session.producer_exited()).await;
+    assert!(matches!(
+        fixture.session.producer_state(),
+        RootProducerState::Failed(_)
+    ));
+    assert_eq!(fixture.channel.snapshot().produced_through, 0);
+    shutdown(&fixture.pool).await;
 }

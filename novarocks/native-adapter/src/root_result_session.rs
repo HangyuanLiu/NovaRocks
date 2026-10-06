@@ -32,7 +32,10 @@ use novarocks_execution::runtime::fragment::io::{
 use novarocks_execution::runtime::observable::{Observable, ObserverSubscription};
 use novarocks_execution_contract::native_result_support::NativeResultSupportGeometry;
 use novarocks_execution_contract::root_lifetime::RootRetentionClose;
-use novarocks_result_contract::{InternalResultDomain, RootOutputKind, RootProfileV1};
+use novarocks_result_contract::{
+    BorrowedScalarLeaf, FrozenRootOutput, InternalResultDomain, RootOutputKind, RootProfileV1,
+    ScalarLeafCursor,
+};
 use novarocks_result_render::{
     ArrowMysqlTextEncoder, BoundedMysqlTextEncoder, RenderTurn, RenderTurnStatus,
 };
@@ -46,18 +49,46 @@ use crate::root_producer_pool::{
 };
 pub use crate::root_producer_pool::{RootProducerLimits, RootProducerPool};
 
+use crate::root_scalar_container_codec::{NativeScalarContainerEncoder, is_container};
+use crate::root_scalar_leaf_codec::{NativeScalarLeafEncoder, ScalarSchemaOwner};
 use crate::root_statistics_codec::{
     StatisticsArtifactEncoder, StatisticsCodecStatus, StatisticsCodecTotals,
 };
 
+/// Whether this BE has the producer codec for a root purpose. Host admission
+/// and session opening share this one decision, so a purpose is admitted only
+/// where its producer exists.
+pub fn root_output_producer_installed(kind: RootOutputKind) -> bool {
+    match kind {
+        RootOutputKind::ClientRows | RootOutputKind::CountOnly => true,
+        RootOutputKind::InternalFacts(domain) => matches!(
+            domain,
+            InternalResultDomain::StatisticsArtifactV1 | InternalResultDomain::ScalarValueV1
+        ),
+    }
+}
+
 enum InputEncoder {
     Client(Box<ArrowMysqlTextEncoder>),
     Statistics(Box<StatisticsArtifactEncoder>),
+    ScalarLeaf(Box<NativeScalarLeafEncoder>),
+    ScalarContainer(Box<NativeScalarContainerEncoder>),
+    /// A schema-validated empty container batch: no record, no row.
+    ScalarEmpty,
 }
 impl InputEncoder {
     fn step(&mut self, output: &mut [u8]) -> Result<RenderTurn, ()> {
         match self {
             Self::Client(encoder) => encoder.step(output).map_err(|_| ()),
+            Self::ScalarLeaf(encoder) => encoder.step(output).map_err(|_| ()),
+            Self::ScalarContainer(encoder) => Ok(encoder.step(output)),
+            Self::ScalarEmpty => Ok(RenderTurn {
+                emitted_bytes: 0,
+                examined_bytes: 0,
+                visited_cells: 0,
+                completed_rows: 0,
+                status: RenderTurnStatus::InputComplete,
+            }),
             Self::Statistics(encoder) => encoder
                 .step(output)
                 .map(|turn| RenderTurn {
@@ -77,7 +108,7 @@ impl InputEncoder {
     fn statistics_totals(&self) -> Option<StatisticsCodecTotals> {
         match self {
             Self::Statistics(encoder) => Some(encoder.totals()),
-            Self::Client(_) => None,
+            _ => None,
         }
     }
 }
@@ -95,6 +126,9 @@ struct ProducerState {
     builder: Option<RootSegmentBuilder>,
     used: usize,
     statistics_totals: StatisticsCodecTotals,
+    /// ScalarValueV1 rows accepted across every input batch: 0 or 1. Its
+    /// record stays in the unpublished segment until the sealed normal End.
+    scalar_rows: u8,
     sealed: bool,
     failed: Option<&'static str>,
     producer: Option<RootProducerExit>,
@@ -143,10 +177,9 @@ impl NativeRootResultSession {
         channel: Arc<RootResultChannel>,
         pool: &Arc<RootProducerPool>,
     ) -> Result<Arc<Self>, FragmentIoError> {
-        if matches!(
-            channel.spec().contract.kind(),
-            RootOutputKind::InternalFacts(domain) if domain != InternalResultDomain::StatisticsArtifactV1
-        ) {
+        let contract = &channel.spec().contract;
+        if !root_output_producer_installed(contract.kind()) || contract.validate_purpose().is_err()
+        {
             return Err(io_error("explicit internal root codec is not installed"));
         }
         // All fixed session/issuer/callback scaffolds are covered before
@@ -193,6 +226,7 @@ impl NativeRootResultSession {
                 builder: None,
                 used: 0,
                 statistics_totals: StatisticsCodecTotals::default(),
+                scalar_rows: 0,
                 sealed: false,
                 failed: None,
                 producer: None,
@@ -344,6 +378,53 @@ impl NativeRootResultSession {
                                 .fail(state, "statistics input differs from its frozen domain");
                         }
                     }
+                } else if let FrozenRootOutput::ScalarValue(schema) = self.spec().contract.output()
+                {
+                    // Cumulative cardinality is decided before any cursor:
+                    // a second row is refused before it can reach a segment.
+                    let rows = input.chunk.len();
+                    if rows > 1 || (rows == 1 && state.scalar_rows != 0) {
+                        return self.fail(state, "scalar root input has more than one row");
+                    }
+                    let encoder = if is_container(schema.field()) {
+                        if rows == 0 {
+                            NativeScalarContainerEncoder::validate_empty(&input.chunk, schema)
+                                .map(|()| InputEncoder::ScalarEmpty)
+                        } else {
+                            NativeScalarContainerEncoder::try_encode(&input.chunk, schema, capacity)
+                                .map(|encoder| InputEncoder::ScalarContainer(Box::new(encoder)))
+                        }
+                    } else {
+                        ScalarSchemaOwner::try_from_contract(Arc::clone(&self.spec().contract))
+                            .and_then(|owner| {
+                                if rows == 0 {
+                                    NativeScalarLeafEncoder::try_validate_empty(
+                                        &input.chunk,
+                                        owner,
+                                        capacity,
+                                    )
+                                } else {
+                                    NativeScalarLeafEncoder::try_begin(
+                                        &input.chunk,
+                                        owner,
+                                        capacity,
+                                    )
+                                }
+                            })
+                            .map(|encoder| InputEncoder::ScalarLeaf(Box::new(encoder)))
+                    };
+                    match encoder {
+                        Ok(encoder) => {
+                            if rows == 1 {
+                                state.scalar_rows = 1;
+                            }
+                            encoder
+                        }
+                        Err(_) => {
+                            return self
+                                .fail(state, "scalar input differs from its frozen root value");
+                        }
+                    }
                 } else {
                     let encoder = match ArrowMysqlTextEncoder::try_new_root(
                         Arc::clone(&self.spec().contract),
@@ -394,6 +475,17 @@ impl NativeRootResultSession {
                 return self.fail(state, "root row count overflow");
             }
             let input_complete = turn.status == RenderTurnStatus::InputComplete;
+            if self.scalar() {
+                // The whole record fits one segment and stays unpublished:
+                // only the sealed normal End publishes it (or NoRows).
+                if turn.status == RenderTurnStatus::NeedsOutput {
+                    return self.fail(state, "scalar record exceeds one root segment");
+                }
+                if input_complete {
+                    drop(state.input.take());
+                }
+                return RootProducerTurn::Yielded;
+            }
             if input_complete {
                 if let Some(totals) = input.encoder.as_ref().unwrap().statistics_totals() {
                     state.statistics_totals = totals;
@@ -430,6 +522,9 @@ impl NativeRootResultSession {
             return RootProducerTurn::Yielded;
         }
         if state.sealed {
+            if self.scalar() {
+                return self.finish_scalar(state);
+            }
             if self
                 .channel
                 .request_finish()
@@ -441,6 +536,56 @@ impl NativeRootResultSession {
             return RootProducerTurn::Complete;
         }
         RootProducerTurn::Idle
+    }
+    fn scalar(&self) -> bool {
+        matches!(
+            self.spec().contract.output(),
+            FrozenRootOutput::ScalarValue(_)
+        )
+    }
+    /// Normal sealed End of a ScalarValueV1 root: exactly one record, the
+    /// accepted value or the unique NoRows, published together with End.
+    /// Failure and cancellation never reach here, so they publish neither.
+    fn finish_scalar(&self, state: &mut ProducerState) -> RootProducerTurn {
+        let FrozenRootOutput::ScalarValue(schema) = self.spec().contract.output() else {
+            unreachable!("scalar finish is reached only for a scalar root");
+        };
+        if state.builder.is_none() {
+            match self.channel.try_segment() {
+                Ok(Some(builder)) => {
+                    state.builder = Some(builder);
+                    state.used = 0;
+                }
+                Ok(None) => return RootProducerTurn::Blocked,
+                Err(_) => return self.fail(state, "root segment reservation was rejected"),
+            }
+        }
+        if state.scalar_rows == 0 {
+            if state.used != 0 {
+                return self.fail(state, "scalar root has bytes without an accepted row");
+            }
+            let output = state.builder.as_mut().unwrap().output_at(0);
+            let written =
+                ScalarLeafCursor::try_new(schema, BorrowedScalarLeaf::NoRows).and_then(|cursor| {
+                    let turn = cursor.copy_range(0, output)?;
+                    Ok((turn.complete, turn.emitted_bytes))
+                });
+            match written {
+                Ok((true, bytes)) => state.used = bytes,
+                _ => return self.fail(state, "scalar NoRows record cannot be encoded"),
+            }
+        } else if state.used == 0 {
+            return self.fail(state, "scalar root accepted a row without its record");
+        }
+        if self.channel.request_finish().is_err() {
+            return self.fail(state, "root finish request was rejected");
+        }
+        let builder = state.builder.take().unwrap();
+        let bytes = std::mem::take(&mut state.used);
+        if self.channel.publish_segment(builder, bytes, true).is_err() {
+            return self.fail(state, "root data publication failed");
+        }
+        RootProducerTurn::Complete
     }
 }
 impl RootResultSession for NativeRootResultSession {

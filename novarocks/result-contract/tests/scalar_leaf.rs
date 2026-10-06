@@ -472,8 +472,12 @@ fn semantic_type_width_precision_unit_and_opaque_mismatches_refuse() {
         })),
         true,
     );
-    for value in [V::Null, V::NoRows, V::Binary(b"[]")] {
-        rejects(&container, value, E::UnsupportedContainer);
+    // Container values are written by ScalarRecordWriter; this cursor only
+    // frames their header-only absent and null records.
+    rejects(&container, V::Binary(b"[]"), E::UnsupportedContainer);
+    for value in [V::Null, V::NoRows] {
+        let cursor = ScalarLeafCursor::try_new(&container, value).unwrap();
+        assert_eq!(cursor.encoded_len(), SCALAR_LEAF_HEADER_BYTES);
     }
 }
 

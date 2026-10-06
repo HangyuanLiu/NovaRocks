@@ -25,9 +25,9 @@
 //! Arbitrary source metadata-container work also remains the caller's responsibility.
 //! These checks neither fund source growth nor admit a root/session assignment.
 //! Empty batches have a separate schema-only validation cursor that emits no
-//! record. Cumulative row admission, NoRows at sealed End, and nested containers
-//! remain the root owner's responsibilities. This module does not
-//! install a producer or enable the Host's ScalarValueV1 gate.
+//! record. Cumulative row admission and NoRows at sealed End belong to the
+//! root session; List/Map/Struct values use the container cursor in
+//! `root_scalar_container_codec`.
 
 use std::sync::Arc;
 
@@ -40,8 +40,8 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, FieldRef, Int32Type, TimeUnit};
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_result_contract::{
-    BorrowedScalarLeaf, ScalarField, ScalarLeafCursor, ScalarLeafError, ScalarOpaqueType,
-    ScalarSchema, ScalarTimestampUnit, ScalarValueType,
+    BorrowedScalarLeaf, FrozenRootOutput, RootOutputContract, ScalarField, ScalarLeafCursor,
+    ScalarLeafError, ScalarOpaqueType, ScalarSchema, ScalarTimestampUnit, ScalarValueType,
 };
 use novarocks_result_render::{RenderTurn, RenderTurnStatus};
 use novarocks_type_contract::result_scalar_type::scalar_field_matches_storage;
@@ -68,7 +68,7 @@ impl std::fmt::Display for NativeScalarLeafError {
             Self::Slot => "scalar leaf input differs from its exact Native source slot",
             Self::Type => "scalar leaf input differs from its exact physical carrier",
             Self::LogicalMetadata => "scalar leaf logical metadata differs from its frozen facts",
-            Self::UnsupportedContainer => "Native scalar container cursor is not installed",
+            Self::UnsupportedContainer => "scalar container value requires the container cursor",
             Self::ScratchLimit => "scalar leaf cursor exceeds its prepaid scratch capacity",
             Self::Leaf(error) => return std::fmt::Display::fmt(error, f),
             Self::ChangedInput => "scalar leaf input changed during emission",
@@ -83,12 +83,45 @@ impl From<ScalarLeafError> for NativeScalarLeafError {
     }
 }
 
+/// An existing frozen owner of the cursor's scalar schema. Retaining it is an
+/// Arc clone; the schema itself is never copied.
+#[derive(Clone)]
+pub enum ScalarSchemaOwner {
+    Schema(Arc<ScalarSchema>),
+    Contract(Arc<RootOutputContract>),
+}
+impl ScalarSchemaOwner {
+    /// Only a ScalarValue root output owns a scalar schema.
+    pub fn try_from_contract(
+        contract: Arc<RootOutputContract>,
+    ) -> Result<Self, NativeScalarLeafError> {
+        match contract.output() {
+            FrozenRootOutput::ScalarValue(_) => Ok(Self::Contract(contract)),
+            _ => Err(NativeScalarLeafError::Type),
+        }
+    }
+    pub fn schema(&self) -> &ScalarSchema {
+        match self {
+            Self::Schema(schema) => schema,
+            Self::Contract(contract) => match contract.output() {
+                FrozenRootOutput::ScalarValue(schema) => schema,
+                _ => unreachable!("scalar schema owner is checked at construction"),
+            },
+        }
+    }
+}
+impl From<Arc<ScalarSchema>> for ScalarSchemaOwner {
+    fn from(schema: Arc<ScalarSchema>) -> Self {
+        Self::Schema(schema)
+    }
+}
+
 /// No extra cursor heap storage exists besides the separately prepaid Box and
-/// RecordBatch columns Vec. The schema Arc retains an existing frozen owner.
+/// RecordBatch columns Vec. The schema owner retains an existing frozen owner.
 pub struct NativeScalarLeafEncoder {
     batch: RecordBatch,
     slot_field: FieldRef,
-    schema: Arc<ScalarSchema>,
+    schema: ScalarSchemaOwner,
     candidate_encoded_len: usize,
     offset: usize,
     phase: ScalarLeafPhase,
@@ -120,10 +153,10 @@ impl NativeScalarLeafEncoder {
     /// original backing and retains its original input permit through exit.
     pub fn try_begin(
         chunk: &Chunk,
-        schema: Arc<ScalarSchema>,
+        schema: impl Into<ScalarSchemaOwner>,
         prepaid_scratch_capacity: usize,
     ) -> Result<Self, NativeScalarLeafError> {
-        Self::try_begin_mode(chunk, schema, prepaid_scratch_capacity, false)
+        Self::try_begin_mode(chunk, schema.into(), prepaid_scratch_capacity, false)
     }
     /// Validate an exactly empty one-column batch under the same original input
     /// and scratch contract. No cell is selected and no ScalarValueV1 record is
@@ -131,17 +164,18 @@ impl NativeScalarLeafEncoder {
     /// the root owner may decide absence after its entire input stream seals.
     pub fn try_validate_empty(
         chunk: &Chunk,
-        schema: Arc<ScalarSchema>,
+        schema: impl Into<ScalarSchemaOwner>,
         prepaid_scratch_capacity: usize,
     ) -> Result<Self, NativeScalarLeafError> {
-        Self::try_begin_mode(chunk, schema, prepaid_scratch_capacity, true)
+        Self::try_begin_mode(chunk, schema.into(), prepaid_scratch_capacity, true)
     }
     fn try_begin_mode(
         chunk: &Chunk,
-        schema: Arc<ScalarSchema>,
+        owner: ScalarSchemaOwner,
         prepaid_scratch_capacity: usize,
         empty_validation: bool,
     ) -> Result<Self, NativeScalarLeafError> {
+        let schema = owner.schema();
         let batch = &chunk.batch;
         if batch.num_columns() != 1
             || batch.schema_ref().fields().len() != 1
@@ -188,13 +222,13 @@ impl NativeScalarLeafEncoder {
             validate_empty_carrier(schema.field(), array)?;
             0
         } else {
-            ScalarLeafCursor::try_new(&schema, borrow_validated_leaf(schema.field(), array)?)?
+            ScalarLeafCursor::try_new(schema, borrow_validated_leaf(schema.field(), array)?)?
                 .encoded_len()
         };
         Ok(Self {
             batch: batch.clone(),
             slot_field: Arc::clone(slot.field_ref()),
-            schema,
+            schema: owner,
             candidate_encoded_len,
             offset: 0,
             phase: ScalarLeafPhase::Validating {
@@ -256,7 +290,7 @@ impl NativeScalarLeafEncoder {
         let mut examined = 0;
         let mut work = 0;
         while source < 3 && work + 8 <= 1024 {
-            let expected = match &self.schema.field().value_type {
+            let expected = match &self.schema.schema().field().value_type {
                 ScalarValueType::Timestamp { timezone, .. } => timezone.as_deref(),
                 _ => None,
             };
@@ -321,8 +355,8 @@ impl NativeScalarLeafEncoder {
         output: &mut [u8],
     ) -> Result<RenderTurn, NativeScalarLeafError> {
         let cursor = ScalarLeafCursor::try_new(
-            &self.schema,
-            borrow_validated_leaf(self.schema.field(), self.batch.column(0).as_ref())?,
+            self.schema.schema(),
+            borrow_validated_leaf(self.schema.schema().field(), self.batch.column(0).as_ref())?,
         )?;
         if cursor.encoded_len() != witness.encoded_len {
             return Err(NativeScalarLeafError::ChangedInput);
@@ -358,7 +392,7 @@ fn reject_container(field: &ScalarField) -> Result<(), NativeScalarLeafError> {
     }
     Ok(())
 }
-fn expected_logical(value: &ScalarValueType) -> Option<LogicalType> {
+pub(crate) fn expected_logical(value: &ScalarValueType) -> Option<LogicalType> {
     match value {
         ScalarValueType::Json => Some(LogicalType::Json),
         ScalarValueType::Opaque(ScalarOpaqueType::Hll) => Some(LogicalType::Hll),
@@ -497,18 +531,31 @@ fn borrow_validated_leaf<'a>(
     expected: &ScalarField,
     array: &'a dyn Array,
 ) -> Result<BorrowedScalarLeaf<'a>, NativeScalarLeafError> {
+    if array.len() != 1 {
+        return Err(NativeScalarLeafError::Type);
+    }
+    borrow_leaf_at(expected, array, 0)
+}
+
+/// Select one leaf value of an exact standard carrier at `index`. Container
+/// cursors use this for nested children; the top-level leaf path selects 0.
+pub(crate) fn borrow_leaf_at<'a>(
+    expected: &ScalarField,
+    array: &'a dyn Array,
+    index: usize,
+) -> Result<BorrowedScalarLeaf<'a>, NativeScalarLeafError> {
     use BorrowedScalarLeaf as V;
     use ScalarValueType as S;
-    if array.len() != 1 {
+    if index >= array.len() {
         return Err(NativeScalarLeafError::Type);
     }
     if dictionary_type(array.data_type()) {
         let dictionary = exact::<DictionaryArray<Int32Type>>(array)?;
-        if dictionary.keys().is_null(0) {
+        if dictionary.keys().is_null(index) {
             return Ok(V::Null);
         }
-        let key =
-            usize::try_from(dictionary.keys().value(0)).map_err(|_| NativeScalarLeafError::Type)?;
+        let key = usize::try_from(dictionary.keys().value(index))
+            .map_err(|_| NativeScalarLeafError::Type)?;
         let values = dictionary.values();
         if key >= values.len() {
             return Err(NativeScalarLeafError::Type);
@@ -539,7 +586,7 @@ fn borrow_validated_leaf<'a>(
     macro_rules! selected {
         ($ty:ty, $value:ident, $expression:expr) => {{
             let $value = exact::<$ty>(array)?;
-            if $value.is_null(0) {
+            if $value.is_null(index) {
                 V::Null
             } else {
                 $expression
@@ -551,13 +598,13 @@ fn borrow_validated_leaf<'a>(
             exact::<NullArray>(array)?;
             V::Null
         }
-        S::Boolean => selected!(BooleanArray, a, V::Boolean(a.value(0))),
+        S::Boolean => selected!(BooleanArray, a, V::Boolean(a.value(index))),
         S::SignedInteger(8) => selected!(
             Int8Array,
             a,
             V::SignedInteger {
                 bits: 8,
-                value: i64::from(a.value(0))
+                value: i64::from(a.value(index))
             }
         ),
         S::SignedInteger(16) => selected!(
@@ -565,7 +612,7 @@ fn borrow_validated_leaf<'a>(
             a,
             V::SignedInteger {
                 bits: 16,
-                value: i64::from(a.value(0))
+                value: i64::from(a.value(index))
             }
         ),
         S::SignedInteger(32) => selected!(
@@ -573,7 +620,7 @@ fn borrow_validated_leaf<'a>(
             a,
             V::SignedInteger {
                 bits: 32,
-                value: i64::from(a.value(0))
+                value: i64::from(a.value(index))
             }
         ),
         S::SignedInteger(64) => selected!(
@@ -581,20 +628,20 @@ fn borrow_validated_leaf<'a>(
             a,
             V::SignedInteger {
                 bits: 64,
-                value: a.value(0)
+                value: a.value(index)
             }
         ),
         S::LargeInt => selected!(
             FixedSizeBinaryArray,
             a,
             V::LargeInt(i128::from_le_bytes(
-                a.value(0)
+                a.value(index)
                     .try_into()
                     .map_err(|_| NativeScalarLeafError::Type)?
             ))
         ),
-        S::Float32 => selected!(Float32Array, a, V::Float32(a.value(0).to_bits())),
-        S::Float64 => selected!(Float64Array, a, V::Float64(a.value(0).to_bits())),
+        S::Float32 => selected!(Float32Array, a, V::Float32(a.value(index).to_bits())),
+        S::Float64 => selected!(Float64Array, a, V::Float64(a.value(index).to_bits())),
         S::Decimal {
             bits: 128,
             precision,
@@ -603,7 +650,7 @@ fn borrow_validated_leaf<'a>(
             Decimal128Array,
             a,
             V::Decimal128 {
-                coefficient: a.value(0),
+                coefficient: a.value(index),
                 precision: *precision,
                 scale: *scale
             }
@@ -616,25 +663,25 @@ fn borrow_validated_leaf<'a>(
             Decimal256Array,
             a,
             V::Decimal256 {
-                coefficient_le: a.value(0).to_le_bytes(),
+                coefficient_le: a.value(index).to_le_bytes(),
                 precision: *precision,
                 scale: *scale
             }
         ),
-        S::String => selected!(StringArray, a, V::String(a.value(0))),
-        S::Binary => selected!(BinaryArray, a, V::Binary(a.value(0))),
-        S::Json => selected!(StringArray, a, V::Json(a.value(0))),
-        S::Variant => selected!(LargeBinaryArray, a, V::Variant(a.value(0))),
+        S::String => selected!(StringArray, a, V::String(a.value(index))),
+        S::Binary => selected!(BinaryArray, a, V::Binary(a.value(index))),
+        S::Json => selected!(StringArray, a, V::Json(a.value(index))),
+        S::Variant => selected!(LargeBinaryArray, a, V::Variant(a.value(index))),
         S::Opaque(kind) => selected!(
             BinaryArray,
             a,
             V::Opaque {
                 kind: *kind,
-                bytes: a.value(0)
+                bytes: a.value(index)
             }
         ),
-        S::Date => selected!(Date32Array, a, V::Date(a.value(0))),
-        S::TimeMicros => selected!(Time64MicrosecondArray, a, V::TimeMicros(a.value(0))),
+        S::Date => selected!(Date32Array, a, V::Date(a.value(index))),
+        S::TimeMicros => selected!(Time64MicrosecondArray, a, V::TimeMicros(a.value(index))),
         S::Timestamp {
             unit: ScalarTimestampUnit::Microsecond,
             ..
@@ -642,7 +689,7 @@ fn borrow_validated_leaf<'a>(
             TimestampMicrosecondArray,
             a,
             V::Timestamp {
-                ticks: a.value(0),
+                ticks: a.value(index),
                 unit: ScalarTimestampUnit::Microsecond
             }
         ),
@@ -653,7 +700,7 @@ fn borrow_validated_leaf<'a>(
             TimestampNanosecondArray,
             a,
             V::Timestamp {
-                ticks: a.value(0),
+                ticks: a.value(index),
                 unit: ScalarTimestampUnit::Nanosecond
             }
         ),

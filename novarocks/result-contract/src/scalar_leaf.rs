@@ -21,12 +21,16 @@
 //! Source admission, schema transport, collector and session commit are absent.
 
 use crate::{
-    ScalarOpaqueType, ScalarProfileV1, ScalarSchema, ScalarTimestampUnit, ScalarValueType,
+    ScalarField, ScalarOpaqueType, ScalarProfileV1, ScalarSchema, ScalarTimestampUnit,
+    ScalarValueType,
 };
 
 pub const SCALAR_LEAF_HEADER_BYTES: usize = 24;
-const NULL: u8 = 1;
-const ABSENT: u8 = 2;
+pub(crate) const NULL: u8 = 1;
+pub(crate) const ABSENT: u8 = 2;
+pub(crate) const CONTAINER_LIST: u8 = 15;
+pub(crate) const CONTAINER_MAP: u8 = 16;
+pub(crate) const CONTAINER_STRUCT: u8 = 17;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScalarLeafError {
@@ -44,7 +48,7 @@ impl std::fmt::Display for ScalarLeafError {
             Self::Nullability => "scalar value violates frozen nullability",
             Self::ValueLimit => "scalar value exceeds its admitted profile",
             Self::InvalidValue => "invalid scalar coefficient or representation",
-            Self::UnsupportedContainer => "scalar container cursor is not installed",
+            Self::UnsupportedContainer => "scalar container value requires the container cursor",
             Self::MalformedRecord => "malformed scalar leaf record",
         })
     }
@@ -279,9 +283,16 @@ impl<'a> ScalarLeafCursor<'a> {
         schema: &ScalarSchema,
         value: BorrowedScalarLeaf<'a>,
     ) -> Result<Self, ScalarLeafError> {
+        Self::try_new_for_field(schema.field(), value)
+    }
+    /// The same record for one field of an already admitted schema. Nested
+    /// record writers use this so a leaf never clones its frozen type.
+    pub(crate) fn try_new_for_field(
+        field: &ScalarField,
+        value: BorrowedScalarLeaf<'a>,
+    ) -> Result<Self, ScalarLeafError> {
         use BorrowedScalarLeaf as V;
         use ScalarValueType as T;
-        let field = schema.field();
         let mut cursor = Self {
             header: [0; SCALAR_LEAF_HEADER_BYTES],
             fixed: [0; 32],
@@ -311,9 +322,11 @@ impl<'a> ScalarLeafCursor<'a> {
             T::Json => (12, 0, 0, 0, 0, 0),
             T::Variant => (13, 0, 0, 0, 0, 0),
             T::Opaque(kind) => (14, 0, 0, 0, 0, opaque_kind(*kind)),
-            T::List(_) | T::Map { .. } | T::Struct(_) => {
-                return Err(ScalarLeafError::UnsupportedContainer);
-            }
+            // Container records carry their payload through ScalarRecordWriter;
+            // this cursor only frames their absent/null headers.
+            T::List(_) => (CONTAINER_LIST, 0, 0, 0, 0, 0),
+            T::Map { .. } => (CONTAINER_MAP, 0, 0, 0, 0, 0),
+            T::Struct(_) => (CONTAINER_STRUCT, 0, 0, 0, 0, 0),
         };
         cursor.header[12] = kind;
         cursor.header[14..16].copy_from_slice(&width.to_le_bytes());
@@ -330,6 +343,9 @@ impl<'a> ScalarLeafCursor<'a> {
                 cursor.header[13] = NULL
             }
             (V::Null, _) => return Err(ScalarLeafError::Nullability),
+            (_, T::List(_) | T::Map { .. } | T::Struct(_)) => {
+                return Err(ScalarLeafError::UnsupportedContainer);
+            }
             (V::Boolean(value), T::Boolean) => cursor.set_fixed(&[u8::from(value)]),
             (V::SignedInteger { bits, value }, T::SignedInteger(expected)) if bits == *expected => {
                 let fits = match bits {
@@ -429,6 +445,9 @@ impl<'a> ScalarLeafCursor<'a> {
     pub fn rows(&self) -> u64 {
         self.rows
     }
+    pub(crate) fn header(&self) -> [u8; SCALAR_LEAF_HEADER_BYTES] {
+        self.header
+    }
     pub fn encoded_len(&self) -> usize {
         SCALAR_LEAF_HEADER_BYTES + self.payload_len
     }
@@ -501,7 +520,7 @@ fn opaque_kind(kind: ScalarOpaqueType) -> u8 {
 // Fixed four-limb arithmetic, including Decimal256 precision 76, requires no
 // decimal string, BigInt heap or client-format conversion. At most 304 limb
 // multiplies plus fixed-size copies/comparisons fit one existing work turn.
-fn decimal_in_range(bytes: &[u8], precision: u8) -> bool {
+pub(crate) fn decimal_in_range(bytes: &[u8], precision: u8) -> bool {
     let mut value = [0u64; 4];
     for (index, bytes) in bytes.chunks_exact(8).enumerate() {
         value[index] = u64::from_le_bytes(bytes.try_into().expect("exact decimal limb"));
