@@ -1,0 +1,80 @@
+-- query 3
+id	tiny	note	reused	plain	small
+1	127	{"b":2,"a":1}	32767	{"b":2,"a":1}	32767
+1	127	{"b":2,"a":1}	32767	{"b":2,"a":1}	32767
+2	-128	{ "a" : 1 }	-32768	{ "a" : 1 }	-32768
+3	NULL	NULL	NULL	null	NULL
+4	NULL	null	NULL	null	0
+
+-- query 4
+payload_type	tiny_type	note_type	reused_type	plain_type	small_type
+struct<tiny tinyint, note json, reused smallint>	tinyint	json	smallint	varchar	smallint
+
+-- query 6
+id	tiny	note	reused	plain	small
+1	127	{"b":2,"a":1}	32767	{"b":2,"a":1}	32767
+1	127	{"b":2,"a":1}	32767	{"b":2,"a":1}	32767
+2	-128	{ "a" : 1 }	-32768	{ "a" : 1 }	-32768
+3	NULL	NULL	NULL	null	NULL
+4	NULL	null	NULL	null	0
+5	0	[2,1]	7	[2,1]	7
+
+-- query 7
+payload_type	tiny_type	note_type	reused_type	plain_type	small_type
+struct<note json, tiny_renamed tinyint, reused smallint>	tinyint	json	smallint	varchar	smallint
+
+-- query 9
+id	tiny	note	reused	plain	small
+1	127	{"b":2,"a":1}	NULL	{"b":2,"a":1}	32767
+1	127	{"b":2,"a":1}	NULL	{"b":2,"a":1}	32767
+2	-128	{ "a" : 1 }	NULL	{ "a" : 1 }	-32768
+3	NULL	NULL	NULL	null	NULL
+4	NULL	null	NULL	null	0
+5	0	[2,1]	NULL	[2,1]	7
+6	127	"new"	128	"new"	32767
+
+-- query 10
+payload_type	tiny_type	note_type	reused_type	plain_type	small_type
+struct<note json, tiny_renamed tinyint, reused int>	tinyint	json	int	varchar	smallint
+
+-- query 11
+id	tiny	note	reused	plain	small
+1	127	{"b":2,"a":1}	32767	{"b":2,"a":1}	32767
+1	127	{"b":2,"a":1}	32767	{"b":2,"a":1}	32767
+2	-128	{ "a" : 1 }	-32768	{ "a" : 1 }	-32768
+3	NULL	NULL	NULL	null	NULL
+4	NULL	null	NULL	null	0
+5	0	[2,1]	7	[2,1]	7
+
+-- query 12
+payload_type	tiny_type	note_type	reused_type	plain_type	small_type
+struct<note json, tiny_renamed tinyint, reused smallint>	tinyint	json	smallint	varchar	smallint
+
+-- query 14
+id	tiny	note	reused	plain	small
+1	127	{"b":2,"a":1}	NULL	{"b":2,"a":1}	32767
+1	127	{"b":2,"a":1}	NULL	{"b":2,"a":1}	32767
+2	-128	{ "a" : 1 }	NULL	{ "a" : 1 }	-32768
+3	NULL	NULL	NULL	null	NULL
+4	NULL	null	NULL	null	0
+5	0	[2,1]	NULL	[2,1]	7
+6	127	"new"	128	"new"	32767
+7	128	{"wide":true}	32768	{"wide":true}	32768
+
+-- query 15
+payload_type	tiny_type	note_type	reused_type	plain_type	small_type
+struct<note json, tiny_renamed bigint, reused int>	bigint	json	int	varchar	bigint
+
+-- query 16
+id	tiny	note	reused	plain	small
+1	127	{"b":2,"a":1}	NULL	{"b":2,"a":1}	32767
+1	127	{"b":2,"a":1}	NULL	{"b":2,"a":1}	32767
+2	-128	{ "a" : 1 }	NULL	{ "a" : 1 }	-32768
+3	NULL	NULL	NULL	null	NULL
+4	NULL	null	NULL	null	0
+5	0	[2,1]	NULL	[2,1]	7
+6	127	"new"	128	"new"	32767
+
+-- query 17
+payload_type	tiny_type	note_type	reused_type	plain_type	small_type
+struct<note json, tiny_renamed tinyint, reused int>	tinyint	json	int	varchar	smallint
