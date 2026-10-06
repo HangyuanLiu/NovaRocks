@@ -535,6 +535,54 @@ impl<'source> PackageTypeViews<'source> {
         budget: &mut TypeViewBudget<'source, '_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<u32, TypeViewError> {
+        self.root_for_in(occurrence, budget, work, |row| {
+            let (TypeRootReference::Value(id), PackageTypeSource::Value(original)) =
+                (row.root, row.source)
+            else {
+                return Err(TypeViewError::InvalidSource(
+                    "type occurrence is not a complete Value root",
+                ));
+            };
+            if !std::ptr::eq(original, expected_original) {
+                return Err(TypeViewError::InvalidSource(
+                    "type occurrence uses a different original Value type",
+                ));
+            }
+            Ok(id)
+        })
+    }
+    /// Schema inputs retain the exact original Arc loan and strict Field root.
+    /// An equal Field or another occurrence cannot select this namespace ID.
+    pub(crate) fn field_root_for_in(
+        &self,
+        occurrence: PackageTypeOccurrence,
+        expected_original: &Arc<Field>,
+        budget: &mut TypeViewBudget<'source, '_, '_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<u32, TypeViewError> {
+        self.root_for_in(occurrence, budget, work, |row| {
+            let (TypeRootReference::Field(id), PackageTypeSource::StrictField(original)) =
+                (row.root, row.source)
+            else {
+                return Err(TypeViewError::InvalidSource(
+                    "type occurrence is not a strict Field root",
+                ));
+            };
+            if !std::ptr::eq(original, expected_original) {
+                return Err(TypeViewError::InvalidSource(
+                    "type occurrence uses a different original Field loan",
+                ));
+            }
+            Ok(id)
+        })
+    }
+    fn root_for_in(
+        &self,
+        occurrence: PackageTypeOccurrence,
+        budget: &mut TypeViewBudget<'source, '_, '_>,
+        work: &mut CompileCheckpoints<'_>,
+        validate: impl Fn(&TypeOccurrenceRow<'source>) -> Result<u32, TypeViewError>,
+    ) -> Result<u32, TypeViewError> {
         self.check_package_in(self.package, budget, work)?;
         budget.before_steps(mul(self.occurrences.len(), 2)?)?;
         let mut found = None;
@@ -542,18 +590,7 @@ impl<'source> PackageTypeViews<'source> {
             let matches = row.occurrence == occurrence;
             work.step()?;
             if matches {
-                let (TypeRootReference::Value(id), PackageTypeSource::Value(original)) =
-                    (row.root, row.source)
-                else {
-                    return Err(TypeViewError::InvalidSource(
-                        "type occurrence is not a complete Value root",
-                    ));
-                };
-                if !std::ptr::eq(original, expected_original) {
-                    return Err(TypeViewError::InvalidSource(
-                        "type occurrence uses a different original Value type",
-                    ));
-                }
+                let id = validate(row)?;
                 if found.replace(id).is_some() {
                     return Err(TypeViewError::InvalidSource(
                         "type occurrence root is ambiguous",

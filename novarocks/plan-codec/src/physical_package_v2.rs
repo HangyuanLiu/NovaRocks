@@ -30,6 +30,7 @@ use std::fmt;
 
 mod binding_sources;
 mod nodes;
+mod provider_sources;
 mod type_sources;
 mod type_views;
 

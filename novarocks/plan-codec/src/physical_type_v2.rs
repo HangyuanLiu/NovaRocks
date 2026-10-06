@@ -445,6 +445,14 @@ pub struct WriterTypeSource<'source> {
     field_ids: &'source [u32],
 }
 impl<'source> WriterTypeSource<'source> {
+    pub(crate) fn recipe(
+        &self,
+    ) -> &'source novarocks_connector_contract::ConnectorWriteRecipeDraft {
+        self.recipe
+    }
+    pub(crate) fn field_ids(&self) -> &'source [u32] {
+        self.field_ids
+    }
     pub fn new(
         recipe: &'source novarocks_connector_contract::ConnectorWriteRecipeDraft,
         field_ids: &'source [u32],
