@@ -683,7 +683,7 @@ fn emit_core(
 
 /// Prepare on the caller's original meter, replacing this child contribution.
 /// No scope, entry, finish, type reconstruction or constant admission is added.
-pub(crate) fn prepare_call_requests_encode_in<'loan, 'source>(
+pub(crate) fn prepare_call_requests_encode_in<'loan, 'source, 'control: 'loan>(
     source: &'loan FragmentCallRequests,
     types: &'loan EncodedTypeTable<'source>,
     type_ids: &'loan [CallRequestTypeIds<'loan>],
@@ -691,7 +691,7 @@ pub(crate) fn prepare_call_requests_encode_in<'loan, 'source>(
     source_retained_bytes: usize,
     limits: CallRequestProjectionLimits,
     admit: &mut CallRequestAdmit<'_>,
-    work: &mut CompileCheckpoints<'loan>,
+    work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedCallRequestsEncode<'loan, 'source>, Error> {
     let facts = preflight(
         source,

@@ -835,4 +835,4 @@ impl<'source, 'ids> ProviderSources<'source, 'ids> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

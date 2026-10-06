@@ -1233,4 +1233,4 @@ impl<'rows, 'source> PreparedRequestArguments<'rows, 'source> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

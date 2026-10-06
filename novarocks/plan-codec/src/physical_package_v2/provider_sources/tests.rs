@@ -115,7 +115,7 @@ fn admission() -> p::FragmentPackageAdmission {
     }
 }
 
-fn checked_read(metadata: bool) -> p::FragmentPackage {
+pub(in crate::physical_package_v2) fn checked_read(metadata: bool) -> p::FragmentPackage {
     let provider = c::ConnectorProviderId::parse("iceberg").unwrap();
     let instance = c::ConnectorInstanceId::try_from_canonical("lake").unwrap();
     let catalog = c::CatalogHandle::new(instance.clone(), c::CatalogVersion::from_bytes([7; 32]));
@@ -344,7 +344,7 @@ fn checked_read(metadata: bool) -> p::FragmentPackage {
     )
     .unwrap()
 }
-fn checked_writer() -> p::FragmentPackage {
+pub(in crate::physical_package_v2) fn checked_writer() -> p::FragmentPackage {
     let provider = c::ConnectorProviderId::parse("iceberg").unwrap();
     let instance = c::ConnectorInstanceId::try_from_canonical("lake").unwrap();
     let catalog = c::CatalogHandle::new(instance.clone(), c::CatalogVersion::from_bytes([7; 32]));

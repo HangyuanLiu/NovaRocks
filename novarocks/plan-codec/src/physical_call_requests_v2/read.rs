@@ -646,14 +646,14 @@ fn index(
     }
     Ok(keys)
 }
-fn prepare_core<'loan>(
+fn prepare_core<'loan, 'control: 'loan>(
     source: Option<&'loan wire::FragmentCallRequests>,
     types: &'loan DecodedTypeTable,
     pools: &'loan ConstantPools,
     source_retained_bytes: usize,
     limits: Limits,
     parent: &mut Option<&mut CallRequestAdmit<'_>>,
-    work: &mut CompileCheckpoints<'loan>,
+    work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedCallRequestsDecode<'loan>, E> {
     let source = source.ok_or_else(|| invalid("fragment call request table is absent"))?;
     let facts = preflight(
@@ -700,14 +700,14 @@ pub fn prepare_call_requests_decode<'loan>(
 
 /// Same receiver author on the caller's original meter. The parent replaces
 /// the complete child contribution; its source invoice is included once.
-pub(crate) fn prepare_call_requests_decode_in<'loan>(
+pub(crate) fn prepare_call_requests_decode_in<'loan, 'control: 'loan>(
     source: Option<&'loan wire::FragmentCallRequests>,
     types: &'loan DecodedTypeTable,
     pools: &'loan ConstantPools,
     source_retained_bytes: usize,
     limits: Limits,
     admit: &mut CallRequestAdmit<'_>,
-    work: &mut CompileCheckpoints<'loan>,
+    work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedCallRequestsDecode<'loan>, E> {
     prepare_core(
         source,

@@ -182,7 +182,7 @@ fn node(
 // Original sparse construction and every mandatory publication author are
 // exercised. Exact signatures and fixture effect claims certify no installed
 // function or executable implementation.
-fn rich_package() -> p::FragmentPackage {
+pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
     let source = p::NodeId::new(0);
     let agg = p::NodeId::new(7);
     let table = p::NodeId::new(u32::MAX);
@@ -222,7 +222,10 @@ fn rich_package() -> p::FragmentPackage {
                 owner: source,
                 lambda_scope: Some(lambda),
                 ty: int(),
-                kind: p::ExprKind::Literal(p::LiteralValue::Int64(42)),
+                kind: p::ExprKind::Constant(p::ConstantReference {
+                    pool: p::ConstantPoolId::new(u32::MAX),
+                    ordinal: 0,
+                }),
             },
         ]
         .into_iter(),
@@ -506,9 +509,25 @@ fn rich_package() -> p::FragmentPackage {
         });
     }
     let claims = p::FrozenFragmentCalls::try_new(&fragment, &uses, claims, &Setup).unwrap();
+    // The lambda body is an actual pool reference, not a legacy literal.
+    let mut pools = p::ConstantPools::empty();
+    pools
+        .insert(
+            p::ConstantPoolId::new(u32::MAX),
+            novarocks_constant_contract::ConstantPool::try_new(
+                Arc::new(Field::new("body", DataType::Int64, false)),
+                int(),
+                Int64Array::from(vec![42]).to_data(),
+                request(Box::default()).constant_policy,
+                CompilePhase::Validate,
+                &Setup,
+            )
+            .unwrap(),
+        )
+        .unwrap();
     p::FragmentPackage::try_new(
         p::FragmentPackageInput {
-            constants: p::ConstantPools::empty(),
+            constants: pools,
             version: p::PlanVersionId::try_new([3; 16]).unwrap(),
             required: p::RequiredContracts {
                 plan_contract_revision: p::PLAN_CONTRACT_REVISION,
@@ -557,7 +576,7 @@ fn rich_package() -> p::FragmentPackage {
     .unwrap()
 }
 
-fn cv_package() -> p::FragmentPackage {
+pub(in crate::physical_package_v2) fn cv_package() -> p::FragmentPackage {
     let source = p::NodeId::new(u32::MAX);
     let pool_id = p::ConstantPoolId::new(u32::MAX);
     let reference = p::ConstantReference {
@@ -817,7 +836,7 @@ fn cv_package() -> p::FragmentPackage {
     )
     .unwrap()
 }
-fn writer_package() -> p::FragmentPackage {
+pub(in crate::physical_package_v2) fn writer_package() -> p::FragmentPackage {
     let provider = c::ConnectorProviderId::parse("iceberg").unwrap();
     let instance = c::ConnectorInstanceId::try_from_canonical("lake").unwrap();
     let catalog = c::CatalogHandle::new(instance.clone(), c::CatalogVersion::from_bytes([7; 32]));
@@ -1394,7 +1413,7 @@ fn actual_scalar_lambda_aggregate_table_and_result_sources_lend_original_roots()
     let out = project(&package, &Control::default(), view_limits(), wide()).unwrap();
     // Two Lambda parameters are recorded once per original definition even
     // though two control-flow invocations use that definition.
-    assert_eq!(out.counts, [0, 5, 3, 2, 4, 1, 2, 0, 4, 0, 0]);
+    assert_eq!(out.counts, [1, 5, 3, 2, 4, 1, 2, 0, 4, 0, 0]);
     assert_eq!(out.requests.entries.len(), 4);
     assert!(out.cuts.inbound.is_empty() && out.cuts.outbound.is_empty());
     let result = package.result().unwrap();
