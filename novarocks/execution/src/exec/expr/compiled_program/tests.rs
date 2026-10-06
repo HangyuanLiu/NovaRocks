@@ -119,7 +119,7 @@ fn options(dop: usize) -> LocalCompileOptions {
 }
 
 #[derive(Clone, Copy)]
-enum SeedMode {
+pub(crate) enum SeedMode {
     Input,
     DirectConstant,
 }
@@ -567,7 +567,7 @@ fn package_with_dictionary(
     )
 }
 
-fn program(mode: SeedMode, twin: bool) -> Arc<LocalProgram> {
+pub(crate) fn program(mode: SeedMode, twin: bool) -> Arc<LocalProgram> {
     let functions = rng_subset();
     let source = package(&functions, mode, twin);
     let providers =
@@ -627,7 +627,7 @@ fn bits(result: SelectedValues<'_>) -> Vec<u64> {
 }
 
 // Independent PCG32 seed expansion + ChaCha12 / rand 0.8.5 oracles.
-const SEED_42_FIRST: u64 = 0x3fe0d98eec6444e4;
+pub(crate) const SEED_42_FIRST: u64 = 0x3fe0d98eec6444e4;
 const SEED_42_SECOND: u64 = 0x3fe15e014267f5aa;
 const SEED_42_THIRD: u64 = 0x3fe45dec0e3bca26;
 const SEED_7_FIRST: u64 = 0x3f9f0b83a5aaa3e0;

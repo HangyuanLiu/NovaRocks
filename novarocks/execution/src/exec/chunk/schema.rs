@@ -371,6 +371,29 @@ impl ChunkSchema {
         )?))
     }
 
+    /// A compiled layout carries each channel's complete type in its Arrow
+    /// Field; there is no separate legacy slot metadata to thaw or guess.
+    pub(crate) fn from_compiled_layout(
+        layout: &novarocks_local_program::StaticLayout,
+    ) -> Result<ChunkSchemaRef, String> {
+        let slots = layout
+            .schema()
+            .fields()
+            .iter()
+            .zip(layout.slots())
+            .map(|(field, slot)| {
+                ChunkSlotSchema::try_new_with_field(*slot, field.as_ref().clone(), None, None)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if slots.len() != layout.schema().fields().len() {
+            return Err("compiled layout slot and field counts differ".to_string());
+        }
+        Ok(Arc::new(Self::try_new_with_schema_metadata(
+            slots,
+            layout.schema().metadata().clone(),
+        )?))
+    }
+
     pub fn try_new(slots: Vec<ChunkSlotSchema>) -> Result<Self, String> {
         Self::try_new_with_schema_metadata(slots, HashMap::new())
     }

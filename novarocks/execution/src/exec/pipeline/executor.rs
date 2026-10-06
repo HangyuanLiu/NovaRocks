@@ -40,7 +40,8 @@ use crate::runtime::runtime_state::RuntimeState;
 use tracing::{info, warn};
 
 use super::builder::{
-    PipelineGraph, build_native_pipeline_graph_for_exec_plan_with_runtime_settings,
+    PipelineGraph, build_compiled_pipeline_graph,
+    build_native_pipeline_graph_for_exec_plan_with_runtime_settings,
     build_native_pipeline_graph_for_local_program_with_runtime_settings,
 };
 use super::dependency::DependencyManager;
@@ -532,6 +533,66 @@ pub(crate) fn prepare_report_neutral_local_program_pipeline_execution(
         terminal_scan_ops,
         exchange_finst_id,
         profiler,
+        pipeline_dop,
+        runtime_state,
+        None,
+        None,
+        None,
+        event_sink,
+        true,
+    )
+}
+
+/// Prepare drivers from one compiled LocalProgram (local-compiler output).
+/// Its expressions run only through compiled roots. The program profile is
+/// authoritative for graph DOP and root sink placement.
+pub(crate) fn prepare_compiled_program_pipeline_execution(
+    program: Arc<novarocks_local_program::LocalProgram>,
+    time_slice: Duration,
+    sink: Box<dyn OperatorFactory>,
+    pipeline_dop: i32,
+    runtime_state: Arc<RuntimeState>,
+    event_sink: Arc<dyn FragmentEventSink>,
+) -> ExecutionResult<PreparedPipelineExecution> {
+    let profile = program.graph().profile();
+    if profile.kernel_abi() != KernelAbiVersion::CURRENT {
+        return Err(format!(
+            "compiled program kernel ABI mismatch: frozen {:?}, runtime {:?}",
+            profile.kernel_abi(),
+            KernelAbiVersion::CURRENT,
+        )
+        .into());
+    }
+    if usize::try_from(pipeline_dop).ok() != Some(profile.pipeline_dop().get()) {
+        return Err(format!(
+            "compiled program profile mismatch: requested dop={pipeline_dop}, frozen dop={}",
+            profile.pipeline_dop(),
+        )
+        .into());
+    }
+    let root_sink_dop = profile
+        .root_sink_dop()
+        .map(|dop| i32::try_from(dop.get()))
+        .transpose()
+        .map_err(|_| "compiled root sink width exceeds i32".to_string())?;
+    let execution_runtime = runtime_state
+        .execution_runtime()
+        .ok_or_else(|| "compiled program execution requires an execution runtime".to_string())?;
+    let graph = build_compiled_pipeline_graph(
+        &program,
+        DependencyManager::new(),
+        pipeline_dop,
+        root_sink_dop,
+        execution_runtime.function_set().clone(),
+        runtime_state.error_state(),
+    )?;
+    prepare_pipeline_execution_from_graph(
+        graph,
+        time_slice,
+        sink,
+        Vec::new(),
+        None,
+        None,
         pipeline_dop,
         runtime_state,
         None,

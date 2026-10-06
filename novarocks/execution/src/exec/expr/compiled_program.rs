@@ -755,7 +755,7 @@ fn gather(
 #[cfg(test)]
 mod row_error_tests;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 mod copy_tests;

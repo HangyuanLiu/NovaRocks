@@ -30,7 +30,9 @@
 
 use std::sync::Arc;
 
+mod compiled;
 mod local;
+pub(crate) use compiled::build_compiled_pipeline_graph;
 pub(crate) use local::build_native_pipeline_graph_for_local_program_with_runtime_settings;
 
 use crate::runtime_filter as execution;
