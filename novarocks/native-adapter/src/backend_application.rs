@@ -22,7 +22,7 @@ use crate::backend_metrics::BackendMetricsRegistry;
 use crate::backend_rpc_service::BackendRpcService;
 use crate::fragment_result_writer::native_result_writer;
 use crate::management_http::MetricsHttpServer;
-use crate::native_transport_capacity::NativeTransportCapacityFactory;
+use crate::native_transport_admission::{NativeTransportAdmission, TransportClass};
 use crate::root_result_session::{RootProducerLimits, RootProducerPool};
 use crate::runtime_filter_ingress::native_runtime_filter_envelope_ingress;
 use crate::runtime_filter_participant::NativeRuntimeFilterParticipantFactory;
@@ -691,32 +691,23 @@ impl BackendApplicationHost {
                 format!("verify backend Native file descriptor baseline: {error}"),
             )
         })?;
-        // Reserve Native connection stock before any root producer can grow.
-        // All application owners receive this one existing process budget.
         let result_retained_budget = novarocks_worker::result_buffer::ResultRetainedBudget::new(
             result_retained_limits.per_process(),
         );
-        let transport_capacity = NativeTransportCapacityFactory::try_new(Arc::clone(
-            &result_retained_budget,
-        ))
-        .map_err(|error| {
+        // One process-wide Native connection admission: physical and handshake
+        // positions per transport class, held outside the HTTP/2 stack.
+        let transport_admission = NativeTransportAdmission::new().map_err(|error| {
             BackendApplicationError::new(
                 BackendApplicationErrorKind::Configuration,
-                format!("compose original Native transport capacity: {error}"),
+                format!("compose Native transport admission: {error}"),
             )
         })?;
         tracing::debug!(
-            reserved_bytes = transport_capacity.reserved_bytes(),
-            connection_pool_bytes = transport_capacity.connection_capacity_bytes(),
-            data_positions = transport_capacity
-                .positions(crate::native_transport_capacity::TransportClass::Data),
-            control_positions = transport_capacity
-                .positions(crate::native_transport_capacity::TransportClass::Control),
-            available_data_positions = transport_capacity
-                .available_positions(crate::native_transport_capacity::TransportClass::Data),
-            available_control_positions = transport_capacity
-                .available_positions(crate::native_transport_capacity::TransportClass::Control),
-            "Prepaid original Native HTTP/2 pool stock"
+            data_positions = transport_admission.positions(TransportClass::Data),
+            control_positions = transport_admission.positions(TransportClass::Control),
+            data_handshakes = transport_admission.handshake_positions(TransportClass::Data),
+            control_handshakes = transport_admission.handshake_positions(TransportClass::Control),
+            "Native transport admission composed"
         );
         // The same process identity signs Native calls and appears in the
         // announce, heartbeat and local execution owners. Bind before channels
@@ -735,11 +726,11 @@ impl BackendApplicationHost {
                 BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
             })?;
         let data_runtime = data_runtime
-            .with_transport_capacity(transport_capacity.clone())
+            .with_transport_admission(transport_admission.clone())
             .map_err(|error| {
                 BackendApplicationError::new(
                     BackendApplicationErrorKind::Configuration,
-                    format!("compose original Native channel cache: {error}"),
+                    format!("compose Native channel cache: {error}"),
                 )
             })?;
         let readiness_runtime = data_runtime.clone();
@@ -873,7 +864,7 @@ impl BackendApplicationHost {
             ),
             control_executor,
         );
-        let mut grpc_server = match NativeRpcServerHandle::start_with_transport_capacity(
+        let mut grpc_server = match NativeRpcServerHandle::start_with_admission(
             &bind_host,
             grpc_port,
             service.clone(),
@@ -885,8 +876,8 @@ impl BackendApplicationHost {
             novarocks_native_adapter::backend_metrics::record_backend_native_authentication_failure,
             novarocks_native_adapter::backend_metrics::record_backend_native_tls_handshake_failure,
             native_ingress,
-            transport_capacity.clone(),
-            crate::native_transport_capacity::TransportClass::Data,
+            transport_admission.clone(),
+            TransportClass::Data,
         ) {
             Ok(server) => server,
             Err(error) => {
@@ -902,7 +893,7 @@ impl BackendApplicationHost {
             }
         };
 
-        let mut control_grpc_server = match NativeRpcServerHandle::start_with_transport_capacity(
+        let mut control_grpc_server = match NativeRpcServerHandle::start_with_admission(
             &bind_host,
             control_grpc_port,
             service,
@@ -914,8 +905,8 @@ impl BackendApplicationHost {
             novarocks_native_adapter::backend_metrics::record_backend_native_authentication_failure,
             novarocks_native_adapter::backend_metrics::record_backend_native_tls_handshake_failure,
             native_ingress,
-            transport_capacity,
-            crate::native_transport_capacity::TransportClass::Control,
+            transport_admission,
+            TransportClass::Control,
         ) {
             Ok(server) => server,
             Err(error) => {
@@ -934,14 +925,8 @@ impl BackendApplicationHost {
         };
 
         for (endpoint, class) in [
-            (
-                readiness_endpoint,
-                crate::native_transport_capacity::TransportClass::Data,
-            ),
-            (
-                control_readiness_endpoint,
-                crate::native_transport_capacity::TransportClass::Control,
-            ),
+            (readiness_endpoint, TransportClass::Data),
+            (control_readiness_endpoint, TransportClass::Control),
         ] {
             if let Err(error) = wait_for_backend_native_endpoint_ready(
                 &readiness_runtime,
@@ -1244,60 +1229,24 @@ mod tests {
     }
 
     #[test]
-    fn short_original_transport_budget_refuses_before_binding_either_listener() {
-        let _serial = LIVE_HOST_TEST.lock().expect("live host test lock");
-        let port = unused_port();
-        let mut config = backend_config(port, port);
-        let metrics_port = config.metrics_http_port;
-        config.result_retained_limits =
-            WorkerResultRetainedLimits::try_new(16 * 1024 * 1024, 32 * 1024 * 1024)
-                .expect("valid deliberately short original budget");
-        let error = BackendApplicationHost::open(config, test_data_runtime())
-            .expect_err("startup must refuse an unfunded original transport stock");
-        assert_eq!(error.kind(), BackendApplicationErrorKind::Configuration);
-        assert!(
-            error
-                .to_string()
-                .contains("compose original Native transport capacity")
-        );
-        let _native = TcpListener::bind(("127.0.0.1", port))
-            .expect("capacity refusal must precede Native listener bind");
-        let _metrics = TcpListener::bind(("127.0.0.1", metrics_port))
-            .expect("capacity refusal must precede management listener bind");
-    }
-
-    #[test]
-    fn installing_original_capacity_creates_a_new_channel_cache_generation() {
+    fn installing_transport_admission_creates_a_new_channel_cache_generation() {
         let original = test_data_runtime();
+        let admission = crate::native_transport_admission::NativeTransportAdmission::new().unwrap();
+        let admitted = original.with_transport_admission(admission).unwrap();
+        assert!(original.transport_admission().is_none());
+        assert!(admitted.transport_admission().is_some());
+        assert!(!original.channels().same_cache(admitted.channels()));
         let endpoint = NativeEndpoint::from_host_port("127.0.0.1", unused_port()).unwrap();
-        let channel = original.block_on(async {
-            tonic::transport::Endpoint::from_shared(format!("http://{endpoint}"))
-                .unwrap()
-                .connect_lazy()
-        });
         let key = crate::native_client::NativeChannelKey::membership(endpoint);
-        original.channels().legacy_insert(key.clone(), channel);
-        let bytes = crate::native_transport_capacity::NativeTransportCapacityFactory::allocation_capacity_bound().unwrap();
-        let budget = novarocks_worker::result_buffer::ResultRetainedBudget::new(
-            std::num::NonZeroUsize::new(bytes).unwrap(),
-        );
-        let capacity =
-            crate::native_transport_capacity::NativeTransportCapacityFactory::try_new(budget)
-                .unwrap();
-        let funded = original.with_transport_capacity(capacity).unwrap();
-        assert!(original.channels().legacy_get(&key).is_some());
-        funded.block_on(async {
+        admitted.block_on(async {
             assert!(matches!(
-                funded
+                admitted
                     .channels()
                     .acquire(key.inline_identity().unwrap())
                     .await,
                 Ok(crate::native_channel_cache::Election::Leader(_))
             ));
         });
-        assert!(!original.channels().same_cache(funded.channels()));
-        assert!(funded.transport_capacity().is_some());
-        original.channels().remove(&key);
     }
 
     async fn connect_live_channel(grpc_port: u16) -> tonic::transport::Channel {

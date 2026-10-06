@@ -28,8 +28,7 @@ mod error;
 mod transport;
 
 pub use adapter::{
-    BoxedNativeIo, NativeEndpointConnector, NativeIncomingAdapter, NativeIo, NativeIoDirection,
-    OwnedNativeIo, native_io_box_layout,
+    BoxedNativeIo, NativeEndpointConnector, NativeIncomingAdapter, NativeIo, OwnedNativeIo,
 };
 pub use auth::{
     AuthenticatedNativeCaller, ManualClock, NativeCallerSubject, NativeClientAuthInterceptor,

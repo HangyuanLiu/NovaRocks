@@ -37,14 +37,13 @@ use tonic::{Code, Status};
 use tower::{Service, ServiceExt};
 
 use crate::backend_metrics;
-use crate::native_response::{NativeResponseHeaders, respond_from_request};
 use crate::native_server::NativeIngressConfig;
 
 const LOCAL_ENTRY_CAP: Duration = Duration::from_secs(300);
 const GRPC_FRAME_HEADER_BYTES: usize = 5;
 
 fn ingress_capacity_status(detail: &'static str, reason: &'static str) -> Status {
-    let mut status = Status::from_static(Code::ResourceExhausted, detail);
+    let mut status = Status::new(Code::ResourceExhausted, detail);
     status.metadata_mut().insert(
         "x-novarocks-ingress-rejection",
         tonic::metadata::MetadataValue::from_static(reason),
@@ -61,16 +60,20 @@ struct IngressFailure {
 impl IngressFailure {
     fn capacity(detail: &'static str, reason: &'static str) -> Self {
         Self {
-            status: Status::from_static(Code::ResourceExhausted, detail),
+            status: Status::new(Code::ResourceExhausted, detail),
             reason: Some(reason),
         }
     }
 
-    fn respond(self, headers: NativeResponseHeaders) -> Response<tonic::body::BoxBody> {
-        match self.reason {
-            Some(reason) => headers.respond_with_static_reason(self.status, reason),
-            None => headers.respond(self.status),
+    fn into_http(self) -> Response<tonic::body::BoxBody> {
+        let mut status = self.status;
+        if let Some(reason) = self.reason {
+            status.metadata_mut().insert(
+                "x-novarocks-ingress-rejection",
+                tonic::metadata::MetadataValue::from_static(reason),
+            );
         }
+        status.into_http()
     }
 }
 
@@ -160,7 +163,7 @@ impl Gate {
     async fn acquire(&self, deadline: Instant) -> Result<RunningPermit, IngressFailure> {
         if Instant::now() >= deadline {
             self.reject("waiting_deadline");
-            return Err(Status::from_static(
+            return Err(Status::new(
                 Code::DeadlineExceeded,
                 "native ingress deadline elapsed",
             )
@@ -169,7 +172,7 @@ impl Gate {
         if let Ok(permit) = Arc::clone(&self.running).try_acquire_owned() {
             if Instant::now() >= deadline {
                 self.reject("waiting_deadline");
-                return Err(Status::from_static(
+                return Err(Status::new(
                     Code::DeadlineExceeded,
                     "native ingress deadline elapsed",
                 )
@@ -190,18 +193,18 @@ impl Gate {
                 .await
                 .map_err(|_| {
                     self.reject("waiting_deadline");
-                    Status::from_static(
+                    Status::new(
                         Code::DeadlineExceeded,
                         "native ingress waiting deadline elapsed",
                     )
                 })?
                 .map_err(|_| {
                     self.reject("closed");
-                    Status::from_static(Code::Unavailable, "native ingress admission closed")
+                    Status::new(Code::Unavailable, "native ingress admission closed")
                 })?;
         if Instant::now() >= deadline {
             self.reject("waiting_deadline");
-            return Err(Status::from_static(
+            return Err(Status::new(
                 Code::DeadlineExceeded,
                 "native ingress deadline elapsed",
             )
@@ -396,13 +399,12 @@ where
         let Some(method) = NativeRpcMethod::from_path(request.uri().path())
             .filter(|method| method.is_allowed_at(self.domain))
         else {
-            let response = respond_from_request(
-                request,
-                Status::from_static(
-                    Code::Unimplemented,
-                    "native RPC method is unavailable on this endpoint",
-                ),
-            );
+            drop(request);
+            let response = Status::new(
+                Code::Unimplemented,
+                "native RPC method is unavailable on this endpoint",
+            )
+            .into_http();
             return Box::pin(async move { Ok(response) });
         };
         if self.domain == NativeEndpointDomain::FrontendMembership {
@@ -415,15 +417,6 @@ where
         // returned future immediately, and that delay consumes the request's
         // original ingress deadline, including response capacity preparation.
         let arrival = Instant::now();
-        // Acquire one original error position before any gate wait or decoder
-        // work. Timeout may cancel a future that already owns the input map.
-        let error_headers = match NativeResponseHeaders::prepare(&request) {
-            Ok(headers) => headers,
-            Err(status) => {
-                let response = respond_from_request(request, status);
-                return Box::pin(async move { Ok(response) });
-            }
-        };
         let class = self.classify(method);
         let gate = match class {
             MethodClass::Control => self.control.clone(),
@@ -440,12 +433,12 @@ where
                 Ok(deadline) => deadline,
                 Err(status) => {
                     gate.reject("invalid_deadline");
-                    return Ok(error_headers.respond(status));
+                    return Ok(status.into_http());
                 }
             };
             let permit = match gate.acquire(deadline).await {
                 Ok(permit) => permit,
-                Err(failure) => return Ok(failure.respond(error_headers)),
+                Err(failure) => return Ok(failure.into_http()),
             };
             let ownership = Arc::new(NativeIngressOwnership {
                 _permit: permit,
@@ -460,10 +453,10 @@ where
             let mut request = request;
             if let Some(limit) = body_limit {
                 let Some(total_limit) = limit.checked_add(GRPC_FRAME_HEADER_BYTES) else {
-                    return Ok(error_headers.respond(Status::from_static(
+                    return Ok(Status::new(
                         Code::Internal,
                         "native ingress frame limit overflow",
-                    )));
+                    ).into_http());
                 };
                 if request
                     .headers()
@@ -473,13 +466,11 @@ where
                     .is_some_and(|length| length > total_limit)
                 {
                     gate.reject("body_limit");
-                    return Ok(error_headers.respond_with_static_reason(
-                        Status::from_static(
-                            Code::ResourceExhausted,
-                            "native request body exceeds method limit",
-                        ),
+                    return Ok(IngressFailure::capacity(
+                        "native request body exceeds method limit",
                         "body_limit",
-                    ));
+                    )
+                    .into_http());
                 }
                 let (parts, body) = request.into_parts();
                 request = Request::from_parts(
@@ -503,10 +494,10 @@ where
                 Ok(result) => result?,
                 Err(_) => {
                     gate.reject("running_deadline");
-                    return Ok(error_headers.respond(Status::from_static(
+                    return Ok(Status::new(
                         Code::DeadlineExceeded,
                         "native ingress deadline elapsed",
-                    )));
+                    ).into_http());
                 }
             };
             if class == MethodClass::Stream {
@@ -532,14 +523,14 @@ fn entry_deadline(headers: &axum::http::HeaderMap, arrival: Instant) -> Result<I
         (None, None) => LOCAL_ENTRY_CAP,
         (Some(value), None) => parse_grpc_timeout(value)?.min(LOCAL_ENTRY_CAP),
         _ => {
-            return Err(Status::from_static(
+            return Err(Status::new(
                 Code::InvalidArgument,
                 "duplicate grpc-timeout header",
             ));
         }
     };
     arrival.checked_add(timeout).ok_or_else(|| {
-        Status::from_static(
+        Status::new(
             Code::InvalidArgument,
             "grpc-timeout exceeds local time range",
         )
@@ -549,23 +540,23 @@ fn entry_deadline(headers: &axum::http::HeaderMap, arrival: Instant) -> Result<I
 fn parse_grpc_timeout(value: &axum::http::HeaderValue) -> Result<Duration, Status> {
     let text = value
         .to_str()
-        .map_err(|_| Status::from_static(Code::InvalidArgument, "invalid grpc-timeout header"))?;
+        .map_err(|_| Status::new(Code::InvalidArgument, "invalid grpc-timeout header"))?;
     if !(2..=9).contains(&text.len()) {
-        return Err(Status::from_static(
+        return Err(Status::new(
             Code::InvalidArgument,
             "invalid grpc-timeout header",
         ));
     }
     let (digits, unit) = text.split_at(text.len() - 1);
     if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(Status::from_static(
+        return Err(Status::new(
             Code::InvalidArgument,
             "invalid grpc-timeout header",
         ));
     }
     let amount = digits
         .parse::<u64>()
-        .map_err(|_| Status::from_static(Code::InvalidArgument, "invalid grpc-timeout header"))?;
+        .map_err(|_| Status::new(Code::InvalidArgument, "invalid grpc-timeout header"))?;
     let nanos = match unit {
         "H" => 3_600_000_000_000_u64,
         "M" => 60_000_000_000_u64,
@@ -574,7 +565,7 @@ fn parse_grpc_timeout(value: &axum::http::HeaderValue) -> Result<Duration, Statu
         "u" => 1_000_u64,
         "n" => 1_u64,
         _ => {
-            return Err(Status::from_static(
+            return Err(Status::new(
                 Code::InvalidArgument,
                 "invalid grpc-timeout header",
             ));
@@ -582,7 +573,7 @@ fn parse_grpc_timeout(value: &axum::http::HeaderValue) -> Result<Duration, Statu
     };
     let duration = amount
         .checked_mul(nanos)
-        .ok_or_else(|| Status::from_static(Code::InvalidArgument, "grpc-timeout is too large"))?;
+        .ok_or_else(|| Status::new(Code::InvalidArgument, "grpc-timeout is too large"))?;
     Ok(Duration::from_nanos(duration))
 }
 

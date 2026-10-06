@@ -11,12 +11,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Original fixed channel-cache metadata and bounded single-flight waiters.
-//! Channels, executor tasks and their physical connection families keep their
-//! separate original owners. StockCore never retains this cache or a Channel.
+//! Bounded single-flight cache of outgoing Native channels.
+//!
+//! One row per peer process, endpoint and method lane. The first caller for a
+//! key becomes the leader that dials; at most `WAITERS` other callers wait for
+//! it, and the next one is refused rather than queued. A Ready row may be
+//! evicted only when nobody waits on it; eviction drops the cache's Channel
+//! alias, while escaped Channels and their connections keep their own owners.
 
-use std::alloc::Layout;
-use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -28,13 +30,11 @@ use novarocks_execution_contract::native_result_support::NativeResultSupportGeom
 use tonic::transport::Channel;
 
 use crate::native_channel_identity::InlineNativeChannelIdentity;
-use crate::native_channel_worker_capacity::{CacheEpoch, NativeChannelWorkerToken};
-use crate::native_client::NativeChannelKey;
-use crate::native_transport_capacity::NativeTransportCapacityFactory;
 
 const WAITERS: usize =
     NativeResultSupportGeometry::V1.transport_tonic_pending_per_connection as usize;
 
+/// Rows cover every legal peer lane with its connecting and closing headroom.
 pub(crate) fn entry_positions() -> io::Result<usize> {
     let g = NativeResultSupportGeometry::V1;
     let backends = usize::try_from(g.transport_maximum_live_backends).map_err(|_| invalid())?;
@@ -84,8 +84,6 @@ struct Entry {
     generation: u64,
     phase: Phase,
     waiters: [Waiter; WAITERS],
-    // Channel and waiter owners exit before the row's attachment is retired.
-    worker: Option<EntryWorker>,
 }
 
 impl Entry {
@@ -99,7 +97,6 @@ impl Entry {
                 occupied: false,
                 waker: None,
             }),
-            worker: None,
         }
     }
     fn reusable(&self) -> bool {
@@ -112,139 +109,35 @@ impl Entry {
     }
 }
 
-enum State {
-    Legacy(HashMap<NativeChannelKey, Channel>),
-    Bounded(Vec<Entry>),
-}
-
-struct EntryWorker {
-    factory: NativeTransportCapacityFactory,
-    token: NativeChannelWorkerToken,
-}
-impl Drop for EntryWorker {
-    fn drop(&mut self) {
-        self.factory.detach_channel_worker(self.token);
-    }
-}
-
-struct CacheExit {
-    factory: NativeTransportCapacityFactory,
-    epoch: CacheEpoch,
-}
-impl Drop for CacheExit {
-    fn drop(&mut self) {
-        self.factory.release_channel_cache(self.epoch);
-    }
-}
 
 struct Core {
-    state: Mutex<State>,
+    state: Mutex<Vec<Entry>>,
     eviction_cursor: AtomicUsize,
-    // Mutex/PAL, fixed Vec, every Channel and waiter exit before this owner.
-    original: Option<CacheExit>,
 }
 
+#[derive(Clone)]
 pub(crate) struct NativeChannelCache {
-    core: Option<Arc<Core>>,
-}
-
-impl Clone for NativeChannelCache {
-    fn clone(&self) -> Self {
-        Self {
-            core: Some(Arc::clone(self.core())),
-        }
-    }
-}
-impl Drop for NativeChannelCache {
-    fn drop(&mut self) {
-        drop(Arc::into_inner(
-            self.core.take().expect("live channel-cache handle"),
-        ));
-    }
+    core: Arc<Core>,
 }
 
 impl NativeChannelCache {
     fn core(&self) -> &Arc<Core> {
-        self.core.as_ref().expect("live channel-cache handle")
+        &self.core
     }
 
-    pub(crate) fn allocation_capacity_bound() -> io::Result<usize> {
-        let arc = Layout::new::<[AtomicUsize; 2]>()
-            .extend(Layout::new::<Core>())
-            .map_err(|_| invalid())?
-            .0
-            .pad_to_align()
-            .size();
-        let entries = Layout::array::<Entry>(entry_positions()?)
-            .map_err(|_| invalid())?
-            .size();
-        // Pinned std uses one lazy pthread Box on Darwin, and inline futex
-        // state on the supported Linux targets. Construction prewarms before
-        // publication, so concurrent first lockers cannot allocate extra Boxes.
-        #[cfg(target_os = "macos")]
-        let pal = Layout::new::<libc::pthread_mutex_t>().size();
-        #[cfg(all(target_os = "linux", target_has_atomic = "32"))]
-        let pal = 0;
-        #[cfg(not(any(
-            target_os = "macos",
-            all(target_os = "linux", target_has_atomic = "32")
-        )))]
-        return Err(io::ErrorKind::Unsupported.into());
-        #[cfg(any(
-            target_os = "macos",
-            all(target_os = "linux", target_has_atomic = "32")
-        ))]
-        arc.checked_add(entries)
-            .and_then(|n| n.checked_add(pal))
-            .ok_or_else(invalid)
-    }
-
-    pub(crate) fn legacy() -> Self {
-        Self {
-            core: Some(Arc::new(Core {
-                state: Mutex::new(State::Legacy(HashMap::new())),
-                eviction_cursor: AtomicUsize::new(0),
-                original: None,
-            })),
-        }
-    }
-
-    pub(crate) fn bounded(factory: NativeTransportCapacityFactory) -> io::Result<Self> {
-        let epoch = factory.claim_channel_cache()?;
-        let original = CacheExit { factory, epoch };
+    pub(crate) fn bounded() -> io::Result<Self> {
         let count = entry_positions()?;
         let mut entries = Vec::new();
         entries
             .try_reserve_exact(count)
             .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
         entries.resize_with(count, Entry::vacant);
-        let core = Core {
-            state: Mutex::new(State::Bounded(entries)),
-            eviction_cursor: AtomicUsize::new(0),
-            original: Some(original),
-        };
-        drop(core.state.lock().expect("unpublished channel-cache mutex"));
         Ok(Self {
-            core: Some(Arc::new(core)),
+            core: Arc::new(Core {
+                state: Mutex::new(entries),
+                eviction_cursor: AtomicUsize::new(0),
+            }),
         })
-    }
-
-    pub(crate) fn is_bounded(&self) -> bool {
-        self.core().original.is_some()
-    }
-
-    pub(crate) fn transient_original_channel_worker(
-        &self,
-    ) -> io::Result<Option<tonic::transport::OriginalChannelWorker>> {
-        self.core()
-            .original
-            .as_ref()
-            .map(|original| {
-                original
-                    .factory
-                    .try_transient_channel_worker(original.epoch)
-            })
-            .transpose()
     }
 
     #[cfg(test)]
@@ -252,43 +145,17 @@ impl NativeChannelCache {
         Arc::ptr_eq(self.core(), other.core())
     }
 
-    pub(crate) fn legacy_get(&self, key: &NativeChannelKey) -> Option<Channel> {
-        match &*self.core().state.lock().expect("channel-cache lock") {
-            State::Legacy(entries) => entries.get(key).cloned(),
-            State::Bounded(_) => None,
-        }
-    }
-
-    pub(crate) fn legacy_insert(&self, key: NativeChannelKey, channel: Channel) {
-        let retired = match &mut *self.core().state.lock().expect("channel-cache lock") {
-            State::Legacy(entries) => entries.insert(key, channel),
-            State::Bounded(_) => panic!("bounded cache requires its exact election token"),
-        };
-        drop(retired);
-    }
-
     #[cfg(test)]
-    pub(crate) fn remove(&self, key: &NativeChannelKey) -> Option<Channel> {
-        let mut retired_worker = None;
+    pub(crate) fn remove(&self, identity: InlineNativeChannelIdentity) -> Option<Channel> {
         let mut state = self.core().state.lock().expect("channel-cache lock");
-        let channel = match &mut *state {
-            State::Legacy(entries) => entries.remove(key),
-            State::Bounded(entries) => {
-                let identity = key.inline_identity().ok()?;
-                let entry = entries.iter_mut().find(|e| e.identity == Some(identity))?;
-                if !matches!(entry.phase, Phase::Ready(_)) {
-                    return None;
-                }
-                retired_worker = entry.worker.take();
-                match std::mem::replace(&mut entry.phase, Phase::Vacant) {
-                    Phase::Ready(channel) => Some(channel),
-                    _ => unreachable!(),
-                }
-            }
-        };
-        drop(state);
-        drop(retired_worker);
-        channel
+        let entry = state.iter_mut().find(|e| e.identity == Some(identity))?;
+        if !matches!(entry.phase, Phase::Ready(_)) {
+            return None;
+        }
+        match std::mem::replace(&mut entry.phase, Phase::Vacant) {
+            Phase::Ready(channel) => Some(channel),
+            _ => unreachable!(),
+        }
     }
 
     pub(crate) fn acquire(&self, identity: InlineNativeChannelIdentity) -> Acquire {
@@ -326,9 +193,7 @@ impl Acquire {
         };
         let retired = {
             let mut state = self.cache.core().state.lock().expect("channel-cache lock");
-            let State::Bounded(entries) = &mut *state else {
-                return;
-            };
+            let entries = &mut *state;
             let waiter = &mut entries[registration.entry].waiters[registration.waiter];
             if waiter.occupied && waiter.generation == registration.waiter_generation {
                 waiter.occupied = false;
@@ -355,12 +220,9 @@ impl Future for Acquire {
         let mut incoming = Some(cx.waker().clone());
         let mut retired = None;
         let mut retired_channel = None;
-        let mut retired_worker = None;
         let outcome = {
             let mut state = me.cache.core().state.lock().expect("channel-cache lock");
-            let State::Bounded(entries) = &mut *state else {
-                return Poll::Ready(Err(invalid()));
-            };
+            let entries = &mut *state;
             if let Some(registration) = me.registration {
                 let entry = &mut entries[registration.entry];
                 if entry.generation != registration.entry_generation {
@@ -438,7 +300,6 @@ impl Future for Acquire {
                         {
                             retired_channel = Some(channel);
                         }
-                        retired_worker = entry.worker.take();
                         entry.generation += 1;
                         entry.identity = Some(me.identity);
                         me.cache
@@ -459,7 +320,6 @@ impl Future for Acquire {
         drop(retired);
         drop(incoming);
         drop(retired_channel);
-        drop(retired_worker);
         if outcome.is_ready() {
             me.unregister();
         }
@@ -471,10 +331,6 @@ impl Future for Acquire {
 #[path = "native_channel_cache_tests.rs"]
 mod tests;
 
-#[cfg(test)]
-#[path = "native_channel_cache_worker_tests.rs"]
-mod worker_tests;
-
 pub(crate) struct Leader {
     cache: NativeChannelCache,
     entry: usize,
@@ -483,55 +339,10 @@ pub(crate) struct Leader {
 }
 
 impl Leader {
-    /// Claim a logical Worker before connector construction. Reconnects on the
-    /// resulting Channel keep this position rather than claiming new workers.
-    pub(crate) fn original_channel_worker(
-        &mut self,
-    ) -> io::Result<tonic::transport::OriginalChannelWorker> {
-        {
-            let state = self.cache.core().state.lock().expect("channel-cache lock");
-            let State::Bounded(entries) = &*state else {
-                return Err(invalid());
-            };
-            let entry = &entries[self.entry];
-            if entry.generation != self.generation
-                || !matches!(entry.phase, Phase::Connecting)
-                || entry.worker.is_some()
-            {
-                return Err(invalid());
-            }
-        }
-        let original = self.cache.core().original.as_ref().ok_or_else(invalid)?;
-        let (worker, token) = original
-            .factory
-            .try_channel_worker(original.epoch, self.generation)?;
-        let attachment = EntryWorker {
-            factory: original.factory.clone(),
-            token,
-        };
-        {
-            let mut state = self.cache.core().state.lock().expect("channel-cache lock");
-            let State::Bounded(entries) = &mut *state else {
-                return Err(invalid());
-            };
-            let entry = &mut entries[self.entry];
-            if entry.generation != self.generation
-                || !matches!(entry.phase, Phase::Connecting)
-                || entry.worker.is_some()
-            {
-                return Err(invalid());
-            }
-            entry.worker = Some(attachment);
-        }
-        Ok(worker)
-    }
-
     pub(crate) fn publish(mut self, channel: Channel) -> io::Result<()> {
         let notifications = {
             let mut state = self.cache.core().state.lock().expect("channel-cache lock");
-            let State::Bounded(entries) = &mut *state else {
-                return Err(invalid());
-            };
+            let entries = &mut *state;
             let entry = &mut entries[self.entry];
             if entry.generation != self.generation || !matches!(entry.phase, Phase::Connecting) {
                 return Err(invalid());
@@ -550,19 +361,16 @@ impl Drop for Leader {
         if self.completed {
             return;
         }
-        let (notifications, retired_worker) = {
+        let notifications = {
             let mut state = self.cache.core().state.lock().expect("channel-cache lock");
-            let State::Bounded(entries) = &mut *state else {
-                return;
-            };
+            let entries = &mut *state;
             let entry = &mut entries[self.entry];
             if entry.generation != self.generation || !matches!(entry.phase, Phase::Connecting) {
                 return;
             }
             entry.phase = Phase::Failed;
-            (entry.notifications(), entry.worker.take())
+            entry.notifications()
         };
-        drop(retired_worker);
         notify(notifications);
     }
 }

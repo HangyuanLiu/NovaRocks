@@ -34,7 +34,7 @@ use tower::service_fn;
 
 use crate::BackendDataRuntime;
 use crate::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
-use crate::native_transport_capacity::TransportClass;
+use crate::native_transport_admission::TransportClass;
 
 const GRPC_MAX_MESSAGE_BYTES: usize =
     novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;
@@ -276,62 +276,87 @@ fn channel_endpoint(
     format!("http://{endpoint}").parse()
 }
 
-/// Produce a factory-backed endpoint, not a reusable once-bound config.
-/// Every reconnect obtains new pools before its connector performs TCP/TLS I/O.
-pub(crate) fn capacity_endpoint(
+/// Endpoint settings for an outgoing Native connection. An admitted runtime
+/// applies the frozen public HTTP/2 limits; the counts and per-item sizes they
+/// set bound what Hyper/H2 allocate, and the transport measurement gate covers
+/// the rest (spec v6 §5.9).
+pub(crate) fn native_endpoint(
     runtime: &BackendDataRuntime,
     endpoint: &NativeEndpoint,
-    class: TransportClass,
-) -> Result<tonic::transport::Endpoint, String> {
-    capacity_endpoint_inner(runtime, endpoint, class, None)
-}
-
-pub(crate) fn capacity_endpoint_for_key(
-    runtime: &BackendDataRuntime,
-    key: &NativeChannelKey,
-    class: TransportClass,
-) -> Result<tonic::transport::Endpoint, String> {
-    let identity = key
-        .inline_identity()
-        .map_err(|error| format!("Native channel identity refused: {error}"))?;
-    capacity_endpoint_inner(runtime, &key.endpoint, class, Some(identity))
-}
-
-fn capacity_endpoint_inner(
-    runtime: &BackendDataRuntime,
-    endpoint: &NativeEndpoint,
-    class: TransportClass,
-    key: Option<crate::native_channel_identity::InlineNativeChannelIdentity>,
 ) -> Result<tonic::transport::Endpoint, String> {
     let endpoint = channel_endpoint(endpoint)
         .map_err(|error| format!("invalid endpoint: {error}"))?
         .tcp_keepalive(Some(Duration::from_secs(60)));
-    match runtime.transport_capacity() {
-        Some(factory) => {
-            let factory = factory.clone();
-            let profile = novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1;
-            Ok(endpoint
-                .connect_timeout(Duration::from_millis(profile.transport_connect_deadline_ms))
-                .http2_adaptive_window(profile.transport_h2_adaptive_window)
-                .initial_stream_window_size(Some(
-                    profile.transport_h2_stream_receive_window_bytes as u32,
-                ))
-                .initial_connection_window_size(Some(
-                    profile.transport_h2_connection_receive_window_bytes as u32,
-                ))
-                .http2_max_header_list_size(profile.transport_h2_header_bytes as u32)
-                .buffer_size(profile.transport_tonic_pending_per_connection as usize)
-                .http2_connection_factory(move || match key {
-                    Some(key) => factory.try_config_for_key(class, key),
-                    None => factory.try_config(class),
-                }))
-        }
-        None => Ok(endpoint
+    if runtime.transport_admission().is_some() {
+        let profile =
+            novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1;
+        Ok(endpoint
+            .connect_timeout(Duration::from_millis(profile.transport_connect_deadline_ms))
+            .http2_adaptive_window(profile.transport_h2_adaptive_window)
+            .initial_stream_window_size(Some(
+                profile.transport_h2_stream_receive_window_bytes as u32,
+            ))
+            .initial_connection_window_size(Some(
+                profile.transport_h2_connection_receive_window_bytes as u32,
+            ))
+            .http2_max_header_list_size(profile.transport_h2_header_bytes as u32)
+            .buffer_size(profile.transport_tonic_pending_per_connection as usize)
+            .concurrency_limit(profile.transport_streams_per_connection as usize))
+    } else {
+        Ok(endpoint
             .connect_timeout(Duration::from_secs(10))
             .http2_adaptive_window(true)
             .initial_stream_window_size(Some(32 * 1024 * 1024))
-            .initial_connection_window_size(Some(128 * 1024 * 1024))),
+            .initial_connection_window_size(Some(128 * 1024 * 1024)))
     }
+}
+
+/// The transport connector, preceded by this runtime's dial admission. The
+/// admission is taken again on every attempt, including Tonic's internal
+/// reconnect; a refused attempt opens no socket, and the physical position of
+/// an established connection follows its IO until the IO is dropped.
+pub(crate) fn admitted_connector(
+    runtime: &BackendDataRuntime,
+    endpoint: &NativeEndpoint,
+    class: TransportClass,
+    key: Option<crate::native_channel_identity::InlineNativeChannelIdentity>,
+) -> Result<
+    impl tower::Service<
+        tonic::codegen::http::Uri,
+        Response = TokioIo<novarocks_native_trust::BoxedNativeIo>,
+        Error = io::Error,
+        Future = impl Send,
+    > + Clone
+    + Send
+    + 'static,
+    String,
+> {
+    let connector = runtime.native_transport().connector_for(endpoint.clone())?;
+    let admission = runtime.transport_admission().cloned();
+    Ok(service_fn(move |_| {
+        let connector = connector.clone();
+        let admission = admission.clone();
+        async move {
+            let dial = admission
+                .as_ref()
+                .map(|admission| admission.try_dial(class, key))
+                .transpose()
+                .map_err(|error| {
+                    io::Error::new(error.kind(), "native dial admission refused")
+                })?;
+            let io = connector.connect().await.map_err(|failure| {
+                io::Error::other(format!("native transport connector failed: {failure}"))
+            })?;
+            let io: novarocks_native_trust::BoxedNativeIo = match dial {
+                Some(dial) => Box::new(novarocks_native_trust::OwnedNativeIo::with_guard(
+                    io,
+                    dial.established()?,
+                )),
+                None => io,
+            };
+            Ok(TokioIo::new(io))
+        }
+    }))
 }
 
 fn client_from_channel(channel: Channel, trust: &NativeTrust) -> AuthenticatedNovaRocksGrpcClient {
@@ -344,62 +369,28 @@ async fn get_or_create_channel(
     runtime: &BackendDataRuntime,
     key: NativeChannelKey,
 ) -> Result<Channel, String> {
-    let mut leader = if runtime.channels().is_bounded() {
-        let identity = key
-            .inline_identity()
-            .map_err(|error| format!("Native channel identity refused: {error}"))?;
-        match runtime
-            .channels()
-            .acquire(identity)
-            .await
-            .map_err(|error| format!("Native channel election refused: {error}"))?
-        {
-            crate::native_channel_cache::Election::Ready(channel) => return Ok(channel),
-            crate::native_channel_cache::Election::Leader(leader) => Some(leader),
-        }
-    } else {
-        if let Some(channel) = runtime.channels().legacy_get(&key) {
-            return Ok(channel);
-        }
-        None
+    let identity = key
+        .inline_identity()
+        .map_err(|error| format!("Native channel identity refused: {error}"))?;
+    let leader = match runtime
+        .channels()
+        .acquire(identity)
+        .await
+        .map_err(|error| format!("Native channel election refused: {error}"))?
+    {
+        crate::native_channel_cache::Election::Ready(channel) => return Ok(channel),
+        crate::native_channel_cache::Election::Leader(leader) => leader,
     };
-    let original_worker = leader
-        .as_mut()
-        .map(|leader| leader.original_channel_worker())
-        .transpose()
-        .map_err(|error| format!("Native channel Worker election refused: {error}"))?;
-    let connector = runtime
-        .native_transport()
-        .connector_for(key.endpoint.clone())?;
-    let connector = service_fn(move |_| {
-        let connector = connector.clone();
-        async move {
-            connector
-                .connect()
-                .await
-                .map(TokioIo::new)
-                .map_err(|failure| {
-                    io::Error::other(format!("native transport connector failed: {failure}"))
-                })
-        }
-    });
-    let endpoint = capacity_endpoint_for_key(runtime, &key, TransportClass::Data)?
-        .timeout(Duration::from_secs(600));
-    let channel = match original_worker {
-        Some(worker) => {
-            endpoint
-                .connect_with_connector_and_original_worker(connector, worker)
-                .await
-        }
-        None => endpoint.connect_with_connector(connector).await,
-    }
-    .map_err(|error| format!("connect exchange endpoint failed: {error}"))?;
-    match leader {
-        Some(leader) => leader
-            .publish(channel.clone())
-            .map_err(|error| format!("Native channel publication refused: {error}"))?,
-        None => runtime.channels().legacy_insert(key, channel.clone()),
-    }
+    let connector =
+        admitted_connector(runtime, &key.endpoint, TransportClass::Data, Some(identity))?;
+    let channel = native_endpoint(runtime, &key.endpoint)?
+        .timeout(Duration::from_secs(600))
+        .connect_with_connector(connector)
+        .await
+        .map_err(|error| format!("connect exchange endpoint failed: {error}"))?;
+    leader
+        .publish(channel.clone())
+        .map_err(|error| format!("Native channel publication refused: {error}"))?;
     Ok(channel)
 }
 

@@ -15,33 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Actual fixed cache metadata, election, notification and original-owner tests.
-//! Lazy Channels are publication values only: their tasks and connection graph
-//! are outside this metadata fixture's original funding and IO claims.
+//! Fixed cache rows, single-flight election and notification tests.
+//! Lazy Channels are publication values only: their tasks and connections are
+//! outside this fixture.
 
 use super::*;
-use novarocks_execution::runtime::fragment::io::ResultWriteAdmission;
 use novarocks_proto_codec::native_rpc::NativeRpcMethod;
 use novarocks_types::{BackendProcessId, NativeEndpoint};
-use novarocks_worker::result_buffer::ResultRetainedBudget;
 use std::mem::ManuallyDrop;
-use std::num::NonZeroUsize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Weak;
 use std::sync::atomic::Ordering;
 use std::task::{RawWaker, RawWakerVTable, Wake};
 
-fn fixture() -> (
-    NativeChannelCache,
-    NativeTransportCapacityFactory,
-    Arc<ResultRetainedBudget>,
-    usize,
-) {
-    let bytes = NativeTransportCapacityFactory::allocation_capacity_bound().unwrap();
-    let budget = ResultRetainedBudget::new(NonZeroUsize::new(bytes).unwrap());
-    let factory = NativeTransportCapacityFactory::try_new(budget.clone()).unwrap();
-    let cache = NativeChannelCache::bounded(factory.clone()).unwrap();
-    (cache, factory, budget, bytes)
+fn fixture() -> (NativeChannelCache, (), (), ()) {
+    (NativeChannelCache::bounded().unwrap(), (), (), ())
 }
 
 fn identity(suffix: u8, port: u16, method: NativeRpcMethod) -> InlineNativeChannelIdentity {
@@ -72,19 +60,7 @@ fn assert_error(outcome: Poll<io::Result<Election>>, expected: io::ErrorKind) {
     }
 }
 
-fn held(budget: &Arc<ResultRetainedBudget>, bytes: usize) {
-    assert!(matches!(
-        budget.try_reserve_process(bytes).unwrap(),
-        ResultWriteAdmission::Blocked
-    ));
-}
 
-fn returned(budget: &Arc<ResultRetainedBudget>, bytes: usize) {
-    let ResultWriteAdmission::Granted(credit) = budget.try_reserve_process(bytes).unwrap() else {
-        panic!("final original cache owner must return the complete stock grant");
-    };
-    drop(credit);
-}
 
 struct WakeCount {
     calls: AtomicUsize,
@@ -225,9 +201,7 @@ fn exhausted_entry_and_waiter_generations_refuse_without_wrapping() {
     let leader = elect(&cache, key);
     {
         let mut state = cache.core().state.lock().unwrap();
-        let State::Bounded(entries) = &mut *state else {
-            panic!("bounded fixture");
-        };
+        let entries = &mut *state;
         for waiter in &mut entries[leader.entry].waiters {
             waiter.generation = u64::MAX;
         }
@@ -239,10 +213,8 @@ fn exhausted_entry_and_waiter_generations_refuse_without_wrapping() {
     drop(leader);
     {
         let mut state = cache.core().state.lock().unwrap();
-        let State::Bounded(entries) = &mut *state else {
-            panic!("bounded fixture");
-        };
-        for entry in entries {
+        let entries = &mut *state;
+        for entry in entries.iter_mut() {
             entry.generation = u64::MAX;
         }
     }
@@ -251,35 +223,8 @@ fn exhausted_entry_and_waiter_generations_refuse_without_wrapping() {
         io::ErrorKind::WouldBlock,
     );
     let state = cache.core().state.lock().unwrap();
-    let State::Bounded(entries) = &*state else {
-        panic!("bounded fixture");
-    };
+    let entries = &*state;
     assert!(entries.iter().all(|entry| entry.generation == u64::MAX));
-}
-
-#[test]
-fn original_cache_claim_and_grant_follow_last_handle_acquire_and_leader() {
-    let (cache, factory, budget, bytes) = fixture();
-    let handle = cache.clone();
-    let pending = cache.acquire(identity(1, 9000, NativeRpcMethod::ExchangeUnary));
-    let leader = elect(&cache, identity(2, 9000, NativeRpcMethod::ExchangeUnary));
-    drop(cache);
-    drop(handle);
-    assert!(
-        matches!(NativeChannelCache::bounded(factory.clone()), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
-    );
-    drop(pending);
-    assert!(
-        matches!(NativeChannelCache::bounded(factory.clone()), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
-    );
-    drop(leader);
-    let replacement = NativeChannelCache::bounded(factory.clone()).unwrap();
-    let last_acquire = replacement.acquire(identity(3, 9000, NativeRpcMethod::ExchangeUnary));
-    drop(replacement);
-    drop(factory);
-    held(&budget, bytes);
-    drop(last_acquire);
-    returned(&budget, bytes);
 }
 
 struct ReentrantWake {
@@ -508,10 +453,8 @@ async fn full_connecting_occupied_ready_or_exhausted_rows_refuse_cold_eviction()
 
     {
         let mut state = cache.core().state.lock().unwrap();
-        let State::Bounded(entries) = &mut *state else {
-            panic!("bounded fixture");
-        };
-        for entry in entries {
+        let entries = &mut *state;
+        for entry in entries.iter_mut() {
             entry.generation = u64::MAX;
         }
     }
@@ -520,9 +463,7 @@ async fn full_connecting_occupied_ready_or_exhausted_rows_refuse_cold_eviction()
         io::ErrorKind::WouldBlock,
     );
     let state = cache.core().state.lock().unwrap();
-    let State::Bounded(entries) = &*state else {
-        panic!("bounded fixture");
-    };
+    let entries = &*state;
     assert!(
         entries
             .iter()

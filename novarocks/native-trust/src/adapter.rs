@@ -3,7 +3,7 @@
 // The ASF licenses this file to you under the Apache License, Version 2.0.
 
 use std::{
-    alloc::Layout,
+    any::Any,
     fmt,
     future::Future,
     io,
@@ -12,7 +12,6 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::Bytes;
 use hyper_util::rt::TokioIo;
 use novarocks_types::NativeEndpoint;
 use rustls::{ClientConfig, ServerConfig, pki_types::ServerName};
@@ -32,49 +31,30 @@ pub trait NativeIo: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> NativeIo for T {}
 pub type BoxedNativeIo = Box<dyn NativeIo>;
 
-/// The concrete Native transport Box produced by the connector or acceptor.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NativeIoDirection {
-    Client,
-    Server,
-}
-
-/// Requested layout of the actual concrete Native transport Box.
+/// Native IO that keeps a caller-supplied guard alive until the transport
+/// itself has been destroyed.
 ///
-/// Obtain original capacity before calling the connector or acceptor that
-/// constructs this Box. Automatic and PEM transports have the same Rust
-/// layout. This covers only the outer concrete Box: socket/runtime state,
-/// TLS configuration, cryptographic buffers and enclosing futures are separate.
-pub fn native_io_box_layout(mode: NativeTransportMode, direction: NativeIoDirection) -> Layout {
-    match (mode, direction) {
-        (NativeTransportMode::Disabled, _) => Layout::new::<TcpStream>(),
-        (NativeTransportMode::Automatic | NativeTransportMode::Pem, NativeIoDirection::Client) => {
-            Layout::new::<tokio_rustls::client::TlsStream<TcpStream>>()
-        }
-        (NativeTransportMode::Automatic | NativeTransportMode::Pem, NativeIoDirection::Server) => {
-            Layout::new::<tokio_rustls::server::TlsStream<TcpStream>>()
-        }
-    }
-}
-
-/// Native IO and the caller's original capacity for its actual concrete Box.
-///
-/// The wrapper allocates nothing. Its optional owner is retained until the
-/// boxed transport has been destroyed and its Box allocation has exited,
-/// including when the transport destructor unwinds. The original owner must
-/// already cover that concrete layout and its own carrier before allocation;
-/// retaining an unrelated Bytes value does not establish this funding proof.
-/// There is deliberately no IO or owner extraction API.
+/// The guard drops after the boxed transport, even when the transport
+/// destructor unwinds, so an admission position carried by the guard is never
+/// returned while its connection's socket is still open. There is deliberately
+/// no IO or guard extraction API.
 pub struct OwnedNativeIo {
     io: Option<BoxedNativeIo>,
-    owner: Option<Bytes>,
+    guard: Option<Box<dyn Any + Send + Sync>>,
 }
 
 impl OwnedNativeIo {
-    pub fn new(io: BoxedNativeIo, owner: Option<Bytes>) -> Self {
+    pub fn new(io: BoxedNativeIo) -> Self {
         Self {
             io: Some(io),
-            owner,
+            guard: None,
+        }
+    }
+
+    pub fn with_guard<G: Send + Sync + 'static>(io: BoxedNativeIo, guard: G) -> Self {
+        Self {
+            io: Some(io),
+            guard: Some(Box::new(guard)),
         }
     }
 
@@ -86,18 +66,18 @@ impl OwnedNativeIo {
 impl fmt::Debug for OwnedNativeIo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OwnedNativeIo")
-            .field("has_original_owner", &self.owner.is_some())
+            .field("guarded", &self.guard.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl Drop for OwnedNativeIo {
     fn drop(&mut self) {
-        // A local owner unwinds after drop(io), even if the boxed destructor
-        // panics. Box drop glue deallocates its backing during that unwind.
-        let owner = self.owner.take();
+        // The local guard unwinds after drop(io), even if the boxed
+        // destructor panics.
+        let guard = self.guard.take();
         drop(self.io.take());
-        drop(owner);
+        drop(guard);
     }
 }
 

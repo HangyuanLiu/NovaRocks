@@ -4090,7 +4090,6 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tonic-build",
- "tower 0.4.13",
  "tower 0.5.2",
  "tracing",
 ]
@@ -7197,7 +7196,6 @@ dependencies = [
 name = "tower"
 version = "0.4.13"
 dependencies = [
- "bytes",
  "futures-core",
  "futures-util",
  "indexmap 1.9.3",

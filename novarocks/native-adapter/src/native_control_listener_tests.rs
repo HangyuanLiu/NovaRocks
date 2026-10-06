@@ -15,21 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Actual independent authenticated Data/Control listener actors using one
-//! startup-funded stock. External client buffers/tasks are fixture-owned;
-//! these tests do not establish BackendHost deployment or a whole IO envelope.
+//! Actual independent authenticated Data/Control listener actors sharing one
+//! process admission. External client buffers/tasks are fixture-owned; these
+//! tests do not establish BackendHost deployment.
 
 use super::*;
 use bytes::Bytes;
 use hyper::http::Request;
-use novarocks_execution::runtime::fragment::io::ResultWriteAdmission;
 use novarocks_native_trust::NativeTrust;
 use novarocks_proto_codec::native_rpc::NativeRpcMethod;
 use novarocks_proto_models::{catalog, filter, novarocks as proto};
-use novarocks_worker::result_buffer::ResultRetainedBudget;
 use std::future::Future;
 use std::io;
-use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use tokio::io::AsyncReadExt;
@@ -167,18 +164,11 @@ impl NovaRocksGrpc for ProbeService {
     }
 }
 
-fn stock() -> (
-    NativeTransportCapacityFactory,
-    Arc<ResultRetainedBudget>,
-    usize,
-) {
-    let bytes = NativeTransportCapacityFactory::allocation_capacity_bound().unwrap();
-    let budget = ResultRetainedBudget::new(NonZeroUsize::new(bytes).unwrap());
-    let factory = NativeTransportCapacityFactory::try_new(budget.clone()).unwrap();
-    (factory, budget, bytes)
+fn stock() -> (NativeTransportAdmission, (), ()) {
+    (NativeTransportAdmission::new().unwrap(), (), ())
 }
 fn start(
-    factory: &NativeTransportCapacityFactory,
+    factory: &NativeTransportAdmission,
     trust: &Arc<NativeTrust>,
     observation: &Arc<Observation>,
     domain: NativeEndpointDomain,
@@ -188,7 +178,7 @@ fn start(
         NativeEndpointDomain::BackendControl => TransportClass::Control,
         NativeEndpointDomain::FrontendMembership => unreachable!(),
     };
-    NativeRpcServerHandle::start_with_transport_capacity(
+    NativeRpcServerHandle::start_with_admission(
         "127.0.0.1",
         0,
         ProbeService(observation.clone()),
@@ -357,19 +347,19 @@ async fn half_open(address: SocketAddr) -> tokio::net::TcpStream {
     peer
 }
 async fn acquisition_at(
-    factory: &NativeTransportCapacityFactory,
+    factory: &NativeTransportAdmission,
     class: TransportClass,
     expected: usize,
 ) {
     bounded(async {
-        while factory.available_acquisitions(class) != expected {
+        while factory.available_handshakes(class) != expected {
             tokio::task::yield_now().await;
         }
     })
     .await;
 }
 async fn positions_at(
-    factory: &NativeTransportCapacityFactory,
+    factory: &NativeTransportAdmission,
     class: TransportClass,
     expected: usize,
 ) {
@@ -386,23 +376,8 @@ async fn peer_exited(mut peer: tokio::net::TcpStream) {
         assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
     }
 }
-async fn capacity_returned(budget: &Arc<ResultRetainedBudget>, bytes: usize) {
-    bounded(async {
-        loop {
-            match budget.try_reserve_process(bytes).unwrap() {
-                ResultWriteAdmission::Granted(credit) => {
-                    drop(credit);
-                    break;
-                }
-                ResultWriteAdmission::Blocked => tokio::task::yield_now().await,
-            }
-        }
-    })
-    .await;
-}
-
 async fn saturated(blocked: TransportClass, expected: usize) {
-    let (factory, budget, bytes) = stock();
+    let (factory, _, _) = stock();
     let trust = crate::backend_test_support::test_backend_native_trust();
     trust
         .bind_process_identity(novarocks_native_trust::NativeProcessIdentity::Frontend(
@@ -447,6 +422,21 @@ async fn saturated(blocked: TransportClass, expected: usize) {
     assert_eq!(data_observation.data.load(Ordering::SeqCst), 0);
     assert_eq!(control_observation.heartbeat.load(Ordering::SeqCst), 0);
     assert_eq!(control_observation.control.load(Ordering::SeqCst), 0);
+    // A connection's bootstrap ends with its first authenticated request on
+    // its own endpoint; until then it holds a handshake position and is closed
+    // at the bootstrap deadline. Each live client completes it now.
+    assert_eq!(
+        data_client
+            .rpc(Some(&trust), NativeRpcMethod::ApplyTaskOperations, true)
+            .await,
+        (200, "0".into())
+    );
+    assert_eq!(
+        control_client
+            .rpc(Some(&trust), NativeRpcMethod::Heartbeat, true)
+            .await,
+        (200, "0".into())
+    );
     acquisition_at(&factory, TransportClass::Data, 32).await;
     acquisition_at(&factory, TransportClass::Control, 8).await;
 
@@ -464,7 +454,7 @@ async fn saturated(blocked: TransportClass, expected: usize) {
             &data_observation,
         ),
     };
-    assert_eq!(factory.acquisition_positions(blocked), expected);
+    assert_eq!(factory.handshake_positions(blocked), expected);
     // Every position below is an actual accepted TCP socket withholding the
     // H2 preface, rather than an unpolled configuration standing in for IO.
     let mut pending = tokio::task::JoinSet::new();
@@ -477,8 +467,8 @@ async fn saturated(blocked: TransportClass, expected: usize) {
     }
     acquisition_at(&factory, blocked, 0).await;
     assert_eq!(
-        factory.available_acquisitions(opposite),
-        factory.acquisition_positions(opposite)
+        factory.available_handshakes(opposite),
+        factory.handshake_positions(opposite)
     );
     let mut refused = bounded(tokio::net::TcpStream::connect(address))
         .await
@@ -489,7 +479,7 @@ async fn saturated(blocked: TransportClass, expected: usize) {
         Err(error) => assert_eq!(error.kind(), io::ErrorKind::ConnectionReset),
     }
     drop(refused);
-    assert_eq!(factory.available_acquisitions(blocked), 0);
+    assert_eq!(factory.available_handshakes(blocked), 0);
     match opposite {
         TransportClass::Control => {
             assert_eq!(
@@ -506,7 +496,7 @@ async fn saturated(blocked: TransportClass, expected: usize) {
                 .await,
                 (200, "0".into())
             );
-            assert_eq!(observation.heartbeat.load(Ordering::SeqCst), 1);
+            assert_eq!(observation.heartbeat.load(Ordering::SeqCst), 2);
             assert_eq!(observation.control.load(Ordering::SeqCst), 1);
         }
         TransportClass::Data => {
@@ -515,7 +505,7 @@ async fn saturated(blocked: TransportClass, expected: usize) {
                     .await,
                 (200, "0".into())
             );
-            assert_eq!(observation.data.load(Ordering::SeqCst), 1);
+            assert_eq!(observation.data.load(Ordering::SeqCst), 2);
         }
     }
     // Both entrypoints receive their stop signal before either actor join.
@@ -536,19 +526,11 @@ async fn saturated(blocked: TransportClass, expected: usize) {
     acquisition_at(&factory, TransportClass::Data, 32).await;
     acquisition_at(&factory, TransportClass::Control, 8).await;
     positions_at(&factory, blocked, factory.positions(blocked)).await;
-    positions_at(&factory, opposite, factory.positions(opposite) - 1).await;
+    positions_at(&factory, opposite, factory.positions(opposite)).await;
     assert_eq!(data_observation.heartbeat.load(Ordering::SeqCst), 0);
     assert_eq!(control_observation.data.load(Ordering::SeqCst), 0);
-    // Only escaped original server metadata fields survive actor/runtime/IO
-    // exit. No client-decoded copy is used as an original-owner oracle.
-    drop(factory);
-    assert!(matches!(
-        budget.try_reserve_process(bytes).unwrap(),
-        ResultWriteAdmission::Blocked
-    ));
     data_observation.aliases.lock().unwrap().clear();
     control_observation.aliases.lock().unwrap().clear();
-    capacity_returned(&budget, bytes).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -562,7 +544,7 @@ async fn actual_control_8_half_open_saturation_refuses_without_borrowing_data_li
 
 #[test]
 fn mismatched_domain_and_stock_class_refuse_before_address_resolution() {
-    let (factory, budget, bytes) = stock();
+    let (factory, _, _) = stock();
     let trust = crate::backend_test_support::test_backend_native_trust();
     for (domain, class) in [
         (NativeEndpointDomain::BackendData, TransportClass::Control),
@@ -572,7 +554,7 @@ fn mismatched_domain_and_stock_class_refuse_before_address_resolution() {
             TransportClass::Data,
         ),
     ] {
-        let outcome = NativeRpcServerHandle::start_with_transport_capacity(
+        let outcome = NativeRpcServerHandle::start_with_admission(
             "not-a-real-native-endpoint.invalid",
             0,
             ProbeService(Arc::new(Observation::default())),
@@ -589,7 +571,7 @@ fn mismatched_domain_and_stock_class_refuse_before_address_resolution() {
         );
         assert_eq!(
             outcome.err().unwrap(),
-            "native endpoint domain and transport capacity class disagree"
+            "native endpoint domain and transport admission class disagree"
         );
     }
     assert_eq!(
@@ -600,9 +582,4 @@ fn mismatched_domain_and_stock_class_refuse_before_address_resolution() {
         factory.available_positions(TransportClass::Control),
         factory.positions(TransportClass::Control)
     );
-    drop(factory);
-    assert!(matches!(
-        budget.try_reserve_process(bytes).unwrap(),
-        ResultWriteAdmission::Granted(_)
-    ));
 }

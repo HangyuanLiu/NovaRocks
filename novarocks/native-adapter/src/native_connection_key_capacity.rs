@@ -16,7 +16,6 @@
 //! Every row still retains its complete endpoint identity. No Channel, callback,
 //! factory alias or independently allocated registry owner is stored here.
 
-use std::alloc::Layout;
 use std::io;
 use std::sync::{Mutex, MutexGuard};
 
@@ -183,46 +182,13 @@ impl State {
 }
 
 impl NativeConnectionKeyCapacity {
-    /// Additional heap backing when Self is embedded in the StockCore layout.
-    /// Pinned Darwin std owns one Box<pal::Mutex>; Linux futex state is inline.
-    pub(crate) fn additional_backing_bytes() -> io::Result<usize> {
-        #[cfg(target_os = "macos")]
-        {
-            Ok(Layout::new::<libc::pthread_mutex_t>().size())
-        }
-        #[cfg(all(target_os = "linux", target_has_atomic = "32"))]
-        {
-            Ok(0)
-        }
-        #[cfg(not(any(
-            target_os = "macos",
-            all(target_os = "linux", target_has_atomic = "32")
-        )))]
-        {
-            Err(io::ErrorKind::Unsupported.into())
-        }
-    }
-
-    /// Self's requested layout plus its platform backing, without an outer Arc.
-    /// An embedding StockCore already includes Self and adds only the additional
-    /// backing above; callers must not charge this complete bound a second time.
-    pub(crate) fn allocation_capacity_bound() -> io::Result<usize> {
-        Layout::new::<Self>()
-            .size()
-            .checked_add(Self::additional_backing_bytes()?)
-            .ok_or_else(invalid)
-    }
-
-    /// Construct only after granting the original enclosing layout and PAL.
-    /// Initialize the lazy Darwin mutex before the kernel becomes shared.
+    /// One fixed row table per role process.
     pub(crate) fn new() -> io::Result<Self> {
-        Self::allocation_capacity_bound()?;
         let result = Self {
             state: Mutex::new(State {
                 rows: [Row::VACANT; ROWS],
             }),
         };
-        drop(result.state.lock().map_err(|_| invalid())?);
         Ok(result)
     }
 
@@ -357,11 +323,6 @@ mod tests {
     #[test]
     fn frozen_rows_and_embedded_layout_are_finite() {
         assert_eq!(ROWS, 230);
-        assert_eq!(
-            NativeConnectionKeyCapacity::allocation_capacity_bound().unwrap(),
-            Layout::new::<NativeConnectionKeyCapacity>().size()
-                + NativeConnectionKeyCapacity::additional_backing_bytes().unwrap()
-        );
     }
 
     #[test]

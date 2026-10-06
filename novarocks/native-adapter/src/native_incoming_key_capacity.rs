@@ -16,7 +16,6 @@
 //! request bodies and topology lookups are not identity authorities. Unsealed
 //! connections remain under the separate original physical/acquisition gates.
 
-use std::alloc::Layout;
 use std::io;
 use std::sync::{Mutex, MutexGuard};
 
@@ -226,41 +225,13 @@ impl State {
 }
 
 impl NativeIncomingKeyCapacity {
-    /// Additional PAL heap only; the enclosing StockCore already includes Self.
-    pub(crate) fn additional_backing_bytes() -> io::Result<usize> {
-        #[cfg(target_os = "macos")]
-        {
-            Ok(Layout::new::<libc::pthread_mutex_t>().size())
-        }
-        #[cfg(all(target_os = "linux", target_has_atomic = "32"))]
-        {
-            Ok(0)
-        }
-        #[cfg(not(any(
-            target_os = "macos",
-            all(target_os = "linux", target_has_atomic = "32")
-        )))]
-        {
-            Err(io::ErrorKind::Unsupported.into())
-        }
-    }
-    /// Standalone requested layout, without an extra Arc or dynamic row table.
-    pub(crate) fn allocation_capacity_bound() -> io::Result<usize> {
-        Layout::new::<Self>()
-            .size()
-            .checked_add(Self::additional_backing_bytes()?)
-            .ok_or_else(invalid)
-    }
-    /// The original enclosing layout and PAL must be granted before this call.
+    /// One fixed row table per role process.
     pub(crate) fn new() -> io::Result<Self> {
-        Self::allocation_capacity_bound()?;
         let result = Self {
             state: Mutex::new(State {
                 rows: [Row::VACANT; ROWS],
             }),
         };
-        // Prewarm the lazy Darwin PAL before publishing the kernel.
-        drop(result.state.lock().map_err(|_| invalid())?);
         Ok(result)
     }
     fn lock(&self) -> io::Result<MutexGuard<'_, State>> {
@@ -356,11 +327,6 @@ mod tests {
     #[test]
     fn finite_embedded_layout_and_all_exact_live_quotas() {
         assert_eq!(ROWS, 254);
-        assert_eq!(
-            NativeIncomingKeyCapacity::allocation_capacity_bound().unwrap(),
-            Layout::new::<NativeIncomingKeyCapacity>().size()
-                + NativeIncomingKeyCapacity::additional_backing_bytes().unwrap()
-        );
         let capacity = NativeIncomingKeyCapacity::new().unwrap();
         for (traffic, expected) in [
             (Frontend(ResultData), 4),

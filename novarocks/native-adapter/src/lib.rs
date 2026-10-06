@@ -64,7 +64,6 @@ pub mod fragment_window;
 pub mod management_http;
 mod native_channel_cache;
 mod native_channel_identity;
-mod native_channel_worker_capacity;
 pub mod native_client;
 mod native_connection_key_capacity;
 pub mod native_fd_capacity;
@@ -82,11 +81,8 @@ pub mod native_fragment_query;
 #[cfg(test)]
 mod native_fragment_query_tests;
 pub mod native_ingress;
-mod native_response;
 pub mod native_server;
-#[doc(hidden)]
-pub mod native_task_executor;
-mod native_transport_capacity;
+pub mod native_transport_admission;
 #[cfg(test)]
 mod physical_v1_roundtrip;
 pub use native_server::NativeRpcServerHandle;
@@ -301,7 +297,7 @@ pub struct BackendDataRuntime {
     native_trust: Arc<NativeTrust>,
     native_transport: BackendNativeTransport,
     channels: native_channel_cache::NativeChannelCache,
-    transport_capacity: Option<native_transport_capacity::NativeTransportCapacityFactory>,
+    transport_admission: Option<native_transport_admission::NativeTransportAdmission>,
 }
 
 impl BackendDataRuntime {
@@ -314,30 +310,30 @@ impl BackendDataRuntime {
             handle,
             native_trust,
             native_transport,
-            channels: native_channel_cache::NativeChannelCache::legacy(),
-            transport_capacity: None,
+            channels: native_channel_cache::NativeChannelCache::bounded()
+                .expect("frozen Native channel-cache geometry is finite"),
+            transport_admission: None,
         }
     }
-    /// A BE host gets its own channel generation and the same original stock.
-    /// Never install capacity over channels from an earlier unfunded runtime.
-    pub(crate) fn with_transport_capacity(
+    /// A BE host gets its own channel generation over the process admission.
+    /// Channels dialed before admission was installed are never reused.
+    pub(crate) fn with_transport_admission(
         &self,
-        capacity: native_transport_capacity::NativeTransportCapacityFactory,
+        admission: native_transport_admission::NativeTransportAdmission,
     ) -> std::io::Result<Self> {
-        let channels = native_channel_cache::NativeChannelCache::bounded(capacity.clone())?;
         Ok(Self {
             handle: self.handle.clone(),
             native_trust: Arc::clone(&self.native_trust),
             native_transport: self.native_transport.clone(),
-            channels,
-            transport_capacity: Some(capacity),
+            channels: native_channel_cache::NativeChannelCache::bounded()?,
+            transport_admission: Some(admission),
         })
     }
 
-    pub(crate) fn transport_capacity(
+    pub(crate) fn transport_admission(
         &self,
-    ) -> Option<&native_transport_capacity::NativeTransportCapacityFactory> {
-        self.transport_capacity.as_ref()
+    ) -> Option<&native_transport_admission::NativeTransportAdmission> {
+        self.transport_admission.as_ref()
     }
 
     pub fn block_on<F>(&self, future: F) -> F::Output

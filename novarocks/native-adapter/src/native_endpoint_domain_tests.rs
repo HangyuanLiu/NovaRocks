@@ -15,17 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Exact manifest admission before body, handler, gate, or spare-map admission.
-//! Original pool exit guards cover their own backing/carrier lifetimes only.
+//! Exact manifest admission before body, handler or gate admission.
 
 use super::*;
-use hyper::http::header::{HeaderFieldAllocationPool, HeaderMapAllocationPool};
-use hyper::http::{HeaderMap, HeaderValue};
-use novarocks_execution::runtime::fragment::io::{ResultWriteAdmission, ResultWriteCredit};
+use hyper::http::HeaderValue;
 use novarocks_proto_codec::native_rpc::NATIVE_METHODS;
-use novarocks_worker::result_buffer::ResultRetainedBudget;
 use std::future::{Ready, ready};
-use std::num::NonZeroUsize;
 use std::sync::atomic::AtomicUsize;
 
 #[derive(Default)]
@@ -273,81 +268,4 @@ async fn heartbeat_uses_control_body_limit_and_never_ordinary_gate() {
     assert_eq!(observed.calls.load(Ordering::SeqCst), 0);
     assert_eq!(observed.polls.load(Ordering::SeqCst), 0);
     assert_eq!(ingress.control.running.available_permits(), 1);
-}
-
-struct OriginalExit {
-    exits: Arc<AtomicUsize>,
-    _credit: ResultWriteCredit,
-}
-impl Drop for OriginalExit {
-    fn drop(&mut self) {
-        self.exits.fetch_add(1, Ordering::SeqCst);
-    }
-}
-fn grant(budget: &Arc<ResultRetainedBudget>, bytes: usize) -> ResultWriteCredit {
-    match budget.try_reserve_process(bytes).unwrap() {
-        ResultWriteAdmission::Granted(credit) => credit,
-        ResultWriteAdmission::Blocked => panic!("complete original grant required"),
-    }
-}
-
-#[tokio::test]
-async fn refusal_consumes_only_original_request_map_and_retains_credit_until_response_exit() {
-    let carrier = Bytes::owner_with_exit_guard_metadata_size::<Bytes, OriginalExit>();
-    let map_bytes = HeaderMapAllocationPool::allocation_capacity_bound(1, 4, 2).unwrap() + carrier;
-    let field_bytes =
-        HeaderFieldAllocationPool::allocation_capacity_bound(1024, 8, 256).unwrap() + carrier;
-    let total = map_bytes + field_bytes;
-    let budget = ResultRetainedBudget::new(NonZeroUsize::new(total).unwrap());
-    let exits = Arc::new(AtomicUsize::new(0));
-    let owner = |bytes| {
-        Bytes::from_owner_with_exit_guard(
-            Bytes::new(),
-            OriginalExit {
-                exits: exits.clone(),
-                _credit: grant(&budget, bytes),
-            },
-        )
-    };
-    let fields = HeaderFieldAllocationPool::new(1024, 8, 256, owner(field_bytes)).unwrap();
-    fields.try_bind_once().unwrap();
-    let maps = HeaderMapAllocationPool::new(1, 4, 2, owner(map_bytes)).unwrap();
-    maps.try_bind_connection_with_fields(&fields).unwrap();
-    let observed = Arc::new(Observed::default());
-    let mut input = request(
-        NativeRpcMethod::ApplyTaskOperations.contract().path,
-        &observed,
-    );
-    *input.headers_mut() = HeaderMap::try_from_allocation_pool(&maps).unwrap();
-    input
-        .headers_mut()
-        .try_insert("x-input", HeaderValue::from_static("clear-on-refusal"))
-        .unwrap();
-    let mut ingress = forbidden(NativeEndpointDomain::BackendControl, &observed);
-    let outcome = ingress.call(input);
-    assert_eq!(observed.exits.load(Ordering::SeqCst), 1);
-    let response = outcome.await.unwrap();
-    assert_eq!(response.headers()["grpc-status"], "12");
-    assert!(!response.headers().contains_key("x-input"));
-    assert!(
-        response
-            .headers()
-            .allocation_pool()
-            .unwrap()
-            .same_pool(&maps)
-    );
-    assert_eq!(
-        maps.available_maps(),
-        0,
-        "refusal never claims a spare position"
-    );
-    drop((fields, maps, ingress));
-    assert_eq!(exits.load(Ordering::SeqCst), 0);
-    assert!(matches!(
-        budget.try_reserve_process(total).unwrap(),
-        ResultWriteAdmission::Blocked
-    ));
-    drop(response);
-    assert_eq!(exits.load(Ordering::SeqCst), 2);
-    drop(grant(&budget, total));
 }
