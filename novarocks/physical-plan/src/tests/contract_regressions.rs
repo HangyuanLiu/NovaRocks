@@ -2260,7 +2260,7 @@ fn table_function_relation_results_and_outer_occurrences_have_separate_mappings(
         );
         let mut builder = PlanBuilder::new(version());
         builder.add_fragment(fragment).unwrap();
-        let plan = builder.finish().unwrap();
+        let plan = builder.finish_observed(&GroupedConstantControl).unwrap();
         let fragment_id = FragmentId::new(101);
         validate_fragment(
             &plan.fragments()[&fragment_id],

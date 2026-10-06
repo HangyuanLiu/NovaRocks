@@ -376,6 +376,50 @@ fn fixture_with_guarantee_count(
         .unwrap();
         fragment = Fragment::from(parts);
     }
+    // Each FunctionCall definition publishes its own original request: Value
+    // arguments of its exact signature, none of which is a constant.
+    let requests = fragment
+        .expressions()
+        .iter()
+        .filter_map(|(id, definition)| match &definition.kind {
+            ExprKind::FunctionCall { function, .. } => Some((
+                crate::PhysicalCallDefinition::Expression(*id),
+                crate::PhysicalCallRequest {
+                    arguments: function
+                        .argument_types
+                        .iter()
+                        .map(|argument| match argument {
+                            novarocks_type_contract::FunctionArgumentType::Value(value_type) => {
+                                crate::StaticFunctionArgument::Value {
+                                    value_type: value_type.clone(),
+                                    constant: None,
+                                }
+                            }
+                            _ => panic!("guarantee fixture calls take Value arguments"),
+                        })
+                        .collect(),
+                    logical_argument_count: function.argument_types.len(),
+                    expected_result_type: None,
+                    constant_policy: crate::ConstantPolicy {
+                        max_rows: 16,
+                        max_array_nodes: 32,
+                        max_logical_elements: 128,
+                        max_retained_buffer_bytes: 64 * 1024,
+                        max_type_depth: 16,
+                        max_type_nodes: 128,
+                        max_dictionary_depth: 8,
+                        max_metadata_bytes: 4096,
+                        max_library_validation_work: 1_000_000,
+                        max_library_validation_bytes: 1_000_000,
+                    },
+                },
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let fragment = fragment
+        .with_call_requests_observed(requests, &Control)
+        .unwrap();
     let read = package_contract::frozen_scan(&fragment);
     let (uses, calls) = fixture_uses_and_calls(&fragment);
     let mut input = package_contract::package_input_with_controls(fragment, uses, calls);

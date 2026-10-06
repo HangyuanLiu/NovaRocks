@@ -19,6 +19,19 @@ use super::*;
 
 const SEQUENCE: AggregateSequenceId = AggregateSequenceId::new(71);
 
+/// Plans with original call requests publish only on an observed caller
+/// control; this one never refuses.
+struct Unbounded;
+impl novarocks_type_contract::PureCompileControl for Unbounded {
+    fn checkpoint(
+        &self,
+        _: novarocks_type_contract::CompilePhase,
+        _: u32,
+    ) -> Result<(), novarocks_type_contract::CompileControlError> {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy)]
 enum BindingDrift {
     None,
@@ -441,7 +454,7 @@ fn finish_two_stage_sequence(drift: BindingDrift, final_groups: FinalGroups) -> 
         &imports,
         Distribution::Singleton,
     );
-    match plan.finish() {
+    match plan.finish_observed(&Unbounded) {
         Ok(_) => String::new(),
         Err(error) => error.to_string(),
     }
@@ -495,7 +508,7 @@ fn aggregate_sequence_rejects_an_orphan_partial() {
     let mut plan = PlanBuilder::new(version());
     plan.add_fragment(fragment).unwrap();
     assert!(
-        plan.finish()
+        plan.finish_observed(&Unbounded)
             .unwrap_err()
             .to_string()
             .contains("aggregate sequence must have exactly one final call")
@@ -606,7 +619,7 @@ fn aggregate_sequence_rejects_duplicate_finals() {
         Distribution::Singleton,
     );
     assert!(
-        plan.finish()
+        plan.finish_observed(&Unbounded)
             .unwrap_err()
             .to_string()
             .contains("aggregate sequence must have exactly one final call")
@@ -738,7 +751,7 @@ fn intermediate_state_chain_reaches_its_partial_and_final() {
         &second_imports,
         Distribution::Singleton,
     );
-    plan.finish().unwrap();
+    plan.finish_observed(&Unbounded).unwrap();
 }
 
 fn invalid_finalization(
@@ -1231,7 +1244,7 @@ fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPl
         .map_err(|e| e.to_string())?;
     let mut plan = PlanBuilder::new(version());
     plan.add_fragment(fragment).unwrap();
-    plan.finish().map_err(|e| e.to_string())
+    plan.finish_observed(&Unbounded).map_err(|e| e.to_string())
 }
 #[test]
 fn grouped_topn_merges_new_exact_intermediate_states_in_both_sequences() {
