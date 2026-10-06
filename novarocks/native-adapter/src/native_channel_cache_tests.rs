@@ -60,8 +60,6 @@ fn assert_error(outcome: Poll<io::Result<Election>>, expected: io::ErrorKind) {
     }
 }
 
-
-
 struct WakeCount {
     calls: AtomicUsize,
     panic: bool,

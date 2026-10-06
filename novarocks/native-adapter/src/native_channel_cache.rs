@@ -109,7 +109,6 @@ impl Entry {
     }
 }
 
-
 struct Core {
     state: Mutex<Vec<Entry>>,
     eviction_cursor: AtomicUsize,

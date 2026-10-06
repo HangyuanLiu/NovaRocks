@@ -358,11 +358,7 @@ async fn acquisition_at(
     })
     .await;
 }
-async fn positions_at(
-    factory: &NativeTransportAdmission,
-    class: TransportClass,
-    expected: usize,
-) {
+async fn positions_at(factory: &NativeTransportAdmission, class: TransportClass, expected: usize) {
     bounded(async {
         while factory.available_positions(class) != expected {
             tokio::task::yield_now().await;

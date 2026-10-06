@@ -341,9 +341,7 @@ pub(crate) fn admitted_connector(
                 .as_ref()
                 .map(|admission| admission.try_dial(class, key))
                 .transpose()
-                .map_err(|error| {
-                    io::Error::new(error.kind(), "native dial admission refused")
-                })?;
+                .map_err(|error| io::Error::new(error.kind(), "native dial admission refused"))?;
             let io = connector.connect().await.map_err(|failure| {
                 io::Error::other(format!("native transport connector failed: {failure}"))
             })?;

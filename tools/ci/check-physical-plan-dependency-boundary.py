@@ -384,23 +384,6 @@ def resolved_package_allow_list(graph):
         for name, expected in sorted(EXTERNAL_PACKAGE_ALLOW_LIST.items())
         if (package := graph.external_package(name, expected)) is not None
     )
-    # M07 patches these original producers in this repository. Admit only the
-    # exact version, source, Cargo id and canonical vendor location; a same-name
-    # path dependency elsewhere cannot impersonate the audited original.
-    vendor_root = Path(__file__).resolve().parents[2] / "vendor"
-    for name, expected in sorted(EXTERNAL_PACKAGE_ALLOW_LIST.items()):
-        version = expected["version"]
-        directory = (vendor_root / f"{name}-{version}").resolve()
-        identity = (
-            f"path+{directory.as_uri()}#{name}@{version}",
-            None,
-            version,
-            str(directory / "Cargo.toml"),
-        )
-        packages.extend(
-            package for package in graph.packages_by_name.get(name, [])
-            if package_identity(package) == identity
-        )
     return frozenset(package_identity(package) for package in packages)
 
 def declared_dependencies_by_kind(package):

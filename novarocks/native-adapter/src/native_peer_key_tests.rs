@@ -338,7 +338,12 @@ async fn funded_singleflight_nine_real_callers_share_one_dial_and_exact_peer_key
     assert_eq!(first.accepted.load(Ordering::SeqCst), 3);
     assert_eq!(other.accepted.load(Ordering::SeqCst), 1);
     for key in [key, replacement_key, filter_key, elsewhere_key] {
-        drop(funded.runtime.channels().remove(key.inline_identity().unwrap()));
+        drop(
+            funded
+                .runtime
+                .channels()
+                .remove(key.inline_identity().unwrap()),
+        );
     }
     // An escaped Channel survives cache removal and still has the original
     // startup family. There is no independent per-key/per-lane budget here.

@@ -37,20 +37,18 @@ pub fn wait_for_backend_native_endpoint_ready(
     let connector = crate::native_client::admitted_connector(runtime, &endpoint, class, None)?;
     let channel_endpoint = crate::native_client::native_endpoint(runtime, &endpoint)?;
     runtime.block_on(async move {
-        let channel = tokio::time::timeout(
-            timeout,
-            channel_endpoint.connect_with_connector(connector),
-        )
-        .await
-        .map_err(|_| {
-            format!(
-                "advertised Native endpoint {endpoint} did not become ready within {}ms",
-                timeout.as_millis()
-            )
-        })?
-        .map_err(|error| {
-            format!("advertised Native endpoint {endpoint} readiness failed: {error}")
-        })?;
+        let channel =
+            tokio::time::timeout(timeout, channel_endpoint.connect_with_connector(connector))
+                .await
+                .map_err(|_| {
+                    format!(
+                        "advertised Native endpoint {endpoint} did not become ready within {}ms",
+                        timeout.as_millis()
+                    )
+                })?
+                .map_err(|error| {
+                    format!("advertised Native endpoint {endpoint} readiness failed: {error}")
+                })?;
         // Dropping the channel closes its connection; the admission positions
         // follow that connection's IO until it is destroyed.
         drop(channel);

@@ -1344,7 +1344,8 @@ pub struct RuntimeConfig {
     /// Joint Arrow-input plus encoded-output memory allowed per root stream.
     #[serde(default = "default_result_retained_bytes_per_root")]
     pub result_retained_bytes_per_root: usize,
-    /// Joint root input/output, producer and Native transport capacity across the BE.
+    /// Joint root input/output and producer capacity across the BE. Native
+    /// connections are bounded by transport admission positions, not by this budget.
     #[serde(default = "default_result_retained_bytes_per_process")]
     pub result_retained_bytes_per_process: usize,
     #[serde(default = "default_lake_publication_max_attempt_duration_ms")]

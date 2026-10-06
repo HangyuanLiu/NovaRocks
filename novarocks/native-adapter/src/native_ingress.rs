@@ -163,20 +163,16 @@ impl Gate {
     async fn acquire(&self, deadline: Instant) -> Result<RunningPermit, IngressFailure> {
         if Instant::now() >= deadline {
             self.reject("waiting_deadline");
-            return Err(Status::new(
-                Code::DeadlineExceeded,
-                "native ingress deadline elapsed",
-            )
-            .into());
+            return Err(
+                Status::new(Code::DeadlineExceeded, "native ingress deadline elapsed").into(),
+            );
         }
         if let Ok(permit) = Arc::clone(&self.running).try_acquire_owned() {
             if Instant::now() >= deadline {
                 self.reject("waiting_deadline");
-                return Err(Status::new(
-                    Code::DeadlineExceeded,
-                    "native ingress deadline elapsed",
-                )
-                .into());
+                return Err(
+                    Status::new(Code::DeadlineExceeded, "native ingress deadline elapsed").into(),
+                );
             }
             return Ok(RunningPermit::new(permit, self.class, self.metrics));
         }
@@ -204,11 +200,9 @@ impl Gate {
                 })?;
         if Instant::now() >= deadline {
             self.reject("waiting_deadline");
-            return Err(Status::new(
-                Code::DeadlineExceeded,
-                "native ingress deadline elapsed",
-            )
-            .into());
+            return Err(
+                Status::new(Code::DeadlineExceeded, "native ingress deadline elapsed").into(),
+            );
         }
         drop(_wait);
         Ok(RunningPermit::new(permit, self.class, self.metrics))
@@ -453,10 +447,10 @@ where
             let mut request = request;
             if let Some(limit) = body_limit {
                 let Some(total_limit) = limit.checked_add(GRPC_FRAME_HEADER_BYTES) else {
-                    return Ok(Status::new(
-                        Code::Internal,
-                        "native ingress frame limit overflow",
-                    ).into_http());
+                    return Ok(
+                        Status::new(Code::Internal, "native ingress frame limit overflow")
+                            .into_http(),
+                    );
                 };
                 if request
                     .headers()
@@ -497,7 +491,8 @@ where
                     return Ok(Status::new(
                         Code::DeadlineExceeded,
                         "native ingress deadline elapsed",
-                    ).into_http());
+                    )
+                    .into_http());
                 }
             };
             if class == MethodClass::Stream {

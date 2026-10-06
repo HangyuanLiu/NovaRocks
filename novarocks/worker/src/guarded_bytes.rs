@@ -27,6 +27,8 @@
 //! wrapper that `from_owner` boxes; it is freed right after the guard drops.
 //! Callers charge [`owner_wrapper_bytes`] for it once per concurrently
 //! retiring position, never against a per-delivery credit.
+//!
+//! Design: ADR-0168 (docs/adr/ADR-0168-third-party-crates-are-bounded-by-public-configuration-not-forked.md)
 
 use std::alloc::Layout;
 use std::sync::atomic::AtomicUsize;

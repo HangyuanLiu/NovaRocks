@@ -28,6 +28,8 @@
 //!
 //! Peer/lane quotas for dialed connections and the incoming key a connection
 //! is sealed to are tracked here too, with the same exit points.
+//!
+//! Design: ADR-0168 (docs/adr/ADR-0168-third-party-crates-are-bounded-by-public-configuration-not-forked.md)
 
 use std::fmt;
 use std::io;
@@ -37,7 +39,9 @@ use novarocks_execution_contract::native_result_support::NativeResultSupportGeom
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::native_channel_identity::InlineNativeChannelIdentity;
-use crate::native_connection_key_capacity::{NativeConnectionKeyCapacity, NativeConnectionKeyToken};
+use crate::native_connection_key_capacity::{
+    NativeConnectionKeyCapacity, NativeConnectionKeyToken,
+};
 use crate::native_incoming_key_capacity::{
     NativeIncomingKey, NativeIncomingKeyCapacity, NativeIncomingKeyToken,
 };
@@ -415,7 +419,11 @@ pub(crate) struct NativeIncomingConnectionBinding {
 
 impl NativeIncomingConnectionBinding {
     pub(crate) fn seal(&self, key: NativeIncomingKey) -> io::Result<()> {
-        let mut state = self.seal.state.lock().map_err(|_| io::ErrorKind::InvalidData)?;
+        let mut state = self
+            .seal
+            .state
+            .lock()
+            .map_err(|_| io::ErrorKind::InvalidData)?;
         match &*state {
             SealState::Closed => Err(io::ErrorKind::ConnectionAborted.into()),
             SealState::Sealed(existing, _) if *existing == key => Ok(()),

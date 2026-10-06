@@ -489,8 +489,7 @@ impl NativeIncomingHeadAdmission {
             .process_identity()
             .ok_or(())
             .and_then(|peer| {
-                NativeIncomingKey::new(peer, self.domain, method.contract().traffic)
-                    .map_err(|_| ())
+                NativeIncomingKey::new(peer, self.domain, method.contract().traffic).map_err(|_| ())
             })
             .and_then(|key| self.binding.seal(key).map_err(|_| ()));
         match sealed {
@@ -542,13 +541,18 @@ where
         mut drain,
         on_transport_handshake_failure,
     } = inputs;
-    let deadline = admitted.as_ref().map(|admitted| admitted.bootstrap_deadline);
+    let deadline = admitted
+        .as_ref()
+        .map(|admitted| admitted.bootstrap_deadline);
     let accepted = match deadline {
         Some(deadline) => match tokio::time::timeout_at(deadline, incoming.accept(stream)).await {
             Ok(accepted) => accepted.map_err(|error| format!("{error:?}")),
             Err(_) => Err("native bootstrap deadline elapsed during TLS".to_owned()),
         },
-        None => incoming.accept(stream).await.map_err(|error| format!("{error:?}")),
+        None => incoming
+            .accept(stream)
+            .await
+            .map_err(|error| format!("{error:?}")),
     };
     let stream = match accepted {
         Ok(stream) => stream,
@@ -679,9 +683,8 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
-    let bootstrap = Duration::from_millis(
-        NativeResultSupportGeometry::V1.transport_handshake_deadline_ms,
-    );
+    let bootstrap =
+        Duration::from_millis(NativeResultSupportGeometry::V1.transport_handshake_deadline_ms);
     // Per listener rather than per process: one all-in-one process hosts both
     // role listeners, and a shared counter would report the other one's work.
     let live_connections = Arc::new(AtomicU64::new(0));

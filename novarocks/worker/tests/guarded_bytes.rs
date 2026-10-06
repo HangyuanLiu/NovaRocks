@@ -58,7 +58,11 @@ fn counted<R>(work: impl FnOnce() -> R) -> (R, usize, usize) {
     COUNTING.with(|on| on.set(true));
     let value = work();
     COUNTING.with(|on| on.set(false));
-    (value, ALLOCATED.with(Cell::get), ALLOCATIONS.with(Cell::get))
+    (
+        value,
+        ALLOCATED.with(Cell::get),
+        ALLOCATIONS.with(Cell::get),
+    )
 }
 
 struct Flag(Arc<AtomicBool>);

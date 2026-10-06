@@ -179,26 +179,9 @@ codegen-units = 256
 # and OverwriteCommit (Plan Tasks 9 / 10) until upstream ships native RowDelta
 # and OverwriteFiles actions. See vendor/iceberg-0.9.0/PATCH.md for the diff.
 [patch.crates-io]
-# Additive owner-wrapper exit guard; original Bytes APIs keep upstream semantics.
-bytes = { path = "vendor/bytes-1.11.0" }
-# Preserve original decoded field ownership through validated HTTP names.
-http = { path = "vendor/http-1.4.0" }
-# Optional receive-event backpressure; default H2 byte-flow semantics remain.
-h2 = { path = "vendor/h2-0.4.12" }
-hyper = { path = "vendor/hyper-1.8.1" }
-# Fresh HTTP/2 configuration for every actual physical connection attempt.
-tonic = { path = "vendor/tonic-0.12.3" }
-# Original-funded socket registrations retain capacity through reactor retirement.
-tokio = { path = "vendor/tokio-1.52.3" }
-# Opt-in response cells keep original pending permits until physical exit.
-tower = { path = "vendor/tower-0.4.13" }
-# Borrowed allocation-capacity introspection for bounded root input owners.
-# Existing Arrow data/encoding/capacity semantics stay unchanged; Custom
-# buffers require a source-owner proof rather than a declared-length guess.
-# See vendor/arrow-buffer-58.2.0/PATCH.md and vendor/arrow-array-58.2.0/PATCH.md.
-arrow-buffer = { path = "vendor/arrow-buffer-58.2.0" }
-arrow-array = { path = "vendor/arrow-array-58.2.0" }
-arrow-schema = { path = "vendor/arrow-schema-58.2.0" }
+# Only the entries below are allowed; none of them exists to meter allocations
+# inside a third-party crate. Design: ADR-0168
+# (docs/adr/ADR-0168-third-party-crates-are-bounded-by-public-configuration-not-forked.md)
 iceberg = { path = "vendor/iceberg-0.9.0" }
 # Vendored to add Iceberg view REST endpoints (create/load/commit/drop/
 # exists/list) that upstream 0.9.0 does not implement. See

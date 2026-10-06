@@ -200,33 +200,6 @@ assert_rejected() {
 python3 "$CHECKER" --manifest-path "$REPO_ROOT/Cargo.toml" >"$tmpdir/repo-stdout"
 grep -Fq "physical-plan dependency boundary: PASS" "$tmpdir/repo-stdout"
 
-# Exercise each exact vendored identity field independently against real Cargo
-# metadata. The policy must never reduce a patched producer to a name waiver.
-python3 - "$CHECKER" "$REPO_ROOT/Cargo.toml" <<'PY'
-import copy
-import importlib.util
-import sys
-from pathlib import Path
-spec = importlib.util.spec_from_file_location("physical_boundary", sys.argv[1])
-guard = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(guard)
-metadata = guard.cargo_metadata(Path(sys.argv[2]))
-for name in ("arrow-schema", "bytes"):
-    original = next(package for package in metadata["packages"]
-                    if package["name"] == name and package["source"] is None)
-    assert guard.package_identity(original) in guard.resolved_package_allow_list(guard.Graph(metadata))
-    for field, value in (
-        ("id", original["id"] + "-foreign"),
-        ("source", "git+https://example.invalid/foreign"),
-        ("version", "99.0.0"),
-        ("manifest_path", "/foreign/vendor/" + name + "/Cargo.toml"),
-    ):
-        mutated = copy.deepcopy(metadata)
-        package = next(package for package in mutated["packages"] if package["id"] == original["id"])
-        package[field] = value
-        assert guard.package_identity(package) not in guard.resolved_package_allow_list(guard.Graph(mutated)), (name, field)
-PY
-
 # The minimal legal graph proves the direct contract allow-list and the neutral
 # Connector contract's bytes carrier edge.
 baseline_root="$tmpdir/baseline"

@@ -131,19 +131,16 @@ impl<'a> UnaryService<wire::FetchRootResultRequest> for RootService<'a> {
         let reader = self.reader;
         let handoff = self.handoff;
         Box::pin(async move {
-            let read =
-                decode_read(request.get_ref(), FieldPath::root("root_read")).map_err(|_| {
-                    Status::new(Code::InvalidArgument, "invalid frozen root read")
-                })?;
+            let read = decode_read(request.get_ref(), FieldPath::root("root_read"))
+                .map_err(|_| Status::new(Code::InvalidArgument, "invalid frozen root read"))?;
             let (message, ownership) = match reader
                 .read_with_transport_metadata(&read, native_root_unary_metadata_bytes())
                 .await
             {
                 NativeRootReadResponse::Owned(reply) => {
                     let ownership = reply.ownership();
-                    let message = encode_reply(reply.reply()).map_err(|_| {
-                        Status::new(Code::Internal, "invalid owned root reply")
-                    })?;
+                    let message = encode_reply(reply.reply())
+                        .map_err(|_| Status::new(Code::Internal, "invalid owned root reply"))?;
                     (message, Some(ownership))
                 }
                 NativeRootReadResponse::AwaitTerminalControl { accepted_consumed } => {
@@ -154,9 +151,7 @@ impl<'a> UnaryService<wire::FetchRootResultRequest> for RootService<'a> {
                         accepted_consumed,
                         outcome: RootReadOutcome::AwaitTerminalControl,
                     })
-                    .map_err(|_| {
-                        Status::new(Code::Internal, "invalid sealed root reply")
-                    })?;
+                    .map_err(|_| Status::new(Code::Internal, "invalid sealed root reply"))?;
                     (message, None)
                 }
                 NativeRootReadResponse::Refused(reason) => return Err(refusal_status(reason)),
@@ -300,9 +295,7 @@ impl Body for NativeRootUnaryBody {
 
 fn refusal_status(reason: NativeRootReadRefusal) -> Status {
     match reason {
-        NativeRootReadRefusal::UnknownRoot => {
-            Status::new(Code::NotFound, "unknown context root")
-        }
+        NativeRootReadRefusal::UnknownRoot => Status::new(Code::NotFound, "unknown context root"),
         NativeRootReadRefusal::Mismatch => {
             Status::new(Code::FailedPrecondition, "frozen root read mismatch")
         }

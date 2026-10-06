@@ -25,8 +25,6 @@ yanked = "deny"
 unmaintained = "workspace"
 unsound = "all"
 unused-ignored-advisory = "deny"
-# Vendored bytes/h2 have no registry source identity. Their known advisory
-# status remains in vendor/*/PATCH.md rather than inactive registry ignores.
 ignore = [
     # CDG-1 establishes policy without changing any resolved dependency identity.
     # Each existing advisory stays visible by exact ID and expires when its affected
@@ -34,8 +32,10 @@ ignore = [
     { id = "RUSTSEC-2026-0190", reason = "anyhow upgrade belongs to a dependency-owner follow-up; CDG-1 freezes the existing lock graph" },
     { id = "RUSTSEC-2021-0145", reason = "atty is retained by the server CLI; replacement belongs to a server-owner follow-up" },
     { id = "RUSTSEC-2024-0375", reason = "atty is retained by the server CLI; replacement belongs to a server-owner follow-up" },
+    { id = "RUSTSEC-2026-0007", reason = "bytes upgrade belongs to a workspace dependency follow-up; CDG-1 freezes the existing lock graph" },
     { id = "RUSTSEC-2026-0204", reason = "crossbeam-epoch upgrade belongs to an upstream-owner follow-up; CDG-1 freezes the existing lock graph" },
     { id = "RUSTSEC-2026-0221", reason = "event-listener upgrade belongs to an upstream-owner follow-up; CDG-1 freezes the existing lock graph" },
+    { id = "RUSTSEC-2026-0258", reason = "h2 upgrade belongs to a transport-owner follow-up; CDG-1 freezes the existing lock graph" },
     { id = "RUSTSEC-2026-0002", reason = "lru 0.12 is retained by the dev-only mysql client; replacement belongs to its owner" },
     { id = "RUSTSEC-2026-0253", reason = "both MySQL lru lines require an owner-reviewed upgrade outside CDG-1" },
     { id = "RUSTSEC-2026-0041", reason = "lz4_flex is controlled by ORC/Paimon upstreams; upgrade belongs to connector owners" },

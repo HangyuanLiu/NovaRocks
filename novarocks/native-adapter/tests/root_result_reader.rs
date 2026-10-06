@@ -1030,11 +1030,8 @@ async fn unary_ack_only_encodes_from_metadata_when_process_data_pool_is_full() {
     ));
     let filler = fixture.fill_process(PROCESS - FIXED - SEGMENT - fixture.header_bytes());
     start_send_probe(RootProfileV1::ENVELOPE_BYTES);
-    let response = root_result_unary(
-        &fixture.reader,
-        unary_request(&fixture.request(None, 1, 1)),
-    )
-    .await;
+    let response =
+        root_result_unary(&fixture.reader, unary_request(&fixture.request(None, 1, 1))).await;
     stop_send_probe();
     // This size also selects the separate pre-admission request decoder.
     assert_eq!(SEND_ALLOC_COUNT.with(Cell::get), 2);
@@ -1078,21 +1075,15 @@ async fn unary_extra_metadata_is_pregranted_before_ack_or_projection() {
     drop(owned(
         fixture.reader.read(&fixture.request(None, 0, 1)).await,
     ));
-    let response = root_result_unary(
-        &fixture.reader,
-        unary_request(&fixture.request(None, 1, 1)),
-    )
-    .await;
+    let response =
+        root_result_unary(&fixture.reader, unary_request(&fixture.request(None, 1, 1))).await;
     assert_eq!(response.headers()["grpc-status"], "8");
     assert_eq!(fixture.root.snapshot().consumed_through, 0);
     drop(response);
     drop(metadata);
-    let mut body = root_result_unary(
-        &fixture.reader,
-        unary_request(&fixture.request(None, 1, 1)),
-    )
-    .await
-    .into_body();
+    let mut body = root_result_unary(&fixture.reader, unary_request(&fixture.request(None, 1, 1)))
+        .await
+        .into_body();
     assert_eq!(
         unary_message(&unary_data(&mut body).await).accepted_consumed_sequence,
         1
@@ -1105,10 +1096,7 @@ async fn unary_extra_metadata_is_pregranted_before_ack_or_projection() {
 async fn unary_cancellation_of_admitted_long_poll_exits_all_original_grants() {
     let fixture = UnaryFixture::new(false);
     let request = unary_request(&fixture.request(Some(1), 0, 300));
-    let mut future = Box::pin(root_result_unary(
-        &fixture.reader,
-        request,
-    ));
+    let mut future = Box::pin(root_result_unary(&fixture.reader, request));
     pending(future.as_mut()).await;
     assert!(!fixture.root.physical_idle());
     let filler = fixture.fill_process(PROCESS - FIXED - COPY - fixture.header_bytes());
@@ -1138,12 +1126,9 @@ async fn unary_closed_route_preserves_actual_ack_without_new_root_holder() {
         QueryContextState::Releasing
     );
     let filler = fixture.fill_process(PROCESS - FIXED - 1 - fixture.header_bytes());
-    let mut body = root_result_unary(
-        &fixture.reader,
-        unary_request(&fixture.request(None, 1, 1)),
-    )
-    .await
-    .into_body();
+    let mut body = root_result_unary(&fixture.reader, unary_request(&fixture.request(None, 1, 1)))
+        .await
+        .into_body();
     let message = unary_message(&unary_data(&mut body).await);
     assert_eq!(message.accepted_consumed_sequence, 0);
     assert_eq!(
@@ -1170,8 +1155,7 @@ async fn unary_two_bodies_hold_two_read_positions_before_first_poll() {
     assert_eq!(third.headers()["grpc-status"], "8");
     drop(third);
     drop(first);
-    let replacement =
-        root_result_unary(&fixture.reader, unary_request(&read)).await;
+    let replacement = root_result_unary(&fixture.reader, unary_request(&read)).await;
     assert!(!replacement.headers().contains_key("grpc-status"));
     drop(second);
     drop(replacement);

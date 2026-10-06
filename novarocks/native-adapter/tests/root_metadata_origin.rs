@@ -268,7 +268,10 @@ fn equal_unknown_large_metadata_tables_cannot_inherit_native_construction_origin
     let known = production_layout(Arc::clone(&source));
     let mut metadata = HashMap::with_capacity(8192);
     metadata.insert(NR_LOGICAL_TYPE_KEY.to_string(), "json".to_string());
-    let unknown_field = source_arrow.fields()[0].as_ref().clone().with_metadata(metadata);
+    let unknown_field = source_arrow.fields()[0]
+        .as_ref()
+        .clone()
+        .with_metadata(metadata);
     assert_eq!(&unknown_field, source_arrow.fields()[0].as_ref());
     let unknown = Arc::new(
         ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(

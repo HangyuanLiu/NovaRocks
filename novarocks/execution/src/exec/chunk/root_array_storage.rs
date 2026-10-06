@@ -50,6 +50,7 @@ pub struct RootArrayStorageLimits {
 /// arrow-buffer, so this is a NovaRocks constant pinned by a counting-allocator
 /// test (`root_capacity_introspection`). It assumes the arrow-buffer `pool`
 /// feature is off, which that test also guards.
+// Design: ADR-0168 (docs/adr/ADR-0168-third-party-crates-are-bounded-by-public-configuration-not-forked.md)
 pub const ARROW_BUFFER_OWNER_METADATA_BOUND: usize = 96;
 
 /// Sum full allocation capacities reported by upstream Arrow, including

@@ -20,3 +20,7 @@
 - 固定 FIFO：历史 `8b84aa164`，相关 825 项、Cargo-only 12,270 passed/7 ignored、该波次原生 1FE+3BE 的 8 System + 8 SQL cases 通过。
 - 空 Scalar leaf：历史 `a884d6818`，相关 768 项、fmt 和 Native all-target Clippy 通过；未重新取得完整 Cargo/SQL/System 验收。
 - 上述两组是不同检查点，Scalar Session/Host gate 仍关闭，DNS/nested 两项裁决仍待用户回答。Linux 正式测试由用户后补。
+
+## 第 6 版说明（2026-10-06）
+
+spec / plan 已改为第 6 版：撤回 v5 引入的 tokio、tonic、tower、hyper、h2、http、bytes 与 arrow-array/buffer/schema 十个 vendor patch，第三方库内部只用公开配置、库外准入与测量约束（ADR-0168）。本目录中 `p04-h2-*`、`p04-hyper-*`、`p04-tonic-*`、`p04-tower-*`、`p04-buffer-*` 等收据及其 probe 清单引用的 vendor 源码已从仓库移除，它们只作为当时测试对象的历史记录保留，不能再在当前分支上运行。原 Codex worktree 及其 `logs/` 下的原始证据归档与历史 bundle 在本机已不存在。第 6 版的新证据写在 `logs/mem-1-m07/v6/`（不入库），精简摘要按阶段加入本目录。
