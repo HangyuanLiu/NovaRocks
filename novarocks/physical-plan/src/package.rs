@@ -257,6 +257,7 @@ impl FragmentPackage {
                 &input,
                 admission.plan_limits,
                 semantic_items,
+                admission.source_retained_bytes,
                 &mut resources,
                 *admit,
                 work,

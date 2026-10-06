@@ -571,3 +571,66 @@ fn borrowed_complete_list_and_map_packages_keep_resource_stage_on_original_decod
         every_prefix(&input, Ok(()));
     }
 }
+
+#[test]
+fn borrowed_result_package_counts_both_original_type_walks_in_existing_decode_scope() {
+    let id = FragmentId::new(981);
+    let (fragment, value) = literal_fragment(id, FragmentSink::Result, false);
+    let mut input = package_input(fragment.clone());
+    input.result = Some(ResultPort {
+        fragment: id,
+        output: fragment.nodes()[&fragment.root()].output.clone(),
+        fields: Box::from([ResultField {
+            name: "actual_result".into(),
+            alias: None,
+            value,
+            ty: fragment.values()[&value].ty.clone(),
+        }]),
+    });
+    assert_no_constant_package_equal(
+        &construct(&input, &BorrowedControl::new(None)).unwrap(),
+        &FragmentPackage::try_new(input.clone(), package_admission(), &Control).unwrap(),
+    );
+    let measure = |input: &FragmentPackageInput| {
+        let control = BorrowedControl::new(None);
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        let mut last = ControlOwnedResourceFacts::default();
+        let result = FragmentPackage::try_new_in(
+            input.clone(),
+            package_admission(),
+            &mut |facts| {
+                last = *facts;
+                Ok(())
+            },
+            &mut work,
+        );
+        (last, finished(work, result))
+    };
+    let (with_type, accepted) = measure(&input);
+    assert!(accepted.is_ok());
+    let mut no_port = input.clone();
+    no_port.result = None;
+    let (without_type, missing) = measure(&no_port);
+    assert!(matches!(missing, Err(FragmentPackageError::Structure(_))));
+    // Same actual fragment/call/graph walks; only the admitted primitive result
+    // type adds one real carrier Vec request. The second logical law uses its
+    // genuine fixed scratch and must also fund that complete initialization.
+    assert_eq!(
+        with_type.allocation_requests_upper_bound - without_type.allocation_requests_upper_bound,
+        1
+    );
+    assert_eq!(
+        with_type.allocation_request_bytes_upper_bound
+            - without_type.allocation_request_bytes_upper_bound,
+        Layout::new::<(&arrow_schema::DataType, usize)>().size()
+    );
+    assert!(
+        with_type.cumulative_work_upper_bound - without_type.cumulative_work_upper_bound
+            >= Layout::new::<
+                [Option<(&arrow_schema::DataType, usize)>;
+                    novarocks_type_contract::MAX_VALUE_TYPE_NODES],
+            >()
+            .size()
+    );
+    every_prefix(&input, Ok(()));
+}

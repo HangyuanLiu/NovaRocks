@@ -460,15 +460,13 @@ impl ConstantPool {
     /// Actual caller-owned fixed scratch of the sole borrowed type grammar.
     /// This stack layout is not a heap request or an allocation grant.
     pub fn type_validation_scratch_layout() -> std::alloc::Layout {
-        std::alloc::Layout::new::<
-            [Option<(&DataType, usize)>; novarocks_type_contract::MAX_VALUE_TYPE_NODES],
-        >()
+        novarocks_type_contract::owned_resources::type_validation::scratch_layout()
     }
     /// One opaque initialization writes the complete fixed scratch backing.
     /// Byte work, rather than slot count, covers the actual original layout;
     /// Parent callers admit it before the first source observation.
     pub fn type_validation_scratch_work_upper_bound() -> usize {
-        Self::type_validation_scratch_layout().size()
+        novarocks_type_contract::owned_resources::type_validation::scratch_work_upper_bound()
     }
 
     pub fn try_new(

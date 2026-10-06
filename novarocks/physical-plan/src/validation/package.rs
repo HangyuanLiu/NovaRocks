@@ -59,6 +59,7 @@ pub(crate) fn validate_package_in(
     input: &FragmentPackageInput,
     limits: PlanLimits,
     semantic_items: usize,
+    source_retained_bytes: usize,
     resources: &mut novarocks_type_contract::ControlResourceCounter,
     admit: &mut dyn FnMut(
         &novarocks_type_contract::ControlOwnedResourceFacts,
@@ -70,7 +71,7 @@ pub(crate) fn validate_package_in(
         limits,
         semantic_items,
         crate::constants::ConstantValidationMode::Caller,
-        Some((resources, admit)),
+        Some((resources, admit, source_retained_bytes)),
         work,
     )
 }
@@ -80,6 +81,7 @@ type PackageScratch<'a> = (
     &'a mut dyn FnMut(
         &novarocks_type_contract::ControlOwnedResourceFacts,
     ) -> Result<(), novarocks_type_contract::CompileControlError>,
+    usize,
 );
 
 fn validate_package_core(
@@ -87,7 +89,7 @@ fn validate_package_core(
     limits: PlanLimits,
     semantic_items: usize,
     mode: crate::constants::ConstantValidationMode,
-    scratch: Option<PackageScratch<'_>>,
+    mut scratch: Option<PackageScratch<'_>>,
     work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
 ) -> Result<(), crate::FragmentPackageError> {
     let mut errors = ValidationContext::for_construction(limits);
@@ -135,7 +137,21 @@ fn validate_package_core(
         for field in &result.fields {
             usage.add_bytes(field.name.len());
             usage.add_bytes(field.alias.as_ref().map_or(0, |alias| alias.len()));
-            usage.add_value_type(&field.ty, "package.result.type", &mut errors);
+            if let Some((resources, admit, source_retained_bytes)) = scratch.as_mut() {
+                usage
+                    .add_value_type_in(
+                        &field.ty,
+                        "package.result.type",
+                        &mut errors,
+                        *source_retained_bytes,
+                        resources,
+                        *admit,
+                        work,
+                    )
+                    .map_err(crate::package::package_resource_error)?;
+            } else {
+                usage.add_value_type(&field.ty, "package.result.type", &mut errors);
+            }
         }
     }
     usage.add_items(input.parameters.entries().len());
@@ -161,7 +177,7 @@ fn validate_package_core(
             "fragment package plan contract revision differs",
         ));
     }
-    if let Some((resources, admit)) = scratch {
+    if let Some((resources, admit, _)) = scratch {
         validate_fragment_structure_into_in(fragment, &mut errors, resources, admit, work)
             .map_err(crate::package::package_resource_error)?;
     } else {

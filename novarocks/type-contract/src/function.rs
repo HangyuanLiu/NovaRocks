@@ -177,8 +177,28 @@ impl FunctionValueType {
     }
 
     pub fn validate(&self) -> Result<(), crate::ValueTypeError> {
+        self.validate_core(crate::validate_nested_logical_types)
+    }
+
+    /// Validate the original root carrier and nested logical grammar using
+    /// caller-owned scratch and borrowed events. The caller admits scratch
+    /// initialization before this call; this method owns no scope or footer.
+    pub fn validate_with_scratch_observed<'a, E: From<crate::ValueTypeError>>(
+        &'a self,
+        scratch: &mut crate::owned_resources::type_validation::TypeValidationScratch<'a>,
+        observe: impl FnMut(crate::ValueTypeVisit<'a>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.validate_core(|root| {
+            crate::validate_value_type_structure_with_scratch_observed(root, scratch, observe)
+        })
+    }
+
+    fn validate_core<'a, E: From<crate::ValueTypeError>>(
+        &'a self,
+        validate_nested: impl FnOnce(&'a DataType) -> Result<(), E>,
+    ) -> Result<(), E> {
         self.logical_type.validate_carrier(&self.data_type)?;
-        crate::validate_nested_logical_types(&self.data_type)
+        validate_nested(&self.data_type)
     }
 
     pub fn fits_value_type(&self, expected: &Self) -> bool {
@@ -655,3 +675,7 @@ mod tests {
 #[cfg(test)]
 #[path = "function/identity_tests.rs"]
 mod identity_tests;
+
+#[cfg(test)]
+#[path = "function/value_type_scratch_tests.rs"]
+mod value_type_scratch_tests;

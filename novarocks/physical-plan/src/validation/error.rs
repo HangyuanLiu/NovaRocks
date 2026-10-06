@@ -21,8 +21,8 @@ use super::limits::PlanLimits;
 
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, ControlOwnedResourceFacts, ControlResourceCounter,
-    ControlResourceError,
-    owned_resources::vec::{boxed_slice_in, push_growth, reserve_for_push_in},
+    ControlResourceError, control_resource_add, control_resource_mul,
+    owned_resources::vec::{VecPushGrowthFacts, boxed_slice_in, push_growth, reserve_for_push_in},
 };
 
 #[cfg(test)]
@@ -89,10 +89,15 @@ impl DiagnosticPolicy for PlainDiagnostic {
         Ok(errors.into_boxed_slice())
     }
 }
+#[derive(Clone, Copy)]
+struct PrepaidDiagnostic {
+    growth: Option<VecPushGrowthFacts>,
+}
 struct CallerDiagnostic<'a, 'control> {
     resources: &'a mut ControlResourceCounter,
     admit: &'a mut DiagnosticAdmission<'a>,
     work: &'a mut CompileCheckpoints<'control>,
+    prepaid: Option<PrepaidDiagnostic>,
 }
 impl CallerDiagnostic<'_, '_> {
     fn copy_spellings(
@@ -122,11 +127,13 @@ impl DiagnosticPolicy for CallerDiagnostic<'_, '_> {
         // Both actual borrowed spellings are already known. Admit both
         // standard Box byte requests before the first pending observation.
         // No intermediate String or trim allocation is introduced.
-        self.resources.buffer::<u8>(path.len(), 1)?;
-        self.resources.buffer::<u8>(message.len(), 1)?;
-        // Two actual Box constructions and their closed byte-payload cleanup,
-        // including the empty spellings with no backing request.
-        self.resources.work(4)?;
+        if self.prepaid.is_none() {
+            self.resources.buffer::<u8>(path.len(), 1)?;
+            self.resources.buffer::<u8>(message.len(), 1)?;
+            // Two actual Box constructions and their closed byte-payload cleanup,
+            // including the empty spellings with no backing request.
+            self.resources.work(4)?;
+        }
         (self.admit)(&self.resources.facts())?;
         self.copy_spellings(path, message)
     }
@@ -135,11 +142,19 @@ impl DiagnosticPolicy for CallerDiagnostic<'_, '_> {
         errors: &mut Vec<ValidationError>,
         error: ValidationError,
     ) -> Result<(), Self::Error> {
-        self.resources.work(1)?; // The actual push also occurs without growth.
+        if self.prepaid.is_none() {
+            self.resources.work(1)?; // The actual push also occurs without growth.
+        }
         reserve_for_push_in::<_, ControlResourceError>(
             errors,
             &mut |facts| {
-                if let Some(layout) = facts.requested_backing {
+                if let Some(prepaid) = self.prepaid {
+                    if prepaid.growth.as_ref() != Some(facts) {
+                        return Err(ControlResourceError::SourceModel(
+                            "diagnostic collector source changed",
+                        ));
+                    }
+                } else if let Some(layout) = facts.requested_backing {
                     self.resources.layout(layout, 1)?;
                 }
                 (self.admit)(&self.resources.facts()).map_err(Into::into)
@@ -154,14 +169,22 @@ impl DiagnosticPolicy for CallerDiagnostic<'_, '_> {
         let path = "validation";
         let message = "additional validation errors were truncated";
         let captured = push_growth(errors)?;
-        self.resources.work(5)?; // Two constructions, their cleanup and one push.
-        // The sentinel's two spellings AND the actual collector growth are
-        // already known at this header. Admit them together before observing
-        // or making any part of the original owned sentinel operation.
-        self.resources.buffer::<u8>(path.len(), 1)?;
-        self.resources.buffer::<u8>(message.len(), 1)?;
-        if let Some(layout) = captured.requested_backing {
-            self.resources.layout(layout, 1)?;
+        if let Some(prepaid) = self.prepaid {
+            if prepaid.growth != Some(captured) {
+                return Err(ControlResourceError::SourceModel(
+                    "diagnostic collector source changed",
+                ));
+            }
+        } else {
+            self.resources.work(5)?; // Two constructions, their cleanup and one push.
+            // The sentinel's two spellings AND the actual collector growth are
+            // already known at this header. Admit them together before observing
+            // or making any part of the original owned sentinel operation.
+            self.resources.buffer::<u8>(path.len(), 1)?;
+            self.resources.buffer::<u8>(message.len(), 1)?;
+            if let Some(layout) = captured.requested_backing {
+                self.resources.layout(layout, 1)?;
+            }
         }
         (self.admit)(&self.resources.facts())?;
         reserve_for_push_in::<_, ControlResourceError>(
@@ -202,6 +225,41 @@ impl DiagnosticPolicy for CallerDiagnostic<'_, '_> {
             },
             self.work,
         )
+    }
+}
+
+struct DiagnosticWriter<'a, 'control> {
+    text: &'a mut String,
+    bound: usize,
+    work: &'a mut CompileCheckpoints<'control>,
+    failure: Option<ControlResourceError>,
+}
+impl fmt::Write for DiagnosticWriter<'_, '_> {
+    fn write_str(&mut self, fragment: &str) -> fmt::Result {
+        if self.failure.is_some() {
+            return Err(fmt::Error);
+        }
+        let copied = (|| {
+            let next = control_resource_add(self.text.len(), fragment.len())?;
+            if next > self.bound || next > self.text.capacity() {
+                return Err(ControlResourceError::SourceModel(
+                    "diagnostic formatter exceeded its source bound",
+                ));
+            }
+            self.work.flush()?;
+            // The complete backing was already reserved. This is the original
+            // standard formatting fragment, not a second message grammar.
+            self.text.push_str(fragment);
+            self.work.step()?;
+            Ok(())
+        })();
+        match copied {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.failure = Some(error);
+                Err(fmt::Error)
+            }
+        }
     }
 }
 
@@ -303,6 +361,7 @@ impl ValidationError {
                 resources,
                 admit,
                 work,
+                prepaid: None,
             },
         )
     }
@@ -425,8 +484,91 @@ impl ValidationContext {
                 resources,
                 admit,
                 work,
+                prepaid: None,
             },
         )
+    }
+
+    /// Format an original closed diagnostic on the caller's resources. The
+    /// source author must supply a truthful output-byte bound and admit the
+    /// primitive Display work separately; arbitrary Display is not covered.
+    /// All backing/payload/collector contributions known at this report header
+    /// are admitted together, even if the collector will drop the candidate.
+    pub(crate) fn report_formatted_in(
+        &mut self,
+        category: ValidationErrorCategory,
+        path: &str,
+        arguments: fmt::Arguments<'_>,
+        message_upper_bound: usize,
+        resources: &mut ControlResourceCounter,
+        admit: &mut DiagnosticAdmission<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), ControlResourceError> {
+        let needs_push = self.errors.len() < MAX_VALIDATION_ERRORS;
+        let needs_sentinel = !needs_push && !self.truncated;
+        let growth = if needs_push || needs_sentinel {
+            Some(push_growth(&self.errors)?)
+        } else {
+            None
+        };
+        // String backing, the candidate's path/message Boxes, their closed
+        // cleanup, and fragment-copy bookkeeping are a single known prefix.
+        resources.buffer::<u8>(message_upper_bound, 1)?;
+        resources.buffer::<u8>(path.len(), 1)?;
+        resources.buffer::<u8>(message_upper_bound, 1)?;
+        resources.work(control_resource_add(
+            control_resource_mul(message_upper_bound, 2)?,
+            8,
+        )?)?;
+        if let Some(facts) = growth
+            && let Some(layout) = facts.requested_backing
+        {
+            resources.layout(layout, 1)?;
+        }
+        if needs_push {
+            resources.work(1)?;
+        }
+        if needs_sentinel {
+            resources.buffer::<u8>("validation".len(), 1)?;
+            resources.buffer::<u8>("additional validation errors were truncated".len(), 1)?;
+            resources.work(5)?;
+        }
+        admit(&resources.facts())?;
+        work.flush()?;
+        let mut text = String::new();
+        if message_upper_bound != 0 {
+            let reserved = text.try_reserve_exact(message_upper_bound);
+            if reserved.is_ok() {
+                work.step()?;
+            }
+            novarocks_type_contract::owned_resources::copy::reserve_exit::<ControlResourceError>(
+                reserved, work,
+            )?;
+        }
+        let mut writer = DiagnosticWriter {
+            text: &mut text,
+            bound: message_upper_bound,
+            work,
+            failure: None,
+        };
+        let formatted = fmt::write(&mut writer, arguments);
+        if let Some(error) = writer.failure {
+            return Err(error);
+        }
+        if formatted.is_err() {
+            return Err(ControlResourceError::SourceModel(
+                "closed diagnostic formatter failed",
+            ));
+        }
+        work.flush()?;
+        let mut policy = CallerDiagnostic {
+            resources,
+            admit,
+            work,
+            prepaid: Some(PrepaidDiagnostic { growth }),
+        };
+        let error = ValidationError::categorized_core(category, path, text.as_str(), &mut policy)?;
+        self.push_core(error, &mut policy)
     }
 
     fn push_core<P: DiagnosticPolicy>(
@@ -461,6 +603,7 @@ impl ValidationContext {
             resources,
             admit,
             work,
+            prepaid: None,
         })
     }
 
@@ -526,6 +669,7 @@ impl ValidationErrors {
                 resources,
                 admit,
                 work,
+                prepaid: None,
             },
         )
     }

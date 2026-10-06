@@ -439,3 +439,152 @@ fn borrowed_empty_spellings_and_reused_collector_admit_actual_work_before_observ
         }
     }
 }
+
+#[test]
+fn formatted_candidates_keep_original_std_text_after_collector_saturation_and_known_invoice() {
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let mut resources = ControlResourceCounter::default();
+    let mut context = ValidationContext::new();
+    let mut original = ValidationContext::new();
+    // These are closed i32/u8 formatting sources, not arbitrary Display.
+    let bound = "value /".len() + 11 + 3;
+    for ordinal in 0..512 {
+        let value = i32::MIN + ordinal;
+        original.push(ValidationError::resource_limit(
+            "p\0",
+            format!("value {value}/{}", u8::MAX),
+        ));
+        context
+            .report_formatted_in(
+                ValidationErrorCategory::ResourceLimit,
+                "p\0",
+                format_args!("value {value}/{}", u8::MAX),
+                bound,
+                &mut resources,
+                &mut |_| Ok(()),
+                &mut work,
+            )
+            .unwrap();
+    }
+    assert_eq!(context.errors, original.errors);
+    assert_eq!(context.errors.len(), 129);
+    assert_eq!(context.errors.capacity(), 256);
+    assert_eq!(
+        resources.facts().allocation_requests_upper_bound,
+        512 * 3 + 2 + 7
+    );
+    assert_eq!(
+        resources.facts().allocation_request_bytes_upper_bound,
+        512 * (2 * bound + 2)
+            + "validation".len()
+            + "additional validation errors were truncated".len()
+            + 508 * Layout::new::<ValidationError>().size()
+    );
+    work.finish().unwrap();
+}
+
+#[test]
+fn formatted_report_combines_candidate_and_sentinel_before_any_format_observer() {
+    for cause in CAUSES {
+        let mut context = ValidationContext::new();
+        for _ in 0..128 {
+            context.push(ValidationError::new("p\0", "mλ"));
+        }
+        assert_eq!(context.errors.capacity(), 128);
+        let mut resources = ControlResourceCounter::default();
+        resources.buffer::<ValidationError>(128, 1).unwrap();
+        for error in &context.errors {
+            resources.buffer::<u8>(error.path().len(), 1).unwrap();
+            resources.buffer::<u8>(error.message().len(), 1).unwrap();
+        }
+        let before = resources.facts();
+        let control = Control {
+            trace: Mutex::default(),
+            refusal: Some((1, cause)),
+        };
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        let result = context.report_formatted_in(
+            ValidationErrorCategory::ResourceLimit,
+            "p\0",
+            format_args!("candidate {}", 42_u32),
+            "candidate ".len() + 10,
+            &mut resources,
+            &mut |facts| {
+                // Candidate String+two Boxes, sentinel two Boxes and real growth
+                // are all already known before the first formatting observation.
+                assert_eq!(
+                    facts.allocation_requests_upper_bound,
+                    before.allocation_requests_upper_bound + 6
+                );
+                if facts.allocation_requests_upper_bound
+                    > before.allocation_requests_upper_bound + 5
+                {
+                    Err(CompileControlError::ResourceExhausted)
+                } else {
+                    Ok(())
+                }
+            },
+            &mut work,
+        );
+        assert_eq!(result, Err(CompileControlError::ResourceExhausted.into()));
+        assert_eq!(control.trace(), [0]);
+        assert_eq!(context.errors.len(), 128);
+        assert_eq!(context.errors.capacity(), 128);
+        assert!(!context.truncated);
+    }
+}
+
+fn formatted_small(
+    control: &Control,
+    bound: usize,
+) -> Result<Vec<ValidationError>, ControlResourceError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+    let mut resources = ControlResourceCounter::default();
+    let mut context = ValidationContext::new();
+    context.report_formatted_in(
+        ValidationErrorCategory::StructuralInvariant,
+        "actual",
+        format_args!("actual {}", i32::MIN),
+        bound,
+        &mut resources,
+        &mut |_| Ok(()),
+        &mut work,
+    )?;
+    work.finish()?;
+    Ok(context.into_vec())
+}
+
+#[test]
+fn actual_standard_formatter_preserves_first_control_and_typed_source_bound_failure() {
+    let baseline = Control::default();
+    let bound = "actual ".len() + 11;
+    let result = formatted_small(&baseline, bound).unwrap();
+    assert_eq!(
+        result,
+        [ValidationError::new(
+            "actual",
+            format!("actual {}", i32::MIN)
+        )]
+    );
+    let trace = baseline.trace();
+    for at in 0..trace.len() {
+        for cause in CAUSES {
+            let control = Control {
+                trace: Mutex::default(),
+                refusal: Some((at, cause)),
+            };
+            assert_eq!(formatted_small(&control, bound), Err(cause.into()));
+            assert_eq!(control.trace(), trace[..=at]);
+        }
+    }
+    // The original std formatter exceeds this deliberately wrong source
+    // invoice; the writer refuses before a push_str could grow the backing.
+    let control = Control::default();
+    assert_eq!(
+        formatted_small(&control, 1),
+        Err(ControlResourceError::SourceModel(
+            "diagnostic formatter exceeded its source bound"
+        ))
+    );
+}
