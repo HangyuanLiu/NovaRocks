@@ -634,3 +634,104 @@ fn borrowed_result_package_counts_both_original_type_walks_in_existing_decode_sc
     );
     every_prefix(&input, Ok(()));
 }
+
+#[test]
+fn borrowed_package_resource_stage_visits_original_fragment_types_on_decode_scope() {
+    let (fragment, _) = literal_fragment(FragmentId::new(982), FragmentSink::Noop, false);
+    let input = package_input(fragment);
+    let control = BorrowedControl::new(None);
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let mut resources = ControlResourceCounter::default();
+    let mut snapshots = Vec::new();
+    let result = crate::validation::validate_package_in(
+        &input,
+        PlanLimits::FROZEN,
+        0,
+        package_admission().source_retained_bytes,
+        &mut resources,
+        &mut |facts| {
+            snapshots.push(*facts);
+            Ok(())
+        },
+        &mut work,
+    );
+    finished(work, result).unwrap();
+    // This actual Values fragment owns one ValueDef and one expression with
+    // the same primitive type. Both original occurrences must be visited;
+    // sharing that type cannot eliminate either carrier or logical law.
+    let tuple_bytes = Layout::new::<(&arrow_schema::DataType, usize)>().size();
+    assert_eq!(snapshots[0].allocation_requests_upper_bound, 1);
+    assert_eq!(
+        snapshots[0].allocation_request_bytes_upper_bound,
+        tuple_bytes
+    );
+    let second = snapshots
+        .iter()
+        .find(|facts| facts.allocation_requests_upper_bound == 2)
+        .unwrap();
+    assert_eq!(second.allocation_request_bytes_upper_bound, 2 * tuple_bytes);
+    assert!(
+        second.cumulative_work_upper_bound
+            >= novarocks_type_contract::owned_resources::type_validation::scratch_work_upper_bound(
+            )
+    );
+    assert_no_constant_package_equal(
+        &construct(&input, &BorrowedControl::new(None)).unwrap(),
+        &FragmentPackage::try_new(input.clone(), package_admission(), &Control).unwrap(),
+    );
+    every_prefix(&input, Ok(()));
+}
+
+#[test]
+fn borrowed_package_fragment_type_known_request_precedes_pending_control_refusal() {
+    let (fragment, _) = literal_fragment(FragmentId::new(983), FragmentSink::Noop, false);
+    let input = package_input(fragment);
+    let spelling = "q".repeat(255);
+    let baseline = BorrowedControl::new(None);
+    let mut before = CompileCheckpoints::try_new(&baseline, CompilePhase::Decode).unwrap();
+    novarocks_type_contract::owned_resources::copy::copy_string::<CompileControlError>(
+        &spelling,
+        &mut before,
+    )
+    .unwrap();
+    let original_prefix = baseline.trace();
+    // Real character copies left exactly 255 completed units pending. No
+    // synthetic step loop or scope reset manufactures this control window.
+    for cause in CAUSES {
+        let control = BorrowedControl::new(Some((original_prefix.len(), cause)));
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        let mut resources = ControlResourceCounter::default();
+        resources
+            .layout(Layout::array::<u8>(spelling.len()).unwrap(), 1)
+            .unwrap();
+        resources.work(spelling.len()).unwrap();
+        let copied = novarocks_type_contract::owned_resources::copy::copy_string::<
+            CompileControlError,
+        >(&spelling, &mut work)
+        .unwrap();
+        assert_eq!(copied, spelling);
+        assert_eq!(control.trace(), original_prefix);
+        let result = crate::validation::validate_package_in(
+            &input,
+            PlanLimits::FROZEN,
+            0,
+            package_admission().source_retained_bytes,
+            &mut resources,
+            &mut |facts| {
+                if facts.allocation_requests_upper_bound > 1 {
+                    Err(CompileControlError::ResourceExhausted)
+                } else {
+                    Ok(())
+                }
+            },
+            &mut work,
+        );
+        assert_eq!(
+            result,
+            Err(FragmentPackageError::Control(
+                CompileControlError::ResourceExhausted
+            ))
+        );
+        assert_eq!(control.trace(), original_prefix);
+    }
+}

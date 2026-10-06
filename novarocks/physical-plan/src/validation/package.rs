@@ -95,8 +95,32 @@ fn validate_package_core(
     let mut errors = ValidationContext::for_construction(limits);
     let fragment = &input.fragment;
     let mut usage = CutResourcePreflight::new();
-    usage.add_fragment(fragment, &mut errors);
-    usage.add_cuts(fragment, &input.cuts, &mut errors);
+    if let Some((resources, admit, source_retained_bytes)) = scratch.as_mut() {
+        usage
+            .add_fragment_in(
+                fragment,
+                &mut errors,
+                *source_retained_bytes,
+                resources,
+                *admit,
+                work,
+            )
+            .map_err(crate::package::package_resource_error)?;
+        usage
+            .add_cuts_in(
+                fragment,
+                &input.cuts,
+                &mut errors,
+                *source_retained_bytes,
+                resources,
+                *admit,
+                work,
+            )
+            .map_err(crate::package::package_resource_error)?;
+    } else {
+        usage.add_fragment(fragment, &mut errors);
+        usage.add_cuts(fragment, &input.cuts, &mut errors);
+    }
     usage
         .add_constants_observed(&input.constants, work)
         .map_err(crate::FragmentPackageError::Control)?;

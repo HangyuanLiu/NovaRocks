@@ -96,6 +96,76 @@ impl CutResourcePreflight {
         self.usage.merge(fragment_cut_usage(fragment, cuts, errors));
     }
 
+    /// Each original fragment type occurrence uses the caller's same two-law author.
+    /// Paths, non-type diagnostics, and mandatory call requests retain Plain authors.
+    pub(crate) fn add_fragment_in(
+        &mut self,
+        fragment: &Fragment,
+        errors: &mut ValidationContext,
+        source_retained_bytes: usize,
+        resources: &mut ControlResourceCounter,
+        admit: &mut TypeAdmission<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), ControlResourceError> {
+        self.usage.merge(fragment_usage_core(
+            fragment,
+            errors,
+            &mut CallerTypeValidation {
+                source: source_retained_bytes,
+                resources,
+                admit,
+                work,
+            },
+        )?);
+        Ok(())
+    }
+    pub(crate) fn add_cuts_in(
+        &mut self,
+        fragment: &Fragment,
+        cuts: &FragmentCuts,
+        errors: &mut ValidationContext,
+        source_retained_bytes: usize,
+        resources: &mut ControlResourceCounter,
+        admit: &mut TypeAdmission<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), ControlResourceError> {
+        self.usage.merge(fragment_cut_usage_core(
+            fragment,
+            cuts,
+            errors,
+            &mut CallerTypeValidation {
+                source: source_retained_bytes,
+                resources,
+                admit,
+                work,
+            },
+        )?);
+        Ok(())
+    }
+    pub(crate) fn add_filter_in(
+        &mut self,
+        filter: &RuntimeFilter,
+        path: &str,
+        errors: &mut ValidationContext,
+        source_retained_bytes: usize,
+        resources: &mut ControlResourceCounter,
+        admit: &mut TypeAdmission<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), ControlResourceError> {
+        add_runtime_filter_usage_core(
+            filter,
+            path,
+            &mut self.usage,
+            errors,
+            &mut CallerTypeValidation {
+                source: source_retained_bytes,
+                resources,
+                admit,
+                work,
+            },
+        )
+    }
+
     /// Count sparse addresses individually and immutable backings once in the
     /// same package envelope. These are source facts, not allocation grants.
     pub(crate) fn add_constants_observed(
@@ -290,11 +360,59 @@ pub(crate) fn validate_fragment_cut_resources(
     );
 }
 
+// Plain entry points keep their original scopes and diagnostic order.
+fn fragment_usage(fragment: &Fragment, errors: &mut ValidationContext) -> ResourceUsage {
+    match fragment_usage_core(fragment, errors, &mut PlainTypeValidation) {
+        Ok(usage) => usage,
+        Err(never) => match never {},
+    }
+}
 fn fragment_cut_usage(
     fragment: &Fragment,
     cuts: &FragmentCuts,
     errors: &mut ValidationContext,
 ) -> ResourceUsage {
+    match fragment_cut_usage_core(fragment, cuts, errors, &mut PlainTypeValidation) {
+        Ok(usage) => usage,
+        Err(never) => match never {},
+    }
+}
+fn plan_usage(plan: &PhysicalPlan, errors: &mut ValidationContext) -> ResourceUsage {
+    match plan_usage_core(plan, errors, &mut PlainTypeValidation) {
+        Ok(usage) => usage,
+        Err(never) => match never {},
+    }
+}
+fn add_runtime_filter_usage(
+    filter: &RuntimeFilter,
+    path: &str,
+    usage: &mut ResourceUsage,
+    errors: &mut ValidationContext,
+) {
+    match add_runtime_filter_usage_core(filter, path, usage, errors, &mut PlainTypeValidation) {
+        Ok(()) => (),
+        Err(never) => match never {},
+    }
+}
+#[cfg(test)]
+fn add_aggregate_binding_usage(
+    binding: &AggregateBinding,
+    path: &str,
+    usage: &mut ResourceUsage,
+    errors: &mut ValidationContext,
+) {
+    match add_aggregate_binding_usage_core(binding, path, usage, errors, &mut PlainTypeValidation) {
+        Ok(()) => (),
+        Err(never) => match never {},
+    }
+}
+
+fn fragment_cut_usage_core<P: TypeValidationPolicy>(
+    fragment: &Fragment,
+    cuts: &FragmentCuts,
+    errors: &mut ValidationContext,
+    policy: &mut P,
+) -> Result<ResourceUsage, P::Error> {
     let prefix = format!("fragments[{}].cuts", fragment.id().get());
     let mut usage = ResourceUsage::limited(MAX_FRAGMENT_DYNAMIC_ITEMS, MAX_FRAGMENT_DYNAMIC_BYTES);
     usage.add_item_counts([cuts.inbound.len(), cuts.outbound.len()]);
@@ -307,12 +425,13 @@ fn fragment_cut_usage(
             usage.add_items(writer.fields.len());
         }
         if let Some(writer) = &cut.writer_result {
-            add_writer_result_cut_usage(
+            add_writer_result_cut_usage_core(
                 writer,
                 &format!("{prefix}.inbound[{index}].writer_result"),
                 &mut usage,
                 errors,
-            );
+                policy,
+            )?;
         }
         add_distribution_usage(&cut.partitioning.source, &mut usage);
         add_distribution_usage(&cut.partitioning.destination, &mut usage);
@@ -320,12 +439,13 @@ fn fragment_cut_usage(
             if usage.exhausted() {
                 break;
             }
-            validate_value_type(
+            validate_value_type_core(
                 &import.source.ty,
                 &format!("{prefix}.inbound[{index}].imports[{ordinal}].type"),
                 &mut usage,
                 errors,
-            );
+                policy,
+            )?;
         }
     }
     for (index, cut) in cuts.outbound.iter().enumerate() {
@@ -337,12 +457,13 @@ fn fragment_cut_usage(
             usage.add_items(writer.fields.len());
         }
         if let Some(writer) = &cut.writer_result {
-            add_writer_result_cut_usage(
+            add_writer_result_cut_usage_core(
                 writer,
                 &format!("{prefix}.outbound[{index}].writer_result"),
                 &mut usage,
                 errors,
-            );
+                policy,
+            )?;
         }
         add_distribution_usage(&cut.partitioning.source, &mut usage);
         add_distribution_usage(&cut.partitioning.destination, &mut usage);
@@ -350,23 +471,25 @@ fn fragment_cut_usage(
             if usage.exhausted() {
                 break;
             }
-            validate_value_type(
+            validate_value_type_core(
                 &value.ty,
                 &format!("{prefix}.outbound[{index}].projection[{ordinal}].type"),
                 &mut usage,
                 errors,
-            );
+                policy,
+            )?;
         }
         for (ordinal, import) in cut.destination_imports.iter().enumerate() {
             if usage.exhausted() {
                 break;
             }
-            validate_value_type(
+            validate_value_type_core(
                 &import.source.ty,
                 &format!("{prefix}.outbound[{index}].destination_imports[{ordinal}].type"),
                 &mut usage,
                 errors,
-            );
+                policy,
+            )?;
         }
     }
     usage.add_items(cuts.runtime_filters.len());
@@ -374,35 +497,39 @@ fn fragment_cut_usage(
         if usage.exhausted() {
             break;
         }
-        add_runtime_filter_usage(
+        add_runtime_filter_usage_core(
             filter,
             &format!("{prefix}.runtime_filters[{index}]"),
             &mut usage,
             errors,
-        );
+            policy,
+        )?;
     }
-    usage
+    Ok(usage)
 }
 
-fn add_writer_result_cut_usage(
+fn add_writer_result_cut_usage_core<P: TypeValidationPolicy>(
     writer: &crate::WriterResultCut,
     path: &str,
     usage: &mut ResourceUsage,
     errors: &mut ValidationContext,
-) {
+    policy: &mut P,
+) -> Result<(), P::Error> {
     usage.add_items(writer.fields.len());
     for (ordinal, field) in writer.fields.iter().enumerate() {
         if usage.exhausted() {
             break;
         }
         usage.add_bytes(field.name.len());
-        validate_value_type(
+        validate_value_type_core(
             &field.ty,
             &format!("{path}.fields[{ordinal}].type"),
             usage,
             errors,
-        );
+            policy,
+        )?;
     }
+    Ok(())
 }
 
 pub(crate) fn validate_plan_resources(plan: &PhysicalPlan, errors: &mut ValidationContext) {
@@ -571,7 +698,11 @@ fn add_unpivot_source_usage(
     )
 }
 
-fn plan_usage(plan: &PhysicalPlan, errors: &mut ValidationContext) -> ResourceUsage {
+fn plan_usage_core<P: TypeValidationPolicy>(
+    plan: &PhysicalPlan,
+    errors: &mut ValidationContext,
+    policy: &mut P,
+) -> Result<ResourceUsage, P::Error> {
     let mut usage = ResourceUsage::limited(MAX_PLAN_DYNAMIC_ITEMS, MAX_PLAN_DYNAMIC_BYTES);
     usage.add_item_counts([
         plan.fragments().len(),
@@ -583,7 +714,7 @@ fn plan_usage(plan: &PhysicalPlan, errors: &mut ValidationContext) -> ResourceUs
         if usage.exhausted() {
             break;
         }
-        usage.merge(fragment_usage(fragment, errors));
+        usage.merge(fragment_usage_core(fragment, errors, policy)?);
     }
     for edge in plan.edges().values() {
         if usage.exhausted() {
@@ -603,24 +734,26 @@ fn plan_usage(plan: &PhysicalPlan, errors: &mut ValidationContext) -> ResourceUs
                 break;
             }
             usage.add_byte_counts([field.name.len(), field.alias.as_deref().map_or(0, str::len)]);
-            validate_value_type(
+            validate_value_type_core(
                 &field.ty,
                 &format!("result.fields[{index}].type"),
                 &mut usage,
                 errors,
-            );
+                policy,
+            )?;
         }
     }
     for (id, filter) in plan.runtime_filters() {
         if usage.exhausted() {
             break;
         }
-        add_runtime_filter_usage(
+        add_runtime_filter_usage_core(
             filter,
             &format!("runtime_filters[{}]", id.get()),
             &mut usage,
             errors,
-        );
+            policy,
+        )?;
     }
     for annotation in plan.annotations() {
         if usage.exhausted() {
@@ -628,7 +761,7 @@ fn plan_usage(plan: &PhysicalPlan, errors: &mut ValidationContext) -> ResourceUs
         }
         usage.add_byte_counts([annotation.key.len(), annotation.value.len()]);
     }
-    usage
+    Ok(usage)
 }
 
 fn add_constant_pool_usage(
@@ -704,7 +837,11 @@ fn validate_usage(
     }
 }
 
-fn fragment_usage(fragment: &Fragment, errors: &mut ValidationContext) -> ResourceUsage {
+fn fragment_usage_core<P: TypeValidationPolicy>(
+    fragment: &Fragment,
+    errors: &mut ValidationContext,
+    policy: &mut P,
+) -> Result<ResourceUsage, P::Error> {
     let prefix = format!("fragments[{}]", fragment.id().get());
     let mut usage = ResourceUsage::limited(MAX_FRAGMENT_DYNAMIC_ITEMS, MAX_FRAGMENT_DYNAMIC_BYTES);
     usage.add_item_counts([
@@ -713,41 +850,45 @@ fn fragment_usage(fragment: &Fragment, errors: &mut ValidationContext) -> Resour
         fragment.nodes().len(),
         fragment.runtime_filters().len(),
     ]);
+    // Mandatory request type validation remains the original Plain author.
     add_call_request_table_usage(fragment.call_requests(), &mut usage, errors);
     for (id, value) in fragment.values() {
         if usage.exhausted() {
-            return usage;
+            return Ok(usage);
         }
         if let crate::ValueOrigin::ProviderField { field, .. } = &value.origin {
             add_encoded_payload_usage(&field.column_payload, &mut usage);
         }
-        validate_value_type(
+        validate_value_type_core(
             &value.ty,
             &format!("{prefix}.values[{}].type", id.get()),
             &mut usage,
             errors,
-        );
+            policy,
+        )?;
     }
     for (id, expression) in fragment.expressions().iter() {
         if usage.exhausted() {
-            return usage;
+            return Ok(usage);
         }
-        validate_value_type(
+        validate_value_type_core(
             &expression.ty,
             &format!("{prefix}.expressions[{}].type", id.get()),
             &mut usage,
             errors,
-        );
-        add_expression_usage(
+            policy,
+        )?;
+        add_expression_usage_core(
             &expression.kind,
             &format!("{prefix}.expressions[{}]", id.get()),
             &mut usage,
             errors,
-        );
+            policy,
+        )?;
     }
     for (id, node) in fragment.nodes() {
         if usage.exhausted() {
-            return usage;
+            return Ok(usage);
         }
         usage.add_item_counts([
             node.inputs.len(),
@@ -757,29 +898,31 @@ fn fragment_usage(fragment: &Fragment, errors: &mut ValidationContext) -> Resour
         add_properties_usage(&node.output_properties, &mut usage);
         for properties in &node.required_inputs {
             if usage.exhausted() {
-                return usage;
+                return Ok(usage);
             }
             add_properties_usage(properties, &mut usage);
         }
-        add_node_usage(
+        add_node_usage_core(
             &node.kind,
             &format!("{prefix}.nodes[{}]", id.get()),
             &mut usage,
             errors,
-        );
+            policy,
+        )?;
     }
     add_sink_usage(fragment.sink(), &mut usage);
-    usage
+    Ok(usage)
 }
 
-fn add_expression_usage(
+fn add_expression_usage_core<P: TypeValidationPolicy>(
     kind: &ExprKind,
     path: &str,
     usage: &mut ResourceUsage,
     errors: &mut ValidationContext,
-) {
+    policy: &mut P,
+) -> Result<(), P::Error> {
     if usage.exhausted() {
-        return;
+        return Ok(());
     }
     match kind {
         // The sparse reference is a leaf. Its selected payload is retained
@@ -787,7 +930,7 @@ fn add_expression_usage(
         ExprKind::Constant(_) => {}
         ExprKind::FunctionCall { function, args } => {
             usage.add_items(args.len());
-            add_function_usage(function, &format!("{path}.function"), usage, errors);
+            add_function_usage_core(function, &format!("{path}.function"), usage, errors, policy)?;
         }
         ExprKind::Lambda {
             parameter_types, ..
@@ -795,18 +938,19 @@ fn add_expression_usage(
             usage.add_items(parameter_types.len());
             for (index, ty) in parameter_types.iter().enumerate() {
                 if usage.exhausted() {
-                    return;
+                    return Ok(());
                 }
-                validate_value_type(
+                validate_value_type_core(
                     ty,
                     &format!("{path}.parameter_types[{index}]"),
                     usage,
                     errors,
-                );
+                    policy,
+                )?;
             }
         }
         ExprKind::Cast { target, .. } => {
-            validate_data_type(target, &format!("{path}.target"), usage, errors);
+            validate_data_type_core(target, &format!("{path}.target"), usage, errors, policy)?;
         }
         ExprKind::InList { list, .. } => usage.add_items(list.len()),
         ExprKind::Case { when_then, .. } => usage.add_items(when_then.len().saturating_mul(2)),
@@ -818,26 +962,29 @@ fn add_expression_usage(
             ..
         } => {
             usage.add_item_counts([args.len(), function_order_by.len()]);
-            add_function_usage(function, &format!("{path}.function"), usage, errors);
+            add_function_usage_core(function, &format!("{path}.function"), usage, errors, policy)?;
             if let Some(binding) = aggregate_binding {
-                add_aggregate_binding_usage(
+                add_aggregate_binding_usage_core(
                     binding,
                     &format!("{path}.aggregate_binding"),
                     usage,
                     errors,
-                );
+                    policy,
+                )?;
             }
         }
         _ => {}
-    }
+    };
+    Ok(())
 }
 
-fn add_function_usage(
+fn add_function_usage_core<P: TypeValidationPolicy>(
     function: &BoundFunction,
     path: &str,
     usage: &mut ResourceUsage,
     errors: &mut ValidationContext,
-) {
+    policy: &mut P,
+) -> Result<(), P::Error> {
     usage.add_item_counts([
         function.argument_types.len(),
         function
@@ -849,21 +996,24 @@ fn add_function_usage(
         function.function_id.as_str().len(),
         function.overload.as_str().len(),
     ]);
-    add_argument_types_usage(&function.argument_types, path, usage, errors);
-    validate_value_type(
+    add_argument_types_usage_core(&function.argument_types, path, usage, errors, policy)?;
+    validate_value_type_core(
         &function.result_type,
         &format!("{path}.result_type"),
         usage,
         errors,
-    );
+        policy,
+    )?;
+    Ok(())
 }
 
-fn add_table_function_usage(
+fn add_table_function_usage_core<P: TypeValidationPolicy>(
     function: &BoundTableFunction,
     path: &str,
     usage: &mut ResourceUsage,
     errors: &mut ValidationContext,
-) {
+    policy: &mut P,
+) -> Result<(), P::Error> {
     usage.add_item_counts([
         function.argument_types.len(),
         function.result_types.len(),
@@ -876,32 +1026,41 @@ fn add_table_function_usage(
         function.function_id.as_str().len(),
         function.overload.as_str().len(),
     ]);
-    add_argument_types_usage(&function.argument_types, path, usage, errors);
+    add_argument_types_usage_core(&function.argument_types, path, usage, errors, policy)?;
     for (index, ty) in function.result_types.iter().enumerate() {
         if usage.exhausted() {
-            return;
+            return Ok(());
         }
-        validate_value_type(ty, &format!("{path}.result_types[{index}]"), usage, errors);
+        validate_value_type_core(
+            ty,
+            &format!("{path}.result_types[{index}]"),
+            usage,
+            errors,
+            policy,
+        )?;
     }
+    Ok(())
 }
 
-fn add_argument_types_usage(
+fn add_argument_types_usage_core<P: TypeValidationPolicy>(
     argument_types: &[FunctionArgumentType],
     path: &str,
     usage: &mut ResourceUsage,
     errors: &mut ValidationContext,
-) {
+    policy: &mut P,
+) -> Result<(), P::Error> {
     for (index, argument) in argument_types.iter().enumerate() {
         if usage.exhausted() {
-            return;
+            return Ok(());
         }
         match argument {
-            FunctionArgumentType::Value(ty) => validate_value_type(
+            FunctionArgumentType::Value(ty) => validate_value_type_core(
                 ty,
                 &format!("{path}.argument_types[{index}]"),
                 usage,
                 errors,
-            ),
+                policy,
+            )?,
             FunctionArgumentType::Lambda {
                 parameter_types,
                 result_type,
@@ -909,69 +1068,78 @@ fn add_argument_types_usage(
                 usage.add_items(parameter_types.len());
                 for (parameter, ty) in parameter_types.iter().enumerate() {
                     if usage.exhausted() {
-                        return;
+                        return Ok(());
                     }
-                    validate_value_type(
+                    validate_value_type_core(
                         ty,
                         &format!("{path}.argument_types[{index}].parameter_types[{parameter}]"),
                         usage,
                         errors,
-                    );
+                        policy,
+                    )?;
                 }
-                validate_value_type(
+                validate_value_type_core(
                     result_type,
                     &format!("{path}.argument_types[{index}].result_type"),
                     usage,
                     errors,
-                );
+                    policy,
+                )?;
             }
         }
     }
+    Ok(())
 }
 
-fn add_aggregate_binding_usage(
+fn add_aggregate_binding_usage_core<P: TypeValidationPolicy>(
     binding: &AggregateBinding,
     path: &str,
     usage: &mut ResourceUsage,
     errors: &mut ValidationContext,
-) {
+    policy: &mut P,
+) -> Result<(), P::Error> {
     usage.add_bytes(binding.state_format.as_str().len());
-    add_function_usage(
+    add_function_usage_core(
         &binding.function,
         &format!("{path}.function"),
         usage,
         errors,
-    );
-    validate_value_type(
+        policy,
+    )?;
+    validate_value_type_core(
         &binding.intermediate_type,
         &format!("{path}.intermediate_type"),
         usage,
         errors,
-    );
+        policy,
+    )?;
+    Ok(())
 }
 
-fn add_node_usage(
+fn add_node_usage_core<P: TypeValidationPolicy>(
     kind: &NodeKind,
     path: &str,
     usage: &mut ResourceUsage,
     errors: &mut ValidationContext,
-) {
+    policy: &mut P,
+) -> Result<(), P::Error> {
     if usage.exhausted() {
-        return;
+        return Ok(());
     }
     if let Some((group_by, calls)) = kind.aggregate_contract() {
         usage.add_item_counts([group_by.len(), calls.len()]);
         for (index, call) in calls.iter().enumerate() {
             if usage.exhausted() {
-                return;
+                return Ok(());
             }
             usage.add_item_counts([call.arguments.len(), call.order_by.len()]);
-            add_aggregate_binding_usage(
+            add_aggregate_binding_usage_core(
                 &call.binding,
                 &format!("{path}.calls[{index}].binding"),
                 usage,
                 errors,
-            );
+                policy,
+            )?;
         }
     }
     match kind {
@@ -989,11 +1157,11 @@ fn add_node_usage(
             ]);
             for (column, _) in provider_outputs {
                 if usage.exhausted() {
-                    return;
+                    return Ok(());
                 }
                 add_encoded_payload_usage(&column.column_payload, usage);
             }
-            add_relation_usage(relation, &format!("{path}.relation"), usage, errors);
+            add_relation_usage_core(relation, &format!("{path}.relation"), usage, errors, policy)?;
         }
         NodeKind::Project { expressions } => usage.add_items(expressions.len()),
         NodeKind::Aggregate { .. } => {}
@@ -1025,7 +1193,7 @@ fn add_node_usage(
             usage.add_items(input_mappings.len());
             for mapping in input_mappings {
                 if usage.exhausted() {
-                    return;
+                    return Ok(());
                 }
                 usage.add_items(mapping.len());
             }
@@ -1034,7 +1202,7 @@ fn add_node_usage(
             usage.add_items(rows.len());
             for row in rows {
                 if usage.exhausted() {
-                    return;
+                    return Ok(());
                 }
                 usage.add_items(row.len());
             }
@@ -1053,13 +1221,13 @@ fn add_node_usage(
             ]);
             for set in grouping_sets {
                 if usage.exhausted() {
-                    return;
+                    return Ok(());
                 }
                 usage.add_items(set.len());
             }
             for output in grouping_outputs {
                 if usage.exhausted() {
-                    return;
+                    return Ok(());
                 }
                 usage.add_items(output.arguments.len());
             }
@@ -1072,12 +1240,12 @@ fn add_node_usage(
             ]);
             for mapping in &spec.mappings {
                 if usage.exhausted() {
-                    return;
+                    return Ok(());
                 }
                 usage.add_items(mapping.constants.len());
                 for constant in &mapping.constants {
                     if usage.exhausted() {
-                        return;
+                        return Ok(());
                     }
                     add_unpivot_constant_usage(constant, usage);
                 }
@@ -1090,7 +1258,13 @@ fn add_node_usage(
             ..
         } => {
             usage.add_item_counts([arguments.len(), outputs.len()]);
-            add_table_function_usage(function, &format!("{path}.function"), usage, errors);
+            add_table_function_usage_core(
+                function,
+                &format!("{path}.function"),
+                usage,
+                errors,
+                policy,
+            )?;
         }
         NodeKind::AssertOneRow(spec) => match spec {
             crate::RowCountAssertionSpec::Global { subject, .. } => usage.add_bytes(subject.len()),
@@ -1103,7 +1277,7 @@ fn add_node_usage(
                 usage.add_bytes(message.len());
                 for label in labels {
                     if usage.exhausted() {
-                        return;
+                        return Ok(());
                     }
                     usage.add_bytes(label.len());
                 }
@@ -1113,7 +1287,7 @@ fn add_node_usage(
             usage.add_items(events.len());
             for event in events {
                 if usage.exhausted() {
-                    return;
+                    return Ok(());
                 }
                 usage.add_items(event.assignments.len());
             }
@@ -1129,7 +1303,7 @@ fn add_node_usage(
             add_encoded_payload_usage(&target.handle, usage);
             for (index, field) in target.target_fields.iter().enumerate() {
                 if usage.exhausted() {
-                    return;
+                    return Ok(());
                 }
                 usage.add_bytes(field.provider_name.len());
                 if field.provider_name.len() > MAX_DATA_TYPE_FIELD_NAME_BYTES {
@@ -1138,68 +1312,78 @@ fn add_node_usage(
                         "writer provider field name exceeds the field-name byte limit",
                     ));
                 }
-                validate_value_type(
+                validate_value_type_core(
                     &field.ty,
                     &format!("{path}.target_fields[{index}].type"),
                     usage,
                     errors,
-                );
+                    policy,
+                )?;
             }
-            add_writer_schema_usage(
+            add_writer_schema_usage_core(
                 &target.output_schema,
                 &format!("{path}.output_schema"),
                 usage,
                 errors,
-            );
+                policy,
+            )?;
             for (index, aggregate) in target.partial_aggregates.iter().enumerate() {
                 if usage.exhausted() {
-                    return;
+                    return Ok(());
                 }
-                add_aggregate_binding_usage(
+                add_aggregate_binding_usage_core(
                     &aggregate.binding,
                     &format!("{path}.partial_aggregates[{index}].binding"),
                     usage,
                     errors,
-                );
+                    policy,
+                )?;
             }
         }
-        NodeKind::TableFinish(spec) => add_writer_finish_usage(spec, path, usage, errors),
+        NodeKind::TableFinish(spec) => {
+            add_writer_finish_usage_core(spec, path, usage, errors, policy)?
+        }
         NodeKind::Filter { .. } | NodeKind::Limit { .. } | NodeKind::GenerateSeries { .. } => {}
-    }
+    };
+    Ok(())
 }
 
-fn add_writer_finish_usage(
+fn add_writer_finish_usage_core<P: TypeValidationPolicy>(
     spec: &WriterFinishSpec,
     path: &str,
     usage: &mut ResourceUsage,
     errors: &mut ValidationContext,
-) {
+    policy: &mut P,
+) -> Result<(), P::Error> {
     usage.add_item_counts([
         spec.expected_target_ordinals.len(),
         spec.final_aggregates.len(),
     ]);
-    add_writer_schema_usage(
+    add_writer_schema_usage_core(
         &spec.input_schema,
         &format!("{path}.input_schema"),
         usage,
         errors,
-    );
-    add_writer_schema_usage(
+        policy,
+    )?;
+    add_writer_schema_usage_core(
         &spec.output_schema,
         &format!("{path}.output_schema"),
         usage,
         errors,
-    );
+        policy,
+    )?;
     for (index, aggregate) in spec.final_aggregates.iter().enumerate() {
         if usage.exhausted() {
-            return;
+            return Ok(());
         }
-        add_aggregate_binding_usage(
+        add_aggregate_binding_usage_core(
             &aggregate.binding,
             &format!("{path}.final_aggregates[{index}].binding"),
             usage,
             errors,
-        );
+            policy,
+        )?;
     }
     if let Some(grouped) = &spec.grouped_unpivot {
         usage.add_item_counts([
@@ -1209,38 +1393,42 @@ fn add_writer_finish_usage(
         ]);
         for mapping in &grouped.mappings {
             if usage.exhausted() {
-                return;
+                return Ok(());
             }
             usage.add_items(mapping.constants.len());
             for constant in &mapping.constants {
                 if usage.exhausted() {
-                    return;
+                    return Ok(());
                 }
                 add_unpivot_constant_usage(constant, usage);
             }
         }
     }
+    Ok(())
 }
 
-fn add_writer_schema_usage(
+fn add_writer_schema_usage_core<P: TypeValidationPolicy>(
     schema: &WriterRelationSchema,
     path: &str,
     usage: &mut ResourceUsage,
     errors: &mut ValidationContext,
-) {
+    policy: &mut P,
+) -> Result<(), P::Error> {
     usage.add_items(schema.fields.len());
     for (index, field) in schema.fields.iter().enumerate() {
         if usage.exhausted() {
-            return;
+            return Ok(());
         }
         usage.add_bytes(field.name.len());
-        validate_value_type(
+        validate_value_type_core(
             &field.ty,
             &format!("{path}.fields[{index}].type"),
             usage,
             errors,
-        );
+            policy,
+        )?;
     }
+    Ok(())
 }
 
 fn add_unpivot_constant_usage(_constant: &UnpivotConstant, _usage: &mut ResourceUsage) {
@@ -1249,12 +1437,13 @@ fn add_unpivot_constant_usage(_constant: &UnpivotConstant, _usage: &mut Resource
     // observed constant publication accounts repeated consumer work/limits.
 }
 
-fn add_relation_usage(
+fn add_relation_usage_core<P: TypeValidationPolicy>(
     relation: &Relation,
     path: &str,
     usage: &mut ResourceUsage,
     errors: &mut ValidationContext,
-) {
+    policy: &mut P,
+) -> Result<(), P::Error> {
     let (schema, guarantees, evidence_bytes, metadata_kind_bytes) = match relation {
         Relation::Data(relation) => (
             relation.schema.as_ref(),
@@ -1275,16 +1464,18 @@ fn add_relation_usage(
     add_read_reference_usage(relation.read(), usage);
     for (index, field) in schema.iter().enumerate() {
         if usage.exhausted() {
-            return;
+            return Ok(());
         }
         add_encoded_payload_usage(&field.column.column_payload, usage);
-        validate_value_type(
+        validate_value_type_core(
             &field.ty,
             &format!("{path}.schema[{index}].type"),
             usage,
             errors,
-        );
+            policy,
+        )?;
     }
+    Ok(())
 }
 
 fn add_encoded_payload_usage(payload: &ConnectorEncodedPayload, usage: &mut ResourceUsage) {
@@ -1331,26 +1522,33 @@ fn add_sink_usage(sink: &FragmentSink, usage: &mut ResourceUsage) {
     }
 }
 
-fn add_runtime_filter_usage(
+fn add_runtime_filter_usage_core<P: TypeValidationPolicy>(
     filter: &RuntimeFilter,
     path: &str,
     usage: &mut ResourceUsage,
     errors: &mut ValidationContext,
-) {
+    policy: &mut P,
+) -> Result<(), P::Error> {
     if usage.exhausted() {
-        return;
+        return Ok(());
     }
     match &filter.domain {
         RuntimeFilterDomain::Membership { ty, .. } => {
-            validate_value_type(ty, &format!("{path}.domain.type"), usage, errors);
+            validate_value_type_core(ty, &format!("{path}.domain.type"), usage, errors, policy)?;
         }
         RuntimeFilterDomain::Ordered { key, .. } => {
             usage.add_items(1);
-            validate_value_type(&key.ty, &format!("{path}.domain.key.type"), usage, errors);
+            validate_value_type_core(
+                &key.ty,
+                &format!("{path}.domain.key.type"),
+                usage,
+                errors,
+                policy,
+            )?;
         }
     }
     if usage.exhausted() {
-        return;
+        return Ok(());
     }
     add_runtime_filter_coverage_usage(
         &filter.availability_coverage,
@@ -1359,7 +1557,7 @@ fn add_runtime_filter_usage(
         errors,
     );
     if usage.exhausted() {
-        return;
+        return Ok(());
     }
     add_runtime_filter_coverage_usage(
         &filter.terminal_coverage,
@@ -1374,7 +1572,7 @@ fn add_runtime_filter_usage(
     ]);
     for producer in &filter.producers {
         if usage.exhausted() {
-            return;
+            return Ok(());
         }
         usage.add_item_counts([
             producer.endpoint.values.len(),
@@ -1385,7 +1583,7 @@ fn add_runtime_filter_usage(
     }
     for consumer in &filter.consumers {
         if usage.exhausted() {
-            return;
+            return Ok(());
         }
         usage.add_item_counts([consumer.endpoint.values.len(), consumer.capabilities.len()]);
         match &consumer.target {
@@ -1396,6 +1594,7 @@ fn add_runtime_filter_usage(
             crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => {}
         }
     }
+    Ok(())
 }
 
 fn add_runtime_filter_coverage_usage(
@@ -1886,17 +2085,6 @@ fn validate_value_type_core<P: TypeValidationPolicy>(
     }
     Ok(())
 }
-fn validate_data_type(
-    root: &DataType,
-    path: &str,
-    usage: &mut ResourceUsage,
-    errors: &mut ValidationContext,
-) {
-    match validate_data_type_core(root, path, usage, errors, &mut PlainTypeValidation) {
-        Ok(()) => {}
-        Err(never) => match never {},
-    }
-}
 fn validate_data_type_core<P: TypeValidationPolicy>(
     root: &DataType,
     path: &str,
@@ -2273,6 +2461,10 @@ fn invalid_fixed_size_core<P: TypeValidationPolicy>(
         errors,
     )
 }
+
+#[cfg(test)]
+#[path = "resource/usage_type_owned_tests.rs"]
+mod usage_type_owned_tests;
 
 #[cfg(test)]
 #[path = "resource/type_owned_tests.rs"]
