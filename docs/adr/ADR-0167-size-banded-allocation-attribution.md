@@ -10,6 +10,7 @@ date: 2026-10-03
 provenance:
   - "discussion: 2026-09-30 allocation attribution, observation boundaries and lifetime publication"
   - "approval: 2026-10-03 stable lane storage, safe scope interfaces and process observation implementation"
+  - "decision: 2026-10-06 Miri aliasing model for in-band allocator tail reads (Tree Borrows)"
 code-anchors:
   - "novarocks/memory/src/lane/record.rs (LaneRecord, LifetimeState)"
   - "novarocks/memory/src/lane/slot.rs (SlotCore)"
@@ -48,6 +49,8 @@ Rust 普通不可失败分配不能通过 SQL 错误恢复。因此 hook 只观�
 - **每次 hook 锁公共账本或动态映射：设计否决。** 引入再入、等待、metadata 分配及高频公共争用，且混合观察与容量政策。
 - **所有小对象都加 header：成本否决。** 小对象可获得更完整来源，但固定 token 的尺寸放大和 hook 路径成本不满足当前分段目标；环境小对象保留进程计数，R1 显式发布可知的小事实。此成本取舍尚待正式 Linux 结果确认。
 - **按 allocator usable size 充当请求事实：设计否决。** 请求布局、size class 放大与驻留页是不同事实；可把 usable size 用于独立成本测量，不能替换精确原 Layout。
+- **以 exposed provenance 读取尾部，使 Stacked Borrows 通过：合同与成本否决。** 分配时暴露基址、释放与 resize 时按地址恢复，必须放弃 strict provenance，并让每个带来源分配在热路径上额外暴露一次指针。
+- **以带外索引代替尾部读取：暂不采用。** 它是将来可选的实现优化，只在尾部税实测过高时考虑；引入它会改变尾部来源格式，需回到设计讨论。
 - **稳定分段记录 + 线性分配义务 + 单槽批量：采用。** 控制面维持有界记录与成员；hook 仅用 token/TLS 与原子发布。
 
 ## 裁决
@@ -69,7 +72,7 @@ Rust 普通不可失败分配不能通过 SQL 错误恢复。因此 hook 只观�
 - 带来源请求多 8 B，可跨 size class；请求字节、usable 与 resident 放大须分别测量。小释放增加真实释放事件计数，额外原子成本待正式 Linux 门，不用 smoke 代替结论。
 - 静态存储容量、保留 segments、无代次回绕和预算维护以固定资源换审查简单性；耗尽记覆盖错误。其 metadata 含观察控制估计与 retained backing，不冒充瞬时物理账本。
 - 有界并发模型验证的是有限操作/抢占下真实协议；它不替代 Miri 的地址验证。Miri 与 Linux 正式成本有独立收敛门，未完成不得声称 unsafe/性能验收完成。
-- **unsafe 验证以 Tree Borrows 为别名模型。** Stacked Borrows 把引用派生指针的权限限制在 `size_of::<T>()`，std 的 Box/Arc 把这样收窄的指针交给 `dealloc`。因此只要 allocator 经调用方指针读取请求长度之后的带内元数据，就会被 SB 判为 UB，std 自身的 Box 即可触发，与本条的协议实现无关。Miri 以 Tree Borrows 加 strict provenance 与 symbolic alignment 覆盖全部归属目标；在 SB 下，不经收窄指针的 resize、失败、跨线程释放、TLS 与 scope 路径同样通过。Tree Borrows 比 SB 更新，也更实验性，Rust 最终的别名模型可能更严格。exposed provenance 需要放弃 strict provenance，并在热路径暴露指针；带外索引违背裁决 2。两者均未采用。
+- **unsafe 验证以 Tree Borrows 为别名模型。** Stacked Borrows 把引用派生指针的权限限制在 `size_of::<T>()`，std 的 Box/Arc 把这样收窄的指针交给 `dealloc`。因此只要 allocator 经调用方指针读取请求长度之后的带内元数据，就会被 SB 判为 UB，std 自身的 Box 即可触发，与本条的协议实现无关。Miri 以 Tree Borrows 加 strict provenance 与 symbolic alignment 覆盖全部归属目标；在 SB 下，不经收窄指针的 resize、失败、跨线程释放、TLS 与 scope 路径同样通过。Tree Borrows 比 SB 更新，也更实验性，Rust 最终的别名模型可能更严格，因此这不是最终别名模型下的证明。
 - 读数按字段/分片独立采样，不存在全堆一致快照；Q×sampled pins 排除在途项，无法用它证明严格峰值。
 
 ## 何时重新评估

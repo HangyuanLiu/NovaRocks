@@ -111,7 +111,10 @@ if [[ "$mode" == --miri || "$mode" == --all ]]; then
       --lib --locked --offline "$module" -- --test-threads=1
   done
   # Select the actual source targets, including the standalone reconcile binary.
-  for source in novarocks/memory/tests/attribution_*.rs novarocks/memory/tests/allocator_observation.rs; do
+  # owner_lifetime and lane_lifecycle drive funded-domain FactToken publication,
+  # release and store dereference after authority/account exit.
+  for source in novarocks/memory/tests/attribution_*.rs novarocks/memory/tests/allocator_observation.rs \
+    novarocks/memory/tests/owner_lifetime.rs novarocks/memory/tests/lane_lifecycle.rs; do
     target="${source##*/}"
     target="${target%.rs}"
     printf 'Running System-backend Miri integration checks: %s\n' "$target"
