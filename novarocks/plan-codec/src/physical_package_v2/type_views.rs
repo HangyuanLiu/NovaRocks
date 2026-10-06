@@ -36,7 +36,7 @@ use novarocks_type_contract::{
 use std::{alloc::Layout, fmt, mem::size_of, ops::Range, sync::Arc};
 
 #[derive(Debug)]
-pub(crate) enum TypeViewError {
+pub enum TypeViewError {
     Control(CompileControlError),
     SourceModel(&'static str),
     InvalidSource(&'static str),
@@ -253,7 +253,7 @@ impl<'source, 'control, const N: usize> SourceInputPrefix<'source, 'control, N> 
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct TypeViewLimits {
+pub struct TypeViewLimits {
     pub max_occurrences: usize,
     pub max_value_roots: usize,
     pub max_field_roots: usize,

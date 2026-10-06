@@ -97,7 +97,7 @@ use std::{cell::Cell, fmt};
 /// chooses them. `source_retained_bytes` is the checked package's retained
 /// backing, invoiced once to every component that requires a source floor.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct PackageEncodeLimits {
+pub struct PackageEncodeLimits {
     pub source_retained_bytes: usize,
     /// Coarse bound on the complete encoded DTO, checked before return.
     pub max_wire_bytes: usize,
@@ -127,7 +127,7 @@ pub(crate) struct PackageEncodeLimits {
 }
 
 #[derive(Debug)]
-pub(crate) enum PackageEncodeError {
+pub enum PackageEncodeError {
     Control(CompileControlError),
     Source(TypeViewError),
     Provider(ProviderSourceError),
@@ -217,7 +217,7 @@ impl fmt::Display for PackageEncodeError {
 impl std::error::Error for PackageEncodeError {}
 
 /// Encode one checked package on its own Encode scope of `control`.
-pub(crate) fn encode_fragment_package(
+pub fn encode_fragment_package(
     package: &p::FragmentPackage,
     limits: &PackageEncodeLimits,
     control: &dyn PureCompileControl,

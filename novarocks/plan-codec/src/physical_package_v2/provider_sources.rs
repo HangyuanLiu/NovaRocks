@@ -37,7 +37,7 @@ use novarocks_type_contract::{CompileCheckpoints, CompileControlError, PureCompi
 use std::{fmt, ops::Range};
 
 #[derive(Debug)]
-pub(crate) enum ProviderSourceError {
+pub enum ProviderSourceError {
     Control(CompileControlError),
     Source(TypeViewError),
     Connector(c::ConnectorError),
@@ -89,7 +89,7 @@ fn id(n: usize) -> Result<u32, Error> {
 /// Caps count actual source occurrences, including aliases. Reserved capacity
 /// remains the actual occurrence upper even when pointer aliases reduce len.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ProviderSourceLimits {
+pub struct ProviderSourceLimits {
     pub max_provider_occurrences: usize,
     pub max_payload_occurrences: usize,
     pub max_read_occurrences: usize,

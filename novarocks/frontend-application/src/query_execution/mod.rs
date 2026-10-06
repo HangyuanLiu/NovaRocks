@@ -42,6 +42,7 @@ pub mod mv_native_write;
 pub(crate) mod native_execution_adapter;
 pub mod native_fragment;
 pub(crate) mod outcome;
+pub(crate) mod package_freeze;
 pub(crate) mod physical_encoding;
 pub(crate) mod pinned_connector_read;
 pub mod planning;

@@ -107,7 +107,7 @@ use std::{
 /// default exists. `admission.plan_limits` is the one structural PlanLimits
 /// for the owned expression arena, the Fragment and the Package.
 #[derive(Clone, Debug)]
-pub(crate) struct PackageDecodeLimits {
+pub struct PackageDecodeLimits {
     /// Generated-layout byte admission before Prost allocates.
     pub wire: DecodeProjectionLimits,
     pub types: PackageTypeProjectionLimits,
@@ -139,7 +139,7 @@ pub(crate) struct PackageDecodeLimits {
 }
 
 #[derive(Debug)]
-pub(crate) enum PackageDecodeError {
+pub enum PackageDecodeError {
     Control(CompileControlError),
     Wire(PackageWireError),
     Metadata(PackageMetadataCodecError),
@@ -339,7 +339,7 @@ fn result_port_backing(
 
 /// Decode one complete package on a single Decode scope. A control refusal
 /// returns directly; every other outcome observes the ordinary completion.
-pub(crate) fn decode_fragment_package(
+pub fn decode_fragment_package(
     raw: &[u8],
     model: &FragmentDecodeResourceModel,
     limits: &PackageDecodeLimits,

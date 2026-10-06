@@ -991,6 +991,67 @@ mod tests {
         assert_eq!(encoded.native.fragment_ids().count(), plan_fragments);
     }
 
+    /// The same completed statement freezes into one checked v2 package per
+    /// fragment; the receiver reads each back through the original
+    /// constructors and the sender reproduces the exact bytes.
+    #[test]
+    fn a_completed_statement_freezes_v2_packages_that_roundtrip_through_the_receiver() {
+        use novarocks_plan_codec::physical_package_v2::test_support::{
+            decode_limits, encode_limits,
+        };
+        use novarocks_plan_codec::physical_package_v2::{
+            decode_fragment_package, encode_fragment_package,
+        };
+        use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
+        use prost::Message;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (_root, scope) = query_scope();
+        let completed = runtime
+            .block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope))
+            .unwrap_or_else(|error| panic!("VALUES completes without facts: {error}"));
+        let control = SqlCompileControl::unbounded();
+        let admission = novarocks_physical_plan::FragmentPackageAdmission {
+            plan_limits: novarocks_physical_plan::PlanLimits::FROZEN,
+            source_retained_bytes: 2 << 30,
+            property_projection_limits: novarocks_physical_plan::PropertyProofProjectionLimits {
+                max_request_bytes: 512 << 20,
+                max_coexisting_bytes: 4 << 30,
+                max_projection_work: usize::MAX / 4,
+            },
+        };
+        let packages = crate::query_execution::package_freeze::freeze_fragment_packages(
+            completed.candidate(),
+            crate::application::test_constant_policy(),
+            &admission,
+            &encode_limits(),
+            &control,
+        )
+        .unwrap_or_else(|error| panic!("checked v2 packages: {error}"));
+        assert_eq!(
+            packages.keys().collect::<Vec<_>>(),
+            completed
+                .candidate()
+                .plan()
+                .fragments()
+                .keys()
+                .collect::<Vec<_>>()
+        );
+        let model = FragmentDecodeResourceModel::try_new(&control).expect("decode model");
+        for (id, bytes) in &packages {
+            let decoded = decode_fragment_package(bytes, &model, &decode_limits(), &control)
+                .unwrap_or_else(|error| panic!("fragment {id:?} receives: {error}"));
+            assert_eq!(decoded.fragment().id(), *id);
+            let again = encode_fragment_package(&decoded, &encode_limits(), &control)
+                .expect("re-encode")
+                .encode_to_vec();
+            assert_eq!(&again, bytes, "fragment {id:?} roundtrips byte-identically");
+        }
+    }
+
     #[test]
     fn completed_encoding_observes_tail_after_freezing_and_preserves_first_control_failure() {
         use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};

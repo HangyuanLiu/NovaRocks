@@ -27,6 +27,10 @@ workspace = true
 [lib]
 doctest = false
 
+[features]
+# Generous whole-package limits for dependent crates' tests.
+test-support = []
+
 [dependencies]
 flatbuffers.workspace = true
 novarocks-arrow-ipc-frame.workspace = true

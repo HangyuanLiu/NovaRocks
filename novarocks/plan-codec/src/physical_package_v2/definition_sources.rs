@@ -52,7 +52,7 @@ fn twice(n: usize) -> Result<usize, Error> {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct DefinitionSourceLimits {
+pub struct DefinitionSourceLimits {
     pub max_constants: usize,
     pub max_values: usize,
     pub max_expressions: usize,

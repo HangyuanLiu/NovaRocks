@@ -34,8 +34,17 @@ mod definition_sources;
 mod encode;
 mod nodes;
 mod provider_sources;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 mod type_sources;
 mod type_views;
+
+pub use binding_sources::BindingSourceLimits;
+pub use decode::{PackageDecodeError, PackageDecodeLimits, decode_fragment_package};
+pub use definition_sources::DefinitionSourceLimits;
+pub use encode::{PackageEncodeError, PackageEncodeLimits, encode_fragment_package};
+pub use provider_sources::{ProviderSourceError, ProviderSourceLimits};
+pub use type_views::{TypeViewError, TypeViewLimits};
 
 #[derive(Debug)]
 pub enum PackageWireError {

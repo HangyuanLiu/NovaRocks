@@ -35,7 +35,7 @@ use novarocks_type_contract::{CompileCheckpoints, CompileControlError, PureCompi
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct BindingSourceLimits {
+pub struct BindingSourceLimits {
     pub max_functions: usize,
     pub max_aggregates: usize,
     pub max_arguments: usize,

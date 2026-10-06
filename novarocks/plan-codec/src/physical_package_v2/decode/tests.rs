@@ -16,131 +16,15 @@
 // under the License.
 
 use super::*;
-use crate::ipc_flat_batch_v2::FlatBatchProjectionLimits;
-use crate::ipc_flat_stream_v2::{FlatReaderProjectionLimits, FlatStreamProjectionLimits};
-use crate::ipc_recursive_stream_v2::{
-    RecursiveBatchProjectionLimits, RecursiveReaderProjectionLimits,
-    RecursiveStreamProjectionLimits,
-};
-use crate::ipc_schema_v2::IpcSchemaProjectionLimits;
 use crate::physical_package_v2::definition_sources::tests::{
     cv_package, rich_package, writer_constant_package,
 };
-use crate::physical_package_v2::encode::tests::encode_limits;
 use crate::physical_package_v2::encode::{PackageEncodeError, encode_fragment_package};
 use crate::physical_package_v2::provider_sources::tests::checked_read;
+use crate::physical_package_v2::test_support::{decode_limits, encode_limits};
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use prost::Message;
 use std::sync::Mutex;
-
-const GIB: usize = 1024 * 1024 * 1024;
-
-fn schema() -> IpcSchemaProjectionLimits {
-    IpcSchemaProjectionLimits {
-        max_field_occurrences: 4096,
-        max_type_occurrences: 4096,
-        max_string_bytes: 65536,
-        max_flatbuffer_bytes: 4 * 1024 * 1024,
-    }
-}
-fn batch() -> FlatBatchProjectionLimits {
-    FlatBatchProjectionLimits {
-        max_metadata_bytes: 1024 * 1024,
-        max_body_bytes: 8 * 1024 * 1024,
-        max_rows: 4096,
-        max_buffer_descriptors: 16384,
-        max_view_validation_bytes: 8 * 1024 * 1024,
-    }
-}
-
-/// Generous receiver limits built from the sender's test limits where the
-/// same component limit type serves both directions.
-fn decode_limits() -> PackageDecodeLimits {
-    let e = encode_limits();
-    PackageDecodeLimits {
-        wire: DecodeProjectionLimits {
-            max_input_bytes: 64 << 20,
-            max_requested_heap_bytes: 512 << 20,
-            max_message_occurrences: 1_000_000,
-            max_scalar_elements: 1_000_000,
-            max_field_occurrences: 1_000_000,
-            max_copied_bytes: 512 << 20,
-            max_initialization_bytes: 512 << 20,
-            max_wire_depth: 100,
-        },
-        types: e.types,
-        node: e.node,
-        constant_policy: ConstantPolicy {
-            max_rows: 4096,
-            max_array_nodes: 4096,
-            max_logical_elements: 65536,
-            max_retained_buffer_bytes: 8 * 1024 * 1024,
-            max_type_depth: 64,
-            max_type_nodes: 4096,
-            max_dictionary_depth: 8,
-            max_metadata_bytes: 65536,
-            max_library_validation_work: 32 * 1024 * 1024,
-            max_library_validation_bytes: 32 * 1024 * 1024,
-        },
-        constant_records: ConstantDecodeProjectionLimits {
-            flat_stream: FlatStreamProjectionLimits {
-                max_input_bytes: 16 * 1024 * 1024,
-                schema: schema(),
-                batch: batch(),
-            },
-            flat_reader: FlatReaderProjectionLimits {
-                max_new_allocation_request_bytes: 128 * 1024 * 1024,
-                max_coexisting_source_and_request_bytes: 4 * GIB,
-                max_cumulative_library_work: 512 * 1024 * 1024,
-            },
-            recursive_stream: RecursiveStreamProjectionLimits {
-                max_input_bytes: 16 * 1024 * 1024,
-                schema: schema(),
-                batch: RecursiveBatchProjectionLimits {
-                    flat: batch(),
-                    max_field_nodes: 4096,
-                    max_total_rows: 65536,
-                    max_geometry_request_bytes: 1024 * 1024,
-                },
-            },
-            recursive_reader: RecursiveReaderProjectionLimits {
-                max_new_allocation_request_bytes: 128 * 1024 * 1024,
-                max_coexisting_source_and_request_bytes: 4 * GIB,
-                max_cumulative_library_work: GIB,
-            },
-        },
-        constants: e.constants,
-        verifier: VerifierOptions {
-            max_depth: 67,
-            max_tables: 65536,
-            max_apparent_size: 16 * 1024 * 1024,
-            ignore_missing_null_terminator: false,
-        },
-        bindings: e.bindings,
-        provider_bindings: e.provider_bindings,
-        payloads: e.payloads,
-        reads: e.reads,
-        relations: e.relations,
-        values: e.values,
-        expressions: e.expressions,
-        requests: e.requests,
-        parameters: e.parameters,
-        cuts: e.cuts,
-        scans: e.scans,
-        writers: e.writers,
-        writer_schema: e.writer_schema,
-        control: e.control,
-        admission: p::FragmentPackageAdmission {
-            plan_limits: p::PlanLimits::FROZEN,
-            source_retained_bytes: 2 * GIB,
-            property_projection_limits: p::PropertyProofProjectionLimits {
-                max_request_bytes: 512 * 1024 * 1024,
-                max_coexisting_bytes: 4 * GIB,
-                max_projection_work: usize::MAX / 4,
-            },
-        },
-    }
-}
 
 #[derive(Default)]
 struct Control {

@@ -105,6 +105,36 @@ impl CompletedPhysicalPlanCandidate {
         })
     }
 
+    /// Author every fragment's package semantics from SQL's original source
+    /// journal. A structural program has no SQL journal; it is refused rather
+    /// than given fabricated call scopes.
+    pub fn author_package_semantics(
+        &self,
+        statement_constant_policy: novarocks_physical_plan::ConstantPolicy,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        std::collections::BTreeMap<
+            novarocks_physical_plan::FragmentId,
+            novarocks_sql::compiler::FragmentPackageSemantics,
+        >,
+        novarocks_sql::compiler::PackageSemanticsError,
+    > {
+        match &self.source {
+            CompletedPlanSource::Sql(source) => {
+                novarocks_sql::compiler::author_fragment_package_semantics(
+                    source,
+                    statement_constant_policy,
+                    control,
+                )
+            }
+            CompletedPlanSource::Program(_) => Err(
+                novarocks_sql::compiler::PackageSemanticsError::InvalidSource(
+                    "a structural program has no SQL call source journal",
+                ),
+            ),
+        }
+    }
+
     pub fn plan(&self) -> &Arc<PhysicalPlan> {
         match &self.source {
             CompletedPlanSource::Sql(source) => source.plan_arc(),
