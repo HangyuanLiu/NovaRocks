@@ -208,7 +208,54 @@ impl FrozenFragmentCalls {
         control: &dyn PureCompileControl,
     ) -> Result<OccurrencePropertyProof<'a>, FrozenCallError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-        let result = (|| {
+        let result = self.property_proof_core(
+            fragment,
+            uses,
+            limits,
+            source_retained_bytes,
+            projection_limits,
+            None,
+            &mut work,
+        );
+        finish_frozen_calls(work, result)
+    }
+
+    /// Project the same source on the caller's meter without entry or finish.
+    /// This scope port does not invoice the opaque structural scratch owners.
+    pub(crate) fn property_proof_in<'a>(
+        &'a self,
+        fragment: &'a Fragment,
+        uses: &'a PhysicalRootUses,
+        limits: &PlanLimits,
+        source_retained_bytes: usize,
+        projection_limits: PropertyProofProjectionLimits,
+        admit: &mut dyn FnMut(
+            &novarocks_type_contract::ControlOwnedResourceFacts,
+        ) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<OccurrencePropertyProof<'a>, FrozenCallError> {
+        self.property_proof_core(
+            fragment,
+            uses,
+            limits,
+            source_retained_bytes,
+            projection_limits,
+            Some(admit),
+            work,
+        )
+    }
+
+    fn property_proof_core<'a>(
+        &'a self,
+        fragment: &'a Fragment,
+        uses: &'a PhysicalRootUses,
+        limits: &PlanLimits,
+        source_retained_bytes: usize,
+        projection_limits: PropertyProofProjectionLimits,
+        mut admit: Option<&mut ResourceAdmission<'_>>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<OccurrencePropertyProof<'a>, FrozenCallError> {
+        (|| {
             // Bound source cardinalities before a source validator or the new
             // canonical node index allocates. Limits count definitions, not IDs.
             for (count, maximum) in [
@@ -257,7 +304,11 @@ impl FrozenFragmentCalls {
                 }
             }
             work.flush()?;
-            let call_items = self.dynamic_items_observed(control)?;
+            let call_items = if admit.is_some() {
+                self.dynamic_items_in(work)?
+            } else {
+                self.dynamic_items_observed(work.control())?
+            };
             // Reuse the source's numerical vocabulary. This is a structural
             // envelope, not a model of source/validator allocations or MEM.
             let mut errors = ValidationContext::with_limits(*limits);
@@ -282,7 +333,11 @@ impl FrozenFragmentCalls {
                 return Err(FrozenCallError::TooManyItems);
             }
             work.flush()?;
-            self.validate_fragment(fragment, uses, control)?;
+            if let Some(admit) = admit.as_deref_mut() {
+                self.validate_fragment_in(fragment, uses, &mut |facts| admit(facts), work)?;
+            } else {
+                self.validate_fragment(fragment, uses, work.control())?;
+            }
             work.flush()?;
             let mut nodes = Vec::new();
             let reserved = nodes.try_reserve_exact(fragment.nodes().len());
@@ -307,7 +362,7 @@ impl FrozenFragmentCalls {
                 work.step()?;
             }
             let mut first_broadcast_unsafe = None;
-            visit_calls::<FrozenCallError>(fragment, uses, &mut work, |site, binding, work| {
+            visit_calls::<FrozenCallError>(fragment, uses, work, |site, binding, work| {
                 let owner = match site {
                     PhysicalCallSite::Expression(id) => {
                         let invocation = uses.flow().uses().get(&id);
@@ -348,7 +403,6 @@ impl FrozenFragmentCalls {
                 facts,
                 first_broadcast_unsafe,
             })
-        })();
-        finish_frozen_calls(work, result)
+        })()
     }
 }

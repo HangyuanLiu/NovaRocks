@@ -1395,3 +1395,7 @@ fn package_admission() -> crate::FragmentPackageAdmission {
         },
     }
 }
+
+mod owned_tests {
+    include!("owned_tests.rs");
+}

@@ -134,31 +134,51 @@ impl FragmentCallRequests {
         control: &dyn PureCompileControl,
     ) -> Result<Self, CallRequestError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-        let result = (|| {
-            crate::resource::validate_call_request_source_observed(
-                &entries,
-                entries.capacity(),
-                &mut work,
-            )?;
-            let mut table = BTreeMap::new();
-            for (definition, request) in entries {
-                work.flush()?;
-                let previous = table.insert(definition, request);
-                work.step()?;
-                work.flush()?;
-                if previous.is_some() {
-                    return Err(CallRequestError::DuplicateDefinition(definition));
-                }
-            }
-            let table = Self {
-                fragment: fragment.id(),
-                entries: Arc::new(table),
-            };
-            work.flush()?;
-            table.validate_fragment(fragment, control)?;
-            Ok(table)
-        })();
+        let result = Self::try_new_core(fragment, entries, &mut work, |table, fragment, _| {
+            table.validate_fragment(fragment, control)
+        });
         finish(result, work)
+    }
+    /// Construct mandatory requests on the caller's original meter. The caller
+    /// owns entry and ordinary/success finish and admits the original storage.
+    /// This port supplies neither provenance nor an allocation/MEM grant.
+    pub fn try_new_in(
+        fragment: &Fragment,
+        entries: Vec<(PhysicalCallDefinition, PhysicalCallRequest)>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, CallRequestError> {
+        Self::try_new_core(fragment, entries, work, |table, fragment, work| {
+            table.validate_fragment_in(fragment, work)
+        })
+    }
+    fn try_new_core(
+        fragment: &Fragment,
+        entries: Vec<(PhysicalCallDefinition, PhysicalCallRequest)>,
+        work: &mut CompileCheckpoints<'_>,
+        validate: impl FnOnce(
+            &Self,
+            &Fragment,
+            &mut CompileCheckpoints<'_>,
+        ) -> Result<(), CallRequestError>,
+    ) -> Result<Self, CallRequestError> {
+        crate::resource::validate_call_request_source_observed(&entries, entries.capacity(), work)?;
+        let mut table = BTreeMap::new();
+        for (definition, request) in entries {
+            work.flush()?;
+            let previous = table.insert(definition, request);
+            work.step()?;
+            work.flush()?;
+            if previous.is_some() {
+                return Err(CallRequestError::DuplicateDefinition(definition));
+            }
+        }
+        let table = Self {
+            fragment: fragment.id(),
+            entries: Arc::new(table),
+        };
+        work.flush()?;
+        validate(&table, fragment, work)?;
+        Ok(table)
     }
     pub fn validate_fragment(
         &self,
@@ -166,72 +186,79 @@ impl FragmentCallRequests {
         control: &dyn PureCompileControl,
     ) -> Result<(), CallRequestError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-        let result = (|| {
-            let wrong_fragment = fragment.id() != self.fragment;
-            work.step()?;
-            if wrong_fragment {
-                return Err(CallRequestError::WrongFragment);
-            }
-            crate::resource::validate_call_request_table_observed(self, &mut work)?;
-            let mut visited = 0usize;
-            let mut check = |definition,
-                             binding: PhysicalCallBinding<'_>,
-                             window_logical_count: Option<usize>,
-                             work: &mut CompileCheckpoints<'_>|
-             -> Result<(), CallRequestError> {
-                let request = self.entries.get(&definition);
-                work.step()?;
-                let request = request.ok_or(CallRequestError::MissingDefinition(definition))?;
-                validate_request_binding(definition, request, binding, window_logical_count, work)?;
-                visited = visited
-                    .checked_add(1)
-                    .ok_or(CompileControlError::ResourceExhausted)?;
-                work.step()?;
-                Ok(())
-            };
-            for (&id, expression) in fragment.expressions().iter() {
-                work.step()?;
-                let (binding, window_logical_count) = match &expression.kind {
-                    ExprKind::FunctionCall { function, .. } => {
-                        (PhysicalCallBinding::Scalar(function), None)
-                    }
-                    ExprKind::WindowCall {
-                        function,
-                        aggregate_binding,
-                        args,
-                        ..
-                    } => (
-                        PhysicalCallBinding::Window {
-                            function,
-                            aggregate: aggregate_binding.as_deref(),
-                        },
-                        aggregate_binding.is_none().then_some(args.len()),
-                    ),
-                    _ => continue,
-                };
-                check(
-                    PhysicalCallDefinition::Expression(id),
-                    binding,
-                    window_logical_count,
-                    &mut work,
-                )?;
-            }
-            crate::visit_relational_calls_observed(fragment, &mut work, |site, binding, work| {
-                check(
-                    PhysicalCallDefinition::Relational(site),
-                    binding,
-                    None,
-                    work,
-                )
-            })?;
-            let extra = visited != self.entries.len();
-            work.step()?;
-            if extra {
-                return Err(CallRequestError::ExtraDefinition);
-            }
-            Ok(())
-        })();
+        let result = self.validate_fragment_in(fragment, &mut work);
         finish(result, work)
+    }
+    /// Recheck the complete original definition table, including dead and
+    /// TypeOnly definitions, without creating a child scope or footer.
+    pub fn validate_fragment_in(
+        &self,
+        fragment: &Fragment,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), CallRequestError> {
+        let wrong_fragment = fragment.id() != self.fragment;
+        work.step()?;
+        if wrong_fragment {
+            return Err(CallRequestError::WrongFragment);
+        }
+        crate::resource::validate_call_request_table_observed(self, work)?;
+        let mut visited = 0usize;
+        let mut check = |definition,
+                         binding: PhysicalCallBinding<'_>,
+                         window_logical_count: Option<usize>,
+                         work: &mut CompileCheckpoints<'_>|
+         -> Result<(), CallRequestError> {
+            let request = self.entries.get(&definition);
+            work.step()?;
+            let request = request.ok_or(CallRequestError::MissingDefinition(definition))?;
+            validate_request_binding(definition, request, binding, window_logical_count, work)?;
+            visited = visited
+                .checked_add(1)
+                .ok_or(CompileControlError::ResourceExhausted)?;
+            work.step()?;
+            Ok(())
+        };
+        for (&id, expression) in fragment.expressions().iter() {
+            work.step()?;
+            let (binding, window_logical_count) = match &expression.kind {
+                ExprKind::FunctionCall { function, .. } => {
+                    (PhysicalCallBinding::Scalar(function), None)
+                }
+                ExprKind::WindowCall {
+                    function,
+                    aggregate_binding,
+                    args,
+                    ..
+                } => (
+                    PhysicalCallBinding::Window {
+                        function,
+                        aggregate: aggregate_binding.as_deref(),
+                    },
+                    aggregate_binding.is_none().then_some(args.len()),
+                ),
+                _ => continue,
+            };
+            check(
+                PhysicalCallDefinition::Expression(id),
+                binding,
+                window_logical_count,
+                work,
+            )?;
+        }
+        crate::visit_relational_calls_observed(fragment, work, |site, binding, work| {
+            check(
+                PhysicalCallDefinition::Relational(site),
+                binding,
+                None,
+                work,
+            )
+        })?;
+        let extra = visited != self.entries.len();
+        work.step()?;
+        if extra {
+            return Err(CallRequestError::ExtraDefinition);
+        }
+        Ok(())
     }
 }
 fn validate_request_binding(
@@ -288,6 +315,17 @@ impl Fragment {
         control: &dyn PureCompileControl,
     ) -> Result<Self, CallRequestError> {
         let requests = FragmentCallRequests::try_new(&self, entries, control)?;
+        self.call_requests = requests;
+        Ok(self)
+    }
+    /// Attach the caller-authored mandatory table using the same publication
+    /// meter. Complete source/resource/binding coverage is still rechecked.
+    pub fn with_call_requests_in(
+        mut self,
+        entries: Vec<(PhysicalCallDefinition, PhysicalCallRequest)>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, CallRequestError> {
+        let requests = FragmentCallRequests::try_new_in(&self, entries, work)?;
         self.call_requests = requests;
         Ok(self)
     }

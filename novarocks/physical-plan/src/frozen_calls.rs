@@ -498,17 +498,25 @@ impl FrozenFragmentCalls {
         control: &dyn PureCompileControl,
     ) -> Result<usize, FrozenCallError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-        let result = (|| {
-            let mut items = self.entries.len();
-            for call in self.entries.values() {
-                items = items
-                    .checked_add(call.effects.environment.len())
-                    .ok_or(FrozenCallError::TooManyItems)?;
-                work.step()?;
-            }
-            Ok(items)
-        })();
+        let result = self.dynamic_items_in(&mut work);
         finish_frozen_calls(work, result)
+    }
+
+    /// Count the same immutable environment references in the caller's scope.
+    /// This lends observations only; source admission and the ordinary/success
+    /// tail remain with the caller, without a nested entry or completion.
+    pub(crate) fn dynamic_items_in(
+        &self,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<usize, FrozenCallError> {
+        let mut items = self.entries.len();
+        for call in self.entries.values() {
+            items = items
+                .checked_add(call.effects.environment.len())
+                .ok_or(FrozenCallError::TooManyItems)?;
+            work.step()?;
+        }
+        Ok(items)
     }
 
     /// Lookup the real binding for this occurrence. This is not admission; the

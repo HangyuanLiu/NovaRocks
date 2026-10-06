@@ -108,6 +108,15 @@ impl FrozenFragmentPruning {
         count_items(self.fragment, &self.witnesses, control)
     }
 
+    /// Count the same original declaration grammar without renewing a scope.
+    /// Ordinary and successful tails are the caller's responsibility.
+    pub fn dynamic_items_in(
+        &self,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<usize, FrozenPruningError> {
+        count_items_core(self.fragment, &self.witnesses, None, work)
+    }
+
     pub(crate) fn validate_package(
         &self,
         package: &FragmentPackage,
@@ -119,15 +128,40 @@ impl FrozenFragmentPruning {
         if self.witnesses.is_empty() {
             return Ok(());
         }
-        // One actual consumer index and one combined proof-work allowance for
-        // all declarations. Later FE semantic validation still checks effects
-        // and complete global consumers before granting pruning authority.
+        // One actual consumer index and one combined proof-work allowance.
         let mut work = PruningWork::try_new(control)?;
-        let index = PruningConsumerIndex::try_new(package, &mut work)?;
-        for witness in self.witnesses.iter() {
-            PruningDomainStructure::try_new_indexed(package, witness, &index, control, &mut work)?;
-        }
+        self.validate_package_core(package, control, &mut work)?;
         work.finish()?;
+        Ok(())
+    }
+
+    /// Retain the original consumer/index and witness laws on the caller's
+    /// scope. No empty table grants pruning or complete Package authority.
+    pub(crate) fn validate_package_in(
+        &self,
+        package: &FragmentPackage,
+        observed: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), FrozenPruningError> {
+        if self.fragment != package.fragment().id() {
+            return Err(FrozenPruningError::WrongFragment);
+        }
+        if self.witnesses.is_empty() {
+            return Ok(());
+        }
+        let control = observed.control();
+        let mut work = PruningWork::borrowed(observed);
+        self.validate_package_core(package, control, &mut work)
+    }
+    fn validate_package_core(
+        &self,
+        package: &FragmentPackage,
+        control: &dyn PureCompileControl,
+        work: &mut PruningWork<'_, '_>,
+    ) -> Result<(), FrozenPruningError> {
+        let index = PruningConsumerIndex::try_new(package, work)?;
+        for witness in self.witnesses.iter() {
+            PruningDomainStructure::try_new_indexed(package, witness, &index, control, work)?;
+        }
         Ok(())
     }
 }

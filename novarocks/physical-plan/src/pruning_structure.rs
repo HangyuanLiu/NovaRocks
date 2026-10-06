@@ -155,12 +155,25 @@ impl<'package, 'witness> PruningDomainStructure<'package, 'witness> {
         Ok(checked)
     }
 
+    /// Borrow the caller's observation scope while retaining the original
+    /// combined structural fuel. This establishes only same-snapshot shape.
+    pub fn try_new_in(
+        package: &'package FragmentPackage,
+        witness: &'witness PruningDomainWitness,
+        observed: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, PruningStructureError> {
+        let control = observed.control();
+        let mut work = PruningWork::borrowed(observed);
+        let index = PruningConsumerIndex::try_new(package, &mut work)?;
+        Self::try_new_indexed(package, witness, &index, control, &mut work)
+    }
+
     pub(crate) fn try_new_indexed(
         package: &'package FragmentPackage,
         witness: &'witness PruningDomainWitness,
         index: &PruningConsumerIndex<'_>,
         control: &dyn PureCompileControl,
-        work: &mut PruningWork<'_>,
+        work: &mut PruningWork<'_, '_>,
     ) -> Result<Self, PruningStructureError> {
         if !std::ptr::eq(index.package, package) {
             return Err(PruningStructureError::WrongSnapshot);
@@ -203,13 +216,23 @@ impl<'package, 'witness> PruningDomainStructure<'package, 'witness> {
                 work.step()?;
                 conjunct_path.push(*ordinal);
             }
-            let checked = PredicateConjunctSource::try_new(
-                fragment,
-                package.expression_uses(),
-                source.responsibility.site,
-                conjunct_path,
-                control,
-            )?;
+            let checked = if work.is_borrowed() {
+                PredicateConjunctSource::try_new_in(
+                    fragment,
+                    package.expression_uses(),
+                    source.responsibility.site,
+                    conjunct_path,
+                    work.observed_mut(),
+                )?
+            } else {
+                PredicateConjunctSource::try_new(
+                    fragment,
+                    package.expression_uses(),
+                    source.responsibility.site,
+                    conjunct_path,
+                    control,
+                )?
+            };
             if checked.responsibility().anchor() != source.responsibility {
                 return Err(PruningStructureError::WrongResponsibility);
             }
@@ -334,7 +357,7 @@ pub(crate) struct PruningConsumerIndex<'package> {
 impl<'package> PruningConsumerIndex<'package> {
     pub(crate) fn try_new(
         package: &'package FragmentPackage,
-        work: &mut PruningWork<'_>,
+        work: &mut PruningWork<'_, '_>,
     ) -> Result<Self, PruningStructureError> {
         let fragment = package.fragment();
         let mut inputs = BTreeMap::new();
@@ -365,38 +388,63 @@ impl<'package> PruningConsumerIndex<'package> {
 
 /// Local structural proof fuel. Exhaustion declines this proof; it is not a
 /// new whole-plan admission limit or a memory allowance. Nested conjunct-source
-/// work is independently observed and preflighted by the same reference bound.
+/// work remains preflighted by the same reference bound. Borrowed mode observes
+/// it on the caller's meter without adding it to this original structural fuel.
 pub const MAX_PRUNING_STRUCTURE_WORK: usize = crate::MAX_FRAGMENT_DYNAMIC_ITEMS;
-pub(crate) struct PruningWork<'a> {
-    observed: CompileCheckpoints<'a>,
+enum PruningObservation<'control, 'borrow> {
+    Owned(CompileCheckpoints<'control>),
+    Borrowed(&'borrow mut CompileCheckpoints<'control>),
+}
+pub(crate) struct PruningWork<'control, 'borrow> {
+    observed: PruningObservation<'control, 'borrow>,
     units: usize,
 }
-impl<'a> PruningWork<'a> {
+impl<'control, 'borrow> PruningWork<'control, 'borrow> {
     pub(crate) fn try_new(
-        control: &'a dyn PureCompileControl,
+        control: &'control dyn PureCompileControl,
     ) -> Result<Self, PruningStructureError> {
         Ok(Self {
-            observed: CompileCheckpoints::try_new(control, CompilePhase::Validate)?,
+            observed: PruningObservation::Owned(CompileCheckpoints::try_new(
+                control,
+                CompilePhase::Validate,
+            )?),
             units: 0,
         })
+    }
+    pub(crate) fn borrowed(observed: &'borrow mut CompileCheckpoints<'control>) -> Self {
+        Self {
+            observed: PruningObservation::Borrowed(observed),
+            units: 0,
+        }
+    }
+    fn is_borrowed(&self) -> bool {
+        matches!(&self.observed, PruningObservation::Borrowed(_))
+    }
+    fn observed_mut(&mut self) -> &mut CompileCheckpoints<'control> {
+        match &mut self.observed {
+            PruningObservation::Owned(observed) => observed,
+            PruningObservation::Borrowed(observed) => observed,
+        }
     }
     fn step(&mut self) -> Result<(), PruningStructureError> {
         if self.units == MAX_PRUNING_STRUCTURE_WORK {
             return Err(PruningStructureError::TooLarge);
         }
         self.units += 1;
-        self.observed.step()?;
+        self.observed_mut().step()?;
         Ok(())
     }
     pub(crate) fn finish(self) -> Result<(), PruningStructureError> {
-        self.observed.finish()?;
+        if let PruningObservation::Owned(observed) = self.observed {
+            observed.finish()?;
+        }
         Ok(())
     }
 }
 
 fn preflight(
     witness: &PruningDomainWitness,
-    work: &mut PruningWork<'_>,
+    work: &mut PruningWork<'_, '_>,
 ) -> Result<(), PruningStructureError> {
     if witness.sources.is_empty() {
         return Err(PruningStructureError::EmptySources);
@@ -437,7 +485,7 @@ fn preflight(
 fn contains_value(
     columns: &[ValueId],
     value: ValueId,
-    work: &mut PruningWork<'_>,
+    work: &mut PruningWork<'_, '_>,
 ) -> Result<(), PruningStructureError> {
     for column in columns {
         work.step()?;
@@ -453,7 +501,7 @@ fn actual_transport(
     edge: PruningInputEdge,
     output: ValueId,
     input: ValueId,
-    work: &mut PruningWork<'_>,
+    work: &mut PruningWork<'_, '_>,
 ) -> Result<bool, PruningStructureError> {
     // A Project's real field is checked even when IDs happen to be equal.
     if let NodeKind::Project { expressions } = &parent.kind {

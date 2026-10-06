@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[path = "dynamic_items_owned_tests.rs"]
+mod dynamic_items_owned_tests;
 #[path = "property_formula_tests.rs"]
 mod property_formula_tests;
 #[path = "property_proof_tests.rs"]
@@ -266,6 +268,33 @@ impl Fixture {
         )
     }
 }
+// A genuine zero-row, zero-column source has no unreachable expression.
+// Empty call/request tables are explicit and checked by their original owners.
+fn empty_fixture() -> Fixture {
+    let mut builder = FragmentBuilder::new(FragmentId::new(u32::MAX));
+    let node = builder.reserve_node_id().unwrap();
+    install_node(
+        &mut builder,
+        node,
+        vec![],
+        vec![],
+        NodeKind::Values {
+            rows: Box::default(),
+        },
+    );
+    let fragment = builder
+        .finish_definition(node, FragmentSink::Noop, dop())
+        .unwrap()
+        .with_call_requests_observed(vec![], &Control::default())
+        .unwrap();
+    let uses = leaf_roots(&fragment);
+    Fixture {
+        fragment,
+        uses,
+        calls: vec![],
+    }
+}
+
 fn scalar_fixture(count: usize, fragment_id: u32) -> Fixture {
     let mut builder = FragmentBuilder::new(FragmentId::new(fragment_id));
     let request = zero_argument_request();

@@ -106,6 +106,18 @@ impl ExactPredicateResponsibility {
         control: &dyn PureCompileControl,
     ) -> Result<Self, PredicateSourceError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+        let value = Self::try_new_in(fragment, roots, site, &mut work)?;
+        work.finish()?;
+        Ok(value)
+    }
+
+    /// The same original responsibility author on the caller's scope.
+    pub fn try_new_in(
+        fragment: &Fragment,
+        roots: &PhysicalRootUses,
+        site: ExpressionRootSite,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, PredicateSourceError> {
         if roots.roots().fragment() != fragment.id() {
             return Err(PredicateSourceError::InvalidFragment);
         }
@@ -159,7 +171,6 @@ impl ExactPredicateResponsibility {
             return Err(PredicateSourceError::InvalidUse);
         }
         work.step()?;
-        work.finish()?;
         Ok(Self {
             anchor: PredicateResponsibilityRef {
                 fragment: fragment.id(),
@@ -201,16 +212,68 @@ impl PredicateConjunctSource {
         control: &dyn PureCompileControl,
     ) -> Result<Self, PredicateSourceError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+        let (responsibility, definition, context) =
+            Self::checked_parts(fragment, roots, site, &path, false, &mut work)?;
+        work.finish()?;
+        Ok(Self {
+            responsibility,
+            path: path.into(),
+            definition,
+            context,
+        })
+    }
+
+    /// Validate the same full path and actual root using the caller's scope.
+    /// The final Arc remains an opaque host boundary, not an allocation grant.
+    pub fn try_new_in(
+        fragment: &Fragment,
+        roots: &PhysicalRootUses,
+        site: ExpressionRootSite,
+        path: Vec<u32>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, PredicateSourceError> {
+        let (responsibility, definition, context) =
+            Self::checked_parts(fragment, roots, site, &path, true, work)?;
+        work.flush()?;
+        let path = path.into();
+        work.step()?;
+        work.flush()?;
+        Ok(Self {
+            responsibility,
+            path,
+            definition,
+            context,
+        })
+    }
+    fn checked_parts(
+        fragment: &Fragment,
+        roots: &PhysicalRootUses,
+        site: ExpressionRootSite,
+        path: &[u32],
+        borrowed: bool,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<
+        (
+            ExactPredicateResponsibility,
+            ExprId,
+            ExpressionEffectContext,
+        ),
+        PredicateSourceError,
+    > {
         if path.len() >= MAX_CONTROL_DEPTH {
             return Err(PredicateSourceError::TooDeep);
         }
-        let responsibility = ExactPredicateResponsibility::try_new(fragment, roots, site, control)?;
+        let responsibility = if borrowed {
+            ExactPredicateResponsibility::try_new_in(fragment, roots, site, work)?
+        } else {
+            ExactPredicateResponsibility::try_new(fragment, roots, site, work.control())?
+        };
         let mut current = roots
             .flow()
             .uses()
             .get(&responsibility.anchor.use_id)
             .ok_or(PredicateSourceError::InvalidUse)?;
-        for ordinal in &path {
+        for ordinal in path {
             let source = definition(fragment, current.definition, site)?;
             let ExprKind::Conjunction { args } = &source.kind else {
                 return Err(PredicateSourceError::NotPositiveConjunction);
@@ -248,13 +311,7 @@ impl PredicateConjunctSource {
         }
         definition(fragment, current.definition, site)?;
         work.step()?;
-        work.finish()?;
-        Ok(Self {
-            responsibility,
-            path: path.into(),
-            definition: current.definition,
-            context: current.context,
-        })
+        Ok((responsibility, current.definition, current.context))
     }
     pub const fn responsibility(&self) -> &ExactPredicateResponsibility {
         &self.responsibility

@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[path = "owned_tests.rs"]
+mod owned_tests;
 use crate::{
     Distribution, ExprId, ExprKind, ExprNode, LiteralValue, NodeKind, OutputPort,
     PhysicalProperties, RowMultiplicity, ValidationErrorCategory, ValueOrigin, ValueType,

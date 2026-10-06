@@ -584,3 +584,282 @@ fn occurrence_property_proof_global_broadcast_fault_follows_visit_order_not_node
     assert_eq!(run(&ProofControl::default()), expected);
     prefixes(run, false);
 }
+
+#[derive(Default)]
+struct BorrowedProofControl {
+    trace: Mutex<Vec<(CompilePhase, u32)>>,
+    refusal: Option<(usize, CompileControlError)>,
+}
+impl PureCompileControl for BorrowedProofControl {
+    fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+        assert_eq!(phase, CompilePhase::LowerProgram, "unexpected nested scope");
+        assert!(units <= 256);
+        let mut trace = self.trace.lock().unwrap();
+        let at = trace.len();
+        if let Some((stop, _)) = self.refusal {
+            assert!(at <= stop, "callback after borrowed primary refusal");
+        }
+        trace.push((phase, units));
+        match self.refusal {
+            Some((stop, cause)) if at == stop => Err(cause),
+            _ => Ok(()),
+        }
+    }
+}
+fn borrowed_proof_run(
+    fixture: &Fixture,
+    calls: &FrozenFragmentCalls,
+    source: usize,
+    complete: bool,
+    control: &BorrowedProofControl,
+    admit: &mut dyn FnMut(
+        &novarocks_type_contract::ControlOwnedResourceFacts,
+    ) -> Result<(), CompileControlError>,
+) -> Result<PropertyProofProjectionFacts, FragmentPropertyError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let result = if complete {
+        crate::validation::validate_fragment_output_properties_in(
+            &fixture.fragment,
+            &fixture.uses,
+            calls,
+            PlanLimits::FROZEN,
+            source,
+            PROJECTION_LIMITS,
+            admit,
+            &mut work,
+        )
+    } else {
+        calls
+            .property_proof_in(
+                &fixture.fragment,
+                &fixture.uses,
+                &PlanLimits::FROZEN,
+                source,
+                PROJECTION_LIMITS,
+                admit,
+                &mut work,
+            )
+            .map(|proof| proof.facts())
+            .map_err(FragmentPropertyError::from)
+    };
+    if matches!(&result, Err(FragmentPropertyError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+fn borrowed_facts_axes(f: novarocks_type_contract::ControlOwnedResourceFacts) -> [usize; 3] {
+    [
+        f.allocation_requests_upper_bound,
+        f.allocation_request_bytes_upper_bound,
+        f.cumulative_work_upper_bound,
+    ]
+}
+fn borrowed_gate(
+    facts: &novarocks_type_contract::ControlOwnedResourceFacts,
+    maximum: [usize; 3],
+) -> Result<(), CompileControlError> {
+    if borrowed_facts_axes(*facts)
+        .iter()
+        .zip(maximum)
+        .any(|(value, max)| *value > max)
+    {
+        return Err(CompileControlError::ResourceExhausted);
+    }
+    Ok(())
+}
+
+#[test]
+fn borrowed_property_source_and_complete_formulas_keep_actual_admission_exact_replay() {
+    let fixture = scalar_fixture(2, u32::MAX);
+    let calls = fixture.checked().unwrap();
+    for complete in [false, true] {
+        let plain = if complete {
+            crate::validation::validate_fragment_output_properties_observed(
+                &fixture.fragment,
+                &fixture.uses,
+                &calls,
+                PlanLimits::FROZEN,
+                SOURCE_INVOICE,
+                PROJECTION_LIMITS,
+                &ProofControl::default(),
+            )
+            .unwrap()
+        } else {
+            calls
+                .property_proof(
+                    &fixture.fragment,
+                    &fixture.uses,
+                    &PlanLimits::FROZEN,
+                    SOURCE_INVOICE,
+                    PROJECTION_LIMITS,
+                    &ProofControl::default(),
+                )
+                .unwrap()
+                .facts()
+        };
+        let control = BorrowedProofControl::default();
+        let mut maximum = [0; 3];
+        let mut captures = 0;
+        let result = borrowed_proof_run(
+            &fixture,
+            &calls,
+            SOURCE_INVOICE,
+            complete,
+            &control,
+            &mut |facts| {
+                captures += 1;
+                for (index, value) in borrowed_facts_axes(*facts).into_iter().enumerate() {
+                    maximum[index] = maximum[index].max(value);
+                }
+                borrowed_gate(facts, [usize::MAX; 3])
+            },
+        )
+        .unwrap();
+        assert!(captures > 0);
+        assert!(maximum.iter().all(|value| *value > 0));
+        assert_eq!(
+            [
+                result.request_bytes,
+                result.coexisting_bytes,
+                result.projection_work
+            ],
+            [
+                plain.request_bytes,
+                plain.coexisting_bytes,
+                plain.projection_work
+            ]
+        );
+        assert_eq!(
+            result.coexisting_bytes,
+            SOURCE_INVOICE + result.request_bytes
+        );
+        let control = BorrowedProofControl::default();
+        borrowed_proof_run(
+            &fixture,
+            &calls,
+            SOURCE_INVOICE,
+            complete,
+            &control,
+            &mut |facts| borrowed_gate(facts, maximum),
+        )
+        .unwrap();
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = BorrowedProofControl::default();
+            let mut at_refusal = None;
+            assert!(
+                matches!(borrowed_proof_run(&fixture, &calls, SOURCE_INVOICE, complete, &control,
+                &mut |_| {
+                    assert!(at_refusal.is_none(), "admission after first refusal");
+                    at_refusal = Some(control.trace.lock().unwrap().clone());
+                    Err(cause)
+                }), Err(FragmentPropertyError::Control(actual)) if actual==cause)
+            );
+            assert_eq!(*control.trace.lock().unwrap(), at_refusal.unwrap());
+        }
+        for axis in 0..3 {
+            let mut tight = maximum;
+            tight[axis] -= 1;
+            let control = BorrowedProofControl::default();
+            assert!(matches!(
+                borrowed_proof_run(
+                    &fixture,
+                    &calls,
+                    SOURCE_INVOICE,
+                    complete,
+                    &control,
+                    &mut |facts| borrowed_gate(facts, tight)
+                ),
+                Err(FragmentPropertyError::Control(
+                    CompileControlError::ResourceExhausted
+                ))
+            ));
+        }
+    }
+}
+
+#[test]
+fn borrowed_property_success_and_ordinary_source_error_keep_every_actual_primary_prefix() {
+    let fixture = scalar_fixture(2, 71);
+    let calls = fixture.checked().unwrap();
+    for complete in [false, true] {
+        for source in [SOURCE_INVOICE, 0] {
+            let control = BorrowedProofControl::default();
+            let baseline =
+                borrowed_proof_run(&fixture, &calls, source, complete, &control, &mut |facts| {
+                    borrowed_gate(facts, [usize::MAX; 3])
+                });
+            if source == 0 {
+                assert!(matches!(
+                    baseline,
+                    Err(FragmentPropertyError::Calls(FrozenCallError::TooManyItems))
+                ));
+            } else {
+                baseline.unwrap();
+            }
+            let trace = control.trace.lock().unwrap().clone();
+            assert!(trace.len() > 1);
+            for at in 0..trace.len() {
+                for cause in [
+                    CompileControlError::Cancelled,
+                    CompileControlError::DeadlineExceeded,
+                    CompileControlError::ResourceExhausted,
+                ] {
+                    let control = BorrowedProofControl {
+                        trace: Mutex::new(vec![]),
+                        refusal: Some((at, cause)),
+                    };
+                    assert!(
+                        matches!(borrowed_proof_run(&fixture, &calls, source, complete, &control,
+                        &mut |facts| borrowed_gate(facts, [usize::MAX; 3])), Err(FragmentPropertyError::Control(actual)) if actual==cause)
+                    );
+                    assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn borrowed_property_empty_calls_and_foreign_source_still_use_original_owners() {
+    // The original empty Values fixture has no values, expressions or calls;
+    // it has no unreachable definition and still uses real root/flow owners.
+    let fixture = empty_fixture();
+    let calls = fixture.checked().unwrap();
+    assert!(calls.entries().is_empty());
+    assert!(fixture.uses.bindings().is_empty());
+    for complete in [false, true] {
+        borrowed_proof_run(
+            &fixture,
+            &calls,
+            SOURCE_INVOICE,
+            complete,
+            &BorrowedProofControl::default(),
+            &mut |facts| borrowed_gate(facts, [usize::MAX; 3]),
+        )
+        .unwrap();
+    }
+    let control = BorrowedProofControl::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+    let proof = calls
+        .property_proof_in(
+            &fixture.fragment,
+            &fixture.uses,
+            &PlanLimits::FROZEN,
+            SOURCE_INVOICE,
+            PROJECTION_LIMITS,
+            &mut |facts| borrowed_gate(facts, [usize::MAX; 3]),
+            &mut work,
+        )
+        .unwrap();
+    let other = fixture.fragment.clone();
+    assert_eq!(
+        proof.require_fragment(&other, &mut work),
+        Err(FrozenCallError::WrongFragment)
+    );
+    work.finish().unwrap();
+}

@@ -43,7 +43,7 @@ pub(crate) use package::*;
 pub(crate) use properties::*;
 pub use properties::{
     FragmentPropertyError, derive_fragment_output_properties_observed,
-    derive_replica_sensitive_output_properties_observed,
+    derive_replica_sensitive_output_properties_observed, validate_fragment_output_properties_in,
     validate_fragment_output_properties_observed,
 };
 pub(crate) use runtime_filter::*;

@@ -632,3 +632,6 @@ fn static_requests_window_logical_count_excludes_function_order_channels() {
         );
     }
 }
+
+#[path = "owned_tests.rs"]
+mod owned;

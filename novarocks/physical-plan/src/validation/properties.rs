@@ -27,6 +27,11 @@ use crate::{
 };
 use novarocks_type_contract::CompileCheckpoints;
 
+type PropertyResourceAdmission<'a> = dyn FnMut(
+        &novarocks_type_contract::ControlOwnedResourceFacts,
+    ) -> Result<(), novarocks_type_contract::CompileControlError>
+    + 'a;
+
 /// Only old standalone definition validation consults migration-era binding
 /// bits. The frozen package route supplies a checked proof of the same source
 /// and its original meter; it cannot fall back to legacy expression facts.
@@ -149,28 +154,94 @@ pub fn validate_fragment_output_properties_observed(
 ) -> Result<crate::PropertyProofProjectionFacts, FragmentPropertyError> {
     let mut work =
         CompileCheckpoints::try_new(control, novarocks_type_contract::CompilePhase::Validate)?;
-    let result = (|| {
+    let result = validate_fragment_output_properties_core(
+        fragment,
+        uses,
+        calls,
+        limits,
+        source_retained_bytes,
+        projection_limits,
+        None,
+        &mut work,
+    );
+    if matches!(&result, Err(FragmentPropertyError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+
+/// Validate the same complete property laws on the caller's original meter.
+/// No nested entry or footer is created. Opaque structural/formula scratch
+/// still requires its original resource author; this is only a scope port.
+pub fn validate_fragment_output_properties_in(
+    fragment: &Fragment,
+    uses: &crate::PhysicalRootUses,
+    calls: &crate::FrozenFragmentCalls,
+    limits: PlanLimits,
+    source_retained_bytes: usize,
+    projection_limits: crate::PropertyProofProjectionLimits,
+    admit: &mut dyn FnMut(
+        &novarocks_type_contract::ControlOwnedResourceFacts,
+    ) -> Result<(), novarocks_type_contract::CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<crate::PropertyProofProjectionFacts, FragmentPropertyError> {
+    validate_fragment_output_properties_core(
+        fragment,
+        uses,
+        calls,
+        limits,
+        source_retained_bytes,
+        projection_limits,
+        Some(admit),
+        work,
+    )
+}
+
+fn validate_fragment_output_properties_core(
+    fragment: &Fragment,
+    uses: &crate::PhysicalRootUses,
+    calls: &crate::FrozenFragmentCalls,
+    limits: PlanLimits,
+    source_retained_bytes: usize,
+    projection_limits: crate::PropertyProofProjectionLimits,
+    admit: Option<&mut PropertyResourceAdmission<'_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<crate::PropertyProofProjectionFacts, FragmentPropertyError> {
+    (|| {
         work.flush()?;
-        let proof = calls.property_proof(
-            fragment,
-            uses,
-            &limits,
-            source_retained_bytes,
-            projection_limits,
-            control,
-        )?;
+        let proof = if let Some(admit) = admit {
+            calls.property_proof_in(
+                fragment,
+                uses,
+                &limits,
+                source_retained_bytes,
+                projection_limits,
+                admit,
+                work,
+            )?
+        } else {
+            calls.property_proof(
+                fragment,
+                uses,
+                &limits,
+                source_retained_bytes,
+                projection_limits,
+                work.control(),
+            )?
+        };
         work.flush()?;
         let structure = super::validate_fragment_construction_after_admission(fragment, limits);
         work.step()?;
         work.flush()?;
         structure.map_err(FragmentPropertyError::Structure)?;
-        proof.require_declared_broadcast_equivalence(&mut work)?;
+        proof.require_declared_broadcast_equivalence(work)?;
         let facts = super::guarantee::validate_guarantees_observed(
             fragment,
             proof.facts(),
             limits,
             projection_limits,
-            &mut work,
+            work,
         )?;
         let mut errors = ValidationContext::with_limits(limits);
         let _completion = super::graph::visit_node_graph_child_first(fragment, |event| {
@@ -191,7 +262,7 @@ pub fn validate_fragment_output_properties_observed(
                         &mut errors,
                         &mut PropertyEffectSource::Frozen {
                             proof: &proof,
-                            work: &mut work,
+                            work,
                         },
                     )?;
                     work.step()?;
@@ -210,12 +281,7 @@ pub fn validate_fragment_output_properties_observed(
             ));
         }
         Ok(facts)
-    })();
-    if matches!(&result, Err(FragmentPropertyError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    })()
 }
 
 pub(crate) fn validate_fragment_partition_identities(

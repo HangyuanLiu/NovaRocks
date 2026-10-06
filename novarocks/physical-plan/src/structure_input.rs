@@ -54,90 +54,100 @@ impl Fragment {
         control: &dyn PureCompileControl,
     ) -> Result<Self, FragmentStructureError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-        let result = (|| {
-            let mut errors = ValidationContext::for_construction(limits);
-            crate::builder::admit_structure_counts(
-                input.nodes.len(),
-                input.values.len(),
-                input.expressions.len(),
-                input.runtime_filters.len(),
-                limits,
-                &mut errors,
-                &mut work,
-            )?;
-            if !errors.is_empty() {
-                return Err(FragmentStructureError::Structure(
-                    ValidationErrors::from_collector(errors),
-                ));
-            }
-            // Public maps preserve sparse keys, but each key must still name
-            // its original definition. Mutable builders established this while
-            // inserting; receiving ownership establishes it here before use.
-            for (id, value) in &input.values {
-                let matches = *id == value.id;
-                work.step()?;
-                if !matches {
-                    errors.push(ValidationError::new(
-                        "fragment.structure.values",
-                        "value map key differs from its definition identity",
-                    ));
-                }
-                if errors.is_saturated() {
-                    break;
-                }
-            }
-            for (id, node) in &input.nodes {
-                let matches = *id == node.id;
-                work.step()?;
-                if !matches {
-                    errors.push(ValidationError::new(
-                        "fragment.structure.nodes",
-                        "node map key differs from its definition identity",
-                    ));
-                }
-                if errors.is_saturated() {
-                    break;
-                }
-            }
-            if !errors.is_empty() {
-                return Err(FragmentStructureError::Structure(
-                    ValidationErrors::from_collector(errors),
-                ));
-            }
-            let fragment = Fragment::from(FragmentParts {
-                id: input.id,
-                root: input.root,
-                values: input.values,
-                expressions: input.expressions,
-                nodes: input.nodes,
-                sink: input.sink,
-                dop_domain: input.dop_domain,
-                runtime_filters: input.runtime_filters,
-                call_requests: crate::FragmentCallRequests::unpublished_empty(input.id),
-            });
-            work.flush()?;
-            let mut usage = crate::resource::CutResourcePreflight::new();
-            usage.add_fragment(&fragment, &mut errors);
-            usage.validate("fragment.structure.resources", &mut errors);
-            work.step()?;
-            work.flush()?;
-            if !errors.is_empty() {
-                return Err(FragmentStructureError::Structure(
-                    ValidationErrors::from_collector(errors),
-                ));
-            }
-            work.flush()?;
-            let validation = validate_fragment_construction_after_admission(&fragment, limits);
-            work.step()?;
-            work.flush()?;
-            validation?;
-            Ok(fragment)
-        })();
+        let result = Self::try_from_structure_in(input, limits, &mut work);
         if matches!(&result, Err(FragmentStructureError::Control(_))) {
             return result;
         }
         work.finish()?;
         result
+    }
+
+    /// Move the same sparse source through the original structural laws in the
+    /// caller's scope. The caller admits maps and opaque validator scratch;
+    /// this port creates no entry, completion, allocation grant or executable
+    /// request fallback. Full Package publication remains mandatory.
+    pub fn try_from_structure_in(
+        input: FragmentStructureInput,
+        limits: PlanLimits,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, FragmentStructureError> {
+        let mut errors = ValidationContext::for_construction(limits);
+        crate::builder::admit_structure_counts(
+            input.nodes.len(),
+            input.values.len(),
+            input.expressions.len(),
+            input.runtime_filters.len(),
+            limits,
+            &mut errors,
+            work,
+        )?;
+        if !errors.is_empty() {
+            return Err(FragmentStructureError::Structure(
+                ValidationErrors::from_collector(errors),
+            ));
+        }
+        // Public maps preserve sparse keys, but each key must still name
+        // its original definition. Mutable builders established this while
+        // inserting; receiving ownership establishes it here before use.
+        for (id, value) in &input.values {
+            let matches = *id == value.id;
+            work.step()?;
+            if !matches {
+                errors.push(ValidationError::new(
+                    "fragment.structure.values",
+                    "value map key differs from its definition identity",
+                ));
+            }
+            if errors.is_saturated() {
+                break;
+            }
+        }
+        for (id, node) in &input.nodes {
+            let matches = *id == node.id;
+            work.step()?;
+            if !matches {
+                errors.push(ValidationError::new(
+                    "fragment.structure.nodes",
+                    "node map key differs from its definition identity",
+                ));
+            }
+            if errors.is_saturated() {
+                break;
+            }
+        }
+        if !errors.is_empty() {
+            return Err(FragmentStructureError::Structure(
+                ValidationErrors::from_collector(errors),
+            ));
+        }
+        let fragment = Fragment::from(FragmentParts {
+            id: input.id,
+            root: input.root,
+            values: input.values,
+            expressions: input.expressions,
+            nodes: input.nodes,
+            sink: input.sink,
+            dop_domain: input.dop_domain,
+            runtime_filters: input.runtime_filters,
+            call_requests: crate::FragmentCallRequests::unpublished_empty(input.id),
+        });
+        work.flush()?;
+        let mut usage = crate::resource::CutResourcePreflight::new();
+        usage.add_fragment(&fragment, &mut errors);
+        usage.validate("fragment.structure.resources", &mut errors);
+        work.step()?;
+        work.flush()?;
+        if !errors.is_empty() {
+            return Err(FragmentStructureError::Structure(
+                ValidationErrors::from_collector(errors),
+            ));
+        }
+        work.flush()?;
+        let validation = validate_fragment_construction_after_admission(&fragment, limits);
+        work.step()?;
+        work.flush()?;
+        validation?;
+        Ok(fragment)
     }
 }
 
