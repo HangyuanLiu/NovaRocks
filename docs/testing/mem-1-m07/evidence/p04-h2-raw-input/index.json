@@ -394,5 +394,11 @@
     "vendor/hyper-1.8.1/src/proto/h2/client.rs": "305246513bc4bdfe654b685d2bb20910f5005bea0b2260c918755a7e9deb698e",
     "vendor/hyper-1.8.1/src/proto/h2/server.rs": "ac56de4ce599d807a61201303f6cbfd35b5328c509fe84dfbaa657a1210c8709",
     "vendor/hyper-1.8.1/src/server/conn/http2.rs": "f3f4b25c3056a84ca0a99f0b659a01406d01da57a0c4a44f745bccd1cb98f1f0"
+  },
+  "artifact_storage": {
+    "kind": "local_unpublished_archive",
+    "archive_sha256": "936f502e6f86483ddeb7b7b549c4292ac046f1c45479789d787015f0ee5066cb",
+    "manifest_path_in_archive": "docs/testing/mem-1-m07/evidence/p04-h2-raw-input/index.json",
+    "notes": "Historical artifact paths/hashes refer to the original archive, not tracked repository files. See ../README.md."
   }
 }

@@ -440,5 +440,11 @@
     "tonic-0.12.3.patch.gz": "7fd7af233ee44284b9dd51e802f85c33af157afc78de905af682291b80bb0ee0",
     "v3-quality-wrapper-fmt-failure.log.gz": "a67dda57ff4e0928462b7c7eecde0218b7b62b0052ef4fdc163e1383fb4583d5",
     "logs/m07-send-header-table-document-scan.log.gz": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  "artifact_storage": {
+    "kind": "local_unpublished_archive",
+    "archive_sha256": "936f502e6f86483ddeb7b7b549c4292ac046f1c45479789d787015f0ee5066cb",
+    "manifest_path_in_archive": "docs/testing/mem-1-m07/evidence/p04-h2-send-header-table/index.json",
+    "notes": "Historical artifact paths/hashes refer to the original archive, not tracked repository files. See ../README.md."
   }
 }

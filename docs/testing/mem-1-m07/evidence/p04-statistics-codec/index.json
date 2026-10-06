@@ -89,5 +89,11 @@
   "agent_original_sources": {
     "novarocks/native-adapter/src/root_statistics_codec.rs": "c577cabe09a7f0f8e4b16876096ca532c113266105af83a66804f101ad0749e5",
     "novarocks/native-adapter/tests/root_statistics_codec.rs": "29c84d2aa5c99c75091aabad35ecf373ae96c9064ab9c768b50b10b7123b6e9d"
+  },
+  "artifact_storage": {
+    "kind": "local_unpublished_archive",
+    "archive_sha256": "936f502e6f86483ddeb7b7b549c4292ac046f1c45479789d787015f0ee5066cb",
+    "manifest_path_in_archive": "docs/testing/mem-1-m07/evidence/p04-statistics-codec/index.json",
+    "notes": "Historical artifact paths/hashes refer to the original archive, not tracked repository files. See ../README.md."
   }
 }

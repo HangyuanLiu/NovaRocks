@@ -76,5 +76,11 @@
       "path": "vendor/arrow-schema-58.2.0/src/field.rs",
       "sha256": "ed435b03f097936cdd09c67e8c1abd4472cbd73018e91f902c67f754ff959fd6"
     }
-  ]
+  ],
+  "artifact_storage": {
+    "kind": "local_unpublished_archive",
+    "archive_sha256": "936f502e6f86483ddeb7b7b549c4292ac046f1c45479789d787015f0ee5066cb",
+    "manifest_path_in_archive": "docs/testing/mem-1-m07/evidence/p04-capacity-introspection/index.json",
+    "notes": "Historical artifact paths/hashes refer to the original archive, not tracked repository files. See ../README.md."
+  }
 }

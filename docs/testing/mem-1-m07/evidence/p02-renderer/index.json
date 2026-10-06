@@ -184,5 +184,11 @@
     "Cancel is not physical backing release.",
     "No SQL golden changes, native 1FE+3BE or P09 product performance acceptance claimed.",
     "Linux tests are deferred to the user."
-  ]
+  ],
+  "artifact_storage": {
+    "kind": "local_unpublished_archive",
+    "archive_sha256": "936f502e6f86483ddeb7b7b549c4292ac046f1c45479789d787015f0ee5066cb",
+    "manifest_path_in_archive": "docs/testing/mem-1-m07/evidence/p02-renderer/index.json",
+    "notes": "Historical artifact paths/hashes refer to the original archive, not tracked repository files. See ../README.md."
+  }
 }

@@ -64,5 +64,11 @@
     "novarocks/native-adapter/src/fragment_scan_output.rs": "255b0afe8e4eb7cabbbc1b12f6bfbc7fcc04f62974f01ef2718f8fae92ba3e1f",
     "novarocks/native-adapter/tests/root_metadata_origin.rs": "a285eb8ecd21a7179efe11e6c1f9e9d663654d185ef5b52361b8f2d642839689",
     "novarocks/plan-codec/src/native_type.rs": "ecc33d6ad0cb6efbe289b6c90745099ca6ff5fa18564817736f41998b61a40e1"
+  },
+  "artifact_storage": {
+    "kind": "local_unpublished_archive",
+    "archive_sha256": "936f502e6f86483ddeb7b7b549c4292ac046f1c45479789d787015f0ee5066cb",
+    "manifest_path_in_archive": "docs/testing/mem-1-m07/evidence/p04-scan-project-hydration/index.json",
+    "notes": "Historical artifact paths/hashes refer to the original archive, not tracked repository files. See ../README.md."
   }
 }

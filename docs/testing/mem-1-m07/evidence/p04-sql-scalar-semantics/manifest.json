@@ -221,5 +221,11 @@
     "FE typed collector, assignment, session live/staged ownership and successful End commit",
     "Full SQL/default System CI and final M07 acceptance",
     "Linux/performance evidence explicitly delegated to user; DNS and nested single-value metric decisions pending"
-  ]
+  ],
+  "artifact_storage": {
+    "kind": "local_unpublished_archive",
+    "archive_sha256": "936f502e6f86483ddeb7b7b549c4292ac046f1c45479789d787015f0ee5066cb",
+    "manifest_path_in_archive": "docs/testing/mem-1-m07/evidence/p04-sql-scalar-semantics/manifest.json",
+    "notes": "Historical artifact paths/hashes refer to the original archive, not tracked repository files. See ../README.md."
+  }
 }

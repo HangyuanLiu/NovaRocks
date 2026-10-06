@@ -26,5 +26,11 @@
     "fixture-spec.json": "89f1e714893f3ddf9456e6eea24a23ee91f0821a8d3d56a639815a6d0c4ec430",
     "run-completion.json": "b6dceb40da53d5dd640902cca44b60143e5c5684e6593b2d5ba8d4bf406e96d8",
     "effective-launch-config.json": "8202d410b36c8dbfffe2a039c76153bc839d3d932429c4f4b9ce5bdccc9f8361"
+  },
+  "artifact_storage": {
+    "kind": "local_unpublished_archive",
+    "archive_sha256": "936f502e6f86483ddeb7b7b549c4292ac046f1c45479789d787015f0ee5066cb",
+    "manifest_path_in_archive": "docs/testing/mem-1-m07/evidence/old-macos-short-smoke/index.json",
+    "notes": "Historical artifact paths/hashes refer to the original archive, not tracked repository files. See ../README.md."
   }
 }

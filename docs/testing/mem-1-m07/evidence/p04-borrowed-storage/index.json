@@ -49,5 +49,11 @@
     "novarocks/execution/tests/root_capacity_introspection.rs": "b09a52b2e046737b99ff4860d4e5294e6a1abfa3690981df6a7092f29763e88d",
     "vendor/arrow-buffer-58.2.0/src/bytes.rs": "ca66d7ebeb54fee6f59b26af6620214eeb10621078d1226353cc19d9430707e1",
     "vendor/arrow-buffer-58.2.0/src/buffer/immutable.rs": "5b6187aad9713aa602880d8723a123ddff0ef7fc908a99aee131333e8fb5009c"
+  },
+  "artifact_storage": {
+    "kind": "local_unpublished_archive",
+    "archive_sha256": "936f502e6f86483ddeb7b7b549c4292ac046f1c45479789d787015f0ee5066cb",
+    "manifest_path_in_archive": "docs/testing/mem-1-m07/evidence/p04-borrowed-storage/index.json",
+    "notes": "Historical artifact paths/hashes refer to the original archive, not tracked repository files. See ../README.md."
   }
 }

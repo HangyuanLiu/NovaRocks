@@ -323,5 +323,11 @@
     "vendor/hyper-1.8.1/src/proto/h2/client.rs": "ffa8180002a2db8ba0a6d2f99af6894c0b5ba680ca1b5cda7c2111db2993755d",
     "vendor/hyper-1.8.1/src/proto/h2/server.rs": "28e7c59517a747dbbeffcf876a6a3c5c96e80801328de6760a43e3b84fbfa0d5",
     "vendor/hyper-1.8.1/src/server/conn/http2.rs": "e8650db69f17f7d13672e05276101460d10e25aa034cc59548681e38beb48145"
+  },
+  "artifact_storage": {
+    "kind": "local_unpublished_archive",
+    "archive_sha256": "936f502e6f86483ddeb7b7b549c4292ac046f1c45479789d787015f0ee5066cb",
+    "manifest_path_in_archive": "docs/testing/mem-1-m07/evidence/p04-h2-goaway-backing/index.json",
+    "notes": "Historical artifact paths/hashes refer to the original archive, not tracked repository files. See ../README.md."
   }
 }

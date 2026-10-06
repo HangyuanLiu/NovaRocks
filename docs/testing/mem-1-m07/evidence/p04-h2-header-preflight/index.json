@@ -240,5 +240,11 @@
   "isolated_private_tests": 18,
   "isolated_miri_probes": 7,
   "scope": "opt-in header decoding allocation prechecks; complete Native connection ownership not established",
-  "documentation_check_note": "Template directory assertions were inapplicable because the legacy design root and root src do not exist. Resolved external DOC_ROOT is used; no legacy documentation directory was created. Actual-directory reference scan before receipt creation returned rg exit 1."
+  "documentation_check_note": "Template directory assertions were inapplicable because the legacy design root and root src do not exist. Resolved external DOC_ROOT is used; no legacy documentation directory was created. Actual-directory reference scan before receipt creation returned rg exit 1.",
+  "artifact_storage": {
+    "kind": "local_unpublished_archive",
+    "archive_sha256": "936f502e6f86483ddeb7b7b549c4292ac046f1c45479789d787015f0ee5066cb",
+    "manifest_path_in_archive": "docs/testing/mem-1-m07/evidence/p04-h2-header-preflight/index.json",
+    "notes": "Historical artifact paths/hashes refer to the original archive, not tracked repository files. See ../README.md."
+  }
 }

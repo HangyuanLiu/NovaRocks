@@ -403,5 +403,11 @@
   ],
   "remaining": "P02 implementation; P04-P08 runtime wiring; P09/P10 native functional/performance/SQL/system acceptance",
   "linux": "not run; user will test manually",
-  "fixture": "Iceberg REST ready; all base images and artifacts present; Paimon derived definition refresh remains"
+  "fixture": "Iceberg REST ready; all base images and artifacts present; Paimon derived definition refresh remains",
+  "artifact_storage": {
+    "kind": "local_unpublished_archive",
+    "archive_sha256": "936f502e6f86483ddeb7b7b549c4292ac046f1c45479789d787015f0ee5066cb",
+    "manifest_path_in_archive": "docs/testing/mem-1-m07/evidence/p01-contracts/index.json",
+    "notes": "Historical artifact paths/hashes refer to the original archive, not tracked repository files. See ../README.md."
+  }
 }

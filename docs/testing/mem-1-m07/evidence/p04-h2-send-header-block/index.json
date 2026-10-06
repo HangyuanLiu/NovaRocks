@@ -208,5 +208,11 @@
       "raw_sha256": "e61392a13382df8177e8a44ad4c2baa55b5bd2272a2b14acb1d23aea995e1358",
       "gzip_sha256": "1cecd88ea870cee7dea086176e39ae56271b694c8383173251a5a8b70a07bd84"
     }
-  ]
+  ],
+  "artifact_storage": {
+    "kind": "local_unpublished_archive",
+    "archive_sha256": "936f502e6f86483ddeb7b7b549c4292ac046f1c45479789d787015f0ee5066cb",
+    "manifest_path_in_archive": "docs/testing/mem-1-m07/evidence/p04-h2-send-header-block/index.json",
+    "notes": "Historical artifact paths/hashes refer to the original archive, not tracked repository files. See ../README.md."
+  }
 }

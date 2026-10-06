@@ -43,3 +43,18 @@ novarocks-server/log/
 # own contents, but a failed one deliberately retains artifacts for diagnosis.
 novarocks-server/.server-binary-smoke-runtime/
 /tests/sql/.runtime/
+
+# M07 raw verification artifacts belong in ignored logs/, not Git history.
+/docs/testing/mem-1-m07/evidence/**/*.log
+/docs/testing/mem-1-m07/evidence/**/*.gz
+/docs/testing/mem-1-m07/evidence/**/*.diff
+/docs/testing/mem-1-m07/evidence/**/*.patch
+/docs/testing/mem-1-m07/evidence/**/*.snapshot
+/docs/testing/mem-1-m07/evidence/**/*mutant*
+/docs/testing/mem-1-m07/evidence/**/logs/
+/docs/testing/mem-1-m07/evidence/**/full-ci*/
+/docs/testing/mem-1-m07/evidence/**/negatives/
+/docs/testing/mem-1-m07/evidence/**/source-negatives/
+/docs/testing/mem-1-m07/evidence/**/mutants/
+/docs/testing/mem-1-m07/evidence/**/*resources*.json
+/docs/testing/mem-1-m07/evidence/**/*samples*.json

@@ -159,5 +159,11 @@
       "gzip_sha256": "a55e6418e8bdd0a8e5ef599bc6d55b30f347a309582b2ee5ff31ebfc5868150e",
       "source_scope": "historical agent iteration; final source hashes do not claim to bind the earlier failed revisions"
     }
+  },
+  "artifact_storage": {
+    "kind": "local_unpublished_archive",
+    "archive_sha256": "936f502e6f86483ddeb7b7b549c4292ac046f1c45479789d787015f0ee5066cb",
+    "manifest_path_in_archive": "docs/testing/mem-1-m07/evidence/p04-native-reader/index.json",
+    "notes": "Historical artifact paths/hashes refer to the original archive, not tracked repository files. See ../README.md."
   }
 }

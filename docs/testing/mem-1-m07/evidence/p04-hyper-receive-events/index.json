@@ -218,5 +218,11 @@
       "failure": "strict coalescence rejected valid independently read End: None",
       "gzip_sha256": "802cd14643371ec07d16b2f82185cee2055c175a3d10d476f81e663b09b79823"
     }
+  },
+  "artifact_storage": {
+    "kind": "local_unpublished_archive",
+    "archive_sha256": "936f502e6f86483ddeb7b7b549c4292ac046f1c45479789d787015f0ee5066cb",
+    "manifest_path_in_archive": "docs/testing/mem-1-m07/evidence/p04-hyper-receive-events/index.json",
+    "notes": "Historical artifact paths/hashes refer to the original archive, not tracked repository files. See ../README.md."
   }
 }

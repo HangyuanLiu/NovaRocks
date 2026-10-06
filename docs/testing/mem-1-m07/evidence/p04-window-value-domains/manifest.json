@@ -621,5 +621,11 @@
       "bytes": 1134,
       "sha256": "d4d212ca95ffacd2e88e3ba6ad0c4f73d62bbbd02cc3a6753c312ae9d5325d19"
     }
-  ]
+  ],
+  "artifact_storage": {
+    "kind": "local_unpublished_archive",
+    "archive_sha256": "936f502e6f86483ddeb7b7b549c4292ac046f1c45479789d787015f0ee5066cb",
+    "manifest_path_in_archive": "docs/testing/mem-1-m07/evidence/p04-window-value-domains/manifest.json",
+    "notes": "Historical artifact paths/hashes refer to the original archive, not tracked repository files. See ../README.md."
+  }
 }

@@ -6,13 +6,13 @@
 
 | 检查 | 命令 / 文件 | 结果 |
 | --- | --- | --- |
-| 首次编译 | `cargo check -p novarocks-result-render`；[first-check.log](first-check.log.gz) | PASS |
-| 最终 C2 | `cargo test -p novarocks-result-render -- --test-threads=1`；[c2-tests.log](c2-tests.log.gz) | 27 PASS：3 unit、4 actual allocator/lifetime、20 independent bytes/limits integration；0 ignored |
-| 主 agent 独立复跑 | 同一 C2 命令；[main-c2-tests.log](main-c2-tests.log.gz) | 27/27 PASS |
-| 严格 clippy | `cargo clippy -p novarocks-result-render --all-targets -- -D warnings`；[clippy.log](clippy.log.gz)、[main-clippy.log](main-clippy.log.gz) | 两次 PASS，没有 allow 新 warning |
-| 定向格式 | `rustfmt --edition 2024 --check` 对本次六个新 Rust 文件；[fmt.log](fmt.log.gz) | PASS，空输出 |
-| 差异格式 | `git diff --check`；[diff-check.log](diff-check.log.gz) | PASS，空输出 |
-| 实际 scratch | `cargo test -p novarocks-result-render --lib actual_scratch_capacity_layout -- --nocapture --test-threads=1`；[scratch-capacity.log](scratch-capacity.log.gz) | 187,696 bytes |
+| 首次编译 | `cargo check -p novarocks-result-render`；first-check.log（本地归档：`first-check.log.gz`） | PASS |
+| 最终 C2 | `cargo test -p novarocks-result-render -- --test-threads=1`；c2-tests.log（本地归档：`c2-tests.log.gz`） | 27 PASS：3 unit、4 actual allocator/lifetime、20 independent bytes/limits integration；0 ignored |
+| 主 agent 独立复跑 | 同一 C2 命令；main-c2-tests.log（本地归档：`main-c2-tests.log.gz`） | 27/27 PASS |
+| 严格 clippy | `cargo clippy -p novarocks-result-render --all-targets -- -D warnings`；clippy.log（本地归档：`clippy.log.gz`）、main-clippy.log（本地归档：`main-clippy.log.gz`） | 两次 PASS，没有 allow 新 warning |
+| 定向格式 | `rustfmt --edition 2024 --check` 对本次六个新 Rust 文件；fmt.log（本地归档：`fmt.log.gz`） | PASS，空输出 |
+| 差异格式 | `git diff --check`；diff-check.log（本地归档：`diff-check.log.gz`） | PASS，空输出 |
+| 实际 scratch | `cargo test -p novarocks-result-render --lib actual_scratch_capacity_layout -- --nocapture --test-threads=1`；scratch-capacity.log（本地归档：`scratch-capacity.log.gz`） | 187,696 bytes |
 
 当前 64-bit Rust 布局测得 `scratch = 65,536 staging + 16,384 cell lengths + 196 × 536 Task = 105,056 stack + 720 control = 187,696 bytes`。三个固定 heap allocation 合计 186,976 bytes；720 bytes control 包括 move-owned encoder 状态。运行时 oracle 取 `size_of` 与 `Vec.capacity()`，不能把这次编译器布局数字当跨平台 ABI。完整 scratch 小于 profile 2MiB，schema 与原始 input backing 的容量另由 host 保护。
 

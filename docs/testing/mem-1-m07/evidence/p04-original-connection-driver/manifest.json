@@ -30,5 +30,11 @@
     "production_lock_matching_dependencies": 62
   },
   "allocator_scope": "new System oracle proves Core/PAL; actual TaskCell ownership proved by real Join/Abort final-credit behavior; no new driver Cell address/Layout oracle claim",
-  "remaining": "P04 executing, P05-P10 open, V1 None; DNS pending, Linux user manual; no final SQL/default System/release/performance/push/PR/archive claim"
+  "remaining": "P04 executing, P05-P10 open, V1 None; DNS pending, Linux user manual; no final SQL/default System/release/performance/push/PR/archive claim",
+  "artifact_storage": {
+    "kind": "local_unpublished_archive",
+    "archive_sha256": "936f502e6f86483ddeb7b7b549c4292ac046f1c45479789d787015f0ee5066cb",
+    "manifest_path_in_archive": "docs/testing/mem-1-m07/evidence/p04-original-connection-driver/manifest.json",
+    "notes": "Historical artifact paths/hashes refer to the original archive, not tracked repository files. See ../README.md."
+  }
 }

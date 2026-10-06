@@ -155,5 +155,11 @@
     "system/native-trust-automatic-dns/safe-evidence.json": "2e1f223add6b58fe8a099a27a18b7672b933566e02d1833d5e5a3ce48196e30a",
     "system/native-trust-pem-ip/safe-evidence.json": "77000b9e6026c525e9be277c963a480b328fb29c1dd73d0a851ee81b5853d961",
     "system/native-trust-plaintext-ip/safe-evidence.json": "520db4c9654eeeaded11b36c440c56995203371a192afdea2f224b2ed1dfa43a"
+  },
+  "artifact_storage": {
+    "kind": "local_unpublished_archive",
+    "archive_sha256": "936f502e6f86483ddeb7b7b549c4292ac046f1c45479789d787015f0ee5066cb",
+    "manifest_path_in_archive": "docs/testing/mem-1-m07/evidence/p04-scalar-leaf-contract/manifest.json",
+    "notes": "Historical artifact paths/hashes refer to the original archive, not tracked repository files. See ../README.md."
   }
 }

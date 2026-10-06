@@ -177,5 +177,11 @@
     "command": "cargo test --offline --locked -p novarocks-native-adapter --test root_producer_session repeated_cancel_observer -- --test-threads=1",
     "exit_code": 101,
     "mutation": "restore HEAD fail/abort implementations only; preserve current independent Drop safety; restored in finally"
+  },
+  "artifact_storage": {
+    "kind": "local_unpublished_archive",
+    "archive_sha256": "936f502e6f86483ddeb7b7b549c4292ac046f1c45479789d787015f0ee5066cb",
+    "manifest_path_in_archive": "docs/testing/mem-1-m07/evidence/p04-native-host/index.json",
+    "notes": "Historical artifact paths/hashes refer to the original archive, not tracked repository files. See ../README.md."
   }
 }

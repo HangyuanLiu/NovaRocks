@@ -283,5 +283,11 @@
       "sha256": "19d5aa29624d8acb9cdaf8cfecf12b841fcd4fde9529220e64ac3edf62093537",
       "lossless_gzip": true
     }
+  },
+  "artifact_storage": {
+    "kind": "local_unpublished_archive",
+    "archive_sha256": "936f502e6f86483ddeb7b7b549c4292ac046f1c45479789d787015f0ee5066cb",
+    "manifest_path_in_archive": "docs/testing/mem-1-m07/evidence/p04-original-request-tasks/manifest.json",
+    "notes": "Historical artifact paths/hashes refer to the original archive, not tracked repository files. See ../README.md."
   }
 }

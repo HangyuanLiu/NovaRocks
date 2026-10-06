@@ -24,5 +24,11 @@
     "novarocks/execution/src/exec/chunk/schema.rs": "1818189d0d1fb7b1aa9e4a08bb44a3f9734536eeec1d998302dceceef6ffc473",
     "novarocks/execution/src/exec/chunk/type_compatibility.rs": "1b7d9e2095ae127d036ea67118c4cb74e9d8b7c023f1df941db5ae7df2269cf2",
     "novarocks/execution/tests/root_capacity_introspection.rs": "c1b684db53a96e76f83cab6b5fde10f6349b307e1e1a0bf124c883db68f72a68"
+  },
+  "artifact_storage": {
+    "kind": "local_unpublished_archive",
+    "archive_sha256": "936f502e6f86483ddeb7b7b549c4292ac046f1c45479789d787015f0ee5066cb",
+    "manifest_path_in_archive": "docs/testing/mem-1-m07/evidence/p04-retag-batch-storage/index.json",
+    "notes": "Historical artifact paths/hashes refer to the original archive, not tracked repository files. See ../README.md."
   }
 }

@@ -14,5 +14,11 @@
       "raw_bytes": 19431
     }
   },
-  "build_profile": "dev-opt"
+  "build_profile": "dev-opt",
+  "artifact_storage": {
+    "kind": "local_unpublished_archive",
+    "archive_sha256": "936f502e6f86483ddeb7b7b549c4292ac046f1c45479789d787015f0ee5066cb",
+    "manifest_path_in_archive": "docs/testing/mem-1-m07/evidence/old-macos-maintenance/index.json",
+    "notes": "Historical artifact paths/hashes refer to the original archive, not tracked repository files. See ../README.md."
+  }
 }

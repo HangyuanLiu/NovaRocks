@@ -21,7 +21,7 @@ python3 docs/testing/mem-1-m07/evidence/p04-tonic-connection-factory/channel-onl
 
 Native 首轮 lib 在 `bounded_root_count_finishes_before_read_and_survives_task_retirement` 的即时 task-runtime retirement 断言失败（573 pass/1 fail，Worker 尚未执行）；该用例单跑与全 lib 再跑均通过，按 workflow 时序噪声判据记录。helper 只等待 Finished，而 retirement_ready 另需 actual_stopped/output_released/resources_converged（Worker convergence/status 与 registry settle）；不修改产品源，不将 Finished 当作资源退出证据。初次 helper lifetime、dial error Debug 文本 oracle、never-loop Clippy 失败均已修复并保留完整日志。
 
-channel-only 私有锁的 62 个依赖身份与 production lock 完全对应，offline/locked check、probe strict Clippy、实际 Tonic strict lib Clippy 及主 agent 重放通过；无下载/升级。初次从 root 用 feature flags 检查非 workspace-member Tonic 的命令被 Cargo 拒绝（101），不计通过。73 个原文件 hash 同时核对缓存 registry 与 exact crate checksum，修改仅五个原文件与一个新模块；完整 diff 为 [tonic.patch.gz](tonic.patch.gz)。独立上游 dev suite 未运行。
+channel-only 私有锁的 62 个依赖身份与 production lock 完全对应，offline/locked check、probe strict Clippy、实际 Tonic strict lib Clippy 及主 agent 重放通过；无下载/升级。初次从 root 用 feature flags 检查非 workspace-member Tonic 的命令被 Cargo 拒绝（101），不计通过。73 个原文件 hash 同时核对缓存 registry 与 exact crate checksum，修改仅五个原文件与一个新模块；完整 diff 为 tonic.patch.gz（本地归档：`tonic.patch.gz`）。独立上游 dev suite 未运行。
 
 最终 Tonic/h2/Hyper strict lib Clippy 零 warning；Native 正常 all-target Clippy、workspace all-target check、root/vendor fmt 通过，保留既有 warnings。额外 target `--no-deps -D warnings` 被 Native lib 35 个既有/shared lint 阻断，未到新测试，不称 strict target 通过。全局 Cargo patch 与公共传输 API 触发此次 wave workspace 编译检查；尚未安装的产品不提前做最终 SQL/system/native 验收。
 

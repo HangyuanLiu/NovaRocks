@@ -157,5 +157,11 @@
       "bytes": 1952,
       "sha256": "d57383685296efd0414549589d2e080f521bf3bea77869018bbde7c2a499afce"
     }
-  ]
+  ],
+  "artifact_storage": {
+    "kind": "local_unpublished_archive",
+    "archive_sha256": "936f502e6f86483ddeb7b7b549c4292ac046f1c45479789d787015f0ee5066cb",
+    "manifest_path_in_archive": "docs/testing/mem-1-m07/evidence/p04-scalar-empty-validation/manifest.json",
+    "notes": "Historical artifact paths/hashes refer to the original archive, not tracked repository files. See ../README.md."
+  }
 }
