@@ -2850,3 +2850,7 @@ fn exact_signature_without_legacy_metadata_uses_fresh_frozen_package_authority()
         Err(FrozenCallError::InvalidEffects(_))
     ));
 }
+
+mod borrowed_constructor_tests {
+    include!("package_contract/borrowed_constructor_tests.rs");
+}

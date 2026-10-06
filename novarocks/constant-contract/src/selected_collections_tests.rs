@@ -565,3 +565,6 @@ fn raw_map_and_entry_parent_offsets_are_applied_once_by_original_pool() {
         );
     }
 }
+
+#[path = "borrowed_reader_tests.rs"]
+mod borrowed_reader_tests;

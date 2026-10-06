@@ -112,7 +112,31 @@ impl CutResourcePreflight {
         limits: crate::PlanLimits,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), crate::ConstantReferenceError> {
-        add_unpivot_source_usage(fragment, pools, limits, &mut self.usage, work)
+        add_unpivot_source_usage(
+            fragment,
+            pools,
+            limits,
+            &mut self.usage,
+            crate::constants::ConstantValidationMode::Plain,
+            work,
+        )
+    }
+
+    pub(crate) fn add_unpivot_sources_in(
+        &mut self,
+        fragment: &Fragment,
+        pools: &crate::ConstantPools,
+        limits: crate::PlanLimits,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), crate::ConstantReferenceError> {
+        add_unpivot_source_usage(
+            fragment,
+            pools,
+            limits,
+            &mut self.usage,
+            crate::constants::ConstantValidationMode::Caller,
+            work,
+        )
     }
 
     pub(crate) fn add_items(&mut self, count: usize) {
@@ -373,6 +397,33 @@ pub(crate) fn validate_plan_resources_observed(
     errors: &mut ValidationContext,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), crate::ConstantReferenceError> {
+    validate_plan_resources_core(
+        plan,
+        errors,
+        crate::constants::ConstantValidationMode::Plain,
+        work,
+    )
+}
+
+pub(crate) fn validate_plan_resources_in(
+    plan: &PhysicalPlan,
+    errors: &mut ValidationContext,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), crate::ConstantReferenceError> {
+    validate_plan_resources_core(
+        plan,
+        errors,
+        crate::constants::ConstantValidationMode::Caller,
+        work,
+    )
+}
+
+fn validate_plan_resources_core(
+    plan: &PhysicalPlan,
+    errors: &mut ValidationContext,
+    mode: crate::constants::ConstantValidationMode,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), crate::ConstantReferenceError> {
     let mut usage = plan_usage(plan, errors);
     add_constant_pool_usage(plan.constants(), &mut usage, work)?;
     for fragment in plan.fragments().values() {
@@ -388,6 +439,7 @@ pub(crate) fn validate_plan_resources_observed(
             plan.constants(),
             crate::PlanLimits::FROZEN,
             &mut fragment_usage,
+            mode,
             work,
         )?;
         validate_usage(
@@ -419,6 +471,7 @@ fn add_unpivot_source_usage(
     pools: &crate::ConstantPools,
     limits: crate::PlanLimits,
     usage: &mut ResourceUsage,
+    mode: crate::constants::ConstantValidationMode,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), crate::ConstantReferenceError> {
     if usage.exhausted() {
@@ -463,9 +516,18 @@ fn add_unpivot_source_usage(
                     )
                     .map_err(|_| resource())?,
                 );
-            let selected = crate::constants::unpivot_collection_usage_observed(
-                pools, constant, output, item_bound, byte_bound, work,
-            )?;
+            let selected = match mode {
+                crate::constants::ConstantValidationMode::Plain => {
+                    crate::constants::unpivot_collection_usage_observed(
+                        pools, constant, output, item_bound, byte_bound, work,
+                    )?
+                }
+                crate::constants::ConstantValidationMode::Caller => {
+                    crate::constants::unpivot_collection_usage_in(
+                        pools, constant, output, item_bound, byte_bound, work,
+                    )?
+                }
+            };
             node_items = node_items
                 .checked_add(selected.items)
                 .ok_or_else(resource)?;

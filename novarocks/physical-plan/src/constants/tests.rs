@@ -1212,3 +1212,7 @@ fn captured_source_missing_and_ordinal_errors_keep_plain_observations_and_contro
         }
     }
 }
+
+mod borrowed_validation_tests {
+    include!("borrowed_validation_tests.rs");
+}

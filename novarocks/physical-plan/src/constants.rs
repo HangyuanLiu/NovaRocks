@@ -460,6 +460,14 @@ fn strictly_increasing(
     Ok(ordered)
 }
 
+/// Observation policy for the original constant consumer and resource bodies.
+/// Caller mode borrows the existing meter; it does not admit opaque scratch.
+#[derive(Clone, Copy)]
+pub(crate) enum ConstantValidationMode {
+    Plain,
+    Caller,
+}
+
 /// Sole special-consumer policy. Generic checked Map/List readers remain
 /// permissive; this consumer retains the original exact special source rules.
 pub(crate) fn unpivot_collection_usage_observed(
@@ -468,6 +476,45 @@ pub(crate) fn unpivot_collection_usage_observed(
     output: Option<&FunctionValueType>,
     max_items: usize,
     max_bytes: u64,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<UnpivotCollectionUsage, ConstantReferenceError> {
+    unpivot_collection_usage_core(
+        pools,
+        constant,
+        output,
+        max_items,
+        max_bytes,
+        ConstantValidationMode::Plain,
+        work,
+    )
+}
+
+pub(crate) fn unpivot_collection_usage_in(
+    pools: &ConstantPools,
+    constant: &crate::UnpivotConstant,
+    output: Option<&FunctionValueType>,
+    max_items: usize,
+    max_bytes: u64,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<UnpivotCollectionUsage, ConstantReferenceError> {
+    unpivot_collection_usage_core(
+        pools,
+        constant,
+        output,
+        max_items,
+        max_bytes,
+        ConstantValidationMode::Caller,
+        work,
+    )
+}
+
+fn unpivot_collection_usage_core(
+    pools: &ConstantPools,
+    constant: &crate::UnpivotConstant,
+    output: Option<&FunctionValueType>,
+    max_items: usize,
+    max_bytes: u64,
+    mode: ConstantValidationMode,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<UnpivotCollectionUsage, ConstantReferenceError> {
     let reference = collection_reference(constant).ok_or(
@@ -495,16 +542,25 @@ pub(crate) fn unpivot_collection_usage_observed(
     }
     match constant {
         crate::UnpivotConstant::Int32List(_) => {
-            work.flush()?;
-            let view = source
-                .int32_list_observed(
-                    novarocks_type_contract::CompilePhase::Validate,
-                    work.control(),
-                )?
-                .ok_or(ConstantReferenceError::InvalidConsumer(
-                    "Unpivot collection root is NULL",
-                ))?;
-            work.flush()?;
+            let view =
+                match mode {
+                    ConstantValidationMode::Plain => {
+                        work.flush()?;
+                        let view = source
+                            .int32_list_observed(
+                                novarocks_type_contract::CompilePhase::Validate,
+                                work.control(),
+                            )?
+                            .ok_or(ConstantReferenceError::InvalidConsumer(
+                                "Unpivot collection root is NULL",
+                            ))?;
+                        work.flush()?;
+                        view
+                    }
+                    ConstantValidationMode::Caller => source.int32_list_in(work)?.ok_or(
+                        ConstantReferenceError::InvalidConsumer("Unpivot collection root is NULL"),
+                    )?,
+                };
             let items = view.len();
             let bytes = u64::try_from(items)
                 .map_err(|_| resource_refusal())?
@@ -528,16 +584,28 @@ pub(crate) fn unpivot_collection_usage_observed(
             })
         }
         crate::UnpivotConstant::Utf8Map(_) => {
-            work.flush()?;
-            let view = source
-                .utf8_map_observed(
-                    novarocks_type_contract::CompilePhase::Validate,
-                    work.control(),
-                )?
-                .ok_or(ConstantReferenceError::InvalidConsumer(
-                    "Unpivot collection root is NULL",
-                ))?;
-            work.flush()?;
+            let view = match mode {
+                ConstantValidationMode::Plain => {
+                    work.flush()?;
+                    let view = source
+                        .utf8_map_observed(
+                            novarocks_type_contract::CompilePhase::Validate,
+                            work.control(),
+                        )?
+                        .ok_or(ConstantReferenceError::InvalidConsumer(
+                            "Unpivot collection root is NULL",
+                        ))?;
+                    work.flush()?;
+                    view
+                }
+                ConstantValidationMode::Caller => {
+                    source
+                        .utf8_map_in(work)?
+                        .ok_or(ConstantReferenceError::InvalidConsumer(
+                            "Unpivot collection root is NULL",
+                        ))?
+                }
+            };
             let items = view.len();
             let admitted = items <= max_items;
             if !admitted {
@@ -599,58 +667,96 @@ pub(crate) fn validate_fragment_constants_observed(
 ) -> Result<(), ConstantReferenceError> {
     use novarocks_type_contract::CompilePhase;
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-    let result = (|| {
-        // A whole plan has one table spanning peer fragments; its enclosing
-        // plan gate accounts that table. Only a closed local package owns it
-        // within this fragment envelope.
-        if require_closed {
-            let mut errors = crate::validation::ValidationContext::new();
-            let mut usage = crate::resource::CutResourcePreflight::new();
-            usage.add_fragment(fragment, &mut errors);
-            usage.add_constants_observed(pools, &mut work)?;
-            usage.add_unpivot_sources_observed(fragment, pools, limits, &mut work)?;
-            usage.validate("package.constants.resources", &mut errors);
-            if !errors.is_empty() {
-                return Err(ConstantReferenceError::Structure(
-                    crate::ValidationErrors::from_collector(errors),
-                ));
-            }
-        }
-        let mut used = std::collections::BTreeSet::new();
-        visit_typed_constant_references_observed(
-            fragment,
-            &mut work,
-            |reference, expected, work| {
-                pools.resolve_observed(reference, expected, work)?;
-                if require_closed {
-                    work.flush()?;
-                    used.insert(reference.pool);
-                    work.step()?;
-                    work.flush()?;
-                }
-                Ok(())
-            },
-        )?;
-        for (_, expression) in fragment.expressions().iter() {
-            work.step()?;
-            if let crate::ExprKind::WindowCall {
-                frame: Some(frame), ..
-            } = &expression.kind
-            {
-                validate_window_constants(fragment, pools, frame, &mut work)?;
-            }
-        }
-        validate_unpivot_constants(fragment, pools, limits, &mut used, &mut work)?;
-        if require_closed && used.len() != pools.entries.len() {
-            return Err(ConstantReferenceError::UnusedPools);
-        }
-        Ok(())
-    })();
+    let result = validate_fragment_constants_core(
+        fragment,
+        pools,
+        require_closed,
+        limits,
+        ConstantValidationMode::Plain,
+        &mut work,
+    );
     if matches!(result, Err(ConstantReferenceError::Control(_))) {
         return result;
     }
     work.finish()?;
     result
+}
+
+/// The caller owns entry and completion of the original mandatory validation.
+/// This reuses every source/consumer/closure law; scratch admission is separate.
+pub(crate) fn validate_fragment_constants_in(
+    fragment: &crate::Fragment,
+    pools: &ConstantPools,
+    require_closed: bool,
+    limits: crate::PlanLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ConstantReferenceError> {
+    validate_fragment_constants_core(
+        fragment,
+        pools,
+        require_closed,
+        limits,
+        ConstantValidationMode::Caller,
+        work,
+    )
+}
+
+fn validate_fragment_constants_core(
+    fragment: &crate::Fragment,
+    pools: &ConstantPools,
+    require_closed: bool,
+    limits: crate::PlanLimits,
+    mode: ConstantValidationMode,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ConstantReferenceError> {
+    // A whole plan has one table spanning peer fragments; its enclosing
+    // plan gate accounts that table. Only a closed local package owns it
+    // within this fragment envelope.
+    if require_closed {
+        let mut errors = crate::validation::ValidationContext::new();
+        let mut usage = crate::resource::CutResourcePreflight::new();
+        usage.add_fragment(fragment, &mut errors);
+        usage.add_constants_observed(pools, work)?;
+        match mode {
+            ConstantValidationMode::Plain => {
+                usage.add_unpivot_sources_observed(fragment, pools, limits, work)?
+            }
+            ConstantValidationMode::Caller => {
+                usage.add_unpivot_sources_in(fragment, pools, limits, work)?
+            }
+        }
+        usage.validate("package.constants.resources", &mut errors);
+        if !errors.is_empty() {
+            return Err(ConstantReferenceError::Structure(
+                crate::ValidationErrors::from_collector(errors),
+            ));
+        }
+    }
+    let mut used = std::collections::BTreeSet::new();
+    visit_typed_constant_references_observed(fragment, work, |reference, expected, work| {
+        pools.resolve_observed(reference, expected, work)?;
+        if require_closed {
+            work.flush()?;
+            used.insert(reference.pool);
+            work.step()?;
+            work.flush()?;
+        }
+        Ok(())
+    })?;
+    for (_, expression) in fragment.expressions().iter() {
+        work.step()?;
+        if let crate::ExprKind::WindowCall {
+            frame: Some(frame), ..
+        } = &expression.kind
+        {
+            validate_window_constants(fragment, pools, frame, work)?;
+        }
+    }
+    validate_unpivot_constants(fragment, pools, limits, &mut used, mode, work)?;
+    if require_closed && used.len() != pools.entries.len() {
+        return Err(ConstantReferenceError::UnusedPools);
+    }
+    Ok(())
 }
 
 /// Read the original window-bound constant through its admitted source type.
@@ -731,6 +837,7 @@ fn validate_unpivot_constants(
     pools: &ConstantPools,
     limits: crate::PlanLimits,
     used: &mut std::collections::BTreeSet<ConstantPoolId>,
+    mode: ConstantValidationMode,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ConstantReferenceError> {
     let mut previous_node = None;
@@ -749,20 +856,25 @@ fn validate_unpivot_constants(
                 };
                 if let crate::ExprKind::Constant(reference) = expression.kind {
                     let value = pools.resolve_observed(reference, &expression.ty, work)?;
-                    work.flush()?;
-                    let selected = value.selected_payload_bytes_observed(
-                        novarocks_type_contract::CompilePhase::Validate,
-                        work.control(),
-                    )?;
-                    work.flush()?;
-                    selected
+                    match mode {
+                        ConstantValidationMode::Plain => {
+                            work.flush()?;
+                            let selected = value.selected_payload_bytes_observed(
+                                novarocks_type_contract::CompilePhase::Validate,
+                                work.control(),
+                            )?;
+                            work.flush()?;
+                            selected
+                        }
+                        ConstantValidationMode::Caller => value.selected_payload_bytes_in(work)?,
+                    }
                 } else {
                     crate::validation::unpivot_scalar_literal_bytes(fragment, *id) as u64
                 }
             }
             crate::UnpivotConstant::Int32List(reference)
             | crate::UnpivotConstant::Utf8Map(reference) => {
-                let usage = unpivot_collection_usage_observed(
+                let usage = unpivot_collection_usage_core(
                     pools,
                     constant,
                     output,
@@ -773,6 +885,7 @@ fn validate_unpivot_constants(
                     (crate::MAX_UNPIVOT_LITERAL_BYTES as u64)
                         .checked_sub(bytes)
                         .ok_or_else(resource_refusal)?,
+                    mode,
                     work,
                 )?;
                 items = items
@@ -797,51 +910,82 @@ pub(crate) fn validate_plan_constants_observed(
 ) -> Result<(), ConstantReferenceError> {
     use novarocks_type_contract::CompilePhase;
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-    let result = (|| {
-        let mut errors = crate::validation::ValidationContext::new();
-        crate::resource::validate_plan_resources_observed(plan, &mut errors, &mut work)?;
-        if !errors.is_empty() {
-            return Err(ConstantReferenceError::Structure(
-                crate::ValidationErrors::from_collector(errors),
-            ));
-        }
-        let mut used = std::collections::BTreeSet::new();
-        for fragment in plan.fragments().values() {
-            work.step()?;
-            work.flush()?;
-            validate_fragment_constants_observed(
-                fragment,
-                plan.constants(),
-                false,
-                crate::PlanLimits::FROZEN,
-                control,
-            )?;
-            work.flush()?;
-            visit_typed_constant_references_observed(fragment, &mut work, |reference, _, work| {
-                work.flush()?;
-                used.insert(reference.pool);
-                work.step()?;
-                work.flush()?;
-                Ok(())
-            })?;
-            visit_unpivot_constants_observed(fragment, &mut work, |_, constant, _, work| {
-                if let Some(reference) = collection_reference(constant) {
-                    used.insert(reference.pool);
-                    work.step()?;
-                }
-                Ok(())
-            })?;
-        }
-        if used.len() != plan.constants().entries().len() {
-            return Err(ConstantReferenceError::UnusedPools);
-        }
-        Ok(())
-    })();
+    let result = validate_plan_constants_core(plan, ConstantValidationMode::Plain, &mut work);
     if matches!(result, Err(ConstantReferenceError::Control(_))) {
         return result;
     }
     work.finish()?;
     result
+}
+
+pub(crate) fn validate_plan_constants_in(
+    plan: &crate::PhysicalPlan,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ConstantReferenceError> {
+    validate_plan_constants_core(plan, ConstantValidationMode::Caller, work)
+}
+
+fn validate_plan_constants_core(
+    plan: &crate::PhysicalPlan,
+    mode: ConstantValidationMode,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ConstantReferenceError> {
+    let mut errors = crate::validation::ValidationContext::new();
+    match mode {
+        ConstantValidationMode::Plain => {
+            crate::resource::validate_plan_resources_observed(plan, &mut errors, work)?
+        }
+        ConstantValidationMode::Caller => {
+            crate::resource::validate_plan_resources_in(plan, &mut errors, work)?
+        }
+    }
+    if !errors.is_empty() {
+        return Err(ConstantReferenceError::Structure(
+            crate::ValidationErrors::from_collector(errors),
+        ));
+    }
+    let mut used = std::collections::BTreeSet::new();
+    for fragment in plan.fragments().values() {
+        work.step()?;
+        match mode {
+            ConstantValidationMode::Plain => {
+                work.flush()?;
+                validate_fragment_constants_observed(
+                    fragment,
+                    plan.constants(),
+                    false,
+                    crate::PlanLimits::FROZEN,
+                    work.control(),
+                )?;
+                work.flush()?;
+            }
+            ConstantValidationMode::Caller => validate_fragment_constants_in(
+                fragment,
+                plan.constants(),
+                false,
+                crate::PlanLimits::FROZEN,
+                work,
+            )?,
+        }
+        visit_typed_constant_references_observed(fragment, work, |reference, _, work| {
+            work.flush()?;
+            used.insert(reference.pool);
+            work.step()?;
+            work.flush()?;
+            Ok(())
+        })?;
+        visit_unpivot_constants_observed(fragment, work, |_, constant, _, work| {
+            if let Some(reference) = collection_reference(constant) {
+                used.insert(reference.pool);
+                work.step()?;
+            }
+            Ok(())
+        })?;
+    }
+    if used.len() != plan.constants().entries().len() {
+        return Err(ConstantReferenceError::UnusedPools);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

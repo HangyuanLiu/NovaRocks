@@ -78,6 +78,17 @@ pub struct FragmentPackageAdmission {
 #[derive(Clone, Debug)]
 pub struct FragmentPackage(FragmentPackageInput);
 
+type PackageResourceAdmission<'a> = dyn FnMut(&novarocks_type_contract::ControlOwnedResourceFacts) -> Result<(), CompileControlError>
+    + 'a;
+
+enum PackageValidation<'borrow, 'control, 'admit> {
+    Plain(&'control dyn PureCompileControl),
+    Caller {
+        admit: &'borrow mut PackageResourceAdmission<'admit>,
+        work: &'borrow mut CompileCheckpoints<'control>,
+    },
+}
+
 impl FragmentPackage {
     pub fn try_new(
         input: FragmentPackageInput,
@@ -87,94 +98,228 @@ impl FragmentPackage {
         control
             .checkpoint(CompilePhase::Validate, 0)
             .map_err(FragmentPackageError::Control)?;
-        crate::validate_fragment_output_properties_observed(
-            &input.fragment,
-            &input.expression_uses,
-            &input.calls,
-            admission.plan_limits,
-            admission.source_retained_bytes,
-            admission.property_projection_limits,
-            control,
-        )
-        .map_err(property_error)?;
-        input
-            .fragment
-            .call_requests()
-            .validate_fragment(&input.fragment, control)
-            .map_err(|error| match error {
-                crate::CallRequestError::Control(cause) => FragmentPackageError::Control(cause),
-                other => FragmentPackageError::Requests(other),
-            })?;
-        crate::constants::validate_fragment_constants_observed(
-            &input.fragment,
-            &input.constants,
-            true,
-            admission.plan_limits,
-            control,
-        )
-        .map_err(|error| match error {
-            crate::ConstantReferenceError::Control(error) => FragmentPackageError::Control(error),
+        Self::try_new_core(input, admission, PackageValidation::Plain(control))
+    }
+
+    /// Run all original package laws in the caller's existing scope.
+    /// The hook covers the existing call/control author and parameter scratch.
+    /// Other structural, type and diagnostic scratch still requires its owner;
+    /// this entry does not claim a complete allocation grant.
+    pub fn try_new_in(
+        input: FragmentPackageInput,
+        admission: FragmentPackageAdmission,
+        admit: &mut PackageResourceAdmission<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, FragmentPackageError> {
+        Self::try_new_core(input, admission, PackageValidation::Caller { admit, work })
+    }
+
+    fn try_new_core(
+        input: FragmentPackageInput,
+        admission: FragmentPackageAdmission,
+        mut observation: PackageValidation<'_, '_, '_>,
+    ) -> Result<Self, FragmentPackageError> {
+        let mut resources = novarocks_type_contract::ControlResourceCounter::default();
+        match &mut observation {
+            PackageValidation::Plain(control) => {
+                crate::validate_fragment_output_properties_observed(
+                    &input.fragment,
+                    &input.expression_uses,
+                    &input.calls,
+                    admission.plan_limits,
+                    admission.source_retained_bytes,
+                    admission.property_projection_limits,
+                    *control,
+                )
+                .map_err(property_error)?;
+            }
+            PackageValidation::Caller { admit, work } => {
+                // One original call/control contribution emits cumulative
+                // snapshots. Replace that contribution, never sum snapshots.
+                let mut child = novarocks_type_contract::ControlOwnedResourceFacts::default();
+                crate::validate_fragment_output_properties_in(
+                    &input.fragment,
+                    &input.expression_uses,
+                    &input.calls,
+                    admission.plan_limits,
+                    admission.source_retained_bytes,
+                    admission.property_projection_limits,
+                    &mut |next| {
+                        child = *next;
+                        admit(next)
+                    },
+                    work,
+                )
+                .map_err(property_error)?;
+                resources.merge(child).map_err(package_resource_error)?;
+            }
+        }
+        let requests = match &mut observation {
+            PackageValidation::Plain(control) => input
+                .fragment
+                .call_requests()
+                .validate_fragment(&input.fragment, *control),
+            PackageValidation::Caller { work, .. } => input
+                .fragment
+                .call_requests()
+                .validate_fragment_in(&input.fragment, work),
+        };
+        requests.map_err(|error| match error {
+            crate::CallRequestError::Control(cause) => FragmentPackageError::Control(cause),
+            other => FragmentPackageError::Requests(other),
+        })?;
+        let constants = match &mut observation {
+            PackageValidation::Plain(control) => {
+                crate::constants::validate_fragment_constants_observed(
+                    &input.fragment,
+                    &input.constants,
+                    true,
+                    admission.plan_limits,
+                    *control,
+                )
+            }
+            PackageValidation::Caller { work, .. } => {
+                crate::constants::validate_fragment_constants_in(
+                    &input.fragment,
+                    &input.constants,
+                    true,
+                    admission.plan_limits,
+                    work,
+                )
+            }
+        };
+        constants.map_err(|error| match error {
+            crate::ConstantReferenceError::Control(cause) => FragmentPackageError::Control(cause),
             error => FragmentPackageError::Constant(error),
         })?;
-        let call_items =
-            input
-                .calls
-                .dynamic_items_observed(control)
-                .map_err(|error| match error {
-                    FrozenCallError::Control(error) => FragmentPackageError::Control(error),
-                    error => FragmentPackageError::Calls(error),
-                })?;
-        let pruning_items = input
-            .pruning
-            .dynamic_items_observed(control)
-            .map_err(pruning_error)?;
-        let counts =
-            visit_fragment_parameter_references(&input.fragment, &input.calls, control, |_| {})
-                .map_err(parameter_error)?;
-        let mut resource_work = CompileCheckpoints::try_new(control, CompilePhase::Validate)
-            .map_err(FragmentPackageError::Control)?;
-        let resource_result = crate::validation::validate_package(
-            &input,
-            admission.plan_limits,
-            call_items
+        let call_items = match &mut observation {
+            PackageValidation::Plain(control) => input.calls.dynamic_items_observed(*control),
+            PackageValidation::Caller { work, .. } => input.calls.dynamic_items_in(work),
+        }
+        .map_err(|error| match error {
+            FrozenCallError::Control(cause) => FragmentPackageError::Control(cause),
+            error => FragmentPackageError::Calls(error),
+        })?;
+        let pruning_items = match &mut observation {
+            PackageValidation::Plain(control) => input.pruning.dynamic_items_observed(*control),
+            PackageValidation::Caller { work, .. } => input.pruning.dynamic_items_in(work),
+        }
+        .map_err(pruning_error)?;
+        let counts = match &mut observation {
+            PackageValidation::Plain(control) => {
+                visit_fragment_parameter_references(&input.fragment, &input.calls, *control, |_| {})
+                    .map_err(parameter_error)?
+            }
+            PackageValidation::Caller { admit, work } => {
+                parameter_walk_resources(&mut resources, &input.fragment, call_items)?;
+                admit(&resources.facts()).map_err(FragmentPackageError::Control)?;
+                visit_fragment_parameter_references_core(
+                    &input.fragment,
+                    &input.calls,
+                    true,
+                    work,
+                    |_| {},
+                )
+                .map_err(parameter_error)?
+            }
+        };
+        let semantic_items = match &observation {
+            PackageValidation::Plain(_) => call_items
                 .saturating_add(pruning_items)
                 .saturating_add(counts.intrinsic),
-            &mut resource_work,
-        );
-        if matches!(resource_result, Err(FragmentPackageError::Control(_))) {
-            return resource_result.map(|_| Self(input));
+            PackageValidation::Caller { .. } => call_items
+                .checked_add(pruning_items)
+                .and_then(|n| n.checked_add(counts.intrinsic))
+                .ok_or(FragmentPackageError::Control(
+                    CompileControlError::ResourceExhausted,
+                ))?,
+        };
+        match &mut observation {
+            PackageValidation::Plain(control) => {
+                let mut resource_work =
+                    CompileCheckpoints::try_new(*control, CompilePhase::Validate)
+                        .map_err(FragmentPackageError::Control)?;
+                let result = crate::validation::validate_package(
+                    &input,
+                    admission.plan_limits,
+                    semantic_items,
+                    &mut resource_work,
+                );
+                if matches!(result, Err(FragmentPackageError::Control(_))) {
+                    return result.map(|_| Self(input));
+                }
+                resource_work
+                    .finish()
+                    .map_err(FragmentPackageError::Control)?;
+                result?;
+            }
+            PackageValidation::Caller { work, .. } => crate::validation::validate_package_in(
+                &input,
+                admission.plan_limits,
+                semantic_items,
+                work,
+            )?,
         }
-        resource_work
-            .finish()
-            .map_err(FragmentPackageError::Control)?;
-        resource_result?;
-        // The exact package profile must admit the complete source before
-        // materializing any repeated semantic-parameter references.
-        let references = fragment_parameter_references(&input.fragment, &input.calls, control)
-            .map_err(parameter_error)?;
-        let closure = input
-            .parameters
-            .project_observed(references, CompilePhase::Validate, control)
-            .map_err(|error| match error {
-                SemanticParameterProjectionError::Control(error) => {
-                    FragmentPackageError::Control(error)
-                }
-                SemanticParameterProjectionError::Parameter(error) => {
-                    FragmentPackageError::Parameter(error)
-                }
-            })?;
-        // Projection resolves and copies this exact immutable table. Its keys
-        // are a subset, so equal counts prove closure without an unobserved
-        // second traversal/comparison of all frozen values.
+        // Preserve the second actual reference walk after the complete original
+        // package profile, before immutable parameter subset publication.
+        let closure = match &mut observation {
+            PackageValidation::Plain(control) => {
+                let references =
+                    fragment_parameter_references(&input.fragment, &input.calls, *control)
+                        .map_err(parameter_error)?;
+                input
+                    .parameters
+                    .project_observed(references, CompilePhase::Validate, *control)
+                    .map_err(parameter_error)?
+            }
+            PackageValidation::Caller { admit, work } => {
+                parameter_walk_resources(&mut resources, &input.fragment, call_items)?;
+                resources
+                    .buffer::<SemanticParameterRef>(counts.total, 1)
+                    .map_err(package_resource_error)?;
+                admit(&resources.facts()).map_err(FragmentPackageError::Control)?;
+                let mut references = Vec::new();
+                references.try_reserve_exact(counts.total).map_err(|_| {
+                    FragmentPackageError::Control(CompileControlError::ResourceExhausted)
+                })?;
+                visit_fragment_parameter_references_core(
+                    &input.fragment,
+                    &input.calls,
+                    true,
+                    work,
+                    |reference| references.push(reference),
+                )
+                .map_err(parameter_error)?;
+                let mut tree = novarocks_type_contract::ControlOwnedResourceFacts::default();
+                input.parameters.project_in::<FragmentPackageError>(
+                    references,
+                    &mut |visit| {
+                        parameter_projection_resources(&mut resources, &mut tree, visit)?;
+                        let mut combined =
+                            novarocks_type_contract::ControlResourceCounter::default();
+                        combined
+                            .merge(resources.facts())
+                            .map_err(package_resource_error)?;
+                        combined.merge(tree).map_err(package_resource_error)?;
+                        admit(&combined.facts()).map_err(FragmentPackageError::Control)
+                    },
+                    work,
+                )?
+            }
+        };
         if closure.entries().len() != input.parameters.entries().len() {
             return Err(FragmentPackageError::UnusedParameters);
         }
         let package = Self(input);
-        package
-            .0
-            .pruning
-            .validate_package(&package, control)
-            .map_err(pruning_error)?;
+        match &mut observation {
+            PackageValidation::Plain(control) => {
+                package.0.pruning.validate_package(&package, *control)
+            }
+            PackageValidation::Caller { work, .. } => {
+                package.0.pruning.validate_package_in(&package, work)
+            }
+        }
+        .map_err(pruning_error)?;
         Ok(package)
     }
 
@@ -355,6 +500,7 @@ fn call_error(error: FrozenCallError) -> FragmentPackageError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FragmentPackageError {
+    ResourceSource(&'static str),
     Requests(crate::CallRequestError),
     Control(CompileControlError),
     Constant(crate::ConstantReferenceError),
@@ -368,6 +514,7 @@ pub enum FragmentPackageError {
 impl fmt::Display for FragmentPackageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ResourceSource(message) => f.write_str(message),
             Self::Requests(error) => error.fmt(f),
             Self::Control(error) => error.fmt(f),
             Self::Constant(error) => error.fmt(f),
@@ -393,6 +540,97 @@ fn parameter_error(error: SemanticParameterProjectionError) -> FragmentPackageEr
     }
 }
 
+impl From<SemanticParameterProjectionError> for FragmentPackageError {
+    fn from(error: SemanticParameterProjectionError) -> Self {
+        parameter_error(error)
+    }
+}
+
+fn package_resource_error(
+    error: novarocks_type_contract::ControlResourceError,
+) -> FragmentPackageError {
+    match error {
+        novarocks_type_contract::ControlResourceError::Control(cause) => {
+            FragmentPackageError::Control(cause)
+        }
+        novarocks_type_contract::ControlResourceError::SourceModel(message) => {
+            FragmentPackageError::ResourceSource(message)
+        }
+    }
+}
+
+fn parameter_walk_resources(
+    resources: &mut novarocks_type_contract::ControlResourceCounter,
+    fragment: &Fragment,
+    call_items: usize,
+) -> Result<(), FragmentPackageError> {
+    // call_items is the original entries + environment references count.
+    // Each actual definition owns one visit and at most one primitive reference.
+    let expressions =
+        novarocks_type_contract::control_resource_mul(fragment.expressions().len(), 2)
+            .map_err(package_resource_error)?;
+    resources
+        .work(
+            novarocks_type_contract::control_resource_add(call_items, expressions)
+                .map_err(package_resource_error)?,
+        )
+        .map_err(package_resource_error)
+}
+
+fn parameter_projection_resources(
+    resources: &mut novarocks_type_contract::ControlResourceCounter,
+    tree: &mut novarocks_type_contract::ControlOwnedResourceFacts,
+    visit: novarocks_type_contract::SemanticParameterProjectionVisit<'_>,
+) -> Result<(), FragmentPackageError> {
+    use novarocks_type_contract::{
+        ControlResourceCounter, SemanticParameterId, SemanticParameterProjectionVisit,
+        SemanticParameterValue,
+    };
+    match visit {
+        SemanticParameterProjectionVisit::BeforeLookup {
+            source_definition_count,
+            output_definition_count,
+            ..
+        } => {
+            resources
+                .work(
+                    ControlResourceCounter::lookup_work(source_definition_count)
+                        .map_err(package_resource_error)?,
+                )
+                .map_err(package_resource_error)?;
+            resources
+                .work(
+                    ControlResourceCounter::lookup_work(output_definition_count)
+                        .map_err(package_resource_error)?,
+                )
+                .map_err(package_resource_error)?;
+        }
+        SemanticParameterProjectionVisit::CapturedValue {
+            value,
+            is_new,
+            output_definition_count,
+            ..
+        } => {
+            if is_new {
+                let count =
+                    novarocks_type_contract::control_resource_add(output_definition_count, 1)
+                        .map_err(package_resource_error)?;
+                let mut next_tree = ControlResourceCounter::default();
+                next_tree
+                    .tree::<SemanticParameterId, SemanticParameterValue>(count)
+                    .map_err(package_resource_error)?;
+                *tree = next_tree.facts();
+                if let SemanticParameterValue::TimeZone(zone) = value {
+                    resources
+                        .buffer::<u8>(zone.len(), 1)
+                        .map_err(package_resource_error)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct ParameterReferenceCounts {
     total: usize,
@@ -406,15 +644,38 @@ fn visit_fragment_parameter_references(
     fragment: &Fragment,
     calls: &FrozenFragmentCalls,
     control: &dyn PureCompileControl,
-    mut visit: impl FnMut(SemanticParameterRef),
+    visit: impl FnMut(SemanticParameterRef),
 ) -> Result<ParameterReferenceCounts, SemanticParameterProjectionError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)
         .map_err(SemanticParameterProjectionError::Control)?;
+    let counts =
+        visit_fragment_parameter_references_core(fragment, calls, false, &mut work, visit)?;
+    work.finish()
+        .map_err(SemanticParameterProjectionError::Control)?;
+    Ok(counts)
+}
+
+fn visit_fragment_parameter_references_core(
+    fragment: &Fragment,
+    calls: &FrozenFragmentCalls,
+    checked: bool,
+    work: &mut CompileCheckpoints<'_>,
+    mut visit: impl FnMut(SemanticParameterRef),
+) -> Result<ParameterReferenceCounts, SemanticParameterProjectionError> {
     let mut counts = ParameterReferenceCounts::default();
     for call in calls.entries().values() {
         for reference in &call.effects.environment {
             visit(*reference);
-            counts.total = counts.total.saturating_add(1);
+            counts.total = if checked {
+                counts
+                    .total
+                    .checked_add(1)
+                    .ok_or(SemanticParameterProjectionError::Control(
+                        CompileControlError::ResourceExhausted,
+                    ))?
+            } else {
+                counts.total.saturating_add(1)
+            };
             work.step()
                 .map_err(SemanticParameterProjectionError::Control)?;
         }
@@ -424,14 +685,30 @@ fn visit_fragment_parameter_references(
     for (_, definition) in fragment.expressions().iter() {
         for reference in definition.kind.intrinsic_parameter_references() {
             visit(*reference);
-            counts.total = counts.total.saturating_add(1);
-            counts.intrinsic = counts.intrinsic.saturating_add(1);
+            counts.total = if checked {
+                counts
+                    .total
+                    .checked_add(1)
+                    .ok_or(SemanticParameterProjectionError::Control(
+                        CompileControlError::ResourceExhausted,
+                    ))?
+            } else {
+                counts.total.saturating_add(1)
+            };
+            counts.intrinsic = if checked {
+                counts
+                    .intrinsic
+                    .checked_add(1)
+                    .ok_or(SemanticParameterProjectionError::Control(
+                        CompileControlError::ResourceExhausted,
+                    ))?
+            } else {
+                counts.intrinsic.saturating_add(1)
+            };
         }
         work.step()
             .map_err(SemanticParameterProjectionError::Control)?;
     }
-    work.finish()
-        .map_err(SemanticParameterProjectionError::Control)?;
     Ok(counts)
 }
 

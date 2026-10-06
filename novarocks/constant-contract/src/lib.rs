@@ -667,15 +667,24 @@ impl ConstantValue {
         control: &dyn PureCompileControl,
     ) -> Result<u64, ConstantError> {
         let mut work = CompileCheckpoints::try_new(control, phase)?;
-        let bytes = selected_payload_bytes(
+        let bytes = self.selected_payload_bytes_in(&mut work)?;
+        work.finish()?;
+        Ok(bytes)
+    }
+    /// Read the exact selected payload using the caller's original meter.
+    /// The caller owns entry and finish. This semantic byte count does not
+    /// admit the traversal's temporary stack or retained Arrow resources.
+    pub fn selected_payload_bytes_in(
+        &self,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<u64, ConstantError> {
+        selected_payload_bytes(
             Row {
                 data: &self.pool.0.data,
                 index: self.ordinal as usize,
             },
-            &mut work,
-        )?;
-        work.finish()?;
-        Ok(bytes)
+            work,
+        )
     }
     /// Factories use the same checked owner. The caller supplies all type/field
     /// facts and policy; no logical label, field name or environment is guessed.

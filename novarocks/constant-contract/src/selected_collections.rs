@@ -65,28 +65,35 @@ impl ConstantValue {
         control: &dyn PureCompileControl,
     ) -> Result<Option<SelectedInt32List<'_>>, ConstantError> {
         let mut work = CompileCheckpoints::try_new(control, phase)?;
-        let result = (|| {
-            let Some(row) = selected_row(self, &mut work)? else {
-                return Ok(None);
-            };
-            let valid = matches!(row.data.data_type(), DataType::List(field) if field.data_type() == &DataType::Int32);
-            work.step()?;
-            if !valid {
-                return Err(ConstantError::Invalid(
-                    "selected constant is not a List<Int32>",
-                ));
-            }
-            let range = list_range(row);
-            work.step()?;
-            let (start, end) = range?;
-            Ok(Some(SelectedInt32List {
-                source: self,
-                child: &row.data.child_data()[0],
-                start,
-                len: end - start,
-            }))
-        })();
+        let result = self.int32_list_in(&mut work);
         finish(work, result)
+    }
+
+    /// Borrow the selected collection using the caller's original meter.
+    /// No entry or tail is published; items retain this exact source owner.
+    pub fn int32_list_in(
+        &self,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<SelectedInt32List<'_>>, ConstantError> {
+        let Some(row) = selected_row(self, work)? else {
+            return Ok(None);
+        };
+        let valid = matches!(row.data.data_type(), DataType::List(field) if field.data_type() == &DataType::Int32);
+        work.step()?;
+        if !valid {
+            return Err(ConstantError::Invalid(
+                "selected constant is not a List<Int32>",
+            ));
+        }
+        let range = list_range(row);
+        work.step()?;
+        let (start, end) = range?;
+        Ok(Some(SelectedInt32List {
+            source: self,
+            child: &row.data.child_data()[0],
+            start,
+            len: end - start,
+        }))
     }
 
     pub fn utf8_map_observed(
@@ -95,35 +102,42 @@ impl ConstantValue {
         control: &dyn PureCompileControl,
     ) -> Result<Option<SelectedUtf8Map<'_>>, ConstantError> {
         let mut work = CompileCheckpoints::try_new(control, phase)?;
-        let result = (|| {
-            let Some(row) = selected_row(self, &mut work)? else {
-                return Ok(None);
-            };
-            let valid = matches!(row.data.data_type(), DataType::Map(entries, _)
-                if matches!(entries.data_type(), DataType::Struct(fields)
-                    if fields.len() == 2 && fields[0].data_type() == &DataType::Utf8
-                        && fields[1].data_type() == &DataType::Utf8));
-            work.step()?;
-            if !valid {
-                return Err(ConstantError::Invalid(
-                    "selected constant is not a Map<Utf8, Utf8>",
-                ));
-            }
-            let range = list_range(row);
-            work.step()?;
-            let (start, end) = range?;
-            // ConstantPool canonicalization has already applied Struct parent
-            // offsets to its children. Reuse the original row addressing.
-            let children = row.data.child_data()[0].child_data();
-            Ok(Some(SelectedUtf8Map {
-                source: self,
-                keys: &children[0],
-                values: &children[1],
-                start,
-                len: end - start,
-            }))
-        })();
+        let result = self.utf8_map_in(&mut work);
         finish(work, result)
+    }
+
+    /// Borrow the selected collection using the caller's original meter.
+    /// No entry or tail is published; items retain this exact source owner.
+    pub fn utf8_map_in(
+        &self,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<SelectedUtf8Map<'_>>, ConstantError> {
+        let Some(row) = selected_row(self, work)? else {
+            return Ok(None);
+        };
+        let valid = matches!(row.data.data_type(), DataType::Map(entries, _)
+            if matches!(entries.data_type(), DataType::Struct(fields)
+                if fields.len() == 2 && fields[0].data_type() == &DataType::Utf8
+                    && fields[1].data_type() == &DataType::Utf8));
+        work.step()?;
+        if !valid {
+            return Err(ConstantError::Invalid(
+                "selected constant is not a Map<Utf8, Utf8>",
+            ));
+        }
+        let range = list_range(row);
+        work.step()?;
+        let (start, end) = range?;
+        // ConstantPool canonicalization has already applied Struct parent
+        // offsets to its children. Reuse the original row addressing.
+        let children = row.data.child_data()[0].child_data();
+        Ok(Some(SelectedUtf8Map {
+            source: self,
+            keys: &children[0],
+            values: &children[1],
+            start,
+            len: end - start,
+        }))
     }
 }
 

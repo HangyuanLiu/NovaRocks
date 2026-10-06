@@ -45,6 +45,37 @@ pub(crate) fn validate_package(
     semantic_items: usize,
     work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
 ) -> Result<(), crate::FragmentPackageError> {
+    validate_package_core(
+        input,
+        limits,
+        semantic_items,
+        crate::constants::ConstantValidationMode::Plain,
+        work,
+    )
+}
+
+pub(crate) fn validate_package_in(
+    input: &FragmentPackageInput,
+    limits: PlanLimits,
+    semantic_items: usize,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<(), crate::FragmentPackageError> {
+    validate_package_core(
+        input,
+        limits,
+        semantic_items,
+        crate::constants::ConstantValidationMode::Caller,
+        work,
+    )
+}
+
+fn validate_package_core(
+    input: &FragmentPackageInput,
+    limits: PlanLimits,
+    semantic_items: usize,
+    mode: crate::constants::ConstantValidationMode,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<(), crate::FragmentPackageError> {
     let mut errors = ValidationContext::for_construction(limits);
     let fragment = &input.fragment;
     let mut usage = CutResourcePreflight::new();
@@ -53,14 +84,20 @@ pub(crate) fn validate_package(
     usage
         .add_constants_observed(&input.constants, work)
         .map_err(crate::FragmentPackageError::Control)?;
-    usage
-        .add_unpivot_sources_observed(fragment, &input.constants, limits, work)
-        .map_err(|error| match error {
-            crate::ConstantReferenceError::Control(cause) => {
-                crate::FragmentPackageError::Control(cause)
-            }
-            error => crate::FragmentPackageError::Constant(error),
-        })?;
+    let unpivot = match mode {
+        crate::constants::ConstantValidationMode::Plain => {
+            usage.add_unpivot_sources_observed(fragment, &input.constants, limits, work)
+        }
+        crate::constants::ConstantValidationMode::Caller => {
+            usage.add_unpivot_sources_in(fragment, &input.constants, limits, work)
+        }
+    };
+    unpivot.map_err(|error| match error {
+        crate::ConstantReferenceError::Control(cause) => {
+            crate::FragmentPackageError::Control(cause)
+        }
+        error => crate::FragmentPackageError::Constant(error),
+    })?;
     // Count the immutable control representation in the same package dynamic
     // item bound. These counts are not a decoded-allocation or peak-byte model.
     let control = &input.expression_uses;
