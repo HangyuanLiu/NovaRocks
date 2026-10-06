@@ -364,6 +364,15 @@ pub(crate) fn preflight_table_signature_copy_counts(
 ) -> Result<(), BindingCodecError> {
     preflight_table_signature_copy_counts_core(source, model, limits, None, work)
 }
+pub(crate) fn preflight_table_signature_copy_counts_in(
+    source: &BoundTableFunction,
+    model: &mut MaterializationModel,
+    limits: BindingProjectionLimits,
+    admit: &mut super::owner_admission::Admit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), BindingCodecError> {
+    preflight_table_signature_copy_counts_core(source, model, limits, Some(admit), work)
+}
 fn preflight_table_signature_copy_counts_core(
     source: &BoundTableFunction,
     model: &mut MaterializationModel,
@@ -415,6 +424,15 @@ pub(crate) fn preflight_table_signature_copy_types(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
     preflight_table_signature_copy_types_core(source, model, limits, None, work)
+}
+pub(crate) fn preflight_table_signature_copy_types_in(
+    source: &BoundTableFunction,
+    model: &mut MaterializationModel,
+    limits: BindingProjectionLimits,
+    admit: &mut super::owner_admission::Admit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), BindingCodecError> {
+    preflight_table_signature_copy_types_core(source, model, limits, Some(admit), work)
 }
 fn preflight_table_signature_copy_types_core(
     source: &BoundTableFunction,

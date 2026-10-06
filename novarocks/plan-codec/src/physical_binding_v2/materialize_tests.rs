@@ -605,7 +605,7 @@ fn node_limits() -> resources::NodeProjectionLimits {
         },
     }
 }
-fn composed_model() -> Model {
+fn composed_model() -> Model<'static> {
     let mut model = Model::for_composition(1, 0, SOURCE, 0);
     model.items = 3;
     model.request::<u64>(2, 2).unwrap();

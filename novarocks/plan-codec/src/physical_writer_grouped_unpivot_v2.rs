@@ -70,10 +70,26 @@ pub(crate) struct GroupedProjection {
     pub(crate) parent: Option<GroupedNodeAdmission>,
 }
 impl GroupedProjection {
-    fn admit(self, model: &Model, values: usize) -> Result<NodeProjectionFacts, Error> {
+    fn admit(
+        self,
+        model: &Model,
+        values: usize,
+        admit: &mut Option<&mut NodeAdmit<'_>>,
+    ) -> Result<NodeProjectionFacts, Error> {
         let facts = model.numerical_facts(self.source, values, self.limits)?;
         if let Some(parent) = self.parent {
             parent.admit(self.source, facts)?;
+        }
+        if let Some(callback) = admit.as_mut() {
+            let next = match self.parent {
+                Some(parent) => parent.merge(facts)?.numerical_facts(
+                    self.source,
+                    parent.values,
+                    parent.limits,
+                )?,
+                None => facts,
+            };
+            callback(&next)?;
         }
         Ok(facts)
     }
@@ -85,12 +101,13 @@ fn admit_counts(
     scalars: usize,
     pools: usize,
     expressions: &impl Expressions,
+    admit: &mut Option<&mut NodeAdmit<'_>>,
 ) -> Result<(), Error> {
     // Snapshot the current own model and add the sole lookup bound once.
     // Do not cumulatively add each earlier prefix to the eventual facts.
     let mut counted = *model;
     delegate_counts(&mut counted, scalars, pools, expressions)?;
-    projection.admit(&counted, values)?;
+    projection.admit(&counted, values, admit)?;
     Ok(())
 }
 
@@ -121,9 +138,43 @@ pub(crate) fn preflight_grouped_encode_observed(
     projection: GroupedProjection,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<WriterGroupedUnpivotProjectionFacts, Error> {
+    preflight_grouped_encode_core(input, values, expressions, projection, None, work)
+}
+pub(crate) fn preflight_grouped_encode_in(
+    input: &p::WriterGroupedUnpivotSpec,
+    values: &EncodedValues<'_, '_, '_>,
+    expressions: &EncodedExpressions<'_, '_, '_>,
+    projection: GroupedProjection,
+    admit: &mut NodeAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<WriterGroupedUnpivotProjectionFacts, Error> {
+    preflight_grouped_encode_core(input, values, expressions, projection, Some(admit), work)
+}
+fn preflight_grouped_encode_core(
+    input: &p::WriterGroupedUnpivotSpec,
+    values: &EncodedValues<'_, '_, '_>,
+    expressions: &EncodedExpressions<'_, '_, '_>,
+    projection: GroupedProjection,
+    mut admit: Option<&mut NodeAdmit<'_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<WriterGroupedUnpivotProjectionFacts, Error> {
     let GroupedProjection { source, limits, .. } = projection;
+    if admit.is_some() && !std::ptr::addr_eq(work.control(), expressions.control()) {
+        return Err(invalid(
+            "grouped Unpivot caller has another original control",
+        ));
+    }
     let same = std::ptr::eq(values.types(), expressions.types())
-        && std::ptr::eq(values.original_control(), expressions.control());
+        && if admit.is_some() {
+            std::ptr::addr_eq(values.original_control(), expressions.control())
+        } else {
+            std::ptr::eq(values.original_control(), expressions.control())
+        };
+    if admit.is_some() && !same {
+        return Err(invalid(
+            "grouped Unpivot namespaces do not retain the same types and control",
+        ));
+    }
     let mut known = add(
         size_of::<p::WriterGroupedUnpivotSpec>(),
         add(
@@ -145,7 +196,7 @@ pub(crate) fn preflight_grouped_encode_observed(
     model.request::<u32>(input.statistics_target_ordinals.len(), 1)?;
     model.request::<u32>(input.literal_outputs.len(), 1)?;
     model.request::<wire::WriterGroupedUnpivotMapping>(input.mappings.len(), 1)?;
-    projection.admit(&model, values.count())?;
+    projection.admit(&model, values.count(), &mut admit)?;
     work.step()?;
     if !same {
         return Err(invalid(
@@ -167,6 +218,7 @@ pub(crate) fn preflight_grouped_encode_observed(
             scalars,
             pools,
             expressions,
+            &mut admit,
         )?;
         count_prefix(0, model.items, source, known, limits, work)?;
         for constant in &mapping.constants {
@@ -181,6 +233,7 @@ pub(crate) fn preflight_grouped_encode_observed(
                 scalars,
                 pools,
                 expressions,
+                &mut admit,
             )?;
             work.step()?;
         }
@@ -188,7 +241,7 @@ pub(crate) fn preflight_grouped_encode_observed(
     }
     floor(source, known, work)?;
     delegate_counts(&mut model, scalars, pools, expressions)?;
-    projection.admit(&model, values.count())?;
+    projection.admit(&model, values.count(), &mut admit)?;
     let facts = model.facts(source, values.count(), limits, work)?;
     for id in [
         input.grouping_input,
@@ -252,7 +305,30 @@ pub(crate) fn preflight_grouped_decode_observed(
     projection: GroupedProjection,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<WriterGroupedUnpivotProjectionFacts, Error> {
+    preflight_grouped_decode_core(input, expressions, projection, None, work)
+}
+pub(crate) fn preflight_grouped_decode_in(
+    input: &wire::WriterGroupedUnpivot,
+    expressions: &DecodedExpressions<'_, '_, '_>,
+    projection: GroupedProjection,
+    admit: &mut NodeAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<WriterGroupedUnpivotProjectionFacts, Error> {
+    preflight_grouped_decode_core(input, expressions, projection, Some(admit), work)
+}
+fn preflight_grouped_decode_core(
+    input: &wire::WriterGroupedUnpivot,
+    expressions: &DecodedExpressions<'_, '_, '_>,
+    projection: GroupedProjection,
+    mut admit: Option<&mut NodeAdmit<'_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<WriterGroupedUnpivotProjectionFacts, Error> {
     let GroupedProjection { source, limits, .. } = projection;
+    if admit.is_some() && !std::ptr::addr_eq(work.control(), expressions.control()) {
+        return Err(invalid(
+            "grouped Unpivot caller has another original control",
+        ));
+    }
     let values = expressions.values();
     let mut known = add(
         size_of::<wire::WriterGroupedUnpivot>(),
@@ -278,7 +354,7 @@ pub(crate) fn preflight_grouped_decode_observed(
     model.request::<p::WriteTargetOrdinal>(input.statistics_target_ordinals.len(), 2)?;
     model.request::<p::ValueId>(input.literal_output_ids.len(), 2)?;
     model.request::<p::WriterGroupedUnpivotMapping>(input.mappings.len(), 2)?;
-    projection.admit(&model, values.count())?;
+    projection.admit(&model, values.count(), &mut admit)?;
     // Presence is not an ID-zero default; preserve the ordinary node's order.
     for id in [
         input.grouping_input_value_id,
@@ -313,6 +389,7 @@ pub(crate) fn preflight_grouped_decode_observed(
             scalars,
             pools,
             expressions,
+            &mut admit,
         )?;
         count_prefix(0, model.items, source, known, limits, work)?;
         let result = target_ordinal(mapping.write_target_ordinal);
@@ -335,6 +412,7 @@ pub(crate) fn preflight_grouped_decode_observed(
                 scalars,
                 pools,
                 expressions,
+                &mut admit,
             )?;
             work.step()?;
             kind?;
@@ -343,7 +421,7 @@ pub(crate) fn preflight_grouped_decode_observed(
     }
     floor(source, known, work)?;
     delegate_counts(&mut model, scalars, pools, expressions)?;
-    projection.admit(&model, values.count())?;
+    projection.admit(&model, values.count(), &mut admit)?;
     let facts = model.facts(source, values.count(), limits, work)?;
     for id in [
         input.grouping_input_value_id,
@@ -590,5 +668,101 @@ pub fn decode_writer_grouped_unpivot(
     finish(work, result)
 }
 
+pub fn prepare_writer_grouped_unpivot_encode_in<'input, 'namespace, 'loan, 'source, 'control>(
+    input: &'input p::WriterGroupedUnpivotSpec,
+    values: &'namespace EncodedValues<'loan, 'source, 'control>,
+    expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
+    source: usize,
+    limits: WriterGroupedUnpivotProjectionLimits,
+    admit: &mut NodeAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedWriterGroupedUnpivotEncode<'input, 'namespace, 'loan, 'source, 'control>, Error>
+{
+    let facts = preflight_grouped_encode_core(
+        input,
+        values,
+        expressions,
+        GroupedProjection {
+            source,
+            limits,
+            parent: None,
+        },
+        Some(admit),
+        work,
+    )?;
+    Ok(PreparedWriterGroupedUnpivotEncode {
+        input,
+        values,
+        expressions,
+        facts,
+    })
+}
+impl PreparedWriterGroupedUnpivotEncode<'_, '_, '_, '_, '_> {
+    pub fn emit_in(
+        self,
+        admit: &mut NodeAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<
+        (
+            wire::WriterGroupedUnpivot,
+            WriterGroupedUnpivotProjectionFacts,
+        ),
+        Error,
+    > {
+        if !std::ptr::addr_eq(work.control(), self.expressions.control()) {
+            return Err(invalid(
+                "grouped Unpivot caller has another original control",
+            ));
+        }
+        admit(&self.facts)?;
+        Ok((emit_encode(self.input, work)?, self.facts))
+    }
+}
+pub fn prepare_writer_grouped_unpivot_decode_in<'input, 'namespace, 'loan, 'wire, 'control>(
+    input: &'input wire::WriterGroupedUnpivot,
+    expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
+    source: usize,
+    limits: WriterGroupedUnpivotProjectionLimits,
+    admit: &mut NodeAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedWriterGroupedUnpivotDecode<'input, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let facts = preflight_grouped_decode_core(
+        input,
+        expressions,
+        GroupedProjection {
+            source,
+            limits,
+            parent: None,
+        },
+        Some(admit),
+        work,
+    )?;
+    Ok(PreparedWriterGroupedUnpivotDecode {
+        input,
+        expressions,
+        facts,
+    })
+}
+impl PreparedWriterGroupedUnpivotDecode<'_, '_, '_, '_, '_> {
+    pub fn emit_in(
+        self,
+        admit: &mut NodeAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<
+        (
+            p::WriterGroupedUnpivotSpec,
+            WriterGroupedUnpivotProjectionFacts,
+        ),
+        Error,
+    > {
+        if !std::ptr::addr_eq(work.control(), self.expressions.control()) {
+            return Err(invalid(
+                "grouped Unpivot caller has another original control",
+            ));
+        }
+        admit(&self.facts)?;
+        Ok((emit_decode(self.input, work)?, self.facts))
+    }
+}
 #[cfg(test)]
 mod tests;

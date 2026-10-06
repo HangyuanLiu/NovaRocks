@@ -19,6 +19,7 @@
 //! value and materialized relation-signature owners. Fragment/Package retains
 //! semantic, argument-source and graph closure.
 
+use crate::physical_aggregate_node_v2::{node_facts, node_gate};
 pub use crate::physical_node_v2::{
     NodeCodecError as TableFunctionNodeCodecError,
     NodeProjectionFacts as TableFunctionNodeProjectionFacts,
@@ -27,7 +28,8 @@ use crate::{
     physical_binding_v2::{
         BindingProjectionLimits, MaterializationModel, MaterializedFunctionBinding,
         MaterializedFunctionBindings, copy_table_signature_observed,
-        preflight_table_signature_copy_counts, preflight_table_signature_copy_types,
+        preflight_table_signature_copy_counts, preflight_table_signature_copy_counts_in,
+        preflight_table_signature_copy_types, preflight_table_signature_copy_types_in,
     },
     physical_expression_v2::{DecodedExpressions, EncodedExpressions},
     physical_node_v2::*,
@@ -88,6 +90,9 @@ fn output_value(
         }
         None => Err(invalid("TableFunction output kind is absent")),
     };
+    if matches!(&result, Err(Error::Control(_))) {
+        return result;
+    }
     work.step()?;
     result
 }
@@ -97,6 +102,7 @@ fn properties_encode(
     source_bytes: usize,
     limits: NodeProjectionLimits,
     model: &mut Model,
+    admit: &mut Option<&mut NodeAdmit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
     for property in source
@@ -104,15 +110,23 @@ fn properties_encode(
         .iter()
         .chain(std::iter::once(&source.output_properties))
     {
-        model.property(properties::preflight_encode_observed(
-            property,
-            source_bytes,
-            limits.properties,
-            work,
-        )?)?;
+        if admit.is_some() {
+            let facts = properties::properties_encode_numerical_facts_in(property, source_bytes)?;
+            properties::check_properties_numerical_facts(facts, limits.properties)?;
+            model.property(facts)?;
+            node_gate(model, source_bytes, values.count(), limits, admit)?;
+            properties::preflight_encode_observed(property, source_bytes, limits.properties, work)?;
+        } else {
+            model.property(properties::preflight_encode_observed(
+                property,
+                source_bytes,
+                limits.properties,
+                work,
+            )?)?;
+        }
         work.step()?;
     }
-    model.facts(source_bytes, values.count(), limits, work)?;
+    node_facts(model, source_bytes, values.count(), limits, admit, work)?;
     for property in source
         .required_inputs
         .iter()
@@ -122,25 +136,8 @@ fn properties_encode(
     }
     Ok(())
 }
-fn prepare_encode(
-    source: &p::PhysicalNode,
-    values: &EncodedValues<'_, '_, '_>,
-    expressions: &EncodedExpressions<'_, '_, '_>,
-    source_bytes: usize,
-    limits: TableFunctionNodeProjectionLimits,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<(u32, NodeProjectionFacts), Error> {
-    let same = std::ptr::eq(values.types(), expressions.types())
-        && std::ptr::eq(values.original_control(), expressions.original_control());
-    work.step()?;
-    if !same {
-        return Err(invalid(
-            "TableFunction emission has different original type/control loans",
-        ));
-    }
-    let body = physical(source);
-    work.step()?;
-    let body = body?;
+fn table_encode_root_model(source: &p::PhysicalNode, roots: bool) -> Result<(Model, usize), Error> {
+    let body = physical(source)?;
     let mut model = Model {
         inputs: source.inputs.len(),
         items: add(
@@ -154,6 +151,94 @@ fn prepare_encode(
         bytes::<p::ExprId>(body.arguments.len())?,
         bytes::<p::TableFunctionOutput>(body.outputs.len())?,
     )?;
+    if roots {
+        encode_header_requests(source, &mut model)?;
+        model.request::<u32>(body.arguments.len(), 1)?;
+        model.request::<wire::TableFunctionOutput>(body.outputs.len(), 1)?;
+    }
+    Ok((model, backing))
+}
+fn prepare_encode(
+    source: &p::PhysicalNode,
+    values: &EncodedValues<'_, '_, '_>,
+    expressions: &EncodedExpressions<'_, '_, '_>,
+    source_bytes: usize,
+    limits: TableFunctionNodeProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(u32, NodeProjectionFacts), Error> {
+    prepare_encode_core(
+        source,
+        values,
+        expressions,
+        source_bytes,
+        limits,
+        None,
+        work,
+    )
+}
+fn prepare_encode_core<'parent>(
+    source: &p::PhysicalNode,
+    values: &EncodedValues<'_, '_, '_>,
+    expressions: &EncodedExpressions<'_, '_, '_>,
+    source_bytes: usize,
+    limits: TableFunctionNodeProjectionLimits,
+    mut admit: Option<&'parent mut NodeAdmit<'parent>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(u32, NodeProjectionFacts), Error> {
+    if admit.is_some() && !std::ptr::addr_eq(work.control(), expressions.original_control()) {
+        return Err(invalid(
+            "TableFunction caller has a different original control",
+        ));
+    }
+    let same = std::ptr::eq(values.types(), expressions.types())
+        && if admit.is_some() {
+            std::ptr::addr_eq(values.original_control(), expressions.original_control())
+        } else {
+            std::ptr::eq(values.original_control(), expressions.original_control())
+        };
+    if admit.is_some() && same {
+        values.retained_floor_header_admitted()?;
+        expressions.retained_floor_header_in()?;
+    }
+    let mut early = if admit.is_some() && same && physical(source).is_ok() {
+        let (mut model, backing) = table_encode_root_model(source, true)?;
+        let body = physical(source)?;
+        model.delegated_work = add(
+            mul(body.arguments.len(), expressions.lookup_work_upper_bound()?)?,
+            add(expressions.functions().source_counts(), 32)?,
+        )?;
+        node_gate(
+            &model,
+            source_bytes,
+            values.count(),
+            limits.node,
+            &mut admit,
+        )?;
+        Some((model, backing))
+    } else {
+        None
+    };
+    work.step()?;
+    if !same {
+        return Err(invalid(
+            "TableFunction emission has different original type/control loans",
+        ));
+    }
+    let body = physical(source);
+    work.step()?;
+    let body = body?;
+    let roots_prepared = early.is_some();
+    let (mut model, backing) = match early.take() {
+        Some(root) => root,
+        None => table_encode_root_model(source, false)?,
+    };
+    node_gate(
+        &model,
+        source_bytes,
+        values.count(),
+        limits.node,
+        &mut admit,
+    )?;
     count_prefix(
         model.inputs,
         model.items,
@@ -166,18 +251,42 @@ fn prepare_encode(
         mul(body.arguments.len(), expressions.lookup_work_upper_bound()?)?,
         add(expressions.functions().source_counts(), 32)?,
     )?;
-    model.facts(source_bytes, values.count(), limits.node, work)?;
+    node_facts(
+        &model,
+        source_bytes,
+        values.count(),
+        limits.node,
+        &mut admit,
+        work,
+    )?;
     floor(source_bytes, values.retained_floor(work)?, work)?;
     floor(
         source_bytes,
         expressions.retained_floor_observed(work)?,
         work,
     )?;
-    encode_header_requests(source, &mut model)?;
-    model.request::<u32>(body.arguments.len(), 1)?;
-    model.request::<wire::TableFunctionOutput>(body.outputs.len(), 1)?;
-    model.facts(source_bytes, values.count(), limits.node, work)?;
-    properties_encode(source, values, source_bytes, limits.node, &mut model, work)?;
+    if !roots_prepared {
+        encode_header_requests(source, &mut model)?;
+        model.request::<u32>(body.arguments.len(), 1)?;
+        model.request::<wire::TableFunctionOutput>(body.outputs.len(), 1)?;
+    }
+    node_facts(
+        &model,
+        source_bytes,
+        values.count(),
+        limits.node,
+        &mut admit,
+        work,
+    )?;
+    properties_encode(
+        source,
+        values,
+        source_bytes,
+        limits.node,
+        &mut model,
+        &mut admit,
+        work,
+    )?;
     let binding = expressions
         .functions()
         .table_source_id_observed(body.function, work)?;
@@ -199,12 +308,48 @@ fn prepare_encode(
     for value in &source.output.columns {
         reference(value.get(), values, work)?;
     }
-    let facts = model.facts(source_bytes, values.count(), limits.node, work)?;
+    let facts = node_facts(
+        &model,
+        source_bytes,
+        values.count(),
+        limits.node,
+        &mut admit,
+        work,
+    )?;
     Ok((binding, facts))
 }
 struct ReadPreparation<'a> {
     function: &'a p::BoundTableFunction,
     facts: NodeProjectionFacts,
+}
+fn table_decode_root_model(
+    source: &wire::PhysicalNode,
+    roots: bool,
+) -> Result<(Model, usize), Error> {
+    let body = raw(source)?;
+    let port = source
+        .output
+        .as_ref()
+        .ok_or_else(|| invalid("TableFunction output port is absent"))?;
+    let mut model = Model {
+        inputs: source.input_node_ids.len(),
+        items: add(
+            add(source.required_inputs.len(), port.value_ids.len())?,
+            add(body.argument_expr_ids.len(), body.outputs.len())?,
+        )?,
+        refs: add(port.value_ids.len(), body.outputs.len())?,
+        ..Model::default()
+    };
+    let backing = add(
+        bytes::<u32>(body.argument_expr_ids.capacity())?,
+        bytes::<wire::TableFunctionOutput>(body.outputs.capacity())?,
+    )?;
+    if roots {
+        decode_header_requests(source, port, &mut model)?;
+        model.request::<p::ExprId>(body.argument_expr_ids.len(), 2)?;
+        model.request::<p::TableFunctionOutput>(body.outputs.len(), 2)?;
+    }
+    Ok((model, backing))
 }
 fn prepare_decode<'a>(
     source: &wire::PhysicalNode,
@@ -214,12 +359,71 @@ fn prepare_decode<'a>(
     limits: TableFunctionNodeProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ReadPreparation<'a>, Error> {
+    prepare_decode_core(
+        source,
+        expressions,
+        functions,
+        source_bytes,
+        limits,
+        None,
+        work,
+    )
+}
+fn prepare_decode_core<'a, 'parent>(
+    source: &wire::PhysicalNode,
+    expressions: &DecodedExpressions<'_, '_, '_>,
+    functions: &'a MaterializedFunctionBindings<'_, '_>,
+    source_bytes: usize,
+    limits: TableFunctionNodeProjectionLimits,
+    mut admit: Option<&'parent mut NodeAdmit<'parent>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ReadPreparation<'a>, Error> {
+    if admit.is_some() && !std::ptr::addr_eq(work.control(), expressions.original_control()) {
+        return Err(invalid(
+            "TableFunction caller has a different original control",
+        ));
+    }
     let same = std::ptr::eq(functions.headers(), expressions.functions())
         && std::ptr::eq(functions.headers().type_table(), expressions.types())
-        && std::ptr::eq(
-            functions.headers().original_control(),
-            expressions.original_control(),
-        );
+        && if admit.is_some() {
+            std::ptr::addr_eq(
+                functions.headers().original_control(),
+                expressions.original_control(),
+            )
+        } else {
+            std::ptr::eq(
+                functions.headers().original_control(),
+                expressions.original_control(),
+            )
+        };
+    if admit.is_some() && same {
+        expressions.values().retained_floor_header_admitted()?;
+        add(
+            expressions.retained_floor_header_in()?,
+            functions.retained_output_floor()?,
+        )?;
+    }
+    let mut early = if admit.is_some() && same && raw(source).is_ok() && source.output.is_some() {
+        let (mut model, backing) = table_decode_root_model(source, true)?;
+        let body = raw(source)?;
+        model.delegated_work = add(
+            mul(
+                body.argument_expr_ids.len(),
+                expressions.lookup_work_upper_bound()?,
+            )?,
+            add(functions.definitions().len(), 32)?,
+        )?;
+        node_gate(
+            &model,
+            source_bytes,
+            expressions.values().count(),
+            limits.node,
+            &mut admit,
+        )?;
+        Some((model, backing))
+    } else {
+        None
+    };
     work.step()?;
     if !same {
         return Err(invalid(
@@ -242,18 +446,17 @@ fn prepare_decode<'a>(
         .ok_or_else(|| invalid("TableFunction output properties are absent"));
     work.step()?;
     let output_properties = output_properties?;
-    let mut model = Model {
-        inputs: source.input_node_ids.len(),
-        items: add(
-            add(source.required_inputs.len(), port.value_ids.len())?,
-            add(body.argument_expr_ids.len(), body.outputs.len())?,
-        )?,
-        refs: add(port.value_ids.len(), body.outputs.len())?,
-        ..Model::default()
+    let roots_prepared = early.is_some();
+    let (mut model, backing) = match early.take() {
+        Some(root) => root,
+        None => table_decode_root_model(source, false)?,
     };
-    let backing = add(
-        bytes::<u32>(body.argument_expr_ids.capacity())?,
-        bytes::<wire::TableFunctionOutput>(body.outputs.capacity())?,
+    node_gate(
+        &model,
+        source_bytes,
+        expressions.values().count(),
+        limits.node,
+        &mut admit,
     )?;
     count_prefix(
         model.inputs,
@@ -270,10 +473,12 @@ fn prepare_decode<'a>(
         )?,
         add(functions.definitions().len(), 32)?,
     )?;
-    model.facts(
+    node_facts(
+        &model,
         source_bytes,
         expressions.values().count(),
         limits.node,
+        &mut admit,
         work,
     )?;
     // The original namespace invoice is counted once. Only the newly owned
@@ -288,13 +493,17 @@ fn prepare_decode<'a>(
         expressions.values().retained_floor(work)?,
         work,
     )?;
-    decode_header_requests(source, port, &mut model)?;
-    model.request::<p::ExprId>(body.argument_expr_ids.len(), 2)?;
-    model.request::<p::TableFunctionOutput>(body.outputs.len(), 2)?;
-    model.facts(
+    if !roots_prepared {
+        decode_header_requests(source, port, &mut model)?;
+        model.request::<p::ExprId>(body.argument_expr_ids.len(), 2)?;
+        model.request::<p::TableFunctionOutput>(body.outputs.len(), 2)?;
+    }
+    node_facts(
+        &model,
         source_bytes,
         expressions.values().count(),
         limits.node,
+        &mut admit,
         work,
     )?;
     for property in source
@@ -302,22 +511,88 @@ fn prepare_decode<'a>(
         .iter()
         .chain(std::iter::once(output_properties))
     {
-        model.property(properties::preflight_decode_observed(
-            property,
-            source_bytes,
-            limits.node.properties,
-            work,
-        )?)?;
+        if admit.is_some() {
+            let facts = properties::properties_decode_numerical_facts_in(property, source_bytes)?;
+            properties::check_properties_numerical_facts(facts, limits.node.properties)?;
+            model.property(facts)?;
+            node_gate(
+                &model,
+                source_bytes,
+                expressions.values().count(),
+                limits.node,
+                &mut admit,
+            )?;
+            properties::preflight_decode_observed(
+                property,
+                source_bytes,
+                limits.node.properties,
+                work,
+            )?;
+        } else {
+            model.property(properties::preflight_decode_observed(
+                property,
+                source_bytes,
+                limits.node.properties,
+                work,
+            )?)?;
+        }
         work.step()?;
     }
-    model.facts(
+    node_facts(
+        &model,
         source_bytes,
         expressions.values().count(),
         limits.node,
+        &mut admit,
         work,
     )?;
     let id = required(body.function_binding_id, work)?;
-    let found = functions.definition_observed(id, work)?;
+    let mut child = if let Some(parent) = admit.take() {
+        let mut child = MaterializationModel::for_composition(
+            1,
+            add(expressions.types().value_types().len(), 1)?,
+            source_bytes,
+            known,
+        );
+        child.compose_in_node_in(
+            model,
+            expressions.values().count(),
+            limits.node,
+            limits.binding,
+            parent,
+        )?;
+        Some(child)
+    } else {
+        None
+    };
+    let found = if let Some(child) = child.as_mut() {
+        functions.definition_captured(
+            id,
+            &mut |definition, work| {
+                if let MaterializedFunctionBinding::Table(function) = definition {
+                    preflight_table_signature_copy_counts_in(
+                        function,
+                        child,
+                        limits.binding,
+                        &mut |_| Ok(()),
+                        work,
+                    )?;
+                    child.node_facts(0, work)?;
+                    preflight_table_signature_copy_types_in(
+                        function,
+                        child,
+                        limits.binding,
+                        &mut |_| Ok(()),
+                        work,
+                    )?;
+                }
+                Ok(())
+            },
+            work,
+        )?
+    } else {
+        functions.definition_observed(id, work)?
+    };
     work.step()?;
     let function = match found {
         Some(MaterializedFunctionBinding::Table(function)) => function,
@@ -349,55 +624,65 @@ fn prepare_decode<'a>(
     {
         wire_property_refs(property, expressions.values(), work)?;
     }
-    let base_items = model.items;
-    // O(1) outer signature count admits the count-only pass itself. Lambda
-    // parameter lengths are then charged by the sole shared signature author.
-    model.items = add(
-        base_items,
-        add(function.argument_types.len(), function.result_types.len())?,
-    )?;
-    model.facts(
-        source_bytes,
-        expressions.values().count(),
-        limits.node,
-        work,
-    )?;
-    let mut child = MaterializationModel::for_composition(
-        1,
-        add(expressions.types().value_types().len(), 1)?,
-        source_bytes,
-        known,
-    );
-    // The shared author counts all identity/list/type-reference requests first;
-    // the whole node must admit that complete bound before the sole type walk.
-    preflight_table_signature_copy_counts(function, &mut child, limits.binding, work)?;
-    model.items = add(base_items, child.items)?;
-    let base_requests = model.requests;
-    let base_requested = model.requested;
-    let base_work = model.delegated_work;
-    model.requests = add(base_requests, child.facts.allocation_requests_upper_bound)?;
-    model.requested = add(base_requested, child.facts.request_bytes_upper_bound)?;
-    let early_work = mul(child.facts.cumulative_work_upper_bound, 2)?;
-    model.delegated_work = add(base_work, early_work)?;
-    model.facts(
-        source_bytes,
-        expressions.values().count(),
-        limits.node,
-        work,
-    )?;
-    preflight_table_signature_copy_types(function, &mut child, limits.binding, work)?;
-    model.requests = add(base_requests, child.facts.allocation_requests_upper_bound)?;
-    model.requested = add(base_requested, child.facts.request_bytes_upper_bound)?;
-    model.delegated_work = add(
-        base_work,
-        early_work.max(mul(child.facts.cumulative_work_upper_bound, 2)?),
-    )?;
-    let facts = model.facts(
-        source_bytes,
-        expressions.values().count(),
-        limits.node,
-        work,
-    )?;
+    let facts = if let Some(child) = child.as_mut() {
+        child.node_facts(mul(child.facts.cumulative_work_upper_bound, 2)?, work)?
+    } else {
+        let base_items = model.items;
+        // O(1) outer signature count admits the count-only pass itself. Lambda
+        // parameter lengths are then charged by the sole shared signature author.
+        model.items = add(
+            base_items,
+            add(function.argument_types.len(), function.result_types.len())?,
+        )?;
+        node_facts(
+            &model,
+            source_bytes,
+            expressions.values().count(),
+            limits.node,
+            &mut admit,
+            work,
+        )?;
+        let mut child = MaterializationModel::for_composition(
+            1,
+            add(expressions.types().value_types().len(), 1)?,
+            source_bytes,
+            known,
+        );
+        // The shared author counts all identity/list/type-reference requests first;
+        // the whole node must admit that complete bound before the sole type walk.
+        preflight_table_signature_copy_counts(function, &mut child, limits.binding, work)?;
+        model.items = add(base_items, child.items)?;
+        let base_requests = model.requests;
+        let base_requested = model.requested;
+        let base_work = model.delegated_work;
+        model.requests = add(base_requests, child.facts.allocation_requests_upper_bound)?;
+        model.requested = add(base_requested, child.facts.request_bytes_upper_bound)?;
+        let early_work = mul(child.facts.cumulative_work_upper_bound, 2)?;
+        model.delegated_work = add(base_work, early_work)?;
+        node_facts(
+            &model,
+            source_bytes,
+            expressions.values().count(),
+            limits.node,
+            &mut admit,
+            work,
+        )?;
+        preflight_table_signature_copy_types(function, &mut child, limits.binding, work)?;
+        model.requests = add(base_requests, child.facts.allocation_requests_upper_bound)?;
+        model.requested = add(base_requested, child.facts.request_bytes_upper_bound)?;
+        model.delegated_work = add(
+            base_work,
+            early_work.max(mul(child.facts.cumulative_work_upper_bound, 2)?),
+        )?;
+        node_facts(
+            &model,
+            source_bytes,
+            expressions.values().count(),
+            limits.node,
+            &mut admit,
+            work,
+        )?
+    };
     Ok(ReadPreparation { function, facts })
 }
 fn emit_encode(
@@ -512,6 +797,26 @@ impl PreparedTableFunctionNodeEncode<'_, '_, '_, '_, '_> {
     pub fn facts(&self) -> &NodeProjectionFacts {
         &self.facts
     }
+    pub(crate) fn emit_in(
+        self,
+        admit: &mut NodeAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(wire::PhysicalNode, NodeProjectionFacts), Error> {
+        if !std::ptr::addr_eq(work.control(), self.expressions.original_control()) {
+            return Err(invalid(
+                "TableFunction emission has a different original control",
+            ));
+        }
+        admit(&self.facts)?;
+        let node = emit_encode(
+            self.source,
+            self.binding,
+            self.source_bytes,
+            self.limits.node,
+            work,
+        )?;
+        Ok((node, self.facts))
+    }
     pub fn emit(self) -> Result<(wire::PhysicalNode, NodeProjectionFacts), Error> {
         let mut work =
             CompileCheckpoints::try_new(self.expressions.original_control(), CompilePhase::Encode)?;
@@ -555,6 +860,43 @@ pub fn prepare_table_function_node_encode<'node, 'namespace, 'loan, 'source, 'co
         facts,
     })
 }
+/// Borrow the original caller scope and cumulative parent admission.
+/// This port owns no entry/footer, allocation grant, or Fragment/Package proof.
+pub(crate) fn prepare_table_function_node_encode_in<
+    'node,
+    'namespace,
+    'loan,
+    'source,
+    'control,
+    'parent,
+>(
+    source: &'node p::PhysicalNode,
+    values: &'namespace EncodedValues<'loan, 'source, 'control>,
+    expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
+    source_retained_bytes: usize,
+    limits: TableFunctionNodeProjectionLimits,
+    admit: &'parent mut NodeAdmit<'parent>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedTableFunctionNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let (binding, facts) = prepare_encode_core(
+        source,
+        values,
+        expressions,
+        source_retained_bytes,
+        limits,
+        Some(admit),
+        work,
+    )?;
+    Ok(PreparedTableFunctionNodeEncode {
+        source,
+        expressions,
+        values,
+        binding,
+        source_bytes: source_retained_bytes,
+        limits,
+        facts,
+    })
+}
 pub struct PreparedTableFunctionNodeDecode<'node, 'namespace, 'loan, 'wire, 'control> {
     source: &'node wire::PhysicalNode,
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
@@ -567,6 +909,26 @@ pub struct PreparedTableFunctionNodeDecode<'node, 'namespace, 'loan, 'wire, 'con
 impl PreparedTableFunctionNodeDecode<'_, '_, '_, '_, '_> {
     pub fn facts(&self) -> &NodeProjectionFacts {
         &self.facts
+    }
+    pub(crate) fn emit_in(
+        self,
+        admit: &mut NodeAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(p::PhysicalNode, NodeProjectionFacts), Error> {
+        if !std::ptr::addr_eq(work.control(), self.expressions.original_control()) {
+            return Err(invalid(
+                "TableFunction emission has a different original control",
+            ));
+        }
+        admit(&self.facts)?;
+        let node = emit_decode(
+            self.source,
+            self.function,
+            self.source_bytes,
+            self.limits.node,
+            work,
+        )?;
+        Ok((node, self.facts))
     }
     pub fn emit(self) -> Result<(p::PhysicalNode, NodeProjectionFacts), Error> {
         let mut work =
@@ -605,6 +967,43 @@ pub fn prepare_table_function_node_decode<'node, 'namespace, 'loan, 'wire, 'cont
         &mut work,
     );
     let prepared = finish(work, result)?;
+    Ok(PreparedTableFunctionNodeDecode {
+        source,
+        expressions,
+        functions,
+        function: prepared.function,
+        source_bytes: source_retained_bytes,
+        limits,
+        facts: prepared.facts,
+    })
+}
+/// Borrow the original caller scope and cumulative parent admission.
+/// This port owns no entry/footer, allocation grant, or Fragment/Package proof.
+pub(crate) fn prepare_table_function_node_decode_in<
+    'node,
+    'namespace,
+    'loan,
+    'wire,
+    'control,
+    'parent,
+>(
+    source: &'node wire::PhysicalNode,
+    expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
+    functions: &'namespace MaterializedFunctionBindings<'loan, 'wire>,
+    source_retained_bytes: usize,
+    limits: TableFunctionNodeProjectionLimits,
+    admit: &'parent mut NodeAdmit<'parent>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedTableFunctionNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let prepared = prepare_decode_core(
+        source,
+        expressions,
+        functions,
+        source_retained_bytes,
+        limits,
+        Some(admit),
+        work,
+    )?;
     Ok(PreparedTableFunctionNodeDecode {
         source,
         expressions,

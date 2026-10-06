@@ -913,3 +913,6 @@ fn simple_nodes_all_original_control_prefixes_and_nested_work_admission_are_obse
         for cause in CAUSES{c.arm(Some((at,cause)));assert!(matches!(decode_simple_node(&wire,read,SOURCE,limits()),Err(Error::Control(actual))if actual==cause));assert_eq!(c.trace(),trace[..=at]);}
     });
 }
+
+#[path = "owned_tests.rs"]
+mod owned_tests;

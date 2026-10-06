@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::physical_node_v2::NodeProjectionFacts;
 use crate::physical_type_v2::{TypeProjectionLimits, decode_type_table, encode_type_table_sources};
 use arrow::datatypes::{DataType, Field};
 use novarocks_type_contract::ValueLogicalType;
@@ -1437,4 +1438,286 @@ fn writer_observed_parent_remaining_limits_original_borrowed_metadata_visits() {
             }
         }
     });
+}
+
+#[test]
+fn writer_schema_parent_prefix_replacement_exact_replay_and_actual_callbacks() {
+    let c = Control::default();
+    with_types(&c, |roots, types, read| {
+        let schema = source_schema(roots);
+        let raw = expected_schema();
+        let ids = [0, u32::MAX, 7, 9, 11];
+        for decode in [false, true] {
+            let run = |node_limits, snapshots: &mut Vec<NodeProjectionFacts>| {
+                let phase = if decode {
+                    CompilePhase::Decode
+                } else {
+                    CompilePhase::Encode
+                };
+                let mut work = CompileCheckpoints::try_new(&c, phase)?;
+                let mut admit = |f: &NodeProjectionFacts| {
+                    snapshots.push(*f);
+                    Ok(())
+                };
+                let result = (|| {
+                    let f = if decode {
+                        preflight_schema_decode_in(
+                            &raw,
+                            read,
+                            projection(parent_base(), node_limits),
+                            &mut admit,
+                            &mut work,
+                        )?
+                    } else {
+                        preflight_schema_encode_in(
+                            &schema,
+                            &ids,
+                            types,
+                            projection(parent_base(), node_limits),
+                            &mut admit,
+                            &mut work,
+                        )?
+                    };
+                    if decode {
+                        assert_eq!(read_schema(&raw, read, &mut work)?, schema);
+                    } else {
+                        assert_eq!(emit_schema(&schema, &ids, &mut work)?, raw);
+                    }
+                    Ok(f)
+                })();
+                finish(work, result)
+            };
+            c.arm(None);
+            let mut snapshots = vec![];
+            let f = run(parent_limits(), &mut snapshots).unwrap();
+            let trace = c.trace();
+            let merged = WriterSchemaNodeAdmission {
+                base: parent_base(),
+                values: 2,
+                limits: parent_limits(),
+            }
+            .merge(f)
+            .unwrap();
+            let complete = merged.numerical_facts(SOURCE, 2, parent_limits()).unwrap();
+            // Base is one original contribution, and B is counted once.
+            assert_eq!(
+                complete.allocation_requests_upper_bound,
+                1 + f.allocation_requests_upper_bound
+            );
+            assert_eq!(
+                complete.allocation_request_bytes_upper_bound,
+                8 + f.allocation_request_bytes_upper_bound
+            );
+            for prefix in snapshots {
+                assert!(
+                    prefix.allocation_requests_upper_bound
+                        <= complete.allocation_requests_upper_bound
+                );
+                assert!(prefix.cumulative_work_upper_bound <= complete.cumulative_work_upper_bound);
+                assert_eq!(
+                    prefix.coexisting_source_and_request_bytes_upper_bound,
+                    SOURCE + prefix.allocation_request_bytes_upper_bound
+                );
+            }
+            let mut exact = parent_limits();
+            exact.max_input_nodes = complete.input_node_count;
+            exact.max_value_references = complete.value_reference_count;
+            exact.max_list_items = complete.list_item_count;
+            exact.max_allocation_requests = complete.allocation_requests_upper_bound;
+            exact.max_allocation_request_bytes = complete.allocation_request_bytes_upper_bound;
+            exact.max_coexisting_source_and_request_bytes =
+                complete.coexisting_source_and_request_bytes_upper_bound;
+            exact.max_work = complete.cumulative_work_upper_bound;
+            c.arm(None);
+            assert_eq!(run(exact, &mut vec![]).unwrap(), f);
+            for at in 0..trace.len() {
+                for cause in CAUSES {
+                    c.arm(Some((at, cause)));
+                    assert!(
+                        matches!(run(parent_limits(), &mut vec![]), Err(Error::Control(actual)) if actual == cause)
+                    );
+                    assert_eq!(c.trace(), trace[..=at]);
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn writer_schema_parent_dictionary_capture_uses_two_real_boxes_before_lookup_completion() {
+    let c = Control::default();
+    with_types(&c, |roots, _, read| {
+        let raw = wire::WriterRelationSchema {
+            revision: 0,
+            fields: vec![wire::WriterRelationField {
+                value_id: Some(0),
+                name: "a".into(),
+                value_type_id: Some(9),
+                role: role(p::WriterRelationFieldRole::CommitFragment),
+            }],
+        };
+        assert!(matches!(
+            roots.iter().find(|r| r.0 == 9).unwrap().1.data_type,
+            DataType::Dictionary(_, _)
+        ));
+        // One base request, Vec+Box fields, and Vec+Box name precede the
+        // captured Dictionary's two Box<DataType> requests.
+        let before = 1 + 2 + 2;
+        let complete_requests = before + 2;
+        let mut at_capture = None;
+        c.arm(None);
+        let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Decode).unwrap();
+        let mut admit = |f: &NodeProjectionFacts| {
+            if f.allocation_requests_upper_bound == complete_requests && at_capture.is_none() {
+                at_capture = Some(c.trace().len());
+            }
+            Ok(())
+        };
+        let f = preflight_schema_decode_in(
+            &raw,
+            read,
+            projection(parent_base(), parent_limits()),
+            &mut admit,
+            &mut work,
+        )
+        .unwrap();
+        finish(work, Ok(())).unwrap();
+        assert_eq!(f.allocation_requests_upper_bound, 2 + 2 + 2);
+        let capture = at_capture.unwrap();
+        for cause in CAUSES {
+            c.arm(Some((capture, cause)));
+            let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Decode).unwrap();
+            let mut tight = parent_limits();
+            tight.max_allocation_requests = before;
+            let mut admit = |f: &NodeProjectionFacts| {
+                assert!(f.allocation_requests_upper_bound <= before);
+                Ok(())
+            };
+            let result = preflight_schema_decode_in(
+                &raw,
+                read,
+                projection(parent_base(), tight),
+                &mut admit,
+                &mut work,
+            );
+            assert!(matches!(
+                finish(work, result),
+                Err(Error::Control(CompileControlError::ResourceExhausted))
+            ));
+            assert!(c.trace().len() <= capture);
+        }
+    });
+}
+
+#[test]
+fn writer_schema_captured_comparison_prefix_numeric_first_and_final_peak() {
+    let c = Control::default();
+    with_types(&c, |roots, types, read| {
+        let schema = p::WriterRelationSchema {
+            revision: 0,
+            fields: Box::from([p::WriterRelationField {
+                value: p::ValueId::new(0),
+                name: "a".into(),
+                ty: roots[3].1.clone(),
+                role: p::WriterRelationFieldRole::CommitFragment,
+            }]),
+        };
+        let raw = wire::WriterRelationSchema {
+            revision: 0,
+            fields: vec![wire::WriterRelationField {
+                value_id: Some(0),
+                name: "a".into(),
+                value_type_id: Some(9),
+                role: role(p::WriterRelationFieldRole::CommitFragment),
+            }],
+        };
+        for decode in [false, true] {
+            let run = |node_limits, snapshots: &mut Vec<(usize, NodeProjectionFacts)>| {
+                let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Decode)?;
+                let mut admit = |f: &NodeProjectionFacts| {
+                    snapshots.push((c.trace().len(), *f));
+                    Ok(())
+                };
+                let result = if decode {
+                    preflight_schema_decode_in(
+                        &raw,
+                        read,
+                        projection(parent_base(), node_limits),
+                        &mut admit,
+                        &mut work,
+                    )
+                } else {
+                    preflight_schema_encode_in(
+                        &schema,
+                        &[9],
+                        types,
+                        projection(parent_base(), node_limits),
+                        &mut admit,
+                        &mut work,
+                    )
+                };
+                finish(work, result)
+            };
+            c.arm(None);
+            let mut snapshots = vec![];
+            let f = run(parent_limits(), &mut snapshots).unwrap();
+            let (at, captured) = snapshots
+                .iter()
+                .copied()
+                .find(|(_, f)| f.cumulative_work_upper_bound >= SOURCE)
+                .unwrap();
+            let final_node = WriterSchemaNodeAdmission {
+                base: parent_base(),
+                values: 2,
+                limits: parent_limits(),
+            }
+            .merge(f)
+            .unwrap()
+            .numerical_facts(SOURCE, 2, parent_limits())
+            .unwrap();
+            assert!(final_node.cumulative_work_upper_bound >= captured.cumulative_work_upper_bound);
+            for cause in CAUSES {
+                c.arm(Some((at, cause)));
+                let mut tight = parent_limits();
+                tight.max_work = captured.cumulative_work_upper_bound - 1;
+                assert!(matches!(
+                    run(tight, &mut vec![]),
+                    Err(Error::Control(CompileControlError::ResourceExhausted))
+                ));
+                assert!(c.trace().len() <= at);
+            }
+        }
+    });
+    // Actual count-author seam: no datatype walk or allocation is needed to
+    // test the sole captured-root arithmetic and its pending-tail priority.
+    let ty = FunctionValueType::new(DataType::Int64, false);
+    let scratch = std::alloc::Layout::new::<
+        [Option<(&DataType, usize)>; novarocks_type_contract::MAX_VALUE_TYPE_NODES],
+    >()
+    .size();
+    for source in [
+        usize::MAX,
+        usize::MAX - scratch - 1,
+        usize::MAX - scratch - 2,
+    ] {
+        for cause in CAUSES {
+            c.arm(Some((1, cause)));
+            let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Decode).unwrap();
+            for _ in 0..255 {
+                work.step().unwrap();
+            }
+            let mut callback =
+                |_: &WriterSchemaProjectionFacts| -> Result<(), CompileControlError> {
+                    panic!("known numeric overflow precedes parent")
+                };
+            let mut count = Count::new(1);
+            count.admit = Some(&mut callback);
+            let result = count.comparison_prefix(&ty, &ty, source, 1, limits());
+            assert!(matches!(
+                finish(work, result),
+                Err(Error::Control(CompileControlError::ResourceExhausted))
+            ));
+            assert_eq!(c.trace(), vec![(CompilePhase::Decode, 0)]);
+        }
+    }
 }

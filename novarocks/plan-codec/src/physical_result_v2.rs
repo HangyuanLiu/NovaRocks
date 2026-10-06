@@ -20,7 +20,10 @@
 //! source/request facts are not a host allocation grant or an opaque time bound.
 
 use crate::{
-    borrowed_type_resources::verify_type_binding,
+    borrowed_type_resources::{
+        type_binding_prefix_work_upper_bound_in, verify_type_binding,
+        verify_type_binding_admitted_in,
+    },
     physical_node_v2::*,
     physical_type_v2::{self, DecodedTypeTable, TypeCodecError},
     physical_value_v2::{DecodedValues, EncodedValues, ValueCodecError},
@@ -49,54 +52,129 @@ trait Namespace: Values {
         &'a self,
         id: u32,
         w: &mut CompileCheckpoints<'_>,
-    ) -> Result<&'a FunctionValueType, Error>;
-}
-impl Namespace for EncodedValues<'_, '_, '_> {
-    fn ty<'a>(
+    ) -> Result<&'a FunctionValueType, Error> {
+        self.ty_captured(id, &mut |_, _| Ok(()), w)
+    }
+    fn ty_captured<'a>(
         &'a self,
         id: u32,
+        capture: &mut impl FnMut(
+            &'a FunctionValueType,
+            &mut CompileCheckpoints<'_>,
+        ) -> Result<(), Error>,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<&'a FunctionValueType, Error> {
-        let found = self.value_observed(id, w)?;
+        let found = self.value_captured(id, &mut |value, work| capture(&value.ty, work), w)?;
         w.step()?;
         found
-            .map(|v| &v.ty)
+            .map(|value| &value.ty)
             .ok_or_else(|| invalid("result value reference is unknown"))
     }
 }
-impl Namespace for DecodedValues<'_, '_, '_> {
-    fn ty<'a>(
-        &'a self,
-        id: u32,
-        w: &mut CompileCheckpoints<'_>,
-    ) -> Result<&'a FunctionValueType, Error> {
-        let found = self.value_observed(id, w)?;
-        w.step()?;
-        found
-            .map(|v| &v.ty)
-            .ok_or_else(|| invalid("result value reference is unknown"))
+impl Namespace for EncodedValues<'_, '_, '_> {}
+impl Namespace for DecodedValues<'_, '_, '_> {}
+fn decoded_type_captured<'a>(
+    types: &'a DecodedTypeTable,
+    id: u32,
+    capture: &mut impl FnMut(&'a FunctionValueType, &mut CompileCheckpoints<'_>) -> Result<(), Error>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<&'a FunctionValueType, Error> {
+    w.flush()?;
+    let ty = types.value_type(id);
+    if let Some(ty) = ty {
+        capture(ty, w)?;
     }
+    w.step()?;
+    w.flush()?;
+    ty.ok_or_else(|| invalid("result type reference is unknown"))
 }
 fn decoded_type<'a>(
     types: &'a DecodedTypeTable,
     id: u32,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<&'a FunctionValueType, Error> {
-    w.flush()?;
-    let ty = types.value_type(id);
-    w.step()?;
-    w.flush()?;
-    ty.ok_or_else(|| invalid("result type reference is unknown"))
+    decoded_type_captured(types, id, &mut |_, _| Ok(()), w)
 }
-fn remaining(
-    model: &Model,
+struct Admission<'loan, 'parent> {
     source: usize,
     values: usize,
     limits: NodeProjectionLimits,
+    parent: Option<&'loan mut NodeAdmit<'parent>>,
+    work_peak: usize,
+}
+impl Admission<'_, '_> {
+    fn observed(&self) -> bool {
+        self.parent.is_some()
+    }
+    fn admit(&mut self, model: &Model) -> Result<NodeProjectionFacts, Error> {
+        let mut facts = model.numerical_facts(self.source, self.values, self.limits)?;
+        if let Some(parent) = self.parent.as_deref_mut() {
+            self.work_peak = self.work_peak.max(facts.cumulative_work_upper_bound);
+            check_cap(self.work_peak, self.limits.max_work)?;
+            facts.cumulative_work_upper_bound = self.work_peak;
+            parent(&facts)?;
+        }
+        Ok(facts)
+    }
+    fn facts(
+        &mut self,
+        model: &Model,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<NodeProjectionFacts, Error> {
+        match self.parent.as_deref_mut() {
+            Some(parent) => {
+                let peak = &mut self.work_peak;
+                let mut facts = model.facts_in(
+                    self.source,
+                    self.values,
+                    self.limits,
+                    &mut |facts| {
+                        *peak = (*peak).max(facts.cumulative_work_upper_bound);
+                        if *peak > self.limits.max_work {
+                            return Err(CompileControlError::ResourceExhausted);
+                        }
+                        let mut current = *facts;
+                        current.cumulative_work_upper_bound = *peak;
+                        parent(&current)
+                    },
+                    work,
+                )?;
+                facts.cumulative_work_upper_bound = self.work_peak;
+                Ok(facts)
+            }
+            None => model.facts(self.source, self.values, self.limits, work),
+        }
+    }
+    fn comparison_prefix(
+        &mut self,
+        left: &FunctionValueType,
+        right: &FunctionValueType,
+        model: &Model,
+    ) -> Result<(), Error> {
+        let prefix = type_binding_prefix_work_upper_bound_in(left, right, self.source)
+            .map_err(type_error)?;
+        let mut next = *model;
+        next.delegated_work = add(next.delegated_work, prefix.work_upper_bound())?;
+        self.admit(&next)?;
+        Ok(())
+    }
+}
+fn remaining(
+    model: &Model,
+    admission: &mut Admission<'_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<usize, Error> {
-    let facts = model.facts(source, values, limits, w)?;
-    limits
+    let facts = if admission.observed() {
+        // The known comparison prefix is a replacement work ceiling, not a
+        // second charge deducted from this same delegated comparison's room.
+        let actual = model.numerical_facts(admission.source, admission.values, admission.limits)?;
+        admission.facts(model, w)?;
+        actual
+    } else {
+        admission.facts(model, w)?
+    };
+    admission
+        .limits
         .max_work
         .checked_sub(facts.cumulative_work_upper_bound)
         .ok_or_else(|| CompileControlError::ResourceExhausted.into())
@@ -105,15 +183,38 @@ fn compare(
     left: &FunctionValueType,
     right: &FunctionValueType,
     model: &mut Model,
-    source: usize,
-    values: usize,
-    limits: NodeProjectionLimits,
+    admission: &mut Admission<'_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
-    let room = remaining(model, source, values, limits, w)?;
-    let compared = verify_type_binding(left, right, source, room, w).map_err(type_error)?;
-    model.delegated_work = add(model.delegated_work, compared.work_upper_bound())?;
-    model.facts(source, values, limits, w)?;
+    if admission.observed() {
+        admission.comparison_prefix(left, right, model)?;
+    }
+    let room = remaining(model, admission, w)?;
+    let compared = if admission.observed() {
+        let base = model.delegated_work;
+        verify_type_binding_admitted_in::<Error>(
+            left,
+            right,
+            admission.source,
+            room,
+            &mut |prefix| {
+                model.delegated_work = add(base, prefix.work_upper_bound())?;
+                admission.admit(model)?;
+                Ok(())
+            },
+            w,
+        )
+        .map_err(|error| match error {
+            Error::Type(error) => type_error(error),
+            error => error,
+        })?
+    } else {
+        let compared =
+            verify_type_binding(left, right, admission.source, room, w).map_err(type_error)?;
+        model.delegated_work = add(model.delegated_work, compared.work_upper_bound())?;
+        compared
+    };
+    admission.facts(model, w)?;
     let matches = compared.matches();
     w.step()?;
     if !matches {
@@ -146,13 +247,11 @@ fn text_request(
     model: &mut Model,
     text: &str,
     copies: usize,
-    source: usize,
-    values: usize,
-    limits: NodeProjectionLimits,
+    admission: &mut Admission<'_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
     model.request::<u8>(text.len(), copies)?;
-    model.facts(source, values, limits, w)?;
+    admission.facts(model, w)?;
     Ok(())
 }
 fn preflight_encode(
@@ -161,10 +260,36 @@ fn preflight_encode(
     values: &EncodedValues<'_, '_, '_>,
     source: usize,
     limits: NodeProjectionLimits,
+    parent: Option<&mut NodeAdmit<'_>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<NodeProjectionFacts, Error> {
+    let mut admission = Admission {
+        source,
+        values: values.count(),
+        limits,
+        parent,
+        work_peak: 0,
+    };
     let mut model = Model::default();
-    let known_namespace = values.retained_floor(w)?;
+    let known_namespace = if admission.observed() {
+        values.retained_floor_header()?
+    } else {
+        values.retained_floor(w)?
+    };
+    if admission.observed() {
+        if let Some(input) = input {
+            add(known_namespace, physical_floor(input, ids)?)?;
+            model.items = add(input.output.columns.len(), input.fields.len())?;
+            model.refs = model.items;
+            model.request::<u32>(input.output.columns.len(), 1)?;
+            model.request::<wire::ResultField>(input.fields.len(), 1)?;
+            model.delegated_work = mul(
+                input.fields.len(),
+                add(values.types().source_counts().0, 8)?,
+            )?;
+        }
+        admission.admit(&model)?;
+    }
     let Some(input) = input else {
         let empty = ids.is_empty();
         w.step()?;
@@ -172,26 +297,28 @@ fn preflight_encode(
             return Err(invalid("absent result has field type IDs"));
         }
         count_prefix(0, 0, source, known_namespace, limits, w)?;
-        return model.facts(source, values.count(), limits, w);
+        return admission.facts(&model, w);
     };
     let mut known = add(known_namespace, physical_floor(input, ids)?)?;
     model.items = add(input.output.columns.len(), input.fields.len())?;
     model.refs = model.items;
     count_prefix(0, model.items, source, known, limits, w)?;
-    model.facts(source, values.count(), limits, w)?;
+    admission.facts(&model, w)?;
     let same_width = ids.len() == input.fields.len();
     w.step()?;
     if !same_width {
         return Err(invalid("result field type ID count differs"));
     }
-    model.request::<u32>(input.output.columns.len(), 1)?;
-    model.request::<wire::ResultField>(input.fields.len(), 1)?;
-    let roots = values.types().source_counts().0;
-    model.delegated_work = add(
-        model.delegated_work,
-        mul(input.fields.len(), add(roots, 8)?)?,
-    )?;
-    model.facts(source, values.count(), limits, w)?;
+    if !admission.observed() {
+        model.request::<u32>(input.output.columns.len(), 1)?;
+        model.request::<wire::ResultField>(input.fields.len(), 1)?;
+        let roots = values.types().source_counts().0;
+        model.delegated_work = add(
+            model.delegated_work,
+            mul(input.fields.len(), add(roots, 8)?)?,
+        )?;
+    }
+    admission.facts(&model, w)?;
     for field in &input.fields {
         known = add(
             known,
@@ -200,18 +327,19 @@ fn preflight_encode(
                 field.alias.as_ref().map_or(0, |v| v.len()),
             )?,
         )?;
+        if admission.observed() {
+            model.request::<u8>(field.name.len(), 1)?;
+            if let Some(alias) = &field.alias {
+                model.request::<u8>(alias.len(), 1)?;
+            }
+            admission.admit(&model)?;
+        }
         floor(source, known, w)?;
-        text_request(
-            &mut model,
-            &field.name,
-            1,
-            source,
-            values.count(),
-            limits,
-            w,
-        )?;
-        if let Some(alias) = &field.alias {
-            text_request(&mut model, alias, 1, source, values.count(), limits, w)?;
+        if !admission.observed() {
+            text_request(&mut model, &field.name, 1, &mut admission, w)?;
+            if let Some(alias) = &field.alias {
+                text_request(&mut model, alias, 1, &mut admission, w)?;
+            }
         }
         w.step()?;
     }
@@ -219,59 +347,123 @@ fn preflight_encode(
         values.ty(value.get(), w)?;
     }
     for (field, id) in input.fields.iter().zip(ids) {
-        let referenced = values
-            .types()
-            .value_type_observed(*id, w)
-            .map_err(type_error)?;
+        if admission.observed() {
+            model.delegated_work = add(
+                model.delegated_work,
+                physical_type_v2::value_type_clone_preflight_work_upper_bound(),
+            )?;
+            admission.admit(&model)?;
+        }
+        let referenced = if admission.observed() {
+            values
+                .types()
+                .value_type_captured::<Error>(
+                    *id,
+                    &mut |ty, _| admission.comparison_prefix(&field.ty, ty, &model),
+                    w,
+                )
+                .map_err(|error| match error {
+                    Error::Type(error) => type_error(error),
+                    error => error,
+                })?
+        } else {
+            values
+                .types()
+                .value_type_observed(*id, w)
+                .map_err(type_error)?
+        };
         w.step()?;
         let referenced = referenced.ok_or_else(|| invalid("result type reference is unknown"))?;
-        compare(
-            &field.ty,
-            referenced,
-            &mut model,
-            source,
-            values.count(),
-            limits,
-            w,
-        )?;
-        compare(
-            &field.ty,
-            values.ty(field.value.get(), w)?,
-            &mut model,
-            source,
-            values.count(),
-            limits,
-            w,
-        )?;
+        compare(&field.ty, referenced, &mut model, &mut admission, w)?;
+        let value_ty = if admission.observed() {
+            values.ty_captured(
+                field.value.get(),
+                &mut |ty, _| admission.comparison_prefix(&field.ty, ty, &model),
+                w,
+            )?
+        } else {
+            values.ty(field.value.get(), w)?
+        };
+        compare(&field.ty, value_ty, &mut model, &mut admission, w)?;
         // Direct Dictionary Boxes are owned by this actual ResultField FVT;
         // shared FieldRef children are neither copied nor billed as deep clones.
         // Admit the sole owner's clone-preflight bound before that actual
         // walk. Keep this early ceiling in the final facts for tight replay.
-        model.delegated_work = add(
-            model.delegated_work,
-            physical_type_v2::value_type_clone_preflight_work_upper_bound(),
-        )?;
-        model.facts(source, values.count(), limits, w)?;
-        let clone =
-            physical_type_v2::preflight_value_type_clone(&field.ty, w).map_err(type_error)?;
-        known = add(known, clone.allocation_request_bytes_upper_bound())?;
+        if !admission.observed() {
+            model.delegated_work = add(
+                model.delegated_work,
+                physical_type_v2::value_type_clone_preflight_work_upper_bound(),
+            )?;
+        }
+        admission.facts(&model, w)?;
+        if admission.observed() {
+            let base = known;
+            physical_type_v2::preflight_value_type_clone_admitted::<Error>(
+                &field.ty,
+                &mut |clone, _| {
+                    known = add(base, clone.allocation_request_bytes_upper_bound())?;
+                    admission.admit(&model)?;
+                    Ok(())
+                },
+                w,
+            )
+            .map_err(|error| match error {
+                Error::Type(error) => type_error(error),
+                error => error,
+            })?;
+        } else {
+            let clone =
+                physical_type_v2::preflight_value_type_clone(&field.ty, w).map_err(type_error)?;
+            known = add(known, clone.allocation_request_bytes_upper_bound())?;
+        }
         floor(source, known, w)?;
-        model.facts(source, values.count(), limits, w)?;
+        admission.facts(&model, w)?;
     }
-    model.facts(source, values.count(), limits, w)
+    admission.facts(&model, w)
 }
 fn preflight_decode(
     input: Option<&wire::ResultPort>,
     values: &DecodedValues<'_, '_, '_>,
     source: usize,
     limits: NodeProjectionLimits,
+    parent: Option<&mut NodeAdmit<'_>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<NodeProjectionFacts, Error> {
+    let mut admission = Admission {
+        source,
+        values: values.count(),
+        limits,
+        parent,
+        work_peak: 0,
+    };
     let mut model = Model::default();
-    let known_namespace = values.retained_floor(w)?;
+    let known_namespace = if admission.observed() {
+        values.retained_floor_header()?
+    } else {
+        values.retained_floor(w)?
+    };
+    if admission.observed() {
+        if let Some(input) = input {
+            let columns = input
+                .output
+                .as_ref()
+                .map_or(0, |output| output.value_ids.len());
+            if let Some(output) = &input.output {
+                add(known_namespace, wire_floor(input, output)?)?;
+            }
+            model.items = add(columns, input.fields.len())?;
+            model.refs = model.items;
+            model.request::<p::ValueId>(columns, 2)?;
+            model.request::<p::ResultField>(input.fields.len(), 2)?;
+            let lookup = crate::btree_resources_v2::lookup_work(values.types().value_types().len())
+                .map_err(invalid)?;
+            model.delegated_work = mul(input.fields.len(), mul(lookup, 2)?)?;
+        }
+        admission.admit(&model)?;
+    }
     let Some(input) = input else {
         count_prefix(0, 0, source, known_namespace, limits, w)?;
-        return model.facts(source, values.count(), limits, w);
+        return admission.facts(&model, w);
     };
     required(input.fragment_id, "result fragment ID is absent", w)?;
     let output = required(input.output.as_ref(), "result output port is absent", w)?;
@@ -280,12 +472,14 @@ fn preflight_decode(
     model.items = add(output.value_ids.len(), input.fields.len())?;
     model.refs = model.items;
     count_prefix(0, model.items, source, known, limits, w)?;
-    model.request::<p::ValueId>(output.value_ids.len(), 2)?;
-    model.request::<p::ResultField>(input.fields.len(), 2)?;
-    let lookup = crate::btree_resources_v2::lookup_work(values.types().value_types().len())
-        .map_err(invalid)?;
-    model.delegated_work = mul(input.fields.len(), mul(lookup, 2)?)?;
-    model.facts(source, values.count(), limits, w)?;
+    if !admission.observed() {
+        model.request::<p::ValueId>(output.value_ids.len(), 2)?;
+        model.request::<p::ResultField>(input.fields.len(), 2)?;
+        let lookup = crate::btree_resources_v2::lookup_work(values.types().value_types().len())
+            .map_err(invalid)?;
+        model.delegated_work = mul(input.fields.len(), mul(lookup, 2)?)?;
+    }
+    admission.facts(&model, w)?;
     for field in &input.fields {
         known = add(
             known,
@@ -294,18 +488,19 @@ fn preflight_decode(
                 field.alias.as_ref().map_or(0, String::capacity),
             )?,
         )?;
+        if admission.observed() {
+            model.request::<u8>(field.name.len(), 2)?;
+            if let Some(alias) = &field.alias {
+                model.request::<u8>(alias.len(), 2)?;
+            }
+            admission.admit(&model)?;
+        }
         floor(source, known, w)?;
-        text_request(
-            &mut model,
-            &field.name,
-            2,
-            source,
-            values.count(),
-            limits,
-            w,
-        )?;
-        if let Some(alias) = &field.alias {
-            text_request(&mut model, alias, 2, source, values.count(), limits, w)?;
+        if !admission.observed() {
+            text_request(&mut model, &field.name, 2, &mut admission, w)?;
+            if let Some(alias) = &field.alias {
+                text_request(&mut model, alias, 2, &mut admission, w)?;
+            }
         }
         required(field.value_id, "result field value ID is absent", w)?;
         required(field.value_type_id, "result field type ID is absent", w)?;
@@ -316,36 +511,96 @@ fn preflight_decode(
     }
     for field in &input.fields {
         let id = required(field.value_type_id, "result field type ID is absent", w)?;
-        let ty = decoded_type(values.types(), id, w)?;
+        let mut root_clone = None;
+        let ty = if admission.observed() {
+            decoded_type_captured(
+                values.types(),
+                id,
+                &mut |ty, _| {
+                    let root =
+                        physical_type_v2::value_type_clone_root_facts(ty).map_err(type_error)?;
+                    model.requests = add(model.requests, root.allocation_requests_upper_bound())?;
+                    model.requested =
+                        add(model.requested, root.allocation_request_bytes_upper_bound())?;
+                    model.delegated_work = add(
+                        model.delegated_work,
+                        mul(
+                            physical_type_v2::value_type_clone_preflight_work_upper_bound(),
+                            2,
+                        )?,
+                    )?;
+                    root_clone = Some(root);
+                    admission.admit(&model)?;
+                    Ok(())
+                },
+                w,
+            )?
+        } else {
+            decoded_type(values.types(), id, w)?
+        };
         let value = required(field.value_id, "result field value ID is absent", w)?;
-        compare(
-            ty,
-            values.ty(value, w)?,
-            &mut model,
-            source,
-            values.count(),
-            limits,
-            w,
-        )?;
+        let value_ty = if admission.observed() {
+            values.ty_captured(
+                value,
+                &mut |value_ty, _| admission.comparison_prefix(ty, value_ty, &model),
+                w,
+            )?
+        } else {
+            values.ty(value, w)?
+        };
+        compare(ty, value_ty, &mut model, &mut admission, w)?;
         // This covers both the original preflight and the later emit clone;
         // the actual loops still observe only their completed work.
-        model.delegated_work = add(
-            model.delegated_work,
-            mul(
-                physical_type_v2::value_type_clone_preflight_work_upper_bound(),
-                2,
-            )?,
-        )?;
-        model.facts(source, values.count(), limits, w)?;
-        let clone = physical_type_v2::preflight_value_type_clone(ty, w).map_err(type_error)?;
-        model.requests = add(model.requests, clone.allocation_requests_upper_bound())?;
-        model.requested = add(
-            model.requested,
-            clone.allocation_request_bytes_upper_bound(),
-        )?;
-        model.facts(source, values.count(), limits, w)?;
+        if admission.observed() {
+            admission.facts(&model, w)?;
+            let mut previous =
+                root_clone.ok_or_else(|| invalid("captured result clone root is absent"))?;
+            physical_type_v2::preflight_value_type_clone_admitted::<Error>(
+                ty,
+                &mut |clone, _| {
+                    model.requests = add(
+                        model.requests,
+                        clone
+                            .allocation_requests_upper_bound()
+                            .checked_sub(previous.allocation_requests_upper_bound())
+                            .ok_or(CompileControlError::ResourceExhausted)?,
+                    )?;
+                    model.requested = add(
+                        model.requested,
+                        clone
+                            .allocation_request_bytes_upper_bound()
+                            .checked_sub(previous.allocation_request_bytes_upper_bound())
+                            .ok_or(CompileControlError::ResourceExhausted)?,
+                    )?;
+                    previous = clone;
+                    admission.admit(&model)?;
+                    Ok(())
+                },
+                w,
+            )
+            .map_err(|error| match error {
+                Error::Type(error) => type_error(error),
+                error => error,
+            })?;
+        } else {
+            model.delegated_work = add(
+                model.delegated_work,
+                mul(
+                    physical_type_v2::value_type_clone_preflight_work_upper_bound(),
+                    2,
+                )?,
+            )?;
+            admission.facts(&model, w)?;
+            let clone = physical_type_v2::preflight_value_type_clone(ty, w).map_err(type_error)?;
+            model.requests = add(model.requests, clone.allocation_requests_upper_bound())?;
+            model.requested = add(
+                model.requested,
+                clone.allocation_request_bytes_upper_bound(),
+            )?;
+        }
+        admission.facts(&model, w)?;
     }
-    model.facts(source, values.count(), limits, w)
+    admission.facts(&model, w)
 }
 pub(crate) fn copy_string(input: &str, w: &mut CompileCheckpoints<'_>) -> Result<String, Error> {
     let mut bytes = reserve::<u8>(input.len(), w)?;
@@ -477,6 +732,43 @@ impl PreparedResultEncode<'_, '_, '_, '_, '_> {
         let result = emit_encode(self.input, self.ids, &mut w).map(|v| (v, self.facts));
         finish(w, result)
     }
+    pub(crate) fn emit_in(
+        self,
+        admit: &mut NodeAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(Option<wire::ResultPort>, NodeProjectionFacts), Error> {
+        if !std::ptr::addr_eq(self.control, work.control()) {
+            return Err(invalid(
+                "result control differs from original value namespace",
+            ));
+        }
+        admit(&self.facts)?;
+        emit_encode(self.input, self.ids, work).map(|output| (output, self.facts))
+    }
+}
+pub(crate) fn prepare_result_encode_in<'input, 'values, 'loan, 'source, 'control>(
+    input: Option<&'input p::ResultPort>,
+    ids: &'input [u32],
+    values: &'values EncodedValues<'loan, 'source, 'control>,
+    source: usize,
+    limits: NodeProjectionLimits,
+    admit: &mut NodeAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedResultEncode<'input, 'values, 'loan, 'source, 'control>, Error> {
+    let control = values.original_control();
+    if !std::ptr::addr_eq(control, work.control()) {
+        return Err(invalid(
+            "result control differs from original value namespace",
+        ));
+    }
+    let facts = preflight_encode(input, ids, values, source, limits, Some(admit), work)?;
+    Ok(PreparedResultEncode {
+        input,
+        ids,
+        values,
+        control,
+        facts,
+    })
 }
 pub(crate) fn prepare_result_encode<'input, 'values, 'loan, 'source, 'control>(
     input: Option<&'input p::ResultPort>,
@@ -495,7 +787,7 @@ pub(crate) fn prepare_result_encode<'input, 'values, 'loan, 'source, 'control>(
                 "result control differs from original value namespace",
             ));
         }
-        preflight_encode(input, ids, values, source, limits, &mut w)
+        preflight_encode(input, ids, values, source, limits, None, &mut w)
     })();
     let facts = finish(w, result)?;
     Ok(PreparedResultEncode {
@@ -521,6 +813,41 @@ impl PreparedResultDecode<'_, '_, '_, '_, '_> {
         let result = emit_decode(self.input, self.values.types(), &mut w).map(|v| (v, self.facts));
         finish(w, result)
     }
+    pub(crate) fn emit_in(
+        self,
+        admit: &mut NodeAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(Option<p::ResultPort>, NodeProjectionFacts), Error> {
+        if !std::ptr::addr_eq(self.control, work.control()) {
+            return Err(invalid(
+                "result control differs from original value namespace",
+            ));
+        }
+        admit(&self.facts)?;
+        emit_decode(self.input, self.values.types(), work).map(|output| (output, self.facts))
+    }
+}
+pub(crate) fn prepare_result_decode_in<'input, 'values, 'loan, 'wire, 'control>(
+    input: Option<&'input wire::ResultPort>,
+    values: &'values DecodedValues<'loan, 'wire, 'control>,
+    source: usize,
+    limits: NodeProjectionLimits,
+    admit: &mut NodeAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedResultDecode<'input, 'values, 'loan, 'wire, 'control>, Error> {
+    let control = values.original_control();
+    if !std::ptr::addr_eq(control, work.control()) {
+        return Err(invalid(
+            "result control differs from original value namespace",
+        ));
+    }
+    let facts = preflight_decode(input, values, source, limits, Some(admit), work)?;
+    Ok(PreparedResultDecode {
+        input,
+        values,
+        control,
+        facts,
+    })
 }
 pub(crate) fn prepare_result_decode<'input, 'values, 'loan, 'wire, 'control>(
     input: Option<&'input wire::ResultPort>,
@@ -538,7 +865,7 @@ pub(crate) fn prepare_result_decode<'input, 'values, 'loan, 'wire, 'control>(
                 "result control differs from original value namespace",
             ));
         }
-        preflight_decode(input, values, source, limits, &mut w)
+        preflight_decode(input, values, source, limits, None, &mut w)
     })();
     let facts = finish(w, result)?;
     Ok(PreparedResultDecode {

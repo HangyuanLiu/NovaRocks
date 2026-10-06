@@ -929,3 +929,6 @@ fn wide_result_actual_byte_copy_and_occurrences_expose_bounded_quantum() {
         }
     });
 }
+
+#[path = "owner_tests.rs"]
+mod owner_tests;

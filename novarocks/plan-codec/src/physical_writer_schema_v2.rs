@@ -20,7 +20,11 @@
 //! do not retain control provenance; the caller supplies its original control.
 
 use crate::{
-    borrowed_type_resources::{preflight_type_binding, verify_type_binding},
+    borrowed_type_resources::{
+        preflight_type_binding, preflight_type_binding_admitted_in,
+        type_binding_prefix_work_upper_bound_in, verify_type_binding,
+        verify_type_binding_admitted_in,
+    },
     physical_node_v2::{self as resources, Model, NodeProjectionLimits},
     physical_properties_v2::PhysicalPropertyProjectionLimits,
     physical_type_v2::{self, DecodedTypeTable, EncodedTypeTable, TypeCodecError},
@@ -210,12 +214,16 @@ struct ProjectionContext {
     limits: WriterSchemaProjectionLimits,
     parent: Option<WriterSchemaNodeAdmission>,
 }
-struct Count {
+type SchemaAdmit<'a> =
+    dyn FnMut(&WriterSchemaProjectionFacts) -> Result<(), CompileControlError> + 'a;
+struct Count<'a> {
     model: Model,
     names: usize,
+    work_peak: usize,
+    admit: Option<&'a mut SchemaAdmit<'a>>,
     parent: Option<WriterSchemaNodeAdmission>,
 }
-impl Count {
+impl<'a> Count<'a> {
     fn new(n: usize) -> Self {
         Self {
             model: Model {
@@ -224,11 +232,13 @@ impl Count {
                 ..Model::default()
             },
             names: 0,
+            work_peak: 0,
+            admit: None,
             parent: None,
         }
     }
     fn numerical_facts(
-        &self,
+        &mut self,
         source: usize,
         types: usize,
         limits: WriterSchemaProjectionLimits,
@@ -239,7 +249,7 @@ impl Count {
         let f = self
             .model
             .numerical_facts(source, types, limits.resources())?;
-        let facts = WriterSchemaProjectionFacts {
+        let mut facts = WriterSchemaProjectionFacts {
             field_count: f.list_item_count,
             name_bytes: self.names,
             type_reference_count: f.value_reference_count,
@@ -249,13 +259,73 @@ impl Count {
                 .coexisting_source_and_request_bytes_upper_bound,
             cumulative_work_upper_bound: f.cumulative_work_upper_bound,
         };
+        if self.admit.is_some() {
+            self.work_peak = self.work_peak.max(facts.cumulative_work_upper_bound);
+            resources::check_cap(self.work_peak, limits.max_work)?;
+            facts.cumulative_work_upper_bound = self.work_peak;
+        }
         if let Some(parent) = self.parent {
             parent.remaining(source, facts)?;
         }
+        if let Some(admit) = self.admit.as_mut() {
+            admit(&facts)?;
+        }
         Ok(facts)
     }
+    fn comparison_prefix(
+        &mut self,
+        left: &FunctionValueType,
+        right: &FunctionValueType,
+        source: usize,
+        roots: usize,
+        limits: WriterSchemaProjectionLimits,
+    ) -> Result<(), Error> {
+        let prefix = type_binding_prefix_work_upper_bound_in(left, right, source)?;
+        let mut current = self.model;
+        current.delegated_work = resources::add(current.delegated_work, prefix.work_upper_bound())?;
+        let facts = current.numerical_facts(source, roots, limits.resources())?;
+        self.work_peak = self.work_peak.max(facts.cumulative_work_upper_bound);
+        self.numerical_facts(source, roots, limits)?;
+        Ok(())
+    }
+    fn clone_facts(
+        &mut self,
+        ty: &FunctionValueType,
+        charge: bool,
+        request_base: Option<Model>,
+        source: usize,
+        roots: usize,
+        limits: WriterSchemaProjectionLimits,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<physical_type_v2::ValueTypeCloneFacts, Error> {
+        if self.admit.is_none() {
+            return Ok(physical_type_v2::preflight_value_type_clone(ty, w)?);
+        }
+        let base = request_base.unwrap_or(self.model);
+        physical_type_v2::preflight_value_type_clone_admitted(
+            ty,
+            &mut |facts, _| {
+                if charge {
+                    self.model.requests =
+                        resources::add(base.requests, facts.allocation_requests_upper_bound())?;
+                    self.model.requested = resources::add(
+                        base.requested,
+                        facts.allocation_request_bytes_upper_bound(),
+                    )?;
+                }
+                if facts.work_upper_bound()
+                    > physical_type_v2::value_type_clone_preflight_work_upper_bound()
+                {
+                    return Err(CompileControlError::ResourceExhausted.into());
+                }
+                self.numerical_facts(source, roots, limits)?;
+                Ok(())
+            },
+            w,
+        )
+    }
     fn facts(
-        &self,
+        &mut self,
         source: usize,
         types: usize,
         limits: WriterSchemaProjectionLimits,
@@ -269,13 +339,27 @@ impl Count {
         Ok(facts)
     }
     fn remaining(
-        &self,
+        &mut self,
         source: usize,
         types: usize,
         limits: WriterSchemaProjectionLimits,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<usize, Error> {
-        let f = self.facts(source, types, limits, w)?;
+        let raw_work = if self.admit.is_some() {
+            Some(
+                self.model
+                    .numerical_facts(source, types, limits.resources())?
+                    .cumulative_work_upper_bound,
+            )
+        } else {
+            None
+        };
+        let mut f = self.facts(source, types, limits, w)?;
+        if let Some(raw_work) = raw_work {
+            // The captured comparison prefix is a replacement peak. The same
+            // delegated comparison retains its room without deducting it twice.
+            f.cumulative_work_upper_bound = raw_work;
+        }
         let child = limits
             .max_work
             .checked_sub(f.cumulative_work_upper_bound)
@@ -388,14 +472,16 @@ fn preflight_encode(
             limits: l,
             parent: None,
         },
+        None,
         w,
     )
 }
-fn preflight_encode_context(
+fn preflight_encode_context<'admit>(
     source: Source<'_>,
     ids: &[u32],
     types: &EncodedTypeTable<'_>,
     context: ProjectionContext,
+    admit: Option<&'admit mut SchemaAdmit<'admit>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<WriterSchemaProjectionFacts, Error> {
     let ProjectionContext {
@@ -407,6 +493,7 @@ fn preflight_encode_context(
     let roots = types.source_counts().0;
     let mut c = Count::new(n);
     c.parent = parent;
+    c.admit = admit;
     // Original linear root lookups run once here; emitted IDs need no lookup.
     // Admit the sole clone preflight for every actual source occurrence.
     c.model.delegated_work = resources::mul(
@@ -416,6 +503,12 @@ fn preflight_encode_context(
             physical_type_v2::value_type_clone_preflight_work_upper_bound(),
         )?,
     )?;
+    if c.admit.is_some() {
+        match source {
+            Source::Schema(_) => c.model.request::<wire::WriterRelationField>(n, 1)?,
+            Source::Targets(_) => c.model.request::<wire::WriterTargetField>(n, 1)?,
+        }
+    }
     c.facts(invoice, roots, l, w)?;
     let mut known = resources::add(source.floor()?, resources::bytes::<u32>(ids.len())?)?;
     resources::floor(
@@ -430,9 +523,11 @@ fn preflight_encode_context(
             "writer field type ID count differs from original fields",
         ));
     }
-    match source {
-        Source::Schema(_) => c.model.request::<wire::WriterRelationField>(n, 1)?,
-        Source::Targets(_) => c.model.request::<wire::WriterTargetField>(n, 1)?,
+    if c.admit.is_none() {
+        match source {
+            Source::Schema(_) => c.model.request::<wire::WriterRelationField>(n, 1)?,
+            Source::Targets(_) => c.model.request::<wire::WriterTargetField>(n, 1)?,
+        }
     }
     c.numerical_facts(invoice, roots, l)?;
     for i in 0..n {
@@ -449,17 +544,50 @@ fn preflight_encode_context(
         c.facts(invoice, roots, l, w)?;
     }
     for (i, id) in ids.iter().enumerate() {
-        let ty = types
-            .value_type_observed(*id, w)?
-            .ok_or_else(|| shape("writer field type reference is unknown"))?;
-        let bound = verify_type_binding(
-            source.ty(i),
-            ty,
-            invoice,
-            c.remaining(invoice, roots, l, w)?,
-            w,
-        )?;
-        c.model.delegated_work = resources::add(c.model.delegated_work, bound.work_upper_bound())?;
+        let bound = if c.admit.is_some() {
+            let mut captured_bound = None;
+            let captured = types.value_type_captured(
+                *id,
+                &mut |ty, work| {
+                    c.comparison_prefix(source.ty(i), ty, invoice, roots, l)?;
+                    let remaining = c.remaining(invoice, roots, l, work)?;
+                    let base = c.model.delegated_work;
+                    captured_bound = Some(verify_type_binding_admitted_in(
+                        source.ty(i),
+                        ty,
+                        invoice,
+                        remaining,
+                        &mut |facts| {
+                            c.model.delegated_work =
+                                resources::add(base, facts.work_upper_bound())?;
+                            c.numerical_facts(invoice, roots, l)?;
+                            Ok::<(), Error>(())
+                        },
+                        work,
+                    )?);
+                    Ok::<(), Error>(())
+                },
+                w,
+            )?;
+            if captured.is_none() {
+                return Err(shape("writer field type reference is unknown"));
+            }
+            captured_bound.ok_or_else(|| shape("writer field type capture is absent"))?
+        } else {
+            let ty = types
+                .value_type_observed(*id, w)?
+                .ok_or_else(|| shape("writer field type reference is unknown"))?;
+            let bound = verify_type_binding(
+                source.ty(i),
+                ty,
+                invoice,
+                c.remaining(invoice, roots, l, w)?,
+                w,
+            )?;
+            c.model.delegated_work =
+                resources::add(c.model.delegated_work, bound.work_upper_bound())?;
+            bound
+        };
         c.numerical_facts(invoice, roots, l)?;
         w.step()?;
         if !bound.matches() {
@@ -469,7 +597,7 @@ fn preflight_encode_context(
         }
         // Root-owned Dictionary Boxes are retained even when encoding; reuse
         // the sole clone topology for their necessary source backing floor.
-        let clone = physical_type_v2::preflight_value_type_clone(source.ty(i), w)?;
+        let clone = c.clone_facts(source.ty(i), false, None, invoice, roots, l, w)?;
         known = resources::add(known, clone.allocation_request_bytes_upper_bound())?;
         // The sole grammar's ceiling was admitted for every occurrence before
         // any type walk, and remains in final facts for exact-envelope replay.
@@ -499,13 +627,15 @@ fn preflight_decode(
             limits: l,
             parent: None,
         },
+        None,
         w,
     )
 }
-fn preflight_decode_context(
+fn preflight_decode_context<'admit>(
     raw: Raw<'_>,
     types: &DecodedTypeTable,
     context: ProjectionContext,
+    admit: Option<&'admit mut SchemaAdmit<'admit>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<WriterSchemaProjectionFacts, Error> {
     let ProjectionContext {
@@ -517,6 +647,7 @@ fn preflight_decode_context(
     let roots = types.value_types().len();
     let mut c = Count::new(n);
     c.parent = parent;
+    c.admit = admit;
     let lookups = crate::btree_resources_v2::lookup_work(roots).map_err(shape)?;
     // Each actual occurrence has a lookup and clone in prepare and in emit.
     // Keep both original clone ceilings rather than narrowing final facts.
@@ -530,6 +661,12 @@ fn preflight_decode_context(
             2,
         )?,
     )?;
+    if c.admit.is_some() {
+        match raw {
+            Raw::Schema(_) => c.model.request::<p::WriterRelationField>(n, 2)?,
+            Raw::Targets(_) => c.model.request::<p::WriterTargetField>(n, 2)?,
+        }
+    }
     c.facts(invoice, roots, l, w)?;
     let mut known = raw.floor()?;
     resources::floor(
@@ -537,9 +674,11 @@ fn preflight_decode_context(
         resources::add(known, resources::bytes::<FunctionValueType>(roots)?)?,
         w,
     )?;
-    match raw {
-        Raw::Schema(_) => c.model.request::<p::WriterRelationField>(n, 2)?,
-        Raw::Targets(_) => c.model.request::<p::WriterTargetField>(n, 2)?,
+    if c.admit.is_none() {
+        match raw {
+            Raw::Schema(_) => c.model.request::<p::WriterRelationField>(n, 2)?,
+            Raw::Targets(_) => c.model.request::<p::WriterTargetField>(n, 2)?,
+        }
     }
     c.numerical_facts(invoice, roots, l)?;
     for i in 0..n {
@@ -571,19 +710,61 @@ fn preflight_decode_context(
         c.facts(invoice, roots, l, w)?;
     }
     for i in 0..n {
-        let ty = typed(types, required(raw.type_id(i), w)?, w)?;
+        let id = required(raw.type_id(i), w)?;
+        let request_base = c.model;
+        let ty = if c.admit.is_some() {
+            w.flush()?;
+            let captured = types.value_type(id);
+            if let Some(ty) = captured {
+                let root = physical_type_v2::value_type_clone_root_facts(ty)?;
+                c.model.requests = resources::add(
+                    request_base.requests,
+                    root.allocation_requests_upper_bound(),
+                )?;
+                c.model.requested = resources::add(
+                    request_base.requested,
+                    root.allocation_request_bytes_upper_bound(),
+                )?;
+                c.comparison_prefix(ty, ty, invoice, roots, l)?;
+            }
+            w.flush()?;
+            w.step()?;
+            captured.ok_or_else(|| shape("writer field type reference is unknown"))?
+        } else {
+            typed(types, id, w)?
+        };
         // Borrowed fixed-scratch admission supplies an existing full-type
         // numerical bound before the sole owned-Dictionary clone topology.
-        let bound = preflight_type_binding(ty, ty, invoice, c.remaining(invoice, roots, l, w)?, w)?;
-        c.model.delegated_work = resources::add(c.model.delegated_work, bound.work_upper_bound())?;
+        let remaining = c.remaining(invoice, roots, l, w)?;
+        if c.admit.is_some() {
+            let base = c.model.delegated_work;
+            preflight_type_binding_admitted_in(
+                ty,
+                ty,
+                invoice,
+                remaining,
+                &mut |facts| {
+                    c.model.delegated_work = resources::add(base, facts.work_upper_bound())?;
+                    c.numerical_facts(invoice, roots, l)?;
+                    Ok::<(), Error>(())
+                },
+                w,
+            )?;
+        } else {
+            let bound = preflight_type_binding(ty, ty, invoice, remaining, w)?;
+            c.model.delegated_work =
+                resources::add(c.model.delegated_work, bound.work_upper_bound())?;
+        }
         c.numerical_facts(invoice, roots, l)?;
-        let clone = physical_type_v2::preflight_value_type_clone(ty, w)?;
-        c.model.requests =
-            resources::add(c.model.requests, clone.allocation_requests_upper_bound())?;
-        c.model.requested = resources::add(
-            c.model.requested,
-            clone.allocation_request_bytes_upper_bound(),
-        )?;
+        let clone = c.clone_facts(ty, true, Some(request_base), invoice, roots, l, w)?;
+        if c.admit.is_none() {
+            c.model.requests =
+                resources::add(c.model.requests, clone.allocation_requests_upper_bound())?;
+            c.model.requested = resources::add(
+                c.model.requested,
+                clone.allocation_request_bytes_upper_bound(),
+            )?;
+        }
         if clone.work_upper_bound()
             > physical_type_v2::value_type_clone_preflight_work_upper_bound()
         {
@@ -730,7 +911,14 @@ pub(crate) fn preflight_schema_encode_observed(
     projection: WriterSchemaProjection,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<WriterSchemaProjectionFacts, Error> {
-    preflight_encode_context(Source::Schema(input), ids, types, projection.context(), w)
+    preflight_encode_context(
+        Source::Schema(input),
+        ids,
+        types,
+        projection.context(),
+        None,
+        w,
+    )
 }
 pub(crate) fn preflight_targets_encode_observed(
     input: &[p::WriterTargetField],
@@ -739,7 +927,14 @@ pub(crate) fn preflight_targets_encode_observed(
     projection: WriterSchemaProjection,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<WriterSchemaProjectionFacts, Error> {
-    preflight_encode_context(Source::Targets(input), ids, types, projection.context(), w)
+    preflight_encode_context(
+        Source::Targets(input),
+        ids,
+        types,
+        projection.context(),
+        None,
+        w,
+    )
 }
 pub(crate) fn preflight_schema_decode_observed(
     input: &wire::WriterRelationSchema,
@@ -747,7 +942,7 @@ pub(crate) fn preflight_schema_decode_observed(
     projection: WriterSchemaProjection,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<WriterSchemaProjectionFacts, Error> {
-    preflight_decode_context(Raw::Schema(input), types, projection.context(), w)
+    preflight_decode_context(Raw::Schema(input), types, projection.context(), None, w)
 }
 pub(crate) fn preflight_targets_decode_observed(
     input: &Vec<wire::WriterTargetField>,
@@ -755,7 +950,131 @@ pub(crate) fn preflight_targets_decode_observed(
     projection: WriterSchemaProjection,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<WriterSchemaProjectionFacts, Error> {
-    preflight_decode_context(Raw::Targets(input), types, projection.context(), w)
+    preflight_decode_context(Raw::Targets(input), types, projection.context(), None, w)
+}
+pub(crate) fn preflight_schema_encode_in(
+    input: &p::WriterRelationSchema,
+    ids: &[u32],
+    types: &EncodedTypeTable<'_>,
+    projection: WriterSchemaProjection,
+    admit: &mut resources::NodeAdmit<'_>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<WriterSchemaProjectionFacts, Error> {
+    let parent = projection.parent;
+    let source = projection.source;
+    let mut update = |facts: &WriterSchemaProjectionFacts| {
+        let merged = parent.merge(*facts).map_err(|error| match error {
+            resources::NodeCodecError::Control(cause) => cause,
+            _ => CompileControlError::ResourceExhausted,
+        })?;
+        let next = merged
+            .numerical_facts(source, parent.values, parent.limits)
+            .map_err(|error| match error {
+                resources::NodeCodecError::Control(cause) => cause,
+                _ => CompileControlError::ResourceExhausted,
+            })?;
+        admit(&next)
+    };
+    preflight_encode_context(
+        Source::Schema(input),
+        ids,
+        types,
+        projection.context(),
+        Some(&mut update),
+        w,
+    )
+}
+pub(crate) fn preflight_targets_encode_in(
+    input: &[p::WriterTargetField],
+    ids: &[u32],
+    types: &EncodedTypeTable<'_>,
+    projection: WriterSchemaProjection,
+    admit: &mut resources::NodeAdmit<'_>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<WriterSchemaProjectionFacts, Error> {
+    let parent = projection.parent;
+    let source = projection.source;
+    let mut update = |facts: &WriterSchemaProjectionFacts| {
+        let merged = parent.merge(*facts).map_err(|error| match error {
+            resources::NodeCodecError::Control(cause) => cause,
+            _ => CompileControlError::ResourceExhausted,
+        })?;
+        let next = merged
+            .numerical_facts(source, parent.values, parent.limits)
+            .map_err(|error| match error {
+                resources::NodeCodecError::Control(cause) => cause,
+                _ => CompileControlError::ResourceExhausted,
+            })?;
+        admit(&next)
+    };
+    preflight_encode_context(
+        Source::Targets(input),
+        ids,
+        types,
+        projection.context(),
+        Some(&mut update),
+        w,
+    )
+}
+pub(crate) fn preflight_schema_decode_in(
+    input: &wire::WriterRelationSchema,
+    types: &DecodedTypeTable,
+    projection: WriterSchemaProjection,
+    admit: &mut resources::NodeAdmit<'_>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<WriterSchemaProjectionFacts, Error> {
+    let parent = projection.parent;
+    let source = projection.source;
+    let mut update = |facts: &WriterSchemaProjectionFacts| {
+        let merged = parent.merge(*facts).map_err(|error| match error {
+            resources::NodeCodecError::Control(cause) => cause,
+            _ => CompileControlError::ResourceExhausted,
+        })?;
+        let next = merged
+            .numerical_facts(source, parent.values, parent.limits)
+            .map_err(|error| match error {
+                resources::NodeCodecError::Control(cause) => cause,
+                _ => CompileControlError::ResourceExhausted,
+            })?;
+        admit(&next)
+    };
+    preflight_decode_context(
+        Raw::Schema(input),
+        types,
+        projection.context(),
+        Some(&mut update),
+        w,
+    )
+}
+pub(crate) fn preflight_targets_decode_in(
+    input: &Vec<wire::WriterTargetField>,
+    types: &DecodedTypeTable,
+    projection: WriterSchemaProjection,
+    admit: &mut resources::NodeAdmit<'_>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<WriterSchemaProjectionFacts, Error> {
+    let parent = projection.parent;
+    let source = projection.source;
+    let mut update = |facts: &WriterSchemaProjectionFacts| {
+        let merged = parent.merge(*facts).map_err(|error| match error {
+            resources::NodeCodecError::Control(cause) => cause,
+            _ => CompileControlError::ResourceExhausted,
+        })?;
+        let next = merged
+            .numerical_facts(source, parent.values, parent.limits)
+            .map_err(|error| match error {
+                resources::NodeCodecError::Control(cause) => cause,
+                _ => CompileControlError::ResourceExhausted,
+            })?;
+        admit(&next)
+    };
+    preflight_decode_context(
+        Raw::Targets(input),
+        types,
+        projection.context(),
+        Some(&mut update),
+        w,
+    )
 }
 macro_rules! encoding_api {
     ($token:ident,$prepare:ident,$encode:ident,$input:ty,$output:ty,$variant:ident,$emit:ident) => {

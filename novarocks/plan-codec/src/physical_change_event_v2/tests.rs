@@ -990,3 +990,6 @@ fn change_event_empty_events_and_absent_expressions_are_representation_not_stati
         );
     });
 }
+
+#[path = "owned_tests.rs"]
+mod owned_tests;

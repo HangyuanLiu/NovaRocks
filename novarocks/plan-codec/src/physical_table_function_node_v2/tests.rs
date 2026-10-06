@@ -789,3 +789,384 @@ fn wide_actual_counts_have_real_quantum_and_numeric_refusal_has_no_late_callback
         assert_eq!(control.trace(), [(CompilePhase::Decode, 0)]);
     });
 }
+
+fn caller_table_encode(
+    source: &p::PhysicalNode,
+    values: &EncodedValues<'_, '_, '_>,
+    expressions: &EncodedExpressions<'_, '_, '_>,
+    l: TableFunctionNodeProjectionLimits,
+    control: &Control,
+    parent: &mut NodeAdmit<'_>,
+) -> Result<(wire::PhysicalNode, NodeProjectionFacts), Error> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
+    let result = (|| {
+        let token = prepare_table_function_node_encode_in(
+            source,
+            values,
+            expressions,
+            SOURCE,
+            l,
+            parent,
+            &mut work,
+        )?;
+        token.emit_in(parent, &mut work)
+    })();
+    finish(work, result)
+}
+fn caller_table_decode(
+    source: &wire::PhysicalNode,
+    expressions: &DecodedExpressions<'_, '_, '_>,
+    functions: &MaterializedFunctionBindings<'_, '_>,
+    l: TableFunctionNodeProjectionLimits,
+    control: &Control,
+    parent: &mut NodeAdmit<'_>,
+) -> Result<(p::PhysicalNode, NodeProjectionFacts), Error> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+    let result = (|| {
+        let token = prepare_table_function_node_decode_in(
+            source,
+            expressions,
+            functions,
+            SOURCE,
+            l,
+            parent,
+            &mut work,
+        )?;
+        token.emit_in(parent, &mut work)
+    })();
+    finish(work, result)
+}
+fn caller_table_axes(f: NodeProjectionFacts) -> [usize; 7] {
+    [
+        f.input_node_count,
+        f.value_reference_count,
+        f.list_item_count,
+        f.allocation_requests_upper_bound,
+        f.allocation_request_bytes_upper_bound,
+        f.coexisting_source_and_request_bytes_upper_bound,
+        f.cumulative_work_upper_bound,
+    ]
+}
+#[test]
+fn table_caller_owned_full_lambda_dictionary_relation_seals_prefixes_and_replays_exact() {
+    let f = Fixture::new(1, true);
+    let control = Control::default();
+    f.with_tokens(&control,|values,expressions,read,functions| {
+        let mut sent=Vec::new();
+        let (wire,sf)=caller_table_encode(&f.node,values,expressions,node_limits(),&control,&mut |f|{sent.push(*f);Ok(())}).unwrap();
+        let body=raw(&wire).unwrap();
+        assert_eq!(body.function_binding_id,Some(0));
+        assert_eq!(body.argument_expr_ids,[7,7]);
+        assert!(body.left_outer);
+        assert_eq!(body.outputs.len(),3);
+        let mut received=Vec::new();
+        let (owned,rf)=caller_table_decode(&wire,read,functions,node_limits(),&control,&mut |f|{received.push(*f);Ok(())}).unwrap();
+        assert_node(&owned,&f.node);
+        assert_eq!(physical(&owned).unwrap().function.result_types.len(),3);
+        assert!(matches!(&physical(&owned).unwrap().function.argument_types[1],FunctionArgumentType::Lambda{parameter_types,result_type} if parameter_types.len()==2 && result_type.logical_type==ValueLogicalType::Json));
+        for (prefixes,final_facts) in [(&sent,sf),(&received,rf)] {
+            assert!(!prefixes.is_empty());
+            for prefix in prefixes {
+                assert!(caller_table_axes(*prefix).into_iter().zip(caller_table_axes(final_facts)).all(|(p,f)|p<=f));
+            }
+        }
+        for receive in [false,true] {
+            let bound=if receive {rf}else{sf};let mut l=node_limits();
+            l.node.max_input_nodes=bound.input_node_count;
+            l.node.max_value_references=bound.value_reference_count;
+            l.node.max_list_items=bound.list_item_count;
+            l.node.max_allocation_requests=bound.allocation_requests_upper_bound;
+            l.node.max_allocation_request_bytes=bound.allocation_request_bytes_upper_bound;
+            l.node.max_coexisting_source_and_request_bytes=bound.coexisting_source_and_request_bytes_upper_bound;
+            l.node.max_work=bound.cumulative_work_upper_bound;
+            let replay=if receive {caller_table_decode(&wire,read,functions,l,&control,&mut |_|Ok(())).map(|r|r.1)} else {caller_table_encode(&f.node,values,expressions,l,&control,&mut |_|Ok(())).map(|r|r.1)};
+            assert_eq!(replay.unwrap(),bound);
+        }
+    });
+}
+#[test]
+fn table_caller_owned_actual_success_ordinary_prefixes_and_foreign_control() {
+    let f = Fixture::new(1, false);
+    let control = Control::default();
+    f.with_tokens(&control, |values, expressions, read, functions| {
+        let wire = caller_table_encode(
+            &f.node,
+            values,
+            expressions,
+            node_limits(),
+            &control,
+            &mut |_| Ok(()),
+        )
+        .unwrap()
+        .0;
+        prefixes(
+            &control,
+            || {
+                caller_table_encode(
+                    &f.node,
+                    values,
+                    expressions,
+                    node_limits(),
+                    &control,
+                    &mut |_| Ok(()),
+                )
+                .map(|_| ())
+            },
+            true,
+        );
+        prefixes(
+            &control,
+            || {
+                caller_table_decode(&wire, read, functions, node_limits(), &control, &mut |_| {
+                    Ok(())
+                })
+                .map(|_| ())
+            },
+            true,
+        );
+        let mut bad = wire.clone();
+        raw_mut(&mut bad).function_binding_id = Some(8);
+        prefixes(
+            &control,
+            || {
+                caller_table_decode(&bad, read, functions, node_limits(), &control, &mut |_| {
+                    Ok(())
+                })
+                .map(|_| ())
+            },
+            false,
+        );
+        let foreign = Control::default();
+        let mut callbacks = 0;
+        assert!(matches!(
+            caller_table_encode(
+                &f.node,
+                values,
+                expressions,
+                node_limits(),
+                &foreign,
+                &mut |_| {
+                    callbacks += 1;
+                    Ok(())
+                }
+            ),
+            Err(Error::InvalidShape(_))
+        ));
+        assert_eq!(callbacks, 0);
+        assert!(matches!(
+            caller_table_encode(
+                &f.node.clone(),
+                values,
+                expressions,
+                node_limits(),
+                &control,
+                &mut |_| Ok(())
+            ),
+            Err(Error::Binding(_))
+        ));
+    });
+}
+#[test]
+fn table_caller_owned_known_root_requests_win_at_pending255_and_wide_is_actual() {
+    let f = Fixture::new(320, false);
+    let control = Control::default();
+    f.with_tokens(&control, |values, expressions, read, functions| {
+        control.arm(None);
+        let (wire, _) = caller_table_encode(
+            &f.node,
+            values,
+            expressions,
+            node_limits(),
+            &control,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        let sent = control.trace();
+        assert!(sent.iter().any(|(_, u)| *u == 256));
+        assert_eq!(raw(&wire).unwrap().argument_expr_ids, vec![7; 320]);
+        control.arm(None);
+        let (owned, _) =
+            caller_table_decode(&wire, read, functions, node_limits(), &control, &mut |_| {
+                Ok(())
+            })
+            .unwrap();
+        let received = control.trace();
+        assert!(received.iter().any(|(_, u)| *u == 256));
+        assert_eq!(physical(&owned).unwrap().arguments.len(), 320);
+        for receive in [false, true] {
+            let trace = if receive { &received } else { &sent };
+            let quantum = trace.iter().position(|(_, u)| *u == 256).unwrap();
+            for at in [0, quantum, trace.len() - 1] {
+                for cause in CAUSES {
+                    control.arm(Some((at, cause)));
+                    let result = if receive {
+                        caller_table_decode(
+                            &wire,
+                            read,
+                            functions,
+                            node_limits(),
+                            &control,
+                            &mut |_| Ok(()),
+                        )
+                        .map(|_| ())
+                    } else {
+                        caller_table_encode(
+                            &f.node,
+                            values,
+                            expressions,
+                            node_limits(),
+                            &control,
+                            &mut |_| Ok(()),
+                        )
+                        .map(|_| ())
+                    };
+                    assert!(matches!(result,Err(Error::Control(actual)) if actual==cause));
+                    assert_eq!(control.trace(), trace[..=at]);
+                }
+            }
+            for cause in CAUSES {
+                control.arm(Some((1, cause)));
+                let phase = if receive {
+                    CompilePhase::Decode
+                } else {
+                    CompilePhase::Encode
+                };
+                let mut work = CompileCheckpoints::try_new(&control, phase).unwrap();
+                for _ in 0..255 {
+                    work.step().unwrap();
+                }
+                let mut parent = |f: &NodeProjectionFacts| {
+                    if f.allocation_requests_upper_bound > 0 {
+                        Err(CompileControlError::ResourceExhausted)
+                    } else {
+                        Ok(())
+                    }
+                };
+                let result = if receive {
+                    prepare_table_function_node_decode_in(
+                        &wire,
+                        read,
+                        functions,
+                        SOURCE,
+                        node_limits(),
+                        &mut parent,
+                        &mut work,
+                    )
+                    .map(|_| ())
+                } else {
+                    prepare_table_function_node_encode_in(
+                        &f.node,
+                        values,
+                        expressions,
+                        SOURCE,
+                        node_limits(),
+                        &mut parent,
+                        &mut work,
+                    )
+                    .map(|_| ())
+                };
+                assert!(matches!(
+                    result,
+                    Err(Error::Control(CompileControlError::ResourceExhausted))
+                ));
+                assert_eq!(control.trace(), [(phase, 0)]);
+            }
+        }
+    });
+}
+
+#[test]
+fn table_caller_parent_seven_axes_known_refusal_precedes_late_control() {
+    let f = Fixture::new(1, true);
+    let control = Control::default();
+    f.with_tokens(&control, |values, expressions, read, functions| {
+        control.arm(None);
+        let wire = caller_table_encode(
+            &f.node,
+            values,
+            expressions,
+            node_limits(),
+            &control,
+            &mut |_| Ok(()),
+        )
+        .unwrap()
+        .0;
+        for receive in [false, true] {
+            control.arm(None);
+            let mut prefixes = Vec::new();
+            let mut collect = |f: &NodeProjectionFacts| {
+                prefixes.push((*f, control.trace().len()));
+                Ok(())
+            };
+            let facts = if receive {
+                caller_table_decode(
+                    &wire,
+                    read,
+                    functions,
+                    node_limits(),
+                    &control,
+                    &mut collect,
+                )
+                .unwrap()
+                .1
+            } else {
+                caller_table_encode(
+                    &f.node,
+                    values,
+                    expressions,
+                    node_limits(),
+                    &control,
+                    &mut collect,
+                )
+                .unwrap()
+                .1
+            };
+            let trace = control.trace();
+            for axis in 0..7 {
+                let bound = caller_table_axes(facts)[axis];
+                assert!(bound > 0);
+                let marker = prefixes
+                    .iter()
+                    .find(|(f, _)| caller_table_axes(*f)[axis] > bound - 1)
+                    .unwrap()
+                    .1;
+                for cause in CAUSES {
+                    control.arm(Some((marker, cause)));
+                    let mut parent = |f: &NodeProjectionFacts| {
+                        if caller_table_axes(*f)[axis] > bound - 1 {
+                            Err(CompileControlError::ResourceExhausted)
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    let result = if receive {
+                        caller_table_decode(
+                            &wire,
+                            read,
+                            functions,
+                            node_limits(),
+                            &control,
+                            &mut parent,
+                        )
+                        .map(|_| ())
+                    } else {
+                        caller_table_encode(
+                            &f.node,
+                            values,
+                            expressions,
+                            node_limits(),
+                            &control,
+                            &mut parent,
+                        )
+                        .map(|_| ())
+                    };
+                    assert!(matches!(
+                        result,
+                        Err(Error::Control(CompileControlError::ResourceExhausted))
+                    ));
+                    assert_eq!(control.trace(), trace[..marker]);
+                }
+            }
+        }
+    });
+}

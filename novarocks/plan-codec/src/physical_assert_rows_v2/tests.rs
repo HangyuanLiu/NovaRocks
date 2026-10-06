@@ -828,3 +828,6 @@ fn wide_ordered_keys_and_utf8_copy_reach_actual_quantum_without_after_refusal() 
         }
     });
 }
+
+#[path = "owned_tests.rs"]
+mod owned_tests;

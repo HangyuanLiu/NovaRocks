@@ -915,3 +915,6 @@ fn unpivot_original_control_every_small_success_and_ordinary_prefix_and_real_qua
         c.arm(None);decode_unpivot_node(&wire,read,SOURCE,limits()).unwrap();assert!(c.trace().iter().any(|(_,units)|*units==256));
     });
 }
+
+#[path = "owned_tests.rs"]
+mod owned_tests;

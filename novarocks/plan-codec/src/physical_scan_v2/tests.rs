@@ -1117,3 +1117,286 @@ fn scan_every_small_original_control_prefix_and_real_wide_quantum_are_primary() 
         },
     );
 }
+
+#[test]
+fn scan_parent_actual_loans_exact_axes_and_all_small_control_prefixes() {
+    let c = Control::default();
+    let node = source();
+    let raw = expected();
+    with_tokens(
+        &node,
+        &c,
+        |relations, values, expressions, read_relations, read_expr| {
+            for decode in [false, true] {
+                let run = |l, snapshots: &mut Vec<NodeProjectionFacts>| {
+                    let phase = if decode {
+                        CompilePhase::Decode
+                    } else {
+                        CompilePhase::Encode
+                    };
+                    let owner = if decode {
+                        read_expr.original_control()
+                    } else {
+                        values.original_control()
+                    };
+                    let mut work = CompileCheckpoints::try_new(owner, phase)?;
+                    let mut admit = |f: &NodeProjectionFacts| {
+                        snapshots.push(*f);
+                        Ok(())
+                    };
+                    let result = if decode {
+                        prepare_scan_node_decode_in(
+                            &raw,
+                            read_relations,
+                            read_expr,
+                            SOURCE,
+                            l,
+                            &mut admit,
+                            &mut work,
+                        )
+                        .and_then(|p| p.emit_in(&mut admit, &mut work))
+                        .map(|(out, f)| {
+                            assert_eq!(out, node);
+                            f
+                        })
+                    } else {
+                        prepare_scan_node_encode_in(
+                            &node,
+                            relations,
+                            values,
+                            expressions,
+                            SOURCE,
+                            l,
+                            &mut admit,
+                            &mut work,
+                        )
+                        .and_then(|p| p.emit_in(&mut admit, &mut work))
+                        .map(|(out, f)| {
+                            assert_eq!(out, raw);
+                            f
+                        })
+                    };
+                    finish(work, result)
+                };
+                c.arm(None);
+                let mut captured = vec![];
+                let f = run(limits(), &mut captured).unwrap();
+                let trace = c.trace();
+                assert!(!captured.is_empty());
+                for prefix in &captured {
+                    assert!(
+                        prefix.allocation_requests_upper_bound <= f.allocation_requests_upper_bound
+                    );
+                    assert!(
+                        prefix.allocation_request_bytes_upper_bound
+                            <= f.allocation_request_bytes_upper_bound
+                    );
+                    assert!(prefix.cumulative_work_upper_bound <= f.cumulative_work_upper_bound);
+                    assert_eq!(
+                        prefix.coexisting_source_and_request_bytes_upper_bound,
+                        SOURCE + prefix.allocation_request_bytes_upper_bound
+                    );
+                }
+                c.arm(None);
+                assert_eq!(run(exact(f), &mut vec![]).unwrap(), f);
+                for axis in 0..7 {
+                    c.arm(None);
+                    assert!(matches!(
+                        run(under(exact(f), axis), &mut vec![]),
+                        Err(Error::Control(CompileControlError::ResourceExhausted))
+                    ));
+                }
+                for at in 0..trace.len() {
+                    for cause in CAUSES {
+                        c.arm(Some((at, cause)));
+                        assert!(
+                            matches!(run(limits(), &mut vec![]), Err(Error::Control(actual)) if actual == cause)
+                        );
+                        assert_eq!(c.trace(), trace[..=at]);
+                    }
+                }
+            }
+        },
+    );
+}
+
+#[test]
+fn scan_parent_known_header_precedes_pending_refusal_and_foreign_admission() {
+    let c = Control::default();
+    let node = source();
+    let raw = expected();
+    with_tokens(
+        &node,
+        &c,
+        |relations, values, expressions, read_relations, read_expr| {
+            for decode in [false, true] {
+                for cause in CAUSES {
+                    c.arm(Some((1, cause)));
+                    let owner = if decode {
+                        read_expr.original_control()
+                    } else {
+                        values.original_control()
+                    };
+                    let mut work =
+                        CompileCheckpoints::try_new(owner, CompilePhase::Decode).unwrap();
+                    for _ in 0..255 {
+                        work.step().unwrap();
+                    }
+                    let mut l = limits();
+                    l.node.max_allocation_requests = 0;
+                    let mut admit = |_: &NodeProjectionFacts| -> Result<(), CompileControlError> {
+                        panic!("own known cap must refuse before parent")
+                    };
+                    let result = if decode {
+                        prepare_scan_node_decode_in(
+                            &raw,
+                            read_relations,
+                            read_expr,
+                            SOURCE,
+                            l,
+                            &mut admit,
+                            &mut work,
+                        )
+                        .map(|_| ())
+                    } else {
+                        prepare_scan_node_encode_in(
+                            &node,
+                            relations,
+                            values,
+                            expressions,
+                            SOURCE,
+                            l,
+                            &mut admit,
+                            &mut work,
+                        )
+                        .map(|_| ())
+                    };
+                    assert!(matches!(
+                        finish(work, result),
+                        Err(Error::Control(CompileControlError::ResourceExhausted))
+                    ));
+                    assert_eq!(c.trace(), vec![(CompilePhase::Decode, 0)]);
+                }
+                let foreign = Control::default();
+                let mut work = CompileCheckpoints::try_new(&foreign, CompilePhase::Decode).unwrap();
+                let mut admit = |_: &NodeProjectionFacts| -> Result<(), CompileControlError> {
+                    panic!("foreign caller cannot reach parent")
+                };
+                let result = if decode {
+                    prepare_scan_node_decode_in(
+                        &raw,
+                        read_relations,
+                        read_expr,
+                        SOURCE,
+                        limits(),
+                        &mut admit,
+                        &mut work,
+                    )
+                    .map(|_| ())
+                } else {
+                    prepare_scan_node_encode_in(
+                        &node,
+                        relations,
+                        values,
+                        expressions,
+                        SOURCE,
+                        limits(),
+                        &mut admit,
+                        &mut work,
+                    )
+                    .map(|_| ())
+                };
+                assert!(matches!(finish(work, result), Err(Error::InvalidShape(_))));
+            }
+        },
+    );
+}
+
+#[test]
+fn scan_parent_ordinary_tail_and_real_320_residual_occurrences() {
+    let c = Control::default();
+    let mut node = source();
+    if let p::NodeKind::Scan { residuals, .. } = &mut node.kind {
+        *residuals = vec![p::ExprId::new(0); 320].into_boxed_slice();
+    }
+    with_tokens(
+        &node,
+        &c,
+        |relations, values, expressions, read_relations, read_expr| {
+            c.arm(None);
+            let mut work =
+                CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)
+                    .unwrap();
+            let mut admit = |_: &NodeProjectionFacts| Ok(());
+            let prepared = prepare_scan_node_encode_in(
+                &node,
+                relations,
+                values,
+                expressions,
+                SOURCE,
+                limits(),
+                &mut admit,
+                &mut work,
+            )
+            .unwrap();
+            let (raw, _) = prepared.emit_in(&mut admit, &mut work).unwrap();
+            finish(work, Ok(())).unwrap();
+            assert_eq!(
+                match raw.kind.as_ref().unwrap() {
+                    wire::physical_node::Kind::Scan(scan) => scan.residual_expr_ids.len(),
+                    _ => panic!("expected actual Scan"),
+                },
+                320
+            );
+            c.arm(None);
+            let mut work =
+                CompileCheckpoints::try_new(read_expr.original_control(), CompilePhase::Decode)
+                    .unwrap();
+            let (decoded, _) = prepare_scan_node_decode_in(
+                &raw,
+                read_relations,
+                read_expr,
+                SOURCE,
+                limits(),
+                &mut admit,
+                &mut work,
+            )
+            .and_then(|p| p.emit_in(&mut admit, &mut work))
+            .unwrap();
+            finish(work, Ok(())).unwrap();
+            assert_eq!(decoded, node);
+            assert!(c.trace().iter().any(|(_, units)| *units == 256));
+            let mut invalid = expected();
+            if let Some(wire::physical_node::Kind::Scan(scan)) = &mut invalid.kind {
+                scan.residual_expr_ids.push(123456);
+            }
+            let run = || {
+                let mut work = CompileCheckpoints::try_new(
+                    read_expr.original_control(),
+                    CompilePhase::Decode,
+                )?;
+                let result = prepare_scan_node_decode_in(
+                    &invalid,
+                    read_relations,
+                    read_expr,
+                    SOURCE,
+                    limits(),
+                    &mut |_: &NodeProjectionFacts| Ok(()),
+                    &mut work,
+                )
+                .map(|_| ());
+                finish(work, result)
+            };
+            c.arm(None);
+            assert!(matches!(run(), Err(Error::InvalidShape(_))));
+            let trace = c.trace();
+            for at in 0..trace.len() {
+                for cause in CAUSES {
+                    c.arm(Some((at, cause)));
+                    assert!(matches!(run(), Err(Error::Control(actual)) if actual == cause));
+                    assert_eq!(c.trace(), trace[..=at]);
+                }
+            }
+        },
+    );
+}

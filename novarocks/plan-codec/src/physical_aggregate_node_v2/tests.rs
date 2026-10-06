@@ -1555,3 +1555,324 @@ fn aggregate_collection_parent_tighter_gates_preserve_work_and_nested_capacity_e
         c.disarm();
     });
 }
+
+// The caller owns one original scope, including success/ordinary footer.
+fn caller_aggregate_encode(
+    n: &p::PhysicalNode,
+    v: &EncodedValues<'_, '_, '_>,
+    e: &EncodedExpressions<'_, '_, '_>,
+    l: AggregateNodeProjectionLimits,
+    c: &Control,
+    parent: &mut NodeAdmit<'_>,
+) -> Result<(wire::PhysicalNode, AggregateNodeProjectionFacts), Error> {
+    let mut w = CompileCheckpoints::try_new(c, CompilePhase::Encode)?;
+    let result = (|| {
+        let token = prepare_aggregate_node_encode_in(n, v, e, SOURCE, l, parent, &mut w)?;
+        token.emit_in(parent, &mut w)
+    })();
+    finish(w, result)
+}
+fn caller_aggregate_decode(
+    raw: &wire::PhysicalNode,
+    d: &DecodedExpressions<'_, '_, '_>,
+    a: &MaterializedAggregateBindings<'_, '_, '_>,
+    l: AggregateNodeProjectionLimits,
+    c: &Control,
+    parent: &mut NodeAdmit<'_>,
+) -> Result<(p::PhysicalNode, AggregateNodeProjectionFacts), Error> {
+    let mut w = CompileCheckpoints::try_new(c, CompilePhase::Decode)?;
+    let result = (|| {
+        let token = prepare_aggregate_node_decode_in(raw, d, a, SOURCE, l, parent, &mut w)?;
+        token.emit_in(parent, &mut w)
+    })();
+    finish(w, result)
+}
+fn caller_aggregate_axes(f: AggregateNodeProjectionFacts) -> [usize; 7] {
+    [
+        f.input_node_count,
+        f.value_reference_count,
+        f.list_item_count,
+        f.allocation_requests_upper_bound,
+        f.allocation_request_bytes_upper_bound,
+        f.coexisting_source_and_request_bytes_upper_bound,
+        f.cumulative_work_upper_bound,
+    ]
+}
+#[test]
+fn aggregate_caller_owned_complete_loans_preserve_wire_and_seal_every_prefix() {
+    let n = node();
+    let c = Control::default();
+    Fixture::new().with(&n, &c, |v, e, d, a| {
+        let mut sent = Vec::new();
+        let (wire, sf) = caller_aggregate_encode(&n, v, e, limits(), &c, &mut |f| {
+            sent.push(*f);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(wire, expected());
+        let mut received = Vec::new();
+        let (owned, rf) = caller_aggregate_decode(&wire, d, a, limits(), &c, &mut |f| {
+            received.push(*f);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(owned, n);
+        for (prefixes, final_facts) in [(&sent, sf), (&received, rf)] {
+            assert!(!prefixes.is_empty());
+            for prefix in prefixes {
+                assert!(
+                    caller_aggregate_axes(*prefix)
+                        .into_iter()
+                        .zip(caller_aggregate_axes(final_facts))
+                        .all(|(p, f)| p <= f)
+                );
+            }
+        }
+        for receive in [false, true] {
+            let bound = if receive { rf } else { sf };
+            let mut exact = limits();
+            exact.node.max_input_nodes = bound.input_node_count;
+            exact.node.max_value_references = bound.value_reference_count;
+            exact.node.max_list_items = bound.list_item_count;
+            exact.node.max_allocation_requests = bound.allocation_requests_upper_bound;
+            exact.node.max_allocation_request_bytes = bound.allocation_request_bytes_upper_bound;
+            exact.node.max_coexisting_source_and_request_bytes =
+                bound.coexisting_source_and_request_bytes_upper_bound;
+            exact.node.max_work = bound.cumulative_work_upper_bound;
+            let actual = if receive {
+                caller_aggregate_decode(&wire, d, a, exact, &c, &mut |_| Ok(())).map(|r| r.1)
+            } else {
+                caller_aggregate_encode(&n, v, e, exact, &c, &mut |_| Ok(())).map(|r| r.1)
+            };
+            assert_eq!(actual.unwrap(), bound);
+        }
+    });
+}
+#[test]
+fn aggregate_caller_owned_actual_success_ordinary_and_foreign_control_prefixes() {
+    let n = node();
+    let c = Control::default();
+    Fixture::new().with(&n, &c, |v, e, d, a| {
+        prefixes(&c, || {
+            caller_aggregate_encode(&n, v, e, limits(), &c, &mut |_| Ok(())).map(|_| ())
+        });
+        let raw = expected();
+        prefixes(&c, || {
+            caller_aggregate_decode(&raw, d, a, limits(), &c, &mut |_| Ok(())).map(|_| ())
+        });
+        let mut bad = raw.clone();
+        body(&mut bad).calls[0].aggregate_binding_id = None;
+        prefixes(&c, || {
+            caller_aggregate_decode(&bad, d, a, limits(), &c, &mut |_| Ok(())).map(|_| ())
+        });
+        let foreign = Control::default();
+        let mut calls = 0;
+        let result = caller_aggregate_encode(&n, v, e, limits(), &foreign, &mut |_| {
+            calls += 1;
+            Ok(())
+        });
+        assert!(matches!(result, Err(Error::InvalidShape(_))));
+        assert_eq!(calls, 0);
+        assert!(matches!(
+            caller_aggregate_encode(&n.clone(), v, e, limits(), &c, &mut |_| Ok(())),
+            Err(Error::Binding(_))
+        ));
+    });
+}
+#[test]
+fn aggregate_caller_owned_known_root_requests_win_at_pending255() {
+    let n = node();
+    let c = Control::default();
+    Fixture::new().with(&n, &c, |v, e, d, a| {
+        let raw = expected();
+        for receive in [false, true] {
+            for cause in CAUSES {
+                c.arm(Some((1, cause)));
+                let phase = if receive {
+                    CompilePhase::Decode
+                } else {
+                    CompilePhase::Encode
+                };
+                let mut w = CompileCheckpoints::try_new(&c, phase).unwrap();
+                for _ in 0..255 {
+                    w.step().unwrap();
+                }
+                let mut parent = |f: &NodeProjectionFacts| {
+                    if f.allocation_requests_upper_bound > 0 {
+                        Err(CompileControlError::ResourceExhausted)
+                    } else {
+                        Ok(())
+                    }
+                };
+                let result = if receive {
+                    prepare_aggregate_node_decode_in(
+                        &raw,
+                        d,
+                        a,
+                        SOURCE,
+                        limits(),
+                        &mut parent,
+                        &mut w,
+                    )
+                    .map(|_| ())
+                } else {
+                    prepare_aggregate_node_encode_in(
+                        &n,
+                        v,
+                        e,
+                        SOURCE,
+                        limits(),
+                        &mut parent,
+                        &mut w,
+                    )
+                    .map(|_| ())
+                };
+                assert!(matches!(
+                    result,
+                    Err(Error::Control(CompileControlError::ResourceExhausted))
+                ));
+                assert_eq!(c.trace(), [(phase, 0)]);
+            }
+        }
+        c.disarm();
+    });
+}
+
+#[test]
+fn aggregate_caller_parent_seven_axes_known_refusal_precedes_late_control() {
+    let n = node();
+    let c = Control::default();
+    Fixture::new().with(&n, &c, |v, e, d, a| {
+        let raw = expected();
+        for receive in [false, true] {
+            c.arm(None);
+            let mut prefixes = Vec::new();
+            let mut collect = |f: &NodeProjectionFacts| {
+                prefixes.push((*f, c.trace().len()));
+                Ok(())
+            };
+            let facts = if receive {
+                caller_aggregate_decode(&raw, d, a, limits(), &c, &mut collect)
+                    .unwrap()
+                    .1
+            } else {
+                caller_aggregate_encode(&n, v, e, limits(), &c, &mut collect)
+                    .unwrap()
+                    .1
+            };
+            let trace = c.trace();
+            for axis in 0..7 {
+                let bound = caller_aggregate_axes(facts)[axis];
+                assert!(bound > 0);
+                let marker = prefixes
+                    .iter()
+                    .find(|(f, _)| caller_aggregate_axes(*f)[axis] > bound - 1)
+                    .unwrap()
+                    .1;
+                for cause in CAUSES {
+                    c.arm(Some((marker, cause)));
+                    let mut parent = |f: &NodeProjectionFacts| {
+                        if caller_aggregate_axes(*f)[axis] > bound - 1 {
+                            Err(CompileControlError::ResourceExhausted)
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    let result = if receive {
+                        caller_aggregate_decode(&raw, d, a, limits(), &c, &mut parent).map(|_| ())
+                    } else {
+                        caller_aggregate_encode(&n, v, e, limits(), &c, &mut parent).map(|_| ())
+                    };
+                    assert!(matches!(
+                        result,
+                        Err(Error::Control(CompileControlError::ResourceExhausted))
+                    ));
+                    assert_eq!(c.trace(), trace[..marker]);
+                }
+            }
+        }
+        c.disarm();
+    });
+}
+
+#[test]
+fn aggregate_caller_owned_actual320_signatures_and_lambda_copy_preserve_source_profiles() {
+    for lambda in [false, true] {
+        let mut n = node();
+        calls(&mut n)[0].binding.function.argument_types = if lambda {
+            Box::from([
+                FunctionArgumentType::Value(dictionary()),
+                FunctionArgumentType::Lambda {
+                    parameter_types: vec![nested(); 320].into_boxed_slice(),
+                    result_type: nominal(),
+                },
+            ])
+        } else {
+            vec![FunctionArgumentType::Value(dictionary()); 320].into_boxed_slice()
+        };
+        let c = Control::default();
+        Fixture::new().with(&n, &c, |_, _, d, a| {
+            let raw = expected();
+            // This wide namespace was admitted with 8 * 128 KiB of original
+            // source. Its retained index and both newly owned signature tables
+            // coexist with that invoice; SOURCE alone omits those outputs.
+            let namespace_floor = d
+                .retained_floor_header_in()
+                .unwrap()
+                .checked_add(a.functions().retained_output_floor().unwrap())
+                .unwrap()
+                .checked_add(a.retained_output_floor().unwrap())
+                .unwrap();
+            assert!(namespace_floor > SOURCE);
+            // Keep the original small node's conservative source envelope and
+            // add the separately owned namespace outputs exactly once. This is
+            // a fixture invoice, not a measured backing or allocation grant.
+            let source = namespace_floor.checked_add(SOURCE).unwrap();
+            let decode = |l| {
+                let mut w = CompileCheckpoints::try_new(&c, CompilePhase::Decode)?;
+                let mut parent = |_: &NodeProjectionFacts| Ok(());
+                let result = (|| {
+                    let token = prepare_aggregate_node_decode_in(
+                        &raw,
+                        d,
+                        a,
+                        source,
+                        l,
+                        &mut parent,
+                        &mut w,
+                    )?;
+                    token.emit_in(&mut parent, &mut w)
+                })();
+                finish(w, result)
+            };
+            c.arm(None);
+            let (owned, facts) = decode(limits()).unwrap();
+            let actual = &physical(&owned).unwrap().1[0].binding;
+            assert_eq!(
+                actual.function.argument_types,
+                physical(&n).unwrap().1[0].binding.function.argument_types
+            );
+            assert_eq!(actual.phase, physical(&n).unwrap().1[0].binding.phase);
+            let trace = c.trace();
+            if !lambda {
+                assert!(trace.iter().any(|(_, u)| *u == 256));
+            }
+            let mut samples = vec![0, trace.len() - 1];
+            if let Some(at) = trace.iter().position(|(_, u)| *u == 256) {
+                samples.push(at);
+            }
+            for at in samples {
+                for cause in CAUSES {
+                    c.arm(Some((at, cause)));
+                    assert!(
+                        matches!(decode(limits()),Err(Error::Control(actual)) if actual==cause)
+                    );
+                    assert_eq!(c.trace(), trace[..=at]);
+                }
+            }
+            c.disarm();
+            let (_, replay) = decode(exact(limits(), facts)).unwrap();
+            assert_eq!(replay, facts);
+        });
+    }
+}

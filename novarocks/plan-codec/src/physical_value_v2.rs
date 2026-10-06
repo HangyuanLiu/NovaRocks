@@ -544,12 +544,8 @@ impl<'loan, 'source, 'control> EncodedValues<'loan, 'source, 'control> {
         let result = self.retained_floor_observed(&mut w);
         finish(result, w)
     }
-    pub(crate) fn retained_floor_observed(
-        &self,
-        w: &mut CompileCheckpoints<'_>,
-    ) -> Result<usize, Error> {
-        same_control(self.original_control(), w)?;
-        let known = add(
+    fn retained_floor_header(&self) -> Result<usize, Error> {
+        add(
             self.original_source_bytes,
             add(
                 size_of::<Self>(),
@@ -558,7 +554,18 @@ impl<'loan, 'source, 'control> EncodedValues<'loan, 'source, 'control> {
                     bytes::<wire::ValueDefinition>(self.wire.capacity())?,
                 )?,
             )?,
-        )?;
+        )
+    }
+    pub(crate) fn retained_floor_header_admitted(&self) -> Result<usize, CompileControlError> {
+        self.retained_floor_header()
+            .map_err(|_| CompileControlError::ResourceExhausted)
+    }
+    pub(crate) fn retained_floor_observed(
+        &self,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<usize, Error> {
+        same_control(self.original_control(), w)?;
+        let known = self.retained_floor_header()?;
         w.step()?;
         // All origin DTO variants are inline; they own no string/Vec payload.
         Ok(known)

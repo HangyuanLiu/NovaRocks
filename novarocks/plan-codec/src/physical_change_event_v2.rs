@@ -111,12 +111,41 @@ fn prepare_encode(
     values: &EncodedValues<'_, '_, '_>,
     expressions: &EncodedExpressions<'_, '_, '_>,
     source: usize,
-    limits: ChangeEventNodeProjectionLimits,
-    work: &mut CompileCheckpoints<'_>,
+    l: ChangeEventNodeProjectionLimits,
+    w: &mut CompileCheckpoints<'_>,
+    mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<ChangeEventNodeProjectionFacts, Error> {
+    let namespace_floor = if parent.is_some() {
+        values
+            .retained_floor_header()?
+            .max(expressions.retained_floor_header_in()?)
+    } else {
+        0
+    };
+    // Synchronous snapshots borrow the sole containing-node numerical author.
+    // They replace this contribution; they do not create a meter or another B.
+    let gate = |model: &Model,
+                known: usize,
+                parent: &mut Option<&mut NodeAdmit<'_>>|
+     -> Result<(), Error> {
+        if let Some(admit) = parent.as_deref_mut() {
+            model.admit_in(source, values.count(), l, admit)?;
+            if source < known.max(namespace_floor) {
+                return Err(invalid("Repeat source invoice omits original backing"));
+            }
+        }
+        Ok(())
+    };
+
     let same = std::ptr::eq(values.types(), expressions.types())
-        && std::ptr::eq(values.original_control(), expressions.original_control());
-    work.step()?;
+        && if parent.is_some() {
+            std::ptr::addr_eq(values.original_control(), expressions.original_control())
+        } else {
+            std::ptr::eq(values.original_control(), expressions.original_control())
+        };
+    if parent.is_none() {
+        w.step()?;
+    }
     if !same {
         return Err(invalid(
             "change-event namespaces differ in original type table or control",
@@ -136,9 +165,12 @@ fn prepare_encode(
         refs: add(input.output.columns.len(), 1)?,
         ..Model::default()
     };
-    count_prefix(model.inputs, model.items, source, known, limits, work)?;
-    floor(source, values.retained_floor(work)?, work)?;
-    floor(source, expressions.retained_floor_observed(work)?, work)?;
+    if parent.is_none() {
+        gate(&model, known, &mut parent)?;
+        count_prefix(model.inputs, model.items, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+        floor(source, expressions.retained_floor_observed(w)?, w)?;
+    }
     encode_header_requests(input, &mut model)?;
     model.request::<wire::ChangeEvent>(events.len(), 1)?;
     let mut occurrences = 0;
@@ -150,52 +182,83 @@ fn prepare_encode(
             bytes::<(p::ValueId, Option<p::ExprId>)>(event.assignments.len())?,
         )?;
         model.request::<wire::ChangeAssignment>(event.assignments.len(), 1)?;
-        count_prefix(model.inputs, model.items, source, known, limits, work)?;
-        occurrences = add(occurrences, usize::from(event.predicate.is_some()))?;
-        work.step()?;
+        if parent.is_some() {
+            occurrences = add(occurrences, usize::from(event.predicate.is_some()))?;
+            model.delegated_work = mul(occurrences, expressions.lookup_work_upper_bound()?)?;
+        }
+        gate(&model, known, &mut parent)?;
+        count_prefix(model.inputs, model.items, source, known, l, w)?;
+        if parent.is_none() {
+            occurrences = add(occurrences, usize::from(event.predicate.is_some()))?;
+        }
+        gate(&model, known, &mut parent)?;
+        w.step()?;
         for (_, expression) in &event.assignments {
             occurrences = add(occurrences, usize::from(expression.is_some()))?;
-            work.step()?;
+            if parent.is_some() {
+                model.delegated_work = mul(occurrences, expressions.lookup_work_upper_bound()?)?;
+            }
+            gate(&model, known, &mut parent)?;
+            w.step()?;
         }
     }
     model.delegated_work = mul(occurrences, expressions.lookup_work_upper_bound()?)?;
+    if parent.is_some() {
+        gate(&model, known, &mut parent)?;
+        count_prefix(model.inputs, model.items, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+        floor(source, expressions.retained_floor_observed(w)?, w)?;
+    }
     for property in input
         .required_inputs
         .iter()
         .chain(std::iter::once(&input.output_properties))
     {
-        model.property(properties::preflight_encode_observed(
-            property,
-            source,
-            limits.properties,
-            work,
-        )?)?;
-        work.step()?;
+        if parent.is_some() {
+            let pf = properties::properties_encode_numerical_facts_in(property, source)?;
+            properties::check_properties_numerical_facts(pf, l.properties)?;
+            model.property(pf)?;
+            gate(&model, known, &mut parent)?;
+            properties::preflight_encode_observed(property, source, l.properties, w)?;
+        } else {
+            model.property(properties::preflight_encode_observed(
+                property,
+                source,
+                l.properties,
+                w,
+            )?)?;
+        }
+        gate(&model, known, &mut parent)?;
+        w.step()?;
     }
-    let facts = model.facts(source, values.count(), limits, work)?;
+    let facts = if let Some(admit) = parent {
+        model.facts_in(source, values.count(), l, admit, w)?
+    } else {
+        model.facts(source, values.count(), l, w)?
+    };
     for id in &input.output.columns {
-        reference(id.get(), values, work)?;
+        reference(id.get(), values, w)?;
     }
-    reference(effect_output.get(), values, work)?;
+    reference(effect_output.get(), values, w)?;
     for event in events {
         if let Some(predicate) = event.predicate {
-            expression_encode(predicate, expressions, work)?;
+            expression_encode(predicate, expressions, w)?;
         }
         for (output, expression) in &event.assignments {
-            reference(output.get(), values, work)?;
+            reference(output.get(), values, w)?;
             if let Some(expression) = expression {
-                expression_encode(*expression, expressions, work)?;
+                expression_encode(*expression, expressions, w)?;
             }
-            work.step()?;
+            w.step()?;
         }
-        work.step()?;
+        w.step()?;
     }
     for property in input
         .required_inputs
         .iter()
         .chain(std::iter::once(&input.output_properties))
     {
-        physical_property_refs(property, values, work)?;
+        physical_property_refs(property, values, w)?;
     }
     Ok(facts)
 }
@@ -203,16 +266,44 @@ fn prepare_decode(
     input: &wire::PhysicalNode,
     expressions: &DecodedExpressions<'_, '_, '_>,
     source: usize,
-    limits: ChangeEventNodeProjectionLimits,
-    work: &mut CompileCheckpoints<'_>,
+    l: ChangeEventNodeProjectionLimits,
+    w: &mut CompileCheckpoints<'_>,
+    mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<ChangeEventNodeProjectionFacts, Error> {
     let values = expressions.values();
+    let namespace_floor = if parent.is_some() {
+        values
+            .retained_floor_header()?
+            .max(expressions.retained_floor_header_in()?)
+    } else {
+        0
+    };
+    // Synchronous snapshots borrow the sole containing-node numerical author.
+    // They replace this contribution; they do not create a meter or another B.
+    let gate = |model: &Model,
+                known: usize,
+                parent: &mut Option<&mut NodeAdmit<'_>>|
+     -> Result<(), Error> {
+        if let Some(admit) = parent.as_deref_mut() {
+            model.admit_in(source, values.count(), l, admit)?;
+            if source < known.max(namespace_floor) {
+                return Err(invalid("Repeat source invoice omits original backing"));
+            }
+        }
+        Ok(())
+    };
+
     let payload = wire_payload(input)?;
     let port = input
         .output
         .as_ref()
         .ok_or_else(|| invalid("change-event output port is absent"))?;
-    required(port.node_id, work)?;
+    if parent.is_none() {
+        required(port.node_id, w)?;
+    } else {
+        port.node_id
+            .ok_or_else(|| invalid("node output ID is absent"))?;
+    }
     let output_property = input
         .output_properties
         .as_ref()
@@ -230,9 +321,12 @@ fn prepare_decode(
         refs: add(port.value_ids.len(), 1)?,
         ..Model::default()
     };
-    count_prefix(model.inputs, model.items, source, known, limits, work)?;
-    floor(source, values.retained_floor(work)?, work)?;
-    floor(source, expressions.retained_floor_observed(work)?, work)?;
+    if parent.is_none() {
+        gate(&model, known, &mut parent)?;
+        count_prefix(model.inputs, model.items, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+        floor(source, expressions.retained_floor_observed(w)?, w)?;
+    }
     decode_header_requests(input, port, &mut model)?;
     model.request::<p::ChangeEventSpec>(payload.events.len(), 2)?;
     let mut occurrences = 0;
@@ -244,57 +338,84 @@ fn prepare_decode(
             bytes::<wire::ChangeAssignment>(event.assignments.capacity())?,
         )?;
         model.request::<(p::ValueId, Option<p::ExprId>)>(event.assignments.len(), 2)?;
-        count_prefix(model.inputs, model.items, source, known, limits, work)?;
-        occurrences = add(occurrences, usize::from(event.predicate_expr_id.is_some()))?;
-        work.step()?;
+        if parent.is_some() {
+            occurrences = add(occurrences, usize::from(event.predicate_expr_id.is_some()))?;
+            model.delegated_work = mul(occurrences, expressions.lookup_work_upper_bound()?)?;
+        }
+        gate(&model, known, &mut parent)?;
+        count_prefix(model.inputs, model.items, source, known, l, w)?;
+        if parent.is_none() {
+            occurrences = add(occurrences, usize::from(event.predicate_expr_id.is_some()))?;
+        }
+        gate(&model, known, &mut parent)?;
+        w.step()?;
         for assignment in &event.assignments {
             occurrences = add(occurrences, usize::from(assignment.expr_id.is_some()))?;
-            work.step()?;
+            if parent.is_some() {
+                model.delegated_work = mul(occurrences, expressions.lookup_work_upper_bound()?)?;
+            }
+            gate(&model, known, &mut parent)?;
+            w.step()?;
         }
     }
     model.delegated_work = mul(occurrences, expressions.lookup_work_upper_bound()?)?;
+    if parent.is_some() {
+        gate(&model, known, &mut parent)?;
+        count_prefix(model.inputs, model.items, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+        floor(source, expressions.retained_floor_observed(w)?, w)?;
+    }
     for property in input
         .required_inputs
         .iter()
         .chain(std::iter::once(output_property))
     {
-        model.property(properties::preflight_decode_observed(
-            property,
-            source,
-            limits.properties,
-            work,
-        )?)?;
-        work.step()?;
+        if parent.is_some() {
+            let pf = properties::properties_decode_numerical_facts_in(property, source)?;
+            properties::check_properties_numerical_facts(pf, l.properties)?;
+            model.property(pf)?;
+            gate(&model, known, &mut parent)?;
+            properties::preflight_decode_observed(property, source, l.properties, w)?;
+        } else {
+            model.property(properties::preflight_decode_observed(
+                property,
+                source,
+                l.properties,
+                w,
+            )?)?;
+        }
+        gate(&model, known, &mut parent)?;
+        w.step()?;
     }
-    let facts = model.facts(source, values.count(), limits, work)?;
+    let facts = if let Some(admit) = parent {
+        model.facts_in(source, values.count(), l, admit, w)?
+    } else {
+        model.facts(source, values.count(), l, w)?
+    };
     for id in &port.value_ids {
-        reference(*id, values, work)?;
+        reference(*id, values, w)?;
     }
-    reference(
-        required(payload.effect_output_value_id, work)?,
-        values,
-        work,
-    )?;
+    reference(required(payload.effect_output_value_id, w)?, values, w)?;
     for event in &payload.events {
-        decode_mutation_effect(event.effect, work)?;
+        decode_mutation_effect(event.effect, w)?;
         if let Some(predicate) = event.predicate_expr_id {
-            expression_decode(predicate, expressions, work)?;
+            expression_decode(predicate, expressions, w)?;
         }
         for assignment in &event.assignments {
-            reference(required(assignment.value_id, work)?, values, work)?;
+            reference(required(assignment.value_id, w)?, values, w)?;
             if let Some(expression) = assignment.expr_id {
-                expression_decode(expression, expressions, work)?;
+                expression_decode(expression, expressions, w)?;
             }
-            work.step()?;
+            w.step()?;
         }
-        work.step()?;
+        w.step()?;
     }
     for property in input
         .required_inputs
         .iter()
         .chain(std::iter::once(output_property))
     {
-        wire_property_refs(property, values, work)?;
+        wire_property_refs(property, values, w)?;
     }
     Ok(facts)
 }
@@ -407,6 +528,22 @@ impl PreparedChangeEventNodeEncode<'_, '_, '_, '_, '_> {
             .map(|node| (node, self.facts));
         finish(work, result)
     }
+
+    /// Emit the already admitted original body in the containing caller scope.
+    pub fn emit_in(
+        self,
+        admit: &mut NodeAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(wire::PhysicalNode, ChangeEventNodeProjectionFacts), Error> {
+        if !std::ptr::addr_eq(self.values.original_control(), work.control()) {
+            return Err(invalid(
+                "node caller does not borrow the original controller",
+            ));
+        }
+        admit(&self.facts)?;
+        let node = emit_encode(self.input, self.source, self.limits, work)?;
+        Ok((node, self.facts))
+    }
 }
 pub fn prepare_change_event_node_encode<'node, 'namespace, 'loan, 'source, 'control>(
     input: &'node p::PhysicalNode,
@@ -423,6 +560,7 @@ pub fn prepare_change_event_node_encode<'node, 'namespace, 'loan, 'source, 'cont
         source_retained_bytes,
         limits,
         &mut work,
+        None,
     );
     let facts = finish(work, result)?;
     Ok(PreparedChangeEventNodeEncode {
@@ -434,6 +572,40 @@ pub fn prepare_change_event_node_encode<'node, 'namespace, 'loan, 'source, 'cont
         facts,
     })
 }
+/// Caller-owned preparation; no entry, footer, or second namespace author.
+pub fn prepare_change_event_node_encode_in<'node, 'namespace, 'loan, 'source, 'control>(
+    input: &'node p::PhysicalNode,
+    values: &'namespace EncodedValues<'loan, 'source, 'control>,
+    expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
+    source_retained_bytes: usize,
+    limits: ChangeEventNodeProjectionLimits,
+    admit: &mut NodeAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedChangeEventNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    if !std::ptr::addr_eq(values.original_control(), work.control()) {
+        return Err(invalid(
+            "node caller does not borrow the original controller",
+        ));
+    }
+    let facts = prepare_encode(
+        input,
+        values,
+        expressions,
+        source_retained_bytes,
+        limits,
+        work,
+        Some(admit),
+    )?;
+    Ok(PreparedChangeEventNodeEncode {
+        input,
+        values,
+        expressions,
+        source: source_retained_bytes,
+        limits,
+        facts,
+    })
+}
+
 pub struct PreparedChangeEventNodeDecode<'node, 'namespace, 'loan, 'wire, 'control> {
     input: &'node wire::PhysicalNode,
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
@@ -452,6 +624,22 @@ impl PreparedChangeEventNodeDecode<'_, '_, '_, '_, '_> {
             .map(|node| (node, self.facts));
         finish(work, result)
     }
+
+    /// Emit the already admitted original body in the containing caller scope.
+    pub fn emit_in(
+        self,
+        admit: &mut NodeAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(p::PhysicalNode, ChangeEventNodeProjectionFacts), Error> {
+        if !std::ptr::addr_eq(self.expressions.original_control(), work.control()) {
+            return Err(invalid(
+                "node caller does not borrow the original controller",
+            ));
+        }
+        admit(&self.facts)?;
+        let node = emit_decode(self.input, self.source, self.limits, work)?;
+        Ok((node, self.facts))
+    }
 }
 pub fn prepare_change_event_node_decode<'node, 'namespace, 'loan, 'wire, 'control>(
     input: &'node wire::PhysicalNode,
@@ -461,7 +649,14 @@ pub fn prepare_change_event_node_decode<'node, 'namespace, 'loan, 'wire, 'contro
 ) -> Result<PreparedChangeEventNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
     let mut work =
         CompileCheckpoints::try_new(expressions.original_control(), CompilePhase::Decode)?;
-    let result = prepare_decode(input, expressions, source_retained_bytes, limits, &mut work);
+    let result = prepare_decode(
+        input,
+        expressions,
+        source_retained_bytes,
+        limits,
+        &mut work,
+        None,
+    );
     let facts = finish(work, result)?;
     Ok(PreparedChangeEventNodeDecode {
         input,
@@ -471,6 +666,37 @@ pub fn prepare_change_event_node_decode<'node, 'namespace, 'loan, 'wire, 'contro
         facts,
     })
 }
+/// Caller-owned preparation; no entry, footer, or second namespace author.
+pub fn prepare_change_event_node_decode_in<'node, 'namespace, 'loan, 'wire, 'control>(
+    input: &'node wire::PhysicalNode,
+    expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
+    source_retained_bytes: usize,
+    limits: ChangeEventNodeProjectionLimits,
+    admit: &mut NodeAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedChangeEventNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    if !std::ptr::addr_eq(expressions.original_control(), work.control()) {
+        return Err(invalid(
+            "node caller does not borrow the original controller",
+        ));
+    }
+    let facts = prepare_decode(
+        input,
+        expressions,
+        source_retained_bytes,
+        limits,
+        work,
+        Some(admit),
+    )?;
+    Ok(PreparedChangeEventNodeDecode {
+        input,
+        expressions,
+        source: source_retained_bytes,
+        limits,
+        facts,
+    })
+}
+
 pub fn encode_change_event_node(
     input: &p::PhysicalNode,
     values: &EncodedValues<'_, '_, '_>,
@@ -487,6 +713,7 @@ pub fn encode_change_event_node(
             source_retained_bytes,
             limits,
             &mut work,
+            None,
         )?;
         let node = emit_encode(input, source_retained_bytes, limits, &mut work)?;
         Ok((node, facts))
@@ -502,7 +729,14 @@ pub fn decode_change_event_node(
     let mut work =
         CompileCheckpoints::try_new(expressions.original_control(), CompilePhase::Decode)?;
     let result = (|| {
-        let facts = prepare_decode(input, expressions, source_retained_bytes, limits, &mut work)?;
+        let facts = prepare_decode(
+            input,
+            expressions,
+            source_retained_bytes,
+            limits,
+            &mut work,
+            None,
+        )?;
         let node = emit_decode(input, source_retained_bytes, limits, &mut work)?;
         Ok((node, facts))
     })();

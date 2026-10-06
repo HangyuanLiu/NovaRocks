@@ -1474,3 +1474,6 @@ fn relational_empty_payloads_and_optional_predicates_remain_representation_only(
         // SetOp widths/domains and exchange edge/source ValueOrigin agreement.
     });
 }
+
+#[path = "owned_tests.rs"]
+mod owned_tests;

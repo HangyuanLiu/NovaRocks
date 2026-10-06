@@ -42,7 +42,28 @@ fn prepare_encode(
     source: usize,
     l: RepeatNodeProjectionLimits,
     w: &mut CompileCheckpoints<'_>,
+    mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<RepeatNodeProjectionFacts, Error> {
+    let namespace_floor = if parent.is_some() {
+        values.retained_floor_header()?
+    } else {
+        0
+    };
+    // Synchronous snapshots borrow the sole containing-node numerical author.
+    // They replace this contribution; they do not create a meter or another B.
+    let gate = |model: &Model,
+                known: usize,
+                parent: &mut Option<&mut NodeAdmit<'_>>|
+     -> Result<(), Error> {
+        if let Some(admit) = parent.as_deref_mut() {
+            model.admit_in(source, values.count(), l, admit)?;
+            if source < known.max(namespace_floor) {
+                return Err(invalid("Repeat source invoice omits original backing"));
+            }
+        }
+        Ok(())
+    };
+
     let p::NodeKind::Repeat {
         rollup_keys,
         grouping_sets,
@@ -73,9 +94,11 @@ fn prepare_encode(
             )?,
         )?,
     )?;
-    count_prefix(input.inputs.len(), outer, source, known, l, w)?;
-    floor(source, values.retained_floor(w)?, w)?;
-    let mut m = Model {
+    if parent.is_none() {
+        count_prefix(input.inputs.len(), outer, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+    }
+    let mut model = Model {
         inputs: input.inputs.len(),
         items: outer,
         refs: add(
@@ -87,36 +110,62 @@ fn prepare_encode(
         )?,
         ..Model::default()
     };
-    encode_header_requests(input, &mut m)?;
-    m.request::<u32>(rollup_keys.len(), 1)?;
-    m.request::<wire::ValueIds>(grouping_sets.len(), 1)?;
-    m.request::<wire::ValueMapping>(grouping_values.len(), 1)?;
-    m.request::<wire::GroupingOutput>(grouping_outputs.len(), 1)?;
+    encode_header_requests(input, &mut model)?;
+    model.request::<u32>(rollup_keys.len(), 1)?;
+    model.request::<wire::ValueIds>(grouping_sets.len(), 1)?;
+    model.request::<wire::ValueMapping>(grouping_values.len(), 1)?;
+    model.request::<wire::GroupingOutput>(grouping_outputs.len(), 1)?;
     for set in grouping_sets {
-        m.items = add(m.items, set.len())?;
-        m.refs = add(m.refs, set.len())?;
+        model.items = add(model.items, set.len())?;
+        model.refs = add(model.refs, set.len())?;
         known = add(known, bytes::<p::ValueId>(set.len())?)?;
-        m.request::<u32>(set.len(), 1)?;
+        model.request::<u32>(set.len(), 1)?;
+        gate(&model, known, &mut parent)?;
         w.step()?;
     }
     for output in grouping_outputs {
-        m.items = add(m.items, output.arguments.len())?;
-        m.refs = add(m.refs, output.arguments.len())?;
+        model.items = add(model.items, output.arguments.len())?;
+        model.refs = add(model.refs, output.arguments.len())?;
         known = add(known, bytes::<p::ValueId>(output.arguments.len())?)?;
-        m.request::<u32>(output.arguments.len(), 1)?;
+        model.request::<u32>(output.arguments.len(), 1)?;
+        gate(&model, known, &mut parent)?;
         w.step()?;
     }
+    if parent.is_some() {
+        gate(&model, known, &mut parent)?;
+    }
     floor(source, known, w)?;
+    if parent.is_some() {
+        count_prefix(input.inputs.len(), outer, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+    }
     for property in input
         .required_inputs
         .iter()
         .chain(std::iter::once(&input.output_properties))
     {
-        let pf = properties::preflight_encode_observed(property, source, l.properties, w)?;
-        m.property(pf)?;
+        if parent.is_some() {
+            let pf = properties::properties_encode_numerical_facts_in(property, source)?;
+            properties::check_properties_numerical_facts(pf, l.properties)?;
+            model.property(pf)?;
+            gate(&model, known, &mut parent)?;
+            properties::preflight_encode_observed(property, source, l.properties, w)?;
+        } else {
+            model.property(properties::preflight_encode_observed(
+                property,
+                source,
+                l.properties,
+                w,
+            )?)?;
+        }
+        gate(&model, known, &mut parent)?;
         w.step()?;
     }
-    let facts = m.facts(source, values.count(), l, w)?;
+    let facts = if let Some(admit) = parent {
+        model.facts_in(source, values.count(), l, admit, w)?
+    } else {
+        model.facts(source, values.count(), l, w)?
+    };
     for id in &input.output.columns {
         reference(id.get(), values, w)?;
     }
@@ -153,7 +202,28 @@ fn prepare_decode(
     source: usize,
     l: RepeatNodeProjectionLimits,
     w: &mut CompileCheckpoints<'_>,
+    mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<RepeatNodeProjectionFacts, Error> {
+    let namespace_floor = if parent.is_some() {
+        values.retained_floor_header()?
+    } else {
+        0
+    };
+    // Synchronous snapshots borrow the sole containing-node numerical author.
+    // They replace this contribution; they do not create a meter or another B.
+    let gate = |model: &Model,
+                known: usize,
+                parent: &mut Option<&mut NodeAdmit<'_>>|
+     -> Result<(), Error> {
+        if let Some(admit) = parent.as_deref_mut() {
+            model.admit_in(source, values.count(), l, admit)?;
+            if source < known.max(namespace_floor) {
+                return Err(invalid("Repeat source invoice omits original backing"));
+            }
+        }
+        Ok(())
+    };
+
     let Some(wire::physical_node::Kind::Repeat(repeat)) = input.kind.as_ref() else {
         return Err(invalid("wire physical node kind is not Repeat"));
     };
@@ -191,9 +261,11 @@ fn prepare_decode(
             )?,
         )?,
     )?;
-    count_prefix(input.input_node_ids.len(), outer, source, known, l, w)?;
-    floor(source, values.retained_floor(w)?, w)?;
-    let mut m = Model {
+    if parent.is_none() {
+        count_prefix(input.input_node_ids.len(), outer, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+    }
+    let mut model = Model {
         inputs: input.input_node_ids.len(),
         items: outer,
         refs: add(
@@ -208,36 +280,62 @@ fn prepare_decode(
         )?,
         ..Model::default()
     };
-    decode_header_requests(input, port, &mut m)?;
-    m.request::<p::ValueId>(repeat.rollup_key_value_ids.len(), 2)?;
-    m.request::<Box<[p::ValueId]>>(repeat.grouping_sets.len(), 2)?;
-    m.request::<(p::ValueId, p::ValueId)>(repeat.grouping_values.len(), 2)?;
-    m.request::<p::GroupingOutput>(repeat.grouping_outputs.len(), 2)?;
+    decode_header_requests(input, port, &mut model)?;
+    model.request::<p::ValueId>(repeat.rollup_key_value_ids.len(), 2)?;
+    model.request::<Box<[p::ValueId]>>(repeat.grouping_sets.len(), 2)?;
+    model.request::<(p::ValueId, p::ValueId)>(repeat.grouping_values.len(), 2)?;
+    model.request::<p::GroupingOutput>(repeat.grouping_outputs.len(), 2)?;
     for set in &repeat.grouping_sets {
-        m.items = add(m.items, set.value_ids.len())?;
-        m.refs = add(m.refs, set.value_ids.len())?;
+        model.items = add(model.items, set.value_ids.len())?;
+        model.refs = add(model.refs, set.value_ids.len())?;
         known = add(known, bytes::<u32>(set.value_ids.capacity())?)?;
-        m.request::<p::ValueId>(set.value_ids.len(), 2)?;
+        model.request::<p::ValueId>(set.value_ids.len(), 2)?;
+        gate(&model, known, &mut parent)?;
         w.step()?;
     }
     for output in &repeat.grouping_outputs {
-        m.items = add(m.items, output.argument_value_ids.len())?;
-        m.refs = add(m.refs, output.argument_value_ids.len())?;
+        model.items = add(model.items, output.argument_value_ids.len())?;
+        model.refs = add(model.refs, output.argument_value_ids.len())?;
         known = add(known, bytes::<u32>(output.argument_value_ids.capacity())?)?;
-        m.request::<p::ValueId>(output.argument_value_ids.len(), 2)?;
+        model.request::<p::ValueId>(output.argument_value_ids.len(), 2)?;
+        gate(&model, known, &mut parent)?;
         w.step()?;
     }
+    if parent.is_some() {
+        gate(&model, known, &mut parent)?;
+    }
     floor(source, known, w)?;
+    if parent.is_some() {
+        count_prefix(input.input_node_ids.len(), outer, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+    }
     for property in input
         .required_inputs
         .iter()
         .chain(std::iter::once(output_property))
     {
-        let pf = properties::preflight_decode_observed(property, source, l.properties, w)?;
-        m.property(pf)?;
+        if parent.is_some() {
+            let pf = properties::properties_decode_numerical_facts_in(property, source)?;
+            properties::check_properties_numerical_facts(pf, l.properties)?;
+            model.property(pf)?;
+            gate(&model, known, &mut parent)?;
+            properties::preflight_decode_observed(property, source, l.properties, w)?;
+        } else {
+            model.property(properties::preflight_decode_observed(
+                property,
+                source,
+                l.properties,
+                w,
+            )?)?;
+        }
+        gate(&model, known, &mut parent)?;
         w.step()?;
     }
-    let facts = m.facts(source, values.count(), l, w)?;
+    let facts = if let Some(admit) = parent {
+        model.facts_in(source, values.count(), l, admit, w)?
+    } else {
+        model.facts(source, values.count(), l, w)?
+    };
     for id in &port.value_ids {
         reference(*id, values, w)?;
     }
@@ -297,6 +395,22 @@ impl PreparedRepeatNodeEncode<'_, '_, '_, '_, '_> {
             .map(|node| (node, self.facts));
         finish(w, result)
     }
+
+    /// Emit the already admitted original body in the containing caller scope.
+    pub fn emit_in(
+        self,
+        admit: &mut NodeAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(wire::PhysicalNode, RepeatNodeProjectionFacts), Error> {
+        if !std::ptr::addr_eq(self.values.original_control(), work.control()) {
+            return Err(invalid(
+                "node caller does not borrow the original controller",
+            ));
+        }
+        admit(&self.facts)?;
+        let node = emit_encode(self.input, self.source, self.limits, work)?;
+        Ok((node, self.facts))
+    }
 }
 pub fn prepare_repeat_node_encode<'node, 'namespace, 'loan, 'source, 'control>(
     input: &'node p::PhysicalNode,
@@ -305,7 +419,7 @@ pub fn prepare_repeat_node_encode<'node, 'namespace, 'loan, 'source, 'control>(
     limits: RepeatNodeProjectionLimits,
 ) -> Result<PreparedRepeatNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
     let mut w = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
-    let result = prepare_encode(input, values, source_retained_bytes, limits, &mut w);
+    let result = prepare_encode(input, values, source_retained_bytes, limits, &mut w, None);
     let facts = finish(w, result)?;
     Ok(PreparedRepeatNodeEncode {
         input,
@@ -315,6 +429,37 @@ pub fn prepare_repeat_node_encode<'node, 'namespace, 'loan, 'source, 'control>(
         facts,
     })
 }
+/// Caller-owned preparation; no entry, footer, or second namespace author.
+pub fn prepare_repeat_node_encode_in<'node, 'namespace, 'loan, 'source, 'control>(
+    input: &'node p::PhysicalNode,
+    values: &'namespace EncodedValues<'loan, 'source, 'control>,
+    source_retained_bytes: usize,
+    limits: RepeatNodeProjectionLimits,
+    admit: &mut NodeAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedRepeatNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    if !std::ptr::addr_eq(values.original_control(), work.control()) {
+        return Err(invalid(
+            "node caller does not borrow the original controller",
+        ));
+    }
+    let facts = prepare_encode(
+        input,
+        values,
+        source_retained_bytes,
+        limits,
+        work,
+        Some(admit),
+    )?;
+    Ok(PreparedRepeatNodeEncode {
+        input,
+        values,
+        source: source_retained_bytes,
+        limits,
+        facts,
+    })
+}
+
 /// Sealed preparation borrowing the exact received node and Value owner.
 pub struct PreparedRepeatNodeDecode<'node, 'namespace, 'loan, 'wire, 'control> {
     input: &'node wire::PhysicalNode,
@@ -334,6 +479,22 @@ impl PreparedRepeatNodeDecode<'_, '_, '_, '_, '_> {
             .map(|node| (node, self.facts));
         finish(w, result)
     }
+
+    /// Emit the already admitted original body in the containing caller scope.
+    pub fn emit_in(
+        self,
+        admit: &mut NodeAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(p::PhysicalNode, RepeatNodeProjectionFacts), Error> {
+        if !std::ptr::addr_eq(self.values.original_control(), work.control()) {
+            return Err(invalid(
+                "node caller does not borrow the original controller",
+            ));
+        }
+        admit(&self.facts)?;
+        let node = emit_decode(self.input, self.source, self.limits, work)?;
+        Ok((node, self.facts))
+    }
 }
 pub fn prepare_repeat_node_decode<'node, 'namespace, 'loan, 'wire, 'control>(
     input: &'node wire::PhysicalNode,
@@ -342,7 +503,7 @@ pub fn prepare_repeat_node_decode<'node, 'namespace, 'loan, 'wire, 'control>(
     limits: RepeatNodeProjectionLimits,
 ) -> Result<PreparedRepeatNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
     let mut w = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Decode)?;
-    let result = prepare_decode(input, values, source_retained_bytes, limits, &mut w);
+    let result = prepare_decode(input, values, source_retained_bytes, limits, &mut w, None);
     let facts = finish(w, result)?;
     Ok(PreparedRepeatNodeDecode {
         input,
@@ -352,6 +513,37 @@ pub fn prepare_repeat_node_decode<'node, 'namespace, 'loan, 'wire, 'control>(
         facts,
     })
 }
+/// Caller-owned preparation; no entry, footer, or second namespace author.
+pub fn prepare_repeat_node_decode_in<'node, 'namespace, 'loan, 'wire, 'control>(
+    input: &'node wire::PhysicalNode,
+    values: &'namespace DecodedValues<'loan, 'wire, 'control>,
+    source_retained_bytes: usize,
+    limits: RepeatNodeProjectionLimits,
+    admit: &mut NodeAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedRepeatNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    if !std::ptr::addr_eq(values.original_control(), work.control()) {
+        return Err(invalid(
+            "node caller does not borrow the original controller",
+        ));
+    }
+    let facts = prepare_decode(
+        input,
+        values,
+        source_retained_bytes,
+        limits,
+        work,
+        Some(admit),
+    )?;
+    Ok(PreparedRepeatNodeDecode {
+        input,
+        values,
+        source: source_retained_bytes,
+        limits,
+        facts,
+    })
+}
+
 /// Single-phase complete projection. Preparation and emission share one meter.
 pub fn encode_repeat_node(
     input: &p::PhysicalNode,
@@ -361,7 +553,7 @@ pub fn encode_repeat_node(
 ) -> Result<(wire::PhysicalNode, RepeatNodeProjectionFacts), Error> {
     let mut w = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let result = (|| {
-        let facts = prepare_encode(input, values, source_retained_bytes, limits, &mut w)?;
+        let facts = prepare_encode(input, values, source_retained_bytes, limits, &mut w, None)?;
         let node = emit_encode(input, source_retained_bytes, limits, &mut w)?;
         Ok((node, facts))
     })();
@@ -376,7 +568,7 @@ pub fn decode_repeat_node(
 ) -> Result<(p::PhysicalNode, RepeatNodeProjectionFacts), Error> {
     let mut w = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Decode)?;
     let result = (|| {
-        let facts = prepare_decode(input, values, source_retained_bytes, limits, &mut w)?;
+        let facts = prepare_decode(input, values, source_retained_bytes, limits, &mut w, None)?;
         let node = emit_decode(input, source_retained_bytes, limits, &mut w)?;
         Ok((node, facts))
     })();

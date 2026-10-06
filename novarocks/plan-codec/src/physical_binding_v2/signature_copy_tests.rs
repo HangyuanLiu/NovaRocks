@@ -599,3 +599,176 @@ fn staged_scalar_counts_admit_all_roots_before_owned_dictionary_walk() {
         model.facts.request_bytes_upper_bound
     );
 }
+
+#[test]
+fn table_signature_parent_port_preserves_full_relation_and_independent_layouts() {
+    use crate::physical_node_v2::{Model as NodeModel, NodeProjectionLimits};
+    use crate::physical_properties_v2::PhysicalPropertyProjectionLimits;
+    let source = table_fixture();
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let mut snapshots = Vec::new();
+    let mut parent = |facts: &crate::physical_node_v2::NodeProjectionFacts| {
+        snapshots.push(*facts);
+        Ok(())
+    };
+    let node_limits = NodeProjectionLimits {
+        max_input_nodes: 8,
+        max_value_references: 4096,
+        max_list_items: 4096,
+        max_allocation_requests: 8192,
+        max_allocation_request_bytes: 4 << 20,
+        max_coexisting_source_and_request_bytes: 8 << 20,
+        max_work: 1 << 30,
+        properties: PhysicalPropertyProjectionLimits {
+            max_value_references: 4096,
+            max_allocation_requests: 8192,
+            max_allocation_request_bytes: 4 << 20,
+            max_coexisting_source_and_request_bytes: 8 << 20,
+            max_work: 1 << 30,
+        },
+    };
+    let base = NodeModel {
+        inputs: 1,
+        refs: 2,
+        items: 4,
+        requests: 1,
+        requested: 9,
+        delegated_work: 37,
+    };
+    let final_facts = {
+        let mut model = MaterializationModel::for_composition(1, 0, 4096, 4096);
+        model
+            .compose_in_node_in(base, 1, node_limits, limits(), &mut parent)
+            .unwrap();
+        preflight_table_signature_copy_counts_in(
+            &source,
+            &mut model,
+            limits(),
+            &mut |_| Ok(()),
+            &mut work,
+        )
+        .unwrap();
+        assert_eq!(model.facts.type_reference_count, 6);
+        assert_eq!(model.facts.allocation_requests_upper_bound, 8);
+        preflight_table_signature_copy_types_in(
+            &source,
+            &mut model,
+            limits(),
+            &mut |_| Ok(()),
+            &mut work,
+        )
+        .unwrap();
+        let request_bytes = 12
+            + 2 * Layout::array::<FunctionArgumentType>(2).unwrap().size()
+            + 4 * Layout::array::<FunctionValueType>(2).unwrap().size()
+            + 4 * Layout::new::<DataType>().size();
+        assert_eq!(model.facts.allocation_requests_upper_bound, 12);
+        assert_eq!(model.facts.request_bytes_upper_bound, request_bytes);
+        let final_facts = model
+            .node_facts(2 * model.facts.cumulative_work_upper_bound, &mut work)
+            .unwrap();
+        assert_eq!(final_facts.allocation_requests_upper_bound, 13);
+        assert_eq!(
+            final_facts.allocation_request_bytes_upper_bound,
+            9 + request_bytes
+        );
+        assert_eq!(final_facts.list_item_count, 10);
+        let copied = copy_table_signature_observed(&source, &mut work).unwrap();
+        assert_eq!(copied, source);
+        work.finish().unwrap();
+        final_facts
+    };
+    assert!(snapshots.iter().all(|p| p.allocation_requests_upper_bound
+        <= final_facts.allocation_requests_upper_bound
+        && p.allocation_request_bytes_upper_bound
+            <= final_facts.allocation_request_bytes_upper_bound
+        && p.cumulative_work_upper_bound <= final_facts.cumulative_work_upper_bound));
+}
+
+#[test]
+fn table_signature_parent_dictionary_known_boxes_precede_pending255_callback() {
+    use crate::physical_node_v2::{Model as NodeModel, NodeProjectionFacts, NodeProjectionLimits};
+    use crate::physical_properties_v2::PhysicalPropertyProjectionLimits;
+    let source = table_fixture();
+    let node_limits = NodeProjectionLimits {
+        max_input_nodes: 8,
+        max_value_references: 4096,
+        max_list_items: 4096,
+        max_allocation_requests: 8192,
+        max_allocation_request_bytes: 4 << 20,
+        max_coexisting_source_and_request_bytes: 8 << 20,
+        max_work: 1 << 30,
+        properties: PhysicalPropertyProjectionLimits {
+            max_value_references: 4096,
+            max_allocation_requests: 8192,
+            max_allocation_request_bytes: 4 << 20,
+            max_coexisting_source_and_request_bytes: 8 << 20,
+            max_work: 1 << 30,
+        },
+    };
+    // Eight requests are the argument/result Vec-to-Box pairs, two identity
+    // strings and the actual Lambda parameter pair. The first Dictionary adds
+    // two DataType boxes through the sole clone preflight, before its flush.
+    let run = |control: &Control, reject: bool| -> Result<usize, BindingCodecError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+        let mut marker = None;
+        let mut parent = |facts: &NodeProjectionFacts| {
+            if facts.allocation_requests_upper_bound > 8 {
+                marker.get_or_insert_with(|| control.trace().len());
+                if reject {
+                    return Err(CompileControlError::ResourceExhausted);
+                }
+            }
+            Ok(())
+        };
+        {
+            let mut model = MaterializationModel::for_composition(1, 0, 4096, 4096);
+            model.compose_in_node_in(
+                NodeModel::default(),
+                1,
+                node_limits,
+                limits(),
+                &mut parent,
+            )?;
+            preflight_table_signature_copy_counts_in(
+                &source,
+                &mut model,
+                limits(),
+                &mut |_| Ok(()),
+                &mut work,
+            )?;
+            work.flush()?;
+            for _ in 0..255 {
+                work.step()?;
+            }
+            let result = preflight_table_signature_copy_types_in(
+                &source,
+                &mut model,
+                limits(),
+                &mut |_| Ok(()),
+                &mut work,
+            );
+            if matches!(result, Err(BindingCodecError::Control(_))) {
+                return result.map(|_| 0);
+            }
+            result?;
+            work.finish()?;
+        }
+        Ok(marker.unwrap())
+    };
+    let success = Control::default();
+    let marker = run(&success, false).unwrap();
+    let trace = success.trace();
+    assert_eq!(trace[marker], 255);
+    for cause in CAUSES {
+        let control = Control::rejecting(marker, cause);
+        assert!(matches!(
+            run(&control, true),
+            Err(BindingCodecError::Control(
+                CompileControlError::ResourceExhausted
+            ))
+        ));
+        assert_eq!(control.trace(), trace[..marker]);
+    }
+}

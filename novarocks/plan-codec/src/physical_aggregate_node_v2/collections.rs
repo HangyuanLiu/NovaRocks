@@ -20,6 +20,32 @@
 
 use super::*;
 
+pub(crate) fn node_gate(
+    model: &Model,
+    source: usize,
+    values: usize,
+    limits: NodeProjectionLimits,
+    admit: &mut Option<&mut NodeAdmit<'_>>,
+) -> Result<AggregateNodeProjectionFacts, Error> {
+    match admit {
+        Some(parent) => model.admit_in(source, values, limits, *parent),
+        None => model.numerical_facts(source, values, limits),
+    }
+}
+pub(crate) fn node_facts(
+    model: &Model,
+    source: usize,
+    values: usize,
+    limits: NodeProjectionLimits,
+    admit: &mut Option<&mut NodeAdmit<'_>>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<AggregateNodeProjectionFacts, Error> {
+    match admit {
+        Some(parent) => model.facts_in(source, values, limits, *parent, w),
+        None => model.facts(source, values, limits, w),
+    }
+}
+
 /// A mutable loan of the containing node's original numerical model. The
 /// caller includes the actual outer collection capacities in `known`, charges
 /// the group/call roots and their lookup work before invoking these ports, and
@@ -62,6 +88,24 @@ impl CollectionProjection<'_> {
         e: &EncodedExpressions<'_, '_, '_>,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
+        self.count_encode_core(calls, e, None, w)
+    }
+    pub(crate) fn count_encode_in(
+        self,
+        calls: &[p::AggregateCall],
+        e: &EncodedExpressions<'_, '_, '_>,
+        admit: &mut NodeAdmit<'_>,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), Error> {
+        self.count_encode_core(calls, e, Some(admit), w)
+    }
+    fn count_encode_core(
+        self,
+        calls: &[p::AggregateCall],
+        e: &EncodedExpressions<'_, '_, '_>,
+        mut admit: Option<&mut NodeAdmit<'_>>,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), Error> {
         let Self {
             model,
             mut known,
@@ -86,7 +130,7 @@ impl CollectionProjection<'_> {
             model.request::<u32>(call.arguments.len(), 1)?;
             model.request::<wire::SortExpression>(call.order_by.len(), 1)?;
             model.delegated_work = add(initial_work, mul(nested_exprs, expression_lookup)?)?;
-            model.numerical_facts(source, value_count, limits)?;
+            node_gate(model, source, value_count, limits, &mut admit)?;
             count_prefix(model.inputs, model.items, source, known, limits, w)?;
             w.step()?;
         }
@@ -96,6 +140,24 @@ impl CollectionProjection<'_> {
         self,
         calls: &[wire::AggregateCall],
         e: &DecodedExpressions<'_, '_, '_>,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), Error> {
+        self.count_decode_core(calls, e, None, w)
+    }
+    pub(crate) fn count_decode_in(
+        self,
+        calls: &[wire::AggregateCall],
+        e: &DecodedExpressions<'_, '_, '_>,
+        admit: &mut NodeAdmit<'_>,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), Error> {
+        self.count_decode_core(calls, e, Some(admit), w)
+    }
+    fn count_decode_core(
+        self,
+        calls: &[wire::AggregateCall],
+        e: &DecodedExpressions<'_, '_, '_>,
+        mut admit: Option<&mut NodeAdmit<'_>>,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
         let Self {
@@ -122,7 +184,7 @@ impl CollectionProjection<'_> {
             model.request::<p::ExprId>(call.argument_expr_ids.len(), 2)?;
             model.request::<p::SortExpr>(call.order_by.len(), 2)?;
             model.delegated_work = add(initial_work, mul(nested_exprs, expression_lookup)?)?;
-            model.numerical_facts(source, value_count, limits)?;
+            node_gate(model, source, value_count, limits, &mut admit)?;
             count_prefix(model.inputs, model.items, source, known, limits, w)?;
             w.step()?;
         }
@@ -139,24 +201,95 @@ pub(crate) fn preflight_collection_binding_copies(
     limits: BindingProjectionLimits,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<AggregateNodeProjectionFacts, Error> {
+    preflight_collection_binding_copies_core(calls, e, a, parent, dependency, limits, None, w)
+}
+pub(crate) fn preflight_collection_binding_copies_in<'parent>(
+    calls: &[wire::AggregateCall],
+    e: &DecodedExpressions<'_, '_, '_>,
+    a: &MaterializedAggregateBindings<'_, '_, '_>,
+    parent: CollectionProjection<'_>,
+    dependency: usize,
+    limits: BindingProjectionLimits,
+    admit: &'parent mut NodeAdmit<'parent>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<AggregateNodeProjectionFacts, Error> {
+    preflight_collection_binding_copies_core(
+        calls,
+        e,
+        a,
+        parent,
+        dependency,
+        limits,
+        Some(admit),
+        w,
+    )
+}
+pub(crate) fn preflight_collection_binding_copies_core<'parent>(
+    calls: &[wire::AggregateCall],
+    e: &DecodedExpressions<'_, '_, '_>,
+    a: &MaterializedAggregateBindings<'_, '_, '_>,
+    parent: CollectionProjection<'_>,
+    dependency: usize,
+    limits: BindingProjectionLimits,
+    admit: Option<&'parent mut NodeAdmit<'parent>>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<AggregateNodeProjectionFacts, Error> {
     let mut child = MaterializationModel::for_composition(
         calls.len(),
         add(e.types().value_types().len(), 1)?,
         parent.source,
         dependency,
     );
-    child.compose_in_node(*parent.model, parent.values, parent.limits, limits)?;
+    let caller_owned = admit.is_some();
+    match admit {
+        Some(admit) => {
+            child.compose_in_node_in(*parent.model, parent.values, parent.limits, limits, admit)?
+        }
+        None => child.compose_in_node(*parent.model, parent.values, parent.limits, limits)?,
+    }
     // Every delegated count/type check gates the same containing node before
     // its next observer. All signatures are counted before any full type walk.
     for call in calls {
-        let source_binding = binding(required(call.aggregate_binding_id, w)?, a, w)?;
-        preflight_aggregate_binding_copy_counts(source_binding, &mut child, limits, w)?;
+        let id = required(call.aggregate_binding_id, w)?;
+        if caller_owned {
+            let found = a.definition_captured(
+                id,
+                &mut |source, w| {
+                    preflight_aggregate_binding_copy_counts_in(
+                        source,
+                        &mut child,
+                        limits,
+                        &mut |_| Ok(()),
+                        w,
+                    )
+                },
+                w,
+            )?;
+            completed(
+                found
+                    .ok_or_else(|| invalid("Aggregate binding is not in original owned namespace")),
+                w,
+            )?;
+        } else {
+            let source_binding = binding(id, a, w)?;
+            preflight_aggregate_binding_copy_counts(source_binding, &mut child, limits, w)?;
+        }
         w.step()?;
     }
     child.node_facts(0, w)?;
     for call in calls {
         let source_binding = binding(required(call.aggregate_binding_id, w)?, a, w)?;
-        preflight_aggregate_binding_copy_types(source_binding, &mut child, limits, w)?;
+        if caller_owned {
+            preflight_aggregate_binding_copy_types_in(
+                source_binding,
+                &mut child,
+                limits,
+                &mut |_| Ok(()),
+                w,
+            )?;
+        } else {
+            preflight_aggregate_binding_copy_types(source_binding, &mut child, limits, w)?;
+        }
         w.step()?;
     }
     let copy_work = mul(2, child.facts.cumulative_work_upper_bound)?;

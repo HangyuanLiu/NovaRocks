@@ -76,18 +76,42 @@ type Error = PhysicalPropertyCodecError;
 fn invalid(text: &'static str) -> Error {
     Error::InvalidShape(text)
 }
-fn add(a: usize, b: usize) -> Result<usize, Error> {
-    a.checked_add(b)
-        .ok_or_else(|| invalid("physical property resource sum overflow"))
+#[derive(Clone, Copy)]
+enum Arithmetic {
+    Plain,
+    Parent,
 }
+impl Arithmetic {
+    fn error(self, text: &'static str) -> Error {
+        match self {
+            Self::Plain => invalid(text),
+            Self::Parent => CompileControlError::ResourceExhausted.into(),
+        }
+    }
+    fn add(self, a: usize, b: usize) -> Result<usize, Error> {
+        a.checked_add(b)
+            .ok_or_else(|| self.error("physical property resource sum overflow"))
+    }
+    fn mul(self, a: usize, b: usize) -> Result<usize, Error> {
+        a.checked_mul(b)
+            .ok_or_else(|| self.error("physical property resource product overflow"))
+    }
+    fn bytes<T>(self, count: usize) -> Result<usize, Error> {
+        Layout::array::<T>(count)
+            .map(|layout| layout.size())
+            .map_err(|_| self.error("physical property allocation layout is unrepresentable"))
+    }
+}
+#[cfg(test)]
+fn add(a: usize, b: usize) -> Result<usize, Error> {
+    Arithmetic::Plain.add(a, b)
+}
+#[cfg(test)]
 fn mul(a: usize, b: usize) -> Result<usize, Error> {
-    a.checked_mul(b)
-        .ok_or_else(|| invalid("physical property resource product overflow"))
+    Arithmetic::Plain.mul(a, b)
 }
 fn bytes<T>(count: usize) -> Result<usize, Error> {
-    Layout::array::<T>(count)
-        .map(|layout| layout.size())
-        .map_err(|_| invalid("physical property allocation layout is unrepresentable"))
+    Arithmetic::Plain.bytes::<T>(count)
 }
 fn floor(source: usize, known: usize) -> Result<(), Error> {
     if source < known {
@@ -107,11 +131,12 @@ fn cap(value: usize, limit: usize, work: &mut CompileCheckpoints<'_>) -> Result<
         Err(invalid("physical property projection envelope exceeded"))
     }
 }
-fn numerical_facts(
+fn numerical_facts_core(
     references: usize,
     requests: usize,
     requested_bytes: usize,
     source: usize,
+    arithmetic: Arithmetic,
 ) -> Result<PhysicalPropertyProjectionFacts, Error> {
     // All own passes inspect only fixed-size keys/ordering/identity values.
     // This includes numerical gates, constructors, copies and conversion
@@ -121,40 +146,58 @@ fn numerical_facts(
         value_reference_count: references,
         allocation_requests_upper_bound: requests,
         allocation_request_bytes_upper_bound: requested_bytes,
-        coexisting_source_and_request_bytes_upper_bound: add(source, requested_bytes)?,
-        cumulative_work_upper_bound: add(
+        coexisting_source_and_request_bytes_upper_bound: arithmetic.add(source, requested_bytes)?,
+        cumulative_work_upper_bound: arithmetic.add(
             128,
-            add(mul(references, 32)?, mul(requested_bytes, 4)?)?,
+            arithmetic.add(
+                arithmetic.mul(references, 32)?,
+                arithmetic.mul(requested_bytes, 4)?,
+            )?,
         )?,
     };
     Ok(result)
+}
+fn fact_axes(
+    result: PhysicalPropertyProjectionFacts,
+    limits: PhysicalPropertyProjectionLimits,
+) -> [(usize, usize); 5] {
+    [
+        (result.value_reference_count, limits.max_value_references),
+        (
+            result.allocation_requests_upper_bound,
+            limits.max_allocation_requests,
+        ),
+        (
+            result.allocation_request_bytes_upper_bound,
+            limits.max_allocation_request_bytes,
+        ),
+        (
+            result.coexisting_source_and_request_bytes_upper_bound,
+            limits.max_coexisting_source_and_request_bytes,
+        ),
+        (result.cumulative_work_upper_bound, limits.max_work),
+    ]
+}
+/// Admit every known property axis before a containing node observes work.
+pub(crate) fn check_properties_numerical_facts(
+    result: PhysicalPropertyProjectionFacts,
+    limits: PhysicalPropertyProjectionLimits,
+) -> Result<(), Error> {
+    for (actual, maximum) in fact_axes(result, limits) {
+        if actual > maximum {
+            return Err(CompileControlError::ResourceExhausted.into());
+        }
+    }
+    Ok(())
 }
 fn admit_facts(
     result: PhysicalPropertyProjectionFacts,
     limits: PhysicalPropertyProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PhysicalPropertyProjectionFacts, Error> {
-    cap(
-        result.value_reference_count,
-        limits.max_value_references,
-        work,
-    )?;
-    cap(
-        result.allocation_requests_upper_bound,
-        limits.max_allocation_requests,
-        work,
-    )?;
-    cap(
-        result.allocation_request_bytes_upper_bound,
-        limits.max_allocation_request_bytes,
-        work,
-    )?;
-    cap(
-        result.coexisting_source_and_request_bytes_upper_bound,
-        limits.max_coexisting_source_and_request_bytes,
-        work,
-    )?;
-    cap(result.cumulative_work_upper_bound, limits.max_work, work)?;
+    for (actual, maximum) in fact_axes(result, limits) {
+        cap(actual, maximum, work)?;
+    }
     Ok(result)
 }
 fn reserve<T>(count: usize, work: &mut CompileCheckpoints<'_>) -> Result<Vec<T>, Error> {
@@ -275,6 +318,19 @@ pub(crate) fn properties_encode_numerical_facts(
     input: &physical::PhysicalProperties,
     source: usize,
 ) -> Result<PhysicalPropertyProjectionFacts, Error> {
+    properties_encode_numerical_facts_core(input, source, Arithmetic::Plain)
+}
+pub(crate) fn properties_encode_numerical_facts_in(
+    input: &physical::PhysicalProperties,
+    source: usize,
+) -> Result<PhysicalPropertyProjectionFacts, Error> {
+    properties_encode_numerical_facts_core(input, source, Arithmetic::Parent)
+}
+fn properties_encode_numerical_facts_core(
+    input: &physical::PhysicalProperties,
+    source: usize,
+    arithmetic: Arithmetic,
+) -> Result<PhysicalPropertyProjectionFacts, Error> {
     let keys = match &input.distribution {
         physical::Distribution::Hash { keys, .. }
         | physical::Distribution::BucketShuffle { keys, .. } => &**keys,
@@ -287,32 +343,32 @@ pub(crate) fn properties_encode_numerical_facts(
         input.distribution,
         physical::Distribution::Hash { .. } | physical::Distribution::BucketShuffle { .. }
     );
-    let references = add(keys.len(), input.ordering.len())?;
+    let references = arithmetic.add(keys.len(), input.ordering.len())?;
     floor(
         source,
-        add(
+        arithmetic.add(
             size_of::<physical::PhysicalProperties>(),
-            add(
-                bytes::<physical::ValueId>(keys.len())?,
-                bytes::<physical::OrderingKey>(input.ordering.len())?,
+            arithmetic.add(
+                arithmetic.bytes::<physical::ValueId>(keys.len())?,
+                arithmetic.bytes::<physical::OrderingKey>(input.ordering.len())?,
             )?,
         )?,
     )?;
-    let requested = add(
-        add(
-            bytes::<u32>(keys.len())?,
-            bytes::<wire::OrderingKey>(input.ordering.len())?,
+    let requested = arithmetic.add(
+        arithmetic.add(
+            arithmetic.bytes::<u32>(keys.len())?,
+            arithmetic.bytes::<wire::OrderingKey>(input.ordering.len())?,
         )?,
         if keyed { 64 } else { 0 },
     )?;
-    let requests = add(
+    let requests = arithmetic.add(
         usize::from(!keys.is_empty()),
-        add(
+        arithmetic.add(
             usize::from(!input.ordering.is_empty()),
             if keyed { 2 } else { 0 },
         )?,
     )?;
-    numerical_facts(references, requests, requested, source)
+    numerical_facts_core(references, requests, requested, source, arithmetic)
 }
 
 /// Emit only after the containing owner has admitted the original request.
@@ -494,6 +550,12 @@ fn decode_header(
 /// Allocation-free resource admission through the sole wire-property grammar.
 /// Exact header/ordering validation still occurs before decoder reservations.
 fn decode_distribution_source(input: &wire::Distribution) -> Result<(&[u32], usize), Error> {
+    decode_distribution_source_core(input, Arithmetic::Plain)
+}
+fn decode_distribution_source_core(
+    input: &wire::Distribution,
+    arithmetic: Arithmetic,
+) -> Result<(&[u32], usize), Error> {
     let kind = input
         .kind
         .as_ref()
@@ -510,9 +572,9 @@ fn decode_distribution_source(input: &wire::Distribution) -> Result<(&[u32], usi
                 .ok_or_else(|| invalid("physical property count parameter is absent"))?;
             (
                 &hash.key_value_ids[..],
-                add(
-                    bytes::<u32>(hash.key_value_ids.capacity())?,
-                    add(scheme.partition_space.capacity(), count.id.capacity())?,
+                arithmetic.add(
+                    arithmetic.bytes::<u32>(hash.key_value_ids.capacity())?,
+                    arithmetic.add(scheme.partition_space.capacity(), count.id.capacity())?,
                 )?,
             )
         }
@@ -527,9 +589,9 @@ fn decode_distribution_source(input: &wire::Distribution) -> Result<(&[u32], usi
                 .ok_or_else(|| invalid("physical property bucket ordinal proof is absent"))?;
             (
                 &bucket.key_value_ids[..],
-                add(
-                    bytes::<u32>(bucket.key_value_ids.capacity())?,
-                    add(
+                arithmetic.add(
+                    arithmetic.bytes::<u32>(bucket.key_value_ids.capacity())?,
+                    arithmetic.add(
                         scheme.partition_space.capacity(),
                         proof.evidence_digest.capacity(),
                     )?,
@@ -545,11 +607,17 @@ fn decode_distribution_source(input: &wire::Distribution) -> Result<(&[u32], usi
 }
 
 fn decode_source(input: &wire::PhysicalProperties) -> Result<(&[u32], usize), Error> {
+    decode_source_core(input, Arithmetic::Plain)
+}
+fn decode_source_core(
+    input: &wire::PhysicalProperties,
+    arithmetic: Arithmetic,
+) -> Result<(&[u32], usize), Error> {
     let distribution = input
         .distribution
         .as_ref()
         .ok_or_else(|| invalid("physical property distribution is absent"))?;
-    decode_distribution_source(distribution)
+    decode_distribution_source_core(distribution, arithmetic)
 }
 
 pub(crate) fn preflight_decode_observed(
@@ -570,38 +638,52 @@ pub(crate) fn properties_decode_numerical_facts(
     input: &wire::PhysicalProperties,
     source: usize,
 ) -> Result<PhysicalPropertyProjectionFacts, Error> {
-    let (keys, extra_source) = decode_source(input)?;
+    properties_decode_numerical_facts_core(input, source, Arithmetic::Plain)
+}
+pub(crate) fn properties_decode_numerical_facts_in(
+    input: &wire::PhysicalProperties,
+    source: usize,
+) -> Result<PhysicalPropertyProjectionFacts, Error> {
+    properties_decode_numerical_facts_core(input, source, Arithmetic::Parent)
+}
+fn properties_decode_numerical_facts_core(
+    input: &wire::PhysicalProperties,
+    source: usize,
+    arithmetic: Arithmetic,
+) -> Result<PhysicalPropertyProjectionFacts, Error> {
+    let (keys, extra_source) = decode_source_core(input, arithmetic)?;
     floor(
         source,
-        add(
+        arithmetic.add(
             size_of::<wire::PhysicalProperties>(),
-            add(
+            arithmetic.add(
                 extra_source,
-                bytes::<wire::OrderingKey>(input.ordering.capacity())?,
+                arithmetic.bytes::<wire::OrderingKey>(input.ordering.capacity())?,
             )?,
         )?,
     )?;
     // Vec-to-Box may shrink to the exact length; admit both requested layouts
     // and their coexistence even when the library actually reuses backing.
-    let requested = mul(
-        add(
-            bytes::<physical::ValueId>(keys.len())?,
-            bytes::<physical::OrderingKey>(input.ordering.len())?,
+    let requested = arithmetic.mul(
+        arithmetic.add(
+            arithmetic.bytes::<physical::ValueId>(keys.len())?,
+            arithmetic.bytes::<physical::OrderingKey>(input.ordering.len())?,
         )?,
         2,
     )?;
-    let requests = mul(
-        add(
+    let requests = arithmetic.mul(
+        arithmetic.add(
             usize::from(!keys.is_empty()),
             usize::from(!input.ordering.is_empty()),
         )?,
         2,
     )?;
-    numerical_facts(
-        add(keys.len(), input.ordering.len())?,
+    numerical_facts_core(
+        arithmetic.add(keys.len(), input.ordering.len())?,
         requests,
         requested,
         source,
+        arithmetic,
     )
 }
 
@@ -758,19 +840,36 @@ pub(crate) fn distribution_encode_numerical_facts(
     input: &physical::Distribution,
     source: usize,
 ) -> Result<PhysicalPropertyProjectionFacts, Error> {
+    distribution_encode_numerical_facts_core(input, source, Arithmetic::Plain)
+}
+pub(crate) fn distribution_encode_numerical_facts_in(
+    input: &physical::Distribution,
+    source: usize,
+) -> Result<PhysicalPropertyProjectionFacts, Error> {
+    distribution_encode_numerical_facts_core(input, source, Arithmetic::Parent)
+}
+fn distribution_encode_numerical_facts_core(
+    input: &physical::Distribution,
+    source: usize,
+    arithmetic: Arithmetic,
+) -> Result<PhysicalPropertyProjectionFacts, Error> {
     let (keys, keyed) = distribution_encode_source(input);
     floor(
         source,
-        add(
+        arithmetic.add(
             size_of::<physical::Distribution>(),
-            bytes::<physical::ValueId>(keys.len())?,
+            arithmetic.bytes::<physical::ValueId>(keys.len())?,
         )?,
     )?;
-    numerical_facts(
+    numerical_facts_core(
         keys.len(),
-        add(usize::from(!keys.is_empty()), if keyed { 2 } else { 0 })?,
-        add(bytes::<u32>(keys.len())?, if keyed { 64 } else { 0 })?,
+        arithmetic.add(usize::from(!keys.is_empty()), if keyed { 2 } else { 0 })?,
+        arithmetic.add(
+            arithmetic.bytes::<u32>(keys.len())?,
+            if keyed { 64 } else { 0 },
+        )?,
         source,
+        arithmetic,
     )
 }
 
@@ -792,13 +891,30 @@ pub(crate) fn distribution_decode_numerical_facts(
     input: &wire::Distribution,
     source: usize,
 ) -> Result<PhysicalPropertyProjectionFacts, Error> {
-    let (keys, extra_source) = decode_distribution_source(input)?;
-    floor(source, add(size_of::<wire::Distribution>(), extra_source)?)?;
-    numerical_facts(
-        keys.len(),
-        mul(usize::from(!keys.is_empty()), 2)?,
-        mul(bytes::<physical::ValueId>(keys.len())?, 2)?,
+    distribution_decode_numerical_facts_core(input, source, Arithmetic::Plain)
+}
+pub(crate) fn distribution_decode_numerical_facts_in(
+    input: &wire::Distribution,
+    source: usize,
+) -> Result<PhysicalPropertyProjectionFacts, Error> {
+    distribution_decode_numerical_facts_core(input, source, Arithmetic::Parent)
+}
+fn distribution_decode_numerical_facts_core(
+    input: &wire::Distribution,
+    source: usize,
+    arithmetic: Arithmetic,
+) -> Result<PhysicalPropertyProjectionFacts, Error> {
+    let (keys, extra_source) = decode_distribution_source_core(input, arithmetic)?;
+    floor(
         source,
+        arithmetic.add(size_of::<wire::Distribution>(), extra_source)?,
+    )?;
+    numerical_facts_core(
+        keys.len(),
+        arithmetic.mul(usize::from(!keys.is_empty()), 2)?,
+        arithmetic.mul(arithmetic.bytes::<physical::ValueId>(keys.len())?, 2)?,
+        source,
+        arithmetic,
     )
 }
 

@@ -1206,3 +1206,281 @@ fn topn_wide_actual_sort_and_nested_lists_observe_quantum_and_numeric_first_refu
         });
     }
 }
+
+// The caller owns one original scope, including success/ordinary footer.
+fn caller_topn_encode(
+    n: &p::PhysicalNode,
+    v: &EncodedValues<'_, '_, '_>,
+    e: &EncodedExpressions<'_, '_, '_>,
+    l: TopNNodeProjectionLimits,
+    c: &Control,
+    parent: &mut NodeAdmit<'_>,
+) -> Result<(wire::PhysicalNode, TopNNodeProjectionFacts), Error> {
+    let mut w = CompileCheckpoints::try_new(c, CompilePhase::Encode)?;
+    let result = (|| {
+        let token = prepare_topn_node_encode_in(n, v, e, SOURCE, l, parent, &mut w)?;
+        token.emit_in(parent, &mut w)
+    })();
+    finish(w, result)
+}
+fn caller_topn_decode(
+    raw: &wire::PhysicalNode,
+    d: &DecodedExpressions<'_, '_, '_>,
+    a: &MaterializedAggregateBindings<'_, '_, '_>,
+    l: TopNNodeProjectionLimits,
+    c: &Control,
+    parent: &mut NodeAdmit<'_>,
+) -> Result<(p::PhysicalNode, TopNNodeProjectionFacts), Error> {
+    let mut w = CompileCheckpoints::try_new(c, CompilePhase::Decode)?;
+    let result = (|| {
+        let token = prepare_topn_node_decode_in(raw, d, a, SOURCE, l, parent, &mut w)?;
+        token.emit_in(parent, &mut w)
+    })();
+    finish(w, result)
+}
+fn caller_topn_axes(f: TopNNodeProjectionFacts) -> [usize; 7] {
+    [
+        f.input_node_count,
+        f.value_reference_count,
+        f.list_item_count,
+        f.allocation_requests_upper_bound,
+        f.allocation_request_bytes_upper_bound,
+        f.coexisting_source_and_request_bytes_upper_bound,
+        f.cumulative_work_upper_bound,
+    ]
+}
+#[test]
+fn topn_caller_owned_complete_loans_preserve_wire_and_seal_every_prefix() {
+    let n = node();
+    let c = Control::default();
+    Fixture::new().with(&n, &c, |v, e, d, a| {
+        let mut sent = Vec::new();
+        let (wire, sf) = caller_topn_encode(&n, v, e, limits(), &c, &mut |f| {
+            sent.push(*f);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(wire, expected());
+        let mut received = Vec::new();
+        let (owned, rf) = caller_topn_decode(&wire, d, a, limits(), &c, &mut |f| {
+            received.push(*f);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(owned, n);
+        for (prefixes, final_facts) in [(&sent, sf), (&received, rf)] {
+            assert!(!prefixes.is_empty());
+            for prefix in prefixes {
+                assert!(
+                    caller_topn_axes(*prefix)
+                        .into_iter()
+                        .zip(caller_topn_axes(final_facts))
+                        .all(|(p, f)| p <= f)
+                );
+            }
+        }
+        for receive in [false, true] {
+            let bound = if receive { rf } else { sf };
+            let mut exact = limits();
+            exact.node.max_input_nodes = bound.input_node_count;
+            exact.node.max_value_references = bound.value_reference_count;
+            exact.node.max_list_items = bound.list_item_count;
+            exact.node.max_allocation_requests = bound.allocation_requests_upper_bound;
+            exact.node.max_allocation_request_bytes = bound.allocation_request_bytes_upper_bound;
+            exact.node.max_coexisting_source_and_request_bytes =
+                bound.coexisting_source_and_request_bytes_upper_bound;
+            exact.node.max_work = bound.cumulative_work_upper_bound;
+            let actual = if receive {
+                caller_topn_decode(&wire, d, a, exact, &c, &mut |_| Ok(())).map(|r| r.1)
+            } else {
+                caller_topn_encode(&n, v, e, exact, &c, &mut |_| Ok(())).map(|r| r.1)
+            };
+            assert_eq!(actual.unwrap(), bound);
+        }
+    });
+}
+#[test]
+fn topn_caller_owned_actual_success_ordinary_and_foreign_control_prefixes() {
+    let n = node();
+    let c = Control::default();
+    Fixture::new().with(&n, &c, |v, e, d, a| {
+        prefixes(&c, || {
+            caller_topn_encode(&n, v, e, limits(), &c, &mut |_| Ok(())).map(|_| ())
+        });
+        let raw = expected();
+        prefixes(&c, || {
+            caller_topn_decode(&raw, d, a, limits(), &c, &mut |_| Ok(())).map(|_| ())
+        });
+        let mut bad = raw.clone();
+        match body(&mut bad)
+            .reduction
+            .as_mut()
+            .unwrap()
+            .kind
+            .as_mut()
+            .unwrap()
+        {
+            wire::top_n_reduction::Kind::GroupedStates(g) => g.calls[0].aggregate_binding_id = None,
+            _ => panic!("fixture is GroupedStates"),
+        }
+        prefixes(&c, || {
+            caller_topn_decode(&bad, d, a, limits(), &c, &mut |_| Ok(())).map(|_| ())
+        });
+        let foreign = Control::default();
+        let mut calls = 0;
+        let result = caller_topn_encode(&n, v, e, limits(), &foreign, &mut |_| {
+            calls += 1;
+            Ok(())
+        });
+        assert!(matches!(result, Err(Error::InvalidShape(_))));
+        assert_eq!(calls, 0);
+        assert!(matches!(
+            caller_topn_encode(&n.clone(), v, e, limits(), &c, &mut |_| Ok(())),
+            Err(Error::Binding(_))
+        ));
+    });
+}
+#[test]
+fn topn_caller_owned_known_root_requests_win_at_pending255() {
+    let n = node();
+    let c = Control::default();
+    Fixture::new().with(&n, &c, |v, e, d, a| {
+        let raw = expected();
+        for receive in [false, true] {
+            for cause in CAUSES {
+                c.arm(Some((1, cause)));
+                let phase = if receive {
+                    CompilePhase::Decode
+                } else {
+                    CompilePhase::Encode
+                };
+                let mut w = CompileCheckpoints::try_new(&c, phase).unwrap();
+                for _ in 0..255 {
+                    w.step().unwrap();
+                }
+                let mut parent = |f: &NodeProjectionFacts| {
+                    if f.allocation_requests_upper_bound > 0 {
+                        Err(CompileControlError::ResourceExhausted)
+                    } else {
+                        Ok(())
+                    }
+                };
+                let result = if receive {
+                    prepare_topn_node_decode_in(&raw, d, a, SOURCE, limits(), &mut parent, &mut w)
+                        .map(|_| ())
+                } else {
+                    prepare_topn_node_encode_in(&n, v, e, SOURCE, limits(), &mut parent, &mut w)
+                        .map(|_| ())
+                };
+                assert!(matches!(
+                    result,
+                    Err(Error::Control(CompileControlError::ResourceExhausted))
+                ));
+                assert_eq!(c.trace(), [(phase, 0)]);
+            }
+        }
+        c.disarm();
+    });
+}
+
+#[test]
+fn topn_caller_parent_seven_axes_known_refusal_precedes_late_control() {
+    let n = node();
+    let c = Control::default();
+    Fixture::new().with(&n, &c, |v, e, d, a| {
+        let raw = expected();
+        for receive in [false, true] {
+            c.arm(None);
+            let mut prefixes = Vec::new();
+            let mut collect = |f: &NodeProjectionFacts| {
+                prefixes.push((*f, c.trace().len()));
+                Ok(())
+            };
+            let facts = if receive {
+                caller_topn_decode(&raw, d, a, limits(), &c, &mut collect)
+                    .unwrap()
+                    .1
+            } else {
+                caller_topn_encode(&n, v, e, limits(), &c, &mut collect)
+                    .unwrap()
+                    .1
+            };
+            let trace = c.trace();
+            for axis in 0..7 {
+                let bound = caller_topn_axes(facts)[axis];
+                assert!(bound > 0);
+                let marker = prefixes
+                    .iter()
+                    .find(|(f, _)| caller_topn_axes(*f)[axis] > bound - 1)
+                    .unwrap()
+                    .1;
+                for cause in CAUSES {
+                    c.arm(Some((marker, cause)));
+                    let mut parent = |f: &NodeProjectionFacts| {
+                        if caller_topn_axes(*f)[axis] > bound - 1 {
+                            Err(CompileControlError::ResourceExhausted)
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    let result = if receive {
+                        caller_topn_decode(&raw, d, a, limits(), &c, &mut parent).map(|_| ())
+                    } else {
+                        caller_topn_encode(&n, v, e, limits(), &c, &mut parent).map(|_| ())
+                    };
+                    assert!(matches!(
+                        result,
+                        Err(Error::Control(CompileControlError::ResourceExhausted))
+                    ));
+                    assert_eq!(c.trace(), trace[..marker]);
+                }
+            }
+        }
+        c.disarm();
+    });
+}
+
+#[test]
+fn topn_caller_owned_actual320_ordered_rows_and_grouped_paths_share_same_parent() {
+    for grouped_mode in [false, true] {
+        let mut n = if grouped_mode { node() } else { rows() };
+        if let p::NodeKind::TopN { order_by, .. } = &mut n.kind {
+            *order_by = vec![keys()[0]; 320].into_boxed_slice();
+        }
+        if grouped_mode {
+            calls(&mut n)[0].arguments = vec![p::ExprId::new(0); 320].into_boxed_slice();
+        }
+        let c = Control::default();
+        Fixture::new().with(&n, &c, |v, e, d, a| {
+            c.arm(None);
+            let (wire, _) = caller_topn_encode(&n, v, e, limits(), &c, &mut |_| Ok(())).unwrap();
+            assert_eq!(raw(&wire).unwrap().order_by, vec![expected_keys()[0]; 320]);
+            let sent = c.trace();
+            assert!(sent.iter().any(|(_, u)| *u == 256));
+            c.arm(None);
+            let (owned, _) =
+                caller_topn_decode(&wire, d, a, limits(), &c, &mut |_| Ok(())).unwrap();
+            assert_eq!(owned, n);
+            let received = c.trace();
+            assert!(received.iter().any(|(_, u)| *u == 256));
+            for receive in [false, true] {
+                let trace = if receive { &received } else { &sent };
+                let at = trace.iter().position(|(_, u)| *u == 256).unwrap();
+                for stop in [0, at, trace.len() - 1] {
+                    for cause in CAUSES {
+                        c.arm(Some((stop, cause)));
+                        let result = if receive {
+                            caller_topn_decode(&wire, d, a, limits(), &c, &mut |_| Ok(()))
+                                .map(|_| ())
+                        } else {
+                            caller_topn_encode(&n, v, e, limits(), &c, &mut |_| Ok(())).map(|_| ())
+                        };
+                        assert!(matches!(result,Err(Error::Control(actual)) if actual==cause));
+                        assert_eq!(c.trace(), trace[..=stop]);
+                    }
+                }
+            }
+            c.disarm();
+        });
+    }
+}

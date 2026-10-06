@@ -50,7 +50,8 @@ pub(crate) use signature_copy::{
     preflight_scalar_signature_copy_counts, preflight_scalar_signature_copy_counts_in,
     preflight_scalar_signature_copy_in, preflight_scalar_signature_copy_types,
     preflight_scalar_signature_copy_types_in, preflight_table_signature_copy_counts,
-    preflight_table_signature_copy_types,
+    preflight_table_signature_copy_counts_in, preflight_table_signature_copy_types,
+    preflight_table_signature_copy_types_in,
 };
 
 #[derive(Debug)]

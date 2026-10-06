@@ -105,7 +105,10 @@ pub(crate) fn encode_join_side(input: p::JoinSide) -> i32 {
         p::JoinSide::Right => wire::JoinSide::Right as i32,
     }
 }
-pub(crate) fn decode_join_side(input: i32, w: &mut CompileCheckpoints<'_>) -> Result<p::JoinSide, Error> {
+pub(crate) fn decode_join_side(
+    input: i32,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<p::JoinSide, Error> {
     let result = match wire::JoinSide::try_from(input) {
         Ok(wire::JoinSide::Left) => Ok(p::JoinSide::Left),
         Ok(wire::JoinSide::Right) => Ok(p::JoinSide::Right),
@@ -332,10 +335,39 @@ fn prepare_encode(
     source: usize,
     l: RelationalNodeProjectionLimits,
     w: &mut CompileCheckpoints<'_>,
+    mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<RelationalNodeProjectionFacts, Error> {
+    let namespace_floor = if parent.is_some() {
+        values
+            .retained_floor_header()?
+            .max(expressions.retained_floor_header_in()?)
+    } else {
+        0
+    };
+    // Synchronous snapshots borrow the sole containing-node numerical author.
+    // They replace this contribution; they do not create a meter or another B.
+    let gate = |model: &Model,
+                known: usize,
+                parent: &mut Option<&mut NodeAdmit<'_>>|
+     -> Result<(), Error> {
+        if let Some(admit) = parent.as_deref_mut() {
+            model.admit_in(source, values.count(), l, admit)?;
+            if source < known.max(namespace_floor) {
+                return Err(invalid("Repeat source invoice omits original backing"));
+            }
+        }
+        Ok(())
+    };
+
     let same = std::ptr::eq(values.types(), expressions.types())
-        && std::ptr::eq(values.original_control(), expressions.original_control());
-    w.step()?;
+        && if parent.is_some() {
+            std::ptr::addr_eq(values.original_control(), expressions.original_control())
+        } else {
+            std::ptr::eq(values.original_control(), expressions.original_control())
+        };
+    if parent.is_none() {
+        w.step()?;
+    }
     if !same {
         return Err(invalid(
             "relational namespaces differ in original type table or control",
@@ -347,9 +379,11 @@ fn prepare_encode(
         add(input.required_inputs.len(), input.output.columns.len())?,
     )?;
     let mut known = add(physical_header_floor(input)?, backing)?;
-    count_prefix(input.inputs.len(), items, source, known, l, w)?;
-    floor(source, values.retained_floor(w)?, w)?;
-    floor(source, expressions.retained_floor_observed(w)?, w)?;
+    if parent.is_none() {
+        count_prefix(input.inputs.len(), items, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+        floor(source, expressions.retained_floor_observed(w)?, w)?;
+    }
     let mut model = Model {
         inputs: input.inputs.len(),
         items,
@@ -401,7 +435,9 @@ fn prepare_encode(
                 model.refs = add(model.refs, row.len())?;
                 known = add(known, bytes::<p::ValueId>(row.len())?)?;
                 model.request::<u32>(row.len(), 1)?;
+                gate(&model, known, &mut parent)?;
                 count_prefix(model.inputs, model.items, source, known, l, w)?;
+                gate(&model, known, &mut parent)?;
                 w.step()?;
             }
             0
@@ -421,20 +457,39 @@ fn prepare_encode(
         model.delegated_work,
         mul(occurrences, expressions.lookup_work_upper_bound()?)?,
     )?;
+    if parent.is_some() {
+        gate(&model, known, &mut parent)?;
+        count_prefix(input.inputs.len(), items, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+        floor(source, expressions.retained_floor_observed(w)?, w)?;
+    }
     for property in input
         .required_inputs
         .iter()
         .chain(std::iter::once(&input.output_properties))
     {
-        model.property(properties::preflight_encode_observed(
-            property,
-            source,
-            l.properties,
-            w,
-        )?)?;
+        if parent.is_some() {
+            let pf = properties::properties_encode_numerical_facts_in(property, source)?;
+            properties::check_properties_numerical_facts(pf, l.properties)?;
+            model.property(pf)?;
+            gate(&model, known, &mut parent)?;
+            properties::preflight_encode_observed(property, source, l.properties, w)?;
+        } else {
+            model.property(properties::preflight_encode_observed(
+                property,
+                source,
+                l.properties,
+                w,
+            )?)?;
+        }
+        gate(&model, known, &mut parent)?;
         w.step()?;
     }
-    let facts = model.facts(source, values.count(), l, w)?;
+    let facts = if let Some(admit) = parent {
+        model.facts_in(source, values.count(), l, admit, w)?
+    } else {
+        model.facts(source, values.count(), l, w)?
+    };
     for id in &input.output.columns {
         reference(id.get(), values, w)?;
     }
@@ -525,14 +580,42 @@ fn prepare_decode(
     source: usize,
     l: RelationalNodeProjectionLimits,
     w: &mut CompileCheckpoints<'_>,
+    mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<RelationalNodeProjectionFacts, Error> {
     let values = expressions.values();
+    let namespace_floor = if parent.is_some() {
+        values
+            .retained_floor_header()?
+            .max(expressions.retained_floor_header_in()?)
+    } else {
+        0
+    };
+    // Synchronous snapshots borrow the sole containing-node numerical author.
+    // They replace this contribution; they do not create a meter or another B.
+    let gate = |model: &Model,
+                known: usize,
+                parent: &mut Option<&mut NodeAdmit<'_>>|
+     -> Result<(), Error> {
+        if let Some(admit) = parent.as_deref_mut() {
+            model.admit_in(source, values.count(), l, admit)?;
+            if source < known.max(namespace_floor) {
+                return Err(invalid("Repeat source invoice omits original backing"));
+            }
+        }
+        Ok(())
+    };
+
     let (payload_items, backing) = wire_outer(input)?;
     let port = input
         .output
         .as_ref()
         .ok_or_else(|| invalid("relational output port is absent"))?;
-    required(port.node_id, w)?;
+    if parent.is_none() {
+        required(port.node_id, w)?;
+    } else {
+        port.node_id
+            .ok_or_else(|| invalid("node output ID is absent"))?;
+    }
     let output_properties = input
         .output_properties
         .as_ref()
@@ -542,9 +625,11 @@ fn prepare_decode(
         add(input.required_inputs.len(), port.value_ids.len())?,
     )?;
     let mut known = add(wire_header_floor(input, port)?, backing)?;
-    count_prefix(input.input_node_ids.len(), items, source, known, l, w)?;
-    floor(source, values.retained_floor(w)?, w)?;
-    floor(source, expressions.retained_floor_observed(w)?, w)?;
+    if parent.is_none() {
+        count_prefix(input.input_node_ids.len(), items, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+        floor(source, expressions.retained_floor_observed(w)?, w)?;
+    }
     let mut model = Model {
         inputs: input.input_node_ids.len(),
         items,
@@ -594,7 +679,9 @@ fn prepare_decode(
                 model.refs = add(model.refs, row.value_ids.len())?;
                 known = add(known, bytes::<u32>(row.value_ids.capacity())?)?;
                 model.request::<p::ValueId>(row.value_ids.len(), 2)?;
+                gate(&model, known, &mut parent)?;
                 count_prefix(model.inputs, model.items, source, known, l, w)?;
+                gate(&model, known, &mut parent)?;
                 w.step()?;
             }
             0
@@ -610,20 +697,39 @@ fn prepare_decode(
         model.delegated_work,
         mul(occurrences, expressions.lookup_work_upper_bound()?)?,
     )?;
+    if parent.is_some() {
+        gate(&model, known, &mut parent)?;
+        count_prefix(input.input_node_ids.len(), items, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+        floor(source, expressions.retained_floor_observed(w)?, w)?;
+    }
     for property in input
         .required_inputs
         .iter()
         .chain(std::iter::once(output_properties))
     {
-        model.property(properties::preflight_decode_observed(
-            property,
-            source,
-            l.properties,
-            w,
-        )?)?;
+        if parent.is_some() {
+            let pf = properties::properties_decode_numerical_facts_in(property, source)?;
+            properties::check_properties_numerical_facts(pf, l.properties)?;
+            model.property(pf)?;
+            gate(&model, known, &mut parent)?;
+            properties::preflight_decode_observed(property, source, l.properties, w)?;
+        } else {
+            model.property(properties::preflight_decode_observed(
+                property,
+                source,
+                l.properties,
+                w,
+            )?)?;
+        }
+        gate(&model, known, &mut parent)?;
         w.step()?;
     }
-    let facts = model.facts(source, values.count(), l, w)?;
+    let facts = if let Some(admit) = parent {
+        model.facts_in(source, values.count(), l, admit, w)?
+    } else {
+        model.facts(source, values.count(), l, w)?
+    };
     for id in &port.value_ids {
         reference(*id, values, w)?;
     }
@@ -1004,6 +1110,22 @@ impl PreparedRelationalNodeEncode<'_, '_, '_, '_, '_> {
             .map(|node| (node, self.facts));
         finish(work, result)
     }
+
+    /// Emit the already admitted original body in the containing caller scope.
+    pub fn emit_in(
+        self,
+        admit: &mut NodeAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(wire::PhysicalNode, RelationalNodeProjectionFacts), Error> {
+        if !std::ptr::addr_eq(self.values.original_control(), work.control()) {
+            return Err(invalid(
+                "node caller does not borrow the original controller",
+            ));
+        }
+        admit(&self.facts)?;
+        let node = emit_encode(self.input, self.source, self.limits, work)?;
+        Ok((node, self.facts))
+    }
 }
 pub fn prepare_relational_node_encode<'node, 'namespace, 'loan, 'source, 'control>(
     input: &'node p::PhysicalNode,
@@ -1020,6 +1142,7 @@ pub fn prepare_relational_node_encode<'node, 'namespace, 'loan, 'source, 'contro
         source_retained_bytes,
         limits,
         &mut work,
+        None,
     );
     let facts = finish(work, result)?;
     Ok(PreparedRelationalNodeEncode {
@@ -1031,6 +1154,40 @@ pub fn prepare_relational_node_encode<'node, 'namespace, 'loan, 'source, 'contro
         facts,
     })
 }
+/// Caller-owned preparation; no entry, footer, or second namespace author.
+pub fn prepare_relational_node_encode_in<'node, 'namespace, 'loan, 'source, 'control>(
+    input: &'node p::PhysicalNode,
+    values: &'namespace EncodedValues<'loan, 'source, 'control>,
+    expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
+    source_retained_bytes: usize,
+    limits: RelationalNodeProjectionLimits,
+    admit: &mut NodeAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedRelationalNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    if !std::ptr::addr_eq(values.original_control(), work.control()) {
+        return Err(invalid(
+            "node caller does not borrow the original controller",
+        ));
+    }
+    let facts = prepare_encode(
+        input,
+        values,
+        expressions,
+        source_retained_bytes,
+        limits,
+        work,
+        Some(admit),
+    )?;
+    Ok(PreparedRelationalNodeEncode {
+        input,
+        values,
+        expressions,
+        source: source_retained_bytes,
+        limits,
+        facts,
+    })
+}
+
 pub struct PreparedRelationalNodeDecode<'node, 'namespace, 'loan, 'wire, 'control> {
     input: &'node wire::PhysicalNode,
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
@@ -1049,6 +1206,22 @@ impl PreparedRelationalNodeDecode<'_, '_, '_, '_, '_> {
             .map(|node| (node, self.facts));
         finish(work, result)
     }
+
+    /// Emit the already admitted original body in the containing caller scope.
+    pub fn emit_in(
+        self,
+        admit: &mut NodeAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(p::PhysicalNode, RelationalNodeProjectionFacts), Error> {
+        if !std::ptr::addr_eq(self.expressions.original_control(), work.control()) {
+            return Err(invalid(
+                "node caller does not borrow the original controller",
+            ));
+        }
+        admit(&self.facts)?;
+        let node = emit_decode(self.input, self.source, self.limits, work)?;
+        Ok((node, self.facts))
+    }
 }
 pub fn prepare_relational_node_decode<'node, 'namespace, 'loan, 'wire, 'control>(
     input: &'node wire::PhysicalNode,
@@ -1058,7 +1231,14 @@ pub fn prepare_relational_node_decode<'node, 'namespace, 'loan, 'wire, 'control>
 ) -> Result<PreparedRelationalNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
     let mut work =
         CompileCheckpoints::try_new(expressions.original_control(), CompilePhase::Decode)?;
-    let result = prepare_decode(input, expressions, source_retained_bytes, limits, &mut work);
+    let result = prepare_decode(
+        input,
+        expressions,
+        source_retained_bytes,
+        limits,
+        &mut work,
+        None,
+    );
     let facts = finish(work, result)?;
     Ok(PreparedRelationalNodeDecode {
         input,
@@ -1068,6 +1248,37 @@ pub fn prepare_relational_node_decode<'node, 'namespace, 'loan, 'wire, 'control>
         facts,
     })
 }
+/// Caller-owned preparation; no entry, footer, or second namespace author.
+pub fn prepare_relational_node_decode_in<'node, 'namespace, 'loan, 'wire, 'control>(
+    input: &'node wire::PhysicalNode,
+    expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
+    source_retained_bytes: usize,
+    limits: RelationalNodeProjectionLimits,
+    admit: &mut NodeAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedRelationalNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    if !std::ptr::addr_eq(expressions.original_control(), work.control()) {
+        return Err(invalid(
+            "node caller does not borrow the original controller",
+        ));
+    }
+    let facts = prepare_decode(
+        input,
+        expressions,
+        source_retained_bytes,
+        limits,
+        work,
+        Some(admit),
+    )?;
+    Ok(PreparedRelationalNodeDecode {
+        input,
+        expressions,
+        source: source_retained_bytes,
+        limits,
+        facts,
+    })
+}
+
 pub fn encode_relational_node(
     input: &p::PhysicalNode,
     values: &EncodedValues<'_, '_, '_>,
@@ -1084,6 +1295,7 @@ pub fn encode_relational_node(
             source_retained_bytes,
             limits,
             &mut work,
+            None,
         )?;
         let node = emit_encode(input, source_retained_bytes, limits, &mut work)?;
         Ok((node, facts))
@@ -1099,7 +1311,14 @@ pub fn decode_relational_node(
     let mut work =
         CompileCheckpoints::try_new(expressions.original_control(), CompilePhase::Decode)?;
     let result = (|| {
-        let facts = prepare_decode(input, expressions, source_retained_bytes, limits, &mut work)?;
+        let facts = prepare_decode(
+            input,
+            expressions,
+            source_retained_bytes,
+            limits,
+            &mut work,
+            None,
+        )?;
         let node = emit_decode(input, source_retained_bytes, limits, &mut work)?;
         Ok((node, facts))
     })();

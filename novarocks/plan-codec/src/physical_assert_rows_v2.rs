@@ -86,9 +86,30 @@ fn prepare_encode(
     input: &p::PhysicalNode,
     values: &impl Values,
     source: usize,
-    limits: AssertRowsNodeProjectionLimits,
-    work: &mut CompileCheckpoints<'_>,
+    l: AssertRowsNodeProjectionLimits,
+    w: &mut CompileCheckpoints<'_>,
+    mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<AssertRowsNodeProjectionFacts, Error> {
+    let namespace_floor = if parent.is_some() {
+        values.retained_floor_header()?
+    } else {
+        0
+    };
+    // Synchronous snapshots borrow the sole containing-node numerical author.
+    // They replace this contribution; they do not create a meter or another B.
+    let gate = |model: &Model,
+                known: usize,
+                parent: &mut Option<&mut NodeAdmit<'_>>|
+     -> Result<(), Error> {
+        if let Some(admit) = parent.as_deref_mut() {
+            model.admit_in(source, values.count(), l, admit)?;
+            if source < known.max(namespace_floor) {
+                return Err(invalid("Repeat source invoice omits original backing"));
+            }
+        }
+        Ok(())
+    };
+
     let p::NodeKind::AssertOneRow(assertion) = &input.kind else {
         return Err(invalid("physical node kind is not AssertOneRow"));
     };
@@ -108,8 +129,10 @@ fn prepare_encode(
             )?,
         },
     )?;
-    count_prefix(input.inputs.len(), outer, source, known, limits, work)?;
-    floor(source, values.retained_floor(work)?, work)?;
+    if parent.is_none() {
+        count_prefix(input.inputs.len(), outer, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+    }
     let mut model = Model {
         inputs: input.inputs.len(),
         items: outer,
@@ -133,31 +156,52 @@ fn prepare_encode(
             for label in labels {
                 known = add(known, label.len())?;
                 model.request::<u8>(label.len(), 1)?;
-                work.step()?;
+                gate(&model, known, &mut parent)?;
+                w.step()?;
             }
         }
     }
-    floor(source, known, work)?;
+    if parent.is_some() {
+        gate(&model, known, &mut parent)?;
+    }
+    floor(source, known, w)?;
+    if parent.is_some() {
+        count_prefix(input.inputs.len(), outer, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+    }
     for property in input
         .required_inputs
         .iter()
         .chain(std::iter::once(&input.output_properties))
     {
-        model.property(properties::preflight_encode_observed(
-            property,
-            source,
-            limits.properties,
-            work,
-        )?)?;
-        work.step()?;
+        if parent.is_some() {
+            let pf = properties::properties_encode_numerical_facts_in(property, source)?;
+            properties::check_properties_numerical_facts(pf, l.properties)?;
+            model.property(pf)?;
+            gate(&model, known, &mut parent)?;
+            properties::preflight_encode_observed(property, source, l.properties, w)?;
+        } else {
+            model.property(properties::preflight_encode_observed(
+                property,
+                source,
+                l.properties,
+                w,
+            )?)?;
+        }
+        gate(&model, known, &mut parent)?;
+        w.step()?;
     }
-    let facts = model.facts(source, values.count(), limits, work)?;
+    let facts = if let Some(admit) = parent {
+        model.facts_in(source, values.count(), l, admit, w)?
+    } else {
+        model.facts(source, values.count(), l, w)?
+    };
     for id in &input.output.columns {
-        reference(id.get(), values, work)?;
+        reference(id.get(), values, w)?;
     }
     if let p::RowCountAssertionSpec::PerKeyAtMostOne { keys, .. } = assertion {
         for id in keys {
-            reference(id.get(), values, work)?;
+            reference(id.get(), values, w)?;
         }
     }
     for property in input
@@ -165,7 +209,7 @@ fn prepare_encode(
         .iter()
         .chain(std::iter::once(&input.output_properties))
     {
-        physical_property_refs(property, values, work)?;
+        physical_property_refs(property, values, w)?;
     }
     Ok(facts)
 }
@@ -173,9 +217,30 @@ fn prepare_decode(
     input: &wire::PhysicalNode,
     values: &impl Values,
     source: usize,
-    limits: AssertRowsNodeProjectionLimits,
-    work: &mut CompileCheckpoints<'_>,
+    l: AssertRowsNodeProjectionLimits,
+    w: &mut CompileCheckpoints<'_>,
+    mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<AssertRowsNodeProjectionFacts, Error> {
+    let namespace_floor = if parent.is_some() {
+        values.retained_floor_header()?
+    } else {
+        0
+    };
+    // Synchronous snapshots borrow the sole containing-node numerical author.
+    // They replace this contribution; they do not create a meter or another B.
+    let gate = |model: &Model,
+                known: usize,
+                parent: &mut Option<&mut NodeAdmit<'_>>|
+     -> Result<(), Error> {
+        if let Some(admit) = parent.as_deref_mut() {
+            model.admit_in(source, values.count(), l, admit)?;
+            if source < known.max(namespace_floor) {
+                return Err(invalid("Repeat source invoice omits original backing"));
+            }
+        }
+        Ok(())
+    };
+
     let Some(wire::physical_node::Kind::AssertOneRow(assertion)) = input.kind.as_ref() else {
         return Err(invalid("wire physical node kind is not AssertOneRow"));
     };
@@ -205,15 +270,10 @@ fn prepare_decode(
             )?,
         },
     )?;
-    count_prefix(
-        input.input_node_ids.len(),
-        outer,
-        source,
-        known,
-        limits,
-        work,
-    )?;
-    floor(source, values.retained_floor(work)?, work)?;
+    if parent.is_none() {
+        count_prefix(input.input_node_ids.len(), outer, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+    }
     let mut model = Model {
         inputs: input.input_node_ids.len(),
         items: outer,
@@ -233,36 +293,57 @@ fn prepare_decode(
             for label in &v.labels {
                 known = add(known, label.capacity())?;
                 model.request::<u8>(label.len(), 2)?;
-                work.step()?;
+                gate(&model, known, &mut parent)?;
+                w.step()?;
             }
         }
     }
-    floor(source, known, work)?;
+    if parent.is_some() {
+        gate(&model, known, &mut parent)?;
+    }
+    floor(source, known, w)?;
+    if parent.is_some() {
+        count_prefix(input.input_node_ids.len(), outer, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+    }
     for property in input
         .required_inputs
         .iter()
         .chain(std::iter::once(output_property))
     {
-        model.property(properties::preflight_decode_observed(
-            property,
-            source,
-            limits.properties,
-            work,
-        )?)?;
-        work.step()?;
+        if parent.is_some() {
+            let pf = properties::properties_decode_numerical_facts_in(property, source)?;
+            properties::check_properties_numerical_facts(pf, l.properties)?;
+            model.property(pf)?;
+            gate(&model, known, &mut parent)?;
+            properties::preflight_decode_observed(property, source, l.properties, w)?;
+        } else {
+            model.property(properties::preflight_decode_observed(
+                property,
+                source,
+                l.properties,
+                w,
+            )?)?;
+        }
+        gate(&model, known, &mut parent)?;
+        w.step()?;
     }
-    let facts = model.facts(source, values.count(), limits, work)?;
+    let facts = if let Some(admit) = parent {
+        model.facts_in(source, values.count(), l, admit, w)?
+    } else {
+        model.facts(source, values.count(), l, w)?
+    };
     if let wire::row_count_assertion_node::Kind::Global(v) = assertion {
         let comparison = decode_comparison(v.comparison);
-        work.step()?;
+        w.step()?;
         comparison?;
     }
     for id in &port.value_ids {
-        reference(*id, values, work)?;
+        reference(*id, values, w)?;
     }
     if let wire::row_count_assertion_node::Kind::PerKeyAtMostOne(v) = assertion {
         for id in &v.key_value_ids {
-            reference(*id, values, work)?;
+            reference(*id, values, w)?;
         }
     }
     for property in input
@@ -270,7 +351,7 @@ fn prepare_decode(
         .iter()
         .chain(std::iter::once(output_property))
     {
-        wire_property_refs(property, values, work)?;
+        wire_property_refs(property, values, w)?;
     }
     Ok(facts)
 }
@@ -430,6 +511,22 @@ impl PreparedAssertRowsNodeEncode<'_, '_, '_, '_, '_> {
             .map(|node| (node, self.facts));
         finish(w, result)
     }
+
+    /// Emit the already admitted original body in the containing caller scope.
+    pub fn emit_in(
+        self,
+        admit: &mut NodeAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(wire::PhysicalNode, AssertRowsNodeProjectionFacts), Error> {
+        if !std::ptr::addr_eq(self.values.original_control(), work.control()) {
+            return Err(invalid(
+                "node caller does not borrow the original controller",
+            ));
+        }
+        admit(&self.facts)?;
+        let node = emit_encode(self.input, self.source, self.limits, work)?;
+        Ok((node, self.facts))
+    }
 }
 pub fn prepare_assert_rows_node_encode<'node, 'namespace, 'loan, 'source, 'control>(
     input: &'node p::PhysicalNode,
@@ -438,7 +535,7 @@ pub fn prepare_assert_rows_node_encode<'node, 'namespace, 'loan, 'source, 'contr
     limits: AssertRowsNodeProjectionLimits,
 ) -> Result<PreparedAssertRowsNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
     let mut w = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
-    let result = prepare_encode(input, values, source_retained_bytes, limits, &mut w);
+    let result = prepare_encode(input, values, source_retained_bytes, limits, &mut w, None);
     let facts = finish(w, result)?;
     Ok(PreparedAssertRowsNodeEncode {
         input,
@@ -448,6 +545,37 @@ pub fn prepare_assert_rows_node_encode<'node, 'namespace, 'loan, 'source, 'contr
         facts,
     })
 }
+/// Caller-owned preparation; no entry, footer, or second namespace author.
+pub fn prepare_assert_rows_node_encode_in<'node, 'namespace, 'loan, 'source, 'control>(
+    input: &'node p::PhysicalNode,
+    values: &'namespace EncodedValues<'loan, 'source, 'control>,
+    source_retained_bytes: usize,
+    limits: AssertRowsNodeProjectionLimits,
+    admit: &mut NodeAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedAssertRowsNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    if !std::ptr::addr_eq(values.original_control(), work.control()) {
+        return Err(invalid(
+            "node caller does not borrow the original controller",
+        ));
+    }
+    let facts = prepare_encode(
+        input,
+        values,
+        source_retained_bytes,
+        limits,
+        work,
+        Some(admit),
+    )?;
+    Ok(PreparedAssertRowsNodeEncode {
+        input,
+        values,
+        source: source_retained_bytes,
+        limits,
+        facts,
+    })
+}
+
 /// Sealed preparation borrowing the exact received node and Value owner.
 pub struct PreparedAssertRowsNodeDecode<'node, 'namespace, 'loan, 'wire, 'control> {
     input: &'node wire::PhysicalNode,
@@ -467,6 +595,22 @@ impl PreparedAssertRowsNodeDecode<'_, '_, '_, '_, '_> {
             .map(|node| (node, self.facts));
         finish(w, result)
     }
+
+    /// Emit the already admitted original body in the containing caller scope.
+    pub fn emit_in(
+        self,
+        admit: &mut NodeAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(p::PhysicalNode, AssertRowsNodeProjectionFacts), Error> {
+        if !std::ptr::addr_eq(self.values.original_control(), work.control()) {
+            return Err(invalid(
+                "node caller does not borrow the original controller",
+            ));
+        }
+        admit(&self.facts)?;
+        let node = emit_decode(self.input, self.source, self.limits, work)?;
+        Ok((node, self.facts))
+    }
 }
 pub fn prepare_assert_rows_node_decode<'node, 'namespace, 'loan, 'wire, 'control>(
     input: &'node wire::PhysicalNode,
@@ -475,7 +619,7 @@ pub fn prepare_assert_rows_node_decode<'node, 'namespace, 'loan, 'wire, 'control
     limits: AssertRowsNodeProjectionLimits,
 ) -> Result<PreparedAssertRowsNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
     let mut w = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Decode)?;
-    let result = prepare_decode(input, values, source_retained_bytes, limits, &mut w);
+    let result = prepare_decode(input, values, source_retained_bytes, limits, &mut w, None);
     let facts = finish(w, result)?;
     Ok(PreparedAssertRowsNodeDecode {
         input,
@@ -485,6 +629,37 @@ pub fn prepare_assert_rows_node_decode<'node, 'namespace, 'loan, 'wire, 'control
         facts,
     })
 }
+/// Caller-owned preparation; no entry, footer, or second namespace author.
+pub fn prepare_assert_rows_node_decode_in<'node, 'namespace, 'loan, 'wire, 'control>(
+    input: &'node wire::PhysicalNode,
+    values: &'namespace DecodedValues<'loan, 'wire, 'control>,
+    source_retained_bytes: usize,
+    limits: AssertRowsNodeProjectionLimits,
+    admit: &mut NodeAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedAssertRowsNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    if !std::ptr::addr_eq(values.original_control(), work.control()) {
+        return Err(invalid(
+            "node caller does not borrow the original controller",
+        ));
+    }
+    let facts = prepare_decode(
+        input,
+        values,
+        source_retained_bytes,
+        limits,
+        work,
+        Some(admit),
+    )?;
+    Ok(PreparedAssertRowsNodeDecode {
+        input,
+        values,
+        source: source_retained_bytes,
+        limits,
+        facts,
+    })
+}
+
 /// Single-phase complete projection. Preparation and emission share one meter.
 pub fn encode_assert_rows_node(
     input: &p::PhysicalNode,
@@ -494,7 +669,7 @@ pub fn encode_assert_rows_node(
 ) -> Result<(wire::PhysicalNode, AssertRowsNodeProjectionFacts), Error> {
     let mut w = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Encode)?;
     let result = (|| {
-        let facts = prepare_encode(input, values, source_retained_bytes, limits, &mut w)?;
+        let facts = prepare_encode(input, values, source_retained_bytes, limits, &mut w, None)?;
         let node = emit_encode(input, source_retained_bytes, limits, &mut w)?;
         Ok((node, facts))
     })();
@@ -509,7 +684,7 @@ pub fn decode_assert_rows_node(
 ) -> Result<(p::PhysicalNode, AssertRowsNodeProjectionFacts), Error> {
     let mut w = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Decode)?;
     let result = (|| {
-        let facts = prepare_decode(input, values, source_retained_bytes, limits, &mut w)?;
+        let facts = prepare_decode(input, values, source_retained_bytes, limits, &mut w, None)?;
         let node = emit_decode(input, source_retained_bytes, limits, &mut w)?;
         Ok((node, facts))
     })();

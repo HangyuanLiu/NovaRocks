@@ -1008,3 +1008,6 @@ fn original_repeat_envelope_trace_remains_exact_after_shared_author_extraction()
         );
     });
 }
+
+#[path = "owned_tests.rs"]
+mod owned_tests;

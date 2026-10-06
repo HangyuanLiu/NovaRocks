@@ -543,6 +543,24 @@ pub(crate) const fn value_type_clone_preflight_work_upper_bound() -> usize {
     16 + 8 * novarocks_type_contract::MAX_VALUE_TYPE_NODES
 }
 
+/// The sole clone author's known root contribution, before a lookup callback.
+/// Shared FieldRef children have no independently owned request at this root.
+pub(crate) fn value_type_clone_root_facts(
+    value: &FunctionValueType,
+) -> Result<ValueTypeCloneFacts, TypeCodecError> {
+    value_type_clone_facts(1, value_type_clone_requests(&value.data_type, 0)?)
+}
+
+fn value_type_clone_requests(carrier: &DataType, requests: usize) -> Result<usize, TypeCodecError> {
+    if matches!(carrier, DataType::Dictionary(_, _)) {
+        requests.checked_add(2).ok_or(TypeCodecError::InvalidShape(
+            "value type clone request count overflow",
+        ))
+    } else {
+        Ok(requests)
+    }
+}
+
 /// Fixed borrowed scratch covers only children which the sole clone author
 /// actually clones. Dictionaries underneath shared FieldRef owners allocate
 /// nothing here. This is numerical admission, not a host allocation grant.
@@ -581,10 +599,8 @@ pub(crate) fn preflight_value_type_clone_admitted<E: From<TypeCodecError>>(
             )
             .into());
         }
+        requests = value_type_clone_requests(carrier, requests)?;
         if let DataType::Dictionary(key, item) = carrier {
-            requests = requests.checked_add(2).ok_or(TypeCodecError::InvalidShape(
-                "value type clone request count overflow",
-            ))?;
             // Preserve the original ordinary-error checkpoint and its grammar.
             if length + 2 > pending.len() {
                 work.step().map_err(TypeCodecError::from)?;

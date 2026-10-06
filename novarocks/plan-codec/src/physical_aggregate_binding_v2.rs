@@ -54,8 +54,9 @@ pub use read::{
 };
 pub(crate) use signature_copy::{
     copy_aggregate_binding_observed, preflight_aggregate_binding_copy,
-    preflight_aggregate_binding_copy_counts, preflight_aggregate_binding_copy_in,
-    preflight_aggregate_binding_copy_types,
+    preflight_aggregate_binding_copy_counts, preflight_aggregate_binding_copy_counts_in,
+    preflight_aggregate_binding_copy_in, preflight_aggregate_binding_copy_types,
+    preflight_aggregate_binding_copy_types_in,
 };
 
 /// Projects the explicit state owner's contract, independently of function identity.

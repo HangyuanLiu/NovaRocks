@@ -201,12 +201,41 @@ fn prepare_encode(
     source: usize,
     l: UnpivotNodeProjectionLimits,
     w: &mut CompileCheckpoints<'_>,
+    mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<UnpivotNodeProjectionFacts, Error> {
+    let namespace_floor = if parent.is_some() {
+        values
+            .retained_floor_header()?
+            .max(expressions.retained_floor_header_in()?)
+    } else {
+        0
+    };
+    // Synchronous snapshots borrow the sole containing-node numerical author.
+    // They replace this contribution; they do not create a meter or another B.
+    let gate = |model: &Model,
+                known: usize,
+                parent: &mut Option<&mut NodeAdmit<'_>>|
+     -> Result<(), Error> {
+        if let Some(admit) = parent.as_deref_mut() {
+            model.admit_in(source, values.count(), l, admit)?;
+            if source < known.max(namespace_floor) {
+                return Err(invalid("Repeat source invoice omits original backing"));
+            }
+        }
+        Ok(())
+    };
+
     // The retained Values token is a distinct mandatory loan. An equivalent
     // type table or a different control is not this original correspondence.
     let same = std::ptr::eq(values.types(), expressions.types())
-        && std::ptr::eq(values.original_control(), expressions.control());
-    w.step()?;
+        && if parent.is_some() {
+            std::ptr::addr_eq(values.original_control(), expressions.control())
+        } else {
+            std::ptr::eq(values.original_control(), expressions.control())
+        };
+    if parent.is_none() {
+        w.step()?;
+    }
     if !same {
         return Err(invalid(
             "Unpivot namespaces do not retain the same type table and original control",
@@ -230,9 +259,11 @@ fn prepare_encode(
             )?,
         )?,
     )?;
-    count_prefix(input.inputs.len(), outer, source, known, l, w)?;
-    floor(source, values.retained_floor(w)?, w)?;
-    floor(source, expressions.floor(w)?, w)?;
+    if parent.is_none() {
+        count_prefix(input.inputs.len(), outer, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+        floor(source, expressions.floor(w)?, w)?;
+    }
     let mut model = Model {
         inputs: input.inputs.len(),
         items: outer,
@@ -255,32 +286,62 @@ fn prepare_encode(
         model.items = add(model.items, mapping.constants.len())?;
         known = add(known, bytes::<p::UnpivotConstant>(mapping.constants.len())?)?;
         model.request::<wire::UnpivotConstant>(mapping.constants.len(), 1)?;
+        gate(&model, known, &mut parent)?;
         count_prefix(model.inputs, model.items, source, known, l, w)?;
         for constant in &mapping.constants {
             match constant {
                 p::UnpivotConstant::Scalar(_) => scalars = add(scalars, 1)?,
                 _ => pools = add(pools, 1)?,
             }
+            if parent.is_some() {
+                model.delegated_work = 0;
+                delegate_counts(&mut model, scalars, pools, expressions)?;
+            }
+            gate(&model, known, &mut parent)?;
             w.step()?;
         }
+        gate(&model, known, &mut parent)?;
         w.step()?;
     }
+    if parent.is_some() {
+        gate(&model, known, &mut parent)?;
+    }
     floor(source, known, w)?;
+    model.delegated_work = 0;
     delegate_counts(&mut model, scalars, pools, expressions)?;
+    if parent.is_some() {
+        gate(&model, known, &mut parent)?;
+        count_prefix(input.inputs.len(), outer, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+        floor(source, expressions.floor(w)?, w)?;
+    }
     for property in input
         .required_inputs
         .iter()
         .chain(std::iter::once(&input.output_properties))
     {
-        model.property(properties::preflight_encode_observed(
-            property,
-            source,
-            l.properties,
-            w,
-        )?)?;
+        if parent.is_some() {
+            let pf = properties::properties_encode_numerical_facts_in(property, source)?;
+            properties::check_properties_numerical_facts(pf, l.properties)?;
+            model.property(pf)?;
+            gate(&model, known, &mut parent)?;
+            properties::preflight_encode_observed(property, source, l.properties, w)?;
+        } else {
+            model.property(properties::preflight_encode_observed(
+                property,
+                source,
+                l.properties,
+                w,
+            )?)?;
+        }
+        gate(&model, known, &mut parent)?;
         w.step()?;
     }
-    let facts = model.facts(source, values.count(), l, w)?;
+    let facts = if let Some(admit) = parent {
+        model.facts_in(source, values.count(), l, admit, w)?
+    } else {
+        model.facts(source, values.count(), l, w)?
+    };
     for id in &input.output.columns {
         reference(id.get(), values, w)?;
     }
@@ -317,8 +378,31 @@ fn prepare_decode(
     source: usize,
     l: UnpivotNodeProjectionLimits,
     w: &mut CompileCheckpoints<'_>,
+    mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<UnpivotNodeProjectionFacts, Error> {
     let values = expressions.values();
+    let namespace_floor = if parent.is_some() {
+        values
+            .retained_floor_header()?
+            .max(expressions.retained_floor_header_in()?)
+    } else {
+        0
+    };
+    // Synchronous snapshots borrow the sole containing-node numerical author.
+    // They replace this contribution; they do not create a meter or another B.
+    let gate = |model: &Model,
+                known: usize,
+                parent: &mut Option<&mut NodeAdmit<'_>>|
+     -> Result<(), Error> {
+        if let Some(admit) = parent.as_deref_mut() {
+            model.admit_in(source, values.count(), l, admit)?;
+            if source < known.max(namespace_floor) {
+                return Err(invalid("Repeat source invoice omits original backing"));
+            }
+        }
+        Ok(())
+    };
+
     let spec = decode_spec(input)?;
     let port = input
         .output
@@ -347,9 +431,11 @@ fn prepare_decode(
             )?,
         )?,
     )?;
-    count_prefix(input.input_node_ids.len(), outer, source, known, l, w)?;
-    floor(source, values.retained_floor(w)?, w)?;
-    floor(source, expressions.floor(w)?, w)?;
+    if parent.is_none() {
+        count_prefix(input.input_node_ids.len(), outer, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+        floor(source, expressions.floor(w)?, w)?;
+    }
     let mut model = Model {
         inputs: input.input_node_ids.len(),
         items: outer,
@@ -375,36 +461,73 @@ fn prepare_decode(
             bytes::<wire::UnpivotConstant>(mapping.constants.capacity())?,
         )?;
         model.request::<p::UnpivotConstant>(mapping.constants.len(), 2)?;
+        gate(&model, known, &mut parent)?;
         count_prefix(model.inputs, model.items, source, known, l, w)?;
         for constant in &mapping.constants {
             let kind = constant
                 .kind
                 .as_ref()
                 .ok_or_else(|| invalid("Unpivot constant kind is absent"));
+            if parent.is_some() {
+                match &kind {
+                    Ok(wire::unpivot_constant::Kind::ScalarExprId(_)) => {
+                        delegate_counts(&mut model, 1, 0, expressions)?;
+                    }
+                    Ok(_) => {
+                        delegate_counts(&mut model, 0, 1, expressions)?;
+                    }
+                    Err(_) => {}
+                }
+            }
+            gate(&model, known, &mut parent)?;
             w.step()?;
             match kind? {
                 wire::unpivot_constant::Kind::ScalarExprId(_) => scalars = add(scalars, 1)?,
                 _ => pools = add(pools, 1)?,
             }
         }
+        gate(&model, known, &mut parent)?;
         w.step()?;
     }
+    if parent.is_some() {
+        gate(&model, known, &mut parent)?;
+    }
     floor(source, known, w)?;
+    model.delegated_work = 0;
     delegate_counts(&mut model, scalars, pools, expressions)?;
+    if parent.is_some() {
+        gate(&model, known, &mut parent)?;
+        count_prefix(input.input_node_ids.len(), outer, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+        floor(source, expressions.floor(w)?, w)?;
+    }
     for property in input
         .required_inputs
         .iter()
         .chain(std::iter::once(output_properties))
     {
-        model.property(properties::preflight_decode_observed(
-            property,
-            source,
-            l.properties,
-            w,
-        )?)?;
+        if parent.is_some() {
+            let pf = properties::properties_decode_numerical_facts_in(property, source)?;
+            properties::check_properties_numerical_facts(pf, l.properties)?;
+            model.property(pf)?;
+            gate(&model, known, &mut parent)?;
+            properties::preflight_decode_observed(property, source, l.properties, w)?;
+        } else {
+            model.property(properties::preflight_decode_observed(
+                property,
+                source,
+                l.properties,
+                w,
+            )?)?;
+        }
+        gate(&model, known, &mut parent)?;
         w.step()?;
     }
-    let facts = model.facts(source, values.count(), l, w)?;
+    let facts = if let Some(admit) = parent {
+        model.facts_in(source, values.count(), l, admit, w)?
+    } else {
+        model.facts(source, values.count(), l, w)?
+    };
     for id in &port.value_ids {
         reference(*id, values, w)?;
     }
@@ -602,6 +725,22 @@ impl PreparedUnpivotNodeEncode<'_, '_, '_, '_, '_> {
             .map(|node| (node, self.facts));
         finish(work, result)
     }
+
+    /// Emit the already admitted original body in the containing caller scope.
+    pub fn emit_in(
+        self,
+        admit: &mut NodeAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(wire::PhysicalNode, UnpivotNodeProjectionFacts), Error> {
+        if !std::ptr::addr_eq(self.values.original_control(), work.control()) {
+            return Err(invalid(
+                "node caller does not borrow the original controller",
+            ));
+        }
+        admit(&self.facts)?;
+        let node = emit_encode(self.input, self.source, self.limits, work)?;
+        Ok((node, self.facts))
+    }
 }
 pub fn prepare_unpivot_node_encode<'node, 'namespace, 'loan, 'source, 'control>(
     input: &'node p::PhysicalNode,
@@ -618,6 +757,7 @@ pub fn prepare_unpivot_node_encode<'node, 'namespace, 'loan, 'source, 'control>(
         source_retained_bytes,
         limits,
         &mut work,
+        None,
     );
     let facts = finish(work, result)?;
     Ok(PreparedUnpivotNodeEncode {
@@ -629,6 +769,40 @@ pub fn prepare_unpivot_node_encode<'node, 'namespace, 'loan, 'source, 'control>(
         facts,
     })
 }
+/// Caller-owned preparation; no entry, footer, or second namespace author.
+pub fn prepare_unpivot_node_encode_in<'node, 'namespace, 'loan, 'source, 'control>(
+    input: &'node p::PhysicalNode,
+    values: &'namespace EncodedValues<'loan, 'source, 'control>,
+    expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
+    source_retained_bytes: usize,
+    limits: UnpivotNodeProjectionLimits,
+    admit: &mut NodeAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedUnpivotNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    if !std::ptr::addr_eq(values.original_control(), work.control()) {
+        return Err(invalid(
+            "node caller does not borrow the original controller",
+        ));
+    }
+    let facts = prepare_encode(
+        input,
+        values,
+        expressions,
+        source_retained_bytes,
+        limits,
+        work,
+        Some(admit),
+    )?;
+    Ok(PreparedUnpivotNodeEncode {
+        input,
+        values,
+        expressions,
+        source: source_retained_bytes,
+        limits,
+        facts,
+    })
+}
+
 pub struct PreparedUnpivotNodeDecode<'node, 'namespace, 'loan, 'wire, 'control> {
     input: &'node wire::PhysicalNode,
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
@@ -647,6 +821,22 @@ impl PreparedUnpivotNodeDecode<'_, '_, '_, '_, '_> {
             .map(|node| (node, self.facts));
         finish(work, result)
     }
+
+    /// Emit the already admitted original body in the containing caller scope.
+    pub fn emit_in(
+        self,
+        admit: &mut NodeAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(p::PhysicalNode, UnpivotNodeProjectionFacts), Error> {
+        if !std::ptr::addr_eq(self.expressions.control(), work.control()) {
+            return Err(invalid(
+                "node caller does not borrow the original controller",
+            ));
+        }
+        admit(&self.facts)?;
+        let node = emit_decode(self.input, self.source, self.limits, work)?;
+        Ok((node, self.facts))
+    }
 }
 pub fn prepare_unpivot_node_decode<'node, 'namespace, 'loan, 'wire, 'control>(
     input: &'node wire::PhysicalNode,
@@ -655,7 +845,14 @@ pub fn prepare_unpivot_node_decode<'node, 'namespace, 'loan, 'wire, 'control>(
     limits: UnpivotNodeProjectionLimits,
 ) -> Result<PreparedUnpivotNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
     let mut work = CompileCheckpoints::try_new(expressions.control(), CompilePhase::Decode)?;
-    let result = prepare_decode(input, expressions, source_retained_bytes, limits, &mut work);
+    let result = prepare_decode(
+        input,
+        expressions,
+        source_retained_bytes,
+        limits,
+        &mut work,
+        None,
+    );
     let facts = finish(work, result)?;
     Ok(PreparedUnpivotNodeDecode {
         input,
@@ -665,6 +862,37 @@ pub fn prepare_unpivot_node_decode<'node, 'namespace, 'loan, 'wire, 'control>(
         facts,
     })
 }
+/// Caller-owned preparation; no entry, footer, or second namespace author.
+pub fn prepare_unpivot_node_decode_in<'node, 'namespace, 'loan, 'wire, 'control>(
+    input: &'node wire::PhysicalNode,
+    expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
+    source_retained_bytes: usize,
+    limits: UnpivotNodeProjectionLimits,
+    admit: &mut NodeAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedUnpivotNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    if !std::ptr::addr_eq(expressions.control(), work.control()) {
+        return Err(invalid(
+            "node caller does not borrow the original controller",
+        ));
+    }
+    let facts = prepare_decode(
+        input,
+        expressions,
+        source_retained_bytes,
+        limits,
+        work,
+        Some(admit),
+    )?;
+    Ok(PreparedUnpivotNodeDecode {
+        input,
+        expressions,
+        source: source_retained_bytes,
+        limits,
+        facts,
+    })
+}
+
 pub fn encode_unpivot_node(
     input: &p::PhysicalNode,
     values: &EncodedValues<'_, '_, '_>,
@@ -681,6 +909,7 @@ pub fn encode_unpivot_node(
             source_retained_bytes,
             limits,
             &mut work,
+            None,
         )?;
         let node = emit_encode(input, source_retained_bytes, limits, &mut work)?;
         Ok((node, facts))
@@ -695,7 +924,14 @@ pub fn decode_unpivot_node(
 ) -> Result<(p::PhysicalNode, UnpivotNodeProjectionFacts), Error> {
     let mut work = CompileCheckpoints::try_new(expressions.control(), CompilePhase::Decode)?;
     let result = (|| {
-        let facts = prepare_decode(input, expressions, source_retained_bytes, limits, &mut work)?;
+        let facts = prepare_decode(
+            input,
+            expressions,
+            source_retained_bytes,
+            limits,
+            &mut work,
+            None,
+        )?;
         let node = emit_decode(input, source_retained_bytes, limits, &mut work)?;
         Ok((node, facts))
     })();

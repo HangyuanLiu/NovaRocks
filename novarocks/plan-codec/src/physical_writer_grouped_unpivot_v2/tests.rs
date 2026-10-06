@@ -854,3 +854,98 @@ fn grouped_nonempty_header_parent_merges_value_occurrences_and_source_invoice_on
         c.arm(None);
     });
 }
+
+#[test]
+fn grouped_parent_exact_source_occurrences_and_every_small_callback() {
+    let fixture = Fixture::new();
+    let c = Control::default();
+    fixture.with_tokens(&c, |values, expressions, read| {
+        let input = source(); let raw = expected();
+        for decode in [false, true] {
+            let run = |l, snapshots: &mut Vec<NodeProjectionFacts>| {
+                let owner = if decode { read.original_control() } else { expressions.original_control() };
+                let phase = if decode { CompilePhase::Decode } else { CompilePhase::Encode };
+                let mut work = CompileCheckpoints::try_new(owner, phase)?;
+                let mut admit = |f: &NodeProjectionFacts| { snapshots.push(*f); Ok(()) };
+                let result = if decode {
+                    prepare_writer_grouped_unpivot_decode_in(&raw, read, SOURCE, l, &mut admit, &mut work)
+                        .and_then(|p| p.emit_in(&mut admit, &mut work)).map(|(out, f)| { assert_eq!(out, input); f })
+                } else {
+                    prepare_writer_grouped_unpivot_encode_in(&input, values, expressions, SOURCE, l, &mut admit, &mut work)
+                        .and_then(|p| p.emit_in(&mut admit, &mut work)).map(|(out, f)| { assert_eq!(out, raw); f })
+                };
+                finish(work, result)
+            };
+            c.arm(None); let mut snapshots = vec![];
+            let f = run(limits(), &mut snapshots).unwrap(); let trace = c.trace();
+            for prefix in snapshots {
+                assert!(prefix.allocation_requests_upper_bound <= f.allocation_requests_upper_bound);
+                assert!(prefix.cumulative_work_upper_bound <= f.cumulative_work_upper_bound);
+                assert_eq!(prefix.coexisting_source_and_request_bytes_upper_bound, SOURCE + prefix.allocation_request_bytes_upper_bound);
+            }
+            c.arm(None); assert_eq!(run(exact(f), &mut vec![]).unwrap(), f);
+            for axis in 0..6 {
+                c.arm(None);
+                assert!(matches!(run(under(exact(f), axis), &mut vec![]), Err(Error::Control(CompileControlError::ResourceExhausted))));
+            }
+            for at in 0..trace.len() {
+                for cause in CAUSES {
+                    c.arm(Some((at, cause)));
+                    assert!(matches!(run(limits(), &mut vec![]), Err(Error::Control(actual)) if actual == cause));
+                    assert_eq!(c.trace(), trace[..=at]);
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn grouped_parent_known_layout_beats_pending_control_in_both_directions() {
+    let fixture = Fixture::new();
+    let c = Control::default();
+    fixture.with_tokens(&c, |values, expressions, read| {
+        let input = source();
+        let raw = expected();
+        for decode in [false, true] {
+            for cause in CAUSES {
+                c.arm(Some((1, cause)));
+                let owner = if decode {
+                    read.original_control()
+                } else {
+                    expressions.original_control()
+                };
+                let mut work = CompileCheckpoints::try_new(owner, CompilePhase::Decode).unwrap();
+                for _ in 0..255 {
+                    work.step().unwrap();
+                }
+                let mut l = limits();
+                l.max_allocation_requests = 0;
+                let mut admit = |_: &NodeProjectionFacts| -> Result<(), CompileControlError> {
+                    panic!("known layout precedes parent")
+                };
+                let result = if decode {
+                    prepare_writer_grouped_unpivot_decode_in(
+                        &raw, read, SOURCE, l, &mut admit, &mut work,
+                    )
+                    .map(|_| ())
+                } else {
+                    prepare_writer_grouped_unpivot_encode_in(
+                        &input,
+                        values,
+                        expressions,
+                        SOURCE,
+                        l,
+                        &mut admit,
+                        &mut work,
+                    )
+                    .map(|_| ())
+                };
+                assert!(matches!(
+                    finish(work, result),
+                    Err(Error::Control(CompileControlError::ResourceExhausted))
+                ));
+                assert_eq!(c.trace(), vec![(CompilePhase::Decode, 0)]);
+            }
+        }
+    });
+}

@@ -1747,3 +1747,113 @@ fn table_write_wide_real_fields_and_group_constants_sample_quantum_and_numeric_p
         }
     });
 }
+
+#[test]
+fn table_write_parent_whole_writer_and_finish_exact_replay_and_control_prefixes() {
+    let fixture = Fixture::new();
+    let c = Control::default();
+    for node in [writer(), finisher(true)] {
+        let ids = Ids::new(&node);
+        fixture.with(&node, &c, |values, expressions, read, aggregates| {
+            for decode in [false, true] {
+                c.arm(None);
+                let raw = encode_table_write_node(&node, values, expressions, ids.view(), SOURCE, limits()).unwrap().0;
+                let run = |l, snapshots: &mut Vec<NodeProjectionFacts>| {
+                    let phase = if decode { CompilePhase::Decode } else { CompilePhase::Encode };
+                    let owner = if decode { read.original_control() } else { values.original_control() };
+                    let mut work = CompileCheckpoints::try_new(owner, phase)?;
+                    let mut admit = |f: &NodeProjectionFacts| { snapshots.push(*f); Ok(()) };
+                    let result = if decode {
+                        prepare_table_write_node_decode_in(&raw, read, aggregates, SOURCE, l, &mut admit, &mut work)
+                            .and_then(|p| p.emit_in(&mut admit, &mut work)).map(|(out, f)| { assert_eq!(out, node); f })
+                    } else {
+                        prepare_table_write_node_encode_in(&node, values, expressions, ids.view(), SOURCE, l, &mut admit, &mut work)
+                            .and_then(|p| p.emit_in(&mut admit, &mut work)).map(|(out, f)| { assert_eq!(out, raw); f })
+                    };
+                    finish(work, result)
+                };
+                c.arm(None);
+                let mut snapshots = vec![];
+                let f = run(limits(), &mut snapshots).unwrap();
+                let trace = c.trace();
+                assert!(!snapshots.is_empty());
+                for prefix in &snapshots {
+                    assert!(prefix.allocation_requests_upper_bound <= f.allocation_requests_upper_bound);
+                    assert!(prefix.allocation_request_bytes_upper_bound <= f.allocation_request_bytes_upper_bound);
+                    assert!(prefix.cumulative_work_upper_bound <= f.cumulative_work_upper_bound);
+                    assert_eq!(prefix.coexisting_source_and_request_bytes_upper_bound, SOURCE + prefix.allocation_request_bytes_upper_bound);
+                }
+                c.arm(None);
+                assert_eq!(run(exact(limits(), f), &mut vec![]).unwrap(), f);
+                for axis in 0..7 {
+                    let mut l = exact(limits(), f); under(&mut l, axis);
+                    c.arm(None);
+                    assert!(matches!(run(l, &mut vec![]), Err(Error::Control(CompileControlError::ResourceExhausted))));
+                }
+                for at in 0..trace.len() {
+                    for cause in CAUSES {
+                        c.arm(Some((at, cause)));
+                        assert!(matches!(run(limits(), &mut vec![]), Err(Error::Control(actual)) if actual == cause));
+                        assert_eq!(c.trace(), trace[..=at]);
+                    }
+                }
+            }
+        });
+    }
+}
+
+#[test]
+fn table_write_parent_known_containers_refuse_before_pending_callback() {
+    let fixture = Fixture::new();
+    let c = Control::default();
+    let node = writer();
+    let ids = Ids::new(&node);
+    fixture.with(&node, &c, |values, expressions, read, aggregates| {
+        c.arm(None);
+        let raw = encode_table_write_node(&node, values, expressions, ids.view(), SOURCE, limits())
+            .unwrap()
+            .0;
+        for decode in [false, true] {
+            for cause in CAUSES {
+                c.arm(Some((1, cause)));
+                let owner = if decode {
+                    read.original_control()
+                } else {
+                    values.original_control()
+                };
+                let mut work = CompileCheckpoints::try_new(owner, CompilePhase::Decode).unwrap();
+                for _ in 0..255 {
+                    work.step().unwrap();
+                }
+                let mut l = limits();
+                l.node.max_allocation_requests = 0;
+                let mut admit = |_: &NodeProjectionFacts| -> Result<(), CompileControlError> {
+                    panic!("known container cap precedes parent")
+                };
+                let result = if decode {
+                    prepare_table_write_node_decode_in(
+                        &raw, read, aggregates, SOURCE, l, &mut admit, &mut work,
+                    )
+                    .map(|_| ())
+                } else {
+                    prepare_table_write_node_encode_in(
+                        &node,
+                        values,
+                        expressions,
+                        ids.view(),
+                        SOURCE,
+                        l,
+                        &mut admit,
+                        &mut work,
+                    )
+                    .map(|_| ())
+                };
+                assert!(matches!(
+                    finish(work, result),
+                    Err(Error::Control(CompileControlError::ResourceExhausted))
+                ));
+                assert_eq!(c.trace(), vec![(CompilePhase::Decode, 0)]);
+            }
+        }
+    });
+}

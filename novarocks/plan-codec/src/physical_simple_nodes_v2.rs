@@ -114,10 +114,39 @@ fn prepare_encode(
     source: usize,
     l: SimpleNodeProjectionLimits,
     w: &mut CompileCheckpoints<'_>,
+    mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<SimpleNodeProjectionFacts, Error> {
+    let namespace_floor = if parent.is_some() {
+        values
+            .retained_floor_header()?
+            .max(expressions.retained_floor_header_in()?)
+    } else {
+        0
+    };
+    // Synchronous snapshots borrow the sole containing-node numerical author.
+    // They replace this contribution; they do not create a meter or another B.
+    let gate = |model: &Model,
+                known: usize,
+                parent: &mut Option<&mut NodeAdmit<'_>>|
+     -> Result<(), Error> {
+        if let Some(admit) = parent.as_deref_mut() {
+            model.admit_in(source, values.count(), l, admit)?;
+            if source < known.max(namespace_floor) {
+                return Err(invalid("Repeat source invoice omits original backing"));
+            }
+        }
+        Ok(())
+    };
+
     let same = std::ptr::eq(values.types(), expressions.types())
-        && std::ptr::eq(values.original_control(), expressions.original_control());
-    w.step()?;
+        && if parent.is_some() {
+            std::ptr::addr_eq(values.original_control(), expressions.original_control())
+        } else {
+            std::ptr::eq(values.original_control(), expressions.original_control())
+        };
+    if parent.is_none() {
+        w.step()?;
+    }
     if !same {
         return Err(invalid(
             "simple node namespaces differ in type table or original control",
@@ -129,9 +158,11 @@ fn prepare_encode(
         add(input.required_inputs.len(), input.output.columns.len())?,
     )?;
     let mut known = add(physical_header_floor(input)?, backing)?;
-    count_prefix(input.inputs.len(), items, source, known, l, w)?;
-    floor(source, values.retained_floor(w)?, w)?;
-    floor(source, expressions.retained_floor_observed(w)?, w)?;
+    if parent.is_none() {
+        count_prefix(input.inputs.len(), items, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+        floor(source, expressions.retained_floor_observed(w)?, w)?;
+    }
     let mut model = Model {
         inputs: input.inputs.len(),
         items,
@@ -157,7 +188,12 @@ fn prepare_encode(
                 model.items = add(model.items, row.len())?;
                 known = add(known, bytes::<p::ExprId>(row.len())?)?;
                 model.request::<u32>(row.len(), 1)?;
+                if parent.is_some() {
+                    model.delegated_work = mul(total, expressions.lookup_work_upper_bound()?)?;
+                }
+                gate(&model, known, &mut parent)?;
                 count_prefix(model.inputs, model.items, source, known, l, w)?;
+                gate(&model, known, &mut parent)?;
                 w.step()?;
             }
             total
@@ -166,24 +202,40 @@ fn prepare_encode(
         p::NodeKind::Limit { .. } => 0,
         _ => return Err(invalid("prepared physical kind is outside simple family")),
     };
-    model.delegated_work = add(
-        model.delegated_work,
-        mul(occurrences, expressions.lookup_work_upper_bound()?)?,
-    )?;
+    model.delegated_work = mul(occurrences, expressions.lookup_work_upper_bound()?)?;
+    if parent.is_some() {
+        gate(&model, known, &mut parent)?;
+        count_prefix(input.inputs.len(), items, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+        floor(source, expressions.retained_floor_observed(w)?, w)?;
+    }
     for property in input
         .required_inputs
         .iter()
         .chain(std::iter::once(&input.output_properties))
     {
-        model.property(properties::preflight_encode_observed(
-            property,
-            source,
-            l.properties,
-            w,
-        )?)?;
+        if parent.is_some() {
+            let pf = properties::properties_encode_numerical_facts_in(property, source)?;
+            properties::check_properties_numerical_facts(pf, l.properties)?;
+            model.property(pf)?;
+            gate(&model, known, &mut parent)?;
+            properties::preflight_encode_observed(property, source, l.properties, w)?;
+        } else {
+            model.property(properties::preflight_encode_observed(
+                property,
+                source,
+                l.properties,
+                w,
+            )?)?;
+        }
+        gate(&model, known, &mut parent)?;
         w.step()?;
     }
-    let facts = model.facts(source, values.count(), l, w)?;
+    let facts = if let Some(admit) = parent {
+        model.facts_in(source, values.count(), l, admit, w)?
+    } else {
+        model.facts(source, values.count(), l, w)?
+    };
     for id in &input.output.columns {
         reference(id.get(), values, w)?;
     }
@@ -236,14 +288,42 @@ fn prepare_decode(
     source: usize,
     l: SimpleNodeProjectionLimits,
     w: &mut CompileCheckpoints<'_>,
+    mut parent: Option<&mut NodeAdmit<'_>>,
 ) -> Result<SimpleNodeProjectionFacts, Error> {
     let values = expressions.values();
+    let namespace_floor = if parent.is_some() {
+        values
+            .retained_floor_header()?
+            .max(expressions.retained_floor_header_in()?)
+    } else {
+        0
+    };
+    // Synchronous snapshots borrow the sole containing-node numerical author.
+    // They replace this contribution; they do not create a meter or another B.
+    let gate = |model: &Model,
+                known: usize,
+                parent: &mut Option<&mut NodeAdmit<'_>>|
+     -> Result<(), Error> {
+        if let Some(admit) = parent.as_deref_mut() {
+            model.admit_in(source, values.count(), l, admit)?;
+            if source < known.max(namespace_floor) {
+                return Err(invalid("Repeat source invoice omits original backing"));
+            }
+        }
+        Ok(())
+    };
+
     let (payload_items, backing) = wire_outer(input)?;
     let port = input
         .output
         .as_ref()
         .ok_or_else(|| invalid("simple node output port is absent"))?;
-    required(port.node_id, w)?;
+    if parent.is_none() {
+        required(port.node_id, w)?;
+    } else {
+        port.node_id
+            .ok_or_else(|| invalid("node output ID is absent"))?;
+    }
     let output_properties = input
         .output_properties
         .as_ref()
@@ -253,9 +333,11 @@ fn prepare_decode(
         add(input.required_inputs.len(), port.value_ids.len())?,
     )?;
     let mut known = add(wire_header_floor(input, port)?, backing)?;
-    count_prefix(input.input_node_ids.len(), items, source, known, l, w)?;
-    floor(source, values.retained_floor(w)?, w)?;
-    floor(source, expressions.retained_floor_observed(w)?, w)?;
+    if parent.is_none() {
+        count_prefix(input.input_node_ids.len(), items, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+        floor(source, expressions.retained_floor_observed(w)?, w)?;
+    }
     let mut model = Model {
         inputs: input.input_node_ids.len(),
         items,
@@ -281,7 +363,12 @@ fn prepare_decode(
                 model.items = add(model.items, row.expr_ids.len())?;
                 known = add(known, bytes::<u32>(row.expr_ids.capacity())?)?;
                 model.request::<p::ExprId>(row.expr_ids.len(), 2)?;
+                if parent.is_some() {
+                    model.delegated_work = mul(total, expressions.lookup_work_upper_bound()?)?;
+                }
+                gate(&model, known, &mut parent)?;
                 count_prefix(model.inputs, model.items, source, known, l, w)?;
+                gate(&model, known, &mut parent)?;
                 w.step()?;
             }
             total
@@ -292,24 +379,40 @@ fn prepare_decode(
         Some(wire::physical_node::Kind::Limit(_)) => 0,
         _ => return Err(invalid("prepared wire kind is outside simple family")),
     };
-    model.delegated_work = add(
-        model.delegated_work,
-        mul(occurrences, expressions.lookup_work_upper_bound()?)?,
-    )?;
+    model.delegated_work = mul(occurrences, expressions.lookup_work_upper_bound()?)?;
+    if parent.is_some() {
+        gate(&model, known, &mut parent)?;
+        count_prefix(input.input_node_ids.len(), items, source, known, l, w)?;
+        floor(source, values.retained_floor(w)?, w)?;
+        floor(source, expressions.retained_floor_observed(w)?, w)?;
+    }
     for property in input
         .required_inputs
         .iter()
         .chain(std::iter::once(output_properties))
     {
-        model.property(properties::preflight_decode_observed(
-            property,
-            source,
-            l.properties,
-            w,
-        )?)?;
+        if parent.is_some() {
+            let pf = properties::properties_decode_numerical_facts_in(property, source)?;
+            properties::check_properties_numerical_facts(pf, l.properties)?;
+            model.property(pf)?;
+            gate(&model, known, &mut parent)?;
+            properties::preflight_decode_observed(property, source, l.properties, w)?;
+        } else {
+            model.property(properties::preflight_decode_observed(
+                property,
+                source,
+                l.properties,
+                w,
+            )?)?;
+        }
+        gate(&model, known, &mut parent)?;
         w.step()?;
     }
-    let facts = model.facts(source, values.count(), l, w)?;
+    let facts = if let Some(admit) = parent {
+        model.facts_in(source, values.count(), l, admit, w)?
+    } else {
+        model.facts(source, values.count(), l, w)?
+    };
     for id in &port.value_ids {
         reference(*id, values, w)?;
     }
@@ -511,6 +614,22 @@ impl PreparedSimpleNodeEncode<'_, '_, '_, '_, '_> {
             .map(|node| (node, self.facts));
         finish(work, result)
     }
+
+    /// Emit the already admitted original body in the containing caller scope.
+    pub fn emit_in(
+        self,
+        admit: &mut NodeAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(wire::PhysicalNode, SimpleNodeProjectionFacts), Error> {
+        if !std::ptr::addr_eq(self.values.original_control(), work.control()) {
+            return Err(invalid(
+                "node caller does not borrow the original controller",
+            ));
+        }
+        admit(&self.facts)?;
+        let node = emit_encode(self.input, self.source, self.limits, work)?;
+        Ok((node, self.facts))
+    }
 }
 pub fn prepare_simple_node_encode<'node, 'namespace, 'loan, 'source, 'control>(
     input: &'node p::PhysicalNode,
@@ -527,6 +646,7 @@ pub fn prepare_simple_node_encode<'node, 'namespace, 'loan, 'source, 'control>(
         source_retained_bytes,
         limits,
         &mut work,
+        None,
     );
     let facts = finish(work, result)?;
     Ok(PreparedSimpleNodeEncode {
@@ -538,6 +658,40 @@ pub fn prepare_simple_node_encode<'node, 'namespace, 'loan, 'source, 'control>(
         facts,
     })
 }
+/// Caller-owned preparation; no entry, footer, or second namespace author.
+pub fn prepare_simple_node_encode_in<'node, 'namespace, 'loan, 'source, 'control>(
+    input: &'node p::PhysicalNode,
+    values: &'namespace EncodedValues<'loan, 'source, 'control>,
+    expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
+    source_retained_bytes: usize,
+    limits: SimpleNodeProjectionLimits,
+    admit: &mut NodeAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedSimpleNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    if !std::ptr::addr_eq(values.original_control(), work.control()) {
+        return Err(invalid(
+            "node caller does not borrow the original controller",
+        ));
+    }
+    let facts = prepare_encode(
+        input,
+        values,
+        expressions,
+        source_retained_bytes,
+        limits,
+        work,
+        Some(admit),
+    )?;
+    Ok(PreparedSimpleNodeEncode {
+        input,
+        values,
+        expressions,
+        source: source_retained_bytes,
+        limits,
+        facts,
+    })
+}
+
 pub struct PreparedSimpleNodeDecode<'node, 'namespace, 'loan, 'wire, 'control> {
     input: &'node wire::PhysicalNode,
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
@@ -556,6 +710,22 @@ impl PreparedSimpleNodeDecode<'_, '_, '_, '_, '_> {
             .map(|node| (node, self.facts));
         finish(work, result)
     }
+
+    /// Emit the already admitted original body in the containing caller scope.
+    pub fn emit_in(
+        self,
+        admit: &mut NodeAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(p::PhysicalNode, SimpleNodeProjectionFacts), Error> {
+        if !std::ptr::addr_eq(self.expressions.original_control(), work.control()) {
+            return Err(invalid(
+                "node caller does not borrow the original controller",
+            ));
+        }
+        admit(&self.facts)?;
+        let node = emit_decode(self.input, self.source, self.limits, work)?;
+        Ok((node, self.facts))
+    }
 }
 pub fn prepare_simple_node_decode<'node, 'namespace, 'loan, 'wire, 'control>(
     input: &'node wire::PhysicalNode,
@@ -565,7 +735,14 @@ pub fn prepare_simple_node_decode<'node, 'namespace, 'loan, 'wire, 'control>(
 ) -> Result<PreparedSimpleNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
     let mut work =
         CompileCheckpoints::try_new(expressions.original_control(), CompilePhase::Decode)?;
-    let result = prepare_decode(input, expressions, source_retained_bytes, limits, &mut work);
+    let result = prepare_decode(
+        input,
+        expressions,
+        source_retained_bytes,
+        limits,
+        &mut work,
+        None,
+    );
     let facts = finish(work, result)?;
     Ok(PreparedSimpleNodeDecode {
         input,
@@ -575,6 +752,37 @@ pub fn prepare_simple_node_decode<'node, 'namespace, 'loan, 'wire, 'control>(
         facts,
     })
 }
+/// Caller-owned preparation; no entry, footer, or second namespace author.
+pub fn prepare_simple_node_decode_in<'node, 'namespace, 'loan, 'wire, 'control>(
+    input: &'node wire::PhysicalNode,
+    expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
+    source_retained_bytes: usize,
+    limits: SimpleNodeProjectionLimits,
+    admit: &mut NodeAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedSimpleNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    if !std::ptr::addr_eq(expressions.original_control(), work.control()) {
+        return Err(invalid(
+            "node caller does not borrow the original controller",
+        ));
+    }
+    let facts = prepare_decode(
+        input,
+        expressions,
+        source_retained_bytes,
+        limits,
+        work,
+        Some(admit),
+    )?;
+    Ok(PreparedSimpleNodeDecode {
+        input,
+        expressions,
+        source: source_retained_bytes,
+        limits,
+        facts,
+    })
+}
+
 pub fn encode_simple_node(
     input: &p::PhysicalNode,
     values: &EncodedValues<'_, '_, '_>,
@@ -591,6 +799,7 @@ pub fn encode_simple_node(
             source_retained_bytes,
             limits,
             &mut work,
+            None,
         )?;
         let node = emit_encode(input, source_retained_bytes, limits, &mut work)?;
         Ok((node, facts))
@@ -606,7 +815,14 @@ pub fn decode_simple_node(
     let mut work =
         CompileCheckpoints::try_new(expressions.original_control(), CompilePhase::Decode)?;
     let result = (|| {
-        let facts = prepare_decode(input, expressions, source_retained_bytes, limits, &mut work)?;
+        let facts = prepare_decode(
+            input,
+            expressions,
+            source_retained_bytes,
+            limits,
+            &mut work,
+            None,
+        )?;
         let node = emit_decode(input, source_retained_bytes, limits, &mut work)?;
         Ok((node, facts))
     })();

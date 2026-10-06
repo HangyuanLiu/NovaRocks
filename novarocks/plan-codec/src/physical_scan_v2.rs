@@ -22,7 +22,7 @@ pub use crate::physical_node_v2::{
     NodeCodecError as ScanNodeCodecError, NodeProjectionFacts as ScanNodeProjectionFacts,
 };
 use crate::{
-    physical_connector_payload_v2::bytes_shared_upper,
+    physical_connector_payload_v2::{bytes_shared_upper, bytes_shared_upper_for_mode},
     physical_expression_v2::{DecodedExpressions, EncodedExpressions},
     physical_node_v2::*,
     physical_properties_v2 as properties,
@@ -34,7 +34,7 @@ use crate::{
 };
 use novarocks_physical_plan as p;
 use novarocks_proto_models::physical_package_v2 as wire;
-use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+use novarocks_type_contract::{CompileCheckpoints, CompileControlError, CompilePhase};
 
 #[derive(Clone, Copy, Debug)]
 pub struct ScanProjectionLimits {
@@ -118,6 +118,7 @@ struct SourceWork {
     relations: usize,
     payloads: usize,
     expressions: usize,
+    values: usize,
 }
 fn physical_model(
     input: &p::PhysicalNode,
@@ -125,6 +126,7 @@ fn physical_model(
     source: usize,
     limits: ScanProjectionLimits,
     source_work: SourceWork,
+    admit: &mut Option<&mut NodeAdmit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Model, Error> {
     let mut model = Model {
@@ -152,14 +154,16 @@ fn physical_model(
             )?,
         )?,
     )?;
-    count_prefix(
-        model.inputs,
-        model.items,
-        source,
-        add(physical_header_floor(input)?, backing)?,
-        limits.node,
-        work,
-    )?;
+    if admit.is_none() {
+        count_prefix(
+            model.inputs,
+            model.items,
+            source,
+            add(physical_header_floor(input)?, backing)?,
+            limits.node,
+            work,
+        )?;
+    }
     encode_header_requests(input, &mut model)?;
     model.request::<wire::ProviderOutput>(body.columns.len(), 1)?;
     model.request::<u32>(body.residuals.len(), 1)?;
@@ -178,6 +182,17 @@ fn physical_model(
             )?,
         )?,
     )?;
+    if let Some(callback) = admit.as_mut() {
+        model.admit_in(source, source_work.values, limits.node, &mut **callback)?;
+        count_prefix(
+            model.inputs,
+            model.items,
+            source,
+            add(physical_header_floor(input)?, backing)?,
+            limits.node,
+            work,
+        )?;
+    }
     cap(
         add(
             add(256, mul(add(model.items, model.inputs)?, 32)?)?,
@@ -197,12 +212,46 @@ fn prepare_encode(
     limits: ScanProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ScanNodeProjectionFacts, Error> {
+    prepare_encode_core(
+        input,
+        relations,
+        values,
+        expressions,
+        source,
+        limits,
+        None,
+        work,
+    )
+}
+fn prepare_encode_core(
+    input: &p::PhysicalNode,
+    relations: &EncodedRelations<'_, '_, '_>,
+    values: &EncodedValues<'_, '_, '_>,
+    expressions: &EncodedExpressions<'_, '_, '_>,
+    source: usize,
+    limits: ScanProjectionLimits,
+    mut admit: Option<&mut NodeAdmit<'_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ScanNodeProjectionFacts, Error> {
+    if admit.is_some() && !std::ptr::addr_eq(work.control(), values.original_control()) {
+        return Err(invalid("Scan caller has another original control"));
+    }
     let same = std::ptr::eq(relations.types(), values.types())
         && std::ptr::eq(values.types(), expressions.types())
-        && std::ptr::eq(relations.original_control(), values.original_control())
-        && std::ptr::eq(values.original_control(), expressions.original_control())
+        && (if admit.is_some() {
+            std::ptr::addr_eq(relations.original_control(), values.original_control())
+        } else {
+            std::ptr::eq(relations.original_control(), values.original_control())
+        })
+        && (if admit.is_some() {
+            std::ptr::addr_eq(values.original_control(), expressions.original_control())
+        } else {
+            std::ptr::eq(values.original_control(), expressions.original_control())
+        })
         && std::ptr::eq(relations.reads().payloads(), values.payloads());
-    work.step()?;
+    if admit.is_none() {
+        work.step()?;
+    }
     if !same {
         return Err(invalid(
             "Scan namespaces differ in original type, payload or control owner",
@@ -218,9 +267,14 @@ fn prepare_encode(
             relations: relations.source_count(),
             payloads: values.payloads().source_count(),
             expressions: expressions.lookup_work_upper_bound()?,
+            values: values.count(),
         },
+        &mut admit,
         work,
     )?;
+    if admit.is_some() {
+        work.step()?;
+    }
     floor(source, relations.retained_floor_observed(work)?, work)?;
     floor(source, values.retained_floor(work)?, work)?;
     floor(source, expressions.retained_floor_observed(work)?, work)?;
@@ -229,15 +283,29 @@ fn prepare_encode(
         .iter()
         .chain(std::iter::once(&input.output_properties))
     {
-        model.property(properties::preflight_encode_observed(
-            property,
-            source,
-            limits.node.properties,
-            work,
-        )?)?;
+        if let Some(callback) = admit.as_mut() {
+            let property_facts =
+                properties::properties_encode_numerical_facts_in(property, source)?;
+            properties::check_properties_numerical_facts(property_facts, limits.node.properties)?;
+            model.property(property_facts)?;
+            model.admit_in(source, values.count(), limits.node, &mut **callback)?;
+            properties::preflight_encode_observed(property, source, limits.node.properties, work)?;
+        } else {
+            model.property(properties::preflight_encode_observed(
+                property,
+                source,
+                limits.node.properties,
+                work,
+            )?)?;
+        }
         work.step()?;
     }
-    let facts = model.facts(source, values.count(), limits.node, work)?;
+    let facts = match admit.as_mut() {
+        Some(callback) => {
+            model.facts_in(source, values.count(), limits.node, &mut **callback, work)?
+        }
+        None => model.facts(source, values.count(), limits.node, work)?,
+    };
     relations.source_id_observed(body.relation, work)?;
     work.step()?;
     for (column, value) in body.columns {
@@ -274,10 +342,95 @@ fn prepare_decode<'namespace, 'loan, 'wire, 'control>(
     limits: ScanProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ReadPreparation<'namespace, 'loan, 'wire, 'control>, Error> {
+    prepare_decode_core(input, relations, expressions, source, limits, None, work)
+}
+fn prepare_decode_core<'namespace, 'loan, 'wire, 'control>(
+    input: &wire::PhysicalNode,
+    relations: &'namespace DecodedRelations<'loan, 'wire, 'control>,
+    expressions: &DecodedExpressions<'loan, 'wire, 'control>,
+    source: usize,
+    limits: ScanProjectionLimits,
+    mut admit: Option<&mut NodeAdmit<'_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ReadPreparation<'namespace, 'loan, 'wire, 'control>, Error> {
+    if admit.is_some() && !std::ptr::addr_eq(work.control(), relations.original_control()) {
+        return Err(invalid("Scan caller has another original control"));
+    }
     let values = expressions.values();
+    let counted =
+        |body: &wire::ScanNode, port: &wire::OutputPort| -> Result<(Model, usize), Error> {
+            let model = Model {
+                inputs: input.input_node_ids.len(),
+                items: add(
+                    add(input.required_inputs.len(), port.value_ids.len())?,
+                    add(
+                        body.provider_outputs.len(),
+                        add(body.residual_expr_ids.len(), body.derived_value_ids.len())?,
+                    )?,
+                )?,
+                refs: add(
+                    port.value_ids.len(),
+                    add(body.provider_outputs.len(), body.derived_value_ids.len())?,
+                )?,
+                ..Model::default()
+            };
+            let backing = add(
+                bytes::<wire::ProviderOutput>(body.provider_outputs.capacity())?,
+                add(
+                    bytes::<u32>(body.residual_expr_ids.capacity())?,
+                    bytes::<u32>(body.derived_value_ids.capacity())?,
+                )?,
+            )?;
+
+            Ok((model, backing))
+        };
+
     let same = std::ptr::eq(relations.types(), values.types())
-        && std::ptr::eq(relations.original_control(), values.original_control())
+        && (if admit.is_some() {
+            std::ptr::addr_eq(relations.original_control(), values.original_control())
+        } else {
+            std::ptr::eq(relations.original_control(), values.original_control())
+        })
         && std::ptr::eq(relations.reads().payloads(), values.payloads());
+    if admit.is_some() && !same {
+        return Err(invalid(
+            "receiving Scan namespaces differ in original type, payload or control owner",
+        ));
+    }
+    let early = if let Some(callback) = admit.as_mut() {
+        let body = raw(input)?;
+        let port = input
+            .output
+            .as_ref()
+            .ok_or_else(|| invalid("Scan output port is absent"))?;
+        let (mut model, backing) = counted(body, port)?;
+        decode_header_requests(input, port, &mut model)?;
+        model.request::<p::Relation>(1, 1)?;
+        model
+            .request::<(p::ProviderColumnReference, p::ValueId)>(body.provider_outputs.len(), 2)?;
+        model.request::<p::ExprId>(body.residual_expr_ids.len(), 2)?;
+        model.request::<p::ValueId>(body.derived_value_ids.len(), 2)?;
+        model.delegated_work = add(
+            mul(relations.source_count(), 8)?,
+            add(
+                mul(
+                    mul(
+                        body.provider_outputs.len(),
+                        lookup_work(values.payloads().source_count())?,
+                    )?,
+                    2,
+                )?,
+                mul(
+                    body.residual_expr_ids.len(),
+                    expressions.lookup_work_upper_bound()?,
+                )?,
+            )?,
+        )?;
+        model.admit_in(source, values.count(), limits.node, &mut **callback)?;
+        Some((model, backing))
+    } else {
+        None
+    };
     work.step()?;
     if !same {
         return Err(invalid(
@@ -302,28 +455,10 @@ fn prepare_decode<'namespace, 'loan, 'wire, 'control>(
         .output_properties
         .as_ref()
         .ok_or_else(|| invalid("Scan output properties are absent"))?;
-    let mut model = Model {
-        inputs: input.input_node_ids.len(),
-        items: add(
-            add(input.required_inputs.len(), port.value_ids.len())?,
-            add(
-                body.provider_outputs.len(),
-                add(body.residual_expr_ids.len(), body.derived_value_ids.len())?,
-            )?,
-        )?,
-        refs: add(
-            port.value_ids.len(),
-            add(body.provider_outputs.len(), body.derived_value_ids.len())?,
-        )?,
-        ..Model::default()
+    let (mut model, backing) = match early {
+        Some(counted) => counted,
+        None => counted(body, port)?,
     };
-    let backing = add(
-        bytes::<wire::ProviderOutput>(body.provider_outputs.capacity())?,
-        add(
-            bytes::<u32>(body.residual_expr_ids.capacity())?,
-            bytes::<u32>(body.derived_value_ids.capacity())?,
-        )?,
-    )?;
     count_prefix(
         model.inputs,
         model.items,
@@ -359,33 +494,64 @@ fn prepare_decode<'namespace, 'loan, 'wire, 'control>(
     floor(source, relations.retained_floor_observed(work)?, work)?;
     floor(source, values.retained_floor(work)?, work)?;
     floor(source, expressions.retained_floor_observed(work)?, work)?;
-    decode_header_requests(input, port, &mut model)?;
-    model.request::<p::Relation>(1, 1)?;
-    model.request::<(p::ProviderColumnReference, p::ValueId)>(body.provider_outputs.len(), 2)?;
-    model.request::<p::ExprId>(body.residual_expr_ids.len(), 2)?;
-    model.request::<p::ValueId>(body.derived_value_ids.len(), 2)?;
+    if admit.is_none() {
+        decode_header_requests(input, port, &mut model)?;
+        model.request::<p::Relation>(1, 1)?;
+        model
+            .request::<(p::ProviderColumnReference, p::ValueId)>(body.provider_outputs.len(), 2)?;
+        model.request::<p::ExprId>(body.residual_expr_ids.len(), 2)?;
+        model.request::<p::ValueId>(body.derived_value_ids.len(), 2)?;
+    }
     for property in input
         .required_inputs
         .iter()
         .chain(std::iter::once(output_properties))
     {
-        model.property(properties::preflight_decode_observed(
-            property,
-            source,
-            limits.node.properties,
-            work,
-        )?)?;
+        if let Some(callback) = admit.as_mut() {
+            let property_facts =
+                properties::properties_decode_numerical_facts_in(property, source)?;
+            properties::check_properties_numerical_facts(property_facts, limits.node.properties)?;
+            model.property(property_facts)?;
+            model.admit_in(source, values.count(), limits.node, &mut **callback)?;
+            properties::preflight_decode_observed(property, source, limits.node.properties, work)?;
+        } else {
+            model.property(properties::preflight_decode_observed(
+                property,
+                source,
+                limits.node.properties,
+                work,
+            )?)?;
+        }
         work.step()?;
     }
     // These bounded lookups determine whether each actual Bytes clone can
     // promote a Shared owner. Even equal payload aliases count per occurrence.
-    model.facts(source, values.count(), limits.node, work)?;
+    match admit.as_mut() {
+        Some(callback) => {
+            model.facts_in(source, values.count(), limits.node, &mut **callback, work)?
+        }
+        None => model.facts(source, values.count(), limits.node, work)?,
+    };
     for column in &body.provider_outputs {
         let id = required(column.column_payload_id, work)?;
-        let payload = values.payloads().payload_observed(id, work)?;
+        let payload = if let Some(callback) = admit.as_mut() {
+            values.payloads().payload_captured_in(
+                id,
+                &mut |payload, _| {
+                    if !payload.payload().is_empty() {
+                        model.request::<u8>(bytes_shared_upper_for_mode(true)?, 1)?;
+                    }
+                    model.admit_in(source, values.count(), limits.node, &mut **callback)?;
+                    Ok::<(), Error>(())
+                },
+                work,
+            )?
+        } else {
+            values.payloads().payload_observed(id, work)?
+        };
         work.step()?;
         let payload = payload.ok_or_else(|| invalid("Scan column payload reference is unknown"))?;
-        if !payload.payload().is_empty() {
+        if admit.is_none() && !payload.payload().is_empty() {
             model.request::<u8>(bytes_shared_upper()?, 1)?;
         }
         reference(required(column.value_id, work)?, values, work)?;
@@ -403,7 +569,12 @@ fn prepare_decode<'namespace, 'loan, 'wire, 'control>(
     {
         wire_property_refs(property, values, work)?;
     }
-    let prefix = model.facts(source, values.count(), limits.node, work)?;
+    let prefix = match admit.as_mut() {
+        Some(callback) => {
+            model.facts_in(source, values.count(), limits.node, &mut **callback, work)?
+        }
+        None => model.facts(source, values.count(), limits.node, work)?,
+    };
     let remaining = limits
         .node
         .max_work
@@ -413,20 +584,59 @@ fn prepare_decode<'namespace, 'loan, 'wire, 'control>(
         max_work: limits.relation.max_work.min(remaining),
         ..limits.relation
     };
-    let relation = prepare_relation_materialization_observed(
-        relations,
-        relation_id,
-        source,
-        relation_limits,
-        work,
-    )?;
+    let relation = if let Some(callback) = admit.as_mut() {
+        let base = model;
+        let mut update = |child: &crate::physical_relation_v2::RelationProjectionFacts| {
+            let mut merged = base;
+            merged.requests = merged
+                .requests
+                .checked_add(child.allocation_requests_upper_bound)
+                .ok_or(CompileControlError::ResourceExhausted)?;
+            merged.requested = merged
+                .requested
+                .checked_add(child.allocation_request_bytes_upper_bound)
+                .ok_or(CompileControlError::ResourceExhausted)?;
+            merged.delegated_work = merged
+                .delegated_work
+                .checked_add(child.cumulative_work_upper_bound)
+                .ok_or(CompileControlError::ResourceExhausted)?;
+            let facts = merged
+                .numerical_facts(source, values.count(), limits.node)
+                .map_err(|error| match error {
+                    Error::Control(cause) => cause,
+                    _ => CompileControlError::ResourceExhausted,
+                })?;
+            callback(&facts)
+        };
+        crate::physical_relation_v2::prepare_relation_materialization_in(
+            relations,
+            relation_id,
+            source,
+            relation_limits,
+            &mut update,
+            work,
+        )?
+    } else {
+        prepare_relation_materialization_observed(
+            relations,
+            relation_id,
+            source,
+            relation_limits,
+            work,
+        )?
+    };
     let child = relation.facts();
     model.requests = add(model.requests, child.allocation_requests_upper_bound)?;
     model.requested = add(model.requested, child.allocation_request_bytes_upper_bound)?;
     // The selected owner's fact already covers preparation plus its sole
     // decode-core preflight/emission; do not add a fourth grammar pass.
     model.delegated_work = add(model.delegated_work, child.cumulative_work_upper_bound)?;
-    let facts = model.facts(source, values.count(), limits.node, work)?;
+    let facts = match admit.as_mut() {
+        Some(callback) => {
+            model.facts_in(source, values.count(), limits.node, &mut **callback, work)?
+        }
+        None => model.facts(source, values.count(), limits.node, work)?,
+    };
     Ok(ReadPreparation { relation, facts })
 }
 fn emit_encode(
@@ -487,8 +697,34 @@ fn emit_decode(
     limits: ScanProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(p::PhysicalNode, ScanNodeProjectionFacts), Error> {
+    emit_decode_core(input, expressions, prepared, source, limits, None, work)
+}
+fn emit_decode_core(
+    input: &wire::PhysicalNode,
+    expressions: &DecodedExpressions<'_, '_, '_>,
+    prepared: ReadPreparation<'_, '_, '_, '_>,
+    source: usize,
+    limits: ScanProjectionLimits,
+    admit: Option<&mut NodeAdmit<'_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(p::PhysicalNode, ScanNodeProjectionFacts), Error> {
     let body = raw(input)?;
-    let relation = prepared.relation.emit_observed(work)?;
+    let relation = if let Some(callback) = admit {
+        let sealed = *prepared.relation.facts();
+        let mut update = |child: &crate::physical_relation_v2::RelationProjectionFacts| {
+            if child.allocation_requests_upper_bound > sealed.allocation_requests_upper_bound
+                || child.allocation_request_bytes_upper_bound
+                    > sealed.allocation_request_bytes_upper_bound
+                || child.cumulative_work_upper_bound > sealed.cumulative_work_upper_bound
+            {
+                return Err(CompileControlError::ResourceExhausted);
+            }
+            callback(&prepared.facts)
+        };
+        prepared.relation.emit_in(&mut update, work)?
+    } else {
+        prepared.relation.emit_observed(work)?
+    };
     work.flush()?;
     let relation = Box::new(relation);
     work.flush()?;
@@ -715,6 +951,108 @@ pub fn decode_scan_node(
         )
     });
     finish(work, result)
+}
+
+/// Compose the original Scan author in the caller's scope, replacing this node's current contribution.
+pub fn prepare_scan_node_encode_in<'node, 'namespace, 'loan, 'source, 'control>(
+    input: &'node p::PhysicalNode,
+    relations: &'namespace EncodedRelations<'loan, 'source, 'control>,
+    values: &'namespace EncodedValues<'loan, 'source, 'control>,
+    expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
+    source: usize,
+    limits: ScanProjectionLimits,
+    admit: &mut NodeAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedScanNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let facts = prepare_encode_core(
+        input,
+        relations,
+        values,
+        expressions,
+        source,
+        limits,
+        Some(admit),
+        work,
+    )?;
+    Ok(PreparedScanNodeEncode {
+        input,
+        relations,
+        values,
+        expressions,
+        source,
+        limits,
+        facts,
+    })
+}
+pub fn prepare_scan_node_decode_in<'node, 'namespace, 'loan, 'wire, 'control>(
+    input: &'node wire::PhysicalNode,
+    relations: &'namespace DecodedRelations<'loan, 'wire, 'control>,
+    expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
+    source: usize,
+    limits: ScanProjectionLimits,
+    admit: &mut NodeAdmit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedScanNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let prepared = prepare_decode_core(
+        input,
+        relations,
+        expressions,
+        source,
+        limits,
+        Some(admit),
+        work,
+    )?;
+    Ok(PreparedScanNodeDecode {
+        input,
+        expressions,
+        source,
+        limits,
+        prepared,
+    })
+}
+impl PreparedScanNodeEncode<'_, '_, '_, '_, '_> {
+    pub fn emit_in(
+        self,
+        admit: &mut NodeAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(wire::PhysicalNode, ScanNodeProjectionFacts), Error> {
+        if !std::ptr::addr_eq(work.control(), self.values.original_control()) {
+            return Err(invalid("Scan caller has another original control"));
+        }
+        admit(&self.facts)?;
+        Ok((
+            emit_encode(
+                self.input,
+                self.relations,
+                self.values,
+                self.source,
+                self.limits,
+                work,
+            )?,
+            self.facts,
+        ))
+    }
+}
+impl PreparedScanNodeDecode<'_, '_, '_, '_, '_> {
+    pub fn emit_in(
+        self,
+        admit: &mut NodeAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(p::PhysicalNode, ScanNodeProjectionFacts), Error> {
+        if !std::ptr::addr_eq(work.control(), self.expressions.original_control()) {
+            return Err(invalid("Scan caller has another original control"));
+        }
+        admit(&self.prepared.facts)?;
+        emit_decode_core(
+            self.input,
+            self.expressions,
+            self.prepared,
+            self.source,
+            self.limits,
+            Some(admit),
+            work,
+        )
+    }
 }
 #[cfg(test)]
 mod tests;

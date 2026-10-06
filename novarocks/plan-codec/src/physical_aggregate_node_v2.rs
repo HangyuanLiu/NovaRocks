@@ -25,7 +25,8 @@ pub use crate::physical_node_v2::{
 use crate::{
     physical_aggregate_binding_v2::{
         MaterializedAggregateBindings, copy_aggregate_binding_observed,
-        preflight_aggregate_binding_copy_counts, preflight_aggregate_binding_copy_types,
+        preflight_aggregate_binding_copy_counts, preflight_aggregate_binding_copy_counts_in,
+        preflight_aggregate_binding_copy_types, preflight_aggregate_binding_copy_types_in,
     },
     physical_binding_v2::{BindingProjectionLimits, MaterializationModel},
     physical_expression_v2::{DecodedExpressions, EncodedExpressions},
@@ -43,7 +44,8 @@ mod collections;
 pub(crate) use collections::{
     CollectionProjection, decode_collection_lookup_work, decode_collection_references,
     decode_collections, encode_collection_lookup_work, encode_collection_references,
-    encode_collections, preflight_collection_binding_copies,
+    encode_collections, node_facts, node_gate, preflight_collection_binding_copies,
+    preflight_collection_binding_copies_in,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -163,19 +165,14 @@ fn prepare_encode(
     l: AggregateNodeProjectionLimits,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<AggregateNodeProjectionFacts, Error> {
-    let same = std::ptr::eq(values.types(), e.types())
-        && std::ptr::eq(values.original_control(), e.original_control());
-    completed(
-        if same {
-            Ok(())
-        } else {
-            Err(invalid(
-                "Aggregate namespaces have different type or control loans",
-            ))
-        },
-        w,
-    )?;
-    let (groups, calls, _) = completed(physical(input), w)?;
+    prepare_encode_core(input, values, e, source, l, None, w)
+}
+fn encode_root_model(
+    input: &p::PhysicalNode,
+    e: &EncodedExpressions<'_, '_, '_>,
+    roots: bool,
+) -> Result<(Model, usize), Error> {
+    let (groups, calls, _) = physical(input)?;
     let mut model = base_model(
         input.inputs.len(),
         input.required_inputs.len(),
@@ -193,39 +190,108 @@ fn prepare_encode(
     // This namespace count is admitted before its source lookup loop. The
     // original expression invoice includes the same aggregate source owners.
     model.delegated_work = encode_collection_lookup_work(groups, calls, e)?;
-    model.numerical_facts(source, values.count(), l.node)?;
+    if roots {
+        encode_header_requests(input, &mut model)?;
+        model.request::<wire::ExpressionOutput>(groups.len(), 1)?;
+        model.request::<wire::AggregateCall>(calls.len(), 1)?;
+    }
+    Ok((model, known))
+}
+fn prepare_encode_core<'parent>(
+    input: &p::PhysicalNode,
+    values: &EncodedValues<'_, '_, '_>,
+    e: &EncodedExpressions<'_, '_, '_>,
+    source: usize,
+    l: AggregateNodeProjectionLimits,
+    mut admit: Option<&'parent mut NodeAdmit<'parent>>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<AggregateNodeProjectionFacts, Error> {
+    if admit.is_some() && !std::ptr::addr_eq(w.control(), values.original_control()) {
+        return Err(invalid("Aggregate caller has a different original control"));
+    }
+    let same = std::ptr::eq(values.types(), e.types())
+        && if admit.is_some() {
+            std::ptr::addr_eq(values.original_control(), e.original_control())
+        } else {
+            std::ptr::eq(values.original_control(), e.original_control())
+        };
+    if admit.is_some() && same {
+        values.retained_floor_header_admitted()?;
+        e.retained_floor_header_in()?;
+    }
+    let mut early = if admit.is_some() && same && physical(input).is_ok() {
+        // Only a successful original shape projection supplies known requests.
+        // Ordinary malformed-shape diagnostics retain their original body order.
+        Some(encode_root_model(input, e, true)?)
+    } else {
+        None
+    };
+    if let Some((model, _)) = early.as_ref() {
+        node_gate(model, source, values.count(), l.node, &mut admit)?;
+    }
+    completed(
+        if same {
+            Ok(())
+        } else {
+            Err(invalid(
+                "Aggregate namespaces have different type or control loans",
+            ))
+        },
+        w,
+    )?;
+    let (groups, calls, _) = completed(physical(input), w)?;
+    let roots_prepared = early.is_some();
+    let (mut model, known) = match early.take() {
+        Some(roots) => roots,
+        None => encode_root_model(input, e, false)?,
+    };
+    node_gate(&model, source, values.count(), l.node, &mut admit)?;
     count_prefix(model.inputs, model.items, source, known, l.node, w)?;
-    model.facts(source, values.count(), l.node, w)?;
+    node_facts(&model, source, values.count(), l.node, &mut admit, w)?;
     floor(source, values.retained_floor(w)?, w)?;
     floor(source, e.retained_floor_observed(w)?, w)?;
-    encode_header_requests(input, &mut model)?;
-    model.request::<wire::ExpressionOutput>(groups.len(), 1)?;
-    model.request::<wire::AggregateCall>(calls.len(), 1)?;
-    model.numerical_facts(source, values.count(), l.node)?;
-    CollectionProjection {
+    if !roots_prepared {
+        encode_header_requests(input, &mut model)?;
+        model.request::<wire::ExpressionOutput>(groups.len(), 1)?;
+        model.request::<wire::AggregateCall>(calls.len(), 1)?;
+    }
+    node_gate(&model, source, values.count(), l.node, &mut admit)?;
+    let collection = CollectionProjection {
         model: &mut model,
         known,
         source,
         values: values.count(),
         limits: l.node,
+    };
+    match admit.as_deref_mut() {
+        Some(parent) => collection.count_encode_in(calls, e, parent, w)?,
+        None => collection.count_encode(calls, e, w)?,
     }
-    .count_encode(calls, e, w)?;
-    model.facts(source, values.count(), l.node, w)?;
+    node_facts(&model, source, values.count(), l.node, &mut admit, w)?;
     for property in input
         .required_inputs
         .iter()
         .chain(std::iter::once(&input.output_properties))
     {
-        model.property(properties::preflight_encode_observed(
-            property,
-            source,
-            l.node.properties,
-            w,
-        )?)?;
-        model.numerical_facts(source, values.count(), l.node)?;
+        if admit.is_some() {
+            let property_facts =
+                properties::properties_encode_numerical_facts_in(property, source)?;
+            properties::check_properties_numerical_facts(property_facts, l.node.properties)?;
+            model.property(property_facts)?;
+            node_gate(&model, source, values.count(), l.node, &mut admit)?;
+            properties::preflight_encode_observed(property, source, l.node.properties, w)?;
+        } else {
+            model.property(properties::preflight_encode_observed(
+                property,
+                source,
+                l.node.properties,
+                w,
+            )?)?;
+        }
+        node_gate(&model, source, values.count(), l.node, &mut admit)?;
         w.step()?;
     }
-    let facts = model.facts(source, values.count(), l.node, w)?;
+    let facts = node_facts(&model, source, values.count(), l.node, &mut admit, w)?;
     encode_collection_references(groups, calls, values, e, w)?;
     for value in &input.output.columns {
         reference(value.get(), values, w)?;
@@ -248,9 +314,82 @@ fn prepare_decode(
     l: AggregateNodeProjectionLimits,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<AggregateNodeProjectionFacts, Error> {
+    prepare_decode_core(input, e, a, source, l, None, w)
+}
+fn decode_root_model(
+    input: &wire::PhysicalNode,
+    e: &DecodedExpressions<'_, '_, '_>,
+    a: &MaterializedAggregateBindings<'_, '_, '_>,
+    roots: bool,
+) -> Result<(Model, usize), Error> {
+    let body = raw(input)?;
+    let port = input
+        .output
+        .as_ref()
+        .ok_or_else(|| invalid("node output port is absent"))?;
+    let mut base = base_model(
+        input.input_node_ids.len(),
+        input.required_inputs.len(),
+        port.value_ids.len(),
+        body.group_by.len(),
+        body.calls.len(),
+    )?;
+    let known = add(
+        wire_header_floor(input, port)?,
+        add(
+            bytes::<wire::ExpressionOutput>(body.group_by.capacity())?,
+            bytes::<wire::AggregateCall>(body.calls.capacity())?,
+        )?,
+    )?;
+    // Counts, types and emit each use the same actual count-sized lookup.
+    // Admit all three passes before lending this immutable base to the child.
+    base.delegated_work = decode_collection_lookup_work(&body.group_by, &body.calls, e, a)?;
+    if roots {
+        decode_header_requests(input, port, &mut base)?;
+        base.request::<(p::ExprId, p::ValueId)>(body.group_by.len(), 2)?;
+        base.request::<p::AggregateCall>(body.calls.len(), 2)?;
+    }
+    Ok((base, known))
+}
+fn prepare_decode_core<'parent>(
+    input: &wire::PhysicalNode,
+    e: &DecodedExpressions<'_, '_, '_>,
+    a: &MaterializedAggregateBindings<'_, '_, '_>,
+    source: usize,
+    l: AggregateNodeProjectionLimits,
+    mut admit: Option<&'parent mut NodeAdmit<'parent>>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<AggregateNodeProjectionFacts, Error> {
+    if admit.is_some() && !std::ptr::addr_eq(w.control(), e.original_control()) {
+        return Err(invalid("Aggregate caller has a different original control"));
+    }
     let same = std::ptr::eq(a.headers(), e.aggregates())
         && std::ptr::eq(a.functions().headers(), e.functions())
-        && std::ptr::eq(a.original_control(), e.original_control());
+        && if admit.is_some() {
+            std::ptr::addr_eq(e.original_control(), a.original_control())
+        } else {
+            std::ptr::eq(a.original_control(), e.original_control())
+        };
+    if admit.is_some() && same {
+        e.values().retained_floor_header_admitted()?;
+        add(
+            e.retained_floor_header_in()?,
+            add(
+                a.functions().retained_output_floor()?,
+                a.retained_output_floor()?,
+            )?,
+        )?;
+    }
+    let mut early = if admit.is_some() && same && raw(input).is_ok() && input.output.is_some() {
+        // Only a successful original shape projection supplies known requests.
+        // Ordinary malformed-shape diagnostics retain their original body order.
+        Some(decode_root_model(input, e, a, true)?)
+    } else {
+        None
+    };
+    if let Some((model, _)) = early.as_ref() {
+        node_gate(model, source, e.values().count(), l.node, &mut admit)?;
+    }
     completed(
         if same {
             Ok(())
@@ -278,26 +417,14 @@ fn prepare_decode(
             .ok_or_else(|| invalid("Aggregate output properties are absent")),
         w,
     )?;
-    let mut base = base_model(
-        input.input_node_ids.len(),
-        input.required_inputs.len(),
-        port.value_ids.len(),
-        body.group_by.len(),
-        body.calls.len(),
-    )?;
-    let known = add(
-        wire_header_floor(input, port)?,
-        add(
-            bytes::<wire::ExpressionOutput>(body.group_by.capacity())?,
-            bytes::<wire::AggregateCall>(body.calls.capacity())?,
-        )?,
-    )?;
-    // Counts, types and emit each use the same actual count-sized lookup.
-    // Admit all three passes before lending this immutable base to the child.
-    base.delegated_work = decode_collection_lookup_work(&body.group_by, &body.calls, e, a)?;
-    base.numerical_facts(source, e.values().count(), l.node)?;
+    let roots_prepared = early.is_some();
+    let (mut base, known) = match early.take() {
+        Some(roots) => roots,
+        None => decode_root_model(input, e, a, false)?,
+    };
+    node_gate(&base, source, e.values().count(), l.node, &mut admit)?;
     count_prefix(base.inputs, base.items, source, known, l.node, w)?;
-    base.facts(source, e.values().count(), l.node, w)?;
+    node_facts(&base, source, e.values().count(), l.node, &mut admit, w)?;
     let borrowed = e.retained_floor_observed(w)?;
     let owned = add(
         a.functions().retained_output_floor()?,
@@ -305,44 +432,71 @@ fn prepare_decode(
     )?;
     let dependency = add(borrowed, owned)?;
     floor(source, dependency, w)?;
-    decode_header_requests(input, port, &mut base)?;
-    base.request::<(p::ExprId, p::ValueId)>(body.group_by.len(), 2)?;
-    base.request::<p::AggregateCall>(body.calls.len(), 2)?;
-    base.numerical_facts(source, e.values().count(), l.node)?;
-    CollectionProjection {
+    if !roots_prepared {
+        decode_header_requests(input, port, &mut base)?;
+        base.request::<(p::ExprId, p::ValueId)>(body.group_by.len(), 2)?;
+        base.request::<p::AggregateCall>(body.calls.len(), 2)?;
+    }
+    node_gate(&base, source, e.values().count(), l.node, &mut admit)?;
+    let collection = CollectionProjection {
         model: &mut base,
         known,
         source,
         values: e.values().count(),
         limits: l.node,
+    };
+    match admit.as_deref_mut() {
+        Some(parent) => collection.count_decode_in(&body.calls, e, parent, w)?,
+        None => collection.count_decode(&body.calls, e, w)?,
     }
-    .count_decode(&body.calls, e, w)?;
-    base.facts(source, e.values().count(), l.node, w)?;
+    node_facts(&base, source, e.values().count(), l.node, &mut admit, w)?;
     for property in input.required_inputs.iter().chain(std::iter::once(props)) {
-        base.property(properties::preflight_decode_observed(
-            property,
-            source,
-            l.node.properties,
-            w,
-        )?)?;
-        base.numerical_facts(source, e.values().count(), l.node)?;
+        if admit.is_some() {
+            let property_facts =
+                properties::properties_decode_numerical_facts_in(property, source)?;
+            properties::check_properties_numerical_facts(property_facts, l.node.properties)?;
+            base.property(property_facts)?;
+            node_gate(&base, source, e.values().count(), l.node, &mut admit)?;
+            properties::preflight_decode_observed(property, source, l.node.properties, w)?;
+        } else {
+            base.property(properties::preflight_decode_observed(
+                property,
+                source,
+                l.node.properties,
+                w,
+            )?)?;
+        }
+        node_gate(&base, source, e.values().count(), l.node, &mut admit)?;
         w.step()?;
     }
-    let facts = preflight_collection_binding_copies(
-        &body.calls,
-        e,
-        a,
-        CollectionProjection {
-            model: &mut base,
-            known,
-            source,
-            values: e.values().count(),
-            limits: l.node,
-        },
-        dependency,
-        l.binding,
-        w,
-    )?;
+    let projection = CollectionProjection {
+        model: &mut base,
+        known,
+        source,
+        values: e.values().count(),
+        limits: l.node,
+    };
+    let facts = match admit {
+        Some(parent) => preflight_collection_binding_copies_in(
+            &body.calls,
+            e,
+            a,
+            projection,
+            dependency,
+            l.binding,
+            parent,
+            w,
+        )?,
+        None => preflight_collection_binding_copies(
+            &body.calls,
+            e,
+            a,
+            projection,
+            dependency,
+            l.binding,
+            w,
+        )?,
+    };
     decode_collection_references(&body.group_by, &body.calls, e, w)?;
     for value in &port.value_ids {
         reference(*value, e.values(), w)?;
@@ -422,6 +576,20 @@ impl PreparedAggregateNodeEncode<'_, '_, '_, '_, '_> {
     pub fn facts(&self) -> &AggregateNodeProjectionFacts {
         &self.facts
     }
+    pub(crate) fn emit_in(
+        self,
+        admit: &mut NodeAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(wire::PhysicalNode, AggregateNodeProjectionFacts), Error> {
+        if !std::ptr::addr_eq(work.control(), self.values.original_control()) {
+            return Err(invalid(
+                "Aggregate emission has a different original control",
+            ));
+        }
+        admit(&self.facts)?;
+        let node = emit_encode(self.input, self.expressions, self.source, self.limits, work)?;
+        Ok((node, self.facts))
+    }
     pub fn emit(self) -> Result<(wire::PhysicalNode, AggregateNodeProjectionFacts), Error> {
         let mut w =
             CompileCheckpoints::try_new(self.values.original_control(), CompilePhase::Encode)?;
@@ -462,6 +630,42 @@ pub fn prepare_aggregate_node_encode<'node, 'namespace, 'loan, 'source, 'control
         facts,
     })
 }
+/// Borrow the original caller scope and cumulative parent admission.
+/// This port owns no entry/footer, allocation grant, or Fragment/Package proof.
+pub(crate) fn prepare_aggregate_node_encode_in<
+    'node,
+    'namespace,
+    'loan,
+    'source,
+    'control,
+    'parent,
+>(
+    input: &'node p::PhysicalNode,
+    values: &'namespace EncodedValues<'loan, 'source, 'control>,
+    expressions: &'namespace EncodedExpressions<'loan, 'source, 'control>,
+    source_retained_bytes: usize,
+    limits: AggregateNodeProjectionLimits,
+    admit: &'parent mut NodeAdmit<'parent>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedAggregateNodeEncode<'node, 'namespace, 'loan, 'source, 'control>, Error> {
+    let facts = prepare_encode_core(
+        input,
+        values,
+        expressions,
+        source_retained_bytes,
+        limits,
+        Some(admit),
+        work,
+    )?;
+    Ok(PreparedAggregateNodeEncode {
+        input,
+        values,
+        expressions,
+        source: source_retained_bytes,
+        limits,
+        facts,
+    })
+}
 pub struct PreparedAggregateNodeDecode<'node, 'namespace, 'loan, 'wire, 'control> {
     input: &'node wire::PhysicalNode,
     expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
@@ -473,6 +677,27 @@ pub struct PreparedAggregateNodeDecode<'node, 'namespace, 'loan, 'wire, 'control
 impl PreparedAggregateNodeDecode<'_, '_, '_, '_, '_> {
     pub fn facts(&self) -> &AggregateNodeProjectionFacts {
         &self.facts
+    }
+    pub(crate) fn emit_in(
+        self,
+        admit: &mut NodeAdmit<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(p::PhysicalNode, AggregateNodeProjectionFacts), Error> {
+        if !std::ptr::addr_eq(work.control(), self.expressions.original_control()) {
+            return Err(invalid(
+                "Aggregate emission has a different original control",
+            ));
+        }
+        admit(&self.facts)?;
+        let node = emit_decode(
+            self.input,
+            self.expressions,
+            self.aggregates,
+            self.source,
+            self.limits,
+            work,
+        )?;
+        Ok((node, self.facts))
     }
     pub fn emit(self) -> Result<(p::PhysicalNode, AggregateNodeProjectionFacts), Error> {
         let mut w =
@@ -506,6 +731,42 @@ pub fn prepare_aggregate_node_decode<'node, 'namespace, 'loan, 'wire, 'control>(
         &mut w,
     );
     let facts = finish(w, r)?;
+    Ok(PreparedAggregateNodeDecode {
+        input,
+        expressions,
+        aggregates,
+        source: source_retained_bytes,
+        limits,
+        facts,
+    })
+}
+/// Borrow the original caller scope and cumulative parent admission.
+/// This port owns no entry/footer, allocation grant, or Fragment/Package proof.
+pub(crate) fn prepare_aggregate_node_decode_in<
+    'node,
+    'namespace,
+    'loan,
+    'wire,
+    'control,
+    'parent,
+>(
+    input: &'node wire::PhysicalNode,
+    expressions: &'namespace DecodedExpressions<'loan, 'wire, 'control>,
+    aggregates: &'namespace MaterializedAggregateBindings<'namespace, 'loan, 'wire>,
+    source_retained_bytes: usize,
+    limits: AggregateNodeProjectionLimits,
+    admit: &'parent mut NodeAdmit<'parent>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedAggregateNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>, Error> {
+    let facts = prepare_decode_core(
+        input,
+        expressions,
+        aggregates,
+        source_retained_bytes,
+        limits,
+        Some(admit),
+        work,
+    )?;
     Ok(PreparedAggregateNodeDecode {
         input,
         expressions,

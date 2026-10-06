@@ -250,29 +250,58 @@ pub(crate) fn boxed<T>(input: Vec<T>, w: &mut CompileCheckpoints<'_>) -> Result<
 
 pub(crate) trait Values {
     fn count(&self) -> usize;
+    fn retained_floor_header(&self) -> Result<usize, Error>;
     fn retained_floor(&self, w: &mut CompileCheckpoints<'_>) -> Result<usize, Error>;
     fn contains(&self, id: u32, w: &mut CompileCheckpoints<'_>) -> Result<bool, Error>;
+    fn value_captured<'a>(
+        &'a self,
+        id: u32,
+        capture: &mut impl FnMut(&'a p::ValueDef, &mut CompileCheckpoints<'_>) -> Result<(), Error>,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'a p::ValueDef>, Error>;
 }
 impl Values for EncodedValues<'_, '_, '_> {
     fn count(&self) -> usize {
         self.source_count()
+    }
+    fn retained_floor_header(&self) -> Result<usize, Error> {
+        Ok(self.retained_floor_header_admitted()?)
     }
     fn retained_floor(&self, w: &mut CompileCheckpoints<'_>) -> Result<usize, Error> {
         Ok(self.retained_floor_observed(w)?)
     }
     fn contains(&self, id: u32, w: &mut CompileCheckpoints<'_>) -> Result<bool, Error> {
         Ok(self.value_observed(id, w)?.is_some())
+    }
+    fn value_captured<'a>(
+        &'a self,
+        id: u32,
+        capture: &mut impl FnMut(&'a p::ValueDef, &mut CompileCheckpoints<'_>) -> Result<(), Error>,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'a p::ValueDef>, Error> {
+        EncodedValues::value_captured(self, id, &mut |value, work| capture(value, work), w)
     }
 }
 impl Values for DecodedValues<'_, '_, '_> {
     fn count(&self) -> usize {
         self.source_count()
     }
+    fn retained_floor_header(&self) -> Result<usize, Error> {
+        Ok(self.retained_floor_header_admitted()?)
+    }
     fn retained_floor(&self, w: &mut CompileCheckpoints<'_>) -> Result<usize, Error> {
         Ok(self.retained_floor_observed(w)?)
     }
     fn contains(&self, id: u32, w: &mut CompileCheckpoints<'_>) -> Result<bool, Error> {
         Ok(self.value_observed(id, w)?.is_some())
+    }
+    fn value_captured<'a>(
+        &'a self,
+        id: u32,
+        capture: &mut impl FnMut(&'a p::ValueDef, &mut CompileCheckpoints<'_>) -> Result<(), Error>,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'a p::ValueDef>, Error> {
+        DecodedValues::value_captured(self, id, capture, w)
     }
 }
 pub(crate) fn reference(
@@ -340,6 +369,10 @@ pub(crate) struct Model {
     pub(crate) requested: usize,
     pub(crate) delegated_work: usize,
 }
+/// Admit the containing package's current node contribution synchronously.
+/// This hook borrows its original author; it creates no checkpoint scope.
+pub(crate) type NodeAdmit<'a> =
+    dyn FnMut(&NodeProjectionFacts) -> Result<(), CompileControlError> + 'a;
 impl Model {
     /// An actual nonzero request Layout supplied by its sole source author.
     /// Arc slice headers remain requests even when their payload is empty.
@@ -376,10 +409,34 @@ impl Model {
         l: NodeProjectionLimits,
         w: &mut CompileCheckpoints<'_>,
     ) -> Result<NodeProjectionFacts, Error> {
+        self.facts_in(source, values, l, &mut |_| Ok(()), w)
+    }
+    pub(crate) fn facts_in(
+        &self,
+        source: usize,
+        values: usize,
+        l: NodeProjectionLimits,
+        admit: &mut NodeAdmit<'_>,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<NodeProjectionFacts, Error> {
         let (facts, axes) = self.checked_facts(source, values, l)?;
+        admit(&facts)?;
         for _ in 0..axes {
             w.step()?;
         }
+        Ok(facts)
+    }
+    /// Admit known original facts before completed work or a request boundary.
+    /// Growing snapshots replace this node's prior contribution in the caller.
+    pub(crate) fn admit_in(
+        &self,
+        source: usize,
+        values: usize,
+        l: NodeProjectionLimits,
+        admit: &mut NodeAdmit<'_>,
+    ) -> Result<NodeProjectionFacts, Error> {
+        let facts = self.numerical_facts(source, values, l)?;
+        admit(&facts)?;
         Ok(facts)
     }
     /// The same numerical author for a nested model's synchronous admission.
@@ -616,3 +673,5 @@ pub(crate) fn decode_header(
 
 #[cfg(test)]
 mod error_tests;
+#[cfg(test)]
+mod owner_tests;

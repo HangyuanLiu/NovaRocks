@@ -184,7 +184,7 @@ impl PreparedFunctionBindingsMaterialization<'_, '_> {
         &self.facts
     }
 }
-pub(crate) struct Model {
+pub(crate) struct Model<'parent> {
     pub(crate) facts: BindingProjectionFacts,
     pub(crate) items: usize,
     lookup: usize,
@@ -192,17 +192,18 @@ pub(crate) struct Model {
     known: usize,
     pub(crate) retained: usize,
     extra_work: usize,
-    node_admission: Option<NodeAdmission>,
+    node_admission: Option<NodeAdmission<'parent>>,
 }
 /// A containing node's original numerical facts, not a child budget reset.
 /// Only the sole Node model authors the composed axes and work formula.
-struct NodeAdmission {
+struct NodeAdmission<'parent> {
     base: resources::Model,
     limits: resources::NodeProjectionLimits,
     values: usize,
     peak: usize,
+    admit: Option<&'parent mut resources::NodeAdmit<'parent>>,
 }
-impl NodeAdmission {
+impl NodeAdmission<'_> {
     fn accepts_update(
         &self,
         base: resources::Model,
@@ -263,13 +264,17 @@ impl NodeAdmission {
         source: usize,
     ) -> Result<(), Error> {
         self.peak = self.peak.max(child.cumulative_work_upper_bound);
-        self.composed(items, child)?
+        let facts = self
+            .composed(items, child)?
             .numerical_facts(source, self.values, self.limits)
             .map_err(numeric)?;
+        if let Some(admit) = &mut self.admit {
+            admit(&facts)?;
+        }
         Ok(())
     }
 }
-impl Model {
+impl<'parent> Model<'parent> {
     fn new(headers: &PreparedFunctionBindingHeaders<'_>, source: usize) -> Result<Self, Error> {
         Ok(Self::for_composition(
             headers.as_wire().len(),
@@ -322,13 +327,44 @@ impl Model {
                 "containing node envelope changed or cumulative facts decreased",
             ));
         }
-        let peak = self.node_work_peak();
-        self.node_admission = Some(NodeAdmission {
-            base,
-            limits: node_limits,
-            values,
-            peak,
-        });
+        if let Some(parent) = &mut self.node_admission {
+            // The source, envelope and existing peak stay with the same owner.
+            // An updated base never drops the containing package's loan.
+            parent.base = base;
+        } else {
+            self.node_admission = Some(NodeAdmission {
+                base,
+                limits: node_limits,
+                values,
+                peak: 0,
+                admit: None,
+            });
+        }
+        self.check(binding_limits)
+    }
+    /// Borrow the containing package's node author for all delegated prefixes.
+    /// Later base updates retain this loan and the original work peak.
+    pub(crate) fn compose_in_node_in(
+        &mut self,
+        base: resources::Model,
+        values: usize,
+        node_limits: resources::NodeProjectionLimits,
+        binding_limits: BindingProjectionLimits,
+        admit: &'parent mut resources::NodeAdmit<'parent>,
+    ) -> Result<(), Error> {
+        if self
+            .node_admission
+            .as_ref()
+            .is_some_and(|parent| parent.admit.is_some())
+        {
+            return Err(shape("containing node admission loan is already installed"));
+        }
+        self.compose_in_node(base, values, node_limits, binding_limits)?;
+        let parent = self
+            .node_admission
+            .as_mut()
+            .ok_or_else(|| shape("binding model has no containing node admission"))?;
+        parent.admit = Some(admit);
         self.check(binding_limits)
     }
     pub(crate) fn node_work_peak(&self) -> usize {
@@ -341,9 +377,18 @@ impl Model {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<resources::NodeProjectionFacts, Error> {
         let (model, values, limits) = self.node_projection_model(work_ceiling)?;
-        model
-            .facts(self.source, values, limits, work)
-            .map_err(numeric)
+        match self
+            .node_admission
+            .as_mut()
+            .and_then(|parent| parent.admit.as_mut())
+        {
+            Some(admit) => model
+                .facts_in(self.source, values, limits, *admit, work)
+                .map_err(numeric),
+            None => model
+                .facts(self.source, values, limits, work)
+                .map_err(numeric),
+        }
     }
     /// Compose the same current child snapshot and original work peak before
     /// a caller's synchronous parent admission. This adds no observation.
@@ -515,7 +560,7 @@ fn count_clone(
         model.count_owned_type_clone(source, limits, w)
     }
 }
-impl Model {
+impl Model<'_> {
     /// Caller admits this occurrence's reference count before visiting the sole
     /// clone grammar. Repeated owned roots are charged once per actual copy.
     pub(crate) fn count_owned_type_clone(
