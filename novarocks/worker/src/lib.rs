@@ -37,6 +37,7 @@ mod credential_slot;
 mod deadline;
 mod domain;
 mod drain;
+pub mod guarded_bytes;
 mod host;
 mod inbound_capability;
 mod ingress;

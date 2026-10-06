@@ -35,8 +35,8 @@ pub(crate) use memory::{
     record_batch_shared_owner_bytes,
 };
 pub use root_array_storage::{
-    RootArrayStorageError, RootArrayStorageLimits, borrowed_root_array_storage,
-    borrowed_root_batch_storage,
+    ARROW_BUFFER_OWNER_METADATA_BOUND, RootArrayStorageError, RootArrayStorageLimits,
+    borrowed_root_array_storage, borrowed_root_batch_storage,
 };
 pub use root_chunk_storage::{borrowed_root_chunk_schema_storage, borrowed_root_chunk_storage};
 pub use schema::{ChunkFieldSchema, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};

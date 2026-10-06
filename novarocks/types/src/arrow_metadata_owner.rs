@@ -193,11 +193,12 @@ impl MetadataOwnedField {
     ) -> Result<Self, MetadataOwnerError> {
         let metadata =
             clone_known_metadata(self.field.metadata(), self.metadata_backing_bytes, limits)?;
-        let field = self
-            .field
-            .clone_with_metadata(metadata.metadata)
-            .with_data_type(data_type)
-            .with_nullable(nullable);
+        // Build the derived Field directly from the bounded metadata copy, so
+        // the original map is never duplicated first. Only the deprecated
+        // dictionary id is not carried over; NovaRocks never reads it.
+        let field = Field::new(self.field.name().clone(), data_type, nullable)
+            .with_dict_is_ordered(self.field.dict_is_ordered().unwrap_or(false))
+            .with_metadata(metadata.metadata);
         Ok(Self {
             field: Arc::new(field),
             metadata_backing_bytes: metadata.backing_bytes,

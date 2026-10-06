@@ -189,7 +189,7 @@ impl RootSegmentBuilder {
     }
     fn into_body(mut self, bytes: usize) -> Bytes {
         self.backing.truncate(bytes);
-        Bytes::from_owner_with_exit_guard(
+        crate::guarded_bytes::bytes_with_exit_guard(
             self.backing,
             RootSegmentExit {
                 _credit: self._credit,
@@ -305,9 +305,9 @@ impl RootResultChannel {
             + geometry.root_queued_segment_positions
             + geometry.root_retired_segment_tail_positions) as usize;
         let sends = geometry.root_live_send_holders as usize;
-        segments * Bytes::owner_with_exit_guard_metadata_size::<Vec<u8>, RootSegmentExit>()
+        segments * crate::guarded_bytes::owner_wrapper_bytes::<Vec<u8>, RootSegmentExit>()
             + sends
-                * (Bytes::owner_with_exit_guard_metadata_size::<Bytes, RootDeliveryOwner>()
+                * (crate::guarded_bytes::owner_wrapper_bytes::<Bytes, RootDeliveryOwner>()
                     + RootDeliveryOwner::backing_metadata_bytes())
     }
     pub fn try_open(
@@ -860,7 +860,7 @@ impl RootResultChannel {
                                     .iter()
                                     .find(|data| data.sequence().get() == item.sequence)
                                     .ok_or(RootChannelError::Payload)?;
-                                let body = Bytes::from_owner_with_exit_guard(
+                                let body = crate::guarded_bytes::bytes_with_exit_guard(
                                     data.body().clone(),
                                     guard.clone(),
                                 );

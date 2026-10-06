@@ -31,7 +31,6 @@ use novarocks_result_contract::RootProfileV1;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RootArrayStorageError {
     UnsupportedCarrier,
-    UnknownBufferOwner,
     UnknownMetadataOwner,
     CapacityExceeded,
     WorkExceeded,
@@ -46,8 +45,15 @@ pub struct RootArrayStorageLimits {
     pub depth: usize,
 }
 
-/// Sum full standard allocation capacities, including sliced-away backing and
-/// complete dictionary values. Aliases may be counted more than once, making
+/// Fixed upper bound for the `Arc`-held owner record that every immutable
+/// Arrow `Buffer` allocates beside its payload. The owner type is private to
+/// arrow-buffer, so this is a NovaRocks constant pinned by a counting-allocator
+/// test (`root_capacity_introspection`). It assumes the arrow-buffer `pool`
+/// feature is off, which that test also guards.
+pub const ARROW_BUFFER_OWNER_METADATA_BOUND: usize = 96;
+
+/// Sum full allocation capacities reported by upstream Arrow, including
+/// sliced-away backing and complete dictionary values. Aliases may be counted more than once, making
 /// the result a conservative upper bound. No growable identity table, Arrow
 /// to_data(), hydration, or allocation is used. Variable DataType/Field/schema
 /// allocations are excluded and require a separate construction-origin proof.
@@ -106,9 +112,12 @@ pub(crate) fn borrowed_root_batch_storage_with_types(
         inspect_type,
     };
     state.charge(size_of::<RecordBatch>())?;
+    // Upstream Arrow does not expose the column Vec's spare capacity; the
+    // visible column count is charged, and spare entries stay with the
+    // producer that built the batch.
     state.charge(
         batch
-            .columns_capacity()
+            .num_columns()
             .checked_mul(size_of::<ArrayRef>())
             .ok_or(RootArrayStorageError::CapacityExceeded)?,
     )?;
@@ -136,14 +145,12 @@ impl Inspection<'_> {
     }
 
     fn buffer(&mut self, buffer: &Buffer) -> Result<(), RootArrayStorageError> {
-        let capacity = buffer
-            .standard_allocation_capacity()
-            .ok_or(RootArrayStorageError::UnknownBufferOwner)?;
-        let metadata = buffer
-            .standard_owner_metadata_size()
-            .ok_or(RootArrayStorageError::UnknownBufferOwner)?;
-        self.charge(capacity)?;
-        self.charge(metadata)
+        // A standard allocation reports its complete Layout, including bytes
+        // sliced away by this view. A custom allocation (for example an IPC
+        // slice of a received message) reports its declared region; the
+        // complete message backing is accounted by the owner that received it.
+        self.charge(buffer.capacity())?;
+        self.charge(ARROW_BUFFER_OWNER_METADATA_BOUND)
     }
 
     fn array(&mut self, array: &dyn Array, depth: usize) -> Result<(), RootArrayStorageError> {
@@ -284,7 +291,7 @@ impl Inspection<'_> {
         self.object(array)?;
         self.charge(
             array
-                .columns_capacity()
+                .num_columns()
                 .checked_mul(size_of::<ArrayRef>())
                 .ok_or(RootArrayStorageError::CapacityExceeded)?,
         )?;

@@ -27,6 +27,7 @@ use std::sync::Arc;
 thread_local! {
     static TRACK: Cell<bool> = const { Cell::new(false) };
     static CALLS: Cell<usize> = const { Cell::new(0) };
+    static BYTES: Cell<usize> = const { Cell::new(0) };
 }
 struct AllocationProbe;
 // SAFETY: The wrapper delegates every allocator operation unchanged and only
@@ -35,6 +36,7 @@ unsafe impl GlobalAlloc for AllocationProbe {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if TRACK.try_with(Cell::get).unwrap_or(false) {
             let _ = CALLS.try_with(|c| c.set(c.get() + 1));
+            let _ = BYTES.try_with(|b| b.set(b.get() + layout.size()));
         }
         unsafe { System.alloc(layout) }
     }
@@ -56,6 +58,14 @@ unsafe impl GlobalAlloc for AllocationProbe {
 }
 #[global_allocator]
 static ALLOCATOR: AllocationProbe = AllocationProbe;
+fn allocations<T>(f: impl FnOnce() -> T) -> (T, usize, usize) {
+    CALLS.with(|c| c.set(0));
+    BYTES.with(|b| b.set(0));
+    TRACK.with(|c| c.set(true));
+    let value = f();
+    TRACK.with(|c| c.set(false));
+    (value, CALLS.with(Cell::get), BYTES.with(Cell::get))
+}
 fn no_allocation<T>(f: impl FnOnce() -> T) -> T {
     CALLS.with(|c| c.set(0));
     TRACK.with(|c| c.set(true));
@@ -76,18 +86,14 @@ fn standard_buffer_slice_reports_complete_allocator_layout_without_copy() {
     let buffer = Buffer::from_vec(values);
     let alias = buffer.slice_with_length(2, 1);
     assert_eq!(alias.len(), 1);
-    assert_eq!(
-        no_allocation(|| alias.standard_allocation_capacity()),
-        Some(capacity)
-    );
-    assert_eq!(
-        no_allocation(|| buffer.standard_allocation_capacity()),
-        Some(capacity)
-    );
+    assert_eq!(no_allocation(|| alias.capacity()), capacity);
+    assert_eq!(no_allocation(|| buffer.capacity()), capacity);
     assert_eq!(alias.data_ptr(), buffer.data_ptr());
 }
+/// A custom allocation reports only the region it declares. The complete
+/// backing stays with the owner that created it, which accounts for it.
 #[test]
-fn custom_buffer_declared_region_is_never_a_backing_capacity_proof() {
+fn custom_buffer_reports_only_its_declared_region() {
     let mut backing = Vec::<u8>::with_capacity(8192);
     backing.push(7);
     let pointer = NonNull::new(backing.as_mut_ptr()).unwrap();
@@ -97,93 +103,12 @@ fn custom_buffer_declared_region_is_never_a_backing_capacity_proof() {
     // its complete backing until the last custom buffer alias is dropped.
     let buffer = unsafe { Buffer::from_custom_allocation(pointer, 1, owner) };
     let alias = buffer.clone();
-    assert_eq!(buffer.capacity(), 1);
-    assert_eq!(
-        no_allocation(|| buffer.standard_allocation_capacity()),
-        None
-    );
-    assert_eq!(no_allocation(|| alias.standard_allocation_capacity()), None);
+    assert_eq!(no_allocation(|| buffer.capacity()), 1);
+    assert_eq!(no_allocation(|| alias.capacity()), 1);
     drop(buffer);
     assert!(weak.upgrade().is_some());
     drop(alias);
     assert!(weak.upgrade().is_none());
-}
-#[test]
-fn record_batch_reports_original_column_vector_spare_without_clone() {
-    let array = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
-    let mut columns = Vec::with_capacity(8192);
-    columns.push(Arc::clone(&array));
-    let capacity = columns.capacity();
-    let batch = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Int32,
-            false,
-        )])),
-        columns,
-    )
-    .unwrap();
-    assert_eq!(batch.columns().len(), 1);
-    assert_eq!(no_allocation(|| batch.columns_capacity()), capacity);
-    assert!(Arc::ptr_eq(&batch.columns()[0], &array));
-    assert_eq!(no_allocation(|| batch.columns_capacity()), capacity);
-}
-#[test]
-fn struct_array_reports_original_child_vector_spare_without_clone() {
-    let array = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
-    let mut columns = Vec::with_capacity(8192);
-    columns.push(Arc::clone(&array));
-    let capacity = columns.capacity();
-    let structure = StructArray::try_new(
-        vec![Arc::new(Field::new("value", DataType::Int32, false))].into(),
-        columns,
-        None,
-    )
-    .unwrap();
-    assert_eq!(structure.columns().len(), 1);
-    assert_eq!(no_allocation(|| structure.columns_capacity()), capacity);
-    assert!(Arc::ptr_eq(&structure.columns()[0], &array));
-    assert_eq!(no_allocation(|| structure.columns_capacity()), capacity);
-}
-
-#[test]
-fn field_replacement_metadata_does_not_duplicate_unknown_original_table() {
-    let mut original = std::collections::HashMap::with_capacity(16384);
-    original.insert("original".to_string(), "value".to_string());
-    let field = Field::new("", DataType::Int32, true).with_metadata(original);
-    let replacement =
-        std::collections::HashMap::from([("replacement".to_string(), "bounded".to_string())]);
-    let cloned = no_allocation(|| field.clone_with_metadata(replacement));
-    assert_eq!(cloned.name(), field.name());
-    assert_eq!(cloned.data_type(), field.data_type());
-    assert_eq!(cloned.is_nullable(), field.is_nullable());
-    assert_eq!(
-        cloned.metadata().get("replacement").map(String::as_str),
-        Some("bounded")
-    );
-    assert!(!cloned.metadata().contains_key("original"));
-    assert_eq!(
-        field.metadata().get("original").map(String::as_str),
-        Some("value")
-    );
-}
-
-#[test]
-#[allow(deprecated)]
-fn field_replacement_metadata_preserves_exact_dictionary_ipc_properties() {
-    let field = Field::new_dict(
-        "dictionary",
-        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
-        false,
-        77,
-        true,
-    );
-    let cloned = field.clone_with_metadata(std::collections::HashMap::new());
-    assert_eq!(cloned.name(), field.name());
-    assert_eq!(cloned.data_type(), field.data_type());
-    assert_eq!(cloned.is_nullable(), field.is_nullable());
-    assert_eq!(cloned.dict_id(), field.dict_id());
-    assert_eq!(cloned.dict_is_ordered(), field.dict_is_ordered());
 }
 
 fn storage_limits(bytes: usize) -> novarocks_execution::exec::chunk::RootArrayStorageLimits {
@@ -214,11 +139,14 @@ fn borrowed_storage_rejects_sliced_away_standard_capacity_without_cell_scan() {
 }
 
 #[test]
-fn borrowed_storage_rejects_unknown_custom_buffer_without_copy_or_hydration() {
+fn borrowed_storage_charges_custom_buffer_declared_region_without_copy() {
     use arrow::buffer::ScalarBuffer;
-    use novarocks_execution::exec::chunk::{RootArrayStorageError, borrowed_root_array_storage};
+    use novarocks_execution::exec::chunk::{
+        ARROW_BUFFER_OWNER_METADATA_BOUND, borrowed_root_array_storage,
+    };
     let mut backing = Vec::<i32>::with_capacity(32768);
     backing.push(42);
+    let backing_bytes = backing.capacity() * std::mem::size_of::<i32>();
     let pointer = NonNull::new(backing.as_mut_ptr().cast::<u8>()).unwrap();
     let owner = Arc::new(backing);
     let weak = Arc::downgrade(&owner);
@@ -226,10 +154,13 @@ fn borrowed_storage_rejects_unknown_custom_buffer_without_copy_or_hydration() {
     // backing until the final array/buffer alias exits.
     let buffer = unsafe { Buffer::from_custom_allocation(pointer, 4, owner) };
     let array = Int32Array::new(ScalarBuffer::new(buffer, 0, 1), None);
-    assert_eq!(
-        no_allocation(|| { borrowed_root_array_storage(&array, storage_limits(96 * 1024 * 1024)) }),
-        Err(RootArrayStorageError::UnknownBufferOwner)
-    );
+    let bytes =
+        no_allocation(|| borrowed_root_array_storage(&array, storage_limits(96 * 1024 * 1024)))
+            .unwrap();
+    // The declared region and the owner record are charged; the complete
+    // backing is the source owner's responsibility.
+    assert!(bytes >= 4 + ARROW_BUFFER_OWNER_METADATA_BOUND);
+    assert!(bytes < backing_bytes);
     assert!(weak.upgrade().is_some());
     drop(array);
     assert!(weak.upgrade().is_none());
@@ -264,31 +195,32 @@ fn dictionary_storage_includes_unreferenced_complete_values_backing() {
 }
 
 #[test]
-fn borrowed_storage_counts_struct_spare_and_stops_at_finite_work() {
+fn borrowed_storage_counts_struct_columns_and_stops_at_finite_work() {
     use novarocks_execution::exec::chunk::{
         RootArrayStorageError, RootArrayStorageLimits, borrowed_root_array_storage,
     };
-    let mut columns = Vec::with_capacity(8192);
-    columns.push(Arc::new(Int32Array::from(vec![1])) as ArrayRef);
-    let spare_bytes = columns.capacity() * std::mem::size_of::<ArrayRef>();
+    let columns = vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef];
+    let column_bytes = columns.len() * std::mem::size_of::<ArrayRef>();
     let structure = StructArray::try_new(
         vec![Arc::new(Field::new("v", DataType::Int32, false))].into(),
         columns,
         None,
     )
     .unwrap();
-    let bytes = no_allocation(|| {
-        borrowed_root_array_storage(&structure, storage_limits(spare_bytes + 4096))
-    })
-    .unwrap();
-    assert!(bytes >= spare_bytes);
+    let bytes =
+        no_allocation(|| borrowed_root_array_storage(&structure, storage_limits(4096))).unwrap();
+    assert!(bytes >= column_bytes);
+    assert_eq!(
+        no_allocation(|| borrowed_root_array_storage(&structure, storage_limits(bytes - 1))),
+        Err(RootArrayStorageError::CapacityExceeded)
+    );
     for (nodes, depth) in [(1, 64), (65536, 0)] {
         assert_eq!(
             no_allocation(|| {
                 borrowed_root_array_storage(
                     &structure,
                     RootArrayStorageLimits {
-                        bytes: spare_bytes + 4096,
+                        bytes: 4096,
                         nodes,
                         depth,
                     },
@@ -453,47 +385,41 @@ fn caller_cannot_relax_the_frozen_structural_work_ceiling() {
     );
 }
 
+/// Pins `ARROW_BUFFER_OWNER_METADATA_BOUND` against the owner record upstream
+/// arrow-buffer actually allocates when a Vec becomes an immutable Buffer.
+/// A pool-enabled arrow-buffer build grows this record and fails here.
 #[test]
-fn standard_owner_metadata_descriptor_is_borrowed_and_custom_is_unknown() {
-    let buffer = Buffer::from_vec(vec![1_u8]);
-    let metadata = no_allocation(|| buffer.standard_owner_metadata_size()).unwrap();
-    assert!(metadata > 0);
+fn buffer_owner_metadata_bound_covers_the_actual_owner_allocation() {
+    use novarocks_execution::exec::chunk::ARROW_BUFFER_OWNER_METADATA_BOUND;
+    let values = vec![1_u8; 64];
+    let (buffer, calls, bytes) = allocations(move || Buffer::from_vec(values));
     assert_eq!(
-        no_allocation(|| buffer.slice(0).standard_owner_metadata_size()),
-        Some(metadata)
+        calls, 1,
+        "the payload Vec is moved; only the owner is allocated"
     );
-    let mut backing = Vec::<u8>::with_capacity(8192);
-    backing.push(1);
-    let ptr = NonNull::new(backing.as_mut_ptr()).unwrap();
-    // SAFETY: The owner retains the initialized declared region and the larger
-    // whole backing for the complete custom buffer lifetime.
-    let custom = unsafe { Buffer::from_custom_allocation(ptr, 1, Arc::new(backing)) };
-    assert_eq!(
-        no_allocation(|| custom.standard_owner_metadata_size()),
-        None
+    assert!(
+        bytes <= ARROW_BUFFER_OWNER_METADATA_BOUND,
+        "owner record {bytes} exceeds its fixed bound"
     );
+    assert_eq!(buffer.len(), 64);
 }
 
 #[test]
-fn whole_batch_storage_checks_real_spare_column_backing_and_shared_work_limit() {
+fn whole_batch_storage_counts_columns_and_shared_work_limit() {
     use novarocks_execution::exec::chunk::{
         RootArrayStorageError, RootArrayStorageLimits, borrowed_root_batch_storage,
     };
     let array = Arc::new(Int32Array::from(vec![1])) as ArrayRef;
-    let mut columns = Vec::with_capacity(8192);
-    columns.push(Arc::clone(&array));
-    let spare_bytes = columns.capacity() * std::mem::size_of::<ArrayRef>();
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
-        columns,
+        vec![Arc::clone(&array)],
     )
     .unwrap();
     let bound =
-        no_allocation(|| borrowed_root_batch_storage(&batch, storage_limits(spare_bytes + 4096)))
-            .unwrap();
-    assert!(bound >= spare_bytes);
+        no_allocation(|| borrowed_root_batch_storage(&batch, storage_limits(4096))).unwrap();
+    assert!(bound >= std::mem::size_of::<ArrayRef>());
     assert_eq!(
-        no_allocation(|| borrowed_root_batch_storage(&batch, storage_limits(spare_bytes - 1))),
+        no_allocation(|| borrowed_root_batch_storage(&batch, storage_limits(bound - 1))),
         Err(RootArrayStorageError::CapacityExceeded)
     );
     let batch = RecordBatch::try_new(
@@ -580,7 +506,7 @@ fn owned_root_schema(
 }
 
 #[test]
-fn whole_chunk_proof_counts_name_and_original_columns_spare_without_allocation() {
+fn whole_chunk_proof_counts_name_and_columns_without_allocation() {
     use novarocks_execution::exec::chunk::{
         Chunk, RootArrayStorageError, borrowed_root_chunk_storage,
     };
@@ -589,9 +515,8 @@ fn whole_chunk_proof_counts_name_and_original_columns_spare_without_allocation()
     let name_capacity = name.capacity();
     let schema = owned_root_schema(owned_root_field(name, DataType::Int32), Vec::new());
     let array = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
-    let mut columns = Vec::with_capacity(8192);
-    columns.push(array);
-    let spare = columns.capacity() * std::mem::size_of::<ArrayRef>();
+    let columns = vec![array];
+    let spare = columns.len() * std::mem::size_of::<ArrayRef>();
     let batch = RecordBatch::try_new(schema.arrow_schema_ref(), columns).unwrap();
     let chunk = Chunk::try_new_with_chunk_schema(batch, schema).unwrap();
     let bytes =

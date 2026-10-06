@@ -207,8 +207,7 @@ impl StatisticsMaterializerFactory {
             + size_of::<MapArray>()
             + size_of::<StructArray>()
             + 8 * 4 * size_of::<usize>();
-        let buffers = Buffer::standard_unpooled_owner_metadata_capacity()
-            .ok_or("statistics buffer metadata requires an explicit unpooled proof")?;
+        let buffers = crate::exec::chunk::ARROW_BUFFER_OWNER_METADATA_BOUND;
         let fixed_capacity = metadata
             .checked_mul(2)
             .and_then(|n| n.checked_add(objects))

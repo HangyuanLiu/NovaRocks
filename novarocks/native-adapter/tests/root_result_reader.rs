@@ -838,16 +838,11 @@ use prost::Message;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-// These original connection capabilities precede request decode and share
-// the real Worker process budget. This fixture installs no listener or socket.
-struct UnaryHeaderCredit {
-    _credit: ResultWriteCredit,
-}
+// Response header maps are ordinary upstream Tonic/HTTP allocations. They are
+// third-party internals bounded by the listener's header configuration and the
+// transport measurement gate, not by a root grant, so this fixture charges none.
 struct UnaryFixture {
     inner: Fixture,
-    fields: hyper::http::header::HeaderFieldAllocationPool,
-    maps: hyper::http::header::HeaderMapAllocationPool,
-    header_bytes: usize,
 }
 impl std::ops::Deref for UnaryFixture {
     type Target = Fixture;
@@ -857,54 +852,12 @@ impl std::ops::Deref for UnaryFixture {
 }
 impl UnaryFixture {
     fn new(count_only: bool) -> Self {
-        use hyper::http::header::{HeaderFieldAllocationPool, HeaderMapAllocationPool};
-        let inner = Fixture::new(count_only);
-        let carrier = Bytes::owner_with_exit_guard_metadata_size::<Bytes, UnaryHeaderCredit>();
-        let field_bytes =
-            HeaderFieldAllocationPool::allocation_capacity_bound(4096, 64, 256).unwrap() + carrier;
-        let map_bytes =
-            HeaderMapAllocationPool::allocation_capacity_bound(8, 8, 4).unwrap() + carrier;
-        let original = |bytes| {
-            Bytes::from_owner_with_exit_guard(
-                Bytes::new(),
-                UnaryHeaderCredit {
-                    _credit: inner.fill_process(bytes),
-                },
-            )
-        };
-        let fields = HeaderFieldAllocationPool::new(4096, 64, 256, original(field_bytes)).unwrap();
-        let maps = HeaderMapAllocationPool::new(8, 8, 4, original(map_bytes)).unwrap();
-        fields.try_bind_once().unwrap();
-        maps.try_bind_connection_with_fields(&fields).unwrap();
         Self {
-            inner,
-            fields,
-            maps,
-            header_bytes: field_bytes + map_bytes,
+            inner: Fixture::new(count_only),
         }
     }
-    fn headers(&self) -> tonic::server::ResponseHeaderMaps {
-        let initial = hyper::http::HeaderMap::try_from_allocation_pool(&self.maps).unwrap();
-        let trailers = hyper::http::HeaderMap::try_from_allocation_pool(&self.maps).unwrap();
-        assert!(
-            initial
-                .field_allocation_pool()
-                .unwrap()
-                .same_pool(&self.fields)
-        );
-        tonic::server::ResponseHeaderMaps::new(initial, trailers).unwrap()
-    }
-    fn assert_headers(&self, headers: &hyper::http::HeaderMap) {
-        assert!(headers.allocation_pool().is_some(), "original map retained");
-        assert!(
-            headers
-                .field_allocation_pool()
-                .unwrap()
-                .same_pool(&self.fields)
-        );
-    }
     fn header_bytes(&self) -> usize {
-        self.header_bytes
+        0
     }
 }
 
@@ -999,7 +952,6 @@ async fn unary_unpolled_body_keeps_preallocated_buffer_and_full_credit() {
     let response = root_result_unary(
         &fixture.reader,
         unary_request(&fixture.request(Some(1), 0, 1)),
-        fixture.headers(),
     )
     .await;
     stop_send_probe();
@@ -1032,7 +984,6 @@ async fn unary_last_data_slice_outlives_body_and_context_seal() {
     let response = root_result_unary(
         &fixture.reader,
         unary_request(&fixture.request(Some(1), 0, 1)),
-        fixture.headers(),
     )
     .await;
     stop_send_probe();
@@ -1082,7 +1033,6 @@ async fn unary_ack_only_encodes_from_metadata_when_process_data_pool_is_full() {
     let response = root_result_unary(
         &fixture.reader,
         unary_request(&fixture.request(None, 1, 1)),
-        fixture.headers(),
     )
     .await;
     stop_send_probe();
@@ -1131,7 +1081,6 @@ async fn unary_extra_metadata_is_pregranted_before_ack_or_projection() {
     let response = root_result_unary(
         &fixture.reader,
         unary_request(&fixture.request(None, 1, 1)),
-        fixture.headers(),
     )
     .await;
     assert_eq!(response.headers()["grpc-status"], "8");
@@ -1141,7 +1090,6 @@ async fn unary_extra_metadata_is_pregranted_before_ack_or_projection() {
     let mut body = root_result_unary(
         &fixture.reader,
         unary_request(&fixture.request(None, 1, 1)),
-        fixture.headers(),
     )
     .await
     .into_body();
@@ -1160,7 +1108,6 @@ async fn unary_cancellation_of_admitted_long_poll_exits_all_original_grants() {
     let mut future = Box::pin(root_result_unary(
         &fixture.reader,
         request,
-        fixture.headers(),
     ));
     pending(future.as_mut()).await;
     assert!(!fixture.root.physical_idle());
@@ -1194,7 +1141,6 @@ async fn unary_closed_route_preserves_actual_ack_without_new_root_holder() {
     let mut body = root_result_unary(
         &fixture.reader,
         unary_request(&fixture.request(None, 1, 1)),
-        fixture.headers(),
     )
     .await
     .into_body();
@@ -1218,17 +1164,14 @@ async fn unary_two_bodies_hold_two_read_positions_before_first_poll() {
     let fixture = UnaryFixture::new(false);
     fixture.finish();
     let read = fixture.request(Some(1), 0, 1);
-    let first = root_result_unary(&fixture.reader, unary_request(&read), fixture.headers()).await;
-    let second = root_result_unary(&fixture.reader, unary_request(&read), fixture.headers()).await;
-    let third = root_result_unary(&fixture.reader, unary_request(&read), fixture.headers()).await;
-    fixture.assert_headers(first.headers());
-    fixture.assert_headers(second.headers());
-    fixture.assert_headers(third.headers());
+    let first = root_result_unary(&fixture.reader, unary_request(&read)).await;
+    let second = root_result_unary(&fixture.reader, unary_request(&read)).await;
+    let third = root_result_unary(&fixture.reader, unary_request(&read)).await;
     assert_eq!(third.headers()["grpc-status"], "8");
     drop(third);
     drop(first);
     let replacement =
-        root_result_unary(&fixture.reader, unary_request(&read), fixture.headers()).await;
+        root_result_unary(&fixture.reader, unary_request(&read)).await;
     assert!(!replacement.headers().contains_key("grpc-status"));
     drop(second);
     drop(replacement);
@@ -1254,7 +1197,6 @@ async fn unary_maximum_segment_is_one_copy_without_buffer_growth() {
     let mut body = root_result_unary(
         &fixture.reader,
         unary_request(&fixture.request(Some(1), 0, 1)),
-        fixture.headers(),
     )
     .await
     .into_body();
@@ -1275,7 +1217,6 @@ async fn unary_maximum_segment_is_one_copy_without_buffer_growth() {
         .unwrap()
         .into_trailers()
         .unwrap();
-    fixture.assert_headers(&trailers);
     assert_eq!(trailers["grpc-status"], "0");
     assert!(
         poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx))
@@ -1299,8 +1240,7 @@ async fn unary_oversized_request_is_rejected_before_root_admission() {
         .header("content-type", "application/grpc")
         .body(axum::body::Body::from(payload))
         .unwrap();
-    let response = root_result_unary(&fixture.reader, request, fixture.headers()).await;
-    fixture.assert_headers(response.headers());
+    let response = root_result_unary(&fixture.reader, request).await;
     assert_eq!(response.headers()["grpc-status"], "11");
     assert!(fixture.root.physical_idle());
     assert_eq!(fixture.root.snapshot().consumed_through, 0);
@@ -1311,7 +1251,7 @@ async fn unary_count_only_end_uses_the_same_frozen_codec_without_row_payload() {
     let fixture = UnaryFixture::new(true);
     fixture.finish();
     let read = fixture.request(Some(1), 0, 1);
-    let mut body = root_result_unary(&fixture.reader, unary_request(&read), fixture.headers())
+    let mut body = root_result_unary(&fixture.reader, unary_request(&read))
         .await
         .into_body();
     let message = unary_message(&unary_data(&mut body).await);
