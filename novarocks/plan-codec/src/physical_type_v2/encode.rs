@@ -21,8 +21,9 @@
 
 use super::encode_resources::Model;
 use super::{
-    PackageTypeProjectionFacts, PackageTypeProjectionLimits, TypeCodecError, TypeProjectionLimits,
-    WriterTypeSource, encode_logical, validate_field, validate_type,
+    FieldRootSources, PackageTypeProjectionFacts, PackageTypeProjectionLimits, TypeCodecError,
+    TypeProjectionLimits, ValueRootSources, WriterTypeSource, encode_logical, validate_field,
+    validate_type,
 };
 use crate::allocation_exit_v2::reserve_exit;
 use crate::arrow_metadata_v2::{copy_string, encode_metadata};
@@ -266,8 +267,8 @@ fn count_field(
 }
 
 fn preflight<'a>(
-    values: &[(u32, FunctionValueType)],
-    fields: &[(u32, Arc<Field>)],
+    values: ValueRootSources<'_>,
+    fields: FieldRootSources<'_>,
     writers: &[WriterTypeSource<'_>],
     limits: TypeProjectionLimits,
     resources: Option<Admission<'a>>,
@@ -289,13 +290,13 @@ fn preflight<'a>(
     }
     let observed = resources.is_some();
     let mut reserved_fields = BTreeSet::new();
-    for (id, _) in fields {
+    for (id, _) in fields.iter() {
         if observed {
             work.flush()?;
         } else {
             work.step()?;
         }
-        let unique = reserved_fields.insert(*id);
+        let unique = reserved_fields.insert(id);
         if observed {
             work.step()?;
             work.flush()?;
@@ -341,13 +342,13 @@ fn preflight<'a>(
         resources.gate()?;
     }
     let mut ids = BTreeSet::new();
-    for (id, value) in values {
+    for (id, value) in values.iter() {
         if observed {
             work.flush()?;
         } else {
             work.step()?;
         }
-        let unique = ids.insert(*id);
+        let unique = ids.insert(id);
         if observed {
             work.step()?;
             work.flush()?;
@@ -360,7 +361,7 @@ fn preflight<'a>(
         let nodes = count_type(&value.data_type, &mut counts, work, SourceLaw::Strict)?;
         counts.expansion(nodes)?;
     }
-    for (_, field) in fields {
+    for (_, field) in fields.iter() {
         work.step()?;
         validate_field(field, work)?;
         field_logical_type(field)?;
@@ -549,12 +550,19 @@ pub(super) fn encode_with_fields(
     limits: TypeProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::TypeTable, Error> {
-    encode_roots(values, fields, &[], limits, None, work)
+    encode_roots(
+        ValueRootSources::Owned(values),
+        FieldRootSources::Owned(fields),
+        &[],
+        limits,
+        None,
+        work,
+    )
 }
 
 fn encode_roots<'a>(
-    values: &[(u32, FunctionValueType)],
-    fields: &[(u32, Arc<Field>)],
+    values: ValueRootSources<'_>,
+    fields: FieldRootSources<'_>,
     writers: &[WriterTypeSource<'_>],
     limits: TypeProjectionLimits,
     resources: Option<Admission<'a>>,
@@ -578,7 +586,7 @@ fn encode_roots<'a>(
         fields: output_vec(counts.fields, ids.observed, work)?,
         value_types: output_vec(values.len(), ids.observed, work)?,
     };
-    for (id, value) in values {
+    for (id, value) in values.iter() {
         work.step()?;
         let carrier_type_id = emit_type(
             &value.data_type,
@@ -588,17 +596,17 @@ fn encode_roots<'a>(
             SourceLaw::Strict,
         )?;
         table.value_types.push(wire::ValueTypeDefinition {
-            id: *id,
+            id,
             carrier_type_id: Some(carrier_type_id),
             nullable: value.nullable,
             logical_type: encode_logical(value.logical_type),
         });
     }
-    for (id, field) in fields {
+    for (id, field) in fields.iter() {
         work.step()?;
         emit_field(
             field,
-            Some(*id),
+            Some(id),
             &mut table,
             &mut ids,
             work,
@@ -625,8 +633,8 @@ fn encode_roots<'a>(
 }
 
 pub(super) fn encode_writer_sources(
-    values: &[(u32, FunctionValueType)],
-    fields: &[(u32, Arc<Field>)],
+    values: ValueRootSources<'_>,
+    fields: FieldRootSources<'_>,
     writers: &[WriterTypeSource<'_>],
     source_retained_bytes: usize,
     limits: PackageTypeProjectionLimits,
@@ -639,10 +647,10 @@ pub(super) fn encode_writer_sources(
             count.checked_add(source.field_ids.len())
         })
         .ok_or(CompileControlError::ResourceExhausted)?;
-    let model = Model::new(
+    let model = Model::new_sources(
         source_retained_bytes,
-        values.len(),
-        fields.len(),
+        values,
+        fields,
         writers.len(),
         writer_fields,
         limits,

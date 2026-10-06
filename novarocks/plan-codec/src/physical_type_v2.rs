@@ -206,13 +206,73 @@ fn finish<T>(
     result
 }
 
+/// Input storage is a loan policy, not a second type grammar. Borrowed roots
+/// preserve the original checked Package objects without cloning Dictionary
+/// boxes or manufacturing Field handles. Both policies use the same emitter.
+#[derive(Clone, Copy)]
+pub(crate) enum ValueRootSources<'source> {
+    Owned(&'source [(u32, FunctionValueType)]),
+    Borrowed(&'source [(u32, &'source FunctionValueType)]),
+}
+impl<'source> ValueRootSources<'source> {
+    pub(super) fn len(self) -> usize {
+        match self {
+            Self::Owned(roots) => roots.len(),
+            Self::Borrowed(roots) => roots.len(),
+        }
+    }
+    pub(super) fn iter(self) -> impl ExactSizeIterator<Item = (u32, &'source FunctionValueType)> {
+        (0..self.len()).map(move |index| match self {
+            Self::Owned(roots) => (roots[index].0, &roots[index].1),
+            Self::Borrowed(roots) => roots[index],
+        })
+    }
+    pub(super) fn payload_layout(self) -> Result<std::alloc::Layout, CompileControlError> {
+        let layout = match self {
+            Self::Owned(roots) => {
+                std::alloc::Layout::array::<(u32, FunctionValueType)>(roots.len())
+            }
+            Self::Borrowed(roots) => {
+                std::alloc::Layout::array::<(u32, &FunctionValueType)>(roots.len())
+            }
+        };
+        layout.map_err(|_| CompileControlError::ResourceExhausted)
+    }
+}
+#[derive(Clone, Copy)]
+pub(crate) enum FieldRootSources<'source> {
+    Owned(&'source [(u32, Arc<Field>)]),
+    Borrowed(&'source [(u32, &'source Arc<Field>)]),
+}
+impl<'source> FieldRootSources<'source> {
+    pub(super) fn len(self) -> usize {
+        match self {
+            Self::Owned(roots) => roots.len(),
+            Self::Borrowed(roots) => roots.len(),
+        }
+    }
+    pub(super) fn iter(self) -> impl ExactSizeIterator<Item = (u32, &'source Arc<Field>)> {
+        (0..self.len()).map(move |index| match self {
+            Self::Owned(roots) => (roots[index].0, &roots[index].1),
+            Self::Borrowed(roots) => roots[index],
+        })
+    }
+    pub(super) fn payload_layout(self) -> Result<std::alloc::Layout, CompileControlError> {
+        let layout = match self {
+            Self::Owned(roots) => std::alloc::Layout::array::<(u32, Arc<Field>)>(roots.len()),
+            Self::Borrowed(roots) => std::alloc::Layout::array::<(u32, &Arc<Field>)>(roots.len()),
+        };
+        layout.map_err(|_| CompileControlError::ResourceExhausted)
+    }
+}
+
 /// The original source roots and their immutable wire projection from one
 /// successful emission. Root IDs occupy separate sparse namespaces; borrowing
 /// this proof does not reconstruct source Fields or types from the wire DTO.
 pub struct EncodedTypeTable<'source> {
     table: wire::TypeTable,
-    values: &'source [(u32, FunctionValueType)],
-    fields: &'source [(u32, Arc<Field>)],
+    values: ValueRootSources<'source>,
+    fields: FieldRootSources<'source>,
     writers: &'source [WriterTypeSource<'source>],
 }
 impl<'source> EncodedTypeTable<'source> {
@@ -288,7 +348,7 @@ impl<'source> EncodedTypeTable<'source> {
         E: From<TypeCodecError>,
     {
         for (position, (candidate, value)) in self.values.iter().enumerate() {
-            let matches = *candidate == id;
+            let matches = candidate == id;
             if matches {
                 capture(value, work)?;
             }
@@ -304,7 +364,7 @@ impl<'source> EncodedTypeTable<'source> {
                         .ok_or(TypeCodecError::InvalidShape(
                             "encoded root value definition is absent",
                         ))?;
-                if emitted.id != *candidate {
+                if emitted.id != candidate {
                     return Err(TypeCodecError::InvalidShape(
                         "encoded root value definition differs from its source",
                     )
@@ -362,8 +422,8 @@ impl<'source> EncodedTypeTable<'source> {
     where
         E: From<TypeCodecError>,
     {
-        for (candidate, field) in self.fields {
-            let matches = *candidate == id;
+        for (candidate, field) in self.fields.iter() {
+            let matches = candidate == id;
             if matches {
                 capture(field, work)?;
             }
@@ -407,6 +467,39 @@ pub fn encode_type_table_writer_sources_observed<'source>(
     admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<EncodedTypeTable<'source>, TypeCodecError> {
+    let values = ValueRootSources::Owned(values);
+    let fields = FieldRootSources::Owned(fields);
+    let table = encode::encode_writer_sources(
+        values,
+        fields,
+        writers,
+        source_retained_bytes,
+        limits,
+        admit,
+        work,
+    )?;
+    Ok(EncodedTypeTable {
+        table,
+        values,
+        fields,
+        writers,
+    })
+}
+
+/// Whole-package source views lend original roots; no owned type/Field
+/// copies are made to adapt a namespace input. The caller retains all views
+/// for the token lifetime and owns admission and completion on this meter.
+pub(crate) fn encode_borrowed_type_table_writer_sources_in<'source>(
+    values: &'source [(u32, &'source FunctionValueType)],
+    fields: &'source [(u32, &'source Arc<Field>)],
+    writers: &'source [WriterTypeSource<'source>],
+    source_retained_bytes: usize,
+    limits: PackageTypeProjectionLimits,
+    admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<EncodedTypeTable<'source>, TypeCodecError> {
+    let values = ValueRootSources::Borrowed(values);
+    let fields = FieldRootSources::Borrowed(fields);
     let table = encode::encode_writer_sources(
         values,
         fields,
@@ -438,8 +531,8 @@ pub fn encode_type_table_sources<'source>(
     let table = finish(work, table)?;
     Ok(EncodedTypeTable {
         table,
-        values,
-        fields,
+        values: ValueRootSources::Owned(values),
+        fields: FieldRootSources::Owned(fields),
         writers: &[],
     })
 }
@@ -817,6 +910,8 @@ mod package_graph_tests;
 #[cfg(test)]
 mod receiver_tests;
 
+#[cfg(test)]
+mod borrowed_sender_tests;
 #[cfg(test)]
 pub(crate) mod sender_tests;
 

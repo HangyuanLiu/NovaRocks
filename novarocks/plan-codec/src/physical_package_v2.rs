@@ -29,6 +29,8 @@ use prost::Message;
 use std::fmt;
 
 mod nodes;
+mod type_sources;
+mod type_views;
 
 #[derive(Debug)]
 pub enum PackageWireError {

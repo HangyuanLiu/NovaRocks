@@ -19,7 +19,10 @@
 //! owns the meter, source union invoice, actual grammar and allocation scope.
 //! This model neither observes synthetic work nor grants host memory.
 
-use super::{PackageTypeProjectionFacts, PackageTypeProjectionLimits, TypeCodecError};
+use super::{
+    FieldRootSources, PackageTypeProjectionFacts, PackageTypeProjectionLimits, TypeCodecError,
+    ValueRootSources,
+};
 use crate::{
     btree_resources_v2 as btree,
     resource_source_model::{LOCKED_FAMILY, LOCKED_TOOLCHAIN},
@@ -57,6 +60,39 @@ fn hash_error(error: hashmap::HashMapResourceError) -> E {
             CompileControlError::ResourceExhausted.into()
         }
         hashmap::HashMapResourceError::SourceModel(message) => E::ResourceSource(message),
+    }
+}
+
+enum RootStorage<'source> {
+    OwnedCounts {
+        values: usize,
+        fields: usize,
+    },
+    Sources {
+        values: ValueRootSources<'source>,
+        fields: FieldRootSources<'source>,
+    },
+}
+impl RootStorage<'_> {
+    fn counts(&self) -> (usize, usize) {
+        match self {
+            Self::OwnedCounts { values, fields } => (*values, *fields),
+            Self::Sources { values, fields } => (values.len(), fields.len()),
+        }
+    }
+    fn payload_floor(&self) -> Result<usize, E> {
+        match self {
+            Self::OwnedCounts { values, fields } => Ok(array::<(
+                u32,
+                novarocks_type_contract::FunctionValueType,
+            )>(*values)?
+            .size()
+            .max(array::<(u32, Arc<Field>)>(*fields)?.size())),
+            Self::Sources { values, fields } => Ok(values
+                .payload_layout()?
+                .size()
+                .max(fields.payload_layout()?.size())),
+        }
     }
 }
 
@@ -107,14 +143,60 @@ impl Model {
         writer_fields: usize,
         limits: PackageTypeProjectionLimits,
     ) -> Result<Self, E> {
+        Self::new_core(
+            source,
+            RootStorage::OwnedCounts {
+                values: value_roots,
+                fields: strict_field_roots,
+            },
+            writer_sources,
+            writer_fields,
+            limits,
+        )
+    }
+    /// Borrowed tuple storage changes only the necessary source floor. The
+    /// original source trees, traversal and output request model are retained.
+    pub(super) fn new_sources(
+        source: usize,
+        values: ValueRootSources<'_>,
+        fields: FieldRootSources<'_>,
+        writer_sources: usize,
+        writer_fields: usize,
+        limits: PackageTypeProjectionLimits,
+    ) -> Result<Self, E> {
+        match (values, fields) {
+            (ValueRootSources::Owned(values), FieldRootSources::Owned(fields)) => Self::new(
+                source,
+                values.len(),
+                fields.len(),
+                writer_sources,
+                writer_fields,
+                limits,
+            ),
+            _ => Self::new_core(
+                source,
+                RootStorage::Sources { values, fields },
+                writer_sources,
+                writer_fields,
+                limits,
+            ),
+        }
+    }
+    fn new_core(
+        source: usize,
+        roots: RootStorage<'_>,
+        writer_sources: usize,
+        writer_fields: usize,
+        limits: PackageTypeProjectionLimits,
+    ) -> Result<Self, E> {
         if !LOCKED_TOOLCHAIN || !LOCKED_FAMILY {
             return Err(E::ResourceSource("type encoder library source model drift"));
         }
         // Borrowed root slices may alias/share allocation, so their necessary
         // payload floors are combined by max, never summed into a fake union.
-        let floor = array::<(u32, novarocks_type_contract::FunctionValueType)>(value_roots)?
-            .size()
-            .max(array::<(u32, Arc<Field>)>(strict_field_roots)?.size())
+        let (value_roots, strict_field_roots) = roots.counts();
+        let floor = roots
+            .payload_floor()?
             .max(array::<super::WriterTypeSource<'_>>(writer_sources)?.size())
             .max(array::<u32>(writer_fields)?.size());
         if source < floor {
@@ -593,6 +675,49 @@ mod tests {
             model.string(usize::MAX),
             Err(E::Control(CompileControlError::ResourceExhausted))
         ));
+    }
+    #[test]
+    fn borrowed_root_tuple_floor_preserves_owned_request_and_work_model() {
+        let values = [
+            (
+                0,
+                novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+            ),
+            (
+                u32::MAX,
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            ),
+        ];
+        let field = Arc::new(Field::new("f", DataType::Int32, false));
+        let fields = [(0, field.clone()), (u32::MAX, field)];
+        let borrowed_values = [(0, &values[0].1), (u32::MAX, &values[1].1)];
+        let borrowed_fields = [(0, &fields[0].1), (u32::MAX, &fields[1].1)];
+        let value_sources = ValueRootSources::Borrowed(&borrowed_values);
+        let field_sources = FieldRootSources::Borrowed(&borrowed_fields);
+        // This is only the necessary root-slice payload floor. It does not
+        // certify the complete invoice of the original reachable objects.
+        let floor = (2 * std::mem::size_of::<(u32, &novarocks_type_contract::FunctionValueType)>())
+            .max(2 * std::mem::size_of::<(u32, &Arc<Field>)>());
+        assert!(Model::new_sources(floor, value_sources, field_sources, 0, 0, limits()).is_ok());
+        assert!(matches!(
+            Model::new_sources(floor - 1, value_sources, field_sources, 0, 0, limits()),
+            Err(E::Control(CompileControlError::ResourceExhausted))
+        ));
+        let source = 65_536;
+        let original = facts(&Model::new(source, 2, 2, 0, 0, limits()).unwrap());
+        let owned = Model::new_sources(
+            source,
+            ValueRootSources::Owned(&values),
+            FieldRootSources::Owned(&fields),
+            0,
+            0,
+            limits(),
+        )
+        .unwrap();
+        let borrowed =
+            Model::new_sources(source, value_sources, field_sources, 0, 0, limits()).unwrap();
+        assert_eq!(facts(&owned), original);
+        assert_eq!(facts(&borrowed), original);
     }
     #[test]
     fn necessary_source_floors_use_shared_root_max_and_real_occupied_field_handles() {
