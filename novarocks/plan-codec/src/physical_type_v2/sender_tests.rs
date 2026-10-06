@@ -629,8 +629,18 @@ fn relation_fields(
         .collect()
 }
 pub(crate) fn checked_writer_package(recipe: c::ConnectorWriteRecipeDraft) -> p::FragmentPackage {
+    checked_writer_package_with(recipe, false)
+}
+
+/// The same producer, with its Values row authored either as a legacy literal
+/// or as an actual constant pool reference (the publishable v2 form).
+pub(crate) fn checked_writer_package_with(
+    recipe: c::ConnectorWriteRecipeDraft,
+    constant_row: bool,
+) -> p::FragmentPackage {
     // A real producer/stream/finisher plan, with original cut derivation and
     // full Package publication. There are no aggregate or function calls.
+    let pool = p::ConstantPoolId::new(5);
     let ordinal = c::WriteTargetOrdinal::try_new(0).unwrap();
     let edge = p::EdgeId::new(7);
     let mut builder = p::FragmentBuilder::new(p::FragmentId::new(1));
@@ -639,7 +649,11 @@ pub(crate) fn checked_writer_package(recipe: c::ConnectorWriteRecipeDraft) -> p:
         .add_expression(
             source,
             FunctionValueType::new(DataType::Int64, false),
-            p::ExprKind::Literal(p::LiteralValue::Int64(42)),
+            if constant_row {
+                p::ExprKind::Constant(p::ConstantReference { pool, ordinal: 0 })
+            } else {
+                p::ExprKind::Literal(p::LiteralValue::Int64(42))
+            },
         )
         .unwrap();
     let value = builder
@@ -777,6 +791,32 @@ pub(crate) fn checked_writer_package(recipe: c::ConnectorWriteRecipeDraft) -> p:
         .finish_definition(finish, p::FragmentSink::Noop, dop())
         .unwrap();
     let mut plan = p::PlanBuilder::new(p::PlanVersionId::try_new([1; 16]).unwrap());
+    if constant_row {
+        plan.insert_constant_pool(
+            pool,
+            novarocks_constant_contract::ConstantPool::try_new(
+                Arc::new(Field::new("row", DataType::Int64, false)),
+                FunctionValueType::new(DataType::Int64, false),
+                arrow::array::Array::to_data(&arrow::array::Int64Array::from(vec![42])),
+                p::ConstantPolicy {
+                    max_rows: 16,
+                    max_array_nodes: 32,
+                    max_logical_elements: 128,
+                    max_retained_buffer_bytes: 65536,
+                    max_type_depth: 16,
+                    max_type_nodes: 128,
+                    max_dictionary_depth: 8,
+                    max_metadata_bytes: 4096,
+                    max_library_validation_work: 1_000_000,
+                    max_library_validation_bytes: 1_000_000,
+                },
+                CompilePhase::Validate,
+                &Setup,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();
     plan.add_edge(p::Edge {
@@ -803,7 +843,7 @@ pub(crate) fn checked_writer_package(recipe: c::ConnectorWriteRecipeDraft) -> p:
         },
     })
     .unwrap();
-    let plan = plan.finish().unwrap();
+    let plan = plan.finish_observed(&Setup).unwrap();
     let mut uses = BTreeMap::new();
     let mut calls = BTreeMap::new();
     let mut pruning = BTreeMap::new();
@@ -823,7 +863,7 @@ pub(crate) fn checked_writer_package(recipe: c::ConnectorWriteRecipeDraft) -> p:
             .map(|(ordinal, (_, root))| {
                 assert!(matches!(
                     fragment.expressions().get(root.expr).unwrap().kind,
-                    p::ExprKind::Literal(_)
+                    p::ExprKind::Literal(_) | p::ExprKind::Constant(_)
                 ));
                 ExpressionInvocation {
                     context: ExpressionEffectContext {

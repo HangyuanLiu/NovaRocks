@@ -837,6 +837,13 @@ pub(in crate::physical_package_v2) fn cv_package() -> p::FragmentPackage {
     .unwrap()
 }
 pub(in crate::physical_package_v2) fn writer_package() -> p::FragmentPackage {
+    crate::physical_type_v2::sender_tests::checked_writer_package(writer_recipe())
+}
+/// The same checked writer producer with its Values row as a pool reference.
+pub(in crate::physical_package_v2) fn writer_constant_package() -> p::FragmentPackage {
+    crate::physical_type_v2::sender_tests::checked_writer_package_with(writer_recipe(), true)
+}
+fn writer_recipe() -> c::ConnectorWriteRecipeDraft {
     let provider = c::ConnectorProviderId::parse("iceberg").unwrap();
     let instance = c::ConnectorInstanceId::try_from_canonical("lake").unwrap();
     let catalog = c::CatalogHandle::new(instance.clone(), c::CatalogVersion::from_bytes([7; 32]));
@@ -865,7 +872,7 @@ pub(in crate::physical_package_v2) fn writer_package() -> p::FragmentPackage {
         },
     )
     .unwrap();
-    crate::physical_type_v2::sender_tests::checked_writer_package(recipe)
+    recipe
 }
 
 fn view_limits() -> TypeViewLimits {

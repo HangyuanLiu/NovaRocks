@@ -20,7 +20,7 @@ use crate::ipc_flat_pool_v2::FlatPoolWriteLimits;
 use crate::ipc_recursive_pool_v2::RecursivePoolWriteLimits;
 use crate::ipc_schema_v2::IpcSchemaProjectionLimits;
 use crate::physical_package_v2::definition_sources::tests::{
-    cv_package, rich_package, writer_package,
+    cv_package, rich_package, writer_constant_package, writer_package,
 };
 use crate::physical_package_v2::prepare_package_wire_in;
 use crate::physical_package_v2::provider_sources::tests::checked_read;
@@ -294,6 +294,7 @@ fn fixtures() -> Vec<(&'static str, p::FragmentPackage)> {
     vec![
         ("rich", rich_package()),
         ("cv", cv_package()),
+        ("writer", writer_constant_package()),
         ("data-read", checked_read(false)),
         ("metadata-read", checked_read(true)),
     ]
