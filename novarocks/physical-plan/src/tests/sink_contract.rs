@@ -1244,6 +1244,7 @@ fn independent_fragment_rejects_router_cut_projection_drift() {
             edge,
             kind: EdgeKind::ChangeStreamRouter,
             destination_fragment: FragmentId::new(722),
+            destination_node: NodeId::new(722),
             projection: Box::from([CutValue {
                 value: effect,
                 ty: ty(DataType::Int8, false),

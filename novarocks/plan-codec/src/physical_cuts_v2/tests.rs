@@ -141,6 +141,7 @@ fn cut() -> p::FragmentCuts {
             edge: p::EdgeId::new(u32::MAX),
             kind: p::EdgeKind::CteMulticast,
             destination_fragment: p::FragmentId::new(0),
+            destination_node: p::NodeId::new(u32::MAX),
             projection: Box::from([p::CutValue {
                 value: p::ValueId::new(0),
                 ty: ty(),

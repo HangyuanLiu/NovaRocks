@@ -1057,6 +1057,9 @@ message OutboundFragmentCut {
   EdgePartitioning partitioning = 6;
   ChangeStreamWriterCut change_stream_writer = 7;
   WriterResultCut writer_result = 8;
+  // The destination ExchangeSource node of this edge: the sender's routing
+  // address. Symmetric with InboundFragmentCut.destination_node_id.
+  optional uint32 destination_node_id = 9;
 }
 
 // Runtime-filter remote endpoints are immutable contract facts, not remote

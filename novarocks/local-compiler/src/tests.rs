@@ -340,6 +340,7 @@ fn add_writer(
             edge: EdgeId::new(8),
             kind: EdgeKind::Stream,
             destination_fragment: FragmentId::new(100),
+            destination_node: NodeId::new(100),
             projection: projected.into_boxed_slice(),
             destination_imports: imports.clone().into_boxed_slice(),
             partitioning: EdgePartitioning {

@@ -476,6 +476,7 @@ fn cuts() -> FragmentCuts {
             edge: EdgeId::new(1),
             kind: EdgeKind::Stream,
             destination_fragment: FragmentId::new(2),
+            destination_node: NodeId::new(2),
             projection: Box::from([cut_value.clone(), cut_value]),
             destination_imports: Box::from([import]),
             partitioning: partitioning(),

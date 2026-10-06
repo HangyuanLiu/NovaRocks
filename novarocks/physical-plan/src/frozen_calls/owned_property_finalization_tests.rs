@@ -356,6 +356,7 @@ fn owned_finalization_runs_final_package_constants_parameters_pruning_contract_a
                     edge: EdgeId::new(u32::MAX),
                     kind: EdgeKind::Stream,
                     destination_fragment: FragmentId::new(42),
+                    destination_node: NodeId::new(42),
                     projection: Box::default(),
                     destination_imports: Box::default(),
                     partitioning: EdgePartitioning {

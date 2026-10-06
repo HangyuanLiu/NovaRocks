@@ -2198,6 +2198,7 @@ fn independent_fragment_cut_types_share_the_same_resource_validation() {
             edge: EdgeId::new(44),
             kind: EdgeKind::Stream,
             destination_fragment: FragmentId::new(34),
+            destination_node: NodeId::new(34),
             projection: Box::from([CutValue {
                 value,
                 ty: ty(DataType::Decimal128(0, 0), false),

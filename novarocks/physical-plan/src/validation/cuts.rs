@@ -282,6 +282,7 @@ pub(crate) fn fragment_cuts_from_edges(
                 edge: edge.id,
                 kind: edge.kind,
                 destination_fragment: edge.destination.fragment,
+                destination_node: edge.destination.node,
                 projection: projection.into_boxed_slice(),
                 destination_imports: edge
                     .destination

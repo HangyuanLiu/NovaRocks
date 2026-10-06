@@ -1181,6 +1181,9 @@ pub struct OutboundFragmentCut {
     pub edge: EdgeId,
     pub kind: EdgeKind,
     pub destination_fragment: FragmentId,
+    /// The edge's destination ExchangeSource in the destination fragment: the
+    /// sender's routing address. FE derives it from the plan edge.
+    pub destination_node: NodeId,
     pub projection: Box<[CutValue]>,
     /// Exact source-to-destination value mapping at the peer boundary.
     pub destination_imports: Box<[CutImport]>,
