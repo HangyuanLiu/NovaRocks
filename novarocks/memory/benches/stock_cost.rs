@@ -19,9 +19,9 @@
 //! Queue and timing costs are identical for baseline and stock variants.
 #![recursion_limit = "256"]
 use novarocks_memory::{
-    ACCOUNT_METADATA_BYTES, AccountHandle, AccountKind, AllocationOrigin, AuthorityConfig,
-    ExternalRef, FundingDomain, InteractionSnapshot, MaintenanceReason, MemoryAuthority,
-    OWNER_METADATA_BYTES, ScopeLease, TeardownEvidence, TopUpPolicy,
+    ACCOUNT_METADATA_BYTES, AccountHandle, AccountKind, AuthorityConfig, ExternalRef, FactToken,
+    FundingDomain, InteractionSnapshot, MaintenanceReason, MemoryAuthority, OWNER_METADATA_BYTES,
+    ScopeLease, TeardownEvidence, TopUpPolicy,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -239,7 +239,7 @@ struct Assembly {
     floor: u64,
     workset: u64,
     target: u64,
-    historical_origins: Vec<AllocationOrigin>,
+    historical_origins: Vec<FactToken>,
     historical_backing: u64,
 }
 fn assemble(o: &Options, m: &Value) -> BenchResult<Assembly> {
@@ -300,7 +300,7 @@ fn assemble(o: &Options, m: &Value) -> BenchResult<Assembly> {
                 .map_err(|e| e.to_string())?;
             historical_origins.push(scope.record_allocation(o.bytes));
             scope.finish().next_step.map_err(|e| e.to_string())?;
-            lane.retire_lane()
+            lane.stop_producing()
                 .map_err(|e| format!("historical lane retirement: {e:?}"))?;
         }
         history
@@ -400,7 +400,7 @@ fn supply_work(us: u64, tag: u64, iterations: Option<u64>) -> u64 {
     tag.wrapping_mul(0xd6e8feb86659fd93)
 }
 struct Packet {
-    origin: Option<AllocationOrigin>,
+    origin: Option<FactToken>,
     bytes: u64,
     checksum: u64,
     ack: mpsc::Sender<(u64, u64)>,
@@ -849,7 +849,7 @@ fn run_round(o: &Options, m: &Value, round: usize) -> BenchResult<Value> {
     for domains in &a.domains {
         for domain in domains {
             domain
-                .retire_lane()
+                .stop_producing()
                 .map_err(|e| format!("lane retirement: {e:?}"))?;
         }
     }
@@ -878,12 +878,12 @@ fn service(o: &Options, m: &Value) -> BenchResult<Value> {
         .authority
         .take_capacity_writer()
         .map_err(|e| e.to_string())?;
-    let origins = thread::scope(|s| -> BenchResult<Vec<AllocationOrigin>> {
+    let origins = thread::scope(|s| -> BenchResult<Vec<FactToken>> {
         let handles: Vec<_> = a
             .domains
             .iter()
             .map(|domains| {
-                s.spawn(move || -> BenchResult<Vec<AllocationOrigin>> {
+                s.spawn(move || -> BenchResult<Vec<FactToken>> {
                     let mut origins = Vec::with_capacity(domains.len());
                     for domain in domains {
                         let mut scope = domain
@@ -983,7 +983,7 @@ fn service(o: &Options, m: &Value) -> BenchResult<Value> {
         json!({"kind":"deterministic_dynamic_drain_residual_service_probe","provenance":provenance(),"matrix_complete":false,"formal_acceptance":false,"real_io_exit_bound_proved":false,"assembly_storage_bytes":a.storage,"control_floor_bytes":a.floor,"transferred_payload_bytes":payload,"transferred_metadata_bytes":metadata,"returned_idle_bytes":returned_idle,"handoff_ns":handoff_ns,"root_before":before.root_committed,"root_after_handoff":after.root_committed,"U_before":before.query_pressure(),"U_after_handoff":after.query_pressure(),"late_free_ns":free_ns,"actual_protocol_released_bytes":mul((o.threads*o.domains_per_thread)as u64,o.bytes)?,"capacity_transitions":transitions,"coverage_epochs":epochs,"maintenance_batches":batches,"maintenance_elapsed_ns":start.elapsed().as_nanos(),"final_root_committed_bytes":final_projection.root_committed,"final_residual_metadata_bytes":final_projection.residual_metadata,"limitations":["service_probe_has_no_30_second_mixed_load_or_10ms_transition_cadence","empty_io_evidence_is_protocol_only","deterministic_service_does_not_collect_per_lock_telemetry","not_a_formal_dynamic_gate_receipt"]}),
     )
 }
-fn release_history(origins: Vec<AllocationOrigin>, bytes: u64) -> BenchResult<u64> {
+fn release_history(origins: Vec<FactToken>, bytes: u64) -> BenchResult<u64> {
     let freed = mul(origins.len() as u64, bytes)?;
     for origin in origins {
         // SAFETY: each historical record has one outstanding publication;
@@ -1265,7 +1265,7 @@ fn dynamic_round(o: &Options, m: &Value, round: usize) -> BenchResult<Value> {
     writer.set_capacity(high).map_err(|e| e.to_string())?;
     for domain in a.domains.iter().flatten() {
         domain
-            .retire_lane()
+            .stop_producing()
             .map_err(|e| format!("dynamic lane retirement: {e:?}"))?;
     }
     release_history(std::mem::take(&mut a.historical_origins), o.bytes)?;

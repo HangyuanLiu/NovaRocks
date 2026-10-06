@@ -71,7 +71,7 @@ fn protected_trim_accepts_real_debt_release_without_minting_free_rights() {
     assert_eq!(control.committed_bytes(), 4_096);
     assert!(a.snapshot().root.is_internally_consistent());
     free(retained, 1);
-    d.retire_lane().unwrap();
+    d.stop_producing().unwrap();
     drop(d);
     assert!(a.maintain(64).complete);
     assert_eq!(control.local_free_bytes(), 4_096);
@@ -87,7 +87,7 @@ fn protected_retirement_keeps_unbacked_residual_until_real_free() {
     let mut scope = d.activate(1, 0).unwrap();
     let origin = scope.record_allocation(2);
     assert_eq!(scope.finish().debt, 1);
-    d.retire_lane().unwrap();
+    d.stop_producing().unwrap();
     let residual = d.snapshot();
     assert_eq!(
         (residual.authorized, residual.committed, residual.debt),
@@ -114,7 +114,7 @@ fn unbacked_control_exposure_cannot_make_protected_treasury_refundable() {
     let mut scope = d.activate(1, 0).unwrap();
     let origin = scope.record_allocation(2);
     assert_eq!(scope.finish().debt, 1);
-    d.retire_lane().unwrap();
+    d.stop_producing().unwrap();
     assert_eq!(control.local_free_bytes(), 1);
     assert_eq!(control.return_slack(u64::MAX), 0);
     assert_eq!(control.committed_bytes(), floor + 1);

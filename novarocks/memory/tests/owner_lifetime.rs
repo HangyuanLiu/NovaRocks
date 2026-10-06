@@ -117,3 +117,64 @@ fn final_free_does_not_reclaim_record_while_an_external_domain_handle_exists() {
     sweep(&a);
     assert_eq!(a.pressure_projection().residual_metadata, 0);
 }
+
+#[test]
+fn authority_shutdown_preserves_tokens_until_real_last_release() {
+    for bytes in [0, 600] {
+        let a = authority(16_384);
+        let account = work(&a);
+        let lane = account.create_domain(bytes).unwrap();
+        let mut scope = lane.activate(bytes, 0).unwrap();
+        let token = scope.record_allocation(bytes);
+        scope.finish();
+        let reference = token.reference();
+        drop(lane);
+        drop(account);
+        drop(a);
+        let store = novarocks_memory::lane::global_store();
+        let snapshot = store
+            .snapshot_ref(reference)
+            .expect("late allocation stays accessible");
+        assert!(snapshot.is_draining());
+        assert_eq!(snapshot.outstanding, 1);
+        store.reclaim(usize::MAX);
+        assert!(store.snapshot_ref(reference).is_some());
+        free(token, bytes);
+        store.reclaim(usize::MAX);
+        assert!(store.snapshot_ref(reference).is_none());
+    }
+}
+
+#[test]
+fn retired_funding_domain_releases_its_record_after_last_free() {
+    let a = authority(16_384);
+    let account = work(&a);
+    let domain = account.create_domain(600).unwrap();
+    let mut scope = domain.activate(600, 0).unwrap();
+    let token = scope.record_allocation(600);
+    scope.finish();
+    let reference = token.reference();
+    domain.stop_producing().unwrap();
+    drop(domain);
+    a.maintain(usize::MAX);
+    assert!(
+        novarocks_memory::lane::global_store()
+            .snapshot_ref(reference)
+            .is_some()
+    );
+    free(token, 600);
+    a.maintain(usize::MAX);
+    assert!(
+        novarocks_memory::lane::global_store()
+            .snapshot_ref(reference)
+            .is_none()
+    );
+    // The old identity no longer resolves after reuse, even with a live successor.
+    let successor = account.create_domain(1).unwrap();
+    assert_ne!(successor.lane().reference(), reference);
+    assert!(
+        novarocks_memory::lane::global_store()
+            .snapshot_ref(reference)
+            .is_none()
+    );
+}

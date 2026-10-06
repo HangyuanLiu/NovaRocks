@@ -49,11 +49,12 @@ fn explicit_grant_remainder_and_escape_keep_one_charge() {
     assert!(grant.record_success(1_025).is_err());
     drop(grant);
     assert_eq!(
-        a.pressure_projection().residual_committed,
+        a.pressure_projection().query_committed,
         1_024 + OWNER_METADATA_BYTES
     );
     free(p, 1_024);
     while !a.maintain(64).complete {}
+    assert_eq!(a.pressure_projection().query_committed, 0);
     assert_eq!(a.pressure_projection().residual_committed, 0);
 }
 #[test]

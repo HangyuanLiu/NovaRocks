@@ -5,6 +5,7 @@ domain: [memory-governance]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by: [ADR-0167]
 date: 2026-09-28
 provenance:
   - "discussion: 2026-09-28 process allocator as default or switch, compared against Rust systems"

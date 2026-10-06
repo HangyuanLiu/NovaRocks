@@ -1,7 +1,8 @@
-# MEM-M02a behavior and evidence map
+# Memory behavior and evidence map
 
-This map follows accepted spec revision 3 and approved implementation-plan
-revision 3. The candidate suites below are implemented. Execution receipts are
+The historical M02a map below follows accepted spec revision 3 and approved
+implementation-plan revision 3. Current attribution/lifecycle changes are described
+in the M02b section; historical receipts are not current-HEAD receipts. Execution receipts are
 recorded in the approved plan; a suite name alone is not a passing receipt. Retain the
 behavior of explicit grants, external bounds and shared-holder exposure; do not
 retain unused APIs merely to keep historical round trips compiling.
@@ -53,7 +54,7 @@ P00 did not run this counterexample on the old implementation.
 | P01 / V1 | `ledger_debt` | Capacity 4-to-6 counterexample; one domain E cannot be offset by another domain F; accepting real facts is separate from requesting optional new F |
 | P01 / V4 | `dynamic_capacity` | Unique CapacityWriter; target zero/recovery; checked invalid targets; floor is charged once and survives shrink/drain |
 | P01 / V2,V4 | `hierarchical_control` | Funded boundaries have zero parent/root interaction; refill stops balance mutation at adequate parent slack; ancestor freeze prevents new down-grants; growth-gate/shrink handshake |
-| P02 / V3,V5 | `owner_lifetime` | Stable origin and final access; origin thread exit followed by remote free; generations do not replace lifetime proof |
+| P02 / V3,V5 | `owner_lifetime` | FactToken identity and final access; origin thread exit followed by remote free; generations do not replace allocation count/slot pin lifetime proof |
 | P02 / V3 | `residual_handoff` | Teardown and seal are both required; payload survives account retirement; unique cursor; target close and handoff race; common-ancestor commitment remains unchanged |
 | P02 / V3 | `metadata_bounds` | Bounded active slots; separately byte-charged stable record/index storage; checked overflow and typed exhaustion |
 | P02 / V3,V6 | `residual_metadata` | Many historical residuals do not consume active slots; payload plus metadata transfer without new capacity, storage or slot acquisition; slab backing keeps an owner |
@@ -65,7 +66,7 @@ P00 did not run this counterexample on the old implementation.
 | P03 / V6 | `shortage_settlement` | Previously published covered free is settled before recheck; incomplete coverage gives Pending; completed shortage carries exact versions, coverage and age; new free starts follow-up |
 | P04 / V6 | `refusal_classification` | QueryLimit, Pool, ImpossibleRequest, Closed, Invalid and MetadataExhausted remain distinct; request and constraint identities/versions survive |
 | P04 / V6 | `snapshot_consistency` | Settled commitment and active live samples are separate; classification is one committed version; no fake instantaneous full-tree sample |
-| P04 / V6 | `pressure_projection` | Query-to-residual transfer includes metadata; U and N do not drop on handoff; root already includes residual and must not add it twice |
+| P04 / V6 | `pressure_projection` | Historical M02a rule: handoff preserved U/N. Current rule is U=ΣC_query; actual Work teardown can lower U while reclassification preserves root C/N; residual origin is diagnostic |
 | P04 / V8 | `allocator_observation` | Existing physical allocator and coverage facts survive core replacement |
 | P05 / V7 | `stock_races` | Production-thread stress complements explicit loom exploration without replacing it |
 | P05 / V7 | `ledger_loom`, `owner_loom` library models | Real synchronization seam or documented field mapping; growth/shrink, activate/seal, free/handoff/cursor, coverage/recheck and last-free/reclaim |
@@ -76,7 +77,7 @@ aggregate result. Explicitly reject arithmetic overflow or invalid identity;
 do not use saturating subtraction to conceal lost responsibility.
 
 Models must report search bounds and completion. A timeout is not exhaustive
-proof. Raw-address publication, final access and reuse require a separate
+proof. Token identity, final access and record reuse require a separate
 lifetime review and Miri/ASan where supported; logical models alone do not prove
 address safety.
 
@@ -88,7 +89,7 @@ address safety.
 | Native Adapter `native_fragment_query.rs` | Install Work policy from the existing query limit; the existing MemTracker remains the actual allocation mechanism in this slice |
 | Frontend `metrics/management.rs` | Authority/account snapshot, P/B/H and C/L/F/O projections, capacity remainder, bound quality, activity count and control capability presence |
 | Server `main.rs`, `app_config.rs` | One injected authority per process; B+H within P; real prepaid control floor before work admission; explicit composition/configuration refusal |
-| Server `memory_observation.rs` and Native Adapter `backend_metrics.rs` | CountingAllocator, allocator/physical readings, coverage and unknown-source quality; existing jemalloc/cgroup facts |
+| Server `memory_observation.rs` and Native Adapter `backend_metrics.rs` | AttributingAllocator, retained CountingAllocator comparator, allocator/physical readings, coverage and unknown-source quality; existing jemalloc/cgroup facts |
 | Role composition, BackendApplication and ExecutionRuntime | Inject/forward the same Arc authority; no second capacity authority |
 
 No production allocator outside the memory crates consumes the historical
@@ -160,9 +161,43 @@ Linux evidence manually. P06 still delivers the frozen inputs and runnable
 benchmark entrypoint. Agent-run Linux acceptance is not a local goal completion
 condition; formal performance gates remain unverified until that handoff.
 
-The process authority must outlive active scopes, external bounds (including
-zero-byte bounds), and all outstanding allocation origins. Shutdown detaches
-only records without publishing or allocation access rights; it does not prove
-application or I/O exit. Stable metadata fees include these publication owners.
+Active scopes and external bounds retain their required control owners. A
+production FactToken uses process-lifetime record storage and may survive the
+authority facade's drop; it does not retain a query/account pointer. Authority
+drop never substitutes for actual application or I/O exit. Final free and exact
+reclaim, rather than origin identity or a zero-byte sample, govern storage safety.
 Inactive settled authorization and pending drain domains are observed separately
 from active scopes and hook live samples.
+
+## M02b：尺寸分段归属的行为与证据映射
+
+本节记录当前实现的测试入口；执行收据由 approved plan 保存，列出测试名不代表最终验收通过。[ADR-0167](../../../docs/adr/ADR-0167-size-banded-allocation-attribution.md) 是当前长期合同：64 B lane、8 B RecordRef/FactToken、512 B 阈值、尾部 8 B、Q=1 MiB；观测 lane 不授予资金，不消费 stock。
+
+| 验收面 | 真实测试/模型 | 应证明的性质 |
+|---|---|---|
+| V1 格式 | `attribution_format`、lib `lane::token` / `attribution::tls`、Server `server_binary_smoke` | 非对齐尾部、原对齐/原 Layout、溢出失败、small 无 TLS；真实 GLOBAL 在 jemalloc/System 两构建 |
+| V2 释放/保活 | `attribution_release`、`owner_lifetime`、`lane_exhaustion`；L1/L5、`owner_loom` | 同/远端晚 free 一次；槽 pin 和强 owner 保活；回收后不访问；旧代次拒绝 |
+| V3 resize | `attribution_resize`、`attribution_explicit`；L2/L3 | 固定地址与必然搬迁后端各覆盖六条尺寸路线，断言地址关系、用户前缀、来源/count/两段事实；受控失败保持旧块，R1 切换不重不漏 |
+| V4 作用域/explicit | `attribution_scope`、`attribution_explicit` | 嵌套/unwind、跨线程 poll、Pending/Ready/Drop、spawn 不继承；explicit 优先且恢复 outer |
+| V5 政策隔离 | `domain_split`、`lane_lifecycle`、`attribution_scope`、`attribution_hook_contract`；Server/Worker 回归 | 创建/绑定观测 lane 不 qualify、不消费 stock；失败可见，不制造 SQL 拒绝 |
+| V6 原生装配 | system `memory-attribution/observation-families`、`query-lifecycle/distributed-baseline`、`query-lifecycle/mysql-disconnect`、`query-concurrency/16-64-256-governance`；Server smoke | cross-process 1FE+3BE 独立进程观测/取消/退出；all-in-one 仅 smoke |
+| V7 组成/对账 | `attribution_reconcile`（harness=false）、`attribution_explicit`、`domain_split`；lib `attribution::readout`、Native Adapter `backend_metrics` | 环境 small 只计进程；R1 small 成功后且仅一次；零尺寸无事实；flush 后 tagged 对账，盲区 signed |
+| V8 分类 | `lane_lifecycle`、`residual_handoff`、`pressure_projection`；L4、嵌套祖先 `owner_loom` | stop 不改 class，Task→存活 Work 仍 Query；Work teardown U 可降，root C/N 重分类不降；来源不改 |
+| V9 关闭规模 | `lane_membership` | 按目标成员计访问步骤，与其他账户/历史 lane 无关；不用耗时充当 oracle |
+| V10 批量 | `attribution_batching`、lib `lane::slot` / `attribution::readout`；L1/L2/L3/L4 | hook 返回后余额 <Q，字节先于 count/unpin；在途无先验上界，Q×sampled pins 不是结清证明 |
+
+L1–L5 直接执行生产 `SlotCore`、状态字和回收接口的 loom 原子实现：L1 未 flush +1/远端 −1；L2 计数不变 resize；L3 R1 跨阈值两段发布；L4 teardown/晚 free/flush/reclaim；L5 reuse/陈旧身份。`owner_loom` 覆盖账户/祖先交接与归还，`ledger_loom` 覆盖增长/债务/容量目标。每个 builder 为 max_threads=4、preemption_bound=2、max_branches=20000；完成仅说明有界搜索完成，超时或分支错误不是 PASS。
+
+本地模型入口不接默认 CI，不下载工具链或组件：
+
+```bash
+tools/ci/memory-model-checks.sh --loom
+tools/ci/memory-model-checks.sh --miri
+tools/ci/memory-model-checks.sh --all
+# Optional: select an already installed nightly, never install one here.
+MIRI_TOOLCHAIN=nightly-YYYY-MM-DD tools/ci/memory-model-checks.sh --miri
+```
+
+脚本以 `--locked --offline` 执行 Cargo，Miri 预检已安装 nightly、miri、rust-src；缺项非零退出并报告，`--all` 在缺项时不先跑 Loom。Miri sysroot 在 rust-src 的 `library/` 内准备，使用其随附的 vendored std 依赖，不联网。Miri 使用 System 后端、Tree Borrows 与 strict provenance/symbolic alignment，并关闭 isolation（readout 读取 SystemTime；isolation 只限制宿主访问，不放宽 UB 检查）。选择 Tree Borrows 的原因见 ADR-0167：Stacked Borrows 把 std Box/Arc 交给 `dealloc` 的指针权限收窄到 `size_of::<T>()`，任何经该指针读取请求长度之后带内元数据的 allocator 都会被拒绝。Miri 覆盖 lib lane/TLS/readout、全部 `attribution_*`、旧 allocator observation，以及驱动资金域 FactToken 发布与释放的 `owner_lifetime`、`lane_lifecycle`；验证非对齐 token、realloc/受控失败、System segment、TLS，以及 owned store 在最后访问之后释放 backing。生产 store 的 segment 永不释放，回收后的逻辑晚访问不产生地址错误，Miri 看不到；这部分最终访问证明（I4）由 Loom 模型和静态复核承担。token 不含指针，不提供 provenance 豁免。独立 `attribution_reconcile` 避免 libtest 后台分配污染对账；压力测试不代替 Loom/Miri。
+
+收敛边界：Miri 结论以 Tree Borrows 为别名模型，不等于 Rust 最终别名模型下的证明；正式 Linux 成本由用户手动执行，G1 待验证。P00 同一 33 套件选择集记录 822 cases /806 PASS /16 FAIL /0 SKIP，最终 SQL 必须与该失败集合比较，不能声称 all 全通过。当前指标/模型/定向测试不能证明所有生产 query/R1 已接线或硬内存治理交付。
