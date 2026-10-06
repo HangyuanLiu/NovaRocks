@@ -79,6 +79,14 @@ if [[ "$mode" == --miri || "$mode" == --all ]]; then
   done
   # rustup run does not install an absent toolchain without its --install option.
   rustup run "$miri_toolchain" cargo miri --version
+  # cargo-miri builds its sysroot from a temporary directory, where offline
+  # resolution cannot see std's crates.io dependencies. rust-src ships them
+  # vendored, with a Cargo source replacement under library/.cargo; preparing
+  # the sysroot from inside that tree resolves std without fetching anything.
+  miri_library="$(rustup run "$miri_toolchain" rustc --print sysroot)/lib/rustlib/src/rust/library"
+  [[ -f "$miri_library/.cargo/config.toml" && -d "$miri_library/vendor" ]] || \
+    fail "rust-src for $miri_toolchain lacks vendored std dependencies; cannot prepare an offline Miri sysroot."
+  (cd "$miri_library" && rustup run "$miri_toolchain" cargo miri setup)
 fi
 
 if [[ "$mode" == --loom || "$mode" == --all ]]; then
@@ -90,7 +98,9 @@ if [[ "$mode" == --loom || "$mode" == --all ]]; then
   done
 fi
 if [[ "$mode" == --miri || "$mode" == --all ]]; then
-  export MIRIFLAGS="${MIRIFLAGS:+$MIRIFLAGS }-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check"
+  # Attribution readouts stamp samples with SystemTime. Isolation only gates host
+  # access (clocks, environment, files); it does not relax any UB check.
+  export MIRIFLAGS="${MIRIFLAGS:+$MIRIFLAGS }-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-disable-isolation"
   for module in lane:: attribution::; do
     printf 'Running System-backend Miri library checks: %s\n' "$module"
     rustup run "$miri_toolchain" cargo miri test -p novarocks-memory \
