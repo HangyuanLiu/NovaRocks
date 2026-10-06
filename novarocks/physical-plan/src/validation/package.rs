@@ -50,6 +50,7 @@ pub(crate) fn validate_package(
         limits,
         semantic_items,
         crate::constants::ConstantValidationMode::Plain,
+        None,
         work,
     )
 }
@@ -58,6 +59,10 @@ pub(crate) fn validate_package_in(
     input: &FragmentPackageInput,
     limits: PlanLimits,
     semantic_items: usize,
+    resources: &mut novarocks_type_contract::ControlResourceCounter,
+    admit: &mut dyn FnMut(
+        &novarocks_type_contract::ControlOwnedResourceFacts,
+    ) -> Result<(), novarocks_type_contract::CompileControlError>,
     work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
 ) -> Result<(), crate::FragmentPackageError> {
     validate_package_core(
@@ -65,15 +70,24 @@ pub(crate) fn validate_package_in(
         limits,
         semantic_items,
         crate::constants::ConstantValidationMode::Caller,
+        Some((resources, admit)),
         work,
     )
 }
+
+type PackageScratch<'a> = (
+    &'a mut novarocks_type_contract::ControlResourceCounter,
+    &'a mut dyn FnMut(
+        &novarocks_type_contract::ControlOwnedResourceFacts,
+    ) -> Result<(), novarocks_type_contract::CompileControlError>,
+);
 
 fn validate_package_core(
     input: &FragmentPackageInput,
     limits: PlanLimits,
     semantic_items: usize,
     mode: crate::constants::ConstantValidationMode,
+    scratch: Option<PackageScratch<'_>>,
     work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
 ) -> Result<(), crate::FragmentPackageError> {
     let mut errors = ValidationContext::for_construction(limits);
@@ -147,7 +161,12 @@ fn validate_package_core(
             "fragment package plan contract revision differs",
         ));
     }
-    validate_fragment_structure_into(fragment, &mut errors);
+    if let Some((resources, admit)) = scratch {
+        validate_fragment_structure_into_in(fragment, &mut errors, resources, admit, work)
+            .map_err(crate::package::package_resource_error)?;
+    } else {
+        validate_fragment_structure_into(fragment, &mut errors);
+    }
     if !errors.is_empty() {
         return Err(crate::FragmentPackageError::Structure(
             ValidationErrors::from_collector(errors),

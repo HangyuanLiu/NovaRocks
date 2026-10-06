@@ -249,44 +249,225 @@ pub(crate) fn import_origin_matches(
 }
 
 /// One original Kahn author serves structural validation and observed property
-/// consumers. Scratch remains delegated to the admitted caller; this visitor
-/// grants neither allocation requests nor property publication authority.
+/// consumers. Allocation facts remain a contribution to the caller's original
+/// counter, not an allocator or property-publication grant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NodeGraphEvent {
     Step,
     Ready(NodeId),
 }
 
-/// `None` is an explicit caller stop, not successful graph completion. Missing
-/// references keep the original structural author's treatment; its node-owner
-/// validator independently rejects them before frozen property consumption.
-pub(crate) fn visit_node_graph_child_first<E>(
+use novarocks_type_contract::{
+    CompileCheckpoints, CompileControlError, ControlOwnedResourceFacts, ControlResourceCounter,
+    ControlResourceError, control_resource_add, control_resource_mul,
+    owned_resources::vec::reserve_for_push_in,
+};
+
+#[cfg(test)]
+#[path = "node_graph_borrowed_tests.rs"]
+mod node_graph_borrowed_tests;
+
+trait GraphPolicy<E> {
+    fn headers(&mut self, nodes: usize) -> Result<(), E>;
+    fn inputs(&mut self, nodes: usize, inputs: usize) -> Result<(), E>;
+    fn reachability(&mut self, nodes: usize) -> Result<(), E>;
+    fn reachable_inputs(&mut self, inputs: usize) -> Result<(), E>;
+    fn before_library(&mut self) -> Result<(), E>;
+    fn after_library(&mut self) -> Result<(), E>;
+    fn reserve(&mut self, values: &mut Vec<NodeId>) -> Result<(), E>;
+    fn pending(&mut self, root: NodeId) -> Result<Vec<NodeId>, E>;
+    fn push(&mut self, values: &mut Vec<NodeId>, value: NodeId) -> Result<(), E>;
+    fn extend(&mut self, values: &mut Vec<NodeId>, inputs: &[NodeId]) -> Result<(), E>;
+    fn reachable_step(&mut self) -> Result<(), E>;
+    fn observe(&mut self, event: NodeGraphEvent) -> Result<bool, E>;
+}
+
+struct PlainGraph<F>(F);
+impl<E, F: FnMut(NodeGraphEvent) -> Result<bool, E>> GraphPolicy<E> for PlainGraph<F> {
+    fn headers(&mut self, _: usize) -> Result<(), E> {
+        Ok(())
+    }
+    fn inputs(&mut self, _: usize, _: usize) -> Result<(), E> {
+        Ok(())
+    }
+    fn reachability(&mut self, _: usize) -> Result<(), E> {
+        Ok(())
+    }
+    fn reachable_inputs(&mut self, _: usize) -> Result<(), E> {
+        Ok(())
+    }
+    fn before_library(&mut self) -> Result<(), E> {
+        Ok(())
+    }
+    fn after_library(&mut self) -> Result<(), E> {
+        Ok(())
+    }
+    fn reserve(&mut self, _: &mut Vec<NodeId>) -> Result<(), E> {
+        Ok(())
+    }
+    fn pending(&mut self, root: NodeId) -> Result<Vec<NodeId>, E> {
+        Ok(vec![root])
+    }
+    fn push(&mut self, values: &mut Vec<NodeId>, value: NodeId) -> Result<(), E> {
+        values.push(value);
+        Ok(())
+    }
+    fn extend(&mut self, values: &mut Vec<NodeId>, inputs: &[NodeId]) -> Result<(), E> {
+        values.extend(inputs.iter().copied());
+        Ok(())
+    }
+    fn reachable_step(&mut self) -> Result<(), E> {
+        Ok(())
+    }
+    fn observe(&mut self, event: NodeGraphEvent) -> Result<bool, E> {
+        (self.0)(event)
+    }
+}
+
+struct CallerGraph<'a, 'control, F> {
+    counter: &'a mut ControlResourceCounter,
+    admit: &'a mut dyn FnMut(&ControlOwnedResourceFacts) -> Result<(), CompileControlError>,
+    work: &'a mut CompileCheckpoints<'control>,
+    observe: F,
+    raw_inputs: usize,
+}
+impl<E, F> GraphPolicy<E> for CallerGraph<'_, '_, F>
+where
+    E: From<ControlResourceError> + From<CompileControlError>,
+    F: FnMut(NodeGraphEvent, &mut CompileCheckpoints<'_>) -> Result<bool, E>,
+{
+    fn headers(&mut self, nodes: usize) -> Result<(), E> {
+        self.counter.tree::<NodeId, usize>(nodes).map_err(E::from)?;
+        self.counter
+            .tree::<NodeId, Vec<NodeId>>(nodes)
+            .map_err(E::from)?;
+        // Header traversal and final Kahn processing are bounded by actual N.
+        self.counter
+            .work(control_resource_mul(nodes, 4).map_err(E::from)?)
+            .map_err(E::from)?;
+        (self.admit)(&self.counter.facts()).map_err(E::from)
+    }
+    fn inputs(&mut self, nodes: usize, inputs: usize) -> Result<(), E> {
+        self.raw_inputs = control_resource_add(self.raw_inputs, inputs).map_err(E::from)?;
+        self.counter.tree::<NodeId, ()>(inputs).map_err(E::from)?;
+        let lookup = ControlResourceCounter::lookup_work(nodes).map_err(E::from)?;
+        // contains_key, dependency-entry and remaining-degree lookups, plus
+        // original input/dependency events. Duplicates keep their raw work.
+        let per_input = control_resource_add(control_resource_mul(lookup, 4).map_err(E::from)?, 4)
+            .map_err(E::from)?;
+        self.counter
+            .work(control_resource_mul(inputs, per_input).map_err(E::from)?)
+            .map_err(E::from)?;
+        (self.admit)(&self.counter.facts()).map_err(E::from)
+    }
+    fn reachability(&mut self, nodes: usize) -> Result<(), E> {
+        // The original insert precedes node lookup: unknown IDs count too.
+        // Every visited ID comes from the root or an actual raw input.
+        let upper = control_resource_add(self.raw_inputs, 1).map_err(E::from)?;
+        self.counter.tree::<NodeId, ()>(upper).map_err(E::from)?;
+        let lookup = ControlResourceCounter::lookup_work(upper.max(nodes)).map_err(E::from)?;
+        self.counter
+            .work(
+                control_resource_mul(
+                    upper,
+                    control_resource_add(control_resource_mul(lookup, 2).map_err(E::from)?, 4)
+                        .map_err(E::from)?,
+                )
+                .map_err(E::from)?,
+            )
+            .map_err(E::from)?;
+        (self.admit)(&self.counter.facts()).map_err(E::from)
+    }
+    fn reachable_inputs(&mut self, inputs: usize) -> Result<(), E> {
+        self.counter.work(inputs).map_err(E::from)?;
+        (self.admit)(&self.counter.facts()).map_err(E::from)
+    }
+    fn before_library(&mut self) -> Result<(), E> {
+        self.work.flush().map_err(E::from)
+    }
+    fn after_library(&mut self) -> Result<(), E> {
+        self.work.step().map_err(E::from)?;
+        self.work.flush().map_err(E::from)
+    }
+    fn reserve(&mut self, values: &mut Vec<NodeId>) -> Result<(), E> {
+        let counter = &mut *self.counter;
+        let admit = &mut *self.admit;
+        reserve_for_push_in::<_, E>(
+            values,
+            &mut |facts| {
+                if let Some(layout) = facts.requested_backing {
+                    counter.layout(layout, 1).map_err(E::from)?;
+                }
+                admit(&counter.facts()).map_err(E::from)
+            },
+            self.work,
+        )
+    }
+    fn pending(&mut self, root: NodeId) -> Result<Vec<NodeId>, E> {
+        let mut values = Vec::new();
+        self.push(&mut values, root)?;
+        Ok(values)
+    }
+    fn push(&mut self, values: &mut Vec<NodeId>, value: NodeId) -> Result<(), E> {
+        self.reserve(values)?;
+        values.push(value);
+        Ok(())
+    }
+    fn extend(&mut self, values: &mut Vec<NodeId>, inputs: &[NodeId]) -> Result<(), E> {
+        for input in inputs {
+            self.push(values, *input)?;
+            self.work.step().map_err(E::from)?;
+        }
+        Ok(())
+    }
+    fn reachable_step(&mut self) -> Result<(), E> {
+        self.work.step().map_err(E::from)
+    }
+    fn observe(&mut self, event: NodeGraphEvent) -> Result<bool, E> {
+        (self.observe)(event, self.work)
+    }
+}
+
+fn visit_node_graph_core<E>(
     fragment: &Fragment,
-    mut observe: impl FnMut(NodeGraphEvent) -> Result<bool, E>,
+    policy: &mut impl GraphPolicy<E>,
 ) -> Result<Option<usize>, E> {
+    policy.headers(fragment.nodes().len())?;
     let mut remaining_inputs = BTreeMap::new();
     let mut dependents: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
     let mut ready = Vec::new();
     for (id, node) in fragment.nodes() {
+        policy.inputs(fragment.nodes().len(), node.inputs.len())?;
         let mut inputs = BTreeSet::new();
         for input in &node.inputs {
+            policy.before_library()?;
             if fragment.nodes().contains_key(input) {
                 inputs.insert(*input);
             }
-            if !observe(NodeGraphEvent::Step)? {
+            policy.after_library()?;
+            if !policy.observe(NodeGraphEvent::Step)? {
                 return Ok(None);
             }
         }
-        remaining_inputs.insert(*id, inputs.len());
         if inputs.is_empty() {
-            ready.push(*id);
+            policy.reserve(&mut ready)?;
         }
-        if !observe(NodeGraphEvent::Step)? {
+        policy.before_library()?;
+        remaining_inputs.insert(*id, inputs.len());
+        // The header's potential ready growth is admitted before its completed
+        // library observation; Plain retains the original infallible push.
+        if inputs.is_empty() {
+            policy.push(&mut ready, *id)?;
+        }
+        policy.after_library()?;
+        if !policy.observe(NodeGraphEvent::Step)? {
             return Ok(None);
         }
         for input in inputs {
-            dependents.entry(input).or_default().push(*id);
-            if !observe(NodeGraphEvent::Step)? {
+            policy.before_library()?;
+            policy.push(dependents.entry(input).or_default(), *id)?;
+            policy.after_library()?;
+            if !policy.observe(NodeGraphEvent::Step)? {
                 return Ok(None);
             }
         }
@@ -294,44 +475,94 @@ pub(crate) fn visit_node_graph_child_first<E>(
     let mut processed = 0_usize;
     while let Some(id) = ready.pop() {
         processed += 1;
-        if !observe(NodeGraphEvent::Ready(id))? {
+        if !policy.observe(NodeGraphEvent::Ready(id))? {
             return Ok(None);
         }
+        policy.before_library()?;
         if let Some(users) = dependents.get(&id) {
+            // No captured heap-producing value exists at this lookup.
+            policy.after_library()?;
             for user in users {
+                policy.before_library()?;
                 if let Some(remaining) = remaining_inputs.get_mut(user) {
                     *remaining -= 1;
                     if *remaining == 0 {
-                        ready.push(*user);
+                        policy.push(&mut ready, *user)?;
                     }
                 }
-                if !observe(NodeGraphEvent::Step)? {
+                policy.after_library()?;
+                if !policy.observe(NodeGraphEvent::Step)? {
                     return Ok(None);
                 }
             }
+        } else {
+            policy.after_library()?;
         }
     }
     Ok(Some(processed))
 }
 
-pub(crate) fn validate_node_graph(fragment: &Fragment, errors: &mut ValidationContext) {
+/// `None` is an explicit caller stop, not successful graph completion. Missing
+/// references keep the original structural author's treatment; its node-owner
+/// validator independently rejects them before frozen property consumption.
+pub(crate) fn visit_node_graph_child_first<E>(
+    fragment: &Fragment,
+    observe: impl FnMut(NodeGraphEvent) -> Result<bool, E>,
+) -> Result<Option<usize>, E> {
+    visit_node_graph_core(fragment, &mut PlainGraph(observe))
+}
+
+pub(crate) fn visit_node_graph_child_first_in<E>(
+    fragment: &Fragment,
+    counter: &mut ControlResourceCounter,
+    admit: &mut dyn FnMut(&ControlOwnedResourceFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+    observe: impl FnMut(NodeGraphEvent, &mut CompileCheckpoints<'_>) -> Result<bool, E>,
+) -> Result<Option<usize>, E>
+where
+    E: From<ControlResourceError> + From<CompileControlError>,
+{
+    visit_node_graph_core(
+        fragment,
+        &mut CallerGraph {
+            counter,
+            admit,
+            work,
+            observe,
+            raw_inputs: 0,
+        },
+    )
+}
+
+fn validate_node_graph_core<E>(
+    fragment: &Fragment,
+    errors: &mut ValidationContext,
+    policy: &mut impl GraphPolicy<E>,
+) -> Result<(), E> {
     let path = format!("fragments[{}].nodes", fragment.id().get());
-    let completed =
-        visit_node_graph_child_first(fragment, |_| Ok::<_, std::convert::Infallible>(true))
-            .unwrap_or_else(|never| match never {});
+    let completed = visit_node_graph_core(fragment, policy)?;
     if completed != Some(fragment.nodes().len()) {
         errors.push(ValidationError::new(&path, "node graph contains a cycle"));
     }
-
+    policy.reachability(fragment.nodes().len())?;
     let mut visited = BTreeSet::new();
-    let mut pending = vec![fragment.root()];
+    let mut pending = policy.pending(fragment.root())?;
     while let Some(id) = pending.pop() {
-        if !visited.insert(id) {
+        policy.before_library()?;
+        let new = visited.insert(id);
+        policy.after_library()?;
+        if !new {
             continue;
         }
+        policy.before_library()?;
         if let Some(node) = fragment.nodes().get(&id) {
-            pending.extend(node.inputs.iter().copied());
+            policy.reachable_inputs(node.inputs.len())?;
+            // Capture and admit each actual mutable pending growth before the
+            // completed lookup observation; raw duplicates/order are retained.
+            policy.extend(&mut pending, &node.inputs)?;
         }
+        policy.after_library()?;
+        policy.reachable_step()?;
     }
     if visited.len() != fragment.nodes().len() {
         errors.push(ValidationError::new(
@@ -339,6 +570,39 @@ pub(crate) fn validate_node_graph(fragment: &Fragment, errors: &mut ValidationCo
             "fragment contains nodes unreachable from its root",
         ));
     }
+    Ok(())
+}
+
+pub(crate) fn validate_node_graph(fragment: &Fragment, errors: &mut ValidationContext) {
+    validate_node_graph_core(
+        fragment,
+        errors,
+        &mut PlainGraph(|_| Ok::<_, std::convert::Infallible>(true)),
+    )
+    .unwrap_or_else(|never| match never {});
+}
+
+pub(crate) fn validate_node_graph_in(
+    fragment: &Fragment,
+    errors: &mut ValidationContext,
+    counter: &mut ControlResourceCounter,
+    admit: &mut dyn FnMut(&ControlOwnedResourceFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ControlResourceError> {
+    validate_node_graph_core(
+        fragment,
+        errors,
+        &mut CallerGraph {
+            counter,
+            admit,
+            work,
+            observe: |_, work: &mut CompileCheckpoints<'_>| {
+                work.step()?;
+                Ok(true)
+            },
+            raw_inputs: 0,
+        },
+    )
 }
 
 pub(crate) fn validate_edge(

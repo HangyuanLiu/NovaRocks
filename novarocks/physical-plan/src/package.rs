@@ -253,10 +253,12 @@ impl FragmentPackage {
                     .map_err(FragmentPackageError::Control)?;
                 result?;
             }
-            PackageValidation::Caller { work, .. } => crate::validation::validate_package_in(
+            PackageValidation::Caller { admit, work } => crate::validation::validate_package_in(
                 &input,
                 admission.plan_limits,
                 semantic_items,
+                &mut resources,
+                *admit,
                 work,
             )?,
         }
@@ -546,7 +548,7 @@ impl From<SemanticParameterProjectionError> for FragmentPackageError {
     }
 }
 
-fn package_resource_error(
+pub(crate) fn package_resource_error(
     error: novarocks_type_contract::ControlResourceError,
 ) -> FragmentPackageError {
     match error {

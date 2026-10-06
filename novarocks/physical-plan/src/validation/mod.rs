@@ -42,7 +42,8 @@ pub(crate) use node::*;
 pub(crate) use package::*;
 pub(crate) use properties::*;
 pub use properties::{
-    FragmentPropertyError, derive_fragment_output_properties_observed,
+    FragmentPropertyError, derive_fragment_output_properties_in,
+    derive_fragment_output_properties_observed,
     derive_replica_sensitive_output_properties_observed, validate_fragment_output_properties_in,
     validate_fragment_output_properties_observed,
 };
@@ -118,6 +119,29 @@ pub(crate) fn validate_fragment_construction_after_admission(
         Ok(())
     } else {
         Err(ValidationErrors::from_collector(errors))
+    }
+}
+
+/// The same complete construction laws with the caller's original scratch
+/// counter and meter. Other expression/type/diagnostic owners remain separate.
+pub(crate) fn validate_fragment_construction_after_admission_in(
+    fragment: &Fragment,
+    limits: PlanLimits,
+    resources: &mut novarocks_type_contract::ControlResourceCounter,
+    admit: &mut dyn FnMut(
+        &novarocks_type_contract::ControlOwnedResourceFacts,
+    ) -> Result<(), novarocks_type_contract::CompileControlError>,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<(), FragmentPropertyError> {
+    let mut errors = ValidationContext::for_construction(limits);
+    validate_fragment_structure_into_in(fragment, &mut errors, resources, admit, work)?;
+    validate_fragment_partition_identities(fragment, &FragmentCuts::default(), &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(FragmentPropertyError::Structure(
+            ValidationErrors::from_collector(errors),
+        ))
     }
 }
 
@@ -314,10 +338,79 @@ pub(crate) fn validate_fragment_into(fragment: &Fragment, errors: &mut Validatio
     validate_fragment_structure_into(fragment, errors);
 }
 
+// The original structure body chooses only owned scratch operations. All
+// reference, expression, node and error-order laws remain in that one body.
+trait FragmentStructureScratch {
+    type Error;
+    fn node_graph(
+        &mut self,
+        fragment: &Fragment,
+        errors: &mut ValidationContext,
+    ) -> Result<(), Self::Error>;
+}
+struct PlainFragmentScratch;
+impl FragmentStructureScratch for PlainFragmentScratch {
+    type Error = std::convert::Infallible;
+    fn node_graph(
+        &mut self,
+        fragment: &Fragment,
+        errors: &mut ValidationContext,
+    ) -> Result<(), Self::Error> {
+        validate_node_graph(fragment, errors);
+        Ok(())
+    }
+}
+struct CallerFragmentScratch<'a, 'control> {
+    resources: &'a mut novarocks_type_contract::ControlResourceCounter,
+    admit: &'a mut dyn FnMut(
+        &novarocks_type_contract::ControlOwnedResourceFacts,
+    ) -> Result<(), novarocks_type_contract::CompileControlError>,
+    work: &'a mut novarocks_type_contract::CompileCheckpoints<'control>,
+}
+impl FragmentStructureScratch for CallerFragmentScratch<'_, '_> {
+    type Error = novarocks_type_contract::ControlResourceError;
+    fn node_graph(
+        &mut self,
+        fragment: &Fragment,
+        errors: &mut ValidationContext,
+    ) -> Result<(), Self::Error> {
+        graph::validate_node_graph_in(fragment, errors, self.resources, self.admit, self.work)
+    }
+}
+
 pub(crate) fn validate_fragment_structure_into(
     fragment: &Fragment,
     errors: &mut ValidationContext,
 ) {
+    validate_fragment_structure_into_core(fragment, errors, &mut PlainFragmentScratch)
+        .unwrap_or_else(|never| match never {});
+}
+
+pub(crate) fn validate_fragment_structure_into_in(
+    fragment: &Fragment,
+    errors: &mut ValidationContext,
+    resources: &mut novarocks_type_contract::ControlResourceCounter,
+    admit: &mut dyn FnMut(
+        &novarocks_type_contract::ControlOwnedResourceFacts,
+    ) -> Result<(), novarocks_type_contract::CompileControlError>,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<(), novarocks_type_contract::ControlResourceError> {
+    validate_fragment_structure_into_core(
+        fragment,
+        errors,
+        &mut CallerFragmentScratch {
+            resources,
+            admit,
+            work,
+        },
+    )
+}
+
+fn validate_fragment_structure_into_core<S: FragmentStructureScratch>(
+    fragment: &Fragment,
+    errors: &mut ValidationContext,
+    scratch: &mut S,
+) -> Result<(), S::Error> {
     let prefix = format!("fragments[{}]", fragment.id().get());
     bounded_count(
         errors,
@@ -378,7 +471,7 @@ pub(crate) fn validate_fragment_structure_into(
             }
             if errors.is_saturated() {
                 errors.mark_truncated();
-                return;
+                return Ok(());
             }
         }
     }
@@ -386,7 +479,7 @@ pub(crate) fn validate_fragment_structure_into(
         validate_value(fragment, value, &aggregate_calls, errors);
         if errors.is_saturated() {
             errors.mark_truncated();
-            return;
+            return Ok(());
         }
     }
     let indexes = FragmentValidationIndexes::new(fragment);
@@ -437,7 +530,7 @@ pub(crate) fn validate_fragment_structure_into(
         );
         if errors.is_saturated() {
             errors.mark_truncated();
-            return;
+            return Ok(());
         }
     }
     validate_expression_acyclic(fragment, errors);
@@ -447,11 +540,12 @@ pub(crate) fn validate_fragment_structure_into(
         validate_node(fragment, node, &indexes, errors);
         if errors.is_saturated() {
             errors.mark_truncated();
-            return;
+            return Ok(());
         }
     }
-    validate_node_graph(fragment, errors);
+    scratch.node_graph(fragment, errors)?;
     validate_fragment_sink(fragment, errors);
+    Ok(())
 }
 
 pub(crate) fn validate_annotations(plan: &PhysicalPlan, errors: &mut ValidationContext) {

@@ -27,6 +27,9 @@ use crate::{
 };
 use novarocks_type_contract::CompileCheckpoints;
 
+#[cfg(test)]
+mod borrowed_properties_tests;
+
 type PropertyResourceAdmission<'a> = dyn FnMut(
         &novarocks_type_contract::ControlOwnedResourceFacts,
     ) -> Result<(), novarocks_type_contract::CompileControlError>
@@ -124,6 +127,17 @@ impl From<novarocks_type_contract::CompileControlError> for FragmentPropertyErro
         Self::Control(cause)
     }
 }
+impl From<novarocks_type_contract::ControlResourceError> for FragmentPropertyError {
+    fn from(error: novarocks_type_contract::ControlResourceError) -> Self {
+        match error {
+            novarocks_type_contract::ControlResourceError::Control(cause) => Self::Control(cause),
+            novarocks_type_contract::ControlResourceError::SourceModel(message) => {
+                Self::Calls(FrozenCallError::ResourceSource(message))
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for FragmentPropertyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -205,21 +219,28 @@ fn validate_fragment_output_properties_core(
     limits: PlanLimits,
     source_retained_bytes: usize,
     projection_limits: crate::PropertyProofProjectionLimits,
-    admit: Option<&mut PropertyResourceAdmission<'_>>,
+    mut admit: Option<&mut PropertyResourceAdmission<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<crate::PropertyProofProjectionFacts, FragmentPropertyError> {
+    let mut resources = novarocks_type_contract::ControlResourceCounter::default();
     (|| {
         work.flush()?;
-        let proof = if let Some(admit) = admit {
-            calls.property_proof_in(
+        let proof = if let Some(parent) = admit.as_deref_mut() {
+            let mut contribution = novarocks_type_contract::ControlOwnedResourceFacts::default();
+            let proof = calls.property_proof_in(
                 fragment,
                 uses,
                 &limits,
                 source_retained_bytes,
                 projection_limits,
-                admit,
+                &mut |next| {
+                    contribution = *next;
+                    parent(next)
+                },
                 work,
-            )?
+            )?;
+            resources.merge(contribution)?;
+            proof
         } else {
             calls.property_proof(
                 fragment,
@@ -231,10 +252,24 @@ fn validate_fragment_output_properties_core(
             )?
         };
         work.flush()?;
-        let structure = super::validate_fragment_construction_after_admission(fragment, limits);
+        let structure = if let Some(parent) = admit.as_deref_mut() {
+            super::validate_fragment_construction_after_admission_in(
+                fragment,
+                limits,
+                &mut resources,
+                parent,
+                work,
+            )
+        } else {
+            super::validate_fragment_construction_after_admission(fragment, limits)
+                .map_err(FragmentPropertyError::Structure)
+        };
+        if matches!(&structure, Err(FragmentPropertyError::Control(_))) {
+            return structure.map(|_| proof.facts());
+        }
         work.step()?;
         work.flush()?;
-        structure.map_err(FragmentPropertyError::Structure)?;
+        structure?;
         proof.require_declared_broadcast_equivalence(work)?;
         let facts = super::guarantee::validate_guarantees_observed(
             fragment,
@@ -244,37 +279,38 @@ fn validate_fragment_output_properties_core(
             work,
         )?;
         let mut errors = ValidationContext::with_limits(limits);
-        let _completion = super::graph::visit_node_graph_child_first(fragment, |event| {
-            match event {
-                super::graph::NodeGraphEvent::Step => work.step()?,
-                super::graph::NodeGraphEvent::Ready(id) => {
-                    let node = fragment
-                        .nodes()
-                        .get(&id)
-                        .ok_or(FrozenCallError::InvalidSite)?;
-                    // The sole schedule never emits a parent before its actual
-                    // children. Formula scratch/clone/format remains opaque.
-                    work.flush()?;
-                    validate_node_output_properties_from(
-                        fragment,
-                        node,
-                        "fragment.output_properties",
-                        &mut errors,
-                        &mut PropertyEffectSource::Frozen {
-                            proof: &proof,
-                            work,
-                        },
-                    )?;
-                    work.step()?;
-                    work.flush()?;
-                    if errors.is_saturated() {
-                        errors.mark_truncated();
-                        return Ok(false);
+        let _completion =
+            visit_property_graph(fragment, &mut resources, &mut admit, work, |event, work| {
+                match event {
+                    super::graph::NodeGraphEvent::Step => work.step()?,
+                    super::graph::NodeGraphEvent::Ready(id) => {
+                        let node = fragment
+                            .nodes()
+                            .get(&id)
+                            .ok_or(FrozenCallError::InvalidSite)?;
+                        // The sole schedule never emits a parent before its actual
+                        // children. Formula scratch/clone/format remains opaque.
+                        work.flush()?;
+                        validate_node_output_properties_from(
+                            fragment,
+                            node,
+                            "fragment.output_properties",
+                            &mut errors,
+                            &mut PropertyEffectSource::Frozen {
+                                proof: &proof,
+                                work,
+                            },
+                        )?;
+                        work.step()?;
+                        work.flush()?;
+                        if errors.is_saturated() {
+                            errors.mark_truncated();
+                            return Ok(false);
+                        }
                     }
                 }
-            }
-            Ok::<_, FrozenCallError>(true)
-        })?;
+                Ok::<_, FragmentPropertyError>(true)
+            })?;
         if !errors.is_empty() {
             return Err(FragmentPropertyError::Structure(
                 ValidationErrors::from_collector(errors),
@@ -282,6 +318,23 @@ fn validate_fragment_output_properties_core(
         }
         Ok(facts)
     })()
+}
+
+fn visit_property_graph(
+    fragment: &Fragment,
+    resources: &mut novarocks_type_contract::ControlResourceCounter,
+    admit: &mut Option<&mut PropertyResourceAdmission<'_>>,
+    work: &mut CompileCheckpoints<'_>,
+    mut observe: impl FnMut(
+        super::graph::NodeGraphEvent,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<bool, FragmentPropertyError>,
+) -> Result<Option<usize>, FragmentPropertyError> {
+    if let Some(parent) = admit.as_deref_mut() {
+        super::graph::visit_node_graph_child_first_in(fragment, resources, parent, work, observe)
+    } else {
+        super::graph::visit_node_graph_child_first(fragment, |event| observe(event, work))
+    }
 }
 
 pub(crate) fn validate_fragment_partition_identities(
@@ -885,107 +938,216 @@ pub fn derive_fragment_output_properties_observed(
 > {
     let mut work =
         CompileCheckpoints::try_new(control, novarocks_type_contract::CompilePhase::Validate)?;
-    let result = (|| {
+    let result = derive_fragment_output_properties_core(
+        fragment,
+        cuts,
+        uses,
+        calls,
+        limits,
+        source_retained_bytes,
+        projection_limits,
+        None,
+        &mut work,
+    );
+    if matches!(&result, Err(FragmentPropertyError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+
+/// Derive the same candidate formulas on the caller's meter and resource hook.
+/// Graph scratch is included; index/candidate/diagnostic/formula owners still
+/// require admission. This port creates no new entry/footer or runtime owner.
+pub fn derive_fragment_output_properties_in(
+    fragment: &Fragment,
+    cuts: &FragmentCuts,
+    uses: &crate::PhysicalRootUses,
+    calls: &crate::FrozenFragmentCalls,
+    limits: PlanLimits,
+    source_retained_bytes: usize,
+    projection_limits: crate::PropertyProofProjectionLimits,
+    admit: &mut PropertyResourceAdmission<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<
+    (
+        BTreeMap<NodeId, crate::PhysicalProperties>,
+        crate::PropertyProofProjectionFacts,
+    ),
+    FragmentPropertyError,
+> {
+    derive_fragment_output_properties_core(
+        fragment,
+        cuts,
+        uses,
+        calls,
+        limits,
+        source_retained_bytes,
+        projection_limits,
+        Some(admit),
+        work,
+    )
+}
+
+fn derive_fragment_output_properties_core(
+    fragment: &Fragment,
+    cuts: &FragmentCuts,
+    uses: &crate::PhysicalRootUses,
+    calls: &crate::FrozenFragmentCalls,
+    limits: PlanLimits,
+    source_retained_bytes: usize,
+    projection_limits: crate::PropertyProofProjectionLimits,
+    mut admit: Option<&mut PropertyResourceAdmission<'_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<
+    (
+        BTreeMap<NodeId, crate::PhysicalProperties>,
+        crate::PropertyProofProjectionFacts,
+    ),
+    FragmentPropertyError,
+> {
+    let mut resources = novarocks_type_contract::ControlResourceCounter::default();
+    (|| {
         work.flush()?;
-        let proof = calls.property_proof(
-            fragment,
-            uses,
-            &limits,
-            source_retained_bytes,
-            projection_limits,
-            control,
-        )?;
+        let proof = if let Some(parent) = admit.as_deref_mut() {
+            let mut contribution = novarocks_type_contract::ControlOwnedResourceFacts::default();
+            let proof = calls.property_proof_in(
+                fragment,
+                uses,
+                &limits,
+                source_retained_bytes,
+                projection_limits,
+                &mut |next| {
+                    contribution = *next;
+                    parent(next)
+                },
+                work,
+            )?;
+            resources.merge(contribution)?;
+            proof
+        } else {
+            calls.property_proof(
+                fragment,
+                uses,
+                &limits,
+                source_retained_bytes,
+                projection_limits,
+                work.control(),
+            )?
+        };
         work.flush()?;
-        let structure = super::validate_fragment_construction_after_admission(fragment, limits);
+        let structure = if let Some(parent) = admit.as_deref_mut() {
+            super::validate_fragment_construction_after_admission_in(
+                fragment,
+                limits,
+                &mut resources,
+                parent,
+                work,
+            )
+        } else {
+            super::validate_fragment_construction_after_admission(fragment, limits)
+                .map_err(FragmentPropertyError::Structure)
+        };
+        if let Err(FragmentPropertyError::Control(cause)) = &structure {
+            return Err(FragmentPropertyError::Control(*cause));
+        }
         work.step()?;
         work.flush()?;
-        structure.map_err(FragmentPropertyError::Structure)?;
+        structure?;
         let mut candidates = BTreeMap::new();
         let mut errors = ValidationContext::with_limits(limits);
-        let completion = super::graph::visit_node_graph_child_first(fragment, |event| {
-            match event {
-                super::graph::NodeGraphEvent::Step => work.step()?,
-                super::graph::NodeGraphEvent::Ready(id) => {
-                    let node = fragment
-                        .nodes()
-                        .get(&id)
-                        .ok_or(FrozenCallError::InvalidSite)?;
-                    for (input, required) in node.inputs.iter().zip(&node.required_inputs) {
-                        let Some(actual) = candidates.get(input) else {
-                            errors.push(ValidationError::new(
-                                "fragment.property_derivation",
-                                "property derivation lacks a child candidate",
-                            ));
+        let completion = visit_property_graph(
+            fragment,
+            &mut resources,
+            &mut admit,
+            work,
+            |event, work| {
+                match event {
+                    super::graph::NodeGraphEvent::Step => work.step()?,
+                    super::graph::NodeGraphEvent::Ready(id) => {
+                        let node = fragment
+                            .nodes()
+                            .get(&id)
+                            .ok_or(FrozenCallError::InvalidSite)?;
+                        for (input, required) in node.inputs.iter().zip(&node.required_inputs) {
+                            let Some(actual) = candidates.get(input) else {
+                                errors.push(ValidationError::new(
+                                    "fragment.property_derivation",
+                                    "property derivation lacks a child candidate",
+                                ));
+                                work.step()?;
+                                return Ok(false);
+                            };
+                            work.flush()?;
+                            let satisfies = properties_satisfy(actual, required);
                             work.step()?;
-                            return Ok(false);
-                        };
-                        work.flush()?;
-                        let satisfies = properties_satisfy(actual, required);
-                        work.step()?;
-                        work.flush()?;
-                        if !satisfies {
-                            errors.push(ValidationError::new("fragment.property_derivation", "candidate child properties do not satisfy the authored input requirement"));
-                            return Ok(false);
+                            work.flush()?;
+                            if !satisfies {
+                                errors.push(ValidationError::new("fragment.property_derivation", "candidate child properties do not satisfy the authored input requirement"));
+                                return Ok(false);
+                            }
                         }
-                    }
-                    let mut exchange_anchor = None;
-                    if matches!(node.kind, NodeKind::ExchangeSource { .. }) {
-                        for cut in &cuts.inbound {
-                            work.step()?;
-                            if cut.destination_node == id {
-                                if exchange_anchor.is_some()
-                                    || cut.source_fragment == fragment.id()
-                                    || !super::cuts::inbound_cut_matches_exchange_source(cut, node)
-                                {
-                                    errors.push(ValidationError::new(
+                        let mut exchange_anchor = None;
+                        if matches!(node.kind, NodeKind::ExchangeSource { .. }) {
+                            for cut in &cuts.inbound {
+                                work.step()?;
+                                if cut.destination_node == id {
+                                    if exchange_anchor.is_some()
+                                        || cut.source_fragment == fragment.id()
+                                        || !super::cuts::inbound_cut_matches_exchange_source(
+                                            cut, node,
+                                        )
+                                    {
+                                        errors.push(ValidationError::new(
                                         "fragment.property_derivation",
                                         "exchange property derivation lacks one exact inbound cut",
                                     ));
-                                    return Ok(false);
+                                        return Ok(false);
+                                    }
+                                    exchange_anchor = Some(cut);
                                 }
-                                exchange_anchor = Some(cut);
+                            }
+                            if exchange_anchor.is_none() {
+                                errors.push(ValidationError::new(
+                                    "fragment.property_derivation",
+                                    "exchange property derivation lacks one exact inbound cut",
+                                ));
+                                return Ok(false);
                             }
                         }
-                        if exchange_anchor.is_none() {
+                        work.flush()?;
+                        let expected = derive_node_output_properties_from(
+                            fragment,
+                            node,
+                            ChildProperties::Candidates(&candidates),
+                            PropertyOutputTarget::Derived,
+                            exchange_anchor,
+                            "fragment.property_derivation",
+                            &mut errors,
+                            &mut PropertyEffectSource::Frozen {
+                                proof: &proof,
+                                work,
+                            },
+                        )?;
+                        work.step()?;
+                        work.flush()?;
+                        let Some(expected) = expected else {
                             errors.push(ValidationError::new(
                                 "fragment.property_derivation",
-                                "exchange property derivation lacks one exact inbound cut",
+                                "operator properties lack their exact construction prerequisites",
                             ));
                             return Ok(false);
+                        };
+                        if !errors.is_empty() {
+                            return Ok(false);
                         }
+                        candidates.insert(id, expected);
+                        work.step()?;
                     }
-                    work.flush()?;
-                    let expected = derive_node_output_properties_from(
-                        fragment,
-                        node,
-                        ChildProperties::Candidates(&candidates),
-                        PropertyOutputTarget::Derived,
-                        exchange_anchor,
-                        "fragment.property_derivation",
-                        &mut errors,
-                        &mut PropertyEffectSource::Frozen {
-                            proof: &proof,
-                            work: &mut work,
-                        },
-                    )?;
-                    work.step()?;
-                    work.flush()?;
-                    let Some(expected) = expected else {
-                        errors.push(ValidationError::new(
-                            "fragment.property_derivation",
-                            "operator properties lack their exact construction prerequisites",
-                        ));
-                        return Ok(false);
-                    };
-                    if !errors.is_empty() {
-                        return Ok(false);
-                    }
-                    candidates.insert(id, expected);
-                    work.step()?;
                 }
-            }
-            Ok::<_, FrozenCallError>(true)
-        })?;
+                Ok::<_, FragmentPropertyError>(true)
+            },
+        )?;
         work.flush()?;
         if (completion != Some(fragment.nodes().len())
             || candidates.len() != fragment.nodes().len())
@@ -1002,12 +1164,7 @@ pub fn derive_fragment_output_properties_observed(
             ));
         }
         Ok((candidates, proof.facts()))
-    })();
-    if matches!(&result, Err(FragmentPropertyError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    })()
 }
 
 /// Derive the original replica-sensitive operator formulas from complete
