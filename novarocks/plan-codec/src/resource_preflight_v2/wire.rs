@@ -74,6 +74,35 @@ impl<'a> Cursor<'a> {
         let length = usize::try_from(self.varint(work)?).map_err(|_| E::Malformed)?;
         self.fixed(length, work)
     }
+    /// Capture a real available payload before its original fixed-width
+    /// completed progress. Malformed availability keeps the old observation.
+    pub(super) fn length_delimited_captured(
+        &mut self,
+        work: &mut CompileCheckpoints<'_>,
+        mut capture: impl FnMut(&'a [u8]) -> Result<(), E>,
+    ) -> Result<&'a [u8], E> {
+        let length = usize::try_from(self.varint(work)?).map_err(|_| E::Malformed)?;
+        if let Some(bytes) = self.remaining.get(..length) {
+            capture(bytes)?;
+        }
+        self.fixed(length, work)
+    }
+
+    /// The original group resource cap, once the actual key is captured.
+    /// The locked library's hard recursion refusal remains malformed input.
+    pub(super) fn check_group_depth(
+        wire: WireType,
+        depth: usize,
+        max_group_depth: usize,
+    ) -> Result<(), E> {
+        if wire == WireType::StartGroup && depth < 100 && depth >= max_group_depth {
+            return Err(E::Limit(
+                "unknown protobuf group depth exceeds caller limit",
+            ));
+        }
+        Ok(())
+    }
+
     /// Skip one field without heap traversal storage or recursive Rust calls.
     /// Prost scalar primitives may allocate a DecodeError on malformed input;
     /// scanner error scratch remains the host's separate responsibility.
@@ -98,6 +127,18 @@ impl<'a> Cursor<'a> {
         wire: WireType,
         tag: u32,
         max_group_depth: usize,
+        work: &mut CompileCheckpoints<'_>,
+        observe_key: impl FnMut() -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.skip_observed_policy(wire, tag, max_group_depth, false, work, observe_key)
+    }
+
+    pub(super) fn skip_observed_policy(
+        &mut self,
+        wire: WireType,
+        tag: u32,
+        max_group_depth: usize,
+        parent: bool,
         work: &mut CompileCheckpoints<'_>,
         mut observe_key: impl FnMut() -> Result<(), E>,
     ) -> Result<(), E> {
@@ -131,6 +172,9 @@ impl<'a> Cursor<'a> {
                     depth -= 1;
                 }
                 WireType::StartGroup => {
+                    if parent {
+                        Self::check_group_depth(current.1, depth, max_group_depth)?;
+                    }
                     work.step()?;
                     if depth == PROST_RECURSION_LIMIT {
                         // The locked decoder cannot consume this additional
@@ -151,6 +195,9 @@ impl<'a> Cursor<'a> {
                 return Ok(());
             }
             current = self.key(work)?.ok_or(E::Malformed)?;
+            if parent {
+                Self::check_group_depth(current.1, depth, max_group_depth)?;
+            }
             observe_key()?;
         }
     }

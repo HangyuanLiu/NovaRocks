@@ -154,6 +154,28 @@ impl FragmentDecodeResourceModel {
         let result = scan::scan(&self.schema, self.max_message_depth, raw, limits, &mut work);
         finish(work, result)
     }
+
+    /// Project the same fresh-Prost DTO occurrences on the caller's meter.
+    /// Admission receives replacement snapshots of this one contribution;
+    /// input backing is reported once and is not a host/MEM grant. The caller
+    /// owns entry and ordinary/success completion. Known numeric refusal is
+    /// primary and performs no subsequent progress observation.
+    pub fn preflight_in(
+        &self,
+        raw: &[u8],
+        limits: DecodeProjectionLimits,
+        admit: &mut dyn FnMut(&DecodeResourceUsage) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<DecodeResourceProjection, ResourceModelError> {
+        scan::scan_in(
+            &self.schema,
+            self.max_message_depth,
+            raw,
+            limits,
+            admit,
+            work,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -164,3 +186,6 @@ mod tests;
 
 #[cfg(test)]
 mod request_tests;
+
+#[cfg(test)]
+mod owner_tests;

@@ -23,7 +23,7 @@
 use std::collections::btree_map;
 
 use novarocks_proto_models::resource_layout::WireKind;
-use novarocks_type_contract::CompileCheckpoints;
+use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
 use prost::encoding::WireType;
 
 use super::{
@@ -100,11 +100,20 @@ pub(super) fn message_depth(
     Ok(depths[schema.root])
 }
 
-struct Accounting {
+type Admission<'a> = dyn FnMut(&DecodeResourceUsage) -> Result<(), CompileControlError> + 'a;
+
+struct Accounting<'borrow, 'admit> {
     limits: DecodeProjectionLimits,
     usage: DecodeResourceUsage,
+    admit: Option<&'borrow mut Admission<'admit>>,
 }
-impl Accounting {
+impl Accounting<'_, '_> {
+    fn gate(&mut self) -> Result<(), E> {
+        if let Some(admit) = &mut self.admit {
+            admit(&self.usage)?;
+        }
+        Ok(())
+    }
     fn heap(&mut self, bytes: usize) -> Result<(), E> {
         self.usage.cumulative_requested_heap_bytes_upper =
             checked_add(self.usage.cumulative_requested_heap_bytes_upper, bytes)?;
@@ -232,6 +241,34 @@ pub(super) fn scan(
     limits: DecodeProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodeResourceProjection, E> {
+    scan_core(schema, max_message_depth, raw, limits, None, work)
+}
+
+pub(super) fn scan_in(
+    schema: &Schema,
+    max_message_depth: usize,
+    raw: &[u8],
+    limits: DecodeProjectionLimits,
+    admit: &mut Admission<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<DecodeResourceProjection, E> {
+    match scan_core(schema, max_message_depth, raw, limits, Some(admit), work) {
+        // All Limit branches belong to the original numeric envelope. Schema
+        // drift and malformed-prefix semantics retain their original owners.
+        Err(E::Limit(_)) => Err(E::Control(CompileControlError::ResourceExhausted)),
+        result => result,
+    }
+}
+
+fn scan_core(
+    schema: &Schema,
+    max_message_depth: usize,
+    raw: &[u8],
+    limits: DecodeProjectionLimits,
+    admit: Option<&mut Admission<'_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<DecodeResourceProjection, E> {
+    let parent = admit.is_some();
     const PROST_RECURSION_LIMIT: usize = 100;
     if limits.max_wire_depth > PROST_RECURSION_LIMIT {
         return Err(E::Schema(
@@ -250,6 +287,7 @@ pub(super) fn scan(
         .ok_or(E::Schema("missing resource schema root"))?;
     let mut accounting = Accounting {
         limits,
+        admit,
         usage: DecodeResourceUsage {
             input_bytes: raw.len(),
             root_inline_bytes: root.layout.size,
@@ -264,6 +302,7 @@ pub(super) fn scan(
     accounting.copied(errors)?;
     accounting.initialized(errors)?;
     accounting.message(root.layout.size)?;
+    accounting.gate()?;
     struct Frame {
         object: usize,
         end_remaining: usize,
@@ -304,9 +343,32 @@ pub(super) fn scan(
                 .get(frame.object)
                 .ok_or(E::Schema("invalid active resource object"))?;
             let Some(field) = object.fields.get(&tag) else {
-                cursor.skip_observed(wire, tag, limits.max_wire_depth - depth, work, || {
-                    accounting.field()
-                })?;
+                if parent {
+                    Cursor::check_group_depth(wire, 0, limits.max_wire_depth - depth)?;
+                }
+                accounting.gate()?;
+                let mut observe_key = || {
+                    accounting.field()?;
+                    accounting.gate()
+                };
+                if parent {
+                    cursor.skip_observed_policy(
+                        wire,
+                        tag,
+                        limits.max_wire_depth - depth,
+                        true,
+                        work,
+                        &mut observe_key,
+                    )?;
+                } else {
+                    cursor.skip_observed(
+                        wire,
+                        tag,
+                        limits.max_wire_depth - depth,
+                        work,
+                        observe_key,
+                    )?;
+                }
                 continue;
             };
             // One key may change an optional/oneof discriminant whose size
@@ -319,10 +381,17 @@ pub(super) fn scan(
                 if wire == WireType::LengthDelimited && field.repeated.is_some() {
                     // Prost accepts packed and unpacked numeric occurrences,
                     // regardless of the descriptor's preferred packed flag.
+                    accounting.gate()?;
                     let end = delimited_end(&mut cursor, work)?;
                     while cursor.remaining().len() > end {
-                        work.step()?;
-                        accounting.scalar(field)?;
+                        if parent {
+                            accounting.scalar(field)?;
+                            accounting.gate()?;
+                            work.step()?;
+                        } else {
+                            work.step()?;
+                            accounting.scalar(field)?;
+                        }
                         scalar_value(&mut cursor, expected, work)?;
                     }
                     if cursor.remaining().len() != end {
@@ -330,9 +399,11 @@ pub(super) fn scan(
                     }
                 } else {
                     if wire != expected {
+                        accounting.gate()?;
                         return Err(E::Malformed);
                     }
                     accounting.scalar(field)?;
+                    accounting.gate()?;
                     scalar_value(&mut cursor, expected, work)?;
                 }
             } else if field.wire.kind == WireKind::Message {
@@ -347,6 +418,10 @@ pub(super) fn scan(
                 // precedes parsing the nested body. Never discard that prefix.
                 accounting.slots(field)?;
                 accounting.message(child_object.layout.size)?;
+                if parent && depth < PROST_RECURSION_LIMIT && depth >= limits.max_wire_depth {
+                    return Err(E::Limit("protobuf message depth exceeds caller limit"));
+                }
+                accounting.gate()?;
                 if wire != WireType::LengthDelimited {
                     return Err(E::Malformed);
                 }
@@ -364,10 +439,22 @@ pub(super) fn scan(
                 });
             } else {
                 if wire != WireType::LengthDelimited {
+                    accounting.gate()?;
                     return Err(E::Malformed);
                 }
-                let bytes = cursor.length_delimited(work)?;
-                accounting.bytes(field, bytes.len())?;
+                if parent {
+                    // The enclosing optional/oneof initialization is already
+                    // known before the length read; payload charges wait for
+                    // a real captured available slice, including malformed input.
+                    accounting.gate()?;
+                    cursor.length_delimited_captured(work, |bytes| {
+                        accounting.bytes(field, bytes.len())?;
+                        accounting.gate()
+                    })?;
+                } else {
+                    let bytes = cursor.length_delimited(work)?;
+                    accounting.bytes(field, bytes.len())?;
+                }
             }
         }
     })();
@@ -376,10 +463,13 @@ pub(super) fn scan(
             status: ResourceCursorStatus::Complete,
             usage: accounting.usage,
         }),
-        Err(E::Malformed) => Ok(DecodeResourceProjection {
-            status: ResourceCursorStatus::MalformedPrefix,
-            usage: accounting.usage,
-        }),
+        Err(E::Malformed) => {
+            accounting.gate()?;
+            Ok(DecodeResourceProjection {
+                status: ResourceCursorStatus::MalformedPrefix,
+                usage: accounting.usage,
+            })
+        }
         Err(error) => Err(error),
     }
 }
