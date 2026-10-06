@@ -566,6 +566,19 @@ impl<'source> BindingSources<'source> {
     pub(crate) fn aggregates(&self) -> &[AggregateRow<'source>] {
         &self.aggregates
     }
+    /// Later definition inputs borrow this exact package and retained
+    /// contribution before reading any binding occurrence or source loan.
+    pub(crate) fn check_package_in(
+        &self,
+        package: &'source p::FragmentPackage,
+        budget: &TypeViewBudget<'source, '_, '_>,
+        work: &CompileCheckpoints<'_>,
+    ) -> Result<(), TypeViewError> {
+        if !std::ptr::eq(self.package, package) {
+            return Err(invalid("binding source inputs belong to another package"));
+        }
+        self.check(budget, work)
+    }
     fn check(
         &self,
         budget: &TypeViewBudget<'source, '_, '_>,
