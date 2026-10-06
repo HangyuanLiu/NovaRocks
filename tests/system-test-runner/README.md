@@ -140,3 +140,7 @@ attempt encoded none of its own. A full per-target transport window cannot be
 produced at the default task transport budget without a capacity probe. That
 cross-target admission is therefore checked by the frontend's real admission
 pass and transport supervisor composition tests, not by these scenarios.
+
+### 内存归属观测
+
+默认场景 `memory-attribution/observation-families` 启动原生 1FE+3BE，验证分布式查询及连接退出取消前后的每个 BE `/metrics`。证据写入场景目录的 `memory-attribution.json`，关联独立 PID 与 HTTP endpoint；两个进程尺寸段、固定归属分类、记录状态、故障与批量采样族均须存在。S1 未接生产 lane，query/residual/service 记录和事实为零，16 条 immortal unattributed 记录单独存在；unattributed 字节大于零，生命周期与孤儿故障为零。签名的对账及账本盲区为独立采样，不要求在并发 scrape 期间瞬时归零。

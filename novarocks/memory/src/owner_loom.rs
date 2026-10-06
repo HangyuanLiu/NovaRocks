@@ -68,7 +68,7 @@ fn exited() -> TeardownEvidence<'static> {
     }
 }
 
-fn retain_one(domain: &FundingDomain) -> crate::AllocationOrigin {
+fn retain_one(domain: &FundingDomain) -> crate::FactToken {
     let mut scope = domain.activate(1, 0).unwrap();
     let origin = scope.record_allocation(1);
     scope.finish();
@@ -189,18 +189,7 @@ fn seal_and_activation_share_the_production_local_handshake() {
         assert!(snapshot.sealed);
         assert!(!snapshot.active);
         assert_eq!(snapshot.live, 0);
-        assert_eq!(
-            domain.0.owner.scopes.load(crate::sync::Ordering::Acquire),
-            0
-        );
-        assert_eq!(
-            domain
-                .0
-                .owner
-                .allocations
-                .load(crate::sync::Ordering::Acquire),
-            0
-        );
+        assert_eq!(domain.0.lane.record().lifetime().outstanding(), 0);
         assert!(domain.activate(0, 0).is_err());
         assert!(domain.settle().next_step.is_err());
         assert_eq!(authority.root().committed_bytes(), before);
@@ -264,7 +253,7 @@ fn last_free_and_metadata_reclamation_do_not_require_the_origin_thread() {
             .unwrap();
         let domain = account.create_domain(1).unwrap();
         let origin = retain_one(&domain);
-        domain.retire_lane().unwrap();
+        domain.stop_producing().unwrap();
         drop(domain);
         // Only registry publication and the outstanding allocation now keep
         // the origin address alive. Reclamation races its real final access.
@@ -301,7 +290,7 @@ fn protected_last_free_returns_backing_but_never_residual_debt_to_floor() {
         let mut scope = domain.activate(1, 0).unwrap();
         let origin = scope.record_allocation(2);
         assert_eq!(scope.finish().debt, 1);
-        domain.retire_lane().unwrap();
+        domain.stop_producing().unwrap();
         let residual = domain.snapshot();
         assert_eq!(
             (residual.authorized, residual.committed, residual.debt),
@@ -366,5 +355,39 @@ fn ancestor_retirement_and_reclamation_revalidate_affiliation() {
         drop(account);
         drop(parent);
         assert_eq!(authority.root().committed_bytes(), storage);
+    });
+}
+
+#[test]
+fn nested_ancestor_and_child_retirement_cannot_lose_a_moving_lane() {
+    model(|| {
+        let authority = authority(4);
+        let work = authority
+            .create_account(AccountKind::Work, ExternalRef::NONE)
+            .unwrap();
+        let attempt = work
+            .create_child(AccountKind::Attempt, ExternalRef::NONE)
+            .unwrap();
+        let task = attempt
+            .create_child(AccountKind::Task, ExternalRef::NONE)
+            .unwrap();
+        let domain = task.create_domain(1).unwrap();
+        let allocation = retain_one(&domain);
+        let before = authority.root().committed_bytes();
+        let ancestor = work.clone();
+        let parent_exit = thread::spawn(move || ancestor.retire(&exited()).unwrap());
+        let child = task.clone();
+        let child_exit = thread::spawn(move || child.retire(&exited()).unwrap());
+        parent_exit.join().unwrap();
+        child_exit.join().unwrap();
+        assert!(work.is_retired() && attempt.is_retired() && task.is_retired());
+        assert_eq!(domain.affiliation().id(), authority.root().id());
+        assert!(domain.snapshot().residual);
+        assert_eq!(authority.root().committed_bytes(), before);
+        // SAFETY: the one retained allocation has one genuine final release.
+        unsafe { allocation.record_deallocation(1) };
+        drop(domain);
+        complete_quiescent_successor(&authority);
+        assert_empty_registry(&authority);
     });
 }

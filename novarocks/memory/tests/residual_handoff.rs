@@ -18,7 +18,7 @@
 mod common;
 use common::*;
 #[test]
-fn retire_preserves_payload_metadata_and_query_pressure_until_late_free() {
+fn retire_preserves_payload_metadata_but_ends_query_pressure() {
     let a = authority(32_768);
     let q = work(&a);
     let d = q.create_domain(1_024).unwrap();
@@ -34,7 +34,7 @@ fn retire_preserves_payload_metadata_and_query_pressure_until_late_free() {
     );
     let after = a.pressure_projection();
     assert_eq!(after.root_committed, before.root_committed);
-    assert_eq!(after.query_pressure(), before.query_pressure());
+    assert_eq!(after.query_pressure(), 0);
     assert!(q.is_retired());
     assert!(d.activate(0, 0).is_err());
     drop(q);

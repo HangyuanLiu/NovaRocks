@@ -17,11 +17,11 @@
 
 //! The synchronization vocabulary shared by production and model checking.
 #[cfg(loom)]
-pub(crate) use loom::sync::atomic::{AtomicU64, Ordering};
+pub(crate) use loom::sync::atomic::{AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 #[cfg(loom)]
 pub(crate) use loom::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 #[cfg(not(loom))]
-pub(crate) use std::sync::atomic::{AtomicU64, Ordering};
+pub(crate) use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 #[cfg(not(loom))]
 pub(crate) use std::sync::{
     Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,

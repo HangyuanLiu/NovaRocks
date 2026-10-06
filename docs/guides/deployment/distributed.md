@@ -259,6 +259,59 @@ BE management HTTP 的 `/metrics` 或 `/metrics?type=json` 提供当前 Native �
 `novarocks_backend_saturation_source_available` 对尚未接入此读数面的 Exchange slot
 与内存账本报告 unavailable（值为零），不能把它解释成这些资源空闲。
 
+## 内存分配归属与残留诊断
+
+每个 BE 的上述 management 端口导出进程本地内存读数；不要从一个 BE 推断全体 BE，FE 与 BE 的 registry 也不混合。Server 全局 allocator 已使用尺寸分段归属包装器，生产 query/R1 的资金接线尚未完成，当前 query=0 不能证明查询没有内存或已受硬限保护。
+
+| 指标 | 口径与有界标签 |
+|---|---|
+| `novarocks_backend_process_counted_live_bytes{band}` | small/tagged 的存活请求字节；tagged 含 8 B token |
+| `novarocks_backend_process_counted_operations_total{band,kind}` | alloc/dealloc/realloc/failure 事件，跨段是一次 realloc |
+| `novarocks_backend_process_counted_requested_bytes_total{band,flow}` | 请求字节流量；含完整块跨段迁移，不是只有 process delta |
+| `novarocks_backend_memory_attributed_bytes{band,class}` | tagged/r1_small × query/residual/service 的 signed 独立事实采样 |
+| `novarocks_backend_memory_unattributed_bytes` | 无有效 owner 的 tagged 请求 |
+| `novarocks_backend_memory_ledger_blind_spot_bytes` | small 进程请求减 R1 small；普通环境小对象无查询来源 |
+| `novarocks_backend_memory_attribution_reconcile_bytes` | tagged 进程请求减全部 tagged lane（含 unattributed） |
+| `novarocks_backend_memory_lane_records{class,production}` | 四类责任 × producing/sealed/stopped 的记录数 |
+| `novarocks_backend_memory_lane_record_capacity`, `_high_water`, `novarocks_backend_memory_lane_records_draining` | 固定记录容量、采样扫描前缀与待回收数 |
+| `novarocks_backend_memory_lane_record_segment_requested_bytes`, `novarocks_backend_memory_observation_metadata_bytes` | segment 请求 backing 与本 authority 观测控制估计；不等于 resident，不加入 S1 的资金 C |
+| `novarocks_backend_memory_batch_threshold_bytes`, `_pinned_slots`, `_slot_balance_estimate_bytes` | Q=1 MiB、独立采样 pins 与 Q×pins，排除在途项 |
+| `novarocks_backend_memory_attribution_faults_total{kind}` | 七类固定故障计数；观测不拒绝 SQL |
+| `novarocks_backend_memory_attribution_sample_unixtime_seconds`, `_sequence_sum` | 采样时间与独立序号的 wrapping sum；不是一致快照或结清收据 |
+
+`band`、`class`、`production`、`kind`、`flow` 均为固定枚举，不增加 query/account/origin 标签。纯 small 路径不读 TLS，≥512 B 请求的尾部保存下标/代次；free 按原来源扣回。R1 allocator-api 零尺寸没有物理事实，tagged 与 R1 small 对同一块只发布一份。
+
+作用域完成后每槽余额 <Q，但在途分配无先验上界，Q×sampled pins 不能证明瞬时物理峰值或已结清。signed 盲区/对账可以暂时为负，不能 clamp 为零；孤立的对账非零也不能判为缺陷。停止 lane 生产仍保留执行中 Query；真正 Work teardown 才转 Residual。U=ΣC_query 不包含来源诊断，root C/N 不因重分类下降，真实释放和闲置授权归还另计。RSS/cgroup/jemalloc 读数保持独立，不能和请求/责任事实相加。
+
+以下 Prometheus 规则是故障提示示例，阈值与路由由部署 owner 决定；先按 instance 看原值、采样进展和退出证据。残留增长只记诊断，不能据此自动 kill 已退出查询。
+
+```yaml
+groups:
+  - name: novarocks-memory-attribution
+    rules:
+      - alert: NovaRocksResidualMemoryGrowth
+        expr: increase(novarocks_backend_memory_attribution_faults_total{kind="residual_growth"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Residual allocation growth on {{ $labels.instance }}"
+      - alert: NovaRocksAttributionCoverageFailure
+        expr: increase(novarocks_backend_memory_attribution_faults_total{kind=~"binding_failure|record_exhaustion|generation_exhaustion|scope_refusal"}[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Allocation attribution coverage degraded on {{ $labels.instance }}"
+      - alert: NovaRocksAttributionLifetimeFault
+        expr: increase(novarocks_backend_memory_attribution_faults_total{kind=~"orphan|reclaim_nonzero"}[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Allocation attribution lifetime fault on {{ $labels.instance }}"
+```
+
+unsafe 与性能验收分别需要模型/Miri 和用户 Linux 正式成本结论；指标可读、原生场景通过或入口 smoke 不关闭这两道门。详见 [memory 核心边界](../development/memory-boundary.md) 与 [attribution harness](../../../tools/memory-attribution-bench/README.md)。
+
 ## Native trust 与传输选择
 
 每个 deployable FE/BE role 都必须配置相同的 `[native_trust]`。它要求

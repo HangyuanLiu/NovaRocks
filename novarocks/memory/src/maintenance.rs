@@ -122,25 +122,17 @@ impl MemoryAuthority {
                     let domain = FundingDomain(record);
                     // Capture before accepting facts: anything published after
                     // this cutoff invalidates actionable coverage until recheck.
-                    let cutoff = domain.0.owner.sequence.load(Ordering::Acquire);
+                    let cutoff = domain.0.lane.record().sequence.load(Ordering::Acquire);
                     domain.settle();
                     if domain.0.state.lock().unwrap().active {
                         domain.0.state.lock().unwrap().drain_requested = true;
                         deferred += 1;
-                        domain
-                            .0
-                            .owner
-                            .covered_sequence
-                            .store(cutoff, Ordering::Relaxed);
-                        domain.0.owner.covered_epoch.store(epoch, Ordering::Release);
+                        domain.0.covered_sequence.store(cutoff, Ordering::Relaxed);
+                        domain.0.covered_epoch.store(epoch, Ordering::Release);
                     } else {
                         domain.drain_idle();
-                        domain
-                            .0
-                            .owner
-                            .covered_sequence
-                            .store(cutoff, Ordering::Relaxed);
-                        domain.0.owner.covered_epoch.store(epoch, Ordering::Release);
+                        domain.0.covered_sequence.store(cutoff, Ordering::Relaxed);
+                        domain.0.covered_epoch.store(epoch, Ordering::Release);
                         self.reclaim_record(domain, cursor);
                     }
                 }
@@ -157,6 +149,8 @@ impl MemoryAuthority {
             cursor += 1;
             scanned += 1;
         }
+        self.shared.prune_observations(budget);
+        self.shared.record_store.store().reclaim(budget);
         let mut m = self.shared.maintenance.lock().unwrap();
         assert_eq!(
             m.epoch, epoch,
@@ -174,10 +168,10 @@ impl MemoryAuthority {
             let path = Path::new(&affiliation);
             let _gates = path.exclusive_gates();
             let mut state = domain.0.state.lock().unwrap();
-            if state.account.id() != affiliation.id() {
+            if domain.affiliation().id() != affiliation.id() {
                 continue;
             }
-            if !state.residual || state.external != 0 || !domain.0.owner.reclaimable() {
+            if state.registered_active || state.external != 0 || !domain.0.lane.reclaimable() {
                 return;
             }
             // A final free can occur after this batch's settle/idle sample but
@@ -185,7 +179,11 @@ impl MemoryAuthority {
             // the exact affiliation is pinned; removing just the metadata
             // would otherwise orphan the record's last payload commitment.
             let mut states = path.locks();
-            assert_eq!(domain.0.owner.live(), 0, "no allocations retain live bytes");
+            assert_eq!(
+                domain.0.lane.live_bytes(),
+                0,
+                "no allocations retain live bytes"
+            );
             let final_payload = state.committed;
             let final_backing = state.authorized;
             let protected = affiliation.0.control.load(Ordering::Acquire) != 0;
@@ -203,11 +201,13 @@ impl MemoryAuthority {
             state.authorized = 0;
             state.committed = 0;
             state.settled_live = 0;
+            let member = domain.0.lane.detach_member();
             let removed = {
                 let mut registry = self.shared.domains.lock().unwrap();
                 // Recheck while index publication is excluded: a concurrent
                 // observer may have pinned the record after the first sample.
-                if Arc::strong_count(&domain.0) != 2 {
+                if Arc::strong_count(&domain.0) != 2 || !domain.0.lane.reclaimable() {
+                    domain.0.lane.restore_member(&member);
                     return;
                 }
                 let removed = registry.records[index].take();
@@ -219,9 +219,15 @@ impl MemoryAuthority {
                 removed
             };
             let metadata = domain.0.metadata;
+            let reference = domain.0.lane.reference();
             drop(state);
             drop(removed);
             drop(domain);
+            drop(member);
+            assert!(
+                self.shared.record_store.store().reclaim_exact(reference),
+                "final funding owner must complete exact record reclamation"
+            );
             // All affiliation lifecycle gates remain pinned and exclusive.
             // Real stable-record storage is freed before its charge is returned.
             if protected {
@@ -281,9 +287,9 @@ impl MemoryAuthority {
         for index in 0..upper {
             let domain = self.shared.domains.lock().unwrap().records[index].clone();
             if let Some(domain) = domain
-                && (domain.owner.covered_epoch.load(Ordering::Acquire) != coverage.epoch
-                    || domain.owner.covered_sequence.load(Ordering::Acquire)
-                        != domain.owner.sequence.load(Ordering::Acquire))
+                && (domain.covered_epoch.load(Ordering::Acquire) != coverage.epoch
+                    || domain.covered_sequence.load(Ordering::Acquire)
+                        != domain.lane.record().sequence.load(Ordering::Acquire))
             {
                 return false;
             }
@@ -351,7 +357,7 @@ impl FundingDomain {
             let path = Path::new(&account);
             let _gates = path.exclusive_gates();
             let mut s = self.0.state.lock().unwrap();
-            if s.account.id() != account.id() {
+            if self.affiliation().id() != account.id() {
                 continue;
             }
             if s.active {
@@ -359,7 +365,7 @@ impl FundingDomain {
             }
             // Floor-backed lanes return idle to the protected account pool;
             // all other genuinely revoked rights reduce ancestor commitment.
-            let live = self.0.owner.live();
+            let live = self.0.lane.live_bytes();
             let retained_free = if s.drain_requested { 0 } else { retained_free };
             let obligation = live.checked_add(s.external).expect("valid live and bound");
             // The requested retention is a cap, so MAX means retain every

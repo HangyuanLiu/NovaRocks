@@ -19,11 +19,14 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::management_http::RoleMetricsRenderer;
-use novarocks_memory::observe::{AllocatorSnapshot, PhysicalMemoryReading};
+use novarocks_memory::attribution::readout::{
+    AttributionSnapshot, CLASS_LABELS, PRODUCTION_LABELS,
+};
+use novarocks_memory::observe::PhysicalMemoryReading;
 use novarocks_worker::query_context::NativeQueryExecutionResourceSnapshot;
 use once_cell::sync::Lazy;
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounter, IntGauge, IntGaugeVec, Opts, Registry,
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGaugeVec, Opts, Registry,
     TextEncoder,
 };
 
@@ -63,7 +66,7 @@ pub struct ProcessMemoryObservation {
     pub visible_memory: Option<(u64, &'static str)>,
     /// Sampled on every scrape.
     pub sample:
-        std::sync::Arc<dyn Fn() -> (AllocatorSnapshot, PhysicalMemoryReading) + Send + Sync>,
+        std::sync::Arc<dyn Fn() -> (AttributionSnapshot, PhysicalMemoryReading) + Send + Sync>,
 }
 
 /// The gauges refreshed from [`ProcessMemoryObservation::sample`]. Owned by
@@ -71,7 +74,274 @@ pub struct ProcessMemoryObservation {
 struct ProcessMemoryGauges {
     physical: IntGaugeVec,
     allocator: IntGaugeVec,
-    counted_live: IntGauge,
+    counted_live: IntGaugeVec,
+    attribution: AttributionGauges,
+}
+
+/// Absolute samples are published under the registry's scrape lock. No label
+/// contains an account, query, record index, generation or owner identity.
+struct AttributionGauges {
+    operations: IntCounterVec,
+    requested: IntCounterVec,
+    attributed: IntGaugeVec,
+    records: IntGaugeVec,
+    faults: IntCounterVec,
+    unattributed: IntGaugeVec,
+    blind_spot: IntGaugeVec,
+    reconciliation: IntGaugeVec,
+    capacity: IntGaugeVec,
+    high_water: IntGaugeVec,
+    draining: IntGaugeVec,
+    segment_requested: IntGaugeVec,
+    metadata: IntGaugeVec,
+    batch_threshold: IntGaugeVec,
+    pinned_slots: IntGaugeVec,
+    slot_estimate: IntGaugeVec,
+    sampled_at: IntGaugeVec,
+    sequence: IntGaugeVec,
+}
+impl AttributionGauges {
+    fn new(registry: &Registry) -> Result<Self, String> {
+        fn gauge(
+            registry: &Registry,
+            name: &str,
+            help: &str,
+            labels: &[&str],
+        ) -> Result<IntGaugeVec, String> {
+            let value = IntGaugeVec::new(Opts::new(name, help), labels)
+                .map_err(|e| format!("construct {name}: {e}"))?;
+            registry
+                .register(Box::new(value.clone()))
+                .map_err(|e| format!("register {name}: {e}"))?;
+            Ok(value)
+        }
+        fn counter(
+            registry: &Registry,
+            name: &str,
+            help: &str,
+            labels: &[&str],
+        ) -> Result<IntCounterVec, String> {
+            let value = IntCounterVec::new(Opts::new(name, help), labels)
+                .map_err(|e| format!("construct {name}: {e}"))?;
+            registry
+                .register(Box::new(value.clone()))
+                .map_err(|e| format!("register {name}: {e}"))?;
+            Ok(value)
+        }
+        Ok(Self {
+            operations: counter(
+                registry,
+                "novarocks_backend_process_counted_operations_total",
+                "Successful alloc, dealloc and realloc calls and failed requests by size band. Cross-band resize is one realloc and never a fabricated alloc/free pair.",
+                &["band", "kind"],
+            )?,
+            requested: counter(
+                registry,
+                "novarocks_backend_process_counted_requested_bytes_total",
+                "Cumulative requested byte flows within each band, including whole-block cross-band migration; token bytes are included. Band flows are not the delta-only process total.",
+                &["band", "flow"],
+            )?,
+            attributed: gauge(
+                registry,
+                "novarocks_backend_memory_attributed_bytes",
+                "Signed independent lane samples by fact band and responsibility class. Pinned batching can temporarily make samples negative; these are not physical measurements.",
+                &["band", "class"],
+            )?,
+            records: gauge(
+                registry,
+                "novarocks_backend_memory_lane_records",
+                "Record counts from a bounded prefix sample by responsibility and production state; not an instantaneous coherent snapshot.",
+                &["class", "production"],
+            )?,
+            faults: counter(
+                registry,
+                "novarocks_backend_memory_attribution_faults_total",
+                "Cumulative attribution diagnostics sampled from fixed shards; observation never rejects SQL.",
+                &["kind"],
+            )?,
+            unattributed: gauge(
+                registry,
+                "novarocks_backend_memory_unattributed_bytes",
+                "Signed tagged bytes in immortal unattributed source records.",
+                &[],
+            )?,
+            blind_spot: gauge(
+                registry,
+                "novarocks_backend_memory_ledger_blind_spot_bytes",
+                "Signed small-band live request bytes minus explicit R1 small facts; independent samples may transiently be negative.",
+                &[],
+            )?,
+            reconciliation: gauge(
+                registry,
+                "novarocks_backend_memory_attribution_reconcile_bytes",
+                "Signed tagged-band live request bytes minus tagged lane facts including unattributed. Pending slot balances and in-flight events can explain a nonzero sample; this is not a settlement proof.",
+                &[],
+            )?,
+            capacity: gauge(
+                registry,
+                "novarocks_backend_memory_lane_record_capacity",
+                "Maximum record-store positions, including immortal unattributed records.",
+                &[],
+            )?,
+            high_water: gauge(
+                registry,
+                "novarocks_backend_memory_lane_record_high_water",
+                "Sampled occupied-prefix bound for record-store observation.",
+                &[],
+            )?,
+            draining: gauge(
+                registry,
+                "novarocks_backend_memory_lane_records_draining",
+                "Hook-external draining queue length sampled independently.",
+                &[],
+            )?,
+            segment_requested: gauge(
+                registry,
+                "novarocks_backend_memory_lane_record_segment_requested_bytes",
+                "Requested record segment backing represented by sampled high-water; excludes inline/control storage and is not resident memory.",
+                &[],
+            )?,
+            metadata: gauge(
+                registry,
+                "novarocks_backend_memory_observation_metadata_bytes",
+                "This BE authority's observation-control storage estimate (registry backing and record/lane/member fees), absent when unsupplied. S1 excludes this diagnostic from capacity C.",
+                &[],
+            )?,
+            batch_threshold: gauge(
+                registry,
+                "novarocks_backend_memory_batch_threshold_bytes",
+                "Frozen per-slot batching quantum Q.",
+                &[],
+            )?,
+            pinned_slots: gauge(
+                registry,
+                "novarocks_backend_memory_batch_pinned_slots",
+                "Approximate independently sampled slot pins; not an instantaneous concurrent bound.",
+                &[],
+            )?,
+            slot_estimate: gauge(
+                registry,
+                "novarocks_backend_memory_batch_slot_balance_estimate_bytes",
+                "Q times sampled pins, excluding in-flight allocations. This estimate is not an instantaneous or concurrent mathematical upper bound and cannot establish settlement.",
+                &[],
+            )?,
+            sampled_at: gauge(
+                registry,
+                "novarocks_backend_memory_attribution_sample_unixtime_seconds",
+                "Attribution sample time, absent when wall-clock time is unavailable; not a coherent snapshot timestamp.",
+                &[],
+            )?,
+            sequence: gauge(
+                registry,
+                "novarocks_backend_memory_attribution_sequence_sum",
+                "Wrapping sum of independently sampled lane publication sequences; not a settlement or freshness proof.",
+                &[],
+            )?,
+        })
+    }
+    fn publish(&self, sample: AttributionSnapshot) {
+        fn absolute(counter: &IntCounterVec, labels: &[&str], value: u64) {
+            // These collectors are private to this registry. Its scrape lock
+            // covers reset, absolute publication and collection as one operation.
+            let metric = counter.with_label_values(labels);
+            metric.reset();
+            metric.inc_by(value);
+        }
+        fn scalar(gauge: &IntGaugeVec, value: i128) {
+            gauge.with_label_values(&[]).set(signed_gauge_value(value));
+        }
+        fn optional(gauge: &IntGaugeVec, value: Option<u64>) {
+            if let Some(value) = value {
+                gauge.with_label_values(&[]).set(gauge_value(value));
+            } else {
+                let _ = gauge.remove_label_values(&[]);
+            }
+        }
+        for (band, count, frees) in [
+            (
+                "small",
+                sample.process.small,
+                sample.process.small_deallocations,
+            ),
+            (
+                "tagged",
+                sample.process.tagged,
+                sample.process.tagged_deallocations,
+            ),
+        ] {
+            for (kind, value) in [
+                ("alloc", count.allocations),
+                ("dealloc", frees),
+                ("realloc", count.reallocations),
+                ("failure", count.failures),
+            ] {
+                absolute(&self.operations, &[band, kind], value);
+            }
+            for (flow, value) in [
+                ("allocated", count.allocated_total_bytes),
+                ("deallocated", count.deallocated_total_bytes),
+            ] {
+                absolute(&self.requested, &[band, flow], value);
+            }
+        }
+        for (index, facts) in sample.classified.iter().enumerate() {
+            for (band, bytes) in [
+                ("tagged", facts.tagged_bytes),
+                ("r1_small", facts.r1_small_bytes),
+            ] {
+                self.attributed
+                    .with_label_values(&[band, CLASS_LABELS[index]])
+                    .set(signed_gauge_value(bytes));
+            }
+        }
+        for (class, counts) in sample.records.iter().enumerate() {
+            for (production, count) in counts.iter().enumerate() {
+                self.records
+                    .with_label_values(&[CLASS_LABELS[class], PRODUCTION_LABELS[production]])
+                    .set(gauge_value(*count));
+            }
+        }
+        let faults = sample.faults;
+        for (kind, count) in [
+            ("binding_failure", faults.binding_failures),
+            ("record_exhaustion", faults.record_exhaustions),
+            ("orphan", faults.orphan_events),
+            ("residual_growth", faults.residual_growth_events),
+            ("scope_refusal", faults.scope_refusals),
+            ("reclaim_nonzero", faults.reclaim_nonzero_events),
+            ("generation_exhaustion", faults.generation_exhaustions),
+        ] {
+            absolute(&self.faults, &[kind], count);
+        }
+        scalar(&self.unattributed, sample.unattributed_tagged_bytes);
+        scalar(&self.blind_spot, sample.ledger_blind_spot_bytes);
+        scalar(&self.reconciliation, sample.tagged_reconciliation_bytes);
+        scalar(&self.capacity, i128::from(sample.record_capacity));
+        scalar(&self.high_water, i128::from(sample.record_high_water));
+        scalar(&self.draining, sample.draining_records as i128);
+        scalar(
+            &self.segment_requested,
+            i128::from(sample.record_segment_requested_bytes),
+        );
+        optional(&self.metadata, sample.observation_metadata_bytes);
+        scalar(
+            &self.batch_threshold,
+            i128::from(sample.batch_threshold_bytes),
+        );
+        scalar(&self.pinned_slots, i128::from(sample.faults.pinned_slots));
+        scalar(
+            &self.slot_estimate,
+            i128::from(sample.slot_balance_estimate_excluding_in_flight_bytes),
+        );
+        optional(
+            &self.sampled_at,
+            sample.sampled_at_unix_millis.map(|millis| millis / 1000),
+        );
+        scalar(&self.sequence, i128::from(sample.sequence_sum));
+    }
+}
+fn signed_gauge_value(bytes: i128) -> i64 {
+    bytes.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
 // Native query resource gauges are process-global. Serialize their owner
@@ -195,15 +465,12 @@ impl BackendMetricsRegistry {
              overlap and are not additive; they are absent when the allocator publishes none.",
             "statistic",
         )?;
-        let counted_live = IntGauge::with_opts(Opts::new(
+        let counted_live = gauge_vec(
             "novarocks_backend_process_counted_live_bytes",
-            "Live bytes requested through the Rust global allocator, as the process allocation \
-             wrapper counts them.",
-        ))
-        .map_err(|error| format!("construct counted live bytes gauge: {error}"))?;
-        registry
-            .register(Box::new(counted_live.clone()))
-            .map_err(|error| format!("register counted live bytes gauge: {error}"))?;
+            "Live inner requested bytes by user-layout size band; tagged includes source-token bytes. Independent counter samples are not physical measurements.",
+            "band",
+        )?;
+        let attribution = AttributionGauges::new(registry)?;
 
         if let Some((bytes, bound)) = observation.visible_memory {
             visible.with_label_values(&[bound]).set(gauge_value(bytes));
@@ -220,6 +487,7 @@ impl BackendMetricsRegistry {
                 physical,
                 allocator,
                 counted_live,
+                attribution,
             },
         ));
         Ok(self)
@@ -878,7 +1146,7 @@ fn publish_worker_registry_lock(snapshot: novarocks_worker::RegistryLockSnapshot
 
 fn publish_process_memory(
     gauges: &ProcessMemoryGauges,
-    counted: AllocatorSnapshot,
+    counted: AttributionSnapshot,
     physical: PhysicalMemoryReading,
 ) {
     fn set_or_remove(gauge: &IntGaugeVec, label: &str, value: Option<u64>) {
@@ -890,7 +1158,15 @@ fn publish_process_memory(
             }
         }
     }
-    gauges.counted_live.set(gauge_value(counted.live_bytes));
+    gauges
+        .counted_live
+        .with_label_values(&["small"])
+        .set(gauge_value(counted.process.small.live_bytes));
+    gauges
+        .counted_live
+        .with_label_values(&["tagged"])
+        .set(gauge_value(counted.process.tagged.live_bytes));
+    gauges.attribution.publish(counted);
     set_or_remove(
         &gauges.physical,
         "cgroup_anonymous",
@@ -1135,13 +1411,280 @@ mod tests {
             allocator_settings,
             visible_memory: Some((16 << 30, "cgroup")),
             sample: Arc::new(move || {
-                let counted = AllocatorSnapshot {
-                    live_bytes: 4096,
-                    ..AllocatorSnapshot::default()
-                };
+                let mut counted = AttributionSnapshot::default();
+                counted.process.small.live_bytes = 1024;
+                counted.process.tagged.live_bytes = 3072;
+                counted.process.total.live_bytes = 4096;
                 (counted, sample())
             }),
         }
+    }
+
+    fn attribution_fixture() -> AttributionSnapshot {
+        use novarocks_memory::attribution::readout::ClassFacts;
+        let mut sample = AttributionSnapshot::default();
+        sample.process.small.live_bytes = 80;
+        sample.process.small.allocated_total_bytes = 100;
+        sample.process.small.deallocated_total_bytes = 20;
+        sample.process.small.allocations = 3;
+        sample.process.small.reallocations = 4;
+        sample.process.small.failures = 5;
+        sample.process.small_deallocations = 2;
+        sample.process.tagged.live_bytes = 1024;
+        sample.process.tagged.allocated_total_bytes = 2048;
+        sample.process.tagged.deallocated_total_bytes = 1024;
+        sample.process.tagged.allocations = 7;
+        sample.process.tagged.reallocations = 8;
+        sample.process.tagged.failures = 9;
+        sample.process.tagged_deallocations = 6;
+        sample.process.total_deallocations = 8;
+        sample.classified = [
+            ClassFacts {
+                tagged_bytes: 512,
+                r1_small_bytes: 20,
+            },
+            ClassFacts {
+                tagged_bytes: 200,
+                r1_small_bytes: 15,
+            },
+            ClassFacts {
+                tagged_bytes: 256,
+                r1_small_bytes: 5,
+            },
+        ];
+        sample.unattributed_tagged_bytes = 56;
+        sample.ledger_blind_spot_bytes = 40;
+        sample.tagged_reconciliation_bytes = 0;
+        sample.records = [[1, 2, 3], [4, 5, 6], [7, 8, 9], [16, 0, 0]];
+        sample.record_capacity = 262144;
+        sample.record_high_water = 22;
+        sample.draining_records = 3;
+        sample.record_segment_requested_bytes = 262144;
+        sample.observation_metadata_bytes = Some(2048);
+        sample.faults.binding_failures = 1;
+        sample.faults.record_exhaustions = 2;
+        sample.faults.orphan_events = 3;
+        sample.faults.residual_growth_events = 4;
+        sample.faults.scope_refusals = 5;
+        sample.faults.reclaim_nonzero_events = 6;
+        sample.faults.generation_exhaustions = 7;
+        sample.faults.pinned_slots = 2;
+        sample.slot_balance_estimate_excluding_in_flight_bytes = 2 * sample.batch_threshold_bytes;
+        sample.sampled_at_unix_millis = Some(1_700_000_000_000);
+        sample.sequence_sum = 42;
+        sample
+    }
+
+    fn attribution_backend(
+        sample: impl Fn() -> AttributionSnapshot + Send + Sync + 'static,
+    ) -> BackendMetricsRegistry {
+        BackendMetricsRegistry::new()
+            .unwrap()
+            .with_process_memory(ProcessMemoryObservation {
+                allocator: "system",
+                allocator_settings: Vec::new(),
+                visible_memory: None,
+                sample: Arc::new(move || (sample(), PhysicalMemoryReading::default())),
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn attribution_families_export_all_bounded_dimensions_in_text_and_json() {
+        let backend = attribution_backend(attribution_fixture);
+        let rendered = render_metrics(&backend).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&render_metrics_json(&backend).unwrap()).unwrap();
+        for (suffix, labels, value) in [
+            ("process_counted_live_bytes", vec![("band", "small")], 80),
+            ("process_counted_live_bytes", vec![("band", "tagged")], 1024),
+            (
+                "process_counted_operations_total",
+                vec![("band", "small"), ("kind", "dealloc")],
+                2,
+            ),
+            (
+                "process_counted_operations_total",
+                vec![("band", "tagged"), ("kind", "failure")],
+                9,
+            ),
+            (
+                "process_counted_requested_bytes_total",
+                vec![("band", "small"), ("flow", "deallocated")],
+                20,
+            ),
+            (
+                "memory_attributed_bytes",
+                vec![("band", "tagged"), ("class", "query")],
+                512,
+            ),
+            (
+                "memory_attributed_bytes",
+                vec![("band", "r1_small"), ("class", "residual")],
+                15,
+            ),
+            (
+                "memory_attributed_bytes",
+                vec![("band", "tagged"), ("class", "service")],
+                256,
+            ),
+            ("memory_unattributed_bytes", vec![], 56),
+            ("memory_ledger_blind_spot_bytes", vec![], 40),
+            ("memory_attribution_reconcile_bytes", vec![], 0),
+            (
+                "memory_lane_records",
+                vec![("class", "query"), ("production", "sealed")],
+                2,
+            ),
+            (
+                "memory_lane_records",
+                vec![("class", "residual"), ("production", "stopped")],
+                6,
+            ),
+            ("memory_lane_record_capacity", vec![], 262144),
+            ("memory_lane_record_high_water", vec![], 22),
+            ("memory_lane_records_draining", vec![], 3),
+            ("memory_lane_record_segment_requested_bytes", vec![], 262144),
+            ("memory_observation_metadata_bytes", vec![], 2048),
+            (
+                "memory_attribution_faults_total",
+                vec![("kind", "binding_failure")],
+                1,
+            ),
+            (
+                "memory_attribution_faults_total",
+                vec![("kind", "generation_exhaustion")],
+                7,
+            ),
+            ("memory_batch_threshold_bytes", vec![], 1048576),
+            ("memory_batch_pinned_slots", vec![], 2),
+            ("memory_batch_slot_balance_estimate_bytes", vec![], 2097152),
+            (
+                "memory_attribution_sample_unixtime_seconds",
+                vec![],
+                1700000000,
+            ),
+            ("memory_attribution_sequence_sum", vec![], 42),
+        ] {
+            let name = format!("novarocks_backend_{suffix}");
+            let text_labels = if labels.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "{{{}}}",
+                    labels
+                        .iter()
+                        .map(|(key, value)| format!("{key}=\"{value}\""))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            };
+            let line = format!("{name}{text_labels} {value}");
+            assert!(rendered.contains(&line), "missing {line}\n{rendered}");
+            assert!(
+                json.as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["tags"]["metric"] == name
+                        && labels
+                            .iter()
+                            .all(|(key, value)| row["tags"][*key] == *value)
+                        && row["value"].as_f64() == Some(value as f64)),
+                "missing {line} in {json}"
+            );
+        }
+        let rows = json.as_array().unwrap();
+        for (family, count) in [
+            ("memory_attributed_bytes", 6),
+            ("memory_lane_records", 12),
+            ("memory_attribution_faults_total", 7),
+            ("process_counted_operations_total", 8),
+            ("process_counted_requested_bytes_total", 4),
+        ] {
+            let name = format!("novarocks_backend_{family}");
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row["tags"]["metric"] == name)
+                    .count(),
+                count
+            );
+        }
+        assert!(!rendered.contains("novarocks_backend_process_counted_live_bytes  "));
+        assert!(!rendered.contains("novarocks_backend_process_counted_live_bytes 80"));
+        assert!(rendered.contains("excluding in-flight allocations"));
+        assert!(rendered.contains("not an instantaneous or concurrent mathematical upper bound"));
+    }
+
+    #[test]
+    fn attribution_refresh_preserves_signed_samples_removes_unknowns_and_does_not_accumulate_reads()
+    {
+        let sample = Arc::new(Mutex::new(attribution_fixture()));
+        let captured = Arc::clone(&sample);
+        let backend = attribution_backend(move || *captured.lock().unwrap());
+        let initial = render_metrics(&backend).unwrap();
+        assert!(initial.contains("novarocks_backend_memory_observation_metadata_bytes 2048"));
+        {
+            let mut current = sample.lock().unwrap();
+            current.classified[0].tagged_bytes = -5;
+            current.ledger_blind_spot_bytes = -7;
+            current.tagged_reconciliation_bytes = 8;
+            current.observation_metadata_bytes = None;
+            current.sampled_at_unix_millis = None;
+        }
+        for _ in 0..2 {
+            let rendered = render_metrics(&backend).unwrap();
+            assert!(rendered.contains(
+                "novarocks_backend_memory_attributed_bytes{band=\"tagged\",class=\"query\"} -5"
+            ));
+            assert!(rendered.contains("novarocks_backend_memory_ledger_blind_spot_bytes -7"));
+            assert!(rendered.contains("novarocks_backend_memory_attribution_reconcile_bytes 8"));
+            assert!(rendered.contains("novarocks_backend_process_counted_operations_total{band=\"small\",kind=\"dealloc\"} 2"));
+            assert!(!rendered.contains("novarocks_backend_memory_observation_metadata_bytes "));
+            assert!(
+                !rendered.contains("novarocks_backend_memory_attribution_sample_unixtime_seconds ")
+            );
+        }
+        let rows: serde_json::Value =
+            serde_json::from_str(&render_metrics_json(&backend).unwrap()).unwrap();
+        assert!(!rows.as_array().unwrap().iter().any(|row| matches!(
+            row["tags"]["metric"].as_str(),
+            Some(
+                "novarocks_backend_memory_observation_metadata_bytes"
+                    | "novarocks_backend_memory_attribution_sample_unixtime_seconds"
+            )
+        )));
+        assert!(
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["tags"]["metric"]
+                    == "novarocks_backend_memory_ledger_blind_spot_bytes"
+                    && row["value"].as_f64() == Some(-7.0))
+        );
+    }
+
+    #[test]
+    fn attribution_registry_ownership_and_signed_range_are_preserved() {
+        let backend = attribution_backend(attribution_fixture);
+        assert!(
+            render_metrics(&backend)
+                .unwrap()
+                .contains("novarocks_backend_memory_unattributed_bytes 56")
+        );
+        let empty = BackendMetricsRegistry::new().unwrap();
+        assert!(
+            !render_metrics(&empty)
+                .unwrap()
+                .contains("novarocks_backend_memory_attributed_bytes")
+        );
+        assert!(
+            !render_metrics_json(&empty)
+                .unwrap()
+                .contains("novarocks_backend_process_counted_live_bytes")
+        );
+        assert_eq!(signed_gauge_value(i128::MIN), i64::MIN);
+        assert_eq!(signed_gauge_value(-1), -1);
+        assert_eq!(signed_gauge_value(i128::MAX), i64::MAX);
     }
 
     #[test]
@@ -1173,7 +1716,8 @@ mod tests {
             "novarocks_backend_process_allocator_memory_bytes{statistic=\"allocated\"} 100",
             "novarocks_backend_process_allocator_memory_bytes{statistic=\"active\"} 120",
             "novarocks_backend_process_allocator_memory_bytes{statistic=\"resident\"} 150",
-            "novarocks_backend_process_counted_live_bytes 4096",
+            "novarocks_backend_process_counted_live_bytes{band=\"small\"} 1024",
+            "novarocks_backend_process_counted_live_bytes{band=\"tagged\"} 3072",
         ] {
             assert!(rendered.contains(line), "missing {line}\n{rendered}");
         }
@@ -1208,6 +1752,9 @@ mod tests {
         assert!(rendered.contains(
             "novarocks_backend_process_physical_memory_bytes{source=\"process_resident\"} 5000"
         ));
+        let json = render_metrics_json(&backend).unwrap();
+        assert!(!json.contains("novarocks_backend_process_allocator_memory_bytes"));
+        assert!(!json.contains("novarocks_backend_process_allocator_setting"));
         assert!(
             !rendered.contains("novarocks_backend_process_allocator_memory_bytes{"),
             "{rendered}"
