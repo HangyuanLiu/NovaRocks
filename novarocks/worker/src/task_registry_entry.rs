@@ -135,12 +135,15 @@ impl CreationCell {
     }
 
     /// Orders a post-Accept preparation failure against a concurrent stop.
-    pub(super) fn claim_failure(&self, failure: CreationFailure) -> Option<PreparationStop> {
+    ///
+    /// The failure is this creation's own cause only when no stop was
+    /// requested first; once it is claimed, no later stop is accepted. The
+    /// resulting decision is read back through [`Self::stop`].
+    pub(super) fn claim_failure(&self, failure: CreationFailure) {
         let mut decision = self.decision.lock().expect("creation cell lock");
         if decision.stop.is_none() {
             decision.failure = Some(failure);
         }
-        decision.stop
     }
 
     pub(super) fn accept(&self, status: Arc<TaskStatusOwner>) {
