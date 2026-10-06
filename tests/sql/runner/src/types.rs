@@ -280,6 +280,17 @@ pub struct QueryMeta {
     pub result_contains: Vec<String>,
     pub result_contains_any: Vec<String>,
     pub result_not_contains: Vec<String>,
+    /// Exact `column=value` cells selecting the rows a step owns.
+    ///
+    /// A substring of the whole output cannot say which row produced it, so
+    /// on a shared server a row left by another case satisfies it just as
+    /// well. A row assertion first binds to the rows this case is
+    /// responsible for, then asserts on those rows only.
+    pub result_rows_where: Vec<(String, String)>,
+    /// Exact number of rows `result_rows_where` must select.
+    pub result_rows_count: Option<usize>,
+    /// Exact `column=value` cells every selected row must carry.
+    pub result_rows_expect: Vec<(String, String)>,
     pub explain_contains: Vec<String>,
     pub explain_not_contains: Vec<String>,
     pub normalize_explain_timing: bool,

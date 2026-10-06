@@ -171,6 +171,15 @@ statement splitter as execution: `USE db; SELECT ...` requires a recorded
 result and comparison, while `USE db; SET ...` remains implicitly skipped.
 An explicit `@skip_result_check=true` still skips comparison for the whole step.
 
+`@result_contains` searches the whole output, so it cannot say which row
+matched. When the output lists state shared by the whole server, such as
+`SHOW ANALYZE JOBS`, bind the assertion to the rows the case owns instead:
+`@result_rows_where=<column>=<value>` (repeatable, exact cells by header name)
+selects them, `@result_rows_count=<n>` requires exactly that many, and
+`@result_rows_expect=<column>=<value>` (repeatable) must hold on every selected
+row. The count is mandatory, so a selector that matches nothing, or also
+matches another case's row, fails instead of passing.
+
 UEA-4G 的额外原生验收入口是 system scenario `connector/iceberg-delete-applicability`，属于显式阶段。`NOVAROCKS_UEA4G_NATIVE_MANIFEST` 指向已冻结输入清单，清单以 SHA-256 绑定独立 Java corpus 和规模收据；S3 凭证从现有 fixture 环境注入，清单不保存密钥。场景重放准确 snapshot 的行袋，并以真实多文件输入检查三个 BE 的 split/page-source/退出事实，保存对象范围与资源收敛收据。性能对照及 provider 内闭包、union、完成屏障和物理范围测试分别验收，不能由 SQL 行数或空闲 BE 数代替。
 
 `iceberg-ivm/iceberg_ivm_delete_applicability` 使用官方 Iceberg writer 构造五个端点阶段，检查 same-commit DV/equality、同一不可变 Puffin 的不同 blob、删除 artifact 等价替代与整个数据文件移除；每阶段比较增量 MV、独立 FULL MV 和关闭 MV rewrite 的基表行袋。该 suite 使用隔离 REST fixture，需单独运行。

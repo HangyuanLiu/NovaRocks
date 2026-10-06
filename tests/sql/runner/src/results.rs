@@ -265,12 +265,99 @@ pub fn verify_text_assertions(step: &SqlStep, execution: &QueryExecution) -> (bo
             );
         }
     }
+    if let Err(reason) = verify_result_rows(&step.meta, &execution.header, &execution.rows) {
+        return (false, reason);
+    }
     if let Some(contract) = &step.meta.query_stats_contract {
         if let Err(error) = contract.verify(&step.sql, haystack) {
             return (false, format!("query stats contract failed: {error:#}"));
         }
     }
     (true, String::new())
+}
+
+/// Selects the rows named by `@result_rows_where`, requires exactly
+/// `@result_rows_count` of them, and requires each to carry every
+/// `@result_rows_expect` cell. Failures print the selected rows in full, so a
+/// job that reached the wrong terminal state reports its own error columns.
+fn verify_result_rows(
+    meta: &QueryMeta,
+    header: &[String],
+    rows: &[Vec<String>],
+) -> std::result::Result<(), String> {
+    let Some(expected_count) = meta.result_rows_count else {
+        return Ok(());
+    };
+    let selector = resolve_row_cells(header, &meta.result_rows_where)?;
+    let expectations = resolve_row_cells(header, &meta.result_rows_expect)?;
+    let selector_text = describe_cells(&meta.result_rows_where);
+    let selected = rows
+        .iter()
+        .filter(|row| {
+            selector
+                .iter()
+                .all(|(index, _, value)| row.get(*index).map(String::as_str) == Some(*value))
+        })
+        .collect::<Vec<_>>();
+    if selected.len() != expected_count {
+        let listing = selected
+            .iter()
+            .map(|row| format!("[{}]", describe_row(header, row)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Err(format!(
+            "expected {expected_count} result row(s) where {selector_text}, found {} of {} row(s) {listing}",
+            selected.len(),
+            rows.len(),
+        ));
+    }
+    for row in selected {
+        for (index, column, value) in &expectations {
+            if row.get(*index).map(String::as_str) != Some(*value) {
+                return Err(format!(
+                    "result row where {selector_text} expected {column}={value:?}: [{}]",
+                    describe_row(header, row)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolves each `column=value` cell to its header position; a column the
+/// result does not have is a failure, never a cell that silently matches
+/// nothing.
+fn resolve_row_cells<'a>(
+    header: &[String],
+    cells: &'a [(String, String)],
+) -> std::result::Result<Vec<(usize, &'a str, &'a str)>, String> {
+    cells
+        .iter()
+        .map(|(column, value)| {
+            header
+                .iter()
+                .position(|name| name == column)
+                .map(|index| (index, column.as_str(), value.as_str()))
+                .ok_or_else(|| format!("result header {header:?} has no column {column:?}"))
+        })
+        .collect()
+}
+
+fn describe_cells(cells: &[(String, String)]) -> String {
+    cells
+        .iter()
+        .map(|(column, value)| format!("{column}={value:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn describe_row(header: &[String], row: &[String]) -> String {
+    header
+        .iter()
+        .zip(row)
+        .map(|(column, value)| format!("{column}={value:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 pub fn parse_float(cell: &str) -> Option<f64> {
@@ -544,6 +631,7 @@ pub fn step_allows_missing_expected_result(step: &SqlStep) -> bool {
         || !step.meta.result_contains.is_empty()
         || !step.meta.result_contains_any.is_empty()
         || !step.meta.result_not_contains.is_empty()
+        || step.meta.result_rows_count.is_some()
         || step_has_implicit_skip_result(step)
 }
 
@@ -871,5 +959,96 @@ mod expected_error_code_result_classification_tests {
             .replace("fanout_bytes=480", "fanout_bytes=240");
         assert!(!verify_text_assertions(&step, &execution).0);
         assert!(step_allows_missing_expected_result(&step));
+    }
+
+    fn analyze_jobs(rows: &[[&str; 4]]) -> QueryExecution {
+        let header = ["job_id", "state", "table", "error_message"]
+            .map(String::from)
+            .to_vec();
+        let rows = rows
+            .iter()
+            .map(|row| row.map(String::from).to_vec())
+            .collect::<Vec<_>>();
+        QueryExecution {
+            text_output: render_output(&header, &rows),
+            header,
+            rows,
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    fn own_job_wait() -> SqlStep {
+        step_with_meta(QueryMeta {
+            skip_result_check: true,
+            result_rows_where: vec![("table".to_string(), "own".to_string())],
+            result_rows_count: Some(1),
+            result_rows_expect: vec![("state".to_string(), "SUCCEEDED".to_string())],
+            ..QueryMeta::default()
+        })
+    }
+
+    #[test]
+    fn result_rows_wait_is_not_satisfied_by_a_foreign_succeeded_job() {
+        let pending = analyze_jobs(&[
+            ["1", "SUCCEEDED", "foreign", ""],
+            ["2", "COLLECTING", "own", ""],
+        ]);
+        // The whole-output wait this replaces passes on the foreign job.
+        let substring = step_with_meta(QueryMeta {
+            result_contains: vec!["SUCCEEDED".to_string()],
+            ..QueryMeta::default()
+        });
+        assert!(verify_text_assertions(&substring, &pending).0);
+        let (ok, reason) = verify_text_assertions(&own_job_wait(), &pending);
+        assert!(!ok);
+        assert!(reason.contains("expected state=\"SUCCEEDED\""), "{reason}");
+        assert!(reason.contains("job_id=\"2\""), "{reason}");
+
+        let done = analyze_jobs(&[
+            ["1", "SUCCEEDED", "foreign", ""],
+            ["2", "SUCCEEDED", "own", ""],
+        ]);
+        assert!(verify_text_assertions(&own_job_wait(), &done).0);
+        assert!(step_allows_missing_expected_result(&own_job_wait()));
+    }
+
+    #[test]
+    fn result_rows_wait_reports_its_own_terminal_failure() {
+        let failed = analyze_jobs(&[
+            ["1", "SUCCEEDED", "foreign", ""],
+            ["2", "FAILED", "own", "publish rejected"],
+        ]);
+        let (ok, reason) = verify_text_assertions(&own_job_wait(), &failed);
+        assert!(!ok);
+        assert!(
+            reason.contains("error_message=\"publish rejected\""),
+            "{reason}"
+        );
+        assert!(!reason.contains("foreign"), "{reason}");
+    }
+
+    #[test]
+    fn result_rows_wait_requires_the_exact_number_of_owned_rows() {
+        for rows in [
+            vec![["1", "SUCCEEDED", "foreign", ""]],
+            vec![["1", "SUCCEEDED", "own", ""], ["2", "SUCCEEDED", "own", ""]],
+        ] {
+            let (ok, reason) = verify_text_assertions(&own_job_wait(), &analyze_jobs(&rows));
+            assert!(!ok);
+            assert!(
+                reason.contains("expected 1 result row(s) where table=\"own\""),
+                "{reason}"
+            );
+        }
+
+        let misnamed = step_with_meta(QueryMeta {
+            result_rows_where: vec![("tbl".to_string(), "own".to_string())],
+            result_rows_count: Some(1),
+            ..QueryMeta::default()
+        });
+        let (ok, reason) =
+            verify_text_assertions(&misnamed, &analyze_jobs(&[["1", "SUCCEEDED", "own", ""]]));
+        assert!(!ok);
+        assert!(reason.contains("has no column \"tbl\""), "{reason}");
     }
 }

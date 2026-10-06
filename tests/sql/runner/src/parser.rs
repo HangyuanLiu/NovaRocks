@@ -419,6 +419,24 @@ fn parse_meta_with_sql_error_descriptors(
             "result_not_contains" => {
                 meta.result_not_contains.push(raw_value);
             }
+            "result_rows_where" => {
+                meta.result_rows_where
+                    .push(parse_result_row_cell("result_rows_where", &raw_value)?);
+            }
+            "result_rows_count" => {
+                if meta.result_rows_count.is_some() {
+                    bail!("duplicate @result_rows_count directive in the same metadata scope");
+                }
+                meta.result_rows_count = Some(
+                    raw_value
+                        .parse()
+                        .with_context(|| format!("invalid result_rows_count: {raw_value}"))?,
+                );
+            }
+            "result_rows_expect" => {
+                meta.result_rows_expect
+                    .push(parse_result_row_cell("result_rows_expect", &raw_value)?);
+            }
             "explain_contains" => {
                 meta.explain_contains.push(raw_value);
             }
@@ -707,6 +725,50 @@ fn parse_meta_with_sql_error_descriptors(
     Ok(meta)
 }
 
+fn parse_result_row_cell(directive: &str, raw_value: &str) -> Result<(String, String)> {
+    let Some((column, value)) = raw_value.split_once('=') else {
+        bail!("@{directive} expects <column>=<value>, got {raw_value:?}");
+    };
+    let column = column.trim();
+    if column.is_empty() {
+        bail!("@{directive} has an empty column name in {raw_value:?}");
+    }
+    Ok((column.to_string(), value.trim().to_string()))
+}
+
+fn validate_result_rows_assertion(meta: &QueryMeta) -> Result<()> {
+    if meta.result_rows_where.is_empty()
+        && meta.result_rows_count.is_none()
+        && meta.result_rows_expect.is_empty()
+    {
+        return Ok(());
+    }
+    if meta.result_rows_where.is_empty() {
+        bail!("@result_rows_count and @result_rows_expect require @result_rows_where");
+    }
+    // Without an exact count, a selector that matches nothing makes every
+    // expectation vacuously true, and one that also matches a foreign row
+    // lets that row stand in for the step's own.
+    let Some(count) = meta.result_rows_count else {
+        bail!("@result_rows_where requires @result_rows_count");
+    };
+    if count == 0 && !meta.result_rows_expect.is_empty() {
+        bail!("@result_rows_expect cannot hold over @result_rows_count=0");
+    }
+    for (directive, cells) in [
+        ("result_rows_where", &meta.result_rows_where),
+        ("result_rows_expect", &meta.result_rows_expect),
+    ] {
+        let mut seen = std::collections::HashSet::new();
+        for (column, _) in cells {
+            if !seen.insert(column.as_str()) {
+                bail!("@{directive} names column {column:?} more than once");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_sql_error_expectations(
     meta: &QueryMeta,
     sql_error_descriptors: &[SqlErrorDescriptor],
@@ -802,6 +864,17 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             base.result_not_contains.clone()
         } else {
             override_meta.result_not_contains.clone()
+        },
+        result_rows_where: if override_meta.result_rows_where.is_empty() {
+            base.result_rows_where.clone()
+        } else {
+            override_meta.result_rows_where.clone()
+        },
+        result_rows_count: override_meta.result_rows_count.or(base.result_rows_count),
+        result_rows_expect: if override_meta.result_rows_expect.is_empty() {
+            base.result_rows_expect.clone()
+        } else {
+            override_meta.result_rows_expect.clone()
         },
         explain_contains: if override_meta.explain_contains.is_empty() {
             base.explain_contains.clone()
@@ -1172,6 +1245,13 @@ fn load_sql_case_from_file_with_variables(
                     section_id
                 )
             })?;
+        validate_result_rows_assertion(&merged_meta).with_context(|| {
+            format!(
+                "{} ({}): invalid result row assertion",
+                sql_path.display(),
+                section_id
+            )
+        })?;
         steps.push(SqlStep {
             query_number,
             sql,
@@ -2429,6 +2509,85 @@ mod opt5_directive_tests {
                         && step.meta.query_stats_contract.is_some()),
                 "{name}"
             );
+        }
+    }
+
+    fn load_result_rows_test_case(raw: &str) -> Result<SqlCase> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("result_rows.sql");
+        fs::write(&path, raw)?;
+        let marker = Regex::new(r"^--\s*query\s+(\d+)\s*$").unwrap();
+        let variables = HashMap::from([("suite_uuid0".to_string(), "abc123".to_string())]);
+        load_sql_case_from_file(&path, &meta_re(), &marker, &variables)?
+            .context("test must contain a SQL case")
+    }
+
+    #[test]
+    fn result_rows_assertion_binds_expanded_cells_to_each_step() {
+        let case = load_result_rows_test_case(
+            "-- query 1\n\
+             -- @result_rows_where=table = jobs_${suite_uuid0}\n\
+             -- @result_rows_where=catalog=cat\n\
+             -- @result_rows_count=1\n\
+             -- @result_rows_expect=state=SUCCEEDED\n\
+             SHOW ANALYZE JOBS;\n\
+             -- query 2\n\
+             SELECT 1;\n",
+        )
+        .unwrap();
+        let meta = &case.steps[0].meta;
+        assert_eq!(
+            meta.result_rows_where,
+            vec![
+                ("table".to_string(), "jobs_abc123".to_string()),
+                ("catalog".to_string(), "cat".to_string()),
+            ]
+        );
+        assert_eq!(meta.result_rows_count, Some(1));
+        assert_eq!(
+            meta.result_rows_expect,
+            vec![("state".to_string(), "SUCCEEDED".to_string())]
+        );
+        let unrelated = &case.steps[1].meta;
+        assert!(unrelated.result_rows_where.is_empty());
+        assert_eq!(unrelated.result_rows_count, None);
+    }
+
+    #[test]
+    fn result_rows_assertion_rejects_selectors_that_could_match_foreign_or_no_rows() {
+        for (directives, expected) in [
+            (
+                "-- @result_rows_where=table=t\n-- @result_rows_expect=state=SUCCEEDED\n",
+                "requires @result_rows_count",
+            ),
+            (
+                "-- @result_rows_count=1\n-- @result_rows_expect=state=SUCCEEDED\n",
+                "require @result_rows_where",
+            ),
+            (
+                "-- @result_rows_where=table=t\n-- @result_rows_count=0\n-- @result_rows_expect=state=SUCCEEDED\n",
+                "cannot hold over @result_rows_count=0",
+            ),
+            (
+                "-- @result_rows_where=table=t\n-- @result_rows_where=table=u\n-- @result_rows_count=1\n",
+                "names column \"table\" more than once",
+            ),
+            (
+                "-- @result_rows_where=table\n-- @result_rows_count=1\n",
+                "expects <column>=<value>",
+            ),
+            (
+                "-- @result_rows_where==t\n-- @result_rows_count=1\n",
+                "empty column name",
+            ),
+            (
+                "-- @result_rows_where=table=t\n-- @result_rows_count=1\n-- @result_rows_count=1\n",
+                "duplicate @result_rows_count",
+            ),
+        ] {
+            let failure = load_result_rows_test_case(&format!("{directives}SHOW ANALYZE JOBS;\n"))
+                .unwrap_err();
+            assert!(format!("{failure:#}").contains(expected), "{failure:#}");
         }
     }
 }
