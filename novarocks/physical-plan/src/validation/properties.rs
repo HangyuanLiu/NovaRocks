@@ -957,7 +957,7 @@ pub fn derive_fragment_output_properties_observed(
 }
 
 /// Derive the same candidate formulas on the caller's meter and resource hook.
-/// Graph scratch is included; index/candidate/diagnostic/formula owners still
+/// Graph/index scratch is included; candidate/diagnostic/formula owners still
 /// require admission. This port creates no new entry/footer or runtime owner.
 pub fn derive_fragment_output_properties_in(
     fragment: &Fragment,

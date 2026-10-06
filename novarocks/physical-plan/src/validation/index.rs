@@ -25,18 +25,81 @@ use crate::{
     AggregatePhase, EdgeId, ExprId, Fragment, FragmentId, NodeId, NodeKind, PhysicalNode, ValueId,
 };
 
+use novarocks_type_contract::{
+    CompileCheckpoints, CompileControlError, ControlOwnedResourceFacts, ControlResourceCounter,
+    ControlResourceError, control_resource_add, control_resource_mul,
+    owned_resources::{
+        copy::reserve_exit,
+        layout::{LayoutResourceError, arc_layout},
+        vec::boxed_slice_in,
+    },
+};
+use std::alloc::Layout;
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ValuePortIndex {
     pub(crate) occurrences: BTreeMap<ValueId, usize>,
 }
 
+struct IndexAdmission<'a, 'control> {
+    counter: &'a mut ControlResourceCounter,
+    admit: &'a mut dyn FnMut(&ControlOwnedResourceFacts) -> Result<(), CompileControlError>,
+    work: &'a mut CompileCheckpoints<'control>,
+}
+impl IndexAdmission<'_, '_> {
+    fn gate(&mut self) -> Result<(), ControlResourceError> {
+        (self.admit)(&self.counter.facts())?;
+        Ok(())
+    }
+    fn reserve<T>(
+        &mut self,
+        values: &mut Vec<T>,
+        count: usize,
+    ) -> Result<(), ControlResourceError> {
+        if count != 0 {
+            self.work.flush()?;
+            let reserved = values.try_reserve_exact(count);
+            if reserved.is_ok() {
+                self.work.step()?;
+            }
+            reserve_exit::<ControlResourceError>(reserved, self.work)?;
+        }
+        Ok(())
+    }
+}
+
 impl ValuePortIndex {
     pub(crate) fn new(values: &[ValueId]) -> Self {
+        Self::new_core(values, None).expect("plain value-port indexing is infallible")
+    }
+
+    fn new_core(
+        values: &[ValueId],
+        mut admission: Option<&mut IndexAdmission<'_, '_>>,
+    ) -> Result<Self, ControlResourceError> {
+        if let Some(owner) = admission.as_deref_mut() {
+            owner.counter.tree::<ValueId, usize>(values.len())?;
+            owner.gate()?;
+        }
+        Self::build_core(values, admission)
+    }
+
+    fn build_core(
+        values: &[ValueId],
+        mut admission: Option<&mut IndexAdmission<'_, '_>>,
+    ) -> Result<Self, ControlResourceError> {
         let mut occurrences = BTreeMap::new();
         for value in values {
+            if let Some(owner) = admission.as_deref_mut() {
+                owner.work.flush()?;
+            }
             *occurrences.entry(*value).or_default() += 1;
+            if let Some(owner) = admission.as_deref_mut() {
+                owner.work.step()?;
+                owner.work.flush()?;
+            }
         }
-        Self { occurrences }
+        Ok(Self { occurrences })
     }
 
     pub(crate) fn contains(&self, value: &ValueId) -> bool {
@@ -67,48 +130,202 @@ impl VisibleInputIndex {
 
 impl FragmentValidationIndexes {
     pub(crate) fn new(fragment: &Fragment) -> Self {
-        let output_ports = fragment
-            .nodes()
-            .values()
-            .map(|node| (node.id, Arc::new(ValuePortIndex::new(&node.output.columns))))
-            .collect::<BTreeMap<_, _>>();
+        Self::new_core(fragment, None).expect("plain fragment indexing is infallible")
+    }
+
+    /// Quantity capture on the caller's original scope. This does not prove
+    /// fragment structure, allocator admission or arbitrary element cleanup.
+    pub(crate) fn new_in(
+        fragment: &Fragment,
+        counter: &mut ControlResourceCounter,
+        admit: &mut dyn FnMut(&ControlOwnedResourceFacts) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, ControlResourceError> {
+        Self::new_core(
+            fragment,
+            Some(IndexAdmission {
+                counter,
+                admit,
+                work,
+            }),
+        )
+    }
+
+    fn new_core(
+        fragment: &Fragment,
+        mut admission: Option<IndexAdmission<'_, '_>>,
+    ) -> Result<Self, ControlResourceError> {
+        let output_ports = if let Some(owner) = admission.as_mut() {
+            let count = fragment.nodes().len();
+            owner.counter.tree::<NodeId, Arc<ValuePortIndex>>(count)?;
+            owner.counter.tree::<NodeId, VisibleInputIndex>(count)?;
+            let arc = arc_layout(Layout::new::<ValuePortIndex>()).map_err(|error| match error {
+                LayoutResourceError::SourceModel => {
+                    ControlResourceError::SourceModel("Index Arc source model drift")
+                }
+                _ => CompileControlError::ResourceExhausted.into(),
+            })?;
+            owner.counter.layout(arc, count)?;
+            // Two source traversals, including each terminal lookup, use the
+            // sole locked tree work bound. No source B or maximum ID is used.
+            owner.counter.work(control_resource_mul(
+                control_resource_mul(control_resource_add(count, 1)?, 2)?,
+                ControlResourceCounter::lookup_work(count)?,
+            )?)?;
+            owner.gate()?;
+            let mut ports = BTreeMap::new();
+            for node in fragment.nodes().values() {
+                let port = ValuePortIndex::new_core(&node.output.columns, Some(owner))?;
+                owner.work.flush()?;
+                let port = Arc::new(port);
+                owner.work.step()?;
+                owner.work.flush()?;
+                // Source map keys need not equal node.id in an invalid plan.
+                // Explicit insertion preserves the original last winner.
+                ports.insert(node.id, port);
+                owner.work.step()?;
+                owner.work.flush()?;
+            }
+            ports
+        } else {
+            // Preserve the original Plain bulk-build/sort strategy.
+            fragment
+                .nodes()
+                .values()
+                .map(|node| (node.id, Arc::new(ValuePortIndex::new(&node.output.columns))))
+                .collect::<BTreeMap<_, _>>()
+        };
         let mut visible_inputs = BTreeMap::new();
         for node in fragment.nodes().values() {
-            // A scan's own expressions read the provider's columns and the
-            // ones it derives from them while reading -- a residual over a
-            // variant path is evaluated against the path, not against the
-            // bytes it was read out of.
-            let visible = if let NodeKind::Scan {
-                provider_outputs,
-                derived_values,
-                ..
-            } = &node.kind
-            {
-                VisibleInputIndex::One(Arc::new(ValuePortIndex::new(
-                    &provider_outputs
-                        .iter()
-                        .map(|(_, value)| *value)
-                        .chain(derived_values.iter().copied())
-                        .collect::<Vec<_>>(),
-                )))
-            } else {
-                let ports = node
-                    .inputs
-                    .iter()
-                    .filter_map(|input| output_ports.get(input).cloned())
-                    .collect::<Vec<_>>();
-                match ports.as_slice() {
-                    [] => VisibleInputIndex::Empty,
-                    [port] => VisibleInputIndex::One(port.clone()),
-                    _ => VisibleInputIndex::Many(ports.into_boxed_slice()),
-                }
-            };
+            let visible = Self::visible_core(node, &output_ports, admission.as_mut())?;
+            if let Some(owner) = admission.as_mut() {
+                owner.work.flush()?;
+            }
             visible_inputs.insert(node.id, visible);
+            if let Some(owner) = admission.as_mut() {
+                owner.work.step()?;
+                owner.work.flush()?;
+            }
         }
-        Self {
+        Ok(Self {
             output_ports,
             visible_inputs,
-        }
+        })
+    }
+
+    fn visible_core(
+        node: &PhysicalNode,
+        output_ports: &BTreeMap<NodeId, Arc<ValuePortIndex>>,
+        mut admission: Option<&mut IndexAdmission<'_, '_>>,
+    ) -> Result<VisibleInputIndex, ControlResourceError> {
+        // A scan reads both provider columns and its original derived values.
+        let visible = if let NodeKind::Scan {
+            provider_outputs,
+            derived_values,
+            ..
+        } = &node.kind
+        {
+            let values = if let Some(owner) = admission.as_deref_mut() {
+                let count = control_resource_add(provider_outputs.len(), derived_values.len())?;
+                owner.counter.buffer::<ValueId>(count, 1)?;
+                owner.counter.tree::<ValueId, usize>(count)?;
+                owner.counter.arc::<ValuePortIndex>(1)?;
+                owner.counter.work(count)?;
+                owner.gate()?;
+                let mut values = Vec::new();
+                owner.reserve(&mut values, count)?;
+                for value in provider_outputs
+                    .iter()
+                    .map(|(_, value)| *value)
+                    .chain(derived_values.iter().copied())
+                {
+                    values.push(value);
+                    owner.work.step()?;
+                }
+                values
+            } else {
+                provider_outputs
+                    .iter()
+                    .map(|(_, value)| *value)
+                    .chain(derived_values.iter().copied())
+                    .collect::<Vec<_>>()
+            };
+            let port = if admission.is_some() {
+                ValuePortIndex::build_core(&values, admission.as_deref_mut())?
+            } else {
+                ValuePortIndex::new(&values)
+            };
+            if let Some(owner) = admission.as_deref_mut() {
+                owner.work.flush()?;
+            }
+            let port = Arc::new(port);
+            if let Some(owner) = admission.as_deref_mut() {
+                owner.work.step()?;
+                owner.work.flush()?;
+            }
+            VisibleInputIndex::One(port)
+        } else {
+            let ports = if let Some(owner) = admission.as_deref_mut() {
+                let count = node.inputs.len();
+                owner.counter.buffer::<Arc<ValuePortIndex>>(count, 1)?;
+                owner.counter.work(control_resource_mul(
+                    count,
+                    ControlResourceCounter::lookup_work(output_ports.len())?,
+                )?)?;
+                // Each possible matched handle clone/drop and the One branch's
+                // additional clone/drop are closed Arc operations, not backing.
+                owner
+                    .counter
+                    .work(control_resource_add(control_resource_mul(count, 8)?, 4)?)?;
+                owner.gate()?;
+                let mut ports = Vec::new();
+                owner.reserve(&mut ports, count)?;
+                for input in &node.inputs {
+                    owner.work.flush()?;
+                    let port = output_ports.get(input).cloned();
+                    owner.work.step()?;
+                    owner.work.flush()?;
+                    if let Some(port) = port {
+                        ports.push(port);
+                        owner.work.step()?;
+                    }
+                }
+                ports
+            } else {
+                node.inputs
+                    .iter()
+                    .filter_map(|input| output_ports.get(input).cloned())
+                    .collect::<Vec<_>>()
+            };
+            match ports.as_slice() {
+                [] => VisibleInputIndex::Empty,
+                [port] => {
+                    let port = port.clone();
+                    if let Some(owner) = admission.as_deref_mut() {
+                        owner.work.step()?;
+                    }
+                    VisibleInputIndex::One(port)
+                }
+                _ => {
+                    if let Some(owner) = admission {
+                        VisibleInputIndex::Many(boxed_slice_in::<_, ControlResourceError>(
+                            ports,
+                            &mut |facts| {
+                                if let Some(layout) = facts.requested_backing {
+                                    owner.counter.layout(layout, 1)?;
+                                }
+                                (owner.admit)(&owner.counter.facts())?;
+                                Ok(())
+                            },
+                            owner.work,
+                        )?)
+                    } else {
+                        VisibleInputIndex::Many(ports.into_boxed_slice())
+                    }
+                }
+            }
+        };
+        Ok(visible)
     }
 
     pub(crate) fn output(&self, node: NodeId) -> Option<&ValuePortIndex> {
@@ -119,6 +336,10 @@ impl FragmentValidationIndexes {
         self.visible_inputs.get(&node)
     }
 }
+
+#[cfg(test)]
+#[path = "index_borrowed_tests.rs"]
+mod index_borrowed_tests;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ValueMappingIndex {

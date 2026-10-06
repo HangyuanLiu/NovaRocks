@@ -342,6 +342,7 @@ pub(crate) fn validate_fragment_into(fragment: &Fragment, errors: &mut Validatio
 // reference, expression, node and error-order laws remain in that one body.
 trait FragmentStructureScratch {
     type Error;
+    fn indexes(&mut self, fragment: &Fragment) -> Result<FragmentValidationIndexes, Self::Error>;
     fn node_graph(
         &mut self,
         fragment: &Fragment,
@@ -351,6 +352,9 @@ trait FragmentStructureScratch {
 struct PlainFragmentScratch;
 impl FragmentStructureScratch for PlainFragmentScratch {
     type Error = std::convert::Infallible;
+    fn indexes(&mut self, fragment: &Fragment) -> Result<FragmentValidationIndexes, Self::Error> {
+        Ok(FragmentValidationIndexes::new(fragment))
+    }
     fn node_graph(
         &mut self,
         fragment: &Fragment,
@@ -369,6 +373,9 @@ struct CallerFragmentScratch<'a, 'control> {
 }
 impl FragmentStructureScratch for CallerFragmentScratch<'_, '_> {
     type Error = novarocks_type_contract::ControlResourceError;
+    fn indexes(&mut self, fragment: &Fragment) -> Result<FragmentValidationIndexes, Self::Error> {
+        FragmentValidationIndexes::new_in(fragment, self.resources, self.admit, self.work)
+    }
     fn node_graph(
         &mut self,
         fragment: &Fragment,
@@ -482,7 +489,7 @@ fn validate_fragment_structure_into_core<S: FragmentStructureScratch>(
             return Ok(());
         }
     }
-    let indexes = FragmentValidationIndexes::new(fragment);
+    let indexes = scratch.indexes(fragment)?;
     let window_roots = fragment
         .nodes()
         .values()
