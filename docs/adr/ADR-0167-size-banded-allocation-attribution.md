@@ -11,6 +11,7 @@ provenance:
   - "discussion: 2026-09-30 allocation attribution, observation boundaries and lifetime publication"
   - "approval: 2026-10-03 stable lane storage, safe scope interfaces and process observation implementation"
   - "decision: 2026-10-06 Miri aliasing model for in-band allocator tail reads (Tree Borrows)"
+  - "PR: https://github.com/NovaRocks/NovaRocks/pull/1165"
 code-anchors:
   - "novarocks/memory/src/lane/record.rs (LaneRecord, LifetimeState)"
   - "novarocks/memory/src/lane/slot.rs (SlotCore)"
