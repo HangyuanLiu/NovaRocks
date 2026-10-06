@@ -24,6 +24,7 @@ pub(crate) use lowered_draft::{
     SqlSourceJournalError,
 };
 mod expression_occurrences;
+mod package_semantics;
 mod physical_aggregate_occurrences;
 mod physical_aggregate_requests;
 mod physical_call_arguments;
@@ -38,6 +39,9 @@ mod physical_window_occurrences;
 mod physical_window_requests;
 mod physical_writer_occurrences;
 mod physical_writer_requests;
+pub use package_semantics::{
+    FragmentPackageSemantics, PackageSemanticsError, author_fragment_package_semantics,
+};
 
 pub(crate) use contract_lowering::{
     ContractLoweringError, FinalChangeStreamWriteLowering, FinalWriteLowering,

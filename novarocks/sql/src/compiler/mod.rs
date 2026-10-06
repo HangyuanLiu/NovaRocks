@@ -35,6 +35,9 @@ pub use crate::functions::{
 };
 pub use crate::optimizer::options::SessionOptimizerSettings;
 pub use crate::planner::distributed::build::SqlAuthoredPhysicalPlan;
+pub use crate::planner::distributed::build::{
+    FragmentPackageSemantics, PackageSemanticsError, author_fragment_package_semantics,
+};
 #[cfg(test)]
 pub(crate) use completion_driver::compile_authored_aggregate_for_test;
 pub use mv_rewrite::{

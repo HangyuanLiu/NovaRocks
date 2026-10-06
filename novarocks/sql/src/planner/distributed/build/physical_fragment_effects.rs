@@ -518,7 +518,7 @@ fn compose_fragment_effects_observed(
 
 /// Borrow the original call selected by the sole visitor's node/ordinal site.
 /// The sealed request still verifies this exact call/node/source association.
-fn aggregate_source(
+pub(super) fn aggregate_source(
     node: &PhysicalNode,
     site: PhysicalCallSite,
 ) -> Result<&AggregateCall, PhysicalFragmentEffectsError> {
@@ -555,7 +555,7 @@ mod sql_aggregate_tests;
 
 /// Writer calls loan actual Value channels and cannot be converted to ordinary
 /// aggregate calls or expression-based argument roots.
-fn writer_source(
+pub(super) fn writer_source(
     node: &PhysicalNode,
     site: PhysicalCallSite,
 ) -> Result<&WriterAggregateCall, PhysicalFragmentEffectsError> {

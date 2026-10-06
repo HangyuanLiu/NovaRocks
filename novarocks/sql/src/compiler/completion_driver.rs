@@ -3323,5 +3323,9 @@ pub(crate) fn compile_authored_aggregate_for_test(sql: &str) -> super::SqlAuthor
 mod owned_plan_movement_tests;
 
 #[cfg(test)]
+#[path = "package_semantics_tests.rs"]
+mod package_semantics_tests;
+
+#[cfg(test)]
 #[path = "catalogue_retention_tests.rs"]
 mod catalogue_retention_tests;
