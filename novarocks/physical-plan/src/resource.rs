@@ -89,8 +89,8 @@ impl CutResourcePreflight {
         add_distribution_usage(distribution, &mut self.usage);
     }
 
-    pub(crate) fn add_source(&mut self, source: &ArtifactSourceBinding, path: &str) {
-        add_artifact_source_usage(source, path, &mut self.usage);
+    pub(crate) fn add_source(&mut self, source: crate::SourceBindingRef<'_>, _path: &str) {
+        add_read_reference_usage(source.source, &mut self.usage);
     }
 
     pub(crate) fn add_artifact(

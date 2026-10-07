@@ -12,10 +12,13 @@ required/nullable UTF-8 helper 在创建 column tuple Vec 前核对 4,096 列；
 
 输出/stack 超界明确拒绝整份 EXPLAIN，不截断成功，也不把深层表达式变成省略号。内部 bounded stack 是 formatter 的工作区限制，不宣称逻辑计划原来存在同名 frozen 协议。正常 SQL EXPLAIN golden 未修改。
 
-尚未关闭：Contract RenderContext 的 derive_fragment_cuts 会复制 plan-derived cut/proof facts，PhysicalPlan 的既有 512 MiB plan-cut /64 MiB fragment dynamic 上限不等于 Local 32 MiB workspace；该派生的完整前置接管仍需处理。生产 Local window funding、实际 Arrow/renderer/socket 别名、source deadline/退出以及 P07/P08 sole cutover 仍 OPEN。不能根据这份 formatter 收据删除旧 FE 保护。
+Contract RenderContext 现使用 PhysicalPlan owner 的 FragmentIoCutIndex，分配前核对独立 4 MiB auxiliary ceiling。registry 借用 provider read/selection digest，CompactSourceBindingSet 与原 cut 派生共用同一 provenance kernel；imports/projection/type、source bindings、partitioning、router/writer field/name 以 iterator 借用格式化，不建立 proof hull、runtime-filter graph 或 artifact payload 的第二份。checked preflight 计入拓扑/registry、局部和 parent union 的旧新 Vec/Arc、pairwise merge 与 temporary vectors；构建失败或超界整体拒绝。旧独立 fragment/cut API 保留其原 owned 物化语义，不以 Local ceiling 取代它的既有界。生产 Local window funding、实际 Arrow/renderer/socket 别名、source deadline/退出以及 P07/P08 sole cutover 仍 OPEN。不能根据这份 formatter 收据删除旧 FE 保护。
 
 Query Application lib **516 PASS**，`logs/mem-1-m07/p06-local-helper-preflight-20261007.log`；新增 wide schema / required ragged row 反例。
 
 SQL lib **2,588 PASS**，`logs/mem-1-m07/p06-explain-source-lib-20261007.log`；此前 explain filter 44 PASS（随后又加 PROJECT single-pass probe）。Frontend lib **1,421 PASS**，`logs/mem-1-m07/p06-explain-source-fe-20261007.log`。fmt/diff 通过。新反例覆盖实际借用指针、hex expansion/wide args、name/alias/decimal/String、exact output界、capacity增长前拒绝、source index/cycle/depth、MV constraints及正常字节相等。
 
 首次新 tree joined helper 的返回 lifetime 缺失，已显式命名修复；日志 `p06-explain-source-first-20261007.log` 保留。没有修改已有 golden 或放宽断言，没有运行原生 SQL/性能/传输测量。
+
+
+借用 cut 接线验证（local-only）：physical-plan lib 183/183，SQL EXPLAIN filter 55/55，SQL lib 2,588/2,588，Frontend Application lib 1,421/1,421 均通过；日志分别为 `logs/mem-1-m07/p06-borrowed-cut-{physical,sql-first,sql-lib,fe-lib}-20261007.log`。physical owner 新测试逐项对照原 owned cuts 的 DAG/multi-source/重复 provenance/source-free/router/writer facts，核对大 payload/type/name 为原 owner 指针、预算边界和无效拓扑的拒绝。独立只读 review 未发现具体 correctness gap；该 review 不替代上述测试，也不证明生产窗口与实际退出。

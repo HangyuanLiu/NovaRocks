@@ -24,8 +24,8 @@ use std::{
 };
 
 use novarocks_physical_plan::{
-    AnnotationSubject, Edge, ExprId, Fragment, FragmentCuts, FragmentId, FragmentSink, NodeId,
-    NodeKind, PhysicalNode, PhysicalPlan, PlanAnnotation, PlanVersionId, SortExpr, ValueId,
+    AnnotationSubject, Edge, ExprId, Fragment, FragmentId, FragmentIoCutIndex, FragmentSink,
+    NodeId, NodeKind, PhysicalNode, PhysicalPlan, PlanAnnotation, PlanVersionId, SortExpr, ValueId,
     WindowExpression, WriteTargetOrdinal, WriterGroupedUnpivotSpec,
 };
 use sha2::{Digest, Sha256};
@@ -53,6 +53,44 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (index, item) in self.items.iter().enumerate() {
+            if index != 0 {
+                formatter.write_str(self.separator)?;
+            }
+            (self.render)(item, formatter)?;
+        }
+        Ok(())
+    }
+}
+
+// The iterator factory borrows owner facts and can be formatted repeatedly
+// without buffering a cut's fields or provenance payloads.
+struct JoinedIter<M, F> {
+    make: M,
+    separator: &'static str,
+    render: F,
+}
+
+fn joined_iter<M, I, F>(make: M, separator: &'static str, render: F) -> JoinedIter<M, F>
+where
+    M: Fn() -> I,
+    I: Iterator,
+    F: Fn(I::Item, &mut fmt::Formatter<'_>) -> fmt::Result,
+{
+    JoinedIter {
+        make,
+        separator,
+        render,
+    }
+}
+
+impl<M, I, F> fmt::Display for JoinedIter<M, F>
+where
+    M: Fn() -> I,
+    I: Iterator,
+    F: Fn(I::Item, &mut fmt::Formatter<'_>) -> fmt::Result,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, item) in (self.make)().enumerate() {
             if index != 0 {
                 formatter.write_str(self.separator)?;
             }
@@ -807,7 +845,7 @@ struct RenderContext<'a> {
     level: ExplainLevel,
     profile: Option<&'a SqlCompletedExplainProfile>,
     annotations: AnnotationIndex<'a>,
-    cuts: BTreeMap<FragmentId, FragmentCuts>,
+    cuts: FragmentIoCutIndex<'a>,
 }
 
 impl<'a> RenderContext<'a> {
@@ -816,8 +854,10 @@ impl<'a> RenderContext<'a> {
         level: ExplainLevel,
         profile: Option<&'a SqlCompletedExplainProfile>,
     ) -> Result<Self, SqlCompileError> {
-        let cuts = novarocks_physical_plan::derive_fragment_cuts(plan).ok_or_else(|| {
-            invalid_request("completed physical plan cannot derive fragment cut contracts")
+        let cuts = FragmentIoCutIndex::try_new(plan, 4 * 1024 * 1024).ok_or_else(|| {
+            invalid_request(
+                "completed physical plan IO cut index is invalid or exceeds its 4 MiB workspace",
+            )
         })?;
         Ok(Self {
             plan,
@@ -977,49 +1017,51 @@ fn render_cut_attachments(
             inbound: false
         },
     ))?;
-    let cuts = context.cuts.get(&fragment_id).ok_or_else(|| {
+    let cuts = context.cuts.fragment(fragment_id).ok_or_else(|| {
         invalid_request("completed physical plan omitted a derived fragment cut contract")
     })?;
-    for cut in &cuts.inbound {
+    for cut in cuts.inbound() {
         lines.push(format_args!(
             "    inbound edge{} kind={} source=f{} destination=n{} imports=[{}] source-distribution={} source-multiplicity={} destination-distribution={} destination-multiplicity={} source-bindings=[{}] source-free={} change-stream-writer={} writer-result={}",
-            cut.edge.get(),
-            edge_kind(cut.kind),
-            cut.source_fragment.get(),
-            cut.destination_node.get(),
-            joined(&cut.imports, ",", |import: &novarocks_physical_plan::CutImport, output: &mut fmt::Formatter<'_>| write!(output, "v{}:{}->v{}", import.source.value.get(), format_value_type(&import.source.ty), import.destination.get())),
-            format_distribution_complete(context, cut.source_fragment, &cut.partitioning.source),
-            row_multiplicity(cut.partitioning.source_multiplicity),
-            format_distribution_complete(context, fragment_id, &cut.partitioning.destination),
-            row_multiplicity(cut.partitioning.destination_multiplicity),
-            joined(&cut.source_bindings, ";", |binding: &novarocks_physical_plan::ArtifactSourceBinding, output: &mut fmt::Formatter<'_>| format_artifact_source(binding).fmt(output)),
+            cut.edge.id.get(),
+            edge_kind(cut.edge.kind),
+            cut.edge.source.fragment.get(),
+            cut.edge.destination.node.get(),
+            joined_iter(|| cut.imports(), ",", |import: novarocks_physical_plan::CutImportRef<'_>, output: &mut fmt::Formatter<'_>| write!(output, "v{}:{}->v{}", import.source.value.get(), format_value_type(import.source.ty), import.destination.get())),
+            format_distribution_complete(context, cut.edge.source.fragment, &cut.edge.partitioning.source),
+            row_multiplicity(cut.edge.partitioning.source_multiplicity),
+            format_distribution_complete(context, fragment_id, &cut.edge.partitioning.destination),
+            row_multiplicity(cut.edge.partitioning.destination_multiplicity),
+            joined_iter(|| cut.source_bindings(), ";", |binding: novarocks_physical_plan::SourceBindingRef<'_>, output: &mut fmt::Formatter<'_>| ArtifactSourceDisplay(binding).fmt(output)),
             cut.has_source_free_rows,
-            ChangeStreamWriterCutDisplay(cut.change_stream_writer.as_ref()),
-            WriterResultCutDisplay(cut.writer_result.as_ref())
+            ChangeStreamWriterCutDisplay(cut.change_stream_writer),
+            WriterResultCutDisplay(cut.writer_result)
         ))?;
     }
-    for cut in &cuts.outbound {
+    for cut in cuts.outbound() {
         lines.push(format_args!(
             "    outbound edge{} kind={} destination=f{} projection=[{}] destination-imports=[{}] source-distribution={} source-multiplicity={} destination-distribution={} destination-multiplicity={} source-bindings=[{}] source-free={} change-stream-writer={} writer-result={}",
-            cut.edge.get(),
-            edge_kind(cut.kind),
-            cut.destination_fragment.get(),
-            joined(&cut.projection, ",", |value: &novarocks_physical_plan::CutValue, output: &mut fmt::Formatter<'_>| write!(output, "v{}:{}", value.value.get(), format_value_type(&value.ty))),
-            joined(&cut.destination_imports, ",", |import: &novarocks_physical_plan::CutImport, output: &mut fmt::Formatter<'_>| write!(output, "v{}:{}->v{}", import.source.value.get(), format_value_type(&import.source.ty), import.destination.get())),
-            format_distribution_complete(context, fragment_id, &cut.partitioning.source),
-            row_multiplicity(cut.partitioning.source_multiplicity),
-            format_distribution_complete(context, cut.destination_fragment, &cut.partitioning.destination),
-            row_multiplicity(cut.partitioning.destination_multiplicity),
-            joined(&cut.source_bindings, ";", |binding: &novarocks_physical_plan::ArtifactSourceBinding, output: &mut fmt::Formatter<'_>| format_artifact_source(binding).fmt(output)),
+            cut.edge.id.get(),
+            edge_kind(cut.edge.kind),
+            cut.edge.destination.fragment.get(),
+            joined_iter(|| cut.projection(), ",", |value: novarocks_physical_plan::CutValueRef<'_>, output: &mut fmt::Formatter<'_>| write!(output, "v{}:{}", value.value.get(), format_value_type(value.ty))),
+            joined_iter(|| cut.imports(), ",", |import: novarocks_physical_plan::CutImportRef<'_>, output: &mut fmt::Formatter<'_>| write!(output, "v{}:{}->v{}", import.source.value.get(), format_value_type(import.source.ty), import.destination.get())),
+            format_distribution_complete(context, fragment_id, &cut.edge.partitioning.source),
+            row_multiplicity(cut.edge.partitioning.source_multiplicity),
+            format_distribution_complete(context, cut.edge.destination.fragment, &cut.edge.partitioning.destination),
+            row_multiplicity(cut.edge.partitioning.destination_multiplicity),
+            joined_iter(|| cut.source_bindings(), ";", |binding: novarocks_physical_plan::SourceBindingRef<'_>, output: &mut fmt::Formatter<'_>| ArtifactSourceDisplay(binding).fmt(output)),
             cut.has_source_free_rows,
-            ChangeStreamWriterCutDisplay(cut.change_stream_writer.as_ref()),
-            WriterResultCutDisplay(cut.writer_result.as_ref())
+            ChangeStreamWriterCutDisplay(cut.change_stream_writer),
+            WriterResultCutDisplay(cut.writer_result)
         ))?;
     }
     Ok(())
 }
 
-struct ChangeStreamWriterCutDisplay<'a>(Option<&'a novarocks_physical_plan::ChangeStreamWriterCut>);
+struct ChangeStreamWriterCutDisplay<'a>(
+    Option<novarocks_physical_plan::ChangeStreamWriterCutRef<'a>>,
+);
 
 impl fmt::Display for ChangeStreamWriterCutDisplay<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1031,10 +1073,10 @@ impl fmt::Display for ChangeStreamWriterCutDisplay<'_> {
             "{{route={}, target={}, fields=[{}]}}",
             format_hex(&proof.route_id.to_bytes()),
             proof.write_target_ordinal.get(),
-            joined(
-                &proof.fields,
+            joined_iter(
+                || proof.fields(),
                 ",",
-                |field: &novarocks_physical_plan::ChangeStreamWriterCutField,
+                |field: novarocks_physical_plan::ChangeStreamWriterCutField,
                  output: &mut fmt::Formatter<'_>| write!(
                     output,
                     "{}:v{}->v{}",
@@ -1047,7 +1089,7 @@ impl fmt::Display for ChangeStreamWriterCutDisplay<'_> {
     }
 }
 
-struct WriterResultCutDisplay<'a>(Option<&'a novarocks_physical_plan::WriterResultCut>);
+struct WriterResultCutDisplay<'a>(Option<novarocks_physical_plan::WriterResultCutRef<'a>>);
 
 impl fmt::Display for WriterResultCutDisplay<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1059,17 +1101,17 @@ impl fmt::Display for WriterResultCutDisplay<'_> {
             "{{target={}, schema-revision={}, fields=[{}]}}",
             proof.write_target_ordinal.get(),
             proof.schema_revision,
-            joined(
-                &proof.fields,
+            joined_iter(
+                || proof.fields(),
                 ";",
-                |field: &novarocks_physical_plan::WriterResultCutField,
+                |field: novarocks_physical_plan::WriterResultCutFieldRef<'_>,
                  output: &mut fmt::Formatter<'_>| write!(
                     output,
                     "v{}->v{}:{}:{}:{}",
                     field.source.get(),
                     field.destination.get(),
-                    quote_text(&field.name),
-                    format_value_type(&field.ty),
+                    quote_text(field.name),
+                    format_value_type(field.ty),
                     writer_relation_field_role(field.role)
                 )
             )
@@ -1383,15 +1425,15 @@ fn format_distribution_complete<'a>(
     }
 }
 
-struct ArtifactSourceDisplay<'a>(&'a novarocks_physical_plan::ArtifactSourceBinding);
+struct ArtifactSourceDisplay<'a>(novarocks_physical_plan::SourceBindingRef<'a>);
 
 impl fmt::Display for ArtifactSourceDisplay<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
             "{{read={}, selection-digest={}}}",
-            format_provider_read(&self.0.source),
-            format_hex(&self.0.selection_digest)
+            format_provider_read(self.0.source),
+            format_hex(self.0.selection_digest)
         )
     }
 }
@@ -1399,7 +1441,7 @@ impl fmt::Display for ArtifactSourceDisplay<'_> {
 fn format_artifact_source(
     source: &novarocks_physical_plan::ArtifactSourceBinding,
 ) -> ArtifactSourceDisplay<'_> {
-    ArtifactSourceDisplay(source)
+    ArtifactSourceDisplay(source.into())
 }
 
 struct ArtifactRequirementDisplay<'a>(&'a novarocks_physical_plan::ArtifactInputRequirement);

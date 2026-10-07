@@ -531,22 +531,38 @@ pub(crate) struct SourceProvenance {
     pub(crate) has_source_free_rows: bool,
 }
 
-#[derive(Default)]
-pub(crate) struct SourceBindingRegistry {
-    pub(crate) ids: BTreeMap<Arc<ArtifactSourceBinding>, u32>,
-    pub(crate) bindings: Vec<Arc<ArtifactSourceBinding>>,
+pub(crate) struct SourceBindingRegistry<'a> {
+    pub(crate) ids: Vec<(crate::SourceBindingRef<'a>, u32)>,
+    pub(crate) bindings: Vec<crate::SourceBindingRef<'a>>,
 }
 
-impl SourceBindingRegistry {
-    pub(crate) fn intern(&mut self, binding: ArtifactSourceBinding) -> Option<usize> {
-        if let Some(id) = self.ids.get(&binding) {
-            return Some(*id as usize);
+impl<'a> SourceBindingRegistry<'a> {
+    fn new(plan: &'a PhysicalPlan, scans: usize) -> Option<Self> {
+        let mut bindings = Vec::with_capacity(scans);
+        let mut ids = Vec::with_capacity(scans);
+        for fragment in plan.fragments().values() {
+            for node in fragment.nodes().values() {
+                if let NodeKind::Scan { relation, .. } = &node.kind {
+                    let binding = relation.source_binding_ref();
+                    let id = u32::try_from(bindings.len()).ok()?;
+                    bindings.push(binding);
+                    ids.push((binding, id));
+                }
+            }
         }
-        let id = u32::try_from(self.bindings.len()).ok()?;
-        let binding = Arc::new(binding);
-        self.ids.insert(Arc::clone(&binding), id);
-        self.bindings.push(binding);
-        Some(id as usize)
+        // Keep the first occurrence as the canonical id, preserving the old
+        // registry's first-visit order even when equal scans are repeated.
+        ids.sort_unstable();
+        ids.dedup_by(|left, right| left.0 == right.0);
+        Some(Self { ids, bindings })
+    }
+
+    pub(crate) fn intern(&self, binding: crate::SourceBindingRef<'_>) -> Option<usize> {
+        let ordinal = self
+            .ids
+            .binary_search_by(|(key, _)| key.cmp(&binding))
+            .ok()?;
+        Some(self.ids[ordinal].1 as usize)
     }
 }
 
@@ -557,20 +573,25 @@ pub(crate) struct CompactSourceBindingSet {
 
 impl CompactSourceBindingSet {
     pub(crate) fn from_ids(ids: &[usize]) -> Option<Self> {
-        Some(Self {
-            ids: ids
-                .iter()
-                .map(|id| u32::try_from(*id).ok())
-                .collect::<Option<Vec<_>>>()?
-                .into(),
-        })
+        let mut values = Vec::with_capacity(ids.len());
+        for id in ids {
+            values.push(u32::try_from(*id).ok()?);
+        }
+        Some(Self { ids: values.into() })
     }
 
-    pub(crate) fn union(local: &Self, parents: impl IntoIterator<Item = Self>) -> Self {
-        let mut sets = parents
-            .into_iter()
-            .filter(|set| !set.ids.is_empty())
-            .collect::<Vec<_>>();
+    pub(crate) fn union<I>(local: &Self, parents: I) -> Self
+    where
+        I: IntoIterator<Item = Self>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let parents = parents.into_iter();
+        let mut sets = Vec::with_capacity(parents.len().saturating_add(1));
+        for parent in parents {
+            if !parent.ids.is_empty() {
+                sets.push(parent);
+            }
+        }
         if !local.ids.is_empty() {
             sets.push(local.clone());
         }
@@ -642,132 +663,229 @@ pub(crate) fn charge_provenance_cut_items(
     (*current <= MAX_PLAN_DERIVED_CUT_ITEMS).then_some(())
 }
 
-pub(crate) struct PlanSourceProvenance {
-    pub(crate) registry: SourceBindingRegistry,
-    pub(crate) by_fragment: BTreeMap<FragmentId, CompactSourceBindingSet>,
-    pub(crate) source_free_fragments: BTreeSet<FragmentId>,
+pub(crate) struct PlanSourceProvenance<'a> {
+    pub(crate) registry: SourceBindingRegistry<'a>,
+    pub(crate) by_fragment: Vec<(FragmentId, CompactSourceBindingSet)>,
+    pub(crate) source_free_fragments: Vec<FragmentId>,
 }
 
-impl PlanSourceProvenance {
+impl<'a> PlanSourceProvenance<'a> {
+    fn set(&self, fragment: FragmentId) -> Option<&CompactSourceBindingSet> {
+        let ordinal = self
+            .by_fragment
+            .binary_search_by_key(&fragment, |(id, _)| *id)
+            .ok()?;
+        Some(&self.by_fragment[ordinal].1)
+    }
+
     pub(crate) fn binding_refs(
         &self,
         fragment: FragmentId,
-    ) -> Option<impl Iterator<Item = &ArtifactSourceBinding>> {
-        Some(self.by_fragment.get(&fragment)?.ids().map(|id| {
-            self.registry
+    ) -> Option<impl Iterator<Item = crate::SourceBindingRef<'a>> + '_> {
+        Some(self.set(fragment)?.ids().map(|id| {
+            *self
+                .registry
                 .bindings
                 .get(id)
                 .expect("compact provenance ids are interned")
-                .as_ref()
         }))
     }
 
     pub(crate) fn bindings(&self, fragment: FragmentId) -> Option<Vec<ArtifactSourceBinding>> {
-        Some(self.binding_refs(fragment)?.cloned().collect())
+        Some(
+            self.binding_refs(fragment)?
+                .map(crate::SourceBindingRef::to_owned)
+                .collect(),
+        )
     }
 
     pub(crate) fn binding_count(&self, fragment: FragmentId) -> Option<usize> {
-        Some(self.by_fragment.get(&fragment)?.len())
+        Some(self.set(fragment)?.len())
     }
 
     pub(crate) fn has_source_free_rows(&self, fragment: FragmentId) -> Option<bool> {
-        self.by_fragment
-            .contains_key(&fragment)
-            .then(|| self.source_free_fragments.contains(&fragment))
+        self.set(fragment)
+            .map(|_| self.source_free_fragments.binary_search(&fragment).is_ok())
     }
 }
 
-pub(crate) fn source_provenance_index(plan: &PhysicalPlan) -> Option<PlanSourceProvenance> {
-    let mut registry = SourceBindingRegistry::default();
-    let mut local_ids = BTreeMap::<FragmentId, Vec<usize>>::new();
-    let mut local_source_free = BTreeSet::new();
-    let mut indegree = plan
+/// A conservative bound on every allocation made by the provenance kernel,
+/// including live parent sets, merge buffers, Vec-to-Arc copies, topology
+/// indexes, ready work, and the temporary vectors used by pairwise unions.
+/// Counts are read from the borrowed plan before allocating any index.
+/// Unstable sorting needs no heap scratch. The intentionally conservative
+/// all-scans bound also covers distinct-source deduplication without first
+/// building an unbounded registry.
+pub(crate) fn source_provenance_index_bytes(plan: &PhysicalPlan) -> Option<usize> {
+    let fragments = plan.fragments().len();
+    let edges = plan.edges().len();
+    let scans = plan
         .fragments()
-        .keys()
-        .copied()
-        .map(|fragment| (fragment, 0usize))
-        .collect::<BTreeMap<_, _>>();
-    let mut outgoing = BTreeMap::<FragmentId, Vec<FragmentId>>::new();
-    let mut incoming = BTreeMap::<FragmentId, Vec<FragmentId>>::new();
-    for edge in plan.edges().values() {
-        *indegree.get_mut(&edge.destination.fragment)? += 1;
-        outgoing
-            .entry(edge.source.fragment)
-            .or_default()
-            .push(edge.destination.fragment);
-        incoming
-            .entry(edge.destination.fragment)
-            .or_default()
-            .push(edge.source.fragment);
+        .values()
+        .try_fold(0usize, |total, fragment| {
+            total.checked_add(
+                fragment
+                    .nodes()
+                    .values()
+                    .filter(|node| matches!(node.kind, NodeKind::Scan { .. }))
+                    .count(),
+            )
+        })?;
+    // Exact-capacity registry, fragment arrays, two adjacency arrays and local
+    // scan-id vectors. Include empty/default Arc headers and Vec minimum
+    // capacities in unions as well as every live old/new set at a merge.
+    let registry = scans.checked_mul(
+        size_of::<crate::SourceBindingRef<'_>>()
+            .checked_add(size_of::<(crate::SourceBindingRef<'_>, u32)>())?
+            .checked_add(size_of::<usize>())?,
+    )?;
+    let topology = fragments
+        .checked_mul(
+            size_of::<&Fragment>()
+                .checked_add(2 * size_of::<CompactSourceBindingSet>())?
+                .checked_add(size_of::<(FragmentId, CompactSourceBindingSet)>())?
+                .checked_add(2 * size_of::<usize>())?
+                .checked_add(3 * size_of::<FragmentId>())?
+                .checked_add(2 * size_of::<bool>())?,
+        )?
+        .checked_add(edges.checked_mul(2 * size_of::<(usize, usize)>())?)?;
+    let union_count = edges.checked_add(fragments)?;
+    // A pairwise union has at most one merge per parent/local set. Each merge
+    // requests <= 2*scans u32s in its Vec and <= 2*scans in its new Arc while
+    // the old sets remain live. Counting all requests (not just the final
+    // live bytes) safely covers intermediate generations and Arc headers.
+    let sets = union_count.checked_mul(scans.checked_mul(16)?.checked_add(64)?)?;
+    let union_vectors = edges
+        .checked_add(fragments.checked_mul(8)?)?
+        .checked_mul(8 * size_of::<CompactSourceBindingSet>())?;
+    registry
+        .checked_add(topology)?
+        .checked_add(sets)?
+        .checked_add(union_vectors)
+}
+
+pub(crate) fn source_provenance_index(plan: &PhysicalPlan) -> Option<PlanSourceProvenance<'_>> {
+    source_provenance_index_bounded(plan, usize::MAX)
+}
+
+pub(crate) fn source_provenance_index_bounded(
+    plan: &PhysicalPlan,
+    maximum_bytes: usize,
+) -> Option<PlanSourceProvenance<'_>> {
+    if source_provenance_index_bytes(plan)? > maximum_bytes {
+        return None;
     }
-    for fragment in plan.fragments().values() {
-        let mut ids = Vec::new();
+    let scans = plan
+        .fragments()
+        .values()
+        .map(|fragment| {
+            fragment
+                .nodes()
+                .values()
+                .filter(|node| matches!(node.kind, NodeKind::Scan { .. }))
+                .count()
+        })
+        .sum();
+    let registry = SourceBindingRegistry::new(plan, scans)?;
+    let fragments = plan.fragments().values().collect::<Vec<_>>();
+    let ordinal = |id: FragmentId| {
+        fragments
+            .binary_search_by_key(&id, |fragment| fragment.id())
+            .ok()
+    };
+    let mut indegree = vec![0usize; fragments.len()];
+    let mut outgoing = Vec::with_capacity(plan.edges().len());
+    let mut incoming = Vec::with_capacity(plan.edges().len());
+    for edge in plan.edges().values() {
+        let source = ordinal(edge.source.fragment)?;
+        let destination = ordinal(edge.destination.fragment)?;
+        indegree[destination] = indegree[destination].checked_add(1)?;
+        outgoing.push((source, destination));
+        incoming.push((destination, source));
+    }
+    outgoing.sort_unstable();
+    incoming.sort_unstable();
+    let adjacency = |index: &[(usize, usize)], fragment: usize| {
+        let begin = index.partition_point(|(id, _)| *id < fragment);
+        let end = index.partition_point(|(id, _)| *id <= fragment);
+        begin..end
+    };
+    let mut local_sets = Vec::with_capacity(fragments.len());
+    let mut local_source_free = vec![false; fragments.len()];
+    for (ordinal, fragment) in fragments.iter().enumerate() {
+        let scan_count = fragment
+            .nodes()
+            .values()
+            .filter(|node| matches!(node.kind, NodeKind::Scan { .. }))
+            .count();
+        let mut ids = Vec::with_capacity(scan_count);
         for node in fragment.nodes().values() {
             match &node.kind {
                 NodeKind::Scan { relation, .. } => {
-                    ids.push(registry.intern(relation.source_binding())?);
+                    ids.push(registry.intern(relation.source_binding_ref())?);
                 }
-                NodeKind::Values { rows } if !rows.is_empty() => {
-                    local_source_free.insert(fragment.id());
-                }
-                NodeKind::GenerateSeries { .. } => {
-                    local_source_free.insert(fragment.id());
-                }
+                NodeKind::Values { rows } if !rows.is_empty() => local_source_free[ordinal] = true,
+                NodeKind::GenerateSeries { .. } => local_source_free[ordinal] = true,
                 NodeKind::TableFunction { .. } if node.inputs.is_empty() => {
-                    local_source_free.insert(fragment.id());
+                    local_source_free[ordinal] = true
                 }
                 _ => {}
             }
         }
         ids.sort_unstable();
         ids.dedup();
-        local_ids.insert(fragment.id(), ids);
+        local_sets.push(CompactSourceBindingSet::from_ids(&ids)?);
     }
-    let local_sets = local_ids
-        .iter()
-        .map(|(fragment, ids)| Some((*fragment, CompactSourceBindingSet::from_ids(ids)?)))
-        .collect::<Option<BTreeMap<_, _>>>()?;
-    let mut by_fragment = BTreeMap::new();
-    let mut source_free_fragments = BTreeSet::new();
+    let mut by_fragment = Vec::with_capacity(fragments.len());
+    for fragment in &fragments {
+        by_fragment.push((fragment.id(), CompactSourceBindingSet::default()));
+    }
+    let mut source_free = vec![false; fragments.len()];
     let mut cut_binding_items = 0_usize;
-    let mut ready = indegree
-        .iter()
-        .filter_map(|(fragment, degree)| (*degree == 0).then_some(*fragment))
-        .collect::<BTreeSet<_>>();
-    let mut visited = 0usize;
-    while let Some(source) = ready.pop_first() {
-        visited += 1;
-        if !by_fragment.contains_key(&source) {
-            let parents = incoming
-                .get(&source)
-                .into_iter()
-                .flatten()
-                .map(|parent| by_fragment.get(parent).cloned())
-                .collect::<Option<Vec<_>>>()?;
-            let combined = CompactSourceBindingSet::union(local_sets.get(&source)?, parents);
-            by_fragment.insert(source, combined);
-            if local_source_free.contains(&source)
-                || incoming
-                    .get(&source)
-                    .into_iter()
-                    .flatten()
-                    .any(|parent| source_free_fragments.contains(parent))
-            {
-                source_free_fragments.insert(source);
-            }
+    let mut ready = Vec::with_capacity(fragments.len());
+    for (ordinal, degree) in indegree.iter().enumerate() {
+        if *degree == 0 {
+            ready.push(ordinal);
         }
-        let source_binding_count = by_fragment.get(&source)?.len();
-        let outgoing_count = outgoing.get(&source).map_or(0, Vec::len);
-        charge_provenance_cut_items(&mut cut_binding_items, source_binding_count, outgoing_count)?;
-        for destination in outgoing.get(&source).into_iter().flatten() {
-            let degree = indegree.get_mut(destination)?;
-            *degree = degree.checked_sub(1)?;
-            if *degree == 0 {
-                ready.insert(*destination);
+    }
+    let mut visited = 0usize;
+    while !ready.is_empty() {
+        // Match the old BTreeSet's smallest-fragment-first traversal, with no
+        // sorting scratch or growable queue outside the preflighted capacity.
+        ready.sort_unstable_by(|left, right| right.cmp(left));
+        let source = ready.pop()?;
+        visited += 1;
+        let parents = incoming[adjacency(&incoming, source)]
+            .iter()
+            .map(|(_, parent)| by_fragment[*parent].1.clone());
+        by_fragment[source].1 = CompactSourceBindingSet::union(&local_sets[source], parents);
+        source_free[source] = local_source_free[source]
+            || incoming[adjacency(&incoming, source)]
+                .iter()
+                .any(|(_, parent)| source_free[*parent]);
+        let destinations = &outgoing[adjacency(&outgoing, source)];
+        charge_provenance_cut_items(
+            &mut cut_binding_items,
+            by_fragment[source].1.len(),
+            destinations.len(),
+        )?;
+        for (_, destination) in destinations {
+            indegree[*destination] = indegree[*destination].checked_sub(1)?;
+            if indegree[*destination] == 0 {
+                ready.push(*destination);
             }
         }
     }
-    (visited == plan.fragments().len()).then_some(PlanSourceProvenance {
+    if visited != fragments.len() {
+        return None;
+    }
+    let mut source_free_fragments = Vec::with_capacity(fragments.len());
+    for (ordinal, fragment) in fragments.iter().enumerate() {
+        if source_free[ordinal] {
+            source_free_fragments.push(fragment.id());
+        }
+    }
+    Some(PlanSourceProvenance {
         registry,
         by_fragment,
         source_free_fragments,
