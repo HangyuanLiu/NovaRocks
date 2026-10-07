@@ -35,8 +35,8 @@ use novarocks_functions::{
 };
 use novarocks_local_program::{
     LocalProgram, ProgramCallSite, ProgramChannelLayoutRole, ProgramChannelSite,
-    ProgramExpressionRootSite, ProgramLexicalSource, ProgramNodeId, ProgramUseRef, StaticExprKind,
-    root_input_layout,
+    ProgramExpressionRootSite, ProgramLexicalSource, ProgramNodeId, ProgramRootInput,
+    ProgramUseRef, StaticExprKind, root_input_layout,
 };
 use novarocks_type_contract::{ControlShape, FunctionNullBehavior, arrow_fields_exact_observed};
 use std::{
@@ -54,8 +54,9 @@ pub struct CompiledExpressionInstance {
     program: Arc<LocalProgram>,
     root: ProgramExpressionRootSite,
     /// The one input layout this root reads, from the same authority the
-    /// lexical bindings were checked against.
-    input: ProgramNodeId,
+    /// lexical bindings were checked against; `None` is the explicit empty
+    /// port of a root that reads no input.
+    input: Option<ProgramNodeId>,
     instances: BTreeMap<ProgramUseRef, ScalarEvaluationInstance>,
     effects: BTreeMap<ProgramUseRef, ScopedExpressionEffects>,
     failed: bool,
@@ -208,8 +209,12 @@ impl CompiledExpressionInstance {
         let input = match root_input_layout(program.graph(), root)
             .map_err(|_| invalid("root has no actual compiled input port"))?
         {
-            (input, ProgramChannelLayoutRole::NodeOutput) => input,
-            _ => {
+            ProgramRootInput::Layout {
+                node,
+                role: ProgramChannelLayoutRole::NodeOutput,
+            } => Some(node),
+            ProgramRootInput::Empty => None,
+            ProgramRootInput::Layout { .. } => {
                 return Err(invalid(
                     "join-scoped root input requires its dedicated compiled operator protocol",
                 ));
@@ -430,6 +435,7 @@ impl CompiledExpressionInstance {
     }
     /// The caller supplies this root's actual input port, retaining the full
     /// frozen field order and metadata. Selection always names its batch rows.
+    /// An empty-port root is evaluated over exactly one row with no column.
     pub fn evaluate<'a>(
         &mut self,
         input: &RecordBatch,
@@ -465,12 +471,22 @@ impl CompiledExpressionInstance {
         if input.num_rows() != selection.batch_rows() {
             return Err(invalid("selection differs from actual input batch rows"));
         }
-        let checked = self.program.checked();
-        let channels = checked.channels();
-        let typed = channels.expressions();
-        let resolved = typed.resolved_calls();
-        let snapshot = resolved.snapshot();
-        let input_node = self.input;
+        let Some(input_node) = self.input else {
+            // The explicit empty port: no field, no metadata and one row, so
+            // the root is evaluated exactly once per call.
+            let schema = input.schema();
+            work.flush()?;
+            let empty =
+                schema.fields().is_empty() && schema.metadata().is_empty() && input.num_rows() == 1;
+            work.flush()?;
+            if !empty {
+                return Err(invalid(
+                    "actual input differs from the root's empty one-row port",
+                ));
+            }
+            return self.evaluate_root(input, None, selection, work);
+        };
+        let channels = self.program.checked().channels();
         let layout = self.program.graph().nodes()[input_node.index()].output_layout();
         work.flush()?;
         let schema = input.schema();
@@ -512,6 +528,18 @@ impl CompiledExpressionInstance {
             )?;
             work.step()?;
         }
+        self.evaluate_root(input, Some(input_node), selection, work)
+    }
+    fn evaluate_root<'a>(
+        &mut self,
+        input: &RecordBatch,
+        input_node: Option<ProgramNodeId>,
+        selection: Selection<'a>,
+        work: &mut Work<'_>,
+    ) -> Result<SelectedValues<'a>, KernelFailure> {
+        let checked = self.program.checked();
+        let typed = checked.channels().expressions();
+        let snapshot = typed.resolved_calls().snapshot();
         let flow = &snapshot.flows()[&self.root.arena()];
         let result = guarded::evaluate_tree(
             &self.program,

@@ -99,5 +99,6 @@ pub use sink::{
 pub use typed_channels::*;
 pub use typed_expressions::*;
 pub use values::{
-    MAX_STATIC_VALUES_BACKING_BYTES, StaticValues, StaticValuesError, ValuesCompileError,
+    MAX_STATIC_VALUES_BACKING_BYTES, StaticValues, StaticValuesBacking, StaticValuesCell,
+    StaticValuesError, ValuesCompileError,
 };

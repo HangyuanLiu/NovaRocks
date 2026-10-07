@@ -495,7 +495,7 @@ pub(super) fn evaluate_tree<'a>(
     program: &novarocks_local_program::LocalProgram,
     root: ProgramExpressionRootSite,
     input: &RecordBatch,
-    input_node: ProgramNodeId,
+    input_node: Option<ProgramNodeId>,
     selection: Selection<'a>,
     instances: &mut BTreeMap<ProgramUseRef, ScalarEvaluationInstance>,
     effects: &BTreeMap<ProgramUseRef, ScopedExpressionEffects>,
@@ -638,7 +638,8 @@ pub(super) fn evaluate_tree<'a>(
                     else {
                         return Err(invalid("slot requires its actual compiled input source"));
                     };
-                    if *node != input_node {
+                    // An empty-port root has no input source at all.
+                    if Some(*node) != input_node {
                         return Err(invalid("slot source differs from actual root input port"));
                     }
                     OwnedValue::Column(Arc::clone(

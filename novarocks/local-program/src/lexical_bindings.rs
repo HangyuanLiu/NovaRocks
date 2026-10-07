@@ -744,19 +744,33 @@ fn input_scope(
         return Ok(false);
     };
     let program = channels.expressions().resolved_calls().snapshot().program();
-    Ok((node, role) == root_input_layout(program, root)?)
+    // An empty port has no input channel, so no input source is in scope.
+    Ok(root_input_layout(program, root)? == ProgramRootInput::Layout { node, role })
 }
 
-/// The one input layout an expression root reads its input slots from. Both
+/// The input port an expression root reads its input slots from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgramRootInput {
+    /// The root reads this one layout.
+    Layout {
+        node: ProgramNodeId,
+        role: ProgramChannelLayoutRole,
+    },
+    /// The root reads no input layout. It is evaluated over an explicit empty
+    /// port: a batch of exactly one row and no column.
+    Empty,
+}
+
+/// The one input port an expression root reads its input slots from. Both
 /// lexical binding and every executor of a compiled root use this authority,
 /// so an executor presents exactly the port the bindings were checked against.
 pub fn root_input_layout(
     program: &LocalProgramGraph,
     root: ProgramExpressionRootSite,
-) -> Result<(ProgramNodeId, ProgramChannelLayoutRole), ProgramLexicalBindingError> {
+) -> Result<ProgramRootInput, ProgramLexicalBindingError> {
     use ProgramChannelLayoutRole as Layout;
     use ProgramNodeExpressionRole as Role;
-    Ok(match root {
+    let (node, role) = match root {
         ProgramExpressionRootSite::WriterProjection { node: owner, .. } => {
             let ProgramNodeKind::TableWriter { input, .. } = program.nodes()[owner.index()].kind()
             else {
@@ -774,6 +788,9 @@ pub fn root_input_layout(
         } => {
             let kind = program.nodes()[owner.index()].kind();
             match (kind, root_role) {
+                (ProgramNodeKind::Values { .. }, Role::ValuesCell { .. }) => {
+                    return Ok(ProgramRootInput::Empty);
+                }
                 (ProgramNodeKind::Join { .. }, Role::JoinProbeKey { .. }) => {
                     (owner, Layout::JoinLeft)
                 }
@@ -809,7 +826,8 @@ pub fn root_input_layout(
                 _ => return Err(ProgramLexicalBindingError::InvalidSource),
             }
         }
-    })
+    };
+    Ok(ProgramRootInput::Layout { node, role })
 }
 
 #[cfg(test)]

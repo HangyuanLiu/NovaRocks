@@ -300,7 +300,7 @@ fn batch(program: &LocalProgram) -> &arrow_array::RecordBatch {
     let ProgramNodeKind::Values { values } = program.graph().nodes()[0].kind() else {
         panic!("Values")
     };
-    values.batch()
+    values.batch().unwrap()
 }
 fn direct(
     package: &FragmentPackage,
@@ -649,10 +649,11 @@ fn values_wide_real_rows_observe_quantum_and_preserve_all_rows() {
     let ProgramNodeKind::Values { values } = kind else {
         panic!("values")
     };
-    assert_eq!(values.batch().num_rows(), 320);
+    assert_eq!(values.batch().unwrap().num_rows(), 320);
     assert!(
         values
             .batch()
+            .unwrap()
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -760,3 +761,7 @@ fn values_empty_malformed_map_refuses_before_arrow_constructor() {
         })
     ));
 }
+
+#[cfg(test)]
+#[path = "values_cell_lowering_tests.rs"]
+mod values_cell_lowering_tests;

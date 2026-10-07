@@ -16,7 +16,9 @@
 // under the License.
 
 //! Materialize admitted constant cells into the existing static Values owner.
-//! This is not an expression evaluator or an opaque Arrow memory grant.
+//! Every other cell stays a dynamic `ValuesCell` root that the one compiled
+//! evaluator runs at runtime; nothing is evaluated or folded here. This is not
+//! an expression evaluator or an opaque Arrow memory grant.
 
 use crate::{
     assert_rows::reserve_vec, expressions::LoweredExpressions, lowering::FragmentCompileError,
@@ -31,7 +33,9 @@ use novarocks_functions::{
     ConstantError, ConstantValue, KernelFailure,
     selected_copy::{self, CopyError},
 };
-use novarocks_local_program::{ProgramNodeKind, StaticExprKind, StaticLayout, StaticValues};
+use novarocks_local_program::{
+    ProgramExprId, ProgramNodeKind, StaticExprKind, StaticLayout, StaticValues, StaticValuesCell,
+};
 use novarocks_physical_plan::{
     ExprId, ExprKind, ExpressionRootRole, FragmentPackage, PhysicalNode,
 };
@@ -43,11 +47,19 @@ use novarocks_type_contract::{
 use novarocks_types::SlotId;
 use std::{collections::BTreeSet, sync::Arc};
 
-fn constant<'a>(
+/// One admitted Values cell: a compile-time constant materialized into the
+/// backing, or a dynamic cell kept as its own runtime root.
+#[derive(Clone, Copy)]
+enum Cell<'a> {
+    Constant(&'a ConstantValue),
+    Dynamic(ProgramExprId),
+}
+
+fn cell<'a>(
     package: &FragmentPackage,
     expressions: &'a LoweredExpressions,
     id: ExprId,
-) -> Result<&'a ConstantValue, FragmentCompileError> {
+) -> Result<Cell<'a>, FragmentCompileError> {
     let source = package
         .fragment()
         .expressions()
@@ -55,19 +67,18 @@ fn constant<'a>(
         .ok_or(FragmentCompileError::Invalid(
             "missing Values cell definition",
         ))?;
-    if !matches!(source.kind, ExprKind::Literal(_) | ExprKind::Constant(_)) {
-        return Err(FragmentCompileError::Unsupported {
-            node: Some(source.owner),
-            feature: "Values cell requires compile-time constant backing",
-        });
-    }
-    let local = expressions
+    let local = *expressions
         .ids
         .get(&id)
         .ok_or(FragmentCompileError::Invalid("Values cell was not lowered"))?;
+    if !matches!(source.kind, ExprKind::Literal(_) | ExprKind::Constant(_)) {
+        // The compiled evaluator runs it once, over an empty port, with the
+        // same value, NULL and row-error effects as any other root.
+        return Ok(Cell::Dynamic(local));
+    }
     let lowered = expressions
         .arena
-        .node(*local)
+        .node(local)
         .ok_or(FragmentCompileError::Invalid(
             "missing lowered Values definition",
         ))?;
@@ -76,7 +87,17 @@ fn constant<'a>(
             "Values constant source changed",
         ));
     };
-    Ok(value)
+    Ok(Cell::Constant(value))
+}
+fn constant<'a>(
+    package: &FragmentPackage,
+    expressions: &'a LoweredExpressions,
+    id: ExprId,
+) -> Result<Option<&'a ConstantValue>, FragmentCompileError> {
+    Ok(match cell(package, expressions, id)? {
+        Cell::Constant(value) => Some(value),
+        Cell::Dynamic(_) => None,
+    })
 }
 fn copy_error(error: CopyError, node: novarocks_physical_plan::NodeId) -> FragmentCompileError {
     match error {
@@ -146,10 +167,18 @@ fn lower_core(
         }
     }
     // Validate every source before materializing any column. No dynamic call is
-    // evaluated, folded, or removed from its original required occurrence.
-    for row in rows {
+    // evaluated, folded, or removed from its original required occurrence: it
+    // stays a ValuesCell root at its exact position.
+    let mut constant_cells: Vec<usize> = Vec::new();
+    reserve_vec(&mut constant_cells, slots.len(), work)?;
+    for _ in 0..slots.len() {
+        constant_cells.push(0);
+        work.step()?;
+    }
+    let mut dynamic = Vec::new();
+    for (row_index, row) in rows.iter().enumerate() {
         for (ordinal, &id) in row.iter().enumerate() {
-            let value = constant(package, expressions, id);
+            let value = cell(package, expressions, id);
             work.step()?;
             let value = value?;
             let source = package
@@ -165,58 +194,71 @@ fn lower_core(
             if source.owner != node.id {
                 return Err(FragmentCompileError::Invalid("foreign Values cell owner"));
             }
-            if !value
-                .value_type()
-                .exactly_equals_observed::<FragmentCompileError>(&output.ty, || {
-                    work.step().map_err(Into::into)
-                })?
-            {
+            let ty = match value {
+                Cell::Constant(value) => value.value_type(),
+                Cell::Dynamic(_) => &source.ty,
+            };
+            if !ty.exactly_equals_observed::<FragmentCompileError>(&output.ty, || {
+                work.step().map_err(Into::into)
+            })? {
                 return Err(FragmentCompileError::Invalid(
                     "Values cell full type differs from output",
                 ));
             }
+            match value {
+                Cell::Constant(_) => constant_cells[ordinal] += 1,
+                Cell::Dynamic(definition) => dynamic.push(StaticValuesCell {
+                    row: u32::try_from(row_index)
+                        .map_err(|_| CompileControlError::ResourceExhausted)?,
+                    column: u32::try_from(ordinal)
+                        .map_err(|_| CompileControlError::ResourceExhausted)?,
+                    definition,
+                }),
+            }
         }
     }
-    if rows.is_empty() {
-        // Arrow's sole empty constructor selects the first Union child even
-        // for zero rows. The shared type walk also reaches nested empty Unions.
-        for output in &node.output.columns {
-            let ty = &package
-                .fragment()
-                .values()
-                .get(output)
-                .ok_or(FragmentCompileError::Invalid("missing Values output type"))?
-                .ty;
-            work.flush()?;
-            validate_value_type_structure_observed::<FragmentCompileError>(
-                &ty.data_type,
-                |visit| {
-                    if let ValueTypeVisit::TypeNode(data_type) = visit {
-                        validate_arrow_carrier_parameters_observed::<ConstantError>(
-                            data_type,
-                            || work.step().map_err(Into::into),
-                        ).map_err(|error| match error {
-                            ConstantError::Control(cause) => FragmentCompileError::Control(cause),
-                            ConstantError::Limit(_) => FragmentCompileError::Control(CompileControlError::ResourceExhausted),
-                            _ => FragmentCompileError::Unsupported {
-                                node: Some(node.id),
-                                feature: "Values empty carrier has invalid Arrow constructor parameters",
-                            },
-                        })?;
-                    }
-                    let unsupported = matches!(visit, ValueTypeVisit::TypeNode(DataType::Union(fields, _)) if fields.is_empty());
-                    work.step()?;
-                    if unsupported {
-                        return Err(FragmentCompileError::Unsupported {
-                            node: Some(node.id),
-                            feature: "Values empty Union has no Arrow constructor child",
-                        });
-                    }
-                    Ok(())
-                },
-            )?;
-            work.flush()?;
+    // A column without a constant cell keeps an empty constant backing.
+    // Arrow's sole empty constructor selects the first Union child even for
+    // zero rows. The shared type walk also reaches nested empty Unions.
+    for (output, count) in node.output.columns.iter().zip(&constant_cells) {
+        work.step()?;
+        if *count != 0 {
+            continue;
         }
+        let ty = &package
+            .fragment()
+            .values()
+            .get(output)
+            .ok_or(FragmentCompileError::Invalid("missing Values output type"))?
+            .ty;
+        work.flush()?;
+        validate_value_type_structure_observed::<FragmentCompileError>(&ty.data_type, |visit| {
+            if let ValueTypeVisit::TypeNode(data_type) = visit {
+                validate_arrow_carrier_parameters_observed::<ConstantError>(data_type, || {
+                    work.step().map_err(Into::into)
+                })
+                .map_err(|error| match error {
+                    ConstantError::Control(cause) => FragmentCompileError::Control(cause),
+                    ConstantError::Limit(_) => {
+                        FragmentCompileError::Control(CompileControlError::ResourceExhausted)
+                    }
+                    _ => FragmentCompileError::Unsupported {
+                        node: Some(node.id),
+                        feature: "Values empty carrier has invalid Arrow constructor parameters",
+                    },
+                })?;
+            }
+            let unsupported = matches!(visit, ValueTypeVisit::TypeNode(DataType::Union(fields, _)) if fields.is_empty());
+            work.step()?;
+            if unsupported {
+                return Err(FragmentCompileError::Unsupported {
+                    node: Some(node.id),
+                    feature: "Values empty Union has no Arrow constructor child",
+                });
+            }
+            Ok(())
+        })?;
+        work.flush()?;
     }
     let mut fields: Vec<Field> = Vec::new();
     let mut columns: Vec<ArrayRef> = Vec::new();
@@ -245,7 +287,7 @@ fn lower_core(
         let field = ty.try_to_field(name);
         work.flush()?;
         fields.push(field?);
-        let column = if rows.is_empty() {
+        let column = if constant_cells[ordinal] == 0 {
             // The sole Arrow empty constructor follows the admitted type. Its
             // internal type walk/allocation remains opaque, not a MEM grant.
             work.flush()?;
@@ -253,18 +295,26 @@ fn lower_core(
             work.flush()?;
             array
         } else {
+            // Only this column's constant cells, in row order; a dynamic cell
+            // has no placeholder in the backing.
+            let count = constant_cells[ordinal];
             let mut sources = Vec::new();
             let mut choices = Vec::new();
             let mut indices = Vec::new();
             let mut raw_indices = Vec::new();
-            reserve_vec(&mut sources, rows.len(), work)?;
-            reserve_vec(&mut choices, rows.len(), work)?;
-            reserve_vec(&mut indices, rows.len(), work)?;
-            reserve_vec(&mut raw_indices, rows.len(), work)?;
-            let first = constant(package, expressions, rows[0][ordinal])?;
+            reserve_vec(&mut sources, count, work)?;
+            reserve_vec(&mut choices, count, work)?;
+            reserve_vec(&mut indices, count, work)?;
+            reserve_vec(&mut raw_indices, count, work)?;
+            let mut first: Option<&ConstantValue> = None;
             let mut same_backing = true;
             for row in rows {
-                let value = constant(package, expressions, row[ordinal])?;
+                let value = constant(package, expressions, row[ordinal]);
+                work.step()?;
+                let Some(value) = value? else {
+                    continue;
+                };
+                let first = *first.get_or_insert(value);
                 same_backing &= value.pool().backing_identity() == first.pool().backing_identity();
                 sources.push(Arc::clone(value.pool().array()));
                 choices.push((sources.len() - 1, value.ordinal() as usize));
@@ -272,6 +322,9 @@ fn lower_core(
                 raw_indices.push(u64::from(value.ordinal()));
                 work.step()?;
             }
+            let first = first.ok_or(FragmentCompileError::Invalid(
+                "Values constant cell count changed",
+            ))?;
             if same_backing {
                 selected_copy::preflight_take(
                     first.pool().array().as_ref(),
@@ -324,6 +377,17 @@ fn lower_core(
         work.control(),
     )?;
     work.flush()?;
+    if !dynamic.is_empty() {
+        let values = StaticValues::try_new_with_cells_for_compile(
+            rows.len(),
+            columns,
+            dynamic,
+            layout.clone(),
+            work.control(),
+        )?;
+        work.flush()?;
+        return Ok((ProgramNodeKind::Values { values }, layout));
+    }
     let batch = RecordBatch::try_new_with_options(
         layout.schema().clone(),
         columns,
@@ -352,13 +416,15 @@ pub(crate) fn retired_values_uses(
             )?;
             let cell = constant(package, expressions, invocation.definition);
             work.step()?;
-            cell?;
-            if !invocation.arguments.is_empty() {
-                return Err(FragmentCompileError::Invalid(
-                    "constant Values root has arguments",
-                ));
+            // A dynamic cell keeps its root use and every argument use.
+            if cell?.is_some() {
+                if !invocation.arguments.is_empty() {
+                    return Err(FragmentCompileError::Invalid(
+                        "constant Values root has arguments",
+                    ));
+                }
+                retired.insert(*id);
             }
-            retired.insert(*id);
         }
         work.step()?;
     }

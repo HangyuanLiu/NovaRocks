@@ -782,7 +782,12 @@ fn build_pipeline_for_program_node(
         }
         lp::ProgramNodeKind::Values { values } => {
             let chunk_schema = ChunkSchema::from_static_layout(values.layout())?;
-            let chunk = Chunk::new_with_chunk_schema(values.batch().clone(), chunk_schema);
+            // Dynamic cells are compiled roots; only the compiled pipeline
+            // evaluates them.
+            let batch = values.batch().ok_or_else(|| {
+                format!("legacy Values node {node_id} has dynamic cells")
+            })?;
+            let chunk = Chunk::new_with_chunk_schema(batch.clone(), chunk_schema);
             let source: Box<dyn OperatorFactory> =
                 Box::new(ValuesSourceFactory::new(chunk, node_id));
             let pipeline = new_source_pipeline_with_dop(ctx, source, 1);

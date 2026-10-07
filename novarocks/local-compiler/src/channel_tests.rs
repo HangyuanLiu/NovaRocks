@@ -583,7 +583,7 @@ fn value_channels_keep_original_source_ordinals_and_each_occurrence_lexical_bind
     let ProgramNodeKind::Values { values } = graph.nodes()[0].kind() else {
         panic!("Values")
     };
-    assert_eq!(values.batch().num_rows(), 1);
+    assert_eq!(values.batch().unwrap().num_rows(), 1);
     let checked = program.checked();
     let channels = checked.channels();
     let resolved = channels.expressions().resolved_calls();

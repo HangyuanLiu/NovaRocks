@@ -101,6 +101,12 @@ pub enum ProgramNodeExpressionRole {
     SortPartition {
         key: u32,
     },
+    /// One dynamic Values cell. It reads no input layout: the evaluator runs
+    /// it once over an explicit empty port of one row.
+    ValuesCell {
+        row: u32,
+        column: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -286,8 +292,22 @@ impl RootCollector<'_> {
         use EvaluationDemand::{TruthOnly, Value};
         use ProgramNodeExpressionRole as Role;
         match kind {
-            ProgramNodeKind::Values { .. }
-            | ProgramNodeKind::AssertNumRows { .. }
+            ProgramNodeKind::Values { values } => {
+                // Constant cells are materialized backing; only dynamic cells
+                // are runtime roots, in row-major order.
+                for cell in values.dynamic_cells() {
+                    self.node_root(
+                        node,
+                        Role::ValuesCell {
+                            row: cell.row,
+                            column: cell.column,
+                        },
+                        cell.definition,
+                        Value,
+                    )?;
+                }
+            }
+            ProgramNodeKind::AssertNumRows { .. }
             | ProgramNodeKind::Repeat { .. }
             | ProgramNodeKind::UnionAll { .. }
             | ProgramNodeKind::Limit { .. }
@@ -902,3 +922,6 @@ mod control_tests;
 
 #[cfg(test)]
 mod nary_tests;
+
+#[cfg(test)]
+mod values_cell_tests;

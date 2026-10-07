@@ -286,6 +286,7 @@ fn single_topn_public_compile_preserves_ordered_keys_root_occurrences_and_exact_
     };
     let column = values
         .batch()
+        .unwrap()
         .column(0)
         .as_any()
         .downcast_ref::<Int64Array>()

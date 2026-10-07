@@ -1131,8 +1131,9 @@ fn lower(
         Some(sink),
         work.control(),
     )?;
-    // StaticValues has no runtime expression roots. Retire only the actual
-    // constant-cell source occurrences whose materialization succeeded above.
+    // A materialized constant Values cell is backing, not a runtime root.
+    // Retire only those constant-cell source occurrences; every dynamic cell
+    // keeps its root and argument uses as a ValuesCell root.
     let retired = retired_values_uses(package, &expressions, work)?;
     let mut domains = Vec::new();
     for domain in package.expression_uses().flow().domains().values() {
@@ -1203,6 +1204,9 @@ fn lower(
             ExpressionRootRole::TopNOrder { key } => ProgramNodeExpressionRole::SortOrder { key },
             ExpressionRootRole::ProjectOutput { expression } => {
                 ProgramNodeExpressionRole::ProjectOutput { expression }
+            }
+            ExpressionRootRole::ValuesCell { row, column } => {
+                ProgramNodeExpressionRole::ValuesCell { row, column }
             }
             _ => {
                 return Err(FragmentCompileError::Unsupported {

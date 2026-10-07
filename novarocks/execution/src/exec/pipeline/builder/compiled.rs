@@ -23,10 +23,11 @@
 //! Reuse boundary: families that evaluate expressions (Project, Filter, Sort
 //! and every row-count TopN phase, Unpivot, ChangeEventExpand) run compiled
 //! processors that own one instance per root and driver. Legacy operators are
-//! reused only where they evaluate nothing: the Values source, Limit, the
-//! local gather exchange, the row-count assertion and the UnionAll fan-in
-//! queue. Repeat is a compiled processor too, because the legacy one
-//! re-derives its output schema.
+//! reused only where they evaluate nothing: the all-constant Values source,
+//! Limit, the local gather exchange, the row-count assertion and the UnionAll
+//! fan-in queue. A Values with dynamic cells evaluates each cell root once
+//! through the compiled Values source. Repeat is a compiled processor too,
+//! because the legacy one re-derives its output schema.
 
 use std::collections::BTreeSet;
 
@@ -180,10 +181,20 @@ fn build_node(
     let node_id = display_id(id)?;
     match node.kind() {
         ProgramNodeKind::Values { values } => {
-            let chunk_schema = ChunkSchema::from_compiled_layout(values.layout())?;
-            let chunk = Chunk::new_with_chunk_schema(values.batch().clone(), chunk_schema);
-            let source: Box<dyn OperatorFactory> =
-                Box::new(ValuesSourceFactory::new(chunk, node_id));
+            let source: Box<dyn OperatorFactory> = match values.batch() {
+                Some(batch) => {
+                    let chunk_schema = ChunkSchema::from_compiled_layout(values.layout())?;
+                    let chunk = Chunk::new_with_chunk_schema(batch.clone(), chunk_schema);
+                    Box::new(ValuesSourceFactory::new(chunk, node_id))
+                }
+                // Dynamic cells are evaluated once, at the source's opening
+                // turn, by the one compiled evaluator.
+                None => Box::new(values_source::CompiledValuesSourceFactory::try_new(
+                    Arc::clone(program),
+                    id,
+                    Arc::clone(error),
+                )?),
+            };
             let pipeline = new_source_pipeline_with_dop(ctx, source, 1);
             Ok(PipelineBuildResult {
                 pipeline,
@@ -456,6 +467,9 @@ fn assertion_mode(mode: &AssertRowsMode) -> AssertNumRowsMode {
     }
 }
 
+#[path = "compiled_values.rs"]
+mod values_source;
+
 #[cfg(test)]
 #[path = "compiled_tests.rs"]
 mod tests;
@@ -487,3 +501,7 @@ mod expand_tests;
 #[cfg(test)]
 #[path = "compiled_topn_split_tests.rs"]
 mod topn_split_tests;
+
+#[cfg(test)]
+#[path = "compiled_values_tests.rs"]
+mod values_tests;

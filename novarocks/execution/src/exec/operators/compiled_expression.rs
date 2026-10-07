@@ -35,7 +35,7 @@ use arrow::record_batch::RecordBatch;
 use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection};
 use novarocks_local_program::{
     LocalProgram, ProgramChannelLayoutRole, ProgramExpressionRootSite, ProgramNodeExpressionRole,
-    ProgramNodeId, ProgramNodeKind, root_input_layout,
+    ProgramNodeId, ProgramNodeKind, ProgramRootInput, root_input_layout,
 };
 
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
@@ -320,7 +320,10 @@ impl CompiledFilterProcessorFactory {
             }
         };
         match root_input_layout(program.graph(), site) {
-            Ok((_, ProgramChannelLayoutRole::NodeOutput)) => {}
+            Ok(ProgramRootInput::Layout {
+                role: ProgramChannelLayoutRole::NodeOutput,
+                ..
+            }) => {}
             _ => {
                 return Err(format!(
                     "compiled filter root {role:?} at local node {} has no single node-output input port",

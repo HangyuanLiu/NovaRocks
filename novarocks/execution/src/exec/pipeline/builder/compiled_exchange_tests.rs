@@ -824,7 +824,7 @@ fn producer_chunk(program: &LocalProgram) -> Chunk {
         panic!("the producer root is its Values node");
     };
     Chunk::new_with_chunk_schema(
-        values.batch().clone(),
+        values.batch().expect("constant producer Values").clone(),
         ChunkSchema::from_compiled_layout(values.layout()).expect("compiled layout"),
     )
 }

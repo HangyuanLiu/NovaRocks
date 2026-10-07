@@ -404,8 +404,8 @@ fn scalar_result_lowering_preserves_one_empty_row_sparse_sources_and_full_owner(
     let ProgramNodeKind::Values { values } = graph.nodes()[0].kind() else {
         panic!("actual Values")
     };
-    assert_eq!(values.batch().num_rows(), 1);
-    assert_eq!(values.batch().num_columns(), 0);
+    assert_eq!(values.batch().unwrap().num_rows(), 1);
+    assert_eq!(values.batch().unwrap().num_columns(), 0);
     assert!(matches!(graph.sink(), Some(StaticSinkProgram::Result)));
     assert_eq!(graph.profile().pipeline_dop().get(), 1);
     assert_eq!(graph.profile().root_sink_dop().unwrap().get(), 1);
@@ -695,8 +695,8 @@ fn duplicate_produced_value_refuses_and_multiple_empty_source_rows_preserve_card
     let ProgramNodeKind::Values { values } = program.graph().nodes()[0].kind() else {
         panic!("actual Values source");
     };
-    assert_eq!(values.batch().num_rows(), 2);
-    assert_eq!(values.batch().num_columns(), 0);
+    assert_eq!(values.batch().unwrap().num_rows(), 2);
+    assert_eq!(values.batch().unwrap().num_columns(), 0);
     assert_eq!(
         program
             .checked()

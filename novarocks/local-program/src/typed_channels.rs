@@ -356,6 +356,18 @@ impl ProgramTypedChannels {
             work.step()?;
             let node_id = ProgramNodeId::new(index);
             match node.kind() {
+                ProgramNodeKind::Values { values } => {
+                    // A dynamic cell is assembled into its column unchanged,
+                    // so its definition has exactly the column's full type.
+                    for cell in values.dynamic_cells() {
+                        same_value(
+                            self.output(node_id, cell.column as usize)?,
+                            self.definition(ProgramExpressionArena::Main, cell.definition)?,
+                            false,
+                            work,
+                        )?;
+                    }
+                }
                 ProgramNodeKind::Aggregate {
                     group_by,
                     functions,
