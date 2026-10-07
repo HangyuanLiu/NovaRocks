@@ -11,6 +11,10 @@ pub use error::{FieldPath, FieldPathSegment, ProtocolError, ProtocolErrorKind};
 /// Exact, lossless Arrow physical schema carrier used by internal relations.
 pub mod arrow_physical;
 
+/// Bounded validation of flat, preorder-encoded type trees shared by the
+/// native type carriers.
+pub mod flat_type_tree;
+
 /// Validated catalog identity, materialization, and reachability carriers.
 pub mod catalog;
 

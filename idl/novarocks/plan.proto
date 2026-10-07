@@ -178,19 +178,60 @@ message WriterGroupedUnpivotMapping {
 // A slot-bound Arrow field used by internal execution relations. Unlike the
 // SQL TypeDesc carrier, this descriptor preserves the exact Arrow physical
 // representation and every field-level contract bit.
+//
+// The field tree is carried flat. `nodes[0]` is the column's root field and the
+// remaining nodes follow in canonical preorder: each subtree is contiguous and
+// children appear in declared order, so every child index is greater than its
+// parent's. Protobuf nesting is therefore constant whatever the Arrow nesting
+// depth, and the decoder validates the whole tree against bounded limits
+// before it constructs any Arrow value. A column whose `is_internal` is false
+// is a visible relation column and is bounded by the logical type budget; an
+// internal column keeps the auxiliary relation's physical depth budget.
 message ArrowPhysicalColumn {
   uint32 slot_id = 1;
-  ArrowPhysicalField field = 2;
+  reserved 2;
+  reserved "field";
   bool is_internal = 3;
+  repeated ArrowPhysicalNode nodes = 4;
 }
 
-message ArrowPhysicalField {
+// One node of a flat Arrow field tree. A field node carries `field`; the key
+// and value types of a dictionary are bare type nodes without field facts.
+// Child references are indices into the owning column's `nodes`.
+message ArrowPhysicalNode {
+  ArrowPhysicalFieldFacts field = 1;
+  oneof kind {
+    ArrowPrimitiveType primitive = 2;
+    ArrowTimestampType timestamp = 3;
+    ArrowTimeType time32 = 4;
+    ArrowTimeType time64 = 5;
+    ArrowTimeType duration = 6;
+    ArrowIntervalUnit interval = 7;
+    int32 fixed_size_binary = 8;
+    ArrowDecimalType decimal32 = 9;
+    ArrowDecimalType decimal64 = 10;
+    ArrowDecimalType decimal128 = 11;
+    ArrowDecimalType decimal256 = 12;
+    // Index of the item field node.
+    uint32 list = 13;
+    uint32 list_view = 14;
+    ArrowFixedSizeListNode fixed_size_list = 15;
+    uint32 large_list = 16;
+    uint32 large_list_view = 17;
+    ArrowStructNode struct_type = 18;
+    ArrowUnionNode union_type = 19;
+    ArrowDictionaryNode dictionary = 20;
+    ArrowMapNode map = 21;
+    ArrowRunEndEncodedNode run_end_encoded = 22;
+  }
+}
+
+message ArrowPhysicalFieldFacts {
   string name = 1;
   bool nullable = 2;
-  ArrowPhysicalType type = 3;
-  repeated ArrowFieldMetadataEntry metadata = 4;
-  optional int64 dictionary_id = 5;
-  optional bool dictionary_is_ordered = 6;
+  repeated ArrowFieldMetadataEntry metadata = 3;
+  optional int64 dictionary_id = 4;
+  optional bool dictionary_is_ordered = 5;
 }
 
 // Metadata is encoded as a sorted repeated entry rather than a protobuf map so
@@ -198,32 +239,6 @@ message ArrowPhysicalField {
 message ArrowFieldMetadataEntry {
   string key = 1;
   string value = 2;
-}
-
-message ArrowPhysicalType {
-  oneof kind {
-    ArrowPrimitiveType primitive = 1;
-    ArrowTimestampType timestamp = 2;
-    ArrowTimeType time32 = 3;
-    ArrowTimeType time64 = 4;
-    ArrowTimeType duration = 5;
-    ArrowIntervalUnit interval = 6;
-    int32 fixed_size_binary = 7;
-    ArrowDecimalType decimal32 = 8;
-    ArrowDecimalType decimal64 = 9;
-    ArrowDecimalType decimal128 = 10;
-    ArrowDecimalType decimal256 = 11;
-    ArrowPhysicalField list = 12;
-    ArrowPhysicalField list_view = 13;
-    ArrowFixedSizeListType fixed_size_list = 14;
-    ArrowPhysicalField large_list = 15;
-    ArrowPhysicalField large_list_view = 16;
-    ArrowStructType struct_type = 17;
-    ArrowUnionType union_type = 18;
-    ArrowDictionaryType dictionary = 19;
-    ArrowMapType map = 20;
-    ArrowRunEndEncodedType run_end_encoded = 21;
-  }
 }
 
 enum ArrowPrimitiveType {
@@ -286,38 +301,39 @@ message ArrowDecimalType {
   int32 scale = 2;
 }
 
-message ArrowFixedSizeListType {
-  ArrowPhysicalField item = 1;
+message ArrowFixedSizeListNode {
+  uint32 item = 1;
   int32 length = 2;
 }
 
-message ArrowStructType {
-  repeated ArrowPhysicalField fields = 1;
+message ArrowStructNode {
+  repeated uint32 fields = 1;
 }
 
-message ArrowUnionField {
+message ArrowUnionChild {
   int32 type_id = 1;
-  ArrowPhysicalField field = 2;
+  uint32 field = 2;
 }
 
-message ArrowUnionType {
+message ArrowUnionNode {
   ArrowUnionMode mode = 1;
-  repeated ArrowUnionField fields = 2;
+  repeated ArrowUnionChild fields = 2;
 }
 
-message ArrowDictionaryType {
-  ArrowPhysicalType key = 1;
-  ArrowPhysicalType value = 2;
+// Both children are bare type nodes.
+message ArrowDictionaryNode {
+  uint32 key = 1;
+  uint32 value = 2;
 }
 
-message ArrowMapType {
-  ArrowPhysicalField entries = 1;
+message ArrowMapNode {
+  uint32 entries = 1;
   bool ordered = 2;
 }
 
-message ArrowRunEndEncodedType {
-  ArrowPhysicalField run_ends = 1;
-  ArrowPhysicalField values = 2;
+message ArrowRunEndEncodedNode {
+  uint32 run_ends = 1;
+  uint32 values = 2;
 }
 
 // The single per-query write finish node.

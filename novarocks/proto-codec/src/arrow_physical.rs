@@ -21,6 +21,23 @@
 //! semantic and normalize several Arrow representations; this carrier freezes
 //! names, nullability, metadata, nesting, offset widths, map ordering, and the
 //! exact physical type selected by the planner.
+//!
+//! The field tree of every column is carried flat (see `ArrowPhysicalColumn`
+//! in `plan.proto`): one node array in canonical preorder, validated by
+//! [`crate::flat_type_tree`] before any Arrow value is built. Protobuf nesting
+//! is constant whatever the Arrow nesting depth.
+//!
+//! A column is validated in one of two roles, chosen by its frozen
+//! `is_internal` bit:
+//!
+//! - an internal column belongs to an auxiliary execution relation and keeps
+//!   the relation's physical depth budget, every nesting step counting one
+//!   level;
+//! - a visible column carries a user-visible value and is bounded by the
+//!   logical type budget (depth, nodes and text of `LogicalTypeLimits`),
+//!   where physical wrappers -- a map's entries struct, a dictionary's key and
+//!   value types and a run-end encoding's children -- are not levels of their
+//!   own.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -35,12 +52,23 @@ use novarocks_spi::connector::write_stack::{
     MAX_WRITE_RELATION_METADATA_VALUE_BYTES, MAX_WRITE_RELATION_TYPE_DEPTH,
     MAX_WRITER_AUXILIARY_CHANNELS, WRITE_RELATION_COLUMN_COUNT,
 };
+use novarocks_type_contract::LogicalTypeLimits;
 
+use crate::flat_type_tree::{FlatEdge, FlatTreeLimits, FlatTreeViolation, validate_preorder};
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
 
 const FIELD_CHARGE: usize = 128;
 const TYPE_CHARGE: usize = 64;
 const MAX_COLUMNS: usize = WRITE_RELATION_COLUMN_COUNT + MAX_WRITER_AUXILIARY_CHANNELS;
+
+/// Every node is charged at least `TYPE_CHARGE` against the decoded schema
+/// budget, so no internal column can hold more nodes than this.
+const MAX_INTERNAL_COLUMN_NODES: usize = MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES / TYPE_CHARGE;
+
+/// The encoder refuses a type nested deeper than this before it recurses any
+/// further. It only bounds the encoder's own stack; the admitted depth of each
+/// role is enforced by the self-validating decode that follows.
+const MAX_ENCODE_NESTING: usize = 4 * MAX_WRITE_RELATION_TYPE_DEPTH + 2 * 64;
 
 #[derive(Clone, Debug)]
 pub struct DecodedArrowPhysicalSchema {
@@ -60,6 +88,50 @@ impl DecodedArrowPhysicalSchema {
 
     pub fn internal(&self) -> &[bool] {
         &self.internal
+    }
+}
+
+/// The budget one column's field tree is validated against.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ColumnRole {
+    Internal,
+    Visible,
+}
+
+impl ColumnRole {
+    fn of(is_internal: bool) -> Self {
+        if is_internal {
+            Self::Internal
+        } else {
+            Self::Visible
+        }
+    }
+
+    fn tree_limits(self) -> FlatTreeLimits {
+        match self {
+            Self::Internal => FlatTreeLimits {
+                max_depth: MAX_WRITE_RELATION_TYPE_DEPTH,
+                max_nodes: MAX_INTERNAL_COLUMN_NODES,
+            },
+            // A logical node is at most one physical node plus one wrapper,
+            // so twice the logical budget bounds the physical array before
+            // the exact logical count is taken.
+            Self::Visible => {
+                let limits = LogicalTypeLimits::default();
+                FlatTreeLimits {
+                    max_depth: limits.max_depth,
+                    max_nodes: limits.max_nodes.saturating_mul(2),
+                }
+            }
+        }
+    }
+
+    /// Levels one edge adds. Wrappers are not logical levels.
+    fn edge_depth(self, wrapper: bool) -> u8 {
+        match self {
+            Self::Internal => 1,
+            Self::Visible => u8::from(!wrapper),
+        }
     }
 }
 
@@ -114,37 +186,21 @@ pub fn encode_schema_with_internal(
             "Arrow schema exceeds the internal relation column limit",
         ));
     }
-    let mut budget = DecodeBudget::default();
-    budget.charge(
-        schema.fields().len().saturating_mul(FIELD_CHARGE),
-        path.clone().field("columns"),
-    )?;
-    preflight_metadata(
-        schema.metadata(),
-        path.clone().field("schema_metadata"),
-        &mut budget,
-    )?;
-    for (index, field) in schema.fields().iter().enumerate() {
-        preflight_field(
-            field,
-            path.clone().field("columns").index(index).field("field"),
-            1,
-            &mut budget,
-        )?;
-    }
     let columns = schema
         .fields()
         .iter()
         .zip(slot_ids.iter().copied())
         .zip(internal.iter().copied())
-        .map(
-            |((field, slot_id), is_internal)| plan::ArrowPhysicalColumn {
+        .enumerate()
+        .map(|(index, ((field, slot_id), is_internal))| {
+            encode_column(
+                field.as_ref(),
                 slot_id,
-                field: Some(encode_field(field.as_ref())),
                 is_internal,
-            },
-        )
-        .collect::<Vec<_>>();
+                path.clone().field("columns").index(index),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let schema_metadata = encode_metadata(schema.metadata());
     let decoded = decode_schema(&columns, &schema_metadata, path.clone())?;
     let round_trip_columns = decoded
@@ -153,14 +209,16 @@ pub fn encode_schema_with_internal(
         .iter()
         .zip(decoded.slot_ids().iter().copied())
         .zip(decoded.internal().iter().copied())
-        .map(
-            |((field, slot_id), is_internal)| plan::ArrowPhysicalColumn {
+        .enumerate()
+        .map(|(index, ((field, slot_id), is_internal))| {
+            encode_column(
+                field.as_ref(),
                 slot_id,
-                field: Some(encode_field(field.as_ref())),
                 is_internal,
-            },
-        )
-        .collect::<Vec<_>>();
+                path.clone().field("columns").index(index),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let round_trip_metadata = encode_metadata(decoded.schema().metadata());
     if decoded.schema().as_ref() != schema
         || decoded.slot_ids() != slot_ids
@@ -177,8 +235,9 @@ pub fn encode_schema_with_internal(
     Ok((columns, schema_metadata))
 }
 
-/// Decode an untrusted physical schema with semantic allocation limits applied
-/// before constructing Arrow fields.
+/// Decode an untrusted physical schema. Each column's flat tree is validated
+/// against its role's limits, and the decoded allocation budget is charged,
+/// before any Arrow field is constructed.
 pub fn decode_schema(
     columns: &[plan::ArrowPhysicalColumn],
     schema_metadata: &[plan::ArrowFieldMetadataEntry],
@@ -206,19 +265,7 @@ pub fn decode_schema(
     let mut internal = Vec::with_capacity(columns.len());
     for (index, column) in columns.iter().enumerate() {
         let column_path = path.clone().field("columns").index(index);
-        let field = column.field.as_ref().ok_or_else(|| {
-            error(
-                column_path.clone().field("field"),
-                ProtocolErrorKind::MissingField,
-                "Arrow physical column field is required",
-            )
-        })?;
-        fields.push(Arc::new(decode_field(
-            field,
-            column_path.clone().field("field"),
-            1,
-            &mut budget,
-        )?));
+        fields.push(Arc::new(decode_column(column, column_path, &mut budget)?));
         slot_ids.push(column.slot_id);
         internal.push(column.is_internal);
     }
@@ -229,189 +276,102 @@ pub fn decode_schema(
     })
 }
 
-fn encode_field(field: &Field) -> plan::ArrowPhysicalField {
-    #[allow(deprecated)]
-    let dictionary_id = field.dict_id();
-    plan::ArrowPhysicalField {
-        name: field.name().clone(),
-        nullable: field.is_nullable(),
-        r#type: Some(Box::new(encode_type(field.data_type()))),
-        metadata: encode_metadata(field.metadata()),
-        dictionary_id,
-        dictionary_is_ordered: field.dict_is_ordered(),
-    }
-}
-
-fn encode_metadata(metadata: &HashMap<String, String>) -> Vec<plan::ArrowFieldMetadataEntry> {
-    let mut entries = metadata
-        .iter()
-        .map(|(key, value)| plan::ArrowFieldMetadataEntry {
-            key: key.clone(),
-            value: value.clone(),
-        })
-        .collect::<Vec<_>>();
-    entries.sort_unstable_by(|left, right| left.key.cmp(&right.key));
-    entries
-}
-
-fn preflight_field(
+fn encode_column(
     field: &Field,
+    slot_id: u32,
+    is_internal: bool,
     path: FieldPath,
-    depth: usize,
-    budget: &mut DecodeBudget,
-) -> Result<(), ProtocolError> {
-    check_depth(depth, path.clone())?;
+) -> Result<plan::ArrowPhysicalColumn, ProtocolError> {
+    let mut nodes = Vec::new();
+    encode_field_node(field, &mut nodes, 1, path.field("nodes"))?;
+    Ok(plan::ArrowPhysicalColumn {
+        slot_id,
+        is_internal,
+        nodes,
+    })
+}
+
+/// Append `field` and its subtree in canonical preorder; returns its index.
+fn encode_field_node(
+    field: &Field,
+    nodes: &mut Vec<plan::ArrowPhysicalNode>,
+    nesting: usize,
+    path: FieldPath,
+) -> Result<u32, ProtocolError> {
+    let index = push_placeholder(nodes, nesting, path.clone())?;
     check_string(
         field.name(),
         MAX_WRITE_RELATION_FIELD_NAME_BYTES,
-        path.clone().field("name"),
+        path.clone()
+            .index(index as usize)
+            .field("field")
+            .field("name"),
         "Arrow field name",
     )?;
-    budget.charge(FIELD_CHARGE + field.name().len(), path.clone())?;
-    preflight_metadata(field.metadata(), path.clone().field("metadata"), budget)?;
-    preflight_type(field.data_type(), path.field("type"), depth, budget)
+    let kind = encode_kind(field.data_type(), nodes, nesting, path)?;
+    #[allow(deprecated)]
+    let dictionary_id = field.dict_id();
+    nodes[index as usize] = plan::ArrowPhysicalNode {
+        field: Some(plan::ArrowPhysicalFieldFacts {
+            name: field.name().clone(),
+            nullable: field.is_nullable(),
+            metadata: encode_metadata(field.metadata()),
+            dictionary_id,
+            dictionary_is_ordered: field.dict_is_ordered(),
+        }),
+        kind: Some(kind),
+    };
+    Ok(index)
 }
 
-fn preflight_type(
+/// Append a bare type node (a dictionary key or value) and its subtree.
+fn encode_type_node(
     data_type: &DataType,
+    nodes: &mut Vec<plan::ArrowPhysicalNode>,
+    nesting: usize,
     path: FieldPath,
-    depth: usize,
-    budget: &mut DecodeBudget,
-) -> Result<(), ProtocolError> {
-    check_depth(depth, path.clone())?;
-    budget.charge(TYPE_CHARGE, path.clone())?;
-    match data_type {
-        DataType::Timestamp(_, Some(timezone)) => {
-            check_string(
-                timezone,
-                MAX_WRITE_RELATION_FIELD_NAME_BYTES,
-                path.clone().field("timestamp").field("timezone"),
-                "Arrow timestamp timezone",
-            )?;
-            budget.charge(timezone.len(), path)?;
-        }
-        DataType::List(field) => preflight_field(field, path.field("list"), depth + 1, budget)?,
-        DataType::ListView(field) => {
-            preflight_field(field, path.field("list_view"), depth + 1, budget)?
-        }
-        DataType::FixedSizeList(field, _) => {
-            preflight_field(field, path.field("fixed_size_list"), depth + 1, budget)?
-        }
-        DataType::LargeList(field) => {
-            preflight_field(field, path.field("large_list"), depth + 1, budget)?
-        }
-        DataType::LargeListView(field) => {
-            preflight_field(field, path.field("large_list_view"), depth + 1, budget)?
-        }
-        DataType::Struct(fields) => {
-            check_repeated_len(
-                fields.len(),
-                path.clone().field("struct_type").field("fields"),
-            )?;
-            for (index, field) in fields.iter().enumerate() {
-                preflight_field(
-                    field,
-                    path.clone()
-                        .field("struct_type")
-                        .field("fields")
-                        .index(index),
-                    depth + 1,
-                    budget,
-                )?;
-            }
-        }
-        DataType::Union(fields, _) => {
-            check_repeated_len(
-                fields.len(),
-                path.clone().field("union_type").field("fields"),
-            )?;
-            for (index, (_, field)) in fields.iter().enumerate() {
-                preflight_field(
-                    field,
-                    path.clone()
-                        .field("union_type")
-                        .field("fields")
-                        .index(index),
-                    depth + 1,
-                    budget,
-                )?;
-            }
-        }
-        DataType::Dictionary(key, value) => {
-            preflight_type(
-                key,
-                path.clone().field("dictionary").field("key"),
-                depth + 1,
-                budget,
-            )?;
-            preflight_type(
-                value,
-                path.field("dictionary").field("value"),
-                depth + 1,
-                budget,
-            )?;
-        }
-        DataType::Map(entries, _) => preflight_field(
-            entries,
-            path.field("map").field("entries"),
-            depth + 1,
-            budget,
-        )?,
-        DataType::RunEndEncoded(run_ends, values) => {
-            preflight_field(
-                run_ends,
-                path.clone().field("run_end_encoded").field("run_ends"),
-                depth + 1,
-                budget,
-            )?;
-            preflight_field(
-                values,
-                path.field("run_end_encoded").field("values"),
-                depth + 1,
-                budget,
-            )?;
-        }
-        _ => {}
-    }
-    Ok(())
+) -> Result<u32, ProtocolError> {
+    let index = push_placeholder(nodes, nesting, path.clone())?;
+    let kind = encode_kind(data_type, nodes, nesting, path)?;
+    nodes[index as usize] = plan::ArrowPhysicalNode {
+        field: None,
+        kind: Some(kind),
+    };
+    Ok(index)
 }
 
-fn preflight_metadata(
-    metadata: &HashMap<String, String>,
+fn push_placeholder(
+    nodes: &mut Vec<plan::ArrowPhysicalNode>,
+    nesting: usize,
     path: FieldPath,
-    budget: &mut DecodeBudget,
-) -> Result<(), ProtocolError> {
-    if metadata.len() > MAX_WRITE_RELATION_METADATA_ENTRIES_PER_FIELD {
+) -> Result<u32, ProtocolError> {
+    if nesting > MAX_ENCODE_NESTING {
         return Err(error(
             path,
             ProtocolErrorKind::Capacity,
-            "Arrow metadata exceeds the entry limit",
+            "Arrow type exceeds the nesting depth limit",
         ));
     }
-    for (key, value) in metadata {
-        check_string(
-            key,
-            MAX_WRITE_RELATION_METADATA_KEY_BYTES,
-            path.clone().field("key"),
-            "Arrow metadata key",
-        )?;
-        check_string(
-            value,
-            MAX_WRITE_RELATION_METADATA_VALUE_BYTES,
-            path.clone().field("value"),
-            "Arrow metadata value",
-        )?;
-        budget.charge(
-            key.len() + value.len() + 2 * size_of::<String>(),
-            path.clone(),
-        )?;
-    }
-    Ok(())
+    let index = u32::try_from(nodes.len()).map_err(|_| {
+        error(
+            path,
+            ProtocolErrorKind::Capacity,
+            "Arrow field tree exceeds the node index range",
+        )
+    })?;
+    nodes.push(plan::ArrowPhysicalNode::default());
+    Ok(index)
 }
 
-fn encode_type(data_type: &DataType) -> plan::ArrowPhysicalType {
-    use plan::arrow_physical_type::Kind;
-    let kind = match data_type {
+fn encode_kind(
+    data_type: &DataType,
+    nodes: &mut Vec<plan::ArrowPhysicalNode>,
+    nesting: usize,
+    path: FieldPath,
+) -> Result<plan::arrow_physical_node::Kind, ProtocolError> {
+    use plan::arrow_physical_node::Kind;
+    let child = nesting + 1;
+    Ok(match data_type {
         DataType::Null => primitive(plan::ArrowPrimitiveType::Null),
         DataType::Boolean => primitive(plan::ArrowPrimitiveType::Boolean),
         DataType::Int8 => primitive(plan::ArrowPrimitiveType::Int8),
@@ -433,10 +393,20 @@ fn encode_type(data_type: &DataType) -> plan::ArrowPhysicalType {
         DataType::Utf8 => primitive(plan::ArrowPrimitiveType::Utf8),
         DataType::Utf8View => primitive(plan::ArrowPrimitiveType::Utf8View),
         DataType::LargeUtf8 => primitive(plan::ArrowPrimitiveType::LargeUtf8),
-        DataType::Timestamp(unit, timezone) => Kind::Timestamp(plan::ArrowTimestampType {
-            unit: encode_time_unit(*unit) as i32,
-            timezone: timezone.as_ref().map(|value| value.to_string()),
-        }),
+        DataType::Timestamp(unit, timezone) => {
+            if let Some(timezone) = timezone {
+                check_string(
+                    timezone,
+                    MAX_WRITE_RELATION_FIELD_NAME_BYTES,
+                    path.clone().field("timestamp").field("timezone"),
+                    "Arrow timestamp timezone",
+                )?;
+            }
+            Kind::Timestamp(plan::ArrowTimestampType {
+                unit: encode_time_unit(*unit) as i32,
+                timezone: timezone.as_ref().map(|value| value.to_string()),
+            })
+        }
         DataType::Time32(unit) => Kind::Time32(plan::ArrowTimeType {
             unit: encode_time_unit(*unit) as i32,
         }),
@@ -452,52 +422,76 @@ fn encode_type(data_type: &DataType) -> plan::ArrowPhysicalType {
         DataType::Decimal64(precision, scale) => Kind::Decimal64(decimal(*precision, *scale)),
         DataType::Decimal128(precision, scale) => Kind::Decimal128(decimal(*precision, *scale)),
         DataType::Decimal256(precision, scale) => Kind::Decimal256(decimal(*precision, *scale)),
-        DataType::List(field) => Kind::List(Box::new(encode_field(field))),
-        DataType::ListView(field) => Kind::ListView(Box::new(encode_field(field))),
+        DataType::List(field) => Kind::List(encode_field_node(field, nodes, child, path)?),
+        DataType::ListView(field) => Kind::ListView(encode_field_node(field, nodes, child, path)?),
         DataType::FixedSizeList(field, length) => {
-            Kind::FixedSizeList(Box::new(plan::ArrowFixedSizeListType {
-                item: Some(Box::new(encode_field(field))),
+            Kind::FixedSizeList(plan::ArrowFixedSizeListNode {
+                item: encode_field_node(field, nodes, child, path)?,
                 length: *length,
-            }))
+            })
         }
-        DataType::LargeList(field) => Kind::LargeList(Box::new(encode_field(field))),
-        DataType::LargeListView(field) => Kind::LargeListView(Box::new(encode_field(field))),
-        DataType::Struct(fields) => Kind::StructType(plan::ArrowStructType {
-            fields: fields.iter().map(|field| encode_field(field)).collect(),
-        }),
-        DataType::Union(fields, mode) => Kind::UnionType(plan::ArrowUnionType {
-            mode: match mode {
-                UnionMode::Sparse => plan::ArrowUnionMode::Sparse as i32,
-                UnionMode::Dense => plan::ArrowUnionMode::Dense as i32,
-            },
-            fields: fields
-                .iter()
-                .map(|(type_id, field)| plan::ArrowUnionField {
+        DataType::LargeList(field) => {
+            Kind::LargeList(encode_field_node(field, nodes, child, path)?)
+        }
+        DataType::LargeListView(field) => {
+            Kind::LargeListView(encode_field_node(field, nodes, child, path)?)
+        }
+        DataType::Struct(fields) => {
+            check_repeated_len(fields.len(), path.clone().field("struct_type"))?;
+            let mut children = Vec::with_capacity(fields.len());
+            for field in fields {
+                children.push(encode_field_node(field, nodes, child, path.clone())?);
+            }
+            Kind::StructType(plan::ArrowStructNode { fields: children })
+        }
+        DataType::Union(fields, mode) => {
+            check_repeated_len(fields.len(), path.clone().field("union_type"))?;
+            let mut children = Vec::with_capacity(fields.len());
+            for (type_id, field) in fields.iter() {
+                children.push(plan::ArrowUnionChild {
                     type_id: i32::from(type_id),
-                    field: Some(encode_field(field)),
-                })
-                .collect(),
-        }),
-        DataType::Dictionary(key, value) => Kind::Dictionary(Box::new(plan::ArrowDictionaryType {
-            key: Some(Box::new(encode_type(key))),
-            value: Some(Box::new(encode_type(value))),
-        })),
-        DataType::Map(entries, ordered) => Kind::Map(Box::new(plan::ArrowMapType {
-            entries: Some(Box::new(encode_field(entries))),
-            ordered: *ordered,
-        })),
-        DataType::RunEndEncoded(run_ends, values) => {
-            Kind::RunEndEncoded(Box::new(plan::ArrowRunEndEncodedType {
-                run_ends: Some(Box::new(encode_field(run_ends))),
-                values: Some(Box::new(encode_field(values))),
-            }))
+                    field: encode_field_node(field, nodes, child, path.clone())?,
+                });
+            }
+            Kind::UnionType(plan::ArrowUnionNode {
+                mode: match mode {
+                    UnionMode::Sparse => plan::ArrowUnionMode::Sparse as i32,
+                    UnionMode::Dense => plan::ArrowUnionMode::Dense as i32,
+                },
+                fields: children,
+            })
         }
-    };
-    plan::ArrowPhysicalType { kind: Some(kind) }
+        DataType::Dictionary(key, value) => {
+            let key = encode_type_node(key, nodes, child, path.clone())?;
+            let value = encode_type_node(value, nodes, child, path)?;
+            Kind::Dictionary(plan::ArrowDictionaryNode { key, value })
+        }
+        DataType::Map(entries, ordered) => Kind::Map(plan::ArrowMapNode {
+            entries: encode_field_node(entries, nodes, child, path)?,
+            ordered: *ordered,
+        }),
+        DataType::RunEndEncoded(run_ends, values) => {
+            let run_ends = encode_field_node(run_ends, nodes, child, path.clone())?;
+            let values = encode_field_node(values, nodes, child, path)?;
+            Kind::RunEndEncoded(plan::ArrowRunEndEncodedNode { run_ends, values })
+        }
+    })
 }
 
-fn primitive(value: plan::ArrowPrimitiveType) -> plan::arrow_physical_type::Kind {
-    plan::arrow_physical_type::Kind::Primitive(value as i32)
+fn encode_metadata(metadata: &HashMap<String, String>) -> Vec<plan::ArrowFieldMetadataEntry> {
+    let mut entries = metadata
+        .iter()
+        .map(|(key, value)| plan::ArrowFieldMetadataEntry {
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .collect::<Vec<_>>();
+    entries.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+    entries
+}
+
+fn primitive(value: plan::ArrowPrimitiveType) -> plan::arrow_physical_node::Kind {
+    plan::arrow_physical_node::Kind::Primitive(value as i32)
 }
 
 fn decimal(precision: u8, scale: i8) -> plan::ArrowDecimalType {
@@ -524,38 +518,291 @@ fn encode_interval_unit(unit: IntervalUnit) -> plan::ArrowIntervalUnit {
     }
 }
 
-fn decode_field(
-    field: &plan::ArrowPhysicalField,
+/// Validate one column's flat tree in its role, then build its root field.
+fn decode_column(
+    column: &plan::ArrowPhysicalColumn,
     path: FieldPath,
-    depth: usize,
     budget: &mut DecodeBudget,
 ) -> Result<Field, ProtocolError> {
-    check_depth(depth, path.clone())?;
+    let role = ColumnRole::of(column.is_internal);
+    let nodes = &column.nodes;
+    let nodes_path = path.field("nodes");
+    validate_preorder(nodes.len(), role.tree_limits(), |index, edges| {
+        node_edges(&nodes[index], role, edges, nodes_path.clone().index(index))
+    })
+    .map_err(|violation: TreeError| violation.into_protocol(nodes_path.clone()))?;
+    if role == ColumnRole::Visible {
+        check_logical_budget(nodes, nodes_path.clone())?;
+    }
+    build_column(nodes, nodes_path, budget)
+}
+
+/// A kernel violation, or a node rejected while its edges were listed.
+enum TreeError {
+    Violation(FlatTreeViolation),
+    Node(ProtocolError),
+}
+
+impl From<FlatTreeViolation> for TreeError {
+    fn from(violation: FlatTreeViolation) -> Self {
+        Self::Violation(violation)
+    }
+}
+
+impl From<ProtocolError> for TreeError {
+    fn from(error: ProtocolError) -> Self {
+        Self::Node(error)
+    }
+}
+
+impl TreeError {
+    fn into_protocol(self, path: FieldPath) -> ProtocolError {
+        match self {
+            Self::Node(error) => error,
+            Self::Violation(violation) => {
+                let kind = match violation {
+                    FlatTreeViolation::Empty => ProtocolErrorKind::MissingField,
+                    FlatTreeViolation::TooManyNodes { .. } | FlatTreeViolation::TooDeep { .. } => {
+                        ProtocolErrorKind::Capacity
+                    }
+                    FlatTreeViolation::ChildOutOfRange { .. }
+                    | FlatTreeViolation::NonCanonical { .. }
+                    | FlatTreeViolation::Unreachable { .. }
+                    | FlatTreeViolation::TooManyEdges { .. } => ProtocolErrorKind::InvalidValue,
+                };
+                error(path, kind, format!("Arrow field tree: {violation}"))
+            }
+        }
+    }
+}
+
+fn node_edges(
+    node: &plan::ArrowPhysicalNode,
+    role: ColumnRole,
+    edges: &mut Vec<FlatEdge>,
+    path: FieldPath,
+) -> Result<(), TreeError> {
+    use plan::arrow_physical_node::Kind;
+    let kind = node.kind.as_ref().ok_or_else(|| {
+        error(
+            path.clone().field("kind"),
+            ProtocolErrorKind::MissingField,
+            "Arrow physical node kind is required",
+        )
+    })?;
+    let level = role.edge_depth(false);
+    let wrapper = role.edge_depth(true);
+    let mut push = |child: u32, depth: u8| edges.push(FlatEdge { child, depth });
+    match kind {
+        Kind::List(child)
+        | Kind::ListView(child)
+        | Kind::LargeList(child)
+        | Kind::LargeListView(child) => push(*child, level),
+        Kind::FixedSizeList(value) => push(value.item, level),
+        Kind::StructType(value) => {
+            check_repeated_len(
+                value.fields.len(),
+                path.field("struct_type").field("fields"),
+            )?;
+            for child in &value.fields {
+                push(*child, level);
+            }
+        }
+        Kind::UnionType(value) => {
+            check_repeated_len(value.fields.len(), path.field("union_type").field("fields"))?;
+            for child in &value.fields {
+                push(child.field, level);
+            }
+        }
+        Kind::Dictionary(value) => {
+            push(value.key, wrapper);
+            push(value.value, wrapper);
+        }
+        Kind::Map(value) => push(value.entries, wrapper),
+        Kind::RunEndEncoded(value) => {
+            push(value.run_ends, wrapper);
+            push(value.values, wrapper);
+        }
+        Kind::Primitive(_)
+        | Kind::Timestamp(_)
+        | Kind::Time32(_)
+        | Kind::Time64(_)
+        | Kind::Duration(_)
+        | Kind::Interval(_)
+        | Kind::FixedSizeBinary(_)
+        | Kind::Decimal32(_)
+        | Kind::Decimal64(_)
+        | Kind::Decimal128(_)
+        | Kind::Decimal256(_) => {}
+    }
+    Ok(())
+}
+
+/// The logical node and text budget of a visible column. Wrapper nodes --
+/// a map's entries struct, a dictionary's key and value, a run-end encoding's
+/// children -- are not logical nodes, and only struct and union member names
+/// are logical text; a map's synthetic key/value names are not. Called only
+/// after the tree itself has been validated, so every index is in range.
+fn check_logical_budget(
+    nodes: &[plan::ArrowPhysicalNode],
+    path: FieldPath,
+) -> Result<(), ProtocolError> {
+    use plan::arrow_physical_node::Kind;
+    let limits = LogicalTypeLimits::default();
+    let mut wrapper = vec![false; nodes.len()];
+    for node in nodes {
+        match node.kind.as_ref() {
+            Some(Kind::Map(value)) => wrapper[value.entries as usize] = true,
+            Some(Kind::Dictionary(value)) => {
+                wrapper[value.key as usize] = true;
+                wrapper[value.value as usize] = true;
+            }
+            Some(Kind::RunEndEncoded(value)) => {
+                wrapper[value.run_ends as usize] = true;
+                wrapper[value.values as usize] = true;
+            }
+            _ => {}
+        }
+    }
+    let logical_nodes = wrapper.iter().filter(|wrapped| !**wrapped).count();
+    if logical_nodes > limits.max_nodes {
+        return Err(error(
+            path,
+            ProtocolErrorKind::Capacity,
+            format!(
+                "visible Arrow column has {logical_nodes} logical nodes, above the limit {}",
+                limits.max_nodes
+            ),
+        ));
+    }
+    let name_len = |member: u32| {
+        nodes[member as usize]
+            .field
+            .as_ref()
+            .map_or(0, |facts| facts.name.len())
+    };
+    let mut text = 0_usize;
+    for (index, node) in nodes.iter().enumerate() {
+        match node.kind.as_ref() {
+            Some(Kind::StructType(value)) if !wrapper[index] => {
+                for member in &value.fields {
+                    text = text.saturating_add(name_len(*member));
+                }
+            }
+            Some(Kind::UnionType(value)) => {
+                for member in &value.fields {
+                    text = text.saturating_add(name_len(member.field));
+                }
+            }
+            _ => {}
+        }
+    }
+    if text > limits.max_text_bytes {
+        return Err(error(
+            path,
+            ProtocolErrorKind::Capacity,
+            format!(
+                "visible Arrow column has {text} bytes of member names, above the limit {}",
+                limits.max_text_bytes
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// A constructed node waiting for its parent.
+enum Built {
+    Field(Field),
+    Type(DataType),
+}
+
+/// Build the column bottom-up in reverse preorder. Validation already proved
+/// every child index is larger than its parent's and owned by that parent
+/// alone, so each child is complete and unclaimed when its parent is built.
+fn build_column(
+    nodes: &[plan::ArrowPhysicalNode],
+    path: FieldPath,
+    budget: &mut DecodeBudget,
+) -> Result<Field, ProtocolError> {
+    budget.charge(
+        nodes.len().saturating_mul(size_of::<Option<Built>>()),
+        path.clone(),
+    )?;
+    let mut built: Vec<Option<Built>> = Vec::with_capacity(nodes.len());
+    built.resize_with(nodes.len(), || None);
+    for index in (0..nodes.len()).rev() {
+        let node_path = path.clone().index(index);
+        let node = &nodes[index];
+        let data_type = build_type(node, &mut built, node_path.clone(), budget)?;
+        built[index] = Some(match &node.field {
+            Some(facts) => Built::Field(build_field(facts, data_type, node_path, budget)?),
+            None => Built::Type(data_type),
+        });
+    }
+    match built.into_iter().next().flatten() {
+        Some(Built::Field(field)) => Ok(field),
+        _ => Err(error(
+            path.index(0).field("field"),
+            ProtocolErrorKind::MissingField,
+            "Arrow physical column root must be a field node",
+        )),
+    }
+}
+
+fn take_field(
+    built: &mut [Option<Built>],
+    child: u32,
+    path: FieldPath,
+) -> Result<Arc<Field>, ProtocolError> {
+    match built[child as usize].take() {
+        Some(Built::Field(field)) => Ok(Arc::new(field)),
+        _ => Err(error(
+            path,
+            ProtocolErrorKind::InconsistentFields,
+            "Arrow nested child must be a field node",
+        )),
+    }
+}
+
+fn take_type(
+    built: &mut [Option<Built>],
+    child: u32,
+    path: FieldPath,
+) -> Result<DataType, ProtocolError> {
+    match built[child as usize].take() {
+        Some(Built::Type(data_type)) => Ok(data_type),
+        _ => Err(error(
+            path,
+            ProtocolErrorKind::InconsistentFields,
+            "Arrow dictionary child must be a bare type node",
+        )),
+    }
+}
+
+fn build_field(
+    facts: &plan::ArrowPhysicalFieldFacts,
+    data_type: DataType,
+    path: FieldPath,
+    budget: &mut DecodeBudget,
+) -> Result<Field, ProtocolError> {
+    let path = path.field("field");
     check_string(
-        &field.name,
+        &facts.name,
         MAX_WRITE_RELATION_FIELD_NAME_BYTES,
         path.clone().field("name"),
         "Arrow field name",
     )?;
-    budget.charge(FIELD_CHARGE + field.name.len(), path.clone())?;
-    let metadata = decode_metadata(&field.metadata, path.clone().field("metadata"), budget)?;
-    let data_type = field.r#type.as_ref().ok_or_else(|| {
-        error(
-            path.clone().field("type"),
-            ProtocolErrorKind::MissingField,
-            "Arrow physical field type is required",
-        )
-    })?;
-    let data_type = decode_type(data_type, path.clone().field("type"), depth, budget)?;
-    let decoded = if matches!(data_type, DataType::Dictionary(_, _)) {
-        let dictionary_id = field.dictionary_id.ok_or_else(|| {
+    budget.charge(FIELD_CHARGE + facts.name.len(), path.clone())?;
+    let metadata = decode_metadata(&facts.metadata, path.clone().field("metadata"), budget)?;
+    let field = if matches!(data_type, DataType::Dictionary(_, _)) {
+        let dictionary_id = facts.dictionary_id.ok_or_else(|| {
             error(
                 path.clone().field("dictionary_id"),
                 ProtocolErrorKind::MissingField,
                 "Arrow dictionary field id is required",
             )
         })?;
-        let dictionary_is_ordered = field.dictionary_is_ordered.ok_or_else(|| {
+        let dictionary_is_ordered = facts.dictionary_is_ordered.ok_or_else(|| {
             error(
                 path.clone().field("dictionary_is_ordered"),
                 ProtocolErrorKind::MissingField,
@@ -564,39 +811,38 @@ fn decode_field(
         })?;
         #[allow(deprecated)]
         Field::new_dict(
-            &field.name,
+            &facts.name,
             data_type,
-            field.nullable,
+            facts.nullable,
             dictionary_id,
             dictionary_is_ordered,
         )
     } else {
-        if field.dictionary_id.is_some() || field.dictionary_is_ordered.is_some() {
+        if facts.dictionary_id.is_some() || facts.dictionary_is_ordered.is_some() {
             return Err(error(
-                path.clone(),
+                path,
                 ProtocolErrorKind::InconsistentFields,
                 "Arrow dictionary field attributes require Dictionary type",
             ));
         }
-        Field::new(&field.name, data_type, field.nullable)
+        Field::new(&facts.name, data_type, facts.nullable)
     };
-    Ok(decoded.with_metadata(metadata))
+    Ok(field.with_metadata(metadata))
 }
 
-fn decode_type(
-    data_type: &plan::ArrowPhysicalType,
+fn build_type(
+    node: &plan::ArrowPhysicalNode,
+    built: &mut [Option<Built>],
     path: FieldPath,
-    depth: usize,
     budget: &mut DecodeBudget,
 ) -> Result<DataType, ProtocolError> {
-    check_depth(depth, path.clone())?;
     budget.charge(TYPE_CHARGE, path.clone())?;
-    use plan::arrow_physical_type::Kind;
-    let kind = data_type.kind.as_ref().ok_or_else(|| {
+    use plan::arrow_physical_node::Kind;
+    let kind = node.kind.as_ref().ok_or_else(|| {
         error(
             path.clone().field("kind"),
             ProtocolErrorKind::MissingField,
-            "Arrow physical type kind is required",
+            "Arrow physical node kind is required",
         )
     })?;
     match kind {
@@ -618,15 +864,15 @@ fn decode_type(
         }
         Kind::Time32(value) => Ok(DataType::Time32(decode_time_unit(
             value.unit,
-            path.clone().field("time32").field("unit"),
+            path.field("time32").field("unit"),
         )?)),
         Kind::Time64(value) => Ok(DataType::Time64(decode_time_unit(
             value.unit,
-            path.clone().field("time64").field("unit"),
+            path.field("time64").field("unit"),
         )?)),
         Kind::Duration(value) => Ok(DataType::Duration(decode_time_unit(
             value.unit,
-            path.clone().field("duration").field("unit"),
+            path.field("duration").field("unit"),
         )?)),
         Kind::Interval(value) => Ok(DataType::Interval(decode_interval_unit(
             *value,
@@ -645,83 +891,59 @@ fn decode_type(
         Kind::Decimal256(value) => {
             decode_decimal(value, path.field("decimal256"), DataType::Decimal256)
         }
-        Kind::List(field) => Ok(DataType::List(Arc::new(decode_field(
-            field,
+        Kind::List(child) => Ok(DataType::List(take_field(
+            built,
+            *child,
             path.field("list"),
-            depth + 1,
-            budget,
-        )?))),
-        Kind::ListView(field) => Ok(DataType::ListView(Arc::new(decode_field(
-            field,
+        )?)),
+        Kind::ListView(child) => Ok(DataType::ListView(take_field(
+            built,
+            *child,
             path.field("list_view"),
-            depth + 1,
-            budget,
-        )?))),
-        Kind::FixedSizeList(value) => {
-            let item = value.item.as_ref().ok_or_else(|| {
-                error(
-                    path.clone().field("fixed_size_list").field("item"),
-                    ProtocolErrorKind::MissingField,
-                    "Arrow fixed-size list item is required",
-                )
-            })?;
-            Ok(DataType::FixedSizeList(
-                Arc::new(decode_field(
-                    item,
-                    path.field("fixed_size_list").field("item"),
-                    depth + 1,
-                    budget,
-                )?),
-                value.length,
-            ))
-        }
-        Kind::LargeList(field) => Ok(DataType::LargeList(Arc::new(decode_field(
-            field,
+        )?)),
+        Kind::FixedSizeList(value) => Ok(DataType::FixedSizeList(
+            take_field(
+                built,
+                value.item,
+                path.field("fixed_size_list").field("item"),
+            )?,
+            value.length,
+        )),
+        Kind::LargeList(child) => Ok(DataType::LargeList(take_field(
+            built,
+            *child,
             path.field("large_list"),
-            depth + 1,
-            budget,
-        )?))),
-        Kind::LargeListView(field) => Ok(DataType::LargeListView(Arc::new(decode_field(
-            field,
+        )?)),
+        Kind::LargeListView(child) => Ok(DataType::LargeListView(take_field(
+            built,
+            *child,
             path.field("large_list_view"),
-            depth + 1,
-            budget,
-        )?))),
+        )?)),
         Kind::StructType(value) => {
-            check_repeated_len(
-                value.fields.len(),
-                path.clone().field("struct_type").field("fields"),
-            )?;
             let fields = value
                 .fields
                 .iter()
                 .enumerate()
-                .map(|(index, field)| {
-                    decode_field(
-                        field,
+                .map(|(index, child)| {
+                    take_field(
+                        built,
+                        *child,
                         path.clone()
                             .field("struct_type")
                             .field("fields")
                             .index(index),
-                        depth + 1,
-                        budget,
                     )
-                    .map(Arc::new)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(DataType::Struct(Fields::from(fields)))
         }
         Kind::UnionType(value) => {
-            check_repeated_len(
-                value.fields.len(),
-                path.clone().field("union_type").field("fields"),
-            )?;
             let mode = match plan::ArrowUnionMode::try_from(value.mode) {
                 Ok(plan::ArrowUnionMode::Sparse) => UnionMode::Sparse,
                 Ok(plan::ArrowUnionMode::Dense) => UnionMode::Dense,
                 Ok(plan::ArrowUnionMode::Unspecified) | Err(_) => {
                     return Err(error(
-                        path.clone().field("union_type").field("mode"),
+                        path.field("union_type").field("mode"),
                         ProtocolErrorKind::InvalidEnum,
                         "Arrow union mode is unknown or unspecified",
                     ));
@@ -729,37 +951,25 @@ fn decode_type(
             };
             let mut type_ids = Vec::with_capacity(value.fields.len());
             let mut fields = Vec::with_capacity(value.fields.len());
-            for (index, union_field) in value.fields.iter().enumerate() {
-                let field_path = path
+            for (index, child) in value.fields.iter().enumerate() {
+                let child_path = path
                     .clone()
                     .field("union_type")
                     .field("fields")
                     .index(index);
-                let type_id = i8::try_from(union_field.type_id).map_err(|_| {
+                let type_id = i8::try_from(child.type_id).map_err(|_| {
                     error(
-                        field_path.clone().field("type_id"),
+                        child_path.clone().field("type_id"),
                         ProtocolErrorKind::OutOfRange,
                         "Arrow union type id does not fit i8",
                     )
                 })?;
-                let field = union_field.field.as_ref().ok_or_else(|| {
-                    error(
-                        field_path.clone().field("field"),
-                        ProtocolErrorKind::MissingField,
-                        "Arrow union field is required",
-                    )
-                })?;
                 type_ids.push(type_id);
-                fields.push(Arc::new(decode_field(
-                    field,
-                    field_path.field("field"),
-                    depth + 1,
-                    budget,
-                )?));
+                fields.push(take_field(built, child.field, child_path.field("field"))?);
             }
             let fields = UnionFields::try_new(type_ids, fields).map_err(|err| {
                 error(
-                    path.clone().field("union_type").field("fields"),
+                    path.field("union_type").field("fields"),
                     ProtocolErrorKind::InvalidValue,
                     format!("invalid Arrow union fields: {err}"),
                 )
@@ -767,82 +977,34 @@ fn decode_type(
             Ok(DataType::Union(fields, mode))
         }
         Kind::Dictionary(value) => {
-            let key = value.key.as_ref().ok_or_else(|| {
-                error(
-                    path.clone().field("dictionary").field("key"),
-                    ProtocolErrorKind::MissingField,
-                    "Arrow dictionary key type is required",
-                )
-            })?;
-            let dictionary_value = value.value.as_ref().ok_or_else(|| {
-                error(
-                    path.clone().field("dictionary").field("value"),
-                    ProtocolErrorKind::MissingField,
-                    "Arrow dictionary value type is required",
-                )
-            })?;
+            let key = take_type(
+                built,
+                value.key,
+                path.clone().field("dictionary").field("key"),
+            )?;
+            let dictionary_value =
+                take_type(built, value.value, path.field("dictionary").field("value"))?;
             Ok(DataType::Dictionary(
-                Box::new(decode_type(
-                    key,
-                    path.clone().field("dictionary").field("key"),
-                    depth + 1,
-                    budget,
-                )?),
-                Box::new(decode_type(
-                    dictionary_value,
-                    path.field("dictionary").field("value"),
-                    depth + 1,
-                    budget,
-                )?),
+                Box::new(key),
+                Box::new(dictionary_value),
             ))
         }
-        Kind::Map(value) => {
-            let entries = value.entries.as_ref().ok_or_else(|| {
-                error(
-                    path.clone().field("map").field("entries"),
-                    ProtocolErrorKind::MissingField,
-                    "Arrow map entries field is required",
-                )
-            })?;
-            Ok(DataType::Map(
-                Arc::new(decode_field(
-                    entries,
-                    path.field("map").field("entries"),
-                    depth + 1,
-                    budget,
-                )?),
-                value.ordered,
-            ))
-        }
+        Kind::Map(value) => Ok(DataType::Map(
+            take_field(built, value.entries, path.field("map").field("entries"))?,
+            value.ordered,
+        )),
         Kind::RunEndEncoded(value) => {
-            let run_ends = value.run_ends.as_ref().ok_or_else(|| {
-                error(
-                    path.clone().field("run_end_encoded").field("run_ends"),
-                    ProtocolErrorKind::MissingField,
-                    "Arrow run-end field is required",
-                )
-            })?;
-            let values = value.values.as_ref().ok_or_else(|| {
-                error(
-                    path.clone().field("run_end_encoded").field("values"),
-                    ProtocolErrorKind::MissingField,
-                    "Arrow run-end values field is required",
-                )
-            })?;
-            Ok(DataType::RunEndEncoded(
-                Arc::new(decode_field(
-                    run_ends,
-                    path.clone().field("run_end_encoded").field("run_ends"),
-                    depth + 1,
-                    budget,
-                )?),
-                Arc::new(decode_field(
-                    values,
-                    path.field("run_end_encoded").field("values"),
-                    depth + 1,
-                    budget,
-                )?),
-            ))
+            let run_ends = take_field(
+                built,
+                value.run_ends,
+                path.clone().field("run_end_encoded").field("run_ends"),
+            )?;
+            let values = take_field(
+                built,
+                value.values,
+                path.field("run_end_encoded").field("values"),
+            )?;
+            Ok(DataType::RunEndEncoded(run_ends, values))
         }
     }
 }
@@ -983,18 +1145,6 @@ fn check_repeated_len(length: usize, path: FieldPath) -> Result<(), ProtocolErro
             path,
             ProtocolErrorKind::Capacity,
             "Arrow nested field count exceeds the relation limit",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn check_depth(depth: usize, path: FieldPath) -> Result<(), ProtocolError> {
-    if depth > MAX_WRITE_RELATION_TYPE_DEPTH {
-        Err(error(
-            path,
-            ProtocolErrorKind::Capacity,
-            "Arrow type exceeds the nesting depth limit",
         ))
     } else {
         Ok(())
@@ -1222,7 +1372,7 @@ mod tests {
         let path = FieldPath::root("schema");
         let schema = Schema::new(vec![Field::new("x", DataType::Int32, false)]);
         let (mut columns, metadata) = encode_schema(&schema, &[1], true, path.clone()).unwrap();
-        columns[0].field.as_mut().unwrap().r#type = None;
+        columns[0].nodes[0].kind = None;
         assert_eq!(
             decode_schema(&columns, &metadata, path.clone())
                 .unwrap_err()
@@ -1231,7 +1381,7 @@ mod tests {
         );
 
         let (mut columns, metadata) = encode_schema(&schema, &[1], true, path.clone()).unwrap();
-        let field = columns[0].field.as_mut().unwrap();
+        let field = columns[0].nodes[0].field.as_mut().unwrap();
         field.metadata = vec![
             plan::ArrowFieldMetadataEntry {
                 key: "a".into(),
@@ -1255,7 +1405,7 @@ mod tests {
             false,
         )]);
         let (mut columns, metadata) = encode_schema(&dictionary, &[1], true, path.clone()).unwrap();
-        columns[0]
+        columns[0].nodes[0]
             .field
             .as_mut()
             .expect("field")
@@ -1268,7 +1418,11 @@ mod tests {
         );
 
         let (mut columns, metadata) = encode_schema(&schema, &[1], true, path.clone()).unwrap();
-        columns[0].field.as_mut().expect("field").dictionary_id = Some(7);
+        columns[0].nodes[0]
+            .field
+            .as_mut()
+            .expect("field")
+            .dictionary_id = Some(7);
         assert_eq!(
             decode_schema(&columns, &metadata, path.clone())
                 .unwrap_err()
@@ -1285,5 +1439,266 @@ mod tests {
             encode_schema(&schema, &[1], true, path).unwrap_err().kind(),
             ProtocolErrorKind::Capacity
         );
+    }
+
+    fn nested_structs(levels: usize) -> DataType {
+        let mut data_type = DataType::Int32;
+        for level in 0..levels {
+            data_type = DataType::Struct(Fields::from(vec![Field::new(
+                format!("s{level}"),
+                data_type,
+                true,
+            )]));
+        }
+        data_type
+    }
+
+    fn nested_maps(levels: usize) -> DataType {
+        let mut data_type = DataType::Int32;
+        for _ in 0..levels {
+            let entries = Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", data_type, true),
+                ])),
+                false,
+            );
+            data_type = DataType::Map(Arc::new(entries), false);
+        }
+        data_type
+    }
+
+    fn encode_one(
+        data_type: DataType,
+        internal: bool,
+    ) -> Result<
+        (
+            Vec<plan::ArrowPhysicalColumn>,
+            Vec<plan::ArrowFieldMetadataEntry>,
+        ),
+        ProtocolError,
+    > {
+        let schema = Schema::new(vec![Field::new("column", data_type, true)]);
+        encode_schema(&schema, &[1], internal, FieldPath::root("schema"))
+    }
+
+    fn decode_kind(columns: &[plan::ArrowPhysicalColumn]) -> ProtocolErrorKind {
+        decode_schema(columns, &[], FieldPath::root("schema"))
+            .unwrap_err()
+            .kind()
+    }
+
+    #[test]
+    fn internal_columns_keep_the_physical_depth_budget() {
+        // The root plus 31 lists puts the leaf at the 32nd level.
+        let mut nested = DataType::Int32;
+        for depth in 0..MAX_WRITE_RELATION_TYPE_DEPTH - 1 {
+            nested = DataType::List(Arc::new(Field::new(format!("d{depth}"), nested, false)));
+        }
+        encode_one(nested.clone(), true).expect("32 physical levels fit an internal column");
+        let deeper = DataType::List(Arc::new(Field::new("d", nested, false)));
+        assert_eq!(
+            encode_one(deeper, true).unwrap_err().kind(),
+            ProtocolErrorKind::Capacity
+        );
+    }
+
+    #[test]
+    fn visible_columns_admit_logical_depth_64_and_reject_65() {
+        let limit = LogicalTypeLimits::default().max_depth;
+        let (columns, metadata) =
+            encode_one(nested_structs(limit - 1), false).expect("64 logical levels");
+        let decoded = decode_schema(&columns, &metadata, FieldPath::root("schema")).unwrap();
+        assert_eq!(
+            decoded.schema().field(0).data_type(),
+            &nested_structs(limit - 1)
+        );
+        assert_eq!(
+            encode_one(nested_structs(limit), false).unwrap_err().kind(),
+            ProtocolErrorKind::Capacity
+        );
+        // The same 64-level tree exceeds an internal column's physical budget.
+        assert_eq!(
+            encode_one(nested_structs(limit - 1), true)
+                .unwrap_err()
+                .kind(),
+            ProtocolErrorKind::Capacity
+        );
+    }
+
+    #[test]
+    fn visible_map_entries_are_not_logical_levels() {
+        let limit = LogicalTypeLimits::default().max_depth;
+        // 63 maps nest the innermost value at logical depth 64 while the
+        // physical tree is nearly twice as deep.
+        encode_one(nested_maps(limit - 1), false).expect("64 logical levels through maps");
+        assert_eq!(
+            encode_one(nested_maps(limit), false).unwrap_err().kind(),
+            ProtocolErrorKind::Capacity
+        );
+    }
+
+    #[test]
+    fn visible_columns_bound_logical_nodes_excluding_wrappers() {
+        let limit = LogicalTypeLimits::default().max_nodes;
+        let struct_of = |members: usize, member: &dyn Fn(usize) -> Field| {
+            DataType::Struct(Fields::from((0..members).map(member).collect::<Vec<_>>()))
+        };
+        let int_member = |index: usize| Field::new(format!("f{index}"), DataType::Int32, true);
+        encode_one(struct_of(limit - 1, &int_member), false).expect("root plus 4095 members");
+        assert_eq!(
+            encode_one(struct_of(limit, &int_member), false)
+                .unwrap_err()
+                .kind(),
+            ProtocolErrorKind::Capacity
+        );
+        // Each map member is a map, its entries wrapper, a key and a value:
+        // four physical nodes but three logical ones.
+        let map_member = |index: usize| {
+            let entries = Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", DataType::Int32, true),
+                ])),
+                false,
+            );
+            Field::new(
+                format!("m{index}"),
+                DataType::Map(Arc::new(entries), false),
+                true,
+            )
+        };
+        let fitting = (limit - 1) / 3;
+        encode_one(struct_of(fitting, &map_member), false).expect("wrappers are not counted");
+        assert_eq!(
+            encode_one(struct_of(fitting + 1, &map_member), false)
+                .unwrap_err()
+                .kind(),
+            ProtocolErrorKind::Capacity
+        );
+    }
+
+    #[test]
+    fn visible_columns_bound_member_name_text() {
+        let limit = LogicalTypeLimits::default().max_text_bytes;
+        let long = MAX_WRITE_RELATION_FIELD_NAME_BYTES;
+        let members = |extra: usize| {
+            let mut fields = (0..limit / long)
+                .map(|index| {
+                    Field::new(
+                        format!("{index:0>width$}", width = long),
+                        DataType::Int32,
+                        true,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if extra > 0 {
+                fields.push(Field::new("x".repeat(extra), DataType::Int32, true));
+            }
+            DataType::Struct(Fields::from(fields))
+        };
+        encode_one(members(0), false).expect("exactly the text budget");
+        assert_eq!(
+            encode_one(members(1), false).unwrap_err().kind(),
+            ProtocolErrorKind::Capacity
+        );
+    }
+
+    #[test]
+    fn decoder_rejects_every_malformed_tree_shape() {
+        let two_members = DataType::Struct(Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+        let (columns, _) = encode_one(two_members, false).unwrap();
+        let struct_children = |columns: &mut Vec<plan::ArrowPhysicalColumn>, children: Vec<u32>| {
+            let Some(plan::arrow_physical_node::Kind::StructType(node)) =
+                columns[0].nodes[0].kind.as_mut()
+            else {
+                panic!("root is a struct");
+            };
+            node.fields = children;
+        };
+
+        let mut empty = columns.clone();
+        empty[0].nodes.clear();
+        assert_eq!(decode_kind(&empty), ProtocolErrorKind::MissingField);
+
+        let mut out_of_range = columns.clone();
+        struct_children(&mut out_of_range, vec![1, 99]);
+        assert_eq!(decode_kind(&out_of_range), ProtocolErrorKind::InvalidValue);
+
+        let mut reused = columns.clone();
+        struct_children(&mut reused, vec![1, 1]);
+        assert_eq!(decode_kind(&reused), ProtocolErrorKind::InvalidValue);
+
+        let mut swapped = columns.clone();
+        struct_children(&mut swapped, vec![2, 1]);
+        assert_eq!(decode_kind(&swapped), ProtocolErrorKind::InvalidValue);
+
+        let mut back_edge = columns.clone();
+        struct_children(&mut back_edge, vec![1, 0]);
+        assert_eq!(decode_kind(&back_edge), ProtocolErrorKind::InvalidValue);
+
+        let mut orphan = columns.clone();
+        let extra = orphan[0].nodes[1].clone();
+        orphan[0].nodes.push(extra);
+        assert_eq!(decode_kind(&orphan), ProtocolErrorKind::InvalidValue);
+
+        let mut bare_root = columns.clone();
+        bare_root[0].nodes[0].field = None;
+        assert_eq!(decode_kind(&bare_root), ProtocolErrorKind::MissingField);
+
+        let mut bare_member = columns.clone();
+        bare_member[0].nodes[2].field = None;
+        assert_eq!(
+            decode_kind(&bare_member),
+            ProtocolErrorKind::InconsistentFields
+        );
+
+        #[allow(deprecated)]
+        let dictionary_field = Field::new_dict(
+            "dictionary",
+            DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+            false,
+            3,
+            false,
+        );
+        let (dictionary, _) = encode_schema(
+            &Schema::new(vec![dictionary_field]),
+            &[1],
+            true,
+            FieldPath::root("schema"),
+        )
+        .unwrap();
+        let mut fielded_key = dictionary.clone();
+        fielded_key[0].nodes[1].field = fielded_key[0].nodes[0].field.clone();
+        assert_eq!(
+            decode_kind(&fielded_key),
+            ProtocolErrorKind::InconsistentFields
+        );
+    }
+
+    #[test]
+    fn deep_schema_decodes_under_the_default_protobuf_recursion_limit() {
+        use prost::Message;
+        let limit = LogicalTypeLimits::default().max_depth;
+        let (columns, schema_metadata) =
+            encode_one(nested_maps(limit - 1), false).expect("64 logical levels");
+        let bytes = plan::ArrowPhysicalSchema {
+            columns,
+            schema_metadata,
+        }
+        .encode_to_vec();
+        let decoded = plan::ArrowPhysicalSchema::decode(bytes.as_slice())
+            .expect("flat carrier nesting is constant");
+        decode_schema(
+            &decoded.columns,
+            &decoded.schema_metadata,
+            FieldPath::root("schema"),
+        )
+        .expect("decoded schema validates");
     }
 }
