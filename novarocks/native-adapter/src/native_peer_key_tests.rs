@@ -38,8 +38,9 @@ use tokio::net::TcpListener;
 use tokio::sync::Barrier;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::Channel;
 use tower::ServiceExt;
+
+use crate::native_lane::NativeLaneChannel as Channel;
 
 const WATCHDOG: Duration = Duration::from_secs(5);
 

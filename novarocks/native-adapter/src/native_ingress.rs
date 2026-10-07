@@ -37,7 +37,9 @@ use tonic::{Code, Status};
 use tower::{Service, ServiceExt};
 
 use crate::backend_metrics;
+use crate::native_lane::NativeLaneStreamBody;
 use crate::native_server::NativeIngressConfig;
+use crate::native_transport_admission::NativeTransportAdmission;
 
 const LOCAL_ENTRY_CAP: Duration = Duration::from_secs(300);
 const GRPC_FRAME_HEADER_BYTES: usize = 5;
@@ -300,6 +302,13 @@ enum MethodClass {
 }
 
 /// Sits after Native authentication and before the generated Tonic service.
+///
+/// On an admitted listener every request of a known lane first takes one of
+/// that lane's served stream positions. The position is held by the response
+/// body wrapper until the body ends, errors (including a client reset), or is
+/// dropped -- never only until the handler returns. Server-streaming methods
+/// hold theirs for the life of the stream. A refusal answers
+/// `RESOURCE_EXHAUSTED` before any execution gate or decoder.
 // Design: ADR-0157 (docs/adr/ADR-0157-native-rpc-ingress-cost-boundaries.md)
 #[derive(Clone)]
 pub struct NativeIngressService<S> {
@@ -309,6 +318,7 @@ pub struct NativeIngressService<S> {
     config: NativeIngressConfig,
     domain: NativeEndpointDomain,
     backend_metrics: bool,
+    lane_streams: Option<NativeTransportAdmission>,
 }
 
 impl<S> NativeIngressService<S> {
@@ -357,7 +367,15 @@ impl<S> NativeIngressService<S> {
             config,
             domain,
             backend_metrics,
+            lane_streams: None,
         }
+    }
+
+    /// Hold each request's lane stream position from `admission` until its
+    /// response body exits.
+    pub fn with_lane_streams(mut self, admission: Option<NativeTransportAdmission>) -> Self {
+        self.lane_streams = admission;
+        self
     }
 
     fn classify(&self, method: NativeRpcMethod) -> MethodClass {
@@ -418,8 +436,26 @@ where
         };
         let config = self.config;
         let backend_metrics = self.backend_metrics;
+        // The stream position precedes every execution gate and decoder; a
+        // refusal holds nothing.
+        let stream = match &self.lane_streams {
+            Some(admission) => match admission.try_incoming_stream(method) {
+                Some(stream) => stream,
+                None => {
+                    gate.reject("lane_streams");
+                    drop(request);
+                    let response = IngressFailure::capacity(
+                        "native lane stream positions exhausted",
+                        "lane_streams",
+                    )
+                    .into_http();
+                    return Box::pin(async move { Ok(response) });
+                }
+            },
+            None => None,
+        };
         let mut inner = self.inner.clone();
-        Box::pin(async move {
+        let admitted = async move {
             if backend_metrics {
                 backend_metrics::native_async_first_poll_lag(gate.class, arrival.elapsed());
             }
@@ -500,7 +536,7 @@ where
                 // follows the Exchange/status owners' separate frame limits.
                 return Ok(response);
             }
-            Ok(response.map(|body| {
+            Ok::<_, Infallible>(response.map(|body| {
                 tonic::body::boxed(OwnedResponseBody::new(
                     body,
                     ownership,
@@ -508,6 +544,12 @@ where
                     backend_metrics,
                 ))
             }))
+        };
+        Box::pin(async move {
+            // Until the response exists the stream position is held by this
+            // future; afterwards by the body, to the body's public exit.
+            let response = admitted.await?;
+            Ok(response.map(|body| NativeLaneStreamBody::boxed(body, stream)))
         })
     }
 }

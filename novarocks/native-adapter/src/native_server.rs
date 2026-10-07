@@ -343,6 +343,11 @@ impl NativeRpcServerHandle {
                             <NovaRocksGrpcServer<S> as NamedService>::NAME,
                             domain != NativeEndpointDomain::FrontendMembership,
                             domain,
+                        )
+                        .with_lane_streams(
+                            admission
+                                .as_ref()
+                                .map(|listener| listener.admission.clone()),
                         );
                         let app = NativeListenerAuthService::new(
                             app,
@@ -440,10 +445,11 @@ fn box_native_response(
     response.map(boxed)
 }
 
-/// Apply the frozen public HTTP/2 limits to one admitted BE connection. These
-/// bound the counts and per-item sizes inside Hyper/H2; the bytes those
-/// libraries allocate under them are covered by the transport measurement gate.
-fn configure_admitted_server(builder: &mut http2::Builder<TokioExecutor>) {
+/// Apply the frozen public HTTP/2 limits to one Native connection, admitted or
+/// not. These bound the counts and per-item sizes inside Hyper/H2; the bytes
+/// those libraries allocate under them are covered by the transport
+/// measurement gate.
+fn configure_native_server(builder: &mut http2::Builder<TokioExecutor>) {
     let g = NativeResultSupportGeometry::V1;
     builder
         .initial_stream_window_size(g.transport_h2_stream_receive_window_bytes as u32)
@@ -562,23 +568,21 @@ where
             return;
         }
     };
-    let (stream, head, builder) = match admitted {
+    let (stream, head) = match admitted {
         Some(AdmittedConnection {
             connection, head, ..
         }) => {
             // The admission position follows the IO: it is returned only after
             // the socket and its TLS state have been destroyed.
             let stream = novarocks_native_trust::OwnedNativeIo::with_guard(stream, connection);
-            let mut builder = http2::Builder::new(TokioExecutor::new());
-            configure_admitted_server(&mut builder);
-            (stream, Some(head), builder)
+            (stream, Some(head))
         }
-        None => (
-            novarocks_native_trust::OwnedNativeIo::new(stream),
-            None,
-            http2::Builder::new(TokioExecutor::new()),
-        ),
+        // The Frontend's membership listener has no accept admission yet, but
+        // its connections take the same public HTTP/2 limits.
+        None => (novarocks_native_trust::OwnedNativeIo::new(stream), None),
     };
+    let mut builder = http2::Builder::new(TokioExecutor::new());
+    configure_native_server(&mut builder);
     let close = head.as_ref().map(|head| Arc::clone(&head.close));
     let handshake = head.as_ref().map(|head| head.handshake.clone());
     let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
@@ -621,7 +625,15 @@ where
                 connection.as_mut().graceful_shutdown();
             }
             _ = sleep_until_or_forever(deadline), if bootstrap_pending => {
-                break Err("native bootstrap deadline elapsed before an authenticated request");
+                // The guard above was read when this wait began. A request
+                // that authenticated meanwhile ended the bootstrap, and its
+                // connection must keep serving past the deadline.
+                if handshake
+                    .as_ref()
+                    .is_some_and(NativeHandshakePermit::is_held)
+                {
+                    break Err("native bootstrap deadline elapsed before an authenticated request");
+                }
             }
             _ = notified_or_forever(close.as_deref()) => {
                 break Err("native connection seal conflict");

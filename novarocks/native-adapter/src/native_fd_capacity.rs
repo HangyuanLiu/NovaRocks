@@ -17,16 +17,22 @@
 
 //! Read-only verification of the frozen Native operational descriptor baseline.
 //!
-//! The backend socket envelope counts original Data and Control stock positions,
-//! two independent listeners, and two accepted refusal transients. Its remaining
-//! baseline headroom is arithmetic, not a reservation for connectors, files,
-//! scheduler activity, or unrelated process users. The frontend baseline is a
-//! separate startup requirement; the backend counts do not describe its graph.
-//! This module neither changes a process limit nor acquires a descriptor.
+//! The descriptor envelope is derived from the same admission positions the
+//! listeners and dialers enforce. A Backend counts every physical connection
+//! position of both classes (handshakes are a subset of those), its two
+//! listeners, one accepted-then-refused socket per listener, and one resolver
+//! descriptor per DNS position. A Frontend counts its outgoing lane positions,
+//! the Backends' announcement connections to its report listener, that
+//! listener and its DNS positions. Remaining baseline headroom is arithmetic,
+//! not a reservation for connectors, files, scheduler activity, or unrelated
+//! process users. This module neither changes a process limit nor acquires a
+//! descriptor.
 
 use novarocks_execution_contract::native_result_support::NativeResultSupportGeometry;
 use novarocks_proto_codec::native_rpc::NativeEndpointDomain;
 use std::io;
+
+use crate::native_transport_admission::AdmissionDimensions;
 
 /// The process limits observed before a Native listener is bound.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,9 +49,17 @@ pub struct NativeFileDescriptorCapacityReport {
     pub backend_control_socket_positions: u64,
     pub backend_listener_positions: u64,
     pub backend_refusal_positions: u64,
+    /// Resolver descriptors: one per process DNS position.
+    pub dns_resolution_positions: u64,
     pub backend_native_socket_positions: u64,
     /// The BE baseline minus the complete Native socket envelope, not free FDs.
     pub backend_baseline_headroom: u64,
+    pub frontend_outgoing_socket_positions: u64,
+    pub frontend_membership_socket_positions: u64,
+    pub frontend_listener_positions: u64,
+    pub frontend_native_socket_positions: u64,
+    /// The FE baseline minus the complete Native socket envelope.
+    pub frontend_baseline_headroom: u64,
 }
 
 /// Query `RLIMIT_NOFILE` without changing it, then check the frozen role baseline.
@@ -145,6 +159,65 @@ fn mul(a: u64, b: u64) -> io::Result<u64> {
         .ok_or_else(|| io::ErrorKind::InvalidInput.into())
 }
 
+const BACKEND_LISTENERS: u64 = 2;
+/// One accepted socket per listener may be open while it is being refused.
+const BACKEND_REFUSALS: u64 = 2;
+const FRONTEND_LISTENERS: u64 = 1;
+
+fn dns_positions() -> io::Result<u64> {
+    u64::try_from(novarocks_native_trust::NATIVE_DNS_RESOLUTION_POSITIONS)
+        .map_err(|_| io::ErrorKind::InvalidInput.into())
+}
+
+fn counts(dimensions: AdmissionDimensions) -> io::Result<(u64, u64)> {
+    let convert = |value: usize| -> io::Result<u64> {
+        u64::try_from(value).map_err(|_| io::ErrorKind::InvalidInput.into())
+    };
+    Ok((
+        convert(dimensions.data_positions)?,
+        convert(dimensions.control_positions)?,
+    ))
+}
+
+/// Every Native descriptor a Backend can hold: its Data and Control physical
+/// positions, listeners, refusal transients and resolver descriptors.
+pub fn backend_socket_positions(g: &NativeResultSupportGeometry) -> io::Result<u64> {
+    let (data, control) = counts(AdmissionDimensions::backend(g)?)?;
+    add(
+        add(data, control)?,
+        add(add(BACKEND_LISTENERS, BACKEND_REFUSALS)?, dns_positions()?)?,
+    )
+}
+
+/// The Backends' announcement connections to one Frontend's report listener,
+/// with their connecting and closing headroom.
+fn frontend_membership_positions(g: &NativeResultSupportGeometry) -> io::Result<u64> {
+    mul(
+        g.transport_maximum_live_backends,
+        add(
+            1,
+            add(
+                g.transport_connecting_positions_per_lane,
+                g.transport_closing_positions_per_lane,
+            )?,
+        )?,
+    )
+}
+
+/// Every Native descriptor a Frontend can hold: its outgoing lane positions,
+/// the announcement connections it serves, its listener and resolver
+/// descriptors.
+pub fn frontend_socket_positions(g: &NativeResultSupportGeometry) -> io::Result<u64> {
+    let (data, control) = counts(AdmissionDimensions::frontend(g)?)?;
+    add(
+        add(data, control)?,
+        add(
+            frontend_membership_positions(g)?,
+            add(FRONTEND_LISTENERS, dns_positions()?)?,
+        )?,
+    )
+}
+
 fn validate_limits(
     domain: NativeEndpointDomain,
     soft: Limit,
@@ -164,72 +237,19 @@ fn validate_limits(
         return Err(io::ErrorKind::InvalidInput.into());
     }
 
-    // Match the factory's complete stock envelope. Each lane includes live,
-    // connecting, and closing positions; handshakes have their own positions.
-    let fe_live = add(
-        add(
-            g.transport_connections_per_frontend_backend_result,
-            g.transport_connections_per_frontend_backend_observation,
-        )?,
-        g.transport_connections_per_frontend_backend_submission,
-    )?;
-    let lane_tails = add(
-        g.transport_connecting_positions_per_lane,
-        g.transport_closing_positions_per_lane,
-    )?;
-    let incoming_fe_data = mul(
-        g.transport_authenticated_live_frontends_per_backend,
-        add(fe_live, mul(3, lane_tails)?)?,
-    )?;
-    let exchange = add(
-        g.transport_exchange_connections_per_peer,
-        add(
-            g.transport_exchange_connecting_positions_per_peer,
-            g.transport_exchange_closing_positions_per_peer,
-        )?,
-    )?;
-    let filters = add(
-        g.transport_runtime_filter_connections_per_peer,
-        add(
-            g.transport_runtime_filter_connecting_positions_per_peer,
-            g.transport_runtime_filter_closing_positions_per_peer,
-        )?,
-    )?;
-    let peer_data = mul(
-        mul(2, g.transport_maximum_live_backends)?,
-        add(exchange, filters)?,
-    )?;
-    let control_lane = mul(
-        g.transport_authenticated_live_frontends_per_backend,
-        add(
-            g.transport_connections_per_frontend_backend_lifecycle_control,
-            lane_tails,
-        )?,
-    )?;
-    // The distinct outgoing FE announce/report lane belongs to Data stock.
-    let backend_data_socket_positions = add(
-        add(
-            add(incoming_fe_data, peer_data)?,
-            g.transport_data_handshake_positions,
-        )?,
-        control_lane,
-    )?;
-    let backend_control_socket_positions = add(
-        mul(2, control_lane)?,
-        g.transport_control_handshake_positions,
-    )?;
-    let backend_listener_positions = 2;
-    let backend_refusal_positions = 2;
-    let backend_native_socket_positions = add(
-        add(
-            backend_data_socket_positions,
-            backend_control_socket_positions,
-        )?,
-        add(backend_listener_positions, backend_refusal_positions)?,
-    )?;
+    // The same admission positions the listeners and dialers enforce.
+    let (backend_data_socket_positions, backend_control_socket_positions) =
+        counts(AdmissionDimensions::backend(&g)?)?;
+    let backend_native_socket_positions = backend_socket_positions(&g)?;
     let backend_baseline_headroom = g
         .backend_minimum_open_file_limit
         .checked_sub(backend_native_socket_positions)
+        .ok_or(io::ErrorKind::InvalidInput)?;
+    let (frontend_data, frontend_control) = counts(AdmissionDimensions::frontend(&g)?)?;
+    let frontend_native_socket_positions = frontend_socket_positions(&g)?;
+    let frontend_baseline_headroom = g
+        .frontend_minimum_open_file_limit
+        .checked_sub(frontend_native_socket_positions)
         .ok_or(io::ErrorKind::InvalidInput)?;
 
     Ok(NativeFileDescriptorCapacityReport {
@@ -240,10 +260,16 @@ fn validate_limits(
         required_soft_limit,
         backend_data_socket_positions,
         backend_control_socket_positions,
-        backend_listener_positions,
-        backend_refusal_positions,
+        backend_listener_positions: BACKEND_LISTENERS,
+        backend_refusal_positions: BACKEND_REFUSALS,
+        dns_resolution_positions: dns_positions()?,
         backend_native_socket_positions,
         backend_baseline_headroom,
+        frontend_outgoing_socket_positions: add(frontend_data, frontend_control)?,
+        frontend_membership_socket_positions: frontend_membership_positions(&g)?,
+        frontend_listener_positions: FRONTEND_LISTENERS,
+        frontend_native_socket_positions,
+        frontend_baseline_headroom,
     })
 }
 
@@ -271,8 +297,14 @@ mod tests {
             assert_eq!(report.backend_control_socket_positions, 20);
             assert_eq!(report.backend_listener_positions, 2);
             assert_eq!(report.backend_refusal_positions, 2);
-            assert_eq!(report.backend_native_socket_positions, 542);
-            assert_eq!(report.backend_baseline_headroom, 482);
+            assert_eq!(report.dns_resolution_positions, 4);
+            assert_eq!(report.backend_native_socket_positions, 546);
+            assert_eq!(report.backend_baseline_headroom, 478);
+            // 32 BEs * (10 data + 3 lanes * 2 tails) + 32 * (1 control + 2 tails).
+            assert_eq!(report.frontend_outgoing_socket_positions, 512 + 96);
+            assert_eq!(report.frontend_membership_socket_positions, 96);
+            assert_eq!(report.frontend_native_socket_positions, 608 + 96 + 1 + 4);
+            assert_eq!(report.frontend_baseline_headroom, 2048 - 709);
             assert_eq!(report.soft_limit, 1024);
             assert!(!report.soft_unlimited);
             assert_eq!(report.hard_limit, u64::MAX);
@@ -354,15 +386,15 @@ mod tests {
         let report = check(NativeEndpointDomain::BackendControl, 1024, control).unwrap();
         assert_eq!(report.backend_data_socket_positions, 518);
         assert_eq!(report.backend_control_socket_positions, 21);
-        assert_eq!(report.backend_baseline_headroom, 481);
+        assert_eq!(report.backend_baseline_headroom, 477);
 
         let mut peer = NativeResultSupportGeometry::V1;
         peer.transport_maximum_live_backends = 33;
         let report = check(NativeEndpointDomain::BackendData, 1024, peer).unwrap();
         assert_eq!(report.backend_data_socket_positions, 532);
         assert_eq!(report.backend_control_socket_positions, 20);
-        assert_eq!(report.backend_native_socket_positions, 556);
-        assert_eq!(report.backend_baseline_headroom, 468);
+        assert_eq!(report.backend_native_socket_positions, 560);
+        assert_eq!(report.backend_baseline_headroom, 464);
     }
 
     #[test]
@@ -372,8 +404,10 @@ mod tests {
         let mut addition = NativeResultSupportGeometry::V1;
         addition.transport_connections_per_frontend_backend_result = u64::MAX;
         let mut headroom = NativeResultSupportGeometry::V1;
-        headroom.backend_minimum_open_file_limit = 541;
-        for g in [multiply, addition, headroom] {
+        headroom.backend_minimum_open_file_limit = 545;
+        let mut frontend_headroom = NativeResultSupportGeometry::V1;
+        frontend_headroom.frontend_minimum_open_file_limit = 708;
+        for g in [multiply, addition, headroom, frontend_headroom] {
             assert_eq!(
                 check(NativeEndpointDomain::BackendData, u64::MAX, g)
                     .unwrap_err()

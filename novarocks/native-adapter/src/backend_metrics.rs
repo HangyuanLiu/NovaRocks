@@ -386,6 +386,10 @@ impl BackendMetricsRegistry {
             Box::new(Lazy::force(&BACKEND_NATIVE_INGRESS_REQUEST_BYTES).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_INGRESS_FRAME_LIMIT_BYTES).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_RESPONSE_BACKINGS).clone()),
+            Box::new(Lazy::force(&BACKEND_NATIVE_TRANSPORT_POSITIONS).clone()),
+            Box::new(Lazy::force(&BACKEND_NATIVE_TRANSPORT_REFUSED).clone()),
+            Box::new(Lazy::force(&BACKEND_NATIVE_LANE_CONNECTIONS).clone()),
+            Box::new(Lazy::force(&BACKEND_NATIVE_LANE_STREAMS).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_CONTROL_QUEUE_WAIT).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_BLOCKING_QUEUE_WAIT).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_ASYNC_FIRST_POLL_LAG).clone()),
@@ -711,6 +715,113 @@ static BACKEND_NATIVE_RESPONSE_BACKINGS: Lazy<IntGaugeVec> = Lazy::new(|| {
     )
     .expect("construct Native response backing gauge")
 });
+
+static BACKEND_NATIVE_TRANSPORT_POSITIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "novarocks_backend_native_transport_positions",
+            "Native connection admission positions by class and kind: live connections \
+             (until their IO is dropped) and bootstrapping handshakes, used and limit.",
+        ),
+        &["class", "kind", "dimension"],
+    )
+    .expect("construct Native transport position gauge")
+});
+
+static BACKEND_NATIVE_TRANSPORT_REFUSED: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
+    prometheus::IntCounterVec::new(
+        Opts::new(
+            "novarocks_backend_native_transport_refused_connections_total",
+            "Native connections accepted or dialed and refused for lack of a position.",
+        ),
+        &["class"],
+    )
+    .expect("construct Native transport refusal counter")
+});
+
+static BACKEND_NATIVE_LANE_CONNECTIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "novarocks_backend_native_lane_connections",
+            "Live Native connections bound to a lane: sealed incoming and established outgoing.",
+        ),
+        &["lane"],
+    )
+    .expect("construct Native lane connection gauge")
+});
+
+static BACKEND_NATIVE_LANE_STREAMS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "novarocks_backend_native_lane_streams",
+            "Native stream positions by lane and direction, held until the response body ends \
+             or is dropped; used and limit (an outgoing limit is per connection).",
+        ),
+        &["lane", "direction", "dimension"],
+    )
+    .expect("construct Native lane stream gauge")
+});
+
+/// Publishes the Backend's Native admission transitions. It only writes
+/// gauges; admission never reads them.
+#[derive(Debug, Default)]
+pub struct BackendNativeTransportMetrics;
+
+impl crate::native_lane::NativeTransportObserver for BackendNativeTransportMetrics {
+    fn positions(
+        &self,
+        class: crate::native_transport_admission::TransportClass,
+        kind: crate::native_lane::PositionKind,
+        used: usize,
+        limit: usize,
+    ) {
+        for (dimension, value) in [("used", used), ("limit", limit)] {
+            BACKEND_NATIVE_TRANSPORT_POSITIONS
+                .with_label_values(&[class.label(), kind.label(), dimension])
+                .set(i64::try_from(value).unwrap_or(i64::MAX));
+        }
+    }
+
+    fn refused(&self, class: crate::native_transport_admission::TransportClass) {
+        BACKEND_NATIVE_TRANSPORT_REFUSED
+            .with_label_values(&[class.label()])
+            .inc();
+    }
+
+    fn lane_connections(&self, lane: crate::native_lane::NativeLane, delta: i64) {
+        BACKEND_NATIVE_LANE_CONNECTIONS
+            .with_label_values(&[lane.label()])
+            .add(delta);
+    }
+
+    fn lane_streams(
+        &self,
+        lane: crate::native_lane::NativeLane,
+        direction: crate::native_lane::StreamDirection,
+        delta: i64,
+    ) {
+        BACKEND_NATIVE_LANE_STREAMS
+            .with_label_values(&[lane.label(), direction.label(), "used"])
+            .add(delta);
+    }
+
+    fn lane_stream_limit(
+        &self,
+        lane: crate::native_lane::NativeLane,
+        direction: crate::native_lane::StreamDirection,
+        limit: usize,
+    ) {
+        BACKEND_NATIVE_LANE_STREAMS
+            .with_label_values(&[lane.label(), direction.label(), "limit"])
+            .set(i64::try_from(limit).unwrap_or(i64::MAX));
+    }
+}
+
+/// The observer a Backend installs on its process transport admission.
+pub fn backend_native_transport_observer()
+-> std::sync::Arc<dyn crate::native_lane::NativeTransportObserver> {
+    std::sync::Arc::new(BackendNativeTransportMetrics)
+}
 
 static BACKEND_NATIVE_CONTROL_QUEUE_WAIT: Lazy<HistogramVec> = Lazy::new(|| {
     HistogramVec::new(
@@ -1320,6 +1431,12 @@ fn ensure_backend_metric_label_families() {
         "memory_charge",
     ] {
         let _ = BACKEND_SATURATION_SOURCE_AVAILABLE.get_metric_with_label_values(&[source]);
+    }
+    for lane in crate::native_lane::NativeLane::ALL {
+        let _ = BACKEND_NATIVE_LANE_CONNECTIONS.get_metric_with_label_values(&[lane.label()]);
+    }
+    for class in ["data", "control"] {
+        let _ = BACKEND_NATIVE_TRANSPORT_REFUSED.get_metric_with_label_values(&[class]);
     }
     for resource in ["catalog_query_leases", "catalog_handle_leases"] {
         let _ = BACKEND_QUERY_EXECUTION_RESOURCES.get_metric_with_label_values(&[resource]);

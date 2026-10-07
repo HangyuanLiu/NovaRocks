@@ -27,9 +27,9 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use novarocks_execution_contract::native_result_support::NativeResultSupportGeometry;
-use tonic::transport::Channel;
 
 use crate::native_channel_identity::InlineNativeChannelIdentity;
+use crate::native_lane::NativeLaneChannel;
 
 const WAITERS: usize =
     NativeResultSupportGeometry::V1.transport_tonic_pending_per_connection as usize;
@@ -72,21 +72,21 @@ struct Waiter {
     waker: Option<Waker>,
 }
 
-enum Phase {
+enum Phase<C> {
     Vacant,
     Connecting,
-    Ready(Channel),
+    Ready(C),
     Failed,
 }
 
-struct Entry {
+struct Entry<C> {
     identity: Option<InlineNativeChannelIdentity>,
     generation: u64,
-    phase: Phase,
+    phase: Phase<C>,
     waiters: [Waiter; WAITERS],
 }
 
-impl Entry {
+impl<C> Entry<C> {
     fn vacant() -> Self {
         Self {
             identity: None,
@@ -109,18 +109,27 @@ impl Entry {
     }
 }
 
-struct Core {
-    state: Mutex<Vec<Entry>>,
+struct Core<C> {
+    state: Mutex<Vec<Entry<C>>>,
     eviction_cursor: AtomicUsize,
 }
 
-#[derive(Clone)]
-pub(crate) struct NativeChannelCache {
-    core: Arc<Core>,
+/// The published value is the lane channel: one connection owner together
+/// with its stream positions, so every caller shares the same positions.
+pub(crate) struct NativeChannelCache<C = NativeLaneChannel> {
+    core: Arc<Core<C>>,
 }
 
-impl NativeChannelCache {
-    fn core(&self) -> &Arc<Core> {
+impl<C> Clone for NativeChannelCache<C> {
+    fn clone(&self) -> Self {
+        Self {
+            core: Arc::clone(&self.core),
+        }
+    }
+}
+
+impl<C: Clone> NativeChannelCache<C> {
+    fn core(&self) -> &Arc<Core<C>> {
         &self.core
     }
 
@@ -145,7 +154,7 @@ impl NativeChannelCache {
     }
 
     #[cfg(test)]
-    pub(crate) fn remove(&self, identity: InlineNativeChannelIdentity) -> Option<Channel> {
+    pub(crate) fn remove(&self, identity: InlineNativeChannelIdentity) -> Option<C> {
         let mut state = self.core().state.lock().expect("channel-cache lock");
         let entry = state.iter_mut().find(|e| e.identity == Some(identity))?;
         if !matches!(entry.phase, Phase::Ready(_)) {
@@ -157,7 +166,7 @@ impl NativeChannelCache {
         }
     }
 
-    pub(crate) fn acquire(&self, identity: InlineNativeChannelIdentity) -> Acquire {
+    pub(crate) fn acquire(&self, identity: InlineNativeChannelIdentity) -> Acquire<C> {
         Acquire {
             cache: self.clone(),
             identity,
@@ -174,18 +183,18 @@ struct Registration {
     waiter_generation: u64,
 }
 
-pub(crate) enum Election {
-    Ready(Channel),
-    Leader(Leader),
+pub(crate) enum Election<C = NativeLaneChannel> {
+    Ready(C),
+    Leader(Leader<C>),
 }
 
-pub(crate) struct Acquire {
-    cache: NativeChannelCache,
+pub(crate) struct Acquire<C = NativeLaneChannel> {
+    cache: NativeChannelCache<C>,
     identity: InlineNativeChannelIdentity,
     registration: Option<Registration>,
 }
 
-impl Acquire {
+impl<C: Clone> Acquire<C> {
     fn unregister(&mut self) {
         let Some(registration) = self.registration.take() else {
             return;
@@ -204,14 +213,28 @@ impl Acquire {
         drop(retired);
     }
 }
-impl Drop for Acquire {
+impl<C> Drop for Acquire<C> {
     fn drop(&mut self) {
-        self.unregister();
+        let Some(registration) = self.registration.take() else {
+            return;
+        };
+        let retired = {
+            let mut state = self.cache.core.state.lock().expect("channel-cache lock");
+            let entries = &mut *state;
+            let waiter = &mut entries[registration.entry].waiters[registration.waiter];
+            if waiter.occupied && waiter.generation == registration.waiter_generation {
+                waiter.occupied = false;
+                waiter.waker.take()
+            } else {
+                None
+            }
+        };
+        drop(retired);
     }
 }
 
-impl Future for Acquire {
-    type Output = io::Result<Election>;
+impl<C: Clone> Future for Acquire<C> {
+    type Output = io::Result<Election<C>>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
         // Waker clone/drop and wake are outside the cache mutex, including
@@ -330,15 +353,15 @@ impl Future for Acquire {
 #[path = "native_channel_cache_tests.rs"]
 mod tests;
 
-pub(crate) struct Leader {
-    cache: NativeChannelCache,
+pub(crate) struct Leader<C = NativeLaneChannel> {
+    cache: NativeChannelCache<C>,
     entry: usize,
     generation: u64,
     completed: bool,
 }
 
-impl Leader {
-    pub(crate) fn publish(mut self, channel: Channel) -> io::Result<()> {
+impl<C: Clone> Leader<C> {
+    pub(crate) fn publish(mut self, channel: C) -> io::Result<()> {
         let notifications = {
             let mut state = self.cache.core().state.lock().expect("channel-cache lock");
             let entries = &mut *state;
@@ -355,13 +378,13 @@ impl Leader {
     }
 }
 
-impl Drop for Leader {
+impl<C> Drop for Leader<C> {
     fn drop(&mut self) {
         if self.completed {
             return;
         }
         let notifications = {
-            let mut state = self.cache.core().state.lock().expect("channel-cache lock");
+            let mut state = self.cache.core.state.lock().expect("channel-cache lock");
             let entries = &mut *state;
             let entry = &mut entries[self.entry];
             if entry.generation != self.generation || !matches!(entry.phase, Phase::Connecting) {

@@ -68,6 +68,7 @@ pub mod native_client;
 mod native_connection_key_capacity;
 pub mod native_fd_capacity;
 mod native_incoming_key_capacity;
+pub mod native_lane;
 mod root_producer_pool;
 pub mod root_result_reader;
 pub mod root_result_session;
@@ -83,6 +84,7 @@ mod native_fragment_query_tests;
 pub mod native_ingress;
 pub mod native_server;
 pub mod native_transport_admission;
+pub mod native_transport_geometry;
 #[cfg(test)]
 mod physical_v1_roundtrip;
 pub use native_server::NativeRpcServerHandle;
