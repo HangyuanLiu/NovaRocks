@@ -6,8 +6,10 @@ capacity、physical entries（含最终过滤掉的项）、SDK predecessor 与�
 均按同一次 call 计入保守结构界。使用 SDK 原有 database/table/schema 判断和排序，无 vendor 改动。
 
 超界拒绝完整结果，stop/deadline 保持 typed ConnectorError；stream 在拒绝后不再 poll、随调用退出。
-本证明止于 host 已创建 path 的公开 FileIO 边界：更早 FS URI format、OpenDAL page body/XML decode
-未覆盖。source wrapper 是 SDK 收集结构界，不是 BE scan 预付、内存账本或完整 FE 包络。
+初始切片的证明止于 host 已创建 path 的公开 FileIO 边界。后续
+[FS / Paimon source 接入](p06-fs-paimon-source.md) 覆盖 FS URI 构造与 fresh schema HEAD，
+并把 source auxiliary 计入同一 32MiB workspace；OpenDAL page body/XML decode 仍未覆盖。
+source wrapper 是 SDK 收集结构界，不是 BE scan 预付、内存账本或完整 FE 包络。
 
 验证：Paimon connector 全部 lib 47 PASS，日志
 `logs/mem-1-m07/p06-paimon-listing-full-20261007.log`；定向 catalog 14 PASS，日志

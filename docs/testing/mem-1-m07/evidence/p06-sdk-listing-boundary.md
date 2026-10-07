@@ -24,5 +24,7 @@ listing能力的事前拒绝及产品限制；或者明确第三方SDK内部列�
 本记录不选择、不实施任何一种，也不宣称P06/整个M07完成。REST tables的pageSize兼容修复保持。
 
 OpenDAL公开lister limit只是每次请求的page limit；忽略limit的服务端仍可能返回更大body。
-Paimon provider stream gate不能覆盖更早FS URI format和底层page/XML反序列化。另一个FS-owner
-slice可使用公开HttpFetch/HttpClient接缝，需独立body/shape预检证据，不扩ADR-0138 vendor patch。
+初始Paimon provider stream gate未覆盖更早FS URI format；后续
+[FS / Paimon source接入](p06-fs-paimon-source.md)补齐URI与schema HEAD。底层page/XML反序列化
+仍未闭合。公开HttpFetch/HttpClient接缝若用于此缺口，需独立body/shape预检证据，
+不扩ADR-0138 vendor patch。

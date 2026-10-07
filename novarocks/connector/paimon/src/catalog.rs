@@ -60,8 +60,39 @@ impl std::fmt::Debug for PaimonCatalogEntries {
 #[derive(Clone)]
 pub struct PaimonFileSystemCatalog {
     inner: FileSystemCatalog,
-    host_io: Arc<dyn ReadOnlyFileIO>,
+    host_io: CatalogListingHost,
     control: PaimonRequestControl,
+}
+
+/// Production retains the concrete admitted host so a catalog listing can
+/// select its bounded filesystem seam explicitly. Fixture IO is not a product
+/// escape hatch and is compiled only for the source oracle tests.
+#[derive(Clone)]
+enum CatalogListingHost {
+    Host(Arc<PaimonHostFileIo>),
+    #[cfg(test)]
+    Fixture(Arc<dyn ReadOnlyFileIO>),
+}
+
+impl CatalogListingHost {
+    fn bounded_io(
+        &self,
+        bound: ConnectorListingBound,
+    ) -> Result<Arc<dyn ReadOnlyFileIO>, ConnectorError> {
+        match self {
+            Self::Host(host) => {
+                let fs_bound = novarocks_fs::FsListingBound::try_new(
+                    bound.page_entries,
+                    ConnectorListingBound::V1.name_bytes,
+                    32 * 1024 * 1024,
+                )
+                .map_err(|_| invalid("Paimon filesystem listing bound is invalid"))?;
+                Ok(Arc::new(host.as_ref().clone().with_listing_bound(fs_bound)))
+            }
+            #[cfg(test)]
+            Self::Fixture(host) => Ok(Arc::clone(host)),
+        }
+    }
 }
 
 impl PaimonFileSystemCatalog {
@@ -76,14 +107,14 @@ impl PaimonFileSystemCatalog {
             return Err(invalid("Paimon warehouse location must be non-empty"));
         }
         let sdk_control = PaimonSdkReadControl::new(control.clone());
-        let host_io: Arc<dyn ReadOnlyFileIO> = Arc::new(host_io);
-        let file_io = FileIO::from_read_only(Arc::clone(&host_io), Arc::new(sdk_control));
+        let host_io = Arc::new(host_io);
+        let file_io = FileIO::from_read_only(host_io.clone(), Arc::new(sdk_control));
         let mut options = Options::new();
         options.set(CatalogOptions::WAREHOUSE, warehouse);
         let inner = FileSystemCatalog::with_file_io(options, file_io).map_err(map_sdk_error)?;
         Ok(Self {
             inner,
-            host_io,
+            host_io: CatalogListingHost::Host(host_io),
             control,
         })
     }
@@ -156,7 +187,7 @@ impl PaimonFileSystemCatalog {
     ) -> Result<FileSystemCatalog, ConnectorError> {
         // Preflight before cloning the warehouse into options and SDK state.
         let host = listing::BoundedListingIo::new(
-            Arc::clone(&self.host_io),
+            self.host_io.bounded_io(bound)?,
             self.control.clone(),
             self.warehouse(),
             database,
@@ -293,7 +324,12 @@ mod tests {
                     Ok(FileStatus {
                         size: 0,
                         is_dir: true,
-                        path: format!("{warehouse}/{name}.db/"),
+                        // Match the bounded host's exact URI backing. The row
+                        // ceiling oracle must also fit the independent source
+                        // workspace; spare capacity has its own refusal tests.
+                        path: format!("{warehouse}/{name}.db/")
+                            .into_boxed_str()
+                            .into_string(),
                         last_modified: None,
                     })
                 },
@@ -323,7 +359,7 @@ mod tests {
         let inner = FileSystemCatalog::with_file_io(options, file_io).unwrap();
         PaimonFileSystemCatalog {
             inner,
-            host_io,
+            host_io: CatalogListingHost::Fixture(host_io),
             control,
         }
     }

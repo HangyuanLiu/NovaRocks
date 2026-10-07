@@ -29,13 +29,15 @@ use paimon::io::{FileStatus, FileStatusStream, ReadOnlyFileIO};
 use crate::resources::PaimonRequestControl;
 
 const WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
-const FIXED_BYTES: usize = 64 * 1024;
+// Includes the explicit bounded FS URI/context transient allowance. This is
+// part of the same frozen 32 MiB call workspace, not another capacity grant.
+const FIXED_BYTES: usize = 2 * 1024 * 1024;
 
 /// A catalog-call source bound, not a BE reader reservation or a process ledger.
 ///
-/// The host has already constructed each path before this boundary. OpenDAL's
-/// page receive/XML decode and FsAccessHandle's URI construction remain outside
-/// this proof; bounding this stream does not prove those allocations bounded.
+/// The production host checks URI construction and fresh metadata probes at
+/// the filesystem seam, inside the same workspace's fixed auxiliary allowance.
+/// OpenDAL's page receive/XML decode remain outside this source proof.
 #[derive(Debug)]
 pub(super) struct BoundedListingIo {
     host: Arc<dyn ReadOnlyFileIO>,
@@ -335,7 +337,7 @@ mod tests {
         let control = control();
         PaimonFileSystemCatalog {
             inner: sdk(Arc::clone(&host), control.clone()),
-            host_io: host,
+            host_io: super::super::CatalogListingHost::Fixture(host),
             control,
         }
     }

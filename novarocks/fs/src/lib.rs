@@ -38,10 +38,11 @@ mod storage_authority;
 
 pub use access::{
     BoundFile, ConditionalCreateOutcome, FileIdentity, FsAccessHandle, FsAccessResolver,
-    FsListEntry, FsListStream, FsLocation, FsScheme, ObjectStoreAccessContext, ObjectStoreConfig,
-    ObjectStoreCredentialProviderIdentity, ObjectStoreEndpointConfig, ObjectStoreProviderPool,
-    ObjectStoreProviderPoolMetrics, ObjectStoreProviderPoolOptions, ObjectStoreSecretMaterial,
-    ResolvedFsPath, is_object_store_location_parse_only, parse_object_store_path_parse_only,
+    FsListEntry, FsListStream, FsListingBound, FsLocation, FsScheme, ObjectStoreAccessContext,
+    ObjectStoreConfig, ObjectStoreCredentialProviderIdentity, ObjectStoreEndpointConfig,
+    ObjectStoreProviderPool, ObjectStoreProviderPoolMetrics, ObjectStoreProviderPoolOptions,
+    ObjectStoreSecretMaterial, ResolvedFsPath, is_object_store_location_parse_only,
+    parse_object_store_path_parse_only,
 };
 pub use cache::{
     BlockCache, BlockCacheOptions, CacheBlockRead, CacheDomain, CacheInputStream, CacheKey,
