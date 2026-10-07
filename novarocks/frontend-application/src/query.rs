@@ -1384,7 +1384,12 @@ impl FrontendQuerySession {
                     ));
                 }
             };
-            staged_state.set_user_variable(&variable.value, value);
+            if let Err(message) = staged_state.set_user_variable(&variable.value, value) {
+                return Ok(self.governed_typed_error(
+                    QueryServiceError::new(QueryServiceErrorKind::InvalidValue, message),
+                    statement,
+                ));
+            }
         }
         let mut live_state = self.state.lock().map_err(poisoned_state)?;
         match statement.seal_success_visibility() {
