@@ -2258,6 +2258,11 @@ fn table_function_relation_results_and_outer_occurrences_have_separate_mappings(
             fragment.values()[&columns[2]].ty,
             ty(DataType::Int64, left_outer)
         );
+        // The relation's original request: its one bound Value argument.
+        let fragment = super::original_call_requests::with_original_relational_requests(
+            fragment,
+            &GroupedConstantControl,
+        );
         let mut builder = PlanBuilder::new(version());
         builder.add_fragment(fragment).unwrap();
         let plan = builder.finish_observed(&GroupedConstantControl).unwrap();

@@ -32,6 +32,13 @@ impl novarocks_type_contract::PureCompileControl for Unbounded {
     }
 }
 
+/// Every fixture fragment that enters a plan carries the original requests of
+/// its aggregate calls, so the sequence and grouping laws below are what
+/// publication actually checks.
+fn with_requests(fragment: Fragment) -> Fragment {
+    super::original_call_requests::with_original_relational_requests(fragment, &Unbounded)
+}
+
 #[derive(Clone, Copy)]
 enum BindingDrift {
     None,
@@ -405,9 +412,11 @@ fn finish_two_stage_sequence(drift: BindingDrift, final_groups: FinalGroups) -> 
         AggregateCallId::new(1),
         singleton.clone(),
     );
-    let source = source
-        .finish_definition(partial, FragmentSink::Stream { edge }, dop())
-        .unwrap();
+    let source = with_requests(
+        source
+            .finish_definition(partial, FragmentSink::Stream { edge }, dop())
+            .unwrap(),
+    );
 
     let mut destination = FragmentBuilder::new(destination_id);
     let (exchange, imports) = add_exchange_source(
@@ -437,9 +446,11 @@ fn finish_two_stage_sequence(drift: BindingDrift, final_groups: FinalGroups) -> 
         AggregateCallId::new(2),
         singleton,
     );
-    let destination = destination
-        .finish_definition(final_node, FragmentSink::Noop, dop())
-        .unwrap();
+    let destination = with_requests(
+        destination
+            .finish_definition(final_node, FragmentSink::Noop, dop())
+            .unwrap(),
+    );
 
     let mut plan = PlanBuilder::new(version());
     plan.add_fragment(source).unwrap();
@@ -502,9 +513,11 @@ fn aggregate_sequence_rejects_an_orphan_partial() {
         AggregateCallId::new(10),
         singleton,
     );
-    let fragment = fragment
-        .finish_definition(partial, FragmentSink::Noop, dop())
-        .unwrap();
+    let fragment = with_requests(
+        fragment
+            .finish_definition(partial, FragmentSink::Noop, dop())
+            .unwrap(),
+    );
     let mut plan = PlanBuilder::new(version());
     plan.add_fragment(fragment).unwrap();
     assert!(
@@ -538,9 +551,11 @@ fn aggregate_sequence_rejects_duplicate_finals() {
         AggregateCallId::new(11),
         singleton.clone(),
     );
-    let source = source
-        .finish_definition(partial, FragmentSink::Stream { edge }, dop())
-        .unwrap();
+    let source = with_requests(
+        source
+            .finish_definition(partial, FragmentSink::Stream { edge }, dop())
+            .unwrap(),
+    );
 
     let mut destination = FragmentBuilder::new(destination_id);
     let (exchange, imports) = add_exchange_source(
@@ -601,9 +616,11 @@ fn aggregate_sequence_rejects_duplicate_finals() {
             },
         })
         .unwrap();
-    let destination = destination
-        .finish_definition(final_node, FragmentSink::Noop, dop())
-        .unwrap();
+    let destination = with_requests(
+        destination
+            .finish_definition(final_node, FragmentSink::Noop, dop())
+            .unwrap(),
+    );
 
     let mut plan = PlanBuilder::new(version());
     plan.add_fragment(source).unwrap();
@@ -673,9 +690,11 @@ fn intermediate_state_chain_reaches_its_partial_and_final() {
         AggregateCallId::new(21),
         singleton.clone(),
     );
-    let source = source
-        .finish_definition(partial, FragmentSink::Stream { edge: first_edge }, dop())
-        .unwrap();
+    let source = with_requests(
+        source
+            .finish_definition(partial, FragmentSink::Stream { edge: first_edge }, dop())
+            .unwrap(),
+    );
 
     let mut middle = FragmentBuilder::new(middle_id);
     let (first_exchange, first_imports) = add_exchange_source(
@@ -696,13 +715,15 @@ fn intermediate_state_chain_reaches_its_partial_and_final() {
         AggregateCallId::new(22),
         singleton.clone(),
     );
-    let middle = middle
-        .finish_definition(
-            intermediate,
-            FragmentSink::Stream { edge: second_edge },
-            dop(),
-        )
-        .unwrap();
+    let middle = with_requests(
+        middle
+            .finish_definition(
+                intermediate,
+                FragmentSink::Stream { edge: second_edge },
+                dop(),
+            )
+            .unwrap(),
+    );
 
     let mut destination = FragmentBuilder::new(destination_id);
     let (second_exchange, second_imports) = add_exchange_source(
@@ -723,9 +744,11 @@ fn intermediate_state_chain_reaches_its_partial_and_final() {
         AggregateCallId::new(23),
         singleton,
     );
-    let destination = destination
-        .finish_definition(final_node, FragmentSink::Noop, dop())
-        .unwrap();
+    let destination = with_requests(
+        destination
+            .finish_definition(final_node, FragmentSink::Noop, dop())
+            .unwrap(),
+    );
 
     let mut plan = PlanBuilder::new(version());
     plan.add_fragment(source).unwrap();
@@ -1239,9 +1262,10 @@ fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPl
         },
     )
     .unwrap();
-    let fragment = b
-        .finish_definition(final_topn, FragmentSink::Noop, dop())
-        .map_err(|e| e.to_string())?;
+    let fragment = with_requests(
+        b.finish_definition(final_topn, FragmentSink::Noop, dop())
+            .map_err(|e| e.to_string())?,
+    );
     let mut plan = PlanBuilder::new(version());
     plan.add_fragment(fragment).unwrap();
     plan.finish_observed(&Unbounded).map_err(|e| e.to_string())
@@ -1294,6 +1318,11 @@ fn grouped_topn_rejects_missing_contributions_row_budgets_and_binding_drift() {
         GroupedReductionFixture::DistinctState,
     ] {
         let error = grouped_reduction_plan(fixture).unwrap_err();
+        // Complete original requests must not mask the fixture's own defect.
+        assert!(
+            !error.contains("invalid original call requests"),
+            "{fixture:?}: {error}"
+        );
         if matches!(
             fixture,
             GroupedReductionFixture::DroppedGroupingKey
