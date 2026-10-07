@@ -484,3 +484,28 @@ fn rebased_string_offsets_past_their_data_are_refused() {
         Err(CowSelectionCodecError::MalformedBatch)
     );
 }
+
+#[test]
+fn stream_decoder_requires_one_schema_first_and_returns_every_batch() {
+    let batch = wide_batch();
+    let (first, totals, _) = encode(&batch.slice(0, 4), CowSelectionTotals::default(), 1 << 20);
+    let (second, _, _) = encode(&batch.slice(4, 7), totals, 1 << 20);
+    let mut stream = first.clone();
+    stream.extend_from_slice(&second);
+    let mut decoder = CowSelectionStreamDecoder::new();
+    for (_, record) in split(&stream) {
+        decoder.apply_record(record).unwrap();
+    }
+    let (schema, batches) = decoder.finish();
+    assert_eq!(schema.unwrap().fields(), batch.schema().fields());
+    assert_eq!(batches, vec![batch.slice(0, 4), batch.slice(4, 7)]);
+    // A batch before the schema, or a second schema, is refused.
+    let records = split(&stream);
+    let mut early = CowSelectionStreamDecoder::new();
+    assert!(early.apply_record(records[1].1).is_err());
+    let mut twice = CowSelectionStreamDecoder::new();
+    twice.apply_record(records[0].1).unwrap();
+    assert!(twice.apply_record(records[0].1).is_err());
+    // An empty selection has neither schema nor batches.
+    assert_eq!(CowSelectionStreamDecoder::new().finish().1.len(), 0);
+}
