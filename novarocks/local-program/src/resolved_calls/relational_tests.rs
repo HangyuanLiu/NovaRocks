@@ -1135,14 +1135,15 @@ pub(crate) fn window_program(
                         kind: if aggregate {
                             WindowFunctionKind::Sum
                         } else {
-                            WindowFunctionKind::FirstValue { ignore_nulls }
+                            WindowFunctionKind::FirstValue
                         },
                         args: vec![ProgramExprId::new(0)],
                         return_type: DataType::Int64,
                         aggregate_binding: aggregate
                             .then(|| (Arc::from("alias"), resolved_signature(owner))),
+                        frame,
+                        ignore_nulls,
                     }],
-                    window: frame,
                     output_columns: vec![AnalyticOutputColumn::Window(0)],
                 },
                 output,
@@ -1150,6 +1151,46 @@ pub(crate) fn window_program(
         ],
         literal_arena(DataType::Int64),
         vec![],
+    )
+}
+/// One compiled-only prepared call over the fixture source, with `frame`.
+fn prepared_window_graph(
+    frame: Option<WindowFrame>,
+) -> Result<LocalProgramGraph, LocalProgramError> {
+    let output = layout(1, DataType::Int64);
+    let nodes = vec![
+        source(&output),
+        ProgramNode::new(
+            20,
+            ProgramNodeKind::Analytic {
+                input: ProgramNodeId::new(0),
+                partition_exprs: vec![],
+                order_by_exprs: vec![],
+                functions: vec![StaticWindowFunction {
+                    kind: WindowFunctionKind::Prepared,
+                    args: vec![ProgramExprId::new(0)],
+                    return_type: DataType::Int64,
+                    aggregate_binding: None,
+                    frame,
+                    ignore_nulls: false,
+                }],
+                output_columns: vec![AnalyticOutputColumn::Window(0)],
+            },
+            output.clone(),
+        ),
+    ];
+    let profile = CompileProfile::new(
+        NonZeroUsize::new(1).unwrap(),
+        None,
+        output.identity().unwrap(),
+        KernelAbiVersion::CURRENT,
+    );
+    LocalProgramGraph::try_new(
+        nodes,
+        ProgramNodeId::new(1),
+        literal_arena(DataType::Int64),
+        profile,
+        BindingRequirements::try_new(vec![]).unwrap(),
     )
 }
 pub(crate) fn local_frame() -> WindowFrame {
@@ -1856,5 +1897,81 @@ fn graph_reference_and_actual_relational_call_share_one_combined_near_over_budge
     assert_eq!(
         ProgramResolvedCalls::try_new(over, vec![(aggregate_site(), token)], &COMPILE).unwrap_err(),
         ProgramResolvedCallsError::TooManyItems
+    );
+}
+
+#[test]
+fn prepared_window_calls_carry_their_own_explicit_frame() {
+    let owner = Arc::new(Owner::new(FunctionKind::Window, &[PureKernelAbi::WindowV1]));
+    let catalog = seal(
+        FunctionDefinition::try_new_pure_window(
+            "fixture_window",
+            FunctionVisibility::Public,
+            owner.clone(),
+        )
+        .unwrap(),
+        owner.manifest(),
+    )
+    .unwrap();
+    let call = Call::new(&owner, 0);
+    let prepare = |options| {
+        catalog
+            .prepare_frozen(
+                call.input(),
+                call.selected.clone(),
+                &owner.frozen(&call.selected),
+                PureCallPreparation::Window {
+                    arguments: call.children(),
+                    options,
+                },
+                &COMPILE,
+            )
+            .unwrap()
+    };
+    // Explicit ROWS UNBOUNDED PRECEDING .. CURRENT ROW, and an absent frame.
+    let explicit = prepare(window_options());
+    let absent = prepare(WindowCallOptions::try_new(None, false, &COMPILE).unwrap());
+    let running = WindowFrame {
+        start: None,
+        end: Some(WindowBoundary::CurrentRow),
+        window_type: WindowType::Range,
+    };
+    let offset = WindowFrame {
+        start: Some(WindowBoundary::Preceding(1)),
+        end: Some(WindowBoundary::CurrentRow),
+        window_type: WindowType::Rows,
+    };
+    let resolve = |frame, token: &PureCallSpecialization| {
+        ProgramResolvedCalls::try_new(
+            snapshot(prepared_window_graph(Some(frame)).unwrap()),
+            vec![(window_site(), token.clone())],
+            &COMPILE,
+        )
+    };
+    // An explicit prepared frame is the call's frame exactly; an absent one
+    // stands for the compiler's offset-free default derivation.
+    resolve(local_frame(), &explicit).unwrap();
+    resolve(running, &absent).unwrap();
+    for (frame, token) in [(running, &explicit), (offset, &absent)] {
+        assert_eq!(
+            resolve(frame, token).unwrap_err(),
+            ProgramResolvedCallsError::WrongWindow
+        );
+    }
+    // A legacy call keeps exact equality: its explicit frame never stands for
+    // an absent prepared one.
+    assert_eq!(
+        ProgramResolvedCalls::try_new(
+            snapshot(window_program(&owner, false, Some(local_frame()), false)),
+            vec![(window_site(), absent.clone())],
+            &COMPILE,
+        )
+        .unwrap_err(),
+        ProgramResolvedCallsError::WrongWindow
+    );
+    // A prepared call always carries its explicit frame.
+    assert_eq!(
+        prepared_window_graph(None).unwrap_err(),
+        LocalProgramError::InvalidNodeShape
     );
 }

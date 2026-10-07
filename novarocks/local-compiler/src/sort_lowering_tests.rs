@@ -351,28 +351,64 @@ fn global_sort_downstream_project_filter_limit_keep_original_ordered_source() {
     assert!(ty.iter().any(|ty| matches!(ty, novarocks_type_contract::FunctionArgumentType::Value(ty) if ty.logical_type==ValueLogicalType::Json && ty.nullable)));
 }
 #[test]
-fn global_sort_other_modes_stay_explicitly_unsupported() {
+fn partition_topn_sort_mode_stays_explicitly_unsupported() {
     let source = integer_pool();
-    for (mode, topn) in [
-        (
-            SortMode::Analytic {
-                partition_by: Box::default(),
-            },
-            false,
-        ),
-        (
-            SortMode::PartitionTopN {
-                partition_by: Box::default(),
-                limit: 1,
-                kind: novarocks_physical_plan::PartitionTopNType::RowNumber,
-            },
-            false,
-        ),
+    let package = package(
+        &source,
+        1,
+        false,
+        SortMode::PartitionTopN {
+            partition_by: Box::default(),
+            limit: 1,
+            kind: novarocks_physical_plan::PartitionTopNType::RowNumber,
+        },
+        false,
+    );
+    assert!(
+        matches!(compile(package,&Control::good()),Err(FragmentCompileError::Unsupported {node:Some(node),feature:"node family or occurrence shape"}) if node==NodeId::new(0))
+    );
+}
+#[test]
+fn analytic_sort_leads_with_its_partition_keys_and_binds_their_roots() {
+    let source = integer_pool();
+    let package = package(
+        &source,
+        1,
+        false,
+        SortMode::Analytic {
+            partition_by: Box::default(),
+        },
+        false,
+    );
+    let program = compile(package, &Control::good()).unwrap();
+    let sort = ProgramNodeId::new(1);
+    let ProgramNodeKind::Sort {
+        order_by,
+        partition_exprs,
+        partition_limit,
+        use_top_n,
+        ..
+    } = program.graph().nodes()[sort.index()].kind()
+    else {
+        panic!("analytic sort lowers to the local sort owner");
+    };
+    assert_eq!((order_by.len(), partition_exprs.len()), (1, 1));
+    // Partition keys keep their own frozen direction and NULL placement.
+    assert!(partition_exprs[0].asc && !partition_exprs[0].nulls_first);
+    assert!(!order_by[0].asc && order_by[0].nulls_first);
+    assert!(partition_limit.is_none() && !use_top_n);
+    let bindings = program
+        .checked()
+        .channels()
+        .expressions()
+        .resolved_calls()
+        .snapshot()
+        .bindings();
+    for role in [
+        ProgramNodeExpressionRole::SortPartition { key: 0 },
+        ProgramNodeExpressionRole::SortOrder { key: 0 },
     ] {
-        let package = package(&source, 1, false, mode, topn);
-        assert!(
-            matches!(compile(package,&Control::good()),Err(FragmentCompileError::Unsupported {node:Some(node),feature:"node family or occurrence shape"}) if node==NodeId::new(0))
-        );
+        assert!(bindings.contains_key(&ProgramExpressionRootSite::Node { node: sort, role }));
     }
 }
 #[test]
@@ -384,9 +420,7 @@ fn global_sort_component_success_and_missing_key_every_actual_control_prefix() {
         if missing {
             assert!(matches!(
                 result,
-                Err(FragmentCompileError::Invalid(
-                    "missing global sort expression"
-                ))
+                Err(FragmentCompileError::Invalid("missing sort key expression"))
             ));
         } else {
             result.unwrap();

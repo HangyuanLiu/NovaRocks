@@ -357,8 +357,10 @@ fn lower_core(
     // At most one frame per dependency depth. Child lists are borrowed and
     // walked one edge at a time, rather than cloned or enqueued wholesale.
     let mut stack = Vec::new();
-    for (&root, _) in source.iter() {
-        if ids.contains_key(&root) {
+    for (&root, definition) in source.iter() {
+        // A window call is a relational call of its Window node, never a
+        // scalar definition: its arguments are lowered as their own roots.
+        if ids.contains_key(&root) || matches!(definition.kind, ExprKind::WindowCall { .. }) {
             work.step()?;
             continue;
         }
@@ -855,7 +857,15 @@ fn prepare_core(
 ) -> Result<Vec<(ProgramCallSite, PureCallSpecialization)>, ExpressionLoweringError> {
     // The private intermediate is checked against this exact borrowed source
     // again. A same-sized mapping from a foreign package is not authority.
-    if lowered.ids.len() != package.fragment().expressions().len()
+    // Window calls are the only definitions without a scalar local owner.
+    let mut window_calls = 0usize;
+    for (_, definition) in package.fragment().expressions().iter() {
+        if matches!(definition.kind, ExprKind::WindowCall { .. }) {
+            window_calls += 1;
+        }
+        work.step()?;
+    }
+    if lowered.ids.len().checked_add(window_calls) != Some(package.fragment().expressions().len())
         || lowered.types.len() != lowered.arena.nodes().len()
     {
         return Err(ExpressionLoweringError::Invalid(
@@ -864,6 +874,15 @@ fn prepare_core(
     }
     let mut local_ids = BTreeSet::new();
     for (&physical, definition) in package.fragment().expressions().iter() {
+        if matches!(definition.kind, ExprKind::WindowCall { .. }) {
+            if lowered.ids.contains_key(&physical) {
+                return Err(ExpressionLoweringError::Invalid(
+                    "window call was lowered as a scalar definition",
+                ));
+            }
+            work.step()?;
+            continue;
+        }
         let local_id = *lowered
             .ids
             .get(&physical)
@@ -1047,11 +1066,22 @@ fn prepare_core(
         work.step()?;
     }
     let flow = package.expression_uses().flow();
-    // Relational Aggregate and Table calls are prepared after every
+    // Relational Aggregate, Table and Window calls are prepared after every
     // expression occurrence; every other relational lifecycle stays explicit.
     for &site in package.calls().entries().keys() {
         let admitted = match site {
-            PhysicalCallSite::Expression(_) => true,
+            PhysicalCallSite::Expression(id) => {
+                let window = flow.uses().get(&id).is_some_and(|invocation| {
+                    package
+                        .fragment()
+                        .expressions()
+                        .get(invocation.definition)
+                        .is_some_and(|definition| {
+                            matches!(definition.kind, ExprKind::WindowCall { .. })
+                        })
+                });
+                !window || aggregate_nodes.is_some()
+            }
             PhysicalCallSite::Aggregate { .. } | PhysicalCallSite::Table { .. } => {
                 aggregate_nodes.is_some()
             }
@@ -1109,6 +1139,14 @@ fn prepare_core(
                 .ok_or(ExpressionLoweringError::Invalid(
                     "missing invocation definition",
                 ))?;
+            // A window call occurrence is retired from the local flow; its
+            // Window node prepares it from its arguments' effects below.
+            if matches!(source.kind, ExprKind::WindowCall { .. }) {
+                active.remove(&id);
+                stack.pop();
+                work.step()?;
+                continue;
+            }
             let local_id = *lowered
                 .ids
                 .get(&source.id)
@@ -1661,6 +1699,14 @@ fn prepare_core(
             work,
         )?;
         crate::table_function::prepare_table_calls(
+            package,
+            functions,
+            &effects,
+            nodes,
+            &mut tokens,
+            work,
+        )?;
+        crate::window::prepare_window_calls(
             package,
             functions,
             &effects,

@@ -207,7 +207,7 @@ pub enum WindowBoundary {
     Following(i64),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WindowFrame {
     pub start: Option<WindowBoundary>,
     pub end: Option<WindowBoundary>,
@@ -222,21 +222,11 @@ pub enum WindowFunctionKind {
     CumeDist,
     PercentRank,
     Ntile,
-    FirstValue {
-        ignore_nulls: bool,
-    },
-    FirstValueRewrite {
-        ignore_nulls: bool,
-    },
-    LastValue {
-        ignore_nulls: bool,
-    },
-    Lead {
-        ignore_nulls: bool,
-    },
-    Lag {
-        ignore_nulls: bool,
-    },
+    FirstValue,
+    FirstValueRewrite,
+    LastValue,
+    Lead,
+    Lag,
     SessionNumber,
     Count,
     Sum,
@@ -259,14 +249,38 @@ pub enum WindowFunctionKind {
         nulls_first: Vec<bool>,
     },
     ApproxTopK,
+    /// Compiled programs only: the call is exactly the prepared window kernel
+    /// attached at its `ProgramCallSite::Window`. The compiler never derives a
+    /// legacy kind from a function name, and the legacy runtime refuses it.
+    Prepared,
+}
+impl WindowFunctionKind {
+    /// Whether IGNORE NULLS can be a fact of this call kind.
+    pub const fn admits_ignore_nulls(&self) -> bool {
+        matches!(
+            self,
+            Self::FirstValue
+                | Self::FirstValueRewrite
+                | Self::LastValue
+                | Self::Lead
+                | Self::Lag
+                | Self::Prepared
+        )
+    }
 }
 
+/// One window call with its own frame and NULL treatment: calls of one
+/// Analytic node share only partition and order keys. A legacy call copies
+/// its node's frame, where `None` is the legacy absence of a frame. A
+/// `Prepared` call always carries the explicit frame its compiler froze.
 #[derive(Clone, Debug)]
 pub struct StaticWindowFunction {
     pub kind: WindowFunctionKind,
     pub args: Vec<ProgramExprId>,
     pub return_type: DataType,
     pub aggregate_binding: Option<(Arc<str>, ResolvedAggregateSignature)>,
+    pub frame: Option<WindowFrame>,
+    pub ignore_nulls: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -459,7 +473,6 @@ pub enum ProgramNodeKind {
         partition_exprs: Vec<ProgramExprId>,
         order_by_exprs: Vec<ProgramExprId>,
         functions: Vec<StaticWindowFunction>,
-        window: Option<WindowFrame>,
         output_columns: Vec<AnalyticOutputColumn>,
     },
     RuntimeFilterConsumer {
@@ -1633,6 +1646,15 @@ fn validate_shape(
             }
             for column in output_columns {
                 let bad = matches!(column, AnalyticOutputColumn::Window(index) if *index >= functions.len());
+                work.step()?;
+                if bad {
+                    return Err(LocalProgramError::InvalidNodeShape.into());
+                }
+            }
+            for function in functions {
+                let prepared = matches!(function.kind, WindowFunctionKind::Prepared);
+                let bad = (function.ignore_nulls && !function.kind.admits_ignore_nulls())
+                    || (prepared && function.frame.is_none());
                 work.step()?;
                 if bad {
                     return Err(LocalProgramError::InvalidNodeShape.into());

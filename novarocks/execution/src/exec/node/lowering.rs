@@ -768,18 +768,19 @@ impl Lowering<'_> {
             }
             ExecNodeKind::Analytic(n) => {
                 let input = self.node(*n.input)?;
+                let frame = n.window.map(freeze_window_frame);
                 (
                     n.node_id,
                     P::Analytic {
                         input,
                         partition_exprs: n.partition_exprs.into_iter().map(expr).collect(),
                         order_by_exprs: n.order_by_exprs.into_iter().map(expr).collect(),
+                        // Every legacy call copies its node's one frame.
                         functions: n
                             .functions
                             .into_iter()
-                            .map(freeze_window_function)
+                            .map(|function| freeze_window_function(function, frame))
                             .collect(),
-                        window: n.window.map(freeze_window_frame),
                         output_columns: n
                             .output_columns
                             .into_iter()
@@ -1117,8 +1118,17 @@ fn freeze_window_frame(frame: super::analytic::WindowFrame) -> lp::WindowFrame {
 
 fn freeze_window_function(
     function: super::analytic::WindowFunctionSpec,
+    frame: Option<lp::WindowFrame>,
 ) -> lp::StaticWindowFunction {
     use super::analytic::WindowFunctionKind as W;
+    let ignore_nulls = match function.kind {
+        W::FirstValue { ignore_nulls }
+        | W::FirstValueRewrite { ignore_nulls }
+        | W::LastValue { ignore_nulls }
+        | W::Lead { ignore_nulls }
+        | W::Lag { ignore_nulls } => ignore_nulls,
+        _ => false,
+    };
     lp::StaticWindowFunction {
         kind: match function.kind {
             W::RowNumber => lp::WindowFunctionKind::RowNumber,
@@ -1127,13 +1137,11 @@ fn freeze_window_function(
             W::CumeDist => lp::WindowFunctionKind::CumeDist,
             W::PercentRank => lp::WindowFunctionKind::PercentRank,
             W::Ntile => lp::WindowFunctionKind::Ntile,
-            W::FirstValue { ignore_nulls } => lp::WindowFunctionKind::FirstValue { ignore_nulls },
-            W::FirstValueRewrite { ignore_nulls } => {
-                lp::WindowFunctionKind::FirstValueRewrite { ignore_nulls }
-            }
-            W::LastValue { ignore_nulls } => lp::WindowFunctionKind::LastValue { ignore_nulls },
-            W::Lead { ignore_nulls } => lp::WindowFunctionKind::Lead { ignore_nulls },
-            W::Lag { ignore_nulls } => lp::WindowFunctionKind::Lag { ignore_nulls },
+            W::FirstValue { .. } => lp::WindowFunctionKind::FirstValue,
+            W::FirstValueRewrite { .. } => lp::WindowFunctionKind::FirstValueRewrite,
+            W::LastValue { .. } => lp::WindowFunctionKind::LastValue,
+            W::Lead { .. } => lp::WindowFunctionKind::Lead,
+            W::Lag { .. } => lp::WindowFunctionKind::Lag,
             W::SessionNumber => lp::WindowFunctionKind::SessionNumber,
             W::Count => lp::WindowFunctionKind::Count,
             W::Sum => lp::WindowFunctionKind::Sum,
@@ -1166,6 +1174,8 @@ fn freeze_window_function(
         aggregate_binding: function
             .aggregate_binding
             .map(|binding| (Arc::from(binding.function_name), binding.resolved)),
+        frame,
+        ignore_nulls,
     }
 }
 

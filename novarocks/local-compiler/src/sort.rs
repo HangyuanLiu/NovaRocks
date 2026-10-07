@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Lower the admitted global-sort representation into the original local sort owner.
+//! Lower the admitted global and analytic sort representations into the
+//! original local sort owner. An analytic sort orders by its partition keys
+//! first and then by its order keys within each partition; it keeps no
+//! partition limit.
 
 use crate::{assert_rows::reserve_vec, lowering::FragmentCompileError};
 use novarocks_local_program::{
@@ -49,26 +52,47 @@ fn lower_core(
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(ProgramNodeKind, StaticLayout), FragmentCompileError> {
-    let NodeKind::Sort {
-        order_by,
-        mode: SortMode::Global,
-    } = &node.kind
-    else {
-        return Err(FragmentCompileError::Unsupported {
-            node: Some(node.id),
-            feature: "non-global sort mode",
-        });
+    let (order_by, partition_by) = match &node.kind {
+        NodeKind::Sort {
+            order_by,
+            mode: SortMode::Global,
+        } => (order_by, &[][..]),
+        NodeKind::Sort {
+            order_by,
+            mode: SortMode::Analytic { partition_by },
+        } => (order_by, &partition_by[..]),
+        _ => {
+            return Err(FragmentCompileError::Unsupported {
+                node: Some(node.id),
+                feature: "partition TopN sort mode",
+            });
+        }
     };
+    // A global sort orders by at least one key; an analytic sort has at least
+    // one partition key, and may have no order key within its partitions.
+    let analytic = matches!(
+        &node.kind,
+        NodeKind::Sort {
+            mode: SortMode::Analytic { .. },
+            ..
+        }
+    );
     if node.inputs.len() != 1
-        || order_by.is_empty()
+        || (analytic && partition_by.is_empty())
+        || (!analytic && order_by.is_empty())
         || node.output.columns.len() != layout.slots().len()
     {
         return Err(FragmentCompileError::Invalid(
-            "global sort input, keys or output width differs",
+            "sort input, keys or output width differs",
         ));
     }
     let keys = lower_sort_keys(order_by, expressions, work)?;
-    // These inactive fields express Global mode, not a guessed buffering cap.
+    let partition_exprs = if analytic {
+        lower_sort_keys(partition_by, expressions, work)?
+    } else {
+        Vec::new()
+    };
+    // These inactive fields express a full sort, not a guessed buffering cap.
     // The existing full-sort execution path does not consume ranking semantics.
     Ok((
         ProgramNodeKind::Sort {
@@ -80,14 +104,15 @@ fn lower_core(
             topn_type: SortTopNType::RowNumber,
             max_buffered_rows: None,
             max_buffered_bytes: None,
-            partition_exprs: Vec::new(),
+            partition_exprs,
             partition_limit: None,
         },
         layout.clone(),
     ))
 }
 
-/// Global Sort and ordinary TopN borrow one ordered-key projection author.
+/// Global and analytic Sort and ordinary TopN borrow one ordered-key
+/// projection author.
 pub(crate) fn lower_sort_keys(
     order_by: &[novarocks_physical_plan::SortExpr],
     expressions: &BTreeMap<ExprId, ProgramExprId>,
@@ -99,9 +124,7 @@ pub(crate) fn lower_sort_keys(
         let expr = expressions
             .get(&key.expr)
             .copied()
-            .ok_or(FragmentCompileError::Invalid(
-                "missing global sort expression",
-            ));
+            .ok_or(FragmentCompileError::Invalid("missing sort key expression"));
         work.step()?;
         keys.push(SortExpression {
             expr: expr?,

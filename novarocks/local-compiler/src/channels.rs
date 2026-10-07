@@ -508,9 +508,22 @@ fn resolve_core(
             }
             NodeKind::Limit { .. } => passthrough(fragment, node, &nodes, &ports, work)?,
             NodeKind::Sort {
-                mode: novarocks_physical_plan::SortMode::Global,
+                mode:
+                    novarocks_physical_plan::SortMode::Global
+                    | novarocks_physical_plan::SortMode::Analytic { .. },
                 ..
             } => passthrough(fragment, node, &nodes, &ports, work)?,
+            // A window passes its input occurrences through on their own
+            // channels and produces each call's value on a fresh channel.
+            NodeKind::Window(spec) => window_channels(
+                fragment,
+                node,
+                spec.expressions.len(),
+                &nodes,
+                &ports,
+                &mut next_slot,
+                work,
+            )?,
             // Every row-count TopN phase passes its input occurrences through.
             NodeKind::TopN {
                 reduction: novarocks_physical_plan::TopNReduction::Rows,
@@ -823,6 +836,56 @@ fn fresh_relation(
         fresh_slots(node.output.columns.len(), next_slot, work)?,
         port,
     ))
+}
+
+/// A window's output is its whole input followed by one value per call.
+fn window_channels(
+    fragment: &novarocks_physical_plan::Fragment,
+    node: &novarocks_physical_plan::PhysicalNode,
+    calls: usize,
+    nodes: &BTreeMap<NodeId, NodeChannels>,
+    ports: &BTreeMap<NodeId, Port>,
+    next_slot: &mut u64,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(Arc<[SlotId]>, Port), ChannelLoweringError> {
+    let child = single_child(&node.inputs)?;
+    let child_node = &fragment.nodes()[&child];
+    let width = child_node.output.columns.len();
+    if width.checked_add(calls) != Some(node.output.columns.len()) {
+        return Err(ChannelLoweringError::Invalid(
+            "window output is not its input followed by its calls",
+        ));
+    }
+    for (actual, expected) in node.output.columns.iter().zip(&child_node.output.columns) {
+        let same = actual == expected;
+        work.step()?;
+        if !same {
+            return Err(ChannelLoweringError::Invalid(
+                "window pass-through occurrence order differs",
+            ));
+        }
+    }
+    let produced = fresh_slots(calls, next_slot, work)?;
+    let mut slots = Vec::new();
+    reserve_vec(&mut slots, node.output.columns.len(), work)?;
+    slots.extend(nodes[&child].slots.iter().copied());
+    slots.extend(produced.iter().copied());
+    let mut port = Port::new();
+    for (&value, &ordinal) in &ports[&child] {
+        port.insert(value, ordinal);
+        work.step()?;
+    }
+    for (ordinal, &value) in node.output.columns.iter().enumerate().skip(width) {
+        if !fragment.values().contains_key(&value) {
+            return Err(ChannelLoweringError::Invalid("missing window output value"));
+        }
+        port.entry(value).or_insert(ordinal);
+        work.step()?;
+    }
+    work.flush()?;
+    let slots: Arc<[SlotId]> = Arc::from(slots);
+    work.flush()?;
+    Ok((slots, port))
 }
 
 fn single_child(inputs: &[NodeId]) -> Result<NodeId, ChannelLoweringError> {

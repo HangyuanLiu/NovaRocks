@@ -259,31 +259,25 @@ fn thaw_window_boundary(boundary: lp::WindowBoundary) -> RuntimeWindowBoundary {
     }
 }
 
-fn thaw_window_function_kind(kind: &lp::WindowFunctionKind) -> RuntimeWindowFunctionKind {
+/// `None` for the compiled-only prepared kind, which has no legacy operator.
+fn thaw_window_function_kind(
+    kind: &lp::WindowFunctionKind,
+    ignore_nulls: bool,
+) -> Option<RuntimeWindowFunctionKind> {
     use RuntimeWindowFunctionKind as R;
     use lp::WindowFunctionKind as S;
-    match kind {
+    Some(match kind {
         S::RowNumber => R::RowNumber,
         S::Rank => R::Rank,
         S::DenseRank => R::DenseRank,
         S::CumeDist => R::CumeDist,
         S::PercentRank => R::PercentRank,
         S::Ntile => R::Ntile,
-        S::FirstValue { ignore_nulls } => R::FirstValue {
-            ignore_nulls: *ignore_nulls,
-        },
-        S::FirstValueRewrite { ignore_nulls } => R::FirstValueRewrite {
-            ignore_nulls: *ignore_nulls,
-        },
-        S::LastValue { ignore_nulls } => R::LastValue {
-            ignore_nulls: *ignore_nulls,
-        },
-        S::Lead { ignore_nulls } => R::Lead {
-            ignore_nulls: *ignore_nulls,
-        },
-        S::Lag { ignore_nulls } => R::Lag {
-            ignore_nulls: *ignore_nulls,
-        },
+        S::FirstValue => R::FirstValue { ignore_nulls },
+        S::FirstValueRewrite => R::FirstValueRewrite { ignore_nulls },
+        S::LastValue => R::LastValue { ignore_nulls },
+        S::Lead => R::Lead { ignore_nulls },
+        S::Lag => R::Lag { ignore_nulls },
         S::SessionNumber => R::SessionNumber,
         S::Count => R::Count,
         S::Sum => R::Sum,
@@ -310,7 +304,8 @@ fn thaw_window_function_kind(kind: &lp::WindowFunctionKind) -> RuntimeWindowFunc
             nulls_first: nulls_first.clone(),
         },
         S::ApproxTopK => R::ApproxTopK,
-    }
+        S::Prepared => return None,
+    })
 }
 
 fn runtime_filter_contract(
@@ -794,9 +789,9 @@ fn build_pipeline_for_program_node(
             let chunk_schema = ChunkSchema::from_static_layout(values.layout())?;
             // Dynamic cells are compiled roots; only the compiled pipeline
             // evaluates them.
-            let batch = values.batch().ok_or_else(|| {
-                format!("legacy Values node {node_id} has dynamic cells")
-            })?;
+            let batch = values
+                .batch()
+                .ok_or_else(|| format!("legacy Values node {node_id} has dynamic cells"))?;
             let chunk = Chunk::new_with_chunk_schema(batch.clone(), chunk_schema);
             let source: Box<dyn OperatorFactory> =
                 Box::new(ValuesSourceFactory::new(chunk, node_id));
@@ -1351,9 +1346,21 @@ fn build_pipeline_for_program_node(
             partition_exprs,
             order_by_exprs,
             functions,
-            window,
             output_columns,
         } => {
+            // The legacy operator owns one node frame: every legacy call
+            // carries that same frame, and a compiled call never enters here.
+            let window = match functions.split_first() {
+                Some((first, rest)) => {
+                    if rest.iter().any(|function| function.frame != first.frame) {
+                        return Err(format!(
+                            "legacy analytic node {node_id} has calls with different frames"
+                        ));
+                    }
+                    first.frame
+                }
+                None => None,
+            };
             let build = build_pipeline_for_program_node(program, bindings, *input, ctx)?;
             let mut build = gather_to_one(build, ctx, node_id);
             let window = window.as_ref().map(|frame| RuntimeWindowFrame {
@@ -1366,18 +1373,25 @@ fn build_pipeline_for_program_node(
             });
             let functions = functions
                 .iter()
-                .map(|function| WindowFunctionSpec {
-                    kind: thaw_window_function_kind(&function.kind),
-                    args: function.args.iter().copied().map(expr).collect(),
-                    return_type: function.return_type.clone(),
-                    aggregate_binding: function.aggregate_binding.as_ref().map(
-                        |(name, resolved)| WindowAggregateBinding {
-                            function_name: name.to_string(),
-                            resolved: resolved.clone(),
-                        },
-                    ),
+                .map(|function| {
+                    Ok(WindowFunctionSpec {
+                        kind: thaw_window_function_kind(&function.kind, function.ignore_nulls)
+                            .ok_or_else(|| {
+                                format!(
+                                    "legacy analytic node {node_id} received a compiled-only prepared window call"
+                                )
+                            })?,
+                        args: function.args.iter().copied().map(expr).collect(),
+                        return_type: function.return_type.clone(),
+                        aggregate_binding: function.aggregate_binding.as_ref().map(
+                            |(name, resolved)| WindowAggregateBinding {
+                                function_name: name.to_string(),
+                                resolved: resolved.clone(),
+                            },
+                        ),
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, String>>()?;
             let output_columns = output_columns
                 .iter()
                 .map(|column| match column {

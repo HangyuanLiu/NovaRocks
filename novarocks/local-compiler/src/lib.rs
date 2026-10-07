@@ -39,7 +39,11 @@ mod table_function;
 mod union;
 mod union_flow;
 mod unpivot;
+mod window;
 mod writer;
+
+#[cfg(test)]
+mod window_lowering_tests;
 
 #[cfg(test)]
 mod repeat_lowering_tests;

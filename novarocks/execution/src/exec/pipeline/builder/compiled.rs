@@ -21,9 +21,11 @@
 //! a compiled processor is an explicit refusal, never a legacy fallback.
 //!
 //! Reuse boundary: families that evaluate expressions (Project, Filter, Sort
-//! and every row-count TopN phase, Unpivot, ChangeEventExpand, Aggregate) run
-//! compiled processors that own one instance per root and driver; Aggregate
-//! reuses only the key table that owns group-key equivalence. Legacy operators are
+//! and every row-count TopN phase, Unpivot, ChangeEventExpand, Aggregate,
+//! Analytic) run compiled processors that own one instance per root and
+//! driver; Aggregate reuses only the key table that owns group-key
+//! equivalence, and Analytic runs pure window kernels over its own partition
+//! geometry. Legacy operators are
 //! reused only where they evaluate nothing: the all-constant Values source,
 //! Limit, the local gather exchange, the row-count assertion and the UnionAll
 //! fan-in queue. A Values with dynamic cells evaluates each cell root once
@@ -54,6 +56,7 @@ use crate::exec::operators::compiled_repeat::CompiledRepeatProcessorFactory;
 use crate::exec::operators::compiled_sort::CompiledSortProcessorFactory;
 use crate::exec::operators::compiled_table_function::CompiledTableFunctionProcessorFactory;
 use crate::exec::operators::compiled_unpivot::CompiledUnpivotProcessorFactory;
+use crate::exec::operators::compiled_window::CompiledWindowProcessorFactory;
 use crate::exec::operators::runtime_filter::CompiledRuntimeFilterConsumers;
 use crate::runtime::runtime_state::RuntimeErrorState;
 use novarocks_local_program::{
@@ -557,8 +560,10 @@ fn build_node(
             Ok(build)
         }
         ProgramNodeKind::Sort { input, .. } => {
-            // Global Sort and every row-count TopN phase order the whole
-            // instance input on one driver. Single and Final read a Singleton
+            // Global and analytic Sort and every row-count TopN phase order
+            // the whole instance input on one driver. An analytic Sort reads
+            // an input the plan co-locates by its partition keys per instance,
+            // so one driver holds each partition whole. Single and Final read a Singleton
             // input, so the instance input is the relation. A Partial keeps
             // its input distribution and declares its order keys as its
             // output ordering, which the TopN sequence trace matches against
@@ -598,6 +603,20 @@ fn build_node(
             } else {
                 StreamDesc::any(build.pipeline.dop)
             };
+            Ok(build)
+        }
+        ProgramNodeKind::Analytic { input, .. } => {
+            // M1 evaluates every partition on one driver: the instance input
+            // is gathered, in the order its sorted source emits it.
+            let factory = CompiledWindowProcessorFactory::try_new(
+                Arc::clone(program),
+                id,
+                Arc::clone(error),
+            )?;
+            let build = build_node(program, *input, ctx, error)?;
+            let mut build = gather_to_one(build, ctx, node_id);
+            build.pipeline.factories.push(Box::new(factory));
+            build.stream = StreamDesc::single();
             Ok(build)
         }
         ProgramNodeKind::AssertNumRows { input, mode } => {
@@ -870,3 +889,11 @@ mod runtime_filter_compile_tests;
 #[cfg(test)]
 #[path = "compiled_table_function_tests.rs"]
 mod compiled_table_function_tests;
+
+#[cfg(test)]
+#[path = "compiled_window_fixture.rs"]
+mod window_fixture;
+
+#[cfg(test)]
+#[path = "compiled_window_tests.rs"]
+mod compiled_window_tests;

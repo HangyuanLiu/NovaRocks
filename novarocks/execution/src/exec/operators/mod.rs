@@ -39,6 +39,8 @@ pub(crate) mod compiled_repeat;
 pub(crate) mod compiled_sort;
 pub(crate) mod compiled_table_function;
 pub(crate) mod compiled_unpivot;
+pub(crate) mod compiled_window;
+pub(crate) mod compiled_window_geometry;
 pub(crate) mod compiled_writer;
 mod data_stream_sink;
 mod exchange_source;

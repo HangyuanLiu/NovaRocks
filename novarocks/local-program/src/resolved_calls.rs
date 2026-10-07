@@ -410,9 +410,7 @@ impl ProgramResolvedCalls {
                         )?;
                     }
                 }
-                ProgramNodeKind::Analytic {
-                    functions, window, ..
-                } => {
+                ProgramNodeKind::Analytic { functions, .. } => {
                     for (ordinal, function) in functions.iter().enumerate() {
                         let call = u32::try_from(ordinal)
                             .map_err(|_| ProgramResolvedCallsError::TooManyItems)?;
@@ -426,15 +424,7 @@ impl ProgramResolvedCalls {
                                 call,
                             },
                             &mut |token, work| {
-                                validate_window(
-                                    &snapshot,
-                                    node_id,
-                                    call,
-                                    function,
-                                    window.as_ref(),
-                                    token,
-                                    work,
-                                )
+                                validate_window(&snapshot, node_id, call, function, token, work)
                             },
                         )?;
                     }
@@ -902,12 +892,17 @@ fn check_argument_root(
     check_arrow(definition.data_type(), &ty.data_type, work)
 }
 
+/// Each call carries its own frame and NULL treatment. A legacy call's frame
+/// is exactly its prepared options' frame. A `Prepared` call carries the
+/// explicit frame its compiler froze: equal to an explicit prepared frame, or,
+/// where the prepared options preserve the absence of a frame, the compiler's
+/// default derivation, which owns that proof. Such a default never has an
+/// offset, so an offset frame there is refused.
 fn validate_window(
     snapshot: &ProgramRootControlBindings,
     node: ProgramNodeId,
     ordinal: u32,
     source: &StaticWindowFunction,
-    frame: Option<&WindowFrame>,
     token: &PureCallSpecialization,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ProgramResolvedCallsError> {
@@ -922,19 +917,23 @@ fn validate_window(
     {
         check_aggregate_source(source, aggregate, work)?;
     }
-    let ignore_nulls = match source.kind {
-        WindowFunctionKind::FirstValue { ignore_nulls }
-        | WindowFunctionKind::FirstValueRewrite { ignore_nulls }
-        | WindowFunctionKind::LastValue { ignore_nulls }
-        | WindowFunctionKind::Lead { ignore_nulls }
-        | WindowFunctionKind::Lag { ignore_nulls } => ignore_nulls,
-        _ => false,
-    };
-    if ignore_nulls != contract.options().ignore_nulls() {
+    if source.ignore_nulls != contract.options().ignore_nulls() {
         return Err(ProgramResolvedCallsError::WrongWindow);
     }
-    let expected_frame = frame.map(convert_frame).transpose()?;
-    if contract.options().frame() != expected_frame.as_ref() {
+    let frame = source.frame.as_ref().map(convert_frame).transpose()?;
+    let prepared = matches!(source.kind, WindowFunctionKind::Prepared);
+    let frame_matches = match (contract.options().frame(), frame.as_ref()) {
+        (Some(expected), Some(actual)) => expected == actual,
+        (None, None) => !prepared,
+        (None, Some(actual)) => {
+            prepared
+                && [actual.start, actual.end].iter().all(|bound| {
+                    !matches!(bound, WindowBound::Preceding(_) | WindowBound::Following(_))
+                })
+        }
+        (Some(_), None) => false,
+    };
+    if !frame_matches {
         return Err(ProgramResolvedCallsError::WrongWindow);
     }
     if let Some(aggregate) = contract.aggregate() {

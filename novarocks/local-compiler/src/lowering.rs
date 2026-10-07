@@ -479,7 +479,9 @@ fn lower(
         // across instances. Families with a whole-relation meaning (global
         // Sort, Single/Final TopN, Limit, global row-count assertion) reach
         // here only over the Singleton input the checked physical contract
-        // requires, and a per-key assertion only over a key-colocated one. A
+        // requires, and a per-key assertion only over a key-colocated one.
+        // An analytic Sort and its Window consume instance-level partition
+        // co-location: each gathers its instance input to one driver. A
         // Partial row-count TopN prunes each instance's own rows wherever they
         // are placed; its gather-and-Final sequence is a checked plan fact. A
         // family that consumes per-driver key co-location must author its own
@@ -523,13 +525,21 @@ fn lower(
             // Every row-count TopN phase; a grouped-state reduction has no
             // local owner.
             NodeKind::Sort {
-                mode: novarocks_physical_plan::SortMode::Global,
+                mode:
+                    novarocks_physical_plan::SortMode::Global
+                    | novarocks_physical_plan::SortMode::Analytic { .. },
                 ..
             }
             | NodeKind::TopN {
                 reduction: novarocks_physical_plan::TopNReduction::Rows,
                 ..
             } => node.inputs.len() == 1,
+            // A window, under its own admission: one input and an installed
+            // pure window kernel for each call shape.
+            NodeKind::Window(_) => {
+                crate::window::admit_window(package, node, functions, work)?;
+                true
+            }
             NodeKind::SetOp {
                 kind: novarocks_physical_plan::SetOperationKind::UnionAll,
                 ..
@@ -703,31 +713,41 @@ fn lower(
         }
         // Every row-count TopN phase emits its instance's window as one
         // ordered stream on one driver, so its declared ordering holds for
-        // the whole instance output, as the property law states it.
+        // the whole instance output, as the property law states it. An
+        // analytic Sort does the same over its partition keys and then its
+        // order keys.
         let global = matches!(
             node.kind,
             NodeKind::Sort {
-                mode: novarocks_physical_plan::SortMode::Global,
+                mode: novarocks_physical_plan::SortMode::Global
+                    | novarocks_physical_plan::SortMode::Analytic { .. },
                 ..
             } | NodeKind::TopN {
                 reduction: novarocks_physical_plan::TopNReduction::Rows,
                 ..
             }
         );
-        if !(node.output_properties.ordering.is_empty() || global || (sorted && transparent)) {
+        // A window emits its gathered input on one driver in arrival order,
+        // so it preserves exactly the ordering it reads. One that partitions
+        // or orders reads that ordering from an actual sorted source.
+        let window = matches!(node.kind, NodeKind::Window(_));
+        if let NodeKind::Window(spec) = &node.kind
+            && !(spec.partition_by.is_empty() && spec.order_by.is_empty())
+            && !sorted
+        {
+            return Err(FragmentCompileError::Unsupported {
+                node: Some(id),
+                feature: "window input ordering lacks a supported sort source",
+            });
+        }
+        let ordered = global || (sorted && (transparent || window));
+        if !(node.output_properties.ordering.is_empty() || ordered) {
             return Err(FragmentCompileError::Unsupported {
                 node: Some(id),
                 feature: "ordering lacks supported global-sort source",
             });
         }
-        properties.insert(
-            id,
-            (
-                expanded || changes,
-                global || (sorted && transparent),
-                scan_rooted,
-            ),
-        );
+        properties.insert(id, (expanded || changes, ordered, scan_rooted));
     }
     work.flush()?;
     let channels_plan = resolve_tree_channels(package, &order, work.control())?;
@@ -1032,6 +1052,24 @@ fn lower(
                         child,
                         nodes[child.index()].output_layout(),
                         &expressions.ids,
+                        work.control(),
+                    )?
+                }
+                NodeKind::Window(_) => {
+                    let child =
+                        *local_ids
+                            .get(&node.inputs[0])
+                            .ok_or(FragmentCompileError::Invalid(
+                                "missing lowered window child",
+                            ))?;
+                    work.flush()?;
+                    crate::window::lower_window(
+                        package,
+                        node,
+                        child,
+                        nodes[child.index()].output_layout(),
+                        &expressions.ids,
+                        &planned.slots,
                         work.control(),
                     )?
                 }
@@ -1478,7 +1516,11 @@ fn lower(
     // A materialized constant Values cell is backing, not a runtime root.
     // Retire only those constant-cell source occurrences; every dynamic cell
     // keeps its root and argument uses as a ValuesCell root.
-    let retired = retired_values_uses(package, &expressions, work)?;
+    let mut retired = retired_values_uses(package, &expressions, work)?;
+    // A window call occurrence and its frame offsets leave the flow; its
+    // argument uses are re-rooted on the Analytic node.
+    let window_roots = crate::window::window_roots(package, &local_ids, work)?;
+    retired.extend(window_roots.retired.iter().copied());
     let mut domains = Vec::new();
     for domain in package.expression_uses().flow().domains().values() {
         work.step()?;
@@ -1580,6 +1622,15 @@ fn lower(
                 ProgramNodeExpressionRole::ScanResidual
             }
             ExpressionRootRole::SortOrder { key } => ProgramNodeExpressionRole::SortOrder { key },
+            ExpressionRootRole::SortPartition { key } => {
+                ProgramNodeExpressionRole::SortPartition { key }
+            }
+            ExpressionRootRole::WindowPartition { key } => {
+                ProgramNodeExpressionRole::WindowPartition { key }
+            }
+            ExpressionRootRole::WindowOrder { key } => {
+                ProgramNodeExpressionRole::WindowOrder { key }
+            }
             ExpressionRootRole::TopNOrder { key } => ProgramNodeExpressionRole::SortOrder { key },
             ExpressionRootRole::ProjectOutput { expression } => {
                 ProgramNodeExpressionRole::ProjectOutput { expression }
@@ -1627,6 +1678,8 @@ fn lower(
             use_id: *use_id,
         });
     }
+    crate::assert_rows::reserve_vec(&mut roots, window_roots.inputs.len(), work)?;
+    roots.extend(window_roots.inputs);
     work.flush()?;
     let flow = ProgramControlFlow::try_new(
         domains,

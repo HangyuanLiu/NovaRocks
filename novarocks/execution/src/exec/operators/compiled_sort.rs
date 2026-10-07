@@ -15,13 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Compiled global Sort and ordinary row-count TopN.
+//! Compiled global and analytic Sort and ordinary row-count TopN.
 //!
-//! The local compiler emits exactly two shapes of the local Sort vocabulary:
-//! a global sort (`use_top_n = false`, no limit, offset 0) and an ordinary
-//! row-count TopN (`use_top_n = true`, `limit`, `offset`, RowNumber). Both
-//! have no partition keys and no buffering cap. Every other Sort shape is an
-//! explicit refusal here.
+//! The local compiler emits exactly three shapes of the local Sort
+//! vocabulary: a global sort (`use_top_n = false`, no limit, offset 0), an
+//! analytic sort (the same with partition keys and no partition limit) and an
+//! ordinary row-count TopN (`use_top_n = true`, `limit`, `offset`, RowNumber,
+//! no partition keys). None has a buffering cap. An analytic sort orders by
+//! its partition keys first, each with its own direction and NULL placement,
+//! and then by its order keys; it emits every row, so its partitions arrive
+//! contiguously. Every other Sort shape is an explicit refusal here.
 //!
 //! The TopN shape serves every phase of a `Rows` reduction alike, because
 //! each is the window of its own instance input. Single and Final read the
@@ -30,8 +33,9 @@
 //! keeps its instance's top rows and the gathered Final selects the window.
 //! A grouped-state partial never reaches this operator.
 //!
-//! Evaluation boundary: each ORDER BY key is a compiled `SortOrder` root,
-//! evaluated by this driver's own instance exactly once per input row, on
+//! Evaluation boundary: each partition key is a compiled `SortPartition`
+//! root and each ORDER BY key a compiled `SortOrder` root, evaluated by this
+//! driver's own instance exactly once per input row, on
 //! arrival, in arrival order. Key columns travel with their payload rows from
 //! then on; pruning and the final sort never re-evaluate a key. The reused
 //! legacy pieces are pure array code only: `normalize_sort_key_array`, the
@@ -115,9 +119,14 @@ impl CompiledSortProcessorFactory {
             ));
         };
         let at = node.index();
-        if !partition_exprs.is_empty() || partition_limit.is_some() {
+        if partition_limit.is_some() {
             return Err(format!(
-                "compiled Sort at local node {at} with partition keys is not executable"
+                "compiled Sort at local node {at} with a partition limit is not executable"
+            ));
+        }
+        if *use_top_n && !partition_exprs.is_empty() {
+            return Err(format!(
+                "compiled TopN at local node {at} with partition keys is not executable"
             ));
         }
         if *topn_type != SortTopNType::RowNumber {
@@ -130,7 +139,7 @@ impl CompiledSortProcessorFactory {
                 "compiled Sort at local node {at} carries a buffering cap the compiler never authors"
             ));
         }
-        if order_by.is_empty() {
+        if order_by.is_empty() && partition_exprs.is_empty() {
             return Err(format!(
                 "compiled Sort at local node {at} has no ordering key"
             ));
@@ -144,14 +153,29 @@ impl CompiledSortProcessorFactory {
         } else {
             None
         };
-        let mut sites = Vec::with_capacity(order_by.len());
-        let mut options = Vec::with_capacity(order_by.len());
-        for (ordinal, key) in order_by.iter().enumerate() {
+        let mut sites = Vec::with_capacity(partition_exprs.len() + order_by.len());
+        let mut options = Vec::with_capacity(partition_exprs.len() + order_by.len());
+        // Partition keys lead, then the order keys within each partition.
+        let keys = partition_exprs
+            .iter()
+            .enumerate()
+            .map(|(ordinal, key)| (ordinal, key, true))
+            .chain(
+                order_by
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, key)| (ordinal, key, false)),
+            );
+        for (ordinal, key, partition) in keys {
             let key_ordinal = u32::try_from(ordinal)
                 .map_err(|_| format!("compiled Sort at local node {at} has too many keys"))?;
             sites.push(ProgramExpressionRootSite::Node {
                 node,
-                role: ProgramNodeExpressionRole::SortOrder { key: key_ordinal },
+                role: if partition {
+                    ProgramNodeExpressionRole::SortPartition { key: key_ordinal }
+                } else {
+                    ProgramNodeExpressionRole::SortOrder { key: key_ordinal }
+                },
             });
             // NULL placement is independent of direction, as in Arrow.
             options.push(SortOptions {
