@@ -490,6 +490,7 @@ fn classify_plan_node_kind(kind: plan::plan_node::Kind) -> &'static str {
         plan::plan_node::Kind::Unpivot(_) => "unpivot",
         plan::plan_node::Kind::QuotaPreclaim(_) => "quota_preclaim",
         plan::plan_node::Kind::QuotaTrim(_) => "quota_trim",
+        plan::plan_node::Kind::Membership(_) => "membership",
     }
 }
 
@@ -554,13 +555,14 @@ fn plan_node_kind_match_is_exhaustive_over_current_oneof() {
         Kind::Unpivot(plan::UnpivotNode::default()),
         Kind::QuotaPreclaim(plan::QuotaPreclaimNode::default()),
         Kind::QuotaTrim(plan::QuotaTrimNode::default()),
+        Kind::Membership(plan::MembershipNode::default()),
     ];
 
     let names = kinds
         .into_iter()
         .map(classify_plan_node_kind)
         .collect::<Vec<_>>();
-    assert_eq!(names.len(), 25);
+    assert_eq!(names.len(), 26);
     assert!(names.contains(&"scan"));
     assert!(names.contains(&"redistribute"));
 }
