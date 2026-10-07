@@ -25,8 +25,8 @@ use novarocks_connector_contract::{
     ConnectorReadProgramRecipe, ConnectorReadRelationKind, ConnectorReadWorkSource,
 };
 use novarocks_local_program::{
-    BindingRequirement, CompiledScanInput, ProgramExprId, ProgramNodeId, ProgramNodeKind,
-    ProgramScanSource, ScanSourceKind, StaticLayout,
+    BindingRequirement, CompiledScanInput, FilterConsumerAtExpr, ProgramExprId, ProgramNodeId,
+    ProgramNodeKind, ProgramScanSource, ScanSourceKind, StaticLayout,
 };
 use novarocks_physical_plan::{ExprId, NodeKind, PhysicalNode, PredicateGuaranteeKind, Relation};
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
@@ -119,13 +119,10 @@ pub(crate) fn admit_scan(
     let recipe = recipe.ok_or(FragmentCompileError::Invalid(
         "scan has no provider read recipe",
     ))?;
+    // Frozen dynamic filters are the scan's runtime-filter consumers; the
+    // runtime-filter plan already proved they are exactly its admitted ones.
     let scan = recipe.frozen().scan();
     work.step()?;
-    if !scan.dynamic_filters().is_empty() {
-        return Err(unsupported(
-            "scan dynamic filter or runtime-filter consumer",
-        ));
-    }
     if scan.work_source() != data.work_source {
         return Err(FragmentCompileError::Invalid(
             "provider read work source differs from its scan",
@@ -134,16 +131,28 @@ pub(crate) fn admit_scan(
     Ok(())
 }
 
+/// `runtime_filters` are the scan's admitted blocking membership consumers in
+/// binding order; consumer `i` is keyed by its `RuntimeFilter { binding: i }`
+/// root over this scan's own output.
 pub(crate) fn lower_scan(
     node: &PhysicalNode,
     id: ProgramNodeId,
     recipe: ConnectorReadProgramRecipe,
+    runtime_filters: Vec<FilterConsumerAtExpr>,
     slots: &[SlotId],
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredScan, FragmentCompileError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = lower_core(node, id, recipe, slots, expressions, &mut work);
+    let result = lower_core(
+        node,
+        id,
+        recipe,
+        runtime_filters,
+        slots,
+        expressions,
+        &mut work,
+    );
     if matches!(&result, Err(FragmentCompileError::Control(_))) {
         return result;
     }
@@ -155,6 +164,7 @@ fn lower_core(
     node: &PhysicalNode,
     id: ProgramNodeId,
     recipe: ConnectorReadProgramRecipe,
+    runtime_filters: Vec<FilterConsumerAtExpr>,
     slots: &[SlotId],
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     work: &mut CompileCheckpoints<'_>,
@@ -209,7 +219,7 @@ fn lower_core(
     Ok(LoweredScan {
         kind: ProgramNodeKind::Scan {
             source,
-            runtime_filters: Vec::new(),
+            runtime_filters,
             conjunct_predicate,
             limit: None,
         },

@@ -37,6 +37,7 @@ pub(crate) mod compiled_expression;
 pub(crate) mod compiled_nljoin;
 pub(crate) mod compiled_repeat;
 pub(crate) mod compiled_sort;
+pub(crate) mod compiled_table_function;
 pub(crate) mod compiled_unpivot;
 pub(crate) mod compiled_writer;
 mod data_stream_sink;

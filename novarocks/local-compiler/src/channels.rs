@@ -48,6 +48,9 @@ pub(crate) struct PlannedChannels {
     pub joins: BTreeMap<NodeId, crate::join::PlannedJoin>,
     /// Join-owned value reads; their actual source is chosen per use.
     pub join_values: BTreeMap<ExprId, crate::join::JoinValueSource>,
+    /// Each table function's planned channels. Its argument Project's
+    /// pass-through reads are its one branch in `unions`.
+    pub table_functions: BTreeMap<NodeId, crate::table_function::PlannedTableFunction>,
 }
 
 pub(crate) struct NodeChannels {
@@ -182,6 +185,7 @@ fn resolve_core(
     let mut unions = BTreeMap::new();
     let mut writer_projections = BTreeMap::new();
     let mut joins = BTreeMap::new();
+    let mut table_functions = BTreeMap::new();
     for &source in root_first.iter().rev() {
         let node = fragment
             .nodes()
@@ -206,6 +210,9 @@ fn resolve_core(
             }
         ) {
             node.inputs.len()
+        } else if matches!(node.kind, NodeKind::TableFunction { .. }) {
+            // The argument Project directly precedes its table function.
+            1
         } else {
             join_shape
                 .as_ref()
@@ -674,6 +681,26 @@ fn resolve_core(
                 joins.insert(source, planned.planned);
                 (planned.slots, planned.port)
             }
+            // A table function produces its output itself; its argument
+            // Project reads the one outer input.
+            NodeKind::TableFunction { .. } => {
+                let child = single_child(&node.inputs)?;
+                let child_channels = nodes.get(&child).ok_or(ChannelLoweringError::Invalid(
+                    "table function input has not been lowered",
+                ))?;
+                let planned = crate::table_function::plan_table_function_channels(
+                    fragment,
+                    node,
+                    local,
+                    child_channels,
+                    &ports[&child],
+                    &mut next_slot,
+                    work,
+                )?;
+                unions.insert(source, vec![planned.selection]);
+                table_functions.insert(source, planned.planned);
+                (planned.slots, planned.port)
+            }
             _ => {
                 return Err(ChannelLoweringError::Invalid("unsupported channel node"));
             }
@@ -746,6 +773,7 @@ fn resolve_core(
         writer_projections,
         joins,
         join_values,
+        table_functions,
     })
 }
 
@@ -837,7 +865,7 @@ fn passthrough(
     Ok((Arc::clone(&nodes[&child].slots), port))
 }
 
-fn resolve_input(
+pub(crate) fn resolve_input(
     value: ValueId,
     channels: &NodeChannels,
     port: &Port,

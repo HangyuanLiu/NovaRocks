@@ -30,7 +30,7 @@ use novarocks_type_contract::{
     ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionUseId,
     MAX_CONTROL_USE_REFERENCES, PureCompileControl,
 };
-use std::sync::Mutex;
+use std::{collections::BTreeSet, sync::Mutex};
 
 #[derive(Default)]
 struct Control {
@@ -75,8 +75,17 @@ impl Records {
         roots: &[UnionRoot],
         control: &Control,
     ) -> Result<(), FragmentCompileError> {
+        self.append_minted(roots, &BTreeSet::new(), control)
+    }
+    fn append_minted(
+        &mut self,
+        roots: &[UnionRoot],
+        minted: &BTreeSet<ExpressionUseId>,
+        control: &Control,
+    ) -> Result<(), FragmentCompileError> {
         append_union_roots(
             roots,
+            minted,
             &mut self.domains,
             &mut self.uses,
             &mut self.bindings,
@@ -208,6 +217,40 @@ fn union_flow_sparse_max_ids_author_fresh_exact_root_contexts_and_channels() {
             }
         );
     }
+}
+
+// A package-minted identity that is not a flow occurrence, such as a
+// relational call context, is never reused by a fresh occurrence.
+#[test]
+fn union_flow_fresh_uses_skip_every_package_minted_identity() {
+    let mut records = Records::sparse();
+    let roots = [0, 1, 2].map(|ordinal| UnionRoot {
+        node: ProgramNodeId::new(8),
+        ordinal,
+        definition: ProgramExprId::new(5),
+        source: input(4, 0),
+    });
+    // 1 and 3 are the smallest holes; 3 also stands for a minted occurrence
+    // already in the flow's numbering.
+    let minted = BTreeSet::from([1, 3, 4].map(ExpressionUseId::new));
+    records
+        .append_minted(&roots, &minted, &Control::default())
+        .unwrap();
+    assert_eq!(
+        records.uses[3..]
+            .iter()
+            .map(|u| u.context.use_id.get())
+            .collect::<Vec<_>>(),
+        [5, 6, 7]
+    );
+    // Domains are an independent namespace and keep their smallest holes.
+    assert_eq!(
+        records.domains[3..]
+            .iter()
+            .map(|d| d.id.get())
+            .collect::<Vec<_>>(),
+        [1, 2, 4]
+    );
 }
 
 #[test]

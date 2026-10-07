@@ -15,11 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Fresh occurrences for actual Union normalization Project slot reads.
+//! Fresh occurrences for compiler-authored slot reads: Union normalization
+//! and join selection Project outputs, and runtime-filter consumer keys.
 //!
 //! The caller supplies actual emitted definitions and exact input channels.
 //! The original program owners validate definition, root, type and lexical
 //! correspondence afterward. No physical use or effect proof is reused here.
+//!
+//! A fresh use identity never reuses one the package already minted: neither
+//! an expression occurrence (retired ones included) nor the context of any
+//! frozen call. A relational call context is not a flow occurrence, yet the
+//! resolved-call owner requires it to differ from every Main occurrence.
 
 use crate::FragmentCompileError;
 use novarocks_local_program::{
@@ -27,12 +33,13 @@ use novarocks_local_program::{
     ProgramExpressionUse, ProgramLexicalSource, ProgramNodeExpressionRole, ProgramNodeId,
     ProgramRootUseBinding, ProgramSlotBinding, ProgramUseRef,
 };
+use novarocks_physical_plan::FragmentPackage;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, EvaluationDemand,
     EvaluationDomainId, ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionUseId,
     MAX_CONTROL_DEFINITIONS, MAX_CONTROL_USE_REFERENCES, PureCompileControl,
 };
-use std::alloc::Layout;
+use std::{alloc::Layout, collections::BTreeSet};
 
 pub(crate) struct UnionRoot {
     pub node: ProgramNodeId,
@@ -41,12 +48,81 @@ pub(crate) struct UnionRoot {
     pub source: ProgramChannelSite,
 }
 
-/// Append only roots for actual normalization projects. On failure the caller
-/// must discard the unpublished vectors, including any appended prefix.
+/// One scan runtime-filter consumer key: the scan's `RuntimeFilter { binding }`
+/// root, a slot read of one occurrence of its own output port.
+pub(crate) struct RuntimeFilterKeyRoot {
+    pub node: ProgramNodeId,
+    pub binding: u32,
+    pub definition: ProgramExprId,
+    pub source: ProgramChannelSite,
+}
+
+/// A compiler-authored slot-read root: its exact root site, its emitted
+/// definition and the one input channel its single occurrence reads.
+pub(crate) trait DerivedSlotRoot {
+    fn site(&self) -> ProgramExpressionRootSite;
+    fn definition(&self) -> ProgramExprId;
+    fn source(&self) -> ProgramChannelSite;
+}
+impl DerivedSlotRoot for UnionRoot {
+    fn site(&self) -> ProgramExpressionRootSite {
+        ProgramExpressionRootSite::Node {
+            node: self.node,
+            role: ProgramNodeExpressionRole::ProjectOutput {
+                expression: self.ordinal,
+            },
+        }
+    }
+    fn definition(&self) -> ProgramExprId {
+        self.definition
+    }
+    fn source(&self) -> ProgramChannelSite {
+        self.source
+    }
+}
+impl DerivedSlotRoot for RuntimeFilterKeyRoot {
+    fn site(&self) -> ProgramExpressionRootSite {
+        ProgramExpressionRootSite::Node {
+            node: self.node,
+            role: ProgramNodeExpressionRole::RuntimeFilter {
+                binding: self.binding,
+            },
+        }
+    }
+    fn definition(&self) -> ProgramExprId {
+        self.definition
+    }
+    fn source(&self) -> ProgramChannelSite {
+        self.source
+    }
+}
+
+/// Every use identity the package minted: each expression occurrence of its
+/// flow and the context of each frozen call, relational ones included.
+pub(crate) fn package_use_ids(
+    package: &FragmentPackage,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<BTreeSet<ExpressionUseId>, FragmentCompileError> {
+    let mut minted = BTreeSet::new();
+    for use_id in package.expression_uses().flow().uses().keys() {
+        minted.insert(*use_id);
+        work.step()?;
+    }
+    for call in package.calls().entries().values() {
+        minted.insert(call.context.use_id);
+        work.step()?;
+    }
+    Ok(minted)
+}
+
+/// Append only roots for actual compiler-authored slot reads, whose fresh use
+/// identities avoid every identity in `uses` and in `minted`. On failure the
+/// caller must discard the unpublished vectors, including any appended prefix.
 /// Count/Layout checks and fallible requests are not a memory grant: caller
 /// admission owns existing capacities, scratch and retained coexistence.
-pub(crate) fn append_union_roots(
-    roots: &[UnionRoot],
+pub(crate) fn append_union_roots<R: DerivedSlotRoot>(
+    roots: &[R],
+    minted: &BTreeSet<ExpressionUseId>,
     domains: &mut Vec<ExpressionEvaluationDomain>,
     uses: &mut Vec<ProgramExpressionUse>,
     bindings: &mut Vec<ProgramRootUseBinding>,
@@ -54,7 +130,7 @@ pub(crate) fn append_union_roots(
     control: &dyn PureCompileControl,
 ) -> Result<(), FragmentCompileError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let outcome = append(roots, domains, uses, bindings, slots, &mut work);
+    let outcome = append(roots, minted, domains, uses, bindings, slots, &mut work);
     if matches!(&outcome, Err(FragmentCompileError::Control(_))) {
         return outcome;
     }
@@ -62,8 +138,9 @@ pub(crate) fn append_union_roots(
     outcome
 }
 
-fn append(
-    roots: &[UnionRoot],
+fn append<R: DerivedSlotRoot>(
+    roots: &[R],
+    minted: &BTreeSet<ExpressionUseId>,
     domains: &mut Vec<ExpressionEvaluationDomain>,
     uses: &mut Vec<ProgramExpressionUse>,
     bindings: &mut Vec<ProgramRootUseBinding>,
@@ -83,6 +160,10 @@ fn append(
         )?;
         work.step()?;
     }
+    // Use candidates also skip every package-minted identity.
+    let use_candidates = use_count
+        .checked_add(minted.len())
+        .ok_or(CompileControlError::ResourceExhausted)?;
     // Gate every output and scratch request before the first reserve. The
     // count-bounded candidate ranges contain enough free IDs by pigeonhole,
     // regardless of sparse existing IDs, including u32::MAX.
@@ -91,13 +172,13 @@ fn append(
     layout::<ProgramRootUseBinding>(binding_count)?;
     layout::<ProgramSlotBinding>(slot_count)?;
     layout::<bool>(domain_count)?;
-    layout::<bool>(use_count)?;
+    layout::<bool>(use_candidates)?;
     if roots.is_empty() {
         return Ok(());
     }
 
     let mut occupied_domains = occupancy(domain_count, work)?;
-    let mut occupied_uses = occupancy(use_count, work)?;
+    let mut occupied_uses = occupancy(use_candidates, work)?;
     for domain in domains.iter() {
         if let Ok(index) = usize::try_from(domain.id.get())
             && let Some(occupied) = occupied_domains.get_mut(index)
@@ -106,8 +187,9 @@ fn append(
         }
         work.step()?;
     }
-    for invocation in uses.iter() {
-        if let Ok(index) = usize::try_from(invocation.context.use_id.get())
+    let existing = uses.iter().map(|invocation| invocation.context.use_id);
+    for use_id in existing.chain(minted.iter().copied()) {
+        if let Ok(index) = usize::try_from(use_id.get())
             && let Some(occupied) = occupied_uses.get_mut(index)
         {
             *occupied = true;
@@ -135,18 +217,13 @@ fn append(
                 domain,
                 demand: EvaluationDemand::Value,
             },
-            definition: root.definition,
+            definition: root.definition(),
             control: ControlShape::Eager,
             arguments: Box::default(),
         });
         work.step()?;
         bindings.push(ProgramRootUseBinding {
-            site: ProgramExpressionRootSite::Node {
-                node: root.node,
-                role: ProgramNodeExpressionRole::ProjectOutput {
-                    expression: root.ordinal,
-                },
-            },
+            site: root.site(),
             use_id,
         });
         work.step()?;
@@ -155,7 +232,7 @@ fn append(
                 arena: ProgramExpressionArena::Main,
                 use_id,
             },
-            source: ProgramLexicalSource::Input(root.source),
+            source: ProgramLexicalSource::Input(root.source()),
         });
         work.step()?;
     }
@@ -218,6 +295,6 @@ fn fresh(
         }
     }
     Err(FragmentCompileError::Invalid(
-        "Union normalization has no free count-bounded identity",
+        "derived slot read has no free count-bounded identity",
     ))
 }

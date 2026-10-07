@@ -62,7 +62,7 @@ const VALUES: NodeId = NodeId::new(30);
 const SCAN2: NodeId = NodeId::new(14);
 const UNION: NodeId = NodeId::new(15);
 
-struct FixtureControl;
+pub(super) struct FixtureControl;
 impl PureCompileControl for FixtureControl {
     fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
         Ok(())
@@ -71,12 +71,12 @@ impl PureCompileControl for FixtureControl {
 
 /// Records every compile callback and refuses exactly one, after which no
 /// further callback may arrive.
-struct Trace {
-    events: Mutex<Vec<(CompilePhase, u32)>>,
+pub(super) struct Trace {
+    pub(super) events: Mutex<Vec<(CompilePhase, u32)>>,
     stop: Option<(usize, CompileControlError)>,
 }
 impl Trace {
-    fn new(stop: Option<(usize, CompileControlError)>) -> Self {
+    pub(super) fn new(stop: Option<(usize, CompileControlError)>) -> Self {
         Self {
             events: Mutex::default(),
             stop,
@@ -148,13 +148,13 @@ impl Spec {
     }
 }
 
-fn int64() -> ValueType {
+pub(super) fn int64() -> ValueType {
     ValueType::new(DataType::Int64, false)
 }
 fn boolean() -> ValueType {
     ValueType::new(DataType::Boolean, false)
 }
-fn binding() -> ConnectorReadBinding {
+pub(super) fn binding() -> ConnectorReadBinding {
     let instance = ConnectorInstanceId::parse("lake").unwrap();
     ConnectorReadBinding::new(
         ConnectorInstanceDescriptor {
@@ -164,7 +164,7 @@ fn binding() -> ConnectorReadBinding {
         CatalogHandle::new(instance, CatalogVersion::from_bytes([3; 32])),
     )
 }
-fn payload(
+pub(super) fn payload(
     binding: &ConnectorReadBinding,
     category: ConnectorCodecCategory,
     value: &'static [u8],
@@ -181,7 +181,7 @@ fn payload(
 }
 /// The provider's own projected fields: names, field ids and schema metadata
 /// are provider facts the compiled layout must keep exactly.
-fn public_schema() -> Schema {
+pub(super) fn public_schema() -> Schema {
     Schema::new_with_metadata(
         ["v0", "v1"]
             .into_iter()
@@ -765,7 +765,7 @@ fn fixture(spec: Spec) -> Fixture {
 }
 
 /// One complete eager use tree per physical root site in one root domain.
-fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
+pub(super) fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
     struct Author<'a> {
         fragment: &'a Fragment,
         next: u32,
@@ -836,7 +836,7 @@ fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
 
 // Conservative retained-source invoice and independent projection ceilings for
 // these small fixtures only; this is not a production default or a MEM grant.
-fn package_admission() -> FragmentPackageAdmission {
+pub(super) fn package_admission() -> FragmentPackageAdmission {
     FragmentPackageAdmission {
         plan_limits: PlanLimits::FROZEN,
         source_retained_bytes: 64 * 1024 * 1024,
@@ -881,7 +881,7 @@ impl ConnectorReadProgramCompiler for Port {
         })
     }
 }
-fn providers() -> PureProviderProgramCatalog<ConnectorError> {
+pub(super) fn providers() -> PureProviderProgramCatalog<ConnectorError> {
     let provider = ConnectorProviderId::parse("alpha").unwrap();
     PureProviderProgramCatalog::try_new(
         &[PureProviderManifestEntry::new(
@@ -903,7 +903,7 @@ fn providers() -> PureProviderProgramCatalog<ConnectorError> {
 }
 
 // A real RAND-only sealed subset; the fixtures call no function.
-fn functions() -> PureEngineFunctionCatalog {
+pub(super) fn functions() -> PureEngineFunctionCatalog {
     let actual =
         novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
     let mut builder = EngineFunctionCatalogBuilder::new();
@@ -939,7 +939,7 @@ fn functions() -> PureEngineFunctionCatalog {
         .unwrap()
 }
 
-fn options(root_sink_dop: Option<usize>) -> LocalCompileOptions {
+pub(super) fn options(root_sink_dop: Option<usize>) -> LocalCompileOptions {
     LocalCompileOptions {
         pipeline_dop: NonZeroUsize::new(1).unwrap(),
         root_sink_dop: root_sink_dop.map(|dop| NonZeroUsize::new(dop).unwrap()),

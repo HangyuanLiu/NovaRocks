@@ -40,8 +40,11 @@
 //! hash NullAwareLeftAnti and the nested-loop Cross. Build-preserving local
 //! kinds (RightOuter, FullOuter, RightSemi, RightAnti), a partitioned or
 //! colocated null-aware anti join and a nested-loop null-aware anti join with
-//! a predicate stay explicit refusals. Runtime filters are refused before
-//! lowering.
+//! a predicate stay explicit refusals.
+//!
+//! Runtime filters: a hash join owns the build-key membership producers the
+//! runtime-filter plan admitted for it. Producer `k` observes `build_keys[k]`,
+//! whose `JoinBuildKey` root is already the producer's key root.
 
 use crate::{
     assert_rows::reserve_vec,
@@ -51,10 +54,11 @@ use crate::{
 };
 use arrow_schema::{FieldRef, Schema};
 use novarocks_local_program::{
-    DiagnosticSourceNodeId, JoinDistributionMode, JoinType, LocalOperatorId, LocalOperatorOrigin,
-    LocalOperatorProvenance, MetricAggregation, NestedLoopJoinType, OperatorMetricAggregation,
-    ProgramChannelLayoutRole, ProgramChannelSite, ProgramExprId, ProgramNode,
-    ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind, StaticLayout,
+    DiagnosticSourceNodeId, FilterProducerAtExpr, JoinDistributionMode, JoinType, LocalOperatorId,
+    LocalOperatorOrigin, LocalOperatorProvenance, MetricAggregation, NestedLoopJoinType,
+    OperatorMetricAggregation, ProgramChannelLayoutRole, ProgramChannelSite, ProgramExprId,
+    ProgramNode, ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind, StaticFilterProducer,
+    StaticLayout,
 };
 use novarocks_physical_plan::{
     Distribution, ExprId, ExpressionRootRole, Fragment, FragmentPackage, JoinDistribution,
@@ -797,9 +801,11 @@ pub(crate) struct JoinInput<'a> {
     pub layout: &'a StaticLayout,
 }
 
+/// `runtime_filters` are the join's admitted membership producers in binding
+/// order, each with the build-key ordinal it observes.
 #[expect(
     clippy::too_many_arguments,
-    reason = "The planned join, its two lowered inputs and the derived selection reads are independent inputs"
+    reason = "The planned join, its two lowered inputs, the derived selection reads and its runtime-filter producers are independent inputs"
 )]
 pub(crate) fn lower_join(
     package: &FragmentPackage,
@@ -810,6 +816,7 @@ pub(crate) fn lower_join(
     build: JoinInput<'_>,
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     selection_definitions: Option<&[ProgramExprId]>,
+    runtime_filters: Vec<(usize, StaticFilterProducer)>,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredJoin, FragmentCompileError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
@@ -822,6 +829,7 @@ pub(crate) fn lower_join(
         build,
         expressions,
         selection_definitions,
+        runtime_filters,
         &mut work,
     );
     if matches!(&result, Err(FragmentCompileError::Control(_))) {
@@ -950,6 +958,7 @@ fn lower_core(
     build: JoinInput<'_>,
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     selection_definitions: Option<&[ProgramExprId]>,
+    runtime_filters: Vec<(usize, StaticFilterProducer)>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<LoweredJoin, FragmentCompileError> {
     let fragment = package.fragment();
@@ -1044,6 +1053,22 @@ fn lower_core(
                 eq_null_safe.push(key.null_safe);
                 work.step()?;
             }
+            // Each producer observes the build key its witness names.
+            let mut producers = Vec::new();
+            reserve_vec(&mut producers, runtime_filters.len(), work)?;
+            for (key_ordinal, producer) in runtime_filters {
+                let expr_id = *build_keys
+                    .get(key_ordinal)
+                    .ok_or(FragmentCompileError::Invalid(
+                        "runtime-filter producer names an absent build key",
+                    ))?;
+                producers.push(FilterProducerAtExpr {
+                    expr_id,
+                    key_ordinal,
+                    producer,
+                });
+                work.step()?;
+            }
             ProgramNodeKind::Join {
                 left: probe.node,
                 right: build.node,
@@ -1056,8 +1081,15 @@ fn lower_core(
                 build_keys,
                 eq_null_safe,
                 residual_predicate: residual.map(|id| lowered(expressions, id)).transpose()?,
-                runtime_filters: Vec::new(),
+                runtime_filters: producers,
             }
+        }
+        (NodeKind::NestLoopJoin { .. }, LocalJoinKind::NestLoop(_))
+            if !runtime_filters.is_empty() =>
+        {
+            return Err(FragmentCompileError::Invalid(
+                "nested-loop join has runtime-filter producers",
+            ));
         }
         (NodeKind::NestLoopJoin { predicate, .. }, LocalJoinKind::NestLoop(join_type)) => {
             ProgramNodeKind::NestedLoopJoin {

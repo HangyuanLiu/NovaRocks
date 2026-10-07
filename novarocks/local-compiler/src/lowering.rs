@@ -303,14 +303,10 @@ fn lower(
             });
         }
     }
-    // Provider reads and writes are admitted per scan and writer below;
-    // runtime-filter graphs remain explicit.
-    if !package.cuts().runtime_filters.is_empty() || !physical.runtime_filters().is_empty() {
-        return Err(FragmentCompileError::Unsupported {
-            node: None,
-            feature: "runtime-filter graph",
-        });
-    }
+    // Provider reads and writes are admitted per scan and writer below; each
+    // local runtime-filter endpoint is admitted here and later lowered by its
+    // own scan or join.
+    let mut runtime_filters = crate::runtime_filter::plan_runtime_filters(package, &reads, work)?;
     // The result port exists exactly for a Result sink; a stream producer
     // has no result labels and never borrows another fragment's port.
     let result = package.result();
@@ -372,6 +368,20 @@ fn lower(
                 .checked_add(definitions)
                 .ok_or(CompileControlError::ResourceExhausted)?;
         }
+        // A table function also owns its argument Project, that Project's
+        // channels and pass-through reads, and its relation result channels.
+        if let Some((pieces, channels, definitions)) = crate::table_function::resource_bound(node)?
+        {
+            expanded_nodes = expanded_nodes
+                .checked_add(pieces)
+                .ok_or(CompileControlError::ResourceExhausted)?;
+            channel_count = channel_count
+                .checked_add(channels)
+                .ok_or(CompileControlError::ResourceExhausted)?;
+            derived_definitions = derived_definitions
+                .checked_add(definitions)
+                .ok_or(CompileControlError::ResourceExhausted)?;
+        }
         if matches!(
             node.kind,
             NodeKind::SetOp {
@@ -393,6 +403,10 @@ fn lower(
         }
         work.step()?;
     }
+    // Each scan runtime-filter consumer key is one derived slot read.
+    derived_definitions = derived_definitions
+        .checked_add(runtime_filters.consumer_count()?)
+        .ok_or(CompileControlError::ResourceExhausted)?;
     let original_flow = package.expression_uses().flow();
     let mut references = original_flow
         .uses()
@@ -524,6 +538,12 @@ fn lower(
             NodeKind::TableWriter { .. } | NodeKind::TableFinish(_) => node.inputs.len() == 1,
             // Both join families, under their own admission below.
             NodeKind::HashJoin { .. } | NodeKind::NestLoopJoin { .. } => node.inputs.len() == 2,
+            // A table function, under its own admission: exactly one outer
+            // input and an installed pure TableV1 kernel.
+            NodeKind::TableFunction { .. } => {
+                crate::table_function::admit_table_function(node, functions, work)?;
+                true
+            }
             _ => false,
         };
         if !supported {
@@ -561,7 +581,10 @@ fn lower(
         }
         stack.push((id, true, depth));
         for &child in node.inputs.iter().rev() {
-            stack.push((child, false, depth + if union || join { 2 } else { 1 }));
+            // A join's selection, a union's normalizer and a table function's
+            // argument Project each add one local node above the child.
+            let derived = union || join || matches!(node.kind, NodeKind::TableFunction { .. });
+            stack.push((child, false, depth + if derived { 2 } else { 1 }));
             work.step()?;
         }
     }
@@ -605,9 +628,15 @@ fn lower(
         }
         let sorted = node.inputs.len() == 1 && properties.get(&node.inputs[0]).is_some_and(|p| p.1);
         let changes = matches!(node.kind, NodeKind::ChangeEventExpand { .. });
+        // A table function keeps each outer row on its driver and emits its
+        // rows in outer order; the property law keeps exactly the input
+        // ordering prefix its pass-through values carry.
         let transparent = matches!(
             node.kind,
-            NodeKind::Project { .. } | NodeKind::Filter { .. } | NodeKind::Limit { .. }
+            NodeKind::Project { .. }
+                | NodeKind::Filter { .. }
+                | NodeKind::Limit { .. }
+                | NodeKind::TableFunction { .. }
         );
         let partial_rows = matches!(
             node.kind,
@@ -702,12 +731,14 @@ fn lower(
     }
     work.flush()?;
     let channels_plan = resolve_tree_channels(package, &order, work.control())?;
+    let runtime_filter_keys = runtime_filters.consumer_keys(&channels_plan.nodes, work)?;
     work.flush()?;
     let expressions = lower_expressions_with_unions(
         package,
         options.constants,
         &channels_plan.inputs,
         &channels_plan.unions,
+        &runtime_filter_keys,
         work.control(),
     )?;
     work.flush()?;
@@ -730,6 +761,7 @@ fn lower(
     let mut operators = Vec::new();
     let mut allowed = BTreeSet::new();
     let mut union_roots = Vec::new();
+    let mut filter_roots = Vec::new();
     let mut source_requirements = Vec::new();
     let mut exchange_inputs = BTreeMap::new();
     let mut scan_inputs = BTreeMap::new();
@@ -768,6 +800,8 @@ fn lower(
                 .get(&source)
                 .and_then(|rows| rows.first())
                 .map(Vec::as_slice);
+            let filters = runtime_filters.take_join(source, work)?;
+            source_requirements.extend(filters.requirements);
             work.flush()?;
             let lowered = crate::join::lower_join(
                 package,
@@ -784,6 +818,7 @@ fn lower(
                 },
                 &expressions.ids,
                 selection,
+                filters.producers,
                 work.control(),
             )?;
             for emitted in lowered.nodes {
@@ -799,6 +834,50 @@ fn lower(
             channels.extend(lowered.channels);
             operators.extend(lowered.operators);
             union_roots.extend(lowered.selection_roots);
+            allowed.insert(DiagnosticSourceNodeId::new(source.get()));
+            local_ids.insert(source, id);
+            continue;
+        }
+        // A table function lowers to its argument Project and itself.
+        if let Some(table) = channels_plan.table_functions.get(&source) {
+            let child = *local_ids
+                .get(&node.inputs[0])
+                .ok_or(FragmentCompileError::Invalid(
+                    "missing lowered table function input",
+                ))?;
+            let reads = expressions
+                .union_ids
+                .get(&source)
+                .and_then(|rows| rows.first())
+                .ok_or(FragmentCompileError::Invalid(
+                    "missing table function pass-through definitions",
+                ))?;
+            work.flush()?;
+            let lowered = crate::table_function::lower_table_function(
+                package,
+                node,
+                table,
+                &planned.slots,
+                child,
+                &expressions.ids,
+                reads,
+                work.control(),
+            )?;
+            for emitted in lowered.nodes {
+                let same = emitted
+                    .local_id()
+                    .is_some_and(|emitted| emitted.index() == nodes.len());
+                work.step()?;
+                if !same {
+                    return Err(FragmentCompileError::Invalid(
+                        "table function schedule differs",
+                    ));
+                }
+                nodes.push(emitted);
+            }
+            channels.extend(lowered.channels);
+            operators.extend(lowered.operators);
+            union_roots.extend(lowered.pass_through_roots);
             allowed.insert(DiagnosticSourceNodeId::new(source.get()));
             local_ids.insert(source, id);
             continue;
@@ -920,16 +999,25 @@ fn lower(
                     let recipe = reads.remove(&source).ok_or(FragmentCompileError::Invalid(
                         "missing provider read recipe",
                     ))?;
+                    let filters = runtime_filters.take_scan(
+                        source,
+                        id,
+                        expressions.runtime_filter_key_ids.get(&source),
+                        work,
+                    )?;
                     work.flush()?;
                     let lowered = lower_scan(
                         node,
                         id,
                         recipe,
+                        filters.filters,
                         &planned.slots,
                         &expressions.ids,
                         work.control(),
                     )?;
                     source_requirements.push(lowered.requirement);
+                    source_requirements.extend(filters.requirements);
+                    filter_roots.extend(filters.roots);
                     scan_inputs.insert(id, lowered.input);
                     scan_layouts.insert(id);
                     (lowered.kind, lowered.layout)
@@ -1322,6 +1410,7 @@ fn lower(
             "provider write recipe has no lowered table writer",
         ));
     }
+    runtime_filters.finish()?;
     let root = local_ids[&physical.root()];
     let root_layout = nodes[root.index()].output_layout();
     work.flush()?;
@@ -1422,9 +1511,21 @@ fn lower(
     }
     let mut roots = Vec::new();
     let mut union_slot_bindings = Vec::new();
+    let minted = crate::union_flow::package_use_ids(package, work)?;
     work.flush()?;
     crate::union_flow::append_union_roots(
         &union_roots,
+        &minted,
+        &mut domains,
+        &mut uses,
+        &mut roots,
+        &mut union_slot_bindings,
+        work.control(),
+    )?;
+    work.flush()?;
+    crate::union_flow::append_union_roots(
+        &filter_roots,
+        &minted,
         &mut domains,
         &mut uses,
         &mut roots,
@@ -1447,6 +1548,16 @@ fn lower(
                 },
                 use_id: *use_id,
             });
+            continue;
+        }
+        // A table function's argument roots belong to its argument Project.
+        if let ExpressionRootRole::TableFunctionArgument { argument } = site.role {
+            roots.push(crate::table_function::argument_root(
+                &channels_plan.table_functions,
+                site.node,
+                argument,
+                *use_id,
+            )?);
             continue;
         }
         let node = *local_ids

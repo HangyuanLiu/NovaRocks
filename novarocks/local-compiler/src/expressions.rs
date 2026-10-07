@@ -55,6 +55,8 @@ pub(crate) struct LoweredExpressions {
     pub ids: BTreeMap<ExprId, ProgramExprId>,
     pub types: Vec<FunctionArgumentType>,
     pub union_ids: BTreeMap<novarocks_physical_plan::NodeId, Vec<Vec<ProgramExprId>>>,
+    /// Each scan's runtime-filter consumer key reads, in its binding order.
+    pub runtime_filter_key_ids: BTreeMap<novarocks_physical_plan::NodeId, Vec<ProgramExprId>>,
 }
 
 #[derive(Debug)]
@@ -239,21 +241,37 @@ pub(crate) fn lower_expressions(
         policy,
         inputs,
         &BTreeMap::new(),
+        &BTreeMap::new(),
         control,
         &mut work,
     );
     finish(result, &mut work)
 }
 
+/// Lower every actual definition, then author one slot-read definition per
+/// Union normalization or join selection source and per scan runtime-filter
+/// consumer key, each typed exactly as the channel it reads.
 pub(crate) fn lower_expressions_with_unions(
     package: &FragmentPackage,
     policy: ConstantPolicy,
     inputs: &BTreeMap<ExprId, crate::channels::ResolvedInput>,
     unions: &BTreeMap<novarocks_physical_plan::NodeId, Vec<crate::channels::UnionChannelBranch>>,
+    runtime_filter_keys: &BTreeMap<
+        novarocks_physical_plan::NodeId,
+        Vec<crate::channels::UnionChannelSource>,
+    >,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredExpressions, ExpressionLoweringError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = lower_core(package, policy, inputs, unions, control, &mut work);
+    let result = lower_core(
+        package,
+        policy,
+        inputs,
+        unions,
+        runtime_filter_keys,
+        control,
+        &mut work,
+    );
     finish(result, &mut work)
 }
 
@@ -304,6 +322,10 @@ fn lower_core(
     policy: ConstantPolicy,
     inputs: &BTreeMap<ExprId, crate::channels::ResolvedInput>,
     unions: &BTreeMap<novarocks_physical_plan::NodeId, Vec<crate::channels::UnionChannelBranch>>,
+    runtime_filter_keys: &BTreeMap<
+        novarocks_physical_plan::NodeId,
+        Vec<crate::channels::UnionChannelSource>,
+    >,
     control: &dyn PureCompileControl,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<LoweredExpressions, ExpressionLoweringError> {
@@ -316,6 +338,12 @@ fn lower_core(
                 .ok_or(CompileControlError::ResourceExhausted)?;
             work.step()?;
         }
+    }
+    for keys in runtime_filter_keys.values() {
+        count = count
+            .checked_add(keys.len())
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        work.step()?;
     }
     if count > MAX_CONTROL_DEFINITIONS {
         return Err(ExpressionLoweringError::Invalid(
@@ -742,6 +770,28 @@ fn lower_core(
         union_ids.insert(owner, rows);
         work.step()?;
     }
+    // A scan consumer key reads one occurrence of its scan's own output port.
+    let mut runtime_filter_key_ids = BTreeMap::new();
+    for (&scan, keys) in runtime_filter_keys {
+        let mut definitions = Vec::new();
+        definitions
+            .try_reserve_exact(keys.len())
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        for key in keys {
+            work.flush()?;
+            definitions.push(ProgramExprId::new(nodes.len()));
+            nodes.push(StaticExprNode::new(
+                StaticExprKind::SlotId(key.input.slot),
+                key.ty.data_type.clone(),
+                None,
+            ));
+            types.push(FunctionArgumentType::Value(key.ty.clone()));
+            work.step()?;
+            work.flush()?;
+        }
+        runtime_filter_key_ids.insert(scan, definitions);
+        work.step()?;
+    }
     work.flush()?;
     // No legacy exception or session-timezone capability is authored here.
     // Frozen semantic parameters remain on exact prepared call contracts.
@@ -758,6 +808,7 @@ fn lower_core(
         ids,
         types,
         union_ids,
+        runtime_filter_key_ids,
     })
 }
 
@@ -996,12 +1047,14 @@ fn prepare_core(
         work.step()?;
     }
     let flow = package.expression_uses().flow();
-    // Relational Aggregate calls are prepared after every expression
-    // occurrence; every other relational lifecycle stays explicit.
+    // Relational Aggregate and Table calls are prepared after every
+    // expression occurrence; every other relational lifecycle stays explicit.
     for &site in package.calls().entries().keys() {
         let admitted = match site {
             PhysicalCallSite::Expression(_) => true,
-            PhysicalCallSite::Aggregate { .. } => aggregate_nodes.is_some(),
+            PhysicalCallSite::Aggregate { .. } | PhysicalCallSite::Table { .. } => {
+                aggregate_nodes.is_some()
+            }
             _ => false,
         };
         if !admitted {
@@ -1600,6 +1653,14 @@ fn prepare_core(
     }
     if let Some(nodes) = aggregate_nodes {
         crate::aggregate::prepare_aggregate_calls(
+            package,
+            functions,
+            &effects,
+            nodes,
+            &mut tokens,
+            work,
+        )?;
+        crate::table_function::prepare_table_calls(
             package,
             functions,
             &effects,

@@ -33,7 +33,9 @@ mod join_lowering_tests;
 mod lowering;
 mod original_requests;
 mod repeat;
+mod runtime_filter;
 mod scan;
+mod table_function;
 mod union;
 mod union_flow;
 mod unpivot;
@@ -229,7 +231,13 @@ mod exchange_lowering_tests;
 mod scan_lowering_tests;
 
 #[cfg(test)]
+mod runtime_filter_lowering_tests;
+
+#[cfg(test)]
 mod union_flow_tests;
 
 #[cfg(test)]
 mod union_lowering_tests;
+
+#[cfg(test)]
+mod table_function_lowering_tests;

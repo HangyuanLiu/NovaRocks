@@ -52,6 +52,7 @@ use crate::exec::operators::compiled_expression::{
 };
 use crate::exec::operators::compiled_repeat::CompiledRepeatProcessorFactory;
 use crate::exec::operators::compiled_sort::CompiledSortProcessorFactory;
+use crate::exec::operators::compiled_table_function::CompiledTableFunctionProcessorFactory;
 use crate::exec::operators::compiled_unpivot::CompiledUnpivotProcessorFactory;
 use crate::exec::operators::runtime_filter::CompiledRuntimeFilterConsumers;
 use crate::runtime::runtime_state::RuntimeErrorState;
@@ -640,6 +641,19 @@ fn build_node(
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
         }
+        ProgramNodeKind::TableFunction { input, .. } => {
+            // Each driver expands its own rows in input order; its input is
+            // the subordinate argument Project, so the stream keeps its width
+            // and placement.
+            let factory = CompiledTableFunctionProcessorFactory::try_new(
+                Arc::clone(program),
+                id,
+                Arc::clone(error),
+            )?;
+            let mut build = build_node(program, *input, ctx, error)?;
+            build.pipeline.factories.push(Box::new(factory));
+            Ok(build)
+        }
         ProgramNodeKind::TableWriter { input, .. } => {
             writer_pipelines::build_table_writer(program, id, node_id, *input, ctx, error)
         }
@@ -848,3 +862,11 @@ mod join_tests;
 #[cfg(test)]
 #[path = "compiled_runtime_filter_tests.rs"]
 mod runtime_filter_tests;
+
+#[cfg(test)]
+#[path = "compiled_runtime_filter_compile_tests.rs"]
+mod runtime_filter_compile_tests;
+
+#[cfg(test)]
+#[path = "compiled_table_function_tests.rs"]
+mod compiled_table_function_tests;
