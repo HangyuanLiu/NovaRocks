@@ -57,6 +57,10 @@ impl std::fmt::Debug for RuntimeState {
 #[derive(Debug, Default)]
 pub struct RuntimeErrorState {
     error: std::sync::Mutex<Option<RuntimeFailure>>,
+    /// Published under the error lock together with the first failure and
+    /// never cleared, so a stop check needs neither the lock nor its lazy
+    /// platform initialization.
+    published: std::sync::atomic::AtomicBool,
     stopped: std::sync::Condvar,
     #[cfg(test)]
     waiting: std::sync::atomic::AtomicUsize,
@@ -69,8 +73,10 @@ struct RuntimeFailure {
 }
 
 impl RuntimeErrorState {
+    /// Whether a first failure has been published. Lock-free and
+    /// allocation-free, for observation on a task's hot path.
     pub(crate) fn is_stopped(&self) -> bool {
-        self.error.lock().expect("runtime error lock").is_some()
+        self.published.load(Ordering::Acquire)
     }
 
     pub fn set_error(&self, err: String) {
@@ -80,6 +86,7 @@ impl RuntimeErrorState {
                 message: err,
                 task_failure: None,
             });
+            self.published.store(true, Ordering::Release);
             self.stopped.notify_all();
         }
     }
@@ -100,6 +107,7 @@ impl RuntimeErrorState {
                 message: failure.to_string(),
                 task_failure: Some(failure),
             });
+            self.published.store(true, Ordering::Release);
             self.stopped.notify_all();
         }
     }
@@ -442,5 +450,36 @@ mod tests {
             name.contains("novarocks-sink-io"),
             "sink_io task ran on unexpected thread: {name}"
         );
+    }
+
+    #[test]
+    fn runtime_error_stop_observation_is_allocation_free_and_first_wins() {
+        use crate::exec::expr::json_in_pair::test_support::with_admission_witness;
+        use novarocks_execution_contract::{SafeDetail, TaskFailure, TaskFailureCategory};
+
+        // A never-locked error state: the platform lock may initialize lazily
+        // on its first lock, which a stop check must not trigger.
+        let errors = RuntimeErrorState::default();
+        let tracker = MemTracker::new_root("stop-observation");
+        let (stopped, report) = with_admission_witness(&tracker, || errors.is_stopped());
+        assert!(!stopped);
+        assert_eq!(report.non_admitted_allocations, 0, "{report:?}");
+
+        let failure = TaskFailure::new(
+            TaskFailureCategory::Execution,
+            SafeDetail::truncating("first"),
+        );
+        errors.set_failure(failure.clone());
+        errors.set_error("second".to_string());
+        let (stopped, report) = with_admission_witness(&tracker, || errors.is_stopped());
+        assert!(stopped);
+        assert_eq!(report.non_admitted_allocations, 0, "{report:?}");
+        assert_eq!(errors.task_failure(), Some(failure.clone()));
+        assert_eq!(errors.error(), Some(failure.to_string()));
+
+        let untyped = RuntimeErrorState::default();
+        untyped.set_error("plain".to_string());
+        assert!(untyped.is_stopped());
+        assert_eq!(untyped.task_failure(), None);
     }
 }

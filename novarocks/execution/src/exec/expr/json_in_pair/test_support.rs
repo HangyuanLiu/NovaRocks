@@ -36,23 +36,55 @@ use novarocks_execution_contract::TaskIdentity;
 
 /// One process runtime shared by the pair tests, with the production
 /// chrono-backed local offset owner.
-pub(super) fn shared_runtime() -> Arc<ExecutionRuntime> {
+pub(crate) fn shared_runtime() -> Arc<ExecutionRuntime> {
     static RUNTIME: OnceLock<Arc<ExecutionRuntime>> = OnceLock::new();
     Arc::clone(RUNTIME.get_or_init(test_execution_runtime))
 }
 
 /// The shared runtime with its local offset owner replaced by `owner`.
-pub(super) fn runtime_with_offset_owner(owner: Arc<LocalOffsetOwner>) -> Arc<ExecutionRuntime> {
+pub(crate) fn runtime_with_offset_owner(owner: Arc<LocalOffsetOwner>) -> Arc<ExecutionRuntime> {
     Arc::new(ExecutionRuntime::clone(&shared_runtime()).with_local_offset_owner(owner))
 }
 
-pub(super) fn task_state(
+pub(crate) fn task_state(
     identity: TaskIdentity,
     tracker: Arc<MemTracker>,
     runtime: Option<Arc<ExecutionRuntime>>,
 ) -> RuntimeState {
     RuntimeState::new(None, None, None, None, None, Some(tracker), runtime)
         .with_verification(Arc::new(TaskVerificationHolder::new(identity)))
+}
+
+/// The unchanged old IN-list pair rule: SQL NULL is UNKNOWN; both sides
+/// converted by the old text-or-Variant entry compare as JSON values;
+/// otherwise the raw texts compare.
+pub(crate) fn old_in_list_pair(
+    lhs: Option<&str>,
+    rhs: Option<&str>,
+) -> super::interface::JsonPairTruth {
+    use super::interface::JsonPairTruth;
+    let (Some(lhs), Some(rhs)) = (lhs, rhs) else {
+        return JsonPairTruth::Unknown;
+    };
+    let a = super::super::in_pred::json_value_from_text_or_variant(lhs);
+    let b = super::super::in_pred::json_value_from_text_or_variant(rhs);
+    let equal = if a.is_some() && b.is_some() {
+        a == b
+    } else {
+        lhs == rhs
+    };
+    if equal {
+        JsonPairTruth::True
+    } else {
+        JsonPairTruth::False
+    }
+}
+
+/// The JSON text the old IN-list conversion gives `text`.
+pub(crate) fn old_in_list_text(text: &str) -> String {
+    super::super::in_pred::json_value_from_text_or_variant(text)
+        .expect("the old entry converts the text")
+        .to_string()
 }
 
 /// Variant metadata with no keys.
@@ -114,7 +146,7 @@ pub(crate) fn ascii_timestamp_variant(micros: &[i64]) -> String {
 
 /// What the global allocator saw on this thread inside one witness scope.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct AdmissionReport {
+pub(crate) struct AdmissionReport {
     pub admitted_bytes: u64,
     pub non_admitted_allocations: u64,
     pub non_admitted_bytes: u64,
@@ -133,7 +165,7 @@ thread_local! {
 
 /// Runs `body` with every global allocation on this thread checked against
 /// the bytes `tracker` admitted during the same scope.
-pub(super) fn with_admission_witness<R>(
+pub(crate) fn with_admission_witness<R>(
     tracker: &Arc<MemTracker>,
     body: impl FnOnce() -> R,
 ) -> (R, AdmissionReport) {

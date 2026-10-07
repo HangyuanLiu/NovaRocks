@@ -72,6 +72,7 @@ impl JsonPairWork {
             true
         }
     }
+    #[cfg(test)]
     pub(crate) const fn exhausted(&self) -> bool {
         self.remaining == 0
     }
@@ -139,6 +140,14 @@ impl JsonPairTask {
     }
     pub(crate) fn allocator(&self) -> &AggregateAllocator {
         &self.allocator
+    }
+    /// The exact native Task tracker every owner bound to this task charges.
+    pub(crate) fn tracker(&self) -> &Arc<MemTracker> {
+        &self.task
+    }
+    /// The task's own failure, if one has been published.
+    pub(crate) fn task_failure(&self) -> Option<TaskFailure> {
+        self.errors.task_failure()
     }
     /// The local offset in effect now, read once when a Variant conversion
     /// starts. Allocation-free on success.

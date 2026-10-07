@@ -28,8 +28,8 @@ pub use chunk_impl::Chunk;
 pub use hydrate::hydrate_dictionary_columns_except;
 pub use memory::record_batch_bytes;
 pub(crate) use memory::{
-    ChunkMemoryLease, TransferredChunkBytes, record_batch_additional_bytes,
-    record_batch_shared_owner_bytes,
+    BYTES_ALLOCATION_BOUND, ChunkMemoryLease, TransferredChunkBytes, arc_allocation_bytes,
+    record_batch_additional_bytes, record_batch_shared_owner_bytes,
 };
 pub use schema::{ChunkFieldSchema, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 pub use slot_layout::SlotLayout;

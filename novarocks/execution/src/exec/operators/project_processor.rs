@@ -146,6 +146,7 @@ pub struct ProjectProcessorFactory {
     expr_slot_schemas: Option<Vec<ChunkSlotSchema>>,
     output_indices: Option<Vec<usize>>,
     output_chunk_schema: ChunkSchemaRef,
+    checked_task: bool,
 }
 
 impl ProjectProcessorFactory {
@@ -184,7 +185,24 @@ impl ProjectProcessorFactory {
             expr_slot_schemas,
             output_indices,
             output_chunk_schema,
+            checked_task: false,
         }
+    }
+
+    /// Applies the frozen retention admission of this Project. A
+    /// `CheckedTask` Project transfers each generated output to the exact
+    /// Task tracker, with its capacity checked, before the output becomes
+    /// pending. That closes only the holding period of the generated output;
+    /// it does not claim the expression evaluation's own temporary heap.
+    pub(crate) fn with_retention_admission(
+        mut self,
+        admission: novarocks_local_program::ProjectRetentionAdmission,
+    ) -> Self {
+        self.checked_task = match admission {
+            novarocks_local_program::ProjectRetentionAdmission::Existing => false,
+            novarocks_local_program::ProjectRetentionAdmission::CheckedTask => true,
+        };
+        self
     }
 }
 
@@ -212,6 +230,7 @@ impl OperatorFactory for ProjectProcessorFactory {
             output_indices: self.output_indices.clone(),
             output_chunk_schema: Arc::clone(&self.output_chunk_schema),
             pending_output: None,
+            checked_task: self.checked_task,
             finishing: false,
             finished: false,
         })
@@ -232,6 +251,7 @@ struct ProjectProcessorOperator {
     output_indices: Option<Vec<usize>>,
     output_chunk_schema: ChunkSchemaRef,
     pending_output: Option<Chunk>,
+    checked_task: bool,
     finishing: bool,
     finished: bool,
 }
@@ -280,7 +300,22 @@ impl ProcessorOperator for ProjectProcessorOperator {
         if self.pending_output.is_some() {
             return Err("project received input while output buffer is full".to_string());
         }
-        let out = self.process_one_bound(chunk, Some(state))?;
+        let mut out = self.process_one_bound(chunk, Some(state))?;
+        if self.checked_task
+            && let Some(output) = out.as_mut()
+        {
+            let (_, tracker) = state
+                .exact_task_tracker()
+                .ok_or("CheckedTask Project requires an exact native task memory owner")?;
+            if let Err(error) = output.try_transfer_to(&tracker) {
+                // Dropping the refused output releases its attached charge.
+                return Err(state
+                    .error_state()
+                    .task_failure()
+                    .map(|failure| failure.to_string())
+                    .unwrap_or(error));
+            }
+        }
         self.pending_output = out;
         Ok(())
     }
@@ -832,6 +867,7 @@ mod tests {
             output_indices: None,
             output_chunk_schema: utf8_output_schema(output_slot, "lower_status"),
             pending_output: None,
+            checked_task: false,
             finishing: false,
             finished: false,
         };
@@ -867,6 +903,7 @@ mod tests {
             output_indices: None,
             output_chunk_schema: utf8_output_schema(output_slot, "lower_status"),
             pending_output: None,
+            checked_task: false,
             finishing: false,
             finished: false,
         };
@@ -949,6 +986,7 @@ mod tests {
             output_indices: None,
             output_chunk_schema,
             pending_output: None,
+            checked_task: false,
             finishing: false,
             finished: false,
         };
@@ -1016,6 +1054,7 @@ mod tests {
             output_indices: None,
             output_chunk_schema,
             pending_output: None,
+            checked_task: false,
             finishing: false,
             finished: false,
         };
@@ -1088,6 +1127,7 @@ mod tests {
                 .expect("output chunk schema"),
             ),
             pending_output: None,
+            checked_task: false,
             finishing: false,
             finished: false,
         };
@@ -1160,6 +1200,7 @@ mod tests {
             output_indices: None,
             output_chunk_schema: Arc::clone(&output_chunk_schema),
             pending_output: None,
+            checked_task: false,
             finishing: false,
             finished: false,
         };
@@ -1218,6 +1259,7 @@ mod tests {
             output_indices: None,
             output_chunk_schema: Arc::clone(&output_chunk_schema),
             pending_output: None,
+            checked_task: false,
             finishing: false,
             finished: false,
         };
@@ -1278,6 +1320,7 @@ mod tests {
                 .unwrap(),
             ),
             pending_output: None,
+            checked_task: false,
             finishing: false,
             finished: false,
         }
@@ -1486,5 +1529,122 @@ mod tests {
         );
         assert_eq!(op.entry_counter, 0);
         assert_eq!(tracker.current(), 0);
+    }
+
+    fn checked_project(
+        arena: &mut ExprArena,
+    ) -> Box<dyn crate::exec::pipeline::operator::Operator> {
+        use crate::exec::pipeline::operator_factory::OperatorFactory;
+        let slot = SlotId::new(1);
+        let expr = arena.push_typed(ExprNode::SlotId(slot), DataType::Utf8);
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, true)]));
+        let output =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[slot]).unwrap();
+        super::ProjectProcessorFactory::new(
+            9,
+            false,
+            Arc::new(std::mem::take(arena)),
+            vec![expr],
+            vec![slot],
+            None,
+            None,
+            output,
+        )
+        .with_retention_admission(novarocks_local_program::ProjectRetentionAdmission::CheckedTask)
+        .create(1, 0)
+    }
+
+    fn utf8_chunk(rows: usize) -> Chunk {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::StringArray::from_iter_values(
+                (0..rows).map(|row| format!("value-{row}")),
+            ))],
+        )
+        .unwrap();
+        Chunk::new_with_chunk_schema(
+            batch,
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
+                .unwrap(),
+        )
+    }
+
+    fn checked_state(
+        limit: Option<i64>,
+    ) -> (
+        Arc<RuntimeState>,
+        Arc<crate::runtime::mem_tracker::MemTracker>,
+    ) {
+        use crate::exec::expr::json_in_pair::test_support::{shared_runtime, task_state};
+        use novarocks_execution_contract::TaskIdentity;
+        use novarocks_types::identity::{AttemptId, QueryExecutionId, QueryId};
+        use novarocks_types::{BackendProcessId, StageId, TaskId};
+        let tracker = crate::runtime::mem_tracker::MemTracker::new_root("checked-project-task");
+        if let Some(limit) = limit {
+            tracker.install_limit_once(limit).unwrap();
+        }
+        let identity = TaskIdentity::new(
+            QueryExecutionId::new(QueryId::new(7, 9), AttemptId::new(1).unwrap()).unwrap(),
+            StageId::new(1).unwrap(),
+            TaskId::new(1).unwrap(),
+            BackendProcessId::new_v7(),
+        );
+        let state = Arc::new(task_state(
+            identity,
+            Arc::clone(&tracker),
+            Some(shared_runtime()),
+        ));
+        (state, tracker)
+    }
+
+    #[test]
+    fn checked_task_project_charges_pending_output_to_the_exact_task() {
+        let (state, tracker) = checked_state(None);
+        let mut arena = ExprArena::default();
+        let mut project = checked_project(&mut arena);
+        let processor = project.as_processor_mut().unwrap();
+        processor.push_chunk(&state, utf8_chunk(64)).unwrap();
+        assert!(processor.has_output());
+        assert!(
+            tracker.current() > 0,
+            "the pending output is charged to the task"
+        );
+        let output = processor.pull_chunk(&state).unwrap().unwrap();
+        assert_eq!(output.len(), 64);
+        assert!(
+            tracker.current() > 0,
+            "the published output keeps its charge"
+        );
+        drop(output);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn checked_task_project_refuses_capacity_typed_and_requires_an_exact_task() {
+        let (state, tracker) = checked_state(Some(16));
+        let mut arena = ExprArena::default();
+        let mut project = checked_project(&mut arena);
+        let processor = project.as_processor_mut().unwrap();
+        let error = processor.push_chunk(&state, utf8_chunk(64)).unwrap_err();
+        let failure = state.error_state().task_failure().unwrap();
+        assert!(matches!(
+            failure.category(),
+            novarocks_execution_contract::TaskFailureCategory::CapacityRefused { .. }
+        ));
+        assert_eq!(error, failure.to_string());
+        assert!(!processor.has_output(), "a refused output is never pending");
+        assert_eq!(tracker.current(), 0);
+
+        let mut arena = ExprArena::default();
+        let mut project = checked_project(&mut arena);
+        let processor = project.as_processor_mut().unwrap();
+        let untracked = RuntimeState::default();
+        assert!(
+            processor
+                .push_chunk(&untracked, utf8_chunk(1))
+                .unwrap_err()
+                .contains("exact native task memory owner")
+        );
     }
 }

@@ -769,6 +769,15 @@ impl PipelineDriver {
             }
             self.sync_source_backpressure();
 
+            // A resumable operator that spent its turn allowance keeps its
+            // cursor and asks to be rescheduled. This is neither a block nor
+            // an end of stream: return Ready before any readiness inspection,
+            // whatever else moved in this iteration.
+            if self.take_yield_requests() {
+                self.state = DriverState::Ready;
+                return self.state.clone();
+            }
+
             if made_progress {
                 continue;
             }
@@ -836,6 +845,17 @@ impl PipelineDriver {
             self.state = DriverState::Ready;
             return self.state.clone();
         }
+    }
+
+    /// Consumes every operator's pending yield request; true when any asked.
+    fn take_yield_requests(&mut self) -> bool {
+        let mut requested = false;
+        for operator in &mut self.operators {
+            if let Some(processor) = operator.as_processor_mut() {
+                requested |= processor.take_yield_request();
+            }
+        }
+        requested
     }
 
     fn find_precondition_dependency(&self) -> Option<DependencyHandle> {
@@ -2938,5 +2958,211 @@ mod terminal_signal_tests {
         );
         assert_eq!(failure_count.load(Ordering::SeqCst), 1);
         assert_eq!(cancel_count.load(Ordering::SeqCst), 0);
+    }
+
+    /// A resumable middle operator: each pull spends one turn of work until
+    /// its pending chunk is decided, then emits it.
+    struct ResumableOperator {
+        pending: Option<Chunk>,
+        remaining: usize,
+        yield_requested: bool,
+        pulls: Arc<AtomicUsize>,
+        finishing: bool,
+    }
+
+    impl Operator for ResumableOperator {
+        fn name(&self) -> &str {
+            "ResumableOperator"
+        }
+
+        fn is_finished(&self) -> bool {
+            self.finishing && self.pending.is_none()
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for ResumableOperator {
+        fn take_yield_request(&mut self) -> bool {
+            std::mem::take(&mut self.yield_requested)
+        }
+
+        fn need_input(&self) -> bool {
+            !self.finishing && self.pending.is_none()
+        }
+
+        fn has_output(&self) -> bool {
+            self.pending.is_some()
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+            self.pending = Some(chunk);
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            self.pulls.fetch_add(1, Ordering::SeqCst);
+            if self.remaining > 0 {
+                self.remaining -= 1;
+                self.yield_requested = true;
+                return Ok(None);
+            }
+            Ok(self.pending.take())
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            self.finishing = true;
+            Ok(())
+        }
+    }
+
+    struct OneChunkSource {
+        chunk: Option<Chunk>,
+    }
+
+    impl Operator for OneChunkSource {
+        fn name(&self) -> &str {
+            "OneChunkSource"
+        }
+
+        fn is_finished(&self) -> bool {
+            self.chunk.is_none()
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for OneChunkSource {
+        fn need_input(&self) -> bool {
+            false
+        }
+
+        fn has_output(&self) -> bool {
+            self.chunk.is_some()
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Err("source accepts no input".to_string())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(self.chunk.take())
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct CountingSink {
+        received: Arc<AtomicUsize>,
+        finished: bool,
+    }
+
+    impl Operator for CountingSink {
+        fn name(&self) -> &str {
+            "CountingSink"
+        }
+
+        fn is_finished(&self) -> bool {
+            self.finished
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for CountingSink {
+        fn need_input(&self) -> bool {
+            !self.finished
+        }
+
+        fn has_output(&self) -> bool {
+            false
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+            self.received.fetch_add(chunk.len(), Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            self.finished = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn yield_request_returns_ready_and_resumes_without_reading_an_end_of_stream() {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            schema.as_ref(),
+            &[novarocks_types::SlotId::new(1)],
+        )
+        .unwrap();
+        let chunk = Chunk::try_new_with_columns(
+            chunk_schema,
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let received = Arc::new(AtomicUsize::new(0));
+        let mut driver = PipelineDriver::new(
+            0,
+            vec![
+                Box::new(OneChunkSource { chunk: Some(chunk) }),
+                Box::new(ResumableOperator {
+                    pending: None,
+                    remaining: 5,
+                    yield_requested: false,
+                    pulls: Arc::clone(&pulls),
+                    finishing: false,
+                }),
+                Box::new(CountingSink {
+                    received: Arc::clone(&received),
+                    finished: false,
+                }),
+            ],
+            None,
+            Vec::new(),
+            Arc::new(RuntimeState::default()),
+            None,
+        );
+        // Each request ends the turn as Ready, with a generous time slice and
+        // no external blocker; the work resumes on the next turn.
+        for turn in 1..=5 {
+            assert_eq!(driver.process(Duration::from_secs(60)), DriverState::Ready);
+            assert_eq!(pulls.load(Ordering::SeqCst), turn);
+            assert_eq!(received.load(Ordering::SeqCst), 0);
+        }
+        assert_eq!(
+            driver.process(Duration::from_secs(60)),
+            DriverState::Finished
+        );
+        assert_eq!(pulls.load(Ordering::SeqCst), 6);
+        assert_eq!(received.load(Ordering::SeqCst), 3);
     }
 }

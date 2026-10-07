@@ -273,6 +273,32 @@ impl Chunk {
         None
     }
 
+    /// Upper bound of the Arrow management bytes [`Self::into_scoped_columns`]
+    /// allocates when it retains a value of type `R`. Allocation-free, so a
+    /// caller can admit the bound before any of those allocations.
+    pub(crate) fn scoped_columns_bound<R: Send + Sync + 'static>(&self) -> Result<usize, String> {
+        super::memory::scoped_columns_bound::<ScopedChunkOwner<R>>(&self.batch)
+    }
+
+    /// Consumes this chunk and appends its columns, re-exposed zero-copy
+    /// through buffers that share one owner. The owner retains this chunk,
+    /// with its accounting owner, and `retained` until the last derived
+    /// buffer drops, so an ArrayRef, child or slice kept after any output
+    /// chunk is gone still keeps the source charge. Only the derived output
+    /// path uses this; other owners of this chunk's buffers are unchanged.
+    pub(crate) fn into_scoped_columns<R: Send + Sync + 'static>(
+        self,
+        retained: R,
+        columns: &mut Vec<ArrayRef>,
+    ) {
+        let owner = Arc::new(ScopedChunkOwner {
+            chunk: std::panic::AssertUnwindSafe(self),
+            _retained: std::panic::AssertUnwindSafe(retained),
+        });
+        let shared: Arc<dyn arrow::alloc::Allocation> = owner.clone();
+        super::memory::scoped_columns(&owner.chunk.0.batch, &shared, columns);
+    }
+
     /// Move an existing connector output reservation onto this chunk without
     /// charging its Arrow buffers again.
     pub(crate) fn attach_connector_output_memory(
@@ -288,6 +314,13 @@ impl Chunk {
         self.connector_output_memory = Some(Arc::new(Mutex::new(output_memory)));
         Ok(())
     }
+}
+
+/// Shared owner behind the scoped buffers of one derived output. It is only
+/// ever dropped, never read through, after the buffers are created.
+struct ScopedChunkOwner<R> {
+    chunk: std::panic::AssertUnwindSafe<Chunk>,
+    _retained: std::panic::AssertUnwindSafe<R>,
 }
 
 fn retag_columns_to_chunk_schema(
@@ -362,6 +395,72 @@ mod tests {
         builder.append_value("NEW");
         builder.append_value("PAID");
         Arc::new(builder.finish())
+    }
+
+    #[test]
+    fn scoped_columns_keep_the_source_charge_until_the_last_child_or_slice() {
+        use crate::runtime::mem_tracker::MemTracker;
+        use arrow::array::{Int64Array, StructArray};
+
+        let structs = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("x", DataType::Int64, true)),
+            Arc::new(Int64Array::from(vec![Some(1), None, Some(3), Some(4)])) as ArrayRef,
+        )]))
+        .slice(1, 3);
+        let structs = Arc::new(structs) as ArrayRef;
+        let dictionary = dict_utf8();
+        let schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::new_with_field(
+                    SlotId::new(1),
+                    Field::new("s", structs.data_type().clone(), true),
+                    None,
+                    None,
+                ),
+                ChunkSlotSchema::new_with_field(
+                    SlotId::new(2),
+                    Field::new("d", dictionary.data_type().clone(), false),
+                    None,
+                    None,
+                ),
+            ])
+            .unwrap(),
+        );
+        let tracker = MemTracker::new_root("scoped-owner");
+        let mut chunk =
+            Chunk::try_new_with_columns(schema, vec![structs, dictionary.slice(0, 3)]).unwrap();
+        chunk.try_transfer_to(&tracker).unwrap();
+        let charged = tracker.current();
+        assert!(charged > 0);
+        assert!(chunk.scoped_columns_bound::<()>().unwrap() > 0);
+        let originals = chunk.columns().to_vec();
+        let mut columns = Vec::new();
+        chunk.into_scoped_columns((), &mut columns);
+        for (scoped, original) in columns.iter().zip(&originals) {
+            assert_eq!(scoped.as_ref(), original.as_ref());
+        }
+        drop(originals);
+        let child = columns[0]
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column(0)
+            .slice(1, 1);
+        let dictionary_slice = columns[1].slice(1, 1);
+        drop(columns);
+        assert_eq!(
+            tracker.current(),
+            charged,
+            "a struct child keeps the source"
+        );
+        drop(child);
+        assert_eq!(
+            tracker.current(),
+            charged,
+            "a dictionary slice keeps the source"
+        );
+        drop(dictionary_slice);
+        assert_eq!(tracker.current(), 0);
     }
 
     #[test]
