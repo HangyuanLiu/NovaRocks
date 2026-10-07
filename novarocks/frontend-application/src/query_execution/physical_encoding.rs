@@ -344,8 +344,9 @@ fn encode_completed_packages(
         completed_plan_edge_facts(plan)?,
         completed_plan_scan_facts(plan, &encodings)?,
         submission,
-        // Refused above: a compiled plan declares no runtime filter.
-        AttemptRuntimeFilterFacts::default(),
+        // The attempt deploys the plan's filters by the same plan-global
+        // binding numbering each package's cuts carry.
+        AttemptRuntimeFilterFacts::from_completed(plan)?,
         // A plan that writes states which targets its root delivers, because
         // that is what the commit is taken over; a read plan says none.
         Some(written).filter(|targets| !targets.is_empty()),
@@ -379,13 +380,6 @@ fn refuse_uncompiled_plan_shapes(
         if let Some(reason) = compiled_edge_refusal(edge.kind) {
             return Err(novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(reason));
         }
-    }
-    if !plan.runtime_filters().is_empty() {
-        return Err(
-            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
-                "the compiled package carrier does not carry runtime filters yet",
-            ),
-        );
     }
     Ok(())
 }
