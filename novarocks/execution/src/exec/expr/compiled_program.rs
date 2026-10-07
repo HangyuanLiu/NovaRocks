@@ -53,10 +53,12 @@ use std::{
 pub struct CompiledExpressionInstance {
     program: Arc<LocalProgram>,
     root: ProgramExpressionRootSite,
-    /// The one input layout this root reads, from the same authority the
-    /// lexical bindings were checked against; `None` is the explicit empty
-    /// port of a root that reads no input.
-    input: Option<ProgramNodeId>,
+    /// The one input layout this root reads, named by its node and layout
+    /// role, from the same authority the lexical bindings were checked
+    /// against; `None` is the explicit empty port of a root that reads no
+    /// input. A join key reads its own side's layout and a join residual the
+    /// join scope; every other root reads a node output.
+    input: Option<(ProgramNodeId, ProgramChannelLayoutRole)>,
     instances: BTreeMap<ProgramUseRef, ScalarEvaluationInstance>,
     effects: BTreeMap<ProgramUseRef, ScopedExpressionEffects>,
     failed: bool,
@@ -209,16 +211,15 @@ impl CompiledExpressionInstance {
         let input = match root_input_layout(program.graph(), root)
             .map_err(|_| invalid("root has no actual compiled input port"))?
         {
-            ProgramRootInput::Layout {
-                node,
-                role: ProgramChannelLayoutRole::NodeOutput,
-            } => Some(node),
-            ProgramRootInput::Empty => None,
-            ProgramRootInput::Layout { .. } => {
-                return Err(invalid(
-                    "join-scoped root input requires its dedicated compiled operator protocol",
-                ));
+            ProgramRootInput::Layout { node, role } => {
+                // The frozen port must exist before any instance is created.
+                checked
+                    .channels()
+                    .channel_layout(node, role)
+                    .ok_or_else(|| invalid("root input port has no frozen layout"))?;
+                Some((node, role))
             }
+            ProgramRootInput::Empty => None,
         };
         let root_use = *snapshot
             .bindings()
@@ -471,7 +472,7 @@ impl CompiledExpressionInstance {
         if input.num_rows() != selection.batch_rows() {
             return Err(invalid("selection differs from actual input batch rows"));
         }
-        let Some(input_node) = self.input else {
+        let Some((input_node, input_role)) = self.input else {
             // The explicit empty port: no field, no metadata and one row, so
             // the root is evaluated exactly once per call.
             let schema = input.schema();
@@ -487,7 +488,9 @@ impl CompiledExpressionInstance {
             return self.evaluate_root(input, None, selection, work);
         };
         let channels = self.program.checked().channels();
-        let layout = self.program.graph().nodes()[input_node.index()].output_layout();
+        let layout = channels
+            .channel_layout(input_node, input_role)
+            .ok_or_else(|| invalid("root input port has no frozen layout"))?;
         work.flush()?;
         let schema = input.schema();
         let frozen = layout.schema();
@@ -515,7 +518,7 @@ impl CompiledExpressionInstance {
             let ty = channels
                 .channel_type(ProgramChannelSite::Layout {
                     node: input_node,
-                    role: ProgramChannelLayoutRole::NodeOutput,
+                    role: input_role,
                     ordinal,
                 })
                 .ok_or_else(|| invalid("missing exact incoming channel type"))?;
@@ -528,12 +531,12 @@ impl CompiledExpressionInstance {
             )?;
             work.step()?;
         }
-        self.evaluate_root(input, Some(input_node), selection, work)
+        self.evaluate_root(input, Some((input_node, input_role)), selection, work)
     }
     fn evaluate_root<'a>(
         &mut self,
         input: &RecordBatch,
-        input_node: Option<ProgramNodeId>,
+        input_node: Option<(ProgramNodeId, ProgramChannelLayoutRole)>,
         selection: Selection<'a>,
         work: &mut Work<'_>,
     ) -> Result<SelectedValues<'a>, KernelFailure> {

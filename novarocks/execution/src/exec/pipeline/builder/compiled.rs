@@ -28,7 +28,10 @@
 //! Limit, the local gather exchange, the row-count assertion and the UnionAll
 //! fan-in queue. A Values with dynamic cells evaluates each cell root once
 //! through the compiled Values source. Repeat is a compiled processor too,
-//! because the legacy one re-derives its output schema.
+//! because the legacy one re-derives its output schema. Both join families
+//! evaluate their keys, residual and predicate through compiled roots and
+//! reuse only array-level kernels: the hash map, build store, gather, match
+//! decisions, the shared build states and the nested-loop build sink.
 
 use std::collections::BTreeSet;
 
@@ -180,6 +183,7 @@ pub(crate) fn build_compiled_pipeline_graph(
     program: &Arc<LocalProgram>,
     exchange_bindings: ExchangeBindings,
     scan_bindings: ScanBindings,
+    writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
     dep_manager: DependencyManager,
     pipeline_dop: i32,
     root_sink_dop: Option<i32>,
@@ -196,6 +200,7 @@ pub(crate) fn build_compiled_pipeline_graph(
     }
     validate_compiled_exchange_bindings(program, &exchange_bindings)?;
     validate_compiled_scan_bindings(program, &scan_bindings)?;
+    writer_bindings.validate(program)?;
     let mut ctx = PipelineBuildContext {
         arena: Arc::new(ExprArena::default()),
         function_set,
@@ -203,6 +208,7 @@ pub(crate) fn build_compiled_pipeline_graph(
         runtime_filter_execution: PipelineRuntimeFilterExecution { session: None },
         exchange_bindings,
         scan_bindings,
+        compiled_writers: writer_bindings,
         next_pipeline_id: 0,
         pipeline_dop: pipeline_dop.max(1),
         operator_buffer_chunks: 1,
@@ -490,6 +496,19 @@ fn build_node(
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
         }
+        ProgramNodeKind::TableWriter { input, .. } => {
+            writer_pipelines::build_table_writer(program, id, node_id, *input, ctx, error)
+        }
+        ProgramNodeKind::TableFinish { inputs, .. } => {
+            writer_pipelines::build_table_finish(program, id, node_id, inputs, ctx, error)
+        }
+        // The probe is the left input and the build the right input.
+        ProgramNodeKind::Join { left, right, .. } => {
+            join_pipelines::build_hash_join(program, id, node_id, *left, *right, ctx, error)
+        }
+        ProgramNodeKind::NestedLoopJoin { left, right, .. } => {
+            join_pipelines::build_nested_loop_join(program, id, node_id, *left, *right, ctx, error)
+        }
         _ => Err(format!(
             "compiled node family at local node {} has no compiled processor yet",
             id.index()
@@ -616,6 +635,16 @@ fn assertion_mode(mode: &AssertRowsMode) -> AssertNumRowsMode {
 #[path = "compiled_values.rs"]
 mod values_source;
 
+#[path = "compiled_writer.rs"]
+mod writer_pipelines;
+
+#[cfg(test)]
+#[path = "compiled_writer_tests.rs"]
+mod writer_tests;
+
+#[path = "compiled_join.rs"]
+mod join_pipelines;
+
 #[cfg(test)]
 #[path = "compiled_tests.rs"]
 mod tests;
@@ -663,3 +692,7 @@ mod aggregate_fixture;
 #[cfg(test)]
 #[path = "compiled_aggregate_tests.rs"]
 mod aggregate_tests;
+
+#[cfg(test)]
+#[path = "compiled_join_tests.rs"]
+mod join_tests;

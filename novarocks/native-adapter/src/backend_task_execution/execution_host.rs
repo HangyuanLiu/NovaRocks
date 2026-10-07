@@ -100,6 +100,7 @@ use super::compiled_package::{
     CompiledPackageCompiler, CompiledPackageError, CompiledTaskOptions, TaskPreparationControl,
 };
 use crate::compiled_scan_binding::{CompiledScanTask, bind_compiled_scans};
+use crate::compiled_writer_binding::{CompiledWriteTask, bind_compiled_writers};
 use crate::fragment_instance::{NativeFragmentInstanceInput, project_task_instance};
 use crate::fragment_request::NativeFragmentRequest;
 use crate::fragment_submission::compiled_fragment_sink_assignment;
@@ -537,6 +538,19 @@ impl NativeTaskExecutionHost {
             },
         )
         .map_err(|error| protocol(format!("task {identity} scan does not bind: {error}")))?;
+        // Every compiled writer binds its write capability and every finish
+        // its carrier validator here, before anything is registered; a write
+        // execution is opened only when a driver activates.
+        let writers = bind_compiled_writers(
+            &program,
+            &CompiledWriteTask {
+                runtime: &typed_runtime,
+                fragment_instance_id: kernel_key,
+                query_options: &instance_input.query_options,
+                stop: task_stop.view(),
+            },
+        )
+        .map_err(|error| protocol(format!("task {identity} writer does not bind: {error}")))?;
         let sink_assignment = compiled_fragment_sink_assignment(
             sink,
             &instance_input.sink_edge_ids,
@@ -564,12 +578,17 @@ impl NativeTaskExecutionHost {
         );
         let root_display_id = i32::try_from(program.graph().root().index())
             .map_err(|_| internal(format!("task {identity} compiled root index exceeds i32")))?;
-        let submission = CompiledFragmentSubmission::try_new(Arc::new(program), scans, instance)
-            .map_err(|error| {
-                protocol(format!(
-                    "task {identity} compiled program does not fit its instance: {error}"
-                ))
-            })?;
+        let submission = CompiledFragmentSubmission::try_new_with_writers(
+            Arc::new(program),
+            scans,
+            writers,
+            instance,
+        )
+        .map_err(|error| {
+            protocol(format!(
+                "task {identity} compiled program does not fit its instance: {error}"
+            ))
+        })?;
 
         let (delivery_expire, query_expire) =
             novarocks_execution::runtime::query_options::query_expire_durations(Some(
@@ -5719,6 +5738,233 @@ mod tests {
                 stray.contains("assigns scan ranges to node 12, which is not a compiled scan"),
                 "{stray}"
             );
+        }
+
+        /// A query context that leases the test write catalog with a recording
+        /// write execution; every other fact is the stub's.
+        #[derive(Default)]
+        struct WriteContextFacts {
+            stub: StubContextFacts,
+            execution: Option<Arc<crate::connector_write_test_support::RecordingWriteExecution>>,
+        }
+
+        impl TaskQueryContextFacts for WriteContextFacts {
+            fn query_options(
+                &self,
+                execution: QueryExecutionId,
+            ) -> Result<QueryContextOptions, HostRejection> {
+                self.stub.query_options(execution)
+            }
+
+            fn runtime_filter_session(
+                &self,
+                execution: QueryExecutionId,
+                fragment_instance_id: UniqueId,
+                expects_bindings: bool,
+            ) -> Result<Option<RuntimeFilterSessionRef>, HostRejection> {
+                self.stub
+                    .runtime_filter_session(execution, fragment_instance_id, expects_bindings)
+            }
+
+            fn runtime_filter_event_sink(
+                &self,
+                execution: QueryExecutionId,
+                fragment_instance_id: UniqueId,
+            ) -> Arc<dyn FragmentEventSink> {
+                self.stub
+                    .runtime_filter_event_sink(execution, fragment_instance_id)
+            }
+
+            fn bind_runtime_filter_feedback(
+                &self,
+                execution: QueryExecutionId,
+                carrier: TaskIdentity,
+                reporter: &TaskStatusReporter,
+            ) -> bool {
+                self.stub
+                    .bind_runtime_filter_feedback(execution, carrier, reporter)
+            }
+
+            fn deliver_task_dynamic_filter(
+                &self,
+                execution: QueryExecutionId,
+                fragment_instance_id: UniqueId,
+                version: DomainVersion,
+                payload: &Arc<dyn CodecOwnedContent>,
+            ) -> Result<(), HostRejection> {
+                self.stub.deliver_task_dynamic_filter(
+                    execution,
+                    fragment_instance_id,
+                    version,
+                    payload,
+                )
+            }
+
+            fn catalog_read_execution(
+                &self,
+                execution: QueryExecutionId,
+                handle: &CatalogHandle,
+            ) -> Result<ConnectorExecutionReadBinding, String> {
+                self.stub.catalog_read_execution(execution, handle)
+            }
+
+            fn catalog_write_execution(
+                &self,
+                execution: QueryExecutionId,
+                handle: &CatalogHandle,
+            ) -> Result<ConnectorExecutionWriteBinding, String> {
+                let leased = crate::connector_write_test_support::test_write_catalog_handle();
+                match &self.execution {
+                    Some(recording) if handle == &leased => {
+                        Ok(crate::connector_write_test_support::test_write_binding(
+                            Arc::clone(recording),
+                        ))
+                    }
+                    _ => self.stub.catalog_write_execution(execution, handle),
+                }
+            }
+
+            fn storage_resolver(
+                &self,
+                execution: QueryExecutionId,
+            ) -> Result<Arc<dyn ConnectorStorageResolver>, HostRejection> {
+                self.stub.storage_resolver(execution)
+            }
+        }
+
+        /// A compiled host whose provider catalog seals the test provider's
+        /// writer recipes.
+        fn writer_host(facts: Arc<WriteContextFacts>) -> NativeTaskExecutionHost {
+            let data_runtime =
+                novarocks_native_adapter::backend_test_support::test_backend_data_runtime();
+            let completion_supervisor =
+                TaskCompletionSupervisor::start(data_runtime.handle().clone(), 64);
+            NativeTaskExecutionHost::new(
+                NativeFragmentQueryRuntime::global(
+                    novarocks_native_adapter::backend_test_support::test_memory_authority(),
+                ),
+                facts,
+                TaskInboundCapabilities::new(),
+                novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
+                    data_runtime,
+                    Duration::from_millis(120_000),
+                ),
+                novarocks_native_adapter::fragment_result_writer::test_native_result_writer(),
+                Arc::new(UnavailableExchangeReceiverPort),
+                Arc::new(novarocks_worker::sink_commit::WorkerSinkCommitPort),
+                test_execution_runtime(),
+                novarocks_worker::ScanStreamHost::new(
+                    novarocks_worker::ScanPreparationConfig::default(),
+                    novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),
+                ),
+                completion_supervisor,
+            )
+            .with_compiled_package_compiler(Arc::new(CompiledPackageInterpreter::new(
+                FragmentDecodeResourceModel::try_new(&Unbounded).expect("decode model"),
+                decode_limits(),
+                Arc::new(sealed_rand_subset()),
+                Arc::new(crate::compiled_writer_binding::tests::writer_providers()),
+                constants(),
+            )))
+        }
+
+        /// A single-driver writer task streaming to `receiver` over edge 3, as
+        /// fragment instance `finst`. The sink-commit port is process-wide, so
+        /// each test task owns its own instance.
+        fn writer_descriptor(
+            identity: TaskIdentity,
+            receiver: u32,
+            finst: UniqueId,
+        ) -> TaskDescriptor {
+            let node = FragmentNodeId::new(i32::try_from(receiver).expect("small node"));
+            let destination = ExchangeDestination::new(
+                super::identity(70, 2, 1),
+                UniqueId::new(900, 901),
+                RuntimeEndpoint::new("127.0.0.1", 9060).expect("a legal endpoint"),
+                node,
+            );
+            let topology = ExchangeTopology::try_new(
+                vec![
+                    ExchangeEdge::try_new(
+                        ExchangeEdgeId::new(3).expect("nonzero edge"),
+                        node,
+                        DataStreamPartitionType::Unpartitioned,
+                        vec![destination],
+                        0,
+                        NonZeroU32::new(1).expect("nonzero"),
+                    )
+                    .expect("a legal edge"),
+                ],
+                Vec::new(),
+            )
+            .expect("a legal topology");
+            TaskDescriptor::try_new(
+                identity,
+                finst,
+                NonZeroUsize::new(1).expect("nonzero dop"),
+                Vec::new(),
+                topology,
+            )
+            .expect("a legal descriptor")
+        }
+
+        // A compiled writer package is received, provider-validated and
+        // compiled, its writer bound to the write execution the query leased
+        // for the recipe's own catalog, and prepared into an ordinary task
+        // runtime streaming its writer relation. Nothing is opened yet.
+        #[test]
+        fn a_compiled_host_installs_a_writer_package_with_its_leased_write_capability() {
+            use crate::compiled_writer_binding::tests::writer_producer_package;
+
+            let (package, receiver) = writer_producer_package();
+            let recording =
+                Arc::new(crate::connector_write_test_support::RecordingWriteExecution::new());
+            let host = writer_host(Arc::new(WriteContextFacts {
+                stub: StubContextFacts::default(),
+                execution: Some(Arc::clone(&recording)),
+            }));
+            let identity = super::identity(76, 1, 1);
+            let descriptor = writer_descriptor(identity, receiver, UniqueId::new(801, 802));
+            let prepared = host
+                .install_receiver(
+                    &descriptor,
+                    producer_input(&descriptor, package_carrier(&package)),
+                )
+                .expect("the compiled writer producer installs");
+            assert_eq!(prepared.sink_kind(), FragmentSinkKind::DataStream);
+            assert!(host.task_runtime(identity).is_some());
+            assert!(
+                recording.opened().is_empty(),
+                "a writer opens only when a driver activates"
+            );
+            host.remove_receiver(&descriptor);
+            assert!(host.task_runtime(identity).is_none());
+        }
+
+        // Without a write execution leased for the recipe's catalog the
+        // writer has no capability on this backend: the task is refused
+        // before anything is registered.
+        #[test]
+        fn a_compiled_writer_without_a_leased_write_execution_is_refused() {
+            use crate::compiled_writer_binding::tests::writer_producer_package;
+
+            let (package, receiver) = writer_producer_package();
+            let host = writer_host(Arc::new(WriteContextFacts::default()));
+            let identity = super::identity(77, 1, 1);
+            let descriptor = writer_descriptor(identity, receiver, UniqueId::new(803, 804));
+            let rejection = host
+                .install_receiver(
+                    &descriptor,
+                    producer_input(&descriptor, package_carrier(&package)),
+                )
+                .expect_err("an unleased writer must be refused");
+            assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
+            assert!(
+                rejection.detail().as_str().contains("writer does not bind"),
+                "{rejection}"
+            );
+            assert!(host.task_runtime(identity).is_none());
+            assert!(host.split_queues.is_empty(), "the split lease rolled back");
         }
     }
 }

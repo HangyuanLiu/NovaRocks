@@ -225,6 +225,7 @@ pub(crate) fn prepare_completed_mv_write(
             &crate::query_execution::physical_encoding::WriteTargetFacts {
                 sealed: &sealed,
                 field_names,
+                session: write_session.as_ref(),
             },
         ),
         execution.sql_semantics().sql_mode().allow_throw_exception(),

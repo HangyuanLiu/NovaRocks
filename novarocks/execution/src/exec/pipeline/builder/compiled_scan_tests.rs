@@ -98,6 +98,7 @@ fn prepare(
         Box::new(ResultSinkFactory::new(output.clone())),
         ExchangeBindings::default(),
         bindings,
+        crate::runtime::fragment::CompiledWriterBindings::default(),
         None,
         None,
         dop,

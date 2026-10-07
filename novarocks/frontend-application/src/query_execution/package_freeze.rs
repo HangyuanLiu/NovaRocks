@@ -18,10 +18,10 @@
 //! Freeze one completed SQL plan into v2 FragmentPackage wire bytes.
 //!
 //! The SQL owner authors each fragment's uses, calls and pruning; each scan's
-//! frozen read is authored from the plan and the freeze that produced it; the
-//! original extraction law publishes the checked packages; the v2 sender
-//! encodes them. Writer recipes have no production author on this path yet,
-//! so a plan with writers is refused rather than given guessed facts.
+//! frozen read is authored from the plan and the freeze that produced it; each
+//! written target's frozen recipe is authored from the write session that
+//! sealed it; the original extraction law publishes the checked packages; the
+//! v2 sender encodes them.
 //!
 //! Which carrier a Frontend freezes its plans into is one composition choice,
 //! [`StaticPlanCarrier`]. Production composes the plan tree; the compiled
@@ -31,9 +31,10 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use novarocks_connector_contract::ConnectorWriteRecipeDraft;
 use novarocks_physical_plan::{
-    ConstantPolicy, FragmentId, FragmentPackage, FragmentPackageAdmission, NodeKind,
-    ProviderReadOccurrenceId, extract_fragment_packages,
+    ConstantPolicy, FragmentId, FragmentPackage, FragmentPackageAdmission,
+    ProviderReadOccurrenceId, WriteTargetOrdinal, extract_fragment_packages,
 };
 use novarocks_plan_codec::physical_package_v2::{
     PackageEncodeError, PackageEncodeLimits, encode_fragment_package,
@@ -99,8 +100,8 @@ pub(crate) enum PackageFreezeError {
     Facts(String),
     /// A frozen provider read the package cannot carry as frozen.
     Read(String),
-    /// A fact the package needs has no production author on this path.
-    Unsupported(&'static str),
+    /// A frozen writer recipe the package cannot carry as frozen.
+    Write(String),
 }
 impl fmt::Display for PackageFreezeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -111,7 +112,7 @@ impl fmt::Display for PackageFreezeError {
             Self::Encode(error) => error.fmt(f),
             Self::Facts(detail) => write!(f, "package carrier facts: {detail}"),
             Self::Read(detail) => write!(f, "frozen provider read: {detail}"),
-            Self::Unsupported(detail) => f.write_str(detail),
+            Self::Write(detail) => write!(f, "frozen writer recipe: {detail}"),
         }
     }
 }
@@ -123,7 +124,6 @@ impl From<PackageFreezeError> for novarocks_plan_codec::PhysicalEncodeError {
     fn from(error: PackageFreezeError) -> Self {
         match error {
             PackageFreezeError::Control(cause) => Self::Control(cause),
-            PackageFreezeError::Unsupported(detail) => Self::UnsupportedCapability(detail),
             other => Self::Invalid(format!("compiled package carrier: {other}")),
         }
     }
@@ -131,10 +131,12 @@ impl From<PackageFreezeError> for novarocks_plan_codec::PhysicalEncodeError {
 
 /// Every fragment's v2 package bytes. The host admission and encode limits
 /// are caller-owned configuration; none is defaulted here. `encodings` are
-/// what the freeze of each of the plan's provider reads kept.
+/// what the freeze of each of the plan's provider reads kept; `writes` is the
+/// frozen recipe of exactly each target the plan writes.
 pub(crate) fn freeze_fragment_packages(
     candidate: &CompletedPhysicalPlanCandidate,
     encodings: &BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
+    writes: &BTreeMap<WriteTargetOrdinal, ConnectorWriteRecipeDraft>,
     statement_constant_policy: ConstantPolicy,
     admission: &FragmentPackageAdmission,
     limits: &PackageEncodeLimits,
@@ -143,6 +145,7 @@ pub(crate) fn freeze_fragment_packages(
     let packages = extract_checked_packages(
         candidate,
         encodings,
+        writes,
         statement_constant_policy,
         admission,
         control,
@@ -154,27 +157,18 @@ pub(crate) fn freeze_fragment_packages(
     Ok(output)
 }
 
-/// Every fragment's checked v2 package, before encoding.
+/// Every fragment's checked v2 package, before encoding. The extraction law
+/// routes each writer's recipe by its target ordinal and refuses a missing or
+/// unused one.
 pub(crate) fn extract_checked_packages(
     candidate: &CompletedPhysicalPlanCandidate,
     encodings: &BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
+    writes: &BTreeMap<WriteTargetOrdinal, ConnectorWriteRecipeDraft>,
     statement_constant_policy: ConstantPolicy,
     admission: &FragmentPackageAdmission,
     control: &dyn PureCompileControl,
 ) -> Result<BTreeMap<FragmentId, FragmentPackage>, PackageFreezeError> {
     let plan = candidate.plan();
-    for fragment in plan.fragments().values() {
-        for node in fragment.nodes().values() {
-            if matches!(
-                node.kind,
-                NodeKind::TableWriter { .. } | NodeKind::TableFinish(_)
-            ) {
-                return Err(PackageFreezeError::Unsupported(
-                    "writer recipes have no production package author yet",
-                ));
-            }
-        }
-    }
     let scans = author_frozen_reads(plan, encodings, control)?;
     let semantics = candidate
         .author_package_semantics(statement_constant_policy, control)
@@ -197,7 +191,7 @@ pub(crate) fn extract_checked_packages(
     extract_fragment_packages(
         plan,
         &scans,
-        &BTreeMap::new(),
+        writes,
         &uses,
         &calls,
         &pruning,

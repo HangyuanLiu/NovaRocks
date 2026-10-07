@@ -546,6 +546,7 @@ fn compile_dml_change_stream_write(
             &crate::query_execution::physical_encoding::WriteTargetFacts {
                 sealed: &sealed_write_targets,
                 field_names,
+                session: write_session.as_ref(),
             },
         ),
         execution.sql_semantics().sql_mode().allow_throw_exception(),

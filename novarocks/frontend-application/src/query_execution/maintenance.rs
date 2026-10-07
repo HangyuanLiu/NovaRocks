@@ -1647,6 +1647,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
                 })
                 .collect(),
         )]),
+        session: write_session.as_ref(),
     };
 
     let plan = novarocks_sql::planning::dml::build_final_frozen_connector_write_plan(

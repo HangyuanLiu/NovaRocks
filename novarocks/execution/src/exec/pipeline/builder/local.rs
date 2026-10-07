@@ -99,6 +99,7 @@ pub(crate) fn build_native_pipeline_graph_for_local_program_with_runtime_setting
         },
         exchange_bindings,
         scan_bindings,
+        compiled_writers: Default::default(),
         next_pipeline_id: 0,
         pipeline_dop: pipeline_dop.max(1),
         operator_buffer_chunks: operator_buffer_chunks.max(1),

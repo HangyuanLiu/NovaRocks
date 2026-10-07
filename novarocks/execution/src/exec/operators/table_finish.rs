@@ -129,6 +129,27 @@ impl TableFinishOperatorFactory {
         })
     }
 
+    /// A compiled finish over the program's positional relations. It carries
+    /// no statistics, so it binds no aggregate and evaluates no expression:
+    /// the empty arena is never consulted.
+    pub(crate) fn new_compiled(
+        node_id: i32,
+        expected_targets: Vec<WriteTargetOrdinal>,
+        writer_schema: WriterMultiplexRelationSchema,
+        root_schema: RootWriteResultRelationSchema,
+        binding: &TableFinishRuntimeBinding,
+    ) -> Result<Self, String> {
+        Self::new_local(
+            node_id,
+            expected_targets,
+            writer_schema,
+            root_schema,
+            WriterFinalAggregatePlan::default(),
+            binding,
+            Arc::new(ExprArena::default()),
+        )
+    }
+
     /// Construct the NCP-8 composite with the same immutable expression arena
     /// that decoded the generic Unpivot constants.
     pub fn new_with_arena(node: &TableFinishNode, arena: Arc<ExprArena>) -> Self {
@@ -1394,7 +1415,9 @@ impl ProcessorOperator for TableFinishOperator {
                 "table finish writer relation schema drifted from the frozen plan".to_string(),
             );
         }
-        let columns = match TableWriteRelationColumns::try_from_chunk(&chunk) {
+        // The chunk is exactly the frozen relation (checked above), so its
+        // prefix is read at the relation's positions, whatever its slots.
+        let columns = match TableWriteRelationColumns::try_from_relation(&chunk) {
             Ok(columns) => columns,
             Err(error) => return self.fail(error),
         };

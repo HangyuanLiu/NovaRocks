@@ -68,6 +68,7 @@ use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::package_freeze::{
     CompiledPackageCarrier, StaticPlanCarrier, extract_checked_packages,
 };
+use crate::query_execution::package_writes::{WriteRecipeSession, author_frozen_writes};
 use crate::query_execution::post_compile::mint_native_encoding_provenance;
 use crate::query_execution::preparation::attempt_access::{
     ConnectorAttemptAccessPlan, FrozenReadCapability, attempt_access_for_completed_plan,
@@ -147,10 +148,14 @@ impl EncodedCompletedPlan {
 ///
 /// The handle is what the wire carries; the field names are what the provider
 /// matches its own schema by. Both belong to the same admission, so they are
-/// taken together rather than as two independent caller choices.
+/// taken together rather than as two independent caller choices. The session
+/// that sealed them is what a compiled package's frozen writer recipes are
+/// authored from: each target's plan and the handle encoder the plan's own
+/// handles came from.
 pub(crate) struct WriteTargetFacts<'a> {
     pub(crate) sealed: &'a SealedWriteTargets,
     pub(crate) field_names: BTreeMap<WriteTargetOrdinal, BTreeMap<[u8; 32], Box<str>>>,
+    pub(crate) session: &'a dyn WriteRecipeSession,
 }
 
 /// Put one completed plan on the wire in the process's static carrier.
@@ -179,9 +184,13 @@ pub(crate) fn encode_completed_plan(
             root_allow_throw_exception,
             control,
         ),
-        StaticPlanCarrier::CompiledPackage(carrier) => {
-            encode_completed_packages(paired, carrier, statement_constant_policy, control)
-        }
+        StaticPlanCarrier::CompiledPackage(carrier) => encode_completed_packages(
+            paired,
+            carrier,
+            statement_constant_policy,
+            write_targets,
+            control,
+        ),
     };
     if matches!(
         &result,
@@ -274,14 +283,15 @@ fn split_frozen_reads(
 
 /// Freeze one completed plan as compiled packages, one per fragment.
 ///
-/// Every fact here comes from the physical plan, the reads its scans froze
-/// and the packages authored from both; no plan tree is built or consulted.
-/// What the package carrier cannot express yet is refused before any package
-/// is authored.
+/// Every fact here comes from the physical plan, the reads its scans froze,
+/// the write session that sealed its targets and the packages authored from
+/// them; no plan tree is built or consulted. What the package carrier cannot
+/// express yet is refused before any package is authored.
 fn encode_completed_packages(
     paired: CompletedPlanWithAccess<FrozenProviderRead>,
     carrier: &CompiledPackageCarrier,
     statement_constant_policy: novarocks_physical_plan::ConstantPolicy,
+    write_targets: Option<&WriteTargetFacts<'_>>,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
     let semantic_candidate = paired.candidate().clone();
@@ -290,9 +300,24 @@ fn encode_completed_packages(
     refuse_uncompiled_plan_shapes(plan)?;
     let (encodings, capabilities) = split_frozen_reads(reads);
     let topology = completed_plan_topology(plan)?;
+    // Each written target's frozen recipe comes from the session that sealed
+    // it; a plan that writes with no sealing session has no recipe author.
+    let written = completed_plan_write_targets(plan);
+    let writes = match (written.first(), write_targets) {
+        (None, _) => BTreeMap::new(),
+        (Some(target), None) => {
+            return Err(format!(
+                "completed plan writes target {} with no sealed write session",
+                target.get()
+            )
+            .into());
+        }
+        (Some(_), Some(facts)) => author_frozen_writes(plan, facts.session, control)?,
+    };
     let packages = extract_checked_packages(
         &candidate,
         &encodings,
+        &writes,
         statement_constant_policy,
         carrier.admission(),
         control,
@@ -321,8 +346,9 @@ fn encode_completed_packages(
         submission,
         // Refused above: a compiled plan declares no runtime filter.
         AttemptRuntimeFilterFacts::default(),
-        // Refused above: a compiled plan writes no target.
-        None,
+        // A plan that writes states which targets its root delivers, because
+        // that is what the commit is taken over; a read plan says none.
+        Some(written).filter(|targets| !targets.is_empty()),
     );
     let access = attempt_access_for_completed_plan(plan, capabilities)?;
     Ok(EncodedCompletedPlan {
@@ -342,14 +368,9 @@ fn encode_completed_packages(
 fn refuse_uncompiled_plan_shapes(
     plan: &PhysicalPlan,
 ) -> Result<(), novarocks_plan_codec::PhysicalEncodeError> {
+    // Every node family has a package author: what the local compiler cannot
+    // lower yet is refused by the backend's compiler, by name.
     for fragment in plan.fragments().values() {
-        for node in fragment.nodes().values() {
-            if let Some(reason) = compiled_node_refusal(&node.kind) {
-                return Err(
-                    novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(reason),
-                );
-            }
-        }
         if let Some(reason) = compiled_sink_refusal(fragment.sink()) {
             return Err(novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(reason));
         }
@@ -367,15 +388,6 @@ fn refuse_uncompiled_plan_shapes(
         );
     }
     Ok(())
-}
-
-const fn compiled_node_refusal(kind: &NodeKind) -> Option<&'static str> {
-    match kind {
-        NodeKind::TableWriter { .. } | NodeKind::TableFinish(_) => {
-            Some("the compiled package carrier has no production writer recipe author yet")
-        }
-        _ => None,
-    }
 }
 
 const fn compiled_sink_refusal(sink: &FragmentSink) -> Option<&'static str> {
@@ -1233,6 +1245,7 @@ mod tests {
         let packages = crate::query_execution::package_freeze::freeze_fragment_packages(
             completed.candidate(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
             crate::application::test_constant_policy(),
             &test_package_admission(),
             &encode_limits(),
@@ -1531,42 +1544,15 @@ mod tests {
 
     /// What the compiled carrier cannot express yet is refused by name before
     /// any package is authored, and is never encoded as a plan tree instead.
-    /// A scan is expressed, from the read its freeze kept.
+    /// A scan is expressed, from the read its freeze kept, and a writer from
+    /// the session that sealed its target.
     #[test]
-    fn the_compiled_carrier_refuses_writers_routers_and_multicast_but_admits_scans() {
-        use novarocks_physical_plan::{ValueId, WriterFinishSpec, WriterRelationSchema};
+    fn the_compiled_carrier_refuses_routers_and_multicast_but_admits_scans_and_writers() {
+        use novarocks_physical_plan::ValueId;
 
-        let schema = || WriterRelationSchema {
-            revision: 1,
-            fields: Box::default(),
-        };
-        let finish = NodeKind::TableFinish(WriterFinishSpec {
-            expected_target_ordinals: Box::default(),
-            input_schema: schema(),
-            output_schema: schema(),
-            final_aggregates: Box::default(),
-            grouped_unpivot: None,
-        });
-        let writer = NodeKind::TableWriter {
-            target: novarocks_physical_plan::WriterTarget {
-                handle: fixture_payload(
-                    novarocks_connector_contract::ConnectorCodecCategory::WriteHandle,
-                    7,
-                ),
-                write_target_ordinal: WriteTargetOrdinal::try_new(0).unwrap(),
-                input: Box::default(),
-                required_distribution: Distribution::Unconstrained,
-                target_fields: Box::default(),
-                output_schema: schema(),
-                partial_aggregates: Box::default(),
-            },
-        };
-        for kind in [&finish, &writer] {
-            assert!(
-                compiled_node_refusal(kind).is_some_and(|reason| reason.contains("writer recipe")),
-                "{kind:?}"
-            );
-        }
+        let (plan, _) = crate::query_execution::package_writes::tests::insert_values_plan();
+        refuse_uncompiled_plan_shapes(&plan)
+            .expect("a writer and its finish have a compiled shape");
         assert!(
             compiled_sink_refusal(&FragmentSink::Router {
                 effect: ValueId::new(0),

@@ -19,8 +19,9 @@ pub use error::{
 };
 pub use fact::{FragmentCancelReason, FragmentOutcome, FragmentTerminalFact};
 pub use handle::{
-    CompiledFragmentSubmission, DormantFragmentHandle, FragmentPrepareContext,
-    RunningFragmentHandle, compiled_sink_kind, prepare_compiled_fragment, prepare_fragment,
+    CompiledFragmentSubmission, CompiledWriterBindings, DormantFragmentHandle,
+    FragmentPrepareContext, RunningFragmentHandle, compiled_sink_kind, prepare_compiled_fragment,
+    prepare_fragment,
 };
 pub use instance::*;
 pub use submission::FragmentSubmission;

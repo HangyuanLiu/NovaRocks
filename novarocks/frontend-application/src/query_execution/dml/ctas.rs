@@ -805,6 +805,7 @@ fn prepare_planned_ctas_connector_write(
             &crate::query_execution::physical_encoding::WriteTargetFacts {
                 sealed: &sealed,
                 field_names,
+                session: session.as_ref(),
             },
         ),
         execution.sql_semantics().sql_mode().allow_throw_exception(),

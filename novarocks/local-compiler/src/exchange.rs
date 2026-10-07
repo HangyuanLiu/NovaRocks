@@ -85,14 +85,20 @@ fn lower_core(
             "ExchangeSource edge differs from its inbound cut",
         ));
     }
-    if cut.kind != EdgeKind::Stream
-        || cut.change_stream_writer.is_some()
-        || cut.writer_result.is_some()
-    {
+    if cut.kind != EdgeKind::Stream || cut.change_stream_writer.is_some() {
         return Err(FragmentCompileError::Unsupported {
             node: Some(node.id),
-            feature: "inbound CTE, change-stream or writer-result edge",
+            feature: "inbound CTE or change-stream edge",
         });
+    }
+    // A writer-result receiver presents the writer relation positionally,
+    // named by its frozen relation fields; the finish admission proved that
+    // it feeds exactly one finish.
+    let relation = cut.writer_result.as_ref().map(|relation| &relation.fields);
+    if relation.is_some_and(|fields| fields.len() != node.output.columns.len()) {
+        return Err(FragmentCompileError::Invalid(
+            "writer-result cut width differs from its receiver",
+        ));
     }
     // Receive binding is positional: wire column `i` is the cut's import `i`,
     // and the received occurrence `i` is that import's destination value.
@@ -133,8 +139,19 @@ fn lower_core(
             .ty;
         // Full result labels are authoritative only when this receiver's
         // entire ordered output is the result port.
-        let name = match result {
-            Some(result) => {
+        let name = match (relation, result) {
+            (Some(fields), _) => {
+                let field = &fields[ordinal];
+                let same = field.destination == *value && field.ty == *ty;
+                work.step()?;
+                if !same {
+                    return Err(FragmentCompileError::Invalid(
+                        "writer-result cut field differs from its received occurrence",
+                    ));
+                }
+                field.name.to_string()
+            }
+            (None, Some(result)) => {
                 let field = result
                     .fields
                     .get(ordinal)
@@ -143,7 +160,7 @@ fn lower_core(
                     ))?;
                 field.alias.as_deref().unwrap_or(&field.name).to_owned()
             }
-            None => format!("local_exchange_{}_{}", node.id.get(), ordinal),
+            (None, None) => format!("local_exchange_{}_{}", node.id.get(), ordinal),
         };
         work.flush()?;
         let field = ty.try_to_field(name);

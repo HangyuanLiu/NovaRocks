@@ -90,7 +90,7 @@ struct TableWriterPlan {
     target: WriteTargetOrdinal,
     execution: Arc<dyn ConnectorWriteExecution>,
     expected_schema: arrow::datatypes::SchemaRef,
-    projection: TableWriterInputProjection,
+    projection: Arc<dyn WriterProjectionFactory>,
     physical_template: TableWriterPhysicalContextTemplate,
     request_context: ConnectorRequestContext,
     fragment_encoder: Arc<dyn ConnectorCommitFragmentEncoder>,
@@ -98,6 +98,29 @@ struct TableWriterPlan {
     partial_aggregate_factory: Option<AggregateProcessorFactory>,
     #[cfg(debug_assertions)]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
+}
+
+/// How one driver projects an input page onto the exact provider schema its
+/// writer and every embedded aggregate share.
+pub(crate) trait WriterPageProjection: Send {
+    fn project(&mut self, chunk: &Chunk) -> ExecutionResult<Chunk>;
+}
+
+/// Creates each driver's own page projection; it holds no per-driver state.
+pub(crate) trait WriterProjectionFactory: Send + Sync {
+    fn create(&self) -> Box<dyn WriterPageProjection>;
+}
+
+impl WriterPageProjection for TableWriterInputProjection {
+    fn project(&mut self, chunk: &Chunk) -> ExecutionResult<Chunk> {
+        Ok(TableWriterInputProjection::project(self, chunk)?)
+    }
+}
+
+impl WriterProjectionFactory for TableWriterInputProjection {
+    fn create(&self) -> Box<dyn WriterPageProjection> {
+        Box::new(self.clone())
+    }
 }
 
 /// Factory for per-driver table writers.
@@ -154,12 +177,53 @@ impl TableWriterOperatorFactory {
                 target,
                 execution: Arc::clone(&binding.execution),
                 expected_schema,
-                projection,
+                projection: Arc::new(projection),
                 physical_template: binding.physical_template,
                 request_context: binding.request_context.clone(),
                 fragment_encoder: Arc::clone(&binding.fragment_encoder),
                 writer_multiplex_schema,
                 partial_aggregate_factory,
+                #[cfg(debug_assertions)]
+                aggregate_guard: Arc::clone(&binding.aggregate_guard),
+            }),
+        })
+    }
+
+    /// A compiled writer: its projection evaluates the program's
+    /// WriterProjection roots onto the exact provider schema, and it carries
+    /// no statistics, so it binds no aggregate and reads no function set.
+    pub(crate) fn try_new_compiled(
+        node_id: i32,
+        target: WriteTargetOrdinal,
+        expected_schema: arrow::datatypes::SchemaRef,
+        projection: Arc<dyn WriterProjectionFactory>,
+        writer_multiplex_schema: WriterMultiplexRelationSchema,
+        binding: &TableWriterRuntimeBinding,
+    ) -> Result<Self, String> {
+        if binding.execution.catalog_handle() != binding.handle.binding().catalog_handle() {
+            return Err(
+                "table writer catalog handle does not match its query-leased write execution"
+                    .to_string(),
+            );
+        }
+        let name = if node_id >= 0 {
+            format!("TABLE_WRITER (id={node_id})")
+        } else {
+            "TABLE_WRITER".to_string()
+        };
+        Ok(Self {
+            name,
+            plan: Arc::new(TableWriterPlan {
+                handle: binding.handle.clone(),
+                target,
+                execution: Arc::clone(&binding.execution),
+                expected_schema,
+                projection,
+                physical_template: binding.physical_template,
+                request_context: binding.request_context.clone(),
+                fragment_encoder: Arc::clone(&binding.fragment_encoder),
+                writer_multiplex_schema,
+                partial_aggregate_factory: None,
                 #[cfg(debug_assertions)]
                 aggregate_guard: Arc::clone(&binding.aggregate_guard),
             }),
@@ -190,7 +254,7 @@ impl TableWriterOperatorFactory {
                 target: node.target(),
                 execution: Arc::clone(node.execution()),
                 expected_schema: Arc::clone(node.expected_schema()),
-                projection: node.projection().clone(),
+                projection: Arc::new(node.projection().clone()),
                 physical_template: node.physical_template(),
                 request_context: node.request_context().clone(),
                 fragment_encoder: Arc::clone(node.fragment_encoder()),
@@ -334,7 +398,7 @@ impl TableWriterOperatorFactory {
         }
         TableWriterOperator {
             name: self.name.clone(),
-            projection: plan.projection.clone(),
+            projection: plan.projection.create(),
             writer,
             target,
             relation: plan.writer_multiplex_schema.clone(),
@@ -413,7 +477,7 @@ struct WriterCompletion {
 
 struct TableWriterOperator {
     name: String,
-    projection: TableWriterInputProjection,
+    projection: Box<dyn WriterPageProjection>,
     writer: AsyncWriterOwner<WriterCompletion>,
     target: WriteTargetOrdinal,
     relation: WriterMultiplexRelationSchema,
@@ -1283,23 +1347,30 @@ pub(crate) struct TableWriteRelationColumns<'chunk> {
 }
 
 impl<'chunk> TableWriteRelationColumns<'chunk> {
-    pub fn try_from_chunk(chunk: &'chunk Chunk) -> Result<Self, String> {
-        use crate::exec::node::table_write_relation::{
-            WRITE_RELATION_FRAGMENT_SLOT, WRITE_RELATION_KIND_SLOT, WRITE_RELATION_ROW_COUNT_SLOT,
-            WRITE_RELATION_TARGET_SLOT,
+    /// Read the fixed prefix at its SPI relation positions. The caller has
+    /// already proved the chunk is exactly its frozen relation, whose columns
+    /// may be carried by any slots (a compiled program allocates its own).
+    pub fn try_from_relation(chunk: &'chunk Chunk) -> Result<Self, String> {
+        use novarocks_spi::connector::write_stack::{
+            WRITE_RELATION_FRAGMENT_INDEX, WRITE_RELATION_KIND_INDEX,
+            WRITE_RELATION_ROW_COUNT_INDEX, WRITE_RELATION_TARGET_INDEX,
         };
+        Self::from_positions(
+            chunk,
+            WRITE_RELATION_KIND_INDEX,
+            WRITE_RELATION_TARGET_INDEX,
+            WRITE_RELATION_ROW_COUNT_INDEX,
+            WRITE_RELATION_FRAGMENT_INDEX,
+        )
+    }
 
-        let schema = chunk.chunk_schema();
-        let index = |slot| {
-            schema.index_of(slot).ok_or_else(|| {
-                format!("table write relation is missing slot {slot}: unexpected input shape")
-            })
-        };
-        let kind_index = index(WRITE_RELATION_KIND_SLOT)?;
-        let ordinal_index = index(WRITE_RELATION_TARGET_SLOT)?;
-        let row_count_index = index(WRITE_RELATION_ROW_COUNT_SLOT)?;
-        let fragment_index = index(WRITE_RELATION_FRAGMENT_SLOT)?;
-
+    fn from_positions(
+        chunk: &'chunk Chunk,
+        kind_index: usize,
+        ordinal_index: usize,
+        row_count_index: usize,
+        fragment_index: usize,
+    ) -> Result<Self, String> {
         let column = |position: usize, name: &str| {
             chunk.columns().get(position).ok_or_else(|| {
                 format!("table write relation column {name} is outside its record batch")
@@ -2471,7 +2542,7 @@ pub(crate) mod tests {
             );
             let mut row = 0usize;
             for chunk in &chunks {
-                let columns = TableWriteRelationColumns::try_from_chunk(chunk).expect("columns");
+                let columns = TableWriteRelationColumns::try_from_relation(chunk).expect("columns");
                 for local in 0..chunk.len() {
                     if row == 0 {
                         assert_eq!(
@@ -2533,7 +2604,7 @@ pub(crate) mod tests {
                     .arrow_schema()
                     .as_ref(),
             );
-            let prefix = TableWriteRelationColumns::try_from_chunk(chunk).expect("prefix");
+            let prefix = TableWriteRelationColumns::try_from_relation(chunk).expect("prefix");
             for row in 0..chunk.len() {
                 match WriterRowKind::from_wire(prefix.kinds.value(row)).expect("kind") {
                     WriterRowKind::RowCount => {
@@ -2644,7 +2715,7 @@ pub(crate) mod tests {
         let mut partial_values = Vec::new();
         let mut row_count = None;
         for output in &outputs {
-            let prefix = TableWriteRelationColumns::try_from_chunk(output).expect("prefix");
+            let prefix = TableWriteRelationColumns::try_from_relation(output).expect("prefix");
             for row in 0..output.len() {
                 match WriterRowKind::from_wire(prefix.kinds.value(row)).expect("kind") {
                     WriterRowKind::AggregatePartial => {
@@ -2833,7 +2904,7 @@ pub(crate) mod tests {
                 operator.output_size(&output).expect("encoded output size") <= PACKET_BYTES,
                 "every sparse batch must honor the runtime packet budget"
             );
-            let prefix = TableWriteRelationColumns::try_from_chunk(&output).expect("prefix");
+            let prefix = TableWriteRelationColumns::try_from_relation(&output).expect("prefix");
             assert_eq!(
                 WriterRowKind::from_wire(prefix.kinds.value(0)).expect("kind"),
                 WriterRowKind::AggregatePartial
@@ -2885,7 +2956,7 @@ pub(crate) mod tests {
             .set_finishing(&state)
             .expect("finish");
         let chunks = wait_for_output(&mut operator, &state).expect("writer output");
-        let columns = TableWriteRelationColumns::try_from_chunk(&chunks[0]).expect("columns");
+        let columns = TableWriteRelationColumns::try_from_relation(&chunks[0]).expect("columns");
         assert_eq!(chunks[0].len(), 1);
         assert_eq!(columns.row_counts.value(0), 0);
     }
@@ -3128,7 +3199,7 @@ pub(crate) mod tests {
         assert!(saw_pending_finish);
         let chunks = collected.lock().expect("collected chunks");
         assert_eq!(chunks.len(), 2);
-        let columns = TableWriteRelationColumns::try_from_chunk(&chunks[0]).expect("columns");
+        let columns = TableWriteRelationColumns::try_from_relation(&chunks[0]).expect("columns");
         assert_eq!(columns.row_counts.value(0), 3);
         assert_eq!(stats.finished.load(Ordering::Relaxed), 1);
         assert_eq!(stats.aborted.load(Ordering::Relaxed), 0);
@@ -3235,7 +3306,7 @@ pub(crate) mod tests {
         ProcessorOperator::set_finishing(&mut operator, &state).expect("finish");
         let mut boxed: Box<dyn Operator> = Box::new(operator);
         let outputs = wait_for_output(&mut boxed, &state).expect("writer output");
-        let prefix = TableWriteRelationColumns::try_from_chunk(&outputs[0]).expect("prefix");
+        let prefix = TableWriteRelationColumns::try_from_relation(&outputs[0]).expect("prefix");
         assert_eq!(prefix.row_counts.value(0), 5);
         assert_eq!(rows.load(Ordering::Relaxed), 5);
         assert_eq!(

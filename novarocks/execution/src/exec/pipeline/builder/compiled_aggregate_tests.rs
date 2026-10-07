@@ -802,3 +802,49 @@ fn distinct_aggregate_the_owner_does_not_implement_is_an_explicit_compile_refusa
             .expect("COUNT(DISTINCT) is refused");
     assert!(error.contains("DISTINCT"), "{error}");
 }
+
+// A Project that publishes no column (as under `COUNT(*)` above a join's
+// selection) still carries its input's row count.
+#[test]
+fn zero_width_project_carries_its_row_count_into_count_star() {
+    let catalog = extrema_catalog();
+    let count = bind(&catalog, "count", &[]);
+    let mut only = FragmentBuilder::new(SOURCE);
+    let values_node = only.reserve_node_id().unwrap();
+    let rows = (1..=3)
+        .map(|v| vec![LiteralValue::Int64(v)])
+        .collect::<Vec<_>>();
+    values(&mut only, values_node, &[int64(false)], &rows);
+    let project = only.reserve_node_id().unwrap();
+    only.add_project(project, values_node, Box::default(), Box::default())
+        .unwrap();
+    let (node, _) = add_aggregate(
+        &mut only,
+        project,
+        &[],
+        &[CallSpec {
+            bound: &count,
+            phase: AggregatePhase::Single,
+            id: AggregateCallId::new(1),
+            arguments: Vec::new(),
+            distinct: false,
+        }],
+        AggregateGrouping::Complete,
+    );
+    let only = finish(
+        only,
+        node,
+        FragmentSink::Result,
+        u32::try_from(DOP).unwrap(),
+    );
+    let port_output = only.nodes()[&node].output.clone();
+    let mut plan = PlanBuilder::new(version());
+    plan.add_fragment(only).unwrap();
+    plan.set_result_port(result_port(SOURCE, port_output, &[count.result_type()]))
+        .unwrap();
+    let plan = plan
+        .finish_observed(&FixtureControl)
+        .unwrap_or_else(|error| panic!("the zero-width project plan validates: {error:?}"));
+    let chunks = run_single(&plan, &catalog);
+    assert_eq!(int64_rows(&chunks), [vec![Some(3)]]);
+}

@@ -30,6 +30,7 @@ pub mod backend_task_execution;
 pub mod backend_test_support;
 pub mod catalog_prune_rpc;
 pub mod compiled_scan_binding;
+pub mod compiled_writer_binding;
 pub mod connector_write_data_plane;
 #[cfg(any(test, feature = "test-support"))]
 pub mod connector_write_test_support;

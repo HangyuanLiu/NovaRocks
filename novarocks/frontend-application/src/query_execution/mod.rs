@@ -44,6 +44,7 @@ pub mod native_fragment;
 pub(crate) mod outcome;
 pub(crate) mod package_freeze;
 pub(crate) mod package_reads;
+pub(crate) mod package_writes;
 pub(crate) mod physical_encoding;
 pub(crate) mod pinned_connector_read;
 pub mod planning;

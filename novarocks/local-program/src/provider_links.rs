@@ -133,7 +133,25 @@ fn validate_core(
                     let ordinal = ordinal_id(id, ordinal)?;
                     let expected = binding.field();
                     work.step()?;
-                    require_field(id, ordinal, expected, actual, work)?;
+                    // Either side of a writer value may admit more nulls than
+                    // the other; whether one row can be written is the
+                    // target's answer (the physical writer law). A nullable
+                    // value feeding a non-null field is therefore a declared
+                    // row obligation the writer checks before any provider
+                    // I/O, and a non-null value feeding a nullable field needs
+                    // none. Only the top-level nullability is relaxed: name,
+                    // carrier, nested fields and metadata stay exact.
+                    work.flush()?;
+                    let declared = (expected.is_nullable() != actual.is_nullable())
+                        .then(|| expected.clone().with_nullable(actual.is_nullable()));
+                    work.flush()?;
+                    require_field(
+                        id,
+                        ordinal,
+                        declared.as_ref().unwrap_or(expected),
+                        actual,
+                        work,
+                    )?;
                     let site = ProgramChannelSite::Layout {
                         node: id,
                         role: ProgramChannelLayoutRole::WriterProjection,
@@ -147,7 +165,7 @@ fn validate_core(
                     work.flush()?;
                     let logical = logical?;
                     let root_matches =
-                        logical == ty.logical_type && expected.is_nullable() == ty.nullable;
+                        logical == ty.logical_type && actual.is_nullable() == ty.nullable;
                     work.step()?;
                     if !root_matches {
                         return Err(ProviderLinkError::TypeMismatch(site));

@@ -1486,6 +1486,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
             ordinal,
             sink.accepted_field_names().into_iter().collect(),
         )]),
+        session: write_session.as_ref(),
     };
 
     // Optimize the write, then freeze the reads it states. The plan addresses

@@ -40,6 +40,14 @@ pub(crate) struct PlannedChannels {
     pub unpivot_sources: BTreeMap<NodeId, BTreeMap<ValueId, SlotId>>,
     pub assertion_keys: BTreeMap<NodeId, Vec<SlotId>>,
     pub unions: BTreeMap<NodeId, Vec<UnionChannelBranch>>,
+    /// Fresh slots of each TableWriter's projected provider input, in target
+    /// field order. Its output slots are its multiplex relation's.
+    pub writer_projections: BTreeMap<NodeId, Arc<[SlotId]>>,
+    /// Each join's planned channels. A join whose physical output is not
+    /// canonical also has one selection branch in `unions`.
+    pub joins: BTreeMap<NodeId, crate::join::PlannedJoin>,
+    /// Join-owned value reads; their actual source is chosen per use.
+    pub join_values: BTreeMap<ExprId, crate::join::JoinValueSource>,
 }
 
 pub(crate) struct NodeChannels {
@@ -69,7 +77,19 @@ pub(crate) enum ChannelLoweringError {
     ValueType(ValueTypeError),
     Repeat(RepeatLoweringError),
     Unpivot(UnpivotLoweringError),
+    /// A join planning refusal keeps its own category.
+    Join(crate::lowering::FragmentCompileError),
     Invalid(&'static str),
+}
+
+impl From<crate::lowering::FragmentCompileError> for ChannelLoweringError {
+    fn from(error: crate::lowering::FragmentCompileError) -> Self {
+        match error {
+            crate::lowering::FragmentCompileError::Control(cause) => Self::Control(cause),
+            crate::lowering::FragmentCompileError::Invalid(message) => Self::Invalid(message),
+            error => Self::Join(error),
+        }
+    }
 }
 
 impl From<CompileControlError> for ChannelLoweringError {
@@ -107,6 +127,7 @@ impl fmt::Display for ChannelLoweringError {
             Self::ValueType(error) => error.fmt(f),
             Self::Repeat(error) => error.fmt(f),
             Self::Unpivot(error) => error.fmt(f),
+            Self::Join(error) => error.fmt(f),
             Self::Invalid(message) => write!(f, "invalid planned channels: {message}"),
         }
     }
@@ -118,6 +139,7 @@ impl Error for ChannelLoweringError {
             Self::ValueType(error) => Some(error),
             Self::Repeat(error) => Some(error),
             Self::Unpivot(error) => Some(error),
+            Self::Join(error) => Some(error),
             Self::Invalid(_) => None,
         }
     }
@@ -158,6 +180,8 @@ fn resolve_core(
     let mut assertion_keys = BTreeMap::new();
     let mut next_node = 0usize;
     let mut unions = BTreeMap::new();
+    let mut writer_projections = BTreeMap::new();
+    let mut joins = BTreeMap::new();
     for &source in root_first.iter().rev() {
         let node = fragment
             .nodes()
@@ -166,6 +190,14 @@ fn resolve_core(
         if nodes.contains_key(&source) {
             return Err(ChannelLoweringError::Invalid("duplicate tree node"));
         }
+        // A join whose physical output is not its canonical output publishes
+        // it through a selection Project that directly follows the join.
+        let mut join_shape = match node.kind {
+            NodeKind::HashJoin { .. } | NodeKind::NestLoopJoin { .. } => {
+                Some(crate::join::shape_join(fragment, node, &ports, work)?)
+            }
+            _ => None,
+        };
         let additional = if matches!(
             node.kind,
             NodeKind::SetOp {
@@ -175,7 +207,9 @@ fn resolve_core(
         ) {
             node.inputs.len()
         } else {
-            0
+            join_shape
+                .as_ref()
+                .map_or(0, |shape| usize::from(shape.selection()))
         };
         let local_index = next_node
             .checked_add(additional)
@@ -595,6 +629,51 @@ fn resolve_core(
                 )?;
                 (planned.slots, planned.port)
             }
+            // A writer produces its multiplex relation and its projected
+            // provider input itself: every relation ordinal is a fresh
+            // channel. Its projection reads the child's port.
+            NodeKind::TableWriter { target } => {
+                single_child(&node.inputs)?;
+                let projection = fresh_slots(target.input.len(), &mut next_slot, work)?;
+                writer_projections.insert(source, projection);
+                fresh_relation(fragment, node, &mut next_slot, work)?
+            }
+            // A finish produces its root relation itself.
+            NodeKind::TableFinish(_) => {
+                single_child(&node.inputs)?;
+                fresh_relation(fragment, node, &mut next_slot, work)?
+            }
+            // A join produces its canonical output itself; a selection
+            // Project, when present, publishes the physical output.
+            NodeKind::HashJoin { .. } | NodeKind::NestLoopJoin { .. } => {
+                let shape = join_shape
+                    .take()
+                    .ok_or(ChannelLoweringError::Invalid("missing join shape"))?;
+                let (probe, build) = shape.children();
+                let side_slots = |child: NodeId| {
+                    nodes
+                        .get(&child)
+                        .map(|channels| Arc::clone(&channels.slots))
+                        .ok_or(ChannelLoweringError::Invalid(
+                            "join input has not been lowered",
+                        ))
+                };
+                let (probe_slots, build_slots) = (side_slots(probe)?, side_slots(build)?);
+                let planned = crate::join::plan_join_channels(
+                    node,
+                    shape,
+                    local,
+                    probe_slots,
+                    build_slots,
+                    &mut next_slot,
+                    work,
+                )?;
+                if let Some(branch) = planned.selection {
+                    unions.insert(source, vec![branch]);
+                }
+                joins.insert(source, planned.planned);
+                (planned.slots, planned.port)
+            }
             _ => {
                 return Err(ChannelLoweringError::Invalid("unsupported channel node"));
             }
@@ -604,6 +683,7 @@ fn resolve_core(
         work.step()?;
     }
     let mut inputs = BTreeMap::new();
+    let mut join_values = BTreeMap::new();
     for (&id, definition) in fragment.expressions().iter() {
         if let ExprKind::Value(value) = definition.kind {
             let owner =
@@ -613,6 +693,22 @@ fn resolve_core(
                     .ok_or(ChannelLoweringError::Invalid(
                         "missing value-reference owner",
                     ))?;
+            // A join-owned read keeps its side's slot; whether a use reads
+            // its side or the join scope is decided per use by its root.
+            if let Some(planned) = joins.get(&definition.owner) {
+                let (input, source) = crate::join::resolve_join_value(planned, value, &ports)?;
+                let source_type = &fragment
+                    .values()
+                    .get(&value)
+                    .ok_or(ChannelLoweringError::Invalid("missing referenced value"))?
+                    .ty;
+                work.step()?;
+                exact_type(&definition.ty, source_type, work)?;
+                inputs.insert(id, input);
+                join_values.insert(id, source);
+                work.step()?;
+                continue;
+            }
             // A scan-owned root reads the scan's own output port, exactly the
             // input layout that root binding names; every other owner reads
             // its one exact input.
@@ -647,7 +743,55 @@ fn resolve_core(
         unpivot_sources,
         assertion_keys,
         unions,
+        writer_projections,
+        joins,
+        join_values,
     })
+}
+
+/// `count` fresh channels, in order.
+fn fresh_slots(
+    count: usize,
+    next_slot: &mut u64,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Arc<[SlotId]>, ChannelLoweringError> {
+    let mut slots = Vec::new();
+    reserve_vec(&mut slots, count, work)?;
+    for _ in 0..count {
+        let slot = u32::try_from(*next_slot)
+            .map_err(|_| ChannelLoweringError::Invalid("slot identity exhausted"))?;
+        *next_slot = next_slot
+            .checked_add(1)
+            .ok_or(ChannelLoweringError::Invalid("slot identity exhausted"))?;
+        slots.push(SlotId::new(slot));
+        work.step()?;
+    }
+    work.flush()?;
+    let slots: Arc<[SlotId]> = Arc::from(slots);
+    work.flush()?;
+    Ok(slots)
+}
+
+/// One fresh channel per output occurrence of a relation the node produces
+/// itself. A repeated value is one produced value; its first ordinal
+/// represents it.
+fn fresh_relation(
+    fragment: &novarocks_physical_plan::Fragment,
+    node: &novarocks_physical_plan::PhysicalNode,
+    next_slot: &mut u64,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(Arc<[SlotId]>, Port), ChannelLoweringError> {
+    let mut port = Port::new();
+    for (ordinal, value) in node.output.columns.iter().enumerate() {
+        if !fragment.values().contains_key(value) {
+            return Err(ChannelLoweringError::Invalid(
+                "missing writer relation value",
+            ));
+        }
+        port.entry(*value).or_insert(ordinal);
+        work.step()?;
+    }
+    Ok((fresh_slots(node.output.columns.len(), next_slot, work)?, port))
 }
 
 fn single_child(inputs: &[NodeId]) -> Result<NodeId, ChannelLoweringError> {

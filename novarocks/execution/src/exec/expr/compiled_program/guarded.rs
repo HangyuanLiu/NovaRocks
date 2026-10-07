@@ -495,7 +495,7 @@ pub(super) fn evaluate_tree<'a>(
     program: &novarocks_local_program::LocalProgram,
     root: ProgramExpressionRootSite,
     input: &RecordBatch,
-    input_node: Option<ProgramNodeId>,
+    input_node: Option<(ProgramNodeId, ProgramChannelLayoutRole)>,
     selection: Selection<'a>,
     instances: &mut BTreeMap<ProgramUseRef, ScalarEvaluationInstance>,
     effects: &BTreeMap<ProgramUseRef, ScopedExpressionEffects>,
@@ -632,14 +632,15 @@ pub(super) fn evaluate_tree<'a>(
                 StaticExprKind::SlotId(_) => {
                     let Some(ProgramLexicalSource::Input(ProgramChannelSite::Layout {
                         node,
-                        role: ProgramChannelLayoutRole::NodeOutput,
+                        role,
                         ordinal,
                     })) = checked.slots().get(&frame.occurrence)
                     else {
                         return Err(invalid("slot requires its actual compiled input source"));
                     };
-                    // An empty-port root has no input source at all.
-                    if Some(*node) != input_node {
+                    // An empty-port root has no input source at all; every
+                    // other root reads exactly its own (node, role) port.
+                    if Some((*node, *role)) != input_node {
                         return Err(invalid("slot source differs from actual root input port"));
                     }
                     OwnedValue::Column(Arc::clone(

@@ -51,8 +51,16 @@ impl PureCompileControl for Control {
     }
 }
 fn checked(writer: bool, sink: bool, legacy: bool) -> ProgramLexicalBindings {
+    checked_with(writer, sink, legacy, false)
+}
+/// The same graph whose one value channel is nullable when `nullable` holds.
+fn checked_with(writer: bool, sink: bool, legacy: bool, nullable: bool) -> ProgramLexicalBindings {
     let control = Control::default();
-    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "v",
+        DataType::Int64,
+        nullable,
+    )]));
     let layout = StaticLayout::try_new(schema.clone(), Arc::from([SlotId::new(1)])).unwrap();
     let values = StaticValues::try_new(
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![7]))]).unwrap(),
@@ -180,7 +188,7 @@ fn checked(writer: bool, sink: bool, legacy: bool) -> ProgramLexicalBindings {
         types.insert(
             *scope,
             vec![
-                FunctionArgumentType::Value(FunctionValueType::new(DataType::Int64, false));
+                FunctionArgumentType::Value(FunctionValueType::new(DataType::Int64, nullable));
                 arena.nodes().len()
             ],
         );
@@ -194,7 +202,7 @@ fn checked(writer: bool, sink: bool, legacy: bool) -> ProgramLexicalBindings {
             role: ProgramChannelLayoutRole::NodeOutput,
             ordinal: 0,
         },
-        FunctionValueType::new(DataType::Int64, false),
+        FunctionValueType::new(DataType::Int64, nullable),
     )];
     if writer {
         for role in [
@@ -208,7 +216,7 @@ fn checked(writer: bool, sink: bool, legacy: bool) -> ProgramLexicalBindings {
                     role,
                     ordinal: 0,
                 },
-                FunctionValueType::new(DataType::Int64, false),
+                FunctionValueType::new(DataType::Int64, nullable),
             ));
         }
     }
@@ -440,6 +448,62 @@ fn actual_writer_recipe_coverage_and_exact_projection_fields_are_mandatory() {
             ordinal: 0
         })
     );
+}
+#[test]
+fn writer_projection_admits_either_nullability_direction_but_nothing_else() {
+    let id = ProgramNodeId::new(1);
+    let facts = |field| CompiledProgramFacts {
+        writes: BTreeMap::from([(id, recipe(field))]),
+        exchange_inputs: BTreeMap::new(),
+        scan_inputs: BTreeMap::new(),
+        aggregates: BTreeMap::new(),
+    };
+    // A nullable value feeding a NOT NULL target field is the writer's row
+    // obligation, and a non-null value feeding a nullable one needs none.
+    for (nullable_value, nullable_target) in [(true, false), (false, true), (true, true)] {
+        let program = LocalProgram::try_new(
+            checked_with(true, true, false, nullable_value),
+            operators(true, u32::MAX),
+            &allowed(),
+            facts(Field::new("v", DataType::Int64, nullable_target)),
+            &Control::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            program.write_recipes()[&id]
+                .draft()
+                .input()
+                .fields_iter()
+                .next()
+                .unwrap()
+                .field()
+                .is_nullable(),
+            nullable_target
+        );
+    }
+    // Only top-level nullability is relaxed: a name or carrier still differs.
+    for foreign in [
+        Field::new("foreign", DataType::Int64, false),
+        Field::new("v", DataType::Int32, false),
+    ] {
+        let error = LocalProgram::try_new(
+            checked_with(true, true, false, true),
+            operators(true, u32::MAX),
+            &allowed(),
+            facts(foreign),
+            &Control::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                LocalProgramCompileError::Provider(
+                    ProviderLinkError::FieldMismatch { .. } | ProviderLinkError::TypeMismatch(_)
+                )
+            ),
+            "{error:?}"
+        );
+    }
 }
 #[test]
 fn every_final_author_callback_propagates_original_control_without_rechecking() {

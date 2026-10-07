@@ -573,6 +573,7 @@ pub(crate) fn prepare_compiled_program_pipeline_execution(
         sink,
         exchange_bindings,
         ScanBindings::default(),
+        crate::runtime::fragment::CompiledWriterBindings::default(),
         exchange_finst_id,
         None,
         pipeline_dop,
@@ -584,7 +585,8 @@ pub(crate) fn prepare_compiled_program_pipeline_execution(
 /// As [`prepare_compiled_program_pipeline_execution`], reporting into the
 /// Task's profiler. `scan_bindings` binds exactly the program's compiled
 /// scans, keyed by physical scan node; the prepared execution retains their
-/// terminal hooks so an abort reaches parked readers.
+/// terminal hooks so an abort reaches parked readers. `writer_bindings` binds
+/// exactly the program's compiled TableWriter and TableFinish nodes.
 #[expect(
     clippy::too_many_arguments,
     reason = "The compiled program and its Task capabilities are independent inputs"
@@ -595,6 +597,7 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler(
     sink: Box<dyn OperatorFactory>,
     exchange_bindings: ExchangeBindings,
     scan_bindings: ScanBindings,
+    writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
     exchange_finst_id: Option<(i64, i64)>,
     profiler: Option<Profiler>,
     pipeline_dop: i32,
@@ -642,6 +645,7 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler(
         &program,
         exchange_bindings,
         scan_bindings,
+        writer_bindings,
         DependencyManager::new(),
         pipeline_dop,
         root_sink_dop,

@@ -253,8 +253,15 @@ impl ProcessorOperator for CompiledProjectProcessor {
         for (instance, site) in instances.iter_mut().zip(&self.sites) {
             columns.push(evaluate_all(instance, *site, &chunk.batch, &self.control)?);
         }
-        let batch = RecordBatch::try_new(self.output.arrow_schema_ref(), columns)
-            .map_err(|error| ExecutionFailure::from(format!("compiled Project output: {error}")))?;
+        // A Project may publish no column (e.g. under COUNT(*)); its row count
+        // is still its input's, which a zero-column batch cannot infer.
+        let batch = RecordBatch::try_new_with_options(
+            self.output.arrow_schema_ref(),
+            columns,
+            &arrow::record_batch::RecordBatchOptions::new()
+                .with_row_count(Some(chunk.batch.num_rows())),
+        )
+        .map_err(|error| ExecutionFailure::from(format!("compiled Project output: {error}")))?;
         self.pending = Some(Chunk::try_new_with_chunk_schema(
             batch,
             Arc::clone(&self.output),

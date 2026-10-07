@@ -39,7 +39,8 @@ use arrow_schema::Schema;
 use novarocks_functions::{ConstantPolicy, PureEngineFunctionCatalog};
 use novarocks_local_program::*;
 use novarocks_physical_plan::{
-    Distribution, EdgeKind, ExpressionRootRole, FragmentSink, NodeId, NodeKind, RowMultiplicity,
+    Distribution, EdgeKind, ExpressionRootRole, FragmentSink, JoinSide, NodeId, NodeKind,
+    RowMultiplicity,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
@@ -133,6 +134,7 @@ impl From<ChannelLoweringError> for FragmentCompileError {
         match error {
             ChannelLoweringError::Control(cause) => Self::Control(cause),
             ChannelLoweringError::Invalid(message) => Self::Invalid(message),
+            ChannelLoweringError::Join(error) => error,
             error => Self::Owner {
                 phase: "input channels",
                 error: Box::new(error),
@@ -215,7 +217,7 @@ fn lower(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<LocalProgram, FragmentCompileError> {
     // Each validated provider recipe moves into its one lowered owner.
-    let (package, mut reads, writes) = input.into_parts();
+    let (package, mut reads, mut writes) = input.into_parts();
     let package = &package;
     let physical = package.fragment();
     let dop = u32::try_from(options.pipeline_dop.get())
@@ -259,14 +261,20 @@ fn lower(
                     "stream sink edge differs from its outbound cut",
                 ));
             }
-            if cut.kind != EdgeKind::Stream
-                || cut.change_stream_writer.is_some()
-                || cut.writer_result.is_some()
-            {
+            if cut.kind != EdgeKind::Stream || cut.change_stream_writer.is_some() {
                 return Err(FragmentCompileError::Unsupported {
                     node: None,
-                    feature: "outbound CTE, change-stream or writer-result edge",
+                    feature: "outbound CTE or change-stream edge",
                 });
+            }
+            // A writer relation streams only from its root writer, and a root
+            // writer streams exactly its relation.
+            let writer_rooted = physical
+                .nodes()
+                .get(&physical.root())
+                .is_some_and(|root| matches!(root.kind, NodeKind::TableWriter { .. }));
+            if cut.writer_result.is_some() || writer_rooted {
+                crate::writer::admit_writer_result_cut(package, cut, work)?;
             }
             if matches!(
                 cut.partitioning.source,
@@ -288,25 +296,19 @@ fn lower(
     };
     for cut in package.cuts().inbound.iter() {
         work.step()?;
-        if cut.kind != EdgeKind::Stream
-            || cut.change_stream_writer.is_some()
-            || cut.writer_result.is_some()
-        {
+        if cut.kind != EdgeKind::Stream || cut.change_stream_writer.is_some() {
             return Err(FragmentCompileError::Unsupported {
                 node: Some(cut.destination_node),
-                feature: "inbound CTE, change-stream or writer-result edge",
+                feature: "inbound CTE or change-stream edge",
             });
         }
     }
-    // Provider reads are admitted per scan below; writers and runtime-filter
-    // graphs remain explicit.
-    if !writes.is_empty()
-        || !package.cuts().runtime_filters.is_empty()
-        || !physical.runtime_filters().is_empty()
-    {
+    // Provider reads and writes are admitted per scan and writer below;
+    // runtime-filter graphs remain explicit.
+    if !package.cuts().runtime_filters.is_empty() || !physical.runtime_filters().is_empty() {
         return Err(FragmentCompileError::Unsupported {
             node: None,
-            feature: "provider writer or runtime-filter graph",
+            feature: "runtime-filter graph",
         });
     }
     // The result port exists exactly for a Result sink; a stream producer
@@ -325,6 +327,7 @@ fn lower(
     let mut order = Vec::new();
     let mut visited = BTreeSet::new();
     let mut scans = BTreeSet::new();
+    let mut writers = BTreeSet::new();
     let mut stack = Vec::new();
     let mut expanded_nodes = physical.nodes().len();
     let mut derived_definitions = 0usize;
@@ -351,6 +354,24 @@ fn lower(
                     .ok_or(CompileControlError::ResourceExhausted)?,
             )
             .ok_or(CompileControlError::ResourceExhausted)?;
+        // A writer-family node also owns its non-output relation roles.
+        channel_count = crate::writer::extra_channels(package, node)
+            .and_then(|extra| channel_count.checked_add(extra))
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        // A join also owns its side and scope roles, and may publish its
+        // output through one selection Project of derived slot reads.
+        if let Some((pieces, channels, definitions)) = crate::join::resource_bound(physical, node)?
+        {
+            expanded_nodes = expanded_nodes
+                .checked_add(pieces)
+                .ok_or(CompileControlError::ResourceExhausted)?;
+            channel_count = channel_count
+                .checked_add(channels)
+                .ok_or(CompileControlError::ResourceExhausted)?;
+            derived_definitions = derived_definitions
+                .checked_add(definitions)
+                .ok_or(CompileControlError::ResourceExhausted)?;
+        }
         if matches!(
             node.kind,
             NodeKind::SetOp {
@@ -418,6 +439,8 @@ fn lower(
     order
         .try_reserve_exact(physical.nodes().len())
         .map_err(|_| CompileControlError::ResourceExhausted)?;
+    // Only a join's own build receiver may arrive replicated.
+    let replicated_builds = crate::join::replicated_build_inputs(physical, work)?;
     stack.push((physical.root(), false, 1usize));
     while let Some((id, exiting, depth)) = stack.pop() {
         work.step()?;
@@ -447,15 +470,17 @@ fn lower(
         // are placed; its gather-and-Final sequence is a checked plan fact. A
         // family that consumes per-driver key co-location must author its own
         // local partitioning instead of relying on this. Copied rows and
-        // broadcast placement stay refused.
-        if !matches!(
-            node.output_properties.distribution,
-            Distribution::Singleton
-                | Distribution::Unconstrained
-                | Distribution::RoundRobin
-                | Distribution::Hash { .. }
-                | Distribution::BucketShuffle { .. }
-        ) || node.output_properties.row_multiplicity != RowMultiplicity::SingleCopy
+        // broadcast placement stay refused, except the broadcast receiver a
+        // join consumes as its complete build side.
+        if !replicated_builds.contains(&id)
+            && (!matches!(
+                node.output_properties.distribution,
+                Distribution::Singleton
+                    | Distribution::Unconstrained
+                    | Distribution::RoundRobin
+                    | Distribution::Hash { .. }
+                    | Distribution::BucketShuffle { .. }
+            ) || node.output_properties.row_multiplicity != RowMultiplicity::SingleCopy)
         {
             return Err(FragmentCompileError::Unsupported {
                 node: Some(id),
@@ -495,6 +520,10 @@ fn lower(
                 kind: novarocks_physical_plan::SetOperationKind::UnionAll,
                 ..
             } => node.inputs.len() >= 2,
+            // The writer family, under its own admission below.
+            NodeKind::TableWriter { .. } | NodeKind::TableFinish(_) => node.inputs.len() == 1,
+            // Both join families, under their own admission below.
+            NodeKind::HashJoin { .. } | NodeKind::NestLoopJoin { .. } => node.inputs.len() == 2,
             _ => false,
         };
         if !supported {
@@ -507,9 +536,32 @@ fn lower(
             admit_scan(node, reads.get(&id), work)?;
             scans.insert(id);
         }
+        if matches!(
+            node.kind,
+            NodeKind::TableWriter { .. } | NodeKind::TableFinish(_)
+        ) {
+            crate::writer::admit_writer_family(
+                package,
+                node,
+                writes.get(&id),
+                options.pipeline_dop,
+                work,
+            )?;
+            if matches!(node.kind, NodeKind::TableWriter { .. }) {
+                writers.insert(id);
+            }
+        }
+        // A join may lower to itself and a following selection Project.
+        let join = matches!(
+            node.kind,
+            NodeKind::HashJoin { .. } | NodeKind::NestLoopJoin { .. }
+        );
+        if join {
+            crate::join::orient_join(node)?;
+        }
         stack.push((id, true, depth));
         for &child in node.inputs.iter().rev() {
-            stack.push((child, false, depth + if union { 2 } else { 1 }));
+            stack.push((child, false, depth + if union || join { 2 } else { 1 }));
             work.step()?;
         }
     }
@@ -525,6 +577,11 @@ fn lower(
     if reads.len() != scans.len() {
         return Err(FragmentCompileError::Invalid(
             "provider read recipe names no admitted scan node",
+        ));
+    }
+    if writes.len() != writers.len() || writes.keys().any(|node| !writers.contains(node)) {
+        return Err(FragmentCompileError::Invalid(
+            "provider write recipe names no admitted table writer",
         ));
     }
     // Expansion conservatively loses distribution knowledge. It still has
@@ -567,14 +624,29 @@ fn lower(
                 ..
             }
         );
+        // A join's rows are placed where its probe rows are: every instance
+        // holds the whole build it needs, so a join probing a runtime-split
+        // scan inherits that scan's placement.
+        let probe_input = match &node.kind {
+            NodeKind::HashJoin { build_side, .. } if node.inputs.len() == 2 => {
+                Some(node.inputs[usize::from(*build_side == JoinSide::Left)])
+            }
+            NodeKind::NestLoopJoin { .. } if node.inputs.len() == 2 => Some(node.inputs[0]),
+            _ => None,
+        };
         let scan_rooted = matches!(node.kind, NodeKind::Scan { .. })
             || partial_groups
             || ((transparent || partial_rows)
                 && node.inputs.len() == 1
-                && properties.get(&node.inputs[0]).is_some_and(|p| p.2));
+                && properties.get(&node.inputs[0]).is_some_and(|p| p.2))
+            || probe_input.is_some_and(|probe| properties.get(&probe).is_some_and(|p| p.2));
         let unknown = node.output_properties.distribution == Distribution::Unconstrained;
+        // A writer's relation is per-driver summaries of what it wrote, and
+        // the writer is its fragment's root: its rows have no placement a
+        // descendant could consume.
+        let writer_rooted = matches!(node.kind, NodeKind::TableWriter { .. });
         work.step()?;
-        if (unknown && !expanded && !changes && !scan_rooted)
+        if (unknown && !expanded && !changes && !scan_rooted && !writer_rooted)
             || ((expanded || changes) && options.pipeline_dop.get() != 1)
         {
             return Err(FragmentCompileError::Unsupported {
@@ -644,6 +716,8 @@ fn lower(
     let mut exchange_inputs = BTreeMap::new();
     let mut scan_inputs = BTreeMap::new();
     let mut aggregates = BTreeMap::new();
+    let mut program_writes = BTreeMap::new();
+    let mut writer_flows = Vec::new();
     // Local nodes whose layout is a provider scan layout unchanged.
     let mut scan_layouts = BTreeSet::new();
     crate::assert_rows::reserve_vec(&mut nodes, expanded_nodes, work)?;
@@ -660,6 +734,57 @@ fn lower(
                 "missing planned node channels",
             ))?;
         let id = planned.local;
+        // A join lowers to its join node and, when its physical output is not
+        // canonical, one selection Project whose slot reads were authored
+        // like a union normalizer's.
+        if let Some(join) = channels_plan.joins.get(&source) {
+            let input = |child: NodeId| {
+                local_ids
+                    .get(&child)
+                    .copied()
+                    .ok_or(FragmentCompileError::Invalid("missing lowered join input"))
+            };
+            let (probe, build) = (input(join.probe)?, input(join.build)?);
+            let selection = expressions
+                .union_ids
+                .get(&source)
+                .and_then(|rows| rows.first())
+                .map(Vec::as_slice);
+            work.flush()?;
+            let lowered = crate::join::lower_join(
+                package,
+                node,
+                join,
+                &planned.slots,
+                crate::join::JoinInput {
+                    node: probe,
+                    layout: nodes[probe.index()].output_layout(),
+                },
+                crate::join::JoinInput {
+                    node: build,
+                    layout: nodes[build.index()].output_layout(),
+                },
+                &expressions.ids,
+                selection,
+                work.control(),
+            )?;
+            for emitted in lowered.nodes {
+                let same = emitted
+                    .local_id()
+                    .is_some_and(|emitted| emitted.index() == nodes.len());
+                work.step()?;
+                if !same {
+                    return Err(FragmentCompileError::Invalid("join schedule differs"));
+                }
+                nodes.push(emitted);
+            }
+            channels.extend(lowered.channels);
+            operators.extend(lowered.operators);
+            union_roots.extend(lowered.selection_roots);
+            allowed.insert(DiagnosticSourceNodeId::new(source.get()));
+            local_ids.insert(source, id);
+            continue;
+        }
         if let Some(branches) = channels_plan.unions.get(&source) {
             let definitions =
                 expressions
@@ -1035,6 +1160,61 @@ fn lower(
                         layout,
                     )
                 }
+                NodeKind::TableWriter { .. } => {
+                    let child_source = node.inputs[0];
+                    let child =
+                        *local_ids
+                            .get(&child_source)
+                            .ok_or(FragmentCompileError::Invalid(
+                                "missing lowered table writer child",
+                            ))?;
+                    let recipe = writes.remove(&source).ok_or(FragmentCompileError::Invalid(
+                        "missing provider write recipe",
+                    ))?;
+                    let projection_slots = channels_plan.writer_projections.get(&source).ok_or(
+                        FragmentCompileError::Invalid("missing planned writer projection"),
+                    )?;
+                    work.flush()?;
+                    let lowered = crate::writer::lower_writer(
+                        package,
+                        node,
+                        id,
+                        &recipe,
+                        crate::writer::WriterLoweringInput {
+                            child,
+                            child_node: &physical.nodes()[&child_source],
+                            child_layout: nodes[child.index()].output_layout(),
+                            output_slots: &planned.slots,
+                            projection_slots,
+                        },
+                        work.control(),
+                    )?;
+                    source_requirements.push(lowered.requirement);
+                    channels.extend(lowered.channels);
+                    writer_flows.push(lowered.flow);
+                    program_writes.insert(id, recipe);
+                    (lowered.kind, lowered.layout)
+                }
+                NodeKind::TableFinish(_) => {
+                    let child =
+                        *local_ids
+                            .get(&node.inputs[0])
+                            .ok_or(FragmentCompileError::Invalid(
+                                "missing lowered table finish child",
+                            ))?;
+                    work.flush()?;
+                    let lowered = crate::writer::lower_finish(
+                        node,
+                        id,
+                        child,
+                        nodes[child.index()].output_layout(),
+                        &planned.slots,
+                        work.control(),
+                    )?;
+                    source_requirements.push(lowered.requirement);
+                    channels.extend(lowered.channels);
+                    (lowered.kind, lowered.layout)
+                }
                 _ => {
                     return Err(FragmentCompileError::Invalid(
                         "validated node family changed",
@@ -1117,6 +1297,11 @@ fn lower(
     if !reads.is_empty() {
         return Err(FragmentCompileError::Invalid(
             "provider read recipe has no lowered scan",
+        ));
+    }
+    if !writes.is_empty() {
+        return Err(FragmentCompileError::Invalid(
+            "provider write recipe has no lowered table writer",
         ));
     }
     let root = local_ids[&physical.root()];
@@ -1228,6 +1413,19 @@ fn lower(
         if retired.contains(use_id) {
             continue;
         }
+        // A join's roots belong to its join node, never to its selection,
+        // with each key oriented to its local probe or build side.
+        if let Some(join) = channels_plan.joins.get(&site.node) {
+            let (role, _) = crate::join::root_role(join, site.role)?;
+            roots.push(ProgramRootUseBinding {
+                site: ProgramExpressionRootSite::Node {
+                    node: join.join,
+                    role,
+                },
+                use_id: *use_id,
+            });
+            continue;
+        }
         let node = *local_ids
             .get(&site.node)
             .ok_or(FragmentCompileError::Invalid("missing root node"))?;
@@ -1314,6 +1512,16 @@ fn lower(
         types.insert(ProgramExpressionArena::Sink, stream.types);
         sink_slot_bindings = stream.slots;
     }
+    // Each writer owns its WriterProjection arena with its own flow, types,
+    // roots and input occurrences.
+    for writer in writer_flows {
+        crate::assert_rows::reserve_vec(&mut roots, writer.roots.len(), work)?;
+        roots.extend(writer.roots);
+        crate::assert_rows::reserve_vec(&mut sink_slot_bindings, writer.slots.len(), work)?;
+        sink_slot_bindings.extend(writer.slots);
+        flows.insert(writer.arena, writer.flow);
+        types.insert(writer.arena, writer.types);
+    }
     work.flush()?;
     let snapshot = ProgramRootControlBindings::try_new(graph, flows, roots, work.control())?;
     work.flush()?;
@@ -1328,15 +1536,29 @@ fn lower(
         crate::assert_rows::reserve_vec(&mut slot_bindings, sink_slot_bindings.len(), work)?;
         slot_bindings.extend(sink_slot_bindings);
     }
+    // A join-owned read takes the layout its own root reads: a key root its
+    // side, a residual or nested-loop predicate the join scope.
+    work.flush()?;
+    let join_uses = crate::join::join_use_roles(package, &channels_plan.joins, work.control())?;
+    work.flush()?;
     for invocation in package.expression_uses().flow().uses().values() {
         work.step()?;
         if let Some(input) = channels_plan.inputs.get(&invocation.definition) {
+            let source = match channels_plan.join_values.get(&invocation.definition) {
+                Some(value) => {
+                    let (join, role) = *join_uses.get(&invocation.context.use_id).ok_or(
+                        FragmentCompileError::Invalid("join value read outside its join's roots"),
+                    )?;
+                    value.for_root(join, role)?
+                }
+                None => input.source,
+            };
             slot_bindings.push(ProgramSlotBinding {
                 occurrence: ProgramUseRef {
                     arena: ProgramExpressionArena::Main,
                     use_id: invocation.context.use_id,
                 },
-                source: ProgramLexicalSource::Input(input.source),
+                source: ProgramLexicalSource::Input(source),
             });
         }
     }
@@ -1348,7 +1570,7 @@ fn lower(
         operators,
         &allowed,
         CompiledProgramFacts {
-            writes: BTreeMap::new(),
+            writes: program_writes,
             exchange_inputs,
             scan_inputs,
             aggregates,

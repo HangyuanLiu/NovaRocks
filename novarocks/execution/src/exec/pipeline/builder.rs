@@ -117,6 +117,9 @@ struct PipelineBuildContext {
     runtime_filter_execution: PipelineRuntimeFilterExecution,
     exchange_bindings: ExchangeBindings,
     scan_bindings: ScanBindings,
+    /// A compiled program's Task write capabilities; empty for every other
+    /// builder.
+    compiled_writers: crate::runtime::fragment::CompiledWriterBindings,
     next_pipeline_id: i32,
     pipeline_dop: i32,
     operator_buffer_chunks: usize,
@@ -367,6 +370,7 @@ fn build_pipeline_graph_in_mode(
         runtime_filter_execution,
         exchange_bindings,
         scan_bindings,
+        compiled_writers: Default::default(),
         next_pipeline_id: 0,
         pipeline_dop: pipeline_dop.max(1),
         operator_buffer_chunks: operator_buffer_chunks.max(1),

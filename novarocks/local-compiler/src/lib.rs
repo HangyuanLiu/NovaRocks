@@ -27,6 +27,9 @@ mod change_events_lowering_tests;
 mod channels;
 mod exchange;
 mod expressions;
+mod join;
+#[cfg(test)]
+mod join_lowering_tests;
 mod lowering;
 mod original_requests;
 mod repeat;
@@ -34,9 +37,13 @@ mod scan;
 mod union;
 mod union_flow;
 mod unpivot;
+mod writer;
 
 #[cfg(test)]
 mod repeat_lowering_tests;
+
+#[cfg(test)]
+mod writer_lowering_tests;
 
 #[cfg(test)]
 mod unpivot_lowering_tests;
