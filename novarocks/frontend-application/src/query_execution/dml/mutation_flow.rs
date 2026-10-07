@@ -898,27 +898,8 @@ fn cow_selection_from_query_result(
         )
         .map_err(|error| format!("create bounded COW match collector: {error}"))?;
     for batch in result.batches {
-        if batch.num_columns() != schema.fields().len() {
-            return Err(
-                "COW match query output width differs from its signed contract".to_string(),
-            );
-        }
-        let columns = batch
-            .columns()
-            .iter()
-            .zip(schema.fields())
-            .map(|(column, field)| {
-                novarocks_execution::exec::expr::cast_array_to_target(column, field.data_type())
-                    .map_err(|error| {
-                        format!(
-                            "cast COW match ordinal to its signed type {:?}: {error}",
-                            field.data_type()
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
-            .map_err(|error| format!("assemble signed COW match batch: {error}"))?;
+        let batch =
+            crate::query_execution::row_mutation::cast_to_signed_selection(&schema, &batch)?;
         collector
             .push(batch)
             .map_err(|error| format!("collect bounded COW match batch: {error}"))?;

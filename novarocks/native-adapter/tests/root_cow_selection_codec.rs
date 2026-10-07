@@ -493,10 +493,11 @@ fn stream_decoder_requires_one_schema_first_and_returns_every_batch() {
     let mut stream = first.clone();
     stream.extend_from_slice(&second);
     let mut decoder = CowSelectionStreamDecoder::new();
+    let mut batches = Vec::new();
     for (_, record) in split(&stream) {
-        decoder.apply_record(record).unwrap();
+        batches.extend(decoder.apply_record(record).unwrap());
     }
-    let (schema, batches) = decoder.finish();
+    let schema = decoder.finish();
     assert_eq!(schema.unwrap().fields(), batch.schema().fields());
     assert_eq!(batches, vec![batch.slice(0, 4), batch.slice(4, 7)]);
     // A batch before the schema, or a second schema, is refused.
@@ -506,6 +507,6 @@ fn stream_decoder_requires_one_schema_first_and_returns_every_batch() {
     let mut twice = CowSelectionStreamDecoder::new();
     twice.apply_record(records[0].1).unwrap();
     assert!(twice.apply_record(records[0].1).is_err());
-    // An empty selection has neither schema nor batches.
-    assert_eq!(CowSelectionStreamDecoder::new().finish().1.len(), 0);
+    // An empty selection has no schema.
+    assert!(CowSelectionStreamDecoder::new().finish().is_none());
 }

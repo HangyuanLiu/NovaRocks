@@ -21,6 +21,7 @@
 //! interprets provider identity values nor derives a physical write strategy.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::array::{Array, ArrayRef, Int8Array};
@@ -34,6 +35,10 @@ use novarocks_spi::connector::{
 
 use crate::native::fragment_transport::FetchedQueryBatch;
 use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_native_adapter::root_cow_selection_codec::{
+    COW_SELECTION_MAX_RECORD_BYTES, CowSelectionStreamDecoder,
+};
+use novarocks_native_adapter::root_record_assembly::{RootRecordAssembly, RootRecordDomain};
 
 const DELETE_EFFECT_TAG: i8 = 1;
 const REPLACE_EFFECT_TAG: i8 = 2;
@@ -223,6 +228,125 @@ impl BoundedRowMutationMatchCollector {
             ));
         }
         Ok(())
+    }
+}
+
+/// Casts one match batch to the signed selection layout. Both the Arrow
+/// result path and the relayed CowSelectionArrowV1 path use it, so the signed
+/// types are applied by one rule.
+pub fn cast_to_signed_selection(
+    schema: &SchemaRef,
+    batch: &RecordBatch,
+) -> Result<RecordBatch, String> {
+    if batch.num_columns() != schema.fields().len() {
+        return Err("COW match query output width differs from its signed contract".to_string());
+    }
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(column, field)| {
+            novarocks_execution::exec::expr::cast_array_to_target(column, field.data_type())
+                .map_err(|error| {
+                    format!(
+                        "cast COW match ordinal to its signed type {:?}: {error}",
+                        field.data_type()
+                    )
+                })
+        })
+        .collect::<Result<Vec<ArrayRef>, _>>()?;
+    RecordBatch::try_new(Arc::clone(schema), columns)
+        .map_err(|error| format!("assemble signed COW match batch: {error}"))
+}
+
+/// Collects a relayed CowSelectionArrowV1 stream into the bounded selection.
+///
+/// Relayed bodies are assembled into whole records whose declared length is
+/// checked against the collector's byte budget before any assembly buffer is
+/// reserved. Each BATCH record is decoded, cast to the signed layout and
+/// handed to the bounded collector at once, so no second copy of the stream
+/// is retained. A body taken into assembly may be acknowledged before its
+/// record completes; nothing is a published selection until `finish`.
+pub struct RelayedCowSelectionCollector {
+    assembly: RootRecordAssembly,
+    decoder: CowSelectionStreamDecoder,
+    schema: SchemaRef,
+    collector: BoundedRowMutationMatchCollector,
+}
+
+impl RelayedCowSelectionCollector {
+    pub fn try_new(
+        context: ConnectorRequestContext,
+        exec_mem_limit: Option<i64>,
+        schema: SchemaRef,
+    ) -> Result<Self, ConnectorError> {
+        let collector = BoundedRowMutationMatchCollector::try_new_with_schema(
+            context,
+            exec_mem_limit,
+            Arc::clone(&schema),
+        )?;
+        let record_bound = collector.max_bytes().min(COW_SELECTION_MAX_RECORD_BYTES);
+        let record_bound = usize::try_from(record_bound).unwrap_or(usize::MAX);
+        Ok(Self {
+            assembly: RootRecordAssembly::new(RootRecordDomain::CowSelection, record_bound),
+            decoder: CowSelectionStreamDecoder::new(),
+            schema,
+            collector,
+        })
+    }
+
+    /// Bytes held by the bounded collector.
+    pub const fn byte_count(&self) -> u64 {
+        self.collector.byte_count()
+    }
+
+    /// Bytes held by an unfinished record.
+    pub fn assembly_bytes(&self) -> usize {
+        self.assembly.retained_bytes()
+    }
+
+    /// Feed one relayed body.
+    pub fn push_body(&mut self, body: &[u8]) -> Result<(), ConnectorError> {
+        let Self {
+            assembly,
+            decoder,
+            schema,
+            collector,
+        } = self;
+        // Keep the collector's own error kind (cancellation, deadline,
+        // budget) rather than flattening it through the assembly sink.
+        let mut collector_error = None;
+        let pushed = assembly.push(body, |record| {
+            let Some(batch) = decoder
+                .apply_record(record)
+                .map_err(|error| format!("decode relayed COW selection record: {error}"))?
+            else {
+                let width = decoder.schema().map_or(0, |relayed| relayed.fields().len());
+                if width != schema.fields().len() {
+                    return Err(
+                        "relayed COW selection schema width differs from its signed contract"
+                            .to_string(),
+                    );
+                }
+                return Ok(());
+            };
+            let batch = cast_to_signed_selection(schema, &batch)?;
+            collector.push(batch).map_err(|error| {
+                let message = error.to_string();
+                collector_error = Some(error);
+                message
+            })
+        });
+        if let Some(error) = collector_error {
+            return Err(error);
+        }
+        pushed.map_err(invalid_match)
+    }
+
+    /// The stream's End: no record may remain unfinished.
+    pub fn finish(self) -> Result<ConnectorRowMutationSelection, ConnectorError> {
+        self.assembly.finish().map_err(invalid_match)?;
+        self.collector.finish()
     }
 }
 
@@ -658,6 +782,133 @@ mod tests {
             .push(batch(vec![]))
             .unwrap_err();
         assert_eq!(error.kind(), ConnectorErrorKind::DeadlineExceeded);
+    }
+
+    /// Encode inputs as the Backend's CowSelectionArrowV1 stream.
+    fn relayed_stream(inputs: &[RecordBatch]) -> Vec<u8> {
+        use novarocks_native_adapter::root_cow_selection_codec::{
+            CowSelectionEncoder, CowSelectionTotals,
+        };
+        use novarocks_result_render::RenderTurnStatus;
+
+        let mut totals = CowSelectionTotals::default();
+        let mut stream = Vec::new();
+        let mut buffer = vec![0_u8; 64];
+        for input in inputs {
+            let mut encoder = CowSelectionEncoder::try_new(input, totals, usize::MAX).unwrap();
+            loop {
+                let turn = encoder.step(&mut buffer);
+                stream.extend_from_slice(&buffer[..turn.emitted_bytes]);
+                if turn.status == RenderTurnStatus::InputComplete {
+                    break;
+                }
+            }
+            totals = encoder.totals();
+        }
+        stream
+    }
+
+    #[test]
+    fn relayed_selection_equals_the_arrow_selection_across_any_body_split() {
+        let inputs = vec![
+            batch(vec![
+                (1, 10, Some(11), REPLACE_EFFECT_TAG),
+                (2, 20, None, DELETE_EFFECT_TAG),
+            ]),
+            batch(vec![(3, 30, Some(31), INSERT_EFFECT_TAG)]),
+        ];
+        let stream = relayed_stream(&inputs);
+        let cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
+        let mut arrow = BoundedRowMutationMatchCollector::try_new_with_schema(
+            context(Arc::clone(&cancellation), 1 << 20),
+            None,
+            selection_schema(),
+        )
+        .unwrap();
+        for input in &inputs {
+            arrow.push(input.clone()).unwrap();
+        }
+        let expected = arrow.finish().unwrap();
+        for body in [1, 7, 33, stream.len()] {
+            let mut relayed = RelayedCowSelectionCollector::try_new(
+                context(Arc::clone(&cancellation), 1 << 20),
+                None,
+                selection_schema(),
+            )
+            .unwrap();
+            for piece in stream.chunks(body) {
+                relayed.push_body(piece).unwrap();
+            }
+            let selection = relayed.finish().unwrap();
+            assert_eq!(selection.digest(), expected.digest(), "body size {body}");
+            assert_eq!(selection.batches(), expected.batches());
+        }
+        // An empty relayed stream keeps the signed schema.
+        let empty = RelayedCowSelectionCollector::try_new(
+            context(Arc::clone(&cancellation), 1 << 20),
+            None,
+            selection_schema(),
+        )
+        .unwrap()
+        .finish()
+        .unwrap();
+        assert_eq!(empty.schema(), &selection_schema());
+        assert_eq!(empty.row_count(), 0);
+    }
+
+    #[test]
+    fn relayed_selection_refuses_oversized_records_truncation_and_cancellation() {
+        let one = batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)]);
+        let stream = relayed_stream(std::slice::from_ref(&one));
+        let cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
+
+        // A record declaring more than the whole budget is refused from its
+        // header alone, before any assembly buffer beyond the header.
+        let schema_record = {
+            let header = novarocks_native_adapter::root_cow_selection_codec::CowSelectionRecordHeader::parse(&stream)
+                .unwrap();
+            header.record_bytes() as usize
+        };
+        let batch_record = &stream[schema_record..];
+        let budget = schema_record.max(64);
+        let mut small = RelayedCowSelectionCollector::try_new(
+            context(Arc::clone(&cancellation), budget),
+            None,
+            selection_schema(),
+        )
+        .unwrap();
+        small.push_body(&stream[..schema_record]).unwrap();
+        let mut grown = batch_record[..40].to_vec();
+        grown[8..16].copy_from_slice(&((budget as u64) + 1).to_le_bytes());
+        let error = small.push_body(&grown).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(small.assembly_bytes() <= 32, "{}", small.assembly_bytes());
+
+        // End inside an unfinished record is refused.
+        let mut truncated = RelayedCowSelectionCollector::try_new(
+            context(Arc::clone(&cancellation), 1 << 20),
+            None,
+            selection_schema(),
+        )
+        .unwrap();
+        truncated.push_body(&stream[..stream.len() - 1]).unwrap();
+        assert_eq!(
+            truncated.finish().unwrap_err().kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+
+        // The collector's own cancellation kind survives the relay sink.
+        let mut cancelled = RelayedCowSelectionCollector::try_new(
+            context(Arc::clone(&cancellation), 1 << 20),
+            None,
+            selection_schema(),
+        )
+        .unwrap();
+        cancellation.request_stop();
+        assert_eq!(
+            cancelled.push_body(&stream).unwrap_err().kind(),
+            ConnectorErrorKind::Cancelled
+        );
     }
 
     #[test]

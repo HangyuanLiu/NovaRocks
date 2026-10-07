@@ -955,11 +955,12 @@ impl CowSelectionDecoder {
 }
 
 /// A whole COW selection stream: exactly one SCHEMA record first, then
-/// BATCH records within the frozen batch count.
+/// BATCH records within the frozen batch count. Each decoded batch is handed
+/// to the caller at once; the decoder retains only the schema and a count.
 #[derive(Debug, Default)]
 pub struct CowSelectionStreamDecoder {
     schema: Option<SchemaRef>,
-    batches: Vec<RecordBatch>,
+    batches: usize,
 }
 
 impl CowSelectionStreamDecoder {
@@ -967,34 +968,42 @@ impl CowSelectionStreamDecoder {
         Self::default()
     }
 
-    /// Apply one complete, assembled record.
-    pub fn apply_record(&mut self, record: &[u8]) -> Result<(), CowSelectionCodecError> {
+    /// The schema of the SCHEMA record, once it has been applied.
+    pub fn schema(&self) -> Option<&SchemaRef> {
+        self.schema.as_ref()
+    }
+
+    /// Apply one complete, assembled record. A BATCH record yields its
+    /// decoded batch; the SCHEMA record yields nothing.
+    pub fn apply_record(
+        &mut self,
+        record: &[u8],
+    ) -> Result<Option<RecordBatch>, CowSelectionCodecError> {
         let header = CowSelectionRecordHeader::parse(record)?;
         match (header.kind, &self.schema) {
             (CowSelectionRecordKind::Schema, None) => {
                 self.schema = Some(CowSelectionDecoder::decode_schema(record)?);
+                Ok(None)
             }
             (CowSelectionRecordKind::Schema, Some(_)) => {
-                return Err(CowSelectionCodecError::MalformedSchema);
+                Err(CowSelectionCodecError::MalformedSchema)
             }
-            (CowSelectionRecordKind::Batch, None) => {
-                return Err(CowSelectionCodecError::MalformedBatch);
-            }
+            (CowSelectionRecordKind::Batch, None) => Err(CowSelectionCodecError::MalformedBatch),
             (CowSelectionRecordKind::Batch, Some(schema)) => {
-                if self.batches.len() >= MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES {
+                if self.batches >= MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES {
                     return Err(CowSelectionCodecError::BatchLimit);
                 }
-                self.batches
-                    .push(CowSelectionDecoder::decode_batch(schema, record)?);
+                let batch = CowSelectionDecoder::decode_batch(schema, record)?;
+                self.batches += 1;
+                Ok(Some(batch))
             }
         }
-        Ok(())
     }
 
-    /// The stream's End. A selection with no input at all has no schema and
-    /// no rows; the consumer applies its own frozen layout.
-    pub fn finish(self) -> (Option<SchemaRef>, Vec<RecordBatch>) {
-        (self.schema, self.batches)
+    /// The stream's End. A selection with no input at all has no schema;
+    /// the consumer applies its own frozen layout.
+    pub fn finish(self) -> Option<SchemaRef> {
+        self.schema
     }
 }
 
