@@ -41,13 +41,14 @@ use novarocks_spi::connector::read_stack::ConnectorPollBudget;
 use tracing::warn;
 
 use super::output_filter::{
-    ScanLimitDecision, ScanOutputFilter, record_rows_read, scan_limit_decision,
+    ScanDriverFilter, ScanLimitDecision, ScanOutputFilter, record_rows_read, scan_limit_decision,
 };
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::scan::{ScanNode, ScanOp, ScanOutputStream, ScanStreamSource};
 use crate::exec::operators::runtime_filter::{
-    NativeOrderedLiveConsumerSet, RuntimeFilterConsumerSet, RuntimeFilterGate,
+    CompiledRuntimeFilterConsumers, NativeOrderedLiveConsumerSet, RuntimeFilterConsumerSet,
+    RuntimeFilterConsumerState, RuntimeFilterGate,
 };
 use crate::exec::pipeline::operator::{
     DriverBlockDeadline, FinishWatch, Operator, ProcessorOperator, forward_observable,
@@ -192,11 +193,17 @@ impl StreamScanSourceFactory {
     }
 
     /// Build the source of a compiled Scan (local-compiler output). It owns
-    /// no legacy expression arena, no conjunct and no runtime-filter
-    /// consumer: a compiled residual runs as a compiled filter after the
-    /// source, and a compiled scan has no scan-level limit. Every chunk the
-    /// stream delivers is handed downstream as read.
-    pub(crate) fn new_compiled(display_id: i32, op: Arc<dyn ScanOp>) -> Self {
+    /// no legacy expression arena and no conjunct: a compiled residual runs
+    /// as a compiled filter after the source, and a compiled scan has no
+    /// scan-level limit. Its blocking membership `runtime_filters`, if any,
+    /// gate the first read and filter every chunk by their compiled key
+    /// roots; every other chunk the stream delivers is handed downstream as
+    /// read.
+    pub(crate) fn new_compiled(
+        display_id: i32,
+        op: Arc<dyn ScanOp>,
+        runtime_filters: Option<Arc<CompiledRuntimeFilterConsumers>>,
+    ) -> Self {
         let source = op.stream_source();
         Self {
             name: scan_source_name(Some(display_id), op.as_ref()),
@@ -204,7 +211,7 @@ impl StreamScanSourceFactory {
             limit: None,
             op,
             source,
-            filter: ScanOutputFilter::pass_through(),
+            filter: ScanOutputFilter::compiled(runtime_filters),
         }
     }
 }
@@ -231,7 +238,7 @@ impl OperatorFactory for StreamScanSourceFactory {
             readiness,
             budget: ConnectorPollBudget::new(),
             wake_generation: None,
-            filter: self.filter.clone(),
+            filter: self.filter.for_driver(),
             rows_emitted: 0,
             profiles: None,
             event_sink: Arc::new(NoopFragmentEventSink),
@@ -273,7 +280,7 @@ struct StreamScanSourceOperator {
     /// The readiness generation sampled before the last poll, when that poll
     /// returned `Pending`. A different generation means the stream woke up.
     wake_generation: Option<u64>,
-    filter: ScanOutputFilter,
+    filter: ScanDriverFilter,
     rows_emitted: usize,
     profiles: Option<OperatorProfiles>,
     event_sink: Arc<dyn FragmentEventSink>,
@@ -305,7 +312,7 @@ impl StreamScanSourceOperator {
     fn gate_holds_input(&self) -> bool {
         self.filter
             .blocking()
-            .is_some_and(RuntimeFilterConsumerSet::gate_holds_input)
+            .is_some_and(RuntimeFilterConsumerState::gate_holds_input)
     }
 }
 
@@ -499,7 +506,7 @@ impl ProcessorOperator for StreamScanSourceOperator {
     fn source_block_deadline(&self) -> Option<DriverBlockDeadline> {
         self.filter
             .blocking()
-            .and_then(RuntimeFilterConsumerSet::gate_deadline)
+            .and_then(RuntimeFilterConsumerState::gate_deadline)
     }
 
     fn begin_turn(&mut self) {
@@ -997,7 +1004,7 @@ mod tests {
             source: Arc::clone(&source),
             backpressure: Arc::new(Mutex::new(Vec::new())),
         });
-        let factory = StreamScanSourceFactory::new_compiled(3, op);
+        let factory = StreamScanSourceFactory::new_compiled(3, op, None);
         assert!(
             factory.name().contains("plan_node_id=3"),
             "{}",

@@ -32,9 +32,16 @@
 //! evaluate their keys, residual and predicate through compiled roots and
 //! reuse only array-level kernels: the hash map, build store, gather, match
 //! decisions, the shared build states and the nested-loop build sink.
+//!
+//! Runtime filters bind to the Task's runtime-filter session. This milestone
+//! executes BlockingSnapshot membership consumers at a compiled scan source,
+//! applied row by row through the scan's compiled key roots, and membership
+//! producers at a hash join's build keys. Every other runtime-filter shape is
+//! refused by name when the pipeline is built.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
+use super::local::{runtime_filter_consumer_contract, runtime_filter_producer};
 use super::*;
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::node::exchange_source::ExchangeSourceNode;
@@ -46,10 +53,12 @@ use crate::exec::operators::compiled_expression::{
 use crate::exec::operators::compiled_repeat::CompiledRepeatProcessorFactory;
 use crate::exec::operators::compiled_sort::CompiledSortProcessorFactory;
 use crate::exec::operators::compiled_unpivot::CompiledUnpivotProcessorFactory;
+use crate::exec::operators::runtime_filter::CompiledRuntimeFilterConsumers;
 use crate::runtime::runtime_state::RuntimeErrorState;
 use novarocks_local_program::{
-    AssertRowsMode, LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole,
-    ProgramNodeId, ProgramNodeKind, RowAssertion,
+    AssertRowsMode, BindingRequirement, FilterConsumerActivation, FilterConsumerAtExpr,
+    LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
+    ProgramNodeKind, RowAssertion, StaticFilterContract,
 };
 
 /// Operator display identity for a compiled node: its local program index.
@@ -175,6 +184,135 @@ fn validate_compiled_scan_bindings(
     Ok(())
 }
 
+/// The runtime-filter bindings one node's static sites declare, consumers
+/// and producers alike, in their frozen order.
+fn node_runtime_filter_bindings(kind: &ProgramNodeKind) -> Vec<u32> {
+    match kind {
+        ProgramNodeKind::Scan {
+            runtime_filters, ..
+        }
+        | ProgramNodeKind::ExchangeSource {
+            runtime_filters, ..
+        } => runtime_filters
+            .iter()
+            .map(|binding| binding.consumer.binding_id())
+            .collect(),
+        ProgramNodeKind::RuntimeFilterConsumer { bindings, .. } => bindings
+            .iter()
+            .map(|binding| binding.consumer.binding_id())
+            .collect(),
+        ProgramNodeKind::Aggregate { topn_filters, .. } => topn_filters
+            .iter()
+            .map(|filter| filter.producer.binding_id())
+            .collect(),
+        ProgramNodeKind::Join {
+            runtime_filters, ..
+        } => runtime_filters
+            .iter()
+            .map(|filter| filter.producer.binding_id())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The program's runtime-filter binding requirements must name exactly the
+/// bindings of its runtime-filter sites, and a binding is one participant: it
+/// has exactly one site, as a consumer or as a producer. No site runs without
+/// its requirement, no requirement is left without its site, and a program
+/// with any site runs only with the Task's runtime-filter session.
+fn validate_compiled_runtime_filter_bindings(
+    program: &LocalProgram,
+    session: Option<&crate::runtime_filter::RuntimeFilterSessionRef>,
+) -> Result<(), String> {
+    let mut sites = BTreeMap::<i32, usize>::new();
+    for (index, node) in program.graph().nodes().iter().enumerate() {
+        for binding_id in node_runtime_filter_bindings(node.kind()) {
+            let binding_id = i32::try_from(binding_id).map_err(|_| {
+                format!(
+                    "compiled runtime-filter binding_id={binding_id} at local node {index} exceeds i32"
+                )
+            })?;
+            if let Some(other) = sites.insert(binding_id, index) {
+                return Err(format!(
+                    "compiled runtime-filter binding_id={binding_id} has a site at local node {other} and at local node {index}"
+                ));
+            }
+        }
+    }
+    let required = program
+        .graph()
+        .requirements()
+        .entries()
+        .iter()
+        .filter_map(|requirement| match requirement {
+            BindingRequirement::RuntimeFilter { binding_id } => Some(*binding_id),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    if let Some((binding_id, index)) = sites.iter().find(|(id, _)| !required.contains(id)) {
+        return Err(format!(
+            "compiled runtime-filter binding_id={binding_id} at local node {index} has no binding requirement"
+        ));
+    }
+    if let Some(binding_id) = required.iter().find(|id| !sites.contains_key(id)) {
+        return Err(format!(
+            "compiled runtime-filter binding requirement binding_id={binding_id} has no program site"
+        ));
+    }
+    if let Some((binding_id, index)) = sites.iter().next()
+        && session.is_none()
+    {
+        return Err(format!(
+            "compiled runtime-filter binding_id={binding_id} at local node {index} requires an execution runtime-filter session"
+        ));
+    }
+    Ok(())
+}
+
+/// The blocking membership consumers of one compiled scan, keyed by the
+/// scan's `RuntimeFilter { binding }` roots over its own output. This
+/// milestone executes BlockingSnapshot membership (SetUnion) consumers
+/// only; an ordered-domain or NonBlockingLive consumer is refused by name.
+fn compiled_scan_runtime_filters(
+    program: &Arc<LocalProgram>,
+    id: ProgramNodeId,
+    bindings: &[FilterConsumerAtExpr],
+    ctx: &PipelineBuildContext,
+    error: &Arc<RuntimeErrorState>,
+) -> Result<Option<Arc<CompiledRuntimeFilterConsumers>>, String> {
+    if bindings.is_empty() {
+        return Ok(None);
+    }
+    let mut contracts = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let consumer = &binding.consumer;
+        if matches!(consumer.contract(), StaticFilterContract::Ordered { .. }) {
+            return Err(format!(
+                "compiled scan at local node {} runtime-filter binding_id={} with an ordered-domain contract is not executable yet",
+                id.index(),
+                consumer.binding_id()
+            ));
+        }
+        if let FilterConsumerActivation::NonBlockingLive { late_apply } = consumer.activation() {
+            return Err(format!(
+                "compiled scan at local node {} runtime-filter binding_id={} with NonBlockingLive {late_apply:?} activation is not executable yet",
+                id.index(),
+                consumer.binding_id()
+            ));
+        }
+        runtime_filter_session(&ctx.runtime_filter_execution, consumer.binding_id())?;
+        contracts.push(runtime_filter_consumer_contract(consumer)?);
+    }
+    CompiledRuntimeFilterConsumers::try_new(
+        "Scan",
+        Arc::clone(program),
+        id,
+        contracts,
+        Arc::clone(error),
+    )
+    .map(|consumers| Some(Arc::new(consumers)))
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "The compiled program and its Task capabilities are independent inputs"
@@ -184,6 +322,7 @@ pub(crate) fn build_compiled_pipeline_graph(
     exchange_bindings: ExchangeBindings,
     scan_bindings: ScanBindings,
     writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
+    runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
     dep_manager: DependencyManager,
     pipeline_dop: i32,
     root_sink_dop: Option<i32>,
@@ -201,11 +340,14 @@ pub(crate) fn build_compiled_pipeline_graph(
     validate_compiled_exchange_bindings(program, &exchange_bindings)?;
     validate_compiled_scan_bindings(program, &scan_bindings)?;
     writer_bindings.validate(program)?;
+    validate_compiled_runtime_filter_bindings(program, runtime_filter_session.as_ref())?;
     let mut ctx = PipelineBuildContext {
         arena: Arc::new(ExprArena::default()),
         function_set,
         dep_manager,
-        runtime_filter_execution: PipelineRuntimeFilterExecution { session: None },
+        runtime_filter_execution: PipelineRuntimeFilterExecution {
+            session: runtime_filter_session,
+        },
         exchange_bindings,
         scan_bindings,
         compiled_writers: writer_bindings,
@@ -308,12 +450,9 @@ fn build_node(
                     id.index()
                 ));
             }
-            if !runtime_filters.is_empty() {
-                return Err(format!(
-                    "compiled scan at local node {} with runtime-filter consumers is not executable yet",
-                    id.index()
-                ));
-            }
+            // Consumers are built first, so a refused binding builds no driver.
+            let runtime_filters =
+                compiled_scan_runtime_filters(program, id, runtime_filters, ctx, error)?;
             if limit.is_some() {
                 return Err(format!(
                     "compiled scan at local node {} with a scan limit is not executable yet",
@@ -340,8 +479,13 @@ fn build_node(
                 .transpose()?;
             // One driver owns the scan stream; the shared handoff restores the
             // downstream DOP without duplicating the Task's reader capability.
-            let source: Box<dyn OperatorFactory> =
-                Box::new(StreamScanSourceFactory::new_compiled(node_id, op));
+            // Its runtime filters gate the first read and filter every chunk
+            // before the handoff.
+            let source: Box<dyn OperatorFactory> = Box::new(StreamScanSourceFactory::new_compiled(
+                node_id,
+                op,
+                runtime_filters,
+            ));
             let pipeline = new_source_pipeline_with_dop(ctx, source, 1);
             let mut build = PipelineBuildResult {
                 pipeline,
@@ -509,6 +653,10 @@ fn build_node(
         ProgramNodeKind::NestedLoopJoin { left, right, .. } => {
             join_pipelines::build_nested_loop_join(program, id, node_id, *left, *right, ctx, error)
         }
+        ProgramNodeKind::RuntimeFilterConsumer { .. } => Err(format!(
+            "compiled join probe-key runtime-filter consumer at local node {} is not executable yet",
+            id.index()
+        )),
         _ => Err(format!(
             "compiled node family at local node {} has no compiled processor yet",
             id.index()
@@ -696,3 +844,7 @@ mod aggregate_tests;
 #[cfg(test)]
 #[path = "compiled_join_tests.rs"]
 mod join_tests;
+
+#[cfg(test)]
+#[path = "compiled_runtime_filter_tests.rs"]
+mod runtime_filter_tests;

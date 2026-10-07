@@ -89,9 +89,10 @@ pub use requirements::{
 };
 pub use resolved_calls::*;
 pub use runtime_filter::{
-    FilterConsumerActivation, FilterLateApplyGranularity, FilterNullOrder, FilterNullSemantics,
-    FilterOrderKey, FilterProducerKind, FilterReduction, FilterSortDirection, StaticFilterConsumer,
-    StaticFilterContract, StaticFilterError, StaticFilterProducer,
+    FilterConsumerActivation, FilterLateApplyGranularity, FilterMembershipSchema,
+    FilterMembershipSchemaError, FilterNullOrder, FilterNullSemantics, FilterOrderKey,
+    FilterProducerKind, FilterReduction, FilterSortDirection, StaticFilterConsumer,
+    StaticFilterContract, StaticFilterError, StaticFilterProducer, encode_filter_key_type,
 };
 pub use sink::{
     MAX_STATIC_SINK_BRANCHES, MAX_STATIC_SINK_COLUMNS, MAX_STATIC_SINK_EXPRESSIONS,

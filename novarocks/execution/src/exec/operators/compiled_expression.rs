@@ -148,6 +148,29 @@ pub(crate) fn instances(
     Ok(())
 }
 
+/// The static value type the program's checked expressions give one root:
+/// the exact type of every array an instance of that root returns.
+pub(crate) fn root_value_type(
+    program: &LocalProgram,
+    site: ProgramExpressionRootSite,
+) -> Result<novarocks_type_contract::FunctionValueType, String> {
+    let expressions = program.checked().channels().expressions();
+    let root = expressions
+        .resolved_calls()
+        .snapshot()
+        .roots()
+        .sites()
+        .get(&site)
+        .ok_or_else(|| format!("compiled program has no expression root {site:?}"))?;
+    match expressions.definition_type(site.arena(), root.definition) {
+        Some(novarocks_type_contract::FunctionArgumentType::Value(value)) => Ok(value.clone()),
+        Some(_) => Err(format!("compiled expression root {site:?} is not a value")),
+        None => Err(format!(
+            "compiled expression root {site:?} has no static type"
+        )),
+    }
+}
+
 /// Project one compiled node: each output column is one ProjectOutput root.
 pub struct CompiledProjectProcessorFactory {
     name: String,

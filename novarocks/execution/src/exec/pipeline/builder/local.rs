@@ -384,7 +384,17 @@ fn runtime_filter_contract(
 fn runtime_filter_consumer(
     binding: &lp::FilterConsumerAtExpr,
 ) -> Result<RuntimeFilterConsumerBinding, String> {
-    let static_consumer = &binding.consumer;
+    Ok(RuntimeFilterConsumerBinding::new(
+        expr(binding.expr_id),
+        runtime_filter_consumer_contract(&binding.consumer)?,
+    ))
+}
+
+/// The runtime contract of one static consumer. Its membership digest is
+/// checked against the canonical schema of its key type.
+pub(super) fn runtime_filter_consumer_contract(
+    static_consumer: &lp::StaticFilterConsumer,
+) -> Result<execution::RuntimeFilterConsumerContract, String> {
     let id = execution::RuntimeFilterBindingId::new(static_consumer.binding_id());
     let channel = execution::RuntimeFilterChannelId::new(static_consumer.channel_id());
     let contract = runtime_filter_contract(static_consumer.contract())?;
@@ -439,10 +449,7 @@ fn runtime_filter_consumer(
         }
     }
     .map_err(|error| error.to_string())?;
-    Ok(RuntimeFilterConsumerBinding::new(
-        expr(binding.expr_id),
-        runtime_contract,
-    ))
+    Ok(runtime_contract)
 }
 
 fn runtime_filter_consumers(
@@ -451,7 +458,9 @@ fn runtime_filter_consumers(
     bindings.iter().map(runtime_filter_consumer).collect()
 }
 
-fn runtime_filter_producer(
+/// The runtime contract of one static producer. Its membership digest is
+/// checked against the canonical schema of its key type.
+pub(super) fn runtime_filter_producer(
     producer: &lp::StaticFilterProducer,
 ) -> Result<execution::RuntimeFilterProducerContract, String> {
     let id = execution::RuntimeFilterBindingId::new(producer.binding_id());

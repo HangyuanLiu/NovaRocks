@@ -67,11 +67,11 @@ use crate::runtime::fragment::io::exchange::in_process_test_exchange_receiver_po
 use crate::runtime::fragment::io::{ExchangeReceiverPort, NoopFragmentEventSink};
 use crate::runtime::runtime_state::RuntimeState;
 
-type Row = (Option<i64>, Option<i64>);
-type Rows = Vec<Vec<Option<i64>>>;
+pub(super) type Row = (Option<i64>, Option<i64>);
+pub(super) type Rows = Vec<Vec<Option<i64>>>;
 
 /// `(k, x)`: duplicate keys, a NULL key, a NULL `x` and an unmatched key.
-const LEFT_ROWS: [Row; 9] = [
+pub(super) const LEFT_ROWS: [Row; 9] = [
     (Some(1), Some(10)),
     (Some(1), Some(11)),
     (Some(2), Some(20)),
@@ -83,7 +83,7 @@ const LEFT_ROWS: [Row; 9] = [
     (None, Some(1)),
 ];
 /// `(k, y)`: duplicate keys, a NULL key, a NULL `y` and an unmatched key.
-const RIGHT_ROWS: [Row; 9] = [
+pub(super) const RIGHT_ROWS: [Row; 9] = [
     (Some(1), Some(15)),
     (Some(1), Some(9)),
     (Some(2), Some(25)),
@@ -95,7 +95,7 @@ const RIGHT_ROWS: [Row; 9] = [
     (None, Some(2)),
 ];
 
-const SINGLE: FragmentId = FragmentId::new(1);
+pub(super) const SINGLE: FragmentId = FragmentId::new(1);
 const LEFT_SOURCE: FragmentId = FragmentId::new(2);
 const RIGHT_SOURCE: FragmentId = FragmentId::new(3);
 const JOIN: FragmentId = FragmentId::new(4);
@@ -104,7 +104,7 @@ const TO_PROBE: EdgeId = EdgeId::new(21);
 const TO_BUILD: EdgeId = EdgeId::new(22);
 const TO_RESULT: EdgeId = EdgeId::new(23);
 
-const SINGLE_FINST: UniqueId = UniqueId::new(0xa1, 0x01);
+pub(super) const SINGLE_FINST: UniqueId = UniqueId::new(0xa1, 0x01);
 const LEFT_FINST: UniqueId = UniqueId::new(0xa2, 0x01);
 const RIGHT_FINST: UniqueId = UniqueId::new(0xa3, 0x01);
 const JOIN_FINSTS: [UniqueId; 2] = [UniqueId::new(0xa4, 0x01), UniqueId::new(0xa4, 0x02)];
@@ -113,7 +113,7 @@ const RESULT_FINST: UniqueId = UniqueId::new(0xa5, 0x01);
 const JOIN_DOP: usize = 4;
 
 #[derive(Clone, Copy, Debug)]
-enum Family {
+pub(super) enum Family {
     Hash {
         build_side: JoinSide,
         null_safe: bool,
@@ -122,17 +122,17 @@ enum Family {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Spec {
-    family: Family,
-    kind: JoinKind,
+pub(super) struct Spec {
+    pub(super) family: Family,
+    pub(super) kind: JoinKind,
     /// `left.x < right.y`.
-    residual: bool,
+    pub(super) residual: bool,
     /// Publish a reordered subset through the selection Project.
-    permuted: bool,
+    pub(super) permuted: bool,
 }
 
 impl Spec {
-    fn hash(kind: JoinKind, residual: bool) -> Self {
+    pub(super) fn hash(kind: JoinKind, residual: bool) -> Self {
         Self {
             family: Family::Hash {
                 build_side: JoinSide::Right,
@@ -185,7 +185,7 @@ fn pair_matches(spec: Spec, left: Row, right: Row) -> bool {
 }
 
 /// The physical output rows the plan must publish, in output order.
-fn oracle(spec: Spec, left: &[Row], right: &[Row]) -> Rows {
+pub(super) fn oracle(spec: Spec, left: &[Row], right: &[Row]) -> Rows {
     let pair = |l: Row, r: Row| vec![l.0, l.1, r.0, r.1];
     let mut rows = Vec::new();
     match spec.kind {
@@ -528,7 +528,7 @@ fn version() -> PlanVersionId {
 }
 
 /// `Values(left) JOIN Values(right) -> Result` in one fragment.
-fn single_plan(spec: Spec, left: &[Row], right: &[Row]) -> PhysicalPlan {
+pub(super) fn single_plan(spec: Spec, left: &[Row], right: &[Row]) -> PhysicalPlan {
     let mut builder = FragmentBuilder::new(SINGLE);
     let left_node = builder.reserve_node_id().unwrap();
     let left_values = values(
@@ -762,7 +762,7 @@ fn freeze(fragment: &Fragment) -> PhysicalRootUses {
     PhysicalRootUses::try_new(fragment, flow, bindings, &FixtureControl).unwrap()
 }
 
-fn packages(plan: &PhysicalPlan) -> BTreeMap<FragmentId, FragmentPackage> {
+pub(super) fn packages(plan: &PhysicalPlan) -> BTreeMap<FragmentId, FragmentPackage> {
     let mut uses = BTreeMap::new();
     let mut calls = BTreeMap::new();
     let mut pruning = BTreeMap::new();
@@ -793,7 +793,11 @@ fn packages(plan: &PhysicalPlan) -> BTreeMap<FragmentId, FragmentPackage> {
     .unwrap_or_else(|error| panic!("join packages extract: {error:?}"))
 }
 
-fn compile(package: FragmentPackage, pipeline_dop: usize, result: bool) -> Arc<LocalProgram> {
+pub(super) fn compile(
+    package: FragmentPackage,
+    pipeline_dop: usize,
+    result: bool,
+) -> Arc<LocalProgram> {
     let catalog = crate::exec::expr::compiled_program::tests::rng_subset();
     try_compile(package, &catalog, pipeline_dop, result)
         .unwrap_or_else(|error| panic!("join fragment compiles: {error}"))
@@ -836,7 +840,7 @@ fn register_all(
 // ---------------------------------------------------------------------------
 // Runs.
 
-fn sorted(mut rows: Rows) -> Rows {
+pub(super) fn sorted(mut rows: Rows) -> Rows {
     rows.sort();
     rows
 }
@@ -1139,7 +1143,7 @@ const ALLOW: SemanticParameterRef = SemanticParameterRef {
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Overflow {
+pub(super) enum Overflow {
     ProbeKey,
     BuildKey,
     Residual,
@@ -1177,7 +1181,7 @@ fn overflowing(builder: &mut FragmentBuilder, owner: NodeId, value: ValueId) -> 
 }
 
 /// An inner equi-join of the fixture rows whose `at` expression overflows.
-fn overflow_plan(at: Overflow) -> PhysicalPlan {
+pub(super) fn overflow_plan(at: Overflow) -> PhysicalPlan {
     let mut builder = FragmentBuilder::new(SINGLE);
     let left_node = builder.reserve_node_id().unwrap();
     let l = values(

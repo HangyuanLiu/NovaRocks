@@ -36,6 +36,11 @@
 //! NULL-extended build column is already nullable there, so no schema is
 //! patched at runtime. A row data error of a key or of the residual over a
 //! candidate pair is a required error.
+//!
+//! The build driver also feeds the join's membership runtime-filter
+//! producers: each evaluated build-key array is submitted once, the producers
+//! close after the artifact is published, and any build failure or cancel
+//! fails them. The instance's one build driver is their one local partition.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -61,6 +66,9 @@ use super::join_hash_map::gather::{
 };
 use super::join_hash_map::method::{BuildKeyBatch, JoinHashMap, JoinHashMapBuildOptions};
 use super::join_hash_map::search::{JoinSelection, append_cross_selection};
+use super::native_runtime_filter::{
+    NativeRuntimeFilterProducerFactory, NativeRuntimeFilterProducerSet,
+};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::node::join::JoinType;
@@ -71,6 +79,7 @@ use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use crate::runtime_filter::RuntimeFilterProducerFailure;
 
 fn failure(context: &str, error: impl std::fmt::Display) -> ExecutionFailure {
     ExecutionFailure::from(format!("{context}: {error}"))
@@ -107,7 +116,6 @@ impl CompiledHashJoinPlan {
             build_keys,
             eq_null_safe,
             residual_predicate,
-            runtime_filters,
             ..
         } = graph_node.kind()
         else {
@@ -130,12 +138,6 @@ impl CompiledHashJoinPlan {
         if *distribution_mode != JoinDistributionMode::Broadcast {
             return Err(format!(
                 "compiled hash join at local node {} with a local partitioned build is not executable yet",
-                node.index()
-            ));
-        }
-        if !runtime_filters.is_empty() {
-            return Err(format!(
-                "compiled hash join at local node {} with runtime-filter producers is not executable yet",
                 node.index()
             ));
         }
@@ -172,16 +174,28 @@ impl CompiledHashJoinPlan {
             requirements,
         })
     }
+
+    /// The null-safe equality flag of every key pair, in key order.
+    pub(crate) fn eq_null_safe(&self) -> &[bool] {
+        &self.eq_null_safe
+    }
+
+    /// The build-key root of key `ordinal`.
+    pub(crate) fn build_site(&self, ordinal: usize) -> Option<ProgramExpressionRootSite> {
+        self.build_sites.get(ordinal).copied()
+    }
 }
 
 /// The single build driver: evaluates every build key root, collects the
-/// rows the kind needs, and publishes the instance's one build artifact.
+/// rows the kind needs, publishes the instance's one build artifact and
+/// feeds the join's runtime-filter producers.
 pub(crate) struct CompiledHashJoinBuildSinkFactory {
     name: String,
     program: Arc<LocalProgram>,
     plan: Arc<CompiledHashJoinPlan>,
     state: Arc<BroadcastJoinSharedState>,
     error: Arc<RuntimeErrorState>,
+    producers: Option<Arc<NativeRuntimeFilterProducerFactory>>,
 }
 
 impl CompiledHashJoinBuildSinkFactory {
@@ -190,6 +204,7 @@ impl CompiledHashJoinBuildSinkFactory {
         plan: Arc<CompiledHashJoinPlan>,
         state: Arc<BroadcastJoinSharedState>,
         error: Arc<RuntimeErrorState>,
+        producers: Option<Arc<NativeRuntimeFilterProducerFactory>>,
     ) -> Self {
         Self {
             name: format!("COMPILED_HASH_JOIN_BUILD (node={})", plan.node.index()),
@@ -197,17 +212,37 @@ impl CompiledHashJoinBuildSinkFactory {
             plan,
             state,
             error,
+            producers,
         }
     }
+}
+
+/// One build driver's runtime-filter producers: the producer streams of its
+/// local partition, or why they could not be created, reported at bind.
+struct BuildRuntimeFilterProducers {
+    producers: Option<NativeRuntimeFilterProducerSet>,
+    create_error: Option<String>,
+    local_partition_count: u32,
 }
 
 impl OperatorFactory for CompiledHashJoinBuildSinkFactory {
     fn name(&self) -> &str {
         &self.name
     }
-    fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
+    fn create(&self, dop: i32, driver_id: i32) -> Box<dyn Operator> {
         let null_key_rows =
             (self.plan.requirements.null_keys == NullKeyRequirement::NullKeyRows).then(Vec::new);
+        let runtime_filters = self.producers.as_ref().map(|factory| {
+            let (producers, create_error) = match factory.create_for_driver(dop, driver_id) {
+                Ok(producers) => (Some(producers), None),
+                Err(error) => (None, Some(error)),
+            };
+            BuildRuntimeFilterProducers {
+                producers,
+                create_error,
+                local_partition_count: factory.local_partition_count(),
+            }
+        });
         Box::new(CompiledHashJoinBuildSink {
             name: self.name.clone(),
             program: Arc::clone(&self.program),
@@ -224,6 +259,7 @@ impl OperatorFactory for CompiledHashJoinBuildSinkFactory {
             chunks_tracker: None,
             table_tracker: None,
             finished: false,
+            runtime_filters,
         })
     }
     fn is_sink(&self) -> bool {
@@ -249,11 +285,30 @@ struct CompiledHashJoinBuildSink {
     chunks_tracker: Option<Arc<MemTracker>>,
     table_tracker: Option<Arc<MemTracker>>,
     finished: bool,
+    runtime_filters: Option<BuildRuntimeFilterProducers>,
 }
 
 impl Operator for CompiledHashJoinBuildSink {
     fn name(&self) -> &str {
         &self.name
+    }
+    fn bind_runtime_state(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
+        let Some(filters) = self.runtime_filters.as_mut() else {
+            return Ok(());
+        };
+        if let Some(error) = filters.create_error.take() {
+            return Err(error.into());
+        }
+        match filters.producers.as_mut() {
+            Some(producers) => Ok(producers.bind(filters.local_partition_count)?),
+            None => Ok(()),
+        }
+    }
+    fn cancel(&mut self) {
+        let _ = self.fail_runtime_filters(RuntimeFilterProducerFailure::Cancelled);
+    }
+    fn close(&mut self) -> ExecutionResult<()> {
+        Ok(self.fail_runtime_filters(RuntimeFilterProducerFailure::ExecutionFailed)?)
     }
     fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
         let chunks = MemTracker::new_child("BuildInputChunks", &tracker);
@@ -281,10 +336,34 @@ impl ProcessorOperator for CompiledHashJoinBuildSink {
     fn has_output(&self) -> bool {
         false
     }
-    fn push_chunk(&mut self, _state: &RuntimeState, mut chunk: Chunk) -> ExecutionResult<()> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if self.finished || chunk.is_empty() {
             return Ok(());
         }
+        let result = self.push_build_chunk(chunk);
+        if result.is_err() {
+            let _ = self.fail_runtime_filters(RuntimeFilterProducerFailure::ExecutionFailed);
+        }
+        result
+    }
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+        Ok(None)
+    }
+    fn set_finishing(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+        let result = self.publish_build(state);
+        if result.is_err() {
+            let _ = self.fail_runtime_filters(RuntimeFilterProducerFailure::ExecutionFailed);
+        }
+        result
+    }
+}
+
+impl CompiledHashJoinBuildSink {
+    fn push_build_chunk(&mut self, mut chunk: Chunk) -> ExecutionResult<()> {
         instances(
             &mut self.instances,
             &self.program,
@@ -319,6 +398,9 @@ impl ProcessorOperator for CompiledHashJoinBuildSink {
                 }
             }
         }
+        // The producers observe the same evaluated key arrays the table is
+        // built from, after the build accepted the chunk.
+        let submitted = self.runtime_filters.is_some().then(|| keys.clone());
         self.key_batches
             .push(BuildKeyBatch::new(keys, rows).map_err(ExecutionFailure::from)?);
         if self.plan.requirements.requires_row_payload() {
@@ -330,16 +412,15 @@ impl ProcessorOperator for CompiledHashJoinBuildSink {
             }
             self.input_chunks.push(chunk);
         }
+        if let Some(keys) = submitted {
+            self.submit_runtime_filters(&keys)?;
+        }
         Ok(())
     }
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        Ok(None)
-    }
-    fn set_finishing(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
-        if self.finished {
-            return Ok(());
-        }
-        self.finished = true;
+
+    /// Builds and publishes the instance's one artifact, then closes the
+    /// runtime-filter producers: the published build is what they describe.
+    fn publish_build(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         let requirements = self.plan.requirements;
         let mut table = match self.key_batches.first() {
             Some(first) => {
@@ -401,7 +482,41 @@ impl ProcessorOperator for CompiledHashJoinBuildSink {
         self.state
             .set_build(artifact)
             .map_err(ExecutionFailure::from)?;
+        self.finish_runtime_filters()?;
         Ok(())
+    }
+
+    fn submit_runtime_filters(&mut self, keys: &[ArrayRef]) -> Result<(), String> {
+        match self
+            .runtime_filters
+            .as_mut()
+            .and_then(|filters| filters.producers.as_mut())
+        {
+            Some(producers) => producers.submit(keys),
+            None => Ok(()),
+        }
+    }
+
+    fn finish_runtime_filters(&mut self) -> Result<(), String> {
+        match self
+            .runtime_filters
+            .as_mut()
+            .and_then(|filters| filters.producers.as_mut())
+        {
+            Some(producers) => producers.finish(),
+            None => Ok(()),
+        }
+    }
+
+    fn fail_runtime_filters(&mut self, reason: RuntimeFilterProducerFailure) -> Result<(), String> {
+        match self
+            .runtime_filters
+            .as_mut()
+            .and_then(|filters| filters.producers.as_mut())
+        {
+            Some(producers) => producers.fail(reason),
+            None => Ok(()),
+        }
     }
 }
 

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use crate::runtime_filter as execution;
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::ExprArena;
+use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::runtime_filter::{
     RuntimeFilterConsumerBinding, RuntimeFilterExecutionContract,
 };
@@ -35,7 +35,11 @@ use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::fragment::io::{FragmentEvent, FragmentEventSink, NoopFragmentEventSink};
 use crate::runtime::runtime_state::RuntimeState;
+use arrow::array::ArrayRef;
 use arrow::compute::filter_record_batch;
+
+mod compiled;
+pub(crate) use compiled::{CompiledRuntimeFilterConsumers, CompiledRuntimeFilterKeys};
 
 pub(crate) struct NativeOrderedLiveConsumerSet {
     inner: Arc<NativeOrderedLiveConsumerInner>,
@@ -389,15 +393,34 @@ pub(crate) enum RuntimeFilterGate {
     /// Every blocking binding reached its outcome; input may pass.
     Open,
     /// A blocking binding is still pending, at most until
-    /// [`RuntimeFilterConsumerSet::gate_deadline`]. A publication notifies
-    /// [`RuntimeFilterConsumerSet::gate_observable`]; a consumer forwards
+    /// [`RuntimeFilterConsumerState::gate_deadline`]. A publication notifies
+    /// [`RuntimeFilterConsumerState::gate_observable`]; a consumer forwards
     /// that into the observable its driver parks on, whose generation the
     /// driver samples before it asks.
     Pending,
 }
 
+/// Evaluates the key of each binding of one consumer set over the chunk the
+/// set filters. The consumer state decides which bindings apply, in which
+/// order and over which rows; a provider only supplies what a binding's key
+/// is, so the same state serves an ExprArena plan and a compiled program.
+pub(crate) trait RuntimeFilterKeyProvider {
+    /// A failure of preparation or key evaluation. Every failure the state
+    /// itself observes is reported through `From<String>`.
+    type Error: From<String>;
+
+    /// The chunk every key is evaluated over and every mask selects from,
+    /// prepared once for each chunk at least one binding applies to.
+    fn prepare_input(&mut self, chunk: Chunk) -> Result<Chunk, Self::Error>;
+
+    /// The key of the binding at position `binding` of the set over `input`.
+    fn evaluate_key(&mut self, binding: usize, input: &Chunk) -> Result<ArrayRef, Self::Error>;
+}
+
 /// Runtime filters one consumer applies to its input, shared by every driver
-/// of that consumer.
+/// of that consumer: the bindings, their subscriptions and snapshots, and the
+/// gate. It owns no expression; the keys a chunk is filtered by come from a
+/// [`RuntimeFilterKeyProvider`].
 ///
 /// Blocking-snapshot bindings hold input back behind one gate. The gate's
 /// wait starts when a driver first has real input at hand and lasts at most
@@ -405,12 +428,11 @@ pub(crate) enum RuntimeFilterGate {
 /// share that deadline. Nothing blocks a thread; a pending gate is waited on
 /// through its observable and deadline.
 #[derive(Clone)]
-pub(crate) struct RuntimeFilterConsumerSet {
+pub(crate) struct RuntimeFilterConsumerState {
     inner: Arc<NativeConsumerInner>,
 }
 
 struct NativeConsumerInner {
-    arena: Arc<ExprArena>,
     bindings: Mutex<Vec<NativeConsumerBinding>>,
     gate: Mutex<NativeConsumerGate>,
     /// Notified when a blocking binding's outcome is published.
@@ -429,7 +451,7 @@ enum NativeConsumerGate {
 }
 
 struct NativeConsumerBinding {
-    spec: RuntimeFilterConsumerBinding,
+    contract: execution::RuntimeFilterConsumerContract,
     state: NativeConsumerBindingState,
 }
 
@@ -462,26 +484,23 @@ impl NativeConsumerPredicate {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "The direct consumer API remains available for non-polling integration callers."
-)]
-impl RuntimeFilterConsumerSet {
-    pub(crate) fn from_plan(
+impl RuntimeFilterConsumerState {
+    /// Validates every binding in order: its activation and membership
+    /// contract, then `validate_key`, which checks the key coordinate the
+    /// caller's provider evaluates for the binding at that position.
+    pub(crate) fn from_contracts(
         owner: &'static str,
-        specs: &[RuntimeFilterConsumerBinding],
-        arena: Arc<ExprArena>,
+        contracts: Vec<execution::RuntimeFilterConsumerContract>,
+        validate_key: impl FnMut(usize, &execution::RuntimeFilterConsumerContract) -> Result<(), String>,
     ) -> Result<Self, String> {
-        validate_plan_specs(owner, specs, &arena)?;
+        validate_membership_consumer_contracts(owner, &contracts, validate_key)?;
         Ok(Self {
             inner: Arc::new(NativeConsumerInner {
-                arena,
                 bindings: Mutex::new(
-                    specs
-                        .iter()
-                        .cloned()
-                        .map(|spec| NativeConsumerBinding {
-                            spec,
+                    contracts
+                        .into_iter()
+                        .map(|contract| NativeConsumerBinding {
+                            contract,
                             state: NativeConsumerBindingState::Unbound,
                         })
                         .collect(),
@@ -521,13 +540,13 @@ impl RuntimeFilterConsumerSet {
                 continue;
             }
             let request = execution::RuntimeFilterSubscriptionRequest::new(
-                execution_membership_consumer_contract(&binding.spec)?,
+                execution_membership_consumer_contract(&binding.contract)?,
             );
             match execution::RuntimeFilterSession::subscribe(session.as_ref(), request) {
                 Ok(execution::RuntimeFilterBindOutcome::Bound(
                     execution::RuntimeFilterSubscriptionHandle::Blocking(subscription),
                 )) if matches!(
-                    binding.spec.activation(),
+                    binding.contract.activation(),
                     execution::ConsumerActivation::BlockingSnapshot
                 ) =>
                 {
@@ -540,7 +559,7 @@ impl RuntimeFilterConsumerSet {
                 Ok(execution::RuntimeFilterBindOutcome::Bound(
                     execution::RuntimeFilterSubscriptionHandle::Live(subscription),
                 )) if matches!(
-                    binding.spec.activation(),
+                    binding.contract.activation(),
                     execution::ConsumerActivation::NonBlockingLive {
                         late_apply: execution::RuntimeFilterLateApplyGranularity::Batch,
                     }
@@ -557,7 +576,7 @@ impl RuntimeFilterConsumerSet {
                 Ok(_) => {
                     return Err(format!(
                         "native Join runtime-filter binding_id={} session returned an activation-mismatched subscription",
-                        binding.spec.binding_id()
+                        binding.contract.binding_id().get()
                     ));
                 }
                 Err(error)
@@ -568,7 +587,7 @@ impl RuntimeFilterConsumerSet {
                 }
                 Err(error) => return Err(error.to_string()),
             }
-            match binding.spec.activation() {
+            match binding.contract.activation() {
                 execution::ConsumerActivation::BlockingSnapshot
                 | execution::ConsumerActivation::NonBlockingLive {
                     late_apply: execution::RuntimeFilterLateApplyGranularity::Batch,
@@ -576,7 +595,7 @@ impl RuntimeFilterConsumerSet {
                 execution::ConsumerActivation::NonBlockingLive { .. } => {
                     return Err(format!(
                         "native Join runtime-filter binding_id={} has unsupported activation",
-                        binding.spec.binding_id()
+                        binding.contract.binding_id().get()
                     ));
                 }
             }
@@ -703,16 +722,16 @@ impl RuntimeFilterConsumerSet {
             .expect("native RF timeout lock") = timeout;
     }
 
-    pub(crate) fn apply_chunk(&self, chunk: Chunk) -> Result<Option<Chunk>, String> {
-        self.apply_chunk_observed(chunk, None)
-    }
-
-    pub(crate) fn apply_chunk_observed(
+    /// Applies every active binding to `chunk` in binding order, with keys
+    /// from `keys`, and records each evaluated row effect into `event_sink`.
+    /// `None` when no row is left.
+    pub(crate) fn apply_chunk_observed<K: RuntimeFilterKeyProvider + ?Sized>(
         &self,
         chunk: Chunk,
+        keys: &mut K,
         event_sink: Option<&Arc<dyn FragmentEventSink>>,
-    ) -> Result<Option<Chunk>, String> {
-        let (output, effects) = self.apply_chunk_inner(chunk)?;
+    ) -> Result<Option<Chunk>, K::Error> {
+        let (output, effects) = self.apply_chunk_inner(chunk, keys)?;
         if let Some(event_sink) = event_sink {
             for effect in effects {
                 event_sink.record(FragmentEvent::RuntimeFilterRowEffect(effect));
@@ -721,10 +740,11 @@ impl RuntimeFilterConsumerSet {
         Ok(output)
     }
 
-    fn apply_chunk_inner(
+    fn apply_chunk_inner<K: RuntimeFilterKeyProvider + ?Sized>(
         &self,
         chunk: Chunk,
-    ) -> Result<(Option<Chunk>, Vec<execution::RuntimeFilterRowEffect>), String> {
+        keys: &mut K,
+    ) -> Result<(Option<Chunk>, Vec<execution::RuntimeFilterRowEffect>), K::Error> {
         self.poll_live_bindings()?;
         let active = {
             let bindings = self.inner.bindings.lock().expect("native RF consumer lock");
@@ -736,7 +756,9 @@ impl RuntimeFilterConsumerSet {
                 )
             }) {
                 return Err(
-                    "native runtime-filter consumers must pass their gate before apply".into(),
+                    "native runtime-filter consumers must pass their gate before apply"
+                        .to_string()
+                        .into(),
                 );
             }
             bindings
@@ -744,7 +766,7 @@ impl RuntimeFilterConsumerSet {
                 .enumerate()
                 .filter_map(|(index, binding)| match &binding.state {
                     NativeConsumerBindingState::Active(predicate) => {
-                        Some((index, binding.spec.expr_id, predicate.clone_for_apply()))
+                        Some((index, predicate.clone_for_apply()))
                     }
                     _ => None,
                 })
@@ -753,14 +775,14 @@ impl RuntimeFilterConsumerSet {
         if active.is_empty() {
             return Ok((Some(chunk), Vec::new()));
         }
-        let chunk = crate::exec::chunk::hydrate_dictionary_columns_except(&chunk, |_, _| false)?;
+        let chunk = keys.prepare_input(chunk)?;
         let mut current = Some(chunk);
         let mut effects = Vec::new();
-        for (index, expr_id, predicate) in active {
+        for (index, predicate) in active {
             let Some(input) = current else {
                 return Ok((None, effects));
             };
-            let array = self.inner.arena.eval(expr_id, &input)?;
+            let array = keys.evaluate_key(index, &input)?;
             let mask = match predicate {
                 NativeConsumerPredicateForApply::Execution(snapshot) => {
                     let outcome = execution::evaluator::evaluate_rows(
@@ -813,7 +835,7 @@ impl RuntimeFilterConsumerSet {
                         observed,
                     } => Some((
                         index,
-                        binding.spec.clone(),
+                        binding.contract.binding_id().get(),
                         Arc::clone(subscription),
                         *observed,
                     )),
@@ -821,9 +843,9 @@ impl RuntimeFilterConsumerSet {
                 })
                 .collect::<Vec<_>>()
         };
-        for (index, spec, subscription, observed) in pending {
+        for (index, binding_id, subscription, observed) in pending {
             let outcome = subscription.poll_after(observed);
-            self.apply_execution_live_poll_outcome(index, &spec, outcome)?;
+            self.apply_execution_live_poll_outcome(index, binding_id, outcome)?;
         }
         Ok(())
     }
@@ -831,7 +853,7 @@ impl RuntimeFilterConsumerSet {
     fn apply_execution_live_poll_outcome(
         &self,
         index: usize,
-        spec: &RuntimeFilterConsumerBinding,
+        binding_id: u32,
         outcome: execution::LivePollOutcome,
     ) -> Result<(), String> {
         let mut bindings = self.inner.bindings.lock().expect("native RF consumer lock");
@@ -846,22 +868,19 @@ impl RuntimeFilterConsumerSet {
             && version != execution::LogicalVersion::FIRST
         {
             return Err(format!(
-                "native Join CompleteOnce runtime-filter binding_id={} private cursor must use LogicalVersion::FIRST, got {version:?}",
-                spec.binding_id()
+                "native Join CompleteOnce runtime-filter binding_id={binding_id} private cursor must use LogicalVersion::FIRST, got {version:?}"
             ));
         }
         match outcome {
             execution::LivePollOutcome::Updated { snapshot, terminal } => {
                 if snapshot.logical_version() != execution::LogicalVersion::FIRST {
                     return Err(format!(
-                        "native Join CompleteOnce runtime-filter binding_id={} Updated artifact must use LogicalVersion::FIRST",
-                        spec.binding_id()
+                        "native Join CompleteOnce runtime-filter binding_id={binding_id} Updated artifact must use LogicalVersion::FIRST"
                     ));
                 }
                 if terminal != Some(execution::LiveTerminal::Completed) {
                     return Err(format!(
-                        "native Join CompleteOnce runtime-filter binding_id={} Updated artifact requires terminal Completed, got {terminal:?}",
-                        spec.binding_id()
+                        "native Join CompleteOnce runtime-filter binding_id={binding_id} Updated artifact requires terminal Completed, got {terminal:?}"
                     ));
                 }
                 binding.state = NativeConsumerBindingState::Active(
@@ -876,27 +895,23 @@ impl RuntimeFilterConsumerSet {
                     && version != execution::LogicalVersion::FIRST
                 {
                     return Err(format!(
-                        "native Join CompleteOnce runtime-filter binding_id={} Idle latest version must use LogicalVersion::FIRST, got {version:?}",
-                        spec.binding_id()
+                        "native Join CompleteOnce runtime-filter binding_id={binding_id} Idle latest version must use LogicalVersion::FIRST, got {version:?}"
                     ));
                 }
                 if terminal == Some(execution::LiveTerminal::Completed) {
                     return Err(format!(
-                        "native Join CompleteOnce runtime-filter binding_id={} reported Completed without the final artifact",
-                        spec.binding_id()
+                        "native Join CompleteOnce runtime-filter binding_id={binding_id} reported Completed without the final artifact"
                     ));
                 }
                 match (observed_version, latest_version) {
                     (None, Some(_)) => {
                         return Err(format!(
-                            "native Join CompleteOnce runtime-filter binding_id={} Idle cursor advanced without returning an artifact",
-                            spec.binding_id()
+                            "native Join CompleteOnce runtime-filter binding_id={binding_id} Idle cursor advanced without returning an artifact"
                         ));
                     }
                     (Some(_), None) => {
                         return Err(format!(
-                            "native Join CompleteOnce runtime-filter binding_id={} Idle cursor regressed from LogicalVersion::FIRST",
-                            spec.binding_id()
+                            "native Join CompleteOnce runtime-filter binding_id={binding_id} Idle cursor regressed from LogicalVersion::FIRST"
                         ));
                     }
                     _ => {}
@@ -918,19 +933,126 @@ impl RuntimeFilterConsumerSet {
     }
 }
 
+/// An ExprArena plan's runtime-filter consumers: the arena-free state, and
+/// the arena expression of each binding's key.
+#[derive(Clone)]
+pub(crate) struct RuntimeFilterConsumerSet {
+    state: RuntimeFilterConsumerState,
+    keys: Arc<ArenaRuntimeFilterKeys>,
+}
+
+/// The ExprArena key of every binding of a consumer set, in binding order.
+/// Keys are evaluated over the chunk with every dictionary column hydrated,
+/// and the hydrated chunk is what the filters select from.
+struct ArenaRuntimeFilterKeys {
+    arena: Arc<ExprArena>,
+    expr_ids: Vec<ExprId>,
+}
+
+impl RuntimeFilterKeyProvider for &ArenaRuntimeFilterKeys {
+    type Error = String;
+
+    fn prepare_input(&mut self, chunk: Chunk) -> Result<Chunk, String> {
+        crate::exec::chunk::hydrate_dictionary_columns_except(&chunk, |_, _| false)
+    }
+
+    fn evaluate_key(&mut self, binding: usize, input: &Chunk) -> Result<ArrayRef, String> {
+        let expr_id = *self
+            .expr_ids
+            .get(binding)
+            .ok_or("native runtime-filter binding index drifted")?;
+        self.arena.eval(expr_id, input)
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "The direct consumer API remains available for non-polling integration callers."
+)]
+impl RuntimeFilterConsumerSet {
+    pub(crate) fn from_plan(
+        owner: &'static str,
+        specs: &[RuntimeFilterConsumerBinding],
+        arena: Arc<ExprArena>,
+    ) -> Result<Self, String> {
+        let state = RuntimeFilterConsumerState::from_contracts(
+            owner,
+            specs.iter().map(|spec| spec.contract().clone()).collect(),
+            |index, contract| {
+                if arena.data_type(specs[index].expr_id).is_none() {
+                    return Err(format!(
+                        "native Join runtime-filter binding_id={} expression is missing",
+                        contract.binding_id().get()
+                    ));
+                }
+                Ok(())
+            },
+        )?;
+        Ok(Self {
+            state,
+            keys: Arc::new(ArenaRuntimeFilterKeys {
+                arena,
+                expr_ids: specs.iter().map(|spec| spec.expr_id).collect(),
+            }),
+        })
+    }
+
+    /// The arena-free state every driver of this consumer shares.
+    pub(crate) fn state(&self) -> &RuntimeFilterConsumerState {
+        &self.state
+    }
+
+    pub(crate) fn bind(&self, state: &RuntimeState) -> Result<(), String> {
+        self.state.bind(state)
+    }
+
+    pub(crate) fn poll_gate(&self) -> RuntimeFilterGate {
+        self.state.poll_gate()
+    }
+
+    pub(crate) fn gate_holds_input(&self) -> bool {
+        self.state.gate_holds_input()
+    }
+
+    pub(crate) fn gate_deadline(&self) -> Option<DriverBlockDeadline> {
+        self.state.gate_deadline()
+    }
+
+    pub(crate) fn gate_observable(&self) -> Arc<Observable> {
+        self.state.gate_observable()
+    }
+
+    pub(crate) fn set_wait_timeout(&self, timeout: Duration) {
+        self.state.set_wait_timeout(timeout);
+    }
+
+    pub(crate) fn apply_chunk(&self, chunk: Chunk) -> Result<Option<Chunk>, String> {
+        self.apply_chunk_observed(chunk, None)
+    }
+
+    pub(crate) fn apply_chunk_observed(
+        &self,
+        chunk: Chunk,
+        event_sink: Option<&Arc<dyn FragmentEventSink>>,
+    ) -> Result<Option<Chunk>, String> {
+        self.state
+            .apply_chunk_observed(chunk, &mut &*self.keys, event_sink)
+    }
+}
+
 fn execution_membership_consumer_contract(
-    spec: &RuntimeFilterConsumerBinding,
+    contract: &execution::RuntimeFilterConsumerContract,
 ) -> Result<execution::RuntimeFilterConsumerContract, String> {
     if !matches!(
-        spec.execution_contract(),
+        contract.contract(),
         RuntimeFilterExecutionContract::Membership(_)
     ) {
         return Err(format!(
             "native Join runtime-filter binding_id={} requires a Membership contract",
-            spec.binding_id()
+            contract.binding_id().get()
         ));
     }
-    Ok(spec.contract().clone())
+    Ok(contract.clone())
 }
 
 fn execution_ordered_live_consumer_contract(
@@ -960,13 +1082,14 @@ fn execution_ordered_live_consumer_contract(
     Ok(spec.contract().clone())
 }
 
-fn validate_unique_consumer_bindings(specs: &[RuntimeFilterConsumerBinding]) -> Result<(), String> {
+fn validate_unique_consumer_bindings(
+    binding_ids: impl IntoIterator<Item = u32>,
+) -> Result<(), String> {
     let mut bindings = BTreeSet::new();
-    for spec in specs {
-        if !bindings.insert(spec.binding_id()) {
+    for binding_id in binding_ids {
+        if !bindings.insert(binding_id) {
             return Err(format!(
-                "duplicate native runtime-filter consumer binding_id={}",
-                spec.binding_id()
+                "duplicate native runtime-filter consumer binding_id={binding_id}"
             ));
         }
     }
@@ -975,16 +1098,19 @@ fn validate_unique_consumer_bindings(specs: &[RuntimeFilterConsumerBinding]) -> 
 
 /// The activation and contract every operator that applies a membership
 /// filter requires, named by the operator that is about to apply it: the same
-/// spec is sound at one and not at another, so the message says which.
-fn validate_plan_specs(
+/// contract is sound at one and not at another, so the message says which.
+/// `validate_key` checks each binding's key coordinate after its contract.
+fn validate_membership_consumer_contracts(
     owner: &'static str,
-    specs: &[RuntimeFilterConsumerBinding],
-    arena: &ExprArena,
+    contracts: &[execution::RuntimeFilterConsumerContract],
+    mut validate_key: impl FnMut(usize, &execution::RuntimeFilterConsumerContract) -> Result<(), String>,
 ) -> Result<(), String> {
-    validate_unique_consumer_bindings(specs)?;
-    for spec in specs {
+    validate_unique_consumer_bindings(
+        contracts.iter().map(|contract| contract.binding_id().get()),
+    )?;
+    for (index, contract) in contracts.iter().enumerate() {
         if !matches!(
-            spec.activation(),
+            contract.activation(),
             execution::ConsumerActivation::BlockingSnapshot
                 | execution::ConsumerActivation::NonBlockingLive {
                     late_apply: execution::RuntimeFilterLateApplyGranularity::Batch,
@@ -992,25 +1118,20 @@ fn validate_plan_specs(
         ) {
             return Err(format!(
                 "native {owner} runtime-filter binding_id={} requires BlockingSnapshot or Batch NonBlockingLive",
-                spec.binding_id()
+                contract.binding_id().get()
             ));
         }
         if !matches!(
-            spec.execution_contract(),
+            contract.contract(),
             RuntimeFilterExecutionContract::Membership(_)
-        ) || spec.contract().reduction() != execution::RuntimeFilterReduction::SetUnion
+        ) || contract.reduction() != execution::RuntimeFilterReduction::SetUnion
         {
             return Err(format!(
                 "native {owner} runtime-filter binding_id={} requires a membership SetUnion contract",
-                spec.binding_id()
+                contract.binding_id().get()
             ));
         }
-        if arena.data_type(spec.expr_id).is_none() {
-            return Err(format!(
-                "native Join runtime-filter binding_id={} expression is missing",
-                spec.binding_id()
-            ));
-        }
+        validate_key(index, contract)?;
     }
     Ok(())
 }
@@ -1019,7 +1140,7 @@ fn validate_ordered_live_plan_specs(
     specs: &[RuntimeFilterConsumerBinding],
     arena: &ExprArena,
 ) -> Result<(), String> {
-    validate_unique_consumer_bindings(specs)?;
+    validate_unique_consumer_bindings(specs.iter().map(RuntimeFilterConsumerBinding::binding_id))?;
     for spec in specs {
         match spec.activation() {
             execution::ConsumerActivation::NonBlockingLive {

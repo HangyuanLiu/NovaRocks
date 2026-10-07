@@ -586,7 +586,9 @@ pub(crate) fn prepare_compiled_program_pipeline_execution(
 /// Task's profiler. `scan_bindings` binds exactly the program's compiled
 /// scans, keyed by physical scan node; the prepared execution retains their
 /// terminal hooks so an abort reaches parked readers. `writer_bindings` binds
-/// exactly the program's compiled TableWriter and TableFinish nodes.
+/// exactly the program's compiled TableWriter and TableFinish nodes. The
+/// program's runtime-filter sites bind to `runtime_state`'s runtime-filter
+/// session, which every such site requires.
 #[expect(
     clippy::too_many_arguments,
     reason = "The compiled program and its Task capabilities are independent inputs"
@@ -646,6 +648,7 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler(
         exchange_bindings,
         scan_bindings,
         writer_bindings,
+        runtime_state.runtime_filter_session().cloned(),
         DependencyManager::new(),
         pipeline_dop,
         root_sink_dop,
