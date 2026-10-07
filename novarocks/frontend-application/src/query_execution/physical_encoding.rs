@@ -70,7 +70,7 @@ use crate::query_execution::package_freeze::{
 };
 use crate::query_execution::post_compile::mint_native_encoding_provenance;
 use crate::query_execution::preparation::attempt_access::{
-    ConnectorAttemptAccessPlan, attempt_access_for_completed_plan,
+    ConnectorAttemptAccessPlan, FrozenReadCapability, attempt_access_for_completed_plan,
 };
 use crate::query_execution::provider_read_facts::{FrozenProviderRead, FrozenReadEncoding};
 
@@ -207,18 +207,7 @@ fn encode_completed_plan_tree(
         let semantic_candidate = paired.candidate().clone();
         let (candidate, reads) = paired.into_parts();
         let plan = candidate.plan();
-        let mut encodings = BTreeMap::new();
-        let mut capabilities = BTreeMap::new();
-        for (occurrence, read) in reads.into_occurrences() {
-            let FrozenProviderRead {
-                access,
-                generation,
-                catalog,
-                encoding,
-            } = read.access;
-            encodings.insert(occurrence, encoding);
-            capabilities.insert(occurrence, (read.binding, access, generation, catalog));
-        }
+        let (encodings, capabilities) = split_frozen_reads(reads);
         let facts = physical_v1_private_facts(plan, &encodings, write_targets)?;
         let encoded =
             encode_physical_plan_v1(plan, functions, &facts, root_allow_throw_exception, control)?;
@@ -257,11 +246,38 @@ fn encode_completed_plan_tree(
     })()
 }
 
+/// What each frozen read leaves the encoding and what it leaves the attempt,
+/// separated by occurrence.
+///
+/// The capability moves rather than copies, because a capability cannot be
+/// copied; the encoding stays behind for whichever carrier reads it.
+fn split_frozen_reads(
+    reads: novarocks_query_application::preparation::FinalPlanRuntimeAccess<FrozenProviderRead>,
+) -> (
+    BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
+    BTreeMap<ProviderReadOccurrenceId, FrozenReadCapability>,
+) {
+    let mut encodings = BTreeMap::new();
+    let mut capabilities = BTreeMap::new();
+    for (occurrence, read) in reads.into_occurrences() {
+        let FrozenProviderRead {
+            access,
+            generation,
+            catalog,
+            encoding,
+        } = read.access;
+        encodings.insert(occurrence, encoding);
+        capabilities.insert(occurrence, (read.binding, access, generation, catalog));
+    }
+    (encodings, capabilities)
+}
+
 /// Freeze one completed plan as compiled packages, one per fragment.
 ///
-/// Every fact here comes from the physical plan and the packages authored
-/// from it; no plan tree is built or consulted. What the package carrier
-/// cannot express yet is refused before any package is authored.
+/// Every fact here comes from the physical plan, the reads its scans froze
+/// and the packages authored from both; no plan tree is built or consulted.
+/// What the package carrier cannot express yet is refused before any package
+/// is authored.
 fn encode_completed_packages(
     paired: CompletedPlanWithAccess<FrozenProviderRead>,
     carrier: &CompiledPackageCarrier,
@@ -269,14 +285,14 @@ fn encode_completed_packages(
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
     let semantic_candidate = paired.candidate().clone();
-    // A plan without scans pairs with no read capability, so nothing is
-    // released here that an attempt would need.
-    let (candidate, _reads) = paired.into_parts();
+    let (candidate, reads) = paired.into_parts();
     let plan = candidate.plan();
     refuse_uncompiled_plan_shapes(plan)?;
+    let (encodings, capabilities) = split_frozen_reads(reads);
     let topology = completed_plan_topology(plan)?;
     let packages = extract_checked_packages(
         &candidate,
+        &encodings,
         statement_constant_policy,
         carrier.admission(),
         control,
@@ -295,19 +311,20 @@ fn encode_completed_packages(
         topology.anchor,
         provenance,
     )?;
-    let scheduling =
-        completed_plan_scheduling_facts(plan, &BTreeMap::new(), &topology, provenance)?;
+    // Scan scheduling and the attempt's scan facts are read from the plan and
+    // the freezes, exactly as for the plan tree; no wire encoding is consulted.
+    let scheduling = completed_plan_scheduling_facts(plan, &encodings, &topology, provenance)?;
     let plan_facts = AttemptPlanFacts::from_completed(
         scheduling,
         completed_plan_edge_facts(plan)?,
-        Vec::new(),
+        completed_plan_scan_facts(plan, &encodings)?,
         submission,
         // Refused above: a compiled plan declares no runtime filter.
         AttemptRuntimeFilterFacts::default(),
         // Refused above: a compiled plan writes no target.
         None,
     );
-    let access = attempt_access_for_completed_plan(plan, BTreeMap::new())?;
+    let access = attempt_access_for_completed_plan(plan, capabilities)?;
     Ok(EncodedCompletedPlan {
         semantic_candidate,
         native,
@@ -354,9 +371,6 @@ fn refuse_uncompiled_plan_shapes(
 
 const fn compiled_node_refusal(kind: &NodeKind) -> Option<&'static str> {
     match kind {
-        NodeKind::Scan { .. } => {
-            Some("the compiled package carrier has no production provider read author yet")
-        }
         NodeKind::TableWriter { .. } | NodeKind::TableFinish(_) => {
             Some("the compiled package carrier has no production writer recipe author yet")
         }
@@ -1218,6 +1232,7 @@ mod tests {
         let control = SqlCompileControl::unbounded();
         let packages = crate::query_execution::package_freeze::freeze_fragment_packages(
             completed.candidate(),
+            &BTreeMap::new(),
             crate::application::test_constant_policy(),
             &test_package_admission(),
             &encode_limits(),
@@ -1516,8 +1531,9 @@ mod tests {
 
     /// What the compiled carrier cannot express yet is refused by name before
     /// any package is authored, and is never encoded as a plan tree instead.
+    /// A scan is expressed, from the read its freeze kept.
     #[test]
-    fn the_compiled_carrier_refuses_writers_routers_multicast_and_scans() {
+    fn the_compiled_carrier_refuses_writers_routers_and_multicast_but_admits_scans() {
         use novarocks_physical_plan::{ValueId, WriterFinishSpec, WriterRelationSchema};
 
         let schema = || WriterRelationSchema {
@@ -1575,11 +1591,19 @@ mod tests {
         assert_eq!(compiled_edge_refusal(EdgeKind::Stream), None);
         assert_eq!(compiled_sink_refusal(&FragmentSink::Result), None);
 
-        // A validated provider-read program is refused at its scan.
+        // A validated provider-read program has a compiled shape; its frozen
+        // read is authored from the freeze, and a scan with none is refused
+        // there rather than given guessed facts.
+        let plan = scan_plan();
+        refuse_uncompiled_plan_shapes(&plan).expect("a scan has a compiled shape");
         assert!(matches!(
-            refuse_uncompiled_plan_shapes(&scan_plan()),
-            Err(novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(reason))
-                if reason.contains("provider read")
+            crate::query_execution::package_reads::author_frozen_reads(
+                &plan,
+                &BTreeMap::new(),
+                &SqlCompileControl::unbounded(),
+            ),
+            Err(crate::query_execution::package_freeze::PackageFreezeError::Facts(reason))
+                if reason.contains("no frozen read")
         ));
         // A real FE plan has none of these shapes.
         let (plan, _) = encode_with("SELECT 1", &StaticPlanCarrier::PlanTree);
@@ -1711,27 +1735,19 @@ mod tests {
             "SELECT a FROM (SELECT 1 AS a UNION ALL SELECT 2) t LIMIT 1",
             "SELECT a + 1 FROM (SELECT 1 AS a UNION ALL SELECT 2) t",
             "SELECT 'x' AS b UNION ALL SELECT 'yy'",
+            "SELECT b FROM (VALUES ('x'), ('yy')) AS t(b)",
         ] {
             assert_eq!(compiled_programs(sql).len(), 2, "{sql}");
         }
     }
 
     // A multi-row VALUES keeps each literal at its analyzed type and assigns
-    // the common type through an explicit cast cell. The compiler has no
-    // runtime cell evaluation yet, so it refuses the dynamic cell explicitly.
+    // the common type through an explicit cast cell; the compiler lowers each
+    // such cell as a runtime cell root rather than refusing it.
     #[test]
-    fn values_with_common_type_cast_cells_are_refused_by_the_compiler() {
+    fn values_with_common_type_cast_cells_compile_as_runtime_cells() {
         let sql = "SELECT a FROM (VALUES (1), (2), (3)) AS t(a)";
-        let refused = std::panic::catch_unwind(|| compiled_programs(sql))
-            .expect_err("dynamic Values cells are not compiled yet");
-        let message = refused
-            .downcast_ref::<String>()
-            .cloned()
-            .unwrap_or_default();
-        assert!(
-            message.contains("Values cell requires compile-time constant backing"),
-            "{message}"
-        );
+        assert_eq!(compiled_programs(sql).len(), 2, "{sql}");
     }
 
     #[test]
@@ -1953,8 +1969,7 @@ mod tests {
         )
     }
 
-    /// One validated single-scan program; a provider read the compiled
-    /// carrier has no author for yet.
+    /// One validated single-scan program with no freeze behind it.
     fn scan_plan() -> PhysicalPlan {
         use novarocks_connector_contract::{
             CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorInstanceDescriptor,

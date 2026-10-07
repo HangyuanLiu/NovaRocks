@@ -46,16 +46,17 @@ use novarocks_query_application::preparation::{
     FrozenReadAccess, ProviderReadFactPort, ReadAccessDeposit, ReadAccessSink,
 };
 use novarocks_spi::connector::{
-    CatalogProperties, ConnectorControlPlanningLease, ConnectorControlReadBinding,
+    CatalogProperties, ConnectorControlPlanningLease, ConnectorControlReadBinding, ConnectorError,
     ConnectorPlanningContext, ConnectorReadAttemptAccess, ConnectorReadWireEncoder,
     ConnectorRequestContext,
     read_stack::{
         ConnectorExpression, ConnectorReadColumnBinding, ConnectorReadColumnHandle,
         ConnectorReadConstraint, ConnectorReadDistribution, ConnectorReadMetadata,
         ConnectorReadMetadataKind, ConnectorReadMetadataRequest, ConnectorReadMetadataVersion,
-        ConnectorReadNullOrdering, ConnectorReadProperties, ConnectorReadRelationVersion,
-        ConnectorReadRequestControl, ConnectorReadSortDirection, ConnectorReadTableHandle,
-        ConnectorReadWorkSource, ConnectorSession, Constraint, SchemaTableName, TupleDomain,
+        ConnectorReadNullOrdering, ConnectorReadProperties, ConnectorReadPublicSchema,
+        ConnectorReadRelationVersion, ConnectorReadRequestControl, ConnectorReadSortDirection,
+        ConnectorReadStaticFacts, ConnectorReadTableHandle, ConnectorReadWorkSource,
+        ConnectorSession, Constraint, SchemaTableName, TupleDomain,
         negotiation::{
             ReadFreezeRequest, ReadNegotiation, ReadPushdownDisposition, ReadPushdownOp,
             ReadPushdownOutcome,
@@ -135,6 +136,23 @@ pub(crate) struct FrozenReadEncoding {
     pub(crate) remaining_expression: Option<ConnectorExpression>,
     pub(crate) work_source: ConnectorReadWorkSource,
     pub(crate) encoder: Arc<dyn ConnectorReadWireEncoder>,
+    /// The provider's own static facts, exactly as it froze them.
+    ///
+    /// The plan's contract keeps a projection of these with the distribution
+    /// this freeze decided for a relation one reader takes whole, and drops
+    /// the artifact coverage entirely. A compiled program states the
+    /// provider's own answer instead, because the provider's pure compiler
+    /// checks it against the private relation it froze.
+    pub(crate) static_facts: ConnectorReadStaticFacts<ConnectorReadColumnHandle>,
+    /// The public fields of the assignment columns, one per assignment in
+    /// assignment order, as the provider that owns them published them; or
+    /// why it would not.
+    ///
+    /// Only a compiled program carries these fields, and a provider may
+    /// decline to publish them for a relation family it does not program.
+    /// The refusal is kept rather than raised here: a plan tree never reads
+    /// the fields, and the owner that does reports the provider's own reason.
+    pub(crate) public_schema: Result<ConnectorReadPublicSchema, ConnectorError>,
 }
 
 /// Freezes each scan of one statement with its provider.
@@ -395,6 +413,14 @@ pub(crate) fn freeze_one_read(
         .map_err(|error| format!("provider read of {name} could not be frozen: {error}"))?
         .into_verified(&freeze_request)
         .map_err(|error| format!("provider read of {name} froze the wrong read: {error}"))?;
+    // The provider publishes the public fields of exactly the columns this
+    // read assigns, repeats included, from the handle it froze. Asking later
+    // would need a live provider; asking with SQL names would guess.
+    let assigned_columns = assignments
+        .iter()
+        .map(|assignment| assignment.column().clone())
+        .collect::<Vec<_>>();
+    let public_schema = metadata.read_public_schema(session, &negotiated.handle, &assigned_columns);
 
     // 5. Assemble everything the freeze leaves behind, so that taking the
     //    capability and accounting for it are adjacent: nothing may happen
@@ -439,6 +465,8 @@ pub(crate) fn freeze_one_read(
                         remaining_expression,
                         work_source,
                         encoder: Arc::clone(&encoder),
+                        static_facts: frozen.clone(),
+                        public_schema,
                     },
                 },
             },

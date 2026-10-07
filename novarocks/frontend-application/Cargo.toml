@@ -26,6 +26,7 @@ chrono.workspace = true
 futures.workspace = true
 hex.workspace = true
 novarocks-catalog-application.workspace = true
+novarocks-connector-contract.workspace = true
 novarocks-fs.workspace = true
 novarocks-functions.workspace = true
 novarocks-memory.workspace = true
@@ -66,7 +67,7 @@ toml.workspace = true
 uuid = { workspace = true, features = ["v7", "serde"] }
 
 [dev-dependencies]
-novarocks-connector-contract.workspace = true
+novarocks-connector-paimon.workspace = true
 novarocks-local-compiler.workspace = true
 novarocks-local-program.workspace = true
 novarocks-plan-codec = { workspace = true, features = ["test-support"] }

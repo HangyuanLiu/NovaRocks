@@ -17,11 +17,11 @@
 
 //! Freeze one completed SQL plan into v2 FragmentPackage wire bytes.
 //!
-//! The SQL owner authors each fragment's uses, calls and pruning; the
+//! The SQL owner authors each fragment's uses, calls and pruning; each scan's
+//! frozen read is authored from the plan and the freeze that produced it; the
 //! original extraction law publishes the checked packages; the v2 sender
-//! encodes them. Provider read facts and writer recipes have no production
-//! author on this path yet, so a plan with scans or writers is refused rather
-//! than given guessed facts.
+//! encodes them. Writer recipes have no production author on this path yet,
+//! so a plan with writers is refused rather than given guessed facts.
 //!
 //! Which carrier a Frontend freezes its plans into is one composition choice,
 //! [`StaticPlanCarrier`]. Production composes the plan tree; the compiled
@@ -33,7 +33,7 @@ use std::fmt;
 
 use novarocks_physical_plan::{
     ConstantPolicy, FragmentId, FragmentPackage, FragmentPackageAdmission, NodeKind,
-    extract_fragment_packages,
+    ProviderReadOccurrenceId, extract_fragment_packages,
 };
 use novarocks_plan_codec::physical_package_v2::{
     PackageEncodeError, PackageEncodeLimits, encode_fragment_package,
@@ -41,6 +41,9 @@ use novarocks_plan_codec::physical_package_v2::{
 use novarocks_query_application::preparation::CompletedPhysicalPlanCandidate;
 use novarocks_type_contract::{CompileControlError, PureCompileControl};
 use prost::Message;
+
+use crate::query_execution::package_reads::author_frozen_reads;
+use crate::query_execution::provider_read_facts::FrozenReadEncoding;
 
 /// The static carrier one Frontend process freezes every completed plan into.
 ///
@@ -94,6 +97,8 @@ pub(crate) enum PackageFreezeError {
     Encode(PackageEncodeError),
     /// A carrier fact the plan states inconsistently.
     Facts(String),
+    /// A frozen provider read the package cannot carry as frozen.
+    Read(String),
     /// A fact the package needs has no production author on this path.
     Unsupported(&'static str),
 }
@@ -105,6 +110,7 @@ impl fmt::Display for PackageFreezeError {
             Self::Extraction(detail) => write!(f, "fragment package extraction: {detail}"),
             Self::Encode(error) => error.fmt(f),
             Self::Facts(detail) => write!(f, "package carrier facts: {detail}"),
+            Self::Read(detail) => write!(f, "frozen provider read: {detail}"),
             Self::Unsupported(detail) => f.write_str(detail),
         }
     }
@@ -124,16 +130,23 @@ impl From<PackageFreezeError> for novarocks_plan_codec::PhysicalEncodeError {
 }
 
 /// Every fragment's v2 package bytes. The host admission and encode limits
-/// are caller-owned configuration; none is defaulted here.
+/// are caller-owned configuration; none is defaulted here. `encodings` are
+/// what the freeze of each of the plan's provider reads kept.
 pub(crate) fn freeze_fragment_packages(
     candidate: &CompletedPhysicalPlanCandidate,
+    encodings: &BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
     statement_constant_policy: ConstantPolicy,
     admission: &FragmentPackageAdmission,
     limits: &PackageEncodeLimits,
     control: &dyn PureCompileControl,
 ) -> Result<BTreeMap<FragmentId, Vec<u8>>, PackageFreezeError> {
-    let packages =
-        extract_checked_packages(candidate, statement_constant_policy, admission, control)?;
+    let packages = extract_checked_packages(
+        candidate,
+        encodings,
+        statement_constant_policy,
+        admission,
+        control,
+    )?;
     let mut output = BTreeMap::new();
     for (id, package) in packages {
         output.insert(id, encode_checked_package(&package, limits, control)?);
@@ -144,6 +157,7 @@ pub(crate) fn freeze_fragment_packages(
 /// Every fragment's checked v2 package, before encoding.
 pub(crate) fn extract_checked_packages(
     candidate: &CompletedPhysicalPlanCandidate,
+    encodings: &BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
     statement_constant_policy: ConstantPolicy,
     admission: &FragmentPackageAdmission,
     control: &dyn PureCompileControl,
@@ -151,21 +165,17 @@ pub(crate) fn extract_checked_packages(
     let plan = candidate.plan();
     for fragment in plan.fragments().values() {
         for node in fragment.nodes().values() {
-            match node.kind {
-                NodeKind::Scan { .. } => {
-                    return Err(PackageFreezeError::Unsupported(
-                        "provider read facts have no production package author yet",
-                    ));
-                }
-                NodeKind::TableWriter { .. } | NodeKind::TableFinish(_) => {
-                    return Err(PackageFreezeError::Unsupported(
-                        "writer recipes have no production package author yet",
-                    ));
-                }
-                _ => {}
+            if matches!(
+                node.kind,
+                NodeKind::TableWriter { .. } | NodeKind::TableFinish(_)
+            ) {
+                return Err(PackageFreezeError::Unsupported(
+                    "writer recipes have no production package author yet",
+                ));
             }
         }
     }
+    let scans = author_frozen_reads(plan, encodings, control)?;
     let semantics = candidate
         .author_package_semantics(statement_constant_policy, control)
         .map_err(|error| match error {
@@ -186,7 +196,7 @@ pub(crate) fn extract_checked_packages(
     }
     extract_fragment_packages(
         plan,
-        &BTreeMap::new(),
+        &scans,
         &BTreeMap::new(),
         &uses,
         &calls,
