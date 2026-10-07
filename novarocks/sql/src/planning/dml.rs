@@ -625,7 +625,7 @@ pub fn build_final_frozen_connector_write_plan(
         .finalize_provider_read_occurrence(scan_occurrence)
         .map_err(|error| format!("finalize frozen connector scan occurrence: {error}"))?;
     let target_schema =
-        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0);
+        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0)?;
     let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
         &[
             crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
@@ -691,7 +691,7 @@ pub fn begin_final_connector_write_plan(
         .map_err(|_| "connector write intent did not produce optimized SQL facts".to_string())?;
     let physical = crate::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
     let target_schema =
-        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0);
+        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0)?;
     let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
         &[
             crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
@@ -784,7 +784,7 @@ pub fn compile_final_connector_write_plan(
         .map_err(|_| "connector write intent did not produce optimized SQL facts".to_string())?;
     let physical = crate::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
     let target_schema =
-        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0);
+        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0)?;
     let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
         &[
             crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
@@ -1028,7 +1028,7 @@ pub fn begin_final_ctas_connector_write_plan(
 > {
     let mut physical = crate::planner::optimizer_bridge::to_physical_plan(&source.optimized)?;
     let target_schema =
-        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0);
+        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0)?;
     let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
         &[
             crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
@@ -1697,7 +1697,7 @@ fn plan_change_stream_writer_statistics(
                 &route.sink.0,
             )
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     let inputs = routes
         .iter()
         .zip(target_schemas.iter())

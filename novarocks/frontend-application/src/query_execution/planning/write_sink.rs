@@ -71,18 +71,14 @@ pub(crate) fn dml_write_plan_input_for_admitted_target(
             fields: write_input
                 .fields()
                 .into_iter()
-                .map(|field| DmlWriteTargetField {
-                    token: field.token(),
-                    column: ColumnDef {
-                        name: field.field().name().to_string(),
-                        data_type: field.field().data_type().clone(),
-                        nullable: field.field().is_nullable(),
-                        write_default: None,
-                        logical_type: None,
-                    },
-                    is_hidden: false,
+                .map(|field| {
+                    Ok(DmlWriteTargetField {
+                        token: field.token(),
+                        column: admitted_write_column(field.field())?,
+                        is_hidden: false,
+                    })
                 })
-                .collect(),
+                .collect::<Result<_, String>>()?,
         },
         admitted_write_input_columns(write_input)?,
         input,
@@ -148,17 +144,25 @@ fn admitted_write_target(
 fn admitted_write_input_columns(
     input: &ConnectorWriteInputShape,
 ) -> Result<Vec<ColumnDef>, String> {
-    Ok(input
+    input
         .fields()
         .into_iter()
-        .map(|field| ColumnDef {
-            name: field.field().name().to_string(),
-            data_type: field.field().data_type().clone(),
-            nullable: field.field().is_nullable(),
-            write_default: None,
-            logical_type: None,
-        })
-        .collect())
+        .map(|field| admitted_write_column(field.field()))
+        .collect()
+}
+
+/// Freeze one signed write field as the SQL column the planner writes.
+///
+/// The field's own value type authors the column, so a root logical identity
+/// the provider signed (LARGEINT, HLL, BITMAP, UUID, VARIANT, ...) is declared
+/// on the column instead of collapsing onto its Arrow carrier -- the writer
+/// input is what the provider's statistics pins are checked against. A plain
+/// carrier field yields the same undeclared column it always did.
+fn admitted_write_column(field: &arrow::datatypes::Field) -> Result<ColumnDef, String> {
+    let value_type = novarocks_type_contract::FunctionValueType::try_from_field(field)
+        .map_err(|error| format!("admitted write field `{}`: {error}", field.name()))?;
+    ColumnDef::from_value_type(field.name().to_string(), value_type, None)
+        .map_err(|error| format!("admitted write field `{}`: {error}", field.name()))
 }
 
 fn write_input_schema(input: &ConnectorWriteInputShape) -> SchemaRef {
@@ -194,4 +198,101 @@ fn validate_mode(mode: DmlWriteSinkMode, input: &ConnectorWriteInputShape) -> Re
     matches.then_some(()).ok_or_else(|| {
         "SQL write sink mode does not match its Provider-signed input shape".to_string()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_spi::connector::{
+        ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
+    };
+    use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType};
+    use novarocks_types::schema::{ColumnDef, SqlType};
+
+    use super::admitted_write_input_columns;
+
+    fn signed(ordinal: u8, field: Field) -> ConnectorWriteFieldBinding {
+        let field_id = (u32::from(ordinal) + 1).to_string();
+        let mut metadata = field.metadata().clone();
+        metadata.insert("PARQUET:field_id".into(), field_id);
+        ConnectorWriteFieldBinding::new(
+            ConnectorWriteFieldToken::from_bytes([ordinal + 1; 32]),
+            field.with_metadata(metadata),
+        )
+    }
+
+    fn annotated(name: &str, data_type: DataType, logical: &str) -> Field {
+        Field::new(name, data_type, true)
+            .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), logical.into())].into())
+    }
+
+    /// The planner's writer input columns carry each signed field's root
+    /// logical identity, while a plain carrier field projects to exactly the
+    /// undeclared column it always did.
+    #[test]
+    fn admitted_write_columns_declare_signed_root_logical_identities() {
+        let input = ConnectorWriteInputShape::Data {
+            fields: vec![
+                signed(0, Field::new("id", DataType::Int64, false)),
+                signed(
+                    1,
+                    annotated("big", DataType::FixedSizeBinary(16), "largeint"),
+                ),
+                signed(2, annotated("h", DataType::Binary, "hll")),
+                signed(3, Field::new("name", DataType::Utf8, true)),
+            ],
+        };
+        let columns = admitted_write_input_columns(&input).expect("admitted columns");
+        assert_eq!(
+            columns[0],
+            ColumnDef {
+                name: "id".into(),
+                data_type: DataType::Int64,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            }
+        );
+        assert_eq!(
+            columns[3],
+            ColumnDef {
+                name: "name".into(),
+                data_type: DataType::Utf8,
+                nullable: true,
+                write_default: None,
+                logical_type: None,
+            }
+        );
+        for (ordinal, declaration, logical) in [
+            (1, SqlType::LargeInt, ValueLogicalType::LargeInt),
+            (2, SqlType::Hll, ValueLogicalType::Hll),
+        ] {
+            let column = &columns[ordinal];
+            assert_eq!(column.logical_type.as_ref(), Some(&declaration));
+            assert_eq!(
+                &column.data_type,
+                input.fields()[ordinal].field().data_type()
+            );
+            let declared = column.declared_value_type().expect("declared value type");
+            assert_eq!(declared.logical_type, logical);
+            assert_eq!(
+                declared,
+                novarocks_type_contract::FunctionValueType::try_from_field(
+                    input.fields()[ordinal].field()
+                )
+                .expect("signed value type")
+            );
+        }
+    }
+
+    /// A signed field whose annotation its carrier cannot hold is refused
+    /// rather than projected as a plain carrier column.
+    #[test]
+    fn admitted_write_columns_refuse_a_contradictory_annotation() {
+        let input = ConnectorWriteInputShape::Data {
+            fields: vec![signed(0, annotated("big", DataType::Int64, "largeint"))],
+        };
+        let error = admitted_write_input_columns(&input).expect_err("contradiction is refused");
+        assert!(error.contains("admitted write field `big`"), "{error}");
+    }
 }
