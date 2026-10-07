@@ -440,18 +440,14 @@ fn bigint_output_column(column_id: u32, name: &str, nullable: bool) -> proto_com
 }
 
 fn bigint_type_desc() -> proto_common::TypeDesc {
-    proto_common::TypeDesc {
-        kind: Some(proto_common::type_desc::Kind::Scalar(
-            proto_common::ScalarType {
-                r#type: proto_common::PrimitiveType::Bigint as i32,
-                len: None,
-                precision: None,
-                scale: None,
-                time_unit: None,
-                time_zone: None,
-            },
-        )),
-    }
+    novarocks_plan_codec::native_type::scalar_type_desc(proto_common::ScalarType {
+        r#type: proto_common::PrimitiveType::Bigint as i32,
+        len: None,
+        precision: None,
+        scale: None,
+        time_unit: None,
+        time_zone: None,
+    })
 }
 
 fn int64_literal_expr(value: i64) -> expr::Expr {

@@ -7969,12 +7969,8 @@ mod membership_tests {
             probe.output_columns[0].column_id,
             membership.probe_column_id
         );
-        let Some(common::type_desc::Kind::Scalar(json)) = output.output_columns[0]
-            .r#type
-            .as_ref()
-            .unwrap()
-            .kind
-            .as_ref()
+        let Some(json) =
+            crate::native_type::root_scalar(output.output_columns[0].r#type.as_ref().unwrap())
         else {
             panic!("scalar")
         };
@@ -7990,7 +7986,8 @@ mod membership_tests {
         let plain = output_column(slot, "plain", &ty, None, false).unwrap();
         let json = output_column(slot, "json", &ty, Some(ValueLogicalKind::Json), false).unwrap();
         let scalar = |column: common::OutputColumn| {
-            let Some(common::type_desc::Kind::Scalar(value)) = column.r#type.unwrap().kind else {
+            let desc = column.r#type.unwrap();
+            let Some(value) = crate::native_type::root_scalar(&desc) else {
                 panic!("scalar")
             };
             value.r#type

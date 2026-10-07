@@ -108,21 +108,27 @@ fn scalar_type(prim: common::PrimitiveType) -> IType {
 
 fn type_to_proto(ty: &IType) -> common::TypeDesc {
     common::TypeDesc {
-        kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
-            r#type: ty.prim,
-            len: None,
-            precision: None,
-            scale: None,
-            time_unit: None,
-            time_zone: None,
-        })),
+        nodes: vec![common::TypeNode {
+            kind: Some(common::type_node::Kind::Scalar(common::ScalarType {
+                r#type: ty.prim,
+                len: None,
+                precision: None,
+                scale: None,
+                time_unit: None,
+                time_zone: None,
+            })),
+        }],
     }
 }
 
 fn type_from_proto(proto: &common::TypeDesc) -> Result<IType, String> {
-    let kind = proto.kind.as_ref().ok_or("Expr.type.kind missing")?;
+    let kind = proto
+        .nodes
+        .first()
+        .and_then(|node| node.kind.as_ref())
+        .ok_or("Expr.type.kind missing")?;
     match kind {
-        common::type_desc::Kind::Scalar(scalar) => Ok(IType {
+        common::type_node::Kind::Scalar(scalar) => Ok(IType {
             prim: scalar.r#type,
         }),
         _ => Err("expr test analogue only accepts scalar TypeDesc".to_string()),

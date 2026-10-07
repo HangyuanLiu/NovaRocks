@@ -1367,14 +1367,12 @@ mod tests {
     use novarocks_proto_models::expr;
 
     fn int64_type() -> novarocks_proto_models::common::TypeDesc {
-        novarocks_proto_models::common::TypeDesc {
-            kind: Some(novarocks_proto_models::common::type_desc::Kind::Scalar(
-                novarocks_proto_models::common::ScalarType {
-                    r#type: novarocks_proto_models::common::PrimitiveType::Bigint as i32,
-                    ..Default::default()
-                },
-            )),
-        }
+        novarocks_plan_codec::native_type::scalar_type_desc(
+            novarocks_proto_models::common::ScalarType {
+                r#type: novarocks_proto_models::common::PrimitiveType::Bigint as i32,
+                ..Default::default()
+            },
+        )
     }
 
     fn expression(column_id: u32) -> expr::Expr {

@@ -109,10 +109,12 @@ pub(crate) fn encode_physical_logical_type(
         return Err("native logical kind does not admit the frozen physical carrier".into());
     }
     match kind {
-        novarocks_physical_plan::ValueLogicalKind::Json => Ok(scalar_type_desc(common::ScalarType {
-            r#type: common::PrimitiveType::Json as i32,
-            ..Default::default()
-        })),
+        novarocks_physical_plan::ValueLogicalKind::Json => {
+            Ok(scalar_type_desc(common::ScalarType {
+                r#type: common::PrimitiveType::Json as i32,
+                ..Default::default()
+            }))
+        }
     }
 }
 

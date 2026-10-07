@@ -70,7 +70,10 @@ pub fn map_type_desc(key: common::TypeDesc, value: common::TypeDesc) -> common::
     nodes.push(common::TypeNode::default());
     let key = graft(&mut nodes, key);
     let value = graft(&mut nodes, value);
-    nodes[0].kind = Some(common::type_node::Kind::Map(common::TypeMapNode { key, value }));
+    nodes[0].kind = Some(common::type_node::Kind::Map(common::TypeMapNode {
+        key,
+        value,
+    }));
     common::TypeDesc { nodes }
 }
 
@@ -163,8 +166,7 @@ fn decode_tree(desc: &common::TypeDesc) -> Result<(DataType, Option<LogicalType>
     })?;
     check_struct_members(nodes, limits)?;
 
-    let mut built: Vec<Option<(DataType, Option<LogicalType>)>> =
-        Vec::with_capacity(nodes.len());
+    let mut built: Vec<Option<(DataType, Option<LogicalType>)>> = Vec::with_capacity(nodes.len());
     built.resize_with(nodes.len(), || None);
     for index in (0..nodes.len()).rev() {
         let kind = nodes[index]
@@ -262,7 +264,10 @@ fn node_edges(node: &common::TypeNode, edges: &mut Vec<FlatEdge>) -> Result<(), 
 
 /// Struct member names are non-empty, unique within their struct and within
 /// the logical text budget.
-fn check_struct_members(nodes: &[common::TypeNode], limits: LogicalTypeLimits) -> Result<(), String> {
+fn check_struct_members(
+    nodes: &[common::TypeNode],
+    limits: LogicalTypeLimits,
+) -> Result<(), String> {
     let mut text = 0_usize;
     for node in nodes {
         let Some(common::type_node::Kind::Strct(strct)) = node.kind.as_ref() else {
@@ -427,7 +432,11 @@ mod tests {
         });
         assert_eq!(
             decode_type(&list_type_desc(decimal)).expect("decode nested decimal type"),
-            DataType::List(Arc::new(Field::new("item", DataType::Decimal128(18, 2), true)))
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Decimal128(18, 2),
+                true
+            )))
         );
     }
 
@@ -449,7 +458,11 @@ mod tests {
             panic!("root struct");
         };
         assert_eq!(
-            strct.fields.iter().map(|member| member.child).collect::<Vec<_>>(),
+            strct
+                .fields
+                .iter()
+                .map(|member| member.child)
+                .collect::<Vec<_>>(),
             vec![1, 5]
         );
         let data_type = decode_type(&desc).expect("valid nested type");
