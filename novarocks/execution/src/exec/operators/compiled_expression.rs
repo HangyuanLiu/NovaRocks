@@ -34,7 +34,8 @@ use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection};
 use novarocks_local_program::{
-    LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
+    LocalProgram, ProgramChannelLayoutRole, ProgramExpressionRootSite, ProgramNodeExpressionRole,
+    ProgramNodeId, ProgramNodeKind, root_input_layout,
 };
 
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
@@ -81,7 +82,41 @@ pub(crate) fn evaluate_all(
     input: &RecordBatch,
     control: &dyn KernelEvaluationControl,
 ) -> ExecutionResult<ArrayRef> {
-    let selection = Selection::all(input.num_rows());
+    evaluate_selection(
+        instance,
+        site,
+        input,
+        Selection::all(input.num_rows()),
+        control,
+    )
+}
+
+/// Evaluate one root over exactly the strictly increasing batch rows `rows`
+/// and return one value per selected row, in selection order. Unselected rows
+/// are never evaluated, so they raise no row error; a selected row's error is
+/// a required error reported at its batch row.
+pub(crate) fn evaluate_selected(
+    instance: &mut CompiledExpressionInstance,
+    site: ProgramExpressionRootSite,
+    input: &RecordBatch,
+    rows: &[usize],
+    control: &dyn KernelEvaluationControl,
+) -> ExecutionResult<ArrayRef> {
+    let selection = Selection::try_sparse(input.num_rows(), rows).map_err(|_| {
+        ExecutionFailure::from(KernelFailure::Internal(KernelDiagnostic::new(
+            "compiled root selection is not ordered within its batch",
+        )))
+    })?;
+    evaluate_selection(instance, site, input, selection, control)
+}
+
+fn evaluate_selection(
+    instance: &mut CompiledExpressionInstance,
+    site: ProgramExpressionRootSite,
+    input: &RecordBatch,
+    selection: Selection<'_>,
+    control: &dyn KernelEvaluationControl,
+) -> ExecutionResult<ArrayRef> {
     let result = instance.evaluate(input, selection, control)?;
     let (selection, values, errors) = result.into_parts();
     if let Some(error) = errors.into_vec().into_iter().next() {
@@ -132,8 +167,7 @@ impl CompiledProjectProcessorFactory {
             .nodes()
             .get(node.index())
             .ok_or("compiled Project node is absent")?;
-        let novarocks_local_program::ProgramNodeKind::Project { exprs, .. } = graph_node.kind()
-        else {
+        let ProgramNodeKind::Project { exprs, .. } = graph_node.kind() else {
             return Err("compiled node is not a Project".to_string());
         };
         let mut sites = Vec::with_capacity(exprs.len());
@@ -243,8 +277,9 @@ impl ProcessorOperator for CompiledProjectProcessor {
     }
 }
 
-/// Filter one compiled node: keep exactly the rows whose TruthOnly
-/// predicate root is TRUE; FALSE and NULL are both excluded.
+/// Filter by one compiled TruthOnly predicate root: keep exactly the rows
+/// whose root is TRUE; FALSE and NULL are both excluded. The rows keep the
+/// root's input port unchanged.
 pub struct CompiledFilterProcessorFactory {
     name: String,
     program: Arc<LocalProgram>,
@@ -252,26 +287,51 @@ pub struct CompiledFilterProcessorFactory {
     error: Arc<RuntimeErrorState>,
 }
 impl CompiledFilterProcessorFactory {
+    /// `site` names the predicate root this filter owns: a Filter node's
+    /// `FilterPredicate` or a Scan node's `ScanResidual`. Its input port is the
+    /// root's single NodeOutput layout, which is also the filtered output.
     pub(crate) fn try_new(
         program: Arc<LocalProgram>,
-        node: ProgramNodeId,
+        site: ProgramExpressionRootSite,
         error: Arc<RuntimeErrorState>,
     ) -> Result<Self, String> {
+        let ProgramExpressionRootSite::Node { node, role } = site else {
+            return Err(format!(
+                "compiled filter root {site:?} is not a node predicate"
+            ));
+        };
         let graph_node = program
             .graph()
             .nodes()
             .get(node.index())
-            .ok_or("compiled Filter node is absent")?;
-        if !matches!(
-            graph_node.kind(),
-            novarocks_local_program::ProgramNodeKind::Filter { .. }
-        ) {
-            return Err("compiled node is not a Filter".to_string());
+            .ok_or_else(|| format!("compiled filter node {} is absent", node.index()))?;
+        let label = match (graph_node.kind(), role) {
+            (ProgramNodeKind::Filter { .. }, ProgramNodeExpressionRole::FilterPredicate) => {
+                "COMPILED_FILTER"
+            }
+            (ProgramNodeKind::Scan { .. }, ProgramNodeExpressionRole::ScanResidual) => {
+                "COMPILED_SCAN_RESIDUAL"
+            }
+            _ => {
+                return Err(format!(
+                    "compiled filter root {role:?} at local node {} is neither a Filter predicate nor a Scan residual",
+                    node.index()
+                ));
+            }
+        };
+        match root_input_layout(program.graph(), site) {
+            Ok((_, ProgramChannelLayoutRole::NodeOutput)) => {}
+            _ => {
+                return Err(format!(
+                    "compiled filter root {role:?} at local node {} has no single node-output input port",
+                    node.index()
+                ));
+            }
         }
         Ok(Self {
-            name: format!("COMPILED_FILTER (node={})", node.index()),
+            name: format!("{label} (node={})", node.index()),
             program,
-            site: root(node, ProgramNodeExpressionRole::FilterPredicate),
+            site,
             error,
         })
     }

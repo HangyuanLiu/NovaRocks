@@ -92,3 +92,63 @@ fn twin_roots_of_one_definition_keep_independent_instances_in_the_pipeline() {
         assert_eq!(sample.value(0).to_bits(), SEED_42_FIRST, "root {column}");
     }
 }
+
+// The filter factory owns exactly one predicate site: a Filter node's
+// FilterPredicate or a Scan node's ScanResidual. Any other site is refused
+// when the pipeline is built, not discovered while running.
+#[test]
+fn compiled_filter_factory_accepts_only_an_owned_predicate_site() {
+    use crate::exec::operators::compiled_expression::CompiledFilterProcessorFactory;
+    use crate::runtime::runtime_state::RuntimeErrorState;
+    use novarocks_local_program::{
+        ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind,
+    };
+
+    let program = program(SeedMode::Input, false);
+    let filter = ProgramNodeId::new(2);
+    let project = ProgramNodeId::new(3);
+    assert!(matches!(
+        program.graph().nodes()[filter.index()].kind(),
+        ProgramNodeKind::Filter { .. }
+    ));
+    let error = Arc::new(RuntimeErrorState::default());
+    let site = |node, role| ProgramExpressionRootSite::Node { node, role };
+    assert!(
+        CompiledFilterProcessorFactory::try_new(
+            Arc::clone(&program),
+            site(filter, ProgramNodeExpressionRole::FilterPredicate),
+            Arc::clone(&error),
+        )
+        .is_ok()
+    );
+    for refused in [
+        site(project, ProgramNodeExpressionRole::FilterPredicate),
+        site(filter, ProgramNodeExpressionRole::ScanResidual),
+        site(
+            filter,
+            ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
+        ),
+    ] {
+        let message = match CompiledFilterProcessorFactory::try_new(
+            Arc::clone(&program),
+            refused,
+            Arc::clone(&error),
+        ) {
+            Ok(_) => panic!("{refused:?} is not an owned predicate site"),
+            Err(message) => message,
+        };
+        assert!(
+            message.contains("neither a Filter predicate nor a Scan residual"),
+            "{message}"
+        );
+    }
+    let message = match CompiledFilterProcessorFactory::try_new(
+        Arc::clone(&program),
+        ProgramExpressionRootSite::SinkPartition { branch: 0, key: 0 },
+        error,
+    ) {
+        Ok(_) => panic!("a sink partition root is not a node predicate"),
+        Err(message) => message,
+    };
+    assert!(message.contains("is not a node predicate"), "{message}");
+}

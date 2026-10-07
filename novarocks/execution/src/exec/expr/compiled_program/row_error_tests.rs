@@ -754,6 +754,41 @@ fn eager_rng_child_advances_even_when_parent_strict_digits_are_null() {
     assert!(actual.errors().is_empty());
 }
 
+// The operator helper behind ChangeEventExpand assignments evaluates only the
+// selected rows: an overflow on an unselected row raises nothing, and a
+// selected row's overflow is a required error reported at its batch row.
+#[test]
+fn operator_selected_evaluation_skips_unselected_row_errors_and_reports_batch_rows() {
+    use crate::exec::operators::compiled_expression::evaluate_selected;
+    let program = program(Shape::Single);
+    let max38 = 10_i128.pow(38) - 1;
+    let input = batch(
+        &program,
+        vec![Some(15), Some(max38), Some(25)],
+        vec![None; 3],
+    );
+    let site = ProgramExpressionRootSite::Node {
+        node: ProgramNodeId::new(2),
+        role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
+    };
+    let mut evaluator = instance(&program, 0);
+    let values = evaluate_selected(&mut evaluator, site, &input, &[0, 2], &Control).unwrap();
+    let values = values.as_any().downcast_ref::<Decimal128Array>().unwrap();
+    assert_eq!(values.len(), 2);
+    assert_eq!((values.value(0), values.value(1)), (20, 30));
+    let error = evaluate_selected(&mut instance(&program, 0), site, &input, &[1, 2], &Control)
+        .expect_err("the selected overflow row is required");
+    let message = error.to_string();
+    assert!(
+        message.contains("failed at batch row 1 (selected ordinal 0)"),
+        "{message}"
+    );
+    assert!(message.contains("overflow"), "{message}");
+    let unordered = evaluate_selected(&mut instance(&program, 0), site, &input, &[2, 0], &Control)
+        .expect_err("rows must be strictly increasing");
+    assert!(unordered.to_string().contains("not ordered"), "{unordered}");
+}
+
 // Conservative retained-source invoice and independent projection ceilings for
 // these small fixtures only; this is not a production default or a MEM grant.
 fn package_admission() -> novarocks_physical_plan::FragmentPackageAdmission {

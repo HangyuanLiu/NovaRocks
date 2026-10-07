@@ -436,10 +436,13 @@ fn lower(
             .get(&id)
             .ok_or(FragmentCompileError::Invalid("missing physical node"))?;
         // A partitioned single-copy layout only says how rows are placed
-        // across instances; every admitted family computes the same rows
-        // locally under it. A family that consumes per-driver key co-location
-        // must author its own local partitioning instead of relying on this.
-        // Copied rows and broadcast placement stay refused.
+        // across instances. Families with a whole-relation meaning (global
+        // Sort, Single/Final TopN, Limit, global row-count assertion) reach
+        // here only over the Singleton input the checked physical contract
+        // requires, and a per-key assertion only over a key-colocated one. A
+        // family that consumes per-driver key co-location must author its own
+        // local partitioning instead of relying on this. Copied rows and
+        // broadcast placement stay refused.
         if !matches!(
             node.output_properties.distribution,
             Distribution::Singleton

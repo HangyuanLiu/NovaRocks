@@ -19,17 +19,31 @@
 //! output). Expressions are evaluated only through compiled roots; there is no
 //! legacy ExprArena thaw and no legacy node identity. A node family without
 //! a compiled processor is an explicit refusal, never a legacy fallback.
+//!
+//! Reuse boundary: families that evaluate expressions (Project, Filter, Sort
+//! and TopN, Unpivot, ChangeEventExpand) run compiled processors that own one
+//! instance per root and driver. Legacy operators are reused only where they
+//! evaluate nothing: the Values source, Limit, the local gather exchange, the
+//! row-count assertion and the UnionAll fan-in queue. Repeat is a compiled
+//! processor too, because the legacy one re-derives its output schema.
 
 use std::collections::BTreeSet;
 
 use super::*;
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::node::exchange_source::ExchangeSourceNode;
+use crate::exec::operators::compiled_change_events::CompiledChangeEventProcessorFactory;
 use crate::exec::operators::compiled_expression::{
     CompiledFilterProcessorFactory, CompiledProjectProcessorFactory,
 };
+use crate::exec::operators::compiled_repeat::CompiledRepeatProcessorFactory;
+use crate::exec::operators::compiled_sort::CompiledSortProcessorFactory;
+use crate::exec::operators::compiled_unpivot::CompiledUnpivotProcessorFactory;
 use crate::runtime::runtime_state::RuntimeErrorState;
-use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind};
+use novarocks_local_program::{
+    AssertRowsMode, LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole,
+    ProgramNodeId, ProgramNodeKind, RowAssertion,
+};
 
 /// Operator display identity for a compiled node: its local program index.
 /// Profiles keep the program's provenance as the source relation.
@@ -195,7 +209,10 @@ fn build_node(
                 .factories
                 .push(Box::new(CompiledFilterProcessorFactory::try_new(
                     Arc::clone(program),
-                    id,
+                    ProgramExpressionRootSite::Node {
+                        node: id,
+                        role: ProgramNodeExpressionRole::FilterPredicate,
+                    },
                     Arc::clone(error),
                 )?));
             Ok(build)
@@ -252,10 +269,181 @@ fn build_node(
             build.stream = StreamDesc::single();
             Ok(build)
         }
+        ProgramNodeKind::Sort { input, .. } => {
+            // Global Sort and Single TopN order the whole instance input on
+            // one driver.
+            let factory =
+                CompiledSortProcessorFactory::try_new(Arc::clone(program), id, Arc::clone(error))?;
+            let build = build_node(program, *input, ctx, error)?;
+            let mut build = gather_to_one(build, ctx, node_id);
+            build.pipeline.factories.push(Box::new(factory));
+            build.stream = StreamDesc::single();
+            Ok(build)
+        }
+        ProgramNodeKind::UnionAll { inputs } => {
+            build_union_all(program, id, node_id, inputs, ctx, error)
+        }
+        ProgramNodeKind::AssertNumRows { input, mode } => {
+            let factory = AssertNumRowsProcessorFactory::new(node_id, assertion_mode(mode))?;
+            // Both modes judge the whole instance input: a global count, or
+            // at most one row per key, so the assertion runs on one driver.
+            // The keyed mode keeps the existing owner's key identity: a NULL
+            // key equals a NULL key, and values compare by type and display.
+            let build = build_node(program, *input, ctx, error)?;
+            let mut build = gather_to_one(build, ctx, node_id);
+            build.pipeline.factories.push(Box::new(factory));
+            build.stream = StreamDesc::single();
+            Ok(build)
+        }
+        ProgramNodeKind::Repeat { input, .. } => {
+            let factory = CompiledRepeatProcessorFactory::try_new(program, id)?;
+            let mut build = build_node(program, *input, ctx, error)?;
+            build.pipeline.factories.push(Box::new(factory));
+            build.stream = StreamDesc::any(build.pipeline.dop);
+            Ok(build)
+        }
+        ProgramNodeKind::Unpivot { input, .. } => {
+            let factory = CompiledUnpivotProcessorFactory::try_new(
+                Arc::clone(program),
+                id,
+                Arc::clone(error),
+            )?;
+            let mut build = build_node(program, *input, ctx, error)?;
+            build.pipeline.factories.push(Box::new(factory));
+            build.stream = StreamDesc::any(build.pipeline.dop);
+            Ok(build)
+        }
+        ProgramNodeKind::ChangeEventExpand { input, .. } => {
+            let factory = CompiledChangeEventProcessorFactory::try_new(
+                Arc::clone(program),
+                id,
+                Arc::clone(error),
+            )?;
+            let mut build = build_node(program, *input, ctx, error)?;
+            build.pipeline.factories.push(Box::new(factory));
+            build.stream = StreamDesc::any(build.pipeline.dop);
+            Ok(build)
+        }
         _ => Err(format!(
             "compiled node family at local node {} has no compiled processor yet",
             id.index()
         )),
+    }
+}
+
+/// UnionAll as the compiler lowers it: every input is that branch's
+/// subordinate normalizing Project, whose layout is exactly the union's
+/// output layout, so each branch owns the union's channels in their frozen
+/// order and its chunks pass through unchanged. The branches fan in through
+/// the shared UnionAll queue, which carries no expression and no ordering.
+fn build_union_all(
+    program: &Arc<LocalProgram>,
+    id: ProgramNodeId,
+    node_id: i32,
+    inputs: &[ProgramNodeId],
+    ctx: &mut PipelineBuildContext,
+    error: &Arc<RuntimeErrorState>,
+) -> Result<PipelineBuildResult, String> {
+    validate_union_branches(program, id, inputs)?;
+    let mut builds = Vec::with_capacity(inputs.len());
+    let mut producers = 0usize;
+    for input in inputs {
+        let child = build_node(program, *input, ctx, error)?;
+        producers =
+            producers.saturating_add(usize::try_from(child.pipeline.dop.max(1)).unwrap_or(1));
+        builds.push(child);
+    }
+    let state = UnionAllSharedState::new(producers, node_id);
+    let mut extra_pipelines = Vec::new();
+    for mut child in builds {
+        child
+            .pipeline
+            .factories
+            .push(Box::new(UnionAllSinkFactory::new(state.clone(), node_id)));
+        child.pipeline.needs_sink = false;
+        extra_pipelines.push(child.pipeline);
+        extra_pipelines.append(&mut child.extra_pipelines);
+    }
+    // The shared queue has one consumer; one driver drains it.
+    let source: Box<dyn OperatorFactory> = Box::new(UnionAllSourceFactory::new(state, node_id));
+    let pipeline = new_source_pipeline_with_dop(ctx, source, 1);
+    Ok(PipelineBuildResult {
+        pipeline,
+        extra_pipelines,
+        stream: StreamDesc::single(),
+    })
+}
+
+/// Every UnionAll input must be a subordinate normalizing Project whose layout
+/// is exactly the union's: same complete fields, metadata and slot order.
+fn validate_union_branches(
+    program: &LocalProgram,
+    id: ProgramNodeId,
+    inputs: &[ProgramNodeId],
+) -> Result<(), String> {
+    let nodes = program.graph().nodes();
+    let layout = nodes
+        .get(id.index())
+        .ok_or_else(|| format!("missing compiled UnionAll node {}", id.index()))?
+        .output_layout();
+    if inputs.len() < 2 {
+        return Err(format!(
+            "compiled UnionAll at local node {} has fewer than two branches",
+            id.index()
+        ));
+    }
+    for (ordinal, input) in inputs.iter().enumerate() {
+        let branch = nodes
+            .get(input.index())
+            .ok_or_else(|| format!("missing compiled UnionAll branch {}", input.index()))?;
+        let normalizer = matches!(
+            branch.kind(),
+            ProgramNodeKind::Project {
+                is_subordinate: true,
+                ..
+            }
+        );
+        let same_layout = branch.output_layout().schema() == layout.schema()
+            && branch.output_layout().slots() == layout.slots();
+        if !normalizer || !same_layout {
+            return Err(format!(
+                "compiled UnionAll at local node {} branch {ordinal} is not a normalizer owning the union layout",
+                id.index()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The frozen assertion mode in the existing row-count owner's vocabulary.
+fn assertion_mode(mode: &AssertRowsMode) -> AssertNumRowsMode {
+    use crate::exec::node::assert::Assertion;
+    match mode {
+        AssertRowsMode::Global {
+            desired_num_rows,
+            assertion,
+            subquery_string,
+        } => AssertNumRowsMode::Global {
+            desired_num_rows: *desired_num_rows,
+            assertion: match assertion {
+                RowAssertion::Eq => Assertion::Eq,
+                RowAssertion::Ne => Assertion::Ne,
+                RowAssertion::Lt => Assertion::Lt,
+                RowAssertion::Le => Assertion::Le,
+                RowAssertion::Gt => Assertion::Gt,
+                RowAssertion::Ge => Assertion::Ge,
+            },
+            subquery_string: subquery_string.as_ref().map(ToString::to_string),
+        },
+        AssertRowsMode::PerKeyAtMostOne {
+            key_slots,
+            key_labels,
+            message_prefix,
+        } => AssertNumRowsMode::PerKeyAtMostOne {
+            key_slots: key_slots.clone(),
+            key_labels: key_labels.iter().map(ToString::to_string).collect(),
+            message_prefix: message_prefix.to_string(),
+        },
     }
 }
 
@@ -266,3 +454,23 @@ mod tests;
 #[cfg(test)]
 #[path = "compiled_exchange_tests.rs"]
 mod exchange_tests;
+
+#[cfg(test)]
+#[path = "compiled_family_fixture.rs"]
+mod family_fixture;
+
+#[cfg(test)]
+#[path = "compiled_sort_tests.rs"]
+mod sort_tests;
+
+#[cfg(test)]
+#[path = "compiled_union_tests.rs"]
+mod union_tests;
+
+#[cfg(test)]
+#[path = "compiled_assert_tests.rs"]
+mod assert_tests;
+
+#[cfg(test)]
+#[path = "compiled_expand_tests.rs"]
+mod expand_tests;
