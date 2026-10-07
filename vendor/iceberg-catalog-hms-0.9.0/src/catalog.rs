@@ -67,9 +67,21 @@ impl Default for HmsCatalogBuilder {
                 thrift_transport: HmsThriftTransport::default(),
                 warehouse: "".to_string(),
                 props: HashMap::new(),
+                table_metadata_decoder: None,
             },
             storage_factory: None,
         }
+    }
+}
+
+impl HmsCatalogBuilder {
+    /// Use a provider-preflighted decoder while retaining SDK file handling.
+    pub fn with_table_metadata_decoder(
+        mut self,
+        decoder: fn(&[u8]) -> Result<TableMetadata>,
+    ) -> Self {
+        self.config.table_metadata_decoder = Some(decoder);
+        self
     }
 }
 
@@ -160,6 +172,7 @@ pub(crate) struct HmsCatalogConfig {
     thrift_transport: HmsThriftTransport,
     warehouse: String,
     props: HashMap<String, String>,
+    table_metadata_decoder: Option<fn(&[u8]) -> Result<TableMetadata>>,
 }
 
 struct HmsClient(ThriftHiveMetastoreClient);
@@ -551,7 +564,13 @@ impl Catalog for HmsCatalog {
 
         let metadata_location = get_metadata_location(&hive_table.parameters)?;
 
-        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location).await?;
+        let metadata = match self.config.table_metadata_decoder {
+            Some(decode) => {
+                TableMetadata::read_from_with_decoder(&self.file_io, &metadata_location, decode)
+                    .await?
+            }
+            None => TableMetadata::read_from(&self.file_io, &metadata_location).await?,
+        };
 
         Table::builder()
             .file_io(self.file_io())

@@ -32,7 +32,7 @@ impl AnalyzerContext<'_> {
         source: Option<&ast::Expr>,
         expression: &TypedExpr,
         scope: &AnalyzerScope,
-    ) -> Option<SqlType> {
+    ) -> Result<Option<SqlType>, AnalyzeError> {
         // A declared target cannot validate arbitrary Utf8. Only an already
         // proven JSON operand keeps its domain through a same-domain cast.
         // Public string-to-JSON conversion belongs to its cast owner.
@@ -40,12 +40,24 @@ impl AnalyzerContext<'_> {
             let json_target = cast.data_type.name.parts.last().is_some_and(|part| {
                 matches!(part.value.to_ascii_lowercase().as_str(), "json" | "jsonb")
             });
-            return match (&expression.kind, json_target) {
+            return Ok(match (&expression.kind, json_target) {
                 (ExprKind::Cast { expr: inner, .. }, true) => self
-                    .logical_output_type(Some(&cast.expr), inner, scope)
+                    .logical_output_type(Some(&cast.expr), inner, scope)?
                     .filter(|logical| matches!(logical, SqlType::Json)),
                 _ => None,
-            };
+            });
+        }
+        if let ExprKind::FunctionCall { binding, .. } = &expression.kind {
+            // Access paths are not root column names. Consume the selected
+            // Field proof before any AST name shortcut, propagating corruption.
+            let declared = super::resolve_expr::declared_input_logical_type(
+                expression,
+                scope,
+                source.map_or(Span::new(0, 0), ast::Expr::span),
+            )?;
+            return Ok(declared
+                .filter(|logical| matches!(logical, SqlType::Json | SqlType::Bitmap | SqlType::Hll))
+                .or_else(|| crate::functions::scalar_output_logical_type(binding)));
         }
         let source_binding = match source {
             Some(ast::Expr::Identifier(ident)) => scope.resolve(None, &ident.value).ok(),
@@ -58,17 +70,16 @@ impl AnalyzerContext<'_> {
             _ => None,
         };
         if let Some((column_id, _, _)) = source_binding {
-            return self.factory.borrow().logical_type(column_id);
+            return Ok(self.factory.borrow().logical_type(column_id));
         }
-        match &expression.kind {
-            ExprKind::Cast { expr: inner, .. } => self.logical_output_type(source, inner, scope),
+        let logical = match &expression.kind {
+            ExprKind::Cast { expr: inner, .. } => {
+                return self.logical_output_type(source, inner, scope);
+            }
             ExprKind::ColumnRef { .. } => {
                 scope.logical_type_of_expr(expression).filter(|logical| {
                     matches!(logical, SqlType::Json | SqlType::Bitmap | SqlType::Hll)
                 })
-            }
-            ExprKind::FunctionCall { binding, .. } => {
-                crate::functions::scalar_output_logical_type(binding)
             }
             ExprKind::Case {
                 when_then,
@@ -76,7 +87,7 @@ impl AnalyzerContext<'_> {
                 ..
             } => {
                 let Some(ast::Expr::Case(case)) = source else {
-                    return None;
+                    return Ok(None);
                 };
                 let mut saw_json = false;
                 for (source, value) in case
@@ -94,23 +105,27 @@ impl AnalyzerContext<'_> {
                     ) {
                         continue;
                     }
-                    if self.logical_output_type(Some(source), value, scope) != Some(SqlType::Json) {
-                        return None;
+                    if self.logical_output_type(Some(source), value, scope)? != Some(SqlType::Json)
+                    {
+                        return Ok(None);
                     }
                     saw_json = true;
                 }
                 saw_json.then_some(SqlType::Json)
             }
-            ExprKind::Nested(inner) => self.logical_output_type(
-                source.and_then(|source| match source {
-                    ast::Expr::Nested(nested) => Some(nested.expression.as_ref()),
-                    _ => None,
-                }),
-                inner,
-                scope,
-            ),
+            ExprKind::Nested(inner) => {
+                return self.logical_output_type(
+                    source.and_then(|source| match source {
+                        ast::Expr::Nested(nested) => Some(nested.expression.as_ref()),
+                        _ => None,
+                    }),
+                    inner,
+                    scope,
+                );
+            }
             _ => None,
-        }
+        };
+        Ok(logical)
     }
 
     /// Value provenance is separate from a public CAST target's type spelling.
@@ -121,10 +136,10 @@ impl AnalyzerContext<'_> {
         source: Option<&ast::Expr>,
         expression: &TypedExpr,
         scope: &AnalyzerScope,
-    ) -> bool {
+    ) -> Result<bool, AnalyzeError> {
         if let Some(ast::Expr::Cast(cast)) = source {
             let Some(ast::TypeNameArgument::Type(item)) = cast.data_type.arguments.first() else {
-                return false;
+                return Ok(false);
             };
             let array_json = cast
                 .data_type
@@ -135,9 +150,12 @@ impl AnalyzerContext<'_> {
                 && item.name.parts.last().is_some_and(|part| {
                     matches!(part.value.to_ascii_lowercase().as_str(), "json" | "jsonb")
                 });
-            return array_json
-                && matches!(&expression.kind,
-                ExprKind::Cast { expr: inner, .. } if self.json_list_provenance(Some(&cast.expr), inner, scope));
+            return match (&expression.kind, array_json) {
+                (ExprKind::Cast { expr: inner, .. }, true) => {
+                    self.json_list_provenance(Some(&cast.expr), inner, scope)
+                }
+                _ => Ok(false),
+            };
         }
         let source_id = match source {
             Some(ast::Expr::Identifier(ident)) => scope.resolve(None, &ident.value).ok(),
@@ -150,58 +168,60 @@ impl AnalyzerContext<'_> {
             _ => None,
         };
         if let Some((column_id, _, _)) = source_id {
-            return self.factory.borrow().has_json_list_provenance(column_id);
+            return Ok(self.factory.borrow().has_json_list_provenance(column_id));
         }
-        match &expression.kind {
+        let json_list = match &expression.kind {
             // Internal output adapters and materialized binding coercions do
             // not establish proof. The original source must establish it.
-            ExprKind::Cast { expr: inner, .. } => self.json_list_provenance(source, inner, scope),
+            ExprKind::Cast { expr: inner, .. } => {
+                return self.json_list_provenance(source, inner, scope);
+            }
             ExprKind::ColumnRef { column_id, .. } => {
                 self.factory.borrow().has_json_list_provenance(*column_id)
             }
-            ExprKind::Nested(inner) => self.json_list_provenance(
-                source.and_then(|source| match source {
-                    ast::Expr::Nested(nested) => Some(nested.expression.as_ref()),
-                    _ => None,
-                }),
-                inner,
-                scope,
-            ),
+            ExprKind::Nested(inner) => {
+                return self.json_list_provenance(
+                    source.and_then(|source| match source {
+                        ast::Expr::Nested(nested) => Some(nested.expression.as_ref()),
+                        _ => None,
+                    }),
+                    inner,
+                    scope,
+                );
+            }
             ExprKind::FunctionCall { binding, args, .. }
                 if binding.function_id.as_str() == "builtin.scalar/__array_literal/v1" =>
             {
                 let Some(ast::Expr::Array(array)) = source else {
-                    return false;
+                    return Ok(false);
                 };
-                self.json_array_elements_provenance(array, args, scope)
+                return self.json_array_elements_provenance(array, args, scope);
             }
             ExprKind::FunctionCall { binding, args, .. }
                 if binding.function_id.as_str() == "builtin.scalar/array_sortby/v1" =>
             {
                 let Some(ast::Expr::FunctionCall(function)) = source else {
-                    return false;
+                    return Ok(false);
                 };
-                function
-                    .arguments
-                    .first()
-                    .zip(args.first())
-                    .is_some_and(|(source, value)| {
-                        self.json_list_provenance(Some(source), value, scope)
-                    })
+                match function.arguments.first().zip(args.first()) {
+                    Some((source, value)) => {
+                        self.json_list_provenance(Some(source), value, scope)?
+                    }
+                    None => false,
+                }
             }
             ExprKind::AggregateCall { resolved, args, .. }
                 if resolved.function_id.as_str() == "builtin.aggregate/array_agg/v1" =>
             {
                 let Some(ast::Expr::FunctionCall(function)) = source else {
-                    return false;
+                    return Ok(false);
                 };
-                function
-                    .arguments
-                    .first()
-                    .zip(args.first())
-                    .is_some_and(|(source, value)| {
-                        self.logical_output_type(Some(source), value, scope) == Some(SqlType::Json)
-                    })
+                match function.arguments.first().zip(args.first()) {
+                    Some((source, value)) => {
+                        self.logical_output_type(Some(source), value, scope)? == Some(SqlType::Json)
+                    }
+                    None => false,
+                }
             }
             ExprKind::WindowCall {
                 aggregate_binding: Some(binding),
@@ -209,15 +229,14 @@ impl AnalyzerContext<'_> {
                 ..
             } if binding.function_id.as_str() == "builtin.aggregate/array_agg/v1" => {
                 let Some(ast::Expr::FunctionCall(function)) = source else {
-                    return false;
+                    return Ok(false);
                 };
-                function
-                    .arguments
-                    .first()
-                    .zip(args.first())
-                    .is_some_and(|(source, value)| {
-                        self.logical_output_type(Some(source), value, scope) == Some(SqlType::Json)
-                    })
+                match function.arguments.first().zip(args.first()) {
+                    Some((source, value)) => {
+                        self.logical_output_type(Some(source), value, scope)? == Some(SqlType::Json)
+                    }
+                    None => false,
+                }
             }
             ExprKind::Case {
                 when_then,
@@ -225,7 +244,7 @@ impl AnalyzerContext<'_> {
                 ..
             } => {
                 let Some(ast::Expr::Case(case)) = source else {
-                    return false;
+                    return Ok(false);
                 };
                 let mut saw_json = false;
                 for (source, value) in case
@@ -243,15 +262,16 @@ impl AnalyzerContext<'_> {
                     ) {
                         continue;
                     }
-                    if !self.json_list_provenance(Some(source), value, scope) {
-                        return false;
+                    if !self.json_list_provenance(Some(source), value, scope)? {
+                        return Ok(false);
                     }
                     saw_json = true;
                 }
                 saw_json
             }
             _ => false,
-        }
+        };
+        Ok(json_list)
     }
 
     pub(super) fn json_array_elements_provenance(
@@ -259,19 +279,17 @@ impl AnalyzerContext<'_> {
         array: &ast::ArrayExpr,
         args: &[TypedExpr],
         scope: &AnalyzerScope,
-    ) -> bool {
+    ) -> Result<bool, AnalyzeError> {
         if array.element_type.as_ref().is_some_and(|target| {
             !target.name.parts.last().is_some_and(|part| {
                 matches!(part.value.to_ascii_lowercase().as_str(), "json" | "jsonb")
             })
-        }) {
-            return false;
-        }
-        if array.elements.len() != args.len() {
-            return false;
+        }) || array.elements.len() != args.len()
+        {
+            return Ok(false);
         }
         let mut saw_json = false;
-        let all_json = array.elements.iter().zip(args).all(|(source, value)| {
+        for (source, value) in array.elements.iter().zip(args) {
             if matches!(
                 source,
                 ast::Expr::Literal(ast::Literal {
@@ -279,13 +297,15 @@ impl AnalyzerContext<'_> {
                     ..
                 })
             ) {
-                return true;
+                continue;
             }
-            let json = self.logical_output_type(Some(source), value, scope) == Some(SqlType::Json);
+            let json = self.logical_output_type(Some(source), value, scope)? == Some(SqlType::Json);
             saw_json |= json;
-            json
-        });
-        all_json && (saw_json || array.element_type.is_some())
+            if !json {
+                return Ok(false);
+            }
+        }
+        Ok(saw_json || array.element_type.is_some())
     }
 
     /// Keep scalar/aggregate bindings exact. The ordinary output CAST adapts

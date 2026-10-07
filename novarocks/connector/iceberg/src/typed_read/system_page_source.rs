@@ -826,12 +826,13 @@ fn parse_metadata(
     reference: &IcebergSystemTableReference,
     bytes: &Bytes,
 ) -> Result<TableMetadata, ConnectorError> {
-    let metadata: TableMetadata = serde_json::from_slice(bytes.as_ref()).map_err(|error| {
-        corrupt(format!(
-            "iceberg metadata file {} is not table metadata: {error}",
-            reference.metadata_file_location()
-        ))
-    })?;
+    let metadata: TableMetadata =
+        crate::schema_preflight::decode_table_metadata_bytes(bytes.as_ref()).map_err(|error| {
+            corrupt(format!(
+                "iceberg metadata file {} is not table metadata: {error}",
+                reference.metadata_file_location()
+            ))
+        })?;
     reference.verify_loaded_metadata(&metadata)?;
     Ok(metadata)
 }

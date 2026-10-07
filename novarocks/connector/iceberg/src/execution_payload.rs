@@ -129,6 +129,18 @@ pub fn decode_payload<T: for<'de> Deserialize<'de>>(
     })
 }
 
+pub(crate) fn decode_table_payload(
+    payload: &Bytes,
+    subject: &str,
+) -> Result<crate::metadata::IcebergTablePayload, ConnectorError> {
+    crate::schema_preflight::decode_provider_payload(payload).map_err(|error| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            format!("decode Iceberg {subject}: {error}"),
+        )
+    })
+}
+
 pub fn canonical_split_name_mapping(mapping: &str) -> Result<String, ConnectorError> {
     if mapping.len() > novarocks_spi::connector::MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES
     {

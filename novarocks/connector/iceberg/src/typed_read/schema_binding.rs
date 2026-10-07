@@ -40,7 +40,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, RecordBatch, StructArray, UInt64Array, make_array};
+use arrow::array::{
+    Array, ArrayRef, FixedSizeListArray, LargeListArray, ListArray, MapArray, RecordBatch,
+    StructArray, UInt64Array, make_array, new_null_array,
+};
 use arrow::buffer::NullBuffer;
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, FieldRef, Schema as ArrowSchema, SchemaRef, TimeUnit};
@@ -317,6 +320,8 @@ pub struct IcebergSchemaBinding {
     physical_base_field_ids: Vec<i32>,
     coverage: FileFieldIdCoverage,
     name_mapping: Option<Arc<NameMapping>>,
+    /// Exact semantic parent identities in the frozen physical table schema.
+    field_parents: HashMap<i32, Option<i32>>,
 }
 
 impl IcebergSchemaBinding {
@@ -357,8 +362,9 @@ impl IcebergSchemaBinding {
 
     /// Best-effort retained size of the binding itself.
     pub fn retained_size_in_bytes(&self) -> u64 {
-        let mut retained =
-            size_of::<Self>() + self.physical_base_field_ids.len() * size_of::<i32>();
+        let mut retained = size_of::<Self>()
+            + self.physical_base_field_ids.len() * size_of::<i32>()
+            + self.field_parents.capacity() * (size_of::<(i32, Option<i32>)>() + 16);
         for column in &self.columns {
             retained += size_of::<IcebergBoundColumn>()
                 + column.handle.base_type_json().len()
@@ -396,7 +402,20 @@ impl IcebergSchemaBinding {
         // The physical schema is re-indexed per batch because a reader may
         // legally reorder or narrow its output; the binding decisions
         // themselves never change.
-        let physical = PhysicalIndex::build(&batch.schema(), self.name_mapping.as_deref())?;
+        let effective_schema = match self.name_mapping.as_deref() {
+            Some(mapping) => apply_name_mapping_to_schema(&batch.schema(), mapping)
+                .map_err(|error| corrupt(format!("iceberg name mapping: {error}")))?,
+            None => batch.schema(),
+        };
+        // These short-lived indexes validate the complete batch before any
+        // array is cloned or reconstructed. Retired IDs may be dropped, but
+        // an active ID cannot migrate to another semantic parent.
+        validate_physical_id_parents(
+            &effective_schema,
+            &self.field_parents,
+            self.coverage == FileFieldIdCoverage::None,
+        )?;
+        let physical = PhysicalIndex::build(&effective_schema, None)?;
 
         let mut columns = Vec::with_capacity(self.columns.len());
         for bound in &self.columns {
@@ -411,8 +430,14 @@ impl IcebergSchemaBinding {
                             facts.path
                         ))
                     })?;
-                    let base =
-                        adapt_array(batch.column(index), bound.base_target.as_ref(), facts.path)?;
+                    let visible = vec![true; row_count];
+                    let base = project_physical_array(
+                        batch.column(index),
+                        effective_schema.field(index),
+                        bound.base_target.as_ref(),
+                        &visible,
+                        facts.path,
+                    )?;
                     let (base, base_target) = match &bound.domain_binding {
                         Some(binding) => (
                             crate::field_domain::restore_array(
@@ -518,6 +543,17 @@ pub fn bind_scan_columns(
     };
 
     let read_schema = annotated_read_schema(request.table_schema)?;
+    let field_parents = semantic_field_parents(&read_schema, false)?;
+    let effective_file_schema = match name_mapping.as_deref() {
+        Some(mapping) => apply_name_mapping_to_schema(request.file_schema, mapping)
+            .map_err(|error| corrupt(format!("iceberg name mapping: {error}")))?,
+        None => Arc::clone(request.file_schema),
+    };
+    validate_physical_id_parents(
+        &effective_file_schema,
+        &field_parents,
+        coverage == FileFieldIdCoverage::None,
+    )?;
     let identity_partitions = identity_partition_values(
         request.partition_spec,
         request.partition_values,
@@ -588,6 +624,7 @@ pub fn bind_scan_columns(
         physical_base_field_ids,
         coverage,
         name_mapping,
+        field_parents,
     })
 }
 
@@ -1142,6 +1179,368 @@ fn identity_partition_values(
     Ok(result)
 }
 
+/// Collect actual semantic IDs, excluding Map's synthetic entries field and
+/// opaque VARIANT encoding children. This traversal is iterative; the raw
+/// footer may also contain retired fields outside the current table schema.
+fn semantic_field_parents(
+    schema: &ArrowSchema,
+    allow_unidentified: bool,
+) -> Result<HashMap<i32, Option<i32>>, ConnectorError> {
+    let mut pending = schema
+        .fields()
+        .iter()
+        .map(|f| (f.as_ref(), None))
+        .collect::<Vec<_>>();
+    let mut parents = HashMap::new();
+    while let Some((field, parent)) = pending.pop() {
+        let id = field_id_for_arrow_field(field)
+            .map_err(|error| corrupt(format!("iceberg nested field identity: {error}")))?;
+        let Some(id) = id else {
+            if allow_unidentified {
+                // An unmapped legacy subtree is not an identity authority.
+                continue;
+            }
+            return Err(corrupt("iceberg physical semantic field lacks a field ID"));
+        };
+        if id <= 0 || parents.insert(id, parent).is_some() {
+            return Err(corrupt(
+                "iceberg physical semantic field IDs are invalid or duplicated",
+            ));
+        }
+        if is_variant_struct_data_type(field.data_type()) {
+            continue;
+        }
+        let mut data_type = field.data_type();
+        while let DataType::Dictionary(_, values) = data_type {
+            data_type = values;
+        }
+        if is_variant_struct_data_type(data_type) {
+            continue;
+        }
+        match data_type {
+            DataType::Struct(fields) => {
+                pending.extend(fields.iter().map(|f| (f.as_ref(), Some(id))))
+            }
+            DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => {
+                pending.push((f.as_ref(), Some(id)));
+            }
+            DataType::Map(entries, _) => {
+                let DataType::Struct(fields) = entries.data_type() else {
+                    return Err(corrupt("iceberg map has non-struct entries"));
+                };
+                if fields.len() != 2 {
+                    return Err(corrupt("iceberg map must carry exactly key and value"));
+                }
+                pending.extend(fields.iter().map(|f| (f.as_ref(), Some(id))));
+            }
+            _ => {}
+        }
+    }
+    Ok(parents)
+}
+
+fn validate_physical_id_parents(
+    source: &ArrowSchema,
+    expected: &HashMap<i32, Option<i32>>,
+    allow_unidentified: bool,
+) -> Result<(), ConnectorError> {
+    let actual = semantic_field_parents(source, allow_unidentified)?;
+    for (id, parent) in actual {
+        if let Some(expected_parent) = expected.get(&id)
+            && *expected_parent != parent
+        {
+            return Err(corrupt(format!(
+                "iceberg physical field id {id} belongs to a different semantic parent"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn require_same_field_id(source: &Field, target: &Field) -> Result<(), ConnectorError> {
+    let source_id = field_id_for_arrow_field(source).map_err(|error| corrupt(error.to_string()))?;
+    let target_id = field_id_for_arrow_field(target).map_err(|error| corrupt(error.to_string()))?;
+    if source_id.is_none() || source_id != target_id {
+        return Err(corrupt(
+            "iceberg collection member has a different field ID",
+        ));
+    }
+    Ok(())
+}
+
+fn missing_nested_array(target: &Field, len: usize) -> Result<ArrayRef, ConnectorError> {
+    if target
+        .metadata()
+        .contains_key(ICEBERG_INITIAL_DEFAULT_META_KEY)
+    {
+        build_iceberg_default_array(target, len)
+            .map_err(|error| corrupt(format!("iceberg initial default: {error}")))
+    } else if target.is_nullable() {
+        Ok(new_null_array(target.data_type(), len))
+    } else {
+        Err(corrupt(format!(
+            "iceberg data file is missing required field {} and declares no initial default",
+            target.name()
+        )))
+    }
+}
+
+/// Resolve nested physical values by provider ID before logical-domain
+/// restoration. Names and ordinals never select a field; offsets, container
+/// ordering and parent validity remain those of the original physical array.
+fn project_physical_array(
+    source: &ArrayRef,
+    source_field: &Field,
+    target: &Field,
+    visible: &[bool],
+    path: &str,
+) -> Result<ArrayRef, ConnectorError> {
+    if source.len() != visible.len() {
+        return Err(corrupt(
+            "iceberg physical projection visibility length differs",
+        ));
+    }
+    require_same_field_id(source_field, target)?;
+    // Decode only a dictionary's existing outer encoding, retaining the
+    // actual child fields. Casting directly to target would match by ordinal.
+    let decoded_type = match (source_field.data_type(), target.data_type()) {
+        (DataType::Dictionary(_, values), _) => Some(values.as_ref().clone()),
+        _ => None,
+    };
+    if let Some(data_type) = decoded_type {
+        let decoded = cast(source.as_ref(), &data_type)
+            .map_err(|error| corrupt(format!("iceberg physical outer representation: {error}")))?;
+        let field = source_field.clone().with_data_type(data_type);
+        return project_physical_array(&decoded, &field, target, visible, path);
+    }
+    let result: ArrayRef = match (source_field.data_type(), target.data_type()) {
+        (DataType::Struct(source_fields), DataType::Struct(target_fields))
+            if !is_variant_struct_data_type(source_field.data_type()) =>
+        {
+            let array = source
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| corrupt("iceberg physical struct has incompatible array"))?;
+            if array.num_columns() != source_fields.len() {
+                return Err(corrupt("iceberg physical struct arity differs"));
+            }
+            let mask = (0..array.len())
+                .map(|i| visible[i] && array.is_valid(i))
+                .collect::<Vec<_>>();
+            let by_id = source_fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    field_id_for_arrow_field(field)
+                        .map_err(|error| corrupt(error.to_string()))
+                        .map(|id| id.map(|id| (id, index)))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect::<HashMap<_, _>>();
+            let children = target_fields
+                .iter()
+                .map(|field| {
+                    let id = field_id_for_arrow_field(field)
+                        .map_err(|error| corrupt(error.to_string()))?
+                        .ok_or_else(|| corrupt("iceberg target struct child lacks a field ID"))?;
+                    match by_id.get(&id) {
+                        Some(index) => project_physical_array(
+                            array.column(*index),
+                            source_fields[*index].as_ref(),
+                            field,
+                            &mask,
+                            path,
+                        ),
+                        None => missing_nested_array(field, array.len()),
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Arc::new(
+                StructArray::try_new(target_fields.clone(), children, array.nulls().cloned())
+                    .map_err(|error| {
+                        corrupt(format!("iceberg physical struct projection: {error}"))
+                    })?,
+            )
+        }
+        (DataType::List(from), DataType::List(to)) => {
+            require_same_field_id(from, to)?;
+            let array = source
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| corrupt("iceberg physical list has incompatible array"))?;
+            let mask = collection_visibility(
+                visible,
+                array.nulls(),
+                array.value_offsets(),
+                array.values().len(),
+            )?;
+            let values = project_physical_array(array.values(), from, to, &mask, path)?;
+            Arc::new(
+                ListArray::try_new(
+                    Arc::clone(to),
+                    array.offsets().clone(),
+                    values,
+                    array.nulls().cloned(),
+                )
+                .map_err(|error| corrupt(format!("iceberg physical list projection: {error}")))?,
+            )
+        }
+        (DataType::LargeList(from), DataType::LargeList(to)) => {
+            require_same_field_id(from, to)?;
+            let array = source
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .ok_or_else(|| corrupt("iceberg physical large list has incompatible array"))?;
+            let mask = collection_visibility(
+                visible,
+                array.nulls(),
+                array.value_offsets(),
+                array.values().len(),
+            )?;
+            let values = project_physical_array(array.values(), from, to, &mask, path)?;
+            Arc::new(
+                LargeListArray::try_new(
+                    Arc::clone(to),
+                    array.offsets().clone(),
+                    values,
+                    array.nulls().cloned(),
+                )
+                .map_err(|error| {
+                    corrupt(format!("iceberg physical large list projection: {error}"))
+                })?,
+            )
+        }
+        (DataType::FixedSizeList(from, from_size), DataType::FixedSizeList(to, to_size))
+            if from_size == to_size =>
+        {
+            let array = source
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| corrupt("iceberg physical fixed list has incompatible array"))?;
+            let size = usize::try_from(*from_size)
+                .map_err(|_| corrupt("iceberg fixed list size is negative"))?;
+            let mut mask = vec![false; array.values().len()];
+            for (index, visible) in visible.iter().copied().enumerate() {
+                if visible && array.is_valid(index) {
+                    let start = index
+                        .checked_mul(size)
+                        .ok_or_else(|| corrupt("iceberg fixed list offset overflow"))?;
+                    let end = start
+                        .checked_add(size)
+                        .ok_or_else(|| corrupt("iceberg fixed list offset overflow"))?;
+                    let range = mask
+                        .get_mut(start..end)
+                        .ok_or_else(|| corrupt("iceberg fixed list offsets exceed values"))?;
+                    range.fill(true);
+                }
+            }
+            let values = project_physical_array(array.values(), from, to, &mask, path)?;
+            Arc::new(
+                FixedSizeListArray::try_new(to.clone(), *to_size, values, array.nulls().cloned())
+                    .map_err(|error| {
+                    corrupt(format!("iceberg physical fixed list projection: {error}"))
+                })?,
+            )
+        }
+        (DataType::Map(from, from_order), DataType::Map(to, to_order))
+            if from_order == to_order =>
+        {
+            let (DataType::Struct(from_fields), DataType::Struct(to_fields)) =
+                (from.data_type(), to.data_type())
+            else {
+                return Err(corrupt("iceberg map projection has non-struct entries"));
+            };
+            if from_fields.len() != 2 || to_fields.len() != 2 {
+                return Err(corrupt("iceberg map projection must carry key and value"));
+            }
+            require_same_field_id(&from_fields[0], &to_fields[0])?;
+            require_same_field_id(&from_fields[1], &to_fields[1])?;
+            let array = source
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .ok_or_else(|| corrupt("iceberg physical map has incompatible array"))?;
+            let mask = collection_visibility(
+                visible,
+                array.nulls(),
+                array.value_offsets(),
+                array.entries().len(),
+            )?;
+            let key =
+                project_physical_array(array.keys(), &from_fields[0], &to_fields[0], &mask, path)?;
+            let value = project_physical_array(
+                array.values(),
+                &from_fields[1],
+                &to_fields[1],
+                &mask,
+                path,
+            )?;
+            let entries = StructArray::try_new(
+                to_fields.clone(),
+                vec![key, value],
+                array.entries().nulls().cloned(),
+            )
+            .map_err(|error| {
+                corrupt(format!("iceberg physical map entries projection: {error}"))
+            })?;
+            Arc::new(
+                MapArray::try_new(
+                    Arc::clone(to),
+                    array.offsets().clone(),
+                    entries,
+                    array.nulls().cloned(),
+                    *to_order,
+                )
+                .map_err(|error| corrupt(format!("iceberg physical map projection: {error}")))?,
+            )
+        }
+        _ => adapt_array(source, target, path)?,
+    };
+    if !target.is_nullable() && (0..result.len()).any(|i| visible[i] && result.is_null(i)) {
+        return Err(corrupt(format!(
+            "iceberg required physical field {} carries a visible null",
+            target.name()
+        )));
+    }
+    Ok(result)
+}
+
+fn collection_visibility<O: Copy + TryInto<usize>>(
+    visible: &[bool],
+    nulls: Option<&NullBuffer>,
+    offsets: &[O],
+    values_len: usize,
+) -> Result<Vec<bool>, ConnectorError> {
+    if offsets.len()
+        != visible
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| corrupt("iceberg collection length overflow"))?
+        || nulls.is_some_and(|nulls| nulls.len() != visible.len())
+    {
+        return Err(corrupt(
+            "iceberg collection offsets or validity length differs",
+        ));
+    }
+    let mut mask = vec![false; values_len];
+    for (i, visible) in visible.iter().copied().enumerate() {
+        let start = offsets[i].try_into().map_err(|_| {
+            corrupt("iceberg collection offset is negative or exceeds platform range")
+        })?;
+        let end = offsets[i + 1].try_into().map_err(|_| {
+            corrupt("iceberg collection offset is negative or exceeds platform range")
+        })?;
+        let range = mask
+            .get_mut(start..end)
+            .ok_or_else(|| corrupt("iceberg collection offsets are unordered or exceed values"))?;
+        if visible && nulls.is_none_or(|nulls| nulls.is_valid(i)) {
+            range.fill(true);
+        }
+    }
+    Ok(mask)
+}
+
 fn adapt_array(source: &ArrayRef, target: &Field, path: &str) -> Result<ArrayRef, ConnectorError> {
     match physical_adaptation(source.data_type(), target.data_type())? {
         IcebergPhysicalAdaptation::Identity => Ok(Arc::clone(source)),
@@ -1391,6 +1790,13 @@ fn metadata_column(
 }
 
 #[cfg(test)]
+#[path = "schema_binding/id_collection_tests.rs"]
+mod id_collection_tests;
+#[cfg(test)]
+#[path = "schema_binding/id_identity_tests.rs"]
+mod id_identity_tests;
+
+#[cfg(test)]
 mod tests {
     use std::collections::HashMap as StdHashMap;
 
@@ -1450,6 +1856,251 @@ mod tests {
             partition_values: None,
             columns,
         }
+    }
+
+    fn materialize_test_batch(
+        schema: &IcebergSchema,
+        batch: &RecordBatch,
+        columns: &[IcebergColumnHandle],
+    ) -> Result<Vec<ArrayRef>, ConnectorError> {
+        bind_scan_columns(empty_binding_request(schema, &batch.schema(), columns))?.materialize(
+            batch,
+            None,
+            &IcebergSplitFacts {
+                path: "memory://field-id-projection",
+                file_first_row_id: None,
+                data_sequence_number: None,
+            },
+        )
+    }
+
+    fn identified_field(id: i32, name: &str, data_type: DataType, nullable: bool) -> Field {
+        Field::new(name, data_type, nullable).with_metadata(field_id_metadata(id))
+    }
+
+    #[test]
+    fn nested_id_projection_restores_old_and_new_files_without_name_or_position_matching() {
+        use crate::field_domain::{FieldDomain, PersistedFieldDomains};
+        use arrow::array::Int8Array;
+        use std::collections::BTreeMap;
+        let schema = IcebergSchema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                2,
+                "payload",
+                Type::Struct(StructType::new(vec![
+                    Arc::new(NestedField::required(
+                        6,
+                        "note",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                    Arc::new(NestedField::required(
+                        5,
+                        "tiny_renamed",
+                        Type::Primitive(PrimitiveType::Int),
+                    )),
+                    Arc::new(NestedField::optional(
+                        8,
+                        "reused",
+                        Type::Primitive(PrimitiveType::Int),
+                    )),
+                    Arc::new(
+                        NestedField::required(9, "defaulted", Type::Primitive(PrimitiveType::Int))
+                            .with_initial_default(IcebergLiteral::int(42)),
+                    ),
+                ])),
+            ))])
+            .build()
+            .unwrap();
+        let base = handle(&schema, 2)
+            .with_table_field_domains(&PersistedFieldDomains::FieldDomainsV1(BTreeMap::from([
+                (5, FieldDomain::Int8),
+                (6, FieldDomain::Json),
+            ])))
+            .unwrap();
+        let columns = [
+            base.clone(),
+            base.dereference(&[5]).unwrap(),
+            base.dereference(&[6]).unwrap(),
+        ];
+        let old_fields: Fields = vec![
+            identified_field(5, "tiny", DataType::Int32, false),
+            identified_field(6, "note", DataType::Utf8, false),
+            identified_field(7, "reused", DataType::Int32, true),
+        ]
+        .into();
+        let old_array: ArrayRef = Arc::new(StructArray::new(
+            old_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![999, -128, 127])),
+                Arc::new(StringArray::from(vec![
+                    "hidden",
+                    "{ \"b\":2,\"a\":1 }",
+                    "not-json",
+                ])),
+                Arc::new(Int32Array::from(vec![100, 101, 102])),
+            ],
+            Some(NullBuffer::from(vec![false, true, true])),
+        ));
+        let old_batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![identified_field(
+                2,
+                "payload",
+                DataType::Struct(old_fields),
+                true,
+            )])),
+            vec![old_array],
+        )
+        .unwrap();
+        let output = materialize_test_batch(&schema, &old_batch, &columns).unwrap();
+        assert_eq!(
+            output[1]
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![None, Some(-128), Some(127)]
+        );
+        assert_eq!(
+            output[2]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![None, Some("{ \"b\":2,\"a\":1 }"), Some("not-json")]
+        );
+        let root = output[0].as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(
+            root.column(2).null_count(),
+            3,
+            "same name with a new ID never retrieves retired values"
+        );
+        assert_eq!(
+            root.column(3)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(1),
+            42
+        );
+        let target_schema = annotated_read_schema(&schema).unwrap();
+        let DataType::Struct(fields) = target_schema.field(0).data_type() else {
+            panic!("struct");
+        };
+        let new_batch = RecordBatch::try_new(
+            target_schema.clone(),
+            vec![Arc::new(StructArray::new(
+                fields.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["{ \"b\":2,\"a\":1 }"])),
+                    Arc::new(Int32Array::from(vec![-128])),
+                    Arc::new(Int32Array::from(vec![77])),
+                    Arc::new(Int32Array::from(vec![42])),
+                ],
+                None,
+            ))],
+        )
+        .unwrap();
+        let new = materialize_test_batch(&schema, &new_batch, &columns).unwrap();
+        assert_eq!(
+            new[1]
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .unwrap()
+                .value(0),
+            -128
+        );
+        assert_eq!(
+            new[0]
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap()
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            77
+        );
+    }
+
+    #[test]
+    fn nested_id_projection_same_type_reorder_and_leaf_promotion_are_exact() {
+        let schema = IcebergSchema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "s",
+                Type::Struct(StructType::new(vec![
+                    Arc::new(NestedField::optional(
+                        3,
+                        "second",
+                        Type::Primitive(PrimitiveType::Int),
+                    )),
+                    Arc::new(NestedField::optional(
+                        2,
+                        "promoted",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::optional(
+                        4,
+                        "first",
+                        Type::Primitive(PrimitiveType::Int),
+                    )),
+                ])),
+            ))])
+            .build()
+            .unwrap();
+        let fields: Fields = vec![
+            identified_field(4, "first", DataType::Int32, true),
+            identified_field(3, "second", DataType::Int32, true),
+            identified_field(2, "old", DataType::Int32, true),
+        ]
+        .into();
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![identified_field(
+                1,
+                "s",
+                DataType::Struct(fields.clone()),
+                true,
+            )])),
+            vec![Arc::new(StructArray::new(
+                fields,
+                vec![
+                    Arc::new(Int32Array::from(vec![11])),
+                    Arc::new(Int32Array::from(vec![22])),
+                    Arc::new(Int32Array::from(vec![300])),
+                ],
+                None,
+            ))],
+        )
+        .unwrap();
+        let output = materialize_test_batch(&schema, &batch, &[handle(&schema, 1)]).unwrap();
+        let root = output[0].as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(
+            root.column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            22
+        );
+        assert_eq!(
+            root.column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            300
+        );
+        assert_eq!(
+            root.column(2)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            11
+        );
     }
 
     #[test]

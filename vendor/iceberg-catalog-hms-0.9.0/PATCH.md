@@ -39,3 +39,11 @@ Its `iceberg` dependency (`version = "0.9.0"`) is redirected to
   classifies absence from the error kind alone (there is no message-sniffing
   fallback), so without this a Hive catalog would report an absent table as an
   unavailable control plane.
+
+## Provider-preflighted table metadata decode
+
+`HmsCatalogBuilder::with_table_metadata_decoder` optionally installs the
+provider's table metadata decoder. `load_table` passes it to the SDK file
+reader, preserving compression handling and default decode behavior when no
+callback was supplied. NovaRocks configures its schema-budget preflighted
+decoder; no Hive managed-MV or staged-create surface is added.

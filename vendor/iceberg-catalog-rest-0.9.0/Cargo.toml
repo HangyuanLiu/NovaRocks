@@ -74,6 +74,7 @@ version = "1.0.219"
 
 [dependencies.serde_json]
 version = "1.0.142"
+features = ["unbounded_depth"]
 
 [dependencies.tokio]
 version = "1.47"

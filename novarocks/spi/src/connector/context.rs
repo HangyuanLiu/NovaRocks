@@ -876,6 +876,30 @@ mod tests {
     }
 
     #[test]
+    fn read_planning_projection_preserves_admitted_provider_metadata_scope() {
+        struct FrozenMetadataMarker;
+
+        let context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            ConnectorStopOwner::new().view(),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .unwrap();
+        let admitted = context.request_scope_extension_or_insert_with(|| FrozenMetadataMarker);
+        let projected = context
+            .clone()
+            .with_storage_resolver(Arc::new(RejectingResolver))
+            .with_vended_credential_lease_sink(Arc::new(RejectingSink))
+            .without_attempt_capabilities();
+        let planning = ConnectorPlanningContext::try_from_request(projected).unwrap();
+        let observed = planning
+            .request()
+            .request_scope_extension_or_insert_with(|| FrozenMetadataMarker);
+        assert!(Arc::ptr_eq(&admitted, &observed));
+    }
+
+    #[test]
     fn planning_context_rejects_attempt_credential_collection() {
         let base = ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),

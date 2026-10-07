@@ -138,6 +138,27 @@ pub fn load_connector_table_materialization_with_lease_typed(
     namespace: &str,
     table: &str,
 ) -> CatalogResolutionResult<ConnectorQueryTableMaterialization> {
+    load_connector_table_materialization_for_read_with_lease_typed(
+        controls,
+        context,
+        catalog,
+        namespace,
+        table,
+        novarocks_spi::connector::ConnectorReadSelector::Current,
+    )
+}
+
+/// Freeze the selected relation schema and all planning facts in the same
+/// metadata request and admitted control lease. Historical reads never first
+/// materialize a current schema or fall back after a provider refusal.
+pub fn load_connector_table_materialization_for_read_with_lease_typed(
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+    selector: novarocks_spi::connector::ConnectorReadSelector,
+) -> CatalogResolutionResult<ConnectorQueryTableMaterialization> {
     load_connector_table_materialization_with_resolution_typed(
         controls,
         context,
@@ -145,6 +166,7 @@ pub fn load_connector_table_materialization_with_lease_typed(
         namespace,
         table,
         novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        selector,
     )
 }
 
@@ -179,6 +201,7 @@ pub fn load_connector_table_alias_materialization_with_lease_typed(
         namespace,
         alias,
         novarocks_spi::connector::ConnectorTableResolution::ProviderReadAlias,
+        novarocks_spi::connector::ConnectorReadSelector::Current,
     )
 }
 
@@ -189,6 +212,7 @@ fn load_connector_table_materialization_with_resolution_typed(
     namespace: &str,
     table: &str,
     resolution: novarocks_spi::connector::ConnectorTableResolution,
+    selector: novarocks_spi::connector::ConnectorReadSelector,
 ) -> CatalogResolutionResult<ConnectorQueryTableMaterialization> {
     use novarocks_spi::connector::{
         ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableRequest,
@@ -219,21 +243,27 @@ fn load_connector_table_materialization_with_resolution_typed(
     let metadata = planning_lease
         .binding()
         .metadata()
-        .load_table(ConnectorTableRequest {
-            table: ConnectorTableIdentity {
-                instance_id,
-                namespace: Arc::from(namespace),
-                table: Arc::from(table),
+        .load_table_for_read(
+            ConnectorTableRequest {
+                table: ConnectorTableIdentity {
+                    instance_id,
+                    namespace: Arc::from(namespace),
+                    table: Arc::from(table),
+                },
+                resolution,
+                context,
             },
-            resolution,
-            context,
-        })
+            selector,
+        )
         // An absent relation is a SQL name-resolution failure, not a provider
         // incident: render the vocabulary the rest of the engine already
         // recognizes instead of leaking the provider's own wording.
         .map_err(|error| connector_table_resolution_error(error, namespace, table))?;
-    connector_table_materialization_from_metadata(metadata, planning_lease)
-        .map_err(CatalogResolutionError::failed)
+    let mut materialization =
+        connector_table_materialization_from_metadata(metadata, planning_lease)
+            .map_err(CatalogResolutionError::failed)?;
+    materialization.read_selector = selector;
+    Ok(materialization)
 }
 
 fn connector_table_resolution_error(

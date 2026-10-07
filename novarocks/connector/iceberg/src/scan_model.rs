@@ -187,7 +187,7 @@ pub struct IcebergTableInfo {
     /// is referenced as an Iceberg metadata table (`t$snapshots`,
     /// `t$history`, `t$refs`, `t$partitions`) — the native-Rust
     /// The Iceberg metadata SPI reader parses this string back via
-    /// `serde_json::from_str::<TableMetadata>` to materialise the
+    /// the provider's schema-preflighted SDK decoder to materialise the
     /// metadata rows. The native scan plan carries this payload directly;
     /// there is no JNI bridge on the NovaRocks side. `None` for tables
     /// resolved via paths that do not have access to the Iceberg

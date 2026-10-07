@@ -2048,7 +2048,7 @@ fn table_handle_for_version(
 /// identity. A rename preserves the complete field-ID tree, so current SQL
 /// names remain safe for a historical read. Any structural change keeps the
 /// snapshot's own schema rather than guessing a correspondence.
-fn projection_schema_for_pinned_snapshot(
+pub(crate) fn projection_schema_for_pinned_snapshot(
     metadata: &TableMetadata,
     snapshot_id: i64,
 ) -> Result<SchemaRef, ConnectorError> {

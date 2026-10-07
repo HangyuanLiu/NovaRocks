@@ -1487,6 +1487,26 @@ pub trait ConnectorMetadata: Send + Sync {
         &self,
         request: ConnectorTableRequest,
     ) -> Result<ConnectorTableMetadata, ConnectorError>;
+
+    /// Materialize the schema and opaque read authority for one selected
+    /// relation from a single provider metadata observation. Historical reads
+    /// must return their selected schema, field identities and planning facts
+    /// together; changing only the later scan selector is insufficient.
+    fn load_table_for_read(
+        &self,
+        request: ConnectorTableRequest,
+        selector: ConnectorReadSelector,
+    ) -> Result<ConnectorTableMetadata, ConnectorError> {
+        match selector {
+            ConnectorReadSelector::Current => self.load_table(request),
+            ConnectorReadSelector::SnapshotId(_) | ConnectorReadSelector::TimestampMicros(_) => {
+                Err(ConnectorError::new(
+                    super::ConnectorErrorKind::Unsupported,
+                    "connector metadata does not support historical schema materialization",
+                ))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1560,6 +1580,47 @@ mod tests {
             total_payload_bytes,
         )
         .expect("valid connector request context")
+    }
+
+    #[test]
+    fn historical_metadata_capability_never_falls_back_to_current() {
+        let instance_id = ConnectorInstanceId::parse("test").unwrap();
+        let metadata = MetadataWithoutObjectBinding {
+            instance_id: instance_id.clone(),
+        };
+        let request = || ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: Arc::from("namespace"),
+                table: Arc::from("table"),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context: context(4096),
+        };
+        let current = metadata
+            .load_table_for_read(request(), ConnectorReadSelector::Current)
+            .err()
+            .expect("current request reaches the existing provider method");
+        assert!(
+            current
+                .to_string()
+                .contains("test metadata does not load tables")
+        );
+        for selector in [
+            ConnectorReadSelector::SnapshotId(123),
+            ConnectorReadSelector::TimestampMicros(456),
+        ] {
+            let error = metadata
+                .load_table_for_read(request(), selector)
+                .err()
+                .expect("historical capability must be explicitly implemented");
+            assert_eq!(error.kind(), super::super::ConnectorErrorKind::Unsupported);
+            assert!(
+                error
+                    .to_string()
+                    .contains("historical schema materialization")
+            );
+        }
     }
 
     #[test]
