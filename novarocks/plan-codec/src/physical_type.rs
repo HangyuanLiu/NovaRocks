@@ -19,6 +19,9 @@
 
 use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_proto_models::common;
+use novarocks_type_contract::LogicalTypeLimits;
+
+use crate::native_type::{list_type_desc, map_type_desc, scalar_type_desc, struct_type_desc};
 
 /// Encode an Arrow type only when native wire v1 preserves its exact identity.
 ///
@@ -87,16 +90,14 @@ pub(crate) fn encode_physical_type(data_type: &DataType) -> Result<common::TypeD
         other => unreachable!("validated physical type became unsupported: {other:?}"),
     };
 
-    Ok(common::TypeDesc {
-        kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
-            r#type: primitive as i32,
-            len: None,
-            precision,
-            scale,
-            time_unit,
-            time_zone,
-        })),
-    })
+    Ok(scalar_type_desc(common::ScalarType {
+        r#type: primitive as i32,
+        len: None,
+        precision,
+        scale,
+        time_unit,
+        time_zone,
+    }))
 }
 
 /// Encode only a proved root logical kind over its exact physical carrier.
@@ -108,12 +109,12 @@ pub(crate) fn encode_physical_logical_type(
         return Err("native logical kind does not admit the frozen physical carrier".into());
     }
     match kind {
-        novarocks_physical_plan::ValueLogicalKind::Json => Ok(common::TypeDesc {
-            kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
+        novarocks_physical_plan::ValueLogicalKind::Json => {
+            Ok(scalar_type_desc(common::ScalarType {
                 r#type: common::PrimitiveType::Json as i32,
                 ..Default::default()
-            })),
-        }),
+            }))
+        }
     }
 }
 
@@ -134,12 +135,8 @@ pub(crate) fn encode_arrow_authoritative_compatibility_type(
 fn encode_arrow_authoritative_compatibility_type_inner(
     data_type: &DataType,
 ) -> Result<common::TypeDesc, String> {
-    use common::type_desc::Kind;
-
-    let kind = match data_type {
-        DataType::List(field) => Kind::List(Box::new(common::ListType {
-            element: Some(Box::new(encode_nested_field(field)?)),
-        })),
+    Ok(match data_type {
+        DataType::List(field) => list_type_desc(encode_nested_field(field)?),
         DataType::Map(entries, _) => {
             let DataType::Struct(fields) = entries.data_type() else {
                 return Err("native wire v1 writer map entries must be a struct".into());
@@ -147,25 +144,19 @@ fn encode_arrow_authoritative_compatibility_type_inner(
             if fields.len() != 2 {
                 return Err("native wire v1 writer map entries must contain key and value".into());
             }
-            Kind::Map(Box::new(common::MapType {
-                key: Some(Box::new(encode_nested_field(&fields[0])?)),
-                value: Some(Box::new(encode_nested_field(&fields[1])?)),
-            }))
+            map_type_desc(
+                encode_nested_field(&fields[0])?,
+                encode_nested_field(&fields[1])?,
+            )
         }
-        DataType::Struct(fields) => Kind::Strct(common::StructType {
-            fields: fields
+        DataType::Struct(fields) => struct_type_desc(
+            fields
                 .iter()
-                .map(|field| {
-                    Ok(common::StructField {
-                        name: field.name().clone(),
-                        r#type: Some(encode_nested_field(field)?),
-                    })
-                })
+                .map(|field| Ok((field.name().clone(), encode_nested_field(field)?)))
                 .collect::<Result<Vec<_>, String>>()?,
-        }),
+        ),
         _ => return encode_physical_type(data_type),
-    };
-    Ok(common::TypeDesc { kind: Some(kind) })
+    })
 }
 
 /// The descriptor one nested field is carried by.
@@ -187,38 +178,28 @@ fn encode_nested_field(field: &arrow::datatypes::Field) -> Result<common::TypeDe
         LogicalType::Object => common::PrimitiveType::Object,
         LogicalType::Percentile => common::PrimitiveType::Percentile,
     };
-    Ok(common::TypeDesc {
-        kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
-            r#type: primitive as i32,
-            len: None,
-            precision: None,
-            scale: None,
-            time_unit: None,
-            time_zone: None,
-        })),
-    })
+    Ok(scalar_type_desc(common::ScalarType {
+        r#type: primitive as i32,
+        len: None,
+        precision: None,
+        scale: None,
+        time_unit: None,
+        time_zone: None,
+    }))
 }
 
 /// Validate the legacy SQL shape paired with an exact writer Arrow schema
 /// without allocating its protobuf representation.
+///
+/// Writer relation columns are internal relations: their logical depth keeps
+/// the relation budget, and every leaf must be an exact v1 physical type. The
+/// walk is iterative. Wire nesting is not derived from this type any more:
+/// both carriers are flat, so their protobuf depth is a constant.
 pub(crate) fn validate_arrow_authoritative_compatibility_type(
     data_type: &DataType,
 ) -> Result<(), String> {
-    arrow_authoritative_wire_depths(data_type).map(|_| ())
-}
-
-/// Maximum SQL `TypeDesc` and exact `ArrowPhysicalType` message depths.
-///
-/// The walk is iterative because it is the guard for both recursive encoders.
-/// Map's Arrow path includes its synthetic entries struct and is intentionally
-/// charged more deeply than its SQL compatibility descriptor.
-pub(crate) fn arrow_authoritative_wire_depths(
-    data_type: &DataType,
-) -> Result<(usize, usize), String> {
-    let mut pending = vec![(data_type, 1_usize, 1_usize, 1_usize)];
-    let mut sql_depth = 0_usize;
-    let mut arrow_depth = 0_usize;
-    while let Some((data_type, sql_prefix, arrow_prefix, logical_depth)) = pending.pop() {
+    let mut pending = vec![(data_type, 1_usize)];
+    while let Some((data_type, logical_depth)) = pending.pop() {
         if logical_depth > novarocks_spi::connector::write_stack::MAX_WRITE_RELATION_TYPE_DEPTH {
             return Err(format!(
                 "native wire v1 writer type depth {logical_depth} exceeds the relation limit {}",
@@ -226,16 +207,7 @@ pub(crate) fn arrow_authoritative_wire_depths(
             ));
         }
         match data_type {
-            DataType::List(field) => {
-                sql_depth = sql_depth.max(sql_prefix.saturating_add(2));
-                arrow_depth = arrow_depth.max(arrow_prefix.saturating_add(2));
-                pending.push((
-                    field.data_type(),
-                    sql_prefix.saturating_add(2),
-                    arrow_prefix.saturating_add(2),
-                    logical_depth.saturating_add(1),
-                ));
-            }
+            DataType::List(field) => pending.push((field.data_type(), logical_depth + 1)),
             DataType::Map(entries, _) => {
                 let DataType::Struct(fields) = entries.data_type() else {
                     return Err("native wire v1 writer map entries must be a struct".into());
@@ -245,42 +217,62 @@ pub(crate) fn arrow_authoritative_wire_depths(
                         "native wire v1 writer map entries must contain key and value".into(),
                     );
                 }
-                sql_depth = sql_depth.max(sql_prefix.saturating_add(2));
-                arrow_depth = arrow_depth.max(arrow_prefix.saturating_add(5));
                 for field in fields {
-                    pending.push((
-                        field.data_type(),
-                        sql_prefix.saturating_add(2),
-                        arrow_prefix.saturating_add(5),
-                        logical_depth.saturating_add(1),
-                    ));
+                    pending.push((field.data_type(), logical_depth + 1));
                 }
             }
             DataType::Struct(fields) => {
-                sql_depth = sql_depth.max(sql_prefix.saturating_add(2));
-                arrow_depth = arrow_depth.max(arrow_prefix.saturating_add(2));
                 for field in fields {
-                    pending.push((
-                        field.data_type(),
-                        sql_prefix.saturating_add(3),
-                        arrow_prefix.saturating_add(3),
-                        logical_depth.saturating_add(1),
-                    ));
+                    pending.push((field.data_type(), logical_depth + 1));
                 }
             }
-            _ => {
-                validate_physical_type(data_type)?;
-                sql_depth = sql_depth.max(sql_prefix.saturating_add(1));
-                arrow_depth = arrow_depth.max(arrow_prefix.saturating_add(1));
-            }
+            _ => validate_physical_type(data_type)?,
         }
     }
-    Ok((sql_depth, arrow_depth))
+    Ok(())
+}
+
+/// Messages and dynamic bytes the flat `TypeDesc` of `data_type` adds to its
+/// owner: one `TypeNode` plus one kind message per logical node, one member
+/// message per struct field, and every struct member name and time zone.
+/// Iterative, so a deep type cannot exhaust the stack while it is costed.
+pub(crate) fn type_desc_wire_cost(data_type: &DataType) -> (usize, usize) {
+    let mut pending = vec![data_type];
+    let mut messages = 0_usize;
+    let mut dynamic_bytes = 0_usize;
+    while let Some(data_type) = pending.pop() {
+        messages = messages.saturating_add(2);
+        match data_type {
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::FixedSizeList(field, _) => pending.push(field.data_type()),
+            DataType::Map(entries, _) => {
+                if let DataType::Struct(fields) = entries.data_type() {
+                    pending.extend(fields.iter().map(|field| field.data_type()));
+                }
+            }
+            DataType::Struct(fields) => {
+                messages = messages.saturating_add(fields.len());
+                for field in fields {
+                    dynamic_bytes = dynamic_bytes.saturating_add(field.name().len());
+                    pending.push(field.data_type());
+                }
+            }
+            DataType::Timestamp(_, Some(timezone)) => {
+                dynamic_bytes = dynamic_bytes.saturating_add(timezone.len());
+            }
+            _ => {}
+        }
+    }
+    (messages, dynamic_bytes)
 }
 
 /// Validate exact v1 type expressibility without allocating a protobuf value.
-/// How deep a nested type may be before native wire v1 refuses it.
-const MAX_NESTED_TYPE_DEPTH: usize = 16;
+/// A nested type may be as deep as the logical type budget admits; the flat
+/// `TypeDesc` carrier keeps protobuf nesting constant whatever that depth.
+fn max_nested_type_depth() -> usize {
+    LogicalTypeLimits::default().max_depth
+}
 
 /// Whether a nested field is named the way the reader rebuilds it.
 ///
@@ -322,9 +314,10 @@ pub(crate) fn validate_physical_type(data_type: &DataType) -> Result<(), String>
 }
 
 fn validate_physical_type_at(data_type: &DataType, depth: usize) -> Result<(), String> {
-    if depth > MAX_NESTED_TYPE_DEPTH {
+    if depth > max_nested_type_depth() {
         return Err(format!(
-            "native wire v1 TypeDesc nesting exceeds depth {MAX_NESTED_TYPE_DEPTH}"
+            "native wire v1 TypeDesc nesting exceeds depth {}",
+            max_nested_type_depth()
         ));
     }
     match data_type {

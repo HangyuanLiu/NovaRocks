@@ -196,10 +196,12 @@ mod tests {
             name: name.to_string(),
             nullable: true,
             r#type: Some(common::TypeDesc {
-                kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
-                    r#type: common::PrimitiveType::Int as i32,
-                    ..Default::default()
-                })),
+                nodes: vec![common::TypeNode {
+                    kind: Some(common::type_node::Kind::Scalar(common::ScalarType {
+                        r#type: common::PrimitiveType::Int as i32,
+                        ..Default::default()
+                    })),
+                }],
             }),
             is_internal: false,
         }

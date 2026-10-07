@@ -221,7 +221,7 @@ pub(crate) fn encode_logical_domain(
 }
 
 pub(crate) fn encode_type(data_type: &DataType) -> Result<common::TypeDesc, DistributedQueryError> {
-    use common::{PrimitiveType, type_desc::Kind};
+    use common::PrimitiveType;
 
     let (primitive, precision, scale, time_unit) = match data_type {
         DataType::Boolean => (PrimitiveType::Boolean, None, None, None),
@@ -266,16 +266,16 @@ pub(crate) fn encode_type(data_type: &DataType) -> Result<common::TypeDesc, Dist
             )));
         }
     };
-    Ok(common::TypeDesc {
-        kind: Some(Kind::Scalar(common::ScalarType {
+    Ok(novarocks_plan_codec::native_type::scalar_type_desc(
+        common::ScalarType {
             r#type: primitive as i32,
             len: None,
             precision,
             scale,
             time_unit,
             time_zone: None,
-        })),
-    })
+        },
+    ))
 }
 
 fn encode_membership_schema_type(

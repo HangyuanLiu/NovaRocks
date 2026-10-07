@@ -60,6 +60,9 @@ pub const ROOT_WRITE_RESULT_COLUMN_COUNT: usize = 8;
 /// at every plan boundary.
 pub const MAX_WRITER_AUXILIARY_CHANNELS: usize = 4_096;
 pub const MAX_WRITE_RELATION_FIELD_NAME_BYTES: usize = 1_024;
+/// Physical nesting budget of an internal (auxiliary) relation column, where
+/// every nesting step counts one level. A visible column carried in an exact
+/// Arrow schema is bounded by the logical type budget instead.
 pub const MAX_WRITE_RELATION_TYPE_DEPTH: usize = 32;
 pub const MAX_WRITE_RELATION_METADATA_ENTRIES_PER_FIELD: usize = 64;
 pub const MAX_WRITE_RELATION_METADATA_KEY_BYTES: usize = 1_024;

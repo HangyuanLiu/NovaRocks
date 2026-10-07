@@ -16,13 +16,18 @@
 
 //! Small, allocation-free resource checks before prost builds Native task objects.
 //!
-//! This scanner recognizes only fields needed to bound repeated object expansion
-//! and the native plan tree. It does not decide protobuf encoding legality or
-//! business semantics. A malformed cursor is left to prost, which remains the
+//! This scanner recognizes only fields needed to bound repeated object expansion,
+//! the native plan tree and every flat type carrier (`TypeDesc` and exact Arrow
+//! columns, found through the descriptor set decoded once per process). It
+//! does not decide protobuf encoding legality or business semantics. A malformed cursor is left to prost, which remains the
 //! sole protobuf interpreter; unknown fields and noncanonical varints are not
 //! rejected here. The typed codec still validates every semantic relationship.
 
 use std::fmt;
+use std::sync::LazyLock;
+
+use novarocks_types::logical_type::LogicalTypeLimits;
+use prost_reflect::{DescriptorPool, Kind, MessageDescriptor};
 
 use crate::TransportBudget;
 use crate::creation::{MAX_INITIAL_SCAN_NODES, MAX_QUOTA_DOMAINS};
@@ -378,6 +383,175 @@ fn scan_frozen_fragment(raw: &[u8]) -> ScanResult {
             scan_plan_fragment(plan, &mut nodes)?;
         }
         Ok(())
+    })?;
+    scan_type_carriers(raw, &type_carrier_scan().frozen_fragment, 0)
+}
+
+/// Descriptors the type-carrier scan walks with. Built once from the
+/// repository descriptor set the generated models were compiled from.
+struct TypeCarrierScan {
+    frozen_fragment: MessageDescriptor,
+}
+
+fn type_carrier_scan() -> &'static TypeCarrierScan {
+    static SCAN: LazyLock<TypeCarrierScan> = LazyLock::new(|| {
+        let pool = DescriptorPool::decode(novarocks_proto_models::FILE_DESCRIPTOR_SET)
+            .expect("the generated descriptor set decodes");
+        TypeCarrierScan {
+            frozen_fragment: pool
+                .get_message_by_name("novarocks.FrozenFragment")
+                .expect("FrozenFragment is in the descriptor set"),
+        }
+    });
+    &SCAN
+}
+
+const TYPE_DESC_MESSAGE: &str = "novarocks.common.TypeDesc";
+const ARROW_COLUMN_MESSAGE: &str = "novarocks.plan.ArrowPhysicalColumn";
+/// Deeper raw nesting is refused by protobuf decoding itself; the scan only
+/// needs to stop before it could recurse further than that decoder would.
+const MAX_TYPE_CARRIER_SCAN_NESTING: usize = 100;
+
+/// Bound every flat type carrier in a frozen fragment before protobuf decoding
+/// allocates its node arrays. Message fields are found through the descriptor
+/// set, so every carrier position is covered without listing them.
+fn scan_type_carriers(raw: &[u8], message: &MessageDescriptor, nesting: usize) -> ScanResult {
+    if nesting > MAX_TYPE_CARRIER_SCAN_NESTING {
+        return Err(ScanError::Malformed);
+    }
+    for_fields(raw, |number, value| {
+        let Value::Bytes(bytes) = value else {
+            return Ok(());
+        };
+        let Some(field) = message.get_field(number) else {
+            return Ok(());
+        };
+        let Kind::Message(child) = field.kind() else {
+            return Ok(());
+        };
+        match child.full_name() {
+            TYPE_DESC_MESSAGE => scan_type_desc(bytes),
+            ARROW_COLUMN_MESSAGE => scan_arrow_column(bytes),
+            _ => scan_type_carriers(bytes, &child, nesting + 1),
+        }
+    })
+}
+
+/// A flat `TypeDesc`: its nodes, struct member references and member name
+/// bytes stay within the logical type budget.
+fn scan_type_desc(raw: &[u8]) -> ScanResult {
+    let limits = LogicalTypeLimits::default();
+    let mut nodes = 0;
+    let mut members = 0;
+    let mut text = 0_usize;
+    for_fields(raw, |field, value| {
+        if field != 5 {
+            return Ok(());
+        }
+        let Value::Bytes(node) = value else {
+            return Ok(());
+        };
+        checked_increment(
+            &mut nodes,
+            limits.max_nodes,
+            "TypeDesc exceeds the logical type node budget",
+        )?;
+        for_fields(node, |field, value| {
+            if field == 4
+                && let Value::Bytes(strct) = value
+            {
+                for_fields(strct, |field, value| {
+                    if field == 1
+                        && let Value::Bytes(member) = value
+                    {
+                        checked_increment(
+                            &mut members,
+                            limits.max_nodes,
+                            "TypeDesc struct members exceed the logical type node budget",
+                        )?;
+                        for_fields(member, |field, value| {
+                            if field == 1
+                                && let Value::Bytes(name) = value
+                            {
+                                text = text.saturating_add(name.len());
+                                if text > limits.max_text_bytes {
+                                    return Err(limit(
+                                        "TypeDesc struct names exceed the logical text budget",
+                                    ));
+                                }
+                            }
+                            Ok(())
+                        })?;
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })
+    })
+}
+
+/// An exact Arrow column: its nodes and child references stay within the node
+/// budget of the column's role, chosen by its frozen `is_internal` bit.
+fn scan_arrow_column(raw: &[u8]) -> ScanResult {
+    let mut is_internal = false;
+    let mut node_count = 0_usize;
+    for_fields(raw, |field, value| {
+        match (field, value) {
+            (3, Value::Varint(internal)) => is_internal = internal != 0,
+            (4, Value::Bytes(_)) => node_count = node_count.saturating_add(1),
+            _ => {}
+        }
+        Ok(())
+    })?;
+    let max = novarocks_proto_codec::arrow_physical::column_node_limit(is_internal);
+    if node_count > max {
+        return Err(limit("Arrow column exceeds the node budget of its role"));
+    }
+    let mut references = 0;
+    for_fields(raw, |field, value| {
+        if field != 4 {
+            return Ok(());
+        }
+        let Value::Bytes(node) = value else {
+            return Ok(());
+        };
+        for_fields(node, |field, value| {
+            match (field, value) {
+                // struct_type: one packed or unpacked child index per member.
+                (18, Value::Bytes(strct)) => count_repeated_varints(
+                    strct,
+                    1,
+                    &mut references,
+                    max,
+                    "Arrow column child references exceed its node budget",
+                ),
+                // union_type: one child message per member.
+                (19, Value::Bytes(union)) => scan_repeated_message_field_into(
+                    union,
+                    2,
+                    &mut references,
+                    max,
+                    "Arrow column child references exceed its node budget",
+                ),
+                _ => Ok(()),
+            }
+        })
+    })
+}
+
+fn scan_repeated_message_field_into(
+    raw: &[u8],
+    field_number: u32,
+    count: &mut usize,
+    max: usize,
+    message: &'static str,
+) -> ScanResult {
+    for_fields(raw, |field, value| {
+        if field == field_number && matches!(value, Value::Bytes(_)) {
+            checked_increment(count, max, message)?;
+        }
+        Ok(())
     })
 }
 
@@ -463,7 +637,7 @@ fn scan_creation_metadata(raw: &[u8], frozen_raw_bytes: usize) -> ScanResult {
 fn scan_descriptor(raw: &[u8], counts: &mut MetadataCounts) -> ScanResult {
     for_fields(raw, |field, value| {
         match (field, value) {
-            (4, Value::Varint) => checked_increment(
+            (4, Value::Varint(_)) => checked_increment(
                 &mut counts.split_nodes,
                 MAX_SPLIT_PLAN_NODES,
                 "task descriptor exceeds 1024 split nodes",
@@ -553,7 +727,7 @@ fn count_repeated_varints(
     for_fields(raw, |field, value| {
         if field == field_number {
             match value {
-                Value::Varint => checked_increment(count, max, message)?,
+                Value::Varint(_) => checked_increment(count, max, message)?,
                 Value::Bytes(packed) => count_packed_varints(packed, count, max, message)?,
                 Value::Other => {}
             }
@@ -578,7 +752,7 @@ fn count_packed_varints(
 
 #[derive(Clone, Copy)]
 enum Value<'a> {
-    Varint,
+    Varint(u64),
     Bytes(&'a [u8]),
     Other,
 }
@@ -625,10 +799,7 @@ impl<'a> Cursor<'a> {
         let tag = self.varint()?;
         let number = u32::try_from(tag >> 3).map_err(|_| ScanError::Malformed)?;
         let value = match tag & 7 {
-            0 => {
-                self.varint()?;
-                Value::Varint
-            }
+            0 => Value::Varint(self.varint()?),
             1 => {
                 self.advance(8)?;
                 Value::Other
@@ -881,6 +1052,105 @@ mod tests {
             check_frozen_fragment(&frozen).unwrap_err().to_string(),
             "native plan tree exceeds 65536 nodes"
         );
+    }
+
+    fn frozen_with_physical_node(node: plan::PlanNode) -> Vec<u8> {
+        let node = plan::DistributedNode {
+            payload: Some(plan::distributed_node::Payload::Physical(node)),
+            ..Default::default()
+        };
+        let mut fragment = Vec::new();
+        write_bytes_field(&mut fragment, 2, &node.encode_to_vec());
+        let mut frozen = Vec::new();
+        write_bytes_field(&mut frozen, 5, &fragment);
+        frozen
+    }
+
+    fn frozen_with_output_type(desc: novarocks_proto_models::common::TypeDesc) -> Vec<u8> {
+        frozen_with_physical_node(plan::PlanNode {
+            output_columns: vec![novarocks_proto_models::common::OutputColumn {
+                column_id: 1,
+                name: "c".into(),
+                r#type: Some(desc),
+                nullable: true,
+                is_internal: false,
+            }],
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn frozen_fragment_bounds_type_desc_nodes_and_names_before_prost() {
+        use novarocks_proto_models::common;
+        let scalar = common::TypeNode {
+            kind: Some(common::type_node::Kind::Scalar(common::ScalarType {
+                r#type: common::PrimitiveType::Int as i32,
+                ..Default::default()
+            })),
+        };
+        let limits = LogicalTypeLimits::default();
+        let nodes = |count: usize| common::TypeDesc {
+            nodes: vec![scalar.clone(); count],
+        };
+        assert!(check_frozen_fragment(&frozen_with_output_type(nodes(limits.max_nodes))).is_ok());
+        assert_eq!(
+            check_frozen_fragment(&frozen_with_output_type(nodes(limits.max_nodes + 1)))
+                .unwrap_err()
+                .to_string(),
+            "TypeDesc exceeds the logical type node budget"
+        );
+
+        let named = |members: usize| common::TypeDesc {
+            nodes: vec![common::TypeNode {
+                kind: Some(common::type_node::Kind::Strct(common::TypeStructNode {
+                    fields: (0..members)
+                        .map(|index| common::TypeStructMember {
+                            name: format!("{index:0>1024}"),
+                            child: 0,
+                        })
+                        .collect(),
+                })),
+            }],
+        };
+        let fitting = limits.max_text_bytes / 1024;
+        assert!(check_frozen_fragment(&frozen_with_output_type(named(fitting))).is_ok());
+        assert_eq!(
+            check_frozen_fragment(&frozen_with_output_type(named(fitting + 1)))
+                .unwrap_err()
+                .to_string(),
+            "TypeDesc struct names exceed the logical text budget"
+        );
+    }
+
+    #[test]
+    fn frozen_fragment_bounds_arrow_column_nodes_by_role_before_prost() {
+        let unpivot = |is_internal: bool, count: usize| {
+            frozen_with_physical_node(plan::PlanNode {
+                kind: Some(plan::plan_node::Kind::Unpivot(plan::UnpivotNode {
+                    output_schema: Some(plan::ArrowPhysicalSchema {
+                        columns: vec![plan::ArrowPhysicalColumn {
+                            slot_id: 1,
+                            is_internal,
+                            nodes: vec![plan::ArrowPhysicalNode::default(); count],
+                        }],
+                        schema_metadata: Vec::new(),
+                    }),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })
+        };
+        let visible = novarocks_proto_codec::arrow_physical::column_node_limit(false);
+        let internal = novarocks_proto_codec::arrow_physical::column_node_limit(true);
+        assert!(visible < internal);
+        assert!(check_frozen_fragment(&unpivot(false, visible)).is_ok());
+        assert_eq!(
+            check_frozen_fragment(&unpivot(false, visible + 1))
+                .unwrap_err()
+                .to_string(),
+            "Arrow column exceeds the node budget of its role"
+        );
+        assert!(check_frozen_fragment(&unpivot(true, visible + 1)).is_ok());
     }
 
     #[test]

@@ -177,9 +177,16 @@ fn write_relation_contracts_are_versioned_append_only_fields() {
             .number(),
         1
     );
+    let nodes = column.get_field_by_name("nodes").expect("nodes");
+    assert_eq!(nodes.number(), 4);
+    assert!(nodes.is_list());
     assert_eq!(
-        column.get_field_by_name("field").expect("field").number(),
-        2
+        nodes
+            .kind()
+            .as_message()
+            .expect("ArrowPhysicalNode message")
+            .full_name(),
+        "novarocks.plan.ArrowPhysicalNode"
     );
     assert_eq!(
         column
@@ -189,51 +196,62 @@ fn write_relation_contracts_are_versioned_append_only_fields() {
         3
     );
 
-    let field = pool
-        .get_message_by_name("novarocks.plan.ArrowPhysicalField")
-        .expect("ArrowPhysicalField descriptor");
+    let facts = pool
+        .get_message_by_name("novarocks.plan.ArrowPhysicalFieldFacts")
+        .expect("ArrowPhysicalFieldFacts descriptor");
     for (name, number) in [
         ("name", 1),
         ("nullable", 2),
-        ("type", 3),
-        ("metadata", 4),
-        ("dictionary_id", 5),
-        ("dictionary_is_ordered", 6),
+        ("metadata", 3),
+        ("dictionary_id", 4),
+        ("dictionary_is_ordered", 5),
     ] {
-        assert_eq!(field.get_field_by_name(name).expect(name).number(), number);
+        assert_eq!(facts.get_field_by_name(name).expect(name).number(), number);
     }
 
-    let physical_type = pool
-        .get_message_by_name("novarocks.plan.ArrowPhysicalType")
-        .expect("ArrowPhysicalType descriptor");
+    // Child references are indices into the owning column's node array, so
+    // no node message nests another node.
+    let node = pool
+        .get_message_by_name("novarocks.plan.ArrowPhysicalNode")
+        .expect("ArrowPhysicalNode descriptor");
     let expected = [
-        ("primitive", 1),
-        ("timestamp", 2),
-        ("time32", 3),
-        ("time64", 4),
-        ("duration", 5),
-        ("interval", 6),
-        ("fixed_size_binary", 7),
-        ("decimal32", 8),
-        ("decimal64", 9),
-        ("decimal128", 10),
-        ("decimal256", 11),
-        ("list", 12),
-        ("list_view", 13),
-        ("fixed_size_list", 14),
-        ("large_list", 15),
-        ("large_list_view", 16),
-        ("struct_type", 17),
-        ("union_type", 18),
-        ("dictionary", 19),
-        ("map", 20),
-        ("run_end_encoded", 21),
+        ("field", 1),
+        ("primitive", 2),
+        ("timestamp", 3),
+        ("time32", 4),
+        ("time64", 5),
+        ("duration", 6),
+        ("interval", 7),
+        ("fixed_size_binary", 8),
+        ("decimal32", 9),
+        ("decimal64", 10),
+        ("decimal128", 11),
+        ("decimal256", 12),
+        ("list", 13),
+        ("list_view", 14),
+        ("fixed_size_list", 15),
+        ("large_list", 16),
+        ("large_list_view", 17),
+        ("struct_type", 18),
+        ("union_type", 19),
+        ("dictionary", 20),
+        ("map", 21),
+        ("run_end_encoded", 22),
     ];
     for (name, number) in expected {
-        assert_eq!(
-            physical_type.get_field_by_name(name).expect(name).number(),
-            number
-        );
+        assert_eq!(node.get_field_by_name(name).expect(name).number(), number);
+    }
+    for field in node.fields() {
+        if let Some(message) = field.kind().as_message() {
+            assert!(
+                message
+                    .fields()
+                    .all(|inner| inner.kind().as_message().map(|m| m.full_name())
+                        != Some("novarocks.plan.ArrowPhysicalNode")),
+                "{} must reference children by index",
+                message.full_name()
+            );
+        }
     }
 }
 

@@ -264,10 +264,12 @@ mod tests {
             nullable,
             is_internal: false,
             r#type: Some(common::TypeDesc {
-                kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
-                    r#type: primitive as i32,
-                    ..Default::default()
-                })),
+                nodes: vec![common::TypeNode {
+                    kind: Some(common::type_node::Kind::Scalar(common::ScalarType {
+                        r#type: primitive as i32,
+                        ..Default::default()
+                    })),
+                }],
             }),
         }
     }

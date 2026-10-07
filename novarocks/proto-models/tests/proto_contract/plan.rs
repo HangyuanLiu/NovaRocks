@@ -75,14 +75,16 @@ where
 
 fn scalar_type(prim: common::PrimitiveType) -> common::TypeDesc {
     common::TypeDesc {
-        kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
-            r#type: prim as i32,
-            len: None,
-            precision: None,
-            scale: None,
-            time_unit: None,
-            time_zone: None,
-        })),
+        nodes: vec![common::TypeNode {
+            kind: Some(common::type_node::Kind::Scalar(common::ScalarType {
+                r#type: prim as i32,
+                len: None,
+                precision: None,
+                scale: None,
+                time_unit: None,
+                time_zone: None,
+            })),
+        }],
     }
 }
 

@@ -134,6 +134,7 @@ mod tests {
             .as_mut()
             .expect("output schema")
             .columns[1]
+            .nodes[0]
             .field
             .as_mut()
             .expect("field")

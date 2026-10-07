@@ -45,8 +45,8 @@ use crate::physical_expr::{
     encode_window_frame, wire_function_name,
 };
 use crate::physical_type::{
-    arrow_authoritative_wire_depths, encode_arrow_authoritative_compatibility_type,
-    encode_physical_type, validate_arrow_authoritative_compatibility_type, validate_physical_type,
+    encode_arrow_authoritative_compatibility_type, encode_physical_type,
+    validate_arrow_authoritative_compatibility_type, validate_physical_type,
 };
 use crate::physical_v1::native_v1_node_wire_depths;
 use crate::{WireLayout, WireSlotId, preflight_physical_plan_v1};
@@ -937,6 +937,9 @@ const NATIVE_V1_PLAN_FRAGMENT_PREFIX_DEPTH: usize = 2;
 const NATIVE_V1_EXPRESSION_WRAPPER_DEPTH: usize = 6;
 const NATIVE_V1_WRITER_ARROW_WRAPPER_DEPTH: usize = 6;
 const NATIVE_V1_WRITER_SQL_WRAPPER_DEPTH: usize = 4;
+// `ArrowPhysicalNode` -> kind or field-facts message -> member, union child or
+// metadata entry, below the column carried by the writer wrapper.
+const NATIVE_V1_ARROW_NODE_WIRE_DEPTH: usize = 3;
 
 /// Validate the complete recursive wire path before any protobuf tree exists.
 ///
@@ -1148,7 +1151,11 @@ fn validate_writer_wire_depth(
     schema: &novarocks_physical_plan::WriterRelationSchema,
 ) -> Result<(), String> {
     for field in &schema.fields {
-        let (sql_depth, arrow_depth) = arrow_authoritative_wire_depths(&field.ty.data_type)?;
+        validate_arrow_authoritative_compatibility_type(&field.ty.data_type)?;
+        // Both carriers are flat: a TypeDesc and an exact Arrow column add a
+        // constant message depth whatever the type nesting.
+        let sql_depth = crate::native_type::TYPE_DESC_WIRE_DEPTH;
+        let arrow_depth = NATIVE_V1_ARROW_NODE_WIRE_DEPTH;
         let sql_wire_depth = NATIVE_V1_PLAN_FRAGMENT_PREFIX_DEPTH
             .saturating_add(node_depth)
             .saturating_add(NATIVE_V1_WRITER_SQL_WRAPPER_DEPTH)
@@ -5727,17 +5734,24 @@ mod tests {
     }
 
     fn finish_limit_chain_plan(depth: usize) -> PhysicalPlan {
+        finish_typed_limit_chain_plan(
+            depth,
+            ValueType::new(DataType::Int64, false),
+            LiteralValue::Int64(1),
+        )
+    }
+
+    fn finish_typed_limit_chain_plan(
+        depth: usize,
+        ty: ValueType,
+        literal: LiteralValue,
+    ) -> PhysicalPlan {
         assert!(depth > 0);
         let fragment_id = FragmentId::new(23);
         let mut builder = FragmentBuilder::new(fragment_id);
-        let ty = ValueType::new(DataType::Int64, false);
         let values = builder.reserve_node_id().unwrap();
         let literal = builder
-            .add_expression(
-                values,
-                ty.clone(),
-                ExprKind::Literal(LiteralValue::Int64(1)),
-            )
+            .add_expression(values, ty.clone(), ExprKind::Literal(literal))
             .unwrap();
         let value = builder
             .add_value(
@@ -6053,6 +6067,31 @@ mod tests {
         assert_eq!(decoded, encoded);
     }
 
+    /// Flat type carriers add a constant protobuf depth, so a type at the full
+    /// logical depth fits below a plan tree at its decoder-safe depth.
+    #[test]
+    fn logical_depth_64_type_below_the_deepest_plan_tree_prost_decodes() {
+        let limit = novarocks_type_contract::LogicalTypeLimits::default().max_depth;
+        let mut data_type = DataType::Int64;
+        for level in 0..limit - 1 {
+            data_type = DataType::Struct(arrow::datatypes::Fields::from(vec![
+                arrow::datatypes::Field::new(format!("n{level}"), data_type, true),
+            ]));
+        }
+        let physical = finish_typed_limit_chain_plan(
+            crate::NATIVE_V1_MAX_TREE_DEPTH,
+            ValueType::new(data_type, true),
+            LiteralValue::Null,
+        );
+        let (catalog, _) = exact_scalar_catalog();
+        let encoded = encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts)
+            .expect("wire guards admit a 64-level type below a 64-node plan path");
+        let bytes = encoded.encode_to_vec();
+        let decoded = plan::DistributedPlan::decode(bytes.as_slice())
+            .expect("the default protobuf recursion limit decodes it");
+        assert_eq!(decoded, encoded);
+    }
+
     #[test]
     fn tree_depth_over_decoder_safe_boundary_fails_in_preflight() {
         let physical = finish_limit_chain_plan(crate::NATIVE_V1_MAX_TREE_DEPTH + 1);
@@ -6240,13 +6279,26 @@ mod tests {
         assert_eq!(decoded, wire);
     }
 
+    /// Flat type carriers make the writer schema's wire depth constant, so a
+    /// relation-depth writer type fits below the deepest admitted plan path.
     #[test]
-    fn combined_writer_type_over_boundary_fails_before_encoding() {
+    fn writer_type_wire_depth_is_constant_below_the_deepest_plan_path() {
         let (fragment, writer_node, schema) = writer_schema_carrier(31, 25);
         let node = &fragment.nodes()[&writer_node];
-        let error = validate_writer_wire_depth(&fragment, node, 25, &schema)
-            .expect_err("combined node and writer type nesting must fail closed");
-        assert!(error.contains("message depth"), "{error}");
+        validate_writer_wire_depth(&fragment, node, crate::NATIVE_V1_MAX_TREE_DEPTH, &schema)
+            .expect("a relation-depth writer type fits below any admitted plan path");
+    }
+
+    #[test]
+    fn writer_type_over_the_relation_budget_fails_before_encoding() {
+        let (fragment, writer_node, schema) = writer_schema_carrier(
+            novarocks_spi::connector::write_stack::MAX_WRITE_RELATION_TYPE_DEPTH,
+            1,
+        );
+        let node = &fragment.nodes()[&writer_node];
+        let error = validate_writer_wire_depth(&fragment, node, 1, &schema)
+            .expect_err("a writer type over the relation depth budget fails closed");
+        assert!(error.contains("relation limit"), "{error}");
     }
 
     fn append_test_i64_values(
@@ -7969,12 +8021,8 @@ mod membership_tests {
             probe.output_columns[0].column_id,
             membership.probe_column_id
         );
-        let Some(common::type_desc::Kind::Scalar(json)) = output.output_columns[0]
-            .r#type
-            .as_ref()
-            .unwrap()
-            .kind
-            .as_ref()
+        let Some(json) =
+            crate::native_type::root_scalar(output.output_columns[0].r#type.as_ref().unwrap())
         else {
             panic!("scalar")
         };
@@ -7990,7 +8038,8 @@ mod membership_tests {
         let plain = output_column(slot, "plain", &ty, None, false).unwrap();
         let json = output_column(slot, "json", &ty, Some(ValueLogicalKind::Json), false).unwrap();
         let scalar = |column: common::OutputColumn| {
-            let Some(common::type_desc::Kind::Scalar(value)) = column.r#type.unwrap().kind else {
+            let desc = column.r#type.unwrap();
+            let Some(value) = crate::native_type::root_scalar(&desc) else {
                 panic!("scalar")
             };
             value.r#type

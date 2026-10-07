@@ -323,10 +323,12 @@ fn column() -> common::OutputColumn {
 
 fn bigint() -> common::TypeDesc {
     common::TypeDesc {
-        kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
-            r#type: common::PrimitiveType::Bigint as i32,
-            ..Default::default()
-        })),
+        nodes: vec![common::TypeNode {
+            kind: Some(common::type_node::Kind::Scalar(common::ScalarType {
+                r#type: common::PrimitiveType::Bigint as i32,
+                ..Default::default()
+            })),
+        }],
     }
 }
 

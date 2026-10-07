@@ -136,7 +136,7 @@ fn scalar_primitive_from_type_desc(
     desc: &common::TypeDesc,
     path: FieldPath,
 ) -> Result<Option<common::PrimitiveType>, super::NativeExpressionDecodeError> {
-    let Some(common::type_desc::Kind::Scalar(scalar)) = desc.kind.as_ref() else {
+    let Some(scalar) = novarocks_plan_codec::native_type::root_scalar(desc) else {
         return Ok(None);
     };
     let primitive = common::PrimitiveType::try_from(scalar.r#type).map_err(|_| {

@@ -1849,3 +1849,125 @@ fn physical_v1_membership_json_identity_project_broadcast_exchange_roundtrip() {
             == Some(novarocks_types::logical::LogicalType::Json)
     }));
 }
+
+fn nested_struct_type(levels: usize) -> DataType {
+    let mut data_type = DataType::Int64;
+    for level in 0..levels {
+        data_type = DataType::Struct(arrow::datatypes::Fields::from(vec![
+            arrow::datatypes::Field::new(format!("n{level}"), data_type, true),
+        ]));
+    }
+    data_type
+}
+
+fn null_values_plan(fragment_id: u32, data_type: DataType) -> PhysicalPlan {
+    let fragment_id = FragmentId::new(fragment_id);
+    let mut builder = FragmentBuilder::new(fragment_id);
+    let node = builder.reserve_node_id().unwrap();
+    let ty = ValueType::new(data_type, true);
+    let literal = builder
+        .add_expression(node, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+        .unwrap();
+    let value = builder
+        .add_value(
+            ty,
+            ValueOrigin::NodeOutput {
+                node,
+                output_ordinal: 0,
+            },
+        )
+        .unwrap();
+    builder
+        .insert_node_unchecked(PhysicalNode {
+            id: node,
+            inputs: Box::default(),
+            required_inputs: Box::default(),
+            output_properties: singleton_properties(),
+            output: OutputPort {
+                node,
+                columns: Box::from([value]),
+            },
+            kind: NodeKind::Values {
+                rows: Box::from([Box::from([literal])]),
+            },
+        })
+        .unwrap();
+    finish_result_plan(builder, fragment_id, node, Box::from([value]))
+}
+
+/// A type at the full logical depth crosses the production Native path: FE
+/// encoding and its wire guards, the frozen fragment's raw-byte preflight,
+/// protobuf decoding under its default recursion limit, Native decoding and
+/// execution. The expression type and the output column both carry it.
+#[test]
+fn logical_depth_64_types_cross_the_production_native_wire() {
+    use prost::Message;
+
+    let limit = novarocks_type_contract::LogicalTypeLimits::default().max_depth;
+    let data_type = nested_struct_type(limit - 1);
+    let physical = null_values_plan(98, data_type.clone());
+    let catalog = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
+    let encoded = novarocks_plan_codec::encode_physical_plan_v1(
+        &physical,
+        &catalog,
+        &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
+    )
+    .expect("FE wire guards admit a 64-level type");
+    let frozen = novarocks_proto_models::novarocks::FrozenFragment {
+        plan: Some(encoded.fragments[0].clone()),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    novarocks_task_codec::resource_preflight::check_frozen_fragment(&frozen)
+        .expect("raw preflight admits the flat carrier");
+    let decoded = novarocks_proto_models::novarocks::FrozenFragment::decode(frozen.as_slice())
+        .expect("default protobuf recursion limit decodes the flat carrier");
+    let mut arena = ExprArena::default();
+    decode_node(
+        decoded.plan.as_ref().unwrap().root.as_ref().unwrap(),
+        &mut arena,
+        &NativePlanDecodeContext::default(),
+    )
+    .expect("Native decoding builds the 64-level type");
+
+    let (chunks, slots, _) = encode_decode_execute(&physical);
+    let column = chunks[0].column_by_slot_id(slots[0]).unwrap();
+    assert_eq!(column.data_type(), &data_type);
+    assert!(column.is_null(0));
+}
+
+/// A frozen fragment whose type carrier exceeds the logical node budget is
+/// refused from its raw bytes, before protobuf decoding allocates the nodes.
+#[test]
+fn oversized_type_carrier_is_refused_before_protobuf_decoding() {
+    use prost::Message;
+
+    let physical = null_values_plan(97, DataType::Int64);
+    let catalog = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
+    let mut encoded = novarocks_plan_codec::encode_physical_plan_v1(
+        &physical,
+        &catalog,
+        &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
+    )
+    .unwrap();
+    let limit = novarocks_type_contract::LogicalTypeLimits::default().max_nodes;
+    let Some(plan::distributed_node::Payload::Physical(node)) =
+        encoded.fragments[0].root.as_mut().unwrap().payload.as_mut()
+    else {
+        panic!("physical root");
+    };
+    let output = node.output_columns[0].r#type.as_mut().unwrap();
+    let scalar = output.nodes[0].clone();
+    output.nodes = vec![scalar; limit + 1];
+    let frozen = novarocks_proto_models::novarocks::FrozenFragment {
+        plan: Some(encoded.fragments[0].clone()),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    assert_eq!(
+        novarocks_task_codec::resource_preflight::check_frozen_fragment(&frozen)
+            .unwrap_err()
+            .to_string(),
+        "TypeDesc exceeds the logical type node budget"
+    );
+}

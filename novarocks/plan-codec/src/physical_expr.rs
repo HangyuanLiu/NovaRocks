@@ -99,9 +99,7 @@ impl<'a> WireExpressionPreflight<'a> {
                 )
             })?;
             let children = &references[&id];
-            let mut messages = local_expression_messages(&expression.kind);
-            let mut dynamic_bytes = local_expression_dynamic_bytes(expression);
-            let mut depth = 4_usize;
+            let (mut messages, mut dynamic_bytes, mut depth) = local_expression_cost(expression);
             for child in children {
                 let child_cost = costs.get(child).ok_or_else(|| {
                     format!(
@@ -268,6 +266,31 @@ fn expression_children(kind: &ExprKind) -> Vec<ExprId> {
             children
         }
     }
+}
+
+/// The expression's own messages, dynamic bytes and message depth, including
+/// its flat result type and any cast target type. A flat `TypeDesc` adds a
+/// constant depth below its owner and is charged per node and member name.
+fn local_expression_cost(expression: &novarocks_physical_plan::ExprNode) -> (usize, usize, usize) {
+    use crate::native_type::TYPE_DESC_WIRE_DEPTH;
+    use crate::physical_type::type_desc_wire_cost;
+
+    // The scalar TypeDesc of every expression is already among the base
+    // messages counted by `local_expression_messages`.
+    const SCALAR_TYPE_MESSAGES: usize = 2;
+    let (type_messages, type_bytes) = type_desc_wire_cost(&expression.ty.data_type);
+    let mut messages = local_expression_messages(&expression.kind)
+        .saturating_add(type_messages.saturating_sub(SCALAR_TYPE_MESSAGES));
+    let mut dynamic_bytes = local_expression_dynamic_bytes(expression).saturating_add(type_bytes);
+    // Expr -> TypeDesc..., or Expr -> Cast -> TypeDesc... for a cast target.
+    let mut depth = 4_usize.max(1 + TYPE_DESC_WIRE_DEPTH);
+    if let ExprKind::Cast { target, .. } = &expression.kind {
+        let (target_messages, target_bytes) = type_desc_wire_cost(target);
+        messages = messages.saturating_add(target_messages.saturating_sub(SCALAR_TYPE_MESSAGES));
+        dynamic_bytes = dynamic_bytes.saturating_add(target_bytes);
+        depth = depth.max(2 + TYPE_DESC_WIRE_DEPTH);
+    }
+    (messages, dynamic_bytes, depth)
 }
 
 fn local_expression_messages(kind: &ExprKind) -> usize {

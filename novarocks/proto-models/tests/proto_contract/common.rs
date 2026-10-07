@@ -32,8 +32,17 @@ enum InternalType {
 }
 
 fn type_to_proto(t: &InternalType) -> common::TypeDesc {
-    use common::type_desc::Kind;
+    let mut nodes = Vec::new();
+    push_type(t, &mut nodes);
+    common::TypeDesc { nodes }
+}
 
+/// Append `t` in canonical preorder and return its node index.
+fn push_type(t: &InternalType, nodes: &mut Vec<common::TypeNode>) -> u32 {
+    use common::type_node::Kind;
+
+    let index = nodes.len() as u32;
+    nodes.push(common::TypeNode::default());
     let kind = match t {
         InternalType::Scalar {
             prim,
@@ -47,53 +56,55 @@ fn type_to_proto(t: &InternalType) -> common::TypeDesc {
             time_unit: None,
             time_zone: None,
         }),
-        InternalType::List(el) => Kind::List(Box::new(common::ListType {
-            element: Some(Box::new(type_to_proto(el))),
-        })),
-        InternalType::Map(k, v) => Kind::Map(Box::new(common::MapType {
-            key: Some(Box::new(type_to_proto(k))),
-            value: Some(Box::new(type_to_proto(v))),
-        })),
-        InternalType::Struct(fields) => Kind::Strct(common::StructType {
+        InternalType::List(el) => Kind::List(push_type(el, nodes)),
+        InternalType::Map(k, v) => {
+            let key = push_type(k, nodes);
+            let value = push_type(v, nodes);
+            Kind::Map(common::TypeMapNode { key, value })
+        }
+        InternalType::Struct(fields) => Kind::Strct(common::TypeStructNode {
             fields: fields
                 .iter()
-                .map(|(name, ft)| common::StructField {
+                .map(|(name, ft)| common::TypeStructMember {
                     name: name.clone(),
-                    r#type: Some(type_to_proto(ft)),
+                    child: push_type(ft, nodes),
                 })
                 .collect(),
         }),
     };
-
-    common::TypeDesc { kind: Some(kind) }
+    nodes[index as usize].kind = Some(kind);
+    index
 }
 
 fn type_from_proto(p: &common::TypeDesc) -> Result<InternalType, String> {
-    use common::type_desc::Kind;
+    if p.nodes.is_empty() {
+        return Err("TypeDesc.nodes missing".to_string());
+    }
+    node_from_proto(&p.nodes, 0)
+}
 
-    let kind = p.kind.as_ref().ok_or("TypeDesc.kind missing")?;
+fn node_from_proto(nodes: &[common::TypeNode], index: u32) -> Result<InternalType, String> {
+    use common::type_node::Kind;
+
+    let node = nodes
+        .get(index as usize)
+        .ok_or_else(|| format!("TypeDesc node {index} missing"))?;
+    let kind = node.kind.as_ref().ok_or("TypeNode.kind missing")?;
     Ok(match kind {
         Kind::Scalar(s) => InternalType::Scalar {
             prim: s.r#type,
             precision: s.precision,
             scale: s.scale,
         },
-        Kind::List(l) => {
-            let el = l.element.as_ref().ok_or("ListType.element missing")?;
-            InternalType::List(Box::new(type_from_proto(el)?))
-        }
-        Kind::Map(m) => {
-            let k = m.key.as_ref().ok_or("MapType.key missing")?;
-            let v = m.value.as_ref().ok_or("MapType.value missing")?;
-            InternalType::Map(Box::new(type_from_proto(k)?), Box::new(type_from_proto(v)?))
-        }
+        Kind::List(el) => InternalType::List(Box::new(node_from_proto(nodes, *el)?)),
+        Kind::Map(m) => InternalType::Map(
+            Box::new(node_from_proto(nodes, m.key)?),
+            Box::new(node_from_proto(nodes, m.value)?),
+        ),
         Kind::Strct(s) => InternalType::Struct(
             s.fields
                 .iter()
-                .map(|f| {
-                    let ft = f.r#type.as_ref().ok_or("StructField.type missing")?;
-                    Ok((f.name.clone(), type_from_proto(ft)?))
-                })
+                .map(|f| Ok((f.name.clone(), node_from_proto(nodes, f.child)?)))
                 .collect::<Result<Vec<_>, String>>()?,
         ),
     })
@@ -162,8 +173,13 @@ fn recursive_type_desc_survives_proto_roundtrip() {
 
 #[test]
 fn missing_type_desc_kind_reports_boundary_error() {
-    let err = type_from_proto(&common::TypeDesc { kind: None }).expect_err("missing kind");
-    assert_eq!(err, "TypeDesc.kind missing");
+    let err = type_from_proto(&common::TypeDesc::default()).expect_err("missing nodes");
+    assert_eq!(err, "TypeDesc.nodes missing");
+    let err = type_from_proto(&common::TypeDesc {
+        nodes: vec![common::TypeNode::default()],
+    })
+    .expect_err("missing kind");
+    assert_eq!(err, "TypeNode.kind missing");
 }
 
 #[test]

@@ -1571,10 +1571,10 @@ mod tests {
     fn writer_multiplex_prefix_tampering_is_rejected() {
         let mutators: [fn(&mut plan::ArrowPhysicalColumn); 3] = [
             |column: &mut plan::ArrowPhysicalColumn| {
-                column.field.as_mut().expect("field").name = "wrong".to_string()
+                column.nodes[0].field.as_mut().expect("field").name = "wrong".to_string()
             },
             |column: &mut plan::ArrowPhysicalColumn| {
-                column.field.as_mut().expect("field").nullable = true
+                column.nodes[0].field.as_mut().expect("field").nullable = true
             },
             |column: &mut plan::ArrowPhysicalColumn| column.slot_id -= 1,
         ];
@@ -1607,7 +1607,7 @@ mod tests {
         ])
         .expect("writer schema");
         let mut wire = writer_multiplex_schema(&contract);
-        let dictionary = wire.columns[WRITE_RELATION_COLUMN_COUNT]
+        let dictionary = wire.columns[WRITE_RELATION_COLUMN_COUNT].nodes[0]
             .field
             .as_mut()
             .expect("dictionary field");
@@ -1684,12 +1684,9 @@ mod tests {
             panic!("finish payload");
         };
         let root = finish.root_result_schema.as_mut().expect("root schema");
-        root.columns[0].field.as_mut().expect("field").r#type =
-            Some(Box::new(plan::ArrowPhysicalType {
-                kind: Some(plan::arrow_physical_type::Kind::Primitive(
-                    plan::ArrowPrimitiveType::Int64 as i32,
-                )),
-            }));
+        root.columns[0].nodes[0].kind = Some(plan::arrow_physical_node::Kind::Primitive(
+            plan::ArrowPrimitiveType::Int64 as i32,
+        ));
         let error = decode_error(&node);
         assert_protocol(
             &error,
@@ -1952,21 +1949,19 @@ mod tests {
         else {
             panic!("finish payload");
         };
-        let input_type = finish
+        let input_column = &mut finish
             .root_result_schema
             .as_mut()
             .expect("root schema")
-            .columns[4]
-            .field
-            .as_mut()
-            .expect("field")
-            .r#type
-            .as_mut()
-            .expect("type");
-        let Some(plan::arrow_physical_type::Kind::List(item)) = input_type.kind.as_mut() else {
+            .columns[4];
+        let Some(plan::arrow_physical_node::Kind::List(item)) = input_column.nodes[0].kind else {
             panic!("input_fields list");
         };
-        item.nullable = true;
+        input_column.nodes[item as usize]
+            .field
+            .as_mut()
+            .expect("item field")
+            .nullable = true;
         let error = decode_error(&node);
         assert_protocol(
             &error,
@@ -1979,18 +1974,13 @@ mod tests {
         else {
             panic!("finish payload");
         };
-        let map_type = finish
+        let map_column = &mut finish
             .root_result_schema
             .as_mut()
             .expect("root schema")
-            .columns[7]
-            .field
-            .as_mut()
-            .expect("field")
-            .r#type
-            .as_mut()
-            .expect("type");
-        let Some(plan::arrow_physical_type::Kind::Map(map)) = map_type.kind.as_mut() else {
+            .columns[7];
+        let Some(plan::arrow_physical_node::Kind::Map(map)) = map_column.nodes[0].kind.as_mut()
+        else {
             panic!("properties map");
         };
         map.ordered = true;
