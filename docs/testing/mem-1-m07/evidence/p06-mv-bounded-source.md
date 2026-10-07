@@ -37,3 +37,6 @@ InMemory 是 test-only repository：借用已有 canonical state，在 clone 前
 ## 尚未闭合
 
 Local collector/renderer 的 whole-window 生产 funding、实际 capacity 峰值与 1FE+3BE/SOCKET 验收仍留在 P07/P08/P09；本切片不声明整个 96 MiB 物理包络或 P06 全链产品验收。
+
+
+Local builder 自动扩容 slack 的后续修复见 [[p06-local-buffer-capacity|Local buffer capacity]]；collector buffer已显式有界，但全部source scratch、renderer和生产window实际alias仍需P07/P08收敛，此处不改写历史验收状态。

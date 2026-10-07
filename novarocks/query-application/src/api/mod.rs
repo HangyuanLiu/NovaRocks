@@ -20,6 +20,7 @@ mod binding_receipt;
 mod command;
 mod execution;
 mod local_result;
+mod local_result_buffer;
 mod native;
 mod plan_scheduling;
 pub(crate) mod result;
