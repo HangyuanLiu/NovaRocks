@@ -112,7 +112,8 @@ use novarocks_user_error::UserError;
 use novarocks_workload_control::WorkError;
 use novarocks_workload_control::WorkOwner;
 use novarocks_workload_control::{
-    LocalResourceAuthority, RootAdmissionHandle, WorkClass, WorkRequest,
+    LocalResourceAuthority, ResultWindowAlias, ResultWindowClass, RootAdmissionHandle, WorkClass,
+    WorkRequest,
 };
 
 pub(crate) mod compiler;
@@ -171,11 +172,16 @@ where
                         format!("product command scope is no longer active: {error}"),
                     )
                 })?;
-                call(&request_context, &command_context)
-                    .map_err(|error| command_error(CommandErrorKind::Failed, error))
+                let window = command_context.result_window_alias();
+                let result = call(&request_context, &command_context)
+                    .map_err(|error| command_error(CommandErrorKind::Failed, error));
+                // The receipt retains this alias even if the awaiting future
+                // disappears while the blocking worker is still producing.
+                Ok((result, window))
             })
             .await
             .map_err(|error| command_error(CommandErrorKind::Failed, error))?
+            .and_then(|(result, _window)| result)
     })
 }
 
@@ -222,11 +228,16 @@ where
                         format!("specialized command scope is no longer active: {error}"),
                     )
                 })?;
-                call(&request_context, &command_context)
-                    .map_err(|error| command_error(CommandErrorKind::Failed, error))
+                let window = command_context.result_window_alias();
+                let result = call(&request_context, &command_context)
+                    .map_err(|error| command_error(CommandErrorKind::Failed, error));
+                // The receipt retains this alias even if the awaiting future
+                // disappears while the blocking worker is still producing.
+                Ok((result, window))
             })
             .await
             .map_err(|error| command_error(CommandErrorKind::Failed, error))?
+            .and_then(|(result, _window)| result)
     })
 }
 
@@ -566,12 +577,14 @@ impl SpecializedStatementRoute for TypedCommandRoute {
         &self,
         full: bool,
         _context: &RequestContext,
-        _command_context: &CommandContext,
+        command_context: &CommandContext,
     ) -> CommandFuture {
         // The registry snapshot is taken here, under its own lock, and the
         // rest is pure projection, so this route needs no blocking executor.
+        let window = command_context.result_window_alias();
         let processes = self.sessions.list_processes();
         Box::pin(async move {
+            let _window = window;
             process_list_result(processes, full)
                 .map(StatementResult::Query)
                 .map_err(|error| {
@@ -709,8 +722,16 @@ async fn execute_synchronous_stage<T, F>(
     cancellation: QueryCancellationView,
     diagnostic_statement: StatementToken,
     execution_owner: WorkOwner,
+    result_window: Option<ResultWindowAlias>,
     call: F,
-) -> Result<(Result<T, RoutedExecutionError>, WorkOwner), String>
+) -> Result<
+    (
+        Result<T, RoutedExecutionError>,
+        WorkOwner,
+        Option<ResultWindowAlias>,
+    ),
+    String,
+>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, RoutedExecutionError> + Send + 'static,
@@ -727,7 +748,7 @@ where
             } else {
                 call()
             };
-            (result, execution_owner)
+            (result, execution_owner, result_window)
         })
         .await
 }
@@ -741,6 +762,7 @@ async fn execute_prepared_dml_statement<P, Prepare, Execute>(
     cancellation: QueryCancellationView,
     diagnostic_statement: StatementToken,
     execution_owner: WorkOwner,
+    result_window: Option<ResultWindowAlias>,
     prepare: Prepare,
     execute: Execute,
 ) -> Result<(Result<StatementResult, RoutedExecutionError>, WorkOwner), String>
@@ -749,25 +771,26 @@ where
     Prepare: FnOnce() -> Result<P, RoutedExecutionError> + Send + 'static,
     Execute: FnOnce(P) -> Result<StatementResult, RoutedExecutionError> + Send + 'static,
 {
-    let (prepared, execution_owner) = execute_synchronous_stage(
+    let (prepared, execution_owner, result_window) = execute_synchronous_stage(
         executor.clone(),
         cancellation.clone(),
         diagnostic_statement,
         execution_owner,
+        result_window,
         prepare,
     )
     .await?;
     match prepared {
-        Ok(prepared) => {
-            execute_synchronous_stage(
-                executor,
-                cancellation,
-                diagnostic_statement,
-                execution_owner,
-                move || execute(prepared),
-            )
-            .await
-        }
+        Ok(prepared) => execute_synchronous_stage(
+            executor,
+            cancellation,
+            diagnostic_statement,
+            execution_owner,
+            result_window,
+            move || execute(prepared),
+        )
+        .await
+        .map(|(result, owner, _window)| (result, owner)),
         Err(error) => Ok((Err(error), execution_owner)),
     }
 }
@@ -1704,14 +1727,17 @@ impl FrontendQuerySession {
                 )
                 .await
         } else {
-            self.service.query_control.begin_governed_statement(
-                token,
-                &self.service.workload_root_admission,
-                work_class,
-                deadline.map(tokio::time::Instant::from_std),
-                timeout_ms,
-                Some(Arc::from(sql.as_str())),
-            )
+            self.service
+                .query_control
+                .begin_governed_statement_with_result(
+                    token,
+                    &self.service.workload_root_admission,
+                    work_class,
+                    deadline.map(tokio::time::Instant::from_std),
+                    timeout_ms,
+                    Some(Arc::from(sql.as_str())),
+                    ResultWindowClass::Local,
+                )
         }
         .map_err(|error| self.governed_statement_begin_error(error))?;
         let cancellation = QueryCancellationView::governed(
@@ -1822,6 +1848,18 @@ impl FrontendQuerySession {
             diagnostic_statement,
             Arc::clone(&self.principal),
         );
+        let command_context = match statement.result_window_alias() {
+            Some(window) => match command_context.with_result_window(window) {
+                Ok(context) => context,
+                Err(error) => {
+                    return Ok(
+                        self.governed_typed_error(internal_error(error.to_string()), statement)
+                    );
+                }
+            },
+            None => command_context,
+        };
+        let producer_window = command_context.result_window_alias();
         let execution_owner = statement
             .take_execution_owner()
             .expect("governed typed statement transfers its execution owner exactly once");
@@ -1886,6 +1924,7 @@ impl FrontendQuerySession {
                     worker_cancellation,
                     diagnostic_statement,
                     execution_owner,
+                    producer_window,
                     move || {
                         dml_result(prepare_dml.prepare_delete(
                             prepare_engine.as_ref(),
@@ -1916,6 +1955,7 @@ impl FrontendQuerySession {
                     worker_cancellation,
                     diagnostic_statement,
                     execution_owner,
+                    producer_window,
                     move || {
                         dml_result(prepare_dml.prepare_insert(
                             prepare_engine.as_ref(),
@@ -1946,6 +1986,7 @@ impl FrontendQuerySession {
                     worker_cancellation,
                     diagnostic_statement,
                     execution_owner,
+                    producer_window,
                     move || {
                         dml_result(prepare_dml.prepare_delete(
                             prepare_engine.as_ref(),
@@ -1979,6 +2020,7 @@ impl FrontendQuerySession {
                     worker_cancellation,
                     diagnostic_statement,
                     execution_owner,
+                    producer_window,
                     move || {
                         dml_result(prepare_dml.prepare_typed_mutation(
                             prepare_engine.as_ref(),
@@ -2010,6 +2052,7 @@ impl FrontendQuerySession {
                     worker_cancellation,
                     diagnostic_statement,
                     execution_owner,
+                    producer_window,
                     move || {
                         dml_result(prepare_dml.prepare_ctas(
                             prepare_engine.as_ref(),
@@ -2067,6 +2110,7 @@ impl FrontendQuerySession {
                     worker_cancellation,
                     diagnostic_statement,
                     execution_owner,
+                    producer_window,
                     move || {
                         prepare_dml
                             .prepare_truncate(
@@ -2098,6 +2142,7 @@ impl FrontendQuerySession {
                             worker_cancellation,
                             diagnostic_statement,
                             execution_owner,
+                            producer_window,
                             move || {
                                 prepare_dml
                                     .prepare_add_files(
@@ -3624,6 +3669,85 @@ mod tests {
             None,
         );
         (workload, root, cancellation)
+    }
+
+    #[tokio::test]
+    async fn abandoned_synchronous_command_retains_its_window_until_actual_worker_exit() {
+        use novarocks_query_application::cpu::{
+            QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
+        };
+        use novarocks_workload_control::{ResultCapacityConfig, WorkloadConfig, WorkloadControl};
+
+        let workload = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024 * 1024,
+                control_bytes: 1024,
+                per_scope_bytes: 1024 * 1024 - 1024,
+            },
+        )
+        .unwrap();
+        let capacity = workload
+            .configure_result_capacity(ResultCapacityConfig::V1)
+            .unwrap();
+        workload.mark_ready().unwrap();
+        let (root, window) = workload
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Local,
+            )
+            .unwrap();
+        let cancellation =
+            QueryCancellationView::governed(root.owner.scope().cancellation().unwrap(), None);
+        let mut blocking = QueryBlockingExecutorOwner::try_new(QueryBlockingExecutorConfig::new(
+            std::num::NonZeroUsize::new(1).unwrap(),
+            std::num::NonZeroUsize::new(1).unwrap(),
+        ))
+        .unwrap();
+        let executor = blocking.executor();
+        let alias = window.retain_alias();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let worker_gate = Arc::clone(&gate);
+        let (started, running) = tokio::sync::oneshot::channel();
+        let caller = tokio::spawn(async move {
+            execute_synchronous_stage(
+                executor,
+                cancellation,
+                StatementToken::new(SessionToken::new(91, 1), 1),
+                root.owner,
+                Some(alias),
+                move || {
+                    started.send(()).unwrap();
+                    let (open, changed) = &*worker_gate;
+                    let (open, _) = changed
+                        .wait_timeout_while(open.lock().unwrap(), Duration::from_secs(5), |open| {
+                            !*open
+                        })
+                        .unwrap();
+                    assert!(*open, "test worker gate timed out");
+                    Ok(StatementResult::Ok)
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .unwrap()
+            .unwrap();
+        root.business.release();
+        drop(window);
+        caller.abort();
+        assert!(matches!(caller.await, Err(error) if error.is_cancelled()));
+        assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+        let (open, changed) = &*gate;
+        *open.lock().unwrap() = true;
+        changed.notify_all();
+        blocking
+            .shutdown_until(Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
