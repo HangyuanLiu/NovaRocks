@@ -482,3 +482,39 @@ fn header_parse_refuses_forged_declarations() {
         Err(WriteCommitCodecError::TrailingRecordBytes)
     );
 }
+
+#[test]
+fn record_views_return_exactly_what_was_encoded() {
+    let rows = [
+        Row::Fragment(3, b"fragment".to_vec()),
+        artifact(3, &[9, 4], "theta", b"body", &[("k", "v"), ("kk", "")]),
+        Row::Summary(12),
+    ];
+    let encoded = encode(batch(&rows), WriteCommitTotals::default(), 1 << 20);
+    let mut rest = encoded.bytes.as_slice();
+    let mut views = Vec::new();
+    while !rest.is_empty() {
+        let length = WriteCommitRecordHeader::parse(rest).unwrap().record_bytes();
+        views.push(WriteCommitRecordView::parse(&rest[..length]).unwrap());
+        rest = &rest[length..];
+    }
+    assert_eq!(views[0].fragment(), b"fragment");
+    assert_eq!(views[0].header().target(), 3);
+    assert_eq!(views[1].field_ids().collect::<Vec<_>>(), vec![9, 4]);
+    assert_eq!(views[1].blob_type(), "theta");
+    assert_eq!(views[1].body(), b"body");
+    assert_eq!(
+        views[1].properties().collect::<Vec<_>>(),
+        vec![("k", "v"), ("kk", "")]
+    );
+    assert_eq!(views[2].header().row_count(), 12);
+    // A record whose property bytes disagree with its header is refused.
+    let length = WriteCommitRecordHeader::parse(&encoded.bytes[views[0].header().record_bytes()..])
+        .unwrap()
+        .record_bytes();
+    let start = views[0].header().record_bytes();
+    let mut forged = encoded.bytes[start..start + length].to_vec();
+    let last = forged.len() - 1;
+    forged[last - 4] = 0xff; // corrupt the "kk" key's text
+    assert!(WriteCommitRecordView::parse(&forged).is_err());
+}

@@ -71,6 +71,7 @@ novarocks-mv-application = { workspace = true, features = ["test-support"] }
 novarocks-catalog-application = { workspace = true, features = ["test-support"] }
 novarocks-connector-starrocks.workspace = true
 novarocks-query-application = { workspace = true, features = ["test-support"] }
+novarocks-result-render.workspace = true
 novarocks-secret.workspace = true
 novarocks-state-store-testkit.workspace = true
 novarocks-sql = { workspace = true, features = ["test-support"] }

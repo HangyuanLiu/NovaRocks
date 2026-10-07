@@ -352,6 +352,99 @@ impl WriteCommitRecordHeader {
     }
 }
 
+/// One complete, validated write-commit record, borrowed without copies.
+#[derive(Clone, Copy, Debug)]
+pub struct WriteCommitRecordView<'a> {
+    header: WriteCommitRecordHeader,
+    payload: &'a [u8],
+}
+
+impl<'a> WriteCommitRecordView<'a> {
+    /// Validate one assembled record: its header, exact length, UTF-8 blob
+    /// type and property text, non-empty keys, positive field IDs and the
+    /// declared property byte total.
+    pub fn parse(record: &'a [u8]) -> Result<Self, WriteCommitCodecError> {
+        let header = WriteCommitRecordHeader::parse(record)?;
+        header.validate_record_bytes(record.len())?;
+        let view = Self {
+            header,
+            payload: &record[WRITE_COMMIT_HEADER_BYTES..],
+        };
+        if header.kind() == RootRowKind::ArtifactDraft {
+            if view.field_ids().any(|field| field <= 0) {
+                return Err(WriteCommitCodecError::FieldIds);
+            }
+            std::str::from_utf8(view.blob_bytes()).map_err(|_| WriteCommitCodecError::BlobType)?;
+            let mut property_bytes = 0usize;
+            for property in view.raw_properties() {
+                let (key, value) = property?;
+                if key.is_empty() {
+                    return Err(WriteCommitCodecError::PropertyKey);
+                }
+                property_bytes += key.len() + value.len();
+            }
+            if property_bytes != header.property_bytes() {
+                return Err(WriteCommitCodecError::RecordLength);
+            }
+        }
+        Ok(view)
+    }
+
+    pub const fn header(&self) -> WriteCommitRecordHeader {
+        self.header
+    }
+    /// A prepared fragment's canonical bytes; empty for other kinds.
+    pub fn fragment(&self) -> &'a [u8] {
+        &self.payload[..self.header.fragment_bytes()]
+    }
+    pub fn field_ids(&self) -> impl Iterator<Item = i32> + 'a {
+        let fields = &self.payload[..self.header.field_count() * 4];
+        fields
+            .chunks_exact(4)
+            .map(|id| i32::from_le_bytes(id.try_into().unwrap()))
+    }
+    fn blob_bytes(&self) -> &'a [u8] {
+        let start = self.header.field_count() * 4;
+        &self.payload[start..start + self.header.blob_type_bytes()]
+    }
+    pub fn blob_type(&self) -> &'a str {
+        std::str::from_utf8(self.blob_bytes()).expect("blob type validated at parse")
+    }
+    pub fn body(&self) -> &'a [u8] {
+        let start = self.header.field_count() * 4 + self.header.blob_type_bytes();
+        &self.payload[start..start + self.header.body_bytes()]
+    }
+    pub fn properties(&self) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
+        self.raw_properties()
+            .map(|property| property.expect("properties validated at parse"))
+    }
+    fn raw_properties(
+        &self,
+    ) -> impl Iterator<Item = Result<(&'a str, &'a str), WriteCommitCodecError>> + 'a {
+        let start = self.header.field_count() * 4
+            + self.header.blob_type_bytes()
+            + self.header.body_bytes();
+        let mut rest = &self.payload[start..];
+        let count = self.header.property_count();
+        (0..count).map(move |_| {
+            let mut text = || -> Result<&'a str, WriteCommitCodecError> {
+                if rest.len() < 4 {
+                    return Err(WriteCommitCodecError::RecordLength);
+                }
+                let length = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+                let bytes = rest
+                    .get(4..4 + length)
+                    .ok_or(WriteCommitCodecError::RecordLength)?;
+                rest = &rest[4 + length..];
+                std::str::from_utf8(bytes).map_err(|_| WriteCommitCodecError::PropertyLimit)
+            };
+            let key = text()?;
+            let value = text()?;
+            Ok((key, value))
+        })
+    }
+}
+
 /// Cumulative facts of every record whose encoding has completed. Callers
 /// carry them across input batches; they are not commit evidence.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
