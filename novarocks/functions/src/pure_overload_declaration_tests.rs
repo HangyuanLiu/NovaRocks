@@ -303,9 +303,7 @@ fn pure_declaration_unknown_identity_overload_wrong_kind_and_metadata_only_refus
             overload,
             &DeclarationControl::default()
         ),
-        Err(FunctionSpecializationFailure::InvalidInput(
-            "selected function has no installed pure implementation"
-        ))
+        Err(FunctionSpecializationFailure::MissingPureImplementation(_))
     ));
     let name_as_id = FunctionId::try_new("lower").unwrap();
     assert!(matches!(

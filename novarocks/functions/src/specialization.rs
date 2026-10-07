@@ -30,6 +30,9 @@ pub enum FunctionSpecializationFailure {
     Effects(novarocks_type_contract::EffectContractError),
     Control(CompileControlError),
     Kernel(KernelFailure),
+    /// The selected overload has no pure implementation installed in this
+    /// catalog; it names the overload so the missing owner is identifiable.
+    MissingPureImplementation(crate::FunctionOverloadId),
     InvalidInput(&'static str),
 }
 impl fmt::Display for FunctionSpecializationFailure {
@@ -39,6 +42,11 @@ impl fmt::Display for FunctionSpecializationFailure {
             Self::Effects(e) => fmt::Display::fmt(e, f),
             Self::Control(e) => fmt::Display::fmt(e, f),
             Self::Kernel(e) => fmt::Display::fmt(e, f),
+            Self::MissingPureImplementation(overload) => write!(
+                f,
+                "selected overload `{}` has no installed pure implementation",
+                overload.as_str()
+            ),
             Self::InvalidInput(e) => f.write_str(e),
         }
     }

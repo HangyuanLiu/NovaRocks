@@ -389,9 +389,7 @@ fn sql_missing_selected_implementation_keeps_ordinary_tail_and_every_control_pre
     let trace = control.trace();
     assert!(matches!(
         direct,
-        FunctionSpecializationFailure::InvalidInput(
-            "selected function has no installed pure implementation"
-        )
+        FunctionSpecializationFailure::MissingPureImplementation(_)
     ));
     // Keep the original dispatcher's completed attachment lookup on an
     // ordinary missing-owner exit, rather than appending an adapter tail.

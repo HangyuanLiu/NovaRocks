@@ -294,9 +294,7 @@ fn ordinary_selected_fresh_refuses_missing_owner_binding_and_record_as_typed_err
             fixture.options(),
             &Control::default()
         ),
-        Err(FunctionSpecializationFailure::InvalidInput(
-            "selected function has no installed pure implementation"
-        ))
+        Err(FunctionSpecializationFailure::MissingPureImplementation(_))
     ));
     assert_eq!(fixture.calls.load(Ordering::Relaxed), 0);
 

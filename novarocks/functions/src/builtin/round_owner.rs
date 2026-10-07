@@ -340,6 +340,7 @@ fn specialization_failure(error: FunctionSpecializationFailure) -> KernelFailure
         FunctionSpecializationFailure::Binding(error) => binding_failure(error),
         FunctionSpecializationFailure::Kernel(error) => error,
         FunctionSpecializationFailure::Effects(_)
+        | FunctionSpecializationFailure::MissingPureImplementation(_)
         | FunctionSpecializationFailure::InvalidInput(_) => {
             invalid("round recipe differs from its exact checked call")
         }

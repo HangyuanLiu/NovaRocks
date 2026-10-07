@@ -1183,9 +1183,9 @@ fn scalar_occurrences_typeof_unknown_and_metadata_only_catalog_never_supply_owne
             &Control::default()
         ),
         Err(PhysicalScalarOccurrenceError::Occurrence(
-            ExpressionOccurrenceError::Function(FunctionSpecializationFailure::InvalidInput(
-                "selected function has no installed pure implementation"
-            ))
+            ExpressionOccurrenceError::Function(
+                FunctionSpecializationFailure::MissingPureImplementation(_)
+            )
         ))
     ));
     prefixes(

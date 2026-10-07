@@ -1214,9 +1214,9 @@ fn lookup_installed_overload<'a>(
 ) -> Result<PureOverloadDeclaration<'a>, FunctionSpecializationFailure> {
     let attachment = binding.pure.as_ref();
     work.step()?;
-    let attachment = attachment.ok_or(FunctionSpecializationFailure::InvalidInput(
-        "selected function has no installed pure implementation",
-    ))?;
+    let attachment = attachment.ok_or_else(|| {
+        FunctionSpecializationFailure::MissingPureImplementation(overload.clone())
+    })?;
     let effects = binding.declaration.effect_declaration(overload);
     work.step()?;
     let effects = effects?;
