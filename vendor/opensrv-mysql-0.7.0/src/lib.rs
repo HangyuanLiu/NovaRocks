@@ -50,8 +50,8 @@ mod packet_writer;
 mod streaming;
 pub use limits::ProtocolLimits;
 pub use streaming::{
-    ClosingMysqlWriter, ClosingResponseLease, FramingCursor, FrozenMetadata, OwnedStreamingMysqlWriter, ResidentTailPart,
-    StreamingResponseLease, WritePhase,
+    ClosingMysqlWriter, ClosingResponseLease, FramingCursor, FrozenMetadata,
+    OwnedStreamingMysqlWriter, ResidentTailPart, StreamingResponseLease, WritePhase,
 };
 mod params;
 mod resultset;
@@ -124,6 +124,13 @@ pub trait AsyncMysqlShim<W: Send> {
 
     /// Observe bounded input allocation coverage. This does not imply release.
     fn on_protocol_input_usage(&mut self, _usage: ProtocolInputUsage) {}
+
+    /// Whether protocol-local query shortcuts may bypass the query callback.
+    /// A consumer with statement-class admission must disable them for any
+    /// connection class whose admission needs to inspect the whole query.
+    fn permits_query_shortcuts(&self) -> bool {
+        true
+    }
 
     /// Server version
     fn version(&self) -> String {
@@ -309,38 +316,127 @@ where
     }
 
     pub async fn run_with_limits(
+        shim: B,
+        input_stream: R,
+        output_stream: W,
+        opts: &IntermediaryOptions,
+        limits: ProtocolLimits,
+    ) -> Result<(), B::Error> {
+        Self::run_with_optional_input_deadlines(
+            shim,
+            input_stream,
+            output_stream,
+            opts,
+            limits,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Authentication includes greeting, plugin switches, admission and the
+    /// final flush under one caller-supplied absolute deadline. A command's
+    /// deadline starts at its first byte and is not renewed by drip input or
+    /// a continuation packet. An idle authenticated connection may stay idle.
+    pub async fn run_with_input_deadlines(
+        shim: B,
+        input_stream: R,
+        output_stream: W,
+        opts: &IntermediaryOptions,
+        limits: ProtocolLimits,
+        auth_deadline: tokio::time::Instant,
+        command_timeout: std::time::Duration,
+        write_timeout: std::time::Duration,
+    ) -> Result<(), B::Error> {
+        if command_timeout.is_zero() || write_timeout.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "MySQL input and write timeouts must be positive",
+            )
+            .into());
+        }
+        Self::run_with_optional_input_deadlines(
+            shim,
+            input_stream,
+            output_stream,
+            opts,
+            limits,
+            Some(auth_deadline),
+            Some(command_timeout),
+            Some(write_timeout),
+        )
+        .await
+    }
+
+    async fn run_with_optional_input_deadlines(
         mut shim: B,
         input_stream: R,
         mut output_stream: W,
         opts: &IntermediaryOptions,
         limits: ProtocolLimits,
+        auth_deadline: Option<tokio::time::Instant>,
+        command_timeout: Option<std::time::Duration>,
+        write_timeout: Option<std::time::Duration>,
     ) -> Result<(), B::Error> {
         let limits = limits.validate()?;
-        let process_use_statement_on_query = opts.process_use_statement_on_query;
-        let reject_connection_on_dbname_absence = opts.reject_connection_on_dbname_absence;
-        let (_, (handshake, seq, client_capabilities, input_stream)) =
-            AsyncMysqlIntermediary::init_before_ssl_with_limits(
-                &mut shim,
-                input_stream,
-                &mut output_stream,
-                limits,
-                #[cfg(feature = "tls")]
-                &None,
+        if auth_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "MySQL authentication deadline expired",
             )
-            .await?;
+            .into());
+        }
+        let initialize = async {
+            let process_use_statement_on_query = opts.process_use_statement_on_query;
+            let reject_connection_on_dbname_absence = opts.reject_connection_on_dbname_absence;
+            let (_, (handshake, seq, client_capabilities, input_stream)) =
+                AsyncMysqlIntermediary::init_before_ssl_with_limits(
+                    &mut shim,
+                    input_stream,
+                    &mut output_stream,
+                    limits,
+                    #[cfg(feature = "tls")]
+                    &None,
+                )
+                .await?;
 
-        let reader = input_stream;
-        let writer = PacketWriter::with_limits(output_stream, limits);
+            let reader = input_stream;
+            let writer = PacketWriter::with_limits(output_stream, limits);
 
-        let mut mi = AsyncMysqlIntermediary {
-            client_capabilities,
-            process_use_statement_on_query,
-            reject_connection_on_dbname_absence,
-            shim,
-            reader,
-            writer,
+            let mut mi = AsyncMysqlIntermediary {
+                client_capabilities,
+                process_use_statement_on_query,
+                reject_connection_on_dbname_absence,
+                shim,
+                reader,
+                writer,
+            };
+            mi.init_after_ssl(handshake, seq).await?;
+            Ok::<_, B::Error>(mi)
         };
-        mi.init_after_ssl(handshake, seq).await?;
+        let mut mi = match auth_deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, initialize)
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "MySQL authentication deadline expired",
+                    )
+                })??,
+            None => initialize.await?,
+        };
+        // timeout_at polls a ready operation before its timer. Check the
+        // commit boundary too so queued, already-buffered IO cannot renew time.
+        if auth_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "MySQL authentication deadline expired",
+            )
+            .into());
+        }
+        mi.reader.set_message_timeout(command_timeout);
+        mi.writer.set_response_timeout(write_timeout);
         mi.run().await
     }
 
@@ -658,13 +754,16 @@ where
         let mut stmts = input::PreparedStatements::new(self.writer.limits())?;
         self.shim.on_protocol_input_usage(stmts.usage()?);
         while let Some((seq, packet)) = self.reader.next_async().await? {
+            self.writer.reset_response_deadline();
             self.writer.set_seq(seq.wrapping_add(1));
             let res = commands::parse(&packet);
             match res {
                 Ok(cmd) => {
                     match cmd.1 {
                         Command::Query(q) => {
-                            if q.starts_with(b"SELECT @@") || q.starts_with(b"select @@") {
+                            if self.shim.permits_query_shortcuts()
+                                && (q.starts_with(b"SELECT @@") || q.starts_with(b"select @@"))
+                            {
                                 let w = QueryResultWriter::new(
                                     &mut self.writer,
                                     false,

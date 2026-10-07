@@ -624,6 +624,9 @@ struct LeaseShim {
 #[async_trait::async_trait]
 impl crate::AsyncMysqlShim<Socket> for LeaseShim {
     type Error = io::Error;
+    fn permits_query_shortcuts(&self) -> bool {
+        false
+    }
     async fn on_prepare<'a>(
         &'a mut self,
         _: &'a str,
@@ -646,6 +649,11 @@ impl crate::AsyncMysqlShim<Socket> for LeaseShim {
         results: crate::QueryResultWriter<'a, Socket>,
     ) -> io::Result<()> {
         self.seen.lock().unwrap().push(query.to_owned());
+        if query == "refuse" {
+            return results
+                .reject_connection(ErrorKind::ER_ACCESS_DENIED_ERROR, b"reserved connection")
+                .await;
+        }
         let mut lease = results.into_streaming().map_err(|(_, e)| e)?;
         lease.writer().start_row(1)?;
         lease.writer().write_slice(b"a").await?;
@@ -985,4 +993,181 @@ async fn closing_lease_restores_the_connection_only_after_err_flush() {
     drop(closing);
     assert!(!slot.is_detached());
     assert_eq!(slot.next_sequence(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn authentication_deadline_covers_greeting_flush_and_missing_client_input() {
+    for blocked_greeting in [false, true] {
+        let (reader, _client) = tokio::io::duplex(64);
+        let socket = Socket::default();
+        socket.0.lock().unwrap().flush_blocked = blocked_greeting;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let started = tokio::time::Instant::now();
+        let error = crate::AsyncMysqlIntermediary::run_with_input_deadlines(
+            LeaseShim {
+                detached: false,
+                seen: seen.clone(),
+                closing: Arc::new(Mutex::new(None)),
+            },
+            reader,
+            socket,
+            &crate::IntermediaryOptions::default(),
+            ProtocolLimits::default(),
+            started + std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            std::time::Duration::from_secs(10)
+        );
+        assert!(seen.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn legacy_response_write_and_flush_share_one_absolute_deadline() {
+    use std::io::Write;
+    for blocked_packet in [false, true] {
+        let socket = Socket::default();
+        let evidence = socket.clone();
+        let mut writer =
+            crate::packet_writer::PacketWriter::with_limits(socket, ProtocolLimits::default());
+        writer.set_response_timeout(Some(std::time::Duration::from_secs(30)));
+        writer.write_all(b"first").unwrap();
+        writer.end_packet().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        if blocked_packet {
+            evidence.0.lock().unwrap().budget = Some(0);
+        } else {
+            evidence.0.lock().unwrap().flush_blocked = true;
+        }
+        let started = tokio::time::Instant::now();
+        let error = if blocked_packet {
+            writer.write_all(b"second").unwrap();
+            writer.end_packet().await.unwrap_err()
+        } else {
+            writer.flush_all().await.unwrap_err()
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            std::time::Duration::from_secs(10)
+        );
+        assert!(writer.is_poisoned());
+    }
+}
+
+#[tokio::test]
+async fn protocol_query_shortcut_cannot_skip_consumer_admission() {
+    for query in ["SELECT @@max_allowed_packet", "select @@max_allowed_packet"] {
+        let mut wire = vec![(query.len() + 1) as u8, 0, 0, 0, 3];
+        wire.extend_from_slice(query.as_bytes());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mi = crate::AsyncMysqlIntermediary {
+            client_capabilities: crate::CapabilityFlags::empty(),
+            process_use_statement_on_query: true,
+            reject_connection_on_dbname_absence: false,
+            shim: LeaseShim {
+                detached: false,
+                seen: seen.clone(),
+                closing: Arc::new(Mutex::new(None)),
+            },
+            reader: crate::packet_reader::PacketReader::with_limit(wire.as_slice(), 1024),
+            writer: crate::packet_writer::PacketWriter::with_limits(
+                Socket::default(),
+                ProtocolLimits::default(),
+            ),
+        };
+        mi.run().await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![query.to_owned()]);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_already_expired_auth_deadline_refuses_fully_ready_io_before_opening() {
+    let socket = Socket::default();
+    let evidence = socket.clone();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let capabilities = crate::CapabilityFlags::CLIENT_PROTOCOL_41
+        | crate::CapabilityFlags::CLIENT_SECURE_CONNECTION
+        | crate::CapabilityFlags::CLIENT_PLUGIN_AUTH;
+    let mut payload = capabilities.bits().to_le_bytes().to_vec();
+    payload.extend_from_slice(&[0; 4]);
+    payload.push(0x21);
+    payload.extend_from_slice(&[0; 23]);
+    payload.extend_from_slice(b"root\0");
+    payload.push(0);
+    payload.extend_from_slice(b"mysql_native_password\0");
+    let mut wire = vec![payload.len() as u8, 0, 0, 1];
+    wire.extend_from_slice(&payload);
+    let error = crate::AsyncMysqlIntermediary::run_with_input_deadlines(
+        LeaseShim {
+            detached: false,
+            seen: seen.clone(),
+            closing: Arc::new(Mutex::new(None)),
+        },
+        wire.as_slice(),
+        socket,
+        &crate::IntermediaryOptions::default(),
+        ProtocolLimits::default(),
+        tokio::time::Instant::now() - std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(evidence.0.lock().unwrap().bytes.is_empty());
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+
+#[tokio::test(start_paused = true)]
+async fn reserved_connection_refusal_flushes_then_exits_without_reading_next_command() {
+    for blocked_flush in [false, true] {
+        let wire = vec![7, 0, 0, 0, 3, b'r', b'e', b'f', b'u', b's', b'e',
+                        2, 0, 0, 0, 3, b'b'];
+        let consumed = Arc::new(Mutex::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let socket = Socket::default();
+        let evidence = socket.clone();
+        evidence.0.lock().unwrap().flush_blocked = blocked_flush;
+        let mut writer = crate::packet_writer::PacketWriter::with_limits(
+            socket, ProtocolLimits::default());
+        writer.set_response_timeout(Some(std::time::Duration::from_secs(30)));
+        let mi = crate::AsyncMysqlIntermediary {
+            client_capabilities: crate::CapabilityFlags::empty(),
+            process_use_statement_on_query: true,
+            reject_connection_on_dbname_absence: false,
+            shim: LeaseShim {
+                detached: false,
+                seen: seen.clone(),
+                closing: Arc::new(Mutex::new(None)),
+            },
+            reader: crate::packet_reader::PacketReader::new(CommandReader {
+                wire: std::io::Cursor::new(wire),
+                consumed: consumed.clone(),
+            }),
+            writer,
+        };
+        let started = tokio::time::Instant::now();
+        let error = mi.run().await.unwrap_err();
+        assert_eq!(error.kind(), if blocked_flush {
+            io::ErrorKind::TimedOut
+        } else {
+            io::ErrorKind::PermissionDenied
+        });
+        assert_eq!(*consumed.lock().unwrap(), 11);
+        assert_eq!(*seen.lock().unwrap(), vec!["refuse".to_owned()]);
+        let state = evidence.0.lock().unwrap();
+        assert_eq!(state.bytes[4], 0xff);
+        if blocked_flush {
+            assert_eq!(tokio::time::Instant::now() - started,
+                std::time::Duration::from_secs(30));
+        }
+    }
 }

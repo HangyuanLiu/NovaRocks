@@ -43,6 +43,7 @@ use novarocks_query_application::session::{
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
 use novarocks_query_application::sql::admission::negotiated_query_statements;
 
+use crate::connection_registry::{MysqlClientConnectionRegistration, MysqlConnectionClass};
 use crate::{ClientDisconnectWatcher, MysqlClientConnectionRegistry, spawn_disconnect_watcher};
 
 async fn write_negotiated_statement<'writer, W: AsyncWrite + Unpin>(
@@ -138,24 +139,34 @@ where
     R: FnOnce(SocketAddr),
 {
     let (bind_addr, session_user) = settings.into_parts();
-    crate::serve_tcp_until_drain_then_shutdown(
+    let drain_registry = Arc::clone(&connections);
+    let serve_result = crate::listener::serve_tcp_until_drain_then_shutdown_admitted(
         bind_addr,
         drain,
         finalize,
         move |stream, peer_addr| {
-            serve_query_application_mysql_connection(
+            // Acquire a finite position before creating the task, watcher or
+            // intermediary and its protocol buffers. Full admission closes IO.
+            let registration = connections.register().ok()?;
+            Some(serve_registered_mysql_connection(
                 session_user.clone(),
                 server_version.clone(),
                 Arc::clone(&session_factory),
-                Arc::clone(&connections),
+                registration,
                 stream,
                 peer_addr,
-            )
+            ))
         },
         on_ready,
         cleanup_timeout,
     )
-    .await
+    .await;
+    tokio::time::timeout(cleanup_timeout, drain_registry.wait_drained())
+        .await
+        .map_err(|_| {
+            "MySQL connection owners did not drain before the cleanup deadline".to_string()
+        })?;
+    serve_result
 }
 
 pub async fn serve_query_application_mysql_connection(
@@ -166,7 +177,7 @@ pub async fn serve_query_application_mysql_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
 ) {
-    let mut registration = match connections.register() {
+    let registration = match connections.register() {
         Ok(registration) => registration,
         Err(error) => {
             warn!(
@@ -176,10 +187,31 @@ pub async fn serve_query_application_mysql_connection(
             return;
         }
     };
+    serve_registered_mysql_connection(
+        user,
+        server_version,
+        session_factory,
+        registration,
+        stream,
+        peer_addr,
+    )
+    .await;
+}
+
+async fn serve_registered_mysql_connection(
+    user: String,
+    server_version: String,
+    session_factory: Arc<dyn QuerySessionFactory>,
+    mut registration: MysqlClientConnectionRegistration,
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+) {
     let connection = registration.token();
     let session: Arc<OnceLock<Arc<dyn QuerySession>>> = Arc::new(OnceLock::new());
     let session_for_disconnect = Arc::clone(&session);
+    let watcher_owner = registration.retain_owner();
     let disconnect_watcher = spawn_disconnect_watcher(&stream, move || {
+        let _owner = &watcher_owner;
         if let Some(session) = session_for_disconnect.get() {
             session.cancel_current(QueryCancellationReason::ClientDisconnected);
         }
@@ -191,14 +223,23 @@ pub async fn serve_query_application_mysql_connection(
         Arc::clone(&session),
         disconnect_watcher,
         server_version,
-    );
+    )
+    .with_connection_class(registration.class());
     let (reader, writer) = stream.into_split();
     let result = {
-        let intermediary = AsyncMysqlIntermediary::run_with_options(
+        let mut limits = opensrv_mysql::ProtocolLimits::default();
+        if registration.class() == MysqlConnectionClass::Control {
+            limits.command_bytes = limits.diagnostic_bytes;
+        }
+        let intermediary = AsyncMysqlIntermediary::run_with_input_deadlines(
             shim,
             reader,
             writer,
             &crate::MYSQL_INTERMEDIARY_OPTIONS,
+            limits,
+            tokio::time::Instant::from_std(registration.admitted_at()) + Duration::from_secs(10),
+            Duration::from_secs(10),
+            Duration::from_secs(30),
         );
         tokio::pin!(intermediary);
         tokio::select! {
@@ -261,6 +302,7 @@ pub struct QueryApplicationMysqlShim {
     session: Arc<OnceLock<Arc<dyn QuerySession>>>,
     _disconnect_watcher: ClientDisconnectWatcher,
     server_version: String,
+    connection_class: MysqlConnectionClass,
 }
 
 impl QueryApplicationMysqlShim {
@@ -279,7 +321,13 @@ impl QueryApplicationMysqlShim {
             session,
             _disconnect_watcher: disconnect_watcher,
             server_version,
+            connection_class: MysqlConnectionClass::Ordinary,
         }
+    }
+
+    fn with_connection_class(mut self, class: MysqlConnectionClass) -> Self {
+        self.connection_class = class;
+        self
     }
 
     fn session(&self) -> Result<&Arc<dyn QuerySession>, QueryServiceError> {
@@ -303,6 +351,10 @@ impl Drop for QueryApplicationMysqlShim {
 #[async_trait]
 impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlShim {
     type Error = io::Error;
+
+    fn permits_query_shortcuts(&self) -> bool {
+        self.connection_class == MysqlConnectionClass::Ordinary
+    }
 
     fn version(&self) -> String {
         format!("{}-standalone-mysql", self.server_version)
@@ -346,6 +398,12 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
         _query: &'a str,
         info: StatementMetaWriter<'a, W>,
     ) -> io::Result<()> {
+        if self.connection_class == MysqlConnectionClass::Control {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "control connection only accepts KILL",
+            ));
+        }
         info.error(
             ErrorKind::ER_NOT_SUPPORTED_YET,
             b"prepared statements are not supported in standalone server v1",
@@ -359,6 +417,12 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
         _params: ParamParser<'a>,
         results: QueryResultWriter<'a, W>,
     ) -> io::Result<()> {
+        if self.connection_class == MysqlConnectionClass::Control {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "control connection only accepts KILL",
+            ));
+        }
         results
             .error(
                 ErrorKind::ER_NOT_SUPPORTED_YET,
@@ -374,6 +438,12 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
         schema: &'a str,
         writer: InitWriter<'a, W>,
     ) -> io::Result<()> {
+        if self.connection_class == MysqlConnectionClass::Control {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "control connection only accepts KILL",
+            ));
+        }
         let session = match self.session() {
             Ok(session) => session,
             Err(error) => {
@@ -423,6 +493,15 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
         query: &'a str,
         results: QueryResultWriter<'a, W>,
     ) -> io::Result<()> {
+        if self.connection_class == MysqlConnectionClass::Control {
+            if let Err(error) =
+                novarocks_query_application::sql::admission::admit_control_connection_batch(query)
+            {
+                return results
+                    .reject_connection(crate::mysql_error_kind(&error), error.message().as_bytes())
+                    .await;
+            }
+        }
         let session = match self.session() {
             Ok(session) => session,
             Err(error) => {
@@ -555,6 +634,18 @@ mod tests {
         .await
     }
 
+    #[test]
+    fn reserved_control_connections_disable_protocol_query_shortcuts() {
+        let ordinary = rejecting_shim();
+        assert!(AsyncMysqlShim::<tokio::io::Sink>::permits_query_shortcuts(
+            &ordinary
+        ));
+        let control = ordinary.with_connection_class(MysqlConnectionClass::Control);
+        assert!(!AsyncMysqlShim::<tokio::io::Sink>::permits_query_shortcuts(
+            &control
+        ));
+    }
+
     #[tokio::test]
     async fn adapter_rejects_unauthorized_handshakes_before_session_open() {
         let shim = rejecting_shim();
@@ -605,24 +696,25 @@ mod tests {
             "root",
         );
 
-        serve_query_application_mysql_until_shutdown(
+        let server = serve_query_application_mysql_until_shutdown(
             settings,
             "test".to_string(),
             factory,
             Arc::clone(&connections),
             async {},
             |_| {},
-        )
-        .await
-        .expect("ready protocol server should shut down cleanly");
-
-        assert!(cancelled.load(Ordering::SeqCst));
-        assert_eq!(
-            registration
-                .termination_receiver()
-                .try_recv()
-                .expect("shutdown must reach the registered connection"),
-            ClientConnectionTerminationReason::ServerShutdown
         );
+        let (result, reason) = tokio::join!(server, async move {
+            let reason = registration
+                .termination_receiver()
+                .await
+                .expect("shutdown signal");
+            // The protocol task actually exits before the registry is drained.
+            drop(registration);
+            reason
+        });
+        result.expect("ready protocol server should shut down cleanly");
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert_eq!(reason, ClientConnectionTerminationReason::ServerShutdown);
     }
 }

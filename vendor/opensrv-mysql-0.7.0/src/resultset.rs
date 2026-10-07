@@ -258,6 +258,22 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
         writers::write_err(kind, msg.borrow(), self.writer).await
     }
 
+    /// Flush one bounded refusal at an initial response boundary, then make
+    /// the intermediary exit instead of retaining a reserved connection for
+    /// commands its consumer cannot admit.
+    pub async fn reject_connection<E>(mut self, kind: ErrorKind, msg: &E) -> io::Result<()>
+    where
+        E: Borrow<[u8]> + ?Sized,
+    {
+        self.finalize(true).await?;
+        writers::write_err(kind, msg.borrow(), self.writer).await?;
+        self.writer.flush_all().await?;
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "query refused for this connection class",
+        ))
+    }
+
     /// Send the last bits of the last resultset to the client, and indicate that there are no more
     /// resultsets coming.
     pub async fn no_more_results(mut self) -> io::Result<()> {

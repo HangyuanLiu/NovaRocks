@@ -20,6 +20,7 @@ pub struct PacketReader<R> {
     bytes: Vec<u8>,
     limit: usize,
     expected_first: Option<u8>,
+    message_timeout: Option<std::time::Duration>,
     pub r: R,
 }
 impl<R> PacketReader<R> {
@@ -31,8 +32,12 @@ impl<R> PacketReader<R> {
             bytes: Vec::with_capacity(limit),
             limit,
             expected_first: None,
+            message_timeout: None,
             r,
         }
+    }
+    pub(crate) fn set_message_timeout(&mut self, timeout: Option<std::time::Duration>) {
+        self.message_timeout = timeout;
     }
     pub(crate) fn set_limit(&mut self, limit: usize) {
         self.limit = limit;
@@ -113,30 +118,53 @@ impl<R: AsyncRead + Unpin> AsyncRead for PacketReader<R> {
 impl<R: AsyncRead + Unpin> PacketReader<R> {
     pub async fn next_async(&mut self) -> io::Result<Option<(u8, Packet<'_>)>> {
         self.bytes.clear();
-        let mut expected = self.expected_first;
-        let mut continuation = false;
-        loop {
-            let mut header = [0; 4];
-            if self.r.read(&mut header[..1]).await? == 0 {
-                if !continuation {
-                    return Ok(None);
-                }
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "missing MySQL continuation",
-                ));
-            }
-            self.r.read_exact(&mut header[1..]).await?;
-            let length = self.accept_header(header, expected)?;
-            let start = self.bytes.len();
-            self.bytes.resize(start + length, 0);
-            self.r.read_exact(&mut self.bytes[start..]).await?;
-            if length != crate::U24_MAX {
-                return Ok(Some((header[3], Packet(&self.bytes, Vec::new()))));
-            }
-            expected = Some(header[3].wrapping_add(1));
-            continuation = true;
+        let mut header = [0; 4];
+        if self.r.read(&mut header[..1]).await? == 0 {
+            return Ok(None);
         }
+        let deadline = self
+            .message_timeout
+            .map(|timeout| tokio::time::Instant::now() + timeout);
+        let message = async {
+            let mut expected = self.expected_first;
+            loop {
+                self.r.read_exact(&mut header[1..]).await?;
+                let length = self.accept_header(header, expected)?;
+                let start = self.bytes.len();
+                self.bytes.resize(start + length, 0);
+                self.r.read_exact(&mut self.bytes[start..]).await?;
+                if length != crate::U24_MAX {
+                    return Ok(header[3]);
+                }
+                expected = Some(header[3].wrapping_add(1));
+                if self.r.read(&mut header[..1]).await? == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "missing MySQL continuation",
+                    ));
+                }
+            }
+        };
+        let sequence = match deadline {
+            Some(deadline) => {
+                tokio::time::timeout_at(deadline, message)
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "MySQL command input deadline expired",
+                        )
+                    })??
+            }
+            None => message.await?,
+        };
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "MySQL command input deadline expired",
+            ));
+        }
+        Ok(Some((sequence, Packet(&self.bytes, Vec::new()))))
     }
 }
 #[cfg(test)]

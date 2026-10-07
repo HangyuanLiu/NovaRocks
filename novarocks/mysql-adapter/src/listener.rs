@@ -113,6 +113,33 @@ where
     HFut: Future<Output = ()> + Send + 'static,
     R: FnOnce(SocketAddr),
 {
+    serve_tcp_until_drain_then_shutdown_admitted(
+        bind_addr,
+        drain,
+        finalize,
+        move |stream, peer| Some(session_handler(stream, peer)),
+        on_ready,
+        cleanup_timeout,
+    )
+    .await
+}
+
+/// Stop accepting at `drain`, run `finalize`, then drain existing tasks.
+pub(crate) async fn serve_tcp_until_drain_then_shutdown_admitted<F, G, H, HFut, R>(
+    bind_addr: SocketAddr,
+    drain: F,
+    finalize: G,
+    mut session_handler: H,
+    on_ready: R,
+    cleanup_timeout: Duration,
+) -> Result<(), String>
+where
+    F: Future<Output = ()> + Send,
+    G: Future<Output = ()> + Send,
+    H: FnMut(TcpStream, SocketAddr) -> Option<HFut>,
+    HFut: Future<Output = ()> + Send + 'static,
+    R: FnOnce(SocketAddr),
+{
     let listener = TcpListener::bind(bind_addr)
         .await
         .map_err(|error| format!("bind MySQL listener on {bind_addr} failed: {error}"))?;
@@ -134,7 +161,9 @@ where
             }
             accepted = listener.accept() => match accepted {
                 Ok((stream, peer_addr)) => {
-                    sessions.spawn(session_handler(stream, peer_addr));
+                    if let Some(session) = session_handler(stream, peer_addr) {
+                        sessions.spawn(session);
+                    }
                 }
                 Err(error) => break Err(format!("accept MySQL connection failed: {error}")),
             },
@@ -206,6 +235,43 @@ mod tests {
         })
         .await
         .expect("listener should stop accepting within the test timeout");
+    }
+
+    #[tokio::test]
+    async fn refused_admission_closes_socket_without_creating_a_session_task() {
+        use tokio::io::AsyncReadExt;
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        let server = tokio::spawn(serve_tcp_until_drain_then_shutdown_admitted(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            async {
+                let _ = shutdown_rx.await;
+            },
+            async {},
+            move |_stream, _peer| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                None::<std::future::Ready<()>>
+            },
+            move |addr| {
+                let _ = ready_tx.send(addr);
+            },
+            TEST_TIMEOUT,
+        ));
+        let addr = ready_rx.await.unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut bytes = [0; 1];
+        assert_eq!(
+            tokio::time::timeout(TEST_TIMEOUT, client.read(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]

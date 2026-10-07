@@ -45,6 +45,21 @@ reader grows input buffers without an explicit limit. This patch adds:
    `ClosingResponseLease` keeps the detached return slot inert until the full
    ERR and socket flush succeed; partial failure or a dropped finish future
    closes its IO and leaves that slot unusable.
+9. `run_with_input_deadlines` accepts an absolute authentication deadline
+   covering greeting, plugin switches, session admission and final flush.
+   `PacketReader` starts one command deadline at the first received byte;
+   drip input and continuation packets do not renew it. Authentication and
+   input timeout close the owner rather than emitting ERR into partial input.
+   The same entry point supplies a response write timeout: the legacy
+   PacketWriter uses one absolute deadline from initial response construction
+   through the final socket flush, keeping partial IO poisoned on timeout.
+   The relay and closing writers retain their separately owned deadlines.
+   Existing entry points retain their previous timeout policy.
+10. `permits_query_shortcuts` lets the consumer apply its connection-class
+    admission to every query, including the built-in max-packet shortcut.
+    `reject_connection` flushes a bounded refusal and then exits the command
+    loop, so a reserved control connection cannot stay occupied after a
+    refused ordinary query. Flush failure or timeout also closes its owner.
 
 The patch concerns MySQL protocol behavior and NovaRocks-owned buffers only.
 It does not instrument or account allocator use inside the crate. Exit

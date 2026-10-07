@@ -29,6 +29,8 @@ pub struct PacketWriter<W> {
     output_stream: Option<W>,
     limits: crate::ProtocolLimits,
     pending_io: bool,
+    response_timeout: Option<std::time::Duration>,
+    response_deadline: Option<tokio::time::Instant>,
 }
 
 // exports the internal builder as sync Write
@@ -46,6 +48,9 @@ impl<W> Write for PacketWriter<W> {
                 "MySQL writer is detached",
             ));
         }
+        if !buf.is_empty() {
+            self.start_response()?;
+        }
         self.packet_builder.write(buf)
     }
 
@@ -61,7 +66,32 @@ impl<W> PacketWriter<W> {
             output_stream: Some(output_stream),
             limits,
             pending_io: false,
+            response_timeout: None,
+            response_deadline: None,
         }
+    }
+    pub(crate) fn set_response_timeout(&mut self, timeout: Option<std::time::Duration>) {
+        self.response_timeout = timeout;
+    }
+    pub(crate) fn reset_response_deadline(&mut self) {
+        self.response_deadline = None;
+    }
+    fn start_response(&mut self) -> io::Result<()> {
+        if self.response_deadline.is_none() {
+            self.response_deadline = self
+                .response_timeout
+                .map(|timeout| tokio::time::Instant::now() + timeout);
+        }
+        if self
+            .response_deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "MySQL response write deadline expired",
+            ));
+        }
+        Ok(())
     }
     pub(crate) fn is_poisoned(&self) -> bool {
         self.pending_io
@@ -88,6 +118,8 @@ impl<W> PacketWriter<W> {
             ));
         }
         self.output_stream = Some(io);
+        // The owned writer completed its separately timed response before restoration.
+        self.reset_response_deadline();
         self.set_seq(sequence);
         Ok(())
     }
@@ -112,6 +144,8 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
                 "legacy MySQL IO is poisoned",
             ));
         }
+        self.start_response()?;
+        let deadline = self.response_deadline;
         let output_stream = self.output_stream.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "MySQL writer is detached")
         })?;
@@ -121,48 +155,70 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
             self.pending_io = true;
             let raw_packet = builder.take_buffer();
 
-            // split the rww buffer at the boundary of size U24_MAX
-            let chunks = raw_packet.chunks(U24_MAX);
-            let mut header = [0; PACKET_HEADER_SIZE];
-            for chunk in chunks {
-                // prepare the header
-                LittleEndian::write_u24(&mut header, chunk.len() as u32);
-                header[3] = builder.seq();
-                builder.increase_seq();
+            let write = async {
+                // split the rww buffer at the boundary of size U24_MAX
+                let chunks = raw_packet.chunks(U24_MAX);
+                let mut header = [0; PACKET_HEADER_SIZE];
+                for chunk in chunks {
+                    // prepare the header
+                    LittleEndian::write_u24(&mut header, chunk.len() as u32);
+                    header[3] = builder.seq();
+                    builder.increase_seq();
 
-                // write out the header and payload.
-                //
-                // depends on the AsyncWrite provided, this may trigger
-                // real system call or not (for example, if AsyncWrite is buffered stream)
-                let written = output_stream
-                    .write_vectored(&[IoSlice::new(&header), IoSlice::new(chunk)])
-                    .await?;
+                    // write out the header and payload.
+                    //
+                    // depends on the AsyncWrite provided, this may trigger
+                    // real system call or not (for example, if AsyncWrite is buffered stream)
+                    let written = output_stream
+                        .write_vectored(&[IoSlice::new(&header), IoSlice::new(chunk)])
+                        .await?;
 
-                // if write buffer is not drained, fall back to write_all
-                if written > PACKET_HEADER_SIZE + chunk.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "socket reported invalid write length",
-                    ));
-                }
-                if written != PACKET_HEADER_SIZE + chunk.len() {
-                    if written == 0 {
+                    // if write buffer is not drained, fall back to write_all
+                    if written > PACKET_HEADER_SIZE + chunk.len() {
                         return Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "MySQL socket accepted zero bytes",
+                            io::ErrorKind::InvalidData,
+                            "socket reported invalid write length",
                         ));
                     }
-                    if written < PACKET_HEADER_SIZE {
-                        output_stream.write_all(&header[written..]).await?;
+                    if written != PACKET_HEADER_SIZE + chunk.len() {
+                        if written == 0 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "MySQL socket accepted zero bytes",
+                            ));
+                        }
+                        if written < PACKET_HEADER_SIZE {
+                            output_stream.write_all(&header[written..]).await?;
+                        }
+                        let payload_written = written.saturating_sub(PACKET_HEADER_SIZE);
+                        output_stream.write_all(&chunk[payload_written..]).await?
                     }
-                    let payload_written = written.saturating_sub(PACKET_HEADER_SIZE);
-                    output_stream.write_all(&chunk[payload_written..]).await?
                 }
+                if raw_packet.len().is_multiple_of(U24_MAX) {
+                    let header = [0, 0, 0, builder.seq()];
+                    builder.increase_seq();
+                    output_stream.write_all(&header).await?;
+                }
+                Ok::<_, io::Error>(())
+            };
+            match deadline {
+                Some(deadline) => {
+                    tokio::time::timeout_at(deadline, write)
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "MySQL response write deadline expired",
+                            )
+                        })??
+                }
+                None => write.await?,
             }
-            if raw_packet.len().is_multiple_of(U24_MAX) {
-                let header = [0, 0, 0, builder.seq()];
-                builder.increase_seq();
-                output_stream.write_all(&header).await?;
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "MySQL response write deadline expired",
+                ));
             }
             self.pending_io = false;
             Ok(())
@@ -178,11 +234,29 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
                 "legacy MySQL IO is poisoned",
             ));
         }
+        self.start_response()?;
+        let deadline = self.response_deadline;
         let io = self.output_stream.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "MySQL writer is detached")
         })?;
         self.pending_io = true;
-        io.flush().await?;
+        match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, io.flush())
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "MySQL response write deadline expired",
+                    )
+                })??,
+            None => io.flush().await?,
+        }
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "MySQL response write deadline expired",
+            ));
+        }
         self.pending_io = false;
         Ok(())
     }

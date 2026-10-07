@@ -102,7 +102,7 @@ version = "3.3.0"
 
 [dev-dependencies.tokio]
 version = "1.0"
-features = ["full"]
+features = ["full", "test-util"]
 
 [features]
 default = ["tls"]

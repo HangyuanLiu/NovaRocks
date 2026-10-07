@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Explicit allocation limits for the protocol owner. Deadlines belong to its caller.
+//! Explicit allocation limits for the protocol owner. The caller supplies deadlines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProtocolLimits {
     pub row_bytes: usize,

@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 
 use novarocks_query_application::client_connection::{
     ClientConnectionControlPort, ClientConnectionTerminateOutcome,
@@ -29,11 +29,29 @@ use novarocks_query_application::client_connection::{
 
 const MAX_CONNECTION_ID: u32 = u32::MAX;
 const MAX_GENERATION: u64 = u64::MAX;
+// Frozen M07 connection positions include authentication and all protocol tails.
+const ORDINARY_POSITIONS: usize = 512;
+const CONTROL_POSITIONS: usize = 32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MysqlConnectionClass {
+    Ordinary,
+    Control,
+}
+impl MysqlConnectionClass {
+    const fn index(self) -> usize {
+        match self {
+            Self::Ordinary => 0,
+            Self::Control => 1,
+        }
+    }
+}
 
 /// The protocol owner of accepted client connection identities and signals.
 #[derive(Clone)]
 pub struct MysqlClientConnectionRegistry {
     state: Arc<Mutex<RegistryState>>,
+    drained: Arc<Notify>,
 }
 
 impl Default for MysqlClientConnectionRegistry {
@@ -48,9 +66,12 @@ struct RegistryState {
     max_connection_id: u32,
     max_generation: u64,
     entries: BTreeMap<u32, Entry>,
+    capacity: [usize; 2],
+    held: [usize; 2],
 }
 
 struct Entry {
+    class: MysqlConnectionClass,
     token: ClientConnectionToken,
     termination: Option<oneshot::Sender<ClientConnectionTerminationReason>>,
 }
@@ -59,13 +80,25 @@ struct Entry {
 pub enum ConnectionRegistrationError {
     ConnectionIdExhausted,
     GenerationExhausted,
+    CapacityExhausted,
 }
 
 /// A registration whose drop removes only the exact generation it created.
 pub struct MysqlClientConnectionRegistration {
+    lifetime: Arc<RegisteredConnectionLifetime>,
+    token: ClientConnectionToken,
+    admitted_at: std::time::Instant,
+    termination: oneshot::Receiver<ClientConnectionTerminationReason>,
+}
+
+pub(crate) struct RegisteredConnectionLifetime {
     registry: MysqlClientConnectionRegistry,
     token: ClientConnectionToken,
-    termination: oneshot::Receiver<ClientConnectionTerminationReason>,
+}
+impl Drop for RegisteredConnectionLifetime {
+    fn drop(&mut self) {
+        self.registry.unregister(self.token);
+    }
 }
 
 impl MysqlClientConnectionRegistry {
@@ -85,12 +118,15 @@ impl MysqlClientConnectionRegistry {
 
     fn with_bounds(max_connection_id: u32, max_generation: u64) -> Self {
         Self {
+            drained: Arc::new(Notify::new()),
             state: Arc::new(Mutex::new(RegistryState {
                 next_connection_id: 1,
                 next_generation: 1,
                 max_connection_id,
                 max_generation,
                 entries: BTreeMap::new(),
+                capacity: [ORDINARY_POSITIONS, CONTROL_POSITIONS],
+                held: [0; 2],
             })),
         }
     }
@@ -100,6 +136,13 @@ impl MysqlClientConnectionRegistry {
     ) -> Result<MysqlClientConnectionRegistration, ConnectionRegistrationError> {
         let (token, termination) = {
             let mut state = self.lock();
+            let class = if state.held[0] < state.capacity[0] {
+                MysqlConnectionClass::Ordinary
+            } else if state.held[1] < state.capacity[1] {
+                MysqlConnectionClass::Control
+            } else {
+                return Err(ConnectionRegistrationError::CapacityExhausted);
+            };
             let connection_id = state.next_available_connection_id()?;
             let generation = state.next_generation()?;
             let token = ClientConnectionToken::new(connection_id, generation)
@@ -108,6 +151,7 @@ impl MysqlClientConnectionRegistry {
             let previous = state.entries.insert(
                 connection_id,
                 Entry {
+                    class,
                     token,
                     termination: Some(sender),
                 },
@@ -116,11 +160,16 @@ impl MysqlClientConnectionRegistry {
                 previous.is_none(),
                 "allocator must skip live connection IDs"
             );
+            state.held[class.index()] += 1;
             (token, receiver)
         };
         Ok(MysqlClientConnectionRegistration {
-            registry: self.clone(),
+            lifetime: Arc::new(RegisteredConnectionLifetime {
+                registry: self.clone(),
+                token,
+            }),
             token,
+            admitted_at: std::time::Instant::now(),
             termination,
         })
     }
@@ -141,6 +190,18 @@ impl MysqlClientConnectionRegistry {
         count
     }
 
+    pub(crate) async fn wait_drained(&self) {
+        loop {
+            let notified = self.drained.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.lock().entries.is_empty() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     fn unregister(&self, token: ClientConnectionToken) {
         let mut state = self.lock();
         if state
@@ -148,7 +209,12 @@ impl MysqlClientConnectionRegistry {
             .get(&token.connection_id())
             .is_some_and(|entry| entry.token == token)
         {
-            state.entries.remove(&token.connection_id());
+            let entry = state
+                .entries
+                .remove(&token.connection_id())
+                .expect("exact entry exists");
+            state.held[entry.class.index()] -= 1;
+            self.drained.notify_waiters();
         }
     }
 
@@ -184,6 +250,19 @@ impl ClientConnectionControlPort for MysqlClientConnectionRegistry {
 }
 
 impl MysqlClientConnectionRegistration {
+    pub(crate) fn admitted_at(&self) -> std::time::Instant {
+        self.admitted_at
+    }
+
+    pub(crate) fn class(&self) -> MysqlConnectionClass {
+        self.lifetime.registry.lock().entries[&self.token.connection_id()].class
+    }
+
+    /// A watcher keeps the position until its actual task and socket exit.
+    pub(crate) fn retain_owner(&self) -> Arc<RegisteredConnectionLifetime> {
+        Arc::clone(&self.lifetime)
+    }
+
     pub const fn token(&self) -> ClientConnectionToken {
         self.token
     }
@@ -192,12 +271,6 @@ impl MysqlClientConnectionRegistration {
         &mut self,
     ) -> &mut oneshot::Receiver<ClientConnectionTerminationReason> {
         &mut self.termination
-    }
-}
-
-impl Drop for MysqlClientConnectionRegistration {
-    fn drop(&mut self) {
-        self.registry.unregister(self.token);
     }
 }
 
@@ -243,6 +316,52 @@ mod tests {
 
     fn token(connection_id: u32, generation: u64) -> ClientConnectionToken {
         ClientConnectionToken::new(connection_id, generation).expect("valid test token")
+    }
+
+    #[test]
+    fn ordinary_capacity_preserves_a_control_reserve_until_actual_owner_exit() {
+        let registry = MysqlClientConnectionRegistry::new();
+        registry.lock().capacity = [1, 1];
+        let ordinary = registry.register().unwrap();
+        assert_eq!(ordinary.class(), MysqlConnectionClass::Ordinary);
+        let watcher = ordinary.retain_owner();
+        let control = registry.register().unwrap();
+        assert_eq!(control.class(), MysqlConnectionClass::Control);
+        assert!(matches!(
+            registry.register(),
+            Err(ConnectionRegistrationError::CapacityExhausted)
+        ));
+        drop(ordinary);
+        assert!(matches!(
+            registry.register(),
+            Err(ConnectionRegistrationError::CapacityExhausted)
+        ));
+        drop(watcher);
+        let next = registry.register().unwrap();
+        assert_eq!(next.class(), MysqlConnectionClass::Ordinary);
+        assert_eq!(registry.lock().held, [1, 1]);
+        drop(next);
+        drop(control);
+        assert_eq!(registry.lock().held, [0, 0]);
+    }
+
+    #[tokio::test]
+    async fn registry_drain_waits_for_the_final_watcher_owner() {
+        let registry = MysqlClientConnectionRegistry::new();
+        let registration = registry.register().unwrap();
+        let watcher = registration.retain_owner();
+        drop(registration);
+        let drained = registry.wait_drained();
+        tokio::pin!(drained);
+        tokio::select! {
+            biased;
+            _ = &mut drained => panic!("live watcher must prevent drain"),
+            _ = tokio::task::yield_now() => {},
+        }
+        drop(watcher);
+        tokio::time::timeout(std::time::Duration::from_secs(1), drained)
+            .await
+            .unwrap();
     }
 
     #[test]

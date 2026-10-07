@@ -397,3 +397,68 @@ fn long_data_reallocation_covers_old_and_new_even_when_final_state_fits() {
     assert!(states.append_long_data(1, 0, &vec![0; 450_000]).is_err());
     assert_eq!(states.usage().unwrap(), before);
 }
+
+#[tokio::test(start_paused = true)]
+async fn command_drip_input_does_not_renew_its_absolute_deadline() {
+    use tokio::io::AsyncWriteExt;
+    let (reader, mut sender) = tokio::io::duplex(64);
+    let mut reader = PacketReader::with_limit(reader, 32);
+    reader.set_expected_first(Some(0));
+    reader.set_message_timeout(Some(std::time::Duration::from_secs(10)));
+    sender.write_all(&[3]).await.unwrap();
+    let drip = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        sender.write_all(&[0, 0, 0, b'a']).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        let _ = sender.write_all(b"bc").await;
+    });
+    let error = reader.next_async().await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    drip.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn authenticated_idle_time_does_not_spend_the_next_command_deadline() {
+    use tokio::io::AsyncWriteExt;
+    let (reader, mut sender) = tokio::io::duplex(64);
+    let mut reader = PacketReader::with_limit(reader, 32);
+    reader.set_expected_first(Some(0));
+    reader.set_message_timeout(Some(std::time::Duration::from_secs(10)));
+    let client = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(40)).await;
+        sender
+            .write_all(&[3, 0, 0, 0, b'a', b'b', b'c'])
+            .await
+            .unwrap();
+    });
+    let (sequence, packet) = reader.next_async().await.unwrap().unwrap();
+    assert_eq!(sequence, 0);
+    assert_eq!(packet.as_ref(), b"abc");
+    client.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_expired_command_cannot_commit_already_ready_buffered_bytes() {
+    use std::future::Future;
+    use tokio::io::AsyncWriteExt;
+    let (reader, mut sender) = tokio::io::duplex(64);
+    let mut reader = PacketReader::with_limit(reader, 32);
+    reader.set_message_timeout(Some(std::time::Duration::from_secs(10)));
+    sender.write_all(&[3]).await.unwrap();
+    let message = reader.next_async();
+    tokio::pin!(message);
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(message.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    tokio::time::advance(std::time::Duration::from_secs(11)).await;
+    sender
+        .write_all(&[0, 0, 0, b'a', b'b', b'c'])
+        .await
+        .unwrap();
+    assert_eq!(
+        message.await.unwrap_err().kind(),
+        std::io::ErrorKind::TimedOut
+    );
+}
