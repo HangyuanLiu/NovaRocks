@@ -24,6 +24,7 @@ mod change_events;
 #[cfg(test)]
 mod change_events_lowering_tests;
 mod channels;
+mod exchange;
 mod expressions;
 mod lowering;
 mod original_requests;
@@ -196,8 +197,12 @@ mod equality_lowering_tests;
 mod arithmetic_lowering_tests;
 
 mod sort;
+mod stream_sink;
 mod topn;
 mod values;
+
+#[cfg(test)]
+mod exchange_lowering_tests;
 
 #[cfg(test)]
 mod union_flow_tests;

@@ -20,8 +20,11 @@
 //! legacy ExprArena thaw and no legacy node identity. A node family without
 //! a compiled processor is an explicit refusal, never a legacy fallback.
 
+use std::collections::BTreeSet;
+
 use super::*;
 use crate::exec::chunk::{Chunk, ChunkSchema};
+use crate::exec::node::exchange_source::ExchangeSourceNode;
 use crate::exec::operators::compiled_expression::{
     CompiledFilterProcessorFactory, CompiledProjectProcessorFactory,
 };
@@ -34,8 +37,73 @@ fn display_id(id: ProgramNodeId) -> Result<i32, String> {
     i32::try_from(id.index()).map_err(|_| "compiled program node index exceeds i32".to_string())
 }
 
+/// The receiver node id a compiled ExchangeSource is addressed by: the
+/// physical destination node of its edge, which is also the sender's
+/// `dest_node_id` routing key.
+fn receiver_node_id(program: &LocalProgram, id: ProgramNodeId) -> Result<i32, String> {
+    let input = program.exchange_inputs().get(&id).ok_or_else(|| {
+        format!(
+            "compiled exchange source at local node {} has no exchange address",
+            id.index()
+        )
+    })?;
+    i32::try_from(input.receiver_node).map_err(|_| {
+        format!(
+            "compiled exchange receiver node {} exceeds i32",
+            input.receiver_node
+        )
+    })
+}
+
+/// The Task's exchange bindings must cover exactly the program's compiled
+/// exchange sources: no source without its receiver, no binding without a
+/// source, and every binding keyed by the receiver it was registered for.
+fn validate_compiled_exchange_bindings(
+    program: &LocalProgram,
+    bindings: &ExchangeBindings,
+) -> Result<(), String> {
+    let sources = program
+        .graph()
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| matches!(node.kind(), ProgramNodeKind::ExchangeSource { .. }))
+        .map(|(index, _)| ProgramNodeId::new(index))
+        .collect::<BTreeSet<_>>();
+    if sources != program.exchange_inputs().keys().copied().collect() {
+        return Err(
+            "compiled exchange addresses do not match the program's exchange sources".to_string(),
+        );
+    }
+    let mut receivers = BTreeSet::new();
+    for id in &sources {
+        let receiver = receiver_node_id(program, *id)?;
+        if !receivers.insert(receiver) {
+            return Err(format!(
+                "compiled exchange receiver node {receiver} is addressed by more than one source"
+            ));
+        }
+        let binding = bindings.get(receiver).ok_or_else(|| {
+            format!("missing exchange binding for compiled receiver node {receiver}")
+        })?;
+        if binding.key.node_id != receiver {
+            return Err(format!(
+                "exchange binding for compiled receiver node {receiver} is keyed to node {}",
+                binding.key.node_id
+            ));
+        }
+    }
+    if let Some(extra) = bindings.node_ids().find(|id| !receivers.contains(id)) {
+        return Err(format!(
+            "exchange binding for node {extra} has no compiled exchange source"
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn build_compiled_pipeline_graph(
     program: &Arc<LocalProgram>,
+    exchange_bindings: ExchangeBindings,
     dep_manager: DependencyManager,
     pipeline_dop: i32,
     root_sink_dop: Option<i32>,
@@ -50,12 +118,13 @@ pub(crate) fn build_compiled_pipeline_graph(
     {
         return Err("legacy-lowered nodes cannot enter the compiled pipeline".to_string());
     }
+    validate_compiled_exchange_bindings(program, &exchange_bindings)?;
     let mut ctx = PipelineBuildContext {
         arena: Arc::new(ExprArena::default()),
         function_set,
         dep_manager,
         runtime_filter_execution: PipelineRuntimeFilterExecution { session: None },
-        exchange_bindings: ExchangeBindings::default(),
+        exchange_bindings,
         scan_bindings: ScanBindings::default(),
         next_pipeline_id: 0,
         pipeline_dop: pipeline_dop.max(1),
@@ -131,6 +200,42 @@ fn build_node(
                 )?));
             Ok(build)
         }
+        ProgramNodeKind::ExchangeSource {
+            timeout,
+            runtime_filters,
+            hash_partition_exprs,
+        } => {
+            if !runtime_filters.is_empty() {
+                return Err(format!(
+                    "compiled exchange source at local node {} with runtime-filter consumers is not executable yet",
+                    id.index()
+                ));
+            }
+            if !hash_partition_exprs.is_empty() {
+                return Err(format!(
+                    "compiled exchange source at local node {} with hash-key expressions is not executable yet",
+                    id.index()
+                ));
+            }
+            let receiver = receiver_node_id(program, id)?;
+            let binding = ctx.exchange_bindings.get(receiver).ok_or_else(|| {
+                format!("missing exchange binding for compiled receiver node {receiver}")
+            })?;
+            let exchange = ExchangeSourceNode::new(
+                node_id,
+                *timeout,
+                ChunkSchema::from_compiled_layout(node.output_layout())?,
+            );
+            let source: Box<dyn OperatorFactory> =
+                Box::new(ExchangeSourceFactory::new_compiled(exchange, binding)?);
+            // Every driver pulls from the one instance-wide receiver.
+            let pipeline = new_source_pipeline(ctx, source);
+            Ok(PipelineBuildResult {
+                pipeline,
+                extra_pipelines: Vec::new(),
+                stream: StreamDesc::any(ctx.pipeline_dop),
+            })
+        }
         ProgramNodeKind::Limit {
             input,
             limit,
@@ -157,3 +262,7 @@ fn build_node(
 #[cfg(test)]
 #[path = "compiled_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "compiled_exchange_tests.rs"]
+mod exchange_tests;

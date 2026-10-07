@@ -380,8 +380,15 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
         DiagnosticSourceNodeId::new(0),
         DiagnosticSourceNodeId::new(u32::MAX),
     ]);
-    let program =
-        LocalProgram::try_new(lexical, operators, &allowed, BTreeMap::new(), &control).unwrap();
+    let program = LocalProgram::try_new(
+        lexical,
+        operators,
+        &allowed,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        &control,
+    )
+    .unwrap();
     assert!(Arc::ptr_eq(program.graph().expressions(), &arena));
     assert_eq!(program.graph().profile().pipeline_dop().get(), 2);
     assert_eq!(

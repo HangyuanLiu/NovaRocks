@@ -233,6 +233,32 @@ fn resolve_core(
                 work.flush()?;
                 (slots, port)
             }
+            NodeKind::ExchangeSource { .. } if node.inputs.is_empty() => {
+                // Each received occurrence is its own fresh channel. A repeated
+                // import is one sent value, so its first ordinal represents it.
+                let mut slots = Vec::new();
+                reserve_vec(&mut slots, node.output.columns.len(), work)?;
+                let mut port = Port::new();
+                for (ordinal, &value) in node.output.columns.iter().enumerate() {
+                    if !fragment.values().contains_key(&value) {
+                        return Err(ChannelLoweringError::Invalid(
+                            "missing ExchangeSource output value",
+                        ));
+                    }
+                    let slot = u32::try_from(next_slot)
+                        .map_err(|_| ChannelLoweringError::Invalid("slot identity exhausted"))?;
+                    next_slot = next_slot
+                        .checked_add(1)
+                        .ok_or(ChannelLoweringError::Invalid("slot identity exhausted"))?;
+                    slots.push(SlotId::new(slot));
+                    port.entry(value).or_insert(ordinal);
+                    work.step()?;
+                }
+                work.flush()?;
+                let slots: Arc<[SlotId]> = Arc::from(slots);
+                work.flush()?;
+                (slots, port)
+            }
             NodeKind::SetOp {
                 kind: novarocks_physical_plan::SetOperationKind::UnionAll,
                 input_mappings,

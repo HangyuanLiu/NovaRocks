@@ -232,6 +232,93 @@ fn materialize_fragment_sink_components_impl(
     }
 }
 
+/// Materialize the root sink of one compiled LocalProgram (local-compiler
+/// output).
+///
+/// A compiled sink never thaws its sink arena into a legacy `ExprArena`, so
+/// only expression-free shapes are executable here: the caller's result sink
+/// for `Result`, `Noop`, and a single-branch stream whose partitioning
+/// evaluates no key. A shape that would need a compiled partition-key root
+/// is refused explicitly rather than routed through the legacy evaluator.
+pub(crate) fn materialize_compiled_sink(
+    program: &novarocks_local_program::LocalProgram,
+    assignment: &FragmentSinkAssignment,
+    fragment_instance_id: novarocks_types::UniqueId,
+    transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
+    result_sink: Option<Box<dyn OperatorFactory>>,
+    edge_gates: Option<std::sync::Arc<ExchangeEdgeGates>>,
+) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
+    let graph = program.graph();
+    let sink = graph
+        .sink()
+        .ok_or_else(|| materialization_error("compiled local program has no static sink"))?;
+    if !matches!(sink, StaticSinkProgram::Result) && result_sink.is_some() {
+        return Err(materialization_error(format!(
+            "compiled {} sink cannot take a result sink",
+            sink_program_name(sink)
+        )));
+    }
+    match (sink, assignment) {
+        (StaticSinkProgram::Result, FragmentSinkAssignment::None) => result_sink
+            .ok_or_else(|| materialization_error("compiled RESULT_SINK requires a result sink")),
+        (StaticSinkProgram::Noop, FragmentSinkAssignment::None) => {
+            Ok(Box::new(NoopSinkFactory::new()))
+        }
+        (
+            StaticSinkProgram::DataStream { branch, .. },
+            FragmentSinkAssignment::StreamDestinations {
+                destinations,
+                sender_id,
+            },
+        ) => {
+            if branch.partition_type().requires_exprs() || !branch.partition_exprs().is_empty() {
+                return Err(materialization_error(format!(
+                    "compiled partitioned stream sink not executable yet: {}",
+                    branch.partition_type().display_name()
+                )));
+            }
+            if let Some(limit) = branch.limit() {
+                return Err(materialization_error(format!(
+                    "compiled stream sink limit {limit} is not executable yet"
+                )));
+            }
+            let plan_node_id = i32::try_from(graph.root().index())
+                .map_err(|_| materialization_error("compiled program root index exceeds i32"))?;
+            let input = branch_input(branch, destinations.clone())?;
+            // The partitioning evaluates no key, so the operator's partition
+            // arena stays empty; the compiled sink arena is never thawed.
+            let factory = DataStreamSinkFactory::new(
+                input,
+                fragment_instance_id,
+                *sender_id,
+                plan_node_id,
+                ExprArena::default(),
+                transmitter,
+            );
+            // Without the gates a push sink sends the moment it has rows, and
+            // the frozen edge's closed state means nothing.
+            let factory = match edge_gates {
+                Some(gates) => factory.with_edge_gates(gates),
+                None => factory,
+            };
+            Ok(Box::new(factory))
+        }
+        (
+            StaticSinkProgram::MultiCastDataStream { .. }
+            | StaticSinkProgram::SplitDataStream { .. },
+            _,
+        ) => Err(materialization_error(format!(
+            "compiled {} sink not executable yet",
+            sink_program_name(sink)
+        ))),
+        (static_program, dynamic_assignment) => Err(materialization_error(format!(
+            "compiled sink {} cannot be materialized with assignment {}",
+            sink_program_name(static_program),
+            sink_assignment_name(dynamic_assignment)
+        ))),
+    }
+}
+
 fn bound_sink_arena(
     expressions: &novarocks_local_program::ImmutableExpressions,
     runtime_error: std::sync::Arc<crate::runtime::runtime_state::RuntimeErrorState>,

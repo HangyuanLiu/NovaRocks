@@ -546,14 +546,37 @@ pub(crate) fn prepare_report_neutral_local_program_pipeline_execution(
 /// Prepare drivers from one compiled LocalProgram (local-compiler output).
 /// Its expressions run only through compiled roots. The program profile is
 /// authoritative for graph DOP and root sink placement.
+///
+/// `sink` is the root sink materialized for the program's static sink, and
+/// `exchange_bindings` binds exactly its compiled exchange sources, keyed by
+/// receiver node. Every binding belongs to `exchange_finst_id`, the fragment
+/// instance this program runs as.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The compiled program and its Task capabilities are independent inputs"
+)]
 pub(crate) fn prepare_compiled_program_pipeline_execution(
     program: Arc<novarocks_local_program::LocalProgram>,
     time_slice: Duration,
     sink: Box<dyn OperatorFactory>,
+    exchange_bindings: ExchangeBindings,
+    exchange_finst_id: Option<(i64, i64)>,
     pipeline_dop: i32,
     runtime_state: Arc<RuntimeState>,
     event_sink: Arc<dyn FragmentEventSink>,
 ) -> ExecutionResult<PreparedPipelineExecution> {
+    for node_id in exchange_bindings.node_ids() {
+        let binding = exchange_bindings
+            .get(node_id)
+            .ok_or_else(|| format!("exchange binding for node {node_id} disappeared"))?;
+        if exchange_finst_id != Some((binding.key.finst_id_hi, binding.key.finst_id_lo)) {
+            return Err(format!(
+                "compiled exchange binding for node {node_id} belongs to fragment instance {}, not {exchange_finst_id:?}",
+                binding.key.finst_uuid(),
+            )
+            .into());
+        }
+    }
     let profile = program.graph().profile();
     if profile.kernel_abi() != KernelAbiVersion::CURRENT {
         return Err(format!(
@@ -580,6 +603,7 @@ pub(crate) fn prepare_compiled_program_pipeline_execution(
         .ok_or_else(|| "compiled program execution requires an execution runtime".to_string())?;
     let graph = build_compiled_pipeline_graph(
         &program,
+        exchange_bindings,
         DependencyManager::new(),
         pipeline_dop,
         root_sink_dop,
@@ -591,7 +615,7 @@ pub(crate) fn prepare_compiled_program_pipeline_execution(
         time_slice,
         sink,
         Vec::new(),
-        None,
+        exchange_finst_id,
         None,
         pipeline_dop,
         runtime_state,

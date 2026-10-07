@@ -52,6 +52,10 @@ impl ExchangeBindings {
     pub fn get(&self, node_id: i32) -> Option<ExchangeBinding> {
         self.0.get(&node_id).cloned()
     }
+    /// Every bound receiver node id, ascending.
+    pub fn node_ids(&self) -> impl Iterator<Item = i32> + '_ {
+        self.0.keys().copied()
+    }
 }
 
 /// Per-node scan bindings: the instance-local bound `ScanOp` keyed by node_id.

@@ -41,7 +41,7 @@ mod typed_channels;
 mod typed_expressions;
 mod values;
 
-pub use compiled::{LocalProgram, LocalProgramCompileError};
+pub use compiled::{CompiledExchangeInput, LocalProgram, LocalProgramCompileError};
 pub use compiled_origins::CompiledOriginsError;
 pub use contract::{
     CompileProfile, FragmentProgramOptions, FragmentSinkAssignmentKind,
@@ -61,6 +61,9 @@ pub use novarocks_connector_contract::{
     ScanColumnId, StaticConnectorScan, StaticConnectorScanError, StaticScanAssignment,
     StaticScanDynamicFilter,
 };
+// The partition vocabulary of `StaticStreamBranch`, re-exported so a compiler
+// can author a stream sink without a second execution-contract dependency.
+pub use novarocks_execution_contract::DataStreamPartitionType;
 pub use primitives::{ProgramComparisonSite, ProgramPrimitiveError};
 pub use program::{
     AggregateTopNFilter, AnalyticOutputColumn, AssertRowsMode, ChangeEventOutputExpr,

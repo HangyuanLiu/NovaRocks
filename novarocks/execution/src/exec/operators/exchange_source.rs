@@ -240,6 +240,29 @@ impl ExchangeSourceFactory {
             idle_progress: Arc::new(ExchangeIdleProgress::new()),
         })
     }
+
+    /// Build the source for a compiled ExchangeSource (local-compiler
+    /// output). It owns no legacy expression arena: nothing is thawed for it,
+    /// and a node carrying legacy runtime-filter consumers or hash-key
+    /// expressions is refused rather than evaluated against an empty arena.
+    pub(crate) fn new_compiled(
+        node: ExchangeSourceNode,
+        binding: ExchangeBinding,
+    ) -> Result<Self, String> {
+        if !node.native_runtime_filter_specs().is_empty() {
+            return Err(format!(
+                "compiled exchange source {} cannot carry legacy runtime-filter consumers",
+                node.node_id
+            ));
+        }
+        if !node.hash_partition_exprs().is_empty() {
+            return Err(format!(
+                "compiled exchange source {} cannot carry legacy hash-key expressions",
+                node.node_id
+            ));
+        }
+        Self::new_native(node, binding, Arc::new(ExprArena::default()))
+    }
 }
 
 impl OperatorFactory for ExchangeSourceFactory {

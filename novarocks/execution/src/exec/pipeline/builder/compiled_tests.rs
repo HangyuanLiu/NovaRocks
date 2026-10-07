@@ -39,6 +39,8 @@ fn run(program: Arc<novarocks_local_program::LocalProgram>) -> Vec<Chunk> {
         program,
         Duration::from_millis(10),
         Box::new(ResultSinkFactory::new(output.clone())),
+        crate::exec::pipeline::binding::ExchangeBindings::default(),
+        None,
         1,
         state,
         Arc::new(crate::runtime::fragment::io::NoopFragmentEventSink),

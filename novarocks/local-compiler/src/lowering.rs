@@ -22,9 +22,11 @@ use crate::{
     assert_rows::lower_assert_rows,
     change_events::lower_change_events,
     channels::{ChannelLoweringError, resolve_tree_channels},
+    exchange::lower_exchange_source,
     expressions::{ExpressionLoweringError, lower_expressions_with_unions, prepare_calls},
     repeat::{RepeatLoweringError, lower_repeat},
     sort::lower_sort,
+    stream_sink::lower_stream_sink,
     topn::lower_topn,
     unpivot::{UnpivotLoweringError, UnpivotLoweringInput, lower_unpivot},
     values::{lower_values, retired_values_uses},
@@ -33,7 +35,7 @@ use arrow_schema::Schema;
 use novarocks_functions::{ConstantPolicy, PureEngineFunctionCatalog};
 use novarocks_local_program::*;
 use novarocks_physical_plan::{
-    Distribution, ExpressionRootRole, FragmentSink, NodeId, NodeKind, RowMultiplicity,
+    Distribution, EdgeKind, ExpressionRootRole, FragmentSink, NodeId, NodeKind, RowMultiplicity,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
@@ -44,6 +46,7 @@ use std::{
     fmt,
     num::NonZeroUsize,
     sync::Arc,
+    time::Duration,
 };
 
 /// Host-admitted values are explicit; the compiler authors the actual layout
@@ -54,6 +57,9 @@ pub struct LocalCompileOptions {
     pub root_sink_dop: Option<NonZeroUsize>,
     pub kernel_abi: KernelAbiVersion,
     pub constants: ConstantPolicy,
+    /// Host-admitted receive wait copied into every compiled ExchangeSource.
+    /// The compiler never defaults it or derives it from the plan.
+    pub exchange_wait: Duration,
 }
 
 #[derive(Debug)]
@@ -224,27 +230,89 @@ fn lower(
             feature: "result sink width for singleton source",
         });
     }
-    if !matches!(physical.sink(), FragmentSink::Result) {
-        return Err(FragmentCompileError::Unsupported {
-            node: None,
-            feature: "non-result sink",
-        });
+    let outbound = &package.cuts().outbound;
+    // A Result sink publishes the result port; a Stream sink publishes its
+    // one exact outbound cut. Every other sink family remains explicit.
+    let stream_cut = match physical.sink() {
+        FragmentSink::Result => {
+            if !outbound.is_empty() {
+                return Err(FragmentCompileError::Invalid(
+                    "result sink has an outbound exchange cut",
+                ));
+            }
+            None
+        }
+        FragmentSink::Stream { edge } => {
+            let [cut] = &outbound[..] else {
+                return Err(FragmentCompileError::Invalid(
+                    "stream sink requires exactly one outbound cut",
+                ));
+            };
+            if cut.edge != *edge {
+                return Err(FragmentCompileError::Invalid(
+                    "stream sink edge differs from its outbound cut",
+                ));
+            }
+            if cut.kind != EdgeKind::Stream
+                || cut.change_stream_writer.is_some()
+                || cut.writer_result.is_some()
+            {
+                return Err(FragmentCompileError::Unsupported {
+                    node: None,
+                    feature: "outbound CTE, change-stream or writer-result edge",
+                });
+            }
+            if matches!(
+                cut.partitioning.source,
+                Distribution::Unconstrained | Distribution::RoundRobin
+            ) {
+                return Err(FragmentCompileError::Unsupported {
+                    node: None,
+                    feature: "unconstrained or round-robin stream partitioning",
+                });
+            }
+            Some(cut)
+        }
+        FragmentSink::Multicast { .. } | FragmentSink::Router { .. } | FragmentSink::Noop => {
+            return Err(FragmentCompileError::Unsupported {
+                node: None,
+                feature: "multicast, router or noop sink",
+            });
+        }
+    };
+    for cut in package.cuts().inbound.iter() {
+        work.step()?;
+        if cut.kind != EdgeKind::Stream
+            || cut.change_stream_writer.is_some()
+            || cut.writer_result.is_some()
+        {
+            return Err(FragmentCompileError::Unsupported {
+                node: Some(cut.destination_node),
+                feature: "inbound CTE, change-stream or writer-result edge",
+            });
+        }
     }
     if !input.reads().is_empty()
         || !input.writes().is_empty()
-        || !package.cuts().inbound.is_empty()
-        || !package.cuts().outbound.is_empty()
         || !package.cuts().runtime_filters.is_empty()
         || !physical.runtime_filters().is_empty()
     {
         return Err(FragmentCompileError::Unsupported {
             node: None,
-            feature: "provider, exchange or runtime-filter graph",
+            feature: "provider or runtime-filter graph",
         });
     }
-    let result = package
-        .result()
-        .ok_or(FragmentCompileError::Invalid("missing result port"))?;
+    // The result port exists exactly for a Result sink; a stream producer
+    // has no result labels and never borrows another fragment's port.
+    let result = package.result();
+    if stream_cut.is_none() && result.is_none() {
+        return Err(FragmentCompileError::Invalid("missing result port"));
+    }
+    if stream_cut.is_some() && result.is_some() {
+        return Err(FragmentCompileError::Invalid(
+            "stream sink carries a result port",
+        ));
+    }
     // Borrowed input order determines the bounded postorder. Each physical
     // node has one execution owner; shared subgraphs remain unsupported.
     let mut order = Vec::new();
@@ -380,7 +448,7 @@ fn lower(
             }
         );
         let supported = match &node.kind {
-            NodeKind::Values { .. } => node.inputs.is_empty(),
+            NodeKind::Values { .. } | NodeKind::ExchangeSource { .. } => node.inputs.is_empty(),
             NodeKind::Project { .. }
             | NodeKind::Limit { .. }
             | NodeKind::AssertOneRow(_)
@@ -485,6 +553,8 @@ fn lower(
     let mut operators = Vec::new();
     let mut allowed = BTreeSet::new();
     let mut union_roots = Vec::new();
+    let mut exchange_requirements = Vec::new();
+    let mut exchange_inputs = BTreeMap::new();
     crate::assert_rows::reserve_vec(&mut nodes, expanded_nodes, work)?;
     crate::assert_rows::reserve_vec(&mut operators, expanded_nodes, work)?;
     crate::assert_rows::reserve_vec(&mut channels, channel_count, work)?;
@@ -595,6 +665,22 @@ fn lower(
                 NodeKind::Values { .. } => {
                     work.flush()?;
                     lower_values(package, node, &expressions, &planned.slots, work.control())?
+                }
+                NodeKind::ExchangeSource { .. } => {
+                    work.flush()?;
+                    let lowered = lower_exchange_source(
+                        package,
+                        node,
+                        &planned.slots,
+                        options.exchange_wait,
+                        work.control(),
+                    )?;
+                    exchange_requirements.push(BindingRequirement::ExchangeInput {
+                        node: id,
+                        layout: lowered.layout.clone(),
+                    });
+                    exchange_inputs.insert(id, lowered.input);
+                    (lowered.kind, lowered.layout)
                 }
                 NodeKind::Sort { .. } => {
                     let child = *local_ids
@@ -744,9 +830,10 @@ fn lower(
                     let mut fields = Vec::new();
                     let mut slots = Vec::new();
                     let mut exprs = Vec::new();
-                    let mut is_result_output =
-                        node.output.columns.len() == result.output.columns.len();
-                    if is_result_output {
+                    let mut is_result_output = result.is_some_and(|result| {
+                        node.output.columns.len() == result.output.columns.len()
+                    });
+                    if let Some(result) = result.filter(|_| is_result_output) {
                         for (actual, expected) in
                             node.output.columns.iter().zip(&result.output.columns)
                         {
@@ -782,8 +869,7 @@ fn lower(
                         // ordered output matches, including repeated occurrences.
                         let name = if is_result_output {
                             let field = result
-                                .fields
-                                .get(ordinal)
+                                .and_then(|result| result.fields.get(ordinal))
                                 .ok_or(FragmentCompileError::Invalid("missing result field"))?;
                             field.alias.as_deref().unwrap_or(&field.name).to_string()
                         } else {
@@ -878,6 +964,12 @@ fn lower(
         });
         nodes.push(ProgramNode::new_local(id, vec![source_id], kind, layout));
     }
+    // Each inbound cut is consumed by exactly one lowered receiver.
+    if exchange_inputs.len() != package.cuts().inbound.len() {
+        return Err(FragmentCompileError::Invalid(
+            "inbound exchange cut has no lowered receiver",
+        ));
+    }
     let root = local_ids[&physical.root()];
     let root_layout = nodes[root.index()].output_layout();
     work.flush()?;
@@ -887,13 +979,24 @@ fn lower(
         root_layout.identity_for_compile(work.control())?,
         options.kernel_abi,
     );
+    let mut requirement_entries = exchange_requirements;
+    let (sink, stream) = match stream_cut {
+        Some(cut) => {
+            work.flush()?;
+            let lowered = lower_stream_sink(package, cut, root, root_layout, work.control())?;
+            requirement_entries.push(lowered.requirement);
+            (lowered.sink, Some(lowered.flow))
+        }
+        None => {
+            requirement_entries.push(BindingRequirement::ResultSink {
+                layout: root_layout.clone(),
+            });
+            (StaticSinkProgram::Result, None)
+        }
+    };
     work.flush()?;
-    let requirements = BindingRequirements::try_new_for_compile(
-        vec![BindingRequirement::ResultSink {
-            layout: root_layout.clone(),
-        }],
-        work.control(),
-    )?;
+    let requirements =
+        BindingRequirements::try_new_for_compile(requirement_entries, work.control())?;
     work.flush()?;
     let graph = LocalProgramGraph::try_new_with_sink_for_compile(
         nodes,
@@ -901,7 +1004,7 @@ fn lower(
         expressions.arena.clone(),
         profile,
         requirements,
-        Some(StaticSinkProgram::Result),
+        Some(sink),
         work.control(),
     )?;
     // StaticValues has no runtime expression roots. Retire only the actual
@@ -993,25 +1096,32 @@ fn lower(
         expressions.arena.nodes().len(),
         work.control(),
     )?;
+    let mut flows = BTreeMap::from([(ProgramExpressionArena::Main, flow)]);
+    let mut types = BTreeMap::from([(ProgramExpressionArena::Main, expressions.types)]);
+    let mut sink_slot_bindings = Vec::new();
+    // A stream sink always owns a Sink arena, so its flow and types are
+    // supplied even when the arena is empty (Gather and Broadcast).
+    if let Some(stream) = stream {
+        crate::assert_rows::reserve_vec(&mut roots, stream.roots.len(), work)?;
+        roots.extend(stream.roots);
+        flows.insert(ProgramExpressionArena::Sink, stream.flow);
+        types.insert(ProgramExpressionArena::Sink, stream.types);
+        sink_slot_bindings = stream.slots;
+    }
     work.flush()?;
-    let snapshot = ProgramRootControlBindings::try_new(
-        graph,
-        BTreeMap::from([(ProgramExpressionArena::Main, flow)]),
-        roots,
-        work.control(),
-    )?;
+    let snapshot = ProgramRootControlBindings::try_new(graph, flows, roots, work.control())?;
     work.flush()?;
     let calls = ProgramResolvedCalls::try_new(snapshot, tokens, work.control())?;
     work.flush()?;
-    let typed = ProgramTypedExpressions::try_new(
-        calls,
-        BTreeMap::from([(ProgramExpressionArena::Main, expressions.types)]),
-        work.control(),
-    )?;
+    let typed = ProgramTypedExpressions::try_new(calls, types, work.control())?;
     work.flush()?;
     let channels = ProgramTypedChannels::try_new(typed, channels, work.control())?;
     work.flush()?;
     let mut slot_bindings = union_slot_bindings;
+    if !sink_slot_bindings.is_empty() {
+        crate::assert_rows::reserve_vec(&mut slot_bindings, sink_slot_bindings.len(), work)?;
+        slot_bindings.extend(sink_slot_bindings);
+    }
     for invocation in package.expression_uses().flow().uses().values() {
         work.step()?;
         if let Some(input) = channels_plan.inputs.get(&invocation.definition) {
@@ -1032,6 +1142,7 @@ fn lower(
         operators,
         &allowed,
         BTreeMap::new(),
+        exchange_inputs,
         work.control(),
     )
     .map_err(Into::into)

@@ -327,6 +327,7 @@ fn finish(
         }],
         &BTreeSet::from([DiagnosticSourceNodeId::new(u32::MAX)]),
         BTreeMap::new(),
+        BTreeMap::new(),
         control,
     )
 }

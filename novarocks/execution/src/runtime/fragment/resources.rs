@@ -18,6 +18,7 @@
 use std::sync::Arc;
 
 use crate::exec::fragment::program::{FragmentProgram, FragmentSinkKind};
+use crate::runtime::exchange::ExchangeColumnBinding;
 use crate::runtime::fragment::error::{
     FragmentLaunchError, FragmentLaunchErrorKind, FragmentLaunchStage,
 };
@@ -222,6 +223,8 @@ impl ExchangeRegistration {
                 key,
                 expected_senders: assignment.sender_count().get(),
                 expected_chunk_schema: Arc::clone(contract.expected_schema()),
+                // Legacy fragments share one slot namespace across the edge.
+                column_binding: ExchangeColumnBinding::BySlotId,
             }) {
                 let diagnostics = registration.rollback().err().into_iter().collect();
                 return Err(registration_error(error).with_cleanup_diagnostics(diagnostics));

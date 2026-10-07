@@ -62,7 +62,7 @@ impl PureCompileControl for FixtureControl {
         Ok(())
     }
 }
-fn rng_subset() -> PureEngineFunctionCatalog {
+pub(crate) fn rng_subset() -> PureEngineFunctionCatalog {
     let actual =
         novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
     let definition = actual
@@ -102,6 +102,7 @@ fn options(dop: usize) -> LocalCompileOptions {
         pipeline_dop: NonZeroUsize::new(dop).unwrap(),
         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
+        exchange_wait: std::time::Duration::from_secs(120),
         // Explicit fixture admission; these values are not production defaults.
         constants: ConstantPolicy {
             max_rows: 16,

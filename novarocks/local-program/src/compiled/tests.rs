@@ -303,6 +303,7 @@ fn final_owner_has_one_complete_chain_and_sparse_actual_graph_origins() {
         operators(false, u32::MAX),
         &allowed(),
         BTreeMap::new(),
+        BTreeMap::new(),
         &Control::default(),
     )
     .unwrap();
@@ -351,6 +352,7 @@ fn final_owner_rejects_foreign_origins_legacy_identity_and_missing_sink() {
                 operators(false, source),
                 &allowed(),
                 BTreeMap::new(),
+                BTreeMap::new(),
                 &Control::default()
             )
             .unwrap_err(),
@@ -367,6 +369,7 @@ fn actual_writer_recipe_coverage_and_exact_projection_fields_are_mandatory() {
             operators(true, u32::MAX),
             &allowed(),
             BTreeMap::new(),
+            BTreeMap::new(),
             &Control::default()
         )
         .unwrap_err(),
@@ -378,6 +381,7 @@ fn actual_writer_recipe_coverage_and_exact_projection_fields_are_mandatory() {
         operators(true, u32::MAX),
         &allowed(),
         BTreeMap::from([(id, exact.clone())]),
+        BTreeMap::new(),
         &Control::default(),
     )
     .unwrap();
@@ -388,6 +392,7 @@ fn actual_writer_recipe_coverage_and_exact_projection_fields_are_mandatory() {
             operators(false, u32::MAX),
             &allowed(),
             BTreeMap::from([(ProgramNodeId::new(0), exact)]),
+            BTreeMap::new(),
             &Control::default()
         )
         .unwrap_err(),
@@ -402,6 +407,7 @@ fn actual_writer_recipe_coverage_and_exact_projection_fields_are_mandatory() {
             operators(true, u32::MAX),
             &allowed(),
             BTreeMap::from([(id, renamed)]),
+            BTreeMap::new(),
             &Control::default()
         )
         .unwrap_err(),
@@ -422,6 +428,7 @@ fn every_final_author_callback_propagates_original_control_without_rechecking() 
             ProgramNodeId::new(1),
             recipe(Field::new("v", DataType::Int64, false)),
         )]),
+        BTreeMap::new(),
         &baseline,
     )
     .unwrap();
@@ -445,6 +452,7 @@ fn every_final_author_callback_propagates_original_control_without_rechecking() 
                     ProgramNodeId::new(1),
                     recipe(Field::new("v", DataType::Int64, false)),
                 )]),
+                BTreeMap::new(),
                 &control,
             )
             .unwrap_err();
@@ -458,4 +466,37 @@ fn every_final_author_callback_propagates_original_control_without_rechecking() 
             );
         }
     }
+}
+#[test]
+fn exchange_input_addresses_cover_exactly_the_actual_exchange_sources() {
+    let address = CompiledExchangeInput {
+        receiver_node: 3,
+        edge: 5,
+        source_fragment: 1,
+    };
+    // A non-exchange node and a node outside the graph both refuse an address.
+    for node in [ProgramNodeId::new(0), ProgramNodeId::new(9)] {
+        assert_eq!(
+            LocalProgram::try_new(
+                checked(false, true, false),
+                operators(false, u32::MAX),
+                &allowed(),
+                BTreeMap::new(),
+                BTreeMap::from([(node, address)]),
+                &Control::default(),
+            )
+            .unwrap_err(),
+            LocalProgramCompileError::ExchangeInputMismatch(node)
+        );
+    }
+    let program = LocalProgram::try_new(
+        checked(false, true, false),
+        operators(false, u32::MAX),
+        &allowed(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+        &Control::default(),
+    )
+    .unwrap();
+    assert!(program.exchange_inputs().is_empty());
 }

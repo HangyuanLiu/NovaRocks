@@ -22,22 +22,39 @@
 //! must be retired when the production compiler is connected.
 
 use crate::{
-    CompiledOriginsError, DiagnosticSourceNodeId, LocalOperatorProvenance, LocalProgramGraph,
-    ProgramCallSite, ProgramComparisonSite, ProgramLexicalBindings, ProgramNodeId,
-    ProgramPrimitiveError, ProgramProvenance, ProgramStateTemplate, ProviderLinkError,
+    BindingRequirement, CompiledOriginsError, DiagnosticSourceNodeId, LocalOperatorProvenance,
+    LocalProgramGraph, ProgramCallSite, ProgramComparisonSite, ProgramLexicalBindings,
+    ProgramNodeId, ProgramNodeKind, ProgramPrimitiveError, ProgramProvenance, ProgramStateTemplate,
+    ProviderLinkError,
 };
 use novarocks_connector_contract::ConnectorWriteRecipe;
-use novarocks_type_contract::{CompileControlError, PureCompileControl};
+use novarocks_type_contract::{
+    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
 };
+
+/// Compiled-only receiver address of one actual `ExchangeSource` node. A
+/// compiled node has no legacy native identity, so the program carries the
+/// physical routing facts explicitly instead of deriving them from a node ID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompiledExchangeInput {
+    /// Physical NodeId of the receiving ExchangeSource; senders address it.
+    pub receiver_node: u32,
+    /// Physical EdgeId of the inbound stream edge.
+    pub edge: u32,
+    /// Physical FragmentId of the sending fragment.
+    pub source_fragment: u32,
+}
 
 #[derive(Clone, Debug)]
 pub struct LocalProgram {
     checked: ProgramLexicalBindings,
     provenance: ProgramProvenance,
     writes: BTreeMap<ProgramNodeId, ConnectorWriteRecipe>,
+    exchange_inputs: BTreeMap<ProgramNodeId, CompiledExchangeInput>,
     arithmetic: BTreeMap<crate::ProgramUseRef, novarocks_functions::PreparedArithmeticRecipe>,
     casts: BTreeMap<crate::ProgramUseRef, novarocks_functions::PreparedCastRecipe>,
     comparisons: BTreeMap<ProgramComparisonSite, novarocks_functions::PreparedComparisonRecipe>,
@@ -49,6 +66,11 @@ pub struct LocalProgram {
 pub enum LocalProgramCompileError {
     Control(CompileControlError),
     MissingSink,
+    /// The compiled exchange addresses, the actual `ExchangeSource` nodes and
+    /// their `ExchangeInput` requirements are not the same node set.
+    ExchangeInputMismatch(ProgramNodeId),
+    /// Two compiled exchange inputs name the same physical receiver.
+    DuplicateExchangeReceiver(u32),
     Origins(CompiledOriginsError),
     Provider(ProviderLinkError),
     Primitive(ProgramPrimitiveError),
@@ -85,6 +107,15 @@ impl fmt::Display for LocalProgramCompileError {
             Self::Provider(error) => error.fmt(f),
             Self::Primitive(error) => error.fmt(f),
             Self::MissingSink => f.write_str("compiled local program requires an exact sink"),
+            Self::ExchangeInputMismatch(node) => write!(
+                f,
+                "compiled exchange input addresses differ from the exchange sources at local node {}",
+                node.index()
+            ),
+            Self::DuplicateExchangeReceiver(receiver) => write!(
+                f,
+                "compiled exchange inputs share physical receiver node {receiver}"
+            ),
         }
     }
 }
@@ -95,7 +126,9 @@ impl std::error::Error for LocalProgramCompileError {
             Self::Origins(error) => Some(error),
             Self::Provider(error) => Some(error),
             Self::Primitive(error) => Some(error),
-            Self::MissingSink => None,
+            Self::MissingSink
+            | Self::ExchangeInputMismatch(_)
+            | Self::DuplicateExchangeReceiver(_) => None,
         }
     }
 }
@@ -104,11 +137,14 @@ impl LocalProgram {
     /// Provenance is freshly authored against its actual local graph. Compiler
     /// lowering remains responsible for physical-token/source correspondence,
     /// output guarantees and the existence of synthetic non-node entities.
+    /// `exchange_inputs` addresses exactly the graph's `ExchangeSource` nodes,
+    /// which are exactly its `ExchangeInput` requirements; receivers are unique.
     pub fn try_new(
         checked: ProgramLexicalBindings,
         operators: Vec<LocalOperatorProvenance>,
         allowed_sources: &BTreeSet<DiagnosticSourceNodeId>,
         writes: BTreeMap<ProgramNodeId, ConnectorWriteRecipe>,
+        exchange_inputs: BTreeMap<ProgramNodeId, CompiledExchangeInput>,
         control: &dyn PureCompileControl,
     ) -> Result<Self, LocalProgramCompileError> {
         let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
@@ -131,6 +167,7 @@ impl LocalProgram {
         let provenance =
             crate::compiled_origins::compile_origins(graph, operators, allowed_sources, control)?;
         crate::provider_links::validate_provider_links(&checked, &writes, control)?;
+        validate_exchange_inputs(graph, &exchange_inputs, control)?;
         let arithmetic = crate::primitives::compile_arithmetic(&checked, control)?;
         let casts = crate::primitives::compile_casts(&checked, control)?;
         let comparisons = crate::primitives::compile_comparisons(&checked, control)?;
@@ -142,6 +179,7 @@ impl LocalProgram {
             checked,
             provenance,
             writes,
+            exchange_inputs,
             comparisons,
             null_safe_comparisons,
             arithmetic,
@@ -164,6 +202,10 @@ impl LocalProgram {
     }
     pub fn write_recipes(&self) -> &BTreeMap<ProgramNodeId, ConnectorWriteRecipe> {
         &self.writes
+    }
+    /// Exact receiver address of every `ExchangeSource` node in this program.
+    pub fn exchange_inputs(&self) -> &BTreeMap<ProgramNodeId, CompiledExchangeInput> {
+        &self.exchange_inputs
     }
     pub fn comparison_recipe(
         &self,
@@ -200,6 +242,75 @@ impl LocalProgram {
             .get(&site)
             .map(|call| call.state_template())
     }
+}
+
+/// Require one address per actual exchange receiver and per declared exchange
+/// input, and no address elsewhere. A first control refusal stays primary.
+fn validate_exchange_inputs(
+    graph: &LocalProgramGraph,
+    exchange_inputs: &BTreeMap<ProgramNodeId, CompiledExchangeInput>,
+    control: &dyn PureCompileControl,
+) -> Result<(), LocalProgramCompileError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)
+        .map_err(LocalProgramCompileError::Control)?;
+    let result = validate_exchange_inputs_core(graph, exchange_inputs, &mut work);
+    if matches!(result, Err(LocalProgramCompileError::Control(_))) {
+        return result;
+    }
+    work.finish().map_err(LocalProgramCompileError::Control)?;
+    result
+}
+
+fn validate_exchange_inputs_core(
+    graph: &LocalProgramGraph,
+    exchange_inputs: &BTreeMap<ProgramNodeId, CompiledExchangeInput>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), LocalProgramCompileError> {
+    let mut required = BTreeSet::new();
+    for requirement in graph.requirements().entries() {
+        if let BindingRequirement::ExchangeInput { node, .. } = requirement {
+            required.insert(*node);
+        }
+        work.step().map_err(LocalProgramCompileError::Control)?;
+    }
+    // A requirement naming no actual node cannot be hidden by the node walk.
+    for node in &required {
+        let present = node.index() < graph.nodes().len();
+        work.step().map_err(LocalProgramCompileError::Control)?;
+        if !present {
+            return Err(LocalProgramCompileError::ExchangeInputMismatch(*node));
+        }
+    }
+    let mut receivers = BTreeSet::new();
+    for (index, node) in graph.nodes().iter().enumerate() {
+        let id = ProgramNodeId::new(index);
+        let exchange = matches!(node.kind(), ProgramNodeKind::ExchangeSource { .. });
+        let declared = required.contains(&id);
+        let address = exchange_inputs.get(&id);
+        work.step().map_err(LocalProgramCompileError::Control)?;
+        match (exchange, declared, address) {
+            (true, true, Some(input)) => {
+                let unique = receivers.insert(input.receiver_node);
+                work.step().map_err(LocalProgramCompileError::Control)?;
+                if !unique {
+                    return Err(LocalProgramCompileError::DuplicateExchangeReceiver(
+                        input.receiver_node,
+                    ));
+                }
+            }
+            (false, false, None) => {}
+            _ => return Err(LocalProgramCompileError::ExchangeInputMismatch(id)),
+        }
+    }
+    // An address for a node outside the graph cannot be hidden either.
+    for id in exchange_inputs.keys() {
+        let present = id.index() < graph.nodes().len();
+        work.step().map_err(LocalProgramCompileError::Control)?;
+        if !present {
+            return Err(LocalProgramCompileError::ExchangeInputMismatch(*id));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
