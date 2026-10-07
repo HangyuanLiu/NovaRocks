@@ -19,6 +19,8 @@
 
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use novarocks_proto_models::common;
+
+use crate::native_type::{list_type_desc, map_type_desc, scalar_type_desc, struct_type_desc};
 use novarocks_types::logical::{LogicalType, logical_type_of_field};
 
 pub fn encode_type(dt: &DataType) -> Result<common::TypeDesc, String> {
@@ -34,12 +36,9 @@ fn encode_type_inner(dt: &DataType, field: Option<&Field>) -> Result<common::Typ
             None,
         ));
     }
-    use common::type_desc::Kind;
-    let kind = match dt {
+    Ok(match dt {
         DataType::List(item) | DataType::LargeList(item) | DataType::FixedSizeList(item, _) => {
-            Kind::List(Box::new(common::ListType {
-                element: Some(Box::new(encode_type_inner(item.data_type(), Some(item))?)),
-            }))
+            list_type_desc(encode_type_inner(item.data_type(), Some(item))?)
         }
         DataType::Map(entries, _) => {
             let DataType::Struct(fields) = entries.data_type() else {
@@ -54,31 +53,24 @@ fn encode_type_inner(dt: &DataType, field: Option<&Field>) -> Result<common::Typ
                     fields.len()
                 ));
             }
-            Kind::Map(Box::new(common::MapType {
-                key: Some(Box::new(encode_type_inner(
-                    fields[0].data_type(),
-                    Some(&fields[0]),
-                )?)),
-                value: Some(Box::new(encode_type_inner(
-                    fields[1].data_type(),
-                    Some(&fields[1]),
-                )?)),
-            }))
+            map_type_desc(
+                encode_type_inner(fields[0].data_type(), Some(&fields[0]))?,
+                encode_type_inner(fields[1].data_type(), Some(&fields[1]))?,
+            )
         }
-        DataType::Struct(fields) => Kind::Strct(common::StructType {
-            fields: fields
+        DataType::Struct(fields) => struct_type_desc(
+            fields
                 .iter()
                 .map(|field| {
-                    Ok(common::StructField {
-                        name: field.name().to_string(),
-                        r#type: Some(encode_type_inner(field.data_type(), Some(field))?),
-                    })
+                    Ok((
+                        field.name().to_string(),
+                        encode_type_inner(field.data_type(), Some(field))?,
+                    ))
                 })
                 .collect::<Result<Vec<_>, String>>()?,
-        }),
+        ),
         _ => return encode_scalar_type(dt),
-    };
-    Ok(common::TypeDesc { kind: Some(kind) })
+    })
 }
 
 fn encode_scalar_type(dt: &DataType) -> Result<common::TypeDesc, String> {
@@ -165,16 +157,14 @@ fn scalar_desc_with_zone(
     time_unit: Option<i32>,
     time_zone: Option<String>,
 ) -> common::TypeDesc {
-    common::TypeDesc {
-        kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
-            r#type: primitive as i32,
-            len: None,
-            precision,
-            scale,
-            time_unit,
-            time_zone,
-        })),
-    }
+    scalar_type_desc(common::ScalarType {
+        r#type: primitive as i32,
+        len: None,
+        precision,
+        scale,
+        time_unit,
+        time_zone,
+    })
 }
 
 fn validate_decimal(

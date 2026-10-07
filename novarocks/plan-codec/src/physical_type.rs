@@ -19,6 +19,9 @@
 
 use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_proto_models::common;
+use novarocks_type_contract::LogicalTypeLimits;
+
+use crate::native_type::{list_type_desc, map_type_desc, scalar_type_desc, struct_type_desc};
 
 /// Encode an Arrow type only when native wire v1 preserves its exact identity.
 ///
@@ -87,16 +90,14 @@ pub(crate) fn encode_physical_type(data_type: &DataType) -> Result<common::TypeD
         other => unreachable!("validated physical type became unsupported: {other:?}"),
     };
 
-    Ok(common::TypeDesc {
-        kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
-            r#type: primitive as i32,
-            len: None,
-            precision,
-            scale,
-            time_unit,
-            time_zone,
-        })),
-    })
+    Ok(scalar_type_desc(common::ScalarType {
+        r#type: primitive as i32,
+        len: None,
+        precision,
+        scale,
+        time_unit,
+        time_zone,
+    }))
 }
 
 /// Encode only a proved root logical kind over its exact physical carrier.
@@ -108,12 +109,10 @@ pub(crate) fn encode_physical_logical_type(
         return Err("native logical kind does not admit the frozen physical carrier".into());
     }
     match kind {
-        novarocks_physical_plan::ValueLogicalKind::Json => Ok(common::TypeDesc {
-            kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
-                r#type: common::PrimitiveType::Json as i32,
-                ..Default::default()
-            })),
-        }),
+        novarocks_physical_plan::ValueLogicalKind::Json => Ok(scalar_type_desc(common::ScalarType {
+            r#type: common::PrimitiveType::Json as i32,
+            ..Default::default()
+        })),
     }
 }
 
@@ -134,12 +133,8 @@ pub(crate) fn encode_arrow_authoritative_compatibility_type(
 fn encode_arrow_authoritative_compatibility_type_inner(
     data_type: &DataType,
 ) -> Result<common::TypeDesc, String> {
-    use common::type_desc::Kind;
-
-    let kind = match data_type {
-        DataType::List(field) => Kind::List(Box::new(common::ListType {
-            element: Some(Box::new(encode_nested_field(field)?)),
-        })),
+    Ok(match data_type {
+        DataType::List(field) => list_type_desc(encode_nested_field(field)?),
         DataType::Map(entries, _) => {
             let DataType::Struct(fields) = entries.data_type() else {
                 return Err("native wire v1 writer map entries must be a struct".into());
@@ -147,25 +142,19 @@ fn encode_arrow_authoritative_compatibility_type_inner(
             if fields.len() != 2 {
                 return Err("native wire v1 writer map entries must contain key and value".into());
             }
-            Kind::Map(Box::new(common::MapType {
-                key: Some(Box::new(encode_nested_field(&fields[0])?)),
-                value: Some(Box::new(encode_nested_field(&fields[1])?)),
-            }))
+            map_type_desc(
+                encode_nested_field(&fields[0])?,
+                encode_nested_field(&fields[1])?,
+            )
         }
-        DataType::Struct(fields) => Kind::Strct(common::StructType {
-            fields: fields
+        DataType::Struct(fields) => struct_type_desc(
+            fields
                 .iter()
-                .map(|field| {
-                    Ok(common::StructField {
-                        name: field.name().clone(),
-                        r#type: Some(encode_nested_field(field)?),
-                    })
-                })
+                .map(|field| Ok((field.name().clone(), encode_nested_field(field)?)))
                 .collect::<Result<Vec<_>, String>>()?,
-        }),
+        ),
         _ => return encode_physical_type(data_type),
-    };
-    Ok(common::TypeDesc { kind: Some(kind) })
+    })
 }
 
 /// The descriptor one nested field is carried by.
@@ -187,16 +176,14 @@ fn encode_nested_field(field: &arrow::datatypes::Field) -> Result<common::TypeDe
         LogicalType::Object => common::PrimitiveType::Object,
         LogicalType::Percentile => common::PrimitiveType::Percentile,
     };
-    Ok(common::TypeDesc {
-        kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
-            r#type: primitive as i32,
-            len: None,
-            precision: None,
-            scale: None,
-            time_unit: None,
-            time_zone: None,
-        })),
-    })
+    Ok(scalar_type_desc(common::ScalarType {
+        r#type: primitive as i32,
+        len: None,
+        precision: None,
+        scale: None,
+        time_unit: None,
+        time_zone: None,
+    }))
 }
 
 /// Validate the legacy SQL shape paired with an exact writer Arrow schema
@@ -279,8 +266,11 @@ pub(crate) fn arrow_authoritative_wire_depths(
 }
 
 /// Validate exact v1 type expressibility without allocating a protobuf value.
-/// How deep a nested type may be before native wire v1 refuses it.
-const MAX_NESTED_TYPE_DEPTH: usize = 16;
+/// A nested type may be as deep as the logical type budget admits; the flat
+/// `TypeDesc` carrier keeps protobuf nesting constant whatever that depth.
+fn max_nested_type_depth() -> usize {
+    LogicalTypeLimits::default().max_depth
+}
 
 /// Whether a nested field is named the way the reader rebuilds it.
 ///
@@ -322,9 +312,10 @@ pub(crate) fn validate_physical_type(data_type: &DataType) -> Result<(), String>
 }
 
 fn validate_physical_type_at(data_type: &DataType, depth: usize) -> Result<(), String> {
-    if depth > MAX_NESTED_TYPE_DEPTH {
+    if depth > max_nested_type_depth() {
         return Err(format!(
-            "native wire v1 TypeDesc nesting exceeds depth {MAX_NESTED_TYPE_DEPTH}"
+            "native wire v1 TypeDesc nesting exceeds depth {}",
+            max_nested_type_depth()
         ));
     }
     match data_type {

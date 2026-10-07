@@ -39,19 +39,49 @@ message Status {
   string message = 2;  // human-readable detail when code != 0
 }
 
-// Recursive SQL type descriptor. Replaces the flat thrift TTypeDesc node array
-// (thrift lacked recursion; proto does not). Mirrors the SQL primitive type set,
-// NOT raw Arrow -- Arrow cannot distinguish JSON vs VARCHAR, HLL vs VARBINARY.
-// Owner: produced by future FE/native encode conversion layer and consumed by
-// future BE/native prepare conversion layer. Planner/exec must not import
-// generated proto directly.
+// Flat SQL type descriptor. Mirrors the SQL primitive type set, NOT raw
+// Arrow -- Arrow cannot distinguish JSON vs VARCHAR, HLL vs VARBINARY.
+//
+// The type tree is carried as one node array: `nodes[0]` is the root and the
+// remaining nodes follow in canonical preorder, so every subtree is contiguous
+// and children appear in declared order. Child references are indices into
+// `nodes`. Protobuf nesting is therefore constant whatever the SQL nesting
+// depth; a decoder validates the whole tree against the logical type budget
+// before it builds any type.
+// Owner: produced by the FE/native encode conversion layer and consumed by the
+// BE/native prepare conversion layer. Planner/exec must not import generated
+// proto directly.
 message TypeDesc {
+  reserved 1, 2, 3, 4;
+  reserved "scalar", "list", "map", "strct";
+  repeated TypeNode nodes = 5;  // root first, canonical preorder
+}
+
+// One node of a flat SQL type tree.
+message TypeNode {
   oneof kind {
-    ScalarType scalar = 1;  // scalar SQL type
-    ListType list = 2;      // list SQL type
-    MapType map = 3;        // map SQL type
-    StructType strct = 4;   // struct SQL type
+    ScalarType scalar = 1;     // scalar SQL type
+    uint32 list = 2;           // list SQL type: index of the element node
+    TypeMapNode map = 3;       // map SQL type
+    TypeStructNode strct = 4;  // struct SQL type
   }
+}
+
+// Map SQL type node: indices of the key and value nodes.
+message TypeMapNode {
+  uint32 key = 1;    // key type node
+  uint32 value = 2;  // value type node
+}
+
+// Struct SQL type node: ordered named members.
+message TypeStructNode {
+  repeated TypeStructMember fields = 1;  // ordered struct fields
+}
+
+// Named member of a struct SQL type node.
+message TypeStructMember {
+  string name = 1;    // field name
+  uint32 child = 2;   // index of the field type node
 }
 
 // Scalar SQL type descriptor.
@@ -72,40 +102,6 @@ message ScalarType {
   // without are different types, so dropping this would silently rewrite a
   // column's type across the process boundary.
   optional string time_zone = 6;
-}
-
-// List SQL type descriptor.
-// Owner: produced by future FE/native encode conversion layer and consumed by
-// future BE/native prepare conversion layer. Planner/exec must not import
-// generated proto directly.
-message ListType {
-  TypeDesc element = 1;  // element type
-}
-
-// Map SQL type descriptor.
-// Owner: produced by future FE/native encode conversion layer and consumed by
-// future BE/native prepare conversion layer. Planner/exec must not import
-// generated proto directly.
-message MapType {
-  TypeDesc key = 1;    // key type
-  TypeDesc value = 2;  // value type
-}
-
-// Struct SQL type descriptor.
-// Owner: produced by future FE/native encode conversion layer and consumed by
-// future BE/native prepare conversion layer. Planner/exec must not import
-// generated proto directly.
-message StructType {
-  repeated StructField fields = 1;  // ordered struct fields
-}
-
-// Named field inside a struct SQL type.
-// Owner: produced by future FE/native encode conversion layer and consumed by
-// future BE/native prepare conversion layer. Planner/exec must not import
-// generated proto directly.
-message StructField {
-  string name = 1;    // field name
-  TypeDesc type = 2;  // field type
 }
 
 // SQL primitive type set (mirrors the TPrimitiveType subset NovaRocks maps in
