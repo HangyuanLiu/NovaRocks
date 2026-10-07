@@ -160,6 +160,16 @@ impl RootRelayFrontier {
     pub const fn root(&self) -> TaskIdentity {
         self.root
     }
+    pub const fn profile(&self) -> RootProfileId {
+        self.profile
+    }
+    pub const fn kind(&self) -> RootOutputKind {
+        self.kind
+    }
+    /// The ClientRows profile and the row cursor the next body continues.
+    pub fn client_rows(&self) -> Option<(ClientRowProfile, ClientRowStreamCursor)> {
+        self.client_rows.map(|profile| (profile, self.cursor))
+    }
     pub const fn consumed_through(&self) -> u64 {
         self.consumed_through
     }

@@ -31,12 +31,19 @@ use std::{future::Future, num::NonZeroU64, pin::Pin};
 /// one exact read owner and serializes both fetch and optional ACK-only calls.
 /// The physical guard follows the body/codec/connection until actual exit.
 pub trait BoundedRootReadPort: Send + Sync + 'static {
+    /// A failure carries its recovery class and topology requirement exactly
+    /// as the transport classified it.
     fn read(
         &self,
         request: RootResultRead,
         physical_guard: ResultWindowAlias,
     ) -> Pin<
-        Box<dyn Future<Output = Result<RetainedRootReply, QueryExecutionError>> + Send + 'static>,
+        Box<
+            dyn Future<
+                    Output = Result<RetainedRootReply, crate::coordination::RootResultFetchFailure>,
+                > + Send
+                + 'static,
+        >,
     >;
     /// Stop future fetch/replay dispatch before lifecycle joins and Release.
     /// This is local read closure, not a Worker compound close operation.
@@ -91,6 +98,10 @@ impl RetainedRootReply {
     }
     pub fn root_task(&self) -> TaskIdentity {
         self.reply.root_task
+    }
+    /// The decoded reply, for frontier validation.
+    pub fn reply(&self) -> &RootResultReply {
+        &self.reply
     }
     pub fn accepted_consumed(&self) -> u64 {
         self.reply.accepted_consumed

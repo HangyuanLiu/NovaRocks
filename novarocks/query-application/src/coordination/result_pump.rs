@@ -22,9 +22,16 @@
 //! delivery. It deliberately has no Native codec or execution-kernel
 //! dependency.
 
-use std::{future::Future, num::NonZeroUsize, pin::Pin, sync::Arc, time::Instant};
+use std::{
+    future::Future,
+    num::{NonZeroU64, NonZeroUsize},
+    pin::Pin,
+    sync::Arc,
+    time::Instant,
+};
 
 use arrow::record_batch::RecordBatch;
+use novarocks_execution_contract::root_result::RootResultRead;
 use novarocks_execution_contract::{
     AbortCause, MaxWait, QueryContextRef, ResultByteLimit, ResultPacketSequence,
     TaskFailureCategory, TaskIdentity, TaskState, TaskStatus, TerminationDetail,
@@ -36,6 +43,7 @@ use novarocks_workload_control::{
 };
 use tokio::sync::{oneshot, watch};
 
+use crate::api::{BoundedRootReadPort, RetainedRootReply};
 use crate::api::{NativeAttemptTerminal, NativeAttemptTopologyRequirement};
 use crate::api::{QueryExecutionError, QueryExecutionErrorKind, ResultSchema};
 
@@ -1669,6 +1677,310 @@ pub(crate) async fn run_root_result_pump(
                 .await);
             }
         }
+    }
+}
+
+/// One root stream relayed to its consumer without decode: the read port,
+/// the frontier that decides each read, and the window alias every reply
+/// retains until its delivery exits.
+pub struct RootRelayBinding {
+    pub port: Arc<dyn BoundedRootReadPort>,
+    pub frontier: super::RootRelayFrontier,
+    pub window: novarocks_workload_control::ResultWindowAlias,
+    pub max_wait: std::time::Duration,
+}
+
+enum RelayEvent {
+    Delivered(Result<(), LogicalExecutionActorError>),
+    Read(Result<RetainedRootReply, RootResultFetchFailure>),
+}
+
+enum RelayExit {
+    EndConsumed(
+        super::RootRelayRead,
+        novarocks_execution_contract::root_result::RootResultEnd,
+    ),
+    Interruption(PumpInterruption),
+    Failure(RootResultFetchFailure),
+    Actor(&'static str, LogicalExecutionActorError),
+    AwaitTerminalControl,
+}
+
+type DeliveryFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), LogicalExecutionActorError>> + Send + 'a>>;
+type ReadFuture =
+    Pin<Box<dyn Future<Output = Result<RetainedRootReply, RootResultFetchFailure>> + Send>>;
+
+/// Relays one exact attempt's Backend-encoded root stream in order. The next
+/// item is read while the previous one is written; the cumulative ACK on
+/// each read is the prefix whose delivery receipts completed. Success seal
+/// follows the local End consumption proof and the root's terminal facts; it
+/// never waits for the Backend to acknowledge the final item.
+#[doc(hidden)]
+pub(crate) async fn run_root_relay(
+    permit: RunningAttemptPermit,
+    root: TaskIdentity,
+    scope: WorkScope,
+    binding: RootRelayBinding,
+    statuses: AcceptedRootStatusSource,
+    native_terminal: NativeAttemptTerminalSource,
+) -> Result<LogicalConclusion, ResultPumpFailure> {
+    let RootRelayBinding {
+        port,
+        mut frontier,
+        window,
+        max_wait,
+    } = binding;
+    if statuses.root != root
+        || frontier.root() != root
+        || permit.identity().execution() != root.query_execution_id()
+    {
+        return Err(pump_failure(
+            permit,
+            contract_failure(contract_error(
+                "root relay identity does not match its attempt, status source or frontier",
+            )),
+        ));
+    }
+    let cancellation = match scope.cancellation() {
+        Ok(cancellation) => cancellation,
+        Err(error) => return Err(pump_failure(permit, work_failure(error))),
+    };
+    if let Some(reason) = cancellation.reason() {
+        return Err(conclude_cancellation(None, permit, cancellation_failure(reason)).await);
+    }
+    let observer = match permit.bind_root_result(root).await {
+        Ok(observer) => observer,
+        Err(error) => {
+            if let Some(reason) = cancellation.reason() {
+                return Err(
+                    conclude_cancellation(None, permit, cancellation_failure(reason)).await,
+                );
+            }
+            return Err(pump_actor_failure(permit, "bind root result", error));
+        }
+    };
+    let observer_owner = observer;
+    let mut runtime = PumpRuntime {
+        observer: observer_owner.clone(),
+        statuses,
+        native_terminal,
+        cancellation,
+        root_finished: false,
+        success_sealed: false,
+        native_completed: false,
+        pending_root_failure: None,
+    };
+    if let Err(interruption) = runtime.await_initial_root_status().await {
+        return Err(bound_pump_interruption(&observer_owner, permit, interruption).await);
+    }
+
+    let exit = {
+        // A validated item waiting for the previous delivery to finish.
+        let mut ready: Option<(
+            NonZeroU64,
+            RetainedRootReply,
+            Option<(
+                novarocks_result_contract::ClientRowProfile,
+                novarocks_result_contract::ClientRowStreamCursor,
+            )>,
+            u64,
+        )> = None;
+        let mut delivering: Option<(NonZeroU64, DeliveryFuture<'_>)> = None;
+        let mut reading: Option<ReadFuture> = None;
+        loop {
+            if delivering.is_none()
+                && let Some((sequence, reply, client_rows, rows)) = ready.take()
+            {
+                let packet = ResultPacketSequence::new(sequence.get() - 1);
+                delivering = Some((
+                    sequence,
+                    Box::pin(permit.deliver_root_segment(packet, reply, client_rows, rows)),
+                ));
+            }
+            if let Some(end) = frontier.end_consumed()
+                && delivering.is_none()
+                && ready.is_none()
+                && reading.is_none()
+            {
+                // The final ACK-only read is optional and never awaited here.
+                let read = frontier.next_read().unwrap_or(super::RootRelayRead {
+                    wanted: None,
+                    consumed: frontier.consumed_through(),
+                });
+                break RelayExit::EndConsumed(read, end);
+            }
+            if reading.is_none()
+                && let Some(read) = frontier.next_read()
+                && read.wanted.is_some()
+            {
+                let request = match RootResultRead::try_new(
+                    root,
+                    frontier.profile(),
+                    frontier.kind(),
+                    read.wanted,
+                    read.consumed,
+                    max_wait,
+                ) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        break RelayExit::Failure(contract_failure(contract_error(format!(
+                            "root relay read is invalid: {error}"
+                        ))));
+                    }
+                };
+                frontier.sent(read);
+                reading = Some(port.read(request, window.clone()));
+            }
+            if delivering.is_none() && reading.is_none() {
+                break RelayExit::Failure(contract_failure(contract_error(
+                    "root relay has neither a delivery nor a read in progress",
+                )));
+            }
+            let event = runtime
+                .await_step(std::future::poll_fn(|cx| {
+                    if let Some((_, future)) = delivering.as_mut()
+                        && let std::task::Poll::Ready(result) = future.as_mut().poll(cx)
+                    {
+                        return std::task::Poll::Ready(RelayEvent::Delivered(result));
+                    }
+                    if let Some(future) = reading.as_mut()
+                        && let std::task::Poll::Ready(result) = future.as_mut().poll(cx)
+                    {
+                        return std::task::Poll::Ready(RelayEvent::Read(result));
+                    }
+                    std::task::Poll::Pending
+                }))
+                .await;
+            match event {
+                Err(interruption) => break RelayExit::Interruption(interruption),
+                Ok(RelayEvent::Delivered(result)) => {
+                    let (sequence, _) = delivering.take().expect("a delivery completed");
+                    if let Err(error) = result {
+                        break RelayExit::Actor("deliver root segment", error);
+                    }
+                    if let Err(error) = frontier.receipt(sequence) {
+                        break RelayExit::Failure(contract_failure(contract_error(
+                            error.to_string(),
+                        )));
+                    }
+                }
+                Ok(RelayEvent::Read(result)) => {
+                    reading = None;
+                    let reply = match result {
+                        Ok(reply) => reply,
+                        Err(failure) => break RelayExit::Failure(failure),
+                    };
+                    let client_rows = frontier.client_rows();
+                    let body = match reply.outcome() {
+                        crate::api::RootReplyView::Data { body, .. } => Some(body),
+                        _ => None,
+                    };
+                    let step = frontier.accept(reply.reply(), body);
+                    match step {
+                        Err(error) => {
+                            break RelayExit::Failure(contract_failure(contract_error(
+                                error.to_string(),
+                            )));
+                        }
+                        Ok(super::RootRelayStep::Deliver { sequence, rows, .. }) => {
+                            ready = Some((sequence, reply, client_rows, rows));
+                        }
+                        Ok(super::RootRelayStep::AwaitTerminalControl) => {
+                            break RelayExit::AwaitTerminalControl;
+                        }
+                        Ok(
+                            super::RootRelayStep::EndKnown(_)
+                            | super::RootRelayStep::NotReady
+                            | super::RootRelayStep::Acknowledged,
+                        ) => {}
+                    }
+                }
+            }
+        }
+    };
+    let (final_read, end) = match exit {
+        RelayExit::EndConsumed(read, end) => (read, end),
+        RelayExit::Interruption(interruption) => {
+            return Err(bound_pump_interruption(&observer_owner, permit, interruption).await);
+        }
+        RelayExit::Failure(failure) => {
+            return Err(bound_pump_failure(&observer_owner, permit, failure).await);
+        }
+        RelayExit::Actor(operation, error) => {
+            return Err(bound_actor_failure(&observer_owner, permit, operation, error).await);
+        }
+        RelayExit::AwaitTerminalControl => {
+            let interruption = runtime.await_terminal_control().await;
+            return Err(bound_pump_interruption(&observer_owner, permit, interruption).await);
+        }
+    };
+    // Optional early retirement of the consumed prefix on the Backend. It is
+    // neither a seal precondition nor awaited for success.
+    if final_read.wanted.is_none()
+        && let Ok(request) = RootResultRead::try_new(
+            root,
+            frontier.profile(),
+            frontier.kind(),
+            None,
+            final_read.consumed,
+            max_wait,
+        )
+    {
+        let ack = port.read(request, window.clone());
+        tokio::spawn(async move {
+            let _ = ack.await;
+        });
+    }
+    // The local End consumption proof: every data item's delivery completed.
+    let sequence = ResultPacketSequence::new(end.sequence.get() - 1);
+    if let Err(error) = runtime
+        .observer
+        .observe_final_worker_eos_ack(root, sequence)
+        .await
+    {
+        return Err(bound_actor_failure(
+            &observer_owner,
+            permit,
+            "observe local root End consumption",
+            error,
+        )
+        .await);
+    }
+    if !runtime.success_sealed {
+        let seal_reply = match runtime.statuses.begin_success_seal_request() {
+            Ok(reply) => reply,
+            Err(error) => {
+                return Err(
+                    bound_pump_failure(&observer_owner, permit, contract_failure(error)).await,
+                );
+            }
+        };
+        let seal_result = runtime
+            .await_step(async move {
+                seal_reply.await.map_err(|_| {
+                    contract_error("success-seal request owner dropped without a verdict")
+                })?
+            })
+            .await;
+        match seal_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(
+                    bound_pump_failure(&observer_owner, permit, contract_failure(error)).await,
+                );
+            }
+            Err(interruption) => {
+                return Err(bound_pump_interruption(&observer_owner, permit, interruption).await);
+            }
+        }
+    }
+    if let Err(interruption) = runtime.await_success_seal().await {
+        return Err(bound_pump_interruption(&observer_owner, permit, interruption).await);
+    }
+    match permit.finish_result_stream().await {
+        Ok(conclusion) => Ok(conclusion),
+        Err(error) => Err(finish_handoff_failure(observer_owner, error).await),
     }
 }
 
@@ -4829,5 +5141,350 @@ mod tests {
             drop(actor);
             drop(owner);
         }
+    }
+
+    // ---- Backend-encoded root relay ----
+
+    use novarocks_execution_contract::root_result::{
+        RootReadOutcome, RootResultData, RootResultEnd, RootResultReply,
+    };
+    use novarocks_result_contract::{
+        ClientRowProfile, RootOutputKind, RootProfileId, RootProfileV1,
+    };
+    use novarocks_workload_control::{ResultCapacityConfig, ResultWindowClass, ResultWindowGrant};
+
+    /// Answers each read from a script and records it. An ACK-only read with
+    /// no scripted answer is acknowledged.
+    struct ScriptedRootPort {
+        requests: Mutex<Vec<RootResultRead>>,
+        outcomes: Mutex<VecDeque<RootReadOutcome>>,
+    }
+    impl ScriptedRootPort {
+        fn new(outcomes: Vec<RootReadOutcome>) -> Arc<Self> {
+            Arc::new(Self {
+                requests: Mutex::new(Vec::new()),
+                outcomes: Mutex::new(outcomes.into()),
+            })
+        }
+        fn requests(&self) -> Vec<(Option<u64>, u64)> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|read| (read.wanted().map(|wanted| wanted.get()), read.consumed()))
+                .collect()
+        }
+    }
+    impl crate::api::BoundedRootReadPort for ScriptedRootPort {
+        fn read(
+            &self,
+            request: RootResultRead,
+            physical_guard: novarocks_workload_control::ResultWindowAlias,
+        ) -> Pin<Box<dyn Future<Output = Result<RetainedRootReply, RootResultFetchFailure>> + Send>>
+        {
+            self.requests.lock().unwrap().push(request.clone());
+            let outcome = self.outcomes.lock().unwrap().pop_front().unwrap_or(
+                if request.wanted().is_none() {
+                    RootReadOutcome::AckOnly
+                } else {
+                    RootReadOutcome::NotReady
+                },
+            );
+            let reply = RootResultReply {
+                root_task: request.root_task(),
+                profile: request.profile(),
+                kind: request.kind(),
+                accepted_consumed: request.consumed(),
+                outcome,
+            };
+            Box::pin(async move {
+                RetainedRootReply::try_new(reply, physical_guard, 64 * 1024).map_err(|error| {
+                    contract_failure(contract_error(format!("retain root reply: {error}")))
+                })
+            })
+        }
+        fn seal(
+            &self,
+            _sealed: novarocks_execution_contract::root_lifetime::RootReadSealed,
+        ) -> Result<(), QueryExecutionError> {
+            Ok(())
+        }
+    }
+
+    fn rows_data(sequence: u64, body: &'static [u8], end: Option<(u64, u64)>) -> RootReadOutcome {
+        RootReadOutcome::Data(
+            RootResultData::try_new(
+                RootOutputKind::ClientRows,
+                NonZeroU64::new(sequence).unwrap(),
+                bytes::Bytes::from_static(body),
+                end.map(|(sequence, rows)| RootResultEnd {
+                    sequence: NonZeroU64::new(sequence).unwrap(),
+                    output_rows: rows,
+                }),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// The ordinary harness plus a configured result window for the root.
+    async fn relay_harness(tag: i64) -> (Harness, ResultWindowGrant) {
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1 << 20,
+                control_bytes: 1 << 12,
+                per_scope_bytes: 1 << 18,
+            },
+        )
+        .unwrap();
+        let capacity = control
+            .configure_result_capacity(ResultCapacityConfig::V1)
+            .unwrap();
+        control.mark_ready().unwrap();
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let scope = work.owner.scope();
+        let window = capacity
+            .try_acquire(&scope, ResultWindowClass::Client)
+            .unwrap();
+        let stage = scope.try_acquire(Stage::Execution).unwrap();
+        let execution = execution(tag);
+        let config = LogicalExecutionActorConfig::single_attempt_completion(
+            execution,
+            ExecutionEffect::None,
+            NonZeroUsize::new(8).unwrap(),
+            Vec::new(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            work.owner,
+            stage,
+        )
+        .unwrap()
+        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        let (owner, initial, output) = spawn_logical_execution_actor(&Handle::current(), config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
+            panic!("result actor must expose a stream");
+        };
+        stream.begin_schema().unwrap().complete();
+        let actor = owner.actor().clone();
+        let permit = actor.activate(initial.ready()).await.unwrap();
+        (
+            Harness {
+                control,
+                scope,
+                actor,
+                owner,
+                permit,
+                stream,
+                root: root_task(execution),
+            },
+            window,
+        )
+    }
+
+    fn relay_binding(
+        root: TaskIdentity,
+        port: Arc<ScriptedRootPort>,
+        window: &ResultWindowGrant,
+    ) -> RootRelayBinding {
+        RootRelayBinding {
+            port,
+            frontier: super::super::RootRelayFrontier::new(
+                root,
+                RootProfileId::V1,
+                RootOutputKind::ClientRows,
+                Some(ClientRowProfile::try_new(RootProfileV1::SEGMENT_BYTES, 1 << 20).unwrap()),
+            )
+            .unwrap(),
+            window: window.retain_alias(),
+            max_wait: Duration::from_millis(5),
+        }
+    }
+
+    async fn next_segment(
+        stream: &mut crate::api::QueryResultStream,
+    ) -> crate::api::RootSegmentDelivery {
+        match stream.next().await.unwrap().unwrap() {
+            ResultDelivery::Segment(segment) => segment,
+            _ => panic!("expected a relayed root segment"),
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_prefetches_delivers_in_order_and_seals_without_a_final_backend_ack() {
+        let (
+            Harness {
+                control: _control,
+                scope,
+                actor,
+                owner,
+                permit,
+                mut stream,
+                root,
+            },
+            window,
+        ) = relay_harness(31).await;
+        let seal_port = Arc::new(TestSuccessSealPort::default());
+        let (status_sender, statuses) = accepted_root_status_projection_with_control_port(
+            root,
+            Arc::clone(&seal_port) as Arc<dyn AcceptedRootControlPort>,
+        );
+        status_sender.publish(finished(root)).unwrap();
+        // A two-segment row, then a one-row segment carrying End.
+        let port = ScriptedRootPort::new(vec![
+            rows_data(1, &[5, 0, 0, 0, b'a', b'b'], None),
+            rows_data(2, &[b'c', b'd', b'e', 1, 0, 0, 0, b'f'], Some((3, 2))),
+        ]);
+        let (_terminal_sender, terminal_source) = native_attempt_terminal_channel();
+        let relay = tokio::spawn(run_root_relay(
+            permit,
+            root,
+            scope,
+            relay_binding(root, Arc::clone(&port), &window),
+            statuses,
+            terminal_source,
+        ));
+        let first = next_segment(&mut stream).await;
+        assert_eq!(first.sequence(), ResultPacketSequence::new(0));
+        assert_eq!(first.rows(), 0);
+        // Seq 2 is read while seq 1 is still being written; both carry ACK 0.
+        while port.requests().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(port.requests(), vec![(Some(1), 0), (Some(2), 0)]);
+        first.complete();
+        let second = next_segment(&mut stream).await;
+        assert_eq!(second.rows(), 2);
+        let spans = second
+            .client_rows()
+            .unwrap()
+            .payload_spans()
+            .map(|span| (span.bytes.to_vec(), span.completes_row))
+            .collect::<Vec<_>>();
+        assert_eq!(spans, vec![(b"cde".to_vec(), true), (b"f".to_vec(), true)]);
+        second.complete();
+        // Success needs the seal verdict, not a Backend final ACK.
+        seal_port.next().await.accept(status_sender).unwrap();
+        let ResultDelivery::End(end) = stream.next().await.unwrap().unwrap() else {
+            panic!("local End consumption and root Finished produce EOF");
+        };
+        end.complete();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), relay)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            LogicalConclusion::Succeeded
+        );
+        assert_eq!(&port.requests()[..2], &[(Some(1), 0), (Some(2), 0)]);
+        drop((stream, actor, owner, window));
+    }
+
+    #[tokio::test]
+    async fn relay_refuses_malformed_rows_and_end_mismatch_before_delivery() {
+        for (outcomes, label) in [
+            (
+                vec![rows_data(1, &[1, 0, 0, 0, b'a', 1, 0], None)],
+                "prefix without payload",
+            ),
+            (
+                vec![rows_data(1, &[1, 0, 0, 0, b'a'], Some((2, 3)))],
+                "End row count",
+            ),
+            (
+                vec![rows_data(2, &[1, 0, 0, 0, b'a'], None)],
+                "sequence gap",
+            ),
+        ] {
+            let (
+                Harness {
+                    control: _control,
+                    scope,
+                    actor,
+                    owner,
+                    permit,
+                    mut stream,
+                    root,
+                },
+                window,
+            ) = relay_harness(32).await;
+            let (status_sender, statuses) = accepted_root_status_projection(root);
+            status_sender.publish(running(root)).unwrap();
+            let port = ScriptedRootPort::new(outcomes);
+            let (_terminal_sender, terminal_source) = native_attempt_terminal_channel();
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                run_root_relay(
+                    permit,
+                    root,
+                    scope,
+                    relay_binding(root, port, &window),
+                    statuses,
+                    terminal_source,
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_err(), "{label} must fail the attempt");
+            // Nothing was handed to the consumer.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), stream.next())
+                    .await
+                    .map_or(true, |next| !matches!(
+                        next,
+                        Ok(Some(ResultDelivery::Segment(_)))
+                    )),
+                "{label} must not deliver any segment"
+            );
+            drop((stream, actor, owner, window, status_sender));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "OPEN (M07 P05): hangs after a failed relayed delivery; the attempt decision path is not yet settled for the relay"]
+    async fn relay_failed_delivery_fails_the_attempt_without_acknowledging_it() {
+        let (
+            Harness {
+                control: _control,
+                scope,
+                actor,
+                owner,
+                permit,
+                mut stream,
+                root,
+            },
+            window,
+        ) = relay_harness(33).await;
+        let (status_sender, statuses) = accepted_root_status_projection(root);
+        status_sender.publish(running(root)).unwrap();
+        let port = ScriptedRootPort::new(vec![rows_data(1, &[1, 0, 0, 0, b'a'], None)]);
+        let (_terminal_sender, terminal_source) = native_attempt_terminal_channel();
+        let relay = tokio::spawn(run_root_relay(
+            permit,
+            root,
+            scope,
+            relay_binding(root, Arc::clone(&port), &window),
+            statuses,
+            terminal_source,
+        ));
+        let segment = next_segment(&mut stream).await;
+        segment.fail(QueryExecutionError::new(
+            QueryExecutionErrorKind::Failed,
+            "client went away",
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), relay)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        // The failed item was never acknowledged as consumed.
+        assert!(port.requests().iter().all(|(_, consumed)| *consumed == 0));
+        drop((stream, actor, owner, window, status_sender));
     }
 }

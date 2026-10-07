@@ -33,6 +33,9 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use novarocks_execution_contract::ResultPacketSequence;
+use novarocks_result_contract::{
+    ClientRowProfile, ClientRowStreamCursor, RootOutputKind, ValidatedClientBody,
+};
 use novarocks_types::{QueryExecutionId, QueryId, schema::SqlType};
 use novarocks_workload_control::{
     LocalResourceAuthority, ResultCredit, ResultCreditReservationError, ResultCreditStage,
@@ -40,6 +43,7 @@ use novarocks_workload_control::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
+use super::root_delivery::{RetainedRootReply, RootReplyView};
 use super::{QueryExecutionError, QueryExecutionErrorKind};
 
 /// Move-only decoded result and its canonical workload-accounting facts.
@@ -783,8 +787,122 @@ impl EndDelivery {
     }
 }
 
+/// Move-only ownership of one validated Backend-encoded root data item and
+/// the window alias covering its backing. Completing it is the in-order
+/// delivery receipt that lets the relay acknowledge the item; the backing and
+/// its alias exit before that receipt is observed.
+pub struct RootSegmentDelivery {
+    execution_id: QueryExecutionId,
+    sequence: ResultPacketSequence,
+    reply: Option<RetainedRootReply>,
+    client_rows: Option<(ClientRowProfile, ClientRowStreamCursor)>,
+    rows: u64,
+    signal: DeliverySignal,
+}
+
+impl RootSegmentDelivery {
+    /// `reply` must hold Data. ClientRows carries its frozen profile and the
+    /// row cursor before this body, against which the body already validated.
+    pub(crate) fn try_new(
+        execution_id: QueryExecutionId,
+        sequence: ResultPacketSequence,
+        reply: RetainedRootReply,
+        client_rows: Option<(ClientRowProfile, ClientRowStreamCursor)>,
+        rows: u64,
+    ) -> Result<(Self, ResultDeliveryReceipt), QueryExecutionError> {
+        let body = match reply.outcome() {
+            RootReplyView::Data { body, .. } => body,
+            _ => {
+                return Err(invalid_result_delivery(
+                    "a root segment delivery requires a data item",
+                ));
+            }
+        };
+        if client_rows.is_some() != (reply.kind() == RootOutputKind::ClientRows) {
+            return Err(invalid_result_delivery(
+                "a root segment's row profile must match its output kind",
+            ));
+        }
+        if let Some((profile, before)) = client_rows {
+            let validated = before.validate_body(profile, body).map_err(|error| {
+                invalid_result_delivery(format!("root segment rows are malformed: {error}"))
+            })?;
+            if validated.after().completed_rows() - before.completed_rows() != rows {
+                return Err(invalid_result_delivery(
+                    "a root segment's row count differs from its body",
+                ));
+            }
+        }
+        let (signal, receipt) = DeliverySignal::channel();
+        Ok((
+            Self {
+                execution_id,
+                sequence,
+                reply: Some(reply),
+                client_rows,
+                rows,
+                signal,
+            },
+            receipt,
+        ))
+    }
+
+    pub const fn execution_id(&self) -> QueryExecutionId {
+        self.execution_id
+    }
+    pub const fn sequence(&self) -> ResultPacketSequence {
+        self.sequence
+    }
+    /// Rows this item completes.
+    pub const fn rows(&self) -> u64 {
+        self.rows
+    }
+    pub fn kind(&self) -> RootOutputKind {
+        self.reply().kind()
+    }
+    fn reply(&self) -> &RetainedRootReply {
+        self.reply
+            .as_ref()
+            .expect("root segment delivery owns its reply before completion")
+    }
+    /// The item's exact body bytes.
+    pub fn body(&self) -> &[u8] {
+        match self.reply().outcome() {
+            RootReplyView::Data { body, .. } => body,
+            _ => unreachable!("a root segment delivery holds a data item"),
+        }
+    }
+    /// ClientRows payload spans, from the row cursor before this body.
+    pub fn client_rows(&self) -> Option<ValidatedClientBody<'_>> {
+        let (profile, before) = self.client_rows?;
+        Some(
+            before
+                .validate_body(profile, self.body())
+                .expect("a root segment validated at construction"),
+        )
+    }
+    /// Delivery completed: the backing and its alias exit first.
+    pub fn complete(mut self) {
+        drop(self.reply.take());
+        self.signal.finish(ResultDeliveryDisposition::Completed);
+    }
+    pub fn fail(mut self, error: QueryExecutionError) {
+        drop(self.reply.take());
+        self.signal.finish(ResultDeliveryDisposition::Failed(error));
+    }
+}
+
+impl Drop for RootSegmentDelivery {
+    fn drop(&mut self) {
+        drop(self.reply.take());
+        self.signal.finish(ResultDeliveryDisposition::Dropped);
+    }
+}
+
 pub enum ResultDelivery {
     Batch(BatchDelivery),
+    /// A Backend-encoded root item, relayed without Arrow decode.
+    Segment(RootSegmentDelivery),
     End(EndDelivery),
 }
 
@@ -792,6 +910,7 @@ impl ResultDelivery {
     pub const fn execution_id(&self) -> QueryExecutionId {
         match self {
             Self::Batch(delivery) => delivery.execution_id(),
+            Self::Segment(delivery) => delivery.execution_id(),
             Self::End(delivery) => delivery.execution_id(),
         }
     }
@@ -962,7 +1081,9 @@ impl QueryResultStream {
             StreamEvent::Message(message) => message,
         };
         match message {
-            Some(delivery @ ResultDelivery::Batch(_)) => Ok(Some(delivery)),
+            Some(delivery @ (ResultDelivery::Batch(_) | ResultDelivery::Segment(_))) => {
+                Ok(Some(delivery))
+            }
             Some(delivery @ ResultDelivery::End(_)) => {
                 self.terminal_seen = true;
                 Ok(Some(delivery))

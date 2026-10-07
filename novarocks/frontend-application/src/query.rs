@@ -2651,6 +2651,18 @@ async fn consume_governed_scalar_stream(
             }
         };
         match delivery {
+            ResultDelivery::Segment(delivery) => {
+                // A SET scalar is a typed domain value, never relayed rows.
+                let message =
+                    "SET scalar query received Backend-encoded rows instead of its typed value"
+                        .to_string();
+                delivery.fail(QueryExecutionError::new(
+                    QueryExecutionErrorKind::InvalidRequest,
+                    message.clone(),
+                ));
+                let _ = execution.request_cancel();
+                return Err(scalar_query_error(message));
+            }
             ResultDelivery::Batch(delivery) => {
                 let rows = delivery.batch().num_rows();
                 if rows > 1 || (rows == 1 && value.is_some()) {

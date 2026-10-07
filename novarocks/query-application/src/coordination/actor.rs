@@ -39,8 +39,9 @@ use tokio::task::JoinHandle;
 use crate::api::{
     BatchDelivery, DecodedResultBatch, EndDelivery, ExecutionOutput, QueryExecutionError,
     QueryResultStream, QueryResultTransport, ResultDelivery, ResultDeliveryDisposition,
-    ResultDeliveryReceipt, ResultQueuePermit, ResultSchema,
+    ResultDeliveryReceipt, ResultQueuePermit, ResultSchema, RetainedRootReply, RootSegmentDelivery,
 };
+use novarocks_result_contract::{ClientRowProfile, ClientRowStreamCursor};
 
 use super::actor_state::{
     ActorStateError, AttemptCapability, LogicalExecutionState, ReplacementFact, ReplacementToken,
@@ -557,6 +558,28 @@ impl RunningAttemptPermit {
             sequence,
             batch,
             credit,
+            reply,
+        })
+        .await
+    }
+
+    /// Transfers one validated Backend-encoded root item to the actor-owned
+    /// delivery boundary. Like a decoded batch, the future resolves only after
+    /// the protocol consumer completes or rejects it; that completion is the
+    /// in-order receipt the relay acknowledges to the Backend.
+    pub(crate) async fn deliver_root_segment(
+        &self,
+        sequence: ResultPacketSequence,
+        segment: RetainedRootReply,
+        client_rows: Option<(ClientRowProfile, ClientRowStreamCursor)>,
+        rows: u64,
+    ) -> Result<(), LogicalExecutionActorError> {
+        request(self.mailbox(), |reply| ActorCommand::DeliverRootSegment {
+            activation: self.identity(),
+            sequence,
+            segment,
+            client_rows,
+            rows,
             reply,
         })
         .await
@@ -1283,7 +1306,9 @@ type ActorReply<T> = oneshot::Sender<Result<T, LogicalExecutionActorError>>;
 struct PendingResultBatch {
     activation: AttemptActivationIdentity,
     sequence: ResultPacketSequence,
-    delivery: BatchDelivery,
+    /// A decoded batch or a Backend-encoded root segment; both share the
+    /// same ordered delivery, receipt and success gate.
+    delivery: ResultDelivery,
     receipt: ResultDeliveryReceipt,
     reply: ActorReply<()>,
 }
@@ -1398,6 +1423,14 @@ enum ActorCommand {
         sequence: ResultPacketSequence,
         batch: DecodedResultBatch,
         credit: ResultCredit,
+        reply: ActorReply<()>,
+    },
+    DeliverRootSegment {
+        activation: AttemptActivationIdentity,
+        sequence: ResultPacketSequence,
+        segment: RetainedRootReply,
+        client_rows: Option<(ClientRowProfile, ClientRowStreamCursor)>,
+        rows: u64,
         reply: ActorReply<()>,
     },
     BindRootResult {
@@ -3373,9 +3406,7 @@ fn apply_result_capacity(
                     return;
                 }
             };
-            runtime
-                .transport
-                .enqueue(slot, ResultDelivery::Batch(pending.delivery));
+            runtime.transport.enqueue(slot, pending.delivery);
             runtime.in_flight = Some(InFlightResult::Batch {
                 permit,
                 receipt: pending.receipt,
@@ -3828,7 +3859,86 @@ fn handle_command(
             runtime.pending = Some(PendingResult::Batch(PendingResultBatch {
                 activation,
                 sequence,
-                delivery,
+                delivery: ResultDelivery::Batch(delivery),
+                receipt,
+                reply,
+            }));
+        }
+        ActorCommand::DeliverRootSegment {
+            activation,
+            sequence,
+            segment,
+            client_rows,
+            rows,
+            reply,
+        } => {
+            // The same admission guards as a decoded batch: one ordered item
+            // at a time, never outside the attempt's delivery gate.
+            if let Some(conclusion) = state.conclusion() {
+                drop(segment);
+                let _ = reply.send(Err(LogicalExecutionActorError::ExecutionConcluded(
+                    conclusion,
+                )));
+                return;
+            }
+            let Some(runtime) = result_runtime else {
+                drop(segment);
+                let _ = reply.send(Err(LogicalExecutionActorError::WrongPhase));
+                return;
+            };
+            if runtime.attempt_decision_pending == Some(activation) {
+                drop(segment);
+                let _ = reply.send(Err(LogicalExecutionActorError::RootAttemptTerminal));
+                return;
+            }
+            if runtime
+                .root_success
+                .as_ref()
+                .is_some_and(|gate| gate.activation == activation && gate.final_eos_ack.is_some())
+            {
+                drop(segment);
+                conclude_failed(state, "a root segment arrived outside its delivery gate");
+                reply_result_failure(state, reply);
+                return;
+            }
+            if verify_running_activation(state, activation).is_err()
+                || runtime.pending.is_some()
+                || matches!(
+                    runtime.in_flight,
+                    Some(InFlightResult::Batch { .. } | InFlightResult::End { .. })
+                )
+            {
+                drop(segment);
+                let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+                return;
+            }
+            if sequence.next().is_none() {
+                drop(segment);
+                conclude_failed(state, "a root segment sequence overflowed");
+                reply_result_failure(state, reply);
+                return;
+            }
+            let Ok((delivery, receipt)) = RootSegmentDelivery::try_new(
+                activation.execution(),
+                sequence,
+                segment,
+                client_rows,
+                rows,
+            ) else {
+                conclude_failed(state, "a root segment could not be prepared for delivery");
+                reply_result_failure(state, reply);
+                return;
+            };
+            if start_schema_delivery(state, runtime, activation).is_err() {
+                drop(delivery);
+                conclude_failed(state, "schema delivery could not be started");
+                reply_result_failure(state, reply);
+                return;
+            }
+            runtime.pending = Some(PendingResult::Batch(PendingResultBatch {
+                activation,
+                sequence,
+                delivery: ResultDelivery::Segment(delivery),
                 receipt,
                 reply,
             }));

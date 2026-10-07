@@ -594,6 +594,17 @@ pub async fn write_streaming_query_result_one<'writer, W: AsyncWrite + Unpin>(
         };
 
         match delivery {
+            ResultDelivery::Segment(delivery) => {
+                // Backend-encoded root rows are framed by the bounded writer;
+                // this decoded-batch writer refuses them explicitly.
+                let error = invalid_query_result_delivery(
+                    "Backend-encoded root rows require the bounded result writer",
+                );
+                delivery.fail(error.clone());
+                let _ = result.fail();
+                return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
+                    .await;
+            }
             ResultDelivery::Batch(delivery) => {
                 let batch = delivery.batch().clone();
                 let protocol_bytes =

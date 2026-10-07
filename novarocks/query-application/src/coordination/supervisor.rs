@@ -1160,18 +1160,33 @@ async fn drive_rows_attempt_until_pump_decision(
     let (terminal_sender, terminal_source) = super::native_attempt_terminal_channel();
     let mut terminal_sender = Some(terminal_sender);
     let native_run = catch_future_panic(active.run(drive, cancellation));
-    let pump = run_root_result_pump(
-        running,
-        root,
-        scope,
-        resources,
-        schema,
-        runtime.binding,
-        runtime.statuses,
-        terminal_source,
-        max_wait,
-        fetch_byte_limit,
-    );
+    let pump: std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<super::LogicalConclusion, ResultPumpFailure>>
+                + Send,
+        >,
+    > = match runtime.binding {
+        crate::api::NativeRowsDelivery::Pump(binding) => Box::pin(run_root_result_pump(
+            running,
+            root,
+            scope,
+            resources,
+            schema,
+            binding,
+            runtime.statuses,
+            terminal_source,
+            max_wait,
+            fetch_byte_limit,
+        )),
+        crate::api::NativeRowsDelivery::Relay(binding) => Box::pin(super::run_root_relay(
+            running,
+            root,
+            scope,
+            binding,
+            runtime.statuses,
+            terminal_source,
+        )),
+    };
     tokio::pin!(native_run);
     tokio::pin!(pump);
     let pump_result = loop {
