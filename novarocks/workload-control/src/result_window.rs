@@ -458,6 +458,95 @@ mod tests {
         (control, handle)
     }
     #[test]
+    fn nonqueued_root_window_refusal_is_atomic_and_aliases_keep_the_root() {
+        let (control, capacity) = control();
+        let admission = control.root_admission();
+        let (root, window) = admission
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Local,
+            )
+            .unwrap();
+        let alias = window.retain_alias();
+        let before = control.snapshot();
+        assert!(matches!(
+            admission.try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Local
+            ),
+            Err(WorkError::Capacity("complete result window"))
+        ));
+        assert_eq!(
+            control.snapshot().root_responsibilities,
+            before.root_responsibilities
+        );
+        assert_eq!(control.snapshot().businesses, before.businesses);
+        assert_eq!(control.inner.state.lock().unwrap().nodes.len(), 1);
+        root.owner.complete();
+        root.business.release();
+        drop(window);
+        assert_eq!(control.snapshot().businesses, 0);
+        assert_eq!(control.snapshot().root_responsibilities, 1);
+        assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+        drop(alias);
+        assert_eq!(control.snapshot().root_responsibilities, 0);
+        let (next, window) = admission
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Local,
+            )
+            .unwrap();
+        next.owner.complete();
+        next.business.release();
+        drop(window);
+        assert_eq!(control.snapshot().root_responsibilities, 0);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+    }
+
+    #[test]
+    fn nonqueued_root_rejects_unconfigured_or_closing_window_without_work() {
+        let unconfigured = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024,
+                control_bytes: 128,
+                per_scope_bytes: 896,
+            },
+        )
+        .unwrap();
+        unconfigured.mark_ready().unwrap();
+        assert!(matches!(
+            unconfigured.root_admission().try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Local
+            ),
+            Err(WorkError::NotReady)
+        ));
+        assert_eq!(unconfigured.snapshot().root_responsibilities, 0);
+        assert_eq!(unconfigured.snapshot().businesses, 0);
+        assert!(unconfigured.inner.state.lock().unwrap().nodes.is_empty());
+        let (control, capacity) = control();
+        assert!(matches!(
+            control.root_admission().try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Closing
+            ),
+            Err(WorkError::Conflict)
+        ));
+        assert_eq!(control.snapshot().root_responsibilities, 0);
+        assert_eq!(control.snapshot().businesses, 0);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        assert!(matches!(
+            control.root_admission().try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Query),
+                ResultWindowClass::Client
+            ),
+            Err(WorkError::Conflict)
+        ));
+        assert_eq!(control.snapshot().root_responsibilities, 0);
+    }
+
+    #[test]
     fn delegated_window_keeps_exact_child_and_one_position_until_last_alias_exit() {
         let (control, capacity) = control();
         let root = control

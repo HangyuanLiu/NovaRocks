@@ -590,9 +590,22 @@ impl WorkloadShutdownFailure {
 }
 
 fn try_begin_root(inner: &Arc<Inner>, request: WorkRequest) -> Result<RootWork, WorkError> {
+    try_begin_root_window(inner, request, None).map(|(root, _)| root)
+}
+
+fn try_begin_root_window(
+    inner: &Arc<Inner>,
+    request: WorkRequest,
+    window: Option<crate::ResultWindowClass>,
+) -> Result<(RootWork, Option<crate::ResultWindowGrant>), WorkError> {
     inner.update(|state| {
         let class = request.class;
         let result = (|| {
+            if window == Some(crate::ResultWindowClass::Closing)
+                || (window.is_some() && class.uses_warehouse_concurrency())
+            {
+                return Err(WorkError::Conflict);
+            }
             if state.closed {
                 return Err(WorkError::Closed);
             }
@@ -622,12 +635,28 @@ fn try_begin_root(inner: &Arc<Inner>, request: WorkRequest) -> Result<RootWork, 
                 inner: Arc::clone(inner),
                 id,
             };
-            Ok(RootWork {
-                owner: WorkOwner {
-                    scope: Some(scope.clone()),
+            let grant = match window {
+                None => None,
+                Some(class) => match crate::result_window::reserve_window(state, &scope, class) {
+                    Ok(grant) => Some(grant),
+                    Err(error) => {
+                        // No owner or permit has escaped this transaction.
+                        state.nodes.remove(&id);
+                        state.roots -= 1;
+                        state.businesses -= 1;
+                        return Err(error);
+                    }
                 },
-                business: BusinessPermit { scope: Some(scope) },
-            })
+            };
+            Ok((
+                RootWork {
+                    owner: WorkOwner {
+                        scope: Some(scope.clone()),
+                    },
+                    business: BusinessPermit { scope: Some(scope) },
+                },
+                grant,
+            ))
         })();
         if result.is_err() {
             state.root_lifecycle.rejected_admissions.increment(class);
@@ -683,6 +712,21 @@ fn begin_warehouse_root(
 impl RootAdmissionHandle {
     pub fn try_begin_root(&self, request: WorkRequest) -> Result<RootWork, WorkError> {
         try_begin_root(&self.inner, request)
+    }
+
+    /// Admit nonqueued work and its complete result position in one authority
+    /// transaction. Refusal publishes neither a root nor a business permit.
+    pub fn try_begin_root_with_result(
+        &self,
+        request: WorkRequest,
+        class: crate::ResultWindowClass,
+    ) -> Result<(RootWork, crate::ResultWindowGrant), WorkError> {
+        try_begin_root_window(&self.inner, request, Some(class)).map(|(root, window)| {
+            (
+                root,
+                window.expect("requested result position is returned atomically"),
+            )
+        })
     }
 
     /// Register a logical query before it receives warehouse concurrency.

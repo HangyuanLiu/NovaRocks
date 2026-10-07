@@ -810,6 +810,78 @@ mod tests {
         (control, service, workload)
     }
 
+    #[test]
+    fn nonqueued_result_admission_rolls_back_registration_failure_and_retains_aliases() {
+        use novarocks_workload_control::{ResultCapacityConfig, ResultWindowClass, WorkClass};
+        let control = Arc::new(QueryApplicationControl::default());
+        let service = QueryControlService::new(control.clone());
+        let workload = WorkloadControl::try_new(
+            WorkloadConfig {
+                query_concurrency_limit: 1,
+                ..WorkloadConfig::default()
+            },
+            ResourceConfig {
+                total_bytes: 1024,
+                control_bytes: 128,
+                per_scope_bytes: 896,
+            },
+        )
+        .unwrap();
+        let capacity = workload
+            .configure_result_capacity(ResultCapacityConfig {
+                positions: [1, 2, 1, 1],
+                client_compute_positions: 1,
+                client_short_tail_positions: 0,
+                supported_cancel_burst: 0,
+                sustained_cancels_per_second: 0,
+                ..ResultCapacityConfig::V1
+            })
+            .unwrap();
+        workload.mark_ready().unwrap();
+        let session = register(&control, 7, 1, "root");
+        let other = register(&control, 8, 2, "root");
+        let begin = |session| {
+            service.begin_governed_statement_with_result(
+                session,
+                &workload.root_admission(),
+                WorkClass::Management,
+                None,
+                None,
+                None,
+                ResultWindowClass::Local,
+            )
+        };
+        let statement = begin(session).unwrap();
+        assert!(matches!(
+            begin(session),
+            Err(GovernedQueryStatementBeginError::QueryControl(_))
+        ));
+        assert_eq!(workload.snapshot().root_responsibilities, 1);
+        assert_eq!(workload.snapshot().businesses, 1);
+        assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+        let second = begin(other).unwrap();
+        let third = register(&control, 9, 3, "root");
+        assert!(matches!(
+            begin(third),
+            Err(GovernedQueryStatementBeginError::Admission(_))
+        ));
+        assert_eq!(workload.snapshot().root_responsibilities, 2);
+        assert_eq!(workload.snapshot().businesses, 2);
+        assert_eq!(workload.snapshot().admitted_queries, 0);
+        let alias = statement.result_window_alias().unwrap();
+        drop(statement);
+        drop(second);
+        assert_eq!(workload.snapshot().businesses, 0);
+        assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+        assert_eq!(workload.snapshot().root_responsibilities, 1);
+        drop(alias);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        assert_eq!(workload.snapshot().root_responsibilities, 0);
+        // The failed capacity admission did not start a protocol generation.
+        drop(begin(third).unwrap());
+        assert_eq!(workload.snapshot().root_responsibilities, 0);
+    }
+
     #[tokio::test]
     async fn result_statement_takes_its_window_with_the_permit_and_keeps_it_for_aliases() {
         use novarocks_workload_control::{ResultCapacityConfig, ResultWindowClass};

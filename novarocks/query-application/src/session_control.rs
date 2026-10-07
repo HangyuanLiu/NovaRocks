@@ -563,11 +563,61 @@ impl QueryControlService {
         timeout_ms: Option<u64>,
         statement_text: Option<Arc<str>>,
     ) -> Result<GovernedQueryStatementOwner, GovernedQueryStatementBeginError> {
+        self.begin_nonqueued(
+            session,
+            admission,
+            class,
+            deadline,
+            timeout_ms,
+            statement_text,
+            None,
+        )
+    }
+
+    /// Acquire the complete result position together with nonqueued business
+    /// admission, before registering or starting the statement's producer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_governed_statement_with_result(
+        &self,
+        session: SessionToken,
+        admission: &RootAdmissionHandle,
+        class: WorkClass,
+        deadline: Option<Instant>,
+        timeout_ms: Option<u64>,
+        statement_text: Option<Arc<str>>,
+        window: ResultWindowClass,
+    ) -> Result<GovernedQueryStatementOwner, GovernedQueryStatementBeginError> {
+        self.begin_nonqueued(
+            session,
+            admission,
+            class,
+            deadline,
+            timeout_ms,
+            statement_text,
+            Some(window),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_nonqueued(
+        &self,
+        session: SessionToken,
+        admission: &RootAdmissionHandle,
+        class: WorkClass,
+        deadline: Option<Instant>,
+        timeout_ms: Option<u64>,
+        statement_text: Option<Arc<str>>,
+        window: Option<ResultWindowClass>,
+    ) -> Result<GovernedQueryStatementOwner, GovernedQueryStatementBeginError> {
         let mut request = WorkRequest::new(class);
         request.deadline = deadline;
-        let root = admission
-            .try_begin_root(request)
-            .map_err(GovernedQueryStatementBeginError::Admission)?;
+        let (root, result_window) = match window {
+            None => admission.try_begin_root(request).map(|root| (root, None)),
+            Some(window) => admission
+                .try_begin_root_with_result(request, window)
+                .map(|(root, window)| (root, Some(window))),
+        }
+        .map_err(GovernedQueryStatementBeginError::Admission)?;
         let cancellation = match GovernedStatementCancellation::new(&root.owner) {
             Ok(cancellation) => cancellation,
             Err(error) => {
@@ -595,7 +645,7 @@ impl QueryControlService {
             execution_owner: Some(root.owner),
             business: Some(root.business),
             query_concurrency: None,
-            result_window: None,
+            result_window,
             accepted_delivery_cut: None,
             timeout_ms,
             success_visibility_sealed: false,
