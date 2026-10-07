@@ -5,13 +5,15 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use novarocks_execution_contract::native_result_support::NativeResultSupportGeometry;
+use novarocks_native_adapter::native_lane::{NativeLaneChannel, frontend_lane_connections};
+use novarocks_native_adapter::native_transport_admission::NativeTransportAdmission;
 use novarocks_native_trust::NativeTrust;
 use novarocks_proto_codec::native_rpc::FrontendNativeLane;
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::{BackendProcessId, NativeEndpoint};
 use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tonic::transport::Channel;
 
 use super::transport_supervisor::NativeTransportSupervisor;
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
@@ -22,7 +24,8 @@ use novarocks_native_adapter::FrontendNativeTransport;
 const MAX_CONCURRENT_RESULT_FETCHES: usize = 16;
 
 /// Exact peer generation and physical lane. Methods in one manifest lane
-/// share its channel; other lanes and replacement processes cannot alias it.
+/// share its connections; other lanes and replacement processes cannot alias
+/// them.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(super) struct NativeChannelKey {
     pub(super) endpoint: NativeEndpoint,
@@ -30,11 +33,21 @@ pub(super) struct NativeChannelKey {
     pub(super) lane: FrontendNativeLane,
 }
 
+/// One of a lane's connections: the geometry fixes how many connections a
+/// Frontend keeps per Backend process, endpoint and lane, and calls rotate
+/// over them.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub(super) struct NativeChannelSlot {
+    pub(super) key: NativeChannelKey,
+    pub(super) index: usize,
+}
+
 /// A cached connection and its identity travel together. Channel clones do
 /// not identify the cache entry that supplied an older request.
 #[derive(Clone)]
 pub(super) struct CachedNativeChannel {
-    pub(super) channel: Channel,
+    pub(super) channel: NativeLaneChannel,
+    pub(super) slot: NativeChannelSlot,
     generation: Arc<DialGeneration>,
 }
 
@@ -44,14 +57,86 @@ struct DialGeneration {
 
 enum NativeChannelCacheRow {
     Dialing(Arc<DialGeneration>),
-    Ready(CachedNativeChannel),
+    Ready(Box<CachedNativeChannel>),
+}
+
+impl NativeChannelCacheRow {
+    fn generation(&self) -> &Arc<DialGeneration> {
+        match self {
+            Self::Dialing(generation) => generation,
+            Self::Ready(channel) => &channel.generation,
+        }
+    }
+}
+
+/// The connections of one Backend process, endpoint and lane.
+struct LanePool {
+    next: usize,
+    rows: Vec<Option<NativeChannelCacheRow>>,
+}
+
+/// Bounded cache: at most `pool_limit()` lane pools, each with exactly the
+/// geometry's connection count.
+#[derive(Default)]
+struct ChannelPools {
+    pools: HashMap<NativeChannelKey, LanePool>,
+}
+
+/// Every live Backend's four lanes, once for a process and once for its
+/// replacement while the old one is still being invalidated.
+fn pool_limit() -> usize {
+    let backends = usize::try_from(NativeResultSupportGeometry::V1.transport_maximum_live_backends)
+        .expect("validated Native geometry fits the target");
+    backends
+        .checked_mul(4 * 2)
+        .expect("validated Native geometry fits the target")
+}
+
+impl ChannelPools {
+    fn row(&self, slot: &NativeChannelSlot) -> Option<&NativeChannelCacheRow> {
+        self.pools
+            .get(&slot.key)
+            .and_then(|pool| pool.rows.get(slot.index))
+            .and_then(Option::as_ref)
+    }
+
+    fn row_mut(&mut self, slot: &NativeChannelSlot) -> Option<&mut Option<NativeChannelCacheRow>> {
+        self.pools
+            .get_mut(&slot.key)
+            .and_then(|pool| pool.rows.get_mut(slot.index))
+    }
+
+    /// Admit a pool for `key`. When full, only a pool with no dial in flight
+    /// may be evicted; eviction drops cache aliases only, while escaped
+    /// channels and their connections keep their own owners.
+    fn pool(&mut self, key: &NativeChannelKey) -> Result<&mut LanePool, String> {
+        if !self.pools.contains_key(key) {
+            if self.pools.len() >= pool_limit() {
+                let cold = self
+                    .pools
+                    .iter()
+                    .find(|(_, pool)| {
+                        pool.rows
+                            .iter()
+                            .all(|row| !matches!(row, Some(NativeChannelCacheRow::Dialing(_))))
+                    })
+                    .map(|(cold, _)| cold.clone())
+                    .ok_or_else(|| "Frontend Native channel cache is full of dials".to_owned())?;
+                self.pools.remove(&cold);
+            }
+            let mut rows = Vec::new();
+            rows.resize_with(frontend_lane_connections(key.lane), || None);
+            self.pools.insert(key.clone(), LanePool { next: 0, rows });
+        }
+        Ok(self.pools.get_mut(key).expect("pool admitted above"))
+    }
 }
 
 /// One cache generation elected before any connector IO. Cancellation removes
 /// only this generation; replacement invalidation makes late publication fail.
 pub(super) struct NativeDialReservation {
     runtime: FrontendDataRuntime,
-    key: NativeChannelKey,
+    slot: NativeChannelSlot,
     generation: Arc<DialGeneration>,
     published: bool,
     leader: bool,
@@ -74,11 +159,11 @@ impl NativeDialReservation {
         if self.is_retired() {
             return Err("Native channel generation retired before ready".to_owned());
         }
-        match channels.get(&self.key) {
+        match channels.row(&self.slot) {
             Some(NativeChannelCacheRow::Ready(channel))
                 if Arc::ptr_eq(&channel.generation, &self.generation) =>
             {
-                Ok(Some(channel.clone()))
+                Ok(Some(CachedNativeChannel::clone(channel)))
             }
             Some(NativeChannelCacheRow::Dialing(current))
                 if Arc::ptr_eq(current, &self.generation) =>
@@ -89,13 +174,16 @@ impl NativeDialReservation {
         }
     }
 
-    pub(super) fn publish(mut self, channel: Channel) -> Result<CachedNativeChannel, String> {
+    pub(super) fn publish(
+        mut self,
+        channel: NativeLaneChannel,
+    ) -> Result<CachedNativeChannel, String> {
         let mut channels = self
             .runtime
             .channels
             .lock()
             .expect("frontend native channel cache lock");
-        let exact = matches!(channels.get(&self.key), Some(NativeChannelCacheRow::Dialing(current)) if Arc::ptr_eq(current, &self.generation));
+        let exact = matches!(channels.row(&self.slot), Some(NativeChannelCacheRow::Dialing(current)) if Arc::ptr_eq(current, &self.generation));
         if !exact || !self.leader || self.is_retired() {
             drop(channels);
             // Actual IO/worker teardown occurs outside the cache lock.
@@ -104,12 +192,13 @@ impl NativeDialReservation {
         }
         let acquired = CachedNativeChannel {
             channel,
+            slot: self.slot.clone(),
             generation: Arc::clone(&self.generation),
         };
-        channels.insert(
-            self.key.clone(),
-            NativeChannelCacheRow::Ready(acquired.clone()),
-        );
+        *channels
+            .row_mut(&self.slot)
+            .expect("exact dialing row exists") =
+            Some(NativeChannelCacheRow::Ready(Box::new(acquired.clone())));
         self.published = true;
         Ok(acquired)
     }
@@ -123,12 +212,13 @@ impl Drop for NativeDialReservation {
                 .channels
                 .lock()
                 .expect("frontend native channel cache lock");
-            if matches!(channels.get(&self.key), Some(NativeChannelCacheRow::Dialing(current)) if Arc::ptr_eq(current, &self.generation))
+            if let Some(row) = channels.row_mut(&self.slot)
+                && matches!(row, Some(NativeChannelCacheRow::Dialing(current)) if Arc::ptr_eq(current, &self.generation))
             {
                 // Every follower retains this same scope. It must not silently
                 // start a new generation after its elected leader exits.
                 self.generation.retired.store(true, Ordering::Release);
-                channels.remove(&self.key);
+                *row = None;
             }
         }
     }
@@ -144,7 +234,8 @@ pub(crate) struct FrontendDataRuntime {
     handle: Handle,
     native_trust: Arc<NativeTrust>,
     native_transport: FrontendNativeTransport,
-    channels: Arc<Mutex<HashMap<NativeChannelKey, NativeChannelCacheRow>>>,
+    transport_admission: NativeTransportAdmission,
+    channels: Arc<Mutex<ChannelPools>>,
     dial_gates: Arc<[tokio::sync::Mutex<()>; 4]>,
     task_transport_supervisor: NativeTransportSupervisor,
     result_fetch_permits: Arc<Semaphore>,
@@ -162,12 +253,32 @@ impl FrontendDataRuntime {
         native_transport: FrontendNativeTransport,
         task_transport_budget: TransportBudget,
     ) -> Result<Self, String> {
+        // An inconsistent frozen geometry is refused before any channel. The
+        // envelope's count part is logged; P00b freezes the coefficients.
+        let geometry =
+            novarocks_native_adapter::native_transport_geometry::validate_native_transport_geometry(
+                &NativeResultSupportGeometry::V1,
+            )
+            .map_err(|error| format!("validate Native transport geometry: {error}"))?;
+        let transport_admission = NativeTransportAdmission::frontend(Some(
+            crate::metrics::native_transport::frontend_native_transport_observer(),
+        ))
+        .map_err(|error| format!("compose Frontend Native transport admission: {error}"))?;
+        tracing::debug!(
+            connections = geometry.frontend.connections,
+            streams = geometry.frontend.streams,
+            structural_bytes = geometry.frontend.structural_bytes,
+            native_sockets = geometry.frontend_socket_positions,
+            coefficients_frozen = geometry.frontend.coefficients.is_some(),
+            "Frontend Native transport admission composed"
+        );
         let connector_blocking_io = ConnectorBlockingIoSupervisor::new(handle.clone());
         Ok(Self {
             handle,
             native_trust,
             native_transport,
-            channels: Arc::new(Mutex::new(HashMap::new())),
+            transport_admission,
+            channels: Arc::new(Mutex::new(ChannelPools::default())),
             dial_gates: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(()))),
             task_transport_supervisor: NativeTransportSupervisor::from_transport(
                 task_transport_budget,
@@ -208,6 +319,12 @@ impl FrontendDataRuntime {
         &self.native_transport
     }
 
+    /// The Frontend's outgoing connection admission: every dial, including
+    /// Tonic's reconnect, takes a connection and a handshake position.
+    pub(crate) fn transport_admission(&self) -> &NativeTransportAdmission {
+        &self.transport_admission
+    }
+
     pub(crate) fn task_transport_supervisor(&self) -> &NativeTransportSupervisor {
         &self.task_transport_supervisor
     }
@@ -242,42 +359,58 @@ impl FrontendDataRuntime {
         self.handle.spawn(future)
     }
 
-    pub(super) fn cached_channel(&self, key: &NativeChannelKey) -> Option<CachedNativeChannel> {
+    /// The next of `key`'s connections, in deterministic rotation.
+    pub(super) fn select_slot(&self, key: &NativeChannelKey) -> Result<NativeChannelSlot, String> {
+        let mut channels = self
+            .channels
+            .lock()
+            .expect("frontend native channel cache lock");
+        let pool = channels.pool(key)?;
+        let index = pool.next;
+        pool.next = (index + 1) % pool.rows.len();
+        Ok(NativeChannelSlot {
+            key: key.clone(),
+            index,
+        })
+    }
+
+    pub(super) fn cached_channel(&self, slot: &NativeChannelSlot) -> Option<CachedNativeChannel> {
         self.channels
             .lock()
             .expect("frontend native channel cache lock")
-            .get(key)
+            .row(slot)
             .and_then(|row| match row {
-                NativeChannelCacheRow::Ready(channel) => Some(channel.clone()),
+                NativeChannelCacheRow::Ready(channel) => Some(CachedNativeChannel::clone(channel)),
                 NativeChannelCacheRow::Dialing(_) => None,
             })
     }
 
     pub(super) fn begin_dial(
         &self,
-        key: NativeChannelKey,
+        slot: NativeChannelSlot,
     ) -> Result<NativeDialReservation, String> {
         let mut channels = self
             .channels
             .lock()
             .expect("frontend native channel cache lock");
-        let (generation, leader) = match channels.get(&key) {
-            Some(NativeChannelCacheRow::Dialing(generation)) => (Arc::clone(generation), false),
-            Some(NativeChannelCacheRow::Ready(channel)) => (Arc::clone(&channel.generation), false),
+        let pool = channels.pool(&slot.key)?;
+        let row = pool
+            .rows
+            .get_mut(slot.index)
+            .ok_or_else(|| "Native channel slot is outside its lane".to_owned())?;
+        let (generation, leader) = match row {
+            Some(row) => (Arc::clone(row.generation()), false),
             None => {
                 let generation = Arc::new(DialGeneration {
                     retired: AtomicBool::new(false),
                 });
-                channels.insert(
-                    key.clone(),
-                    NativeChannelCacheRow::Dialing(Arc::clone(&generation)),
-                );
+                *row = Some(NativeChannelCacheRow::Dialing(Arc::clone(&generation)));
                 (generation, true)
             }
         };
         Ok(NativeDialReservation {
             runtime: self.clone(),
-            key,
+            slot,
             generation,
             published: false,
             leader,
@@ -285,31 +418,51 @@ impl FrontendDataRuntime {
     }
 
     #[cfg(test)]
-    fn cache_channel(&self, key: NativeChannelKey, channel: Channel) -> CachedNativeChannel {
-        self.begin_dial(key).unwrap().publish(channel).unwrap()
+    fn cache_channel(
+        &self,
+        slot: NativeChannelSlot,
+        channel: tonic::transport::Channel,
+    ) -> CachedNativeChannel {
+        let lane = novarocks_native_adapter::native_lane::NativeLane::frontend(slot.key.lane);
+        self.begin_dial(slot)
+            .unwrap()
+            .publish(NativeLaneChannel::new(channel, lane, None))
+            .unwrap()
+    }
+
+    /// The live connections currently cached for `key`.
+    #[cfg(test)]
+    pub(super) fn cached_connections(&self, key: &NativeChannelKey) -> usize {
+        self.channels
+            .lock()
+            .expect("frontend native channel cache lock")
+            .pools
+            .get(key)
+            .map_or(0, |pool| {
+                pool.rows
+                    .iter()
+                    .filter(|row| matches!(row, Some(NativeChannelCacheRow::Ready(_))))
+                    .count()
+            })
     }
 
     /// An old RPC failure cannot evict a replacement connection that another
     /// attempt installed while the old RPC was still in flight.
-    pub(super) fn invalidate_channel_if_current(
-        &self,
-        key: &NativeChannelKey,
-        acquired: &CachedNativeChannel,
-    ) -> bool {
+    pub(super) fn invalidate_channel_if_current(&self, acquired: &CachedNativeChannel) -> bool {
         let mut channels = self
             .channels
             .lock()
             .expect("frontend native channel cache lock");
-        if channels
-            .get(key)
-            .is_some_and(|current| matches!(current, NativeChannelCacheRow::Ready(current) if Arc::ptr_eq(&current.generation, &acquired.generation)))
+        let Some(row) = channels.row_mut(&acquired.slot) else {
+            return false;
+        };
+        if !matches!(row, Some(NativeChannelCacheRow::Ready(current)) if Arc::ptr_eq(&current.generation, &acquired.generation))
         {
-            acquired.generation.retired.store(true, Ordering::Release);
-            channels.remove(key);
-            true
-        } else {
-            false
+            return false;
         }
+        acquired.generation.retired.store(true, Ordering::Release);
+        *row = None;
+        true
     }
 
     #[cfg(test)]
@@ -317,6 +470,7 @@ impl FrontendDataRuntime {
         self.channels
             .lock()
             .expect("frontend native channel cache lock")
+            .pools
             .retain(|key, _| &key.endpoint != endpoint);
     }
 
@@ -325,15 +479,13 @@ impl FrontendDataRuntime {
             .channels
             .lock()
             .expect("frontend native channel cache lock");
-        channels.retain(|key, row| {
+        channels.pools.retain(|key, pool| {
             if key.peer != peer {
                 return true;
             }
-            let generation = match row {
-                NativeChannelCacheRow::Dialing(generation) => generation,
-                NativeChannelCacheRow::Ready(channel) => &channel.generation,
-            };
-            generation.retired.store(true, Ordering::Release);
+            for row in pool.rows.iter().flatten() {
+                row.generation().retired.store(true, Ordering::Release);
+            }
             false
         });
     }
@@ -363,8 +515,22 @@ mod tests {
     use novarocks_task_codec::TransportBudget;
     use novarocks_types::NativeEndpoint;
 
-    use super::{FrontendDataRuntime, NativeChannelKey};
+    use super::{FrontendDataRuntime, NativeChannelKey, NativeChannelSlot};
     use novarocks_native_adapter::FrontendNativeTransport;
+
+    fn slot(key: NativeChannelKey) -> NativeChannelSlot {
+        NativeChannelSlot { key, index: 0 }
+    }
+
+    fn lane_channel(
+        channel: tonic::transport::Channel,
+    ) -> novarocks_native_adapter::native_lane::NativeLaneChannel {
+        novarocks_native_adapter::native_lane::NativeLaneChannel::new(
+            channel,
+            novarocks_native_adapter::native_lane::NativeLane::Submission,
+            None,
+        )
+    }
 
     fn data_runtime(handle: tokio::runtime::Handle) -> FrontendDataRuntime {
         let trust = NativeTrust::new(
@@ -435,11 +601,11 @@ mod tests {
         let (channel, _updates) =
             runtime.block_on(async { tonic::transport::Channel::balance_channel::<String>(1) });
         let endpoint = NativeEndpoint::from_host_port("be.example", 19040).expect("endpoint");
-        let key = NativeChannelKey {
+        let key = slot(NativeChannelKey {
             endpoint: endpoint.clone(),
             peer: novarocks_types::BackendProcessId::new_v7(),
             lane: novarocks_proto_codec::native_rpc::FrontendNativeLane::Submission,
-        };
+        });
         first.cache_channel(key.clone(), channel);
         assert!(first.cached_channel(&key).is_some());
         first.invalidate_channel(&endpoint);
@@ -459,20 +625,22 @@ mod tests {
         let endpoint = NativeEndpoint::from_host_port("be.example", 19040).expect("endpoint");
         let (first_channel, _first_updates) =
             runtime.block_on(async { tonic::transport::Channel::balance_channel::<String>(1) });
-        let key = NativeChannelKey {
+        let key = slot(NativeChannelKey {
             endpoint: endpoint.clone(),
             peer: novarocks_types::BackendProcessId::new_v7(),
             lane: novarocks_proto_codec::native_rpc::FrontendNativeLane::Submission,
-        };
-        let old = data_runtime.cache_channel(key.clone(), first_channel);
-        assert!(data_runtime.invalidate_channel_if_current(&key, &old));
+        });
+        let old =
+            runtime.block_on(async { data_runtime.cache_channel(key.clone(), first_channel) });
+        assert!(data_runtime.invalidate_channel_if_current(&old));
 
         let (second_channel, _second_updates) =
             runtime.block_on(async { tonic::transport::Channel::balance_channel::<String>(1) });
-        let replacement = data_runtime.cache_channel(key.clone(), second_channel);
-        assert!(!data_runtime.invalidate_channel_if_current(&key, &old));
+        let replacement =
+            runtime.block_on(async { data_runtime.cache_channel(key.clone(), second_channel) });
+        assert!(!data_runtime.invalidate_channel_if_current(&old));
         assert!(data_runtime.cached_channel(&key).is_some());
-        assert!(data_runtime.invalidate_channel_if_current(&key, &replacement));
+        assert!(data_runtime.invalidate_channel_if_current(&replacement));
         assert!(data_runtime.cached_channel(&key).is_none());
     }
     #[tokio::test]
@@ -511,25 +679,25 @@ mod tests {
     #[tokio::test]
     async fn retired_inflight_dial_cannot_publish_or_delete_its_replacement_generation() {
         let runtime = data_runtime(tokio::runtime::Handle::current());
-        let key = NativeChannelKey {
+        let key = slot(NativeChannelKey {
             endpoint: NativeEndpoint::from_host_port("be.example", 19040).unwrap(),
             peer: novarocks_types::BackendProcessId::new_v7(),
             lane: novarocks_proto_codec::native_rpc::FrontendNativeLane::Submission,
-        };
+        });
         let old = runtime.begin_dial(key.clone()).unwrap();
-        runtime.invalidate_peer(key.peer);
+        runtime.invalidate_peer(key.key.peer);
         let replacement = runtime.begin_dial(key.clone()).unwrap();
         let (late_channel, _late_updates) = tonic::transport::Channel::balance_channel::<String>(1);
-        assert!(old.publish(late_channel).is_err());
+        assert!(old.publish(lane_channel(late_channel)).is_err());
         let (current_channel, _current_updates) =
             tonic::transport::Channel::balance_channel::<String>(1);
-        let current = replacement.publish(current_channel).unwrap();
+        let current = replacement.publish(lane_channel(current_channel)).unwrap();
         assert!(Arc::ptr_eq(
             &runtime.cached_channel(&key).unwrap().generation,
             &current.generation
         ));
         let mut other = key.clone();
-        other.peer = novarocks_types::BackendProcessId::new_v7();
+        other.key.peer = novarocks_types::BackendProcessId::new_v7();
         let cancelled = runtime.begin_dial(other.clone()).unwrap();
         assert!(!runtime.begin_dial(other.clone()).unwrap().is_leader());
         drop(cancelled);

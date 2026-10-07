@@ -4,7 +4,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::Channel;
 
 use crate::metrics::observe_backend_heartbeat_rtt;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
@@ -24,6 +23,9 @@ use novarocks_types::{BackendProcessId, NativeEndpoint};
 
 use super::data_runtime::{CachedNativeChannel, FrontendDataRuntime, NativeChannelKey};
 use novarocks_native_adapter::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
+use novarocks_native_adapter::native_lane::{
+    NativeLane, NativeLaneChannel, configure_native_endpoint, frontend_lane_connector,
+};
 
 const MAX_MESSAGE_BYTES: usize =
     novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;
@@ -73,8 +75,11 @@ pub(crate) fn prune_catalogs(
     }
 }
 
+/// Every call takes one of its lane connection's stream positions before it
+/// reaches Tonic, and the response body holds it until the body ends or is
+/// dropped.
 pub(super) type AuthenticatedNovaRocksGrpcClient =
-    NovaRocksGrpcClient<InterceptedService<Channel, NativeClientAuthInterceptor>>;
+    NovaRocksGrpcClient<InterceptedService<NativeLaneChannel, NativeClientAuthInterceptor>>;
 
 /// A Native channel either fails before an outbound connection is attempted,
 /// or while that connection is being established.  TaskUpdate must preserve
@@ -239,24 +244,28 @@ impl Client {
         acquired: &CachedNativeChannel,
     ) -> bool {
         self.channel_key(method).is_ok_and(|key| {
-            self.data_runtime
-                .invalidate_channel_if_current(&key, acquired)
+            key == acquired.slot.key && self.data_runtime.invalidate_channel_if_current(acquired)
         })
     }
 }
 
+/// One of `key`'s geometry-sized connections, chosen in rotation. Each
+/// connection has its own single-flight dial generation.
 async fn channel(
     data_runtime: &FrontendDataRuntime,
     key: NativeChannelKey,
 ) -> Result<CachedNativeChannel, ChannelAcquisitionError> {
-    if let Some(channel) = data_runtime.cached_channel(&key) {
+    let slot = data_runtime
+        .select_slot(&key)
+        .map_err(ChannelAcquisitionError::retryable_network)?;
+    if let Some(channel) = data_runtime.cached_channel(&slot) {
         return Ok(channel);
     }
     // Elect before waiting on the lane. This one generation survives through
     // every wait; cancellation/retirement returns to the existing retry policy.
     let reservation = data_runtime
-        .begin_dial(key.clone())
-        .map_err(ChannelAcquisitionError::fatal)?;
+        .begin_dial(slot)
+        .map_err(ChannelAcquisitionError::retryable_network)?;
     let _dial = data_runtime.dial_lane(key.lane).await;
     if let Some(channel) = reservation
         .ready_channel()
@@ -271,8 +280,8 @@ async fn channel(
     }
     let endpoint = key.endpoint.clone();
     // The URI only provides Tonic's HTTP/2 origin. The connector below owns
-    // the actual TCP/TLS dial using the typed endpoint; this never creates a
-    // bare h2c client factory.
+    // the actual TCP/TLS dial using the typed endpoint, after the Frontend's
+    // dial admission; this never creates a bare h2c client factory.
     let origin = format!("http://{endpoint}");
     let connector = data_runtime
         .native_transport()
@@ -282,27 +291,34 @@ async fn channel(
                 "construct Native endpoint connector failed: {error}"
             ))
         })?;
-    let created = tonic::transport::Endpoint::from_shared(origin)
-        .map_err(|error| {
+    let connector = frontend_lane_connector(
+        connector,
+        data_runtime.transport_admission().clone(),
+        key.lane,
+    );
+    let created = configure_native_endpoint(
+        tonic::transport::Endpoint::from_shared(origin).map_err(|error| {
             ChannelAcquisitionError::fatal(format!(
                 "construct Native client origin failed: {error}"
             ))
-        })?
-        .tcp_keepalive(Some(Duration::from_secs(60)))
-        .timeout(Duration::from_secs(600))
-        .connect_timeout(Duration::from_secs(10))
-        .http2_adaptive_window(true)
-        .initial_stream_window_size(Some(32 * 1024 * 1024))
-        .initial_connection_window_size(Some(128 * 1024 * 1024))
-        .connect_with_connector(connector)
-        .await
-        .map_err(|error| {
-            ChannelAcquisitionError::retryable_network(format!(
-                "connect Native endpoint failed: {error}"
-            ))
-        })?;
+        })?,
+    )
+    .timeout(Duration::from_secs(600))
+    .connect_with_connector(connector)
+    .await
+    .map_err(|error| {
+        ChannelAcquisitionError::retryable_network(format!(
+            "connect Native endpoint failed: {error}"
+        ))
+    })?;
+    // One Channel is one connection; its stream positions live with it.
+    let channel = NativeLaneChannel::new(
+        created,
+        NativeLane::frontend(key.lane),
+        Some(data_runtime.transport_admission()),
+    );
     reservation
-        .publish(created)
+        .publish(channel)
         .map_err(ChannelAcquisitionError::retryable_network)
 }
 
@@ -558,14 +574,19 @@ mod routing_tests {
             BackendProcessId::new_v7(),
             runtime.clone(),
         );
-        let key = client.channel_key(NativeRpcMethod::Heartbeat).unwrap();
+        let lane = client.channel_key(NativeRpcMethod::Heartbeat).unwrap();
+        // Lifecycle control keeps exactly one connection per Backend process.
+        let key = runtime.select_slot(&lane).unwrap();
+        assert_eq!(key.index, 0);
+        let lane_channel =
+            |channel| NativeLaneChannel::new(channel, NativeLane::LifecycleControl, None);
         for rpc_completed in [false, true] {
-            runtime.invalidate_peer(key.peer);
-            let (channel, _) = Channel::balance_channel::<String>(1);
+            runtime.invalidate_peer(lane.peer);
+            let (channel, _) = tonic::transport::Channel::balance_channel::<String>(1);
             let acquired = runtime
                 .begin_dial(key.clone())
                 .unwrap()
-                .publish(channel)
+                .publish(lane_channel(channel))
                 .unwrap();
             drop(HeartbeatChannelAttempt {
                 client: &client,
@@ -575,12 +596,12 @@ mod routing_tests {
             assert_eq!(runtime.cached_channel(&key).is_some(), rpc_completed);
         }
         let old = runtime.cached_channel(&key).unwrap();
-        runtime.invalidate_peer(key.peer);
-        let (channel, _) = Channel::balance_channel::<String>(1);
+        runtime.invalidate_peer(lane.peer);
+        let (channel, _) = tonic::transport::Channel::balance_channel::<String>(1);
         let replacement = runtime
             .begin_dial(key.clone())
             .unwrap()
-            .publish(channel)
+            .publish(lane_channel(channel))
             .unwrap();
         drop(HeartbeatChannelAttempt {
             client: &client,
@@ -589,6 +610,138 @@ mod routing_tests {
         });
         assert!(runtime.cached_channel(&key).is_some());
         assert!(client.invalidate_channel_if_current(NativeRpcMethod::Heartbeat, &replacement));
+    }
+
+    /// Accepts and holds every connection; a stock Tonic dial completes
+    /// without the peer's SETTINGS, so this counts physical connections.
+    async fn counting_listener() -> (
+        NativeEndpoint,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint =
+            NativeEndpoint::from_host_port("127.0.0.1", listener.local_addr().unwrap().port())
+                .unwrap();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&accepted);
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held.push(socket);
+            }
+        });
+        (endpoint, accepted, task)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frontend_lane_connection_count_equals_the_geometry() {
+        use novarocks_native_adapter::native_lane::frontend_lane_connections;
+        use novarocks_native_adapter::native_transport_admission::TransportClass;
+        use novarocks_proto_codec::native_rpc::FrontendNativeLane;
+        let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        let admission = runtime.transport_admission().clone();
+        let peer = BackendProcessId::new_v7();
+        let (data, data_accepted, data_task) = counting_listener().await;
+        let (control, control_accepted, control_task) = counting_listener().await;
+        let data_client = Client::for_endpoint(
+            data,
+            NativeEndpointDomain::BackendData,
+            peer,
+            runtime.clone(),
+        );
+        let control_client = Client::for_endpoint(
+            control,
+            NativeEndpointDomain::BackendControl,
+            peer,
+            runtime.clone(),
+        );
+        let mut expected_data = 0;
+        for (client, method, lane, accepted) in [
+            (
+                &data_client,
+                NativeRpcMethod::FetchTaskResult,
+                FrontendNativeLane::ResultData,
+                &data_accepted,
+            ),
+            (
+                &data_client,
+                NativeRpcMethod::ApplyTaskOperations,
+                FrontendNativeLane::Submission,
+                &data_accepted,
+            ),
+            (
+                &data_client,
+                NativeRpcMethod::SubscribeTaskStatus,
+                FrontendNativeLane::Observation,
+                &data_accepted,
+            ),
+            (
+                &control_client,
+                NativeRpcMethod::Heartbeat,
+                FrontendNativeLane::LifecycleControl,
+                &control_accepted,
+            ),
+        ] {
+            let connections = frontend_lane_connections(lane);
+            let before = accepted.load(std::sync::atomic::Ordering::SeqCst);
+            let mut slots = Vec::new();
+            // Two full rotations: the first dials every connection once, the
+            // second reuses them in the same order.
+            for _ in 0..2 * connections {
+                let (_, acquired) = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    client.grpc_with_channel_identity(method),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(acquired.slot.key.lane, lane);
+                assert_eq!(acquired.channel.lane(), NativeLane::frontend(lane));
+                slots.push(acquired.slot.index);
+            }
+            let expected: Vec<_> = (0..connections).chain(0..connections).collect();
+            assert_eq!(slots, expected, "{lane:?} rotates over its connections");
+            assert_eq!(
+                accepted.load(std::sync::atomic::Ordering::SeqCst) - before,
+                connections,
+                "{lane:?} opens exactly the geometry's connections"
+            );
+            let key = client.channel_key(method).unwrap();
+            assert_eq!(runtime.cached_connections(&key), connections);
+            if lane != FrontendNativeLane::LifecycleControl {
+                expected_data += connections;
+            }
+        }
+        assert_eq!(expected_data, 4 + 2 + 4);
+        assert_eq!(
+            admission.positions(TransportClass::Data)
+                - admission.available_positions(TransportClass::Data),
+            expected_data
+        );
+        assert_eq!(
+            admission.positions(TransportClass::Control)
+                - admission.available_positions(TransportClass::Control),
+            1
+        );
+        // Every dial returned its handshake position once its IO existed.
+        assert_eq!(
+            admission.available_handshakes(TransportClass::Data),
+            admission.handshake_positions(TransportClass::Data)
+        );
+        // A replaced process's connections leave the cache.
+        runtime.invalidate_peer(peer);
+        assert_eq!(
+            runtime.cached_connections(
+                &data_client
+                    .channel_key(NativeRpcMethod::FetchTaskResult)
+                    .unwrap()
+            ),
+            0
+        );
+        data_task.abort();
+        control_task.abort();
     }
 
     #[tokio::test]
