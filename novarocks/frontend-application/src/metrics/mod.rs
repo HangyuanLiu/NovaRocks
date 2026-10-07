@@ -30,6 +30,7 @@ use novarocks_query_application::serving_admission::FrontendServingState;
 pub(crate) mod dml_publication;
 mod http;
 mod management;
+pub(crate) mod native_transport;
 mod process_memory;
 pub(crate) mod task_creation;
 pub(crate) use http::{LateBoundQueryLifecycleConvergenceReader, MetricsHttpServer};
@@ -386,6 +387,7 @@ impl FrontendMetricsRegistry {
         crate::catalog_projection_metrics::register_collectors(&registry)?;
         dml_publication::register_collectors(&registry)?;
         task_creation::register_collectors(&registry)?;
+        native_transport::register_collectors(&registry)?;
         crate::native::task_transport::register_metric_collectors(&registry)?;
         let process_memory = observation
             .map(|observation| {

@@ -33,9 +33,11 @@
 
 use std::fmt;
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use novarocks_execution_contract::native_result_support::NativeResultSupportGeometry;
+use novarocks_proto_codec::native_rpc::{FrontendNativeLane, NativeRpcMethod};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::native_channel_identity::InlineNativeChannelIdentity;
@@ -44,6 +46,10 @@ use crate::native_connection_key_capacity::{
 };
 use crate::native_incoming_key_capacity::{
     NativeIncomingKey, NativeIncomingKeyCapacity, NativeIncomingKeyToken,
+};
+use crate::native_lane::{
+    NativeLane, NativeLaneStreamGate, NativeLaneStreamPermit, NativeTransportObserver,
+    PositionKind, SharedObserver, StreamDirection,
 };
 
 /// Independent admission domains; Control never consumes or lends Data positions.
@@ -60,6 +66,14 @@ impl TransportClass {
         match self {
             Self::Data => 0,
             Self::Control => 1,
+        }
+    }
+
+    /// Stable metric label.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Data => "data",
+            Self::Control => "control",
         }
     }
 }
@@ -90,11 +104,15 @@ fn value(value: u64) -> io::Result<usize> {
 }
 
 impl AdmissionDimensions {
-    /// Checked arithmetic over the frozen geometry. The counts cover every
-    /// legal FE lane and both peer directions with their connecting and
-    /// closing headroom, plus the handshake positions of each class.
+    /// The Backend role's dimensions from the frozen geometry.
     pub fn frozen() -> io::Result<Self> {
-        let g = NativeResultSupportGeometry::V1;
+        Self::backend(&NativeResultSupportGeometry::V1)
+    }
+
+    /// Checked arithmetic over a Backend's support geometry. The counts cover
+    /// every legal FE lane and both peer directions with their connecting and
+    /// closing headroom, plus the handshake positions of each class.
+    pub fn backend(g: &NativeResultSupportGeometry) -> io::Result<Self> {
         let frontends = value(g.transport_authenticated_live_frontends_per_backend)?;
         let connecting = value(g.transport_connecting_positions_per_lane)?;
         let closing = value(g.transport_closing_positions_per_lane)?;
@@ -153,6 +171,44 @@ impl AdmissionDimensions {
         })
     }
 
+    /// Checked arithmetic over a Frontend's outgoing lanes: for every live
+    /// Backend, each lane's connections with their connecting and closing
+    /// headroom. A dial (including Tonic's internal reconnect) holds one
+    /// handshake position until its IO is established; each lane of each
+    /// Backend may have its connecting positions in flight at once.
+    pub fn frontend(g: &NativeResultSupportGeometry) -> io::Result<Self> {
+        let backends = value(g.transport_maximum_live_backends)?;
+        let connecting = value(g.transport_connecting_positions_per_lane)?;
+        let tails = add(connecting, value(g.transport_closing_positions_per_lane)?)?;
+        let data_live = add(
+            add(
+                value(g.transport_connections_per_frontend_backend_result)?,
+                value(g.transport_connections_per_frontend_backend_observation)?,
+            )?,
+            value(g.transport_connections_per_frontend_backend_submission)?,
+        )?;
+        let control_live = value(g.transport_connections_per_frontend_backend_lifecycle_control)?;
+        let data_positions = mul(backends, add(data_live, mul(3, tails)?)?)?;
+        let control_positions = mul(backends, add(control_live, tails)?)?;
+        let data_handshakes = mul(backends, mul(3, connecting)?)?;
+        let control_handshakes = mul(backends, connecting)?;
+        if data_handshakes == 0 || control_handshakes == 0 {
+            return Err(invalid());
+        }
+        Ok(Self {
+            data_positions,
+            control_positions,
+            data_handshakes,
+            control_handshakes,
+        })
+    }
+
+    /// Every connection position of both classes; handshakes are a subset
+    /// of these, because a bootstrapping connection is already a connection.
+    pub fn connection_positions(&self) -> io::Result<usize> {
+        add(self.data_positions, self.control_positions)
+    }
+
     const fn positions(&self, class: TransportClass) -> usize {
         match class {
             TransportClass::Data => self.data_positions,
@@ -168,12 +224,79 @@ impl AdmissionDimensions {
     }
 }
 
+/// Which role's lanes an admission serves. A Backend serves Native lanes and
+/// dials peers and its Frontend; a Frontend only dials Backend lanes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransportRole {
+    Backend,
+    Frontend,
+}
+
+struct ClassState {
+    physical: Arc<Semaphore>,
+    handshake: Arc<Semaphore>,
+    refused: AtomicU64,
+}
+
+impl ClassState {
+    fn new(positions: usize, handshakes: usize) -> Self {
+        Self {
+            physical: Arc::new(Semaphore::new(positions)),
+            handshake: Arc::new(Semaphore::new(handshakes)),
+            refused: AtomicU64::new(0),
+        }
+    }
+}
+
 struct Core {
+    role: TransportRole,
     dimensions: AdmissionDimensions,
-    physical: [Arc<Semaphore>; 2],
-    handshake: [Arc<Semaphore>; 2],
+    classes: [ClassState; 2],
     connection_keys: NativeConnectionKeyCapacity,
     incoming_keys: NativeIncomingKeyCapacity,
+    incoming_streams: [NativeLaneStreamGate; NativeLane::COUNT],
+    observer: SharedObserver,
+}
+
+/// Stream positions a Backend serves per lane: every legal connection of the
+/// lane times the per-connection stream limit H2 advertises. A Frontend's
+/// admission serves no lane.
+pub fn incoming_lane_stream_limit(
+    role: TransportRole,
+    lane: NativeLane,
+    g: &NativeResultSupportGeometry,
+) -> io::Result<usize> {
+    if role == TransportRole::Frontend {
+        return Ok(0);
+    }
+    let frontends = value(g.transport_authenticated_live_frontends_per_backend)?;
+    let backends = value(g.transport_maximum_live_backends)?;
+    let connections = match lane {
+        NativeLane::ResultData => mul(
+            frontends,
+            value(g.transport_connections_per_frontend_backend_result)?,
+        )?,
+        NativeLane::Submission => mul(
+            frontends,
+            value(g.transport_connections_per_frontend_backend_submission)?,
+        )?,
+        NativeLane::Observation => mul(
+            frontends,
+            value(g.transport_connections_per_frontend_backend_observation)?,
+        )?,
+        NativeLane::LifecycleControl => mul(
+            frontends,
+            value(g.transport_connections_per_frontend_backend_lifecycle_control)?,
+        )?,
+        NativeLane::Exchange => mul(backends, value(g.transport_exchange_connections_per_peer)?)?,
+        NativeLane::RuntimeFilter => mul(
+            backends,
+            value(g.transport_runtime_filter_connections_per_peer)?,
+        )?,
+        // Announce is served by the Frontend's membership listener.
+        NativeLane::Membership => 0,
+    };
+    mul(connections, value(g.transport_streams_per_connection)?)
 }
 
 /// Process-scoped Native connection admission. Clones share one set of
@@ -186,33 +309,81 @@ pub struct NativeTransportAdmission {
 impl fmt::Debug for NativeTransportAdmission {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NativeTransportAdmission")
+            .field("role", &self.core.role)
             .field("dimensions", &self.core.dimensions)
             .finish_non_exhaustive()
     }
 }
 
 impl NativeTransportAdmission {
+    /// A Backend admission without a metrics observer.
     pub fn new() -> io::Result<Self> {
-        Self::with_dimensions(AdmissionDimensions::frozen()?)
+        Self::backend(None)
+    }
+
+    /// The Backend role's admission from the frozen geometry.
+    pub fn backend(observer: Option<Arc<dyn NativeTransportObserver>>) -> io::Result<Self> {
+        Self::with_parts(
+            TransportRole::Backend,
+            AdmissionDimensions::frozen()?,
+            observer,
+        )
+    }
+
+    /// The Frontend role's outgoing admission from the frozen geometry.
+    pub fn frontend(observer: Option<Arc<dyn NativeTransportObserver>>) -> io::Result<Self> {
+        Self::with_parts(
+            TransportRole::Frontend,
+            AdmissionDimensions::frontend(&NativeResultSupportGeometry::V1)?,
+            observer,
+        )
     }
 
     pub fn with_dimensions(dimensions: AdmissionDimensions) -> io::Result<Self> {
-        let class = |count: usize| Arc::new(Semaphore::new(count));
-        Ok(Self {
+        Self::with_parts(TransportRole::Backend, dimensions, None)
+    }
+
+    pub(crate) fn with_parts(
+        role: TransportRole,
+        dimensions: AdmissionDimensions,
+        observer: SharedObserver,
+    ) -> io::Result<Self> {
+        let g = NativeResultSupportGeometry::V1;
+        let mut limits = [0; NativeLane::COUNT];
+        for lane in NativeLane::ALL {
+            limits[lane.index()] = incoming_lane_stream_limit(role, lane, &g)?;
+        }
+        let incoming_streams = NativeLane::ALL.map(|lane| {
+            NativeLaneStreamGate::new(
+                lane,
+                StreamDirection::Incoming,
+                limits[lane.index()],
+                observer.clone(),
+            )
+        });
+        let admission = Self {
             core: Arc::new(Core {
+                role,
                 dimensions,
-                physical: [
-                    class(dimensions.data_positions),
-                    class(dimensions.control_positions),
-                ],
-                handshake: [
-                    class(dimensions.data_handshakes),
-                    class(dimensions.control_handshakes),
+                classes: [
+                    ClassState::new(dimensions.data_positions, dimensions.data_handshakes),
+                    ClassState::new(dimensions.control_positions, dimensions.control_handshakes),
                 ],
                 connection_keys: NativeConnectionKeyCapacity::new()?,
                 incoming_keys: NativeIncomingKeyCapacity::new()?,
+                incoming_streams,
+                observer,
             }),
-        })
+        };
+        for class in [TransportClass::Data, TransportClass::Control] {
+            admission.publish(class, PositionKind::Connection);
+            admission.publish(class, PositionKind::Handshake);
+        }
+        Ok(admission)
+    }
+
+    pub fn role(&self) -> TransportRole {
+        self.core.role
     }
 
     pub fn dimensions(&self) -> AdmissionDimensions {
@@ -224,7 +395,9 @@ impl NativeTransportAdmission {
     }
 
     pub fn available_positions(&self, class: TransportClass) -> usize {
-        self.core.physical[class.index()].available_permits()
+        self.core.classes[class.index()]
+            .physical
+            .available_permits()
     }
 
     pub fn handshake_positions(&self, class: TransportClass) -> usize {
@@ -232,20 +405,92 @@ impl NativeTransportAdmission {
     }
 
     pub fn available_handshakes(&self, class: TransportClass) -> usize {
-        self.core.handshake[class.index()].available_permits()
+        self.core.classes[class.index()]
+            .handshake
+            .available_permits()
     }
 
-    fn try_positions(
+    /// Connections of `class` refused for lack of a position since start.
+    pub fn refused_connections(&self, class: TransportClass) -> u64 {
+        self.core.classes[class.index()]
+            .refused
+            .load(Ordering::Relaxed)
+    }
+
+    /// The positions of streams this process serves on `lane`.
+    pub fn incoming_streams(&self, lane: NativeLane) -> &NativeLaneStreamGate {
+        &self.core.incoming_streams[lane.index()]
+    }
+
+    /// Take one served stream position for `method`'s lane, or refuse.
+    pub(crate) fn try_incoming_stream(
         &self,
-        class: TransportClass,
-    ) -> io::Result<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
-        let physical = Arc::clone(&self.core.physical[class.index()])
+        method: NativeRpcMethod,
+    ) -> Option<Option<NativeLaneStreamPermit>> {
+        let Some(lane) = NativeLane::of(method.contract().traffic) else {
+            return Some(None);
+        };
+        self.incoming_streams(lane).try_acquire().map(Some)
+    }
+
+    pub(crate) fn observer(&self) -> SharedObserver {
+        self.core.observer.clone()
+    }
+
+    fn publish(&self, class: TransportClass, kind: PositionKind) {
+        let Some(observer) = &self.core.observer else {
+            return;
+        };
+        let state = &self.core.classes[class.index()];
+        let (limit, available) = match kind {
+            PositionKind::Connection => (
+                self.core.dimensions.positions(class),
+                state.physical.available_permits(),
+            ),
+            PositionKind::Handshake => (
+                self.core.dimensions.handshakes(class),
+                state.handshake.available_permits(),
+            ),
+        };
+        observer.positions(class, kind, limit.saturating_sub(available), limit);
+    }
+
+    fn refuse(&self, class: TransportClass) -> io::Error {
+        self.core.classes[class.index()]
+            .refused
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(observer) = &self.core.observer {
+            observer.refused(class);
+        }
+        io::ErrorKind::WouldBlock.into()
+    }
+
+    fn class_permit(&self, class: TransportClass, kind: PositionKind) -> io::Result<ClassPermit> {
+        let state = &self.core.classes[class.index()];
+        let semaphore = match kind {
+            PositionKind::Connection => &state.physical,
+            PositionKind::Handshake => &state.handshake,
+        };
+        let permit = Arc::clone(semaphore)
             .try_acquire_owned()
             .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
-        let handshake = Arc::clone(&self.core.handshake[class.index()])
-            .try_acquire_owned()
-            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
-        Ok((physical, handshake))
+        self.publish(class, kind);
+        Ok(ClassPermit {
+            permit: Some(permit),
+            admission: self.clone(),
+            class,
+            kind,
+        })
+    }
+
+    fn try_positions(&self, class: TransportClass) -> io::Result<(ClassPermit, ClassPermit)> {
+        let positions = self
+            .class_permit(class, PositionKind::Connection)
+            .and_then(|physical| {
+                self.class_permit(class, PositionKind::Handshake)
+                    .map(|handshake| (physical, handshake))
+            });
+        positions.map_err(|_| self.refuse(class))
     }
 
     /// Admit one accepted socket. Refusal (`WouldBlock`) takes nothing; the
@@ -260,6 +505,7 @@ impl NativeTransportAdmission {
             connection: NativeConnectionPermit {
                 key: None,
                 incoming: Some(Arc::clone(&seal)),
+                lane: None,
                 _physical: physical,
             },
             handshake: NativeHandshakePermit::new(handshake),
@@ -274,12 +520,20 @@ impl NativeTransportAdmission {
         class: TransportClass,
         key: Option<InlineNativeChannelIdentity>,
     ) -> io::Result<DialAdmission> {
+        let lane = key.and_then(|key| NativeLane::of(key.method().contract().traffic));
         let key = key
             .map(|key| {
-                self.core.connection_keys.claim(key).map(|token| KeyClaim {
-                    admission: self.clone(),
-                    token,
-                })
+                self.core
+                    .connection_keys
+                    .claim(key)
+                    .map(|token| KeyClaim {
+                        admission: self.clone(),
+                        token,
+                    })
+                    .map_err(|error| match error.kind() {
+                        io::ErrorKind::WouldBlock => self.refuse(class),
+                        _ => error,
+                    })
             })
             .transpose()?;
         let (physical, handshake) = self.try_positions(class)?;
@@ -287,10 +541,43 @@ impl NativeTransportAdmission {
             connection: NativeConnectionPermit {
                 key,
                 incoming: None,
+                lane: None,
                 _physical: physical,
             },
             handshake: NativeHandshakePermit::new(handshake),
+            lane,
         })
+    }
+
+    /// Admit one Frontend dial of `lane`, before any IO.
+    pub(crate) fn try_dial_lane(&self, lane: FrontendNativeLane) -> io::Result<DialAdmission> {
+        let lane = NativeLane::frontend(lane);
+        let (physical, handshake) = self.try_positions(lane.class())?;
+        Ok(DialAdmission {
+            connection: NativeConnectionPermit {
+                key: None,
+                incoming: None,
+                lane: None,
+                _physical: physical,
+            },
+            handshake: NativeHandshakePermit::new(handshake),
+            lane: Some(lane),
+        })
+    }
+}
+
+/// One held class position; dropping it publishes the new count.
+struct ClassPermit {
+    permit: Option<OwnedSemaphorePermit>,
+    admission: NativeTransportAdmission,
+    class: TransportClass,
+    kind: PositionKind,
+}
+
+impl Drop for ClassPermit {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        self.admission.publish(self.class, self.kind);
     }
 }
 
@@ -305,17 +592,29 @@ pub(crate) struct AcceptedConnection {
 pub(crate) struct DialAdmission {
     connection: NativeConnectionPermit,
     handshake: NativeHandshakePermit,
+    /// Counted as a live lane connection only once the IO is established.
+    lane: Option<NativeLane>,
 }
 
 impl DialAdmission {
     /// The attempt produced a live IO: publish its key as Live and return the
     /// handshake position. A full live quota refuses the connection.
     pub(crate) fn established(self) -> io::Result<NativeConnectionPermit> {
-        if let Some(key) = &self.connection.key {
+        let Self {
+            mut connection,
+            handshake,
+            lane,
+        } = self;
+        if let Some(key) = &connection.key {
             key.admission.core.connection_keys.install(key.token)?;
         }
-        self.handshake.release();
-        Ok(self.connection)
+        handshake.release();
+        if let (Some(lane), Some(observer)) = (lane, &connection._physical.admission.core.observer)
+        {
+            observer.lane_connections(lane, 1);
+        }
+        connection.lane = lane;
+        Ok(connection)
     }
 }
 
@@ -339,7 +638,9 @@ impl Drop for KeyClaim {
 pub struct NativeConnectionPermit {
     key: Option<KeyClaim>,
     incoming: Option<Arc<IncomingSeal>>,
-    _physical: OwnedSemaphorePermit,
+    /// The established outgoing lane, counted in the observer.
+    lane: Option<NativeLane>,
+    _physical: ClassPermit,
 }
 
 impl fmt::Debug for NativeConnectionPermit {
@@ -347,6 +648,7 @@ impl fmt::Debug for NativeConnectionPermit {
         f.debug_struct("NativeConnectionPermit")
             .field("keyed", &self.key.is_some())
             .field("incoming", &self.incoming.is_some())
+            .field("lane", &self.lane)
             .finish_non_exhaustive()
     }
 }
@@ -357,6 +659,9 @@ impl Drop for NativeConnectionPermit {
             seal.close();
         }
         drop(self.key.take());
+        if let (Some(lane), Some(observer)) = (self.lane, &self._physical.admission.core.observer) {
+            observer.lane_connections(lane, -1);
+        }
     }
 }
 
@@ -364,18 +669,19 @@ impl Drop for NativeConnectionPermit {
 /// `release` (bootstrap complete) or the drop of every clone returns it.
 #[derive(Clone)]
 pub(crate) struct NativeHandshakePermit {
-    permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
+    permit: Arc<Mutex<Option<ClassPermit>>>,
 }
 
 impl NativeHandshakePermit {
-    fn new(permit: OwnedSemaphorePermit) -> Self {
+    fn new(permit: ClassPermit) -> Self {
         Self {
             permit: Arc::new(Mutex::new(Some(permit))),
         }
     }
 
     pub(crate) fn release(&self) {
-        drop(self.permit.lock().expect("handshake permit lock").take());
+        let permit = self.permit.lock().expect("handshake permit lock").take();
+        drop(permit);
     }
 
     pub(crate) fn is_held(&self) -> bool {
@@ -385,7 +691,11 @@ impl NativeHandshakePermit {
 
 enum SealState {
     Open,
-    Sealed(NativeIncomingKey, NativeIncomingKeyToken),
+    Sealed(
+        NativeIncomingKey,
+        NativeIncomingKeyToken,
+        Option<NativeLane>,
+    ),
     Closed,
 }
 
@@ -400,11 +710,14 @@ impl IncomingSeal {
             &mut *self.state.lock().expect("incoming seal lock"),
             SealState::Closed,
         );
-        if let SealState::Sealed(_, token) = previous {
+        if let SealState::Sealed(_, token, lane) = previous {
             let keys = &self.admission.core.incoming_keys;
             let _ = keys.retire(token);
             keys.exit(token)
                 .expect("exact original incoming key exits once");
+            if let (Some(lane), Some(observer)) = (lane, &self.admission.core.observer) {
+                observer.lane_connections(lane, -1);
+            }
         }
     }
 }
@@ -426,11 +739,15 @@ impl NativeIncomingConnectionBinding {
             .map_err(|_| io::ErrorKind::InvalidData)?;
         match &*state {
             SealState::Closed => Err(io::ErrorKind::ConnectionAborted.into()),
-            SealState::Sealed(existing, _) if *existing == key => Ok(()),
+            SealState::Sealed(existing, ..) if *existing == key => Ok(()),
             SealState::Sealed(..) => Err(io::ErrorKind::ConnectionAborted.into()),
             SealState::Open => {
                 let token = self.seal.admission.core.incoming_keys.claim(key)?;
-                *state = SealState::Sealed(key, token);
+                let lane = NativeLane::of(key.traffic());
+                *state = SealState::Sealed(key, token, lane);
+                if let (Some(lane), Some(observer)) = (lane, &self.seal.admission.core.observer) {
+                    observer.lane_connections(lane, 1);
+                }
                 Ok(())
             }
         }

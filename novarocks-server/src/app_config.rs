@@ -1466,6 +1466,22 @@ pub struct RuntimeConfig {
     pub execution_services: ExecutionServicesConfig,
 }
 
+/// Validates a Native transport geometry before any role runtime starts.
+///
+/// Connection, stream, queue and handshake counts and the per-item HTTP/2
+/// sizes must be consistent, multiply without overflow, carry the supported
+/// root peak on the result lane and fit the role descriptor baselines. The
+/// returned report carries the count part of `E_native_transport`; its
+/// per-object coefficients are `None` until P00b freezes them.
+pub fn validate_native_transport_geometry(
+    geometry: &novarocks_execution_contract::native_result_support::NativeResultSupportGeometry,
+) -> Result<novarocks_native_adapter::native_transport_geometry::NativeTransportGeometryReport> {
+    novarocks_native_adapter::native_transport_geometry::validate_native_transport_geometry(
+        geometry,
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
 /// `[runtime.native_ingress]` is shared by FE and BE role configuration.
 /// The FE listener consumes the runtime sizing; task admission applies only
 /// to the BE listener. Waiting slots are finite and may be zero.
@@ -4614,5 +4630,39 @@ role = "leader"
         // 0 means "derive from cores"; resolved value must be >= 1.
         assert!(cfg.execution_services.actual_sink_io_worker_threads() >= 1);
         assert!(cfg.execution_services.actual_sink_io_worker_threads() <= 4);
+    }
+
+    #[test]
+    fn frozen_native_transport_geometry_is_accepted_with_its_count_envelope() {
+        let geometry =
+            novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1;
+        let report = super::validate_native_transport_geometry(&geometry).unwrap();
+        assert!(report.backend.structural_bytes > 0);
+        assert!(report.frontend.structural_bytes > 0);
+        assert_eq!(report.backend.coefficients, None);
+        assert_eq!(report.frontend.total_bytes().unwrap(), None);
+    }
+
+    #[test]
+    fn native_transport_geometry_overflow_and_inconsistency_are_refused_at_startup() {
+        let mut overflow =
+            novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1;
+        overflow.transport_maximum_live_backends = u64::MAX;
+        let mut windows =
+            novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1;
+        windows.transport_h2_stream_receive_window_bytes =
+            windows.transport_h2_connection_receive_window_bytes + 1;
+        let mut carrying =
+            novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1;
+        carrying.transport_streams_per_connection = 64;
+        for geometry in [overflow, windows, carrying] {
+            let error = super::validate_native_transport_geometry(&geometry)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("inconsistent Native transport geometry"),
+                "{error}"
+            );
+        }
     }
 }

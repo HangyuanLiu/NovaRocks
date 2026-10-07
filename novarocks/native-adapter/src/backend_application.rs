@@ -694,20 +694,43 @@ impl BackendApplicationHost {
         let result_retained_budget = novarocks_worker::result_buffer::ResultRetainedBudget::new(
             result_retained_limits.per_process(),
         );
+        // The frozen transport geometry is refused here if inconsistent; the
+        // count part of its envelope is logged. Per-object coefficients are
+        // frozen by P00b, so no byte bound is claimed before then.
+        let transport_geometry =
+            crate::native_transport_geometry::validate_native_transport_geometry(
+                &novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1,
+            )
+            .map_err(|error| {
+                BackendApplicationError::new(
+                    BackendApplicationErrorKind::Configuration,
+                    format!("validate Native transport geometry: {error}"),
+                )
+            })?;
         // One process-wide Native connection admission: physical and handshake
-        // positions per transport class, held outside the HTTP/2 stack.
-        let transport_admission = NativeTransportAdmission::new().map_err(|error| {
+        // positions per transport class and served stream positions per lane,
+        // held outside the HTTP/2 stack. Metrics only observe it.
+        let transport_admission = NativeTransportAdmission::backend(Some(
+            crate::backend_metrics::backend_native_transport_observer(),
+        ))
+        .map_err(|error| {
             BackendApplicationError::new(
                 BackendApplicationErrorKind::Configuration,
                 format!("compose Native transport admission: {error}"),
             )
         })?;
-        tracing::debug!(
+        tracing::info!(
             data_positions = transport_admission.positions(TransportClass::Data),
             control_positions = transport_admission.positions(TransportClass::Control),
             data_handshakes = transport_admission.handshake_positions(TransportClass::Data),
             control_handshakes = transport_admission.handshake_positions(TransportClass::Control),
-            "Native transport admission composed"
+            connections = transport_geometry.backend.connections,
+            streams = transport_geometry.backend.streams,
+            structural_bytes = transport_geometry.backend.structural_bytes,
+            native_sockets = transport_geometry.backend_socket_positions,
+            coefficients_frozen = transport_geometry.backend.coefficients.is_some(),
+            "Native transport admission composed; envelope count part only until P00b \
+             freezes per-object coefficients"
         );
         // The same process identity signs Native calls and appears in the
         // announce, heartbeat and local execution owners. Bind before channels

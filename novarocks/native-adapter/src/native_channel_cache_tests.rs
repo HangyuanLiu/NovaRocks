@@ -27,6 +27,15 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Weak;
 use std::sync::atomic::Ordering;
 use std::task::{RawWaker, RawWakerVTable, Wake};
+use tonic::transport::Channel;
+
+// Election mechanics do not depend on the published value; these fixtures
+// publish bare lazy Channels.
+type NativeChannelCache = super::NativeChannelCache<Channel>;
+type Acquire = super::Acquire<Channel>;
+type Election = super::Election<Channel>;
+type Leader = super::Leader<Channel>;
+type Core = super::Core<Channel>;
 
 fn fixture() -> (NativeChannelCache, (), (), ()) {
     (NativeChannelCache::bounded().unwrap(), (), (), ())

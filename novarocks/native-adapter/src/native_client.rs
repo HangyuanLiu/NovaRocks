@@ -29,11 +29,10 @@ use novarocks_types::{BackendProcessId, NativeEndpoint};
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::Channel;
-use tower::service_fn;
 
 use crate::BackendDataRuntime;
 use crate::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
+use crate::native_lane::{NativeDial, NativeLane, NativeLaneChannel, admitted_connector_service};
 use crate::native_transport_admission::TransportClass;
 
 const GRPC_MAX_MESSAGE_BYTES: usize =
@@ -48,7 +47,7 @@ mod peer_key_tests;
 mod peer_key_capacity_tests;
 
 type AuthenticatedNovaRocksGrpcClient =
-    NovaRocksGrpcClient<InterceptedService<Channel, NativeClientAuthInterceptor>>;
+    NovaRocksGrpcClient<InterceptedService<NativeLaneChannel, NativeClientAuthInterceptor>>;
 
 pub struct NativeRpcClient {
     runtime: BackendDataRuntime,
@@ -284,26 +283,13 @@ pub(crate) fn native_endpoint(
     runtime: &BackendDataRuntime,
     endpoint: &NativeEndpoint,
 ) -> Result<tonic::transport::Endpoint, String> {
-    let endpoint = channel_endpoint(endpoint)
-        .map_err(|error| format!("invalid endpoint: {error}"))?
-        .tcp_keepalive(Some(Duration::from_secs(60)));
+    let endpoint =
+        channel_endpoint(endpoint).map_err(|error| format!("invalid endpoint: {error}"))?;
     if runtime.transport_admission().is_some() {
-        let profile =
-            novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1;
-        Ok(endpoint
-            .connect_timeout(Duration::from_millis(profile.transport_connect_deadline_ms))
-            .http2_adaptive_window(profile.transport_h2_adaptive_window)
-            .initial_stream_window_size(Some(
-                profile.transport_h2_stream_receive_window_bytes as u32,
-            ))
-            .initial_connection_window_size(Some(
-                profile.transport_h2_connection_receive_window_bytes as u32,
-            ))
-            .http2_max_header_list_size(profile.transport_h2_header_bytes as u32)
-            .buffer_size(profile.transport_tonic_pending_per_connection as usize)
-            .concurrency_limit(profile.transport_streams_per_connection as usize))
+        Ok(crate::native_lane::configure_native_endpoint(endpoint))
     } else {
         Ok(endpoint
+            .tcp_keepalive(Some(Duration::from_secs(60)))
             .connect_timeout(Duration::from_secs(10))
             .http2_adaptive_window(true)
             .initial_stream_window_size(Some(32 * 1024 * 1024))
@@ -332,32 +318,17 @@ pub(crate) fn admitted_connector(
     String,
 > {
     let connector = runtime.native_transport().connector_for(endpoint.clone())?;
-    let admission = runtime.transport_admission().cloned();
-    Ok(service_fn(move |_| {
-        let connector = connector.clone();
-        let admission = admission.clone();
-        async move {
-            let dial = admission
-                .as_ref()
-                .map(|admission| admission.try_dial(class, key))
-                .transpose()
-                .map_err(|error| io::Error::new(error.kind(), "native dial admission refused"))?;
-            let io = connector.connect().await.map_err(|failure| {
-                io::Error::other(format!("native transport connector failed: {failure}"))
-            })?;
-            let io: novarocks_native_trust::BoxedNativeIo = match dial {
-                Some(dial) => Box::new(novarocks_native_trust::OwnedNativeIo::with_guard(
-                    io,
-                    dial.established()?,
-                )),
-                None => io,
-            };
-            Ok(TokioIo::new(io))
-        }
-    }))
+    Ok(admitted_connector_service(
+        connector,
+        runtime.transport_admission().cloned(),
+        NativeDial::Backend(class, key),
+    ))
 }
 
-fn client_from_channel(channel: Channel, trust: &NativeTrust) -> AuthenticatedNovaRocksGrpcClient {
+fn client_from_channel(
+    channel: NativeLaneChannel,
+    trust: &NativeTrust,
+) -> AuthenticatedNovaRocksGrpcClient {
     NovaRocksGrpcClient::with_interceptor(channel, trust.client_interceptor())
         .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES)
         .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
@@ -366,7 +337,7 @@ fn client_from_channel(channel: Channel, trust: &NativeTrust) -> AuthenticatedNo
 async fn get_or_create_channel(
     runtime: &BackendDataRuntime,
     key: NativeChannelKey,
-) -> Result<Channel, String> {
+) -> Result<NativeLaneChannel, String> {
     let identity = key
         .inline_identity()
         .map_err(|error| format!("Native channel identity refused: {error}"))?;
@@ -386,6 +357,10 @@ async fn get_or_create_channel(
         .connect_with_connector(connector)
         .await
         .map_err(|error| format!("connect exchange endpoint failed: {error}"))?;
+    let lane = NativeLane::of(key.method.contract().traffic)
+        .ok_or_else(|| "retired Native method has no lane".to_owned())?;
+    // One Channel is one connection; its stream positions live with it.
+    let channel = NativeLaneChannel::new(channel, lane, runtime.transport_admission());
     leader
         .publish(channel.clone())
         .map_err(|error| format!("Native channel publication refused: {error}"))?;
