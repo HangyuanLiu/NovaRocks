@@ -200,6 +200,11 @@ struct FrontendExecutionRuntimeOwner {
     query_blocking_executor: QueryBlockingExecutor,
     decode: RootResultDecodeRuntimeOwner,
     decode_runtime: RootResultDecodeRuntime,
+    /// The complete result-window profile, installed before readiness.
+    /// Statements take windows through admission; closing deliveries take
+    /// their separate positions here.
+    #[allow(dead_code, reason = "closing deliveries acquire through this handle")]
+    result_capacity: novarocks_workload_control::ResultCapacityHandle,
     terminal_error: Option<String>,
     shutdown_complete: bool,
 }
@@ -293,6 +298,17 @@ impl FrontendExecutionRuntimeOwner {
                     error,
                 )
             })?;
+        // The frozen result profile must cover computation admission; a
+        // concurrency limit beyond its client positions is refused here.
+        let result_capacity = workload
+            .owner
+            .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
+            .map_err(|error| {
+                FrontendApplicationError::new(
+                    FrontendApplicationErrorKind::WorkloadControlOpen,
+                    format!("install result window capacity: {error}"),
+                )
+            })?;
         let query_cpu = QueryCpuExecutorOwner::try_new(query_cpu_config).map_err(|error| {
             FrontendApplicationError::new(FrontendApplicationErrorKind::QueryCpuExecutorOpen, error)
         })?;
@@ -357,6 +373,7 @@ impl FrontendExecutionRuntimeOwner {
             query_blocking_executor,
             decode,
             decode_runtime,
+            result_capacity,
             terminal_error: None,
             shutdown_complete: false,
         })
