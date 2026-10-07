@@ -602,39 +602,68 @@ impl StatisticsRootResultDecoder {
             if fields.null_count() != 0 {
                 return Err("statistics Root input_fields contains a null item".into());
             }
-            let field_ids = fields.values().to_vec();
-            if field_ids.iter().collect::<BTreeSet<_>>().len() != field_ids.len() {
-                return Err("statistics Root input_fields contains a duplicate field ID".into());
-            }
             let property_offsets = properties.value_offsets();
             let property_count = usize::try_from(property_offsets[row + 1] - property_offsets[row])
                 .map_err(|_| "statistics Root properties offset is invalid".to_string())?;
             if property_count != 0 {
                 return Err("ANALYZE statistics Root properties must be empty".into());
             }
-            let identity = StatisticsArtifactIdentity::try_new(field_ids, blob_types.value(row))
-                .map_err(|error| error.to_string())?;
-            if !self.expected.contains(&identity) {
-                return Err(format!(
-                    "statistics Root emitted unexpected artifact identity {identity:?}"
-                ));
-            }
-            if self.observed.contains_key(&identity) {
-                return Err(format!(
-                    "statistics Root emitted duplicate artifact identity {identity:?}"
-                ));
-            }
-            self.body_bytes =
-                charge_statistics_body_bytes(self.body_bytes, bodies.value(row).len())?;
-            let draft = StatisticsArtifactDraft::try_new(
-                identity.input_fields().to_vec(),
-                identity.blob_type(),
-                bytes::Bytes::copy_from_slice(bodies.value(row)),
-                BTreeMap::new(),
-            )
-            .map_err(|error| error.to_string())?;
-            self.observed.insert(identity, draft);
+            self.apply_artifact(
+                fields.values().to_vec(),
+                blob_types.value(row),
+                bodies.value(row),
+            )?;
         }
+        Ok(())
+    }
+
+    /// Apply one complete StatisticsArtifactV1 record relayed from the
+    /// Backend, under the same identity, membership and body rules.
+    pub fn apply_record(&mut self, record: &[u8]) -> Result<(), String> {
+        if self.root_eof {
+            return Err("statistics Root emitted a trailing record after EOF".into());
+        }
+        if self.observed.len() >= MAX_STATISTICS_ROOT_ROWS {
+            return Err("statistics Root row budget exceeded".into());
+        }
+        let view =
+            novarocks_native_adapter::root_statistics_codec::StatisticsArtifactRecordView::parse(
+                record,
+            )
+            .map_err(|error| format!("statistics Root record: {error}"))?;
+        self.apply_artifact(view.field_ids().collect(), view.blob_type(), view.body())
+    }
+
+    fn apply_artifact(
+        &mut self,
+        field_ids: Vec<i32>,
+        blob_type: &str,
+        body: &[u8],
+    ) -> Result<(), String> {
+        if field_ids.iter().collect::<BTreeSet<_>>().len() != field_ids.len() {
+            return Err("statistics Root input_fields contains a duplicate field ID".into());
+        }
+        let identity = StatisticsArtifactIdentity::try_new(field_ids, blob_type)
+            .map_err(|error| error.to_string())?;
+        if !self.expected.contains(&identity) {
+            return Err(format!(
+                "statistics Root emitted unexpected artifact identity {identity:?}"
+            ));
+        }
+        if self.observed.contains_key(&identity) {
+            return Err(format!(
+                "statistics Root emitted duplicate artifact identity {identity:?}"
+            ));
+        }
+        self.body_bytes = charge_statistics_body_bytes(self.body_bytes, body.len())?;
+        let draft = StatisticsArtifactDraft::try_new(
+            identity.input_fields().to_vec(),
+            identity.blob_type(),
+            bytes::Bytes::copy_from_slice(body),
+            BTreeMap::new(),
+        )
+        .map_err(|error| error.to_string())?;
+        self.observed.insert(identity, draft);
         Ok(())
     }
 
@@ -753,6 +782,77 @@ mod tests {
             chunk_schema,
         )
         .expect("chunk")
+    }
+
+    /// The Backend statistics encoder's records for `chunk`, cut into tiny
+    /// bodies and reassembled.
+    fn statistics_records(chunk: &Chunk) -> Vec<Vec<u8>> {
+        use novarocks_native_adapter::root_record_assembly::{
+            RootRecordAssembly, RootRecordDomain,
+        };
+        use novarocks_native_adapter::root_statistics_codec::{
+            StatisticsArtifactEncoder, StatisticsCodecStatus, StatisticsCodecTotals,
+        };
+        let mut encoder = StatisticsArtifactEncoder::try_new(
+            chunk.batch.clone(),
+            StatisticsCodecTotals::default(),
+        )
+        .expect("statistics relation");
+        let mut stream = Vec::new();
+        let mut output = vec![0_u8; 9];
+        loop {
+            let turn = encoder.step(&mut output).expect("encodable artifacts");
+            stream.extend_from_slice(&output[..turn.emitted_bytes]);
+            if turn.status == StatisticsCodecStatus::InputComplete {
+                break;
+            }
+        }
+        let mut assembly = RootRecordAssembly::new(RootRecordDomain::Statistics, 1 << 20);
+        let mut records = Vec::new();
+        for body in stream.chunks(4) {
+            assembly
+                .push(body, |record| {
+                    records.push(record.to_vec());
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assembly.finish().unwrap();
+        records
+    }
+
+    #[test]
+    fn relayed_statistics_records_match_the_arrow_relation() {
+        let rows = chunk(&[
+            (&[1], "apache-datasketches-theta-v1", b"one", &[]),
+            (&[2, 3], "apache-datasketches-theta-v1", b"two", &[]),
+        ]);
+        let expected = || {
+            StatisticsRootResultDecoder::new([
+                StatisticsArtifactIdentity::try_new(vec![1], "apache-datasketches-theta-v1")
+                    .unwrap(),
+                StatisticsArtifactIdentity::try_new(vec![2, 3], "apache-datasketches-theta-v1")
+                    .unwrap(),
+            ])
+        };
+        let mut from_chunk = expected();
+        from_chunk.apply_chunk(&rows).unwrap();
+        from_chunk.observe_root_eof().unwrap();
+        from_chunk.observe_execution_success().unwrap();
+        let mut from_records = expected();
+        for record in statistics_records(&rows) {
+            from_records.apply_record(&record).unwrap();
+        }
+        from_records.observe_root_eof().unwrap();
+        from_records.observe_execution_success().unwrap();
+        assert_eq!(from_records.finish().unwrap(), from_chunk.finish().unwrap());
+        // Duplicates and unexpected identities are refused on the record path too.
+        let mut duplicate = expected();
+        let records = statistics_records(&rows);
+        duplicate.apply_record(&records[0]).unwrap();
+        assert!(duplicate.apply_record(&records[0]).is_err());
+        let mut unexpected = StatisticsRootResultDecoder::new([identity(9, "x")]);
+        assert!(unexpected.apply_record(&records[0]).is_err());
     }
 
     #[test]

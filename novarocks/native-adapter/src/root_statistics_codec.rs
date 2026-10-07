@@ -227,6 +227,47 @@ impl StatisticsArtifactHeader {
     }
 }
 
+/// One complete, validated statistics artifact record, borrowed.
+#[derive(Clone, Copy, Debug)]
+pub struct StatisticsArtifactRecordView<'a> {
+    header: StatisticsArtifactHeader,
+    payload: &'a [u8],
+}
+
+impl<'a> StatisticsArtifactRecordView<'a> {
+    /// Validate one assembled record: its header, exact length, positive
+    /// field IDs and UTF-8 blob type. Properties are always empty.
+    pub fn parse(record: &'a [u8]) -> Result<Self, StatisticsCodecError> {
+        let header = StatisticsArtifactHeader::parse(record)?;
+        header.validate_record_bytes(record.len())?;
+        let view = Self {
+            header,
+            payload: &record[STATISTICS_HEADER_BYTES..],
+        };
+        if view.field_ids().any(|field| field <= 0) {
+            return Err(StatisticsCodecError::FieldIds);
+        }
+        std::str::from_utf8(view.blob_bytes()).map_err(|_| StatisticsCodecError::BlobType)?;
+        Ok(view)
+    }
+    pub fn field_ids(&self) -> impl Iterator<Item = i32> + 'a {
+        self.payload[..self.header.field_count() * 4]
+            .chunks_exact(4)
+            .map(|id| i32::from_le_bytes(id.try_into().unwrap()))
+    }
+    fn blob_bytes(&self) -> &'a [u8] {
+        let start = self.header.field_count() * 4;
+        &self.payload[start..start + self.header.blob_type_bytes()]
+    }
+    pub fn blob_type(&self) -> &'a str {
+        std::str::from_utf8(self.blob_bytes()).expect("blob type validated at parse")
+    }
+    pub fn body(&self) -> &'a [u8] {
+        let start = self.header.field_count() * 4 + self.header.blob_type_bytes();
+        &self.payload[start..start + self.header.body_bytes()]
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatisticsCodecStatus {
     Yielded,
