@@ -1484,10 +1484,34 @@ fn validate_data_type(
             DataType::List(field)
             | DataType::ListView(field)
             | DataType::LargeList(field)
-            | DataType::LargeListView(field)
-            | DataType::Map(field, _) => {
+            | DataType::LargeListView(field) => {
                 validate_field(field, path, usage, errors);
                 pending.push((field.data_type(), depth.saturating_add(1)));
+            }
+            // A map's entries struct is a physical wrapper, not a level or a
+            // node of the logical type: its key and value sit one level below
+            // the map, as in the logical type budget.
+            DataType::Map(entries, _) => {
+                validate_field(entries, path, usage, errors);
+                match entries.data_type() {
+                    DataType::Struct(fields) => {
+                        if data_type_children_exceed_budget(
+                            nodes,
+                            pending.len(),
+                            fields.len(),
+                            path,
+                            errors,
+                        ) {
+                            return;
+                        }
+                        usage.add_items(fields.len());
+                        for field in fields {
+                            validate_field(field, path, usage, errors);
+                            pending.push((field.data_type(), depth.saturating_add(1)));
+                        }
+                    }
+                    other => pending.push((other, depth.saturating_add(1))),
+                }
             }
             DataType::Struct(fields) => {
                 if data_type_children_exceed_budget(

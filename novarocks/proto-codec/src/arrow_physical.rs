@@ -135,6 +135,12 @@ impl ColumnRole {
     }
 }
 
+/// Most nodes one column's flat field tree may hold in its role. Raw-byte
+/// preflight applies this bound before protobuf decoding allocates the nodes.
+pub fn column_node_limit(is_internal: bool) -> usize {
+    ColumnRole::of(is_internal).tree_limits().max_nodes
+}
+
 /// Encode and immediately decode the descriptor before returning it. This
 /// makes a lossy or incomplete FE mapping fail where the plan is produced.
 pub fn encode_schema(

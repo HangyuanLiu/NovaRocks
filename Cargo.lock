@@ -4507,6 +4507,7 @@ dependencies = [
  "novarocks-spi",
  "novarocks-types",
  "prost 0.13.5",
+ "prost-reflect",
  "sha2",
  "uuid",
 ]

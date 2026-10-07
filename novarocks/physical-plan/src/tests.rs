@@ -2401,6 +2401,36 @@ fn arrow_data_type_depth_is_bounded_iteratively() {
 }
 
 #[test]
+fn map_entries_wrappers_are_not_logical_levels() {
+    use std::sync::Arc;
+
+    use arrow_schema::{Field, Fields};
+
+    let nested_maps = |levels: usize| {
+        let mut data_type = DataType::Int64;
+        for _ in 0..levels {
+            let entries = Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", data_type, true),
+                ])),
+                false,
+            );
+            data_type = DataType::Map(Arc::new(entries), false);
+        }
+        data_type
+    };
+    // 63 maps put the innermost value at logical depth 64.
+    finish_fragment_with_declared_type(nested_maps(MAX_DATA_TYPE_DEPTH - 1))
+        .expect("64 logical levels through maps");
+    let error = finish_fragment_with_declared_type(nested_maps(MAX_DATA_TYPE_DEPTH))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Arrow data type depth exceeds"));
+}
+
+#[test]
 fn arrow_data_type_node_count_is_bounded_before_stack_growth() {
     use std::sync::Arc;
 

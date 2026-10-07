@@ -190,24 +190,16 @@ fn encode_nested_field(field: &arrow::datatypes::Field) -> Result<common::TypeDe
 
 /// Validate the legacy SQL shape paired with an exact writer Arrow schema
 /// without allocating its protobuf representation.
+///
+/// Writer relation columns are internal relations: their logical depth keeps
+/// the relation budget, and every leaf must be an exact v1 physical type. The
+/// walk is iterative. Wire nesting is not derived from this type any more:
+/// both carriers are flat, so their protobuf depth is a constant.
 pub(crate) fn validate_arrow_authoritative_compatibility_type(
     data_type: &DataType,
 ) -> Result<(), String> {
-    arrow_authoritative_wire_depths(data_type).map(|_| ())
-}
-
-/// Maximum SQL `TypeDesc` and exact `ArrowPhysicalType` message depths.
-///
-/// The walk is iterative because it is the guard for both recursive encoders.
-/// Map's Arrow path includes its synthetic entries struct and is intentionally
-/// charged more deeply than its SQL compatibility descriptor.
-pub(crate) fn arrow_authoritative_wire_depths(
-    data_type: &DataType,
-) -> Result<(usize, usize), String> {
-    let mut pending = vec![(data_type, 1_usize, 1_usize, 1_usize)];
-    let mut sql_depth = 0_usize;
-    let mut arrow_depth = 0_usize;
-    while let Some((data_type, sql_prefix, arrow_prefix, logical_depth)) = pending.pop() {
+    let mut pending = vec![(data_type, 1_usize)];
+    while let Some((data_type, logical_depth)) = pending.pop() {
         if logical_depth > novarocks_spi::connector::write_stack::MAX_WRITE_RELATION_TYPE_DEPTH {
             return Err(format!(
                 "native wire v1 writer type depth {logical_depth} exceeds the relation limit {}",
@@ -215,16 +207,7 @@ pub(crate) fn arrow_authoritative_wire_depths(
             ));
         }
         match data_type {
-            DataType::List(field) => {
-                sql_depth = sql_depth.max(sql_prefix.saturating_add(2));
-                arrow_depth = arrow_depth.max(arrow_prefix.saturating_add(2));
-                pending.push((
-                    field.data_type(),
-                    sql_prefix.saturating_add(2),
-                    arrow_prefix.saturating_add(2),
-                    logical_depth.saturating_add(1),
-                ));
-            }
+            DataType::List(field) => pending.push((field.data_type(), logical_depth + 1)),
             DataType::Map(entries, _) => {
                 let DataType::Struct(fields) = entries.data_type() else {
                     return Err("native wire v1 writer map entries must be a struct".into());
@@ -234,37 +217,54 @@ pub(crate) fn arrow_authoritative_wire_depths(
                         "native wire v1 writer map entries must contain key and value".into(),
                     );
                 }
-                sql_depth = sql_depth.max(sql_prefix.saturating_add(2));
-                arrow_depth = arrow_depth.max(arrow_prefix.saturating_add(5));
                 for field in fields {
-                    pending.push((
-                        field.data_type(),
-                        sql_prefix.saturating_add(2),
-                        arrow_prefix.saturating_add(5),
-                        logical_depth.saturating_add(1),
-                    ));
+                    pending.push((field.data_type(), logical_depth + 1));
                 }
             }
             DataType::Struct(fields) => {
-                sql_depth = sql_depth.max(sql_prefix.saturating_add(2));
-                arrow_depth = arrow_depth.max(arrow_prefix.saturating_add(2));
                 for field in fields {
-                    pending.push((
-                        field.data_type(),
-                        sql_prefix.saturating_add(3),
-                        arrow_prefix.saturating_add(3),
-                        logical_depth.saturating_add(1),
-                    ));
+                    pending.push((field.data_type(), logical_depth + 1));
                 }
             }
-            _ => {
-                validate_physical_type(data_type)?;
-                sql_depth = sql_depth.max(sql_prefix.saturating_add(1));
-                arrow_depth = arrow_depth.max(arrow_prefix.saturating_add(1));
-            }
+            _ => validate_physical_type(data_type)?,
         }
     }
-    Ok((sql_depth, arrow_depth))
+    Ok(())
+}
+
+/// Messages and dynamic bytes the flat `TypeDesc` of `data_type` adds to its
+/// owner: one `TypeNode` plus one kind message per logical node, one member
+/// message per struct field, and every struct member name and time zone.
+/// Iterative, so a deep type cannot exhaust the stack while it is costed.
+pub(crate) fn type_desc_wire_cost(data_type: &DataType) -> (usize, usize) {
+    let mut pending = vec![data_type];
+    let mut messages = 0_usize;
+    let mut dynamic_bytes = 0_usize;
+    while let Some(data_type) = pending.pop() {
+        messages = messages.saturating_add(2);
+        match data_type {
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::FixedSizeList(field, _) => pending.push(field.data_type()),
+            DataType::Map(entries, _) => {
+                if let DataType::Struct(fields) = entries.data_type() {
+                    pending.extend(fields.iter().map(|field| field.data_type()));
+                }
+            }
+            DataType::Struct(fields) => {
+                messages = messages.saturating_add(fields.len());
+                for field in fields {
+                    dynamic_bytes = dynamic_bytes.saturating_add(field.name().len());
+                    pending.push(field.data_type());
+                }
+            }
+            DataType::Timestamp(_, Some(timezone)) => {
+                dynamic_bytes = dynamic_bytes.saturating_add(timezone.len());
+            }
+            _ => {}
+        }
+    }
+    (messages, dynamic_bytes)
 }
 
 /// Validate exact v1 type expressibility without allocating a protobuf value.

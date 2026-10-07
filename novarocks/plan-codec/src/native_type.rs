@@ -35,6 +35,11 @@ use novarocks_proto_models::common;
 use novarocks_type_contract::LogicalTypeLimits;
 use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
+/// Protobuf message levels of any flat `TypeDesc`, the descriptor itself
+/// included: `TypeDesc` -> `TypeNode` -> `TypeStructNode` -> `TypeStructMember`.
+/// Constant whatever the SQL nesting depth.
+pub(crate) const TYPE_DESC_WIRE_DEPTH: usize = 4;
+
 const TIME_UNIT_MICROS: i32 = 2;
 const TIME_UNIT_NANOS: i32 = 3;
 
