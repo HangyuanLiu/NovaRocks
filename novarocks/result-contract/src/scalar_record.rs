@@ -35,8 +35,11 @@
 //! length/count/presence bytes, is limited to
 //! [`ScalarProfileV1::SINGLE_VALUE_BYTES`] (64 KiB). Nesting depth is limited
 //! by the frozen schema depth. Neither writer nor decoder allocates beyond the
-//! caller's buffer (writer) or the decoded value tree (decoder), whose node
-//! count never exceeds the payload byte count.
+//! caller's buffer (writer) or the decoded value tree (decoder). Every owned
+//! allocation in the decoded tree is checked against the shared
+//! [`ScalarProfileV1::CHILD_BYTES`] ceiling before it is requested, including
+//! container capacity: a small wire record can otherwise expand to many
+//! large owned nodes.
 
 use crate::scalar_leaf::{
     ABSENT, CONTAINER_LIST, CONTAINER_MAP, CONTAINER_STRUCT, NULL, decimal_in_range,
@@ -213,9 +216,19 @@ pub enum ScalarValue {
 }
 
 impl ScalarValue {
-    fn from_leaf(leaf: BorrowedScalarLeaf<'_>) -> Self {
+    fn from_leaf(
+        leaf: BorrowedScalarLeaf<'_>,
+        owned: &mut OwnedValueBudget,
+    ) -> Result<Self, ScalarLeafError> {
         use BorrowedScalarLeaf as L;
         match leaf {
+            L::String(value) | L::Json(value) => owned.reserve::<u8>(value.len())?,
+            L::Binary(value) | L::Variant(value) | L::Opaque { bytes: value, .. } => {
+                owned.reserve::<u8>(value.len())?
+            }
+            _ => {}
+        }
+        Ok(match leaf {
             L::NoRows | L::Null => Self::Null,
             L::Boolean(value) => Self::Boolean(value),
             L::SignedInteger { bits, value } => Self::SignedInteger { bits, value },
@@ -251,7 +264,7 @@ impl ScalarValue {
                 kind,
                 bytes: bytes.to_vec(),
             },
-        }
+        })
     }
 }
 
@@ -286,6 +299,7 @@ impl ScalarRecord {
                 let mut reader = Reader {
                     payload: &record[SCALAR_LEAF_HEADER_BYTES..],
                     position: 0,
+                    owned: OwnedValueBudget::new(),
                 };
                 let value = reader.body(schema.field(), 1)?;
                 if reader.position != reader.payload.len() {
@@ -295,14 +309,42 @@ impl ScalarRecord {
             }
             _ => Ok(Self::Value(ScalarValue::from_leaf(
                 BorrowedScalarLeaf::decode(schema, record)?,
-            ))),
+                &mut OwnedValueBudget::new(),
+            )?)),
         }
+    }
+}
+
+/// One ceiling for the complete owned tree. Charges are never returned during
+/// decoding: parent containers and earlier children remain live while later
+/// children are constructed. This observes capacity; it grants no funding.
+struct OwnedValueBudget {
+    remaining: usize,
+}
+
+impl OwnedValueBudget {
+    fn new() -> Self {
+        Self {
+            remaining: ScalarProfileV1::CHILD_BYTES,
+        }
+    }
+
+    fn reserve<T>(&mut self, capacity: usize) -> Result<(), ScalarLeafError> {
+        let bytes = capacity
+            .checked_mul(size_of::<T>())
+            .ok_or(ScalarLeafError::ValueLimit)?;
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes)
+            .ok_or(ScalarLeafError::ValueLimit)?;
+        Ok(())
     }
 }
 
 struct Reader<'a> {
     payload: &'a [u8],
     position: usize,
+    owned: OwnedValueBudget,
 }
 
 impl<'a> Reader<'a> {
@@ -407,6 +449,7 @@ impl<'a> Reader<'a> {
             T::String | T::Json => {
                 let len = self.u32()?;
                 let text = std::str::from_utf8(self.take(len)?).map_err(|_| malformed)?;
+                self.owned.reserve::<u8>(len)?;
                 match &field.value_type {
                     T::String => ScalarValue::String(text.to_owned()),
                     _ => ScalarValue::Json(text.to_owned()),
@@ -414,7 +457,9 @@ impl<'a> Reader<'a> {
             }
             T::Binary | T::Variant | T::Opaque(_) => {
                 let len = self.u32()?;
-                let bytes = self.take(len)?.to_vec();
+                let source = self.take(len)?;
+                self.owned.reserve::<u8>(len)?;
+                let bytes = source.to_vec();
                 match &field.value_type {
                     T::Binary => ScalarValue::Binary(bytes),
                     T::Variant => ScalarValue::Variant(bytes),
@@ -428,6 +473,7 @@ impl<'a> Reader<'a> {
                 if count > self.payload.len() - self.position {
                     return Err(malformed);
                 }
+                self.owned.reserve::<ScalarValue>(count)?;
                 let mut items = Vec::with_capacity(count);
                 for _ in 0..count {
                     items.push(self.node(element, depth + 1)?);
@@ -439,6 +485,7 @@ impl<'a> Reader<'a> {
                 if count > (self.payload.len() - self.position) / 2 {
                     return Err(malformed);
                 }
+                self.owned.reserve::<(ScalarValue, ScalarValue)>(count)?;
                 let mut entries = Vec::with_capacity(count);
                 for _ in 0..count {
                     let key = self.node(key, depth + 1)?;
@@ -448,6 +495,7 @@ impl<'a> Reader<'a> {
                 ScalarValue::Map(entries)
             }
             T::Struct(fields) => {
+                self.owned.reserve::<ScalarValue>(fields.len())?;
                 let mut values = Vec::with_capacity(fields.len());
                 for named in fields {
                     values.push(self.node(&named.field, depth + 1)?);
@@ -704,5 +752,201 @@ mod tests {
             ScalarRecord::decode(&schema, &record).unwrap(),
             ScalarRecord::Value(ScalarValue::Date(19000))
         );
+    }
+
+    fn null_container_record(schema: &ScalarSchema, count: usize, nodes: usize) -> Vec<u8> {
+        let mut output = buffer();
+        let mut writer = ScalarRecordWriter::new(schema, &mut output).unwrap();
+        writer.count(count).unwrap();
+        for _ in 0..nodes {
+            writer.append(&[NULL_NODE]).unwrap();
+        }
+        writer.finish(schema).unwrap();
+        output
+    }
+
+    #[test]
+    fn null_lists_and_maps_refuse_small_wire_records_that_expand_past_the_owned_limit() {
+        let null = field(ScalarValueType::Null, true);
+        for (value_type, element_bytes, nodes_per_element) in [
+            (
+                ScalarValueType::List(Box::new(null.clone())),
+                size_of::<ScalarValue>(),
+                1,
+            ),
+            (
+                ScalarValueType::Map {
+                    key: Box::new(null.clone()),
+                    value: Box::new(null),
+                },
+                size_of::<(ScalarValue, ScalarValue)>(),
+                2,
+            ),
+        ] {
+            let schema = ScalarSchema::try_new(field(value_type, false)).unwrap();
+            let maximum = ScalarProfileV1::CHILD_BYTES / element_bytes;
+            let exact = null_container_record(&schema, maximum, maximum * nodes_per_element);
+            assert!(ScalarRecord::decode(&schema, &exact).is_ok());
+            let over =
+                null_container_record(&schema, maximum + 1, (maximum + 1) * nodes_per_element);
+            assert!(over.len() < ScalarProfileV1::SINGLE_VALUE_BYTES);
+            assert_eq!(
+                ScalarRecord::decode(&schema, &over),
+                Err(ScalarLeafError::ValueLimit)
+            );
+        }
+    }
+
+    #[test]
+    fn nested_lists_count_parent_capacity_and_live_siblings_together() {
+        let null = field(ScalarValueType::Null, true);
+        let inner = field(ScalarValueType::List(Box::new(null)), false);
+        let schema =
+            ScalarSchema::try_new(field(ScalarValueType::List(Box::new(inner.clone())), false))
+                .unwrap();
+        let per_list = ScalarProfileV1::CHILD_BYTES / size_of::<ScalarValue>() / 2;
+        // Either inner list fits by itself. Both together exceed the ceiling
+        // because the outer list's two slots are still live as well.
+        let mut output = buffer();
+        let mut writer = ScalarRecordWriter::new(&schema, &mut output).unwrap();
+        writer.count(2).unwrap();
+        for _ in 0..2 {
+            writer.presence(&inner, false).unwrap();
+            writer.count(per_list).unwrap();
+            for _ in 0..per_list {
+                writer.append(&[NULL_NODE]).unwrap();
+            }
+        }
+        writer.finish(&schema).unwrap();
+        assert!(output.len() < ScalarProfileV1::SINGLE_VALUE_BYTES);
+        assert_eq!(
+            ScalarRecord::decode(&schema, &output),
+            Err(ScalarLeafError::ValueLimit)
+        );
+    }
+
+    #[test]
+    fn repeated_structs_charge_each_owned_field_vector() {
+        let fields = (0..4)
+            .map(|index| NamedScalarField {
+                name: format!("f{index}"),
+                field: field(ScalarValueType::Null, true),
+            })
+            .collect();
+        let element = field(ScalarValueType::Struct(fields), false);
+        let schema = ScalarSchema::try_new(field(
+            ScalarValueType::List(Box::new(element.clone())),
+            false,
+        ))
+        .unwrap();
+        // One outer slot plus four struct slots per element.
+        let count = ScalarProfileV1::CHILD_BYTES / (5 * size_of::<ScalarValue>()) + 1;
+        let mut output = buffer();
+        let mut writer = ScalarRecordWriter::new(&schema, &mut output).unwrap();
+        writer.count(count).unwrap();
+        for _ in 0..count {
+            writer.presence(&element, false).unwrap();
+            writer.append(&[NULL_NODE; 4]).unwrap();
+        }
+        writer.finish(&schema).unwrap();
+        assert!(output.len() < ScalarProfileV1::SINGLE_VALUE_BYTES);
+        assert_eq!(
+            ScalarRecord::decode(&schema, &output),
+            Err(ScalarLeafError::ValueLimit)
+        );
+    }
+
+    fn owned_bytes(value: &ScalarValue) -> usize {
+        match value {
+            ScalarValue::String(value) | ScalarValue::Json(value) => value.capacity(),
+            ScalarValue::Binary(value)
+            | ScalarValue::Variant(value)
+            | ScalarValue::Opaque { bytes: value, .. } => value.capacity(),
+            ScalarValue::List(values) | ScalarValue::Struct(values) => {
+                values.capacity() * size_of::<ScalarValue>()
+                    + values.iter().map(owned_bytes).sum::<usize>()
+            }
+            ScalarValue::Map(values) => {
+                values.capacity() * size_of::<(ScalarValue, ScalarValue)>()
+                    + values
+                        .iter()
+                        .map(|(key, value)| owned_bytes(key) + owned_bytes(value))
+                        .sum::<usize>()
+            }
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn variable_leaf_storage_and_container_capacity_share_the_exact_owned_boundary() {
+        let count = ScalarProfileV1::CHILD_BYTES / size_of::<ScalarValue>() - 1;
+        let exact_bytes = ScalarProfileV1::CHILD_BYTES - count * size_of::<ScalarValue>();
+        for value_type in [
+            ScalarValueType::String,
+            ScalarValueType::Json,
+            ScalarValueType::Binary,
+            ScalarValueType::Variant,
+            ScalarValueType::Opaque(ScalarOpaqueType::Hll),
+        ] {
+            let element = field(value_type.clone(), true);
+            let schema = ScalarSchema::try_new(field(
+                ScalarValueType::List(Box::new(element.clone())),
+                false,
+            ))
+            .unwrap();
+            for extra in [0, 1] {
+                let text = "x".repeat(exact_bytes + extra);
+                let leaf = match value_type {
+                    ScalarValueType::String => BorrowedScalarLeaf::String(&text),
+                    ScalarValueType::Json => BorrowedScalarLeaf::Json(&text),
+                    ScalarValueType::Binary => BorrowedScalarLeaf::Binary(text.as_bytes()),
+                    ScalarValueType::Variant => BorrowedScalarLeaf::Variant(text.as_bytes()),
+                    ScalarValueType::Opaque(kind) => BorrowedScalarLeaf::Opaque {
+                        kind,
+                        bytes: text.as_bytes(),
+                    },
+                    _ => unreachable!(),
+                };
+                let mut output = buffer();
+                let mut writer = ScalarRecordWriter::new(&schema, &mut output).unwrap();
+                writer.count(count).unwrap();
+                for _ in 1..count {
+                    writer.presence(&element, true).unwrap();
+                }
+                writer.presence(&element, false).unwrap();
+                writer.leaf(&element, leaf).unwrap();
+                writer.finish(&schema).unwrap();
+                assert!(output.len() < ScalarProfileV1::SINGLE_VALUE_BYTES);
+                if extra == 0 {
+                    let ScalarRecord::Value(value) =
+                        ScalarRecord::decode(&schema, &output).unwrap()
+                    else {
+                        unreachable!()
+                    };
+                    assert_eq!(owned_bytes(&value), ScalarProfileV1::CHILD_BYTES);
+                } else {
+                    assert_eq!(
+                        ScalarRecord::decode(&schema, &output),
+                        Err(ScalarLeafError::ValueLimit)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_owned_capacity_overflow_is_refused_without_charging_it() {
+        let mut owned = OwnedValueBudget::new();
+        owned.reserve::<u8>(1).unwrap();
+        assert_eq!(
+            owned.reserve::<ScalarValue>(usize::MAX),
+            Err(ScalarLeafError::ValueLimit)
+        );
+        assert_eq!(owned.remaining, ScalarProfileV1::CHILD_BYTES - 1);
+        assert_eq!(
+            owned.reserve::<u8>(ScalarProfileV1::CHILD_BYTES),
+            Err(ScalarLeafError::ValueLimit)
+        );
+        assert_eq!(owned.remaining, ScalarProfileV1::CHILD_BYTES - 1);
     }
 }

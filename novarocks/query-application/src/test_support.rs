@@ -88,6 +88,7 @@ pub struct ResultStreamTestProducer {
     failure: watch::Sender<Option<QueryExecutionError>>,
     workload: WorkloadControl,
     root: Option<RootWork>,
+    window: Option<novarocks_workload_control::ResultWindowGrant>,
 }
 
 impl ResultStreamTestProducer {
@@ -105,19 +106,60 @@ impl ResultStreamTestProducer {
         ),
         QueryExecutionError,
     > {
+        Self::open_with_carrier(
+            execution_id,
+            fields,
+            delivery_capacity,
+            resource_config,
+            crate::api::ResultRowCarrier::DecodedBatches,
+        )
+    }
+
+    pub fn open_with_carrier(
+        execution_id: QueryExecutionId,
+        fields: Vec<ResultField>,
+        delivery_capacity: usize,
+        resource_config: ResourceConfig,
+        carrier: crate::api::ResultRowCarrier,
+    ) -> Result<
+        (
+            Self,
+            ExecutionHandle,
+            LocalResourceAuthority,
+            TestResultDeliveryReceipt,
+        ),
+        QueryExecutionError,
+    > {
         let workload = WorkloadControl::try_new(WorkloadConfig::default(), resource_config)
             .expect("test result workload config must be valid");
+        let capacity = matches!(carrier, crate::api::ResultRowCarrier::Relayed { .. }).then(|| {
+            workload
+                .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
+                .expect("test result capacity")
+        });
         workload
             .mark_ready()
             .expect("test result workload becomes ready");
         let root = workload
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .expect("test result root work is admitted");
+        let window = capacity.map(|capacity| {
+            let class = match carrier {
+                crate::api::ResultRowCarrier::Relayed {
+                    kind: novarocks_result_contract::RootOutputKind::ClientRows,
+                    ..
+                } => novarocks_workload_control::ResultWindowClass::Client,
+                _ => novarocks_workload_control::ResultWindowClass::Internal,
+            };
+            capacity
+                .try_acquire(&root.owner.scope(), class)
+                .expect("test root window")
+        });
         let schema = ResultSchema::new(fields);
         let (transport, schema_receipt, failure, stream) = QueryResultStream::try_channel(
             execution_id.query_id(),
             schema,
-            crate::api::ResultRowCarrier::DecodedBatches,
+            carrier,
             delivery_capacity,
         )?;
         let handle = ExecutionHandle::new(
@@ -132,6 +174,7 @@ impl ResultStreamTestProducer {
                 failure,
                 workload,
                 root: Some(root),
+                window,
             },
             handle,
             resources,
@@ -168,6 +211,49 @@ impl ResultStreamTestProducer {
         let permit = self.transport.reserve_owned().await?;
         self.transport
             .enqueue(permit, ResultDelivery::Batch(delivery));
+        Ok(TestResultDeliveryReceipt(receipt))
+    }
+
+    /// Test-only transfer through the real move-only segment/receipt boundary.
+    pub async fn enqueue_segment(
+        &self,
+        sequence: u64,
+        reply: novarocks_execution_contract::root_result::RootResultReply,
+        client_rows: Option<(
+            novarocks_result_contract::ClientRowProfile,
+            novarocks_result_contract::ClientRowStreamCursor,
+        )>,
+        rows: u64,
+    ) -> Result<TestResultDeliveryReceipt, QueryExecutionError> {
+        let window = self
+            .window
+            .as_ref()
+            .expect("relayed test stream has a window");
+        let backing = match &reply.outcome {
+            novarocks_execution_contract::root_result::RootReadOutcome::Data(data) => {
+                data.body().len() as u64 + 4096
+            }
+            _ => 4096,
+        };
+        let retained =
+            crate::api::RetainedRootReply::try_new(reply, window.retain_alias(), backing).map_err(
+                |error| {
+                    QueryExecutionError::new(
+                        crate::api::QueryExecutionErrorKind::InvalidRequest,
+                        error.to_string(),
+                    )
+                },
+            )?;
+        let (delivery, receipt) = crate::api::RootSegmentDelivery::try_new(
+            self.execution_id,
+            ResultPacketSequence::new(sequence),
+            retained,
+            client_rows,
+            rows,
+        )?;
+        let permit = self.transport.reserve_owned().await?;
+        self.transport
+            .enqueue(permit, ResultDelivery::Segment(delivery));
         Ok(TestResultDeliveryReceipt(receipt))
     }
 

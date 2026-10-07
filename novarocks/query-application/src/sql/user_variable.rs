@@ -22,10 +22,9 @@ use std::sync::Arc;
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
     FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, LargeBinaryArray, LargeStringArray, ListArray, MapArray, StringArray, StructArray,
-    Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray, new_null_array,
+    Int64Array, LargeBinaryArray, LargeStringArray, StringArray, Time64MicrosecondArray,
+    TimestampMicrosecondArray, TimestampNanosecondArray, new_null_array,
 };
-use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::datatypes::{DataType, Field, Fields, TimeUnit, i256};
 use novarocks_result_contract::{
     ScalarField, ScalarRecord, ScalarSchema, ScalarTimestampUnit, ScalarValue, ScalarValueType,
@@ -71,19 +70,177 @@ pub fn query_result_to_user_variable_literal(result: &QueryResult) -> Result<Str
 
 /// Converts a relayed ScalarValueV1 record into the same SQL literal the
 /// Arrow result path produces: no rows is `null`, a one-row NULL is `NULL`,
-/// and a value is rebuilt as its exact one-row storage array first.
+/// and containers are walked without allocating an Arrow or Literal tree.
 pub fn scalar_record_to_user_variable_literal(
     schema: &ScalarSchema,
     record: &ScalarRecord,
 ) -> Result<String, String> {
-    match record {
-        ScalarRecord::NoRows => Ok("null".to_string()),
-        ScalarRecord::Value(ScalarValue::Null) => Ok("NULL".to_string()),
-        ScalarRecord::Value(value) => {
-            let field = schema.field();
-            let storage = scalar_storage_type(field);
+    let ScalarRecord::Value(value) = record else {
+        return Ok("null".to_string());
+    };
+    let mut measured = ScalarSqlOutput::new(None);
+    write_scalar_sql(&mut measured, schema.field(), value, false)?;
+    if measured
+        .bytes
+        .checked_add(measured.scratch)
+        .is_none_or(|bytes| {
+            bytes > novarocks_result_contract::ScalarProfileV1::ASSIGNMENT_SCRATCH_BYTES
+        })
+    {
+        return Err("scalar SQL literal exceeds its assignment scratch bound".into());
+    }
+    let mut output = ScalarSqlOutput::new(Some(String::with_capacity(measured.bytes)));
+    write_scalar_sql(&mut output, schema.field(), value, false)?;
+    Ok(output
+        .output
+        .expect("the second pass owns its exact output buffer"))
+}
+
+/// Count first, then allocate once. Container traversal never creates a whole
+/// Arrow value, per-item array vector, Literal tree or formatted child vector.
+struct ScalarSqlOutput {
+    output: Option<String>,
+    bytes: usize,
+    scratch: usize,
+}
+impl ScalarSqlOutput {
+    fn new(output: Option<String>) -> Self {
+        Self {
+            output,
+            bytes: 0,
+            scratch: 0,
+        }
+    }
+    fn append(&mut self, text: &str) -> Result<(), String> {
+        self.bytes = self
+            .bytes
+            .checked_add(text.len())
+            .filter(|bytes| {
+                *bytes <= novarocks_result_contract::ScalarProfileV1::ASSIGNMENT_SCRATCH_BYTES
+            })
+            .ok_or_else(|| "scalar SQL literal exceeds its assignment scratch bound".to_string())?;
+        if let Some(output) = &mut self.output {
+            output.push_str(text);
+        }
+        Ok(())
+    }
+    fn character(&mut self, value: char) -> Result<(), String> {
+        match value {
+            '\'' => self.append("''"),
+            '\\' => self.append(r"\\"),
+            _ => self.append(value.encode_utf8(&mut [0; 4])),
+        }
+    }
+    fn quoted(&mut self, text: &str) -> Result<(), String> {
+        self.append("'")?;
+        for value in text.chars() {
+            self.character(value)?;
+        }
+        self.append("'")
+    }
+}
+
+fn write_scalar_sql(
+    output: &mut ScalarSqlOutput,
+    field: &ScalarField,
+    value: &ScalarValue,
+    nested: bool,
+) -> Result<(), String> {
+    if matches!(field.value_type, ScalarValueType::Null) {
+        return Err("literal_from_batch does not support column type Null".into());
+    }
+    if matches!(value, ScalarValue::Null) {
+        return output.append("NULL");
+    }
+    match (&field.value_type, value) {
+        (ScalarValueType::List(item), ScalarValue::List(values)) => {
+            output.append("[")?;
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.append(", ")?;
+                }
+                write_scalar_sql(output, item, value, true)?;
+            }
+            output.append("]")
+        }
+        (ScalarValueType::Map { key, value }, ScalarValue::Map(entries)) => {
+            output.append("map(")?;
+            for (index, (k, v)) in entries.iter().enumerate() {
+                if index != 0 {
+                    output.append(", ")?;
+                }
+                write_scalar_sql(output, key, k, true)?;
+                output.append(", ")?;
+                write_scalar_sql(output, value, v, true)?;
+            }
+            output.append(")")
+        }
+        (ScalarValueType::Struct(fields), ScalarValue::Struct(values))
+            if fields.len() == values.len() =>
+        {
+            output.append("row(")?;
+            for (index, (field, value)) in fields.iter().zip(values).enumerate() {
+                if index != 0 {
+                    output.append(", ")?;
+                }
+                write_scalar_sql(output, &field.field, value, true)?;
+            }
+            output.append(")")
+        }
+        (ScalarValueType::String, ScalarValue::String(text))
+        | (ScalarValueType::Json, ScalarValue::Json(text)) => output.quoted(text),
+        (ScalarValueType::Binary, ScalarValue::Binary(bytes))
+        | (ScalarValueType::Variant, ScalarValue::Variant(bytes))
+        | (ScalarValueType::Opaque(_), ScalarValue::Opaque { bytes, .. }) => {
+            output.append("'")?;
+            if nested {
+                // literal_from_batch uses Latin-1 inside containers; the
+                // existing top-level text bridge deliberately uses UTF-8 loss.
+                for byte in bytes {
+                    output.character(char::from(*byte))?;
+                }
+            } else {
+                for chunk in bytes.utf8_chunks() {
+                    for value in chunk.valid().chars() {
+                        output.character(value)?;
+                    }
+                    if !chunk.invalid().is_empty() {
+                        output.character('\u{fffd}')?;
+                    }
+                }
+            }
+            output.append("'")
+        }
+        _ => {
+            if matches!(
+                field.value_type,
+                ScalarValueType::List(_) | ScalarValueType::Map { .. } | ScalarValueType::Struct(_)
+            ) {
+                return Err("scalar value differs from its frozen field".into());
+            }
+            let timezone = match &field.value_type {
+                ScalarValueType::Timestamp { timezone, .. } => {
+                    timezone.as_ref().map_or(0, String::len)
+                }
+                _ => 0,
+            };
+            // Only one fixed-width leaf exists at a time. This allowance covers
+            // its small Arrow bridge, Literal/text and timezone-copy peak.
+            let scratch = timezone
+                .checked_mul(4)
+                .and_then(|bytes| bytes.checked_add(4096))
+                .filter(|bytes| {
+                    *bytes <= novarocks_result_contract::ScalarProfileV1::ASSIGNMENT_SCRATCH_BYTES
+                })
+                .ok_or_else(|| "scalar leaf exceeds its assignment scratch bound".to_string())?;
+            output.scratch = output.scratch.max(scratch);
             let array = scalar_value_array(field, value)?;
-            query_result_cell_to_user_variable_sql(&array, &storage, 0)
+            let text = if nested {
+                user_variable_literal_to_sql(&literal_from_batch(&array, 0)?)?
+            } else {
+                query_result_cell_to_user_variable_sql(&array, &scalar_storage_type(field), 0)?
+            };
+            output.append(&text)
         }
     }
 }
@@ -154,6 +311,12 @@ fn scalar_storage_type(field: &ScalarField) -> DataType {
 
 /// One value as a one-row array of its exact storage type.
 fn scalar_value_array(field: &ScalarField, value: &ScalarValue) -> Result<ArrayRef, String> {
+    if matches!(
+        field.value_type,
+        ScalarValueType::List(_) | ScalarValueType::Map { .. } | ScalarValueType::Struct(_)
+    ) {
+        return Err("a scalar leaf bridge cannot materialize a container".into());
+    }
     let storage = scalar_storage_type(field);
     let mismatch = || format!("scalar value does not match its frozen type {storage:?}");
     if matches!(value, ScalarValue::Null) {
@@ -240,87 +403,9 @@ fn scalar_value_array(field: &ScalarField, value: &ScalarValue) -> Result<ArrayR
                 ),
             }
         }
-        (ScalarValueType::List(item), ScalarValue::List(values)) => {
-            let DataType::List(item_field) = &storage else {
-                unreachable!("a list field has list storage")
-            };
-            let children = values
-                .iter()
-                .map(|value| scalar_value_array(item, value))
-                .collect::<Result<Vec<_>, _>>()?;
-            Arc::new(
-                ListArray::try_new(
-                    Arc::clone(item_field),
-                    OffsetBuffer::from_lengths([children.len()]),
-                    concat_or_empty(&children, &scalar_storage_type(item))?,
-                    None,
-                )
-                .map_err(|error| error.to_string())?,
-            )
-        }
-        (ScalarValueType::Map { key, value }, ScalarValue::Map(entries)) => {
-            let DataType::Map(entries_field, _) = &storage else {
-                unreachable!("a map field has map storage")
-            };
-            let DataType::Struct(entry_fields) = entries_field.data_type() else {
-                unreachable!("map entries are a struct")
-            };
-            let keys = entries
-                .iter()
-                .map(|(entry, _)| scalar_value_array(key, entry))
-                .collect::<Result<Vec<_>, _>>()?;
-            let values = entries
-                .iter()
-                .map(|(_, entry)| scalar_value_array(value, entry))
-                .collect::<Result<Vec<_>, _>>()?;
-            let struct_array = StructArray::try_new(
-                entry_fields.clone(),
-                vec![
-                    concat_or_empty(&keys, &scalar_storage_type(key))?,
-                    concat_or_empty(&values, &scalar_storage_type(value))?,
-                ],
-                None,
-            )
-            .map_err(|error| error.to_string())?;
-            Arc::new(
-                MapArray::try_new(
-                    Arc::clone(entries_field),
-                    OffsetBuffer::from_lengths([entries.len()]),
-                    struct_array,
-                    None,
-                    false,
-                )
-                .map_err(|error| error.to_string())?,
-            )
-        }
-        (ScalarValueType::Struct(fields), ScalarValue::Struct(values)) => {
-            let DataType::Struct(storage_fields) = &storage else {
-                unreachable!("a struct field has struct storage")
-            };
-            if fields.len() != values.len() {
-                return Err(mismatch());
-            }
-            let columns = fields
-                .iter()
-                .zip(values)
-                .map(|(named, value)| scalar_value_array(&named.field, value))
-                .collect::<Result<Vec<_>, _>>()?;
-            Arc::new(
-                StructArray::try_new(storage_fields.clone(), columns, None::<NullBuffer>)
-                    .map_err(|error| error.to_string())?,
-            )
-        }
         _ => return Err(mismatch()),
     };
     Ok(array)
-}
-
-fn concat_or_empty(arrays: &[ArrayRef], data_type: &DataType) -> Result<ArrayRef, String> {
-    if arrays.is_empty() {
-        return Ok(arrow::array::new_empty_array(data_type));
-    }
-    let views = arrays.iter().map(AsRef::as_ref).collect::<Vec<_>>();
-    arrow::compute::concat(&views).map_err(|error| error.to_string())
 }
 
 fn query_result_cell_to_user_variable_sql(
@@ -506,8 +591,9 @@ mod tests {
         use std::sync::Arc;
 
         use arrow::array::{
-            ArrayRef, Date32Array, Decimal128Array, FixedSizeBinaryArray, Float64Array, Int32Array,
-            Int64Array, ListArray, MapArray, StringArray, StructArray, TimestampMicrosecondArray,
+            ArrayRef, BinaryArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
+            Float64Array, Int32Array, Int64Array, ListArray, MapArray, StringArray, StructArray,
+            TimestampMicrosecondArray,
         };
         use arrow::buffer::OffsetBuffer;
         use arrow::datatypes::{DataType, Field, Fields};
@@ -542,7 +628,67 @@ mod tests {
         }
 
         #[test]
+        fn typed_sql_literal_checks_growth_before_output_and_keeps_nested_binary_semantics() {
+            use novarocks_result_contract::ScalarProfileV1;
+            let schema = ScalarSchema::try_new(field(ScalarValueType::String)).unwrap();
+            let record = ScalarRecord::Value(ScalarValue::String(
+                "'".repeat(ScalarProfileV1::SINGLE_VALUE_BYTES),
+            ));
+            assert!(
+                scalar_record_to_user_variable_literal(&schema, &record)
+                    .unwrap_err()
+                    .contains("scratch bound")
+            );
+            let binary = ScalarSchema::try_new(field(ScalarValueType::Binary)).unwrap();
+            let record = ScalarRecord::Value(ScalarValue::Binary(vec![
+                    0xff;
+                    ScalarProfileV1::SINGLE_VALUE_BYTES
+                ]));
+            assert!(
+                scalar_record_to_user_variable_literal(&binary, &record)
+                    .unwrap_err()
+                    .contains("scratch bound")
+            );
+            let item = field(ScalarValueType::Binary);
+            let bytes = [0xff, b'\''];
+            assert_same_literal(
+                field(ScalarValueType::List(Box::new(item))),
+                ScalarValue::List(vec![ScalarValue::Binary(bytes.to_vec())]),
+                Arc::new(
+                    ListArray::try_new(
+                        Arc::new(Field::new("item", DataType::Binary, true)),
+                        OffsetBuffer::from_lengths([1]),
+                        Arc::new(BinaryArray::from(vec![bytes.as_slice()])),
+                        None,
+                    )
+                    .unwrap(),
+                ),
+            );
+            let count = 1024;
+            assert_same_literal(
+                field(ScalarValueType::List(Box::new(field(
+                    ScalarValueType::Null,
+                )))),
+                ScalarValue::List(vec![ScalarValue::Null; count]),
+                Arc::new(
+                    ListArray::try_new(
+                        Arc::new(Field::new("item", DataType::Null, true)),
+                        OffsetBuffer::from_lengths([count]),
+                        arrow::array::new_null_array(&DataType::Null, count),
+                        None,
+                    )
+                    .unwrap(),
+                ),
+            );
+        }
+
+        #[test]
         fn no_rows_and_null_keep_their_distinct_literals() {
+            assert_same_literal(
+                field(ScalarValueType::Null),
+                ScalarValue::Null,
+                arrow::array::new_null_array(&DataType::Null, 1),
+            );
             let schema =
                 ScalarSchema::try_new(field(ScalarValueType::SignedInteger(64))).expect("schema");
             assert_eq!(

@@ -397,6 +397,20 @@ impl FrozenExecutionDescription {
     pub const fn output(&self) -> &OutputContract {
         &self.output
     }
+    /// The exact frozen typed scalar contract, without exposing the plan owner.
+    pub fn scalar_schema(&self) -> Option<&novarocks_result_contract::ScalarSchema> {
+        use novarocks_physical_plan::FragmentSink;
+        use novarocks_result_contract::FrozenRootOutput;
+        let plan = self.candidate.plan();
+        let fragment = plan.fragments().get(&plan.result_port()?.fragment)?;
+        match fragment.sink() {
+            FragmentSink::RootResult(contract) => match contract.output() {
+                FrozenRootOutput::ScalarValue(schema) => Some(schema),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
     pub const fn row_carrier(&self) -> crate::api::ResultRowCarrier {
         self.row_carrier
     }

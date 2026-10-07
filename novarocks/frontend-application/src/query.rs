@@ -1497,6 +1497,7 @@ impl FrontendQuerySession {
                 result
             }
             PreparedQueryOperation::LogicalRead(read) => {
+                let scalar_schema = read.scalar_schema().cloned();
                 let start = {
                     let _observation_scope =
                         crate::preparation_diagnostics::enter_bound_statement(statement.token());
@@ -1522,7 +1523,7 @@ impl FrontendQuerySession {
                         "SET scalar query returned completion-only output",
                     ));
                 };
-                consume_governed_scalar_stream(&mut execution, stream).await
+                consume_governed_scalar_stream(&mut execution, stream, scalar_schema.as_ref()).await
             }
             PreparedQueryOperation::Distributed(_) => {
                 child.complete();
@@ -2636,6 +2637,7 @@ fn timeout_message_millis(timeout: Duration) -> u64 {
 async fn consume_governed_scalar_stream(
     execution: &mut novarocks_query_application::api::ExecutionHandle,
     mut stream: novarocks_query_application::api::QueryResultStream,
+    scalar_schema: Option<&novarocks_result_contract::ScalarSchema>,
 ) -> Result<String, QueryServiceError> {
     let schema = match stream.begin_schema() {
         Some(schema) => schema,
@@ -2657,6 +2659,26 @@ async fn consume_governed_scalar_stream(
         ));
         let _ = execution.request_cancel();
         return Err(scalar_query_error(message));
+    }
+    use novarocks_query_application::api::ResultRowCarrier;
+    use novarocks_result_contract::{InternalResultDomain, RootOutputKind, ScalarRecord};
+    let relayed = matches!(
+        schema.row_carrier(),
+        ResultRowCarrier::Relayed {
+            kind: RootOutputKind::InternalFacts(InternalResultDomain::ScalarValueV1),
+            client_rows: None
+        }
+    );
+    if (!relayed && schema.row_carrier() != ResultRowCarrier::DecodedBatches)
+        || (relayed && scalar_schema.is_none())
+    {
+        let message = "SET scalar query has no matching frozen typed scalar contract";
+        schema.fail(QueryExecutionError::new(
+            QueryExecutionErrorKind::InvalidRequest,
+            message,
+        ));
+        let _ = execution.request_cancel();
+        return Err(scalar_query_error(message.to_string()));
     }
     let field = &schema.schema().fields()[0];
     let column = QueryResultColumn::new(
@@ -2684,18 +2706,56 @@ async fn consume_governed_scalar_stream(
         };
         match delivery {
             ResultDelivery::Segment(delivery) => {
-                // A SET scalar is a typed domain value, never relayed rows.
-                let message =
-                    "SET scalar query received Backend-encoded rows instead of its typed value"
-                        .to_string();
-                delivery.fail(QueryExecutionError::new(
-                    QueryExecutionErrorKind::InvalidRequest,
-                    message.clone(),
-                ));
-                let _ = execution.request_cancel();
-                return Err(scalar_query_error(message));
+                let decoded = (|| {
+                    if !relayed
+                        || delivery.kind()
+                            != RootOutputKind::InternalFacts(InternalResultDomain::ScalarValueV1)
+                    {
+                        return Err(
+                            "SET scalar query received a foreign root output domain".to_string()
+                        );
+                    }
+                    if value.is_some() {
+                        return Err("SET scalar producer returned more than one record".to_string());
+                    }
+                    let frozen =
+                        scalar_schema.expect("a typed scalar carrier has its frozen contract");
+                    let record = ScalarRecord::decode(frozen, delivery.body())
+                        .map_err(|error| format!("SET scalar record: {error}"))?;
+                    let rows = u64::from(matches!(record, ScalarRecord::Value(_)));
+                    if delivery.rows() != rows {
+                        return Err(
+                            "SET scalar record row count differs from its delivery".to_string()
+                        );
+                    }
+                    novarocks_query_application::sql::user_variable::scalar_record_to_user_variable_literal(frozen, &record)
+                })();
+                match decoded {
+                    Ok(literal) => {
+                        value = Some(literal);
+                        delivery.complete();
+                    }
+                    Err(message) => {
+                        delivery.fail(QueryExecutionError::new(
+                            QueryExecutionErrorKind::InvalidRequest,
+                            message.clone(),
+                        ));
+                        let _ = execution.request_cancel();
+                        return Err(scalar_query_error(message));
+                    }
+                }
             }
             ResultDelivery::Batch(delivery) => {
+                if relayed {
+                    let message = "SET typed scalar query received a decoded batch";
+                    delivery.fail(QueryExecutionError::new(
+                        QueryExecutionErrorKind::InvalidRequest,
+                        message,
+                    ));
+                    let _ = execution.request_cancel();
+                    return Err(scalar_query_error(message.to_string()));
+                }
+
                 let rows = delivery.batch().num_rows();
                 if rows > 1 || (rows == 1 && value.is_some()) {
                     let message = "Subquery returns more than 1 row".to_string();
@@ -2729,6 +2789,16 @@ async fn consume_governed_scalar_stream(
                 }
             }
             ResultDelivery::End(delivery) => {
+                if relayed && value.is_none() {
+                    let message = "SET typed scalar query ended without its required record";
+                    delivery.fail(QueryExecutionError::new(
+                        QueryExecutionErrorKind::InvalidRequest,
+                        message,
+                    ));
+                    let _ = execution.request_cancel();
+                    return Err(scalar_query_error(message.to_string()));
+                }
+
                 delivery.complete();
                 return Ok(value.unwrap_or_else(|| "null".to_string()));
             }
@@ -3050,6 +3120,221 @@ mod tests {
         .expect("scalar batch")
     }
 
+    fn relayed_scalar_fixture() -> (
+        ResultStreamTestProducer,
+        novarocks_query_application::api::ExecutionHandle,
+        novarocks_query_application::test_support::TestResultDeliveryReceipt,
+        novarocks_types::QueryExecutionId,
+        novarocks_result_contract::ScalarSchema,
+    ) {
+        use novarocks_result_contract::{
+            InternalResultDomain, RootOutputKind, ScalarField, ScalarSchema, ScalarValueType,
+        };
+        let execution_id = novarocks_types::QueryExecutionId::new(
+            novarocks_types::QueryId::new(71, 1),
+            novarocks_types::AttemptId::new(1).unwrap(),
+        )
+        .unwrap();
+        let schema = ScalarSchema::try_new(ScalarField {
+            nullable: true,
+            value_type: ScalarValueType::SignedInteger(64),
+        })
+        .unwrap();
+        let (producer, execution, _resources, receipt) =
+            ResultStreamTestProducer::open_with_carrier(
+                execution_id,
+                vec![scalar_field(true)],
+                1,
+                ResourceConfig {
+                    total_bytes: 1 << 20,
+                    control_bytes: 1024,
+                    per_scope_bytes: (1 << 20) - 1024,
+                },
+                novarocks_query_application::api::ResultRowCarrier::relayed(
+                    RootOutputKind::InternalFacts(InternalResultDomain::ScalarValueV1),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        (producer, execution, receipt, execution_id, schema)
+    }
+
+    fn scalar_root_reply(
+        execution_id: novarocks_types::QueryExecutionId,
+        schema: &novarocks_result_contract::ScalarSchema,
+        leaf: novarocks_result_contract::BorrowedScalarLeaf<'_>,
+        sequence: u64,
+    ) -> (
+        novarocks_execution_contract::root_result::RootResultReply,
+        u64,
+    ) {
+        use novarocks_execution_contract::{
+            TaskIdentity,
+            root_result::{RootReadOutcome, RootResultData, RootResultReply},
+        };
+        use novarocks_result_contract::{
+            InternalResultDomain, RootOutputKind, RootProfileId, ScalarLeafCursor,
+        };
+        use novarocks_types::{StageId, TaskId};
+        let cursor = ScalarLeafCursor::try_new(schema, leaf).unwrap();
+        let rows = cursor.rows();
+        let mut body = vec![0; cursor.encoded_len()];
+        cursor.copy_range(0, &mut body).unwrap();
+        let kind = RootOutputKind::InternalFacts(InternalResultDomain::ScalarValueV1);
+        (
+            RootResultReply {
+                root_task: TaskIdentity::new(
+                    execution_id,
+                    StageId::new(1).unwrap(),
+                    TaskId::new(1).unwrap(),
+                    novarocks_types::BackendProcessId::new_v7(),
+                ),
+                profile: RootProfileId::V1,
+                kind,
+                accepted_consumed: 0,
+                outcome: RootReadOutcome::Data(
+                    RootResultData::try_new(
+                        kind,
+                        std::num::NonZeroU64::new(sequence).unwrap(),
+                        bytes::Bytes::from(body),
+                        None,
+                    )
+                    .unwrap(),
+                ),
+            },
+            rows,
+        )
+    }
+
+    #[tokio::test]
+    async fn governed_scalar_stream_consumes_typed_value_null_and_no_rows_after_success_end() {
+        use novarocks_result_contract::BorrowedScalarLeaf as V;
+        for (leaf, expected) in [
+            (V::SignedInteger { bits: 64, value: 7 }, "7"),
+            (V::Null, "NULL"),
+            (V::NoRows, "null"),
+        ] {
+            let (producer, mut execution, schema_receipt, execution_id, schema) =
+                relayed_scalar_fixture();
+            let ExecutionOutput::Rows(stream) = execution.take_output().unwrap() else {
+                panic!("rows");
+            };
+            let (reply, rows) = scalar_root_reply(execution_id, &schema, leaf, 1);
+            let produce = async {
+                assert_eq!(
+                    schema_receipt.wait().await,
+                    TestResultDeliveryDisposition::Completed
+                );
+                assert_eq!(
+                    producer
+                        .enqueue_segment(0, reply, None, rows)
+                        .await
+                        .unwrap()
+                        .wait()
+                        .await,
+                    TestResultDeliveryDisposition::Completed
+                );
+                assert_eq!(
+                    producer.enqueue_end(1).await.wait().await,
+                    TestResultDeliveryDisposition::Completed
+                );
+                producer.finish();
+            };
+            let (result, ()) = tokio::join!(
+                consume_governed_scalar_stream(&mut execution, stream, Some(&schema)),
+                produce
+            );
+            assert_eq!(result.unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn governed_scalar_stream_refuses_missing_duplicate_foreign_and_late_failed_records() {
+        use novarocks_result_contract::{BorrowedScalarLeaf, InternalResultDomain, RootOutputKind};
+        for fault in ["missing", "duplicate", "foreign", "late"] {
+            let (producer, mut execution, schema_receipt, execution_id, schema) =
+                relayed_scalar_fixture();
+            let ExecutionOutput::Rows(stream) = execution.take_output().unwrap() else {
+                panic!("rows");
+            };
+            let produce = async {
+                assert_eq!(
+                    schema_receipt.wait().await,
+                    TestResultDeliveryDisposition::Completed
+                );
+                if fault == "missing" {
+                    assert!(matches!(
+                        producer.enqueue_end(0).await.wait().await,
+                        TestResultDeliveryDisposition::Failed(_)
+                    ));
+                } else {
+                    let (mut reply, rows) =
+                        scalar_root_reply(execution_id, &schema, BorrowedScalarLeaf::NoRows, 1);
+                    if fault == "foreign" {
+                        reply.kind = RootOutputKind::InternalFacts(
+                            InternalResultDomain::StatisticsArtifactV1,
+                        );
+                        let novarocks_execution_contract::root_result::RootReadOutcome::Data(data) =
+                            &reply.outcome
+                        else {
+                            panic!("data");
+                        };
+                        reply.outcome =
+                            novarocks_execution_contract::root_result::RootReadOutcome::Data(
+                                novarocks_execution_contract::root_result::RootResultData::try_new(
+                                    reply.kind,
+                                    data.sequence(),
+                                    data.body().clone(),
+                                    None,
+                                )
+                                .unwrap(),
+                            );
+                    }
+                    let receipt = producer
+                        .enqueue_segment(0, reply, None, rows)
+                        .await
+                        .unwrap()
+                        .wait()
+                        .await;
+                    if fault == "foreign" {
+                        assert!(matches!(receipt, TestResultDeliveryDisposition::Failed(_)));
+                    } else {
+                        assert_eq!(receipt, TestResultDeliveryDisposition::Completed);
+                        if fault == "duplicate" {
+                            let (reply, rows) = scalar_root_reply(
+                                execution_id,
+                                &schema,
+                                BorrowedScalarLeaf::NoRows,
+                                2,
+                            );
+                            assert!(matches!(
+                                producer
+                                    .enqueue_segment(1, reply, None, rows)
+                                    .await
+                                    .unwrap()
+                                    .wait()
+                                    .await,
+                                TestResultDeliveryDisposition::Failed(_)
+                            ));
+                        } else {
+                            producer.fail(QueryExecutionError::new(
+                                QueryExecutionErrorKind::Failed,
+                                "late scalar failure",
+                            ));
+                        }
+                    }
+                }
+                producer.finish();
+            };
+            let (result, ()) = tokio::join!(
+                consume_governed_scalar_stream(&mut execution, stream, Some(&schema)),
+                produce
+            );
+            assert!(result.is_err(), "{fault}");
+        }
+    }
+
     #[tokio::test]
     async fn governed_scalar_stream_settles_each_batch_before_eof() {
         let (producer, mut execution, resources, schema_receipt) =
@@ -3080,7 +3365,7 @@ mod tests {
             producer.finish();
         };
         let (value, ()) = tokio::join!(
-            consume_governed_scalar_stream(&mut execution, stream),
+            consume_governed_scalar_stream(&mut execution, stream, None),
             producer_side
         );
 
@@ -3122,7 +3407,7 @@ mod tests {
                 producer.finish();
             };
             let (value, ()) = tokio::join!(
-                consume_governed_scalar_stream(&mut execution, stream),
+                consume_governed_scalar_stream(&mut execution, stream, None),
                 producer_side
             );
             assert_eq!(value.expect("empty or null scalar succeeds"), expected);
@@ -3151,7 +3436,7 @@ mod tests {
             ));
         };
         let (result, ()) = tokio::join!(
-            consume_governed_scalar_stream(&mut execution, stream),
+            consume_governed_scalar_stream(&mut execution, stream, None),
             producer_side
         );
 
@@ -3173,7 +3458,7 @@ mod tests {
             panic!("expected row output")
         };
 
-        let error = consume_governed_scalar_stream(&mut execution, stream)
+        let error = consume_governed_scalar_stream(&mut execution, stream, None)
             .await
             .expect_err("two-column scalar result must fail");
         assert_eq!(error.kind(), QueryServiceErrorKind::InvalidValue);
@@ -3200,7 +3485,7 @@ mod tests {
             "test scalar stream failure",
         ));
 
-        let error = consume_governed_scalar_stream(&mut execution, stream)
+        let error = consume_governed_scalar_stream(&mut execution, stream, None)
             .await
             .expect_err("failed scalar result stream must fail");
         assert_eq!(error.kind(), QueryServiceErrorKind::Internal);
