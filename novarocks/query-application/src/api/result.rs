@@ -202,7 +202,10 @@ impl QueryResult {
 /// Builds one bounded, fully materialized immediate result from product-owned
 /// columns and Arrow arrays. Product adapters retain the meaning of their
 /// columns and cells; this function owns the shared query-session schema and
-/// batch projection.
+/// batch projection. The arrays are checked against
+/// [`LocalResultBound::V1`](super::LocalResultBound::V1) before the result is
+/// published; sources with no structural bound push rows through
+/// [`LocalTableBuilder`](super::LocalTableBuilder) instead.
 pub fn build_arrow_query_result(
     columns: Vec<ResultField>,
     arrays: Vec<ArrayRef>,
@@ -210,6 +213,7 @@ pub fn build_arrow_query_result(
     if columns.len() != arrays.len() {
         return Err("immediate result column and array counts must match".to_owned());
     }
+    super::LocalResultBound::V1.check_arrays(&arrays)?;
     let schema = Arc::new(Schema::new(
         columns
             .iter()
@@ -228,14 +232,14 @@ pub fn build_string_query_result(
     column_name: &str,
     rows: Vec<String>,
 ) -> Result<QueryResult, String> {
-    let column = ResultField::new(column_name, DataType::Utf8, false, None);
-    build_arrow_query_result(
-        vec![column],
-        vec![Arc::new(StringArray::from(
-            rows.into_iter().map(Some).collect::<Vec<_>>(),
-        ))],
-    )
-    .map_err(|error| format!("build immediate text result failed: {error}"))
+    let mut table =
+        super::LocalTableBuilder::try_new(&[(column_name, false)], super::LocalResultBound::V1)?;
+    for row in rows {
+        table.push_row(&[Some(row)])?;
+    }
+    table
+        .finish()
+        .map_err(|error| format!("build immediate text result failed: {error}"))
 }
 
 /// Builds a bounded immediate table whose protocol-visible cells are required
@@ -243,8 +247,8 @@ pub fn build_string_query_result(
 ///
 /// Command adapters retain their row semantics; this helper owns only the
 /// common Arrow/schema projection into the query-session result contract.
-/// It rejects ragged rows before constructing any batch, so a product cannot
-/// publish a schema that disagrees with its visible cells.
+/// It rejects ragged rows before appending them, so a product cannot publish
+/// a schema that disagrees with its visible cells.
 pub fn build_utf8_query_result(
     column_names: &[&str],
     rows: Vec<Vec<String>>,
@@ -253,53 +257,28 @@ pub fn build_utf8_query_result(
         .iter()
         .map(|name| (*name, false))
         .collect::<Vec<_>>();
-    let rows = rows
-        .into_iter()
-        .map(|row| row.into_iter().map(Some).collect())
-        .collect();
-    build_utf8_table_query_result(&columns, rows)
+    let mut table = super::LocalTableBuilder::try_new(&columns, super::LocalResultBound::V1)?;
+    for row in rows {
+        let row = row.into_iter().map(Some).collect::<Vec<_>>();
+        table.push_row(&row)?;
+    }
+    table.finish()
 }
 
 /// Builds a bounded immediate UTF-8 table with the supplied per-column
 /// nullability. Product command adapters retain ownership of the row and
 /// column semantics; this helper owns the common Arrow/schema projection.
+/// Each row is checked against [`LocalResultBound::V1`](super::LocalResultBound::V1)
+/// before it is appended.
 pub fn build_utf8_table_query_result(
     columns: &[(&str, bool)],
     rows: Vec<Vec<Option<String>>>,
 ) -> Result<QueryResult, String> {
-    if columns.is_empty() {
-        return Err("immediate tabular result requires at least one column".to_owned());
+    let mut table = super::LocalTableBuilder::try_new(columns, super::LocalResultBound::V1)?;
+    for row in rows {
+        table.push_row(&row)?;
     }
-    if columns.iter().any(|(name, _)| name.is_empty()) {
-        return Err("immediate tabular result column names must be nonempty".to_owned());
-    }
-    if rows.iter().any(|row| row.len() != columns.len()) {
-        return Err(
-            "immediate tabular result contains a row with the wrong column count".to_owned(),
-        );
-    }
-    if rows.iter().any(|row| {
-        row.iter()
-            .enumerate()
-            .any(|(column_index, value)| value.is_none() && !columns[column_index].1)
-    }) {
-        return Err("immediate tabular result contains null in a required column".to_owned());
-    }
-    let result_columns = columns
-        .iter()
-        .map(|(name, nullable)| ResultField::new(*name, DataType::Utf8, *nullable, None))
-        .collect::<Vec<_>>();
-    let arrays = (0..columns.len())
-        .map(|column| {
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|row| row[column].clone())
-                    .collect::<Vec<_>>(),
-            )) as arrow::array::ArrayRef
-        })
-        .collect::<Vec<_>>();
-    build_arrow_query_result(result_columns, arrays)
-        .map_err(|error| format!("build immediate tabular result failed: {error}"))
+    table.finish()
 }
 
 /// Builds a bounded immediate table whose protocol-visible cells are nullable
@@ -307,7 +286,7 @@ pub fn build_utf8_table_query_result(
 ///
 /// Product command adapters retain ownership of their row semantics; this
 /// helper owns only the common Arrow/schema projection into the query-session
-/// result contract. It rejects ragged rows before constructing any batch, so a
+/// result contract. It rejects ragged rows before appending them, so a
 /// product cannot publish a schema that disagrees with its visible cells.
 pub fn build_nullable_utf8_query_result(
     column_names: &[&str],

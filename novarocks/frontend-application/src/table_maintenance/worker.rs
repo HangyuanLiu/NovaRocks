@@ -288,6 +288,10 @@ impl CleanupSession for FrontendCleanupSession<'_> {
     }
 
     fn execute(&mut self) -> Result<CleanupTerminal, String> {
+        // The report is the candidate set, which the manifest fixes before
+        // any batch runs. Collect it first, under the local result bound, so
+        // a report too large to show is refused before anything is deleted.
+        let locations = cleanup_candidate_locations(self.engine, &self.session)?;
         let batches = self.session.plan_ref().summary().batch_count();
         for ordinal in 0..batches {
             let prepared = self.engine.prepare_cleanup_batch(&self.session, ordinal)?;
@@ -307,7 +311,6 @@ impl CleanupSession for FrontendCleanupSession<'_> {
                 }
             }
         }
-        let locations = cleanup_candidate_locations(self.engine, &self.session)?;
         match self.engine.finalize_cleanup_terminal(&self.session) {
             Ok(()) => Ok(CleanupTerminal::KnownCommitted { locations }),
             Err(error) => Ok(CleanupTerminal::KnownCommittedFinalizationFailed { failure: error }),
@@ -348,15 +351,36 @@ fn cleanup_candidates_first_page(
     Ok(page.candidates().to_vec())
 }
 
+/// Reads the operation's candidate locations, one bounded page at a time,
+/// into the one-column report under [`LocalResultBound::V1`]: the candidate
+/// count is checked from the plan before the first page, and every page's
+/// locations before they are kept.
 fn cleanup_candidate_locations(
     engine: &dyn TableMaintenanceEngine,
     session: &crate::connector::cleanup_maintenance::CleanupMaintenanceSession,
 ) -> Result<Vec<String>, String> {
+    use novarocks_query_application::api::LocalResultBound;
+
+    let bound = LocalResultBound::V1;
+    let candidates =
+        usize::try_from(session.plan_ref().summary().candidate_count()).unwrap_or(usize::MAX);
+    bound
+        .admit(candidates, 0)
+        .map_err(|error| format!("orphan cleanup report: {error}"))?;
     let mut offset = 0_u64;
-    let mut locations = Vec::new();
+    let mut locations = Vec::with_capacity(candidates);
+    let mut bytes = 0_usize;
     loop {
         let page = engine.read_cleanup_candidate_page(session, offset, 1024)?;
-        locations.extend(page.display_keys().iter().map(ToString::to_string));
+        for key in page.display_keys() {
+            bytes = bytes
+                .checked_add(LocalResultBound::cell_bytes(key.len()))
+                .unwrap_or(usize::MAX);
+            bound
+                .admit(locations.len() + 1, bytes)
+                .map_err(|error| format!("orphan cleanup report: {error}"))?;
+            locations.push(key.to_string());
+        }
         if page.complete() {
             return Ok(locations);
         }

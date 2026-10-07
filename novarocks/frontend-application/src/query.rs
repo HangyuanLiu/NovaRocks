@@ -459,6 +459,44 @@ fn process_list_result(
     full: bool,
 ) -> Result<QueryResult, String> {
     use arrow::array::{Int64Array, StringArray};
+    use novarocks_query_application::api::LocalResultBound;
+
+    // The snapshot shares each statement text with its session. Count the
+    // whole result from it before building any array; FULL output can carry
+    // every running statement's complete text.
+    let info = processes
+        .iter()
+        .map(|process| {
+            process.statement.as_deref().map(|text| {
+                if full {
+                    std::borrow::Cow::Borrowed(text)
+                } else {
+                    std::borrow::Cow::Owned(truncate_process_list_info(text))
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let bytes = processes
+        .iter()
+        .zip(&info)
+        .try_fold(0_usize, |total, (process, info)| {
+            [
+                size_of::<i64>(),
+                process.principal.len(),
+                0,
+                0,
+                process.command().len(),
+                size_of::<i64>(),
+                0,
+                info.as_deref().map_or(0, str::len),
+            ]
+            .into_iter()
+            .try_fold(total, |total, cell| {
+                total.checked_add(LocalResultBound::cell_bytes(cell))
+            })
+        })
+        .unwrap_or(usize::MAX);
+    LocalResultBound::V1.admit(processes.len(), bytes)?;
 
     let schema = process_list_schema();
     let ids: Int64Array = processes
@@ -480,18 +518,7 @@ fn process_list_result(
         .map(|process| Some(i64::try_from(process.elapsed.as_secs()).unwrap_or(i64::MAX)))
         .collect();
     let states: StringArray = processes.iter().map(|_| None::<&str>).collect();
-    let info: StringArray = processes
-        .iter()
-        .map(|process| {
-            process.statement.as_ref().map(|text| {
-                if full {
-                    text.to_string()
-                } else {
-                    truncate_process_list_info(text)
-                }
-            })
-        })
-        .collect();
+    let info: StringArray = info.iter().map(Option::as_deref).collect();
 
     let batch = arrow::record_batch::RecordBatch::try_new(
         Arc::clone(&schema),
@@ -2977,6 +3004,34 @@ mod tests {
         assert_eq!(truncated_info.chars().count(), PROCESS_LIST_INFO_LIMIT);
         assert!(full_info.chars().count() > PROCESS_LIST_INFO_LIMIT);
         assert_eq!(full_info, text);
+    }
+
+    #[test]
+    fn full_process_list_beyond_the_local_bound_is_refused_before_building() {
+        use novarocks_query_application::api::LocalResultBound;
+        use novarocks_query_application::session_control::SessionProcess;
+        use std::time::Duration;
+
+        // Every session shares one large running statement; FULL output would
+        // carry all of them, the truncated output stays small.
+        let statement: Arc<str> = Arc::from("x".repeat(1024 * 1024).as_str());
+        let sessions = LocalResultBound::V1.bytes / (1024 * 1024) + 1;
+        let processes = (0..sessions)
+            .map(|index| SessionProcess {
+                connection_id: u32::try_from(index).expect("small id"),
+                principal: Arc::from("root"),
+                elapsed: Duration::from_secs(1),
+                statement: Some(Arc::clone(&statement)),
+            })
+            .collect::<Vec<_>>();
+        let error = process_list_result(processes.clone(), true).expect_err("FULL is too large");
+        assert!(error.contains("byte bound"), "{error}");
+        assert_eq!(
+            process_list_result(processes, false)
+                .expect("truncated output")
+                .row_count(),
+            sessions
+        );
     }
 
     fn scalar_field(nullable: bool) -> ResultField {
