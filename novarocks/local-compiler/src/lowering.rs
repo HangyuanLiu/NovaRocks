@@ -430,14 +430,23 @@ fn lower(
             .nodes()
             .get(&id)
             .ok_or(FragmentCompileError::Invalid("missing physical node"))?;
+        // A partitioned single-copy layout only says how rows are placed
+        // across instances; every admitted family computes the same rows
+        // locally under it. A family that consumes per-driver key co-location
+        // must author its own local partitioning instead of relying on this.
+        // Copied rows and broadcast placement stay refused.
         if !matches!(
             node.output_properties.distribution,
-            Distribution::Singleton | Distribution::Unconstrained
+            Distribution::Singleton
+                | Distribution::Unconstrained
+                | Distribution::RoundRobin
+                | Distribution::Hash { .. }
+                | Distribution::BucketShuffle { .. }
         ) || node.output_properties.row_multiplicity != RowMultiplicity::SingleCopy
         {
             return Err(FragmentCompileError::Unsupported {
                 node: Some(id),
-                feature: "non-singleton source-tree properties",
+                feature: "replicated or broadcast source-tree properties",
             });
         }
         let union = matches!(

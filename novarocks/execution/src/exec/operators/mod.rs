@@ -66,7 +66,10 @@ pub use analytic_sink::AnalyticSinkFactory;
 pub use analytic_source::AnalyticSourceFactory;
 pub use assert_num_rows_processor::AssertNumRowsProcessorFactory;
 pub use change_event_expand_processor::ChangeEventExpandProcessorFactory;
+pub(crate) use data_stream_sink::CompiledPartitionKeys;
 pub use data_stream_sink::DataStreamSinkFactory;
+#[cfg(test)]
+pub(crate) use data_stream_sink::partition_chunk_by_hash_arrays;
 pub use exchange_source::ExchangeSourceFactory;
 pub(crate) use filter_processor::FilterEncodingPolicy;
 pub use filter_processor::FilterProcessorFactory;

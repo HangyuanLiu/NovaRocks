@@ -35,8 +35,8 @@ use novarocks_functions::{
 };
 use novarocks_local_program::{
     LocalProgram, ProgramCallSite, ProgramChannelLayoutRole, ProgramChannelSite,
-    ProgramExpressionRootSite, ProgramLexicalSource, ProgramNodeKind, ProgramUseRef,
-    StaticExprKind,
+    ProgramExpressionRootSite, ProgramLexicalSource, ProgramNodeId, ProgramUseRef, StaticExprKind,
+    root_input_layout,
 };
 use novarocks_type_contract::{ControlShape, FunctionNullBehavior, arrow_fields_exact_observed};
 use std::{
@@ -53,6 +53,9 @@ use std::{
 pub struct CompiledExpressionInstance {
     program: Arc<LocalProgram>,
     root: ProgramExpressionRootSite,
+    /// The one input layout this root reads, from the same authority the
+    /// lexical bindings were checked against.
+    input: ProgramNodeId,
     instances: BTreeMap<ProgramUseRef, ScalarEvaluationInstance>,
     effects: BTreeMap<ProgramUseRef, ScopedExpressionEffects>,
     failed: bool,
@@ -202,6 +205,16 @@ impl CompiledExpressionInstance {
     ) -> Result<Self, KernelFailure> {
         let checked = program.checked();
         let snapshot = checked.channels().expressions().resolved_calls().snapshot();
+        let input = match root_input_layout(program.graph(), root)
+            .map_err(|_| invalid("root has no actual compiled input port"))?
+        {
+            (input, ProgramChannelLayoutRole::NodeOutput) => input,
+            _ => {
+                return Err(invalid(
+                    "join-scoped root input requires its dedicated compiled operator protocol",
+                ));
+            }
+        };
         let root_use = *snapshot
             .bindings()
             .get(&root)
@@ -409,6 +422,7 @@ impl CompiledExpressionInstance {
         Ok(Self {
             program,
             root,
+            input,
             instances: BTreeMap::new(),
             effects,
             failed: false,
@@ -456,25 +470,7 @@ impl CompiledExpressionInstance {
         let typed = channels.expressions();
         let resolved = typed.resolved_calls();
         let snapshot = resolved.snapshot();
-        let (owner, _) = match self.root {
-            ProgramExpressionRootSite::Node { node, role } => (node, role),
-            _ => {
-                return Err(invalid(
-                    "root frame requires its dedicated compiled input protocol",
-                ));
-            }
-        };
-        let node = &self.program.graph().nodes()[owner.index()];
-        let input_node = match node.kind() {
-            ProgramNodeKind::Project { input, .. } | ProgramNodeKind::Filter { input, .. } => {
-                *input
-            }
-            _ => {
-                return Err(invalid(
-                    "root input requires its dedicated compiled operator protocol",
-                ));
-            }
-        };
+        let input_node = self.input;
         let layout = self.program.graph().nodes()[input_node.index()].output_layout();
         work.flush()?;
         let schema = input.schema();

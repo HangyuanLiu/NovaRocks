@@ -18,6 +18,7 @@
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::fragment::program::FragmentProgram;
 use crate::exec::fragment::sink::DataStreamSinkFactoryInput;
+use crate::exec::operators::CompiledPartitionKeys;
 use crate::exec::operators::{
     DataStreamSinkFactory, MultiCastDataStreamSinkFactory, NoopSinkFactory,
     ResultBufferSinkFactory, SplitDataStreamSinkFactory,
@@ -241,7 +242,7 @@ fn materialize_fragment_sink_components_impl(
 /// evaluates no key. A shape that would need a compiled partition-key root
 /// is refused explicitly rather than routed through the legacy evaluator.
 pub(crate) fn materialize_compiled_sink(
-    program: &novarocks_local_program::LocalProgram,
+    program: &std::sync::Arc<novarocks_local_program::LocalProgram>,
     assignment: &FragmentSinkAssignment,
     fragment_instance_id: novarocks_types::UniqueId,
     transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
@@ -271,12 +272,7 @@ pub(crate) fn materialize_compiled_sink(
                 sender_id,
             },
         ) => {
-            if branch.partition_type().requires_exprs() || !branch.partition_exprs().is_empty() {
-                return Err(materialization_error(format!(
-                    "compiled partitioned stream sink not executable yet: {}",
-                    branch.partition_type().display_name()
-                )));
-            }
+            let partition_keys = compiled_partition_keys(program, branch)?;
             if let Some(limit) = branch.limit() {
                 return Err(materialization_error(format!(
                     "compiled stream sink limit {limit} is not executable yet"
@@ -284,9 +280,18 @@ pub(crate) fn materialize_compiled_sink(
             }
             let plan_node_id = i32::try_from(graph.root().index())
                 .map_err(|_| materialization_error("compiled program root index exceeds i32"))?;
-            let input = branch_input(branch, destinations.clone())?;
-            // The partitioning evaluates no key, so the operator's partition
-            // arena stays empty; the compiled sink arena is never thawed.
+            // Keys are compiled roots over the sink's input port, so the
+            // legacy partition expressions and arena stay empty; the compiled
+            // sink arena is never thawed.
+            let input = DataStreamSinkFactoryInput::try_from_static_program(
+                branch.dest_node_id(),
+                branch.partition_type(),
+                Vec::new(),
+                Vec::new(),
+                branch.output_columns().to_vec(),
+                destinations.clone(),
+            )
+            .map_err(materialization_error)?;
             let factory = DataStreamSinkFactory::new(
                 input,
                 fragment_instance_id,
@@ -295,6 +300,12 @@ pub(crate) fn materialize_compiled_sink(
                 ExprArena::default(),
                 transmitter,
             );
+            let factory = match partition_keys {
+                Some(keys) => factory
+                    .with_compiled_partition_keys(keys)
+                    .map_err(materialization_error)?,
+                None => factory,
+            };
             // Without the gates a push sink sends the moment it has rows, and
             // the frozen edge's closed state means nothing.
             let factory = match edge_gates {
@@ -317,6 +328,42 @@ pub(crate) fn materialize_compiled_sink(
             sink_assignment_name(dynamic_assignment)
         ))),
     }
+}
+
+/// The compiled partition-key roots of the one DataStream branch, in key
+/// order. A partitioning that evaluates no key must carry none.
+fn compiled_partition_keys(
+    program: &std::sync::Arc<novarocks_local_program::LocalProgram>,
+    branch: &StaticStreamBranch,
+) -> Result<Option<CompiledPartitionKeys>, FragmentLaunchError> {
+    let keys = branch.partition_exprs().len();
+    if !branch.partition_type().requires_exprs() {
+        if keys != 0 {
+            return Err(materialization_error(format!(
+                "compiled {} stream sink cannot carry partition keys",
+                branch.partition_type().display_name()
+            )));
+        }
+        return Ok(None);
+    }
+    if keys == 0 {
+        return Err(materialization_error(format!(
+            "compiled {} stream sink has no partition key",
+            branch.partition_type().display_name()
+        )));
+    }
+    let mut sites = Vec::with_capacity(keys);
+    for key in 0..keys {
+        let key = u32::try_from(key)
+            .map_err(|_| materialization_error("compiled partition key count exceeds u32"))?;
+        sites.push(
+            novarocks_local_program::ProgramExpressionRootSite::SinkPartition { branch: 0, key },
+        );
+    }
+    Ok(Some(CompiledPartitionKeys::new(
+        std::sync::Arc::clone(program),
+        sites,
+    )))
 }
 
 fn bound_sink_arena(

@@ -75,7 +75,7 @@ fn root(node: ProgramNodeId, role: ProgramNodeExpressionRole) -> ProgramExpressi
 
 /// Evaluate one root over every row of `input` and return the full column.
 /// A row data error of the root is a required error and is returned typed.
-fn evaluate_all(
+pub(crate) fn evaluate_all(
     instance: &mut CompiledExpressionInstance,
     site: ProgramExpressionRootSite,
     input: &RecordBatch,
@@ -92,7 +92,7 @@ fn evaluate_all(
 
 /// Lazily create one instance per root on the driver's first batch, so a
 /// refused preparation is reported on the actual operator operation.
-fn instances(
+pub(crate) fn instances(
     slot: &mut Option<Vec<CompiledExpressionInstance>>,
     program: &Arc<LocalProgram>,
     sites: &[ProgramExpressionRootSite],

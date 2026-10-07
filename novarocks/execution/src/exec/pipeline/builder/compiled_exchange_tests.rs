@@ -25,21 +25,24 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{Array, Int64Array};
+use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::DataType;
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_functions::{ConstantPolicy, EngineFunctionCatalogBuilder};
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
 };
-use novarocks_local_program::{KernelAbiVersion, LocalProgram, StaticSinkProgram};
+use novarocks_local_program::{
+    DataStreamPartitionType, KernelAbiVersion, LocalProgram, ProgramNodeKind, StaticSinkProgram,
+};
 use novarocks_physical_plan::{
     Distribution, Edge, EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource, ExprKind,
     Fragment, FragmentBuilder, FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink,
-    FrozenFragmentCalls, FrozenFragmentPruning, LiteralValue, NodeId, PhysicalExpressionRoots,
-    PhysicalPlan, PhysicalRootUses, PipelineDopDomain, PlanBuilder, PlanLimits, PlanVersionId,
-    PropertyProofProjectionLimits, ResultField, ResultPort, RowMultiplicity, ValueOrigin,
-    extract_fragment_packages,
+    FrozenFragmentCalls, FrozenFragmentPruning, HashDefinition, HashPartitionScheme, LiteralValue,
+    NodeId, PartitionCountDomain, PartitionCountParameter, PartitionCountParameterId,
+    PartitionSpaceId, PhysicalExpressionRoots, PhysicalPlan, PhysicalRootUses, PipelineDopDomain,
+    PlanBuilder, PlanLimits, PlanVersionId, PropertyProofProjectionLimits, ResultField, ResultPort,
+    RowMultiplicity, ValueId, ValueOrigin, extract_fragment_packages,
 };
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, ControlShape, EvaluationDomainId, ExpressionControlFlow,
@@ -48,9 +51,9 @@ use novarocks_type_contract::{
 };
 use novarocks_types::UniqueId;
 
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::fragment::program::FragmentNodeId;
-use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
+use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle, partition_chunk_by_hash_arrays};
 use crate::exec::pipeline::binding::{ExchangeBinding, ExchangeBindings};
 use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -75,6 +78,17 @@ const PRODUCER_FINST: UniqueId = UniqueId::new(0x71, 0x01);
 const CONSUMER_FINST: UniqueId = UniqueId::new(0x72, 0x02);
 /// Literal rows `(a, b)` authored by the producer's Values node.
 const ROWS: [(i64, i64); 3] = [(1, 10), (2, 20), (3, 30)];
+const CONSUMER_FINST_2: UniqueId = UniqueId::new(0x72, 0x03);
+const HASH_ROWS: [(i64, i64); 8] = [
+    (1, 10),
+    (2, 20),
+    (3, 30),
+    (4, 40),
+    (5, 50),
+    (6, 60),
+    (7, 70),
+    (8, 80),
+];
 
 struct FixtureControl;
 impl PureCompileControl for FixtureControl {
@@ -100,7 +114,7 @@ fn dop() -> PipelineDopDomain {
 /// slots from zero, so the sender's wire slots are `[slot(b), slot(a)] =
 /// [1, 0]` while the receiver expects `[slot(b'), slot(a')] = [0, 1]`: every
 /// wire id exists in the receiver namespace in the other order.
-fn plan() -> (PhysicalPlan, NodeId) {
+fn plan(hashed: bool, values_rows: &[(i64, i64)]) -> (PhysicalPlan, NodeId) {
     let edge = EdgeId::new(5);
     let producer_id = FragmentId::new(1);
     let consumer_id = FragmentId::new(2);
@@ -126,7 +140,7 @@ fn plan() -> (PhysicalPlan, NodeId) {
         )
         .unwrap();
     let mut rows = Vec::new();
-    for (a_value, b_value) in ROWS {
+    for &(a_value, b_value) in values_rows {
         let a_cell = producer
             .add_expression(
                 values,
@@ -176,13 +190,22 @@ fn plan() -> (PhysicalPlan, NodeId) {
             edge,
             Box::from([(b, b_import), (a, a_import)]),
             Box::from([b_import, a_import]),
-            Distribution::Singleton,
+            if hashed {
+                hash([b_import, a_import])
+            } else {
+                Distribution::Singleton
+            },
             RowMultiplicity::SingleCopy,
         )
         .unwrap();
     let consumer = consumer
         .finish_definition(exchange, FragmentSink::Result, dop())
         .unwrap();
+    let (source_distribution, destination_distribution) = if hashed {
+        (hash([b, a]), hash([b_import, a_import]))
+    } else {
+        (Distribution::Singleton, Distribution::Singleton)
+    };
     let output = consumer.nodes()[&exchange].output.clone();
 
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([73; 16]).unwrap());
@@ -201,9 +224,9 @@ fn plan() -> (PhysicalPlan, NodeId) {
             receive_mapping: Box::from([(b, b_import), (a, a_import)]),
         },
         partitioning: EdgePartitioning {
-            source: Distribution::Singleton,
+            source: source_distribution,
             source_multiplicity: RowMultiplicity::SingleCopy,
-            destination: Distribution::Singleton,
+            destination: destination_distribution,
             destination_multiplicity: RowMultiplicity::SingleCopy,
         },
     })
@@ -370,8 +393,31 @@ struct Programs {
     receiver: NodeId,
 }
 
+/// A native-exchange hash scheme over the given ordered key columns.
+fn hash(keys: [ValueId; 2]) -> Distribution {
+    Distribution::Hash {
+        keys: Box::from(keys),
+        scheme: HashPartitionScheme {
+            space: PartitionSpaceId::try_new([41; 32]).unwrap(),
+            count: PartitionCountParameter {
+                id: PartitionCountParameterId::try_new([42; 32]).unwrap(),
+                admissible: PartitionCountDomain {
+                    min: 1,
+                    max: 64,
+                    requires_power_of_two: true,
+                },
+            },
+            definition: HashDefinition::native_exchange(),
+        },
+    }
+}
+
 fn programs() -> Programs {
-    let (plan, receiver) = plan();
+    programs_shaped(false, &ROWS)
+}
+
+fn programs_shaped(hashed: bool, values_rows: &[(i64, i64)]) -> Programs {
+    let (plan, receiver) = plan(hashed, values_rows);
     let mut packages = packages(&plan);
     let producer = packages.remove(&FragmentId::new(1)).unwrap();
     let consumer = packages.remove(&FragmentId::new(2)).unwrap();
@@ -461,9 +507,17 @@ fn receivers(
     programs: &Programs,
     port: &Arc<dyn ExchangeReceiverPort>,
 ) -> CompiledExchangeReceivers {
+    receivers_at(programs, port, CONSUMER_FINST)
+}
+
+fn receivers_at(
+    programs: &Programs,
+    port: &Arc<dyn ExchangeReceiverPort>,
+    instance: UniqueId,
+) -> CompiledExchangeReceivers {
     materialize_compiled_exchange_receivers(
         &programs.consumer,
-        CONSUMER_FINST,
+        instance,
         &assignments(programs.receiver),
         Arc::clone(port),
     )
@@ -750,4 +804,141 @@ fn compiled_sink_materialization_refuses_mismatched_capabilities() {
         no_destinations.contains("cannot be materialized with assignment none"),
         "{no_destinations}"
     );
+}
+
+fn destination(instance: UniqueId) -> FragmentDestination {
+    FragmentDestination::new(
+        instance,
+        RuntimeEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
+        PRODUCER_FINST,
+        0,
+        1,
+    )
+    .expect("destination")
+}
+
+/// The producer's Values chunk exactly as its root output port presents it.
+fn producer_chunk(program: &LocalProgram) -> Chunk {
+    let root = program.graph().root();
+    let ProgramNodeKind::Values { values } = program.graph().nodes()[root.index()].kind() else {
+        panic!("the producer root is its Values node");
+    };
+    Chunk::new_with_chunk_schema(
+        values.batch().clone(),
+        ChunkSchema::from_compiled_layout(values.layout()).expect("compiled layout"),
+    )
+}
+
+fn sorted(mut rows: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    rows.sort_unstable();
+    rows
+}
+
+// Values -> Stream(Hash[b, a]) to two consumer instances. The partition keys
+// are compiled SlotId roots over the sink's input port; each destination must
+// receive exactly the rows the native-exchange placement assigns to it when
+// applied to the same key columns in key order.
+#[test]
+fn compiled_hash_stream_places_rows_by_the_exchange_hash_of_its_key_roots() {
+    let programs = programs_shaped(true, &HASH_ROWS);
+    let Some(StaticSinkProgram::DataStream { branch, .. }) = programs.producer.graph().sink()
+    else {
+        panic!("the producer compiles to a single-branch stream sink");
+    };
+    assert_eq!(
+        branch.partition_type(),
+        DataStreamPartitionType::HashPartitioned
+    );
+    assert_eq!(branch.partition_exprs().len(), 2);
+
+    let chunk = producer_chunk(&programs.producer);
+    assert_eq!(
+        int64_column(&chunk, 0),
+        HASH_ROWS.iter().map(|(a, _)| *a).collect::<Vec<_>>(),
+        "the Values port is (a, b)"
+    );
+    let keys: Vec<ArrayRef> = vec![
+        Arc::clone(chunk.batch.column(1)),
+        Arc::clone(chunk.batch.column(0)),
+    ];
+    let expected = partition_chunk_by_hash_arrays(&chunk, &keys, 2, false)
+        .expect("oracle placement")
+        .iter()
+        .map(|part| {
+            if part.is_empty() {
+                return Vec::new();
+            }
+            sorted(
+                int64_column(part, 1)
+                    .into_iter()
+                    .zip(int64_column(part, 0))
+                    .collect(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        expected.iter().all(|rows| !rows.is_empty()),
+        "fixture rows reach both destinations: {expected:?}"
+    );
+
+    let port = in_process_test_exchange_receiver_port();
+    let mut consumer_bindings = Vec::new();
+    for instance in [CONSUMER_FINST, CONSUMER_FINST_2] {
+        let CompiledExchangeReceivers {
+            registrations,
+            bindings,
+        } = receivers_at(&programs, &port, instance);
+        for registration in registrations {
+            port.register(registration).expect("register receiver");
+        }
+        consumer_bindings.push((instance, bindings));
+    }
+
+    let producer_sink = materialize_compiled_sink(
+        &programs.producer,
+        &FragmentSinkAssignment::StreamDestinations {
+            destinations: vec![destination(CONSUMER_FINST), destination(CONSUMER_FINST_2)],
+            sender_id: None,
+        },
+        PRODUCER_FINST,
+        Arc::new(LoopbackTransmitter {
+            port: Arc::clone(&port),
+        }),
+        None,
+        None,
+    )
+    .expect("compiled hash stream sink");
+    run(
+        &programs.producer,
+        producer_sink,
+        ExchangeBindings::default(),
+        PRODUCER_FINST,
+    );
+
+    for (index, (instance, bindings)) in consumer_bindings.into_iter().enumerate() {
+        let output = ResultSinkHandle::new();
+        let consumer_sink = materialize_compiled_sink(
+            &programs.consumer,
+            &FragmentSinkAssignment::None,
+            instance,
+            crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
+            Some(Box::new(ResultSinkFactory::new(output.clone()))),
+            None,
+        )
+        .expect("compiled result sink");
+        run(&programs.consumer, consumer_sink, bindings, instance);
+        let mut rows = Vec::new();
+        for chunk in &output.take_chunks() {
+            rows.extend(
+                int64_column(chunk, 0)
+                    .into_iter()
+                    .zip(int64_column(chunk, 1)),
+            );
+        }
+        assert_eq!(
+            sorted(rows),
+            expected[index],
+            "destination {index} receives exactly its hash placement as (b, a)"
+        );
+    }
 }

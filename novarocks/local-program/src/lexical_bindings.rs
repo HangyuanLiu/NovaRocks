@@ -24,9 +24,9 @@
 //! original binding identity, and supplies no runtime evaluation or hoist grant.
 
 use crate::{
-    ProgramCallSite, ProgramChannelLayoutRole, ProgramChannelSite, ProgramExprId,
-    ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind,
-    ProgramTypedChannels, ProgramUseRef, StaticExprKind,
+    LocalProgramGraph, ProgramCallSite, ProgramChannelLayoutRole, ProgramChannelSite,
+    ProgramExprId, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
+    ProgramNodeKind, ProgramTypedChannels, ProgramUseRef, StaticExprKind,
 };
 use novarocks_functions::{FunctionArgumentType, FunctionValueType, PreparedPureKernel};
 use novarocks_type_contract::{
@@ -740,13 +740,23 @@ fn input_scope(
     root: ProgramExpressionRootSite,
     site: ProgramChannelSite,
 ) -> Result<bool, ProgramLexicalBindingError> {
-    use ProgramChannelLayoutRole as Layout;
-    use ProgramNodeExpressionRole as Role;
     let ProgramChannelSite::Layout { node, role, .. } = site else {
         return Ok(false);
     };
     let program = channels.expressions().resolved_calls().snapshot().program();
-    let expected = match root {
+    Ok((node, role) == root_input_layout(program, root)?)
+}
+
+/// The one input layout an expression root reads its input slots from. Both
+/// lexical binding and every executor of a compiled root use this authority,
+/// so an executor presents exactly the port the bindings were checked against.
+pub fn root_input_layout(
+    program: &LocalProgramGraph,
+    root: ProgramExpressionRootSite,
+) -> Result<(ProgramNodeId, ProgramChannelLayoutRole), ProgramLexicalBindingError> {
+    use ProgramChannelLayoutRole as Layout;
+    use ProgramNodeExpressionRole as Role;
+    Ok(match root {
         ProgramExpressionRootSite::WriterProjection { node: owner, .. } => {
             let ProgramNodeKind::TableWriter { input, .. } = program.nodes()[owner.index()].kind()
             else {
@@ -799,8 +809,7 @@ fn input_scope(
                 _ => return Err(ProgramLexicalBindingError::InvalidSource),
             }
         }
-    };
-    Ok((node, role) == expected)
+    })
 }
 
 #[cfg(test)]

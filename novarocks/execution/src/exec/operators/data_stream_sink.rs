@@ -30,8 +30,12 @@
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::fragment::sink::{DataStreamPartitionType, DataStreamSinkFactoryInput};
+use crate::exec::operators::compiled_expression::{
+    RuntimeKernelControl, evaluate_all, instances as compiled_instances,
+};
 use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::exchange;
 use crate::runtime::fragment::io::exchange_queue::{ExchangeSendTask, ExchangeSendTracker};
@@ -41,7 +45,9 @@ use crate::runtime::fragment::io::{
 };
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::task_execution::domain::ExchangeEdgeId;
+use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
+use novarocks_local_program::{LocalProgram, ProgramExpressionRootSite};
 use novarocks_types::SlotId;
 use novarocks_types::{UniqueId, format_uuid};
 use std::collections::VecDeque;
@@ -1033,6 +1039,28 @@ mod data_stream_sink_hash_partition {
 pub(crate) use data_stream_sink_hash_partition::partition_chunk_by_hash;
 pub(crate) use data_stream_sink_hash_partition::partition_chunk_by_hash_arrays;
 
+/// The partition-key roots of one compiled stream branch, in key order.
+/// They are evaluated through compiled roots over the sink's input port; a
+/// compiled sink never thaws its arena into the legacy partition arena.
+#[derive(Clone)]
+pub(crate) struct CompiledPartitionKeys {
+    program: Arc<LocalProgram>,
+    sites: Vec<ProgramExpressionRootSite>,
+}
+
+impl CompiledPartitionKeys {
+    pub(crate) fn new(program: Arc<LocalProgram>, sites: Vec<ProgramExpressionRootSite>) -> Self {
+        Self { program, sites }
+    }
+}
+
+/// Per-driver compiled key state: one instance per key root, created on the
+/// driver's first non-empty chunk.
+struct CompiledPartitionState {
+    keys: CompiledPartitionKeys,
+    instances: Option<Vec<CompiledExpressionInstance>>,
+}
+
 /// Factory for distributed stream sinks that serialize and transmit chunks to remote fragment instances.
 pub struct DataStreamSinkFactory {
     name: String,
@@ -1046,6 +1074,7 @@ pub struct DataStreamSinkFactory {
     finish_state: Arc<DataStreamSinkFinishState>,
     shared_sequence: Arc<AtomicI64>,
     edge_gates: Option<Arc<ExchangeEdgeGates>>,
+    compiled_partition: Option<CompiledPartitionKeys>,
 }
 
 impl DataStreamSinkFactory {
@@ -1079,7 +1108,30 @@ impl DataStreamSinkFactory {
             finish_state: Arc::new(DataStreamSinkFinishState::default()),
             shared_sequence: Arc::new(AtomicI64::new(0)),
             edge_gates: None,
+            compiled_partition: None,
         }
+    }
+
+    /// Evaluate this sink's partition keys through compiled roots. The
+    /// factory input must then carry no legacy partition expression.
+    pub(crate) fn with_compiled_partition_keys(
+        mut self,
+        keys: CompiledPartitionKeys,
+    ) -> Result<Self, String> {
+        if !self.input.output_partition_exprs.is_empty() {
+            return Err(
+                "compiled partition keys cannot coexist with legacy partition expressions"
+                    .to_string(),
+            );
+        }
+        if !self.input.output_partition_type.requires_exprs() || keys.sites.is_empty() {
+            return Err(format!(
+                "compiled partition keys do not match {} partitioning",
+                self.input.output_partition_type.display_name()
+            ));
+        }
+        self.compiled_partition = Some(keys);
+        Ok(self)
     }
 
     /// Installs the send permission of this producer's outbound edges.
@@ -1222,6 +1274,12 @@ impl OperatorFactory for DataStreamSinkFactory {
             send_queue_mem_tracker: None,
             exchange_queue: None,
             edge_gates: self.edge_gates.clone(),
+            compiled_partition: self.compiled_partition.clone().map(|keys| {
+                CompiledPartitionState {
+                    keys,
+                    instances: None,
+                }
+            }),
         })
     }
 
@@ -1304,6 +1362,7 @@ struct DataStreamSinkOperator {
     send_queue_mem_tracker: Option<Arc<MemTracker>>,
     exchange_queue: Option<Arc<crate::runtime::fragment::io::exchange_queue::ExchangeSendQueue>>,
     edge_gates: Option<Arc<ExchangeEdgeGates>>,
+    compiled_partition: Option<CompiledPartitionState>,
 }
 
 impl Operator for DataStreamSinkOperator {
@@ -1747,7 +1806,49 @@ impl DataStreamSinkOperator {
         dest.finst_id().low() == -1
     }
 
-    fn partition_chunk(&mut self, chunk: &Chunk) -> Result<Vec<Vec<Chunk>>, String> {
+    /// Evaluate a compiled branch's partition keys over the whole chunk.
+    /// A legacy branch returns `None` and evaluates through its arena. Row
+    /// data errors and kernel failures of a key root stay typed.
+    fn compiled_partition_keys(&mut self, chunk: &Chunk) -> ExecutionResult<Option<Vec<ArrayRef>>> {
+        let Some(state) = self.compiled_partition.as_mut() else {
+            return Ok(None);
+        };
+        let error = self
+            .error_state
+            .as_ref()
+            .ok_or("compiled partition keys require the fragment error state")?;
+        let control = RuntimeKernelControl::new(Arc::clone(error));
+        compiled_instances(
+            &mut state.instances,
+            &state.keys.program,
+            &state.keys.sites,
+            &control,
+        )?;
+        let instances = state
+            .instances
+            .as_mut()
+            .ok_or("compiled partition key instances are absent")?;
+        let mut arrays = Vec::with_capacity(instances.len());
+        for (instance, site) in instances.iter_mut().zip(&state.keys.sites) {
+            let array = evaluate_all(instance, *site, &chunk.batch, &control)?;
+            // Same refusal as the legacy sink's partition-key type check.
+            if matches!(array.data_type(), DataType::LargeBinary) {
+                return Err(
+                    "VARIANT is not supported in HASH_PARTITIONED partition keys"
+                        .to_string()
+                        .into(),
+                );
+            }
+            arrays.push(array);
+        }
+        Ok(Some(arrays))
+    }
+
+    fn partition_chunk(
+        &mut self,
+        chunk: &Chunk,
+        compiled_keys: Option<&[ArrayRef]>,
+    ) -> Result<Vec<Vec<Chunk>>, String> {
         // Get destinations first to avoid borrowing self
         let dests: Vec<FragmentDestination> = self.destinations().to_vec();
         if dests.is_empty() {
@@ -1807,19 +1908,24 @@ impl DataStreamSinkOperator {
             }
             DataStreamPartitionType::HashPartitioned
             | DataStreamPartitionType::BucketShuffleHashPartitioned => {
-                if self.expr_ids.is_empty() {
-                    return Err("HASH_PARTITIONED missing partition_exprs".to_string());
-                }
-
                 // Use vectorized hash partition without row conversion
                 let use_crc32 = matches!(
                     self.input.output_partition_type,
                     DataStreamPartitionType::BucketShuffleHashPartitioned
                 );
 
-                let partition_chunks =
-                    partition_chunk_by_hash(chunk, &self.expr_ids, &self.arena, n, use_crc32)
-                        .map_err(|e| e.to_string())?;
+                let partition_chunks = match compiled_keys {
+                    // Compiled keys feed the same hash and placement as the
+                    // legacy arena keys; only their evaluation differs.
+                    Some(keys) => partition_chunk_by_hash_arrays(chunk, keys, n, use_crc32)?,
+                    None => {
+                        if self.expr_ids.is_empty() {
+                            return Err("HASH_PARTITIONED missing partition_exprs".to_string());
+                        }
+                        partition_chunk_by_hash(chunk, &self.expr_ids, &self.arena, n, use_crc32)
+                            .map_err(|e| e.to_string())?
+                    }
+                };
 
                 // Convert Vec<Chunk> to Vec<Vec<Chunk>>
                 let mut per_dest_chunks: Vec<Vec<Chunk>> = Vec::with_capacity(n);
@@ -2068,9 +2174,17 @@ impl DataStreamSinkOperator {
     }
 
     fn buffer_chunk(&mut self, chunk: Chunk) -> Result<(), String> {
+        self.buffer_chunk_with_keys(chunk, None)
+    }
+
+    fn buffer_chunk_with_keys(
+        &mut self,
+        chunk: Chunk,
+        compiled_keys: Option<Vec<ArrayRef>>,
+    ) -> Result<(), String> {
         self.ensure_pending_buffers_initialized();
         let dests = self.destinations().to_vec();
-        let per_dest_chunks = self.partition_chunk(&chunk)?;
+        let per_dest_chunks = self.partition_chunk(&chunk, compiled_keys.as_deref())?;
         for (i, chunks) in per_dest_chunks.into_iter().enumerate() {
             if chunks.is_empty() || Self::is_pseudo_destination(&dests[i]) {
                 continue;
@@ -2376,7 +2490,8 @@ impl ProcessorOperator for DataStreamSinkOperator {
         if chunk.is_empty() {
             return Ok(());
         }
-        self.buffer_chunk(chunk)?;
+        let compiled_keys = self.compiled_partition_keys(&chunk)?;
+        self.buffer_chunk_with_keys(chunk, compiled_keys)?;
         self.flush_pending(false, false)?;
         Ok(())
     }
@@ -2707,6 +2822,7 @@ mod tests {
                 ),
             )),
             edge_gates: None,
+            compiled_partition: None,
         }
     }
 
