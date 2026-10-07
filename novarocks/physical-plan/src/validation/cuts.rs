@@ -44,7 +44,8 @@ use crate::resource::{
 };
 use crate::{
     CutImport, CutValue, Edge, EdgeId, Fragment, FragmentCuts, FragmentId, FragmentSink,
-    InboundFragmentCut, NodeId, NodeKind, OutboundFragmentCut, PhysicalPlan, ValueOrigin,
+    InboundFragmentCut, NodeId, NodeKind, OutboundFragmentCut, PhysicalPlan,
+    RuntimeFilterBindingCut, RuntimeFilterBindingRole, ValueOrigin,
 };
 
 /// Derive the explicit cut contract used to validate one fragment without the
@@ -82,6 +83,8 @@ pub(crate) struct FragmentCutDerivation {
     pub(crate) inbound: BTreeMap<FragmentId, Vec<EdgeId>>,
     pub(crate) outbound: BTreeMap<FragmentId, Vec<EdgeId>>,
     pub(crate) change_stream_writers: BTreeMap<EdgeId, crate::ChangeStreamWriterCut>,
+    /// Each fragment's slice of the plan-global binding numbering.
+    pub(crate) runtime_filter_bindings: BTreeMap<FragmentId, Vec<RuntimeFilterBindingCut>>,
 }
 
 impl FragmentCutDerivation {
@@ -117,10 +120,20 @@ impl FragmentCutDerivation {
                 }
             }
         }
+        // The numbering is plan-global, so it is minted once here and every
+        // fragment's cuts take their own slice of it.
+        let mut runtime_filter_bindings = BTreeMap::<FragmentId, Vec<_>>::new();
+        for binding in crate::runtime_filter_bindings(plan).ok()? {
+            runtime_filter_bindings
+                .entry(binding.fragment)
+                .or_default()
+                .push(binding.cut());
+        }
         Some(Self {
             inbound,
             outbound,
             change_stream_writers,
+            runtime_filter_bindings,
         })
     }
 
@@ -162,6 +175,16 @@ impl FragmentCutDerivation {
         edge: EdgeId,
     ) -> Option<crate::ChangeStreamWriterCut> {
         self.change_stream_writers.get(&edge).cloned()
+    }
+
+    pub(crate) fn runtime_filter_bindings(
+        &self,
+        fragment: FragmentId,
+    ) -> &[RuntimeFilterBindingCut] {
+        self.runtime_filter_bindings
+            .get(&fragment)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 }
 
@@ -217,6 +240,7 @@ pub(crate) fn preflight_fragment_cut_resources(
     for filter in fragment.runtime_filters() {
         usage.add_filter(plan.runtime_filters().get(filter)?, &path, errors);
     }
+    usage.add_items(derivation.runtime_filter_bindings(fragment_id).len());
     Some(usage.validate(&format!("{path}.resources"), errors))
 }
 
@@ -314,6 +338,7 @@ pub(crate) fn fragment_cuts_from_edges(
         inbound: inbound.into_boxed_slice(),
         outbound: outbound.into_boxed_slice(),
         runtime_filters: runtime_filters.into_boxed_slice(),
+        runtime_filter_bindings: Box::from(derivation.runtime_filter_bindings(fragment_id)),
     })
 }
 
@@ -406,6 +431,15 @@ pub(crate) fn validate_fragment_cuts_into(
         &format!("{path}.runtime_filters"),
         cuts.runtime_filters.len(),
         errors.limits().plan_runtime_filters,
+    );
+    bounded_count(
+        errors,
+        &format!("{path}.runtime_filter_bindings"),
+        cuts.runtime_filter_bindings.len(),
+        errors
+            .limits()
+            .plan_runtime_filters
+            .saturating_mul(errors.limits().runtime_filter_endpoints),
     );
     let mut inbound_ids = BTreeSet::new();
     for cut in &cuts.inbound {
@@ -720,6 +754,12 @@ pub(crate) fn validate_fragment_cuts_into(
     }
     validate_fragment_writer_results(fragment, cuts, &path, errors);
     validate_fragment_runtime_filter_cuts(fragment, cuts, &path, errors);
+    validate_fragment_runtime_filter_binding_cuts(
+        fragment,
+        cuts,
+        &format!("{path}.runtime_filter_bindings"),
+        errors,
+    );
 }
 
 pub(crate) fn validate_inbound_change_stream_writer(
@@ -1185,6 +1225,180 @@ pub(crate) fn validate_fragment_runtime_filter_cuts(
                 "attached runtime filter has no endpoint in this fragment",
             ));
         }
+    }
+}
+
+/// Refuse a binding table that is not exactly this fragment's slice of the
+/// plan-global runtime-filter numbering.
+///
+/// The identities are plan-global and cannot be recomputed here. The
+/// numbering, however, mints one fragment's bindings as consecutive
+/// identities in the order of its attachments, producers before consumers,
+/// each role in endpoint order. So every local endpoint must have exactly one
+/// binding, no binding may name anything else, and the table must list them
+/// in that order under consecutive nonzero identities: any other table names
+/// an endpoint by an identity the plan never gave it.
+pub(crate) fn validate_fragment_runtime_filter_binding_cuts(
+    fragment: &Fragment,
+    cuts: &FragmentCuts,
+    path: &str,
+    errors: &mut ValidationContext,
+) {
+    let filters = cuts
+        .runtime_filters
+        .iter()
+        .map(|filter| (filter.id, filter))
+        .collect::<BTreeMap<_, _>>();
+    let mut attached = BTreeSet::new();
+    let mut local = Vec::new();
+    for id in fragment.runtime_filters() {
+        // Duplicate or unsupplied attachments are refused by the
+        // runtime-filter cut law; each attached filter is expected once here.
+        if !attached.insert(*id) {
+            continue;
+        }
+        let Some(filter) = filters.get(id) else {
+            continue;
+        };
+        for (index, producer) in filter.producers.iter().enumerate() {
+            if producer.endpoint.fragment == fragment.id() {
+                local.push((filter.id, RuntimeFilterBindingRole::Producer(index)));
+            }
+        }
+        for (index, consumer) in filter.consumers.iter().enumerate() {
+            if consumer.endpoint.fragment == fragment.id() {
+                local.push((filter.id, RuntimeFilterBindingRole::Consumer(index)));
+            }
+        }
+    }
+    let previous_errors = errors.len();
+    let mut identities = BTreeSet::new();
+    let mut bound = BTreeSet::new();
+    for (ordinal, binding) in cuts.runtime_filter_bindings.iter().enumerate() {
+        let entry = format!("{path}[{ordinal}]");
+        if binding.binding_id == 0 {
+            errors.push(ValidationError::new(
+                &entry,
+                "runtime-filter binding identity 0 is never numbered",
+            ));
+        }
+        if !identities.insert(binding.binding_id) {
+            errors.push(ValidationError::new(
+                &entry,
+                format!(
+                    "runtime-filter binding identity {} is not unique",
+                    binding.binding_id
+                ),
+            ));
+        }
+        let endpoint = filters
+            .get(&binding.filter)
+            .and_then(|filter| match binding.role {
+                RuntimeFilterBindingRole::Producer(index) => filter
+                    .producers
+                    .get(index)
+                    .map(|producer| &producer.endpoint),
+                RuntimeFilterBindingRole::Consumer(index) => filter
+                    .consumers
+                    .get(index)
+                    .map(|consumer| &consumer.endpoint),
+            });
+        match endpoint {
+            None => errors.push(ValidationError::new(
+                &entry,
+                format!(
+                    "runtime-filter binding names {} of runtime filter {}, which the fragment cuts do not define",
+                    binding_role_text(binding.role),
+                    binding.filter.get()
+                ),
+            )),
+            Some(endpoint) if endpoint.fragment != fragment.id() => {
+                errors.push(ValidationError::new(
+                    &entry,
+                    format!(
+                        "runtime-filter binding names remote {} of runtime filter {} in fragment {}",
+                        binding_role_text(binding.role),
+                        binding.filter.get(),
+                        endpoint.fragment.get()
+                    ),
+                ))
+            }
+            Some(_) => {
+                if !bound.insert((binding.filter, binding.role)) {
+                    errors.push(ValidationError::new(
+                        &entry,
+                        format!(
+                            "local {} of runtime filter {} has more than one binding",
+                            binding_role_text(binding.role),
+                            binding.filter.get()
+                        ),
+                    ));
+                }
+            }
+        }
+        if errors.is_saturated() {
+            errors.mark_truncated();
+            return;
+        }
+    }
+    for (filter, role) in &local {
+        if !bound.contains(&(*filter, *role)) {
+            errors.push(ValidationError::new(
+                path,
+                format!(
+                    "local {} of runtime filter {} has no binding",
+                    binding_role_text(*role),
+                    filter.get()
+                ),
+            ));
+            if errors.is_saturated() {
+                errors.mark_truncated();
+                return;
+            }
+        }
+    }
+    if errors.len() != previous_errors {
+        return;
+    }
+    // The table is now a bijection onto the local endpoints. Only the
+    // numbering order and consecutive identities remain to be proven.
+    let first = cuts
+        .runtime_filter_bindings
+        .first()
+        .map(|binding| binding.binding_id);
+    for (ordinal, (binding, (filter, role))) in
+        cuts.runtime_filter_bindings.iter().zip(&local).enumerate()
+    {
+        let expected_id = first.and_then(|first| {
+            u32::try_from(ordinal)
+                .ok()
+                .and_then(|offset| first.checked_add(offset))
+        });
+        if binding.filter != *filter || binding.role != *role {
+            errors.push(ValidationError::new(
+                format!("{path}[{ordinal}]"),
+                format!(
+                    "runtime-filter binding is out of numbering order: expected {} of runtime filter {}",
+                    binding_role_text(*role),
+                    filter.get()
+                ),
+            ));
+            return;
+        }
+        if expected_id != Some(binding.binding_id) {
+            errors.push(ValidationError::new(
+                format!("{path}[{ordinal}]"),
+                "runtime-filter binding identities of one fragment are not consecutive",
+            ));
+            return;
+        }
+    }
+}
+
+fn binding_role_text(role: RuntimeFilterBindingRole) -> String {
+    match role {
+        RuntimeFilterBindingRole::Producer(index) => format!("producer {index}"),
+        RuntimeFilterBindingRole::Consumer(index) => format!("consumer {index}"),
     }
 }
 

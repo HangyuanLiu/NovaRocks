@@ -35,6 +35,7 @@ mod ordering_window_assertion_contract;
 mod original_call_requests;
 mod package_contract;
 mod partition_scan_contract;
+mod runtime_filter_binding_contract;
 mod runtime_filter_wait_contract;
 mod set_operation_contract;
 mod sink_contract;
@@ -111,6 +112,38 @@ fn dop() -> PipelineDopDomain {
         max: 8,
         requires_power_of_two: true,
     }
+}
+
+/// The binding slice a fragment carries when it is its plan's only fragment:
+/// its local endpoints numbered from 1 in attachment order, producers before
+/// consumers.
+fn single_fragment_runtime_filter_bindings(
+    fragment: FragmentId,
+    filters: &[RuntimeFilter],
+) -> Box<[RuntimeFilterBindingCut]> {
+    let mut bindings = Vec::new();
+    for filter in filters {
+        let producers = filter
+            .producers
+            .iter()
+            .enumerate()
+            .filter(|(_, producer)| producer.endpoint.fragment == fragment)
+            .map(|(index, _)| RuntimeFilterBindingRole::Producer(index));
+        let consumers = filter
+            .consumers
+            .iter()
+            .enumerate()
+            .filter(|(_, consumer)| consumer.endpoint.fragment == fragment)
+            .map(|(index, _)| RuntimeFilterBindingRole::Consumer(index));
+        for role in producers.chain(consumers) {
+            bindings.push(RuntimeFilterBindingCut {
+                binding_id: u32::try_from(bindings.len() + 1).unwrap(),
+                filter: filter.id,
+                role,
+            });
+        }
+    }
+    bindings.into_boxed_slice()
 }
 
 fn literal_fragment(
@@ -2215,6 +2248,7 @@ fn independent_fragment_cut_types_share_the_same_resource_validation() {
             writer_result: None,
         }]),
         runtime_filters: Box::default(),
+        runtime_filter_bindings: Box::default(),
     };
     let error = validate_fragment(&fragment, &cuts).unwrap_err().to_string();
     assert!(error.contains("Arrow decimal precision/scale"));

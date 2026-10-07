@@ -397,90 +397,31 @@ pub fn physical_v1_cte_consumers(
     result
 }
 
-/// Which runtime-filter role one wire binding identity names.
-///
-/// The index is into that filter's own `producers` or `consumers`, so a
-/// binding identity resolves back to the exact endpoint it was minted for
-/// without a second lookup key.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PhysicalV1RuntimeFilterBindingRole {
-    Producer(usize),
-    Consumer(usize),
-}
+/// Which runtime-filter role one wire binding identity names. The physical
+/// plan owns this vocabulary; v1 names it unchanged.
+pub type PhysicalV1RuntimeFilterBindingRole = novarocks_physical_plan::RuntimeFilterBindingRole;
 
 /// One wire runtime-filter binding identity, and what it names.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PhysicalV1RuntimeFilterBinding {
-    pub binding_id: u32,
-    pub filter: novarocks_physical_plan::RuntimeFilterId,
-    pub fragment: FragmentId,
-    pub node: NodeId,
-    pub role: PhysicalV1RuntimeFilterBindingRole,
-}
+pub type PhysicalV1RuntimeFilterBinding = novarocks_physical_plan::RuntimeFilterBinding;
 
-/// Number every runtime-filter binding of one plan, once.
+/// Every runtime-filter binding of one plan, as the physical plan numbers it.
 ///
-/// The numbering is a property of the plan: fragments in id order, each
-/// fragment's attached filters in its own order, producers before consumers.
-/// Everything that needs a binding identity -- the encoder, the scan sources,
-/// and the facts an attempt deploys from -- reads this one derivation, because
-/// two derivations of one numbering disagree the moment either changes, and
-/// the disagreement would surface as a plan that cannot be encoded rather than
-/// as the numbering bug it is.
+/// The numbering is plan-global and has exactly one owner,
+/// [`novarocks_physical_plan::runtime_filter_bindings`]; the v1 wire, its scan
+/// sources, the facts an attempt deploys from and the v2 package cuts all
+/// read that one derivation. Only the v1 error text is projected here.
 pub fn physical_v1_runtime_filter_bindings(
     physical: &PhysicalPlan,
 ) -> Result<Vec<PhysicalV1RuntimeFilterBinding>, String> {
-    let mut bindings = Vec::new();
-    let mut next_binding = 1_u32;
-    let mut mint = |filter: novarocks_physical_plan::RuntimeFilterId,
-                    fragment: FragmentId,
-                    node: NodeId,
-                    role: PhysicalV1RuntimeFilterBindingRole|
-     -> Result<(), String> {
-        let binding_id = next_binding;
-        next_binding = next_binding.checked_add(1).ok_or_else(|| {
-            "native wire v1 runtime-filter binding identity space exhausted".to_string()
-        })?;
-        bindings.push(PhysicalV1RuntimeFilterBinding {
-            binding_id,
-            filter,
-            fragment,
-            node,
-            role,
-        });
-        Ok(())
-    };
-    for fragment in physical.fragments().values() {
-        for filter_id in fragment.runtime_filters() {
-            let filter = physical.runtime_filters().get(filter_id).ok_or_else(|| {
-                format!(
-                    "fragment references absent runtime filter {}",
-                    filter_id.get()
-                )
-            })?;
-            for (index, producer) in filter.producers.iter().enumerate() {
-                if producer.endpoint.fragment == fragment.id() {
-                    mint(
-                        filter.id,
-                        fragment.id(),
-                        producer.endpoint.node,
-                        PhysicalV1RuntimeFilterBindingRole::Producer(index),
-                    )?;
-                }
-            }
-            for (index, consumer) in filter.consumers.iter().enumerate() {
-                if consumer.endpoint.fragment == fragment.id() {
-                    mint(
-                        filter.id,
-                        fragment.id(),
-                        consumer.endpoint.node,
-                        PhysicalV1RuntimeFilterBindingRole::Consumer(index),
-                    )?;
-                }
-            }
+    use novarocks_physical_plan::RuntimeFilterBindingError;
+    novarocks_physical_plan::runtime_filter_bindings(physical).map_err(|error| match error {
+        RuntimeFilterBindingError::AbsentRuntimeFilter { filter, .. } => {
+            format!("fragment references absent runtime filter {}", filter.get())
         }
-    }
-    Ok(bindings)
+        RuntimeFilterBindingError::IdentitySpaceExhausted => {
+            "native wire v1 runtime-filter binding identity space exhausted".to_string()
+        }
+    })
 }
 
 fn encode_runtime_filters(
@@ -5196,7 +5137,7 @@ fn node_kind_name(kind: &NodeKind) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     fn codec_constant_policy() -> novarocks_constant_contract::ConstantPolicy {
         novarocks_constant_contract::ConstantPolicy {
             max_rows: 4096,
@@ -6745,6 +6686,38 @@ mod tests {
     }
 
     #[test]
+    fn v1_runtime_filter_numbering_is_the_physical_plan_numbering() {
+        let physical = finish_ordered_join_build_filter_plan();
+        let fragment = FragmentId::new(42);
+        let join = physical.fragments()[&fragment].root();
+        let filter = novarocks_physical_plan::RuntimeFilterId::new(40);
+        let numbered = physical_v1_runtime_filter_bindings(&physical).unwrap();
+        assert_eq!(
+            numbered,
+            [
+                PhysicalV1RuntimeFilterBinding {
+                    binding_id: 1,
+                    filter,
+                    fragment,
+                    node: join,
+                    role: PhysicalV1RuntimeFilterBindingRole::Producer(0),
+                },
+                PhysicalV1RuntimeFilterBinding {
+                    binding_id: 2,
+                    filter,
+                    fragment,
+                    node: join,
+                    role: PhysicalV1RuntimeFilterBindingRole::Consumer(0),
+                },
+            ]
+        );
+        assert_eq!(
+            numbered,
+            novarocks_physical_plan::runtime_filter_bindings(&physical).unwrap()
+        );
+    }
+
+    #[test]
     fn broadcast_uses_the_v1_broadcast_partition_carrier() {
         assert_eq!(
             encode_data_partition_kind(&Distribution::Broadcast),
@@ -7980,7 +7953,7 @@ mod tests {
         }
     }
 
-    fn finish_ordered_join_build_filter_plan() -> PhysicalPlan {
+    pub(crate) fn finish_ordered_join_build_filter_plan() -> PhysicalPlan {
         use novarocks_physical_plan::{
             EdgeDestination, EdgePartitioning, EdgeSource, NullOrdering,
             OrderedComparisonAlgorithm, RuntimeFilter, RuntimeFilterApplyPoint,

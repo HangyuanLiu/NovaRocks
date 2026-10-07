@@ -484,6 +484,7 @@ fn cuts() -> FragmentCuts {
             writer_result: Some(writer),
         }]),
         runtime_filters: Box::from([filter()]),
+        runtime_filter_bindings: Box::default(),
     }
 }
 fn cuts_source(cuts: &FragmentCuts) -> usize {

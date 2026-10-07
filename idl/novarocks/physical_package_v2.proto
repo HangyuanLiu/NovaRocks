@@ -995,6 +995,20 @@ message FragmentCuts {
   repeated InboundFragmentCut inbound = 1;
   repeated OutboundFragmentCut outbound = 2;
   repeated RuntimeFilter runtime_filters = 3;
+  // This fragment's slice of the plan-global runtime-filter binding
+  // numbering, one entry per local endpoint in numbering order. A package
+  // cannot recompute it: the numbering depends on every other fragment.
+  repeated RuntimeFilterBindingCut runtime_filter_bindings = 4;
+}
+// One local runtime-filter endpoint and its plan-global binding identity. The
+// index is into that filter's own producers or consumers.
+message RuntimeFilterBindingCut {
+  optional uint32 binding_id = 1;
+  optional uint32 runtime_filter_id = 2;
+  oneof role {
+    uint32 producer_index = 3;
+    uint32 consumer_index = 4;
+  }
 }
 enum EdgeKind {
   EDGE_KIND_UNSPECIFIED = 0;

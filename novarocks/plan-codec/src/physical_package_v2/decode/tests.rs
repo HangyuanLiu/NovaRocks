@@ -298,3 +298,184 @@ fn caller_control_cause_stays_primary_across_the_receiver() {
         }
     }
 }
+
+/// Every checked package of one plan that reads and writes nothing: eager
+/// root uses in one domain, no calls and an explicit empty pruning table.
+fn plan_packages(plan: &p::PhysicalPlan) -> BTreeMap<p::FragmentId, p::FragmentPackage> {
+    use novarocks_type_contract::{
+        ControlShape, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
+        ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
+    };
+    let setup = Control::default();
+    let mut uses = BTreeMap::new();
+    let mut calls = BTreeMap::new();
+    let mut pruning = BTreeMap::new();
+    let mut admissions = BTreeMap::new();
+    for (id, fragment) in plan.fragments() {
+        let roots = p::PhysicalExpressionRoots::try_new(fragment, &setup).unwrap();
+        let bindings = roots
+            .sites()
+            .iter()
+            .enumerate()
+            .map(|(ordinal, (site, _))| (*site, ExpressionUseId::new(ordinal as u32)))
+            .collect::<Vec<_>>();
+        let invocations = roots
+            .sites()
+            .iter()
+            .enumerate()
+            .map(|(ordinal, (_, root))| ExpressionInvocation {
+                context: ExpressionEffectContext {
+                    use_id: ExpressionUseId::new(ordinal as u32),
+                    domain: EvaluationDomainId::new(0),
+                    demand: root.demand,
+                },
+                definition: root.expr,
+                control: ControlShape::Eager,
+                arguments: Box::default(),
+            })
+            .collect::<Vec<_>>();
+        let domains = if invocations.is_empty() {
+            vec![]
+        } else {
+            vec![ExpressionEvaluationDomain {
+                id: EvaluationDomainId::new(0),
+                parent: None,
+                guard: None,
+            }]
+        };
+        let flow = ExpressionControlFlow::try_new(
+            domains,
+            invocations,
+            fragment.expressions(),
+            CompilePhase::Validate,
+            &setup,
+        )
+        .unwrap();
+        let actual = p::PhysicalRootUses::try_new(fragment, flow, bindings, &setup).unwrap();
+        calls.insert(
+            *id,
+            p::FrozenFragmentCalls::try_new(fragment, &actual, vec![], &setup).unwrap(),
+        );
+        uses.insert(*id, actual);
+        pruning.insert(
+            *id,
+            p::FrozenFragmentPruning::try_new(*id, vec![], &setup).unwrap(),
+        );
+        admissions.insert(
+            *id,
+            p::FragmentPackageAdmission {
+                plan_limits: p::PlanLimits::FROZEN,
+                source_retained_bytes: 128 * 1024 * 1024,
+                property_projection_limits: p::PropertyProofProjectionLimits {
+                    max_request_bytes: 64 * 1024 * 1024,
+                    max_coexisting_bytes: 512 * 1024 * 1024,
+                    max_projection_work: 128 * 1024 * 1024,
+                },
+            },
+        );
+    }
+    p::extract_fragment_packages(
+        plan,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &uses,
+        &calls,
+        &pruning,
+        &admissions,
+        &setup,
+    )
+    .unwrap()
+}
+
+// Each package carries its own slice of the plan-global runtime-filter
+// binding numbering. The whole-package wire preserves it exactly, and the
+// receiver's package law refuses identities the plan never gave the slice.
+#[test]
+fn runtime_filter_package_roundtrips_its_plan_binding_slice_byte_identically() {
+    use p::RuntimeFilterBindingRole::{Consumer, Producer};
+    let plan = crate::physical_encode::tests::finish_ordered_join_build_filter_plan();
+    let numbered = p::runtime_filter_bindings(&plan).unwrap();
+    let join_fragment = p::FragmentId::new(42);
+    let filter = p::RuntimeFilterId::new(40);
+    assert_eq!(
+        numbered
+            .iter()
+            .map(|binding| (binding.binding_id, binding.fragment, binding.role))
+            .collect::<Vec<_>>(),
+        [
+            (1, join_fragment, Producer(0)),
+            (2, join_fragment, Consumer(0))
+        ]
+    );
+    let packages = plan_packages(&plan);
+    assert_eq!(packages.len(), 3);
+    for (id, package) in &packages {
+        let slice = numbered
+            .iter()
+            .filter(|binding| binding.fragment == *id)
+            .map(p::RuntimeFilterBinding::cut)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &*package.cuts().runtime_filter_bindings,
+            slice,
+            "{}",
+            id.get()
+        );
+        let bytes = encode(package).unwrap_or_else(|e| panic!("{}: {e}", id.get()));
+        let decoded =
+            decode_fragment_package(&bytes, &model(), &decode_limits(), &Control::default())
+                .unwrap_or_else(|e| panic!("{}: {e}", id.get()));
+        assert_eq!(decoded.cuts(), package.cuts(), "{}", id.get());
+        assert_eq!(encode(&decoded).unwrap(), bytes, "{}", id.get());
+    }
+
+    let package = &packages[&join_fragment];
+    let dto = encode_fragment_package(package, &encode_limits(), &Control::default()).unwrap();
+    let wire_bindings = &dto.cuts.as_ref().unwrap().runtime_filter_bindings;
+    use wire::runtime_filter_binding_cut::Role;
+    assert_eq!(
+        wire_bindings
+            .iter()
+            .map(|binding| (binding.binding_id, binding.runtime_filter_id, binding.role))
+            .collect::<Vec<_>>(),
+        [
+            (Some(1), Some(filter.get()), Some(Role::ProducerIndex(0))),
+            (Some(2), Some(filter.get()), Some(Role::ConsumerIndex(0))),
+        ]
+    );
+    let structure = |error: PackageDecodeError| match error {
+        PackageDecodeError::Package(p::FragmentPackageError::Structure(errors)) => errors,
+        other => panic!("binding table was not refused by the package law: {other}"),
+    };
+    let swapped = refused(&mutated(package, |d| {
+        let bindings = &mut d.cuts.as_mut().unwrap().runtime_filter_bindings;
+        bindings[0].binding_id = Some(2);
+        bindings[1].binding_id = Some(1);
+    }));
+    let errors = structure(swapped);
+    assert!(
+        errors.errors().iter().any(|error| error.path()
+            == "fragments[42].cuts.runtime_filter_bindings[1]"
+            && error.message()
+                == "runtime-filter binding identities of one fragment are not consecutive"),
+        "{errors}"
+    );
+    let dropped = refused(&mutated(package, |d| {
+        d.cuts.as_mut().unwrap().runtime_filter_bindings.pop();
+    }));
+    let errors = structure(dropped);
+    assert!(
+        errors.errors().iter().any(|error| error.path()
+            == "fragments[42].cuts.runtime_filter_bindings"
+            && error.message() == "local consumer 0 of runtime filter 40 has no binding"),
+        "{errors}"
+    );
+    // A shapeless entry is refused by the cut codec before any package law.
+    let shapeless = refused(&mutated(package, |d| {
+        d.cuts.as_mut().unwrap().runtime_filter_bindings[0].role = None;
+    }));
+    assert!(
+        matches!(shapeless, PackageDecodeError::Node(_)),
+        "{shapeless}"
+    );
+}

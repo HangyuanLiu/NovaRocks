@@ -35,6 +35,7 @@ mod predicate;
 mod pruning_structure;
 mod relation;
 mod resource;
+mod runtime_filter_binding;
 mod structure_input;
 mod validation;
 
@@ -74,6 +75,7 @@ pub use resource::{
     MAX_PLAN_DERIVED_CUT_ITEMS, MAX_PLAN_DYNAMIC_BYTES, MAX_PLAN_DYNAMIC_ITEMS,
     MAX_TIMESTAMP_TIMEZONE_BYTES,
 };
+pub use runtime_filter_binding::*;
 pub use structure_input::FragmentStructureInput;
 pub use validation::*;
 

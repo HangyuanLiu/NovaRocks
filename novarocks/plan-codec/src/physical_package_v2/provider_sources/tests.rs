@@ -329,6 +329,7 @@ pub(in crate::physical_package_v2) fn checked_read(metadata: bool) -> p::Fragmen
                 inbound: Box::default(),
                 outbound: Box::default(),
                 runtime_filters: Box::default(),
+                runtime_filter_bindings: Box::default(),
             },
             result: None,
             expression_uses: uses,

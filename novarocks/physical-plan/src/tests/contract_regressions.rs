@@ -699,11 +699,15 @@ fn assert_runtime_filter_plan_accepted(fragment: Fragment, filter: RuntimeFilter
     builder.finish().unwrap();
 }
 
-fn local_runtime_filter_cuts(_fragment: &Fragment, filter: &RuntimeFilter) -> FragmentCuts {
+fn local_runtime_filter_cuts(fragment: &Fragment, filter: &RuntimeFilter) -> FragmentCuts {
     FragmentCuts {
         inbound: Box::default(),
         outbound: Box::default(),
         runtime_filters: Box::from([filter.clone()]),
+        runtime_filter_bindings: single_fragment_runtime_filter_bindings(
+            fragment.id(),
+            std::slice::from_ref(filter),
+        ),
     }
 }
 
@@ -1018,7 +1022,7 @@ fn remote_labels_cannot_bypass_local_runtime_filter_lineage() {
     }
 }
 
-fn cross_fragment_scan_lineage_plan() -> (PhysicalPlan, FragmentId, FragmentId) {
+pub(super) fn cross_fragment_scan_lineage_plan() -> (PhysicalPlan, FragmentId, FragmentId) {
     let (original, mut filter, _) = scan_lineage_filter(true, true, false, false);
     let destination_id = original.id();
     let source_id = FragmentId::new(900);

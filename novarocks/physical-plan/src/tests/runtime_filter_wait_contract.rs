@@ -589,14 +589,14 @@ fn blocking_runtime_filter_rejects_a_cycle_through_a_nested_producer_build() {
     ));
 }
 
-struct AcyclicFixture {
-    plan: PhysicalPlan,
+pub(super) struct AcyclicFixture {
+    pub(super) plan: PhysicalPlan,
     target_fragment: FragmentId,
     recursive_build_edge: EdgeId,
     recursive_source_fragment: FragmentId,
 }
 
-fn acyclic_cross_fragment_fixture() -> AcyclicFixture {
+pub(super) fn acyclic_cross_fragment_fixture() -> AcyclicFixture {
     let source_fragment = FragmentId::new(410);
     let relay_fragment = FragmentId::new(411);
     let target_fragment = FragmentId::new(412);

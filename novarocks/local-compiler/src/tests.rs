@@ -336,6 +336,7 @@ fn add_writer(
     let cuts = FragmentCuts {
         inbound: Box::default(),
         runtime_filters: Box::default(),
+        runtime_filter_bindings: Box::default(),
         outbound: Box::from([OutboundFragmentCut {
             edge: EdgeId::new(8),
             kind: EdgeKind::Stream,

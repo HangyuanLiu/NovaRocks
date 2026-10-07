@@ -1192,12 +1192,36 @@ pub struct OutboundFragmentCut {
     pub writer_result: Option<WriterResultCut>,
 }
 
+/// Which endpoint of one runtime filter a binding identity names.
+///
+/// The index is into that filter's own `producers` or `consumers`, so a
+/// binding identity resolves back to the exact endpoint it was minted for
+/// without a second lookup key.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RuntimeFilterBindingRole {
+    Producer(usize),
+    Consumer(usize),
+}
+
+/// One local runtime-filter endpoint and the plan-global binding identity
+/// [`crate::runtime_filter_bindings`] numbered it with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeFilterBindingCut {
+    pub binding_id: u32,
+    pub filter: RuntimeFilterId,
+    pub role: RuntimeFilterBindingRole,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FragmentCuts {
     pub inbound: Box<[InboundFragmentCut]>,
     pub outbound: Box<[OutboundFragmentCut]>,
     /// Complete static runtime-filter contracts with at least one local endpoint.
     pub runtime_filters: Box<[RuntimeFilter]>,
+    /// Plan-global binding identities of every local runtime-filter endpoint,
+    /// in numbering order. One package cannot recompute them: the numbering
+    /// depends on every other fragment's attachments.
+    pub runtime_filter_bindings: Box<[RuntimeFilterBindingCut]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

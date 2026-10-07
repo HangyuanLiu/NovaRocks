@@ -492,7 +492,10 @@ fn fragment_cut_usage_core<P: TypeValidationPolicy>(
             )?;
         }
     }
-    usage.add_items(cuts.runtime_filters.len());
+    usage.add_item_counts([
+        cuts.runtime_filters.len(),
+        cuts.runtime_filter_bindings.len(),
+    ]);
     for (index, filter) in cuts.runtime_filters.iter().enumerate() {
         if usage.exhausted() {
             break;

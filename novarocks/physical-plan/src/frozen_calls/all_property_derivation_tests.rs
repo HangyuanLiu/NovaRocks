@@ -494,6 +494,7 @@ pub(super) fn exchange() -> (Fixture, FragmentCuts) {
         }]),
         outbound: Box::default(),
         runtime_filters: Box::default(),
+        runtime_filter_bindings: Box::default(),
     };
     (fixture, cuts)
 }

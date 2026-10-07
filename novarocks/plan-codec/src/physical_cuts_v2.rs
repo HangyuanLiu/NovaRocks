@@ -654,46 +654,77 @@ fn count_filters(
     }
     Ok(())
 }
+/// Each binding is one fixed-size entry with one runtime-filter reference.
+/// Its closed shape is checked here, before any materialization; whether it
+/// names exactly the local endpoints remains a Package law.
+fn count_bindings(
+    c: &mut Count,
+    p: Option<&[p::RuntimeFilterBindingCut]>,
+    raw: Option<&Vec<wire::RuntimeFilterBindingCut>>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<(), E> {
+    if let Some(xs) = p {
+        for x in xs {
+            encode_binding(x)?;
+            c.id(w)?;
+        }
+    } else {
+        for x in req(raw)? {
+            decode_binding(x)?;
+            c.id(w)?;
+        }
+    }
+    Ok(())
+}
 fn count(
     c: &mut Count,
     p: Option<&p::FragmentCuts>,
     raw: Option<&wire::FragmentCuts>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(), E> {
-    // All three root extents are O(1) and known together before any callback.
-    let (a, b, d, ac, bc, dc) = if let Some(p) = p {
-        (
+    // All four root extents are O(1) and known together before any callback.
+    let ([a, b, d, g], [ac, bc, dc, gc]) = if let Some(p) = p {
+        let n = [
             p.inbound.len(),
             p.outbound.len(),
             p.runtime_filters.len(),
-            p.inbound.len(),
-            p.outbound.len(),
-            p.runtime_filters.len(),
-        )
+            p.runtime_filter_bindings.len(),
+        ];
+        (n, n)
     } else {
         let p = req(raw)?;
         (
-            p.inbound.len(),
-            p.outbound.len(),
-            p.runtime_filters.len(),
-            p.inbound.capacity(),
-            p.outbound.capacity(),
-            p.runtime_filters.capacity(),
+            [
+                p.inbound.len(),
+                p.outbound.len(),
+                p.runtime_filters.len(),
+                p.runtime_filter_bindings.len(),
+            ],
+            [
+                p.inbound.capacity(),
+                p.outbound.capacity(),
+                p.runtime_filters.capacity(),
+                p.runtime_filter_bindings.capacity(),
+            ],
         )
     };
-    c.model.inputs = r::add(r::add(a, b)?, d)?;
+    c.model.inputs = r::add(r::add(r::add(a, b)?, d)?, g)?;
     c.model.items = c.model.inputs;
     if c.encode {
         c.model.request::<wire::InboundFragmentCut>(a, 1)?;
         c.model.request::<wire::OutboundFragmentCut>(b, 1)?;
         c.model.request::<wire::RuntimeFilter>(d, 1)?;
+        c.model.request::<wire::RuntimeFilterBindingCut>(g, 1)?;
         c.known = r::add(
             c.known,
             r::add(
                 r::bytes::<p::InboundFragmentCut>(a)?,
                 r::add(
                     r::bytes::<p::OutboundFragmentCut>(b)?,
-                    r::bytes::<p::RuntimeFilter>(d)?,
+                    r::add(
+                        r::bytes::<p::RuntimeFilter>(d)?,
+                        r::bytes::<p::RuntimeFilterBindingCut>(g)?,
+                    )?,
                 )?,
             )?,
         )?;
@@ -701,13 +732,17 @@ fn count(
         c.model.request::<p::InboundFragmentCut>(a, 2)?;
         c.model.request::<p::OutboundFragmentCut>(b, 2)?;
         c.model.request::<p::RuntimeFilter>(d, 2)?;
+        c.model.request::<p::RuntimeFilterBindingCut>(g, 2)?;
         c.known = r::add(
             c.known,
             r::add(
                 r::bytes::<wire::InboundFragmentCut>(ac)?,
                 r::add(
                     r::bytes::<wire::OutboundFragmentCut>(bc)?,
-                    r::bytes::<wire::RuntimeFilter>(dc)?,
+                    r::add(
+                        r::bytes::<wire::RuntimeFilter>(dc)?,
+                        r::bytes::<wire::RuntimeFilterBindingCut>(gc)?,
+                    )?,
                 )?,
             )?,
         )?;
@@ -760,6 +795,7 @@ fn count(
             )?;
         }
         count_filters(c, Some(&p.runtime_filters), None, w)?;
+        count_bindings(c, Some(&p.runtime_filter_bindings), None, w)?;
     } else {
         let p = req(raw)?;
         for x in &p.inbound {
@@ -824,6 +860,7 @@ fn count(
             )?;
         }
         count_filters(c, None, Some(&p.runtime_filters), w)?;
+        count_bindings(c, None, Some(&p.runtime_filter_bindings), w)?;
     }
     Ok(())
 }
@@ -994,6 +1031,9 @@ pub fn encode_fragment_cuts_observed(
         runtime_filters: vec_map(&source.runtime_filters, w, |x, w| {
             encode_filter(x, &mut e, w)
         })?,
+        runtime_filter_bindings: vec_map(&source.runtime_filter_bindings, w, |x, _| {
+            encode_binding(x)
+        })?,
     };
     Ok((out, f))
 }
@@ -1057,6 +1097,9 @@ pub fn decode_fragment_cuts_observed(
         outbound: box_map(&source.outbound, w, |x, w| decode_outbound(x, types, w))?,
         runtime_filters: box_map(&source.runtime_filters, w, |x, w| {
             decode_filter(x, types, w)
+        })?,
+        runtime_filter_bindings: box_map(&source.runtime_filter_bindings, w, |x, _| {
+            decode_binding(x)
         })?,
     };
     Ok((out, f))
@@ -1718,6 +1761,34 @@ fn encode_filter(
             deadline_ms: p.policy.deadline_ms,
             max_retries: p.policy.max_retries,
         }),
+    })
+}
+fn encode_binding(p: &p::RuntimeFilterBindingCut) -> Result<wire::RuntimeFilterBindingCut, E> {
+    use wire::runtime_filter_binding_cut::Role as R;
+    let index = |index: usize| {
+        u32::try_from(index).map_err(|_| shape("cut runtime-filter binding index exceeds u32"))
+    };
+    Ok(wire::RuntimeFilterBindingCut {
+        binding_id: Some(p.binding_id),
+        runtime_filter_id: Some(p.filter.get()),
+        role: Some(match p.role {
+            p::RuntimeFilterBindingRole::Producer(i) => R::ProducerIndex(index(i)?),
+            p::RuntimeFilterBindingRole::Consumer(i) => R::ConsumerIndex(index(i)?),
+        }),
+    })
+}
+fn decode_binding(p: &wire::RuntimeFilterBindingCut) -> Result<p::RuntimeFilterBindingCut, E> {
+    use wire::runtime_filter_binding_cut::Role as R;
+    let index = |index: u32| {
+        usize::try_from(index).map_err(|_| shape("cut runtime-filter binding index exceeds usize"))
+    };
+    Ok(p::RuntimeFilterBindingCut {
+        binding_id: req(p.binding_id)?,
+        filter: p::RuntimeFilterId::new(req(p.runtime_filter_id)?),
+        role: match req(p.role.as_ref())? {
+            R::ProducerIndex(i) => p::RuntimeFilterBindingRole::Producer(index(*i)?),
+            R::ConsumerIndex(i) => p::RuntimeFilterBindingRole::Consumer(index(*i)?),
+        },
     })
 }
 fn decode_filter(

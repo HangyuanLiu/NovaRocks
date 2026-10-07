@@ -1430,6 +1430,10 @@ fn duplicate_scan_payloads_keep_runtime_filter_assignment_occurrences() {
     .unwrap();
     let mut input = package_input(fragment.clone());
     input.cuts = FragmentCuts {
+        runtime_filter_bindings: single_fragment_runtime_filter_bindings(
+            fragment.id(),
+            std::slice::from_ref(&filter),
+        ),
         runtime_filters: Box::from([filter]),
         ..FragmentCuts::default()
     };
@@ -1460,6 +1464,47 @@ fn duplicate_scan_payloads_keep_runtime_filter_assignment_occurrences() {
         let result = FragmentPackage::try_new(input.clone(), package_admission(), &Control);
         assert_eq!(result.is_ok(), accepted, "{variable}: {result:?}");
     }
+}
+
+#[test]
+fn package_refuses_a_runtime_filter_binding_table_other_than_its_plan_slice() {
+    let plan = super::runtime_filter_binding_contract::numbered_plan();
+    let fragment = plan.fragments()[&FragmentId::new(412)].clone();
+    let mut input = package_input(fragment.clone());
+    input.cuts = fragment_cuts(&plan, fragment.id()).unwrap();
+    let package = FragmentPackage::try_new(input.clone(), package_admission(), &Control).unwrap();
+    assert_eq!(
+        package.cuts().runtime_filter_bindings,
+        input.cuts.runtime_filter_bindings
+    );
+    let refusal = |input: FragmentPackageInput| match FragmentPackage::try_new(
+        input,
+        package_admission(),
+        &Control,
+    ) {
+        Err(FragmentPackageError::Structure(errors)) => errors,
+        other => panic!("tampered binding table was not refused: {other:?}"),
+    };
+    let mut swapped = input.clone();
+    swapped.cuts.runtime_filter_bindings.swap(0, 1);
+    let errors = refusal(swapped);
+    assert!(
+        errors.errors().iter().any(|error| error.path()
+            == "fragments[412].cuts.runtime_filter_bindings[0]"
+            && error
+                .message()
+                .starts_with("runtime-filter binding is out of numbering order")),
+        "{errors}"
+    );
+    let mut missing = input;
+    missing.cuts.runtime_filter_bindings = Box::default();
+    let errors = refusal(missing);
+    assert!(
+        errors.errors().iter().any(|error| error.path()
+            == "fragments[412].cuts.runtime_filter_bindings"
+            && error.message() == "local producer 0 of runtime filter 410 has no binding"),
+        "{errors}"
+    );
 }
 
 fn parameter_fragment(reference: novarocks_type_contract::SemanticParameterRef) -> Fragment {

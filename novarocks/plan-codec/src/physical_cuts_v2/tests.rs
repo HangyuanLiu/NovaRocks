@@ -158,6 +158,7 @@ fn cut() -> p::FragmentCuts {
             writer_result: None,
         }]),
         runtime_filters: Box::default(),
+        runtime_filter_bindings: Box::default(),
     }
 }
 fn run<T>(
@@ -1152,4 +1153,168 @@ fn lawful_original_checked_package_cuts_project_without_fake_topology() {
         &c,
     );
     assert!(admitted.is_ok());
+}
+fn bindings() -> Box<[p::RuntimeFilterBindingCut]> {
+    Box::from([
+        p::RuntimeFilterBindingCut {
+            binding_id: 1,
+            filter: p::RuntimeFilterId::new(u32::MAX),
+            role: p::RuntimeFilterBindingRole::Producer(0),
+        },
+        p::RuntimeFilterBindingCut {
+            binding_id: u32::MAX,
+            filter: p::RuntimeFilterId::new(0),
+            role: p::RuntimeFilterBindingRole::Consumer(u32::MAX as usize),
+        },
+        p::RuntimeFilterBindingCut {
+            binding_id: 0,
+            filter: p::RuntimeFilterId::new(u32::MAX),
+            role: p::RuntimeFilterBindingRole::Consumer(0),
+        },
+    ])
+}
+// Remote identities are preserved exactly, including ones the Package law
+// will refuse: the codec projects the table, the Package judges it.
+#[test]
+fn runtime_filter_bindings_have_hand_oracles_and_roundtrip_byte_identically() {
+    use prost::Message;
+    use wire::runtime_filter_binding_cut::Role;
+    let c = Control::default();
+    let mut src = cut();
+    src.runtime_filters = Box::from([filter()]);
+    src.runtime_filter_bindings = bindings();
+    let (raw, _) = encode(&src, &c, limits()).unwrap();
+    assert_eq!(
+        raw.runtime_filter_bindings,
+        [
+            wire::RuntimeFilterBindingCut {
+                binding_id: Some(1),
+                runtime_filter_id: Some(u32::MAX),
+                role: Some(Role::ProducerIndex(0)),
+            },
+            wire::RuntimeFilterBindingCut {
+                binding_id: Some(u32::MAX),
+                runtime_filter_id: Some(0),
+                role: Some(Role::ConsumerIndex(u32::MAX)),
+            },
+            wire::RuntimeFilterBindingCut {
+                binding_id: Some(0),
+                runtime_filter_id: Some(u32::MAX),
+                role: Some(Role::ConsumerIndex(0)),
+            },
+        ]
+    );
+    let (owned, _) = decode(&raw, &c, limits()).unwrap();
+    assert_eq!(owned, src);
+    let (again, _) = encode(&owned, &c, limits()).unwrap();
+    assert_eq!(again.encode_to_vec(), raw.encode_to_vec());
+
+    for case in 0..3 {
+        let mut x = raw.clone();
+        match case {
+            0 => x.runtime_filter_bindings[1].binding_id = None,
+            1 => x.runtime_filter_bindings[1].runtime_filter_id = None,
+            _ => x.runtime_filter_bindings[1].role = None,
+        }
+        assert!(
+            matches!(
+                decode(&x, &c, limits()),
+                Err(E::InvalidShape("cut required field is absent"))
+            ),
+            "case {case}"
+        );
+    }
+    if let Ok(index) = usize::try_from(u64::from(u32::MAX) + 1) {
+        let mut wide = src;
+        wide.runtime_filter_bindings[0].role = p::RuntimeFilterBindingRole::Producer(index);
+        assert!(matches!(
+            encode(&wide, &c, limits()),
+            Err(E::InvalidShape(
+                "cut runtime-filter binding index exceeds u32"
+            ))
+        ));
+    }
+}
+#[test]
+fn runtime_filter_bindings_are_one_admitted_root_extent_under_all_seven_envelopes() {
+    let c = Control::default();
+    let source = p::FragmentCuts {
+        runtime_filter_bindings: bindings(),
+        ..Default::default()
+    };
+    let (raw, ef) = encode(&source, &c, limits()).unwrap();
+    let (_, df) = decode(&raw, &c, limits()).unwrap();
+    // One table of three fixed-size entries, one filter reference each.
+    assert_eq!(
+        (
+            ef.input_node_count,
+            ef.value_reference_count,
+            ef.allocation_requests_upper_bound,
+            ef.allocation_request_bytes_upper_bound
+        ),
+        (
+            3,
+            3,
+            1,
+            Layout::array::<wire::RuntimeFilterBindingCut>(3)
+                .unwrap()
+                .size()
+        )
+    );
+    assert_eq!(
+        (
+            df.input_node_count,
+            df.value_reference_count,
+            df.allocation_requests_upper_bound,
+            df.allocation_request_bytes_upper_bound
+        ),
+        (
+            3,
+            3,
+            2,
+            2 * Layout::array::<p::RuntimeFilterBindingCut>(3)
+                .unwrap()
+                .size()
+        )
+    );
+    for receiving in [false, true] {
+        let f = if receiving { df } else { ef };
+        let mut exact = limits();
+        exact.node.max_input_nodes = f.input_node_count;
+        exact.node.max_value_references = f.value_reference_count;
+        exact.node.max_list_items = f.list_item_count;
+        exact.node.max_allocation_requests = f.allocation_requests_upper_bound;
+        exact.node.max_allocation_request_bytes = f.allocation_request_bytes_upper_bound;
+        exact.node.max_coexisting_source_and_request_bytes =
+            f.coexisting_source_and_request_bytes_upper_bound;
+        exact.node.max_work = f.cumulative_work_upper_bound;
+        if receiving {
+            decode(&raw, &c, exact).unwrap();
+        } else {
+            encode(&source, &c, exact).unwrap();
+        }
+        for axis in 0..7 {
+            let mut l = exact;
+            let v = match axis {
+                0 => &mut l.node.max_input_nodes,
+                1 => &mut l.node.max_value_references,
+                2 => &mut l.node.max_list_items,
+                3 => &mut l.node.max_allocation_requests,
+                4 => &mut l.node.max_allocation_request_bytes,
+                5 => &mut l.node.max_coexisting_source_and_request_bytes,
+                _ => &mut l.node.max_work,
+            };
+            assert!(*v > 0);
+            *v -= 1;
+            let error = if receiving {
+                decode(&raw, &c, l).unwrap_err()
+            } else {
+                encode(&source, &c, l).unwrap_err()
+            };
+            assert!(
+                matches!(error, E::Control(CompileControlError::ResourceExhausted)),
+                "receiving {receiving} axis {axis}"
+            );
+        }
+    }
 }

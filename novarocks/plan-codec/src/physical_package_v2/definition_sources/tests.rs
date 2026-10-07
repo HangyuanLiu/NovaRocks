@@ -539,6 +539,7 @@ pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
                 inbound: Box::default(),
                 outbound: Box::default(),
                 runtime_filters: Box::default(),
+                runtime_filter_bindings: Box::default(),
             },
             result: Some(p::ResultPort {
                 fragment: fragment.id(),
@@ -812,6 +813,7 @@ pub(in crate::physical_package_v2) fn cv_package() -> p::FragmentPackage {
                 inbound: Box::default(),
                 outbound: Box::default(),
                 runtime_filters: Box::default(),
+                runtime_filter_bindings: Box::default(),
             },
             pruning: p::FrozenFragmentPruning::try_new(fragment.id(), vec![], &Setup).unwrap(),
             fragment,
