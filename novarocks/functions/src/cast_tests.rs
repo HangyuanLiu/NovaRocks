@@ -763,3 +763,75 @@ fn runtime_original_seven_causes_keep_success_null_and_ordinary_error_tails_with
     }
     assert_eq!(control.trace.lock().unwrap().len(), 640);
 }
+
+// A carrier with no primitive conversion kernel casts exactly to itself:
+// the value passes unchanged, only nullability may widen, and no row can
+// fail. Kernel-backed carriers keep their own row operation.
+#[test]
+fn same_carrier_without_a_kernel_prepares_an_identity_with_no_row_operation() {
+    for carrier in [
+        DataType::Utf8,
+        DataType::Binary,
+        DataType::Date32,
+        DataType::Decimal128(10, 2),
+    ] {
+        let identity = PreparedCastRecipe::try_new(
+            CastOperation::Carrier,
+            &ty(carrier.clone(), false),
+            &ty(carrier.clone(), true),
+            DecimalOverflowPolicy::OutputNull,
+            true,
+            &CompileControl::default(),
+        )
+        .unwrap_or_else(|error| panic!("{carrier:?} identity: {error:?}"));
+        assert!(identity.is_identity(), "{carrier:?}");
+        assert!(
+            !identity
+                .own_effects(context())
+                .for_use(context())
+                .unwrap()
+                .may_raise_row_error,
+            "{carrier:?}"
+        );
+        let array: ArrayRef = arrow_array::new_null_array(&carrier, 1);
+        assert!(matches!(
+            identity.evaluate_row(EvaluatedArgument::Column(&array), 0, 0, &Control::default()),
+            Err(KernelFailure::InvalidProgram(_))
+        ));
+        assert!(matches!(
+            PreparedCastRecipe::try_new(
+                CastOperation::Carrier,
+                &ty(carrier.clone(), true),
+                &ty(carrier.clone(), false),
+                DecimalOverflowPolicy::OutputNull,
+                true,
+                &CompileControl::default(),
+            ),
+            Err(CastPrepareError::TypeMismatch)
+        ));
+    }
+    let kernel = PreparedCastRecipe::try_new(
+        CastOperation::Carrier,
+        &ty(DataType::Int64, false),
+        &ty(DataType::Int64, true),
+        DecimalOverflowPolicy::OutputNull,
+        true,
+        &CompileControl::default(),
+    )
+    .unwrap();
+    assert!(
+        !kernel.is_identity(),
+        "a kernel-backed carrier keeps its row operation"
+    );
+    assert!(matches!(
+        PreparedCastRecipe::try_new(
+            CastOperation::Carrier,
+            &ty(DataType::Utf8, false),
+            &ty(DataType::Binary, true),
+            DecimalOverflowPolicy::OutputNull,
+            true,
+            &CompileControl::default(),
+        ),
+        Err(CastPrepareError::Unsupported)
+    ));
+}

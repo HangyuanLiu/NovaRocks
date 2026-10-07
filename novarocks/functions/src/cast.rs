@@ -265,13 +265,22 @@ pub enum CastRowResult {
     RowError(RowDataError),
 }
 
+/// What a prepared cast does to a value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CastBody {
+    /// A primitive carrier conversion with a row operation.
+    Carrier { source: Source, target: Target },
+    /// Same carrier and logical type; only nullability may widen. The value
+    /// passes unchanged, so no row can fail or become NULL.
+    Identity,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedCastRecipe {
     operation: CastOperation,
     source: FunctionValueType,
     result: FunctionValueType,
-    source_kind: Source,
-    target: Target,
+    body: CastBody,
     decimal_overflow_policy: DecimalOverflowPolicy,
     allow_throw_exception: bool,
 }
@@ -288,6 +297,30 @@ impl PreparedCastRecipe {
         let outcome = (|| {
             for ty in [source, result] {
                 validate_type_observed(ty, &mut work).map_err(CastPrepareError::Kernel)?;
+            }
+            // A Physical carrier with no primitive conversion kernel is still
+            // exactly castable to itself: the value passes unchanged and only
+            // the frozen nullability may widen. Nominal identities are not a
+            // Physical scalar profile and stay refused.
+            let identity = operation == CastOperation::Carrier
+                && source.data_type == result.data_type
+                && source.logical_type == ValueLogicalType::Physical
+                && result.logical_type == ValueLogicalType::Physical
+                && (Source::from_type(&source.data_type).is_none()
+                    || Target::from_type(&result.data_type).is_none());
+            work.step()?;
+            if identity {
+                if source.nullable && !result.nullable {
+                    return Err(CastPrepareError::TypeMismatch);
+                }
+                return Ok(Self {
+                    operation,
+                    source: source.clone(),
+                    result: result.clone(),
+                    body: CastBody::Identity,
+                    decimal_overflow_policy: policy,
+                    allow_throw_exception,
+                });
             }
             let physical = source.logical_type == ValueLogicalType::Physical
                 && result.logical_type == ValueLogicalType::Physical;
@@ -320,8 +353,10 @@ impl PreparedCastRecipe {
                 operation,
                 source: source.clone(),
                 result: result.clone(),
-                source_kind,
-                target,
+                body: CastBody::Carrier {
+                    source: source_kind,
+                    target,
+                },
                 decimal_overflow_policy: policy,
                 allow_throw_exception,
             };
@@ -356,20 +391,30 @@ impl PreparedCastRecipe {
     pub fn allow_throw_exception(&self) -> bool {
         self.allow_throw_exception
     }
+    /// An identity cast has no row operation: its value passes unchanged.
+    pub fn is_identity(&self) -> bool {
+        self.body == CastBody::Identity
+    }
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
-        ScopedExpressionEffects::primitive(
-            context,
-            ExpressionEffects {
-                may_raise_row_error: (self.source_kind.is_float()
-                    && matches!(self.target, Target::Signed(_) | Target::Unsigned(_))
+        let may_raise_row_error = match self.body {
+            CastBody::Identity => false,
+            CastBody::Carrier { source, target } => {
+                (source.is_float()
+                    && matches!(target, Target::Signed(_) | Target::Unsigned(_))
                     && self.allow_throw_exception)
                     || matches!(
-                        (self.source_kind, self.target),
+                        (source, target),
                         (
                             Source::Timestamp(TimeUnit::Microsecond),
                             Target::Timestamp(TimeUnit::Nanosecond)
                         )
-                    ),
+                    )
+            }
+        };
+        ScopedExpressionEffects::primitive(
+            context,
+            ExpressionEffects {
+                may_raise_row_error,
                 ..ExpressionEffects::PURE_VALUE
             },
         )
@@ -386,7 +431,16 @@ impl PreparedCastRecipe {
         control.checkpoint(0)?;
         let mut work = EvaluationCheckpoints::new(control);
         let outcome = (|| {
-            let row = self.checked_row(argument, ordinal, logical_row, &mut work)?;
+            let CastBody::Carrier {
+                source: source_kind,
+                target: carrier_target,
+            } = self.body
+            else {
+                return Err(invalid(
+                    "an identity cast has no row operation; its value passes unchanged",
+                ));
+            };
+            let row = self.checked_row(source_kind, argument, ordinal, logical_row, &mut work)?;
             if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
                 return if self.source.nullable {
                     Ok(CastRowResult::Null)
@@ -394,8 +448,8 @@ impl PreparedCastRecipe {
                     Err(invalid("non-null cast argument contains a selected NULL"))
                 };
             }
-            if let Source::Timestamp(unit) = self.source_kind {
-                let Target::Timestamp(target) = self.target else {
+            if let Source::Timestamp(unit) = source_kind {
+                let Target::Timestamp(target) = carrier_target else {
                     return Err(internal("timestamp cast contains a foreign frozen target"));
                 };
                 macro_rules! read_timestamp {
@@ -458,7 +512,7 @@ impl PreparedCastRecipe {
                         .downcast_ref::<$array>()
                         .ok_or_else(|| internal("cast carrier has a foreign array implementation"))?
                         .value(row);
-                    let output = match self.target {
+                    let output = match carrier_target {
                         Target::Boolean => Some(CastRowResult::Boolean(cast_num_to_bool(source))),
                         Target::Signed(SignedWidth::I8) => num_cast::<$native, i8>(source)
                             .map(|v| CastRowResult::Signed(i64::from(v))),
@@ -493,7 +547,7 @@ impl PreparedCastRecipe {
                     let source = argument.array().as_any().downcast_ref::<$array>()
                         .ok_or_else(|| internal("cast carrier has a foreign array implementation"))?
                         .value(row);
-                    let converted = match self.target {
+                    let converted = match carrier_target {
                         Target::Boolean => {
                             let value = cast_num_to_bool(source);
                             work.step()?;
@@ -527,7 +581,7 @@ impl PreparedCastRecipe {
                         Some(value) => value,
                         None if !self.allow_throw_exception => CastRowResult::Null,
                         None => {
-                            let name = match self.target {
+                            let name = match carrier_target {
                                 Target::Signed(SignedWidth::I8) => "TINYINT",
                                 Target::Signed(SignedWidth::I16) => "SMALLINT",
                                 Target::Signed(SignedWidth::I32) => "INT",
@@ -554,7 +608,7 @@ impl PreparedCastRecipe {
                     }
                 }};
             }
-            Ok(match self.source_kind {
+            Ok(match source_kind {
                 Source::Timestamp(_) => {
                     return Err(internal("timestamp cast escaped its checked operation"));
                 }
@@ -565,7 +619,7 @@ impl PreparedCastRecipe {
                         .downcast_ref::<BooleanArray>()
                         .ok_or_else(|| internal("cast carrier has a foreign array implementation"))?
                         .value(row);
-                    let result = match self.target {
+                    let result = match carrier_target {
                         Target::Boolean => CastRowResult::Boolean(value),
                         Target::Signed(_) => CastRowResult::Signed(i64::from(value)),
                         Target::Unsigned(_) => CastRowResult::Unsigned(u64::from(value)),
@@ -604,6 +658,7 @@ impl PreparedCastRecipe {
     }
     fn checked_row(
         &self,
+        source_kind: Source,
         argument: EvaluatedArgument<'_>,
         ordinal: usize,
         logical_row: usize,
@@ -662,7 +717,7 @@ impl PreparedCastRecipe {
         if !in_bounds {
             return Err(invalid("cast selected address is outside its array"));
         }
-        let concrete = self.source_kind.validate(array.as_ref());
+        let concrete = source_kind.validate(array.as_ref());
         work.step()?;
         if !concrete {
             return Err(internal("cast carrier has a foreign array implementation"));

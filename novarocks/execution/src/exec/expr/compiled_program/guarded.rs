@@ -680,7 +680,22 @@ pub(super) fn evaluate_tree<'a>(
                     let recipe = program
                         .cast_recipe(frame.occurrence)
                         .ok_or_else(|| invalid("missing exact cast recipe"))?;
-                    OwnedValue::from_selected(evaluate_cast(recipe, &child, local_selection, work)?)
+                    if recipe.is_identity() {
+                        // The value passes unchanged, with its row errors;
+                        // only the frozen nullability widens.
+                        OwnedValue::from_selected(child.materialize(
+                            local_selection,
+                            &recipe.result_type().data_type,
+                            work,
+                        )?)
+                    } else {
+                        OwnedValue::from_selected(evaluate_cast(
+                            recipe,
+                            &child,
+                            local_selection,
+                            work,
+                        )?)
+                    }
                 }
                 StaticExprKind::PreparedArithmetic { .. } => {
                     if frame.children.len() != 2 {
