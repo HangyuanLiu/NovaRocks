@@ -345,6 +345,11 @@ pub struct ResultWindowAlias {
     holder: Arc<WindowHolder>,
 }
 impl ResultWindowAlias {
+    /// Numeric scope identities are local to one host. Capacity must match
+    /// both the exact scope and the runtime that admitted it.
+    pub fn is_for_scope(&self, scope: &WorkScope) -> bool {
+        self.holder.scope.id == scope.id && Arc::ptr_eq(&self.holder.scope.inner, &scope.inner)
+    }
     pub fn scope_id(&self) -> WorkId {
         self.holder.scope.id()
     }
@@ -390,6 +395,25 @@ mod tests {
         control.mark_ready().unwrap();
         (control, handle)
     }
+    #[test]
+    fn alias_rejects_same_numeric_scope_from_a_different_host() {
+        let (first, capacity) = control();
+        let (second, _) = control();
+        let a = first
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let b = second
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        assert_eq!(a.owner.scope().id(), b.owner.scope().id());
+        let window = capacity
+            .try_acquire(&a.owner.scope(), ResultWindowClass::Client)
+            .unwrap();
+        let alias = window.retain_alias();
+        assert!(alias.is_for_scope(&a.owner.scope()));
+        assert!(!alias.is_for_scope(&b.owner.scope()));
+    }
+
     #[test]
     fn position_and_scope_survive_timeout_and_late_alias_exit() {
         let (control, capacity) = control();

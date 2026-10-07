@@ -24,6 +24,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use super::root_result_relay::{RelayedRootAnswer, RelayedRootPolls};
 use crate::native::fragment_transport::{
     FinalTaskInfoRead, NativeTaskResultTransport, RootResultOutcome, TaskReadGrace,
     TaskResultTransport,
@@ -41,6 +42,7 @@ use crate::query_execution::lifecycle_diagnostics::{
     RuntimeFilterTerminalRollupSnapshot, RuntimeFilterTerminalRollupUnavailable,
 };
 use crate::query_execution::lifecycle_plan::{QueryCredentialLeases, QueryInitOptions};
+use crate::query_execution::native_execution_adapter::ProductionRootDelivery;
 use crate::query_execution::outcome::{DistributedQueryOutcome, QueryOutcomeFactory};
 use crate::query_execution::profile::ProfileTerminalBuilder;
 #[cfg(test)]
@@ -538,7 +540,32 @@ impl FrontendDistributedQueryCoordinator {
         retry_boundary: Option<&dyn PreReadyRetryBoundary>,
         credential_lease_source: RoundCredentialLeaseSource,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
-        let parts = request.into_parts();
+        let mut parts = request.into_parts();
+        let delivery = ProductionRootDelivery::bind(
+            parts.description.row_carrier(),
+            parts.result_window.take(),
+        )
+        .map_err(|error| failed(error.to_string()))?;
+        if let ProductionRootDelivery::Relayed { kind, .. } = &delivery {
+            use novarocks_result_contract::{InternalResultDomain as D, RootOutputKind as K};
+            let matches = matches!(
+                (parts.completion.intent(), kind),
+                (DistributedQueryIntent::Profile, K::CountOnly)
+                    | (
+                        DistributedQueryIntent::Write,
+                        K::InternalFacts(D::PreparedWriteCommitV1)
+                    )
+                    | (
+                        DistributedQueryIntent::Statistics,
+                        K::InternalFacts(D::StatisticsArtifactV1)
+                    )
+            );
+            if !matches {
+                return Err(failed(
+                    "distributed root kind differs from its internal consumer",
+                ));
+            }
+        }
         let write_stack_session = parts.write_stack_session.clone();
         let intent = parts.completion.intent();
         let write_decoder = parts
@@ -719,6 +746,7 @@ impl FrontendDistributedQueryCoordinator {
             None => init_options,
         };
         let handoff = RoundHandoff {
+            delivery,
             query_id,
             execution_id,
             statement_deadline,
@@ -760,6 +788,7 @@ impl FrontendDistributedQueryCoordinator {
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         let execution_started = Instant::now();
         let RoundHandoff {
+            delivery,
             query_id,
             execution_id,
             statement_deadline,
@@ -950,6 +979,17 @@ impl FrontendDistributedQueryCoordinator {
             .map_err(failed)?,
         );
         let root_task = round.root_task();
+        let mut relayed_reader = match &delivery {
+            ProductionRootDelivery::Decoded => None,
+            ProductionRootDelivery::Relayed { .. } => Some(Arc::new(
+                crate::native::fragment_transport::NativeBoundedRootReadPort::new(Arc::clone(
+                    &result_transport,
+                )),
+            )
+                as Arc<dyn novarocks_query_application::api::BoundedRootReadPort>),
+        };
+        let mut relayed_end = None;
+
         let root_status_source = if intent == DistributedQueryIntent::Result {
             Some(
                 round
@@ -1063,7 +1103,10 @@ impl FrontendDistributedQueryCoordinator {
                 cancellation: &cancellation,
             };
             if cancellation.is_cancelled() {
-                break Err(self.fail_task_round(
+                break Err(self.fail_task_round_with_root_reader(
+                    &mut relayed_reader,
+                    &mut root_result_polls,
+                    root_task,
                     query_id,
                     &mut round,
                     &split_delivery,
@@ -1073,6 +1116,7 @@ impl FrontendDistributedQueryCoordinator {
                 ));
             }
             if let Some(message) = self.registry.first_failure(query_id) {
+                close_failed_root_reads(&mut relayed_reader, &mut root_result_polls, root_task);
                 break Err(self.fail_latched_task_round(
                     query_id,
                     &mut round,
@@ -1093,7 +1137,10 @@ impl FrontendDistributedQueryCoordinator {
                     last_root_poll,
                     write_completion.as_mut(),
                 );
-                break Err(self.fail_task_round(
+                break Err(self.fail_task_round_with_root_reader(
+                    &mut relayed_reader,
+                    &mut root_result_polls,
+                    root_task,
                     query_id,
                     &mut round,
                     &split_delivery,
@@ -1113,7 +1160,10 @@ impl FrontendDistributedQueryCoordinator {
             let mut moved = match advanced {
                 Ok(report) => !report.is_idle(),
                 Err(error) => {
-                    break Err(self.fail_task_round(
+                    break Err(self.fail_task_round_with_root_reader(
+                        &mut relayed_reader,
+                        &mut root_result_polls,
+                        root_task,
                         query_id,
                         &mut round,
                         &split_delivery,
@@ -1136,7 +1186,10 @@ impl FrontendDistributedQueryCoordinator {
                     Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
                 };
                 if let Some(detail) = refusal {
-                    break Err(self.fail_task_round(
+                    break Err(self.fail_task_round_with_root_reader(
+                        &mut relayed_reader,
+                        &mut root_result_polls,
+                        root_task,
                         query_id,
                         &mut round,
                         &split_delivery,
@@ -1177,7 +1230,10 @@ impl FrontendDistributedQueryCoordinator {
                 {
                     Ok(cause) => cause,
                     Err(error) => {
-                        break Err(self.fail_task_round(
+                        break Err(self.fail_task_round_with_root_reader(
+                            &mut relayed_reader,
+                            &mut root_result_polls,
+                            root_task,
                             query_id,
                             &mut round,
                             &split_delivery,
@@ -1197,7 +1253,10 @@ impl FrontendDistributedQueryCoordinator {
                 );
                 let detail =
                     format!("task execution terminated: {detail:?}; terminal_round={waiting_on}");
-                break Err(self.fail_task_round(
+                break Err(self.fail_task_round_with_root_reader(
+                    &mut relayed_reader,
+                    &mut root_result_polls,
+                    root_task,
                     query_id,
                     &mut round,
                     &split_delivery,
@@ -1217,7 +1276,10 @@ impl FrontendDistributedQueryCoordinator {
                 .and_then(SplitAssignmentRoundGuard::failure)
                 .map(|error| format!("split assignment stopped delivering: {error}"));
             if let Some(detail) = delivery_failure {
-                break Err(self.fail_task_round(
+                break Err(self.fail_task_round_with_root_reader(
+                    &mut relayed_reader,
+                    &mut root_result_polls,
+                    root_task,
                     query_id,
                     &mut round,
                     &split_delivery,
@@ -1240,7 +1302,9 @@ impl FrontendDistributedQueryCoordinator {
             if observed_result_eof || round.execution().result_terminal_control_required() {
                 root_result_polls = None;
             } else if root_result_polls.is_none() && round.result_pump_ready() {
-                match RootResultPolls::start(
+                match RootResultPolls::start_for_delivery(
+                    &delivery,
+                    relayed_reader.as_ref(),
                     Arc::clone(&result_transport) as Arc<dyn TaskResultTransport>,
                     root_task,
                     statement_deadline,
@@ -1259,7 +1323,10 @@ impl FrontendDistributedQueryCoordinator {
                         root_result_polls = Some(polls);
                     }
                     Err(error) => {
-                        break Err(self.fail_task_round(
+                        break Err(self.fail_task_round_with_root_reader(
+                            &mut relayed_reader,
+                            &mut root_result_polls,
+                            root_task,
                             query_id,
                             &mut round,
                             &split_delivery,
@@ -1273,7 +1340,148 @@ impl FrontendDistributedQueryCoordinator {
             // One answer per turn. Consuming it makes the turn non-idle, so
             // the loop comes straight back for the next one instead of
             // parking on the wake the poller raised.
-            if let Some(answer) = root_result_polls.as_mut().and_then(RootResultPolls::take) {
+            if let Some(answer) = root_result_polls
+                .as_mut()
+                .and_then(RootResultPolls::take_next)
+            {
+                let answer = match answer {
+                    RootPollAnswer::Legacy(answer) => answer,
+                    RootPollAnswer::Relayed(RelayedRootAnswer::Data(reply)) => {
+                        let novarocks_query_application::api::RootReplyView::Data {
+                            sequence,
+                            body,
+                            ..
+                        } = reply.outcome()
+                        else {
+                            break Err(self.fail_task_round_with_root_reader(
+                                &mut relayed_reader,
+                                &mut root_result_polls,
+                                root_task,
+                                query_id,
+                                &mut round,
+                                &split_delivery,
+                                classification,
+                                QueryFailureCause::FrontendExecution,
+                                "relayed data owner has no data",
+                            ));
+                        };
+                        let applied = if let Some(decoder) = statistics_decoder.as_mut() {
+                            decoder.apply_relay_body(body)
+                        } else if let Some(decoder) = write_decoder.as_mut() {
+                            decoder.apply_relay_body(body)
+                        } else {
+                            Err("relayed data has no typed internal consumer".into())
+                        };
+                        if let Err(error) = applied {
+                            break Err(self.fail_task_round_with_root_reader(
+                                &mut relayed_reader,
+                                &mut root_result_polls,
+                                root_task,
+                                query_id,
+                                &mut round,
+                                &split_delivery,
+                                classification,
+                                QueryFailureCause::FrontendExecution,
+                                error,
+                            ));
+                        }
+                        // No body alias escapes the typed decoder. Drop backing before
+                        // recording local consumption and issuing its exact receipt.
+                        drop(reply);
+                        let packet_sequence = sequence.get() - 1;
+                        let consumed = round
+                            .consume_root_result_packet(packet_sequence, false)
+                            .map_err(|error| error.to_string())
+                            .and_then(|()| {
+                                root_result_polls
+                                    .as_ref()
+                                    .expect("answer retains its reader")
+                                    .acknowledge(packet_sequence)
+                            });
+                        if let Err(error) = consumed {
+                            break Err(self.fail_task_round_with_root_reader(
+                                &mut relayed_reader,
+                                &mut root_result_polls,
+                                root_task,
+                                query_id,
+                                &mut round,
+                                &split_delivery,
+                                classification,
+                                QueryFailureCause::FrontendExecution,
+                                error,
+                            ));
+                        }
+                        root_batch_count = root_batch_count.saturating_add(1);
+                        last_root_poll = RootResultPoll::Packet(packet_sequence);
+                        continue;
+                    }
+                    RootPollAnswer::Relayed(RelayedRootAnswer::End(end)) => {
+                        let checked = if let Some(decoder) = statistics_decoder.as_ref() {
+                            decoder.check_relay_end(end.output_rows)
+                        } else if let Some(decoder) = write_decoder.as_ref() {
+                            decoder.check_relay_end(end.output_rows)
+                        } else {
+                            Ok(())
+                        };
+                        if let Err(error) = checked {
+                            break Err(self.fail_task_round_with_root_reader(
+                                &mut relayed_reader,
+                                &mut root_result_polls,
+                                root_task,
+                                query_id,
+                                &mut round,
+                                &split_delivery,
+                                classification,
+                                QueryFailureCause::FrontendExecution,
+                                error,
+                            ));
+                        }
+                        relayed_end = Some(end);
+                        root_row_count = end.output_rows;
+                        Ok(RootResultOutcome::EndOfStream {
+                            packet_sequence: end.sequence.get() - 1,
+                        })
+                    }
+                    RootPollAnswer::Relayed(RelayedRootAnswer::NotReady) => {
+                        Ok(RootResultOutcome::NotReady)
+                    }
+                    RootPollAnswer::Relayed(RelayedRootAnswer::AwaitTerminalControl) => {
+                        Ok(RootResultOutcome::AwaitTerminalControl)
+                    }
+                    RootPollAnswer::Relayed(RelayedRootAnswer::FetchFailure(error)) => {
+                        use novarocks_query_application::coordination::AttemptFailureClass as C;
+                        let cause = if error.class() == C::RecoverableInfrastructure {
+                            QueryFailureCause::RemoteTransportObservation
+                        } else {
+                            QueryFailureCause::FrontendExecution
+                        };
+                        let failed = self.fail_task_round_with_root_reader(
+                            &mut relayed_reader,
+                            &mut root_result_polls,
+                            root_task,
+                            query_id,
+                            &mut round,
+                            &split_delivery,
+                            classification,
+                            cause,
+                            error.error().to_string(),
+                        );
+                        break Err(failed.with_root_fetch_failure(error));
+                    }
+                    RootPollAnswer::Relayed(RelayedRootAnswer::Refused(error)) => {
+                        break Err(self.fail_task_round_with_root_reader(
+                            &mut relayed_reader,
+                            &mut root_result_polls,
+                            root_task,
+                            query_id,
+                            &mut round,
+                            &split_delivery,
+                            classification,
+                            QueryFailureCause::FrontendExecution,
+                            error,
+                        ));
+                    }
+                };
                 match answer {
                     Ok(RootResultOutcome::Ready(packet)) => {
                         let packet_sequence = packet.packet_sequence().get();
@@ -1286,7 +1494,10 @@ impl FrontendDistributedQueryCoordinator {
                                 execution_started,
                                 Some((root_batch_count, root_row_count)),
                             );
-                            break Err(self.fail_task_round(
+                            break Err(self.fail_task_round_with_root_reader(
+                                &mut relayed_reader,
+                                &mut root_result_polls,
+                                root_task,
                                 query_id,
                                 &mut round,
                                 &split_delivery,
@@ -1302,7 +1513,7 @@ impl FrontendDistributedQueryCoordinator {
                         )) {
                             Ok(batch) => batch,
                             Err(error) => {
-                                break Err(self.fail_task_round(
+                                break Err(self.fail_task_round_with_root_reader(&mut relayed_reader, &mut root_result_polls, root_task,
                                     query_id,
                                     &mut round,
                                     &split_delivery,
@@ -1327,7 +1538,10 @@ impl FrontendDistributedQueryCoordinator {
                                     execution_started,
                                     Some((root_batch_count, root_row_count)),
                                 );
-                                break Err(self.fail_task_round(
+                                break Err(self.fail_task_round_with_root_reader(
+                                    &mut relayed_reader,
+                                    &mut root_result_polls,
+                                    root_task,
                                     query_id,
                                     &mut round,
                                     &split_delivery,
@@ -1347,7 +1561,10 @@ impl FrontendDistributedQueryCoordinator {
                                     execution_started,
                                     Some((root_batch_count, root_row_count)),
                                 );
-                                break Err(self.fail_task_round(
+                                break Err(self.fail_task_round_with_root_reader(
+                                    &mut relayed_reader,
+                                    &mut root_result_polls,
+                                    root_task,
                                     query_id,
                                     &mut round,
                                     &split_delivery,
@@ -1375,7 +1592,10 @@ impl FrontendDistributedQueryCoordinator {
                             .expect("a root result answer requires its poll owner")
                             .acknowledge(packet_sequence)
                         {
-                            break Err(self.fail_task_round(
+                            break Err(self.fail_task_round_with_root_reader(
+                                &mut relayed_reader,
+                                &mut root_result_polls,
+                                root_task,
                                 query_id,
                                 &mut round,
                                 &split_delivery,
@@ -1393,7 +1613,10 @@ impl FrontendDistributedQueryCoordinator {
                             .expect("a root result answer requires its poll owner")
                             .acknowledge(packet_sequence)
                         {
-                            break Err(self.fail_task_round(
+                            break Err(self.fail_task_round_with_root_reader(
+                                &mut relayed_reader,
+                                &mut root_result_polls,
+                                root_task,
                                 query_id,
                                 &mut round,
                                 &split_delivery,
@@ -1433,7 +1656,10 @@ impl FrontendDistributedQueryCoordinator {
                                 execution_started,
                                 Some((root_batch_count, root_row_count)),
                             );
-                            break Err(self.fail_task_round(
+                            break Err(self.fail_task_round_with_root_reader(
+                                &mut relayed_reader,
+                                &mut root_result_polls,
+                                root_task,
                                 query_id,
                                 &mut round,
                                 &split_delivery,
@@ -1452,7 +1678,10 @@ impl FrontendDistributedQueryCoordinator {
                                 execution_started,
                                 Some((root_batch_count, root_row_count)),
                             );
-                            break Err(self.fail_task_round(
+                            break Err(self.fail_task_round_with_root_reader(
+                                &mut relayed_reader,
+                                &mut root_result_polls,
+                                root_task,
                                 query_id,
                                 &mut round,
                                 &split_delivery,
@@ -1471,7 +1700,10 @@ impl FrontendDistributedQueryCoordinator {
                                 execution_started,
                                 Some((root_batch_count, root_row_count)),
                             );
-                            break Err(self.fail_task_round(
+                            break Err(self.fail_task_round_with_root_reader(
+                                &mut relayed_reader,
+                                &mut root_result_polls,
+                                root_task,
                                 query_id,
                                 &mut round,
                                 &split_delivery,
@@ -1497,7 +1729,10 @@ impl FrontendDistributedQueryCoordinator {
                             root_task,
                             &mut root_result_polls,
                         ) {
-                            break Err(self.fail_task_round(
+                            break Err(self.fail_task_round_with_root_reader(
+                                &mut relayed_reader,
+                                &mut root_result_polls,
+                                root_task,
                                 query_id,
                                 &mut round,
                                 &split_delivery,
@@ -1536,7 +1771,10 @@ impl FrontendDistributedQueryCoordinator {
                         let detail = round.failure_cause().map_or(detail, |cause| {
                             format!("task execution terminated: {cause:?}")
                         });
-                        break Err(self.fail_task_round(
+                        break Err(self.fail_task_round_with_root_reader(
+                            &mut relayed_reader,
+                            &mut root_result_polls,
+                            root_task,
                             query_id,
                             &mut round,
                             &split_delivery,
@@ -1555,7 +1793,10 @@ impl FrontendDistributedQueryCoordinator {
                                 )
                             },
                         );
-                        break Err(self.fail_task_round(
+                        break Err(self.fail_task_round_with_root_reader(
+                            &mut relayed_reader,
+                            &mut root_result_polls,
+                            root_task,
                             query_id,
                             &mut round,
                             &split_delivery,
@@ -1593,7 +1834,7 @@ impl FrontendDistributedQueryCoordinator {
                             break Ok(());
                         }
                         if !verdict.is_pending() {
-                            break Err(self.fail_task_round(
+                            break Err(self.fail_task_round_with_root_reader(&mut relayed_reader, &mut root_result_polls, root_task,
                                 query_id,
                                 &mut round,
                                 &split_delivery,
@@ -1644,6 +1885,34 @@ impl FrontendDistributedQueryCoordinator {
         // renews for itself does so only when a request needs material, so an
         // attempt with no reader left starts nothing (CAD-1 D3).
         feedback_state.close();
+        if let Some(port) = relayed_reader.as_ref() {
+            use novarocks_execution_contract::root_lifetime::RootReadConvergence;
+            let mut convergence = RootReadConvergence::new(root_task);
+            let sealed = if outcome.is_err() {
+                convergence.seal_terminated()
+            } else {
+                convergence
+                    .consume_end(
+                        relayed_end
+                            .ok_or_else(|| failed("root success has no locally consumed End"))?,
+                    )
+                    .map_err(|error| failed(error.to_string()))?;
+                if round
+                    .execution()
+                    .task(root_task.task_id())
+                    .and_then(|task| task.status())
+                    .is_none_or(|status| status.state() != TaskState::Finished)
+                {
+                    return Err(failed("root success has no exact Finished observation"));
+                }
+                convergence.observe_root_finished();
+                convergence
+                    .seal_normal()
+                    .map_err(|error| failed(error.to_string()))?
+            };
+            port.seal(sealed)
+                .map_err(|error| failed(error.to_string()))?;
+        }
         outcome?;
 
         // A write cannot stop its Worker producers until the Root stream has
@@ -1839,7 +2108,19 @@ impl FrontendDistributedQueryCoordinator {
                 completion.write_session_outcome(session, prepared_set)
             }
             DistributedQueryIntent::Profile => {
-                let result = expected_output.into_query_result(batches)?;
+                let output_rows = match &delivery {
+                    ProductionRootDelivery::Decoded => {
+                        expected_output.into_query_result(batches)?.row_count() as u64
+                    }
+                    ProductionRootDelivery::Relayed { .. } => {
+                        if !batches.is_empty() || relayed_end.is_none() {
+                            return Err(failed(
+                                "CountOnly profile retained row batches or lost its End",
+                            ));
+                        }
+                        root_row_count
+                    }
+                };
                 let mut builder = ProfileTerminalBuilder::new();
                 let graph = round.execution().graph();
                 for info in &final_task_info.collected {
@@ -1881,7 +2162,7 @@ impl FrontendDistributedQueryCoordinator {
                     )?;
                 }
                 builder.apply_split_assignment_profile(split_assignment_profile);
-                completion.profile(result.row_count() as u64, builder.finish())
+                completion.profile(output_rows, builder.finish())
             }
             DistributedQueryIntent::Statistics => {
                 if let Some(error) = statistics_all_success_error(&round) {
@@ -1975,6 +2256,33 @@ impl FrontendDistributedQueryCoordinator {
     /// was replaced. Nothing is latched in that case, because a replanned
     /// round registers its own attempt and the failure belongs to the one
     /// being abandoned.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The terminal cut explicitly closes its read owners before the existing failure path."
+    )]
+    fn fail_task_round_with_root_reader(
+        &self,
+        reader: &mut Option<Arc<dyn novarocks_query_application::api::BoundedRootReadPort>>,
+        polls: &mut Option<RootResultPolls>,
+        root: TaskIdentity,
+        query_id: QueryId,
+        round: &mut TaskRound,
+        split_delivery: &SplitDeliveryBridge,
+        classification: TaskRoundFailureClassification<'_>,
+        cause: QueryFailureCause,
+        message: impl Into<String>,
+    ) -> DistributedQueryError {
+        close_failed_root_reads(reader, polls, root);
+        self.fail_task_round(
+            query_id,
+            round,
+            split_delivery,
+            classification,
+            cause,
+            message,
+        )
+    }
+
     fn fail_task_round(
         &self,
         query_id: QueryId,
@@ -3563,7 +3871,7 @@ const TASK_ROUND_IDLE_WAIT: Duration = Duration::from_millis(5);
 /// It must not be read as a bound on the loop's responsiveness. It was one
 /// once, and being one is what made every statement of a distributed suite
 /// wait a poll per edge-open decision.
-const MAX_ROOT_RESULT_WAIT: Duration = Duration::from_millis(200);
+pub(super) const MAX_ROOT_RESULT_WAIT: Duration = Duration::from_millis(200);
 
 /// How long an attempt may make no observable progress before it says, in the
 /// log, which facts its completion is still waiting on.
@@ -3751,6 +4059,7 @@ impl TaskRoundWaitWitness {
 /// The handoff keeps the inputs move-only: one attempt is scheduled, sealed
 /// and budgeted exactly once before its task graph becomes the lifecycle owner.
 struct RoundHandoff<'a> {
+    delivery: ProductionRootDelivery,
     query_id: QueryId,
     execution_id: QueryExecutionId,
     statement_deadline: Instant,
@@ -3966,13 +4275,108 @@ fn synchronous_root_completion_ready(round: &TaskRound) -> bool {
 /// One poll is in flight at a time, in order, and each answer wakes the loop.
 /// Data and pending EOS additionally wait for the owner to accept their exact
 /// sequence before the following request may acknowledge it.
-struct RootResultPolls {
+/// Called only after this owner accepts an originating failure/cancellation.
+/// Seal future dispatch before abort/classification can yield or block. The
+/// outstanding request retains its window until its future actually exits.
+pub(super) fn close_failed_root_reads(
+    reader: &mut Option<Arc<dyn novarocks_query_application::api::BoundedRootReadPort>>,
+    polls: &mut Option<RootResultPolls>,
+    root: TaskIdentity,
+) {
+    if let Some(reader) = reader.take() {
+        let mut convergence =
+            novarocks_execution_contract::root_lifetime::RootReadConvergence::new(root);
+        if let Err(error) = reader.seal(convergence.seal_terminated()) {
+            tracing::error!(%error, %root, "Failed to seal terminal root reads");
+        }
+        // Abort requests cancellation; the future's own alias exits later.
+        drop(polls.take());
+    }
+}
+
+enum RootPollAnswer {
+    Legacy(Result<RootResultOutcome, String>),
+    Relayed(RelayedRootAnswer),
+}
+pub(super) enum RootResultPolls {
+    Legacy(LegacyRootResultPolls),
+    Relayed(RelayedRootPolls),
+}
+impl RootResultPolls {
+    fn start(
+        transport: Arc<dyn TaskResultTransport>,
+        root: TaskIdentity,
+        deadline: Instant,
+        limit: ResultByteLimit,
+        wake: Arc<dyn StatusIntakeWake>,
+        runtime: FrontendDataRuntime,
+    ) -> Result<Self, String> {
+        LegacyRootResultPolls::start(transport, root, deadline, limit, wake, runtime)
+            .map(Self::Legacy)
+    }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Transition binds the same transport owners to one declared carrier."
+    )]
+    fn start_for_delivery(
+        delivery: &ProductionRootDelivery,
+        port: Option<&Arc<dyn novarocks_query_application::api::BoundedRootReadPort>>,
+        transport: Arc<dyn TaskResultTransport>,
+        root: TaskIdentity,
+        deadline: Instant,
+        limit: ResultByteLimit,
+        wake: Arc<dyn StatusIntakeWake>,
+        runtime: FrontendDataRuntime,
+    ) -> Result<Self, String> {
+        match delivery {
+            ProductionRootDelivery::Decoded => {
+                Self::start(transport, root, deadline, limit, wake, runtime)
+            }
+            ProductionRootDelivery::Relayed { kind, window, .. } => RelayedRootPolls::start(
+                port.cloned().ok_or("relayed root has no bounded reader")?,
+                root,
+                *kind,
+                window.clone(),
+                deadline,
+                wake,
+                runtime,
+            )
+            .map(Self::Relayed),
+        }
+    }
+    fn take_next(&mut self) -> Option<RootPollAnswer> {
+        match self {
+            Self::Legacy(polls) => polls.take().map(RootPollAnswer::Legacy),
+            Self::Relayed(polls) => polls.take().map(RootPollAnswer::Relayed),
+        }
+    }
+    #[cfg(test)]
+    fn take(&mut self) -> Option<Result<RootResultOutcome, String>> {
+        match self.take_next()? {
+            RootPollAnswer::Legacy(answer) => Some(answer),
+            RootPollAnswer::Relayed(_) => panic!("legacy test requested a relayed answer"),
+        }
+    }
+    fn acknowledge(&self, sequence: u64) -> Result<(), String> {
+        match self {
+            Self::Legacy(polls) => polls.acknowledge(sequence),
+            Self::Relayed(polls) => polls.acknowledge(
+                sequence
+                    .checked_add(1)
+                    .and_then(std::num::NonZeroU64::new)
+                    .ok_or("root receipt sequence overflow")?,
+            ),
+        }
+    }
+}
+
+pub(super) struct LegacyRootResultPolls {
     answers: tokio::sync::mpsc::Receiver<Result<RootResultOutcome, String>>,
     acknowledgements: tokio::sync::mpsc::Sender<ResultPacketSequence>,
     task: tokio::task::JoinHandle<()>,
 }
 
-impl RootResultPolls {
+impl LegacyRootResultPolls {
     /// Starts polling `root_task`.
     ///
     /// The caller has observed this task's Installed status, so the result
@@ -4065,7 +4469,7 @@ impl RootResultPolls {
     }
 }
 
-impl Drop for RootResultPolls {
+impl Drop for LegacyRootResultPolls {
     fn drop(&mut self) {
         self.task.abort();
     }

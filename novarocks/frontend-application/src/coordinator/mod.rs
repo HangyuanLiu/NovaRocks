@@ -18,6 +18,7 @@
 // MIGRATION: wired into the round once the typed producer lands.
 mod execution;
 mod query_registry;
+mod root_result_relay;
 mod scheduler;
 #[allow(
     dead_code,

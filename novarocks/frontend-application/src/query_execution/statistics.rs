@@ -509,6 +509,7 @@ fn admit_statistics_scan_binding(
 /// provider metadata while consuming `finish`.
 pub struct StatisticsRootResultDecoder {
     relay_assembly: RootRecordAssembly,
+    relayed_record_count: u64,
     expected: BTreeSet<StatisticsArtifactIdentity>,
     observed: BTreeMap<StatisticsArtifactIdentity, StatisticsArtifactDraft>,
     body_bytes: usize,
@@ -519,6 +520,7 @@ pub struct StatisticsRootResultDecoder {
 impl StatisticsRootResultDecoder {
     fn new(expected: impl IntoIterator<Item = StatisticsArtifactIdentity>) -> Self {
         Self {
+            relayed_record_count: 0,
             relay_assembly: RootRecordAssembly::new(RootRecordDomain::Statistics, 32 * 1024 * 1024),
             expected: expected.into_iter().collect(),
             observed: BTreeMap::new(),
@@ -622,6 +624,16 @@ impl StatisticsRootResultDecoder {
 
     /// Apply one complete StatisticsArtifactV1 record relayed from the
     /// Backend, under the same identity, membership and body rules.
+    /// Validate complete local domain consumption before the coordinator
+    /// records End. This count is relation rows, not affected write rows.
+    pub(crate) fn check_relay_end(&self, output_rows: u64) -> Result<(), String> {
+        self.relay_assembly.finish()?;
+        if output_rows != self.relayed_record_count {
+            return Err("internal root End differs from decoded record count".into());
+        }
+        Ok(())
+    }
+
     /// Accept a relayed body into the prepaid 32 MiB assembly share. A complete
     /// record is validated before this call returns and its receipt may finish.
     pub(crate) fn apply_relay_body(&mut self, body: &[u8]) -> Result<(), String> {
@@ -632,7 +644,14 @@ impl StatisticsRootResultDecoder {
             &mut self.relay_assembly,
             RootRecordAssembly::new(RootRecordDomain::Statistics, 32 * 1024 * 1024),
         );
-        let result = assembly.push(body, |record| self.apply_record(record));
+        let result = assembly.push(body, |record| {
+            self.apply_record(record)?;
+            self.relayed_record_count = self
+                .relayed_record_count
+                .checked_add(1)
+                .ok_or("internal root record count overflow")?;
+            Ok(())
+        });
         self.relay_assembly = assembly;
         result
     }
@@ -854,6 +873,9 @@ mod tests {
         );
         assert!(!decoder.root_eof);
         decoder.apply_relay_body(&record[7..]).unwrap();
+        assert!(decoder.check_relay_end(2).is_err());
+        assert!(!decoder.root_eof);
+        decoder.check_relay_end(1).unwrap();
         decoder.observe_root_eof().unwrap();
         assert!(decoder.finish().unwrap_err().contains("all-success"));
         let mut decoder = StatisticsRootResultDecoder::new([expected]);

@@ -203,6 +203,7 @@ struct RootWriteRow<'a> {
 
 pub(crate) struct RootWriteResultDecoder {
     relay_assembly: RootRecordAssembly,
+    relayed_record_count: u64,
     contract: RootWriteDecodeContract,
     rows: WriteRowCountAccumulator,
     ledger: PreparedWriteSetLedger,
@@ -217,6 +218,7 @@ pub(crate) struct RootWriteResultDecoder {
 impl RootWriteResultDecoder {
     pub(crate) fn new(contract: RootWriteDecodeContract) -> Self {
         Self {
+            relayed_record_count: 0,
             relay_assembly: RootRecordAssembly::new(
                 RootRecordDomain::WriteCommit,
                 32 * 1024 * 1024,
@@ -335,6 +337,16 @@ impl RootWriteResultDecoder {
         Ok(())
     }
 
+    /// Validate complete local domain consumption before the coordinator
+    /// records End. This count is relation rows, not affected write rows.
+    pub(crate) fn check_relay_end(&self, output_rows: u64) -> Result<(), String> {
+        self.relay_assembly.finish()?;
+        if output_rows != self.relayed_record_count {
+            return Err("internal root End differs from decoded record count".into());
+        }
+        Ok(())
+    }
+
     /// Accept a relayed body into the prepaid 32 MiB assembly share. A complete
     /// record is validated before this call returns and its receipt may finish.
     pub(crate) fn apply_relay_body(&mut self, body: &[u8]) -> Result<(), String> {
@@ -345,7 +357,14 @@ impl RootWriteResultDecoder {
             &mut self.relay_assembly,
             RootRecordAssembly::new(RootRecordDomain::WriteCommit, 32 * 1024 * 1024),
         );
-        let result = assembly.push(body, |record| self.apply_record(record));
+        let result = assembly.push(body, |record| {
+            self.apply_record(record)?;
+            self.relayed_record_count = self
+                .relayed_record_count
+                .checked_add(1)
+                .ok_or("internal root record count overflow")?;
+            Ok(())
+        });
         self.relay_assembly = assembly;
         result
     }
@@ -829,6 +848,9 @@ mod tests {
         decoder.apply_relay_body(&record[7..]).unwrap();
         let tail = records(vec![summary(5)]).remove(0);
         decoder.apply_relay_body(&tail).unwrap();
+        assert!(decoder.check_relay_end(1).is_err());
+        assert!(!decoder.root_eof);
+        decoder.check_relay_end(2).unwrap();
         let prepared = finish(decoder).unwrap();
         assert_eq!(prepared.row_count(), 5);
     }

@@ -914,6 +914,17 @@ impl LogicalReadLauncher for FrontendNativeLogicalReadLauncher {
         result_window: Option<novarocks_workload_control::ResultWindowAlias>,
     ) -> QueryExecutionFuture {
         let (description, template, options) = read.into_parts();
+        if result_window
+            .as_ref()
+            .is_some_and(|window| !window.is_for_scope(&owner.scope()))
+        {
+            return Box::pin(async {
+                Err(QueryExecutionError::new(
+                    QueryExecutionErrorKind::InvalidRequest,
+                    "logical read result window belongs to a foreign scope",
+                ))
+            });
+        }
         if !description.matches_plan_seal(template.native_manifest_template().plan()) {
             return Box::pin(async {
                 Err(QueryExecutionError::new(
@@ -983,7 +994,7 @@ impl std::fmt::Debug for ProductionManifestAttemptProjection {
 /// The frozen carrier and its already-admitted window travel together. A
 /// relayed root cannot fall back to Arrow when its class has no capacity.
 #[derive(Clone)]
-enum ProductionRootDelivery {
+pub(crate) enum ProductionRootDelivery {
     Decoded,
     Relayed {
         kind: novarocks_result_contract::RootOutputKind,
@@ -992,7 +1003,7 @@ enum ProductionRootDelivery {
     },
 }
 impl ProductionRootDelivery {
-    fn bind(
+    pub(crate) fn bind(
         carrier: novarocks_query_application::api::ResultRowCarrier,
         window: Option<novarocks_workload_control::ResultWindowAlias>,
     ) -> Result<Self, QueryExecutionError> {

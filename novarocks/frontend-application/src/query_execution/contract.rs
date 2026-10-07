@@ -203,6 +203,7 @@ pub enum DistributedQueryIntent {
 /// unrelated prepared/native artifacts or replace its cancellation/completion
 /// capabilities.
 pub struct DistributedQueryRequest {
+    result_window: Option<novarocks_workload_control::ResultWindowAlias>,
     payload: DistributedQueryPayload,
     topology: novarocks_query_application::api::BackendTopologySnapshot,
     deadline: Option<Instant>,
@@ -246,6 +247,7 @@ impl RestartableReadExecution {
         execution: &QueryExecutionContext,
     ) -> DistributedQueryRequest {
         DistributedQueryRequest {
+            result_window: None,
             payload: DistributedQueryPayload::RestartableRead(Arc::clone(self)),
             topology: execution.topology().clone(),
             deadline: execution.deadline(),
@@ -264,6 +266,29 @@ impl RestartableReadExecution {
 }
 
 impl DistributedQueryRequest {
+    /// Bind runtime capacity supplied by statement admission. This never enters
+    /// the frozen semantic description or constructs a new result allowance.
+    pub(crate) fn with_result_window(
+        mut self,
+        window: novarocks_workload_control::ResultWindowAlias,
+        scope: &novarocks_workload_control::WorkScope,
+    ) -> Result<Self, DistributedQueryError> {
+        if !window.is_for_scope(scope) {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "distributed request result window belongs to a foreign scope",
+            ));
+        }
+        if self.result_window.is_some() {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "distributed request already owns its result window",
+            ));
+        }
+        self.result_window = Some(window);
+        Ok(self)
+    }
+
     pub fn frozen_description(&self) -> &FrozenExecutionDescription {
         match &self.payload {
             DistributedQueryPayload::RestartableRead(read) => read.description.as_ref(),
@@ -330,6 +355,7 @@ impl DistributedQueryRequest {
             } => (description, artifacts, options),
         };
         DistributedQueryRequestParts {
+            result_window: self.result_window,
             description,
             artifacts,
             options,
@@ -347,6 +373,7 @@ impl DistributedQueryRequest {
 /// Consuming frontend handoff. There is deliberately no constructor,
 /// `Clone`, or inverse recombination API.
 pub struct DistributedQueryRequestParts {
+    pub(crate) result_window: Option<novarocks_workload_control::ResultWindowAlias>,
     pub description: Arc<FrozenExecutionDescription>,
     pub artifacts: PreparedDistributedQuery,
     pub options: Arc<ResolvedQueryOptions>,
@@ -399,6 +426,7 @@ pub(crate) fn build_request_from_finalized_execution(
         }
     };
     Ok(DistributedQueryRequest {
+        result_window: None,
         payload,
         topology: execution.topology().clone(),
         deadline: execution.deadline(),
@@ -495,6 +523,7 @@ pub(crate) enum PreReadyTopologyOutcome {
 /// implementation or frontend state type.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DistributedQueryError {
+    root_fetch_failure: Option<novarocks_query_application::coordination::RootResultFetchFailure>,
     kind: DistributedQueryErrorKind,
     message: String,
     pre_ready_topology_outcome: Option<PreReadyTopologyOutcome>,
@@ -504,6 +533,7 @@ pub struct DistributedQueryError {
 impl DistributedQueryError {
     pub fn new(kind: DistributedQueryErrorKind, message: impl Into<String>) -> Self {
         Self {
+            root_fetch_failure: None,
             kind,
             message: message.into(),
             pre_ready_topology_outcome: None,
@@ -519,6 +549,7 @@ impl DistributedQueryError {
         message: impl Into<String>,
     ) -> Self {
         Self {
+            root_fetch_failure: None,
             kind: DistributedQueryErrorKind::Rejected,
             message: message.into(),
             pre_ready_topology_outcome: Some(outcome),
@@ -532,6 +563,7 @@ impl DistributedQueryError {
     /// display text or after ControlReady.
     pub(crate) fn pre_ready_topology_observation(message: impl Into<String>) -> Self {
         Self {
+            root_fetch_failure: None,
             kind: DistributedQueryErrorKind::Failed,
             message: message.into(),
             pre_ready_topology_outcome: None,
@@ -548,11 +580,33 @@ impl DistributedQueryError {
         message: impl Into<String>,
     ) -> Self {
         Self {
+            root_fetch_failure: None,
             kind: DistributedQueryErrorKind::TopologyRetryUnsupported,
             message: message.into(),
             pre_ready_topology_outcome: Some(outcome),
             pre_ready_topology_observation: false,
         }
+    }
+
+    /// Preserve the transport verdict after this coordinator has failed its
+    /// installed attempt. It grants no pre-ready or transparent retry proof.
+    pub(crate) fn with_root_fetch_failure(
+        mut self,
+        failure: novarocks_query_application::coordination::RootResultFetchFailure,
+    ) -> Self {
+        use novarocks_query_application::coordination::AttemptFailureClass as C;
+        self.kind = match failure.class() {
+            C::ResourceGovernance => DistributedQueryErrorKind::Rejected,
+            C::ContractViolation => DistributedQueryErrorKind::ContractViolation,
+            _ => DistributedQueryErrorKind::Failed,
+        };
+        self.root_fetch_failure = Some(failure);
+        self
+    }
+    pub(crate) fn root_fetch_failure(
+        &self,
+    ) -> Option<&novarocks_query_application::coordination::RootResultFetchFailure> {
+        self.root_fetch_failure.as_ref()
     }
 
     pub fn kind(&self) -> DistributedQueryErrorKind {
