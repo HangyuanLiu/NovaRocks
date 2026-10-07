@@ -1,0 +1,227 @@
+-- query 2
+pid	json_in
+1	1
+1	1
+2	1
+3	1
+4	1
+5	0
+6	0
+7	1
+8	1
+9	0
+10	1
+11	1
+12	0
+13	1
+14	1
+15	0
+16	NULL
+16	NULL
+
+-- query 3
+pid	json_not_in
+1	0
+1	0
+2	0
+3	0
+4	0
+5	1
+6	1
+7	0
+8	0
+9	1
+10	0
+11	0
+12	1
+13	0
+14	0
+15	1
+16	NULL
+16	NULL
+
+-- query 4
+pid	string_in
+1	1
+1	1
+2	0
+3	0
+4	1
+5	0
+6	0
+7	1
+8	0
+9	0
+10	0
+11	0
+12	0
+13	0
+14	1
+15	0
+16	NULL
+16	NULL
+
+-- query 5
+total_rows	non_null_rows	true_rows
+18	16	11
+
+-- query 6
+pid	in_empty
+1	0
+1	0
+5	0
+14	0
+16	0
+16	0
+
+-- query 7
+pid	not_in_empty
+1	1
+1	1
+5	1
+14	1
+16	1
+16	1
+
+-- query 8
+pid	in_match_null
+1	1
+1	1
+2	1
+3	NULL
+14	NULL
+16	NULL
+16	NULL
+
+-- query 9
+pid	not_in_match_null
+1	0
+1	0
+2	0
+3	NULL
+14	NULL
+16	NULL
+16	NULL
+
+-- query 10
+pid	in_miss_null
+1	NULL
+1	NULL
+4	NULL
+14	NULL
+15	NULL
+16	NULL
+16	NULL
+
+-- query 11
+pid	not_in_miss_null
+1	NULL
+1	NULL
+4	NULL
+14	NULL
+15	NULL
+16	NULL
+16	NULL
+
+-- query 12
+pid	in_miss
+1	0
+1	0
+4	0
+14	0
+15	0
+16	NULL
+16	NULL
+
+-- query 13
+pid	not_in_miss
+1	1
+1	1
+4	1
+14	1
+15	1
+16	NULL
+16	NULL
+
+-- query 14
+pid	in_json_null
+1	0
+1	0
+14	1
+15	0
+16	NULL
+16	NULL
+
+-- query 15
+pid	not_in_json_null
+1	1
+1	1
+14	0
+15	1
+16	NULL
+16	NULL
+
+-- query 16
+ord	pid
+1	1
+2	2
+6	6
+17	1
+
+-- query 17
+ord	pid
+5	5
+6	6
+12	12
+14	14
+15	15
+
+-- query 18
+pid	n
+1	2
+5	1
+16	2
+
+-- query 19
+pid	n
+2	1
+3	1
+4	1
+5	1
+6	1
+8	1
+9	1
+10	1
+11	1
+12	1
+13	1
+14	1
+15	1
+16	2
+
+-- query 20
+pid	cte_in
+1	1
+1	1
+2	1
+3	NULL
+16	NULL
+16	NULL
+
+-- query 21
+pid	self_not_in
+1	0
+1	0
+2	0
+3	0
+4	1
+16	NULL
+16	NULL
+
+-- query 22
+pid	case_in
+1	1
+1	1
+3	1
+5	NULL
+14	NULL
