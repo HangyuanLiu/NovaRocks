@@ -27,8 +27,8 @@ use novarocks_connector_contract::WriteTargetOrdinal;
 use novarocks_functions::*;
 use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, DecimalOverflowPolicy, EvaluationDomainId,
-    FunctionEffectDeclaration, FunctionInstanceState, FunctionNullBehavior, ObservableEffects,
-    SemanticParameters, WindowFrame as CommonWindowFrame,
+    ExpressionEffectContext, FunctionEffectDeclaration, FunctionInstanceState,
+    FunctionNullBehavior, ObservableEffects, SemanticParameters, WindowFrame as CommonWindowFrame,
 };
 use std::{
     collections::HashMap,

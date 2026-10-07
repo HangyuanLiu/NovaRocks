@@ -37,8 +37,8 @@ use novarocks_functions::{
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, EvaluationDemand,
-    ExpressionEffectContext, ExpressionUseId, FunctionValueType, MAX_CONTROL_USE_REFERENCES,
-    PureCompileControl, ValueTypeError, WindowBound, WindowFrameExclusion, WindowFrameUnits,
+    ExpressionUseId, FunctionValueType, MAX_CONTROL_USE_REFERENCES, PureCompileControl,
+    ValueTypeError, WindowBound, WindowFrameExclusion, WindowFrameUnits,
     arrow_data_types_exact_observed,
 };
 use novarocks_types::SlotId;

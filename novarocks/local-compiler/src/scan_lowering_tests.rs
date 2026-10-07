@@ -54,6 +54,11 @@ const EDGE: EdgeId = EdgeId::new(5);
 const SCAN: NodeId = NodeId::new(10);
 const FILTER: NodeId = NodeId::new(11);
 const RECEIVER: NodeId = NodeId::new(20);
+const BUILD: FragmentId = FragmentId::new(3);
+const BUILD_EDGE: EdgeId = EdgeId::new(6);
+const BUILD_RECEIVER: NodeId = NodeId::new(12);
+const JOIN: NodeId = NodeId::new(13);
+const VALUES: NodeId = NodeId::new(30);
 
 struct FixtureControl;
 impl PureCompileControl for FixtureControl {
@@ -115,6 +120,8 @@ struct Spec {
     derived: bool,
     reordered: bool,
     filter: bool,
+    /// The scan probes a broadcast hash join whose build is `VALUES (7)`.
+    join: bool,
     kind: ConnectorReadRelationKind,
     sink: Sink,
 }
@@ -129,6 +136,7 @@ impl Spec {
             derived: false,
             reordered: false,
             filter: false,
+            join: false,
             kind: ConnectorReadRelationKind::Table,
             sink: Sink::Gather,
         }
@@ -373,6 +381,82 @@ fn fixture(spec: Spec) -> Fixture {
         max: 1,
         requires_power_of_two: false,
     };
+    // `... JOIN broadcast(VALUES (7)) ON v0 = c0`: every instance receives
+    // the whole build, and the join keeps the scan's output.
+    let mut build_fragment = None;
+    if spec.join {
+        let mut build = FragmentBuilder::new(BUILD);
+        let column = build
+            .add_value(
+                int64(),
+                ValueOrigin::NodeOutput {
+                    node: VALUES,
+                    output_ordinal: 0,
+                },
+            )
+            .unwrap();
+        let cell = build
+            .add_expression(VALUES, int64(), ExprKind::Literal(LiteralValue::Int64(7)))
+            .unwrap();
+        build
+            .add_values(VALUES, Box::from([Box::from([cell])]), Box::from([column]))
+            .unwrap();
+        let fragment = build
+            .finish_definition(VALUES, FragmentSink::Stream { edge: BUILD_EDGE }, dop)
+            .unwrap();
+        let imported = builder
+            .add_value(
+                int64(),
+                ValueOrigin::ExchangeImport {
+                    edge: BUILD_EDGE,
+                    source_value: column,
+                },
+            )
+            .unwrap();
+        builder
+            .add_exchange_source(
+                BUILD_RECEIVER,
+                BUILD_EDGE,
+                Box::from([(column, imported)]),
+                Box::from([imported]),
+                Distribution::Broadcast,
+                RowMultiplicity::Replicated,
+            )
+            .unwrap();
+        let key = JoinKey {
+            left: builder
+                .add_expression(JOIN, int64(), ExprKind::Value(provider[0]))
+                .unwrap(),
+            right: builder
+                .add_expression(JOIN, int64(), ExprKind::Value(imported))
+                .unwrap(),
+            null_safe: false,
+        };
+        let probe = builder.node_output_properties(root).unwrap().clone();
+        let replicated = builder
+            .node_output_properties(BUILD_RECEIVER)
+            .unwrap()
+            .clone();
+        builder
+            .add_join(
+                JOIN,
+                [root, BUILD_RECEIVER],
+                Box::from([probe, replicated]),
+                output.clone().into_boxed_slice(),
+                Distribution::Unconstrained,
+                NodeKind::HashJoin {
+                    kind: JoinKind::Inner,
+                    keys: Box::from([key]),
+                    build_side: JoinSide::Right,
+                    distribution: JoinDistribution::BroadcastBuild,
+                    residual: None,
+                    null_extended: Box::default(),
+                },
+            )
+            .unwrap();
+        build_fragment = Some((fragment, column, imported));
+        root = JOIN;
+    }
     let producer_sink = match spec.sink {
         Sink::Gather => FragmentSink::Stream { edge: EDGE },
         Sink::Result(_) => FragmentSink::Result,
@@ -381,6 +465,29 @@ fn fixture(spec: Spec) -> Fixture {
 
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
     plan.add_fragment(producer).unwrap();
+    if let Some((fragment, column, imported)) = build_fragment {
+        plan.add_fragment(fragment).unwrap();
+        plan.add_edge(Edge {
+            id: BUILD_EDGE,
+            kind: EdgeKind::Stream,
+            source: EdgeSource {
+                fragment: BUILD,
+                projection: Box::from([column]),
+            },
+            destination: EdgeDestination {
+                fragment: PRODUCER,
+                node: BUILD_RECEIVER,
+                receive_mapping: Box::from([(column, imported)]),
+            },
+            partitioning: EdgePartitioning {
+                source: Distribution::Broadcast,
+                source_multiplicity: RowMultiplicity::SingleCopy,
+                destination: Distribution::Broadcast,
+                destination_multiplicity: RowMultiplicity::Replicated,
+            },
+        })
+        .unwrap();
+    }
     match spec.sink {
         Sink::Gather => {
             let mut consumer = FragmentBuilder::new(CONSUMER);
@@ -962,6 +1069,38 @@ fn transparent_filter_over_the_unconstrained_scan_reads_the_scan_port() {
             role: ProgramChannelLayoutRole::NodeOutput,
             ordinal: 1,
         })
+    );
+}
+
+#[test]
+fn broadcast_join_probing_the_unconstrained_scan_inherits_its_placement() {
+    let program = compile(Spec {
+        join: true,
+        ..Spec::slice()
+    })
+    .unwrap();
+    let graph = program.graph();
+    let (scan, _) = graph
+        .nodes()
+        .iter()
+        .enumerate()
+        .find(|(_, node)| matches!(node.kind(), ProgramNodeKind::Scan { .. }))
+        .expect("the probe scan");
+    assert!(
+        graph
+            .nodes()
+            .iter()
+            .any(|node| matches!(node.kind(), ProgramNodeKind::Join { .. })),
+        "the join compiles over the unconstrained scan"
+    );
+    assert_eq!(
+        program.scan_inputs(),
+        &BTreeMap::from([(
+            ProgramNodeId::new(scan),
+            CompiledScanInput {
+                scan_node: SCAN.get(),
+            },
+        )])
     );
 }
 

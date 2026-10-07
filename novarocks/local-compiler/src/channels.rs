@@ -791,7 +791,10 @@ fn fresh_relation(
         port.entry(*value).or_insert(ordinal);
         work.step()?;
     }
-    Ok((fresh_slots(node.output.columns.len(), next_slot, work)?, port))
+    Ok((
+        fresh_slots(node.output.columns.len(), next_slot, work)?,
+        port,
+    ))
 }
 
 fn single_child(inputs: &[NodeId]) -> Result<NodeId, ChannelLoweringError> {

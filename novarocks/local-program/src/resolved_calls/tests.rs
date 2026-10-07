@@ -29,9 +29,9 @@ use arrow_schema::{DataType, Field, Schema};
 use novarocks_functions::*;
 use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, DecimalOverflowPolicy, DomainGuard,
-    EvaluationDomainId, FunctionEffectDeclaration, FunctionFailureBehavior, FunctionInstanceState,
-    FunctionIntrinsicRowError, FunctionKind, FunctionNullBehavior, FunctionVolatility, GuardKind,
-    ObservableEffects, SemanticParameters,
+    EvaluationDomainId, ExpressionEffectContext, FunctionEffectDeclaration,
+    FunctionFailureBehavior, FunctionInstanceState, FunctionIntrinsicRowError, FunctionKind,
+    FunctionNullBehavior, FunctionVolatility, GuardKind, ObservableEffects, SemanticParameters,
 };
 use std::{
     collections::HashMap,
