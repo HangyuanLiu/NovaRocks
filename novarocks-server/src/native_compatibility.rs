@@ -22,7 +22,7 @@ use anyhow::Context;
 use novarocks_physical_plan::PLAN_CONTRACT_REVISION;
 use novarocks_spi::connector::provider::{ProviderContractDefinition, SealedProviderRegistry};
 use novarocks_version::{
-    NativeCarrierDeclaration, NativeCompatibilityMaterial,
+    NativeCarrierDeclaration, NativeCompatibilityMaterial, StaticPlanInterpreter,
     derive_repository_native_compatibility_material,
 };
 
@@ -70,11 +70,13 @@ fn native_carrier_from_contract(
 }
 
 /// Resolves the immutable compatibility material for this binary before role
-/// application composition opens listeners or runtime services.
+/// application composition opens listeners or runtime services. The static
+/// plan interpreter is the one this binary composed for every role.
 pub fn resolve_native_compatibility_material(
     provider_registry: &SealedProviderRegistry,
     function_catalog_digest: [u8; 32],
     execution_implementation_manifest_digest: [u8; 32],
+    static_plan_interpreter: StaticPlanInterpreter,
 ) -> anyhow::Result<NativeCompatibilityMaterial> {
     let declarations = native_carrier_declarations(provider_registry)?;
     derive_repository_native_compatibility_material(
@@ -82,6 +84,7 @@ pub fn resolve_native_compatibility_material(
         function_catalog_digest,
         execution_implementation_manifest_digest,
         PLAN_CONTRACT_REVISION,
+        static_plan_interpreter,
     )
     .with_context(|| "derive native compatibility material")
 }
@@ -100,6 +103,9 @@ mod tests {
         native_carrier_declarations, native_carrier_from_contract,
         resolve_native_compatibility_material,
     };
+    use novarocks_version::StaticPlanInterpreter;
+
+    const PLAN_TREE: StaticPlanInterpreter = StaticPlanInterpreter::PlanTree;
 
     fn server_manifest() -> crate::provider_manifest::ServerProviderManifest {
         crate::provider_manifest::ServerProviderManifest::seal().expect("server provider manifest")
@@ -108,9 +114,13 @@ mod tests {
     #[test]
     fn legacy_raw_text_temporal_peer_has_a_distinct_plan_contract_digest() {
         let manifest = server_manifest();
-        let current =
-            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], [0x41; 32])
-                .unwrap();
+        let current = resolve_native_compatibility_material(
+            manifest.contracts(),
+            [0x31; 32],
+            [0x41; 32],
+            PLAN_TREE,
+        )
+        .unwrap();
         // Catalog declarations and implementation profiles are identical here.
         // Revision 1 admitted raw UTF8 bounds; the normalized contract must not.
         let legacy = novarocks_version::derive_repository_native_compatibility_material(
@@ -118,6 +128,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             1,
+            PLAN_TREE,
         )
         .unwrap();
         assert_ne!(
@@ -198,6 +209,7 @@ mod tests {
                 [0x31; 32],
                 [0x41; 32],
                 novarocks_physical_plan::PLAN_CONTRACT_REVISION,
+                PLAN_TREE,
             )
             .unwrap()
         };
@@ -222,12 +234,20 @@ mod tests {
     #[test]
     fn repository_material_is_nonempty_and_uses_the_server_manifest() {
         let manifest = server_manifest();
-        let material =
-            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], [0x41; 32])
-                .expect("compatibility material");
-        let implementation_only_change =
-            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], [0x42; 32])
-                .expect("implementation-only compatibility material");
+        let material = resolve_native_compatibility_material(
+            manifest.contracts(),
+            [0x31; 32],
+            [0x41; 32],
+            PLAN_TREE,
+        )
+        .expect("compatibility material");
+        let implementation_only_change = resolve_native_compatibility_material(
+            manifest.contracts(),
+            [0x31; 32],
+            [0x42; 32],
+            PLAN_TREE,
+        )
+        .expect("implementation-only compatibility material");
 
         assert_eq!(
             material.carriers(),
@@ -248,6 +268,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             next_plan_revision,
+            PLAN_TREE,
         )
         .expect("plan-only compatibility material");
         assert_ne!(material.id(), plan_only_change.id());
@@ -336,15 +357,20 @@ mod tests {
     #[test]
     fn peer_without_decimal_largeint_pair_rule_has_a_distinct_plan_digest() {
         let manifest = server_manifest();
-        let current =
-            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], [0x41; 32])
-                .unwrap();
+        let current = resolve_native_compatibility_material(
+            manifest.contracts(),
+            [0x31; 32],
+            [0x41; 32],
+            PLAN_TREE,
+        )
+        .unwrap();
         // Revision 2 has normalized temporal casts but lacks this exact pair.
         let legacy = novarocks_version::derive_repository_native_compatibility_material(
             native_carrier_declarations(manifest.contracts()).unwrap(),
             [0x31; 32],
             [0x41; 32],
             2,
+            PLAN_TREE,
         )
         .unwrap();
         assert_ne!(
@@ -361,9 +387,13 @@ mod tests {
     #[test]
     fn prior_intrinsic_binding_peer_has_a_distinct_plan_contract_digest() {
         let manifest = server_manifest();
-        let current =
-            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], [0x41; 32])
-                .unwrap();
+        let current = resolve_native_compatibility_material(
+            manifest.contracts(),
+            [0x31; 32],
+            [0x41; 32],
+            PLAN_TREE,
+        )
+        .unwrap();
         // Revision 2 predates intrinsic facts; revision 3 is reserved for the
         // independent Add/Sub semantic root. Both peers lack this closed fact.
         // Equal catalog and implementation digests isolate the plan revision.
@@ -373,6 +403,7 @@ mod tests {
                 [0x31; 32],
                 [0x41; 32],
                 revision,
+                PLAN_TREE,
             )
             .unwrap();
             assert!(current.plan_contract_revision() > revision);
@@ -393,17 +424,24 @@ mod tests {
     #[test]
     fn intrinsic_peer_without_expression_overflow_policy_has_a_distinct_plan_digest() {
         let manifest = server_manifest();
-        let current =
-            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], [0x41; 32])
-                .unwrap();
+        let current = resolve_native_compatibility_material(
+            manifest.contracts(),
+            [0x31; 32],
+            [0x41; 32],
+            PLAN_TREE,
+        )
+        .unwrap();
         let prior = novarocks_version::derive_repository_native_compatibility_material(
             native_carrier_declarations(manifest.contracts()).unwrap(),
             [0x31; 32],
             [0x41; 32],
             4,
+            PLAN_TREE,
         )
         .unwrap();
-        assert_eq!(current.plan_contract_revision(), 5);
+        // Every later revision keeps the overflow policy the revision-4 peer
+        // lacks; the current one has moved on since revision 5 introduced it.
+        assert!(current.plan_contract_revision() > 4);
         assert_eq!(prior.plan_contract_revision(), 4);
         assert_ne!(current.plan_contract_digest(), prior.plan_contract_digest());
         assert_ne!(current.id(), prior.id());
@@ -416,5 +454,63 @@ mod tests {
             current.execution_implementation_manifest_digest(),
             prior.execution_implementation_manifest_digest()
         );
+    }
+
+    /// A candidate binary and a production binary built from one tree share
+    /// the descriptor, catalogue, implementation, plan and carrier
+    /// components; the interpreter each composed alone puts them on different
+    /// islands, while the production identity stays a pure function of its
+    /// inputs.
+    #[test]
+    fn candidate_and_production_binaries_from_one_tree_are_different_islands() {
+        let manifest = server_manifest();
+        let production = resolve_native_compatibility_material(
+            manifest.contracts(),
+            [0x31; 32],
+            [0x41; 32],
+            PLAN_TREE,
+        )
+        .unwrap();
+        let production_again = resolve_native_compatibility_material(
+            manifest.contracts(),
+            [0x31; 32],
+            [0x41; 32],
+            PLAN_TREE,
+        )
+        .unwrap();
+        let candidate = resolve_native_compatibility_material(
+            manifest.contracts(),
+            [0x31; 32],
+            [0x41; 32],
+            StaticPlanInterpreter::CompiledPackage {
+                pure_function_catalog_digest: [0x51; 32],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(production.id(), production_again.id());
+        assert_ne!(production.id(), candidate.id());
+        assert_ne!(
+            production.static_plan_interpreter_digest(),
+            candidate.static_plan_interpreter_digest()
+        );
+        assert_eq!(
+            production.descriptor_digest(),
+            candidate.descriptor_digest()
+        );
+        assert_eq!(
+            production.function_catalog_digest(),
+            candidate.function_catalog_digest()
+        );
+        assert_eq!(
+            production.execution_implementation_manifest_digest(),
+            candidate.execution_implementation_manifest_digest()
+        );
+        assert_eq!(
+            production.plan_contract_digest(),
+            candidate.plan_contract_digest()
+        );
+        assert_eq!(production.carriers(), candidate.carriers());
+        assert_eq!(production.epoch(), candidate.epoch());
     }
 }

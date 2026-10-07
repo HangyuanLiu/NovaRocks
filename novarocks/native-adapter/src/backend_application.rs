@@ -3,11 +3,16 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
+use novarocks_functions::{ConstantPolicy, PureEngineFunctionCatalog};
 use novarocks_memory::MemoryAuthority;
 use novarocks_native_trust::NativeTrust;
+use novarocks_plan_codec::physical_package_v2::PackageDecodeLimits;
+use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
 use novarocks_spi::connector::ConnectorExecutionRoleBindingFactory;
+use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
 use novarocks_worker::sink_commit::ConfiguredWorkerSinkCommitPort;
 use novarocks_worker::{
@@ -20,10 +25,12 @@ use novarocks_worker::{
 
 use crate::backend_metrics::BackendMetricsRegistry;
 use crate::backend_rpc_service::BackendRpcService;
+use crate::backend_task_execution::{CompiledPackageCompiler, CompiledPackageInterpreter};
 use crate::fragment_result_writer::native_result_writer;
 use crate::management_http::MetricsHttpServer;
 use crate::runtime_filter_ingress::native_runtime_filter_envelope_ingress;
 use crate::runtime_filter_participant::NativeRuntimeFilterParticipantFactory;
+use crate::static_package_admission::StaticPackageAdmission;
 use crate::task_execution_observation::backend_task_execution_ports;
 use crate::task_protocol_ingress::RegistryTaskExecutionIngress;
 use crate::{
@@ -118,9 +125,90 @@ pub struct BackendServerConfig {
     /// Provider-owned complete BE role factories. The backend seals exactly
     /// one factory per provider kind before query lifecycle admission.
     pub execution_role_binding_factories: Vec<Arc<dyn ConnectorExecutionRoleBindingFactory>>,
+    /// The one static plan interpreter Server composed for this process.
+    pub static_plan_interpreter: BackendStaticPlanInterpreter,
     /// This process's memory readings for the `/metrics` endpoint, supplied
     /// by the process that owns the allocator and the probes.
     pub process_memory: crate::backend_metrics::ProcessMemoryObservation,
+}
+
+/// The one static plan interpreter a backend process composes.
+///
+/// Server selects it once, at composition. A task's carrier never selects it,
+/// and no process composes both: the plan-tree decoder refuses a package
+/// carrier and the compiled-package interpreter refuses a plan tree.
+pub enum BackendStaticPlanInterpreter {
+    /// The production plan-tree decoder. No package carrier is gated.
+    PlanTree,
+    /// The compiled-package interpreter and its ingress package gate.
+    CompiledPackage(CompiledStaticPlan),
+}
+
+impl BackendStaticPlanInterpreter {
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::PlanTree => "plan_tree",
+            Self::CompiledPackage(_) => "compiled_package",
+        }
+    }
+}
+
+/// The compiled-package interpreter and the ingress gate, built over the
+/// process's one package decode model.
+pub struct CompiledStaticPlan {
+    compiler: Arc<dyn CompiledPackageCompiler>,
+    admission: Arc<StaticPackageAdmission>,
+}
+
+impl CompiledStaticPlan {
+    /// Builds the one decode model and shares it between the package receiver
+    /// and the ingress gate. The gate admits with the receiver's own wire
+    /// limits, so both refuse the same bytes. Every input is host-authored;
+    /// nothing here supplies a default.
+    pub fn try_new<E>(
+        decode_limits: PackageDecodeLimits,
+        functions: Arc<PureEngineFunctionCatalog>,
+        providers: Arc<PureProviderProgramCatalog<E>>,
+        constants: ConstantPolicy,
+    ) -> Result<Self, BackendApplicationError>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+        PureProviderProgramCatalog<E>: Send + Sync,
+    {
+        let model = Arc::new(
+            FragmentDecodeResourceModel::try_new(&CompositionControl).map_err(|error| {
+                BackendApplicationError::new(
+                    BackendApplicationErrorKind::Configuration,
+                    format!("build the fragment package decode model: {error}"),
+                )
+            })?,
+        );
+        let admission = Arc::new(StaticPackageAdmission::new(
+            Arc::clone(&model),
+            decode_limits.wire,
+        ));
+        let compiler: Arc<dyn CompiledPackageCompiler> = Arc::new(CompiledPackageInterpreter::new(
+            model,
+            decode_limits,
+            functions,
+            providers,
+            constants,
+        ));
+        Ok(Self {
+            compiler,
+            admission,
+        })
+    }
+}
+
+/// Composition runs once, before any listener opens, over a statically sized
+/// generated schema; it has no caller that could cancel it.
+struct CompositionControl;
+
+impl PureCompileControl for CompositionControl {
+    fn checkpoint(&self, _phase: CompilePhase, _units: u32) -> Result<(), CompileControlError> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -343,6 +431,7 @@ fn compose_backend_application_services(
     scan_stream_host: novarocks_worker::ScanStreamHost,
     catalog_manager_config: CatalogManagerConfig,
     execution_role_binding_factories: &[Arc<dyn ConnectorExecutionRoleBindingFactory>],
+    static_plan_interpreter: BackendStaticPlanInterpreter,
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
     let BackendExecutionRuntimeInput {
         config: execution_runtime_config,
@@ -426,7 +515,18 @@ fn compose_backend_application_services(
         data_runtime.handle().clone(),
         completion_capacity,
     );
-    let execution_host = Arc::new(crate::backend_task_execution::NativeTaskExecutionHost::new(
+    tracing::info!(
+        static_plan_interpreter = static_plan_interpreter.label(),
+        "composed the backend static plan interpreter"
+    );
+    let (compiled_package_compiler, static_package_admission) = match static_plan_interpreter {
+        BackendStaticPlanInterpreter::PlanTree => (None, None),
+        BackendStaticPlanInterpreter::CompiledPackage(CompiledStaticPlan {
+            compiler,
+            admission,
+        }) => (Some(compiler), Some(admission)),
+    };
+    let execution_host = crate::backend_task_execution::NativeTaskExecutionHost::new(
         novarocks_native_adapter::native_fragment_query::NativeFragmentQueryRuntime::global(
             Arc::clone(&memory_authority),
         ),
@@ -444,7 +544,11 @@ fn compose_backend_application_services(
         Arc::clone(&execution_runtime),
         scan_stream_host,
         Arc::clone(&task_completion_supervisor),
-    ));
+    );
+    let execution_host = Arc::new(match compiled_package_compiler {
+        None => execution_host,
+        Some(compiler) => execution_host.with_compiled_package_compiler(compiler),
+    });
     let task_execution_registry = TaskExecutionRegistry::with_process_clock_and_task_creation_gate(
         task_execution_registry_config,
         Arc::clone(&context_host) as Arc<dyn QueryContextHost>,
@@ -452,10 +556,17 @@ fn compose_backend_application_services(
         backend_task_execution_ports(),
         Arc::new(RestartAfterEstablishTaskCreationGate),
     );
-    let task_execution_ingress: Arc<dyn TaskExecutionIngress> = RegistryTaskExecutionIngress::new(
-        Arc::clone(&task_execution_registry),
-        native_compatibility_id,
-    );
+    let task_execution_ingress: Arc<dyn TaskExecutionIngress> = match static_package_admission {
+        None => RegistryTaskExecutionIngress::new(
+            Arc::clone(&task_execution_registry),
+            native_compatibility_id,
+        ),
+        Some(admission) => RegistryTaskExecutionIngress::with_static_package_admission(
+            Arc::clone(&task_execution_registry),
+            native_compatibility_id,
+            admission,
+        ),
+    };
     Ok(BackendApplicationServices {
         backend_process_id,
         drain,
@@ -596,6 +707,7 @@ impl BackendApplicationHost {
             scan_stream_runtime,
             catalog_manager_config,
             execution_role_binding_factories,
+            static_plan_interpreter,
             process_memory,
         } = config;
         let readiness_endpoint = novarocks_types::NativeEndpoint::from_host_port(
@@ -624,6 +736,7 @@ impl BackendApplicationHost {
             novarocks_worker::ScanStreamHost::new(scan_preparation_config, scan_stream_runtime),
             catalog_manager_config,
             &execution_role_binding_factories,
+            static_plan_interpreter,
         )?;
         let process_descriptor = BackendProcessDescriptor::try_new(
             services.backend_process_id,
@@ -843,9 +956,9 @@ mod tests {
 
     use super::{
         BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
-        BackendExecutionRuntimeInput, BackendServerConfig, QueryContextRef,
-        UnroutedQueryContextHost, UnroutedTaskExecutionHost, combine_primary_and_shutdown,
-        compose_backend_application_services,
+        BackendExecutionRuntimeInput, BackendServerConfig, BackendStaticPlanInterpreter,
+        CompiledStaticPlan, QueryContextRef, UnroutedQueryContextHost, UnroutedTaskExecutionHost,
+        combine_primary_and_shutdown, compose_backend_application_services,
     };
     use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
     use novarocks_execution::runtime::execution_runtime::ExecutionRuntimeConfig;
@@ -1029,6 +1142,7 @@ mod tests {
                 novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),
             catalog_manager_config: CatalogManagerConfig::default(),
             execution_role_binding_factories: Vec::new(),
+            static_plan_interpreter: BackendStaticPlanInterpreter::PlanTree,
             process_memory: novarocks_native_adapter::backend_test_support::test_process_memory(),
         }
     }
@@ -1097,6 +1211,7 @@ mod tests {
             ),
             CatalogManagerConfig::default(),
             &[],
+            BackendStaticPlanInterpreter::PlanTree,
         )
         .expect("compose backend application services");
 
@@ -1342,6 +1457,182 @@ mod tests {
             error
                 .to_string()
                 .contains("cleanup failed: Shutdown: gRPC join failed")
+        );
+    }
+
+    /// Compiled-package composition: the host interpreter and the ingress
+    /// package gate come from one `CompiledStaticPlan`, so a create whose
+    /// package exceeds the receiver's own wire admission is refused at the
+    /// composed ingress before any owner classifies it.
+    #[test]
+    fn a_compiled_package_backend_gates_creates_with_its_receiver_admission() {
+        use novarocks_connector_contract::PureProviderProgramCatalog;
+        use novarocks_execution_contract::task_execution::identity::{
+            TaskIdentity, TaskOperationId,
+        };
+        use novarocks_functions::{
+            EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
+            InstalledPureKernel, PureImplementationDeclaration, PureImplementationId,
+            PureKernelAbi,
+        };
+        use novarocks_task_codec::identity::{
+            encode_query_context_ref, encode_task_identity, encode_task_operation_id,
+        };
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        use novarocks_types::identity::{
+            AttemptId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+        };
+        use prost::Message;
+
+        struct Unbounded;
+        impl PureCompileControl for Unbounded {
+            fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                Ok(())
+            }
+        }
+
+        // Fixture inputs, not production sizing: the receiver's generous test
+        // admission with a small package bound, and a sealed RAND-only subset.
+        let mut limits = novarocks_plan_codec::physical_package_v2::test_support::decode_limits();
+        limits.wire.max_input_bytes = 64;
+        let constants = limits.constant_policy;
+        let metadata = test_execution_function_set();
+        let mut builder = EngineFunctionCatalogBuilder::new();
+        builder
+            .register(
+                metadata
+                    .catalog()
+                    .definition("rand", FunctionKind::Scalar)
+                    .expect("rand")
+                    .clone(),
+            )
+            .expect("register rand");
+        let functions = builder
+            .seal_pure(
+                [
+                    "builtin.scalar/rand/()->f64;strict;legacy",
+                    "builtin.scalar/rand/(i64)->f64;strict;legacy",
+                ]
+                .into_iter()
+                .map(|overload| InstalledPureKernel {
+                    function: FunctionId::try_new("builtin.scalar/rand/v1").unwrap(),
+                    kind: FunctionKind::Scalar,
+                    implementation: PureImplementationDeclaration {
+                        overload: FunctionOverloadId::try_new(overload).unwrap(),
+                        implementation: PureImplementationId::try_new(
+                            "builtin.scalar/rand/selected-v1",
+                        )
+                        .unwrap(),
+                        abi: PureKernelAbi::ScalarV1,
+                    },
+                    aggregate_state_format: None,
+                }),
+            )
+            .expect("sealed rand subset");
+        let providers =
+            PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &Unbounded)
+                .expect("empty provider catalog");
+        let plan = CompiledStaticPlan::try_new(
+            limits,
+            Arc::new(functions),
+            Arc::new(providers),
+            constants,
+        )
+        .expect("compiled static plan");
+
+        let services = compose_backend_application_services(
+            test_data_runtime(),
+            BackendExecutionRuntimeInput::new(
+                execution_runtime_config(),
+                metadata,
+                novarocks_native_adapter::backend_test_support::test_memory_authority(),
+            ),
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+            WriteCommitEvidenceLimits::default(),
+            WorkerResultRetainedLimits::try_new(16 * 1024 * 1024, 32 * 1024 * 1024)
+                .expect("valid test result retained-byte limits"),
+            novarocks_worker::TaskInboundCapabilityLimits::default(),
+            novarocks_worker::TaskPreparationLimits::default(),
+            novarocks_worker::ScanStreamHost::new(
+                novarocks_worker::ScanPreparationConfig::try_new(
+                    64 * 1024 * 1024,
+                    4,
+                    Duration::from_millis(500),
+                    Duration::from_millis(500),
+                    Duration::from_millis(100),
+                )
+                .expect("valid scan preparation configuration"),
+                novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),
+            ),
+            CatalogManagerConfig::default(),
+            &[],
+            BackendStaticPlanInterpreter::CompiledPackage(plan),
+        )
+        .expect("compose compiled-package backend services");
+
+        let execution = QueryExecutionId::new(
+            QueryId::new(31, 37),
+            AttemptId::new(1).expect("nonzero attempt"),
+        )
+        .expect("nonzero query");
+        let context = QueryContextRef::new(
+            execution,
+            FrontendProcessId::new_v7(),
+            services.backend_process_id,
+        );
+        let identity = TaskIdentity::new(
+            execution,
+            StageId::new(1).expect("nonzero stage"),
+            TaskId::new(1).expect("nonzero task"),
+            services.backend_process_id,
+        );
+        let metadata = protocol::CreationMetadata {
+            query_context: Some(encode_query_context_ref(context)),
+            descriptor: Some(protocol::TaskDescriptor {
+                identity: Some(encode_task_identity(identity)),
+                fragment_instance_id: Some(novarocks_proto_models::common::UniqueId {
+                    hi: 41,
+                    lo: 42,
+                }),
+                pipeline_dop: 1,
+                split_plan_nodes: Vec::new(),
+                topology: Some(protocol::TaskExchangeTopology::default()),
+            }),
+            initial_domains: Vec::new(),
+            assignment: Some(protocol::TaskAssignment::default()),
+        };
+        let carrier = protocol::FrozenFragment {
+            package: vec![0; 65].into(),
+            ..Default::default()
+        };
+        let error = services
+            .task_execution_ingress
+            .apply_task_operations(protocol::ApplyTaskOperationsRequest {
+                operations: vec![protocol::TaskOperation {
+                    envelope: Some(protocol::TaskOperationEnvelope {
+                        operation_id: Some(encode_task_operation_id(TaskOperationId::new_v7())),
+                        max_wait_millis: 5_000,
+                    }),
+                    operation: Some(protocol::task_operation::Operation::CreateTask(
+                        protocol::CreateTaskRequest {
+                            frozen_fragment: carrier.encode_to_vec().into(),
+                            creation_metadata: metadata.encode_to_vec().into(),
+                        },
+                    )),
+                }],
+            })
+            .expect_err("the composed ingress gates the package carrier");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            error
+                .message()
+                .contains("create_task.frozen_fragment.package (out of range)"),
+            "unexpected message: {}",
+            error.message()
+        );
+        assert!(
+            !services.task_execution_registry.has_live_task(identity),
+            "a refused create leaves no task behind"
         );
     }
 }

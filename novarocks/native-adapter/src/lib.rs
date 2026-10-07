@@ -85,6 +85,7 @@ pub mod runtime_filter_terminal;
 pub mod runtime_filter_test_support;
 pub mod runtime_filter_transport;
 pub mod runtime_filter_typed_scan;
+pub mod static_package_admission;
 pub mod task_execution_observation;
 pub mod task_protocol;
 pub mod task_protocol_fault;

@@ -429,10 +429,6 @@ impl NativeTaskExecutionHost {
 
     /// Composes the compiled-package interpreter instead of the plan-tree
     /// decoder. Composition makes this choice once per process.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "composed by the candidate island and tests only")
-    )]
     pub(crate) fn with_compiled_package_compiler(
         mut self,
         compiler: Arc<dyn CompiledPackageCompiler>,

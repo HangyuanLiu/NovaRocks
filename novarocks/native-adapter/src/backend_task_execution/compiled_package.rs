@@ -84,7 +84,8 @@ pub trait CompiledPackageCompiler: Send + Sync + 'static {
 
 /// Receiver, provider validation and local compiler over host-owned inputs.
 pub struct CompiledPackageInterpreter<E: Error + Send + Sync + 'static> {
-    model: FragmentDecodeResourceModel,
+    /// Shared with the ingress package gate, so one process builds one model.
+    model: Arc<FragmentDecodeResourceModel>,
     decode_limits: PackageDecodeLimits,
     functions: Arc<PureEngineFunctionCatalog>,
     providers: Arc<PureProviderProgramCatalog<E>>,
@@ -93,14 +94,14 @@ pub struct CompiledPackageInterpreter<E: Error + Send + Sync + 'static> {
 
 impl<E: Error + Send + Sync + 'static> CompiledPackageInterpreter<E> {
     pub fn new(
-        model: FragmentDecodeResourceModel,
+        model: impl Into<Arc<FragmentDecodeResourceModel>>,
         decode_limits: PackageDecodeLimits,
         functions: Arc<PureEngineFunctionCatalog>,
         providers: Arc<PureProviderProgramCatalog<E>>,
         constants: ConstantPolicy,
     ) -> Self {
         Self {
-            model,
+            model: model.into(),
             decode_limits,
             functions,
             providers,

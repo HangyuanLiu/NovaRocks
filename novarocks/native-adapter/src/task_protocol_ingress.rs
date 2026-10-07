@@ -59,6 +59,7 @@ use novarocks_task_codec::operation::{
 use novarocks_task_codec::status::encode_task_status;
 use novarocks_types::NativeCompatibilityId;
 
+use crate::static_package_admission::StaticPackageAdmission;
 use crate::task_protocol::{
     TaskExecutionIngress, TaskIngressTiming, TaskObservationReader, TaskOperationBatchApplier,
     TaskOperationReceiptAck as ReceiptAck, TaskResultRead, TaskResultReadError,
@@ -77,12 +78,34 @@ use novarocks_worker::{
 pub struct RegistryTaskExecutionIngress {
     registry: Arc<TaskExecutionRegistry>,
     native_compatibility_id: NativeCompatibilityId,
+    /// Present exactly when this process composed the compiled-package
+    /// interpreter; it bounds every create's package before the owner sees it.
+    static_package_admission: Option<Arc<StaticPackageAdmission>>,
 }
 
 impl RegistryTaskExecutionIngress {
+    /// The ingress of a plan-tree process: no package carrier is gated here.
     pub fn new(
         registry: Arc<TaskExecutionRegistry>,
         native_compatibility_id: NativeCompatibilityId,
+    ) -> Arc<Self> {
+        Self::compose(registry, native_compatibility_id, None)
+    }
+
+    /// The ingress of a compiled-package process, gated by the same decode
+    /// model and wire admission its package receiver uses.
+    pub fn with_static_package_admission(
+        registry: Arc<TaskExecutionRegistry>,
+        native_compatibility_id: NativeCompatibilityId,
+        admission: Arc<StaticPackageAdmission>,
+    ) -> Arc<Self> {
+        Self::compose(registry, native_compatibility_id, Some(admission))
+    }
+
+    fn compose(
+        registry: Arc<TaskExecutionRegistry>,
+        native_compatibility_id: NativeCompatibilityId,
+        static_package_admission: Option<Arc<StaticPackageAdmission>>,
     ) -> Arc<Self> {
         assert!(
             registry.config().max_tasks_per_context
@@ -92,6 +115,7 @@ impl RegistryTaskExecutionIngress {
         Arc::new(Self {
             registry,
             native_compatibility_id,
+            static_package_admission,
         })
     }
 
@@ -532,6 +556,10 @@ impl TaskOperationBatchApplier for RegistryTaskExecutionIngress {
             .map(|receipt| encode_operation_receipt(receipt, |_| None))
             .transpose()
     }
+
+    fn static_package_admission(&self) -> Option<&StaticPackageAdmission> {
+        self.static_package_admission.as_deref()
+    }
 }
 
 #[tonic::async_trait]
@@ -818,6 +846,17 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::composed(None)
+        }
+
+        /// The ingress of a process that composed the compiled-package
+        /// interpreter. The execution side is still the plan-tree fake, which
+        /// refuses a package carrier the way a plan-tree host would.
+        fn with_static_package_admission(admission: StaticPackageAdmission) -> Self {
+            Self::composed(Some(Arc::new(admission)))
+        }
+
+        fn composed(admission: Option<Arc<StaticPackageAdmission>>) -> Self {
             let backend = BackendProcessId::new_v7();
             let mut config = TaskExecutionRegistryConfig::for_process(
                 backend,
@@ -837,11 +876,19 @@ mod tests {
                 Arc::clone(&task_host) as Arc<dyn TaskExecutionHost>,
                 crate::task_execution_observation::backend_task_execution_ports(),
             );
-            Self {
-                ingress: RegistryTaskExecutionIngress::new(
+            let ingress = match admission {
+                None => RegistryTaskExecutionIngress::new(
                     Arc::clone(&registry),
                     native_compatibility_id,
                 ),
+                Some(admission) => RegistryTaskExecutionIngress::with_static_package_admission(
+                    Arc::clone(&registry),
+                    native_compatibility_id,
+                    admission,
+                ),
+            };
+            Self {
+                ingress,
                 registry,
                 clock,
                 task_host,
@@ -2753,5 +2800,179 @@ mod tests {
         );
         assert!(fenced.receipts[0].ack.is_none());
         assert_eq!(fixture.task_host.prepared().len(), 1);
+    }
+
+    /// Compiled-package carriers at the ingress of each kind of process.
+    mod static_package_gate {
+        use super::*;
+        use novarocks_plan_codec::physical_package_v2::test_support::decode_limits;
+        use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+
+        /// The admitted package byte bound of these cases. Every other wire
+        /// limit is the receiver's generous test admission.
+        const MAX_PACKAGE_BYTES: usize = 64;
+
+        struct Unbounded;
+        impl PureCompileControl for Unbounded {
+            fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                Ok(())
+            }
+        }
+
+        fn admission() -> StaticPackageAdmission {
+            let mut wire = decode_limits().wire;
+            wire.max_input_bytes = MAX_PACKAGE_BYTES;
+            StaticPackageAdmission::new(
+                Arc::new(FragmentDecodeResourceModel::try_new(&Unbounded).expect("decode model")),
+                wire,
+            )
+        }
+
+        /// A root task whose static carrier is a package of `len` bytes and
+        /// nothing else. The bytes need not be a receivable package: the gate
+        /// bounds resources only, and the winner's interpreter decides the rest.
+        fn package_carriers(
+            context: QueryContextRef,
+            identity: TaskIdentity,
+            len: usize,
+        ) -> CreateCarriers {
+            let mut carriers = CreateCarriers::root(context, identity);
+            carriers.frozen = proto::FrozenFragment {
+                package: bytes::Bytes::from(vec![0; len]),
+                ..Default::default()
+            };
+            carriers
+        }
+
+        fn assert_package_refusal(error: tonic::Status) {
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(
+                error
+                    .message()
+                    .contains("operations[0].create_task.frozen_fragment.package (out of range)"),
+                "unexpected message: {}",
+                error.message()
+            );
+        }
+
+        /// The gate runs before identity classification: a replay is refused
+        /// for an inadmissible package although its body would never be
+        /// prepared, a replay with an admissible body is still answered from
+        /// the original task, and a new identity never reaches its owner.
+        #[test]
+        fn a_compiled_package_process_bounds_every_create_package_before_its_owner() {
+            let fixture = Fixture::with_static_package_admission(admission());
+            let context = fixture.context();
+            let identity = fixture.identity(9, 9);
+            let admitted = package_carriers(context, identity, MAX_PACKAGE_BYTES / 2);
+            let accepted = fixture.apply(vec![
+                fixture.establish(context, TaskOperationId::new_v7()),
+                admitted.operation(TaskOperationId::new_v7()),
+            ]);
+            assert_eq!(
+                outcome_of(&accepted.receipts[1]),
+                proto::TaskOperationOutcome::Accepted,
+                "{:?}",
+                accepted.receipts[1]
+            );
+            // The fake host is a plan-tree interpreter, so the admitted
+            // package spends the identity on a terminal preparation failure.
+            let failed = fixture.wait_status(identity, TaskStatus::is_terminal);
+            assert_eq!(failed.state(), TaskState::Failed);
+            assert_eq!(fixture.task_host.prepared(), vec![admitted.frozen_bytes()]);
+
+            let oversized = package_carriers(context, identity, MAX_PACKAGE_BYTES + 1);
+            assert_package_refusal(
+                fixture
+                    .ingress
+                    .apply_task_operations(proto::ApplyTaskOperationsRequest {
+                        operations: vec![oversized.operation(TaskOperationId::new_v7())],
+                    })
+                    .expect_err("a replay cannot carry an inadmissible package"),
+            );
+
+            let replay = fixture.apply(vec![
+                package_carriers(context, identity, 1).operation(TaskOperationId::new_v7()),
+            ]);
+            assert_eq!(
+                outcome_of(&replay.receipts[0]),
+                proto::TaskOperationOutcome::Idempotent,
+                "{:?}",
+                replay.receipts[0]
+            );
+            assert_create_replay(&accepted.receipts[1], &replay.receipts[0]);
+
+            let fresh = fixture.identity(9, 10);
+            assert_package_refusal(
+                fixture
+                    .ingress
+                    .apply_task_operations(proto::ApplyTaskOperationsRequest {
+                        operations: vec![
+                            package_carriers(context, fresh, MAX_PACKAGE_BYTES + 1)
+                                .operation(TaskOperationId::new_v7()),
+                        ],
+                    })
+                    .expect_err("a new identity cannot carry an inadmissible package"),
+            );
+            assert!(
+                fixture
+                    .registry
+                    .status_source(context)
+                    .expect("the context is established")
+                    .latest(fresh)
+                    .is_none(),
+                "a refused create leaves no task behind"
+            );
+            assert_eq!(
+                fixture.task_host.prepared().len(),
+                1,
+                "only the original winner was ever interpreted"
+            );
+        }
+
+        /// The gate bounds only the package carrier. A plan-tree carrier has
+        /// no package and passes to its owner unchanged; refusing it is the
+        /// compiled interpreter's carrier law, not this gate's.
+        #[test]
+        fn a_carrier_without_a_package_passes_the_package_gate() {
+            let fixture = Fixture::with_static_package_admission(admission());
+            let context = fixture.context();
+            let identity = fixture.identity(9, 11);
+            let response = fixture.apply(vec![
+                fixture.establish(context, TaskOperationId::new_v7()),
+                create_task(context, identity, TaskOperationId::new_v7()),
+            ]);
+            assert_eq!(
+                outcome_of(&response.receipts[1]),
+                proto::TaskOperationOutcome::Accepted,
+                "{:?}",
+                response.receipts[1]
+            );
+            fixture.wait_installed(identity);
+        }
+
+        /// A plan-tree process composes no gate: production ingress is
+        /// unchanged, and its own interpreter refuses any package it is sent.
+        #[test]
+        fn a_plan_tree_process_composes_no_package_gate() {
+            let fixture = Fixture::new();
+            let context = fixture.context();
+            let identity = fixture.identity(9, 12);
+            let unbounded = package_carriers(context, identity, MAX_PACKAGE_BYTES + 1);
+            let response = fixture.apply(vec![
+                fixture.establish(context, TaskOperationId::new_v7()),
+                unbounded.operation(TaskOperationId::new_v7()),
+            ]);
+            assert_eq!(
+                outcome_of(&response.receipts[1]),
+                proto::TaskOperationOutcome::Accepted,
+                "{:?}",
+                response.receipts[1]
+            );
+            let failed = fixture.wait_status(identity, TaskStatus::is_terminal);
+            assert_eq!(failed.state(), TaskState::Failed);
+            assert_eq!(fixture.task_host.prepared(), vec![unbounded.frozen_bytes()]);
+        }
     }
 }
