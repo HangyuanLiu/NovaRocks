@@ -17,7 +17,7 @@
 
 use super::*;
 use crate::physical_package_v2::definition_sources::tests::{
-    cv_package, rich_package, writer_constant_package, writer_finish_package,
+    cv_package, rich_package, values_package, writer_constant_package, writer_finish_package,
 };
 use crate::physical_package_v2::encode::{PackageEncodeError, encode_fragment_package};
 use crate::physical_package_v2::provider_sources::tests::checked_read;
@@ -91,6 +91,29 @@ fn whole_package_roundtrip_is_byte_identical_through_original_constructors() {
             again, bytes,
             "{name}: decode∘encode is the identity on sender bytes"
         );
+    }
+}
+
+// Many-row VALUES lists and wide projections carry hundreds of strict scalar
+// type roots. The sender charges each root's validator by its actual type
+// size, so such a package fits the sender's allocation-request ceiling and
+// its bytes survive the receiver and a re-encode unchanged.
+#[test]
+fn many_scalar_type_roots_roundtrip_byte_identically() {
+    let model = model();
+    for (rows, columns) in [(60, 1), (400, 1), (1000, 1), (1, 400)] {
+        let name = format!("{rows}x{columns}");
+        let package = values_package(rows, columns);
+        let dto = encode_fragment_package(&package, &encode_limits(), &Control::default())
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let roots = dto.types.as_ref().unwrap().value_types.len();
+        assert_eq!(roots, rows * columns + 2 * columns + 1, "{name}");
+        let bytes = dto.encode_to_vec();
+        let decoded =
+            decode_fragment_package(&bytes, &model, &decode_limits(), &Control::default())
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(decoded.fragment(), package.fragment(), "{name}");
+        assert_eq!(encode(&decoded).unwrap(), bytes, "{name}");
     }
 }
 

@@ -31,8 +31,7 @@ use arrow::datatypes::{DataType, Field};
 use novarocks_proto_models::{physical_type_v2 as wire, plan};
 use novarocks_type_contract::{
     CompileControlError, MAX_ARROW_FIELD_METADATA_BYTES, MAX_ARROW_FIELD_METADATA_ENTRIES,
-    MAX_ARROW_FIELD_NAME_BYTES, MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, MAX_VALUE_TYPE_NODES,
-    owned_resources::hashmap,
+    MAX_ARROW_FIELD_NAME_BYTES, MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, owned_resources::hashmap,
 };
 use std::{alloc::Layout, sync::Arc};
 
@@ -104,6 +103,9 @@ pub(super) struct Model {
     requests: usize,
     bytes: usize,
     work: usize,
+    /// Fixed per-node bound of one strict validator visit pair (the Field
+    /// leading to a node and the node's carrier), derived from the source.
+    strict_node_work: usize,
 }
 impl Model {
     fn request(&mut self, layout: Layout, count: usize) -> Result<(), E> {
@@ -131,10 +133,11 @@ impl Model {
         )?;
         Ok(())
     }
-    /// Before the first source walk: the two actual ID sets, every strict
-    /// validator's original heap stack, and count/emission bookkeeping are
-    /// admitted. Writer sources must be the caller's immutable checked Drafts;
-    /// root counts confer no Writer law or source proof of their own.
+    /// Before the first source walk: the two actual ID sets and count/emission
+    /// bookkeeping are admitted. Each strict validator's heap stack and walk
+    /// are admitted later by `strict_nodes`, from that root's actual type.
+    /// Writer sources must be the caller's immutable checked Drafts; root
+    /// counts confer no Writer law or source proof of their own.
     pub(super) fn new(
         source: usize,
         value_roots: usize,
@@ -203,11 +206,19 @@ impl Model {
             return Err(CompileControlError::ResourceExhausted.into());
         }
         let field_roots = add(strict_field_roots, writer_fields)?;
-        let strict_roots = add(value_roots, strict_field_roots)?;
         let roots = add(value_roots, field_roots)?;
         if roots > limits.max_definitions {
             return Err(CompileControlError::ResourceExhausted.into());
         }
+        // One strict validator node: its Field metadata source iteration and
+        // bounded name/metadata/zone byte walks, plus its carrier visit.
+        let iteration =
+            hashmap::source_iterator_work_upper_bound(source, MAX_ARROW_FIELD_METADATA_ENTRIES)
+                .map_err(hash_error)?;
+        let strict_bytes = add(
+            add(MAX_ARROW_FIELD_METADATA_BYTES, MAX_ARROW_FIELD_NAME_BYTES)?,
+            MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES,
+        )?;
         let mut model = Self {
             source,
             definitions: 0,
@@ -216,37 +227,10 @@ impl Model {
             requests: 0,
             bytes: 0,
             work: 256,
+            strict_node_work: add(iteration, add(1024, mul(strict_bytes, 8)?)?)?,
         };
         model.tree(value_roots)?;
         model.tree(field_roots)?;
-        // Rust1.92 Vec starts with the original singleton and grows at least
-        // four/doubling. Per strict root there are <=N requests and <=4N
-        // cumulative tuple payload bytes. No second datatype walk is made.
-        let stack_nodes = mul(strict_roots, MAX_VALUE_TYPE_NODES)?;
-        let stack = array::<(&DataType, usize)>(mul(MAX_VALUE_TYPE_NODES, 4)?)?;
-        let stack_bytes = mul(stack.size(), strict_roots)?;
-        model.requests = add(model.requests, stack_nodes)?;
-        model.bytes = add(model.bytes, stack_bytes)?;
-        model.work = add(
-            model.work,
-            add(mul(stack_bytes, 4)?, mul(stack_nodes, 128)?)?,
-        )?;
-        // Strict validation precedes count_field: its Field metadata source
-        // iteration and bounded byte walks must already be admitted too.
-        let iteration =
-            hashmap::source_iterator_work_upper_bound(source, MAX_ARROW_FIELD_METADATA_ENTRIES)
-                .map_err(hash_error)?;
-        let strict_bytes = add(
-            add(MAX_ARROW_FIELD_METADATA_BYTES, MAX_ARROW_FIELD_NAME_BYTES)?,
-            MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES,
-        )?;
-        model.work = add(
-            model.work,
-            mul(
-                stack_nodes,
-                add(iteration, add(1024, mul(strict_bytes, 8)?)?)?,
-            )?,
-        )?;
         // Existing count expansion terminates at E. Every emitted C/F/V has
         // at least one expanded node. FieldIds' monotone cursor tests at most
         // root Field IDs plus automatic Field occurrences, never max(ID).
@@ -270,6 +254,20 @@ impl Model {
         model.work = add(model.work, 4 * 512 + 128 * 128)?;
         model.facts(limits)?;
         Ok(model)
+    }
+    /// `count` actual nodes of one strict root's original validator walk,
+    /// admitted before that walk reaches them: the root before the walk
+    /// starts, and each carrier's direct children when the carrier is
+    /// visited, before their Field visits and pushes. The walker's heap stack
+    /// is a Rust1.92 Vec holding the original singleton that grows min-four
+    /// and doubling; by the time it grows to 2C it has pushed at least C
+    /// children, each already admitted, so N admitted nodes cover <=N
+    /// requests and <=4N cumulative tuples. This is the receiver's per-root
+    /// summary bound, never the 4096-node per-type maximum.
+    pub(super) fn strict_nodes(&mut self, count: usize) -> Result<(), E> {
+        self.request(array::<(&DataType, usize)>(4)?, count)?;
+        self.work = add(self.work, mul(count, self.strict_node_work)?)?;
+        Ok(())
     }
     /// Header-only numerical contribution, before any child traversal.
     pub(super) fn carrier(&mut self, ty: &DataType) -> Result<(), E> {
@@ -391,7 +389,9 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
+    use novarocks_type_contract::{
+        CompileCheckpoints, CompilePhase, MAX_VALUE_TYPE_NODES, PureCompileControl,
+    };
     use std::{
         collections::HashMap,
         sync::{Arc, Mutex},
@@ -423,19 +423,17 @@ mod tests {
         raw.div_ceil(align) * align
     }
     #[test]
-    fn initial_id_sets_and_strict_original_stack_have_independent_request_layouts() {
+    fn initial_id_sets_and_strict_validator_nodes_have_independent_request_layouts() {
         let model = Model::new(4096, 2, 3, 2, 4, limits()).unwrap();
         let actual = facts(&model);
-        let stack = 5 * 4 * MAX_VALUE_TYPE_NODES * std::mem::size_of::<(&DataType, usize)>();
         assert_eq!(actual.definition_count, 0);
         assert_eq!(actual.expanded_node_count, 0);
-        assert_eq!(
-            actual.allocation_requests_upper_bound,
-            2 + 7 + 5 * MAX_VALUE_TYPE_NODES + 128
-        );
+        // Root counts alone admit only the two ID sets and the diagnostic;
+        // no strict validator stack is charged before its actual type.
+        assert_eq!(actual.allocation_requests_upper_bound, 2 + 7 + 128);
         assert_eq!(
             actual.allocation_request_bytes_upper_bound,
-            9 * tree_bytes() + stack + 512
+            9 * tree_bytes() + 512
         );
         assert_eq!(
             actual.coexisting_source_and_request_bytes_upper_bound,
@@ -447,6 +445,85 @@ mod tests {
         assert_eq!(
             writer.allocation_request_bytes_upper_bound,
             7 * tree_bytes() + 512
+        );
+        // Each admitted strict node is one stack request of four tuples.
+        let mut strict = Model::new(4096, 2, 3, 2, 4, limits()).unwrap();
+        strict.strict_nodes(5).unwrap();
+        let nodes = facts(&strict);
+        let tuple = std::mem::size_of::<(&DataType, usize)>();
+        assert_eq!(
+            nodes.allocation_requests_upper_bound - actual.allocation_requests_upper_bound,
+            5
+        );
+        assert_eq!(
+            nodes.allocation_request_bytes_upper_bound
+                - actual.allocation_request_bytes_upper_bound,
+            5 * 4 * tuple
+        );
+        assert_eq!(nodes.definition_count, 0);
+        assert_eq!(nodes.expanded_node_count, 0);
+        assert_eq!(nodes.string_bytes, 0);
+    }
+    /// Rust1.92 `vec![x]` then push: capacities 1, 4, 8, ... Replaying the
+    /// real walker Vec proves the per-node charge covers every growth request
+    /// and the cumulative requested tuples at the moment each growth happens.
+    #[test]
+    fn strict_node_charge_covers_the_real_validator_vec_growth() {
+        let tuple = std::mem::size_of::<(&DataType, usize)>();
+        let ty = DataType::Int64;
+        let mut stack = vec![(&ty, 1usize)];
+        let (mut requests, mut tuples) = (1usize, stack.capacity());
+        for pushes in 1..=MAX_VALUE_TYPE_NODES - 1 {
+            let before = stack.capacity();
+            stack.push((&ty, pushes));
+            if stack.capacity() != before {
+                requests += 1;
+                tuples += stack.capacity();
+            }
+            // Admitted before this push: the root plus every pushed child.
+            let mut model = empty();
+            let base = facts(&model);
+            model.strict_nodes(pushes + 1).unwrap();
+            let admitted = facts(&model);
+            assert!(
+                admitted.allocation_requests_upper_bound - base.allocation_requests_upper_bound
+                    >= requests
+            );
+            assert!(
+                admitted.allocation_request_bytes_upper_bound
+                    - base.allocation_request_bytes_upper_bound
+                    >= tuples * tuple
+            );
+        }
+    }
+    /// The actual-size charge never exceeds the former per-type maximum: a
+    /// root of the maximum node count charges exactly what every strict root
+    /// used to, and its validator work still scales with the source invoice.
+    #[test]
+    fn strict_nodes_at_the_type_maximum_reproduce_the_former_per_root_charge() {
+        let tuple = std::mem::size_of::<(&DataType, usize)>();
+        let mut low = Model::new(1024, 1, 0, 0, 0, limits()).unwrap();
+        let mut high = Model::new(4096, 1, 0, 0, 0, limits()).unwrap();
+        let (low_base, high_base) = (facts(&low), facts(&high));
+        low.strict_nodes(MAX_VALUE_TYPE_NODES).unwrap();
+        high.strict_nodes(MAX_VALUE_TYPE_NODES).unwrap();
+        let low_nodes = facts(&low);
+        assert_eq!(
+            low_nodes.allocation_requests_upper_bound - low_base.allocation_requests_upper_bound,
+            MAX_VALUE_TYPE_NODES
+        );
+        assert_eq!(
+            low_nodes.allocation_request_bytes_upper_bound
+                - low_base.allocation_request_bytes_upper_bound,
+            4 * MAX_VALUE_TYPE_NODES * tuple
+        );
+        let low_work = low_nodes.cumulative_work_upper_bound - low_base.cumulative_work_upper_bound;
+        let high_work =
+            facts(&high).cumulative_work_upper_bound - high_base.cumulative_work_upper_bound;
+        // The locked metadata iterator's 32 units per source byte, per node.
+        assert_eq!(
+            high_work - low_work,
+            MAX_VALUE_TYPE_NODES * (4096 - 1024) * 32
         );
     }
     #[test]

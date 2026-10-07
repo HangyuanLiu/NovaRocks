@@ -745,6 +745,59 @@ mod tests {
         assert_eq!(limits.source_retained_bytes, encode.source_retained_bytes);
     }
 
+    /// Both directions share one type ceiling, and the sender charges each
+    /// strict type root's validator by that root's actual node count, the
+    /// receiver's own per-root summary bound. A wide fragment's scalar roots
+    /// therefore fit the candidate ceiling under the candidate source invoice,
+    /// where a fixed 4096-node charge per root refused from 245 roots.
+    #[test]
+    fn candidate_type_ceiling_admits_wide_scalar_type_tables() {
+        use arrow_schema::DataType;
+        use novarocks_plan_codec::physical_type_v2::encode_type_table_writer_sources_observed;
+        use novarocks_type_contract::{
+            CompileCheckpoints, CompilePhase, FunctionValueType, MAX_VALUE_TYPE_NODES,
+        };
+        let encode = candidate_encode_limits();
+        let decode = candidate_decode_limits();
+        assert_eq!(
+            decode.types.max_allocation_requests,
+            encode.types.max_allocation_requests
+        );
+        assert_eq!(
+            decode.types.max_allocation_request_bytes,
+            encode.types.max_allocation_request_bytes
+        );
+        const ROOTS: u32 = 2000;
+        assert!(ROOTS as usize * MAX_VALUE_TYPE_NODES > encode.types.max_allocation_requests);
+        let roots = (0..ROOTS)
+            .map(|id| (id, FunctionValueType::new(DataType::Int64, true)))
+            .collect::<Vec<_>>();
+        let mut work =
+            CompileCheckpoints::try_new(&CompositionControl, CompilePhase::Encode).unwrap();
+        let mut last = None;
+        let table = encode_type_table_writer_sources_observed(
+            &roots,
+            &[],
+            &[],
+            encode.source_retained_bytes,
+            encode.types,
+            &mut |facts| {
+                last = Some(*facts);
+                Ok(())
+            },
+            &mut work,
+        )
+        .expect("a wide scalar type table fits the candidate type ceiling");
+        work.finish().unwrap();
+        assert_eq!(table.as_wire().value_types.len(), ROOTS as usize);
+        let facts = last.expect("the sender admitted its type projection");
+        assert!(facts.allocation_requests_upper_bound <= encode.types.max_allocation_requests);
+        assert!(
+            facts.allocation_requests_upper_bound < 4 * ROOTS as usize + 1024,
+            "{facts:?}"
+        );
+    }
+
     /// The candidate binary composes the compiled-package interpreter in
     /// every role, with the sealed catalogue's digest as its island
     /// component, and its backend interpreter builds from the candidate

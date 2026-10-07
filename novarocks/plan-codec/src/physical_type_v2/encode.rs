@@ -23,15 +23,15 @@ use super::encode_resources::Model;
 use super::{
     FieldRootSources, PackageTypeProjectionFacts, PackageTypeProjectionLimits, TypeCodecError,
     TypeProjectionLimits, ValueRootSources, WriterTypeSource, encode_logical, validate_field,
-    validate_type,
+    validate_type_visit,
 };
 use crate::allocation_exit_v2::reserve_exit;
 use crate::arrow_metadata_v2::{copy_string, encode_metadata};
 use arrow::datatypes::{DataType, Field, UnionMode};
 use novarocks_proto_models::{physical_type_v2 as wire, plan};
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, FunctionValueType, field_logical_type,
-    validate_arrow_carrier_parameters_observed,
+    CompileCheckpoints, CompileControlError, FunctionValueType, ValueTypeVisit, field_logical_type,
+    validate_arrow_carrier_parameters_observed, validate_value_type_structure_observed,
 };
 use std::{collections::BTreeSet, sync::Arc};
 use wire::carrier_type_definition::Kind;
@@ -266,6 +266,51 @@ fn count_field(
     Ok(nodes)
 }
 
+/// Admit `count` actual nodes of one strict validator walk before it reaches
+/// them. Without an admission (the unmetered DTO-only API) nothing is owed.
+fn admit_strict_nodes(resources: &mut Option<Admission<'_>>, count: usize) -> Result<(), Error> {
+    if count != 0
+        && let Some(resources) = resources
+    {
+        resources.model.strict_nodes(count)?;
+        resources.gate()?;
+    }
+    Ok(())
+}
+
+/// Exactly the children the strict validator pushes when it visits `ty`.
+pub(super) fn strict_children(ty: &DataType) -> usize {
+    match ty {
+        DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::ListView(_)
+        | DataType::LargeListView(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::Map(_, _) => 1,
+        DataType::Struct(fields) => fields.len(),
+        DataType::Union(fields, _) => fields.len(),
+        DataType::Dictionary(_, _) | DataType::RunEndEncoded(_, _) => 2,
+        _ => 0,
+    }
+}
+
+/// The original strict validator walk of one root whose own node the caller
+/// has admitted. Each visited carrier admits its direct children before the
+/// walker visits their Fields or pushes them, so the charge follows the
+/// actual type rather than the per-type node maximum.
+fn validate_strict_type(
+    ty: &DataType,
+    resources: &mut Option<Admission<'_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), Error> {
+    validate_value_type_structure_observed(ty, |visit| {
+        if let ValueTypeVisit::TypeNode(node) = visit {
+            admit_strict_nodes(resources, strict_children(node))?;
+        }
+        validate_type_visit(visit, work)
+    })
+}
+
 fn preflight<'a>(
     values: ValueRootSources<'_>,
     fields: FieldRootSources<'_>,
@@ -343,6 +388,8 @@ fn preflight<'a>(
     }
     let mut ids = BTreeSet::new();
     for (id, value) in values.iter() {
+        // The root node of this strict walk, before its first callback.
+        admit_strict_nodes(&mut counts.resources, 1)?;
         if observed {
             work.flush()?;
         } else {
@@ -357,15 +404,17 @@ fn preflight<'a>(
             return Err(Error::InvalidShape("duplicate value type definition ID"));
         }
         value.logical_type.validate_carrier(&value.data_type)?;
-        validate_type(&value.data_type, work)?;
+        validate_strict_type(&value.data_type, &mut counts.resources, work)?;
         let nodes = count_type(&value.data_type, &mut counts, work, SourceLaw::Strict)?;
         counts.expansion(nodes)?;
     }
     for (_, field) in fields.iter() {
+        // The root node, whose visit pair is this root Field and its carrier.
+        admit_strict_nodes(&mut counts.resources, 1)?;
         work.step()?;
         validate_field(field, work)?;
         field_logical_type(field)?;
-        validate_type(field.data_type(), work)?;
+        validate_strict_type(field.data_type(), &mut counts.resources, work)?;
         #[allow(deprecated)]
         let dictionary_id = field.dict_id();
         if dictionary_id.is_some() != field.dict_is_ordered().is_some() {

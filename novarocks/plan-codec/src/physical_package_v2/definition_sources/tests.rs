@@ -838,6 +838,191 @@ pub(in crate::physical_package_v2) fn cv_package() -> p::FragmentPackage {
     )
     .unwrap()
 }
+/// A checked `rows` x `columns` Values package whose every cell is its own
+/// Int64 constant expression, the shape a many-row VALUES list or a wide
+/// projection of literals lowers to. Every expression, output value and
+/// result field is a separate strict scalar type root, so the package carries
+/// `rows * columns + 2 * columns + 1` value roots, the pool's included.
+pub(in crate::physical_package_v2) fn values_package(
+    rows: usize,
+    columns: usize,
+) -> p::FragmentPackage {
+    let source = p::NodeId::new(0);
+    let pool_id = p::ConstantPoolId::new(0);
+    let pool_rows = 16;
+    let cell = |row: usize, column: usize| p::ExprId::new((row * columns + column) as u32);
+    let arena = p::ExprArena::try_from_definitions_observed(
+        (0..rows)
+            .flat_map(|row| {
+                (0..columns).map(move |column| p::ExprNode {
+                    id: cell(row, column),
+                    owner: source,
+                    lambda_scope: None,
+                    ty: int(),
+                    kind: p::ExprKind::Constant(p::ConstantReference {
+                        pool: pool_id,
+                        ordinal: ((row * columns + column) % pool_rows) as u32,
+                    }),
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter(),
+        &p::PlanLimits::FROZEN,
+        &Setup,
+    )
+    .unwrap();
+    let values = (0..columns)
+        .map(|column| p::ValueId::new(column as u32))
+        .collect::<Box<[_]>>();
+    let fragment = p::Fragment::try_from_structure_observed(
+        p::FragmentStructureInput {
+            id: p::FragmentId::new(5),
+            root: source,
+            values: values
+                .iter()
+                .enumerate()
+                .map(|(ordinal, id)| {
+                    (
+                        *id,
+                        p::ValueDef {
+                            id: *id,
+                            ty: int(),
+                            origin: p::ValueOrigin::NodeOutput {
+                                node: source,
+                                output_ordinal: ordinal as u32,
+                            },
+                        },
+                    )
+                })
+                .collect(),
+            expressions: arena,
+            nodes: BTreeMap::from([(
+                source,
+                node(
+                    source,
+                    Box::default(),
+                    values.clone(),
+                    p::NodeKind::Values {
+                        rows: (0..rows)
+                            .map(|row| (0..columns).map(|column| cell(row, column)).collect())
+                            .collect(),
+                    },
+                ),
+            )]),
+            sink: p::FragmentSink::Result,
+            dop_domain: p::PipelineDopDomain {
+                min: 1,
+                max: 1,
+                requires_power_of_two: false,
+            },
+            runtime_filters: Box::default(),
+        },
+        p::PlanLimits::FROZEN,
+        &Setup,
+    )
+    .unwrap();
+    // Every cell is one eager root use in the single domain; constants make
+    // no call, so the frozen call table is empty.
+    let roots = p::PhysicalExpressionRoots::try_new(&fragment, &Setup).unwrap();
+    let flow = ExpressionControlFlow::try_new(
+        vec![ExpressionEvaluationDomain {
+            id: EvaluationDomainId::new(0),
+            parent: None,
+            guard: None,
+        }],
+        roots
+            .sites()
+            .iter()
+            .enumerate()
+            .map(|(ordinal, (_, root))| ExpressionInvocation {
+                context: ExpressionEffectContext {
+                    use_id: ExpressionUseId::new(ordinal as u32),
+                    domain: EvaluationDomainId::new(0),
+                    demand: root.demand,
+                },
+                definition: root.expr,
+                control: ControlShape::Eager,
+                arguments: Box::default(),
+            })
+            .collect(),
+        fragment.expressions(),
+        CompilePhase::Validate,
+        &Setup,
+    )
+    .unwrap();
+    let uses = p::PhysicalRootUses::try_new(
+        &fragment,
+        flow,
+        roots
+            .sites()
+            .iter()
+            .enumerate()
+            .map(|(ordinal, (site, _))| (*site, ExpressionUseId::new(ordinal as u32)))
+            .collect(),
+        &Setup,
+    )
+    .unwrap();
+    let calls = p::FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &Setup).unwrap();
+    let mut pools = p::ConstantPools::empty();
+    let pool = novarocks_constant_contract::ConstantPool::try_new(
+        Arc::new(Field::new("cells", DataType::Int64, false)),
+        int(),
+        Int64Array::from_iter_values(0..pool_rows as i64).to_data(),
+        request(Box::default()).constant_policy,
+        CompilePhase::Validate,
+        &Setup,
+    )
+    .unwrap();
+    pools.insert(pool_id, pool).unwrap();
+    p::FragmentPackage::try_new(
+        p::FragmentPackageInput {
+            version: p::PlanVersionId::try_new([5; 16]).unwrap(),
+            required: p::RequiredContracts {
+                plan_contract_revision: p::PLAN_CONTRACT_REVISION,
+            },
+            result: Some(p::ResultPort {
+                fragment: fragment.id(),
+                output: fragment.nodes()[&source].output.clone(),
+                fields: values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, value)| p::ResultField {
+                        name: format!("c{i}").into(),
+                        alias: None,
+                        value: *value,
+                        ty: int(),
+                    })
+                    .collect(),
+            }),
+            cuts: p::FragmentCuts {
+                inbound: Box::default(),
+                outbound: Box::default(),
+                runtime_filters: Box::default(),
+                runtime_filter_bindings: Box::default(),
+            },
+            pruning: p::FrozenFragmentPruning::try_new(fragment.id(), vec![], &Setup).unwrap(),
+            fragment,
+            expression_uses: uses,
+            calls,
+            constants: pools,
+            parameters: SemanticParameters::try_new([]).unwrap(),
+            scans: BTreeMap::new(),
+            writes: BTreeMap::new(),
+            annotations: Box::default(),
+        },
+        p::FragmentPackageAdmission {
+            plan_limits: p::PlanLimits::FROZEN,
+            source_retained_bytes: SOURCE,
+            property_projection_limits: p::PropertyProofProjectionLimits {
+                max_request_bytes: REQUEST_BYTES,
+                max_coexisting_bytes: SOURCE + REQUEST_BYTES,
+                max_projection_work: usize::MAX / 4,
+            },
+        },
+        &Setup,
+    )
+    .unwrap()
+}
 pub(in crate::physical_package_v2) fn writer_package() -> p::FragmentPackage {
     crate::physical_type_v2::sender_tests::checked_writer_package(writer_recipe())
 }

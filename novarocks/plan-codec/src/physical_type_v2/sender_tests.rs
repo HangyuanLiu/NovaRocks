@@ -1262,3 +1262,144 @@ fn sender_actual_projection_admits_complete_request_inventory_and_refuses_each_a
         assert_eq!(control.trace().first(), Some(&0));
     }
 }
+
+fn strict_value_facts(values: &[(u32, FunctionValueType)]) -> PackageTypeProjectionFacts {
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+    let mut last = None;
+    encode_type_table_writer_sources_observed(
+        values,
+        &[],
+        &[],
+        SOURCE,
+        limits(),
+        &mut |facts| {
+            last = Some(*facts);
+            Ok(())
+        },
+        &mut work,
+    )
+    .unwrap();
+    work.finish().unwrap();
+    last.unwrap()
+}
+
+/// Each strict root admits its validator from its own actual node count. A
+/// thousand scalar roots fit the request ceiling that the former per-type
+/// 4096-node charge exhausted at 245 roots; every List level adds exactly
+/// its validator node and its item Field name, so a deeper type charges more
+/// while staying far below the per-type maximum.
+#[test]
+fn sender_strict_roots_admit_their_validator_from_actual_type_size() {
+    use novarocks_type_contract::{MAX_VALUE_TYPE_DEPTH, MAX_VALUE_TYPE_NODES};
+    assert!(245 * MAX_VALUE_TYPE_NODES > limits().max_allocation_requests);
+    let scalars = (0..1000)
+        .map(|id| (id, FunctionValueType::new(DataType::Int64, true)))
+        .collect::<Vec<_>>();
+    let wide = strict_value_facts(&scalars);
+    assert_eq!(wide.definition_count, 2000);
+    // Per scalar root: the ID set's node, one validator node; plus the
+    // fixed diagnostic and the two nonempty namespace Vecs.
+    assert!(
+        wide.allocation_requests_upper_bound <= 2 * 1000 + 128 + 2,
+        "{wide:?}"
+    );
+    let one = strict_value_facts(&scalars[..1]);
+    let tuple = std::mem::size_of::<(&DataType, usize)>();
+    assert!(one.allocation_request_bytes_upper_bound < MAX_VALUE_TYPE_NODES * tuple);
+
+    let nested = |depth: usize| {
+        let ty = (0..depth).fold(DataType::Int64, |ty, _| {
+            DataType::List(Arc::new(Field::new_list_field(ty, true)))
+        });
+        [(0, FunctionValueType::new(ty, true))]
+    };
+    let mut previous = strict_value_facts(&nested(1));
+    assert!(previous.allocation_requests_upper_bound > one.allocation_requests_upper_bound);
+    for depth in 2..MAX_VALUE_TYPE_DEPTH {
+        let facts = strict_value_facts(&nested(depth));
+        assert_eq!(
+            facts.allocation_requests_upper_bound - previous.allocation_requests_upper_bound,
+            2,
+            "depth {depth}"
+        );
+        assert!(
+            facts.allocation_request_bytes_upper_bound
+                - previous.allocation_request_bytes_upper_bound
+                >= 4 * tuple,
+            "depth {depth}"
+        );
+        assert!(facts.cumulative_work_upper_bound > previous.cumulative_work_upper_bound);
+        previous = facts;
+    }
+    assert!(previous.allocation_requests_upper_bound < MAX_VALUE_TYPE_NODES);
+}
+
+/// The admitted children of every visited carrier are exactly the original
+/// walker's pushes, so a valid strict root admits one node per visit.
+#[test]
+fn strict_validator_admission_matches_every_original_walker_visit() {
+    use arrow::datatypes::{UnionFields, UnionMode};
+    use novarocks_type_contract::{ValueTypeError, validate_value_type_structure_observed};
+    let item = |ty: DataType| Arc::new(Field::new("item", ty, true));
+    let entries = Field::new(
+        "entries",
+        DataType::Struct(
+            vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Int64, true),
+            ]
+            .into(),
+        ),
+        false,
+    );
+    let union = UnionFields::try_new(
+        [0, 3],
+        [
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::List(item(DataType::Utf8)), true),
+        ],
+    )
+    .unwrap();
+    let types = [
+        DataType::Int64,
+        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        DataType::List(item(DataType::Int64)),
+        DataType::LargeList(item(DataType::Utf8)),
+        DataType::ListView(item(DataType::Int8)),
+        DataType::LargeListView(item(DataType::Int16)),
+        DataType::FixedSizeList(item(DataType::Float64), 3),
+        DataType::Map(Arc::new(entries), false),
+        DataType::Struct(Vec::<Field>::new().into()),
+        DataType::Struct(
+            vec![
+                Field::new("x", DataType::Int64, true),
+                Field::new("y", DataType::List(item(DataType::Boolean)), true),
+                Field::new(
+                    "z",
+                    DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                    true,
+                ),
+            ]
+            .into(),
+        ),
+        DataType::Union(union, UnionMode::Dense),
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Binary)),
+        DataType::RunEndEncoded(
+            Arc::new(Field::new("run_ends", DataType::Int32, false)),
+            Arc::new(Field::new("values", DataType::Utf8, true)),
+        ),
+    ];
+    for ty in &types {
+        let (mut visits, mut admitted) = (0usize, 1usize);
+        validate_value_type_structure_observed::<ValueTypeError>(ty, |visit| {
+            if let ValueTypeVisit::TypeNode(node) = visit {
+                visits += 1;
+                admitted += super::encode::strict_children(node);
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(admitted, visits, "{ty}");
+    }
+}
