@@ -274,13 +274,15 @@ pub use row_mutation::{
     ConnectorMutationMatchContract, ConnectorMutationRouteInput,
     ConnectorMutationSelectionFieldRef, ConnectorMutationSelectionFieldRole,
     ConnectorMutationSourceField, ConnectorMutationTargetField,
+    ConnectorRowConversionBatchFootprint, ConnectorRowConversionFootprint,
     ConnectorRowMutationActivationRequest, ConnectorRowMutationCohortRecipe,
     ConnectorRowMutationCohortRecipeBody, ConnectorRowMutationEffect,
     ConnectorRowMutationExecutionPlan, ConnectorRowMutationIntent, ConnectorRowMutationPreparation,
     ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
     ConnectorRowMutationRoute, ConnectorRowMutationScanBinding, ConnectorRowMutationSelection,
     ConnectorRowMutationSelectionOrdinal, ConnectorRowMutationSelectionView,
-    ConnectorRowMutationStrategy, ConnectorWriteRouteId, MAX_CONNECTOR_ROW_MUTATION_ROUTES,
+    ConnectorRowMutationStrategy, ConnectorWriteRouteId,
+    MAX_CONNECTOR_ROW_CONVERSION_WORKSPACE_BYTES, MAX_CONNECTOR_ROW_MUTATION_ROUTES,
     MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES,
 };
 pub use scalar::{ConnectorScalarType, ConnectorScalarValue};

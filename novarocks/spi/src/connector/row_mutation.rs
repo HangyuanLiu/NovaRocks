@@ -38,6 +38,21 @@ use super::{
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 
+mod match_bounds;
+#[cfg(test)]
+mod match_bounds_tests;
+mod row_footprint;
+#[cfg(test)]
+thread_local! { static MATCH_LAYOUT_ALLOCATION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+mod row_footprint_tests;
+#[cfg(test)]
+thread_local! { static ROW_CONVERSION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+pub use row_footprint::{
+    ConnectorRowConversionBatchFootprint, ConnectorRowConversionFootprint,
+    MAX_CONNECTOR_ROW_CONVERSION_WORKSPACE_BYTES,
+};
+
 pub const CONNECTOR_ROW_MUTATION_CONTRACT_VERSION: u32 = 2;
 pub const MAX_CONNECTOR_ROW_MUTATION_ROUTES: usize = 4096;
 pub const MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES: usize = 4096;
@@ -221,6 +236,41 @@ impl ConnectorMutationMatchContract {
         uniqueness_tokens: Vec<ConnectorWriteFieldToken>,
         effect_field: ConnectorMutationEffectField,
     ) -> Result<Self, ConnectorError> {
+        let digest = Self::validate_match_layout(
+            &owner,
+            &table,
+            &base_version,
+            &identity_fields,
+            &before_fields,
+            &after_fields,
+            &uniqueness_tokens,
+            &effect_field,
+        )?;
+        Ok(Self {
+            owner,
+            table,
+            base_version,
+            identity_fields,
+            before_fields,
+            after_fields,
+            uniqueness_tokens,
+            effect_field,
+            digest,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::ptr_arg)]
+    fn validate_match_layout(
+        owner: &ConnectorProviderBindingKey,
+        table: &ConnectorTableHandle,
+        base_version: &ConnectorWriteBaseVersion,
+        identity_fields: &Vec<ConnectorMutationSourceField>,
+        before_fields: &Vec<ConnectorMutationTargetField>,
+        after_fields: &Vec<ConnectorMutationTargetField>,
+        uniqueness_tokens: &Vec<ConnectorWriteFieldToken>,
+        effect_field: &ConnectorMutationEffectField,
+    ) -> Result<[u8; 32], ConnectorError> {
         if table.owner() != &owner.instance_id
             || identity_fields.is_empty()
             || uniqueness_tokens.is_empty()
@@ -230,10 +280,19 @@ impl ConnectorMutationMatchContract {
                 "row-mutation match contract needs an exact owner, identity, and uniqueness tuple",
             ));
         }
+        match_bounds::preflight(
+            identity_fields,
+            before_fields,
+            after_fields,
+            uniqueness_tokens,
+            effect_field,
+        )?;
         base_version.validate()?;
+        #[cfg(test)]
+        MATCH_LAYOUT_ALLOCATION_CALLS.with(|n| n.set(n.get() + 1));
         let mut tokens = HashSet::new();
         let mut selection_ordinals = HashSet::new();
-        for value in &identity_fields {
+        for value in identity_fields {
             if !tokens.insert(value.token) || !selection_ordinals.insert(value.source_ordinal) {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
@@ -241,7 +300,7 @@ impl ConnectorMutationMatchContract {
                 ));
             }
         }
-        for value in before_fields.iter().chain(&after_fields) {
+        for value in before_fields.iter().chain(after_fields) {
             if !tokens.insert(value.token) || !selection_ordinals.insert(value.target_ordinal) {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
@@ -281,17 +340,7 @@ impl ConnectorMutationMatchContract {
                 "row-mutation uniqueness tuple contains a foreign or duplicate token",
             ));
         }
-        let digest = match_digest(
-            &owner,
-            &table,
-            &base_version,
-            &identity_fields,
-            &before_fields,
-            &after_fields,
-            &uniqueness_tokens,
-            &effect_field,
-        );
-        Ok(Self {
+        match_digest(
             owner,
             table,
             base_version,
@@ -300,22 +349,21 @@ impl ConnectorMutationMatchContract {
             after_fields,
             uniqueness_tokens,
             effect_field,
-            digest,
-        })
+        )
     }
 
     pub fn validate(&self) -> Result<(), ConnectorError> {
-        let expected = Self::try_new(
-            self.owner.clone(),
-            self.table.clone(),
-            self.base_version.clone(),
-            self.identity_fields.clone(),
-            self.before_fields.clone(),
-            self.after_fields.clone(),
-            self.uniqueness_tokens.clone(),
-            self.effect_field.clone(),
+        let expected = Self::validate_match_layout(
+            &self.owner,
+            &self.table,
+            &self.base_version,
+            &self.identity_fields,
+            &self.before_fields,
+            &self.after_fields,
+            &self.uniqueness_tokens,
+            &self.effect_field,
         )?;
-        if expected.digest != self.digest {
+        if expected != self.digest {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
                 "row-mutation match contract digest does not match contents",
@@ -906,12 +954,21 @@ impl ConnectorRowMutationSelection {
                 "row-mutation selection has too many Arrow batches",
             ));
         }
+        check_selection_headers(batches.capacity(), batches.len())?;
         validate_selection_schema_shape(schema.as_ref())?;
         let mut rows = 0_u64;
-        let mut bytes = 0_u64;
+        let mut bytes =
+            ConnectorRowConversionFootprint::retained_schema_bytes(schema.as_ref())? as u64;
+        if bytes > max_bytes || bytes > 64 * 1024 * 1024 {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "row-mutation selection schema exceeds its source byte budget",
+            ));
+        }
         let mut batch_row_offsets = Vec::with_capacity(batches.len() + 1);
         batch_row_offsets.push(0);
         for batch in &batches {
+            let batch_bytes = ConnectorRowConversionFootprint::retained_batch_bytes(batch)? as u64;
             if batch.schema_ref() != &schema {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
@@ -924,15 +981,14 @@ impl ConnectorRowMutationSelection {
                     "row-mutation selection row accounting overflowed",
                 )
             })?;
-            bytes = bytes
-                .checked_add(batch.get_array_memory_size() as u64)
-                .ok_or_else(|| {
-                    ConnectorError::new(
-                        ConnectorErrorKind::ResourceExhausted,
-                        "row-mutation selection byte accounting overflowed",
-                    )
-                })?;
-            if rows > max_rows || bytes > max_bytes {
+            bytes = bytes.checked_add(batch_bytes).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "row-mutation selection byte accounting overflowed",
+                )
+            })?;
+            if rows > max_rows || rows > 1_048_576 || bytes > max_bytes || bytes > 64 * 1024 * 1024
+            {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::ResourceExhausted,
                     "row-mutation selection exceeds its row or byte budget",
@@ -964,7 +1020,9 @@ impl ConnectorRowMutationSelection {
                 "row-mutation selection retained invalid bounds",
             ));
         }
+        check_selection_headers(self.batches.capacity(), self.batches.len())?;
         validate_selection_schema_shape(self.schema.as_ref())?;
+        let (rows, bytes) = selection_size(self.schema.as_ref(), &self.batches)?;
         if self
             .batches
             .iter()
@@ -975,7 +1033,6 @@ impl ConnectorRowMutationSelection {
                 "row-mutation selection batch differs from its retained schema",
             ));
         }
-        let (rows, bytes) = selection_size(&self.batches)?;
         let mut offsets = Vec::with_capacity(self.batches.len() + 1);
         offsets.push(0);
         for batch in &self.batches {
@@ -1552,41 +1609,38 @@ impl ConnectorRowMutationExecutionPlan {
     }
 }
 
-fn validate_selection_schema_shape(schema: &Schema) -> Result<(), ConnectorError> {
-    fn supported(data_type: &DataType) -> bool {
-        match data_type {
-            DataType::Map(_, _) => false,
-            DataType::List(field)
-            | DataType::LargeList(field)
-            | DataType::ListView(field)
-            | DataType::LargeListView(field)
-            | DataType::FixedSizeList(field, _) => supported(field.data_type()),
-            DataType::Struct(fields) => fields.iter().all(|field| supported(field.data_type())),
-            DataType::Dictionary(_, value) => supported(value),
-            DataType::Union(fields, _) => {
-                fields.iter().all(|(_, field)| supported(field.data_type()))
-            }
-            DataType::RunEndEncoded(_, values) => supported(values.data_type()),
-            _ => true,
-        }
-    }
-    if schema
-        .fields()
-        .iter()
-        .any(|field| !supported(field.data_type()))
-    {
+// The owned outer Vec's capacity is public and separate from Arrow source
+// payload bytes. Leave its old/new headers and offset index within the one
+// MiB collector slice of Internal bookkeeping before constructing offsets.
+fn check_selection_headers(capacity: usize, length: usize) -> Result<(), ConnectorError> {
+    let bytes = capacity
+        .checked_mul(2 * size_of::<RecordBatch>())
+        .and_then(|v| {
+            length
+                .checked_add(1)?
+                .checked_mul(2 * size_of::<u64>())?
+                .checked_add(v)
+        });
+    if bytes.is_none_or(|v| v > 1024 * 1024) {
         return Err(ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "row-mutation selection schema contains an unsupported Map value",
+            ConnectorErrorKind::ResourceExhausted,
+            "row-mutation selection batch containers exceed their bounded bookkeeping",
         ));
     }
     Ok(())
 }
 
-fn selection_size(batches: &[RecordBatch]) -> Result<(u64, u64), ConnectorError> {
-    batches
-        .iter()
-        .try_fold((0_u64, 0_u64), |(rows, bytes), batch| {
+fn validate_selection_schema_shape(schema: &Schema) -> Result<(), ConnectorError> {
+    ConnectorRowConversionFootprint::for_schema(schema).map(|_| ())
+}
+
+fn selection_size(schema: &Schema, batches: &[RecordBatch]) -> Result<(u64, u64), ConnectorError> {
+    batches.iter().try_fold(
+        (
+            0_u64,
+            ConnectorRowConversionFootprint::retained_schema_bytes(schema)? as u64,
+        ),
+        |(rows, bytes), batch| {
             Ok((
                 rows.checked_add(batch.num_rows() as u64).ok_or_else(|| {
                     ConnectorError::new(
@@ -1595,7 +1649,9 @@ fn selection_size(batches: &[RecordBatch]) -> Result<(u64, u64), ConnectorError>
                     )
                 })?,
                 bytes
-                    .checked_add(batch.get_array_memory_size() as u64)
+                    .checked_add(
+                        ConnectorRowConversionFootprint::retained_batch_bytes(batch)? as u64,
+                    )
                     .ok_or_else(|| {
                         ConnectorError::new(
                             ConnectorErrorKind::ResourceExhausted,
@@ -1603,7 +1659,8 @@ fn selection_size(batches: &[RecordBatch]) -> Result<(u64, u64), ConnectorError>
                         )
                     })?,
             ))
-        })
+        },
+    )
 }
 
 fn validate_selection_against_preparation(
@@ -2096,7 +2153,7 @@ fn match_digest(
     after: &[ConnectorMutationTargetField],
     unique: &[ConnectorWriteFieldToken],
     effect: &ConnectorMutationEffectField,
-) -> [u8; 32] {
+) -> Result<[u8; 32], ConnectorError> {
     let mut hasher = Sha256::new();
     hasher.update(b"novarocks.connector-row-mutation-match.v1\0");
     digest_owner(&mut hasher, owner);
@@ -2105,20 +2162,20 @@ fn match_digest(
     for field in identity {
         hasher.update(field.token.to_bytes());
         hasher.update(field.source_ordinal.to_be_bytes());
-        digest_bytes(&mut hasher, format!("{:?}", field.field).as_bytes());
+        match_bounds::digest_debug_field(&mut hasher, &field.field)?;
     }
     for field in before.iter().chain(after) {
         hasher.update(field.token.to_bytes());
         hasher.update(field.target_ordinal.to_be_bytes());
-        digest_bytes(&mut hasher, format!("{:?}", field.field).as_bytes());
+        match_bounds::digest_debug_field(&mut hasher, &field.field)?;
     }
     for token in unique {
         hasher.update(token.to_bytes());
     }
     hasher.update(effect.token.to_bytes());
     hasher.update(effect.target_ordinal.to_be_bytes());
-    digest_bytes(&mut hasher, format!("{:?}", effect.field).as_bytes());
-    hasher.finalize().into()
+    match_bounds::digest_debug_field(&mut hasher, &effect.field)?;
+    Ok(hasher.finalize().into())
 }
 fn route_digest(
     route: ConnectorWriteRouteId,
@@ -2316,10 +2373,45 @@ fn selection_digest(
     batches: &[RecordBatch],
     rows: u64,
 ) -> Result<[u8; 32], ConnectorError> {
+    let footprint = ConnectorRowConversionFootprint::for_schema(schema.as_ref())?;
+    let (_, retained_bytes) = selection_size(schema.as_ref(), batches)?;
+    let retained_bytes = usize::try_from(retained_bytes).map_err(|_| {
+        ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            "row-mutation selection retained byte accounting overflowed",
+        )
+    })?;
+    if rows > 1_048_576
+        || retained_bytes > 64 * 1024 * 1024
+        || batches.len() > MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES
+        || retained_bytes
+            .checked_add(footprint.constructor_peak_bytes)
+            .is_none_or(|n| n > MAX_CONNECTOR_ROW_CONVERSION_WORKSPACE_BYTES)
+    {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            "row-mutation selection exceeds its bounded conversion workspace",
+        ));
+    }
+    // All immutable batches pass one traversal budget before Arrow's
+    // constructor can allocate synthetic null arrays. No encoded Rows or
+    // data copies are retained across batches.
+    footprint.checked_constructor_peak_with(retained_bytes, 1024 * 1024)?;
+    footprint.preflight_batches(
+        batches,
+        retained_bytes.checked_add(1024 * 1024).ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "row-mutation selection bookkeeping accounting overflowed",
+            )
+        })?,
+    )?;
     let mut hasher = Sha256::new();
     hasher.update(b"novarocks.connector-row-mutation-selection.v2\0");
     hasher.update(rows.to_be_bytes());
     hasher.update(canonical_schema_digest(schema.as_ref())?);
+    #[cfg(test)]
+    ROW_CONVERSION_CALLS.with(|n| n.set(n.get() + 1));
     let converter = RowConverter::new(
         schema
             .fields()
@@ -2334,6 +2426,8 @@ fn selection_digest(
         )
     })?;
     for batch in batches {
+        #[cfg(test)]
+        ROW_CONVERSION_CALLS.with(|n| n.set(n.get() + 1));
         let logical_rows = converter
             .convert_columns(batch.columns())
             .map_err(|error| {
@@ -2577,7 +2671,9 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1_i64, 2]))],
         )
         .expect("batch");
-        let bytes = batch.get_array_memory_size() as u64;
+        let bytes = selection_size(schema.as_ref(), std::slice::from_ref(&batch))
+            .expect("bounded source")
+            .1;
         let selection = ConnectorRowMutationSelection::try_new(
             Arc::clone(&schema),
             vec![batch.clone()],
@@ -2700,7 +2796,7 @@ mod tests {
     #[test]
     fn empty_selection_retains_explicit_schema() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let selection = ConnectorRowMutationSelection::try_new(schema.clone(), vec![], 1, 1)
+        let selection = ConnectorRowMutationSelection::try_new(schema.clone(), vec![], 1, 4096)
             .expect("empty selection");
         assert_eq!(selection.schema(), &schema);
         selection.validate().expect("valid empty selection");

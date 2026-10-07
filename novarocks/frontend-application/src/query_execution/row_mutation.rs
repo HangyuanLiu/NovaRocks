@@ -20,17 +20,19 @@
 //! This module deliberately knows only the signed SPI contract.  It neither
 //! interprets provider identity values nor derives a physical write strategy.
 
-use std::collections::HashSet;
+mod uniqueness;
 use std::sync::Arc;
 use std::time::Instant;
+use uniqueness::BoundedMutationKeys;
 
 use arrow::array::{Array, ArrayRef, Int8Array};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use arrow::row::{OwnedRow, RowConverter, SortField};
+use arrow::row::{RowConverter, SortField};
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorMutationMatchContract, ConnectorRequestContext,
-    ConnectorRowMutationEffect, ConnectorRowMutationIntent, ConnectorRowMutationSelection,
+    ConnectorRowConversionFootprint, ConnectorRowMutationEffect, ConnectorRowMutationIntent,
+    ConnectorRowMutationSelection,
 };
 
 use crate::native::fragment_transport::FetchedQueryBatch;
@@ -128,12 +130,24 @@ impl BoundedRowMutationMatchCollector {
                 "row-mutation match collection has no usable byte budget",
             ));
         }
+        let schema_bytes = match &schema {
+            Some(schema) => {
+                ConnectorRowConversionFootprint::retained_schema_bytes(schema.as_ref())? as u64
+            }
+            None => 0,
+        };
+        if schema_bytes > max_bytes {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "COW selection schema exceeds its retained source budget",
+            ));
+        }
         Ok(Self {
             context,
             max_rows: max_bytes.min(COW_SELECTION_ROWS),
             max_bytes,
             row_count: 0,
-            byte_count: 0,
+            byte_count: schema_bytes,
             schema,
             batches: Vec::new(),
         })
@@ -182,8 +196,7 @@ impl BoundedRowMutationMatchCollector {
                     "row-mutation match batch schema differs from the retained selection schema",
                 ));
             }
-            None => self.schema = Some(batch.schema()),
-            Some(_) => {}
+            None | Some(_) => {}
         }
         let rows = u64::try_from(batch.num_rows()).map_err(|_| {
             ConnectorError::new(
@@ -191,7 +204,10 @@ impl BoundedRowMutationMatchCollector {
                 "row-mutation match batch row count does not fit u64",
             )
         })?;
-        let bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
+        let bytes = u64::try_from(ConnectorRowConversionFootprint::retained_batch_bytes(
+            &batch,
+        )?)
+        .map_err(|_| {
             ConnectorError::new(
                 ConnectorErrorKind::ResourceExhausted,
                 "row-mutation match batch byte count does not fit u64",
@@ -203,17 +219,64 @@ impl BoundedRowMutationMatchCollector {
                 "row-mutation match row accounting overflowed",
             )
         })?;
-        let next_bytes = self.byte_count.checked_add(bytes).ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "row-mutation match byte accounting overflowed",
-            )
-        })?;
+        let initial_schema_bytes = if self.schema.is_none() {
+            ConnectorRowConversionFootprint::retained_schema_bytes(batch.schema_ref())? as u64
+        } else {
+            0
+        };
+        let next_bytes = self
+            .byte_count
+            .checked_add(bytes)
+            .and_then(|v| v.checked_add(initial_schema_bytes))
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "row-mutation match byte accounting overflowed",
+                )
+            })?;
         if next_rows > self.max_rows || next_bytes > self.max_bytes {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::ResourceExhausted,
                 "row-mutation match result exceeds its row or byte budget",
             ));
+        }
+        if self.batches.len() == self.batches.capacity() {
+            let maximum = novarocks_spi::connector::MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES;
+            let desired = self
+                .batches
+                .capacity()
+                .saturating_mul(2)
+                .max(1)
+                .min(maximum);
+            let peak = self
+                .batches
+                .capacity()
+                .checked_add(desired)
+                .and_then(|slots| slots.checked_mul(size_of::<RecordBatch>()))
+                .ok_or_else(|| invalid_match("COW collector slot accounting overflowed"))?;
+            if peak > 8 * 1024 * 1024 {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "COW collector batch headers exceed their bookkeeping workspace",
+                ));
+            }
+            self.batches
+                .try_reserve_exact(desired - self.batches.len())
+                .map_err(|_| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::ResourceExhausted,
+                        "COW collector batch header allocation was refused",
+                    )
+                })?;
+            if self.batches.capacity() != desired {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "COW collector batch header allocation exceeds its exact capacity",
+                ));
+            }
+        }
+        if self.schema.is_none() {
+            self.schema = Some(batch.schema());
         }
         self.row_count = next_rows;
         self.byte_count = next_bytes;
@@ -461,7 +524,8 @@ pub struct RowMutationMatchValidator {
     intent: ConnectorRowMutationIntent,
     uniqueness_ordinals: Vec<usize>,
     converter: RowConverter,
-    seen: HashSet<OwnedRow>,
+    conversion_footprint: ConnectorRowConversionFootprint,
+    seen: BoundedMutationKeys,
 }
 
 impl RowMutationMatchValidator {
@@ -471,6 +535,24 @@ impl RowMutationMatchValidator {
     ) -> Result<Self, ConnectorError> {
         contract.validate()?;
         intent.validate()?;
+        // Validate references and borrow the whole type shape before any
+        // ordinals, SortField/DataType clones or converter are constructed.
+        for token in contract.uniqueness_tokens() {
+            match_field(&contract, *token).ok_or_else(|| {
+                invalid_match("row-mutation uniqueness token is foreign to the match contract")
+            })?;
+        }
+        let conversion_footprint =
+            ConnectorRowConversionFootprint::for_fields(contract.uniqueness_tokens().iter().map(
+                |token| match_field(&contract, *token).expect("uniqueness fields were validated"),
+            ))?;
+        let seen = BoundedMutationKeys::new();
+        let vector_bytes = contract
+            .uniqueness_tokens()
+            .len()
+            .checked_mul(size_of::<usize>() + size_of::<ArrayRef>())
+            .ok_or_else(|| invalid_match("uniqueness vector byte count overflowed"))?;
+        conversion_footprint.checked_constructor_peak_with(seen.retained_bytes(), vector_bytes)?;
         let uniqueness_ordinals = contract
             .uniqueness_tokens()
             .iter()
@@ -508,7 +590,8 @@ impl RowMutationMatchValidator {
             intent,
             uniqueness_ordinals,
             converter,
-            seen: HashSet::new(),
+            conversion_footprint,
+            seen,
         })
     }
 
@@ -535,6 +618,14 @@ impl RowMutationMatchValidator {
                     .ok_or_else(|| invalid_match("row-mutation uniqueness ordinal is missing"))
             })
             .collect::<Result<Vec<ArrayRef>, _>>()?;
+        // The complete selection can remain live while this batch's encoded
+        // Rows and all earlier canonical keys coexist. Use the frozen maximum
+        // selection allowance, not only the visible uniqueness-column bytes.
+        let footprint = self
+            .conversion_footprint
+            .for_columns(&uniqueness_columns, COW_SELECTION_BYTES as usize)?;
+        footprint.checked_peak_with(self.seen.retained_bytes(), 0)?;
+        self.seen.set_external_bytes(footprint.peak_bytes)?;
         let rows = self
             .converter
             .convert_columns(&uniqueness_columns)
@@ -561,8 +652,8 @@ impl RowMutationMatchValidator {
                     "row-mutation delete or replace uniqueness tuple contains null",
                 ));
             }
-            let key = rows.row(row_idx).owned();
-            if !self.seen.insert(key) {
+            let key = rows.row(row_idx);
+            if !self.seen.insert(key.data())? {
                 return Err(invalid_match(
                     "row-mutation delete or replace matched the same target more than once",
                 ));
@@ -793,8 +884,12 @@ mod tests {
         let cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
         let first = batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)]);
         let second = batch(vec![(2, 20, Some(21), REPLACE_EFFECT_TAG)]);
-        let max_bytes =
-            u64::try_from(first.get_array_memory_size() + second.get_array_memory_size()).unwrap();
+        let max_bytes = u64::try_from(
+            ConnectorRowConversionFootprint::retained_schema_bytes(first.schema_ref()).unwrap()
+                + ConnectorRowConversionFootprint::retained_batch_bytes(&first).unwrap()
+                + ConnectorRowConversionFootprint::retained_batch_bytes(&second).unwrap(),
+        )
+        .unwrap();
         let mut collector = BoundedRowMutationMatchCollector::try_new(
             context(cancellation, usize::try_from(max_bytes + 10).unwrap()),
             Some(i64::try_from(max_bytes).unwrap()),
@@ -827,7 +922,10 @@ mod tests {
         assert_eq!(selection.schema(), &schema);
         assert!(selection.batches().is_empty());
         assert_eq!(selection.row_count(), 0);
-        assert_eq!(selection.byte_count(), 0);
+        assert_eq!(
+            selection.byte_count(),
+            ConnectorRowConversionFootprint::retained_schema_bytes(schema.as_ref()).unwrap() as u64
+        );
     }
 
     #[test]
@@ -860,7 +958,9 @@ mod tests {
     fn collector_rejects_budget_cancel_and_deadline_before_retaining_batch() {
         let cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
         let one = batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)]);
-        let limit = one.get_array_memory_size();
+        let limit = ConnectorRowConversionFootprint::retained_schema_bytes(one.schema_ref())
+            .unwrap()
+            + ConnectorRowConversionFootprint::retained_batch_bytes(&one).unwrap();
         let mut collector = BoundedRowMutationMatchCollector::try_new(
             context(Arc::clone(&cancellation), limit),
             None,
@@ -973,7 +1073,10 @@ mod tests {
             header.record_bytes() as usize
         };
         let batch_record = &stream[schema_record..];
-        let budget = schema_record.max(64);
+        let budget = schema_record.max(
+            ConnectorRowConversionFootprint::retained_schema_bytes(selection_schema().as_ref())
+                .unwrap(),
+        );
         let mut small = RelayedCowSelectionCollector::try_new(
             context(Arc::clone(&cancellation), budget),
             None,
@@ -1044,6 +1147,8 @@ mod tests {
         )
         .unwrap();
         relayed.push_body(&stream[..schema_bytes]).unwrap();
+        let retained_before_refusal = relayed.byte_count();
+        assert!(retained_before_refusal > 0);
         let mut declared = stream[schema_bytes..].to_vec();
         declared[16..24].copy_from_slice(&(COW_SELECTION_ROWS + 1).to_le_bytes());
         // The payload still describes one row. ResourceExhausted proves the
@@ -1052,7 +1157,7 @@ mod tests {
             relayed.push_body(&declared).unwrap_err().kind(),
             ConnectorErrorKind::ResourceExhausted
         );
-        assert_eq!(relayed.byte_count(), 0);
+        assert_eq!(relayed.byte_count(), retained_before_refusal);
     }
 
     #[test]

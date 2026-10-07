@@ -12,6 +12,8 @@ doctest = false
 
 [dependencies]
 novarocks-type-contract.workspace = true
+allocator-api2.workspace = true
+hashbrown.workspace = true
 anyhow.workspace = true
 apache-avro.workspace = true
 async-trait.workspace = true
