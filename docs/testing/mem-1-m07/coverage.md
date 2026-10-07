@@ -54,12 +54,16 @@ collector 界，旧/新 tail 拷贝与 incoming row 共存先检查 workspace。
 
 ### Connector listing 的公开接口边界
 
+Hive/Hadoop 的 view listing 实际沿 SDK 默认 `FeatureUnsupported`；没有全量 view 枚举路径，
+不能将 Unsupported 伪造为空列表。REST/Hive 接缝裁决见 `evidence/p06-sdk-listing-boundary.md`，
+该记录不改变能力或 accepted spec。
+
 | source → consumer | 已落实的自有 retained 界 / 最后退出 | 公开接口限制与未闭合项 |
 |---|---|---|
 | REST tables：`connector/iceberg/src/catalog/rest.rs:138,165` → SHOW/system facts/document discovery | 请求 page_entries，经 `ConnectorListingCollector::accept_page` 逐页检查后 retain，token/页数错误在下一页前拒绝；临时 SDK 页/names 退出，最终 Vec 跟 SQL consumer 到最后引用退出 | SDK 已先 receive/deserialize 一页，未证明响应字节上限。`5d54685ee` 已修复忽略 pageSize 的 server：无 continuation 的最终页按累计总条数/名称字节界接受；带 continuation 的超请求页在下次读取前拒绝。document discovery 仍在 table loads 前独立检查页/总界；HTTP mock 9 项通过，生产 SQL 验收待 P09 |
-| REST namespace/view、Hive namespace/table/view：`connector/iceberg/src/catalog/delegate.rs:98,132` → metadata/SHOW/system facts | SDK 返回后在 push 自有 collector 前检查条数/名称量，拒绝完整列表；临时 SDK Vec 退出，保留 Vec 随 consumer 最后引用退出 | SDK 无对应公开分页/limit 时完整 list 已在内部形成；没有反序列化事前 bounded 证据。自有 retain 受界不证明 SDK 峰值闭合；需公开配置/准入证据或明确拒绝不可支持规模 |
+| REST namespace/view、Hive namespace/table：`connector/iceberg/src/catalog/delegate.rs:98,132` → metadata/SHOW/system facts | SDK 返回后在 push 自有 collector 前检查条数/名称量，拒绝完整列表；临时 SDK Vec 退出，保留 Vec 随 consumer 最后引用退出 | SDK 无对应公开分页/limit 时完整 list 已在内部形成；没有反序列化事前 bounded 证据。自有 retain 受界不证明 SDK 峰值闭合；需公开配置/准入证据或明确拒绝不可支持规模 |
 | Hadoop：`connector/iceberg/src/hadoop_catalog.rs:242,272` 的 read listing；`catalog/hadoop.rs` → metadata/SHOW/system facts | list_directories 返回后先检查目录条数/名称量，再 child probe/retain table；普通 trait 路径再经 delegate。directory Vec/probe 输出退出，保留 names 随 consumer 退出 | 完整目录 Vec 先于检查形成；不能称 filesystem/object-store 枚举前授权。read binding 和普通 delegate 两条路径均须覆盖 |
-| Paimon：`connector/paimon/src/catalog.rs:89,105` → role metadata → SHOW/system facts | plain list 返回后 retain_listing 整体检查，不截断，cancellation checkpoint 保持；SDK names/collector 退出，最终 entries/SQL names 到最后引用退出 | SDK filesystem 无分页参数，调用内完整枚举已物化；超界拒绝单测不证明枚举/反序列化分配前硬界。不扩大 ADR-0138 vendor 修改范围 |
+| Paimon：`connector/paimon/src/catalog.rs` / `catalog_listing.rs` → role metadata → SHOW/system facts | 每次调用用公开 FileIO read-only decorator：在 yielded FileStatus 进入 SDK Vec 前累计检查 32 MiB source workspace；全部物理条目、path capacity、SDK statuses/dirs/names 的 old+new 与嵌套 schema fallback 共用预算。保持原过滤、探测与排序，取消/deadline 原 typed 错误；超界整批拒绝，最终 entries 随 consumer 退出 | 47 lib tests PASS，包含 SDK oracle、drop/N+1 poll、nested/cancel/deadline 与 65,536 项恰好边界。底层 FS URI format 与 OpenDAL page receive/XML decode 在此接缝之前，仍未闭合；不能声称所有反序列化受界。未扩大 ADR-0138 vendor 修改范围；evidence/p06-paimon-sdk-source.md |
 
 ### 后续收敛要求
 

@@ -20,13 +20,16 @@ use std::sync::Arc;
 use novarocks_spi::connector::read_stack::SchemaTableName;
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorListingBound};
 use paimon::catalog::Identifier;
-use paimon::io::FileIO;
+use paimon::io::{FileIO, ReadOnlyFileIO};
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
 
 use crate::io::PaimonHostFileIo;
 use crate::metadata::{PaimonFrozenRead, PaimonFrozenReadRecipe, freeze_table, rebind_table};
 use crate::resources::PaimonRequestControl;
 use crate::sdk_control::PaimonSdkReadControl;
+
+#[path = "catalog_listing.rs"]
+mod listing;
 
 /// FE-owned catalog entries. The vector owns its elements until materialized or dropped.
 pub struct PaimonCatalogEntries {
@@ -57,6 +60,7 @@ impl std::fmt::Debug for PaimonCatalogEntries {
 #[derive(Clone)]
 pub struct PaimonFileSystemCatalog {
     inner: FileSystemCatalog,
+    host_io: Arc<dyn ReadOnlyFileIO>,
     control: PaimonRequestControl,
 }
 
@@ -72,36 +76,37 @@ impl PaimonFileSystemCatalog {
             return Err(invalid("Paimon warehouse location must be non-empty"));
         }
         let sdk_control = PaimonSdkReadControl::new(control.clone());
-        let file_io = FileIO::from_read_only(Arc::new(host_io), Arc::new(sdk_control));
+        let host_io: Arc<dyn ReadOnlyFileIO> = Arc::new(host_io);
+        let file_io = FileIO::from_read_only(Arc::clone(&host_io), Arc::new(sdk_control));
         let mut options = Options::new();
         options.set(CatalogOptions::WAREHOUSE, warehouse);
         let inner = FileSystemCatalog::with_file_io(options, file_io).map_err(map_sdk_error)?;
-        Ok(Self { inner, control })
+        Ok(Self {
+            inner,
+            host_io,
+            control,
+        })
     }
 
     pub fn warehouse(&self) -> &str {
         self.inner.warehouse()
     }
 
-    /// List the warehouse's databases. The SDK filesystem listing has no
-    /// paging, so its complete result is refused as a whole when it exceeds
-    /// `bound`.
+    /// List databases through a request-local bounded SDK source. An error
+    /// refuses the complete result rather than publishing a truncated listing.
     pub async fn list_databases(
         &self,
         bound: ConnectorListingBound,
     ) -> Result<PaimonCatalogEntries, ConnectorError> {
         bound.validate()?;
         self.control.checkpoint()?;
-        let entries = self
-            .inner
-            .list_databases_plain()
-            .await
-            .map_err(map_sdk_error)?;
+        let inner = self.listing_catalog(bound, None)?;
+        let entries = inner.list_databases_plain().await.map_err(map_sdk_error)?;
         self.retain_listing(entries, bound)
     }
 
-    /// List one database's tables. The SDK filesystem listing has no paging,
-    /// so its complete result is refused as a whole when it exceeds `bound`.
+    /// List tables with the SDK's unchanged schema-based existence checks.
+    /// Root and nested schema listings share one bounded source workspace.
     pub async fn list_tables(
         &self,
         database: &str,
@@ -109,8 +114,8 @@ impl PaimonFileSystemCatalog {
     ) -> Result<PaimonCatalogEntries, ConnectorError> {
         bound.validate()?;
         self.control.checkpoint()?;
-        let entries = self
-            .inner
+        let inner = self.listing_catalog(bound, Some(database))?;
+        let entries = inner
             .list_tables_plain(database)
             .await
             .map_err(map_sdk_error)?;
@@ -142,6 +147,28 @@ impl PaimonFileSystemCatalog {
         recipe: &PaimonFrozenReadRecipe,
     ) -> Result<Arc<PaimonFrozenRead>, ConnectorError> {
         rebind_table(self.inner.file_io().clone(), recipe, self.control.clone()).map(Arc::new)
+    }
+
+    fn listing_catalog(
+        &self,
+        bound: ConnectorListingBound,
+        database: Option<&str>,
+    ) -> Result<FileSystemCatalog, ConnectorError> {
+        // Preflight before cloning the warehouse into options and SDK state.
+        let host = listing::BoundedListingIo::new(
+            Arc::clone(&self.host_io),
+            self.control.clone(),
+            self.warehouse(),
+            database,
+            bound,
+        )?;
+        let file_io = FileIO::from_read_only(
+            Arc::new(host),
+            Arc::new(PaimonSdkReadControl::new(self.control.clone())),
+        );
+        let mut options = Options::new();
+        options.set(CatalogOptions::WAREHOUSE, self.warehouse());
+        FileSystemCatalog::with_file_io(options, file_io).map_err(map_sdk_error)
     }
 
     fn retain_listing(
@@ -283,17 +310,22 @@ mod tests {
             cancellation.view(),
             Instant::now() + Duration::from_secs(60),
         );
+        let host_io: Arc<dyn ReadOnlyFileIO> = Arc::new(DatabaseListingIo {
+            warehouse: warehouse.to_string(),
+            database_count,
+        });
         let file_io = FileIO::from_read_only(
-            Arc::new(DatabaseListingIo {
-                warehouse: warehouse.to_string(),
-                database_count,
-            }),
+            Arc::clone(&host_io),
             Arc::new(PaimonSdkReadControl::new(control.clone())),
         );
         let mut options = Options::new();
         options.set(CatalogOptions::WAREHOUSE, warehouse);
         let inner = FileSystemCatalog::with_file_io(options, file_io).unwrap();
-        PaimonFileSystemCatalog { inner, control }
+        PaimonFileSystemCatalog {
+            inner,
+            host_io,
+            control,
+        }
     }
 
     #[tokio::test]
