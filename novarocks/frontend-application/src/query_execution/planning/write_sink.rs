@@ -31,9 +31,7 @@ use crate::catalog_application::query_bindings::{
     QueryWriteTargetAdmission,
 };
 use novarocks_spi::connector::write_stack::ConnectorWriteTargetPlan;
-use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorWriteInputShape, ConnectorWritePreparation,
-};
+use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorWriteInputShape};
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::planning::dml::{
     DmlWritePlanInput, DmlWriteSinkMode, DmlWriteTarget, DmlWriteTargetField,
@@ -59,11 +57,6 @@ pub(crate) fn dml_write_plan_input_for_admitted_target(
         "SQL write target binding is missing its admission planning lease".to_string()
     })?;
     let admission = admitted_write_target(&captured)?;
-    if let Some(preparation) = admission.preparation.as_ref() {
-        preparation
-            .validate()
-            .map_err(|error| format!("validate SQL write preparation: {error}"))?;
-    }
     let write_input = &admission.input;
     validate_mode(mode, write_input)?;
     let identity =
@@ -135,80 +128,12 @@ pub(crate) fn admit_session_connector_write_target(
             mv_target_read: None,
             write_target_admission: Some(QueryWriteTargetAdmission {
                 input: input.clone(),
-                preparation: None,
             }),
             frozen_cohort_read: None,
             frozen_snapshot_materializations: std::collections::BTreeMap::new(),
             admitted_change_scans: std::collections::BTreeMap::new(),
         })
     })
-}
-
-/// Reserve a SQL write token for a sealed Provider preparation.  The exact
-/// planning lease and opaque table handle remain paired by the preparation;
-/// this function does not inspect either provider-owned value.
-pub(crate) fn admit_prepared_connector_write_target(
-    bindings: &QueryTableBindingStore,
-    identity: FrozenConnectorScanIdentity,
-    preparation: ConnectorWritePreparation,
-    planning_lease: ConnectorControlPlanningLease,
-) -> Result<SqlTableBindingId, String> {
-    preparation
-        .validate()
-        .map_err(|error| format!("validate connector write preparation: {error}"))?;
-    let descriptor = planning_lease.binding().descriptor();
-    if !descriptor
-        .instance_id
-        .as_str()
-        .eq_ignore_ascii_case(preparation.table().owner().as_str())
-    {
-        return Err(
-            "connector write preparation does not match its admission planning lease".to_string(),
-        );
-    }
-    let key = QueryTableBindingKey::write_target(
-        identity.catalog(),
-        identity.namespace(),
-        identity.table(),
-        preparation.digest(),
-    );
-    bindings.resolve_or_insert_with_id(key, |binding| {
-        Ok(QueryTableBinding {
-            resolved: frozen_connector_write_target_resolved_analyzer_table(
-                &identity,
-                admitted_write_input_schema(&preparation),
-                binding,
-            ),
-            statistics_pin: None,
-            admission: QueryTableBindingAdmission::Exact(planning_lease),
-            source_metadata: None,
-            // This token represents a terminal write target, not a read
-            // source.  Do not invent a synthetic Iceberg file scan merely to
-            // prove admission; the provider-owned write table below is the
-            // exact SQL write-target contract.
-            scan_materialization: None,
-            mv_target_read: None,
-            write_target_admission: Some(QueryWriteTargetAdmission {
-                input: preparation.input().clone(),
-                preparation: Some(preparation.clone()),
-            }),
-            frozen_cohort_read: None,
-            frozen_snapshot_materializations: std::collections::BTreeMap::new(),
-            admitted_change_scans: std::collections::BTreeMap::new(),
-        })
-    })
-}
-
-/// Reserve a terminal write token for a synthetic frozen connector identity.
-/// The SQL-facing identity carries no provider handle; the preparation and
-/// exact lease remain in the application-owned binding store.
-pub(crate) fn admit_prepared_frozen_connector_write_target(
-    bindings: &QueryTableBindingStore,
-    identity: FrozenConnectorScanIdentity,
-    preparation: ConnectorWritePreparation,
-    planning_lease: ConnectorControlPlanningLease,
-) -> Result<SqlTableBindingId, String> {
-    admit_prepared_connector_write_target(bindings, identity, preparation, planning_lease)
 }
 
 fn admitted_write_target(
@@ -234,10 +159,6 @@ fn admitted_write_input_columns(
             logical_type: None,
         })
         .collect())
-}
-
-fn admitted_write_input_schema(preparation: &ConnectorWritePreparation) -> SchemaRef {
-    write_input_schema(preparation.input())
 }
 
 fn write_input_schema(input: &ConnectorWriteInputShape) -> SchemaRef {

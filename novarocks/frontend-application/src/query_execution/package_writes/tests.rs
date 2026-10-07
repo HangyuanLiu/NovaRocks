@@ -633,21 +633,20 @@ fn the_sealing_session_authors_the_written_recipe_the_package_carries() {
         let bytes = encode_fragment_package(package, &encode_limits(), &control)
             .unwrap_or_else(|error| panic!("fragment {id:?} encodes: {error}"))
             .encode_to_vec();
-        // The recipe travels in the writer fragment's package; its receiver
-        // reads it back and the sender reproduces the exact bytes.
-        if writes_here {
-            let decoded = decode_fragment_package(&bytes, &model, &decode_limits(), &control)
-                .unwrap_or_else(|error| panic!("fragment {id:?} receives: {error:?}"));
-            assert_eq!(
-                decoded.writes(),
-                &expected,
-                "fragment {id:?} decodes its recipe"
-            );
-            let again = encode_fragment_package(&decoded, &encode_limits(), &control)
-                .expect("re-encode")
-                .encode_to_vec();
-            assert_eq!(again, bytes, "fragment {id:?} roundtrips byte-identically");
-        }
+        // The recipe travels in the writer fragment's package and the finish
+        // fragment carries none; each receiver reads its package back and the
+        // sender reproduces the exact bytes.
+        let decoded = decode_fragment_package(&bytes, &model, &decode_limits(), &control)
+            .unwrap_or_else(|error| panic!("fragment {id:?} receives: {error:?}"));
+        assert_eq!(
+            decoded.writes(),
+            &expected,
+            "fragment {id:?} decodes its recipe"
+        );
+        let again = encode_fragment_package(&decoded, &encode_limits(), &control)
+            .expect("re-encode")
+            .encode_to_vec();
+        assert_eq!(again, bytes, "fragment {id:?} roundtrips byte-identically");
     }
 }
 

@@ -28,7 +28,7 @@ use crate::connector::backend::ResolvedTable;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::planning::write_sink::{
-    admit_prepared_frozen_connector_write_target, dml_write_plan_input_for_admitted_target,
+    admit_session_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
 use crate::query_execution::write_transaction::{
     IcebergWriteCommitPolicy, IcebergWriteSource, IcebergWriteTransactionSpec,
@@ -37,10 +37,8 @@ use crate::query_execution::write_transaction::{
 use novarocks_parser::ast::{Query, Statement};
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_spi::connector::{
-    ConnectorTableHandle, ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest,
-    ConnectorWriteInputRequest, ConnectorWriteIntent, ConnectorWriteLease,
-    ConnectorWriteOperationId, ConnectorWritePreparation, ConnectorWritePreparationOutcome,
-    ConnectorWritePreparationRequest,
+    ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
+    ConnectorWriteIntent, ConnectorWriteOperationId,
 };
 #[cfg(test)]
 use novarocks_sql::literal::bytes_to_latin1_string;
@@ -208,15 +206,6 @@ fn prepare_iceberg_distributed_write(
             })
             .collect::<Result<Vec<_>, String>>()?,
     };
-    let preparation = prepare_iceberg_connector_write(
-        &write_lease,
-        target,
-        target_ref,
-        intent,
-        input.clone(),
-        ConnectorWriteAdmissionPurpose::OrdinaryDml,
-        connector_context.clone(),
-    )?;
     // One logical data branch, admitted on the same generation that resolved
     // the target. The session is opened before the plan is compiled because it
     // owns the recipes that plan's writer node carries.
@@ -233,16 +222,20 @@ fn prepare_iceberg_distributed_write(
             connector_context.clone(),
         )?,
     )?;
+    // The plan's target is the one the session sealed: its input shape carries
+    // the provider's field tokens for the very handle the writer carries, so
+    // the plan and that writer's recipe cannot name two different signings.
+    let session_target = sole_session_write_target(&write_session)?;
     let table_bindings =
         Arc::new(crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()?);
-    let target_binding = admit_prepared_frozen_connector_write_target(
+    let target_binding = admit_session_connector_write_target(
         table_bindings.as_ref(),
         FrozenConnectorScanIdentity::new(
             target.catalog.clone(),
             target.namespace.clone(),
             target.table.clone(),
         ),
-        preparation.clone(),
+        session_target,
         write_target.lease().clone(),
     )?;
     let sql_write_input = dml_write_plan_input_for_admitted_target(
@@ -341,70 +334,19 @@ pub(crate) fn connector_write_begin_request_on_base(
     )
 }
 
-/// Request a sealed preparation from the write-control generation retained by
-/// the original planning lease.  This helper is the only generic-template
-/// construction seam: callers provide Arrow fields, never a table-format
-/// field ID, writer payload, or a freshly acquired connector generation.
-pub(crate) fn prepare_iceberg_connector_write(
-    exact_lease: &ConnectorWriteLease,
-    target: &TargetBackend,
-    target_ref: &str,
-    intent: ConnectorWriteIntent,
-    input: ConnectorWriteInputRequest,
-    purpose: ConnectorWriteAdmissionPurpose,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<ConnectorWritePreparation, String> {
-    let table = crate::catalog_application::resolver::iceberg_connector_table_handle(
-        exact_lease,
-        target,
-        context.clone(),
-    )?;
-    prepare_iceberg_connector_write_with_table(
-        exact_lease,
-        table,
-        target_ref,
-        intent,
-        input,
-        purpose,
-        context,
-    )
-}
-
-/// Request a sealed preparation for a table handle frozen by an earlier exact
-/// metadata observation. The caller must keep the matching write lease; this
-/// avoids reloading a newer table metadata value within the same connector
-/// generation after admission facts have already been derived.
-pub(crate) fn prepare_iceberg_connector_write_with_table(
-    exact_lease: &ConnectorWriteLease,
-    table: ConnectorTableHandle,
-    target_ref: &str,
-    intent: ConnectorWriteIntent,
-    input: ConnectorWriteInputRequest,
-    purpose: ConnectorWriteAdmissionPurpose,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<ConnectorWritePreparation, String> {
-    if !exact_lease.matches_provider_instance(table.owner()) {
-        return Err(
-            "frozen Iceberg write target belongs to a different connector instance".to_string(),
-        );
-    }
-    let outcome = exact_lease
-        .prepare_write(ConnectorWritePreparationRequest {
-            table,
-            target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::parse(target_ref)
-                .map_err(|error| format!("validate Iceberg write target ref: {error}"))?,
-            intent,
-            purpose,
-            input,
-            context,
-        })
-        .map_err(|error| format!("prepare Iceberg connector write: {error}"))?;
-    match outcome {
-        ConnectorWritePreparationOutcome::Prepared(preparation) => Ok(preparation),
-        ConnectorWritePreparationOutcome::Denied(error) => {
-            Err(format!("Iceberg write admission denied: {error}"))
-        }
-    }
+/// The sole logical target an ordinary single-target write session sealed.
+pub(crate) fn sole_session_write_target(
+    session: &crate::query_execution::write_session::ConnectorWriteSession,
+) -> Result<&novarocks_spi::connector::write_stack::ConnectorWriteTargetPlan, String> {
+    let ordinal = session
+        .seal_write_targets()
+        .map_err(|error| error.to_string())?
+        .sole_target_ordinal()?;
+    session
+        .targets()
+        .iter()
+        .find(|target| target.ordinal() == ordinal)
+        .ok_or_else(|| "write session omitted its sealed write target".to_string())
 }
 
 // Resolve an opaque Iceberg write target through the connector metadata
@@ -1081,6 +1023,7 @@ mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
     use novarocks_parser::{ast, printer};
+    use novarocks_spi::connector::ConnectorTableHandle;
     use novarocks_types::schema::ColumnDefault;
 
     fn test_column(

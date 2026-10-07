@@ -429,25 +429,45 @@ fn validate_package_writes(input: &FragmentPackageInput, errors: &mut Validation
             ));
             continue;
         };
-        if write.payload() != &target.handle
-            || write.input().field_count() != target.target_fields.len()
-            || !write
+        // The path names the first differing part, so a refusal says which
+        // side of the recipe disagrees with the plan.
+        let differing = if write.payload() != &target.handle {
+            Some(".handle".to_owned())
+        } else if write.input().field_count() != target.target_fields.len() {
+            Some(".fields".to_owned())
+        } else {
+            write
                 .input()
                 .fields_iter()
                 .zip(&target.target_fields)
-                .all(|(field, target)| {
-                    field.token() == target.token
-                        && field.field().name() == target.provider_name.as_ref()
-                        && novarocks_type_contract::field_logical_type(field.field())
-                            == Ok(target.ty.logical_type)
-                        && novarocks_connector_contract::arrow_data_types_exact(
-                            field.field().data_type(),
-                            &target.ty.data_type,
-                        )
-                        && field.field().is_nullable() == target.ty.nullable
+                .enumerate()
+                .find_map(|(ordinal, (field, target))| {
+                    let part = if field.token() != target.token {
+                        "token"
+                    } else if field.field().name() != target.provider_name.as_ref() {
+                        "name"
+                    } else if novarocks_type_contract::field_logical_type(field.field())
+                        != Ok(target.ty.logical_type)
+                    {
+                        "logical_type"
+                    } else if !novarocks_connector_contract::arrow_data_types_exact(
+                        field.field().data_type(),
+                        &target.ty.data_type,
+                    ) {
+                        "data_type"
+                    } else if field.field().is_nullable() != target.ty.nullable {
+                        "nullable"
+                    } else {
+                        return None;
+                    };
+                    Some(format!(".fields[{ordinal}].{part}"))
                 })
-        {
-            errors.push(ValidationError::new(&path, "frozen writer recipe differs from its exact physical handle or input field occurrence"));
+        };
+        if let Some(part) = differing {
+            errors.push(ValidationError::new(
+                format!("{path}{part}"),
+                "frozen writer recipe differs from its exact physical handle or input field occurrence",
+            ));
         }
         if errors.is_saturated() {
             errors.mark_truncated();
