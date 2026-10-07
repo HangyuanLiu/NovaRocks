@@ -365,7 +365,7 @@ fn partition_topn_sort_mode_stays_explicitly_unsupported() {
         false,
     );
     assert!(
-        matches!(compile(package,&Control::good()),Err(FragmentCompileError::Unsupported {node:Some(node),feature:"node family or occurrence shape"}) if node==NodeId::new(0))
+        matches!(compile(package,&Control::good()),Err(FragmentCompileError::Unsupported {node:Some(node),feature:"sort mode without a local owner"}) if node==NodeId::new(0))
     );
 }
 #[test]

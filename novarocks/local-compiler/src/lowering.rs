@@ -559,7 +559,7 @@ fn lower(
         if !supported {
             return Err(FragmentCompileError::Unsupported {
                 node: Some(id),
-                feature: "node family or occurrence shape",
+                feature: unsupported_node_shape(&node.kind),
             });
         }
         if matches!(node.kind, NodeKind::Scan { .. }) {
@@ -1778,4 +1778,16 @@ fn lower(
         work.control(),
     )
     .map_err(Into::into)
+}
+
+/// Which node shape has no local owner, so a refusal names it.
+fn unsupported_node_shape(kind: &NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Filter { .. } => "filter with other than one predicate or input",
+        NodeKind::Sort { .. } => "sort mode without a local owner",
+        NodeKind::TopN { .. } => "grouped-state TopN reduction",
+        NodeKind::SetOp { .. } => "INTERSECT or EXCEPT set operation",
+        NodeKind::GenerateSeries { .. } => "generate_series source",
+        _ => "node family or occurrence shape",
+    }
 }

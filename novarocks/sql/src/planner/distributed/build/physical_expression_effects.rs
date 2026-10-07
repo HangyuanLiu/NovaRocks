@@ -102,6 +102,11 @@ pub(crate) enum PhysicalExpressionEffectsError {
     WindowRequest(PhysicalWindowRequestError),
     Window(PhysicalWindowOccurrenceError),
     Cast(CastPrepareError),
+    /// A cast between these carriers has no prepared recipe.
+    UnsupportedCast {
+        from: arrow::datatypes::DataType,
+        to: arrow::datatypes::DataType,
+    },
     Arithmetic(ArithmeticPrepareError),
     Comparison(ComparisonPrepareError),
     Effects(EffectContractError),
@@ -109,7 +114,8 @@ pub(crate) enum PhysicalExpressionEffectsError {
     Type(ValueTypeError),
     MissingCallScope(ExpressionUseId),
     InvalidSource(&'static str),
-    UnsupportedExpression(ExprId),
+    /// An expression kind without an effect author, with its kind label.
+    UnsupportedExpression(ExprId, Box<str>),
 }
 impl From<CompileControlError> for PhysicalExpressionEffectsError {
     fn from(error: CompileControlError) -> Self {
@@ -572,7 +578,14 @@ fn primitive_own_effects(
                 *decimal_overflow_policy,
                 allow,
                 control,
-            )?;
+            )
+            .map_err(|error| match error {
+                CastPrepareError::Unsupported => PhysicalExpressionEffectsError::UnsupportedCast {
+                    from: child.ty.data_type.clone(),
+                    to: source.ty.data_type.clone(),
+                },
+                other => other.into(),
+            })?;
             work.flush()?;
             recipe.own_effects(context)
         }
@@ -625,15 +638,30 @@ fn primitive_own_effects(
             } else {
                 return Err(PhysicalExpressionEffectsError::UnsupportedExpression(
                     source.id,
+                    format!("Binary({op:?})").into(),
                 ));
             }
         }
-        _ => {
+        other => {
             return Err(PhysicalExpressionEffectsError::UnsupportedExpression(
                 source.id,
+                expression_kind_label(other),
             ));
         }
     })
+}
+
+/// The variant name of an expression kind, for refusals that must say which
+/// kind has no effect author without dumping its operands.
+fn expression_kind_label(kind: &ExprKind) -> Box<str> {
+    let debug = format!("{kind:?}");
+    let end = debug
+        .find(|c: char| c == ' ' || c == '{' || c == '(')
+        .unwrap_or(debug.len());
+    match kind {
+        ExprKind::Unary { op, .. } => format!("Unary({op:?})").into(),
+        _ => debug[..end].into(),
+    }
 }
 
 /// The original Value leaf author is shared by authenticated materialized
