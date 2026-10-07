@@ -2008,12 +2008,21 @@ impl TypeValidationPolicy for CallerTypeValidation<'_, '_> {
         let result = ty.validate_with_scratch_observed::<TypeLogicalError>(&mut scratch, |visit| {
             match visit {
                 ValueTypeVisit::Field(_) => {
+                    // One `get` of the closed logical key. Its probe count is
+                    // bounded by the retained source buckets, but each
+                    // candidate comparison is `str` equality against this
+                    // key: a length mismatch is refused before any byte is
+                    // read, so no comparison reads more than the key. The
+                    // stored keys' lengths never enter this charge; using the
+                    // source as the key length made it quadratic in the
+                    // source and overflowed the meter on a truthful
+                    // multi-GiB invoice.
                     let key = novarocks_type_contract::NR_LOGICAL_TYPE_KEY;
                     self.hash_work(hashmap::string_operations_work_upper_bound(
                         self.source,
                         1,
                         key.len(),
-                        self.source.max(key.len()),
+                        key.len(),
                     ))?;
                     // The original owner executes its getter after this hook.
                     self.work.flush()?;

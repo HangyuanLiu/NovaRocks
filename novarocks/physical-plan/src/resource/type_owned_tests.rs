@@ -555,3 +555,48 @@ fn all_owned_axes_exact_replay_and_saturated_original_usage_remain_distinct() {
     assert!(errors.errors.is_empty());
     assert_eq!(control.trace(), [0, 0]);
 }
+
+/// The logical getter probes the closed key over at most the retained source
+/// buckets, and each candidate comparison reads at most that key. Its charge
+/// is affine in the source invoice, so a truthful multi-GiB receiver invoice
+/// with several nested fields stays representable.
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn nested_field_logical_lookup_charge_is_linear_in_the_retained_source() {
+    let ty = ValueType::new(
+        DataType::Struct(
+            vec![
+                Arc::new(Field::new("a", DataType::Int64, false)),
+                Arc::new(Field::new("b", DataType::Utf8, true)),
+            ]
+            .into(),
+        ),
+        false,
+    );
+    let work = |source| {
+        let out = run(&ty, source, OPEN, &Control::default()).unwrap();
+        assert_plain(&ty, &out);
+        assert!(out.errors.is_empty());
+        out.facts.cumulative_work_upper_bound
+    };
+    let key = novarocks_type_contract::NR_LOGICAL_TYPE_KEY.len();
+    let lookup = |source| hashmap::string_operations_work_upper_bound(source, 1, key, key).unwrap();
+    let header = |source| hashmap::source_iterator_work_upper_bound(source, 0).unwrap();
+    let step = 1usize << 30;
+    let (one, two, three) = (work(step), work(2 * step), work(3 * step));
+    // Exactly one field header and one logical lookup per nested field depend
+    // on the source; nothing else does, and neither grows faster than it.
+    let per_step = 2 * (lookup(2 * step) - lookup(step) + header(2 * step) - header(step));
+    assert_eq!(two - one, per_step);
+    assert_eq!(three - two, per_step);
+    // A source-sized key length charged about 2 * source^2 per field: two
+    // nested fields under a 2 GiB invoice overflowed the meter.
+    let receiver = 2 * step;
+    assert!(
+        hashmap::string_operations_work_upper_bound(receiver, 1, key, receiver)
+            .unwrap()
+            .checked_mul(2)
+            .is_none()
+    );
+    assert_eq!(two, work(receiver));
+}

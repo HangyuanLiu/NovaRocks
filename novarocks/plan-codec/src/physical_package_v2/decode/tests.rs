@@ -17,12 +17,14 @@
 
 use super::*;
 use crate::physical_package_v2::definition_sources::tests::{
-    cv_package, rich_package, writer_constant_package,
+    cv_package, rich_package, writer_constant_package, writer_finish_package,
 };
 use crate::physical_package_v2::encode::{PackageEncodeError, encode_fragment_package};
 use crate::physical_package_v2::provider_sources::tests::checked_read;
 use crate::physical_package_v2::test_support::{decode_limits, encode_limits};
-use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+use novarocks_type_contract::{
+    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+};
 use prost::Message;
 use std::sync::Mutex;
 
@@ -54,6 +56,7 @@ fn fixtures() -> Vec<(&'static str, p::FragmentPackage)> {
         ("rich", rich_package()),
         ("cv", cv_package()),
         ("writer", writer_constant_package()),
+        ("finish", writer_finish_package()),
         ("data-read", checked_read(false)),
         ("metadata-read", checked_read(true)),
     ]
@@ -89,6 +92,92 @@ fn whole_package_roundtrip_is_byte_identical_through_original_constructors() {
             "{name}: decode∘encode is the identity on sender bytes"
         );
     }
+}
+
+/// Nested Arrow fields (List item, Map entries and their Struct children)
+/// carried by one data type, counted on the original value type.
+fn nested_fields(ty: &arrow::datatypes::DataType) -> usize {
+    use arrow::datatypes::DataType;
+    match ty {
+        DataType::List(field) | DataType::LargeList(field) | DataType::Map(field, _) => {
+            1 + nested_fields(field.data_type())
+        }
+        DataType::Struct(fields) => fields
+            .iter()
+            .map(|field| 1 + nested_fields(field.data_type()))
+            .sum(),
+        _ => 0,
+    }
+}
+
+// The finisher fragment of a checked writer plan: the writer's multiplexed
+// result relation arrives over an ExchangeSource and feeds a TableFinish
+// whose root write-result schema carries List and Map fields. The receiver
+// reproduces its TableFinish exactly and the sender its bytes.
+#[test]
+fn finish_package_roundtrips_byte_identically_with_its_exact_table_finish() {
+    let package = writer_finish_package();
+    let finish = package
+        .fragment()
+        .nodes()
+        .values()
+        .find(|node| matches!(node.kind, p::NodeKind::TableFinish(_)))
+        .expect("finish fixture has a TableFinish")
+        .clone();
+    assert!(package.writes().is_empty() && package.scans().is_empty());
+    let bytes = encode(&package).unwrap();
+    let decoded = decode_fragment_package(&bytes, &model(), &decode_limits(), &Control::default())
+        .unwrap_or_else(|error| panic!("finish package receives: {error:?}"));
+    assert_eq!(decoded.fragment().nodes()[&finish.id], finish);
+    assert_eq!(
+        decoded.fragment().values(),
+        package.fragment().values(),
+        "imported and derived writer values are reproduced"
+    );
+    assert_eq!(encode(&decoded).unwrap(), bytes);
+}
+
+// The receiver publishes through the caller-scope Package constructor with
+// its host admission. Each nested field's logical metadata lookup is charged
+// against that retained-source invoice; the charge must stay linear in it.
+// With a source-sized key length, two nested fields under the 2 GiB receiver
+// invoice overflowed the work meter and the finish package was refused.
+#[test]
+fn caller_scope_package_admission_charges_nested_field_lookups_linearly() {
+    let package = writer_finish_package();
+    let nested: usize = package
+        .fragment()
+        .values()
+        .values()
+        .map(|value| nested_fields(&value.ty.data_type))
+        .sum();
+    assert!(nested >= 2, "the fixture carries {nested} nested fields");
+    let admission = decode_limits().admission;
+    assert!(admission.source_retained_bytes >= 2 * 1024 * 1024 * 1024);
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let mut peak = 0usize;
+    let readmitted = p::FragmentPackage::try_new_in(
+        package.clone().into_input(),
+        admission,
+        &mut |facts| {
+            peak = peak.max(facts.cumulative_work_upper_bound);
+            Ok(())
+        },
+        &mut work,
+    )
+    .unwrap_or_else(|error| panic!("caller-scope admission: {error:?}"));
+    work.finish().unwrap();
+    assert_eq!(
+        readmitted.fragment().nodes(),
+        package.fragment().nodes(),
+        "the original constructor publishes the same fragment"
+    );
+    // Linear: far below the about 2 * source^2 a source-sized key charged
+    // for each nested field.
+    let source = admission.source_retained_bytes;
+    let per_field_quadratic = source.saturating_mul(2).saturating_mul(source);
+    assert!(peak < per_field_quadratic / 1024, "peak work {peak}");
 }
 
 fn mutated(

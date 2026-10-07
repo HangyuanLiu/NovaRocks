@@ -638,6 +638,27 @@ pub(crate) fn checked_writer_package_with(
     recipe: c::ConnectorWriteRecipeDraft,
     constant_row: bool,
 ) -> p::FragmentPackage {
+    checked_writer_plan_packages(recipe, constant_row)
+        .remove(&p::FragmentId::new(1))
+        .unwrap()
+}
+
+/// The finisher of the same checked plan: an ExchangeSource importing the
+/// writer's multiplexed result relation into a TableFinish.
+pub(crate) fn checked_finish_package_with(
+    recipe: c::ConnectorWriteRecipeDraft,
+    constant_row: bool,
+) -> p::FragmentPackage {
+    checked_writer_plan_packages(recipe, constant_row)
+        .remove(&p::FragmentId::new(2))
+        .unwrap()
+}
+
+/// Both checked packages of one producer/stream/finisher plan.
+fn checked_writer_plan_packages(
+    recipe: c::ConnectorWriteRecipeDraft,
+    constant_row: bool,
+) -> BTreeMap<p::FragmentId, p::FragmentPackage> {
     // A real producer/stream/finisher plan, with original cut derivation and
     // full Package publication. There are no aggregate or function calls.
     let pool = p::ConstantPoolId::new(5);
@@ -917,7 +938,7 @@ pub(crate) fn checked_writer_package_with(
             },
         );
     }
-    let mut packages = p::extract_fragment_packages(
+    p::extract_fragment_packages(
         &plan,
         &BTreeMap::new(),
         &BTreeMap::from([(ordinal, recipe)]),
@@ -927,8 +948,7 @@ pub(crate) fn checked_writer_package_with(
         &admissions,
         &Setup,
     )
-    .unwrap();
-    packages.remove(&p::FragmentId::new(1)).unwrap()
+    .unwrap()
 }
 
 #[test]
