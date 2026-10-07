@@ -628,3 +628,160 @@ async fn a_table_this_process_holds_no_projection_for_is_not_an_mv() {
         MvQueryAdmission::NotAnMv,
     );
 }
+
+fn local_inventory_bound() -> crate::repository::MvProjectionInventoryBound {
+    crate::repository::MvProjectionInventoryBound {
+        entries: 64,
+        snapshot_bytes: 16 * 1024 * 1024,
+        raw_page_bytes: 1024 * 1024,
+        decode: PersistenceDecodeBudget {
+            max_working_set_bytes: 4 * 1024 * 1024,
+            ..Default::default()
+        },
+    }
+}
+
+#[tokio::test]
+async fn bounded_inventory_reloads_replacement_and_requires_its_exact_installed_version() {
+    let (repository, service) = service();
+    service
+        .observe_current_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
+        .await
+        .unwrap();
+    let mut inventory = service
+        .bounded_projection_inventory(local_inventory_bound())
+        .await
+        .unwrap();
+    let old = repository.find_by_target(&target()).await.unwrap().unwrap();
+    let changed = repository
+        .replace_projection(
+            Uuid::now_v7(),
+            ReplaceMvProjectionRequest {
+                mv_id: old.projection.mv_id,
+                expected_version: old.version,
+                projection: sample_projection(target(), Some(2)).into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(inventory.next_ready().await.unwrap().is_none());
+    let mut inventory = service
+        .bounded_projection_inventory(local_inventory_bound())
+        .await
+        .unwrap();
+    assert!(inventory.next_listable().await.unwrap().is_none());
+    service
+        .observe_current_and_install(Uuid::now_v7(), request(2, Arc::default()), &source(2))
+        .await
+        .unwrap();
+    let mut inventory = service
+        .bounded_projection_inventory(local_inventory_bound())
+        .await
+        .unwrap();
+    let fresh = inventory.next_ready().await.unwrap().unwrap();
+    assert_eq!(fresh.version, changed.version);
+    assert_eq!(
+        fresh.projection.facts.metadata_version().snapshot_id(),
+        Some(2)
+    );
+    assert!(inventory.next_ready().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn bounded_inventory_never_displays_a_projection_deleted_after_enumeration() {
+    let (repository, service) = service();
+    service
+        .observe_current_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
+        .await
+        .unwrap();
+    let mut ready = service
+        .bounded_projection_inventory(local_inventory_bound())
+        .await
+        .unwrap();
+    let mut listable = service
+        .bounded_projection_inventory(local_inventory_bound())
+        .await
+        .unwrap();
+    let old = repository.find_by_target(&target()).await.unwrap().unwrap();
+    repository
+        .delete_projection(
+            Uuid::now_v7(),
+            DeleteMvProjectionRequest {
+                mv_id: old.projection.mv_id,
+                expected_version: old.version,
+                expected_source_revision: old.projection.facts.source_revision().clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(ready.next_ready().await.unwrap().is_none());
+    assert!(listable.next_listable().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn bounded_listable_inventory_preserves_exact_read_only_and_quarantine_reasons() {
+    let (_, service) = service();
+    service
+        .observe_current_read_only_and_install(
+            Uuid::now_v7(),
+            request(1, Arc::default()),
+            &source(1),
+        )
+        .await
+        .unwrap();
+    let mut listable = service
+        .bounded_projection_inventory(local_inventory_bound())
+        .await
+        .unwrap();
+    let first = listable.next_listable().await.unwrap().unwrap();
+    let expected = match service.runtime.readiness(&target()) {
+        TargetReadiness::ReadOnly(reason) => reason,
+        other => panic!("expected read-only, got {other:?}"),
+    };
+    assert_eq!(
+        first.manageability,
+        MvListedManageability::ReadOnly(expected)
+    );
+    let mut ready = service
+        .bounded_projection_inventory(local_inventory_bound())
+        .await
+        .unwrap();
+    assert!(ready.next_ready().await.unwrap().is_none());
+    service
+        .invalidate_current(target(), "exact quarantine reason".into())
+        .await
+        .unwrap();
+    let mut listable = service
+        .bounded_projection_inventory(local_inventory_bound())
+        .await
+        .unwrap();
+    assert_eq!(
+        listable
+            .next_listable()
+            .await
+            .unwrap()
+            .unwrap()
+            .manageability,
+        MvListedManageability::Unavailable("exact quarantine reason".into())
+    );
+}
+
+#[tokio::test]
+async fn bounded_listing_refuses_a_large_reason_before_cloning_it_into_a_row() {
+    let (_, service) = service();
+    service
+        .observe_current_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
+        .await
+        .unwrap();
+    service
+        .invalidate_current(target(), "x".repeat(4 * 1024 * 1024))
+        .await
+        .unwrap();
+    let mut inventory = service
+        .bounded_projection_inventory(local_inventory_bound())
+        .await
+        .unwrap();
+    let error = inventory.next_listable().await.unwrap_err();
+    assert_eq!(error.kind(), MvRepositoryErrorKind::InvalidRequest);
+    assert!(error.to_string().contains("readiness reason"));
+}

@@ -27,6 +27,8 @@ mod tests_definition;
 #[path = "tests_dependency.rs"]
 mod tests_dependency;
 #[cfg(test)]
+mod tests_inventory;
+#[cfg(test)]
 #[path = "tests_port.rs"]
 mod tests_port;
 
@@ -46,16 +48,17 @@ use crate::persistence::dependency::{
 use crate::persistence::projection::StoredMvProjection;
 use crate::product::MvTarget;
 use crate::repository::{
-    DeleteMvProjectionRequest, LoadedMvProjection, MvProjectionRequest, MvProjectionVersion,
-    MvRepository, MvRepositoryError, MvRepositoryErrorKind, MvTargetLookup,
+    DeleteMvProjectionRequest, LoadedMvProjection, MvProjectionInventoryBound,
+    MvProjectionInventoryBuilder, MvProjectionInventoryEntry, MvProjectionRequest,
+    MvProjectionVersion, MvRepository, MvRepositoryError, MvRepositoryErrorKind, MvTargetLookup,
     ReplaceMvProjectionRequest,
 };
 use crate::repository_metrics::MvRepositoryMetrics;
 use novarocks_state_store_runtime::StateStoreRunPolicy;
 
 use self::codec::{
-    DecodedMvRecord, MvRecordKind, MvSequence, decode_projection, decode_record, encode_projection,
-    encode_record,
+    DecodedMvRecord, MvRecordKind, MvSequence, decode_projection, decode_projection_with_budget,
+    decode_record, encode_projection, encode_record,
 };
 use self::key::{
     accelerator_prefix, dependency_by_downstream_key, dependency_by_downstream_prefix,
@@ -379,6 +382,99 @@ impl MvRepository for StateStoreMvRepository {
             .collect()
     }
 
+    async fn list_projection_inventory(
+        &self,
+        bound: MvProjectionInventoryBound,
+    ) -> Result<Vec<MvProjectionInventoryEntry>, MvRepositoryError> {
+        let mut inventory = MvProjectionInventoryBuilder::new(bound)?;
+        let range = KeyRange::for_prefix(projection_prefix().map_err(corruption)?)
+            .map_err(operation::state_store_error)?;
+        let mut transaction = self
+            .store
+            .begin_read()
+            .await
+            .map_err(operation::state_store_error)?;
+        let result = async {
+            let mut continuation = None;
+            loop {
+                let page = transaction
+                    .range(&RangeRequest {
+                        range: range.clone(),
+                        direction: Direction::Forward,
+                        page_size: 1,
+                        continuation: continuation.clone(),
+                    })
+                    .await
+                    .map_err(operation::state_store_error)?;
+                if page.records.len() > 1
+                    || (page.records.is_empty() && page.continuation.is_some())
+                {
+                    return Err(corruption(
+                        "MV inventory provider violated the exact page bound",
+                    ));
+                }
+                if page.continuation.is_some() && page.continuation == continuation {
+                    return Err(corruption("MV inventory continuation made no progress"));
+                }
+                continuation = page.continuation;
+                for record in page.records {
+                    check_inventory_raw_record(&record, bound)?;
+                    let decoded =
+                        decode_projection_with_budget(&record.key, &record.value, bound.decode)
+                            .map_err(corruption)?;
+                    inventory.push(&decoded.value)?;
+                }
+                if continuation.is_none() {
+                    return Ok(inventory.finish());
+                }
+            }
+        }
+        .await;
+        // Error, budget refusal and success all close the same snapshot before
+        // a readiness consumer may start its fresh per-target lookups.
+        let close = transaction
+            .abort()
+            .await
+            .map_err(operation::state_store_error);
+        match (result, close) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(entries), Ok(())) => Ok(entries),
+        }
+    }
+
+    async fn find_by_target_bounded(
+        &self,
+        target: &MvTarget,
+        bound: MvProjectionInventoryBound,
+    ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
+        MvProjectionInventoryBuilder::new(bound)?;
+        let key = target_key(target).map_err(corruption)?;
+        let Some(lookup_record) = self.read_record(&key).await? else {
+            return Ok(None);
+        };
+        check_inventory_raw_record(&lookup_record, bound)?;
+        let lookup: DecodedMvRecord<MvTargetLookup> =
+            decode_record(&key, &lookup_record.value).map_err(corruption)?;
+        let key = projection_by_id_key(lookup.value.mv_id).map_err(corruption)?;
+        let record = self.read_record(&key).await?.ok_or_else(|| {
+            corruption("MV Accelerator target lookup references a missing projection")
+        })?;
+        check_inventory_raw_record(&record, bound)?;
+        let decoded =
+            decode_projection_with_budget(&key, &record.value, bound.decode).map_err(corruption)?;
+        let loaded = LoadedMvProjection {
+            projection: decoded.value,
+            version: MvProjectionVersion::from_store(record.version),
+        };
+        if loaded.projection.facts.target() != target {
+            return Err(corruption(
+                "MV Accelerator target lookup does not match its projection",
+            ));
+        }
+        Ok(Some(loaded))
+    }
+
     /// A delete stamps no record, so it carries no operation provenance; the
     /// runner owns the attempt identity this write is retried under.
     async fn delete_projection(
@@ -626,6 +722,25 @@ pub async fn observe_catalog_references(
         }
     }
     Ok(None)
+}
+
+fn check_inventory_raw_record(
+    record: &StateRecord,
+    bound: MvProjectionInventoryBound,
+) -> Result<(), MvRepositoryError> {
+    if record
+        .key
+        .as_bytes()
+        .len()
+        .checked_add(record.value.as_bytes().len())
+        .is_none_or(|bytes| bytes > bound.raw_page_bytes)
+    {
+        return Err(MvRepositoryError::new(
+            MvRepositoryErrorKind::InvalidRequest,
+            "MV inventory exceeds its raw page byte bound",
+        ));
+    }
+    Ok(())
 }
 
 fn loaded_projection(

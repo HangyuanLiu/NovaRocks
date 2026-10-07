@@ -31,8 +31,10 @@ use crate::persistence::dependency::{
 use crate::persistence::projection::StoredMvProjection;
 use crate::product::MvTarget;
 use crate::repository::{
-    DeleteMvProjectionRequest, LoadedMvProjection, MvProjectionRequest, MvProjectionVersion,
-    MvRepository, MvRepositoryError, MvRepositoryErrorKind, ReplaceMvProjectionRequest,
+    DeleteMvProjectionRequest, LoadedMvProjection, MvProjectionInventoryBound,
+    MvProjectionInventoryBuilder, MvProjectionInventoryEntry, MvProjectionRequest,
+    MvProjectionVersion, MvRepository, MvRepositoryError, MvRepositoryErrorKind,
+    ReplaceMvProjectionRequest,
 };
 
 #[derive(Default)]
@@ -196,6 +198,63 @@ impl MvRepository for InMemoryMvRepository {
             .keys()
             .filter_map(|mv_id| Self::loaded(&state, *mv_id))
             .collect())
+    }
+
+    async fn list_projection_inventory(
+        &self,
+        bound: MvProjectionInventoryBound,
+    ) -> Result<Vec<MvProjectionInventoryEntry>, MvRepositoryError> {
+        let state = self.state()?;
+        let mut inventory = MvProjectionInventoryBuilder::new(bound)?;
+        for projection in state.projections.values() {
+            inventory.push(projection)?;
+        }
+        Ok(inventory.finish())
+    }
+
+    async fn find_by_target_bounded(
+        &self,
+        target: &MvTarget,
+        bound: MvProjectionInventoryBound,
+    ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
+        let state = self.state()?;
+        MvProjectionInventoryBuilder::new(bound)?;
+        let Some((&id, projection)) = state
+            .projections
+            .iter()
+            .find(|(_, projection)| projection.facts.target() == target)
+        else {
+            return Ok(None);
+        };
+        // This test double owns already validated models. Exercise the same
+        // bounded durable decode without cloning a loaded model first.
+        let key = crate::state_store_repository::key::projection_by_id_key(id)
+            .map_err(|error| MvRepositoryError::new(MvRepositoryErrorKind::Corruption, error))?;
+        let value =
+            crate::state_store_repository::codec::encode_projection(Uuid::nil(), projection)
+                .map_err(|error| {
+                    MvRepositoryError::new(MvRepositoryErrorKind::Corruption, error)
+                })?;
+        if key.as_bytes().len().saturating_add(value.as_bytes().len()) > bound.raw_page_bytes {
+            return Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::InvalidRequest,
+                "MV inventory exceeds its raw page byte bound",
+            ));
+        }
+        let decoded = crate::state_store_repository::codec::decode_projection_with_budget(
+            &key,
+            &value,
+            bound.decode,
+        )
+        .map_err(|error| MvRepositoryError::new(MvRepositoryErrorKind::Corruption, error))?;
+        Ok(Some(LoadedMvProjection {
+            projection: decoded.value,
+            version: state
+                .versions
+                .get(&id)
+                .expect("test projection version")
+                .clone(),
+        }))
     }
 
     async fn delete_projection(
