@@ -224,6 +224,17 @@ fn load_role_config(mode: ServerLaunchMode, path: PathBuf) -> Result<RoleConfig>
     }
     let endpoints = role_bind_endpoints(expected, &config, &path)?;
     ensure_no_endpoint_overlap(&endpoints, &[])?;
+    // The frozen Native transport geometry is refused before any startup
+    // side effect if its counts and sizes are inconsistent or overflow.
+    crate::app_config::validate_native_transport_geometry(
+        &novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1,
+    )
+    .with_context(|| {
+        format!(
+            "validate {mode:?} Native transport geometry: {}",
+            path.display()
+        )
+    })?;
     // Observe the operational limit before any logging/runtime/listener startup.
     // This check neither reserves descriptors nor advertises result support.
     novarocks_native_adapter::native_fd_capacity::verify_native_file_descriptor_capacity_for_role(
