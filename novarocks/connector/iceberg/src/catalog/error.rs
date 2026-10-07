@@ -262,8 +262,14 @@ pub(crate) fn predispatch_failure(
 /// that way, and callers depend on telling that apart from an authoritative
 /// absence.
 pub(crate) fn map_read_error(error: &crate::iceberg::Error) -> ConnectorError {
+    ConnectorError::new(read_error_kind(error.kind()), error.to_string())
+}
+
+/// Classify the typed read failure without formatting its message, context or
+/// source. Bounded consumers choose their own admitted diagnostic projection.
+pub(crate) fn read_error_kind(kind: crate::iceberg::ErrorKind) -> ConnectorErrorKind {
     use crate::iceberg::ErrorKind;
-    let kind = match error.kind() {
+    match kind {
         ErrorKind::NamespaceNotFound | ErrorKind::TableNotFound => ConnectorErrorKind::NotFound,
         ErrorKind::FeatureUnsupported => ConnectorErrorKind::Unsupported,
         ErrorKind::NamespaceAlreadyExists | ErrorKind::TableAlreadyExists => {
@@ -275,8 +281,7 @@ pub(crate) fn map_read_error(error: &crate::iceberg::Error) -> ConnectorError {
         ErrorKind::DataInvalid => ConnectorErrorKind::CorruptData,
         ErrorKind::Unexpected => ConnectorErrorKind::Unavailable,
         _ => ConnectorErrorKind::Internal,
-    };
-    ConnectorError::new(kind, error.to_string())
+    }
 }
 
 /// Whether a vendored catalog error proves the mutation was **not** applied.

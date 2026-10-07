@@ -86,21 +86,35 @@ impl NovaRocksHadoopCatalog {
     }
 }
 
-/// Classify a bounded Hadoop read. A listing-bound refusal travels through the
-/// vendored error type as its typed source and keeps its `ResourceExhausted`
-/// kind; every other failure keeps the ordinary read classification.
+const MAX_BOUNDED_READ_DIAGNOSTIC_BYTES: usize = 4 * 1024;
+const OVERSIZED_READ_DIAGNOSTIC: &str = "Hadoop catalog read diagnostic exceeds its bounded limit";
+
+/// Keep control/refusal source kinds and ordinary typed read classification,
+/// copying only an admitted borrowed message. The SDK's source/context display
+/// can retain an arbitrary remote response and must never be rendered here.
 fn map_bounded_read_error(error: &crate::iceberg::Error) -> ConnectorError {
-    match std::error::Error::source(error)
+    use novarocks_spi::connector::ConnectorErrorKind;
+    let (kind, message) = match std::error::Error::source(error)
         .and_then(|source| source.downcast_ref::<ConnectorError>())
     {
-        Some(refusal)
-            if refusal.kind()
-                == novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted =>
+        Some(source)
+            if matches!(
+                source.kind(),
+                ConnectorErrorKind::ResourceExhausted
+                    | ConnectorErrorKind::Cancelled
+                    | ConnectorErrorKind::DeadlineExceeded
+            ) =>
         {
-            refusal.clone()
+            (source.kind(), source.message())
         }
-        _ => super::error::map_read_error(error),
-    }
+        _ => (super::error::read_error_kind(error.kind()), error.message()),
+    };
+    let message = if message.len() <= MAX_BOUNDED_READ_DIAGNOSTIC_BYTES {
+        message
+    } else {
+        OVERSIZED_READ_DIAGNOSTIC
+    };
+    ConnectorError::new(kind, message)
 }
 
 #[async_trait]
@@ -580,5 +594,103 @@ fn message(failure: &crate::hadoop_catalog::HadoopCreateFailure) -> String {
     match failure.facts.as_ref() {
         Some(facts) => format!("{} [operation_id={}]", failure.message, facts.operation_id),
         None => failure.message.clone(),
+    }
+}
+
+#[cfg(test)]
+mod bounded_read_error_tests {
+    use std::fmt;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+
+    use super::{
+        MAX_BOUNDED_READ_DIAGNOSTIC_BYTES, OVERSIZED_READ_DIAGNOSTIC, map_bounded_read_error,
+    };
+    use crate::iceberg::{Error, ErrorKind};
+
+    #[derive(Debug)]
+    struct PanicDisplay;
+
+    impl fmt::Display for PanicDisplay {
+        fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+            panic!("bounded projection must not render the remote source")
+        }
+    }
+
+    impl std::error::Error for PanicDisplay {}
+
+    #[derive(Debug)]
+    struct LargeRemoteDisplay {
+        response: String,
+        displays: Arc<AtomicUsize>,
+    }
+
+    impl fmt::Display for LargeRemoteDisplay {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.displays.fetch_add(1, Ordering::SeqCst);
+            formatter.write_str(&self.response)
+        }
+    }
+
+    impl std::error::Error for LargeRemoteDisplay {}
+
+    #[test]
+    fn bounded_read_error_never_renders_source_or_context() {
+        let error = Error::new(ErrorKind::DataInvalid, "invalid directory metadata")
+            .with_context("remote-response", "r".repeat(1024 * 1024))
+            .with_source(PanicDisplay);
+        let projected = map_bounded_read_error(&error);
+        assert_eq!(projected.kind(), ConnectorErrorKind::CorruptData);
+        assert_eq!(projected.message(), "invalid directory metadata");
+
+        let displays = Arc::new(AtomicUsize::new(0));
+        let error = Error::new(ErrorKind::Unexpected, "directory request failed").with_source(
+            LargeRemoteDisplay {
+                response: "response".repeat(1024 * 1024),
+                displays: displays.clone(),
+            },
+        );
+        let projected = map_bounded_read_error(&error);
+        assert_eq!(projected.kind(), ConnectorErrorKind::Unavailable);
+        assert_eq!(projected.message(), "directory request failed");
+        assert_eq!(displays.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn bounded_read_error_admits_bytes_before_message_copy() {
+        let exact = "🦀".repeat(MAX_BOUNDED_READ_DIAGNOSTIC_BYTES / 4);
+        let error =
+            Error::new(ErrorKind::FeatureUnsupported, exact.clone()).with_source(PanicDisplay);
+        let projected = map_bounded_read_error(&error);
+        assert_eq!(projected.kind(), ConnectorErrorKind::Unsupported);
+        assert_eq!(projected.message(), exact);
+        let oversized = Error::new(ErrorKind::TableNotFound, exact + "x").with_source(PanicDisplay);
+        let projected = map_bounded_read_error(&oversized);
+        assert_eq!(projected.kind(), ConnectorErrorKind::NotFound);
+        assert_eq!(projected.message(), OVERSIZED_READ_DIAGNOSTIC);
+    }
+
+    #[test]
+    fn bounded_read_error_preserves_control_kinds_with_bounded_source_message() {
+        for kind in [
+            ConnectorErrorKind::ResourceExhausted,
+            ConnectorErrorKind::Cancelled,
+            ConnectorErrorKind::DeadlineExceeded,
+        ] {
+            let error = Error::new(ErrorKind::Unexpected, "wrapper")
+                .with_source(ConnectorError::new(kind, "typed control reason"));
+            let projected = map_bounded_read_error(&error);
+            assert_eq!(projected.kind(), kind);
+            assert_eq!(projected.message(), "typed control reason");
+
+            let error = Error::new(ErrorKind::Unexpected, "wrapper").with_source(
+                ConnectorError::new(kind, "x".repeat(MAX_BOUNDED_READ_DIAGNOSTIC_BYTES + 1)),
+            );
+            let projected = map_bounded_read_error(&error);
+            assert_eq!(projected.kind(), kind);
+            assert_eq!(projected.message(), OVERSIZED_READ_DIAGNOSTIC);
+        }
     }
 }

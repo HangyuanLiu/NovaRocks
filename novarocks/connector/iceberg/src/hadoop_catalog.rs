@@ -218,112 +218,232 @@ impl HadoopFileSystemCatalog {
         format!("{}/{}", self.warehouse_location, namespace.join("/"))
     }
 
-    async fn external_tables(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
-        let namespace_location = self.namespace_location(namespace);
-        let mut tables = Vec::new();
-        for table in self.file_io.list_directories(&namespace_location).await? {
-            if self
-                .file_io
-                .exists(Self::version_hint_path(&format!(
-                    "{namespace_location}/{table}"
-                )))
-                .await?
-            {
-                tables.push(TableIdent::new(namespace.clone(), table));
-            }
-        }
-        tables.sort_by(|left, right| left.name().cmp(right.name()));
-        tables.dedup();
-        Ok(tables)
+    fn listing_binding(&self) -> Result<crate::access_binding::IcebergReadBinding> {
+        self.binding.clone().ok_or_else(|| {
+            Error::new(
+                ErrorKind::FeatureUnsupported,
+                "Bounded Hadoop listing requires the provider-owned filesystem binding",
+            )
+        })
     }
 
-    async fn external_tables_for_read(
+    fn check_listing_location(&self, namespace: Option<&NamespaceIdent>) -> Result<()> {
+        let components = namespace.map(|namespace| namespace.as_ref());
+        let bytes = components
+            .into_iter()
+            .flatten()
+            .try_fold(self.warehouse_location.len(), |bytes, component| {
+                bytes.checked_add(component.len())?.checked_add(1)
+            })
+            .ok_or_else(crate::fs_io::listing_refusal)?;
+        // Include the longest suffix used by the listing's existence probes.
+        crate::fs_io::check_listing_path_size(
+            bytes
+                .checked_add(32)
+                .ok_or_else(crate::fs_io::listing_refusal)?,
+        )
+    }
+
+    async fn external_tables(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
+        self.list_tables_for_read(
+            namespace,
+            self.listing_binding()?,
+            novarocks_spi::connector::ConnectorListingBound::V1,
+        )
+        .await
+    }
+
+    /// Both listing and existence use the same complete directory/probe walk.
+    /// Existence keeps only a bool rather than cloning unused TableIdent values.
+    async fn scan_external_tables(
         &self,
         namespace: &NamespaceIdent,
-        file_io: &FileIO,
-        control: &Option<Arc<dyn novarocks_spi::connector::ConnectorOperationControl>>,
+        binding: crate::access_binding::IcebergReadBinding,
         bound: novarocks_spi::connector::ConnectorListingBound,
-    ) -> Result<Vec<TableIdent>> {
+        workspace_bytes: usize,
+        retain_tables: bool,
+    ) -> Result<(Vec<TableIdent>, bool)> {
+        self.check_listing_location(Some(namespace))?;
+        let control = binding.operation_control();
+        check_catalog_read_control(&control)?;
         let namespace_location = self.namespace_location(namespace);
+        let file_io = crate::fs_io::build_bounded_file_io_for_location(
+            &namespace_location,
+            binding,
+            bound,
+            workspace_bytes,
+        )?;
         let children = file_io.list_directories(&namespace_location).await?;
         check_directory_listing_bound(&children, bound)?;
+        let source_bytes = directory_heap_bytes(&children)?;
+        let qualifier_bytes = namespace_clone_heap_bytes(namespace)?;
+        let mut retained_qualifiers = 0usize;
         let mut tables = Vec::new();
+        let mut found = false;
         for table in children {
-            check_catalog_read_control(control)?;
+            check_catalog_read_control(&control)?;
+            let path_bytes = namespace_location
+                .len()
+                .checked_add(table.len())
+                .and_then(|bytes| bytes.checked_add(32))
+                .ok_or_else(crate::fs_io::listing_refusal)?;
+            crate::fs_io::check_listing_path_size(path_bytes)?;
             if file_io
                 .exists(Self::version_hint_path(&format!(
                     "{namespace_location}/{table}"
                 )))
                 .await?
             {
-                check_catalog_read_control(control)?;
-                tables.push(TableIdent::new(namespace.clone(), table));
+                check_catalog_read_control(&control)?;
+                found = true;
+                if retain_tables {
+                    let next_qualifiers = retained_qualifiers
+                        .checked_add(qualifier_bytes)
+                        .ok_or_else(crate::fs_io::listing_refusal)?;
+                    let other_bytes = source_bytes
+                        .checked_add(next_qualifiers)
+                        .ok_or_else(crate::fs_io::listing_refusal)?;
+                    crate::fs_io::grow_listing_vec(
+                        &mut tables,
+                        other_bytes,
+                        workspace_bytes,
+                        bound.entries,
+                    )?;
+                    tables.push(TableIdent::new(namespace.clone(), table));
+                    retained_qualifiers = next_qualifiers;
+                }
             }
         }
-        tables.sort_by(|left, right| left.name().cmp(right.name()));
+        tables.sort_unstable_by(|left, right| left.name().cmp(right.name()));
         tables.dedup();
-        check_catalog_read_control(control)?;
-        Ok(tables)
+        check_catalog_read_control(&control)?;
+        Ok((tables, found))
     }
 
-    /// Enumerate namespaces for one admitted read. The warehouse directory
-    /// listing is refused as a whole when it exceeds `bound`, before any child
-    /// is probed.
-    pub(crate) async fn list_namespaces_for_read(
+    async fn list_namespaces_bounded(
         &self,
+        parent: Option<&NamespaceIdent>,
         binding: crate::access_binding::IcebergReadBinding,
         bound: novarocks_spi::connector::ConnectorListingBound,
     ) -> Result<Vec<NamespaceIdent>> {
+        self.check_listing_location(parent)?;
+        let workspace_bytes = hadoop_listing_workspace();
         let control = binding.operation_control();
         check_catalog_read_control(&control)?;
-        let file_io = crate::fs_io::build_file_io_for_location(&self.warehouse_location, binding);
-        let children = file_io.list_directories(&self.warehouse_location).await?;
+        let location = parent
+            .map(|parent| self.namespace_location(parent))
+            .unwrap_or_else(|| self.warehouse_location.clone());
+        let file_io = crate::fs_io::build_bounded_file_io_for_location(
+            &location,
+            binding.clone(),
+            bound,
+            workspace_bytes,
+        )?;
+        let children = file_io.list_directories(&location).await?;
         check_directory_listing_bound(&children, bound)?;
+        let source_bytes = directory_heap_bytes(&children)?;
+        let parent_bytes = parent
+            .map(namespace_clone_heap_bytes)
+            .transpose()?
+            .unwrap_or(0);
+        let mut namespace_bytes = 0usize;
         let mut namespaces = Vec::new();
         for child in children {
             check_catalog_read_control(&control)?;
             if child.starts_with('.') {
                 continue;
             }
-            let namespace = NamespaceIdent::new(child);
+            let next_namespace_bytes = namespace_bytes
+                .checked_add(parent_bytes)
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<String>()))
+                .ok_or_else(crate::fs_io::listing_refusal)?;
+            let other_bytes = source_bytes
+                .checked_add(next_namespace_bytes)
+                .ok_or_else(crate::fs_io::listing_refusal)?;
+            crate::fs_io::grow_listing_vec(
+                &mut namespaces,
+                other_bytes,
+                workspace_bytes,
+                bound.entries,
+            )?;
+            let namespace = match parent {
+                Some(parent) => {
+                    // Build the exact component backing after its whole request
+                    // was admitted; to_vec followed by push could grow twice.
+                    let mut components = Vec::with_capacity(parent.as_ref().len() + 1);
+                    components.extend(parent.as_ref().iter().cloned());
+                    components.push(child);
+                    NamespaceIdent::from_vec(components)?
+                }
+                None => NamespaceIdent::new(child),
+            };
+            let held_bytes = namespaces
+                .capacity()
+                .checked_mul(std::mem::size_of::<NamespaceIdent>())
+                .and_then(|slots| other_bytes.checked_add(slots))
+                .ok_or_else(crate::fs_io::listing_refusal)?;
+            let remaining = workspace_bytes
+                .checked_sub(held_bytes)
+                .ok_or_else(crate::fs_io::listing_refusal)?;
             if self
-                .namespace_exists_with_io(&namespace, &file_io, &control)
+                .namespace_exists_bounded(&namespace, binding.clone(), bound, remaining)
                 .await?
             {
                 namespaces.push(namespace);
+                namespace_bytes = next_namespace_bytes;
             }
         }
-        namespaces.sort();
+        namespaces.sort_unstable();
         namespaces.dedup();
         check_catalog_read_control(&control)?;
         Ok(namespaces)
     }
 
-    async fn namespace_exists_with_io(
+    /// Refuse the complete root source before probing any child. The internal
+    /// existence source uses V1 and the workspace left by its parent.
+    pub(crate) async fn list_namespaces_for_read(
+        &self,
+        binding: crate::access_binding::IcebergReadBinding,
+        bound: novarocks_spi::connector::ConnectorListingBound,
+    ) -> Result<Vec<NamespaceIdent>> {
+        self.list_namespaces_bounded(None, binding, bound).await
+    }
+
+    async fn namespace_exists_bounded(
         &self,
         namespace: &NamespaceIdent,
-        file_io: &FileIO,
-        control: &Option<Arc<dyn novarocks_spi::connector::ConnectorOperationControl>>,
+        binding: crate::access_binding::IcebergReadBinding,
+        bound: novarocks_spi::connector::ConnectorListingBound,
+        workspace_bytes: usize,
     ) -> Result<bool> {
-        check_catalog_read_control(control)?;
+        self.check_listing_location(Some(namespace))?;
+        let control = binding.operation_control();
+        check_catalog_read_control(&control)?;
+        let file_io = crate::fs_io::build_bounded_file_io_for_location(
+            &self.warehouse_location,
+            binding.clone(),
+            bound,
+            workspace_bytes,
+        )?;
         let exists = file_io
             .exists(self.namespace_marker_location(namespace))
             .await?;
-        check_catalog_read_control(control)?;
+        check_catalog_read_control(&control)?;
         if exists {
             return Ok(true);
         }
-        // An existence probe that has to enumerate the namespace is a listing
-        // like any other and observes the production listing bound.
-        Ok(!self
-            .external_tables_for_read(
-                namespace,
-                file_io,
-                control,
-                novarocks_spi::connector::ConnectorListingBound::V1,
-            )
-            .await?
-            .is_empty())
+        // The caller's bound describes the namespace output, not the table
+        // directories needed to prove that this namespace exists. The latter
+        // are a separate source under V1 and the same remaining workspace.
+        self.scan_external_tables(
+            namespace,
+            binding,
+            novarocks_spi::connector::ConnectorListingBound::V1,
+            workspace_bytes,
+            false,
+        )
+        .await
+        .map(|(_, found)| found)
     }
 
     pub(crate) async fn namespace_exists_for_read(
@@ -331,26 +451,24 @@ impl HadoopFileSystemCatalog {
         namespace: &NamespaceIdent,
         binding: crate::access_binding::IcebergReadBinding,
     ) -> Result<bool> {
-        let control = binding.operation_control();
-        let file_io = crate::fs_io::build_file_io_for_location(&self.warehouse_location, binding);
-        self.namespace_exists_with_io(namespace, &file_io, &control)
-            .await
+        self.namespace_exists_bounded(
+            namespace,
+            binding,
+            novarocks_spi::connector::ConnectorListingBound::V1,
+            hadoop_listing_workspace(),
+        )
+        .await
     }
 
-    /// Enumerate one namespace's tables for an admitted read. The namespace
-    /// directory listing is refused as a whole when it exceeds `bound`, before
-    /// any child is probed for a version hint.
     pub(crate) async fn list_tables_for_read(
         &self,
         namespace: &NamespaceIdent,
         binding: crate::access_binding::IcebergReadBinding,
         bound: novarocks_spi::connector::ConnectorListingBound,
     ) -> Result<Vec<TableIdent>> {
-        let control = binding.operation_control();
-        check_catalog_read_control(&control)?;
-        let file_io = crate::fs_io::build_file_io_for_location(&self.warehouse_location, binding);
-        self.external_tables_for_read(namespace, &file_io, &control, bound)
+        self.scan_external_tables(namespace, binding, bound, hadoop_listing_workspace(), true)
             .await
+            .map(|(tables, _)| tables)
     }
 
     pub(crate) async fn table_exists_for_read(
@@ -876,6 +994,42 @@ fn hex_digest(bytes: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+// Eight bounded path temporaries cover namespace joins, probe paths, and
+// provider-relative paths while the directory/result containers coexist.
+fn hadoop_listing_workspace() -> usize {
+    crate::fs_io::HADOOP_LISTING_WORKSPACE_BYTES
+        - 8 * novarocks_spi::connector::ConnectorListingBound::V1.name_bytes
+}
+
+fn directory_heap_bytes(children: &Vec<String>) -> Result<usize> {
+    children.iter().try_fold(
+        children
+            .capacity()
+            .checked_mul(std::mem::size_of::<String>())
+            .ok_or_else(crate::fs_io::listing_refusal)?,
+        |bytes, child| {
+            bytes
+                .checked_add(child.capacity())
+                .ok_or_else(crate::fs_io::listing_refusal)
+        },
+    )
+}
+
+fn namespace_clone_heap_bytes(namespace: &NamespaceIdent) -> Result<usize> {
+    namespace.as_ref().iter().try_fold(
+        namespace
+            .as_ref()
+            .len()
+            .checked_mul(std::mem::size_of::<String>())
+            .ok_or_else(crate::fs_io::listing_refusal)?,
+        |bytes, component| {
+            bytes
+                .checked_add(component.len())
+                .ok_or_else(crate::fs_io::listing_refusal)
+        },
+    )
+}
+
 /// Refuse a directory listing that exceeds the caller's listing bound. The
 /// refusal is carried as the typed source so the catalog owner can keep its
 /// `ResourceExhausted` classification.
@@ -909,29 +1063,12 @@ impl Catalog for HadoopFileSystemCatalog {
         &self,
         parent: Option<&NamespaceIdent>,
     ) -> Result<Vec<NamespaceIdent>> {
-        let location = parent
-            .map(|namespace| self.namespace_location(namespace))
-            .unwrap_or_else(|| self.warehouse_location.clone());
-        let mut namespaces = Vec::new();
-        for child in self.file_io.list_directories(&location).await? {
-            if child.starts_with('.') {
-                continue;
-            }
-            let namespace = match parent {
-                Some(parent) => {
-                    let mut components = parent.as_ref().to_vec();
-                    components.push(child);
-                    NamespaceIdent::from_vec(components)?
-                }
-                None => NamespaceIdent::new(child),
-            };
-            if self.namespace_exists(&namespace).await? {
-                namespaces.push(namespace);
-            }
-        }
-        namespaces.sort();
-        namespaces.dedup();
-        Ok(namespaces)
+        self.list_namespaces_bounded(
+            parent,
+            self.listing_binding()?,
+            novarocks_spi::connector::ConnectorListingBound::V1,
+        )
+        .await
     }
 
     async fn create_namespace(
@@ -952,6 +1089,14 @@ impl Catalog for HadoopFileSystemCatalog {
     }
 
     async fn namespace_exists(&self, namespace: &NamespaceIdent) -> Result<bool> {
+        if let Some(binding) = &self.binding {
+            return self
+                .namespace_exists_for_read(namespace, binding.clone())
+                .await;
+        }
+        // The compatibility constructor may answer its exact marker probe,
+        // but has no receipt for a custom Storage's listing allocations.
+        self.check_listing_location(Some(namespace))?;
         if self
             .file_io
             .exists(self.namespace_marker_location(namespace))
@@ -959,11 +1104,10 @@ impl Catalog for HadoopFileSystemCatalog {
         {
             return Ok(true);
         }
-        // Hadoop catalogs do not have a standard namespace metadata object.
-        // External engines such as Spark establish one through direct table
-        // directories. Inspect only direct children and their version hints;
-        // never scan data files below the namespace.
-        Ok(!self.external_tables(namespace).await?.is_empty())
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Bounded Hadoop namespace discovery requires the provider-owned filesystem binding",
+        ))
     }
 
     async fn update_namespace(
@@ -1221,6 +1365,204 @@ mod tests {
         let binding = local_test_binding();
         let file_io = crate::fs_io::build_file_io_for_location(location, binding.clone());
         HadoopFileSystemCatalog::new_with_binding(file_io, location.to_string(), binding)
+    }
+
+    fn listing_error_kind(error: &Error) -> ConnectorErrorKind {
+        std::error::Error::source(error)
+            .and_then(|source| source.downcast_ref::<ConnectorError>())
+            .expect("typed listing refusal")
+            .kind()
+    }
+
+    #[tokio::test]
+    async fn bounded_hadoop_listing_preserves_marker_fallback_and_hierarchical_names() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        for path in [
+            "external/table/metadata",
+            "external/not-a-table",
+            "marked",
+            ".hidden",
+        ] {
+            std::fs::create_dir_all(warehouse.path().join(path)).expect("directory");
+        }
+        std::fs::write(
+            warehouse
+                .path()
+                .join("external/table/metadata/version-hint.text"),
+            b"1",
+        )
+        .expect("external table hint");
+        std::fs::write(warehouse.path().join("marked/.novarocks_namespace"), b"")
+            .expect("namespace marker");
+        std::fs::create_dir_all(warehouse.path().join("parent/child")).expect("child");
+        std::fs::write(
+            warehouse.path().join("parent/child/.novarocks_namespace"),
+            b"",
+        )
+        .expect("child marker");
+        let location = warehouse.path().to_string_lossy().to_string();
+        let catalog = test_catalog(&location);
+        let namespaces = catalog
+            .list_namespaces(None)
+            .await
+            .expect("plain bounded namespaces");
+        assert_eq!(
+            namespaces,
+            [
+                NamespaceIdent::new("external".into()),
+                NamespaceIdent::new("marked".into())
+            ]
+        );
+        let parent = NamespaceIdent::new("parent".into());
+        assert_eq!(
+            catalog
+                .list_namespaces(Some(&parent))
+                .await
+                .expect("hierarchical listing"),
+            [NamespaceIdent::from_vec(vec!["parent".into(), "child".into()]).expect("namespace")]
+        );
+        assert!(
+            catalog
+                .namespace_exists(&NamespaceIdent::new("external".into()))
+                .await
+                .expect("fallback")
+        );
+        let bound = novarocks_spi::connector::ConnectorListingBound {
+            entries: 2,
+            page_entries: 1,
+            ..novarocks_spi::connector::ConnectorListingBound::V1
+        };
+        let tables = catalog
+            .list_tables_for_read(
+                &NamespaceIdent::new("external".into()),
+                local_test_binding(),
+                bound,
+            )
+            .await
+            .expect("actual caller bound");
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].name(), "table");
+        assert_eq!(
+            listing_error_kind(
+                &catalog
+                    .list_tables_for_read(
+                        &NamespaceIdent::new("external".into()),
+                        local_test_binding(),
+                        novarocks_spi::connector::ConnectorListingBound {
+                            entries: 1,
+                            ..bound
+                        },
+                    )
+                    .await
+                    .expect_err("whole source exceeds caller bound")
+            ),
+            ConnectorErrorKind::ResourceExhausted
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_hadoop_scan_precharges_qualifier_and_result_backing() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        std::fs::create_dir_all(warehouse.path().join("n/t/metadata")).expect("table");
+        std::fs::write(
+            warehouse.path().join("n/t/metadata/version-hint.text"),
+            b"1",
+        )
+        .expect("hint");
+        let location = warehouse.path().to_string_lossy().to_string();
+        let catalog = test_catalog(&location);
+        let namespace = NamespaceIdent::new("n".into());
+        let bound = novarocks_spi::connector::ConnectorListingBound {
+            entries: 1,
+            ..novarocks_spi::connector::ConnectorListingBound::V1
+        };
+        let source_bytes = std::mem::size_of::<String>() + 1;
+        let result_bytes = source_bytes
+            + namespace_clone_heap_bytes(&namespace).expect("qualifier")
+            + std::mem::size_of::<TableIdent>();
+        assert_eq!(
+            listing_error_kind(
+                &catalog
+                    .scan_external_tables(
+                        &namespace,
+                        local_test_binding(),
+                        bound,
+                        result_bytes - 1,
+                        true,
+                    )
+                    .await
+                    .expect_err("clone/result before allocation")
+            ),
+            ConnectorErrorKind::ResourceExhausted
+        );
+        assert_eq!(
+            catalog
+                .scan_external_tables(&namespace, local_test_binding(), bound, result_bytes, true)
+                .await
+                .expect("exact result boundary")
+                .0
+                .len(),
+            1
+        );
+        // The existence fallback walks the same complete source and all probes
+        // while retaining no TableIdent namespace clones.
+        assert!(
+            catalog
+                .scan_external_tables(&namespace, local_test_binding(), bound, source_bytes, false)
+                .await
+                .expect("existence under remaining workspace")
+                .1
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_hadoop_namespace_output_does_not_limit_fallback_table_source() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        for table in ["first", "second"] {
+            let metadata = warehouse.path().join("n").join(table).join("metadata");
+            std::fs::create_dir_all(&metadata).expect("table directory");
+            std::fs::write(metadata.join("version-hint.text"), b"1").expect("table hint");
+        }
+        let location = warehouse.path().to_string_lossy().to_string();
+        let catalog = test_catalog(&location);
+        let bound = novarocks_spi::connector::ConnectorListingBound {
+            entries: 1,
+            name_bytes: 1,
+            total_name_bytes: 1,
+            ..novarocks_spi::connector::ConnectorListingBound::V1
+        };
+        assert_eq!(
+            catalog
+                .list_namespaces_for_read(local_test_binding(), bound)
+                .await
+                .expect("one namespace with two longer table names"),
+            [NamespaceIdent::new("n".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_hadoop_listing_refuses_custom_storage_without_owner_binding() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let catalog = HadoopFileSystemCatalog::new(
+            FileIO::new_with_fs(),
+            warehouse.path().to_string_lossy().to_string(),
+        );
+        assert_eq!(
+            catalog
+                .list_namespaces(None)
+                .await
+                .expect_err("no owner proof")
+                .kind(),
+            ErrorKind::FeatureUnsupported
+        );
+        assert_eq!(
+            catalog
+                .list_tables(&NamespaceIdent::new("n".into()))
+                .await
+                .expect_err("no owner proof")
+                .kind(),
+            ErrorKind::FeatureUnsupported
+        );
     }
 
     fn read_request(
