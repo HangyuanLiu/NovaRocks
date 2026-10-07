@@ -995,7 +995,7 @@ fn charge_node_expressions(
                 charge(*predicate)?;
             }
         }
-        NodeKind::Project { expressions } => {
+        NodeKind::Project { expressions, .. } => {
             for (expression, _) in expressions {
                 charge(*expression)?;
             }
@@ -1127,7 +1127,8 @@ fn charge_node_expressions(
                 }
             }
         }
-        NodeKind::QuotaPreclaim { .. }
+        NodeKind::Membership { .. }
+        | NodeKind::QuotaPreclaim { .. }
         | NodeKind::QuotaTrim { .. }
         | NodeKind::Limit { .. }
         | NodeKind::SetOp { .. }
@@ -2585,7 +2586,10 @@ fn encode_node_payload(
                 ValueResolution::NodeInput,
             )?),
         }),
-        NodeKind::Project { expressions } => Kind::Project(plan::ProjectNode {
+        NodeKind::Project {
+            expressions,
+            retention_admission,
+        } => Kind::Project(plan::ProjectNode {
             items: expressions
                 .iter()
                 .enumerate()
@@ -2617,6 +2621,14 @@ fn encode_node_payload(
                 })
                 .collect::<Result<Vec<_>, String>>()?,
             output_qualifier: None,
+            retention_admission: match retention_admission {
+                novarocks_physical_plan::ProjectRetentionAdmission::Existing => {
+                    plan::ProjectRetentionAdmission::Existing as i32
+                }
+                novarocks_physical_plan::ProjectRetentionAdmission::CheckedTask => {
+                    plan::ProjectRetentionAdmission::CheckedTask as i32
+                }
+            },
         }),
         NodeKind::Values { rows } => Kind::Values(plan::ValuesNode {
             rows: rows
@@ -2988,6 +3000,31 @@ fn encode_node_payload(
                 .collect::<Result<Vec<_>, String>>()?,
             output_columns: outputs.clone(),
         }),
+        NodeKind::Membership { spec } => Kind::Membership(plan::MembershipNode {
+            probe_column_id: layout
+                .input_value_slot_at(node.id, 0, spec.probe)
+                .map_err(|e| e.to_string())?
+                .get_u32(),
+            build_column_id: layout
+                .input_value_slot_at(node.id, 1, spec.build)
+                .map_err(|e| e.to_string())?
+                .get_u32(),
+            result_column_id: output_slot_for_value(layout, node, spec.result)?.get_u32(),
+            negated: spec.negated,
+            comparison: match spec.comparison {
+                novarocks_physical_plan::MembershipComparison::JsonInListV1 => {
+                    plan::MembershipComparison::JsonInListV1 as i32
+                }
+            },
+            distribution: match spec.distribution {
+                novarocks_physical_plan::MembershipDistribution::Singleton => {
+                    plan::MembershipDistribution::Singleton as i32
+                }
+                novarocks_physical_plan::MembershipDistribution::BroadcastBuild => {
+                    plan::MembershipDistribution::BroadcastBuild as i32
+                }
+            },
+        }),
         NodeKind::QuotaPreclaim { spec } => Kind::QuotaPreclaim(plan::QuotaPreclaimNode {
             demand_entry_id_column_id: layout
                 .input_value_slot_at(node.id, 0, spec.demand_entry_id)
@@ -3257,13 +3294,20 @@ fn encode_scan(
                         slot,
                         &fact_column.name,
                         &fact_column.ty,
+                        fragment.values()[value].logical_kind,
                         fact_column.internal,
                     ),
                     None if derived_values.contains(value) => {
                         let definition = fragment.values().get(value).ok_or_else(|| {
                             format!("scan derived value {} is absent", value.get())
                         })?;
-                        output_column(slot, &value_name(*value), &definition.ty, false)
+                        output_column(
+                            slot,
+                            &value_name(*value),
+                            &definition.ty,
+                            definition.logical_kind,
+                            false,
+                        )
                     }
                     None => Err(format!(
                         "scan output value {} is neither provider-owned nor derived",
@@ -4269,7 +4313,13 @@ fn output_columns(
                 fragment.values()[value].origin,
                 ValueOrigin::WriterDerived { .. }
             );
-            output_column(slot, name, ty, internal)
+            output_column(
+                slot,
+                name,
+                ty,
+                fragment.values()[value].logical_kind,
+                internal,
+            )
         })
         .collect()
 }
@@ -4291,6 +4341,7 @@ fn projected_columns(
                 slot,
                 value_name_ref(*value),
                 &fragment.values()[value].ty,
+                fragment.values()[value].logical_kind,
                 false,
             )
         })
@@ -4301,9 +4352,12 @@ fn output_column(
     slot: WireSlotId,
     name: &str,
     ty: &ValueType,
+    logical_kind: Option<novarocks_physical_plan::ValueLogicalKind>,
     internal: bool,
 ) -> Result<common::OutputColumn, String> {
-    let wire_type = if internal {
+    let wire_type = if let Some(kind) = logical_kind {
+        super::physical_type::encode_physical_logical_type(&ty.data_type, kind)?
+    } else if internal {
         // Writer relation values are paired with the mandatory exact
         // ArrowPhysicalSchema on TableWriter/TableFinish. That schema owns
         // execution type identity; this legacy descriptor is only its SQL
@@ -4436,6 +4490,7 @@ fn output_column_at(
         output_slot_at(layout, node, ordinal, expected)?,
         &names.output_name(fragment.id(), expected),
         &fragment.values()[&expected].ty,
+        fragment.values()[&expected].logical_kind,
         false,
     )
 }
@@ -4967,7 +5022,7 @@ mod tests {
         }
     }
 
-    fn exact_scalar_catalog() -> (
+    pub(super) fn exact_scalar_catalog() -> (
         EngineFunctionCatalog,
         novarocks_physical_plan::BoundFunction,
     ) {
@@ -5863,6 +5918,8 @@ mod tests {
                     columns: Box::from([output]),
                 },
                 kind: NodeKind::Project {
+                    retention_admission:
+                        novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                     expressions: Box::from([(expression, output)]),
                 },
             })
@@ -6113,6 +6170,8 @@ mod tests {
                     columns: outputs.into_boxed_slice(),
                 },
                 kind: NodeKind::Project {
+                    retention_admission:
+                        novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                     expressions: expressions.clone().into_boxed_slice(),
                 },
             })
@@ -6966,6 +7025,8 @@ mod tests {
                     columns: Box::from([value, value]),
                 },
                 kind: NodeKind::Project {
+                    retention_admission:
+                        novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                     expressions: Box::from([(reference, value), (reference, value)]),
                 },
             })
@@ -7712,4 +7773,239 @@ fn encode_quota_need(
             }
         }),
     })
+}
+
+#[cfg(test)]
+mod membership_tests {
+    use super::*;
+    use arrow::datatypes::DataType;
+    use novarocks_physical_plan::{
+        FragmentBuilder, MembershipComparison, MembershipDistribution, MembershipSpec, OutputPort,
+        PhysicalProperties, PipelineDopDomain, PlanBuilder, PlanVersionId,
+        ProjectRetentionAdmission, ResultField, RowMultiplicity, ValueLogicalKind,
+    };
+    use prost::Message;
+
+    fn props() -> PhysicalProperties {
+        PhysicalProperties {
+            distribution: Distribution::Singleton,
+            row_multiplicity: RowMultiplicity::SingleCopy,
+            ordering: Box::default(),
+        }
+    }
+    fn rows(builder: &mut FragmentBuilder) -> (NodeId, ValueId) {
+        let node = builder.reserve_node_id().unwrap();
+        let ty = ValueType::new(DataType::Utf8, true);
+        let expression = builder
+            .add_expression(
+                node,
+                ty.clone(),
+                ExprKind::Literal(LiteralValue::Utf8("{\"a\":1}".into())),
+            )
+            .unwrap();
+        let value = builder
+            .add_value_with_logical_kind(
+                ty,
+                ValueOrigin::NodeOutput {
+                    node,
+                    output_ordinal: 0,
+                },
+                Some(ValueLogicalKind::Json),
+            )
+            .unwrap();
+        builder
+            .insert_node_unchecked(PhysicalNode {
+                id: node,
+                inputs: Box::default(),
+                required_inputs: Box::default(),
+                output_properties: props(),
+                output: OutputPort {
+                    node,
+                    columns: Box::from([value]),
+                },
+                kind: NodeKind::Values {
+                    rows: Box::from([Box::from([expression]), Box::from([expression])]),
+                },
+            })
+            .unwrap();
+        (node, value)
+    }
+    fn finished_plan() -> PhysicalPlan {
+        let fragment = FragmentId::new(631);
+        let mut builder = FragmentBuilder::new(fragment);
+        let (probe, probe_value) = rows(&mut builder);
+        let (build, build_value) = rows(&mut builder);
+        let project = builder.reserve_node_id().unwrap();
+        let expression = builder
+            .add_expression(
+                project,
+                ValueType::new(DataType::Utf8, true),
+                ExprKind::Value(probe_value),
+            )
+            .unwrap();
+        builder
+            .insert_node_unchecked(PhysicalNode {
+                id: project,
+                inputs: Box::from([probe]),
+                required_inputs: Box::from([props()]),
+                output_properties: props(),
+                output: OutputPort {
+                    node: project,
+                    columns: Box::from([probe_value]),
+                },
+                kind: NodeKind::Project {
+                    expressions: Box::from([(expression, probe_value)]),
+                    retention_admission: ProjectRetentionAdmission::CheckedTask,
+                },
+            })
+            .unwrap();
+        let membership = builder.reserve_node_id().unwrap();
+        let result = builder
+            .add_value(
+                ValueType::new(DataType::Boolean, true),
+                ValueOrigin::NodeOutput {
+                    node: membership,
+                    output_ordinal: 1,
+                },
+            )
+            .unwrap();
+        builder
+            .add_membership(
+                membership,
+                project,
+                build,
+                MembershipSpec {
+                    probe: probe_value,
+                    build: build_value,
+                    result,
+                    negated: true,
+                    comparison: MembershipComparison::JsonInListV1,
+                    distribution: MembershipDistribution::Singleton,
+                },
+            )
+            .unwrap();
+        let definition = builder
+            .finish_definition(
+                membership,
+                FragmentSink::Result,
+                PipelineDopDomain {
+                    min: 1,
+                    max: 1,
+                    requires_power_of_two: false,
+                },
+            )
+            .unwrap();
+        let mut plan = PlanBuilder::new(PlanVersionId::try_new([63; 16]).unwrap());
+        plan.add_fragment(definition).unwrap();
+        plan.set_result_port(ResultPort {
+            fragment,
+            output: OutputPort {
+                node: membership,
+                columns: Box::from([probe_value, result]),
+            },
+            fields: Box::from([
+                ResultField {
+                    name: "json".into(),
+                    alias: None,
+                    value: probe_value,
+                    ty: ValueType::new(DataType::Utf8, true),
+                },
+                ResultField {
+                    name: "member".into(),
+                    alias: None,
+                    value: result,
+                    ty: ValueType::new(DataType::Boolean, true),
+                },
+            ]),
+        })
+        .unwrap();
+        plan.finish().unwrap()
+    }
+    #[test]
+    fn membership_encoding_preserves_child_slots_and_checked_project() {
+        let physical = finished_plan();
+        let (catalog, _) = super::tests::exact_scalar_catalog();
+        let encoded =
+            encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts).unwrap();
+        let encoded = plan::DistributedPlan::decode(encoded.encode_to_vec().as_slice()).unwrap();
+        let root = encoded.fragments[0].root.as_ref().unwrap();
+        let Some(plan::distributed_node::Payload::Physical(output)) = root.payload.as_ref() else {
+            panic!("membership payload")
+        };
+        let Some(plan::plan_node::Kind::Membership(membership)) = output.kind.as_ref() else {
+            panic!("membership kind")
+        };
+        assert!(membership.negated);
+        assert_eq!(
+            membership.comparison,
+            plan::MembershipComparison::JsonInListV1 as i32
+        );
+        assert_eq!(
+            membership.distribution,
+            plan::MembershipDistribution::Singleton as i32
+        );
+        assert_eq!(
+            output.output_columns[0].column_id,
+            membership.probe_column_id
+        );
+        assert_eq!(
+            output.output_columns[1].column_id,
+            membership.result_column_id
+        );
+        assert_ne!(membership.result_column_id, membership.build_column_id);
+        let Some(plan::distributed_node::Payload::Physical(probe)) =
+            root.children[0].payload.as_ref()
+        else {
+            panic!("probe project")
+        };
+        let Some(plan::plan_node::Kind::Project(project)) = probe.kind.as_ref() else {
+            panic!("project")
+        };
+        assert_eq!(
+            project.retention_admission,
+            plan::ProjectRetentionAdmission::CheckedTask as i32
+        );
+        assert_eq!(
+            probe.output_columns[0].column_id,
+            membership.probe_column_id
+        );
+        let Some(common::type_desc::Kind::Scalar(json)) = output.output_columns[0]
+            .r#type
+            .as_ref()
+            .unwrap()
+            .kind
+            .as_ref()
+        else {
+            panic!("scalar")
+        };
+        assert_eq!(json.r#type, common::PrimitiveType::Json as i32);
+    }
+    #[test]
+    fn membership_root_json_declaration_does_not_relabel_plain_utf8() {
+        let ty = ValueType::new(DataType::Utf8, true);
+        let physical = finished_plan();
+        let fragment = physical.fragments().values().next().unwrap();
+        let layout = WireLayout::try_new(fragment).unwrap();
+        let slot = layout.output_slot(fragment.root(), 0).unwrap();
+        let plain = output_column(slot, "plain", &ty, None, false).unwrap();
+        let json = output_column(slot, "json", &ty, Some(ValueLogicalKind::Json), false).unwrap();
+        let scalar = |column: common::OutputColumn| {
+            let Some(common::type_desc::Kind::Scalar(value)) = column.r#type.unwrap().kind else {
+                panic!("scalar")
+            };
+            value.r#type
+        };
+        assert_eq!(scalar(plain), common::PrimitiveType::Varchar as i32);
+        assert_eq!(scalar(json), common::PrimitiveType::Json as i32);
+        assert!(
+            output_column(
+                slot,
+                "invalid",
+                &ValueType::new(DataType::Binary, true),
+                Some(ValueLogicalKind::Json),
+                false
+            )
+            .is_err()
+        );
+    }
 }

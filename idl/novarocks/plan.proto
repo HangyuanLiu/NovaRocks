@@ -378,6 +378,7 @@ message PlanNode {
     RedistributeNode redistribute = 31;              // explicit redistribution node.
     QuotaPreclaimNode quota_preclaim = 33;
     QuotaTrimNode quota_trim = 34;
+    MembershipNode membership = 35;
     UnpivotNode unpivot = 32;                        // typed wide-to-long expansion node.
   }
 }
@@ -875,6 +876,7 @@ message FilterNode {
 message ProjectNode {
   repeated ProjectItem items = 1;        // projection items.
   optional string output_qualifier = 2;  // optional output qualifier.
+  ProjectRetentionAdmission retention_admission = 3;
 }
 
 // One projection item.
@@ -1569,3 +1571,28 @@ message QuotaTrimNode {
 // Every predicate reads the same already-materialized producer chunk.
 message PredicateFanoutBranch { DataStreamSink stream = 1; novarocks.expr.Expr predicate = 2; }
 message PredicateFanoutSink { repeated PredicateFanoutBranch branches = 1; }
+
+// Exact value-form JSON membership; child 0 is probe and child 1 is build.
+// Types remain solely in PlanNode.output_columns and the child layouts.
+message MembershipNode {
+  uint32 probe_column_id = 1;
+  uint32 build_column_id = 2;
+  uint32 result_column_id = 3;
+  bool negated = 4;
+  MembershipComparison comparison = 5;
+  MembershipDistribution distribution = 6;
+}
+enum MembershipComparison {
+  MEMBERSHIP_COMPARISON_UNSPECIFIED = 0;
+  MEMBERSHIP_COMPARISON_JSON_IN_LIST_V1 = 1;
+}
+enum MembershipDistribution {
+  MEMBERSHIP_DISTRIBUTION_UNSPECIFIED = 0;
+  MEMBERSHIP_DISTRIBUTION_SINGLETON = 1;
+  MEMBERSHIP_DISTRIBUTION_BROADCAST_BUILD = 2;
+}
+// Zero preserves existing projects. Generated materialization is explicit.
+enum ProjectRetentionAdmission {
+  PROJECT_RETENTION_ADMISSION_EXISTING = 0;
+  PROJECT_RETENTION_ADMISSION_CHECKED_TASK = 1;
+}
