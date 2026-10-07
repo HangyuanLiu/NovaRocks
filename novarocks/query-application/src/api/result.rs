@@ -253,12 +253,18 @@ pub fn build_utf8_query_result(
     column_names: &[&str],
     rows: Vec<Vec<String>>,
 ) -> Result<QueryResult, String> {
+    preflight_text_column_count(column_names.len())?;
     let columns = column_names
         .iter()
         .map(|name| (*name, false))
         .collect::<Vec<_>>();
     let mut table = super::LocalTableBuilder::try_new(&columns, super::LocalResultBound::V1)?;
     for row in rows {
+        if row.len() != columns.len() {
+            return Err(
+                "immediate tabular result contains a row with the wrong column count".to_owned(),
+            );
+        }
         let row = row.into_iter().map(Some).collect::<Vec<_>>();
         table.push_row(&row)?;
     }
@@ -292,11 +298,22 @@ pub fn build_nullable_utf8_query_result(
     column_names: &[&str],
     rows: Vec<Vec<Option<String>>>,
 ) -> Result<QueryResult, String> {
+    preflight_text_column_count(column_names.len())?;
     let columns = column_names
         .iter()
         .map(|name| (*name, true))
         .collect::<Vec<_>>();
     build_utf8_table_query_result(&columns, rows)
+}
+
+fn preflight_text_column_count(columns: usize) -> Result<(), String> {
+    let bound = super::LocalResultBound::V1.columns;
+    if columns > bound {
+        return Err(format!(
+            "local result has {columns} columns, beyond its {bound} column bound"
+        ));
+    }
+    Ok(())
 }
 
 impl ResultSchema {
@@ -1323,6 +1340,23 @@ mod tests {
             vec![vec![Some("job-1".to_owned())]],
         )
         .expect_err("ragged rows must not produce a visible schema");
+        assert_eq!(
+            error,
+            "immediate tabular result contains a row with the wrong column count"
+        );
+    }
+
+    #[test]
+    fn text_helpers_refuse_wide_schema_and_ragged_required_rows_before_projection() {
+        let columns = vec!["column"; super::super::LocalResultBound::V1.columns + 1];
+        for error in [
+            build_utf8_query_result(&columns, Vec::new()).unwrap_err(),
+            build_nullable_utf8_query_result(&columns, Vec::new()).unwrap_err(),
+        ] {
+            assert!(error.contains("4097 columns, beyond its 4096 column bound"));
+        }
+        let error = build_utf8_query_result(&["one"], vec![vec!["x".into(), "y".into()]])
+            .expect_err("required row width must be checked before Option projection");
         assert_eq!(
             error,
             "immediate tabular result contains a row with the wrong column count"

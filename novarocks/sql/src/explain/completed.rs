@@ -167,6 +167,12 @@ impl ExplainRenderBudget {
                 "EXPLAIN render budget requires non-zero line and byte limits",
             ));
         }
+        let frozen = Self::default();
+        if max_lines > frozen.max_lines || max_bytes > frozen.max_bytes {
+            return Err(invalid_request(
+                "EXPLAIN render budget cannot exceed the frozen output bounds",
+            ));
+        }
         Ok(Self {
             max_lines,
             max_bytes,
@@ -455,28 +461,42 @@ fn validate_profile(
     plan: &PhysicalPlan,
     profile: &SqlCompletedExplainProfile,
 ) -> Result<(), String> {
-    let expected_fragments = plan.fragments().keys().copied().collect::<BTreeSet<_>>();
-    let actual_fragments = profile.fragments.keys().copied().collect::<BTreeSet<_>>();
-    if expected_fragments != actual_fragments {
-        let missing = expected_fragments.difference(&actual_fragments).count();
-        let extra = actual_fragments.difference(&expected_fragments).count();
+    if plan.fragments().keys().ne(profile.fragments.keys()) {
+        let missing = plan
+            .fragments()
+            .keys()
+            .filter(|fragment| !profile.fragments.contains_key(*fragment))
+            .count();
+        let extra = profile
+            .fragments
+            .keys()
+            .filter(|fragment| !plan.fragments().contains_key(*fragment))
+            .count();
         return Err(format!(
             "EXPLAIN ANALYZE fragment coverage mismatch: missing=[count={missing}], extra=[count={extra}]"
         ));
     }
-    let expected_operators = plan
-        .fragments()
-        .iter()
-        .flat_map(|(fragment, plan)| {
+    let expected_operators = || {
+        plan.fragments().iter().flat_map(|(fragment, plan)| {
             plan.nodes()
                 .keys()
                 .map(|node| SqlExplainNodeKey::new(*fragment, *node))
         })
-        .collect::<BTreeSet<_>>();
-    let actual_operators = profile.operators.keys().copied().collect::<BTreeSet<_>>();
-    if expected_operators != actual_operators {
-        let missing = expected_operators.difference(&actual_operators).count();
-        let extra = actual_operators.difference(&expected_operators).count();
+    };
+    if expected_operators().ne(profile.operators.keys().copied()) {
+        let missing = expected_operators()
+            .filter(|operator| !profile.operators.contains_key(operator))
+            .count();
+        let extra = profile
+            .operators
+            .keys()
+            .filter(|operator| {
+                !plan
+                    .fragments()
+                    .get(&operator.fragment)
+                    .is_some_and(|fragment| fragment.nodes().contains_key(&operator.node))
+            })
+            .count();
         return Err(format!(
             "EXPLAIN ANALYZE operator coverage mismatch: missing=[count={missing}], extra=[count={extra}]"
         ));
@@ -484,14 +504,14 @@ fn validate_profile(
     Ok(())
 }
 
-struct ExplainRenderOutput {
+pub(super) struct ExplainRenderOutput {
     budget: ExplainRenderBudget,
     bytes: usize,
     lines: Vec<String>,
 }
 
 impl ExplainRenderOutput {
-    fn new(budget: ExplainRenderBudget) -> Self {
+    pub(super) fn new(budget: ExplainRenderBudget) -> Self {
         Self {
             budget,
             bytes: 0,
@@ -499,7 +519,7 @@ impl ExplainRenderOutput {
         }
     }
 
-    fn push(&mut self, arguments: fmt::Arguments<'_>) -> Result<(), SqlCompileError> {
+    pub(super) fn push(&mut self, arguments: fmt::Arguments<'_>) -> Result<(), SqlCompileError> {
         if self.lines.len() >= self.budget.max_lines {
             return Err(explain_budget_exceeded(self.budget));
         }
@@ -513,12 +533,32 @@ impl ExplainRenderOutput {
             .max_bytes
             .checked_sub(used)
             .ok_or_else(|| explain_budget_exceeded(self.budget))?;
+        // Completed lines have exact capacities. One growing line stays
+        // within the remaining logical bound, including during replacement:
+        // all live payloads plus a copied allocation use at most 2 * 8 MiB.
+        // Header growth, per-line allocation allowance and bounded auxiliary
+        // indexes fit separately within the Local conversion workspace.
         let mut line = String::new();
         let mut writer = BoundedStringWriter {
             output: &mut line,
             remaining,
         };
         fmt::write(&mut writer, arguments).map_err(|_| explain_budget_exceeded(self.budget))?;
+        let line = line.into_boxed_str().into_string();
+        if self.lines.len() == self.lines.capacity() {
+            let capacity = self
+                .lines
+                .capacity()
+                .saturating_mul(2)
+                .max(1)
+                .min(self.budget.max_lines);
+            self.lines
+                .try_reserve_exact(capacity - self.lines.len())
+                .map_err(|_| explain_budget_exceeded(self.budget))?;
+            if self.lines.capacity() != capacity {
+                return Err(explain_budget_exceeded(self.budget));
+            }
+        }
         self.bytes = used
             .checked_add(line.len())
             .ok_or_else(|| explain_budget_exceeded(self.budget))?;
@@ -526,11 +566,11 @@ impl ExplainRenderOutput {
         Ok(())
     }
 
-    fn finish(self) -> Vec<String> {
+    pub(super) fn finish(self) -> Vec<String> {
         self.lines
     }
 
-    fn ensure_prefix_fits(&self, bytes: usize) -> Result<(), SqlCompileError> {
+    pub(super) fn ensure_prefix_fits(&self, bytes: usize) -> Result<(), SqlCompileError> {
         let separator = usize::from(!self.lines.is_empty());
         let used = self
             .bytes
@@ -553,6 +593,27 @@ impl Write for BoundedStringWriter<'_> {
     fn write_str(&mut self, value: &str) -> fmt::Result {
         if value.len() > self.remaining {
             return Err(fmt::Error);
+        }
+        let needed = self
+            .output
+            .len()
+            .checked_add(value.len())
+            .ok_or(fmt::Error)?;
+        if needed > self.output.capacity() {
+            let maximum = self
+                .output
+                .len()
+                .checked_add(self.remaining)
+                .ok_or(fmt::Error)?;
+            let capacity = needed
+                .max(self.output.capacity().saturating_mul(2))
+                .min(maximum);
+            self.output
+                .try_reserve_exact(capacity - self.output.len())
+                .map_err(|_| fmt::Error)?;
+            if self.output.capacity() != capacity {
+                return Err(fmt::Error);
+            }
         }
         self.output.push_str(value);
         self.remaining -= value.len();
@@ -639,7 +700,7 @@ pub fn render_completed_plan(
                 &mut lines,
             )?;
             for (value, annotations) in context.annotations.values_for_fragment(*fragment_id) {
-                for annotation in annotations.iter().filter(|annotation| {
+                for annotation in annotations.filter(|annotation| {
                     !annotation_is_internal_display(&annotation.key)
                         && annotation_visible(level, &annotation.key)
                 }) {
@@ -662,131 +723,82 @@ pub fn render_completed_plan(
     Ok(lines.finish())
 }
 
-struct AnnotationIndex<'a> {
-    plan: Vec<&'a PlanAnnotation>,
-    fragments: BTreeMap<FragmentId, Vec<&'a PlanAnnotation>>,
-    nodes: BTreeMap<(FragmentId, NodeId), Vec<&'a PlanAnnotation>>,
-    values: BTreeMap<(FragmentId, ValueId), Vec<&'a PlanAnnotation>>,
-    plan_values: BTreeMap<&'a str, &'a str>,
-    fragment_values: BTreeMap<FragmentId, BTreeMap<&'a str, &'a str>>,
-    node_values: BTreeMap<(FragmentId, NodeId), BTreeMap<&'a str, &'a str>>,
-    value_values: BTreeMap<(FragmentId, ValueId), BTreeMap<&'a str, &'a str>>,
-}
+// Display lookup borrows the frozen annotations. It neither clones names nor
+// builds one set of vectors/maps for each annotation subject.
+struct AnnotationIndex<'a>(&'a [PlanAnnotation]);
 
 impl<'a> AnnotationIndex<'a> {
     fn new(plan: &'a PhysicalPlan) -> Self {
-        let mut index = Self {
-            plan: Vec::new(),
-            fragments: BTreeMap::new(),
-            nodes: BTreeMap::new(),
-            values: BTreeMap::new(),
-            plan_values: BTreeMap::new(),
-            fragment_values: BTreeMap::new(),
-            node_values: BTreeMap::new(),
-            value_values: BTreeMap::new(),
-        };
-        for annotation in plan.annotations() {
-            match annotation.subject {
-                AnnotationSubject::Plan => {
-                    index.plan.push(annotation);
-                    index
-                        .plan_values
-                        .entry(&annotation.key)
-                        .or_insert(&annotation.value);
-                }
-                AnnotationSubject::Fragment(fragment) => {
-                    index
-                        .fragments
-                        .entry(fragment)
-                        .or_default()
-                        .push(annotation);
-                    index
-                        .fragment_values
-                        .entry(fragment)
-                        .or_default()
-                        .entry(&annotation.key)
-                        .or_insert(&annotation.value);
-                }
-                AnnotationSubject::Node(fragment, node) => {
-                    index
-                        .nodes
-                        .entry((fragment, node))
-                        .or_default()
-                        .push(annotation);
-                    index
-                        .node_values
-                        .entry((fragment, node))
-                        .or_default()
-                        .entry(&annotation.key)
-                        .or_insert(&annotation.value);
-                }
-                AnnotationSubject::Value(fragment, value) => {
-                    index
-                        .values
-                        .entry((fragment, value))
-                        .or_default()
-                        .push(annotation);
-                    index
-                        .value_values
-                        .entry((fragment, value))
-                        .or_default()
-                        .entry(&annotation.key)
-                        .or_insert(&annotation.value);
-                }
-            }
-        }
-        index
+        Self(plan.annotations())
     }
 
-    fn get(&self, subject: AnnotationSubject) -> &[&'a PlanAnnotation] {
-        match subject {
-            AnnotationSubject::Plan => &self.plan,
-            AnnotationSubject::Fragment(fragment) => self
-                .fragments
-                .get(&fragment)
-                .map(Vec::as_slice)
-                .unwrap_or_default(),
-            AnnotationSubject::Node(fragment, node) => self
-                .nodes
-                .get(&(fragment, node))
-                .map(Vec::as_slice)
-                .unwrap_or_default(),
-            AnnotationSubject::Value(fragment, value) => self
-                .values
-                .get(&(fragment, value))
-                .map(Vec::as_slice)
-                .unwrap_or_default(),
+    fn get(&self, subject: AnnotationSubject) -> AnnotationRows<'a> {
+        AnnotationRows {
+            rows: self.0.iter(),
+            subject,
         }
     }
 
     fn value(&self, subject: AnnotationSubject, key: &str) -> Option<&'a str> {
-        match subject {
-            AnnotationSubject::Plan => self.plan_values.get(key).copied(),
-            AnnotationSubject::Fragment(fragment) => self
-                .fragment_values
-                .get(&fragment)
-                .and_then(|values| values.get(key))
-                .copied(),
-            AnnotationSubject::Node(fragment, node) => self
-                .node_values
-                .get(&(fragment, node))
-                .and_then(|values| values.get(key))
-                .copied(),
-            AnnotationSubject::Value(fragment, value) => self
-                .value_values
-                .get(&(fragment, value))
-                .and_then(|values| values.get(key))
-                .copied(),
-        }
+        self.get(subject)
+            .find(|annotation| annotation.key.as_ref() == key)
+            .map(|annotation| annotation.value.as_ref())
     }
 
-    fn values_for_fragment(
-        &self,
-        fragment: FragmentId,
-    ) -> impl Iterator<Item = (ValueId, &[&'a PlanAnnotation])> {
-        self.values
-            .range((fragment, ValueId::new(0))..=(fragment, ValueId::new(u32::MAX)))
-            .map(|((_, value), annotations)| (*value, annotations.as_slice()))
+    fn values_for_fragment(&self, fragment: FragmentId) -> AnnotationValues<'a> {
+        AnnotationValues {
+            rows: self.0,
+            fragment,
+            previous: None,
+        }
+    }
+}
+
+struct AnnotationRows<'a> {
+    rows: std::slice::Iter<'a, PlanAnnotation>,
+    subject: AnnotationSubject,
+}
+
+impl<'a> Iterator for AnnotationRows<'a> {
+    type Item = &'a PlanAnnotation;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.rows
+            .find(|annotation| annotation.subject == self.subject)
+    }
+}
+
+// Keep the old value-id order, including annotations on unknown ids, without
+// allocating a second index. The plan's frozen annotation count bounds work.
+struct AnnotationValues<'a> {
+    rows: &'a [PlanAnnotation],
+    fragment: FragmentId,
+    previous: Option<ValueId>,
+}
+
+impl<'a> Iterator for AnnotationValues<'a> {
+    type Item = (ValueId, AnnotationRows<'a>);
+    fn next(&mut self) -> Option<Self::Item> {
+        let value = self
+            .rows
+            .iter()
+            .filter_map(|annotation| match annotation.subject {
+                AnnotationSubject::Value(fragment, value)
+                    if fragment == self.fragment
+                        && self.previous.is_none_or(|previous| value > previous) =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .min()?;
+        self.previous = Some(value);
+        Some((
+            value,
+            AnnotationRows {
+                rows: self.rows.iter(),
+                subject: AnnotationSubject::Value(self.fragment, value),
+            },
+        ))
     }
 }
 
@@ -795,8 +807,6 @@ struct RenderContext<'a> {
     level: ExplainLevel,
     profile: Option<&'a SqlCompletedExplainProfile>,
     annotations: AnnotationIndex<'a>,
-    inbound_edges: BTreeMap<FragmentId, Vec<&'a Edge>>,
-    outbound_edges: BTreeMap<FragmentId, Vec<&'a Edge>>,
     cuts: BTreeMap<FragmentId, FragmentCuts>,
 }
 
@@ -806,18 +816,6 @@ impl<'a> RenderContext<'a> {
         level: ExplainLevel,
         profile: Option<&'a SqlCompletedExplainProfile>,
     ) -> Result<Self, SqlCompileError> {
-        let mut inbound_edges: BTreeMap<FragmentId, Vec<&Edge>> = BTreeMap::new();
-        let mut outbound_edges: BTreeMap<FragmentId, Vec<&Edge>> = BTreeMap::new();
-        for edge in plan.edges().values() {
-            inbound_edges
-                .entry(edge.destination.fragment)
-                .or_default()
-                .push(edge);
-            outbound_edges
-                .entry(edge.source.fragment)
-                .or_default()
-                .push(edge);
-        }
         let cuts = novarocks_physical_plan::derive_fragment_cuts(plan).ok_or_else(|| {
             invalid_request("completed physical plan cannot derive fragment cut contracts")
         })?;
@@ -826,8 +824,6 @@ impl<'a> RenderContext<'a> {
             level,
             profile,
             annotations: AnnotationIndex::new(plan),
-            inbound_edges,
-            outbound_edges,
             cuts,
         })
     }
@@ -935,37 +931,51 @@ fn render_edges(
     Ok(())
 }
 
+struct EdgeAttachments<'a> {
+    plan: &'a PhysicalPlan,
+    fragment: FragmentId,
+    inbound: bool,
+}
+
+impl fmt::Display for EdgeAttachments<'_> {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut separator = "";
+        for edge in self.plan.edges().values().filter(|edge| {
+            if self.inbound {
+                edge.destination.fragment == self.fragment
+            } else {
+                edge.source.fragment == self.fragment
+            }
+        }) {
+            write!(
+                output,
+                "{separator}edge{}:{}",
+                edge.id.get(),
+                edge_kind(edge.kind)
+            )?;
+            separator = ", ";
+        }
+        Ok(())
+    }
+}
+
 fn render_cut_attachments(
     context: &RenderContext<'_>,
     fragment_id: FragmentId,
     lines: &mut ExplainRenderOutput,
 ) -> Result<(), SqlCompileError> {
-    let inbound = context
-        .inbound_edges
-        .get(&fragment_id)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    let outbound = context
-        .outbound_edges
-        .get(&fragment_id)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
     lines.push(format_args!(
         "  CUT ATTACHMENTS inbound=[{}], outbound=[{}]",
-        joined(
-            inbound,
-            ", ",
-            |edge: &&Edge, output: &mut fmt::Formatter<'_>| {
-                write!(output, "edge{}:{}", edge.id.get(), edge_kind(edge.kind))
-            }
-        ),
-        joined(
-            outbound,
-            ", ",
-            |edge: &&Edge, output: &mut fmt::Formatter<'_>| {
-                write!(output, "edge{}:{}", edge.id.get(), edge_kind(edge.kind))
-            }
-        )
+        EdgeAttachments {
+            plan: context.plan,
+            fragment: fragment_id,
+            inbound: true
+        },
+        EdgeAttachments {
+            plan: context.plan,
+            fragment: fragment_id,
+            inbound: false
+        },
     ))?;
     let cuts = context.cuts.get(&fragment_id).ok_or_else(|| {
         invalid_request("completed physical plan omitted a derived fragment cut contract")
@@ -1623,18 +1633,28 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
             ExprKind::Conjunction { args } => write!(
                 formatter,
                 "({})",
-                args.iter()
-                    .map(|arg| format!("e{}", expr(*arg)))
-                    .collect::<Vec<_>>()
-                    .join(" AND ")
+                joined(
+                    args,
+                    " AND ",
+                    |arg: &ExprId, output: &mut fmt::Formatter<'_>| write!(
+                        output,
+                        "e{}",
+                        expr(*arg)
+                    )
+                )
             ),
             ExprKind::Disjunction { args } => write!(
                 formatter,
                 "({})",
-                args.iter()
-                    .map(|arg| format!("e{}", expr(*arg)))
-                    .collect::<Vec<_>>()
-                    .join(" OR ")
+                joined(
+                    args,
+                    " OR ",
+                    |arg: &ExprId, output: &mut fmt::Formatter<'_>| write!(
+                        output,
+                        "e{}",
+                        expr(*arg)
+                    )
+                )
             ),
             ExprKind::Binary {
                 left, op, right, ..
@@ -2775,15 +2795,10 @@ fn render_node_contract(
             derived_values,
             ..
         } => {
-            let relation_kind = match relation.as_ref() {
-                novarocks_physical_plan::Relation::Data(_) => "data".to_string(),
-                novarocks_physical_plan::Relation::Metadata(metadata) => {
-                    format!("metadata({})", metadata.kind.as_str())
-                }
-            };
             lines.push(format_args!(
-                "{pad}  occurrence=pr{}, relation={relation_kind}, work-source={}, schema-fields={}, read-budget={{rows={}, bytes={}}}",
+                "{pad}  occurrence=pr{}, relation={}, work-source={}, schema-fields={}, read-budget={{rows={}, bytes={}}}",
                 occurrence.get(),
+                RelationKindDisplay(relation.as_ref()),
                 connector_read_work_source(relation.work_source()),
                 relation.schema().len(),
                 read_budget.max_batch_rows,
@@ -3248,6 +3263,19 @@ fn format_literal(value: &novarocks_physical_plan::LiteralValue) -> LiteralDispl
     LiteralDisplay(value)
 }
 
+struct RelationKindDisplay<'a>(&'a novarocks_physical_plan::Relation);
+
+impl fmt::Display for RelationKindDisplay<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            novarocks_physical_plan::Relation::Data(_) => formatter.write_str("data"),
+            novarocks_physical_plan::Relation::Metadata(metadata) => {
+                write!(formatter, "metadata({})", metadata.kind.as_str())
+            }
+        }
+    }
+}
+
 fn function_display_name(identity: &novarocks_physical_plan::FunctionId) -> &str {
     identity
         .as_str()
@@ -3543,15 +3571,10 @@ fn render_annotations(
     pad: &str,
     lines: &mut ExplainRenderOutput,
 ) -> Result<(), SqlCompileError> {
-    for annotation in context
-        .annotations
-        .get(subject)
-        .iter()
-        .filter(|annotation| {
-            !annotation_is_internal_display(&annotation.key)
-                && annotation_visible(context.level, &annotation.key)
-        })
-    {
+    for annotation in context.annotations.get(subject).filter(|annotation| {
+        !annotation_is_internal_display(&annotation.key)
+            && annotation_visible(context.level, &annotation.key)
+    }) {
         if matches!(subject, AnnotationSubject::Node(_, _))
             && matches!(
                 annotation.key.as_ref(),
@@ -4605,6 +4628,94 @@ mod tests {
                 .push(format_args!("{}", runtime_filter_coverage(&coverage)))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn bounded_writer_preflights_capacity_and_preserves_exact_text() {
+        let mut text = String::new();
+        let mut writer = BoundedStringWriter {
+            output: &mut text,
+            remaining: 1024,
+        };
+        for _ in 0..1024 {
+            writer.write_str("x").expect("exact byte bound");
+            assert!(writer.output.capacity() <= 1024);
+            assert!(writer.output.capacity() <= writer.output.len().saturating_mul(2));
+        }
+        let capacity = writer.output.capacity();
+        assert!(writer.write_str("x").is_err());
+        assert_eq!(writer.output.capacity(), capacity);
+        assert_eq!(writer.output.len(), 1024);
+        assert!(writer.output.bytes().all(|byte| byte == b'x'));
+
+        let budget = ExplainRenderBudget::try_new(5, 1024).unwrap();
+        let mut output = ExplainRenderOutput::new(budget);
+        for expected in ["a", "b", "c", "d", "e"] {
+            output.push(format_args!("{expected}")).unwrap();
+            assert!(output.lines.capacity() <= 5);
+            assert!(output.lines.iter().map(String::capacity).sum::<usize>() <= 2 * output.bytes);
+        }
+        assert!(output.push(format_args!("sixth")).is_err());
+        assert_eq!(output.finish(), ["a", "b", "c", "d", "e"]);
+        assert!(ExplainRenderBudget::try_new(65_537, 1).is_err());
+        assert!(ExplainRenderBudget::try_new(1, 8 * 1024 * 1024 + 1).is_err());
+    }
+
+    #[test]
+    fn wide_boolean_definitions_write_borrowed_arguments_under_the_line_bound() {
+        let completed = completed(
+            SqlCompileIntent::Explain {
+                level: ExplainLevel::Contract,
+                analyze: false,
+            },
+            79,
+        );
+        let context = RenderContext::new(completed.plan(), ExplainLevel::Contract, None).unwrap();
+        let mut expression = novarocks_physical_plan::ExprNode {
+            id: ExprId::new(0),
+            owner: NodeId::new(0),
+            lambda_scope: None,
+            ty: novarocks_physical_plan::ValueType::new(arrow::datatypes::DataType::Boolean, false),
+            kind: novarocks_physical_plan::ExprKind::Conjunction {
+                args: Box::from([ExprId::new(1), ExprId::new(2)]),
+            },
+        };
+        let mut output = ExplainRenderOutput::new(ExplainRenderBudget::try_new(1, 128).unwrap());
+        output
+            .push(format_args!(
+                "{}",
+                ExprDefinitionDisplay {
+                    context: &context,
+                    fragment: FragmentId::new(0),
+                    expression: &expression,
+                }
+            ))
+            .unwrap();
+        assert_eq!(output.finish(), ["(e1 AND e2)"]);
+        for conjunction in [true, false] {
+            let args = vec![ExprId::new(1); 32_768].into_boxed_slice();
+            expression.kind = if conjunction {
+                novarocks_physical_plan::ExprKind::Conjunction { args }
+            } else {
+                novarocks_physical_plan::ExprKind::Disjunction { args }
+            };
+            let mut output =
+                ExplainRenderOutput::new(ExplainRenderBudget::try_new(1, 128).unwrap());
+            assert!(
+                output
+                    .push(format_args!(
+                        "{}",
+                        ExprDefinitionDisplay {
+                            context: &context,
+                            fragment: FragmentId::new(0),
+                            expression: &expression,
+                        }
+                    ))
+                    .is_err()
+            );
+            assert!(output.lines.is_empty());
+            assert_eq!(output.bytes, 0);
+        }
     }
 
     #[test]

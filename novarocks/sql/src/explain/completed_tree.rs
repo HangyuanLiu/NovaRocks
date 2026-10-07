@@ -29,8 +29,9 @@
 //! named is printed by that name; one it did not is printed by its identity,
 //! which is the only honest thing to call it.
 
-use std::collections::BTreeMap;
-use std::fmt::Write as _;
+use std::fmt::{self, Display, Write as _};
+
+use super::completed::{ExplainRenderBudget, ExplainRenderOutput};
 
 use arrow::datatypes::DataType;
 use novarocks_physical_plan::{
@@ -46,81 +47,354 @@ pub fn render_completed_plan_tree(
     plan: &PhysicalPlan,
     level: ExplainLevel,
 ) -> Result<Vec<String>, SqlCompileError> {
-    let context = TreeContext::new(plan, level);
-    let mut out = Vec::new();
+    render_tree_with_budget(plan, level, ExplainRenderBudget::default())
+}
+
+fn render_tree_with_budget(
+    plan: &PhysicalPlan,
+    level: ExplainLevel,
+    budget: ExplainRenderBudget,
+) -> Result<Vec<String>, SqlCompileError> {
+    let context = TreeContext::new(plan, level)?;
+    let mut out = ExplainRenderOutput::new(budget);
     if context.costs() {
-        out.extend(plan.annotations().iter().filter_map(|annotation| {
-            (annotation.subject == AnnotationSubject::Plan
+        for annotation in plan.annotations() {
+            if annotation.subject == AnnotationSubject::Plan
                 && annotation.key.as_ref()
-                    == crate::optimizer::stats_input::TABLE_STATISTICS_ANNOTATION_KEY)
-                .then(|| annotation.value.to_string())
-        }));
+                    == crate::optimizer::stats_input::TABLE_STATISTICS_ANNOTATION_KEY
+            {
+                out.push(format_args!("{}", annotation.value))?;
+            }
+        }
     }
-    context.render_runtime_filters(&mut out);
-    for (display_id, fragment_id) in context.fragment_order().into_iter().enumerate() {
+    context.render_runtime_filters(&mut out)?;
+    for (display_id, fragment_id) in context.fragment_order().enumerate() {
         let Some(fragment) = plan.fragments().get(&fragment_id) else {
             continue;
         };
         if context.detailed() {
-            out.push(format!("PLAN FRAGMENT {display_id}"));
-            out.push("  OUTPUT EXPRS: *".to_string());
-            out.push(format!(
+            out.push(format_args!("PLAN FRAGMENT {display_id}"))?;
+            out.push(format_args!("  OUTPUT EXPRS: *"))?;
+            let distribution = fragment
+                .nodes()
+                .get(&fragment.root())
+                .map_or(&Distribution::Unconstrained, |node| {
+                    &node.output_properties.distribution
+                });
+            out.push(format_args!(
                 "  PARTITION: {}",
-                context.distribution_label(fragment_id, &fragment.root_output_distribution())
-            ));
-            context.render_sink(fragment, &mut out);
+                context.distribution_label(fragment_id, distribution)
+            ))?;
+            context.render_sink(fragment, &mut out)?;
         }
-        context.render_node(fragment, fragment.root(), 0, &mut out);
+        context.render_node(fragment, fragment.root(), 0, &mut out)?;
     }
-    Ok(out)
+    Ok(out.finish())
 }
 
-/// What a fragment's own rows are laid out as, read at its root.
-trait RootDistribution {
-    fn root_output_distribution(&self) -> Distribution;
+fn fragment_order(plan: &PhysicalPlan) -> impl Iterator<Item = FragmentId> + '_ {
+    let root = plan
+        .result_port()
+        .map(|port| port.fragment)
+        .or_else(|| plan.fragments().keys().next().copied());
+    root.into_iter().chain(
+        plan.fragments()
+            .keys()
+            .copied()
+            .filter(move |fragment| Some(*fragment) != root),
+    )
 }
 
-impl RootDistribution for Fragment {
-    fn root_output_distribution(&self) -> Distribution {
-        self.nodes()
-            .get(&self.root())
-            .map_or(Distribution::Unconstrained, |node| {
-                node.output_properties.distribution.clone()
-            })
+struct Text<F>(F);
+fn text<F>(render: F) -> Text<F>
+where
+    F: Fn(&mut fmt::Formatter<'_>) -> fmt::Result,
+{
+    Text(render)
+}
+impl<F> Display for Text<F>
+where
+    F: Fn(&mut fmt::Formatter<'_>) -> fmt::Result,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (self.0)(f)
     }
+}
+struct Joined<'a, T, F> {
+    items: &'a [T],
+    separator: &'static str,
+    render: F,
+}
+fn joined<'a, T, F>(items: &'a [T], separator: &'static str, render: F) -> Joined<'a, T, F>
+where
+    F: Fn(&T, &mut fmt::Formatter<'_>) -> fmt::Result,
+{
+    Joined {
+        items,
+        separator,
+        render,
+    }
+}
+impl<T, F> Display for Joined<'_, T, F>
+where
+    F: Fn(&T, &mut fmt::Formatter<'_>) -> fmt::Result,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, item) in self.items.iter().enumerate() {
+            if index != 0 {
+                f.write_str(self.separator)?;
+            }
+            (self.render)(item, f)?;
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Copy)]
+struct ValueName<'a> {
+    name: Option<&'a str>,
+    value: ValueId,
+}
+impl ValueName<'_> {
+    fn column(mut self) -> Self {
+        self.name = self
+            .name
+            .map(|name| name.rsplit_once('.').map_or(name, |(_, column)| column));
+        self
+    }
+}
+impl Display for ValueName<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.name {
+            Some(name) => f.write_str(name),
+            None => write!(f, "v{}", self.value.get()),
+        }
+    }
+}
+#[derive(Clone, Copy)]
+struct Indent(usize);
+impl Display for Indent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for _ in 0..self.0 {
+            f.write_str("  ")?;
+        }
+        Ok(())
+    }
+}
+struct Uppercase<'a>(&'a str);
+impl Display for Uppercase<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for character in self.0.chars().flat_map(char::to_uppercase) {
+            f.write_char(character)?;
+        }
+        Ok(())
+    }
+}
+
+/// Emit an expression once while comparing its emitted bytes with the alias.
+/// The bounded output owns the only formatting pass; a refused write stops
+/// comparison and expression traversal together.
+struct ProjectExpressionDisplay<'a, D> {
+    expression: D,
+    name: ValueName<'a>,
+}
+impl<D: Display> Display for ProjectExpressionDisplay<'_, D> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut fallback = [0u8; 16];
+        let expected = match self.name.name {
+            Some(name) => name,
+            None => {
+                // A value ID is u32, so its name is at most 11 ASCII bytes.
+                struct Fixed<'a> {
+                    bytes: &'a mut [u8],
+                    len: usize,
+                }
+                impl fmt::Write for Fixed<'_> {
+                    fn write_str(&mut self, value: &str) -> fmt::Result {
+                        let end = self.len + value.len();
+                        self.bytes
+                            .get_mut(self.len..end)
+                            .ok_or(fmt::Error)?
+                            .copy_from_slice(value.as_bytes());
+                        self.len = end;
+                        Ok(())
+                    }
+                }
+                let mut output = Fixed {
+                    bytes: &mut fallback,
+                    len: 0,
+                };
+                write!(&mut output, "{}", self.name)?;
+                let len = output.len;
+                std::str::from_utf8(&fallback[..len]).map_err(|_| fmt::Error)?
+            }
+        };
+        struct ComparingWrite<'a, 'b, 'c> {
+            formatter: &'a mut fmt::Formatter<'b>,
+            remaining: Option<&'c str>,
+        }
+        impl fmt::Write for ComparingWrite<'_, '_, '_> {
+            fn write_str(&mut self, value: &str) -> fmt::Result {
+                self.formatter.write_str(value)?;
+                self.remaining = self
+                    .remaining
+                    .and_then(|remaining| remaining.strip_prefix(value));
+                Ok(())
+            }
+        }
+        let equal = {
+            let mut output = ComparingWrite {
+                formatter,
+                remaining: Some(expected),
+            };
+            write!(&mut output, "{}", self.expression)?;
+            output.remaining == Some("")
+        };
+        if !equal {
+            write!(formatter, " AS {}", self.name)?;
+        }
+        Ok(())
+    }
+}
+
+const MAX_TREE_DEPTH: usize = 128;
+const SOURCE_INDEX_BYTES: usize = 4 * 1024 * 1024;
+
+fn source_refusal() -> SqlCompileError {
+    SqlCompileError::InvalidRequest(
+        "EXPLAIN tree exceeds its source workspace or depth bound".into(),
+    )
+}
+
+// One key-sorted slot per node. The traversal state also detects a back edge
+// without allocating a pending input queue or an ancestor set.
+struct DisplayNode {
+    key: (FragmentId, NodeId),
+    display: usize,
+    active: bool,
 }
 
 struct TreeContext<'a> {
     plan: &'a PhysicalPlan,
     level: ExplainLevel,
-    node_annotations: BTreeMap<(FragmentId, NodeId), Vec<&'a PlanAnnotation>>,
-    value_names: BTreeMap<(FragmentId, ValueId), &'a str>,
-    /// What a reader calls each node.
-    ///
-    /// A node's identity is unique within its fragment, which is all the plan
-    /// needs; a reader looking at every fragment at once needs a name that is
-    /// unique across them, so each node is numbered where it is met.
-    display_ids: BTreeMap<(FragmentId, NodeId), usize>,
+    // Stable sorting preserves the old first node annotation / last value
+    // annotation rules. The strings remain borrowed from the frozen plan.
+    node_annotations: Vec<&'a PlanAnnotation>,
+    value_names: Vec<&'a PlanAnnotation>,
+    display_ids: Vec<DisplayNode>,
+}
+
+fn annotation_key(annotation: &PlanAnnotation) -> (FragmentId, u32) {
+    match annotation.subject {
+        AnnotationSubject::Node(fragment, node) => (fragment, node.get()),
+        AnnotationSubject::Value(fragment, value) => (fragment, value.get()),
+        _ => unreachable!("only node/value annotations enter their indexes"),
+    }
+}
+
+fn reserve_exact<T>(count: usize) -> Result<Vec<T>, SqlCompileError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| source_refusal())?;
+    if values.capacity() != count {
+        return Err(source_refusal());
+    }
+    Ok(values)
+}
+
+fn assign_display_ids<'a>(
+    entries: &mut [DisplayNode],
+    fragment: FragmentId,
+    node: NodeId,
+    depth: usize,
+    next: &mut usize,
+    inputs: &impl Fn(NodeId) -> Option<&'a [NodeId]>,
+) -> Result<(), SqlCompileError> {
+    if depth > MAX_TREE_DEPTH {
+        return Err(source_refusal());
+    }
+    let Ok(index) = entries.binary_search_by_key(&(fragment, node), |entry| entry.key) else {
+        return Ok(());
+    };
+    if entries[index].active {
+        return Err(source_refusal());
+    }
+    if entries[index].display != usize::MAX {
+        // Preserve the original DFS numbering of a shared input: its latest
+        // encounter names it with the current next ID, without expanding it
+        // again. Cycle detection remains independent of this display rule.
+        entries[index].display = *next;
+        return Ok(());
+    }
+    entries[index].display = *next;
+    entries[index].active = true;
+    *next += 1;
+    if let Some(inputs_for_node) = inputs(node) {
+        for input in inputs_for_node {
+            assign_display_ids(entries, fragment, *input, depth + 1, next, inputs)?;
+        }
+    }
+    entries[index].active = false;
+    Ok(())
 }
 
 impl<'a> TreeContext<'a> {
-    fn new(plan: &'a PhysicalPlan, level: ExplainLevel) -> Self {
-        let mut node_annotations: BTreeMap<_, Vec<&PlanAnnotation>> = BTreeMap::new();
-        let mut value_names = BTreeMap::new();
+    fn new(plan: &'a PhysicalPlan, level: ExplainLevel) -> Result<Self, SqlCompileError> {
+        let mut node_count = 0usize;
+        for fragment in plan.fragments().values() {
+            node_count = node_count
+                .checked_add(fragment.nodes().len())
+                .ok_or_else(source_refusal)?;
+        }
+        let mut nodes = 0usize;
+        let mut values = 0usize;
         for annotation in plan.annotations() {
             match annotation.subject {
-                AnnotationSubject::Node(fragment, node) => {
-                    node_annotations
-                        .entry((fragment, node))
-                        .or_default()
-                        .push(annotation);
-                }
-                AnnotationSubject::Value(fragment, value)
-                    if annotation.key.as_ref() == "sql.display_name" =>
-                {
-                    value_names.insert((fragment, value), annotation.value.as_ref());
+                AnnotationSubject::Node(..) => nodes += 1,
+                AnnotationSubject::Value(..) if annotation.key.as_ref() == "sql.display_name" => {
+                    values += 1
                 }
                 _ => {}
+            }
+        }
+        // Two reference capacities include stable-sort scratch. All indexing
+        // is admitted before allocating. Together with the output collector's
+        // <=16 MiB payload/copy peak, <=3 MiB old/new line headers and <=4 MiB
+        // per-line allocation allowance, this 4 MiB index leaves the 32 MiB
+        // source workspace room for fixed depth stacks and formatter adapters.
+        let bytes = nodes
+            .checked_add(values)
+            .and_then(|n| n.checked_mul(2 * size_of::<&PlanAnnotation>()))
+            .and_then(|n| {
+                node_count
+                    .checked_mul(size_of::<DisplayNode>())
+                    .and_then(|m| n.checked_add(m))
+            })
+            .ok_or_else(source_refusal)?;
+        if bytes > SOURCE_INDEX_BYTES || node_count > 65_536 {
+            return Err(source_refusal());
+        }
+        let mut node_annotations = reserve_exact(nodes)?;
+        let mut value_names = reserve_exact(values)?;
+        for annotation in plan.annotations() {
+            match annotation.subject {
+                AnnotationSubject::Node(..) => node_annotations.push(annotation),
+                AnnotationSubject::Value(..) if annotation.key.as_ref() == "sql.display_name" => {
+                    value_names.push(annotation)
+                }
+                _ => {}
+            }
+        }
+        node_annotations.sort_by_key(|annotation| annotation_key(annotation));
+        value_names.sort_by_key(|annotation| annotation_key(annotation));
+        let mut display_ids = reserve_exact(node_count)?;
+        for (fragment, definition) in plan.fragments() {
+            for node in definition.nodes().keys() {
+                display_ids.push(DisplayNode {
+                    key: (*fragment, *node),
+                    display: usize::MAX,
+                    active: false,
+                });
             }
         }
         let mut context = Self {
@@ -128,36 +402,33 @@ impl<'a> TreeContext<'a> {
             level,
             node_annotations,
             value_names,
-            display_ids: BTreeMap::new(),
+            display_ids,
         };
-        let mut next = 0_usize;
-        for fragment_id in context.fragment_order() {
-            let Some(fragment) = plan.fragments().get(&fragment_id) else {
-                continue;
-            };
-            let mut pending = vec![fragment.root()];
-            while let Some(node_id) = pending.pop() {
-                if context
-                    .display_ids
-                    .insert((fragment_id, node_id), next)
-                    .is_some()
-                {
-                    continue;
-                }
-                next = next.saturating_add(1);
-                if let Some(node) = fragment.nodes().get(&node_id) {
-                    pending.extend(node.inputs.iter().rev().copied());
-                }
+        let mut next = 0;
+        // Iterate the borrowed plan so the context remains mutable while IDs
+        // are assigned. No fragment-order Vec or distribution clone exists.
+        for fragment_id in fragment_order(plan) {
+            if let Some(fragment) = plan.fragments().get(&fragment_id) {
+                assign_display_ids(
+                    &mut context.display_ids,
+                    fragment.id(),
+                    fragment.root(),
+                    0,
+                    &mut next,
+                    &|node| fragment.nodes().get(&node).map(|node| node.inputs.as_ref()),
+                )?;
             }
         }
-        context
+        Ok(context)
     }
 
     fn display_id(&self, fragment: FragmentId, node: NodeId) -> usize {
         self.display_ids
-            .get(&(fragment, node))
-            .copied()
-            .unwrap_or_else(|| node.get() as usize)
+            .binary_search_by_key(&(fragment, node), |entry| entry.key)
+            .ok()
+            .map(|index| self.display_ids[index].display)
+            .filter(|id| *id != usize::MAX)
+            .unwrap_or(node.get() as usize)
     }
 
     const fn detailed(&self) -> bool {
@@ -179,39 +450,31 @@ impl<'a> TreeContext<'a> {
     ///
     /// A reader follows the plan from what it answers back to what it reads,
     /// and the numbering is the reader's, not the plan's.
-    fn fragment_order(&self) -> Vec<FragmentId> {
-        let root = self
-            .plan
-            .result_port()
-            .map_or_else(
-                || self.plan.fragments().keys().next().copied(),
-                |port| Some(port.fragment),
-            )
-            .unwrap_or(FragmentId::new(0));
-        let mut order = vec![root];
-        order.extend(
-            self.plan
-                .fragments()
-                .keys()
-                .copied()
-                .filter(|fragment| *fragment != root),
-        );
-        order
+    fn fragment_order(&self) -> impl Iterator<Item = FragmentId> + '_ {
+        fragment_order(self.plan)
     }
 
     fn node_annotation(&self, fragment: FragmentId, node: NodeId, key: &str) -> Option<&'a str> {
-        self.node_annotations
-            .get(&(fragment, node))?
+        let index = self
+            .node_annotations
+            .partition_point(|a| annotation_key(a) < (fragment, node.get()));
+        self.node_annotations[index..]
             .iter()
-            .find(|annotation| annotation.key.as_ref() == key)
-            .map(|annotation| annotation.value.as_ref())
+            .take_while(|a| annotation_key(a) == (fragment, node.get()))
+            .find(|a| a.key.as_ref() == key)
+            .map(|a| a.value.as_ref())
     }
 
-    /// What a value is called, which is what the statement called it.
-    fn value_name(&self, fragment: FragmentId, value: ValueId) -> String {
-        self.value_names
-            .get(&(fragment, value))
-            .map_or_else(|| format!("v{}", value.get()), ToString::to_string)
+    fn value_name(&self, fragment: FragmentId, value: ValueId) -> ValueName<'a> {
+        let end = self
+            .value_names
+            .partition_point(|a| annotation_key(a) <= (fragment, value.get()));
+        let name = end
+            .checked_sub(1)
+            .and_then(|index| self.value_names.get(index))
+            .filter(|a| annotation_key(a) == (fragment, value.get()))
+            .map(|a| a.value.as_ref());
+        ValueName { name, value }
     }
 
     /// The filters one side of a join builds for another side to read.
@@ -220,25 +483,25 @@ impl<'a> TreeContext<'a> {
     /// where each end of it sits. Both ends name the expression they are
     /// bound to, because that is what makes a filter checkable against the
     /// join it came from.
-    fn render_runtime_filters(&self, out: &mut Vec<String>) {
+    fn render_runtime_filters(&self, out: &mut ExplainRenderOutput) -> Result<(), SqlCompileError> {
         use novarocks_physical_plan::RuntimeFilterDomain;
 
         if !self.detailed() || self.plan.runtime_filters().is_empty() {
-            return;
+            return Ok(());
         }
-        out.push("RUNTIME FILTER GRAPH".to_string());
+        out.push(format_args!("RUNTIME FILTER GRAPH"))?;
         for filter in self.plan.runtime_filters().values() {
             match &filter.domain {
                 RuntimeFilterDomain::Membership { .. } => {
-                    out.push(format!("  runtime filter channel {}", filter.id.get()));
+                    out.push(format_args!("  runtime filter channel {}", filter.id.get()))?;
                 }
                 RuntimeFilterDomain::Ordered {
                     key,
                     inclusive,
                     comparator: _,
                 } => {
-                    out.push("  runtime filter".to_string());
-                    out.push(format!(
+                    out.push(format_args!("  runtime filter"))?;
+                    out.push(format_args!(
                         "    domain = OrderedBound(key={} {} NULLS {}, inclusive={inclusive})",
                         key.ty.data_type,
                         match key.direction {
@@ -249,52 +512,57 @@ impl<'a> TreeContext<'a> {
                             novarocks_physical_plan::NullOrdering::First => "FIRST",
                             novarocks_physical_plan::NullOrdering::Last => "LAST",
                         }
-                    ));
+                    ))?;
                 }
             }
             for producer in filter.producers.iter() {
-                out.push(format!(
+                out.push(format_args!(
                     "    producer binding {}, fragment = {}, node = {}, expr = ({})",
                     filter.id.get(),
                     producer.endpoint.fragment.get(),
                     self.display_id(producer.endpoint.fragment, producer.endpoint.node),
                     self.endpoint_text(&producer.endpoint)
-                ));
+                ))?;
             }
             for consumer in filter.consumers.iter() {
-                out.push(format!(
+                out.push(format_args!(
                     "    consumer binding {}, fragment = {}, node = {}, expr = ({}), activation = {}",
                     filter.id.get(),
                     consumer.endpoint.fragment.get(),
                     self.display_id(consumer.endpoint.fragment, consumer.endpoint.node),
                     self.endpoint_text(&consumer.endpoint),
                     activation_text(&consumer.activation)
-                ));
+                ))?;
             }
         }
+        Ok(())
     }
 
-    /// The values one end of a filter is bound to.
-    fn endpoint_text(&self, endpoint: &novarocks_physical_plan::RuntimeFilterEndpoint) -> String {
-        endpoint
-            .values
-            .iter()
-            .map(|value| self.value_name(endpoint.fragment, *value))
-            .collect::<Vec<_>>()
-            .join(", ")
+    /// The values one end of a filter is bound to, streamed into its line.
+    fn endpoint_text<'b>(
+        &'b self,
+        endpoint: &'b novarocks_physical_plan::RuntimeFilterEndpoint,
+    ) -> impl Display + 'b {
+        joined(&endpoint.values, ", ", move |value, f| {
+            self.value_name(endpoint.fragment, *value).fmt(f)
+        })
     }
 
-    fn render_sink(&self, fragment: &Fragment, out: &mut Vec<String>) {
+    fn render_sink(
+        &self,
+        fragment: &Fragment,
+        out: &mut ExplainRenderOutput,
+    ) -> Result<(), SqlCompileError> {
         match fragment.sink() {
-            FragmentSink::Stream { edge } => self.render_edge_sink(*edge, out),
+            FragmentSink::Stream { edge } => self.render_edge_sink(*edge, out)?,
             FragmentSink::Multicast { edges } => {
                 for edge in edges.iter() {
-                    self.render_edge_sink(*edge, out);
+                    self.render_edge_sink(*edge, out)?;
                 }
             }
             FragmentSink::Router { routes, .. } => {
                 for route in routes.iter() {
-                    self.render_edge_sink(route.edge, out);
+                    self.render_edge_sink(route.edge, out)?;
                 }
             }
             FragmentSink::Result
@@ -302,86 +570,100 @@ impl<'a> TreeContext<'a> {
             | FragmentSink::SealedArtifact(_)
             | FragmentSink::Noop => {}
         }
+        Ok(())
     }
 
-    fn render_edge_sink(&self, edge: novarocks_physical_plan::EdgeId, out: &mut Vec<String>) {
+    fn render_edge_sink(
+        &self,
+        edge: novarocks_physical_plan::EdgeId,
+        out: &mut ExplainRenderOutput,
+    ) -> Result<(), SqlCompileError> {
         let Some(edge) = self.plan.edges().get(&edge) else {
-            return;
+            return Ok(());
         };
-        out.push("  STREAM DATA SINK".to_string());
-        out.push(format!(
+        out.push(format_args!("  STREAM DATA SINK"))?;
+        out.push(format_args!(
             "    EXCHANGE ID: {}",
             self.display_id(edge.destination.fragment, edge.destination.node)
-        ));
-        out.push(format!(
+        ))?;
+        out.push(format_args!(
             "    PARTITION: {}",
             self.distribution_label(edge.destination.fragment, &edge.partitioning.destination)
-        ));
+        ))?;
+        Ok(())
     }
 
-    /// One node and everything under it.
-    ///
-    /// Recursion is bounded by the tree-depth the contract already validates,
-    /// so the traversal reads the way the output does.
+    /// Input recursion has a fixed bound, checked before any indentation or
+    /// node output. The ID prepass refuses cycles before publication starts.
     fn render_node(
         &self,
         fragment: &Fragment,
         node_id: NodeId,
         indent: usize,
-        out: &mut Vec<String>,
-    ) {
-        let pad = "  ".repeat(indent);
+        out: &mut ExplainRenderOutput,
+    ) -> Result<(), SqlCompileError> {
+        if indent > MAX_TREE_DEPTH {
+            return Err(source_refusal());
+        }
+        out.ensure_prefix_fits(indent * 2)?;
+        let pad = Indent(indent);
         let Some(node) = fragment.nodes().get(&node_id) else {
-            out.push(format!("{pad}{}:UNKNOWN", node_id.get()));
-            return;
+            return out.push(format_args!("{pad}{}:UNKNOWN", node_id.get()));
         };
-        self.render_node_lines(fragment, node, &pad, out);
-        for input in node.inputs.iter() {
-            self.render_node(fragment, *input, indent.saturating_add(1), out);
+        self.render_node_lines(fragment, node, pad, out)?;
+        for input in &node.inputs {
+            self.render_node(fragment, *input, indent + 1, out)?;
         }
+        Ok(())
     }
 
-    fn stats_suffix(&self, fragment: FragmentId, node: NodeId) -> String {
-        if !self.detailed() {
-            return String::new();
-        }
-        let Some(statistics) = self.node_annotation(fragment, node, "optimizer.statistics") else {
-            return String::new();
-        };
-        let mut rows = "?".to_string();
-        let mut confidence = String::new();
-        for field in statistics.split(", ") {
-            if let Some(value) = field.strip_prefix("rows=") {
-                rows = row_count_text(value);
-            } else if let Some(value) = field.strip_prefix("conf=")
-                && self.costs()
-            {
-                confidence = format!(" conf={value}");
+    fn stats_suffix(&self, fragment: FragmentId, node: NodeId) -> impl Display + '_ {
+        let statistics = self
+            .detailed()
+            .then(|| self.node_annotation(fragment, node, "optimizer.statistics"))
+            .flatten();
+        text(move |f| {
+            let Some(statistics) = statistics else {
+                return Ok(());
+            };
+            let mut rows = "?";
+            let mut confidence = None;
+            for field in statistics.split(", ") {
+                if let Some(value) = field.strip_prefix("rows=") {
+                    rows = value;
+                } else if let Some(value) = field.strip_prefix("conf=")
+                    && self.costs()
+                {
+                    confidence = Some(value);
+                }
             }
-        }
-        format!(" stats={{rows={rows}{confidence}}}")
+            write!(f, " stats={{rows={}", RowCount(rows))?;
+            if let Some(confidence) = confidence {
+                write!(f, " conf={confidence}")?;
+            }
+            f.write_str("}")
+        })
     }
 
-    /// What the cost model decided about broadcasting this join.
-    ///
-    /// The verdict is the part a reader acts on, so it shows from Verbose; the
-    /// numbers behind it belong with the other costs.
-    fn broadcast_suffix(&self, fragment: FragmentId, node: NodeId) -> String {
-        if !self.detailed() {
-            return String::new();
-        }
-        let Some(decision) = self.node_annotation(fragment, node, "optimizer.broadcast") else {
-            return String::new();
-        };
-        let verdict = decision
-            .split(", ")
-            .find_map(|field| field.strip_prefix("verdict="))
-            .unwrap_or("unknown");
-        let mut suffix = format!(" bcast_verdict={verdict}");
-        if self.costs() {
-            let _ = write!(suffix, " bcast[{decision}]");
-        }
-        suffix
+    fn broadcast_suffix(&self, fragment: FragmentId, node: NodeId) -> impl Display + '_ {
+        let decision = self
+            .detailed()
+            .then(|| self.node_annotation(fragment, node, "optimizer.broadcast"))
+            .flatten();
+        text(move |f| {
+            let Some(decision) = decision else {
+                return Ok(());
+            };
+            let verdict = decision
+                .split(", ")
+                .find_map(|field| field.strip_prefix("verdict="))
+                .unwrap_or("unknown");
+            write!(f, " bcast_verdict={verdict}")?;
+            if self.costs() {
+                write!(f, " bcast[{decision}]")?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -390,19 +672,15 @@ impl<'a> TreeContext<'a> {
 /// The estimate is arithmetic over fractions and arrives as one; a reader
 /// counts rows. An estimate of none and an estimate too large to mean
 /// anything both say so rather than printing a number.
-fn row_count_text(value: &str) -> String {
-    /// Above this the estimate has stopped being a number a reader can use.
-    const UNBOUNDED: f64 = 1e15;
-
-    let Ok(rows) = value.parse::<f64>() else {
-        return value.to_string();
-    };
-    if rows.is_nan() || rows <= 0.0 {
-        "?".to_string()
-    } else if rows.is_infinite() || rows >= UNBOUNDED {
-        ">=1e15".to_string()
-    } else {
-        format!("{}", rows.round() as i64)
+struct RowCount<'a>(&'a str);
+impl Display for RowCount<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0.parse::<f64>() {
+            Err(_) => f.write_str(self.0),
+            Ok(rows) if rows.is_nan() || rows <= 0.0 => f.write_str("?"),
+            Ok(rows) if rows.is_infinite() || rows >= 1e15 => f.write_str(">=1e15"),
+            Ok(rows) => write!(f, "{}", rows.round() as i64),
+        }
     }
 }
 
@@ -466,25 +744,28 @@ fn relation_table(relation: &str) -> &str {
 }
 
 impl TreeContext<'_> {
-    /// How a layout places its rows, and what it places them by.
-    fn distribution_label(&self, fragment: FragmentId, distribution: &Distribution) -> String {
-        let keys = |keys: &[ValueId]| {
-            keys.iter()
-                .map(|value| self.value_name(fragment, *value))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        match distribution {
-            Distribution::Singleton | Distribution::Unconstrained => "UNPARTITIONED".to_string(),
-            Distribution::RoundRobin => "RANDOM".to_string(),
-            Distribution::Broadcast => "BROADCAST".to_string(),
-            Distribution::Hash { keys: values, .. } => {
-                format!("HASH_PARTITIONED ({})", keys(values))
+    fn distribution_label<'b>(
+        &'b self,
+        fragment: FragmentId,
+        distribution: &'b Distribution,
+    ) -> impl Display + 'b {
+        text(move |f| match distribution {
+            Distribution::Singleton | Distribution::Unconstrained => f.write_str("UNPARTITIONED"),
+            Distribution::RoundRobin => f.write_str("RANDOM"),
+            Distribution::Broadcast => f.write_str("BROADCAST"),
+            Distribution::Hash { keys, .. } | Distribution::BucketShuffle { keys, .. } => {
+                f.write_str(if matches!(distribution, Distribution::Hash { .. }) {
+                    "HASH_PARTITIONED ("
+                } else {
+                    "BUCKET_SHUFFLE_HASH_PARTITIONED ("
+                })?;
+                joined(keys, ", ", |value, f| {
+                    self.value_name(fragment, *value).fmt(f)
+                })
+                .fmt(f)?;
+                f.write_str(")")
             }
-            Distribution::BucketShuffle { keys: values, .. } => {
-                format!("BUCKET_SHUFFLE_HASH_PARTITIONED ({})", keys(values))
-            }
-        }
+        })
     }
 }
 
@@ -506,11 +787,10 @@ impl std::fmt::Display for ExprText<'_> {
 }
 
 impl ExprText<'_> {
-    /// How deep an expression may be written out before it is elided.
+    /// Maximum expression depth; malformed input is refused, never elided.
     ///
-    /// The contract bounds an expression's depth, and this bound is above it;
-    /// it exists so a malformed plan cannot turn rendering into recursion
-    /// without end.
+    /// This is the renderer's own source boundary. A completed plan's broader
+    /// validation limits do not authorize unbounded formatting recursion.
     const MAX_DEPTH: usize = 64;
 
     fn nested(&self, expr: ExprId) -> Self {
@@ -528,7 +808,7 @@ impl ExprText<'_> {
         depth: usize,
     ) -> std::fmt::Result {
         if depth > Self::MAX_DEPTH {
-            return formatter.write_str("...");
+            return Err(fmt::Error);
         }
         let Some(node) = self.fragment.expressions().get(expr) else {
             return write!(formatter, "e{}", expr.get());
@@ -538,9 +818,10 @@ impl ExprText<'_> {
             depth: depth.saturating_add(1),
         };
         match &node.kind {
-            ExprKind::Value(value) => {
-                formatter.write_str(&self.context.value_name(self.fragment.id(), *value))
-            }
+            ExprKind::Value(value) => self
+                .context
+                .value_name(self.fragment.id(), *value)
+                .fmt(formatter),
             ExprKind::Literal(value) => write!(formatter, "{}", literal_text(value)),
             ExprKind::LambdaParameter { ordinal, .. } => write!(formatter, "arg{ordinal}"),
             ExprKind::Lambda { body, .. } => write!(formatter, "-> {}", inner(*body)),
@@ -772,42 +1053,60 @@ impl std::fmt::Display for LiteralText<'_> {
     }
 }
 
-/// One sort key, with the direction and null placement it establishes.
-fn sort_item_text(context: &TreeContext<'_>, fragment: &Fragment, item: &SortExpr) -> String {
-    format!(
-        "{} {} NULLS {}",
-        ExprText {
-            context,
-            fragment,
-            expr: item.expr,
-        },
-        match item.direction {
-            novarocks_physical_plan::SortDirection::Ascending => "ASC",
-            novarocks_physical_plan::SortDirection::Descending => "DESC",
-        },
-        match item.null_ordering {
-            novarocks_physical_plan::NullOrdering::First => "FIRST",
-            novarocks_physical_plan::NullOrdering::Last => "LAST",
-        }
-    )
+fn sort_items_text<'a>(
+    context: &'a TreeContext<'a>,
+    fragment: &'a Fragment,
+    items: &'a [SortExpr],
+) -> impl Display + 'a {
+    sort_items_pair(context, fragment, items, &[])
 }
-
-fn sort_items_text(context: &TreeContext<'_>, fragment: &Fragment, items: &[SortExpr]) -> String {
-    items
-        .iter()
-        .map(|item| sort_item_text(context, fragment, item))
-        .collect::<Vec<_>>()
-        .join(", ")
+fn sort_items_pair<'a>(
+    context: &'a TreeContext<'a>,
+    fragment: &'a Fragment,
+    first: &'a [SortExpr],
+    second: &'a [SortExpr],
+) -> impl Display + 'a {
+    text(move |f| {
+        for (index, item) in first.iter().chain(second).enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            write!(
+                f,
+                "{} {} NULLS {}",
+                context.expr(fragment, item.expr),
+                match item.direction {
+                    novarocks_physical_plan::SortDirection::Ascending => "ASC",
+                    novarocks_physical_plan::SortDirection::Descending => "DESC",
+                },
+                match item.null_ordering {
+                    novarocks_physical_plan::NullOrdering::First => "FIRST",
+                    novarocks_physical_plan::NullOrdering::Last => "LAST",
+                }
+            )?;
+        }
+        Ok(())
+    })
 }
 
 impl TreeContext<'_> {
-    fn expr(&self, fragment: &Fragment, expr: ExprId) -> String {
+    fn expr<'a>(&'a self, fragment: &'a Fragment, expr: ExprId) -> ExprText<'a> {
         ExprText {
             context: self,
             fragment,
             expr,
         }
-        .to_string()
+    }
+
+    fn expressions<'a>(
+        &'a self,
+        fragment: &'a Fragment,
+        expressions: &'a [ExprId],
+        separator: &'static str,
+    ) -> impl Display + 'a {
+        joined(expressions, separator, move |expr, f| {
+            self.expr(fragment, *expr).fmt(f)
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -815,12 +1114,12 @@ impl TreeContext<'_> {
         &self,
         fragment: &Fragment,
         node: &PhysicalNode,
-        pad: &str,
-        out: &mut Vec<String>,
-    ) {
+        pad: Indent,
+        out: &mut ExplainRenderOutput,
+    ) -> Result<(), SqlCompileError> {
         use novarocks_physical_plan::NodeKind;
 
-        let prefix = format!("{pad}{}:", self.display_id(fragment.id(), node.id));
+        let prefix = text(|f| write!(f, "{pad}{}:", self.display_id(fragment.id(), node.id)));
         let stats = self.stats_suffix(fragment.id(), node.id);
         match &node.kind {
             NodeKind::Scan {
@@ -832,140 +1131,105 @@ impl TreeContext<'_> {
                 let relation = self
                     .node_annotation(fragment.id(), node.id, "sql.relation")
                     .unwrap_or("relation");
-                out.push(format!("{prefix}SCAN {relation}{stats}"));
-                out.push(format!("{pad}     TABLE: {}", relation_table(relation)));
+                out.push(format_args!("{prefix}SCAN {relation}{stats}"))?;
+                out.push(format_args!(
+                    "{pad}     TABLE: {}",
+                    relation_table(relation)
+                ))?;
                 if let Some(mv) =
                     self.node_annotation(fragment.id(), node.id, "sql.mv_rewritten_from")
                 {
-                    out.push(format!("{pad}     rewritten with mv: {mv}"));
+                    out.push(format_args!("{pad}     rewritten with mv: {mv}"))?;
                 }
                 if let Some(provenance) =
                     self.node_annotation(fragment.id(), node.id, "sql.mv_rewrite_provenance")
                 {
-                    out.push(format!("{pad}     mv rewrite provenance: {provenance}"));
+                    out.push(format_args!(
+                        "{pad}     mv rewrite provenance: {provenance}"
+                    ))?;
                 }
-                if self.detailed() {
-                    // The relation's own columns, by the relation's own names:
-                    // which of them this scan reads is the question here, and
-                    // the name the statement reaches them by is not part of it.
-                    let columns = node
-                        .output
-                        .columns
-                        .iter()
-                        .map(|value| {
-                            let name = self.value_name(fragment.id(), *value);
-                            name.rsplit_once('.')
-                                .map_or(name.clone(), |(_, column)| column.to_string())
-                        })
-                        .collect::<Vec<_>>();
-                    if !columns.is_empty() {
-                        out.push(format!("{pad}     columns: {}", columns.join(", ")));
-                    }
+                if self.detailed() && !node.output.columns.is_empty() {
+                    let columns = joined(&node.output.columns, ", ", |value, f| {
+                        self.value_name(fragment.id(), *value).column().fmt(f)
+                    });
+                    out.push(format_args!("{pad}     columns: {columns}"))?;
                 }
-                // A column the scan derives while it reads, and the call it
-                // derives it with: the reader applies that call to the bytes
-                // it is already reading rather than to a column handed on.
                 if self.detailed() && !derived_values.is_empty() {
-                    let derived = derived_values
-                        .iter()
-                        .map(|value| {
-                            let name = self.value_name(fragment.id(), *value);
-                            match fragment.values().get(value).map(|def| &def.origin) {
-                                Some(novarocks_physical_plan::ValueOrigin::Expr {
-                                    expr, ..
-                                }) => {
-                                    format!("{name} := {}", self.expr(fragment, *expr))
-                                }
-                                _ => name,
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    out.push(format!("{pad}     variant columns: {}", derived.join(", ")));
+                    let derived = joined(derived_values, ", ", |value, f| {
+                        self.value_name(fragment.id(), *value).fmt(f)?;
+                        if let Some(novarocks_physical_plan::ValueOrigin::Expr { expr, .. }) =
+                            fragment.values().get(value).map(|def| &def.origin)
+                        {
+                            write!(f, " := {}", self.expr(fragment, *expr))?;
+                        }
+                        Ok(())
+                    });
+                    out.push(format_args!("{pad}     variant columns: {derived}"))?;
                 }
                 // Whether this scan's shape admits min/max pruning at all:
                 // it reads data rather than metadata, and every column it
                 // projects is one a reader can state bounds for. It says
                 // nothing about whether bounds have been collected.
                 if self.verbose() && scan_admits_min_max_stats(fragment, frozen, node) {
-                    out.push(format!("{pad}     min-max stats"));
+                    out.push(format_args!("{pad}     min-max stats"))?;
                 }
                 if !residuals.is_empty() {
-                    let predicates = residuals
-                        .iter()
-                        .map(|expression| self.expr(fragment, *expression))
-                        .collect::<Vec<_>>();
-                    out.push(format!(
+                    out.push(format_args!(
                         "{pad}     predicates: {}",
-                        predicates.join(" AND ")
-                    ));
+                        self.expressions(fragment, residuals, " AND ")
+                    ))?;
                 }
             }
             NodeKind::Filter { predicates } => {
-                out.push(format!("{prefix}FILTER{stats}"));
-                let text = predicates
-                    .iter()
-                    .map(|expression| self.expr(fragment, *expression))
-                    .collect::<Vec<_>>();
-                out.push(format!("{pad}  predicate: {}", text.join(" AND ")));
+                out.push(format_args!("{prefix}FILTER{stats}"))?;
+                out.push(format_args!(
+                    "{pad}  predicate: {}",
+                    self.expressions(fragment, predicates, " AND ")
+                ))?;
             }
             NodeKind::Project { expressions } => {
-                let items = expressions
-                    .iter()
-                    .map(|(expression, value)| {
-                        let text = self.expr(fragment, *expression);
-                        let name = self.value_name(fragment.id(), *value);
-                        if text == name {
-                            name
-                        } else {
-                            format!("{text} AS {name}")
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                out.push(format!("{prefix}PROJECT [{}]{stats}", items.join(", ")));
+                let items = joined(expressions, ", ", |(expression, value), f| {
+                    let expression = self.expr(fragment, *expression);
+                    let name = self.value_name(fragment.id(), *value);
+                    ProjectExpressionDisplay { expression, name }.fmt(f)
+                });
+                out.push(format_args!("{prefix}PROJECT [{items}]{stats}"))?;
             }
             NodeKind::Aggregate {
                 group_by,
                 calls,
                 grouping,
             } => {
-                let mut header = format!(
-                    "{prefix}HASH AGGREGATE ({}",
+                let groups = text(|f| {
+                    if !group_by.is_empty() {
+                        write!(
+                            f,
+                            ", group by: [{}]",
+                            joined(group_by, ", ", |(expression, _), f| self
+                                .expr(fragment, *expression)
+                                .fmt(f))
+                        )?;
+                    }
+                    Ok(())
+                });
+                out.push(format_args!(
+                    "{prefix}HASH AGGREGATE ({}{groups}){stats}",
                     aggregate_mode(calls, *grouping)
-                );
-                if !group_by.is_empty() {
-                    let keys = group_by
-                        .iter()
-                        .map(|(expression, _)| self.expr(fragment, *expression))
-                        .collect::<Vec<_>>();
-                    let _ = write!(header, ", group by: [{}]", keys.join(", "));
-                }
-                let _ = write!(header, "){stats}");
-                out.push(header);
+                ))?;
                 if !calls.is_empty() {
-                    let aggregates = calls
-                        .iter()
-                        .map(|call| -> String {
-                            // A phase that merges reads the state the phase
-                            // below it produced, and that state is already
-                            // named after the call it belongs to. Printing the
-                            // call around it would say the call twice.
-                            if !call.binding.phase.consumes_logical_arguments() {
-                                return self.value_name(fragment.id(), call.output);
-                            }
-                            let args = call
-                                .arguments
-                                .iter()
-                                .map(|argument| self.expr(fragment, *argument))
-                                .collect::<Vec<_>>();
-                            format!(
-                                "{}({}{})",
-                                function_text(&call.binding.function.function_id),
-                                if call.distinct { "DISTINCT " } else { "" },
-                                args.join(", ")
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    out.push(format!("{pad}  aggregations: {}", aggregates.join(", ")));
+                    let aggregates = joined(calls, ", ", |call, f| {
+                        if !call.binding.phase.consumes_logical_arguments() {
+                            return self.value_name(fragment.id(), call.output).fmt(f);
+                        }
+                        write!(
+                            f,
+                            "{}({}{})",
+                            function_text(&call.binding.function.function_id),
+                            if call.distinct { "DISTINCT " } else { "" },
+                            self.expressions(fragment, &call.arguments, ", ")
+                        )
+                    });
+                    out.push(format_args!("{pad}  aggregations: {aggregates}"))?;
                 }
             }
             NodeKind::HashJoin {
@@ -975,60 +1239,68 @@ impl TreeContext<'_> {
                 residual,
                 ..
             } => {
-                let equalities = keys
-                    .iter()
-                    .map(|key| {
-                        format!(
-                            "{} {} {}",
-                            self.expr(fragment, key.left),
-                            if key.null_safe { "<=>" } else { "=" },
-                            self.expr(fragment, key.right)
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                out.push(format!(
+                let equalities = joined(keys, ", ", |key, f| {
+                    write!(
+                        f,
+                        "{} {} {}",
+                        self.expr(fragment, key.left),
+                        if key.null_safe { "<=>" } else { "=" },
+                        self.expr(fragment, key.right)
+                    )
+                });
+                out.push(format_args!(
                     "{prefix}HASH JOIN ({}, {}, eq: [{}]){}{stats}",
                     join_distribution_text(*distribution),
                     join_kind_text(*kind),
-                    equalities.join(", "),
+                    equalities,
                     self.broadcast_suffix(fragment.id(), node.id)
-                ));
+                ))?;
                 if let Some(residual) = residual {
-                    out.push(format!("{pad}  other: {}", self.expr(fragment, *residual)));
+                    out.push(format_args!(
+                        "{pad}  other: {}",
+                        self.expr(fragment, *residual)
+                    ))?;
                 }
             }
             NodeKind::NestLoopJoin {
                 kind, predicate, ..
             } => {
-                out.push(format!(
+                out.push(format_args!(
                     "{prefix}NEST LOOP JOIN ({}){stats}",
                     join_kind_text(*kind)
-                ));
+                ))?;
                 if let Some(predicate) = predicate {
-                    out.push(format!("{pad}  on: {}", self.expr(fragment, *predicate)));
+                    out.push(format_args!(
+                        "{pad}  on: {}",
+                        self.expr(fragment, *predicate)
+                    ))?;
                 }
             }
             NodeKind::Sort { order_by, mode } => {
-                let mut keys = match mode {
-                    novarocks_physical_plan::SortMode::Global => Vec::new(),
+                let partitions = match mode {
+                    novarocks_physical_plan::SortMode::Global => &[][..],
                     novarocks_physical_plan::SortMode::Analytic { partition_by }
                     | novarocks_physical_plan::SortMode::PartitionTopN { partition_by, .. } => {
-                        partition_by.to_vec()
+                        partition_by.as_ref()
                     }
                 };
-                keys.extend(order_by.iter().cloned());
-                let mut suffix = String::new();
-                if let novarocks_physical_plan::SortMode::PartitionTopN { limit, kind, .. } = mode {
-                    let _ = write!(
-                        suffix,
-                        " partition_limit={limit} topn_type={}",
-                        partition_topn_text(*kind)
-                    );
-                }
-                out.push(format!(
+                let suffix = text(|f| {
+                    if let novarocks_physical_plan::SortMode::PartitionTopN {
+                        limit, kind, ..
+                    } = mode
+                    {
+                        write!(
+                            f,
+                            " partition_limit={limit} topn_type={}",
+                            partition_topn_text(*kind)
+                        )?;
+                    }
+                    Ok(())
+                });
+                out.push(format_args!(
                     "{prefix}SORT BY [{}]{suffix}{stats}",
-                    sort_items_text(self, fragment, &keys)
-                ));
+                    sort_items_pair(self, fragment, partitions, order_by)
+                ))?;
             }
             NodeKind::TopN {
                 order_by,
@@ -1042,98 +1314,99 @@ impl TreeContext<'_> {
                 };
                 // Both bounds, always: a top-N that skips nothing says so
                 // rather than leaving a reader to infer it.
-                let parts = [format!("limit={limit}"), format!("offset={offset}")];
-                out.push(format!(
-                    "{prefix}{label} ({}) [{}]{stats}",
-                    parts.join(", "),
+                out.push(format_args!(
+                    "{prefix}{label} (limit={limit}, offset={offset}) [{}]{stats}",
                     sort_items_text(self, fragment, order_by)
-                ));
+                ))?;
             }
             NodeKind::Limit { limit, offset } => {
-                let mut parts = Vec::new();
-                if let Some(limit) = limit {
-                    parts.push(format!("limit={limit}"));
-                }
-                if *offset > 0 {
-                    parts.push(format!("offset={offset}"));
-                }
-                out.push(format!("{prefix}LIMIT ({}){stats}", parts.join(", ")));
+                let parts = text(|f| {
+                    if let Some(limit) = limit {
+                        write!(f, "limit={limit}")?;
+                    }
+                    if *offset > 0 {
+                        if limit.is_some() {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "offset={offset}")?;
+                    }
+                    Ok(())
+                });
+                out.push(format_args!("{prefix}LIMIT ({parts}){stats}"))?;
             }
             NodeKind::Window(spec) => {
-                let functions = spec
-                    .expressions
-                    .iter()
-                    .map(|expression| self.expr(fragment, expression.expression))
-                    .collect::<Vec<_>>();
-                out.push(format!("{prefix}WINDOW [{}]{stats}", functions.join("; ")));
+                let functions = joined(&spec.expressions, "; ", |expression, f| {
+                    self.expr(fragment, expression.expression).fmt(f)
+                });
+                out.push(format_args!("{prefix}WINDOW [{functions}]{stats}"))?;
                 if self.detailed() && !spec.partition_by.is_empty() {
-                    out.push(format!(
+                    out.push(format_args!(
                         "{pad}  partition by: [{}]",
                         sort_items_text(self, fragment, &spec.partition_by)
-                    ));
+                    ))?;
                 }
                 if self.detailed() && !spec.order_by.is_empty() {
-                    out.push(format!(
+                    out.push(format_args!(
                         "{pad}  order by: [{}]",
                         sort_items_text(self, fragment, &spec.order_by)
-                    ));
+                    ))?;
                 }
             }
             NodeKind::SetOp { kind, .. } => {
-                out.push(format!(
+                out.push(format_args!(
                     "{prefix}{}{stats}",
                     match kind {
                         novarocks_physical_plan::SetOperationKind::UnionAll => "UNION ALL",
                         novarocks_physical_plan::SetOperationKind::Intersect => "INTERSECT",
                         novarocks_physical_plan::SetOperationKind::Except => "EXCEPT",
                     }
-                ));
+                ))?;
             }
             NodeKind::Values { rows } => {
-                out.push(format!("{prefix}VALUES ({} rows){stats}", rows.len()));
+                out.push(format_args!("{prefix}VALUES ({} rows){stats}", rows.len()))?;
             }
             NodeKind::Repeat { grouping_sets, .. } => {
-                out.push(format!(
+                out.push(format_args!(
                     "{prefix}REPEAT ({} grouping sets){stats}",
                     grouping_sets.len()
-                ));
+                ))?;
             }
             NodeKind::Unpivot { spec } => {
-                out.push(format!(
+                out.push(format_args!(
                     "{prefix}UNPIVOT (mappings={}){stats}",
                     spec.mappings.len()
-                ));
+                ))?;
             }
             NodeKind::GenerateSeries { start, stop, step } => {
-                let step = step.map_or_else(
-                    || "1".to_string(),
-                    |expression| self.expr(fragment, expression),
-                );
-                out.push(format!(
+                let step = text(|f| match step {
+                    None => f.write_str("1"),
+                    Some(expression) => self.expr(fragment, *expression).fmt(f),
+                });
+                out.push(format_args!(
                     "{prefix}GENERATE_SERIES({}, {}, {step}){stats}",
                     self.expr(fragment, *start),
                     self.expr(fragment, *stop)
-                ));
+                ))?;
             }
             NodeKind::TableFunction {
                 function,
                 left_outer,
                 ..
             } => {
-                out.push(format!(
+                out.push(format_args!(
                     "{prefix}TABLE_FUNCTION [{} {}]{stats}",
                     if *left_outer { "LEFT" } else { "CROSS" },
-                    function_text(&function.function_id).to_uppercase()
-                ));
+                    Uppercase(function_text(&function.function_id))
+                ))?;
             }
             NodeKind::AssertOneRow(_) => {
-                out.push(format!("{prefix}ASSERT ONE ROW{stats}"));
+                out.push(format_args!("{prefix}ASSERT ONE ROW{stats}"))?;
             }
             NodeKind::ChangeEventExpand { events, .. } => {
-                out.push(format!(
+                out.push(format_args!(
                     "{prefix}CHANGE_EVENT_EXPAND(events={}){stats}",
                     events.len()
-                ));
+                ))?;
             }
             NodeKind::ExchangeSource { edge, .. } => {
                 // A gather that keeps an ordering is merging its senders
@@ -1153,15 +1426,16 @@ impl TreeContext<'_> {
                         Distribution::Singleton | Distribution::Unconstrained => "GATHER",
                     }
                 });
-                out.push(format!("{prefix}{label}{stats}"));
+                out.push(format_args!("{prefix}{label}{stats}"))?;
             }
             NodeKind::TableWriter { .. } => {
-                out.push(format!("{prefix}TABLE WRITER{stats}"));
+                out.push(format_args!("{prefix}TABLE WRITER{stats}"))?;
             }
             NodeKind::TableFinish(_) => {
-                out.push(format!("{prefix}TABLE FINISH{stats}"));
+                out.push(format_args!("{prefix}TABLE FINISH{stats}"))?;
             }
         }
+        Ok(())
     }
 }
 
@@ -1189,23 +1463,22 @@ fn aggregate_mode(
 /// When a consumer starts reading through a filter.
 fn activation_text(
     activation: &novarocks_physical_plan::RuntimeFilterConsumerActivation,
-) -> String {
+) -> impl Display + '_ {
     use novarocks_physical_plan::{LateApplyGranularity, RuntimeFilterConsumerActivation};
-
-    let granularity = |late_apply: LateApplyGranularity| match late_apply {
-        LateApplyGranularity::Row => "Row",
-        LateApplyGranularity::Batch => "Batch",
-        LateApplyGranularity::RowGroup => "RowGroup",
-        LateApplyGranularity::Split => "Split",
-        LateApplyGranularity::File => "File",
-    };
-    match activation {
-        RuntimeFilterConsumerActivation::BlockingSnapshot => "BlockingSnapshot".to_string(),
+    text(move |f| match activation {
+        RuntimeFilterConsumerActivation::BlockingSnapshot => f.write_str("BlockingSnapshot"),
         RuntimeFilterConsumerActivation::NonBlockingLive { late_apply }
         | RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete { late_apply } => {
-            format!("NonBlockingLive({})", granularity(*late_apply))
+            let granularity = match late_apply {
+                LateApplyGranularity::Row => "Row",
+                LateApplyGranularity::Batch => "Batch",
+                LateApplyGranularity::RowGroup => "RowGroup",
+                LateApplyGranularity::Split => "Split",
+                LateApplyGranularity::File => "File",
+            };
+            write!(f, "NonBlockingLive({granularity})")
         }
-    }
+    })
 }
 
 fn join_kind_text(kind: novarocks_physical_plan::JoinKind) -> &'static str {
@@ -1242,3 +1515,7 @@ fn partition_topn_text(kind: novarocks_physical_plan::PartitionTopNType) -> &'st
         PartitionTopNType::DenseRank => "DENSE_RANK",
     }
 }
+
+#[cfg(test)]
+#[path = "completed_tree_tests.rs"]
+mod tests;
