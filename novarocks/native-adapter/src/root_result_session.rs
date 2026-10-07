@@ -49,6 +49,7 @@ use crate::root_producer_pool::{
 };
 pub use crate::root_producer_pool::{RootProducerLimits, RootProducerPool};
 
+use crate::root_cow_selection_codec::{CowSelectionEncoder, CowSelectionTotals};
 use crate::root_scalar_container_codec::{NativeScalarContainerEncoder, is_container};
 use crate::root_scalar_leaf_codec::{NativeScalarLeafEncoder, ScalarSchemaOwner};
 use crate::root_statistics_codec::{
@@ -56,25 +57,11 @@ use crate::root_statistics_codec::{
 };
 use crate::root_write_commit_codec::{WriteCommitEncoder, WriteCommitTotals};
 
-/// Whether this BE has the producer codec for a root purpose. Host admission
-/// and session opening share this one decision, so a purpose is admitted only
-/// where its producer exists.
-pub fn root_output_producer_installed(kind: RootOutputKind) -> bool {
-    match kind {
-        RootOutputKind::ClientRows | RootOutputKind::CountOnly => true,
-        RootOutputKind::InternalFacts(domain) => matches!(
-            domain,
-            InternalResultDomain::StatisticsArtifactV1
-                | InternalResultDomain::ScalarValueV1
-                | InternalResultDomain::PreparedWriteCommitV1
-        ),
-    }
-}
-
 enum InputEncoder {
     Client(Box<ArrowMysqlTextEncoder>),
     Statistics(Box<StatisticsArtifactEncoder>),
     WriteCommit(Box<WriteCommitEncoder>),
+    CowSelection(Box<CowSelectionEncoder>),
     ScalarLeaf(Box<NativeScalarLeafEncoder>),
     ScalarContainer(Box<NativeScalarContainerEncoder>),
     /// A schema-validated empty container batch: no record, no row.
@@ -85,6 +72,7 @@ impl InputEncoder {
         match self {
             Self::Client(encoder) => encoder.step(output).map_err(|_| ()),
             Self::WriteCommit(encoder) => encoder.step(output).map_err(|_| ()),
+            Self::CowSelection(encoder) => Ok(encoder.step(output)),
             Self::ScalarLeaf(encoder) => encoder.step(output).map_err(|_| ()),
             Self::ScalarContainer(encoder) => Ok(encoder.step(output)),
             Self::ScalarEmpty => Ok(RenderTurn {
@@ -116,6 +104,12 @@ impl InputEncoder {
             _ => None,
         }
     }
+    fn cow_selection_totals(&self) -> Option<CowSelectionTotals> {
+        match self {
+            Self::CowSelection(encoder) => Some(encoder.totals()),
+            _ => None,
+        }
+    }
     fn write_commit_totals(&self) -> Option<WriteCommitTotals> {
         match self {
             Self::WriteCommit(encoder) => Some(encoder.totals()),
@@ -139,6 +133,8 @@ struct ProducerState {
     statistics_totals: StatisticsCodecTotals,
     /// PreparedWriteCommitV1 records completed across every input batch.
     write_totals: WriteCommitTotals,
+    /// CowSelectionArrowV1 schema and batch records completed so far.
+    cow_totals: CowSelectionTotals,
     /// ScalarValueV1 rows accepted across every input batch: 0 or 1. Its
     /// record stays in the unpublished segment until the sealed normal End.
     scalar_rows: u8,
@@ -191,8 +187,9 @@ impl NativeRootResultSession {
         pool: &Arc<RootProducerPool>,
     ) -> Result<Arc<Self>, FragmentIoError> {
         let contract = &channel.spec().contract;
-        if !root_output_producer_installed(contract.kind()) || contract.validate_purpose().is_err()
-        {
+        // Every closed internal domain has its producer codec; only a scalar
+        // domain identity without its typed schema has none.
+        if contract.validate_purpose().is_err() {
             return Err(io_error("explicit internal root codec is not installed"));
         }
         // All fixed session/issuer/callback scaffolds are covered before
@@ -240,6 +237,7 @@ impl NativeRootResultSession {
                 used: 0,
                 statistics_totals: StatisticsCodecTotals::default(),
                 write_totals: WriteCommitTotals::default(),
+                cow_totals: CowSelectionTotals::default(),
                 scalar_rows: 0,
                 sealed: false,
                 failed: None,
@@ -371,116 +369,17 @@ impl NativeRootResultSession {
                 // Chunk accounting/source capabilities remain live in input.
                 let cloning =
                     input.chunk.batch.num_columns() * std::mem::size_of::<arrow::array::ArrayRef>();
-                let encoder = if self.spec().contract.kind()
-                    == RootOutputKind::InternalFacts(InternalResultDomain::StatisticsArtifactV1)
-                {
-                    // Cursor storage is fixed and its RecordBatch clone owns only
-                    // a finite columns Vec; both are prepaid before creation.
-                    if StatisticsArtifactEncoder::inline_capacity_bytes()
-                        .checked_add(cloning)
-                        .is_none_or(|n| n > capacity)
-                    {
-                        return self.fail(state, "statistics cursor scratch exceeds its pregrant");
-                    }
-                    match StatisticsArtifactEncoder::try_new(
-                        input.chunk.batch.clone(),
-                        state.statistics_totals,
-                    ) {
-                        Ok(encoder) => InputEncoder::Statistics(Box::new(encoder)),
-                        Err(_) => {
-                            return self
-                                .fail(state, "statistics input differs from its frozen domain");
-                        }
-                    }
-                } else if self.spec().contract.kind()
-                    == RootOutputKind::InternalFacts(InternalResultDomain::PreparedWriteCommitV1)
-                {
-                    // Fixed cursor storage plus the finite columns Vec clone,
-                    // both prepaid before creation, as for statistics.
-                    if WriteCommitEncoder::inline_capacity_bytes()
-                        .checked_add(cloning)
-                        .is_none_or(|n| n > capacity)
-                    {
-                        return self
-                            .fail(state, "write commit cursor scratch exceeds its pregrant");
-                    }
-                    match WriteCommitEncoder::try_new(input.chunk.batch.clone(), state.write_totals)
-                    {
-                        Ok(encoder) => InputEncoder::WriteCommit(Box::new(encoder)),
-                        Err(_) => {
-                            return self
-                                .fail(state, "write commit input differs from its fixed contract");
-                        }
-                    }
-                } else if let FrozenRootOutput::ScalarValue(schema) = self.spec().contract.output()
-                {
-                    // Cumulative cardinality is decided before any cursor:
-                    // a second row is refused before it can reach a segment.
-                    let rows = input.chunk.len();
-                    if rows > 1 || (rows == 1 && state.scalar_rows != 0) {
-                        return self.fail(state, "scalar root input has more than one row");
-                    }
-                    let encoder = if is_container(schema.field()) {
-                        if rows == 0 {
-                            NativeScalarContainerEncoder::validate_empty(&input.chunk, schema)
-                                .map(|()| InputEncoder::ScalarEmpty)
-                        } else {
-                            NativeScalarContainerEncoder::try_encode(&input.chunk, schema, capacity)
-                                .map(|encoder| InputEncoder::ScalarContainer(Box::new(encoder)))
-                        }
-                    } else {
-                        ScalarSchemaOwner::try_from_contract(Arc::clone(&self.spec().contract))
-                            .and_then(|owner| {
-                                if rows == 0 {
-                                    NativeScalarLeafEncoder::try_validate_empty(
-                                        &input.chunk,
-                                        owner,
-                                        capacity,
-                                    )
-                                } else {
-                                    NativeScalarLeafEncoder::try_begin(
-                                        &input.chunk,
-                                        owner,
-                                        capacity,
-                                    )
-                                }
-                            })
-                            .map(|encoder| InputEncoder::ScalarLeaf(Box::new(encoder)))
-                    };
-                    match encoder {
-                        Ok(encoder) => {
-                            if rows == 1 {
-                                state.scalar_rows = 1;
-                            }
-                            encoder
-                        }
-                        Err(_) => {
-                            return self
-                                .fail(state, "scalar input differs from its frozen root value");
-                        }
-                    }
-                } else {
-                    let encoder = match ArrowMysqlTextEncoder::try_new_root(
-                        Arc::clone(&self.spec().contract),
-                        input.chunk.batch.clone(),
-                    ) {
-                        Ok(encoder) => encoder,
-                        Err(_) => {
-                            return self.fail(
-                                state,
-                                "root input cannot be rendered under its frozen schema",
-                            );
-                        }
-                    };
-                    if encoder
-                        .scratch_capacity_bytes()
-                        .checked_add(cloning)
-                        .and_then(|n| n.checked_add(std::mem::size_of::<ArrowMysqlTextEncoder>()))
-                        .is_none_or(|n| n > capacity)
-                    {
-                        return self.fail(state, "root renderer scratch exceeds its pregrant");
-                    }
-                    InputEncoder::Client(Box::new(encoder))
+                let encoder = match self.begin_encoder(
+                    input,
+                    capacity,
+                    cloning,
+                    &mut state.scalar_rows,
+                    state.statistics_totals,
+                    state.write_totals,
+                    &state.cow_totals,
+                ) {
+                    Ok(encoder) => encoder,
+                    Err(message) => return self.fail(state, message),
                 };
                 input.encoder = Some(encoder);
                 return RootProducerTurn::Yielded;
@@ -527,6 +426,9 @@ impl NativeRootResultSession {
                 }
                 if let Some(totals) = encoder.write_commit_totals() {
                     state.write_totals = totals;
+                }
+                if let Some(totals) = encoder.cow_selection_totals() {
+                    state.cow_totals = totals;
                 }
                 drop(state.input.take());
             }
@@ -580,6 +482,102 @@ impl NativeRootResultSession {
             return RootProducerTurn::Complete;
         }
         RootProducerTurn::Idle
+    }
+    /// One cursor for one original input, chosen by the frozen root purpose.
+    /// Every cursor's storage is prepaid by `capacity` before it is created.
+    #[allow(clippy::too_many_arguments)]
+    fn begin_encoder(
+        &self,
+        input: &Input,
+        capacity: usize,
+        cloning: usize,
+        scalar_rows: &mut u8,
+        statistics_totals: StatisticsCodecTotals,
+        write_totals: WriteCommitTotals,
+        cow_totals: &CowSelectionTotals,
+    ) -> Result<InputEncoder, &'static str> {
+        let fits = |inline: usize| inline.checked_add(cloning).is_some_and(|n| n <= capacity);
+        match self.spec().contract.output() {
+            FrozenRootOutput::InternalFacts(InternalResultDomain::StatisticsArtifactV1) => {
+                // Fixed cursor storage plus the finite columns Vec clone.
+                if !fits(StatisticsArtifactEncoder::inline_capacity_bytes()) {
+                    return Err("statistics cursor scratch exceeds its pregrant");
+                }
+                StatisticsArtifactEncoder::try_new(input.chunk.batch.clone(), statistics_totals)
+                    .map(|encoder| InputEncoder::Statistics(Box::new(encoder)))
+                    .map_err(|_| "statistics input differs from its frozen domain")
+            }
+            FrozenRootOutput::InternalFacts(InternalResultDomain::PreparedWriteCommitV1) => {
+                if !fits(WriteCommitEncoder::inline_capacity_bytes()) {
+                    return Err("write commit cursor scratch exceeds its pregrant");
+                }
+                WriteCommitEncoder::try_new(input.chunk.batch.clone(), write_totals)
+                    .map(|encoder| InputEncoder::WriteCommit(Box::new(encoder)))
+                    .map_err(|_| "write commit input differs from its fixed contract")
+            }
+            FrozenRootOutput::InternalFacts(InternalResultDomain::CowSelectionArrowV1) => {
+                // Node/buffer tables and the record prefix are sized exactly
+                // from this input before anything is allocated.
+                CowSelectionEncoder::try_new(&input.chunk.batch, cow_totals.clone(), capacity)
+                    .map(|encoder| InputEncoder::CowSelection(Box::new(encoder)))
+                    .map_err(|_| "COW selection input differs from its domain codec")
+            }
+            FrozenRootOutput::ScalarValue(schema) => {
+                // Cumulative cardinality is decided before any cursor: a
+                // second row is refused before it can reach a segment.
+                let rows = input.chunk.len();
+                if rows > 1 || (rows == 1 && *scalar_rows != 0) {
+                    return Err("scalar root input has more than one row");
+                }
+                let encoder = if is_container(schema.field()) {
+                    if rows == 0 {
+                        NativeScalarContainerEncoder::validate_empty(&input.chunk, schema)
+                            .map(|()| InputEncoder::ScalarEmpty)
+                    } else {
+                        NativeScalarContainerEncoder::try_encode(&input.chunk, schema, capacity)
+                            .map(|encoder| InputEncoder::ScalarContainer(Box::new(encoder)))
+                    }
+                } else {
+                    ScalarSchemaOwner::try_from_contract(Arc::clone(&self.spec().contract))
+                        .and_then(|owner| {
+                            if rows == 0 {
+                                NativeScalarLeafEncoder::try_validate_empty(
+                                    &input.chunk,
+                                    owner,
+                                    capacity,
+                                )
+                            } else {
+                                NativeScalarLeafEncoder::try_begin(&input.chunk, owner, capacity)
+                            }
+                        })
+                        .map(|encoder| InputEncoder::ScalarLeaf(Box::new(encoder)))
+                }
+                .map_err(|_| "scalar input differs from its frozen root value")?;
+                if rows == 1 {
+                    *scalar_rows = 1;
+                }
+                Ok(encoder)
+            }
+            FrozenRootOutput::ClientRows(_) => {
+                let encoder = ArrowMysqlTextEncoder::try_new_root(
+                    Arc::clone(&self.spec().contract),
+                    input.chunk.batch.clone(),
+                )
+                .map_err(|_| "root input cannot be rendered under its frozen schema")?;
+                if !encoder
+                    .scratch_capacity_bytes()
+                    .checked_add(size_of::<ArrowMysqlTextEncoder>())
+                    .is_some_and(fits)
+                {
+                    return Err("root renderer scratch exceeds its pregrant");
+                }
+                Ok(InputEncoder::Client(Box::new(encoder)))
+            }
+            // Session opening refuses an untyped scalar identity, and
+            // CountOnly counts rows without a cursor.
+            FrozenRootOutput::InternalFacts(InternalResultDomain::ScalarValueV1)
+            | FrozenRootOutput::CountOnly => Err("root purpose has no input cursor"),
+        }
     }
     /// Domain facts a normal sealed End must already hold. A write root
     /// without its SUMMARY fails instead of publishing a success End.

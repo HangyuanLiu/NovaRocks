@@ -1059,7 +1059,7 @@ async fn write_commit_without_summary_fails_instead_of_a_success_end() {
 }
 
 #[tokio::test]
-async fn uninstalled_internal_domain_and_untyped_scalar_identity_stay_closed() {
+async fn every_internal_domain_opens_and_an_untyped_scalar_identity_has_no_channel() {
     use novarocks_result_contract::InternalResultDomain;
     let limits = WorkerResultRetainedLimits::try_new(256 << 20, 512 << 20).unwrap();
     let budget = ResultRetainedBudget::new(limits.per_process());
@@ -1085,28 +1085,97 @@ async fn uninstalled_internal_domain_and_untyped_scalar_identity_stay_closed() {
         )
         .is_err()
     );
-    for output in [FrozenRootOutput::InternalFacts(
+    for domain in [
+        InternalResultDomain::StatisticsArtifactV1,
+        InternalResultDomain::PreparedWriteCommitV1,
         InternalResultDomain::CowSelectionArrowV1,
-    )] {
+    ] {
         let channel = RootResultChannel::try_open(
             RootResultWriteSpec {
                 task: task(),
-                contract: Arc::new(RootOutputContract::new(RootProfileId::V1, output)),
+                contract: Arc::new(RootOutputContract::new(
+                    RootProfileId::V1,
+                    FrozenRootOutput::InternalFacts(domain),
+                )),
             },
             Arc::clone(&budget),
             limits,
         )
         .unwrap();
         channel.mark_context_owned().unwrap();
-        let rejected = NativeRootResultSession::try_open(Arc::clone(&channel), &pool);
-        assert!(
-            matches!(rejected, Err(ref error) if error.to_string().contains("explicit internal root codec is not installed"))
-        );
-        assert_eq!(channel.snapshot().produced_through, 0);
-        assert!(channel.physical_idle());
+        let session = NativeRootResultSession::try_open(Arc::clone(&channel), &pool)
+            .unwrap_or_else(|error| panic!("{domain:?} producer is installed: {error}"));
+        session.abort(ResultAbort::Cancelled(String::new()));
+        drop(session);
         channel.close(RootRetentionClose::ContextReleased);
     }
     shutdown(&pool).await;
+}
+
+#[tokio::test]
+async fn cow_selection_records_decode_back_to_their_batches() {
+    use novarocks_native_adapter::root_cow_selection_codec::{
+        CowSelectionDecoder, CowSelectionRecordHeader, CowSelectionRecordKind,
+    };
+    use novarocks_result_contract::InternalResultDomain;
+    let fixture = Fixture::new(FrozenRootOutput::InternalFacts(
+        InternalResultDomain::CowSelectionArrowV1,
+    ));
+    let inputs = [
+        longs(vec![]),
+        longs(vec![Some(7), None, Some(9)]),
+        longs(vec![Some(-1)]),
+    ];
+    let expected = inputs[1..]
+        .iter()
+        .map(|chunk| chunk.batch.clone())
+        .collect::<Vec<_>>();
+    for chunk in inputs {
+        fixture
+            .session
+            .submit_input(chunk, input(&fixture.session).await)
+            .unwrap();
+    }
+    fixture.session.finish_input().unwrap();
+    // Three records exceed the unacknowledged window: consume while reading.
+    let mut bytes = Vec::new();
+    let mut sequence = 1;
+    let rows = loop {
+        let delivery = read(&fixture.channel, Some(sequence), sequence - 1).await;
+        match &delivery.reply().outcome {
+            RootReadOutcome::Data(data) => bytes.extend_from_slice(data.body().as_ref()),
+            RootReadOutcome::End(end) => break end.output_rows,
+            other => panic!("unexpected root outcome {other:?}"),
+        }
+        sequence += 1;
+    };
+    assert_eq!(rows, 4);
+    wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
+    let mut rest = bytes.as_slice();
+    let mut schema = None;
+    let mut batches = Vec::new();
+    while !rest.is_empty() {
+        let header = CowSelectionRecordHeader::parse(rest).unwrap();
+        let (record, tail) = rest.split_at(header.record_bytes() as usize);
+        match header.kind() {
+            CowSelectionRecordKind::Schema => {
+                schema = Some(CowSelectionDecoder::decode_schema(record).unwrap())
+            }
+            CowSelectionRecordKind::Batch => batches
+                .push(CowSelectionDecoder::decode_batch(schema.as_ref().unwrap(), record).unwrap()),
+        }
+        rest = tail;
+    }
+    let decoded = batches
+        .iter()
+        .map(|batch| batch.column(0).clone())
+        .collect::<Vec<_>>();
+    let original = expected
+        .iter()
+        .map(|batch| batch.column(0).clone())
+        .collect::<Vec<_>>();
+    assert_eq!(decoded, original);
+    shutdown(&fixture.pool).await;
 }
 
 fn scalar(field: ScalarField) -> (FrozenRootOutput, ScalarSchema) {

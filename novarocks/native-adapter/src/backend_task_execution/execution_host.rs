@@ -809,9 +809,9 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         // channel under its existing creation/context fence below.
         let root_session = match submission.program().local_program().sink() {
             Some(novarocks_local_program::StaticSinkProgram::RootResult(contract)) => {
-                if !crate::root_result_session::root_output_producer_installed(contract.kind())
-                    || contract.validate_purpose().is_err()
-                {
+                // Every closed internal domain has its BE producer; only a
+                // scalar domain identity without its typed schema has none.
+                if contract.validate_purpose().is_err() {
                     return Err(protocol("explicit internal root codec is not installed"));
                 }
                 let local_program = submission.program().local_program();
@@ -5293,13 +5293,13 @@ mod tests {
     }
 
     #[test]
-    fn bounded_root_missing_domain_codec_is_protocol_refusal_before_channel_install() {
+    fn bounded_root_untyped_scalar_identity_is_protocol_refusal_before_channel_install() {
         let (host, _) = isolated_resource_host();
         let root = identity(91_004, 1, 1);
         let descriptor = consistent_descriptor(root, UniqueId::new(91_004, 1));
         let body = Body::bounded_root(
             novarocks_result_contract::FrozenRootOutput::InternalFacts(
-                novarocks_result_contract::InternalResultDomain::CowSelectionArrowV1,
+                novarocks_result_contract::InternalResultDomain::ScalarValueV1,
             ),
             &[],
         );
@@ -5307,9 +5307,11 @@ mod tests {
             .install_receiver(&descriptor, body.input(&descriptor))
             .unwrap_err();
         assert_eq!(rejected.category(), TaskFailureCategory::Protocol);
-        assert_eq!(
-            rejected.detail().as_str(),
-            "explicit internal root codec is not installed"
+        assert!(
+            rejected
+                .detail()
+                .as_str()
+                .contains("root schema does not match its frozen purpose")
         );
         assert!(host.task_runtime(root).is_none());
         host.root_producer_pool.shutdown().unwrap();
