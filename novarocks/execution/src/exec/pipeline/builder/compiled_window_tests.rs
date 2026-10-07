@@ -30,7 +30,9 @@ use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind};
 use novarocks_type_contract::{WindowBound, WindowFrameUnits};
 
 use super::family_fixture::try_run;
-use super::window_fixture::{Arg, Call, Key, Shape, compile, m1_catalog, package, try_compile};
+use super::window_fixture::{
+    Arg, Call, Key, Shape, compile, installed_catalog, package, try_compile,
+};
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::operators::compiled_window::CompiledWindowProcessorFactory;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -271,6 +273,21 @@ fn evaluate_partition(partition: &[Row], shape: &Shape) -> Vec<Vec<Option<String
                         int(call.args.get(2).map(constant))
                     }
                 }
+                "sum" | "min" | "max" => {
+                    let source = column(&call.args[0]);
+                    let members = frame(call.frame)
+                        .into_iter()
+                        .filter_map(|member| partition[member][source])
+                        .collect::<Vec<_>>();
+                    int(match call.name {
+                        "sum" => (!members.is_empty()).then(|| {
+                            let sum: i128 = members.iter().map(|&value| i128::from(value)).sum();
+                            i64::try_from(sum).expect("oracle sums fit BIGINT")
+                        }),
+                        "min" => members.iter().min().copied(),
+                        _ => members.iter().max().copied(),
+                    })
+                }
                 "count" => {
                     let members = frame(call.frame);
                     let count = match call.args.first() {
@@ -300,7 +317,7 @@ fn run(program: &Arc<LocalProgram>) -> Vec<RecordBatch> {
 
 /// Compile and run `shape` over `rows` at every DOP, against the oracle.
 fn check(rows: &[Row], shape: &Shape) {
-    let catalog = m1_catalog();
+    let catalog = installed_catalog();
     let expected = oracle(rows, shape);
     for dop in [1, 4] {
         let program = compile(package(rows, 3, shape, &catalog, 4), &catalog, dop);
@@ -442,7 +459,7 @@ fn range_current_row_to_unbounded_following_starts_at_the_first_peer() {
             ),
         ],
     };
-    let catalog = m1_catalog();
+    let catalog = installed_catalog();
     let program = compile(package(&rows, 3, &shape, &catalog, 1), &catalog, 1);
     let actual = table(&run(&program))
         .into_iter()
@@ -619,7 +636,7 @@ fn partitions_and_peer_groups_spanning_chunks_match_one_whole_chunk() {
             ),
         ],
     };
-    let catalog = m1_catalog();
+    let catalog = installed_catalog();
     let program = compile(package(&rows(), 3, &shape, &catalog, 1), &catalog, 1);
     let (_, schema) = analytic(&program);
     let batch = sorted_input(&rows(), &shape, schema);
@@ -642,7 +659,7 @@ fn empty_input_emits_no_rows() {
             Call::aggregate("count", &[]),
         ],
     };
-    let catalog = m1_catalog();
+    let catalog = installed_catalog();
     let program = compile(package(&rows(), 3, &shape, &catalog, 1), &catalog, 1);
     let (_, schema) = analytic(&program);
     let empty = RecordBatch::new_empty(schema);
@@ -651,11 +668,12 @@ fn empty_input_emits_no_rows() {
 
 #[test]
 fn aggregate_over_without_a_window_kernel_is_refused_before_running() {
-    let catalog = m1_catalog();
+    // AVG installs no pure aggregate owner and so no window kernel.
+    let catalog = installed_catalog();
     let shape = Shape {
         partition: vec![P],
         order: vec![key(O, true, false)],
-        calls: vec![Call::aggregate("sum", &[Arg::Column(X)])],
+        calls: vec![Call::uninstalled_aggregate("avg", &[Arg::Column(X)])],
     };
     let error = try_compile(package(&rows(), 3, &shape, &catalog, 1), &catalog, 1).unwrap_err();
     assert!(
@@ -673,7 +691,7 @@ fn a_row_error_of_an_argument_root_fails_the_query() {
         order: vec![key(O, true, false)],
         calls: vec![Call::window("first_value", &[Arg::Overflowing(X)])],
     };
-    let catalog = m1_catalog();
+    let catalog = installed_catalog();
     for dop in [1, 4] {
         let program = compile(package(&rows(), 3, &shape, &catalog, 4), &catalog, dop);
         let error = try_run(&program).unwrap_err();
@@ -695,4 +713,170 @@ fn a_row_error_of_an_argument_root_fails_the_query() {
         output,
         vec![max.clone(), max, Some((-i64::MAX).to_string())]
     );
+}
+
+/// `rows` rows over four partitions (one of them NULL), order keys with
+/// ties and NULLs, and values with NULLs; arrival order is scrambled.
+fn generated_rows(rows: usize) -> Vec<Row> {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = |bound: u64| {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 33) % bound
+    };
+    (0..rows)
+        .map(|_| {
+            let partition = next(4);
+            let order = next(9);
+            let value = next(201) as i64 - 100;
+            vec![
+                (partition != 3).then_some(partition as i64),
+                (order != 8).then_some(order as i64),
+                (next(5) != 0).then_some(value),
+            ]
+        })
+        .collect()
+}
+
+fn aggregate_over_calls() -> Vec<Call> {
+    use WindowBound::{CurrentRow, Following, Preceding, UnboundedFollowing, UnboundedPreceding};
+    let x = [Arg::Column(X)];
+    vec![
+        // The default frame with ORDER BY extends over the current row's peers.
+        Call::aggregate("sum", &x),
+        Call::aggregate("min", &x),
+        Call::aggregate("max", &x),
+        // Running frames.
+        Call::aggregate("sum", &x).framed(WindowFrameUnits::Rows, UnboundedPreceding, CurrentRow),
+        Call::aggregate("max", &x).framed(WindowFrameUnits::Rows, UnboundedPreceding, CurrentRow),
+        // Sliding frames, refolded per row.
+        Call::aggregate("sum", &x).framed(WindowFrameUnits::Rows, Preceding(2), Following(2)),
+        Call::aggregate("min", &x).framed(WindowFrameUnits::Rows, Preceding(2), Following(2)),
+        Call::aggregate("max", &x).framed(WindowFrameUnits::Rows, Preceding(2), Following(2)),
+        // Frames that end empty or start empty.
+        Call::aggregate("sum", &x).framed(WindowFrameUnits::Rows, Following(1), Following(3)),
+        Call::aggregate("min", &x).framed(WindowFrameUnits::Rows, UnboundedPreceding, Preceding(1)),
+        Call::aggregate("sum", &x).framed(WindowFrameUnits::Range, CurrentRow, UnboundedFollowing),
+        Call::aggregate("max", &x).framed(WindowFrameUnits::Range, CurrentRow, CurrentRow),
+    ]
+}
+
+#[test]
+fn sum_min_max_over_running_sliding_and_peer_frames_match_the_oracle() {
+    for rows in [rows(), generated_rows(157)] {
+        check(
+            &rows,
+            &Shape {
+                partition: vec![P],
+                order: vec![key(O, true, false)],
+                calls: aggregate_over_calls(),
+            },
+        );
+        // Descending NULLS FIRST order keys and a second key.
+        check(
+            &rows,
+            &Shape {
+                partition: vec![P],
+                order: vec![key(O, false, true), key(X, true, true)],
+                calls: aggregate_over_calls(),
+            },
+        );
+        // Without ORDER BY the default frame is the whole partition.
+        let x = [Arg::Column(X)];
+        check(
+            &rows,
+            &Shape {
+                partition: vec![P],
+                order: vec![],
+                calls: vec![
+                    Call::aggregate("sum", &x),
+                    Call::aggregate("min", &x),
+                    Call::aggregate("max", &x),
+                ],
+            },
+        );
+    }
+}
+
+#[test]
+fn sum_min_max_over_partitions_spanning_chunks_match_one_whole_chunk() {
+    let rows = generated_rows(61);
+    let shape = Shape {
+        partition: vec![P],
+        order: vec![key(O, true, false)],
+        calls: aggregate_over_calls(),
+    };
+    let catalog = installed_catalog();
+    let program = compile(package(&rows, 3, &shape, &catalog, 1), &catalog, 1);
+    let (_, schema) = analytic(&program);
+    let batch = sorted_input(&rows, &shape, schema);
+    let expected = oracle(&rows, &shape);
+    for step in [1, 2, 3, 7, batch.num_rows()] {
+        assert_eq!(
+            table(&drive(&program, &batch, step)),
+            expected,
+            "{step}-row chunks"
+        );
+    }
+}
+
+#[test]
+fn sum_over_fails_the_query_only_for_a_frame_whose_result_overflows_bigint() {
+    use WindowBound::{CurrentRow, UnboundedPreceding};
+    let catalog = installed_catalog();
+    let x = [Arg::Column(X)];
+    // ROWS UNBOUNDED PRECEDING: the frame of the second row holds MAX + 1.
+    let distinct_order = vec![
+        vec![Some(1), Some(1), Some(i64::MAX)],
+        vec![Some(1), Some(2), Some(1)],
+        vec![Some(1), Some(3), Some(-1)],
+    ];
+    let running = Shape {
+        partition: vec![P],
+        order: vec![key(O, true, false)],
+        calls: vec![Call::aggregate("sum", &x).framed(
+            WindowFrameUnits::Rows,
+            UnboundedPreceding,
+            CurrentRow,
+        )],
+    };
+    for dop in [1, 4] {
+        let program = compile(
+            package(&distinct_order, 3, &running, &catalog, 4),
+            &catalog,
+            dop,
+        );
+        let error = try_run(&program).unwrap_err();
+        assert!(error.contains("SUM result overflows BIGINT"), "{error}");
+    }
+    // The same rows one at a time: no frame overflows.
+    let current = Shape {
+        calls: vec![Call::aggregate("sum", &x).framed(
+            WindowFrameUnits::Rows,
+            CurrentRow,
+            CurrentRow,
+        )],
+        ..running.clone()
+    };
+    check(&distinct_order, &current);
+    // The default frame over peers {1} and {2, 2}: the exact running state
+    // passes MAX + 1 between two frames, and neither frame overflows.
+    let peers = vec![
+        vec![Some(1), Some(1), Some(i64::MAX)],
+        vec![Some(1), Some(2), Some(1)],
+        vec![Some(1), Some(2), Some(-1)],
+    ];
+    let default = Shape {
+        calls: vec![Call::aggregate("sum", &x)],
+        ..running
+    };
+    for dop in [1, 4] {
+        let program = compile(package(&peers, 3, &default, &catalog, 4), &catalog, dop);
+        let sums = table(&run(&program))
+            .into_iter()
+            .map(|row| row[3].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(sums, vec![Some(i64::MAX.to_string()); 3], "DOP {dop}");
+    }
 }

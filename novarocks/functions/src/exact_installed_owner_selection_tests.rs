@@ -348,11 +348,7 @@ fn installed_exact_count_min_max_keep_actual_aggregate_state_and_full_signature(
             FunctionKind::Aggregate,
             &initial,
             &late,
-            if name == "count" {
-                PureKernelAbi::AggregateWindowV1
-            } else {
-                PureKernelAbi::AggregateV1
-            },
+            PureKernelAbi::AggregateWindowV1,
         );
         assert_eq!(selected.argument_types.as_ref(), &[late[0].argument_type()]);
         assert_eq!(scalar_carrier(&selected), &DataType::Int64);

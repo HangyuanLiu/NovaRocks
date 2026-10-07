@@ -54,10 +54,12 @@ use novarocks_physical_plan::{
     WindowSpec,
 };
 use novarocks_type_contract::{
-    CallProofScope, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDomainId,
-    ExpressionControlFlow, ExpressionEffectContext, ExpressionEffects, ExpressionEvaluationDomain,
-    ExpressionInvocation, ExpressionUseId, FunctionValueType, SemanticParameters, WindowBound,
-    WindowFrame, WindowFrameExclusion, WindowFrameUnits,
+    ArgumentControl, CallEffects, CallProofScope, CompilePhase, ControlShape,
+    DecimalOverflowPolicy, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
+    ExpressionEffects, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
+    FunctionFailureBehavior, FunctionInstanceState, FunctionIntrinsicRowError,
+    FunctionNullBehavior, FunctionValueType, FunctionVolatility, ObservableEffects,
+    SemanticParameters, WindowBound, WindowFrame, WindowFrameExclusion, WindowFrameUnits,
 };
 
 use super::family_fixture::{FixtureControl, constant_policy};
@@ -106,8 +108,8 @@ pub(super) fn window_catalog(definitions: &[(&str, FunctionKind)]) -> PureEngine
     builder.seal_pure(installed).unwrap()
 }
 
-/// Every M1 window owner plus COUNT, and SUM for its explicit refusal.
-pub(super) fn m1_catalog() -> PureEngineFunctionCatalog {
+/// Every installed window owner and every installed aggregate OVER owner.
+pub(super) fn installed_catalog() -> PureEngineFunctionCatalog {
     window_catalog(&[
         ("row_number", FunctionKind::Window),
         ("rank", FunctionKind::Window),
@@ -121,7 +123,24 @@ pub(super) fn m1_catalog() -> PureEngineFunctionCatalog {
         ("lag", FunctionKind::Window),
         ("count", FunctionKind::Aggregate),
         ("sum", FunctionKind::Aggregate),
+        ("min", FunctionKind::Aggregate),
+        ("max", FunctionKind::Aggregate),
     ])
+}
+
+/// The effects every installed builtin aggregate owner declares and freezes.
+fn declared_aggregate_effects(proof_scope: CallProofScope) -> CallEffects {
+    CallEffects {
+        value_stability: FunctionVolatility::Immutable,
+        own_row_error: FunctionIntrinsicRowError::NotRowEvaluated,
+        failure_behavior: FunctionFailureBehavior::Propagate,
+        null_behavior: FunctionNullBehavior::CalledOnNull,
+        argument_control: ArgumentControl::Aggregate,
+        instance_state: FunctionInstanceState::AggregateInstance,
+        observable_effects: ObservableEffects::NONE,
+        environment: Box::new([]),
+        proof_scope,
+    }
 }
 
 /// One call argument: an input column, a checked BIGINT constant, or an
@@ -156,6 +175,9 @@ pub(super) struct Call {
     pub frame: Option<Frame>,
     pub ignore_nulls: bool,
     pub distinct: bool,
+    /// Bound by the complete builtin metadata, which installs no pure owner
+    /// for it; its frozen effects are the declared aggregate effects.
+    pub uninstalled: bool,
 }
 
 impl Call {
@@ -167,12 +189,19 @@ impl Call {
             frame: None,
             ignore_nulls: false,
             distinct: false,
+            uninstalled: false,
         }
     }
     pub(super) fn aggregate(name: &'static str, args: &[Arg]) -> Self {
         Self {
             kind: FunctionKind::Aggregate,
             ..Self::window(name, args)
+        }
+    }
+    pub(super) fn uninstalled_aggregate(name: &'static str, args: &[Arg]) -> Self {
+        Self {
+            uninstalled: true,
+            ..Self::aggregate(name, args)
         }
     }
     pub(super) fn framed(
@@ -235,6 +264,8 @@ pub(super) fn package(
     catalog: &PureEngineFunctionCatalog,
     max_dop: u32,
 ) -> Arc<FragmentPackage> {
+    let complete =
+        novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
     let mut builder = FragmentBuilder::new(FragmentId::new(43));
     let types = vec![int64(true); width];
     let literal_rows = rows
@@ -406,8 +437,12 @@ pub(super) fn package(
                 }
             }
         }
-        let bound = catalog
-            .metadata()
+        let metadata = if call.uninstalled {
+            &complete
+        } else {
+            catalog.metadata()
+        };
+        let bound = metadata
             .resolve_bound_user(
                 call.name,
                 call.kind,
@@ -643,7 +678,7 @@ pub(super) fn package(
         SemanticParameters::try_new([]).unwrap()
     };
     let mut frozen = Vec::new();
-    for (use_id, expression, children) in window_uses {
+    for ((use_id, expression, children), call) in window_uses.into_iter().zip(&shape.calls) {
         let ExprKind::WindowCall {
             function,
             args,
@@ -689,6 +724,15 @@ pub(super) fn package(
             .map(|child| Some(*child))
             .collect::<Vec<_>>();
         let call_context = context(use_id.get());
+        if call.uninstalled {
+            frozen.push(FrozenPhysicalCall {
+                site: PhysicalCallSite::Expression(use_id),
+                context: call_context,
+                effects: declared_aggregate_effects(CallProofScope::Domain(domain)),
+                decimal_overflow_policy: POLICY,
+            });
+            continue;
+        }
         let arguments =
             ScopedExpressionEffects::primitive(call_context, ExpressionEffects::PURE_VALUE);
         // A call's frozen effects do not depend on its frame or DISTINCT.

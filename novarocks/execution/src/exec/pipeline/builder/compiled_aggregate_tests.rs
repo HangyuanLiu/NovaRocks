@@ -700,7 +700,7 @@ const SUM_ROWS: [Row; 12] = [
 fn sum_catalog() -> novarocks_functions::PureEngineFunctionCatalog {
     super::aggregate_fixture::aggregate_catalog(&[(
         "sum",
-        novarocks_functions::PureKernelAbi::AggregateV1,
+        novarocks_functions::PureKernelAbi::AggregateWindowV1,
     )])
 }
 

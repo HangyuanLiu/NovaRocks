@@ -146,8 +146,8 @@ pub(super) fn aggregate_catalog(owners: &[(&str, PureKernelAbi)]) -> PureEngineF
 pub(super) fn extrema_catalog() -> PureEngineFunctionCatalog {
     aggregate_catalog(&[
         ("count", PureKernelAbi::AggregateWindowV1),
-        ("min", PureKernelAbi::AggregateV1),
-        ("max", PureKernelAbi::AggregateV1),
+        ("min", PureKernelAbi::AggregateWindowV1),
+        ("max", PureKernelAbi::AggregateWindowV1),
     ])
 }
 

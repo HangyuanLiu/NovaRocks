@@ -116,6 +116,8 @@ fn catalog() -> PureEngineFunctionCatalog {
         ("lead", FunctionKind::Window),
         ("count", FunctionKind::Aggregate),
         ("sum", FunctionKind::Aggregate),
+        ("min", FunctionKind::Aggregate),
+        ("max", FunctionKind::Aggregate),
     ] {
         let definition = actual.definition(name, kind).unwrap().clone();
         let declaration = definition.binding_declaration().unwrap();
@@ -159,6 +161,9 @@ struct Call {
     distinct: bool,
     /// One function ORDER BY channel over `x`, appended to the binding.
     function_order: bool,
+    /// Bound by the complete builtin metadata, which installs no pure owner
+    /// for it; its frozen effects are the declared aggregate effects.
+    uninstalled: bool,
 }
 impl Call {
     fn window(name: &'static str, args: &[Arg]) -> Self {
@@ -170,12 +175,19 @@ impl Call {
             ignore_nulls: false,
             distinct: false,
             function_order: false,
+            uninstalled: false,
         }
     }
     fn aggregate(name: &'static str, args: &[Arg]) -> Self {
         Self {
             kind: FunctionKind::Aggregate,
             ..Self::window(name, args)
+        }
+    }
+    fn uninstalled_aggregate(name: &'static str, args: &[Arg]) -> Self {
+        Self {
+            uninstalled: true,
+            ..Self::aggregate(name, args)
         }
     }
     fn framed(
@@ -225,6 +237,8 @@ fn references(fragment: &Fragment, definition: ExprId) -> Vec<ExprId> {
 
 /// `Values(p, o, x) -> Sort -> Window(shape) -> Result`.
 fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPackage> {
+    let complete =
+        novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
     let mut builder = FragmentBuilder::new(FragmentId::new(47));
     let columns = (0..3)
         .map(|ordinal| {
@@ -356,8 +370,12 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
                 }
             }
         }
-        let bound = catalog
-            .metadata()
+        let metadata = if call.uninstalled {
+            &complete
+        } else {
+            catalog.metadata()
+        };
+        let bound = metadata
             .resolve_bound_user(
                 call.name,
                 call.kind,
@@ -612,6 +630,15 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
             .map(|child| Some(*child))
             .collect::<Vec<_>>();
         let call_context = context(use_id.get());
+        if call.uninstalled {
+            frozen.push(FrozenPhysicalCall {
+                site: PhysicalCallSite::Expression(use_id),
+                context: call_context,
+                effects: declared_aggregate_effects(CallProofScope::Domain(domain)),
+                decimal_overflow_policy: POLICY,
+            });
+            continue;
+        }
         let arguments =
             ScopedExpressionEffects::primitive(call_context, ExpressionEffects::PURE_VALUE);
         let options = if aggregate_binding.is_some() {
@@ -709,6 +736,21 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
         )
         .unwrap(),
     )
+}
+
+/// The effects every installed builtin aggregate owner declares and freezes.
+fn declared_aggregate_effects(proof_scope: CallProofScope) -> novarocks_type_contract::CallEffects {
+    novarocks_type_contract::CallEffects {
+        value_stability: novarocks_functions::FunctionVolatility::Immutable,
+        own_row_error: novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
+        failure_behavior: novarocks_functions::FunctionFailureBehavior::Propagate,
+        null_behavior: novarocks_type_contract::FunctionNullBehavior::CalledOnNull,
+        argument_control: novarocks_type_contract::ArgumentControl::Aggregate,
+        instance_state: novarocks_type_contract::FunctionInstanceState::AggregateInstance,
+        observable_effects: novarocks_type_contract::ObservableEffects::NONE,
+        environment: Box::new([]),
+        proof_scope,
+    }
 }
 
 fn try_compile(shape: &Shape) -> Result<LocalProgram, FragmentCompileError> {
@@ -969,8 +1011,9 @@ fn unsupported_window_shapes_are_refused_by_feature() {
         } if node == WINDOW => feature,
         other => panic!("expected a window refusal, got {other}"),
     };
+    // AVG has no installed pure aggregate, so no window kernel either.
     assert_eq!(
-        feature(refused(Call::aggregate("sum", &[x]))),
+        feature(refused(Call::uninstalled_aggregate("avg", &[x]))),
         "aggregate OVER without an installed pure window kernel"
     );
     let mut distinct = Call::aggregate("count", &[x]);
@@ -987,4 +1030,68 @@ fn unsupported_window_shapes_are_refused_by_feature() {
         ))),
         "GROUPS window frame"
     );
+}
+
+#[test]
+fn sum_min_max_over_prepare_through_their_installed_window_kernels() {
+    use WindowBound::{CurrentRow, Following, Preceding, UnboundedFollowing, UnboundedPreceding};
+    let x = Arg::Column(X);
+    let shape = Shape {
+        partitioned: true,
+        ordered: true,
+        calls: vec![
+            Call::aggregate("sum", &[x]),
+            Call::aggregate("min", &[x]).framed(WindowFrameUnits::Rows, Preceding(1), Following(1)),
+            Call::aggregate("max", &[x]).framed(
+                WindowFrameUnits::Range,
+                UnboundedPreceding,
+                UnboundedFollowing,
+            ),
+            Call::aggregate("sum", &[x]).framed(WindowFrameUnits::Rows, CurrentRow, Following(2)),
+        ],
+    };
+    let program = try_compile(&shape).unwrap();
+    let (node, kind) = analytic(&program);
+    let ProgramNodeKind::Analytic { functions, .. } = kind else {
+        panic!("the window lowers to the local Analytic owner");
+    };
+    use WindowBoundary::{CurrentRow as Current, Following as After, Preceding as Before};
+    assert_eq!(
+        functions.iter().map(|call| call.frame).collect::<Vec<_>>(),
+        vec![
+            frame(WindowType::Range, None, Some(Current)),
+            frame(WindowType::Rows, Some(Before(1)), Some(After(1))),
+            frame(WindowType::Range, None, None),
+            frame(WindowType::Rows, Some(Current), Some(After(2))),
+        ]
+    );
+    let calls = program
+        .checked()
+        .channels()
+        .expressions()
+        .resolved_calls()
+        .calls();
+    for (call, name) in ["sum", "min", "max", "sum"].into_iter().enumerate() {
+        let function = &functions[call];
+        assert!(matches!(function.kind, WindowFunctionKind::Prepared));
+        assert!(function.aggregate_binding.is_some());
+        let resolved = &calls[&ProgramCallSite::Window {
+            node,
+            call: call as u32,
+        }];
+        // Admission is the installed kernel of the frozen overload, never a
+        // name: the prepared kernel is the owner's aggregate window adapter.
+        assert_eq!(
+            resolved.specialization().implementation().abi,
+            novarocks_functions::PureKernelAbi::AggregateWindowV1
+        );
+        assert_eq!(
+            resolved.call_contract().function_id().as_str(),
+            format!("builtin.aggregate/{name}/v1")
+        );
+        let PreparedPureKernel::Window(kernel) = resolved.specialization().prepared() else {
+            panic!("an aggregate OVER prepares an exact window kernel");
+        };
+        assert!(kernel.contract().aggregate().is_some());
+    }
 }

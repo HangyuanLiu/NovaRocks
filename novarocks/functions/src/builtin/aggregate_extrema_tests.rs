@@ -116,7 +116,7 @@ impl Fixture {
                         "builtin.aggregate/{name}/selected-v1"
                     ))
                     .unwrap(),
-                    abi: PureKernelAbi::AggregateV1,
+                    abi: PureKernelAbi::AggregateWindowV1,
                 },
                 aggregate_state_format: Some(
                     AggregateStateFormatIdentity::try_new(format!("novarocks/{name}/state-v1"))
@@ -346,7 +346,10 @@ fn aggregate_extrema_installed_fresh_frozen_all_phases_exact_full_types_and_poli
                     assert_eq!(fresh.source(), PurePreparationSource::Fresh);
                     assert_eq!(frozen.source(), PurePreparationSource::Frozen);
                     for actual in [&fresh, &frozen] {
-                        assert_eq!(actual.implementation().abi, PureKernelAbi::AggregateV1);
+                        assert_eq!(
+                            actual.implementation().abi,
+                            PureKernelAbi::AggregateWindowV1
+                        );
                         assert!(std::ptr::eq(
                             actual.call_contract().selected(),
                             fixture.selected.as_ref()

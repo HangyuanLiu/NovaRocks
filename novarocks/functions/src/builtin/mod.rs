@@ -45,6 +45,7 @@ mod aggregate_extrema_owner;
 mod aggregate_extrema_utf8;
 mod aggregate_sum;
 mod aggregate_sum_owner;
+mod aggregate_window_adapter;
 mod bit_shift;
 mod bit_shift_owner;
 mod bitwise;

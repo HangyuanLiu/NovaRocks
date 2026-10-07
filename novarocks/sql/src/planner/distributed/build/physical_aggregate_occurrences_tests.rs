@@ -613,11 +613,7 @@ fn aggregate_occurrences_installed_count_min_max_single_partial_keep_complete_se
                 ));
                 assert_eq!(
                     result.preparation.implementation().abi,
-                    if name == "count" {
-                        PureKernelAbi::AggregateWindowV1
-                    } else {
-                        PureKernelAbi::AggregateV1
-                    }
+                    PureKernelAbi::AggregateWindowV1
                 );
                 assert_eq!(
                     &result.frozen.effects,

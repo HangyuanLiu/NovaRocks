@@ -115,7 +115,7 @@ impl Fixture {
                         "builtin.aggregate/{name}/selected-v1"
                     ))
                     .unwrap(),
-                    abi: PureKernelAbi::AggregateV1,
+                    abi: PureKernelAbi::AggregateWindowV1,
                 },
                 aggregate_state_format: Some(
                     AggregateStateFormatIdentity::try_new(format!("novarocks/{name}/state-v1"))

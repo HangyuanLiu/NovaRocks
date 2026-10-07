@@ -17,8 +17,10 @@
 
 //! One real immutable owner for the installed SUM aggregate identity.
 //! DISTINCT, function ORDER BY and DECIMAL256 inputs are explicit refusals.
+//! SUM OVER folds each frame through this same exact kernel.
 
-use super::aggregate_sum::{SumDomain, SumKernel};
+use super::aggregate_sum::{SumDomain, SumKernel, SumState};
+use super::aggregate_window_adapter::InlineAggregateWindowKernel;
 use super::catalogue::BuiltinAggregateResolver;
 use crate::kernel_control::{compile_failure, invalid};
 use crate::*;
@@ -49,12 +51,11 @@ pub(super) fn definition(
     resolver: Arc<BuiltinAggregateResolver>,
 ) -> Result<FunctionDefinition, FunctionCatalogError> {
     let owner = Arc::new(SumOwner::new(name, declaration, resolver)?);
-    FunctionDefinition::try_new_pure_aggregate(name, FunctionVisibility::Public, owner).map_err(
-        |error| FunctionCatalogError::InvalidStableIdentity {
+    FunctionDefinition::try_new_pure_aggregate_window(name, FunctionVisibility::Public, owner)
+        .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
             subject: "builtin SUM pure owner",
             value: error.to_string().into(),
-        },
-    )
+        })
 }
 
 struct SumOwner {
@@ -94,7 +95,7 @@ impl SumOwner {
             .map(|overload| PureImplementationDeclaration {
                 overload: overload.identity.clone(),
                 implementation: implementation.clone(),
-                abi: PureKernelAbi::AggregateV1,
+                abi: PureKernelAbi::AggregateWindowV1,
             })
             .collect();
         Ok(Self {
@@ -185,6 +186,23 @@ fn domain(
         return Err(invalid("SUM result or state differs from its exact domain"));
     }
     Ok(domain)
+}
+
+impl InlineAggregateWindowKernel for SumKernel {
+    fn copy_state(&self, state: &SumState) -> Result<SumState, KernelFailure> {
+        Ok(*state)
+    }
+}
+
+impl PureAggregateWindowImplementation for SumOwner {
+    fn prepare_aggregate_window(
+        &self,
+        aggregate: Arc<SumKernel>,
+        contract: Arc<WindowCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedWindowKernel>, KernelFailure> {
+        super::aggregate_window_adapter::prepare(aggregate, contract, control)
+    }
 }
 
 impl FunctionBindingResolver for SumOwner {

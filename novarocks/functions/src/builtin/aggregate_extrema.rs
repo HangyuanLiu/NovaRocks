@@ -16,7 +16,7 @@
 // under the License.
 
 //! Exact selected fixed-width extrema with inline state and original four phases.
-//! Utf8 retained state and aggregate OVER are not implemented by this attachment.
+//! Utf8 retained state belongs to its own kernel; OVER folds through this one.
 
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;

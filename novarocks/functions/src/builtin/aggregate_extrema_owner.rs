@@ -15,15 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Exact MIN/MAX fixed-width and UTF-8 owners; aggregate OVER remains separate.
+//! Exact MIN/MAX fixed-width and UTF-8 owners. MIN/MAX OVER folds each frame
+//! through the same fixed-width kernel; a UTF-8 state retains heap and has no
+//! inline window state, so its OVER form is refused by name.
 
-use super::aggregate_extrema_dispatch::PreparedExtrema;
+use super::aggregate_extrema_dispatch::{ExtremaState, PreparedExtrema};
 use super::aggregate_extrema_utf8::Utf8ExtremaKernel;
+use super::aggregate_window_adapter::InlineAggregateWindowKernel;
 use super::{
     aggregate_extrema::{ExtremaKernel, ExtremaOperation, supported_type},
     catalogue::BuiltinAggregateResolver,
 };
-use crate::kernel_control::{compile_failure, invalid};
+use crate::kernel_control::{compile_failure, internal, invalid};
 use crate::*;
 use arrow_schema::DataType;
 use novarocks_type_contract::{
@@ -59,12 +62,11 @@ pub(super) fn definition(
     resolver: Arc<BuiltinAggregateResolver>,
 ) -> Result<FunctionDefinition, FunctionCatalogError> {
     let owner = Arc::new(ExtremaOwner::new(name, declaration, resolver)?);
-    FunctionDefinition::try_new_pure_aggregate(name, FunctionVisibility::Public, owner).map_err(
-        |error| FunctionCatalogError::InvalidStableIdentity {
+    FunctionDefinition::try_new_pure_aggregate_window(name, FunctionVisibility::Public, owner)
+        .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
             subject: "builtin MIN/MAX pure owner",
             value: error.to_string().into(),
-        },
-    )
+        })
 }
 struct ExtremaOwner {
     resolver: Arc<BuiltinAggregateResolver>,
@@ -108,7 +110,7 @@ impl ExtremaOwner {
             .map(|overload| PureImplementationDeclaration {
                 overload: overload.identity.clone(),
                 implementation: implementation.clone(),
-                abi: PureKernelAbi::AggregateV1,
+                abi: PureKernelAbi::AggregateWindowV1,
             })
             .collect();
         Ok(Self {
@@ -133,6 +135,36 @@ impl ExtremaOwner {
         }
     }
 }
+impl InlineAggregateWindowKernel for PreparedExtrema {
+    fn copy_state(&self, state: &ExtremaState) -> Result<ExtremaState, KernelFailure> {
+        match (self, state) {
+            (PreparedExtrema::Fixed(_), ExtremaState::Fixed(value)) => {
+                Ok(ExtremaState::Fixed(*value))
+            }
+            _ => Err(internal("MIN/MAX OVER state has no inline window copy")),
+        }
+    }
+}
+
+impl PureAggregateWindowImplementation for ExtremaOwner {
+    fn prepare_aggregate_window(
+        &self,
+        aggregate: Arc<PreparedExtrema>,
+        contract: Arc<WindowCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedWindowKernel>, KernelFailure> {
+        if matches!(aggregate.as_ref(), PreparedExtrema::Utf8(_)) {
+            control
+                .checkpoint(CompilePhase::FunctionSpecialization, 0)
+                .map_err(compile_failure)?;
+            return Err(invalid(
+                "MIN/MAX OVER a UTF-8 value has no inline window state",
+            ));
+        }
+        super::aggregate_window_adapter::prepare(aggregate, contract, control)
+    }
+}
+
 impl FunctionBindingResolver for ExtremaOwner {
     fn resolve(
         &self,
