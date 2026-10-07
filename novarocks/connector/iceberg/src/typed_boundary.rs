@@ -2325,14 +2325,15 @@ fn metadata_pseudo_columns(
     Ok(columns)
 }
 
-/// A metadata column is always optional: it is synthesized per row from split
-/// facts, and a nullable declaration is what lets the engine model a row the
-/// fact does not cover.
+/// A metadata column's NULL contract is the column's own, the same one the
+/// table metadata states to SQL: a frozen read publishes this handle's field,
+/// and it must be exactly the type the scan was planned with.
 fn pseudo_column(metadata: IcebergMetadataColumn) -> Result<IcebergColumnHandle, ConnectorError> {
-    IcebergColumnHandle::base_column(&NestedField::optional(
+    IcebergColumnHandle::base_column(&NestedField::new(
         metadata.field_id(),
         metadata.column_name(),
         Type::Primitive(metadata.declared_type()),
+        !metadata.nullable(),
     ))
 }
 
@@ -3408,6 +3409,43 @@ mod public_read_schema_tests {
                 .collect::<Vec<_>>(),
             [("id", "1"), ("id", "1")]
         );
+    }
+
+    /// A hidden metadata column is planned with the field the table metadata
+    /// states to SQL, and its frozen read publishes the field of the handle
+    /// the read binding mints. Both are this provider's statement about the
+    /// same column, and the package law compares them exactly: logical type,
+    /// NULL contract and Arrow data type.
+    #[test]
+    fn metadata_pseudo_columns_publish_the_type_the_table_states_to_sql() {
+        let relation = crate::typed_read::IcebergRuntimeRelation::Table(
+            final_static_facts_tests::table_handle(),
+        );
+        let (names, columns): (Vec<_>, Vec<_>) = metadata_pseudo_columns(true)
+            .expect("metadata columns")
+            .into_iter()
+            .map(|(name, column)| (name.to_string(), column))
+            .unzip();
+        let published = public_read_schema(&relation, &columns).expect("public schema");
+        let planned = crate::metadata::metadata_arrow_fields(&names).expect("table fields");
+
+        assert_eq!(published.schema().fields().len(), planned.len());
+        for (ordinal, (public, sql)) in published.schema().fields().iter().zip(&planned).enumerate()
+        {
+            let sql_logical =
+                novarocks_type_contract::field_logical_type(sql).expect("SQL logical type");
+            assert_eq!(public.name(), sql.name());
+            assert_eq!(
+                (
+                    published.logical_types()[ordinal],
+                    public.is_nullable(),
+                    public.data_type()
+                ),
+                (sql_logical, sql.is_nullable(), sql.data_type()),
+                "metadata column {} publishes a different type than the table states",
+                sql.name()
+            );
+        }
     }
 
     #[test]

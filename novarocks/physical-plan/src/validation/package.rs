@@ -301,17 +301,26 @@ fn validate_package_scans(input: &FragmentPackageInput, errors: &mut ValidationC
                     && public.source().coverage_evidence() == metadata.coverage_evidence.as_ref()
             }
         };
-        if public.source().input_version() != &relation.read().input_version
-            || public.source().selection_digest() != relation.selection_digest()
-            || !metadata_matches
-            || public.schema().fields().len() != relation.schema().len()
-            || !relation
+        // The path names the first differing part, so a refusal says which
+        // public fact disagrees with the physical relation.
+        let differing = if public.source().input_version() != &relation.read().input_version {
+            Some(".input_version".to_owned())
+        } else if public.source().selection_digest() != relation.selection_digest() {
+            Some(".selection_digest".to_owned())
+        } else if !metadata_matches {
+            Some(".metadata".to_owned())
+        } else if public.schema().fields().len() != relation.schema().len() {
+            Some(".schema".to_owned())
+        } else {
+            relation
                 .schema()
                 .iter()
                 .enumerate()
-                .all(|(ordinal, field)| public.matches_value_type(ordinal, &field.ty))
-        {
-            errors.push(ValidationError::new(&path,
+                .position(|(ordinal, field)| !public.matches_value_type(ordinal, &field.ty))
+                .map(|ordinal| format!(".schema[{ordinal}]"))
+        };
+        if let Some(part) = differing {
+            errors.push(ValidationError::new(format!("{path}{part}"),
                 "frozen read public version, selection, metadata or exact schema differs from its physical relation"));
         }
         validate_public_read_properties(frozen, relation, provider_outputs, &path, errors);

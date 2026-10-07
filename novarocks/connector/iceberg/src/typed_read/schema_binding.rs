@@ -155,6 +155,22 @@ impl IcebergMetadataColumn {
         }
     }
 
+    /// Whether this column may be NULL.
+    ///
+    /// Like [`Self::declared_type`], every statement of the column reads it
+    /// from here: the table metadata states it to SQL and the read binding
+    /// mints the published handle with it, so the type a scan is planned with
+    /// and the type its frozen read publishes are one exact type. The reader
+    /// never yields NULL for a required column: `_file` and `_pos` are facts of
+    /// every row's split and position, and a row that cannot answer `_row_id`
+    /// is refused rather than answered with NULL.
+    pub const fn nullable(self) -> bool {
+        match self {
+            Self::Path | Self::RowPosition | Self::RowId | Self::IsDeleted => false,
+            Self::LastUpdatedSequenceNumber => true,
+        }
+    }
+
     /// Whether a scan may name this column in its declared output.
     pub const fn is_externally_visible(self) -> bool {
         match self {
