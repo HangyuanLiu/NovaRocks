@@ -325,7 +325,7 @@ impl<'a> AnalyzerContext<'a> {
             return Ok(false);
         }
         let probe = self.analyze_expr(source, scope)?;
-        if self.logical_output_type(Some(source), &probe, scope) != Some(SqlType::Json) {
+        if self.logical_output_type(Some(source), &probe, scope)? != Some(SqlType::Json) {
             return Ok(false);
         }
         if !self.json_membership_enabled {
