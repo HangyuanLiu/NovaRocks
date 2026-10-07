@@ -91,7 +91,7 @@ use novarocks_query_application::sql::admission::{
 };
 use novarocks_query_application::sql::catalog::SessionCatalogService;
 use novarocks_query_application::sql::dml_admission::validate_table_statement_admission;
-use novarocks_query_application::sql::kill::execute_kill_statement;
+use novarocks_query_application::sql::kill::execute_control_session_statement;
 use novarocks_query_application::sql::session::{
     SessionExecutionSettings, SessionSetAssignmentOutcome, SessionSqlState,
     admit_session_set_assignment as admit_query_application_session_set_assignment,
@@ -1065,6 +1065,15 @@ impl FrontendQuerySession {
         statement: &ast::SessionStatement,
     ) -> Result<StatementResult, QueryServiceError> {
         let token = self.token()?;
+        if let Some(result) = execute_control_session_statement(
+            source,
+            statement,
+            token,
+            &self.service.query_control,
+            self.service.client_connection_control.as_ref(),
+        ) {
+            return result;
+        }
         let mut governed = self
             .service
             .query_control
@@ -1108,7 +1117,9 @@ impl FrontendQuerySession {
                 }
                 Ok(StatementResult::Ok)
             }
-            ast::SessionStatement::Kill(statement) => self.execute_session_kill(source, statement),
+            ast::SessionStatement::Kill(_) => {
+                unreachable!("KILL enters the dedicated control route before ordinary admission")
+            },
             ast::SessionStatement::TransactionControl(statement) => Err(
                 QueryServiceError::from_user_error(
                     SessionAdmitError::TransactionUnsupported.to_user_error(
@@ -1199,21 +1210,6 @@ impl FrontendQuerySession {
                 .database_exists(state.current_database())?;
         state.apply_resolved_catalog(catalog, current_database_exists);
         Ok(())
-    }
-
-    fn execute_session_kill(
-        &self,
-        source: &str,
-        statement: &ast::KillStatement,
-    ) -> Result<StatementResult, QueryServiceError> {
-        let requester = self.token()?;
-        execute_kill_statement(
-            source,
-            statement,
-            requester,
-            &self.service.query_control,
-            self.service.client_connection_control.as_ref(),
-        )
     }
 
     async fn init_database_with_cancellation(
