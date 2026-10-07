@@ -31,10 +31,10 @@ use crate::persistence::dependency::{
 use crate::persistence::projection::StoredMvProjection;
 use crate::product::MvTarget;
 use crate::repository::{
-    DeleteMvProjectionRequest, LoadedMvProjection, MvProjectionInventoryBound,
-    MvProjectionInventoryBuilder, MvProjectionInventoryEntry, MvProjectionRequest,
-    MvProjectionVersion, MvRepository, MvRepositoryError, MvRepositoryErrorKind,
-    ReplaceMvProjectionRequest,
+    DeleteMvProjectionRequest, LoadedMvProjection, MvDependencyReadBound,
+    MvProjectionInventoryBound, MvProjectionInventoryBuilder, MvProjectionInventoryEntry,
+    MvProjectionRequest, MvProjectionVersion, MvRepository, MvRepositoryError,
+    MvRepositoryErrorKind, ReplaceMvProjectionRequest,
 };
 
 #[derive(Default)]
@@ -315,6 +315,40 @@ impl MvRepository for InMemoryMvRepository {
             &mut dependencies,
             &state.projections.values().cloned().collect::<Vec<_>>(),
         );
+        Ok(dependencies)
+    }
+
+    async fn list_dependencies_by_downstream_bounded(
+        &self,
+        mv_id: i64,
+        expected_version: &MvProjectionVersion,
+        bound: MvDependencyReadBound,
+    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
+        use crate::bounded_dependencies::{DependencyCollector, classify, validate_canonical};
+        let mut dependencies = DependencyCollector::new(bound)?;
+        let state = self.state()?;
+        if state.versions.get(&mv_id) != Some(expected_version) {
+            return Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Conflict,
+                "MV dependency root changed",
+            ));
+        }
+        let projection = state.projections.get(&mv_id).ok_or_else(|| {
+            MvRepositoryError::new(
+                MvRepositoryErrorKind::Conflict,
+                "MV dependency root disappeared",
+            )
+        })?;
+        for dependency in state.dependencies.get(&mv_id).into_iter().flatten() {
+            dependencies.push_clone(dependency)?;
+        }
+        let mut dependencies = dependencies.finish();
+        validate_canonical(projection, &dependencies)?;
+        let mut inventory = MvProjectionInventoryBuilder::new(bound.inventory)?;
+        for projection in state.projections.values() {
+            inventory.push(projection)?;
+        }
+        classify(&mut dependencies, &inventory.finish());
         Ok(dependencies)
     }
 

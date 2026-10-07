@@ -79,6 +79,33 @@ pub(super) fn projection_v3(
     Ok(documents)
 }
 
+/// The registered dependency V3 is a fixed record, with no collections.
+pub(super) fn dependency_v3(payload: &[u8], working_set_bytes: usize) -> Result<(), String> {
+    let mut input = Datum { remaining: payload };
+    input.long()?;
+    input.long()?;
+    input.bytes()?;
+    input.optional(Datum::string)?;
+    input.string()?;
+    input.string()?;
+    if !(0..=2).contains(&input.long()?) || !(0..=3).contains(&input.long()?) {
+        return Err("MV dependency Avro enum index is invalid".into());
+    }
+    input.long()?;
+    if !input.remaining.is_empty() {
+        return Err("MV dependency Avro payload has trailing bytes".into());
+    }
+    if payload
+        .len()
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(4096))
+        .is_none_or(|n| n > working_set_bytes)
+    {
+        return Err("MV dependency exceeds its decode working set bound".into());
+    }
+    Ok(())
+}
+
 struct Datum<'a> {
     remaining: &'a [u8],
 }

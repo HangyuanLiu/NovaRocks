@@ -434,6 +434,20 @@ pub fn decode_projection_with_budget(
     })
 }
 
+/// Bounded structural check precedes the owned Avro/serde dependency datum.
+pub(crate) fn decode_dependency_with_budget(
+    key: &Key,
+    value: &Value,
+    working_set_bytes: usize,
+) -> Result<DecodedMvRecord<crate::persistence::dependency::StoredMvDependency>, String> {
+    decode_record_checked(key, value, |kind, schema_id, payload| {
+        if kind != MvRecordKind::Dependency || schema_id != 3 {
+            return Err("bounded MV dependency decode requires the registered V3 schema".into());
+        }
+        preflight::dependency_v3(payload, working_set_bytes)
+    })
+}
+
 pub fn encode_record<T>(kind: MvRecordKind, operation_id: Uuid, value: &T) -> Result<Value, String>
 where
     T: Serialize,

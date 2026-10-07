@@ -138,7 +138,18 @@ pub struct MvProjectionInventoryBound {
     pub entries: usize,
     pub snapshot_bytes: usize,
     pub raw_page_bytes: usize,
+    pub single_name_bytes: usize,
+    pub continuation_token_bytes: usize,
     pub decode: PersistenceDecodeBudget,
+}
+
+/// Local dependency display reads share one raw/decode page promise with a
+/// complete thin classification inventory and a separate finite collector.
+#[derive(Clone, Copy, Debug)]
+pub struct MvDependencyReadBound {
+    pub inventory: MvProjectionInventoryBound,
+    pub entries: usize,
+    pub collection_bytes: usize,
 }
 
 /// Thin identities from one complete StateStore snapshot. These are inventory
@@ -161,6 +172,8 @@ impl MvProjectionInventoryBuilder {
         if bound.entries == 0
             || bound.snapshot_bytes == 0
             || bound.raw_page_bytes == 0
+            || bound.single_name_bytes == 0
+            || bound.continuation_token_bytes == 0
             || bound.decode.max_working_set_bytes == 0
             || bound.decode.max_document_bytes == 0
         {
@@ -188,6 +201,18 @@ impl MvProjectionInventoryBuilder {
         }
         let target = projection.facts.target();
         let object = &projection.facts.source_revision().target_object_id;
+        if [
+            target.catalog().unwrap_or_default(),
+            target.namespace(),
+            target.name(),
+        ]
+        .into_iter()
+        .any(|name| name.len() > self.bound.single_name_bytes)
+        {
+            return Err(Self::refusal(
+                "MV inventory exceeds its single name byte bound",
+            ));
+        }
         let payload = [
             target.catalog().map_or(0, str::len),
             target.namespace().len(),
@@ -349,6 +374,15 @@ pub trait MvRepository: Send + Sync {
     async fn list_dependencies_by_downstream(
         &self,
         mv_id: i64,
+    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError>;
+
+    /// Exact downstream version and canonical occurrences, classified only
+    /// against one complete bounded inventory in the same read snapshot.
+    async fn list_dependencies_by_downstream_bounded(
+        &self,
+        mv_id: i64,
+        expected_version: &MvProjectionVersion,
+        bound: MvDependencyReadBound,
     ) -> Result<Vec<StoredMvDependency>, MvRepositoryError>;
 
     async fn list_downstream_dependencies(

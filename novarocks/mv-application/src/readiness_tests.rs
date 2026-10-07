@@ -634,6 +634,8 @@ fn local_inventory_bound() -> crate::repository::MvProjectionInventoryBound {
         entries: 64,
         snapshot_bytes: 16 * 1024 * 1024,
         raw_page_bytes: 1024 * 1024,
+        single_name_bytes: 65_536,
+        continuation_token_bytes: 4096,
         decode: PersistenceDecodeBudget {
             max_working_set_bytes: 4 * 1024 * 1024,
             ..Default::default()
@@ -784,4 +786,88 @@ async fn bounded_listing_refuses_a_large_reason_before_cloning_it_into_a_row() {
     let error = inventory.next_listable().await.unwrap_err();
     assert_eq!(error.kind(), MvRepositoryErrorKind::InvalidRequest);
     assert!(error.to_string().contains("readiness reason"));
+}
+
+#[tokio::test]
+async fn bounded_dependency_display_requires_ready_and_exact_installed_root_version() {
+    use crate::repository::MvDependencyReadBound;
+    let (repository, service) = service();
+    service
+        .observe_current_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
+        .await
+        .unwrap();
+    let loaded = service.load_ready(&target()).await.unwrap().unwrap();
+    let bound = MvDependencyReadBound {
+        inventory: local_inventory_bound(),
+        entries: 4096,
+        collection_bytes: 4 * 1024 * 1024,
+    };
+    let rows = service
+        .list_ready_dependencies_by_downstream_bounded(&loaded, bound)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        service
+            .list_ready_dependencies_by_downstream(&loaded)
+            .await
+            .unwrap()
+    );
+    let tiny = MvDependencyReadBound {
+        collection_bytes: 1,
+        ..bound
+    };
+    assert_eq!(
+        service
+            .list_ready_dependencies_by_downstream_bounded(&loaded, tiny)
+            .await
+            .unwrap_err()
+            .kind(),
+        MvRepositoryErrorKind::InvalidRequest
+    );
+    let fresh = repository
+        .replace_projection(
+            Uuid::now_v7(),
+            ReplaceMvProjectionRequest {
+                mv_id: loaded.projection.mv_id,
+                expected_version: loaded.version.clone(),
+                projection: sample_projection(target(), Some(2)).into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        service
+            .list_ready_dependencies_by_downstream_bounded(&loaded, bound)
+            .await
+            .unwrap_err()
+            .kind(),
+        MvRepositoryErrorKind::Conflict
+    );
+    assert_eq!(
+        service
+            .list_ready_dependencies_by_downstream_bounded(&fresh, bound)
+            .await
+            .unwrap_err()
+            .kind(),
+        MvRepositoryErrorKind::Unavailable
+    );
+    service
+        .observe_current_and_install(Uuid::now_v7(), request(2, Arc::default()), &source(2))
+        .await
+        .unwrap();
+    assert!(
+        service
+            .list_ready_dependencies_by_downstream_bounded(&fresh, bound)
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        service
+            .list_ready_dependencies_by_downstream_bounded(&loaded, bound)
+            .await
+            .unwrap_err()
+            .kind(),
+        MvRepositoryErrorKind::Unavailable
+    );
 }

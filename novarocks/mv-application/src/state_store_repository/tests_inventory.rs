@@ -44,10 +44,17 @@ struct PagePause {
     resume: oneshot::Receiver<()>,
 }
 
+enum PageFault {
+    WrongContinuation,
+    ProviderFailure,
+    CloseFailure,
+}
+
 struct RecordingStore {
     inner: Arc<dyn StateStore>,
     trace: Arc<Mutex<ReadTrace>>,
     pause: Arc<Mutex<Option<PagePause>>>,
+    fault: Arc<Mutex<Option<PageFault>>>,
 }
 
 impl RecordingStore {
@@ -56,6 +63,7 @@ impl RecordingStore {
             inner,
             trace: Arc::new(Mutex::new(ReadTrace::default())),
             pause: Arc::new(Mutex::new(None)),
+            fault: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -94,6 +102,7 @@ struct RecordingRead {
     inner: Box<dyn ReadTransaction>,
     trace: Arc<Mutex<ReadTrace>>,
     pause: Arc<Mutex<Option<PagePause>>>,
+    fault: Arc<Mutex<Option<PageFault>>>,
 }
 
 #[async_trait::async_trait]
@@ -108,7 +117,27 @@ impl ReadTransaction for RecordingRead {
             .expect("read trace")
             .ranges
             .push(request.clone());
-        let page = self.inner.range(request).await?;
+        let mut page = self.inner.range(request).await?;
+        let fault = {
+            let mut fault = self.fault.lock().unwrap();
+            if matches!(*fault, Some(PageFault::CloseFailure)) {
+                None
+            } else {
+                fault.take()
+            }
+        };
+        match fault {
+            Some(PageFault::WrongContinuation) => {
+                page.continuation = Some(request.continuation_after(&request.range.start)?);
+            }
+            Some(PageFault::ProviderFailure) => {
+                return Err(StateStoreError::new(
+                    novarocks_state_store_api::StateStoreErrorKind::ProviderUnavailable,
+                    "injected bounded dependency range failure",
+                ));
+            }
+            _ => {}
+        }
         // Pause after the real store has fixed and read the first snapshot.
         let pause = self.pause.lock().expect("page pause").take();
         if let Some(pause) = pause {
@@ -120,7 +149,14 @@ impl ReadTransaction for RecordingRead {
 
     async fn abort(self: Box<Self>) -> Result<(), StateStoreError> {
         self.trace.lock().expect("read trace").aborts += 1;
-        self.inner.abort().await
+        self.inner.abort().await?;
+        if self.fault.lock().unwrap().take().is_some() {
+            return Err(StateStoreError::new(
+                novarocks_state_store_api::StateStoreErrorKind::ProviderUnavailable,
+                "injected bounded dependency close failure",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -141,6 +177,7 @@ impl StateStore for RecordingStore {
             inner,
             trace: Arc::clone(&self.trace),
             pause: Arc::clone(&self.pause),
+            fault: Arc::clone(&self.fault),
         }))
     }
 
@@ -162,6 +199,8 @@ fn bound() -> MvProjectionInventoryBound {
         entries: 4,
         snapshot_bytes: 16 * 1024,
         raw_page_bytes: 128 * 1024,
+        single_name_bytes: 65_536,
+        continuation_token_bytes: 4096,
         decode: PersistenceDecodeBudget::default(),
     }
 }
@@ -380,4 +419,332 @@ async fn bounded_target_lookup_returns_the_current_exact_version_after_replaceme
             .unwrap(),
         Some(fresh),
     );
+}
+
+fn dependency_bound() -> crate::repository::MvDependencyReadBound {
+    crate::repository::MvDependencyReadBound {
+        inventory: bound(),
+        entries: 4,
+        collection_bytes: 16 * 1024,
+    }
+}
+
+fn assert_dependency_scan_closed(store: &RecordingStore, ranges: usize) {
+    let trace = store.trace.lock().unwrap();
+    assert_eq!(trace.begins, 1);
+    assert_eq!(trace.aborts, 1);
+    assert_eq!(trace.ranges.len(), ranges);
+    assert!(trace.ranges.iter().all(|range| range.page_size == 1));
+}
+
+#[tokio::test]
+async fn bounded_dependencies_preserve_the_exact_classification_and_sort_oracle() {
+    use crate::dependency::MvDependencyObjectType;
+    let (store, repository) = recorded_repository().await;
+    repository
+        .create_projection(
+            Uuid::now_v7(),
+            projection_request("renamed_base", b"base-orders", 1, "other"),
+        )
+        .await
+        .unwrap();
+    let downstream = repository
+        .create_projection(
+            Uuid::now_v7(),
+            projection_request("downstream", b"downstream", 2, "orders"),
+        )
+        .await
+        .unwrap();
+    let oracle = repository
+        .list_dependencies_by_downstream(downstream.projection.mv_id)
+        .await
+        .unwrap();
+    store.reset();
+    let rows = repository
+        .list_dependencies_by_downstream_bounded(
+            downstream.projection.mv_id,
+            &downstream.version,
+            dependency_bound(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, oracle);
+    assert!(rows.iter().all(|row| row.upstream.object_type
+        == MvDependencyObjectType::MaterializedView
+        && row.upstream.display_name() == "mv:ice.sales.orders"));
+    assert_dependency_scan_closed(&store, 4);
+    let trace = store.trace.lock().unwrap();
+    assert!(trace.ranges[0].continuation.is_none());
+    assert!(trace.ranges[1].continuation.is_some());
+    assert!(trace.ranges[2].continuation.is_none());
+    assert!(trace.ranges[3].continuation.is_some());
+}
+
+#[tokio::test]
+async fn bounded_dependencies_refuse_before_retaining_or_following_an_over_budget_stream() {
+    let (store, repository) = recorded_repository().await;
+    let downstream = seed(&repository, "downstream").await;
+    for (tiny, ranges, message) in [
+        (
+            crate::repository::MvDependencyReadBound {
+                entries: 1,
+                ..dependency_bound()
+            },
+            2,
+            "entry bound",
+        ),
+        (
+            crate::repository::MvDependencyReadBound {
+                collection_bytes: 1,
+                ..dependency_bound()
+            },
+            1,
+            "collection byte bound",
+        ),
+        (
+            crate::repository::MvDependencyReadBound {
+                inventory: MvProjectionInventoryBound {
+                    single_name_bytes: 1,
+                    ..bound()
+                },
+                ..dependency_bound()
+            },
+            1,
+            "single name byte bound",
+        ),
+        (
+            crate::repository::MvDependencyReadBound {
+                inventory: MvProjectionInventoryBound {
+                    continuation_token_bytes: 1,
+                    ..bound()
+                },
+                ..dependency_bound()
+            },
+            1,
+            "continuation token byte bound",
+        ),
+        (
+            crate::repository::MvDependencyReadBound {
+                inventory: MvProjectionInventoryBound {
+                    raw_page_bytes: 1,
+                    ..bound()
+                },
+                ..dependency_bound()
+            },
+            0,
+            "raw page byte bound",
+        ),
+        (
+            crate::repository::MvDependencyReadBound {
+                inventory: MvProjectionInventoryBound {
+                    decode: PersistenceDecodeBudget {
+                        max_working_set_bytes: 1,
+                        ..PersistenceDecodeBudget::default()
+                    },
+                    ..bound()
+                },
+                ..dependency_bound()
+            },
+            0,
+            "outer decode working set bound",
+        ),
+    ] {
+        store.reset();
+        let error = repository
+            .list_dependencies_by_downstream_bounded(
+                downstream.projection.mv_id,
+                &downstream.version,
+                tiny,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+        assert_dependency_scan_closed(&store, ranges);
+    }
+}
+
+#[tokio::test]
+async fn bounded_dependencies_refuse_an_incomplete_classification_inventory() {
+    let (store, repository) = recorded_repository().await;
+    let downstream = seed(&repository, "downstream").await;
+    seed(&repository, "other").await;
+    let mut tiny = dependency_bound();
+    tiny.inventory.entries = 1;
+    store.reset();
+    let error = repository
+        .list_dependencies_by_downstream_bounded(
+            downstream.projection.mv_id,
+            &downstream.version,
+            tiny,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), MvRepositoryErrorKind::InvalidRequest);
+    assert_dependency_scan_closed(&store, 4);
+}
+
+#[tokio::test]
+async fn bounded_dependencies_require_the_fresh_exact_downstream_version() {
+    let (store, repository) = recorded_repository().await;
+    let downstream = seed(&repository, "downstream").await;
+    let replaced = repository
+        .replace_projection(
+            Uuid::now_v7(),
+            ReplaceMvProjectionRequest {
+                mv_id: downstream.projection.mv_id,
+                expected_version: downstream.version.clone(),
+                projection: projection_request("downstream", b"downstream", 2, "changed"),
+            },
+        )
+        .await
+        .unwrap();
+    store.reset();
+    let error = repository
+        .list_dependencies_by_downstream_bounded(
+            downstream.projection.mv_id,
+            &downstream.version,
+            dependency_bound(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), MvRepositoryErrorKind::Conflict);
+    assert_dependency_scan_closed(&store, 0);
+    assert_eq!(
+        repository
+            .list_dependencies_by_downstream_bounded(
+                replaced.projection.mv_id,
+                &replaced.version,
+                dependency_bound()
+            )
+            .await
+            .unwrap()[0]
+            .upstream
+            .name,
+        "changed"
+    );
+}
+
+#[tokio::test]
+async fn bounded_dependency_index_and_classification_share_the_first_read_snapshot() {
+    use crate::dependency::MvDependencyObjectType;
+    let (store, repository) = recorded_repository().await;
+    let upstream = repository
+        .create_projection(
+            Uuid::now_v7(),
+            projection_request("orders", b"base-orders", 1, "other"),
+        )
+        .await
+        .unwrap();
+    let downstream = repository
+        .create_projection(
+            Uuid::now_v7(),
+            projection_request("downstream", b"downstream", 2, "orders"),
+        )
+        .await
+        .unwrap();
+    let mutator = StateStoreMvRepository::open(store.inner.clone(), StateStoreRunPolicy::default())
+        .await
+        .unwrap();
+    store.reset();
+    let (observed, resume) = store.pause_next_page();
+    let reader = repository.clone();
+    let version = downstream.version.clone();
+    let mv_id = downstream.projection.mv_id;
+    let running = tokio::spawn(async move {
+        reader
+            .list_dependencies_by_downstream_bounded(mv_id, &version, dependency_bound())
+            .await
+    });
+    observed.await.unwrap();
+    mutator
+        .delete_projection(
+            Uuid::now_v7(),
+            DeleteMvProjectionRequest {
+                mv_id: upstream.projection.mv_id,
+                expected_version: upstream.version,
+                expected_source_revision: upstream.projection.facts.source_revision().clone(),
+            },
+        )
+        .await
+        .unwrap();
+    resume.send(()).unwrap();
+    let rows = running.await.unwrap().unwrap();
+    assert!(
+        rows.iter()
+            .all(|row| row.upstream.object_type == MvDependencyObjectType::MaterializedView)
+    );
+    assert_dependency_scan_closed(&store, 4);
+    let rows = repository
+        .list_dependencies_by_downstream_bounded(mv_id, &downstream.version, dependency_bound())
+        .await
+        .unwrap();
+    assert!(
+        rows.iter()
+            .all(|row| row.upstream.object_type == MvDependencyObjectType::Table)
+    );
+}
+
+#[tokio::test]
+async fn bounded_dependencies_reject_a_missing_canonical_occurrence_before_classifying() {
+    use novarocks_state_store_api::{CommitOutcome, Precondition};
+    let (store, repository) = recorded_repository().await;
+    let downstream = seed(&repository, "downstream").await;
+    let canonical = crate::persistence::dependency::projection_dependencies(
+        downstream.projection.mv_id,
+        &downstream.projection.facts,
+    );
+    let row = &canonical[0];
+    let key = super::key::dependency_by_downstream_key(
+        row.downstream_mv_id,
+        &row.upstream,
+        row.occurrence_id,
+    )
+    .unwrap();
+    let (attempt, _) = store.attempts().reserve().unwrap();
+    let mut write = store
+        .begin_write(attempt, "remove canonical occurrence for bounded display")
+        .await
+        .unwrap();
+    let record = write.get(&key).await.unwrap().unwrap();
+    write
+        .delete(key, Precondition::Version(record.version))
+        .await
+        .unwrap();
+    assert!(matches!(write.commit().await, CommitOutcome::Committed(_)));
+    store.reset();
+    let error = repository
+        .list_dependencies_by_downstream_bounded(
+            downstream.projection.mv_id,
+            &downstream.version,
+            dependency_bound(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), MvRepositoryErrorKind::Corruption);
+    assert!(error.to_string().contains("incomplete"));
+    assert_dependency_scan_closed(&store, 1);
+}
+
+#[tokio::test]
+async fn bounded_dependency_range_or_close_failures_never_publish_partial_facts() {
+    let (store, repository) = recorded_repository().await;
+    let downstream = seed(&repository, "downstream").await;
+    for (fault, ranges, message) in [
+        (PageFault::WrongContinuation, 1, "continuation differs"),
+        (PageFault::ProviderFailure, 1, "range failure"),
+        (PageFault::CloseFailure, 3, "close failure"),
+    ] {
+        store.reset();
+        *store.fault.lock().unwrap() = Some(fault);
+        let error = repository
+            .list_dependencies_by_downstream_bounded(
+                downstream.projection.mv_id,
+                &downstream.version,
+                dependency_bound(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+        assert_dependency_scan_closed(&store, ranges);
+    }
 }

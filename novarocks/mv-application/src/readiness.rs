@@ -904,6 +904,34 @@ impl MvReadinessService {
             .list_dependencies_by_downstream(projection.projection.mv_id)
             .await
     }
+    /// Local display keeps the current ready version and bounded index read
+    /// under the target's observation order, without cloning a second model.
+    pub async fn list_ready_dependencies_by_downstream_bounded(
+        &self,
+        projection: &LoadedMvProjection,
+        bound: crate::repository::MvDependencyReadBound,
+    ) -> Result<Vec<crate::persistence::dependency::StoredMvDependency>, MvRepositoryError> {
+        let target = projection.projection.facts.target();
+        let order = self.runtime.projection_order(target.clone());
+        let cell = order.lock().await;
+        let ready = self
+            .runtime
+            .with_readiness(target, |state| matches!(state, TargetReadiness::Ready));
+        if !ready || cell.installed.as_ref() != Some(&projection.version) {
+            return Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Unavailable,
+                "MV target requires a successful fresh Current observation",
+            ));
+        }
+        self.repository
+            .list_dependencies_by_downstream_bounded(
+                projection.projection.mv_id,
+                &projection.version,
+                bound,
+            )
+            .await
+    }
+
     pub async fn ensure_no_ready_downstream_dependencies(
         &self,
         upstream: &MvDependencyObjectIdentity,

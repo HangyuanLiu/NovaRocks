@@ -75,6 +75,23 @@ impl MvLocalProjectionInventory {
     }
 }
 
+fn local_inventory_bound() -> novarocks_mv_application::repository::MvProjectionInventoryBound {
+    use novarocks_mv_application::repository::MvProjectionInventoryBound;
+    let bound = MvProjectionInventoryBound {
+        entries: novarocks_query_application::api::LocalResultBound::V1.rows,
+        snapshot_bytes: 16 * 1024 * 1024,
+        raw_page_bytes: 1024 * 1024,
+        single_name_bytes: 65_536,
+        continuation_token_bytes: 4096,
+        decode: novarocks_mv_application::persistence::validation::PersistenceDecodeBudget {
+            max_document_bytes: 1024 * 1024,
+            max_working_set_bytes: 4 * 1024 * 1024,
+            ..Default::default()
+        },
+    };
+    bound
+}
+
 /// Read-only inventory for query-local MV candidate discovery.
 ///
 /// A query freezes and validates every returned lake publication before it can
@@ -216,17 +233,7 @@ impl MvReadinessPort {
     pub(crate) fn local_projection_inventory(
         &self,
     ) -> Result<MvLocalProjectionInventory, MvRepositoryError> {
-        use novarocks_mv_application::repository::MvProjectionInventoryBound;
-        let bound = MvProjectionInventoryBound {
-            entries: novarocks_query_application::api::LocalResultBound::V1.rows,
-            snapshot_bytes: 16 * 1024 * 1024,
-            raw_page_bytes: 1024 * 1024,
-            decode: novarocks_mv_application::persistence::validation::PersistenceDecodeBudget {
-                max_document_bytes: 1024 * 1024,
-                max_working_set_bytes: 4 * 1024 * 1024,
-                ..Default::default()
-            },
-        };
+        let bound = local_inventory_bound();
         let inventory = self.block_on(self.service.bounded_projection_inventory(bound))?;
         Ok(MvLocalProjectionInventory {
             inventory,
@@ -254,6 +261,22 @@ impl MvReadinessPort {
         self.block_on(
             self.service
                 .list_ready_dependencies_by_downstream(projection),
+        )
+    }
+
+    pub(crate) fn list_local_dependencies_by_downstream(
+        &self,
+        projection: &LoadedMvProjection,
+    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
+        use novarocks_mv_application::repository::MvDependencyReadBound;
+        let bound = MvDependencyReadBound {
+            inventory: local_inventory_bound(),
+            entries: 4096,
+            collection_bytes: 4 * 1024 * 1024,
+        };
+        self.block_on(
+            self.service
+                .list_ready_dependencies_by_downstream_bounded(projection, bound),
         )
     }
 

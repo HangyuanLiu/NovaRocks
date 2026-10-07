@@ -48,17 +48,17 @@ use crate::persistence::dependency::{
 use crate::persistence::projection::StoredMvProjection;
 use crate::product::MvTarget;
 use crate::repository::{
-    DeleteMvProjectionRequest, LoadedMvProjection, MvProjectionInventoryBound,
-    MvProjectionInventoryBuilder, MvProjectionInventoryEntry, MvProjectionRequest,
-    MvProjectionVersion, MvRepository, MvRepositoryError, MvRepositoryErrorKind, MvTargetLookup,
-    ReplaceMvProjectionRequest,
+    DeleteMvProjectionRequest, LoadedMvProjection, MvDependencyReadBound,
+    MvProjectionInventoryBound, MvProjectionInventoryBuilder, MvProjectionInventoryEntry,
+    MvProjectionRequest, MvProjectionVersion, MvRepository, MvRepositoryError,
+    MvRepositoryErrorKind, MvTargetLookup, ReplaceMvProjectionRequest,
 };
 use crate::repository_metrics::MvRepositoryMetrics;
 use novarocks_state_store_runtime::StateStoreRunPolicy;
 
 use self::codec::{
-    DecodedMvRecord, MvRecordKind, MvSequence, decode_projection, decode_projection_with_budget,
-    decode_record, encode_projection, encode_record,
+    DecodedMvRecord, MvRecordKind, MvSequence, decode_dependency_with_budget, decode_projection,
+    decode_projection_with_budget, decode_record, encode_projection, encode_record,
 };
 use self::key::{
     accelerator_prefix, dependency_by_downstream_key, dependency_by_downstream_prefix,
@@ -386,50 +386,13 @@ impl MvRepository for StateStoreMvRepository {
         &self,
         bound: MvProjectionInventoryBound,
     ) -> Result<Vec<MvProjectionInventoryEntry>, MvRepositoryError> {
-        let mut inventory = MvProjectionInventoryBuilder::new(bound)?;
-        let range = KeyRange::for_prefix(projection_prefix().map_err(corruption)?)
-            .map_err(operation::state_store_error)?;
+        MvProjectionInventoryBuilder::new(bound)?;
         let mut transaction = self
             .store
             .begin_read()
             .await
             .map_err(operation::state_store_error)?;
-        let result = async {
-            let mut continuation = None;
-            loop {
-                let page = transaction
-                    .range(&RangeRequest {
-                        range: range.clone(),
-                        direction: Direction::Forward,
-                        page_size: 1,
-                        continuation: continuation.clone(),
-                    })
-                    .await
-                    .map_err(operation::state_store_error)?;
-                if page.records.len() > 1
-                    || (page.records.is_empty() && page.continuation.is_some())
-                {
-                    return Err(corruption(
-                        "MV inventory provider violated the exact page bound",
-                    ));
-                }
-                if page.continuation.is_some() && page.continuation == continuation {
-                    return Err(corruption("MV inventory continuation made no progress"));
-                }
-                continuation = page.continuation;
-                for record in page.records {
-                    check_inventory_raw_record(&record, bound)?;
-                    let decoded =
-                        decode_projection_with_budget(&record.key, &record.value, bound.decode)
-                            .map_err(corruption)?;
-                    inventory.push(&decoded.value)?;
-                }
-                if continuation.is_none() {
-                    return Ok(inventory.finish());
-                }
-            }
-        }
-        .await;
+        let result = bounded_inventory(transaction.as_mut(), bound).await;
         // Error, budget refusal and success all close the same snapshot before
         // a readiness consumer may start its fresh per-target lookups.
         let close = transaction
@@ -570,6 +533,98 @@ impl MvRepository for StateStoreMvRepository {
     ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
         self.classified_dependencies(dependency_by_downstream_prefix(mv_id).map_err(corruption)?)
             .await
+    }
+
+    async fn list_dependencies_by_downstream_bounded(
+        &self,
+        mv_id: i64,
+        expected_version: &MvProjectionVersion,
+        bound: MvDependencyReadBound,
+    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
+        use crate::bounded_dependencies::{DependencyCollector, classify, validate_canonical};
+        let mut dependencies = DependencyCollector::new(bound)?;
+        let root_key = projection_by_id_key(mv_id).map_err(corruption)?;
+        let mut transaction = self
+            .store
+            .begin_read()
+            .await
+            .map_err(operation::state_store_error)?;
+        let result = async {
+            // Current CAS and D's canonical occurrences are read from exactly
+            // the snapshot that also owns the index and classification scan.
+            {
+                let root = transaction
+                    .get(&root_key)
+                    .await
+                    .map_err(operation::state_store_error)?
+                    .ok_or_else(|| {
+                        MvRepositoryError::new(
+                            MvRepositoryErrorKind::Conflict,
+                            "MV dependency root disappeared",
+                        )
+                    })?;
+                if &root.version != expected_version.store_version() {
+                    return Err(MvRepositoryError::new(
+                        MvRepositoryErrorKind::Conflict,
+                        "MV dependency root changed",
+                    ));
+                }
+                check_inventory_raw_record(&root, bound.inventory)?;
+                let projection =
+                    decode_projection_with_budget(&root_key, &root.value, bound.inventory.decode)
+                        .map_err(corruption)?
+                        .value;
+                if projection.mv_id != mv_id || root.key != root_key {
+                    return Err(corruption(
+                        "MV dependency root key differs from its identity",
+                    ));
+                }
+                drop(root);
+                let mut range = BoundedRecordRange::new(
+                    dependency_by_downstream_prefix(mv_id).map_err(corruption)?,
+                )?;
+                while let Some(record) = range.next(transaction.as_mut(), bound.inventory).await? {
+                    let dependency = decode_dependency_with_budget(
+                        &record.key,
+                        &record.value,
+                        bound.inventory.decode.max_working_set_bytes,
+                    )
+                    .map_err(corruption)?
+                    .value;
+                    let expected_key = dependency_by_downstream_key(
+                        dependency.downstream_mv_id,
+                        &dependency.upstream,
+                        dependency.occurrence_id,
+                    )
+                    .map_err(corruption)?;
+                    if record.key != expected_key {
+                        return Err(corruption(
+                            "MV dependency key differs from its canonical occurrence",
+                        ));
+                    }
+                    dependencies.push(dependency)?;
+                }
+                let dependencies = dependencies.finish();
+                validate_canonical(&projection, &dependencies)?;
+                // Drop the fresh canonical root before opening the inventory
+                // page; the caller may still own its earlier ready model.
+                drop(projection);
+                let inventory = bounded_inventory(transaction.as_mut(), bound.inventory).await?;
+                let mut dependencies = dependencies;
+                classify(&mut dependencies, &inventory);
+                Ok(dependencies)
+            }
+        }
+        .await;
+        let close = transaction
+            .abort()
+            .await
+            .map_err(operation::state_store_error);
+        match (result, close) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(dependencies), Ok(())) => Ok(dependencies),
+        }
     }
 
     async fn list_downstream_dependencies(
@@ -722,6 +777,149 @@ pub async fn observe_catalog_references(
         }
     }
     Ok(None)
+}
+
+/// One record per provider call, one continuation, no retained raw stream.
+struct BoundedRecordRange {
+    range: KeyRange,
+    continuation: Option<novarocks_state_store_api::ContinuationToken>,
+    previous: Option<Key>,
+    exhausted: bool,
+}
+
+impl BoundedRecordRange {
+    fn new(prefix: Key) -> Result<Self, MvRepositoryError> {
+        Ok(Self {
+            range: KeyRange::for_prefix(prefix).map_err(operation::state_store_error)?,
+            continuation: None,
+            previous: None,
+            exhausted: false,
+        })
+    }
+
+    async fn next(
+        &mut self,
+        transaction: &mut dyn ReadTransaction,
+        bound: MvProjectionInventoryBound,
+    ) -> Result<Option<StateRecord>, MvRepositoryError> {
+        if self.exhausted {
+            return Ok(None);
+        }
+        let request = RangeRequest {
+            range: self.range.clone(),
+            direction: Direction::Forward,
+            page_size: 1,
+            continuation: self.continuation.clone(),
+        };
+        let page = transaction
+            .range(&request)
+            .await
+            .map_err(operation::state_store_error)?;
+        if page.records.len() > 1 || (page.records.is_empty() && page.continuation.is_some()) {
+            return Err(corruption(
+                "MV inventory provider violated the exact page bound",
+            ));
+        }
+        if page
+            .continuation
+            .as_ref()
+            .is_some_and(|token| token.as_bytes().len() > bound.continuation_token_bytes)
+        {
+            return Err(invalid(
+                "MV inventory exceeds its continuation token byte bound",
+            ));
+        }
+        if page.continuation.is_some() && page.continuation == self.continuation {
+            return Err(corruption("MV inventory continuation made no progress"));
+        }
+        let cursor_bytes = self
+            .previous
+            .as_ref()
+            .map_or(0, |key| key.as_bytes().len())
+            .saturating_add(
+                self.continuation
+                    .as_ref()
+                    .map_or(0, |token| token.as_bytes().len()),
+            );
+        let Some(record) = page.records.into_iter().next() else {
+            self.exhausted = true;
+            return Ok(None);
+        };
+        // Account old cursor, provider page and exact cursor copies together.
+        let raw_peak = record
+            .value
+            .as_bytes()
+            .len()
+            .saturating_add(record.key.as_bytes().len().saturating_mul(2))
+            .saturating_add(
+                page.continuation
+                    .as_ref()
+                    .map_or(0, |token| token.as_bytes().len())
+                    .saturating_mul(2),
+            )
+            .saturating_add(cursor_bytes);
+        if raw_peak > bound.raw_page_bytes {
+            return Err(invalid("MV inventory exceeds its raw page byte bound"));
+        }
+        if let Some(token) = &page.continuation {
+            if token
+                .resume_after(&request)
+                .map_err(operation::state_store_error)?
+                != record.key
+            {
+                return Err(corruption(
+                    "MV inventory continuation differs from its last page key",
+                ));
+            }
+        }
+        self.exhausted = page.continuation.is_none();
+        self.continuation = page
+            .continuation
+            .map(|token| {
+                novarocks_state_store_api::ContinuationToken::try_from(
+                    bytes::Bytes::copy_from_slice(token.as_bytes()),
+                )
+            })
+            .transpose()
+            .map_err(operation::state_store_error)?;
+        check_inventory_raw_record(&record, bound)?;
+        if record.key < self.range.start
+            || record.key >= self.range.end
+            || self
+                .previous
+                .as_ref()
+                .is_some_and(|previous| previous >= &record.key)
+        {
+            return Err(corruption(
+                "MV inventory page key is out of range or made no progress",
+            ));
+        }
+        self.previous = Some(
+            Key::try_from(bytes::Bytes::copy_from_slice(record.key.as_bytes()))
+                .map_err(operation::state_store_error)?,
+        );
+        Ok(Some(record))
+    }
+}
+
+async fn bounded_inventory(
+    transaction: &mut dyn ReadTransaction,
+    bound: MvProjectionInventoryBound,
+) -> Result<Vec<MvProjectionInventoryEntry>, MvRepositoryError> {
+    let mut inventory = MvProjectionInventoryBuilder::new(bound)?;
+    let mut range = BoundedRecordRange::new(projection_prefix().map_err(corruption)?)?;
+    while let Some(record) = range.next(transaction, bound).await? {
+        let projection = decode_projection_with_budget(&record.key, &record.value, bound.decode)
+            .map_err(corruption)?
+            .value;
+        if record.key != projection_by_id_key(projection.mv_id).map_err(corruption)? {
+            return Err(corruption(
+                "MV inventory root key differs from its identity",
+            ));
+        }
+        inventory.push(&projection)?;
+    }
+    Ok(inventory.finish())
 }
 
 fn check_inventory_raw_record(

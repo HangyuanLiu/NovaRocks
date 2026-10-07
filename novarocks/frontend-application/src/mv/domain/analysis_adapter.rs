@@ -456,8 +456,15 @@ fn dependency_display_for_mv_with_readiness(
     maximum: usize,
 ) -> Result<String, String> {
     let dependencies = readiness
-        .list_ready_dependencies_by_downstream(projection)
+        .list_local_dependencies_by_downstream(projection)
         .map_err(|e| format!("load MV dependencies for display failed: {e}"))?;
+    render_dependency_display(&dependencies, maximum)
+}
+
+fn render_dependency_display(
+    dependencies: &[novarocks_mv_application::persistence::dependency::StoredMvDependency],
+    maximum: usize,
+) -> Result<String, String> {
     use novarocks_mv_application::dependency::MvDependencyObjectType;
     let bytes = dependencies.iter().fold(
         dependencies.len().saturating_sub(1).saturating_mul(2),
@@ -952,5 +959,53 @@ mod bounded_mv_row_tests {
                 .unwrap_err()
                 .contains("workspace")
         );
+    }
+}
+
+#[cfg(test)]
+mod bounded_dependency_display_tests {
+    use super::render_dependency_display;
+    use novarocks_mv_application::dependency::{
+        MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
+    };
+    use novarocks_mv_application::persistence::dependency::StoredMvDependency;
+
+    #[test]
+    fn display_preserves_mv_prefixes_and_separators_under_the_exact_join_bound() {
+        let rows = [
+            MvDependencyObjectType::Table,
+            MvDependencyObjectType::MaterializedView,
+            MvDependencyObjectType::Unclassified,
+        ]
+        .into_iter()
+        .map(|object_type| StoredMvDependency {
+            downstream_mv_id: 1,
+            occurrence_id: 0,
+            upstream_object_id: Default::default(),
+            created_at_ms: 0,
+            upstream: MvDependencyObjectRef {
+                catalog: Some("ice".into()),
+                database_or_namespace: "sales".into(),
+                name: "base".into(),
+                object_type,
+                storage_engine: MvDependencyStorageEngine::Unclassified,
+            },
+        })
+        .collect::<Vec<_>>();
+        let expected = rows
+            .iter()
+            .map(|row| row.upstream.display_name())
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(
+            render_dependency_display(&rows, expected.len()).unwrap(),
+            expected
+        );
+        assert!(
+            render_dependency_display(&rows, expected.len() - 1)
+                .unwrap_err()
+                .contains("row byte bound")
+        );
+        assert_eq!(render_dependency_display(&[], 0).unwrap(), "");
     }
 }
