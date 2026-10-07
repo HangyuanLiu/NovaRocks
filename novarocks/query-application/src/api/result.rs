@@ -27,7 +27,7 @@
 use std::{collections::HashSet, sync::Arc};
 
 use arrow::{
-    array::{ArrayData, ArrayRef, StringArray},
+    array::{ArrayData, ArrayRef},
     buffer::Buffer,
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
@@ -430,19 +430,55 @@ impl Drop for DeliverySignal {
 }
 
 /// Move-only schema delivery that starts a row result.
+/// How the rows of one result stream reach its consumer. It is fixed when the
+/// stream is created, before the schema is published, so a protocol writer
+/// chooses its framing before it writes any metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResultRowCarrier {
+    /// Rows arrive as decoded Arrow batches.
+    DecodedBatches,
+    /// Rows arrive as Backend-encoded root items of this output kind, in
+    /// order; ClientRows items carry this frozen row profile.
+    Relayed {
+        kind: RootOutputKind,
+        client_rows: Option<ClientRowProfile>,
+    },
+}
+
+impl ResultRowCarrier {
+    /// A relayed carrier whose row profile matches its output kind.
+    pub fn relayed(
+        kind: RootOutputKind,
+        client_rows: Option<ClientRowProfile>,
+    ) -> Result<Self, QueryExecutionError> {
+        if client_rows.is_some() != (kind == RootOutputKind::ClientRows) {
+            return Err(invalid_result_delivery(
+                "a relayed result carrier's row profile must match its output kind",
+            ));
+        }
+        Ok(Self::Relayed { kind, client_rows })
+    }
+}
+
 pub struct SchemaDelivery {
     query_id: QueryId,
     schema: ResultSchema,
+    carrier: ResultRowCarrier,
     signal: DeliverySignal,
 }
 
 impl SchemaDelivery {
-    pub(crate) fn new(query_id: QueryId, schema: ResultSchema) -> (Self, ResultDeliveryReceipt) {
+    pub(crate) fn new(
+        query_id: QueryId,
+        schema: ResultSchema,
+        carrier: ResultRowCarrier,
+    ) -> (Self, ResultDeliveryReceipt) {
         let (signal, receipt) = DeliverySignal::channel();
         (
             Self {
                 query_id,
                 schema,
+                carrier,
                 signal,
             },
             receipt,
@@ -455,6 +491,11 @@ impl SchemaDelivery {
 
     pub const fn schema(&self) -> &ResultSchema {
         &self.schema
+    }
+
+    /// How this stream's rows will arrive.
+    pub const fn row_carrier(&self) -> ResultRowCarrier {
+        self.carrier
     }
 
     pub fn complete(mut self) {
@@ -985,6 +1026,7 @@ impl QueryResultStream {
     pub(crate) fn try_channel(
         query_id: QueryId,
         schema: ResultSchema,
+        carrier: ResultRowCarrier,
         delivery_capacity: usize,
     ) -> Result<
         (
@@ -1000,7 +1042,8 @@ impl QueryResultStream {
                 "result delivery capacity must be nonzero",
             ));
         }
-        let (schema_delivery, schema_receipt) = SchemaDelivery::new(query_id, schema.clone());
+        let (schema_delivery, schema_receipt) =
+            SchemaDelivery::new(query_id, schema.clone(), carrier);
         let (sender, receiver) = mpsc::channel(delivery_capacity);
         let (failure_sender, failure) = watch::channel(None);
         Ok((
@@ -1469,7 +1512,11 @@ mod tests {
     async fn schema_disposition_distinguishes_complete_failure_and_drop() {
         let id = execution_id(1);
 
-        let (complete, complete_receipt) = SchemaDelivery::new(id.query_id(), result_schema());
+        let (complete, complete_receipt) = SchemaDelivery::new(
+            id.query_id(),
+            result_schema(),
+            ResultRowCarrier::DecodedBatches,
+        );
         complete.complete();
         assert_eq!(
             complete_receipt.await.unwrap(),
@@ -1477,14 +1524,22 @@ mod tests {
         );
 
         let expected = QueryExecutionError::new(QueryExecutionErrorKind::Failed, "encode schema");
-        let (failed, failed_receipt) = SchemaDelivery::new(id.query_id(), result_schema());
+        let (failed, failed_receipt) = SchemaDelivery::new(
+            id.query_id(),
+            result_schema(),
+            ResultRowCarrier::DecodedBatches,
+        );
         failed.fail(expected.clone());
         assert_eq!(
             failed_receipt.await.unwrap(),
             ResultDeliveryDisposition::Failed(expected)
         );
 
-        let (dropped, dropped_receipt) = SchemaDelivery::new(id.query_id(), result_schema());
+        let (dropped, dropped_receipt) = SchemaDelivery::new(
+            id.query_id(),
+            result_schema(),
+            ResultRowCarrier::DecodedBatches,
+        );
         drop(dropped);
         assert_eq!(
             dropped_receipt.await.unwrap(),
@@ -1928,7 +1983,13 @@ mod tests {
             .unwrap();
         let id = execution_id(2);
         let (transport, schema_receipt, _failure_sender, mut stream) =
-            QueryResultStream::try_channel(id.query_id(), result_schema(), 1).unwrap();
+            QueryResultStream::try_channel(
+                id.query_id(),
+                result_schema(),
+                ResultRowCarrier::DecodedBatches,
+                1,
+            )
+            .unwrap();
 
         let error = match stream.next().await {
             Err(error) => error,
@@ -1986,7 +2047,13 @@ mod tests {
     async fn stream_failure_is_terminal_without_success_eof() {
         let id = execution_id(3);
         let (_transport, schema_receipt, failure_sender, mut stream) =
-            QueryResultStream::try_channel(id.query_id(), result_schema(), 1).unwrap();
+            QueryResultStream::try_channel(
+                id.query_id(),
+                result_schema(),
+                ResultRowCarrier::DecodedBatches,
+                1,
+            )
+            .unwrap();
         stream.begin_schema().unwrap().complete();
         assert_eq!(
             schema_receipt.await.unwrap(),
@@ -2007,7 +2074,13 @@ mod tests {
     async fn owner_loss_drops_queued_success_eof() {
         let id = execution_id(4);
         let (transport, schema_receipt, failure_sender, mut stream) =
-            QueryResultStream::try_channel(id.query_id(), result_schema(), 1).unwrap();
+            QueryResultStream::try_channel(
+                id.query_id(),
+                result_schema(),
+                ResultRowCarrier::DecodedBatches,
+                1,
+            )
+            .unwrap();
         stream.begin_schema().unwrap().complete();
         assert_eq!(
             schema_receipt.await.unwrap(),

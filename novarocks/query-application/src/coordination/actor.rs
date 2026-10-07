@@ -811,6 +811,7 @@ pub struct LogicalExecutionActorConfig {
     execution_stage: Option<StagePermit>,
     result_schema: Option<ResultSchema>,
     result_delivery_capacity: Option<NonZeroUsize>,
+    result_row_carrier: crate::api::ResultRowCarrier,
 }
 
 impl fmt::Debug for LogicalExecutionActorConfig {
@@ -894,6 +895,7 @@ impl LogicalExecutionActorConfig {
             execution_stage: Some(initial_execution_stage),
             result_schema: None,
             result_delivery_capacity: None,
+            result_row_carrier: crate::api::ResultRowCarrier::DecodedBatches,
         })
     }
 
@@ -1010,6 +1012,7 @@ impl LogicalExecutionActorConfig {
             execution_stage: Some(initial_execution_stage),
             result_schema: None,
             result_delivery_capacity: None,
+            result_row_carrier: crate::api::ResultRowCarrier::DecodedBatches,
         })
     }
 
@@ -1055,6 +1058,14 @@ impl LogicalExecutionActorConfig {
         self.output_mode = LogicalOutputMode::ResultStream;
         self.result_schema = Some(schema);
         self.result_delivery_capacity = Some(delivery_capacity);
+        self
+    }
+
+    /// Fixes how this execution's result rows arrive. A relayed carrier admits
+    /// only Backend-encoded root items of its exact kind and row profile; the
+    /// default admits only decoded batches.
+    pub(crate) fn with_result_row_carrier(mut self, carrier: crate::api::ResultRowCarrier) -> Self {
+        self.result_row_carrier = carrier;
         self
     }
 
@@ -1369,6 +1380,7 @@ enum InFlightResult {
 
 struct ResultRuntime {
     schema: ResultSchema,
+    carrier: crate::api::ResultRowCarrier,
     schema_receipt: Option<ResultDeliveryReceipt>,
     schema_writer_completed: bool,
     failure_sender: Option<watch::Sender<Option<QueryExecutionError>>>,
@@ -2103,12 +2115,14 @@ pub(crate) fn spawn_logical_execution_actor(
                 QueryResultStream::try_channel(
                     config.initial_execution.query_id(),
                     schema.clone(),
+                    config.result_row_carrier,
                     capacity.get(),
                 )
                 .map_err(|_| LogicalExecutionActorError::InvariantViolation)?;
             (
                 Some(ResultRuntime {
                     schema,
+                    carrier: config.result_row_carrier,
                     schema_receipt: Some(schema_receipt),
                     schema_writer_completed: false,
                     failure_sender: Some(failure_sender),
@@ -3834,6 +3848,16 @@ fn handle_command(
                 let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
                 return;
             }
+            if runtime.carrier != crate::api::ResultRowCarrier::DecodedBatches {
+                drop(batch);
+                drop(credit);
+                conclude_failed(
+                    state,
+                    "a decoded batch arrived on a result that declared relayed rows",
+                );
+                reply_result_failure(state, reply);
+                return;
+            }
             if sequence.next().is_none() || !runtime.schema.accepts(batch.batch()) {
                 drop(batch);
                 drop(credit);
@@ -3915,6 +3939,19 @@ fn handle_command(
             if sequence.next().is_none() {
                 drop(segment);
                 conclude_failed(state, "a root segment sequence overflowed");
+                reply_result_failure(state, reply);
+                return;
+            }
+            let expected = crate::api::ResultRowCarrier::Relayed {
+                kind: segment.kind(),
+                client_rows: client_rows.map(|(profile, _)| profile),
+            };
+            if runtime.carrier != expected {
+                drop(segment);
+                conclude_failed(
+                    state,
+                    "a root segment does not match the row carrier this result declared",
+                );
                 reply_result_failure(state, reply);
                 return;
             }

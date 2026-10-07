@@ -114,8 +114,12 @@ impl ResultStreamTestProducer {
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .expect("test result root work is admitted");
         let schema = ResultSchema::new(fields);
-        let (transport, schema_receipt, failure, stream) =
-            QueryResultStream::try_channel(execution_id.query_id(), schema, delivery_capacity)?;
+        let (transport, schema_receipt, failure, stream) = QueryResultStream::try_channel(
+            execution_id.query_id(),
+            schema,
+            crate::api::ResultRowCarrier::DecodedBatches,
+            delivery_capacity,
+        )?;
         let handle = ExecutionHandle::new(
             root.owner.cancellation_requester(),
             ExecutionOutput::Rows(stream),

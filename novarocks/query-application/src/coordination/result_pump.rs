@@ -5235,6 +5235,13 @@ mod tests {
 
     /// The ordinary harness plus a configured result window for the root.
     async fn relay_harness(tag: i64) -> (Harness, ResultWindowGrant) {
+        relay_harness_with(tag, relay_carrier()).await
+    }
+
+    async fn relay_harness_with(
+        tag: i64,
+        carrier: crate::api::ResultRowCarrier,
+    ) -> (Harness, ResultWindowGrant) {
         let control = WorkloadControl::try_new(
             WorkloadConfig::default(),
             ResourceConfig {
@@ -5268,14 +5275,17 @@ mod tests {
             stage,
         )
         .unwrap()
-        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+        .with_result_row_carrier(carrier);
         let (owner, initial, output) = spawn_logical_execution_actor(&Handle::current(), config)
             .unwrap()
             .into_parts();
         let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result actor must expose a stream");
         };
-        stream.begin_schema().unwrap().complete();
+        let schema = stream.begin_schema().unwrap();
+        assert_eq!(schema.row_carrier(), carrier);
+        schema.complete();
         let actor = owner.actor().clone();
         let permit = actor.activate(initial.ready()).await.unwrap();
         (
@@ -5292,6 +5302,15 @@ mod tests {
         )
     }
 
+    fn relay_profile() -> ClientRowProfile {
+        ClientRowProfile::try_new(RootProfileV1::SEGMENT_BYTES, 1 << 20).unwrap()
+    }
+
+    fn relay_carrier() -> crate::api::ResultRowCarrier {
+        crate::api::ResultRowCarrier::relayed(RootOutputKind::ClientRows, Some(relay_profile()))
+            .unwrap()
+    }
+
     fn relay_binding(
         root: TaskIdentity,
         port: Arc<ScriptedRootPort>,
@@ -5303,7 +5322,7 @@ mod tests {
                 root,
                 RootProfileId::V1,
                 RootOutputKind::ClientRows,
-                Some(ClientRowProfile::try_new(RootProfileV1::SEGMENT_BYTES, 1 << 20).unwrap()),
+                Some(relay_profile()),
             )
             .unwrap(),
             window: window.retain_alias(),
@@ -5449,6 +5468,53 @@ mod tests {
             );
             drop((stream, actor, owner, window, status_sender));
         }
+    }
+
+    #[tokio::test]
+    async fn a_relayed_segment_on_a_decoded_batch_result_is_refused() {
+        let (
+            Harness {
+                control: _control,
+                scope,
+                actor,
+                owner,
+                permit,
+                mut stream,
+                root,
+            },
+            window,
+        ) = relay_harness_with(33, crate::api::ResultRowCarrier::DecodedBatches).await;
+        let (status_sender, statuses) = accepted_root_status_projection(root);
+        status_sender.publish(running(root)).unwrap();
+        let port = ScriptedRootPort::new(vec![rows_data(1, &[1, 0, 0, 0, b'a'], None)]);
+        let (_terminal_sender, terminal_source) = native_attempt_terminal_channel();
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_root_relay(
+                permit,
+                root,
+                scope,
+                relay_binding(root, port, &window),
+                statuses,
+                terminal_source,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            matches!(error, ResultPumpFailure::Concluded(_)),
+            "unexpected error: {error:?}"
+        );
+        // No segment reaches the decoded-batch consumer; it sees the reason.
+        let Err(consumer) = stream.next().await else {
+            panic!("the decoded-batch consumer must see the refusal");
+        };
+        assert!(
+            consumer.to_string().contains("row carrier"),
+            "unexpected consumer error: {consumer}"
+        );
+        drop((stream, actor, owner, window, status_sender));
     }
 
     #[tokio::test]
