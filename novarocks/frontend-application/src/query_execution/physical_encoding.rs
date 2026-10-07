@@ -1751,6 +1751,31 @@ mod tests {
         }
     }
 
+    // A VALUES cell keeps its analyzed type until final lowering assigns its
+    // column's, so a NULL cell is a NULL of its column's type. Lowered in its
+    // own type first and then replaced, it left a definition no operator
+    // read, which final validation refused before either carrier encoded.
+    #[test]
+    fn values_with_null_cells_complete_and_encode_under_both_carriers() {
+        for sql in [
+            "SELECT a, b FROM (VALUES (1, NULL), (2, 3)) t(a, b) ORDER BY a",
+            "SELECT a, b, c FROM (VALUES (1, 10, 'x'), (2, NULL, 'y'), (3, 20, NULL), \
+             (NULL, 20, 'z'), (5, 20, 'w'), (6, NULL, NULL), (7, 30, 'v')) AS t(a, b, c)",
+            "SELECT a, b, c, d FROM (VALUES (1, NULL, 'x', 1.5), (2, 3, NULL, NULL), \
+             (NULL, 4, 'y', 2.5)) AS t(a, b, c, d)",
+        ] {
+            let (plan, encoded) = encode_with(sql, &StaticPlanCarrier::PlanTree);
+            encoded.unwrap_or_else(|error| panic!("{sql}: the plan-tree carrier encodes: {error}"));
+            let (_, encoded) = encode_with(sql, &compiled_carrier());
+            encoded.unwrap_or_else(|error| panic!("{sql}: the compiled carrier encodes: {error}"));
+            assert_eq!(
+                compiled_programs(sql).len(),
+                plan.fragments().len(),
+                "{sql}"
+            );
+        }
+    }
+
     #[test]
     fn completed_encoding_observes_tail_after_freezing_and_preserves_first_control_failure() {
         use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};

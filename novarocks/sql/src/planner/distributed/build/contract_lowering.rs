@@ -8306,10 +8306,12 @@ impl<'a> ContractLoweringVisitor<'a> {
             });
         }
 
-        let lowered = self.lower_expression(owner, expression, &BTreeMap::new())?;
-        let lowered = self.convert_expression_to(
+        // A cell keeps its analyzed type until here, so a NULL cell is typed
+        // by its column as it is lowered rather than converted afterwards.
+        let lowered = self.lower_expression_as(
             owner,
-            lowered,
+            expression,
+            &BTreeMap::new(),
             target,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         )?;
@@ -8545,8 +8547,13 @@ impl<'a> ContractLoweringVisitor<'a> {
                 decimal_overflow_policy,
                 ..
             } => {
-                let child = self.lower_expression(owner, expr, visible)?;
-                return self.convert_expression_to(owner, child, &ty, *decimal_overflow_policy);
+                return self.lower_expression_as(
+                    owner,
+                    expr,
+                    visible,
+                    &ty,
+                    *decimal_overflow_policy,
+                );
             }
             ExprKind::IsNull { expr, negated } => ContractExprKind::IsNull {
                 expr: self.lower_expression(owner, expr, visible)?,
@@ -8651,27 +8658,25 @@ impl<'a> ContractLoweringVisitor<'a> {
                 }
                 let mut branches = Vec::with_capacity(when_then.len());
                 for ((_, then), when) in when_then.iter().zip(whens) {
-                    let then = self.lower_expression(owner, then, visible)?;
                     branches.push((
                         when,
-                        self.convert_expression_to(
+                        self.lower_expression_as(
                             owner,
                             then,
+                            visible,
                             &ty,
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         )?,
                     ));
                 }
                 let else_expr = match else_expr.as_deref() {
-                    Some(item) => {
-                        let item = self.lower_expression(owner, item, visible)?;
-                        Some(self.convert_expression_to(
-                            owner,
-                            item,
-                            &ty,
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                        )?)
-                    }
+                    Some(item) => Some(self.lower_expression_as(
+                        owner,
+                        item,
+                        visible,
+                        &ty,
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    )?),
                     None => None,
                 };
                 ContractExprKind::Case {
@@ -9534,10 +9539,65 @@ impl<'a> ContractLoweringVisitor<'a> {
             .ok_or(ContractLoweringError::IdentitySpaceExhausted("expression"))
     }
 
+    /// Lowers one expression as `target`.
+    ///
+    /// A NULL constant converts to a NULL of `target` without reading
+    /// anything, so it is authored in that type where it stands, the way the
+    /// analyzer's own typed NULL conversion does. Lowering it in its own type
+    /// first and replacing it afterwards would leave that first definition in
+    /// the fragment's arena with nothing reading it.
+    fn lower_expression_as(
+        &mut self,
+        owner: NodeId,
+        expression: &TypedExpr,
+        visible: &BTreeMap<ColumnId, ValueId>,
+        target: &ValueType,
+        policy: novarocks_type_contract::DecimalOverflowPolicy,
+    ) -> Result<ExprId, ContractLoweringError> {
+        if let Some(source) = self.null_constant_type(expression)?
+            && source != *target
+        {
+            let mut target = target.clone();
+            target.nullable = true;
+            return self.author_literal_expression(owner, &LiteralValue::Null, target);
+        }
+        let lowered = self.lower_expression(owner, expression, visible)?;
+        self.convert_expression_to(owner, lowered, target, policy)
+    }
+
+    /// The type a NULL constant is lowered in, or `None` for any other
+    /// expression.
+    ///
+    /// This is the type `lower_expression` would author it with: a syntax
+    /// NULL admits null because it is one, and a checked constant keeps its
+    /// own complete type.
+    fn null_constant_type(
+        &mut self,
+        expression: &TypedExpr,
+    ) -> Result<Option<ValueType>, ContractLoweringError> {
+        match &expression.kind {
+            ExprKind::Literal(LiteralValue::Null) => {
+                let mut ty = expression_type(expression);
+                ty.nullable = true;
+                Ok(Some(ty))
+            }
+            ExprKind::Constant(value) => {
+                self.work.flush()?;
+                let null = value.is_null_observed(CompilePhase::Validate, self.control)?;
+                self.work.flush()?;
+                Ok(null.then(|| expression_type(expression)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// The same expression, compared as `target`.
     ///
     /// An expression that already has the type is returned as it is: a
-    /// conversion that converts nothing is not written down.
+    /// conversion that converts nothing is not written down. Any other
+    /// conversion reads `expression`, so what the caller lowered stays
+    /// reachable; a NULL constant that should simply take `target` is typed
+    /// before it is lowered, by `lower_expression_as`.
     fn convert_expression_to(
         &mut self,
         owner: NodeId,
@@ -9563,32 +9623,6 @@ impl<'a> ContractLoweringVisitor<'a> {
         let source = self.expression_value_type(expression)?;
         if source == *target {
             return Ok(expression);
-        }
-        let reference = self
-            .fragment_mut()
-            .expressions()
-            .get(expression)
-            .and_then(|node| {
-                if let ContractExprKind::Constant(reference) = node.kind {
-                    Some(reference)
-                } else {
-                    None
-                }
-            });
-        if let Some(reference) = reference {
-            let value = self.plan_builder.constants().resolve_observed(
-                reference,
-                &source,
-                &mut self.work,
-            )?;
-            self.work.flush()?;
-            let null = value.is_null_observed(CompilePhase::Validate, self.control)?;
-            self.work.flush()?;
-            if null {
-                let mut target = target.clone();
-                target.nullable = true;
-                return self.author_literal_expression(owner, &LiteralValue::Null, target);
-            }
         }
         self.control.checkpoint(CompilePhase::Validate, 0)?;
         let intermediate =
@@ -14614,6 +14648,74 @@ mod tests {
             assert_eq!(source.ty.logical_type, expression.ty.logical_type);
             assert!(matches!(source.kind, ContractExprKind::Constant(_)));
             checked_constant_for_test(&final_plan, source);
+        }
+    }
+
+    /// A NULL cell is typed by its column where it is lowered. Converting a
+    /// cell already lowered in its own type would replace it with a typed
+    /// NULL and leave the original definition in the arena, read by no
+    /// operator, which final validation refuses.
+    #[test]
+    fn values_null_cells_take_their_column_type_without_unread_definitions() {
+        let untyped_null = || TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Null),
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Null, true),
+        };
+        let narrower_null = TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Null),
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
+        };
+        let text = |value: &str| TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::String(value.to_string())),
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+        };
+        let columns = vec![
+            column(1, "a", DataType::Int64, true),
+            column(2, "b", DataType::Float64, true),
+            column(3, "c", DataType::Utf8, true),
+            column(4, "d", DataType::Int64, true),
+        ];
+        let rows = vec![
+            vec![literal_int(1), untyped_null(), text("x"), literal_int(4)],
+            vec![
+                literal_int(2),
+                literal_int(3),
+                untyped_null(),
+                narrower_null,
+            ],
+            vec![
+                untyped_null(),
+                literal_float(4.5),
+                text("y"),
+                untyped_null(),
+            ],
+        ];
+        let null_cells = [(0, 1), (1, 2), (1, 3), (2, 0), (2, 3)];
+
+        // Finishing runs final validation, which refuses an arena definition
+        // no operator root reaches.
+        let final_plan = finish_for_test(&values(columns.clone(), rows)).unwrap();
+        let fragment = final_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+        let root = fragment.nodes().get(&fragment.root()).unwrap();
+        let NodeKind::Values { rows } = &root.kind else {
+            panic!("expected Values root");
+        };
+        for (row, column) in null_cells {
+            let expression = fragment.expressions().get(rows[row][column]).unwrap();
+            assert_eq!(
+                expression.ty,
+                ValueType::new(columns[column].value_type.data_type.clone(), true),
+                "row {row} column {column}"
+            );
+            let value = checked_constant_for_test(&final_plan, expression);
+            assert!(
+                value
+                    .is_null_observed(
+                        CompilePhase::Validate,
+                        &crate::compiler::SqlCompileControl::unbounded(),
+                    )
+                    .unwrap()
+            );
         }
     }
 

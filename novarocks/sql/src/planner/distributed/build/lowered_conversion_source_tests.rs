@@ -313,8 +313,9 @@ fn conversion_journal_identity_and_null_fastpaths_have_no_phantom_source() {
         ));
     }
 
-    // The NULL fastpath is an original visitor emission fixture only. The
-    // existing orphan-expression validation boundary is not publication proof.
+    // The NULL fastpath is an original visitor emission fixture only, not
+    // publication proof. It types the NULL where it is lowered, so no
+    // original in the source type is left behind for nothing to read.
     let expression = cast(
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Null),
@@ -344,6 +345,7 @@ fn conversion_journal_identity_and_null_fastpaths_have_no_phantom_source() {
     let source = fragment.expressions().get(id).unwrap();
     assert_eq!(source.ty, ValueType::new(DataType::Utf8, true));
     assert!(matches!(source.kind, ContractExprKind::Constant(_)));
+    assert_eq!(fragment.expressions().len(), 1);
     visitor.work.finish().unwrap();
 }
 
