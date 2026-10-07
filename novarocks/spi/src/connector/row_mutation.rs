@@ -42,6 +42,12 @@ mod match_bounds;
 #[cfg(test)]
 mod match_bounds_tests;
 mod row_footprint;
+mod source_owner;
+pub use source_owner::{
+    ConnectorRowMutationSourceArray, ConnectorRowMutationSourceBatch,
+    ConnectorRowMutationSourceBuffer, ConnectorRowMutationSourceBuilder,
+    ConnectorRowMutationSourceChildren, MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES,
+};
 #[cfg(test)]
 thread_local! { static MATCH_LAYOUT_ALLOCATION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 #[cfg(test)]
@@ -896,6 +902,8 @@ pub struct ConnectorRowMutationSelection {
     max_rows: u64,
     max_bytes: u64,
     digest: [u8; 32],
+    // Present only when the private construction owner supplied every batch.
+    source_ownership: Option<std::sync::Arc<[usize]>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -936,6 +944,64 @@ impl<'a> ConnectorRowMutationSelectionView<'a> {
 }
 
 impl ConnectorRowMutationSelection {
+    /// Consume receipts minted by the bounded source construction owner. No
+    /// arbitrary RecordBatch can assert or acquire this source eligibility.
+    pub fn try_new_owned(
+        schema: SchemaRef,
+        sources: Vec<ConnectorRowMutationSourceBatch>,
+        max_rows: u64,
+        max_bytes: u64,
+    ) -> Result<Self, ConnectorError> {
+        let header_peak = sources
+            .capacity()
+            .checked_mul(size_of::<ConnectorRowMutationSourceBatch>())
+            .and_then(|bytes| {
+                sources
+                    .len()
+                    .checked_mul(size_of::<RecordBatch>() + 3 * size_of::<usize>())?
+                    .checked_add(bytes)
+            });
+        if sources.len() > MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES
+            || header_peak.is_none_or(|bytes| bytes > 1024 * 1024)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "owned COW source containers exceed their bounded bookkeeping",
+            ));
+        }
+        let mut source_total = ConnectorRowConversionFootprint::retained_schema_bytes(&schema)?;
+        for source in &sources {
+            source_total = source_total
+                .checked_add(source.source_bytes())
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::ResourceExhausted,
+                        "owned COW source accounting overflowed",
+                    )
+                })?;
+            if source_total as u64 > max_bytes || source_total > 64 * 1024 * 1024 {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "owned COW sources exceed the retained selection profile",
+                ));
+            }
+        }
+        let mut ownership = Vec::with_capacity(sources.len());
+        let mut batches = Vec::with_capacity(sources.len());
+        for source in sources {
+            ownership.push(source.source_bytes());
+            batches.push(source.into_batch());
+        }
+        let mut selection = Self::try_new(schema, batches, max_rows, max_bytes)?;
+        selection.source_ownership = Some(ownership.into());
+        Ok(selection)
+    }
+
+    /// Only constructor-owned sources qualify for production bounded ingress.
+    pub fn has_owned_sources(&self) -> bool {
+        self.source_ownership.is_some()
+    }
+
     pub fn try_new(
         schema: SchemaRef,
         batches: Vec<RecordBatch>,
@@ -1006,6 +1072,7 @@ impl ConnectorRowMutationSelection {
             max_rows,
             max_bytes,
             digest,
+            source_ownership: None,
         })
     }
     pub fn validate(&self) -> Result<(), ConnectorError> {
@@ -1019,6 +1086,21 @@ impl ConnectorRowMutationSelection {
                 ConnectorErrorKind::CorruptData,
                 "row-mutation selection retained invalid bounds",
             ));
+        }
+        if let Some(ownership) = &self.source_ownership {
+            let total = ownership.iter().try_fold(
+                ConnectorRowConversionFootprint::retained_schema_bytes(&self.schema)?,
+                |total, bytes| total.checked_add(*bytes),
+            );
+            if ownership.len() != self.batches.len()
+                || total
+                    .is_none_or(|bytes| bytes as u64 > self.max_bytes || bytes > 64 * 1024 * 1024)
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "COW selection lost its exact bounded source ownership",
+                ));
+            }
         }
         check_selection_headers(self.batches.capacity(), self.batches.len())?;
         validate_selection_schema_shape(self.schema.as_ref())?;
@@ -2396,15 +2478,21 @@ fn selection_digest(
     // All immutable batches pass one traversal budget before Arrow's
     // constructor can allocate synthetic null arrays. No encoded Rows or
     // data copies are retained across batches.
-    footprint.checked_constructor_peak_with(retained_bytes, 1024 * 1024)?;
+    // A signed consumer may retain its bounded validator converter (32 MiB)
+    // and all Internal bookkeeping (8 MiB) while this digest runs. Reserve
+    // that coexistence before constructing a second converter.
+    const OTHER_CONSUMER_BYTES: usize = 40 * 1024 * 1024;
+    footprint.checked_constructor_peak_with(retained_bytes, OTHER_CONSUMER_BYTES)?;
     footprint.preflight_batches(
         batches,
-        retained_bytes.checked_add(1024 * 1024).ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "row-mutation selection bookkeeping accounting overflowed",
-            )
-        })?,
+        retained_bytes
+            .checked_add(OTHER_CONSUMER_BYTES)
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "row-mutation selection bookkeeping accounting overflowed",
+                )
+            })?,
     )?;
     let mut hasher = Sha256::new();
     hasher.update(b"novarocks.connector-row-mutation-selection.v2\0");

@@ -20,7 +20,9 @@
 //! This module deliberately knows only the signed SPI contract.  It neither
 //! interprets provider identity values nor derives a physical write strategy.
 
+mod cast_footprint;
 mod uniqueness;
+use cast_footprint::CowSignedCastFootprint;
 use std::sync::Arc;
 use std::time::Instant;
 use uniqueness::BoundedMutationKeys;
@@ -32,14 +34,15 @@ use arrow::row::{RowConverter, SortField};
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorMutationMatchContract, ConnectorRequestContext,
     ConnectorRowConversionFootprint, ConnectorRowMutationEffect, ConnectorRowMutationIntent,
-    ConnectorRowMutationSelection,
+    ConnectorRowMutationSelection, ConnectorRowMutationSourceBatch,
+    ConnectorRowMutationSourceBuilder, MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES,
 };
 
 use crate::native::fragment_transport::FetchedQueryBatch;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_native_adapter::root_cow_selection_codec::{
-    COW_SELECTION_MAX_RECORD_BYTES, CowSelectionRecordHeader, CowSelectionRecordKind,
-    CowSelectionStreamDecoder,
+    COW_SELECTION_MAX_RECORD_BYTES, CowSelectionCodecError, CowSelectionRecordHeader,
+    CowSelectionRecordKind, CowSelectionStreamDecoder,
 };
 use novarocks_native_adapter::root_record_assembly::{RootRecordAssembly, RootRecordDomain};
 
@@ -67,8 +70,28 @@ pub struct BoundedRowMutationMatchCollector {
     row_count: u64,
     byte_count: u64,
     schema: Option<SchemaRef>,
-    batches: Vec<RecordBatch>,
+    batches: Vec<CollectedCowBatch>,
 }
+
+enum CollectedCowBatch {
+    Legacy(RecordBatch),
+    Owned(ConnectorRowMutationSourceBatch),
+}
+impl CollectedCowBatch {
+    fn batch(&self) -> &RecordBatch {
+        match self {
+            Self::Legacy(batch) => batch,
+            Self::Owned(source) => source.batch(),
+        }
+    }
+    fn source_bytes(&self) -> Result<usize, ConnectorError> {
+        match self {
+            Self::Legacy(batch) => ConnectorRowConversionFootprint::retained_batch_bytes(batch),
+            Self::Owned(source) => Ok(source.source_bytes()),
+        }
+    }
+}
+const _: () = assert!(2 * 4096 * size_of::<CollectedCowBatch>() <= 1024 * 1024);
 
 #[allow(
     dead_code,
@@ -188,6 +211,24 @@ impl BoundedRowMutationMatchCollector {
 
     /// Retains one result batch without concatenating it with prior batches.
     pub fn push(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
+        self.push_item(CollectedCowBatch::Legacy(batch))
+    }
+
+    fn push_owned(&mut self, batch: ConnectorRowMutationSourceBatch) -> Result<(), ConnectorError> {
+        self.push_item(CollectedCowBatch::Owned(batch))
+    }
+
+    fn push_item(&mut self, item: CollectedCowBatch) -> Result<(), ConnectorError> {
+        if self
+            .batches
+            .first()
+            .is_some_and(|first| std::mem::discriminant(first) != std::mem::discriminant(&item))
+        {
+            return Err(invalid_match(
+                "COW source carrier changed during collection",
+            ));
+        }
+        let batch = item.batch();
         self.check_next_batch(batch.num_rows() as u64)?;
         match &self.schema {
             Some(schema) if batch.schema_ref() != schema => {
@@ -204,10 +245,7 @@ impl BoundedRowMutationMatchCollector {
                 "row-mutation match batch row count does not fit u64",
             )
         })?;
-        let bytes = u64::try_from(ConnectorRowConversionFootprint::retained_batch_bytes(
-            &batch,
-        )?)
-        .map_err(|_| {
+        let bytes = u64::try_from(item.source_bytes()?).map_err(|_| {
             ConnectorError::new(
                 ConnectorErrorKind::ResourceExhausted,
                 "row-mutation match batch byte count does not fit u64",
@@ -252,9 +290,9 @@ impl BoundedRowMutationMatchCollector {
                 .batches
                 .capacity()
                 .checked_add(desired)
-                .and_then(|slots| slots.checked_mul(size_of::<RecordBatch>()))
+                .and_then(|slots| slots.checked_mul(size_of::<CollectedCowBatch>()))
                 .ok_or_else(|| invalid_match("COW collector slot accounting overflowed"))?;
-            if peak > 8 * 1024 * 1024 {
+            if peak > 1024 * 1024 {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::ResourceExhausted,
                     "COW collector batch headers exceed their bookkeeping workspace",
@@ -280,7 +318,7 @@ impl BoundedRowMutationMatchCollector {
         }
         self.row_count = next_rows;
         self.byte_count = next_bytes;
-        self.batches.push(batch);
+        self.batches.push(item);
         Ok(())
     }
 
@@ -298,7 +336,39 @@ impl BoundedRowMutationMatchCollector {
                 "empty row-mutation match collection has no explicit selection schema",
             )
         })?;
-        ConnectorRowMutationSelection::try_new(schema, self.batches, self.max_rows, self.max_bytes)
+        // The old/new header vectors fit the frozen one-MiB collector slice.
+        if self
+            .batches
+            .first()
+            .is_none_or(|batch| matches!(batch, CollectedCowBatch::Owned(_)))
+        {
+            let sources = self
+                .batches
+                .into_iter()
+                .map(|batch| match batch {
+                    CollectedCowBatch::Owned(source) => source,
+                    CollectedCowBatch::Legacy(_) => {
+                        unreachable!("collector rejects mixed carriers")
+                    }
+                })
+                .collect();
+            ConnectorRowMutationSelection::try_new_owned(
+                schema,
+                sources,
+                self.max_rows,
+                self.max_bytes,
+            )
+        } else {
+            let batches = self
+                .batches
+                .into_iter()
+                .map(|batch| match batch {
+                    CollectedCowBatch::Legacy(batch) => batch,
+                    CollectedCowBatch::Owned(_) => unreachable!("collector rejects mixed carriers"),
+                })
+                .collect();
+            ConnectorRowMutationSelection::try_new(schema, batches, self.max_rows, self.max_bytes)
+        }
     }
 
     fn check_control(&self) -> Result<(), ConnectorError> {
@@ -344,6 +414,56 @@ pub fn cast_to_signed_selection(
         .collect::<Result<Vec<ArrayRef>, _>>()?;
     RecordBatch::try_new(Arc::clone(schema), columns)
         .map_err(|error| format!("assemble signed COW match batch: {error}"))
+}
+
+/// Preserve source eligibility through a canonical signed cast. The source
+/// receipt proves all input backing; the kernel preflight precedes the cast.
+/// The copied output is minted by the same safe owner, with no raw adoption.
+fn cast_owned_to_signed_selection(
+    schema: &SchemaRef,
+    source: &ConnectorRowMutationSourceBatch,
+    retained_selection: usize,
+    assembly_bytes: usize,
+) -> Result<ConnectorRowMutationSourceBatch, ConnectorError> {
+    let input = source.batch();
+    // Check the target's closed source profile before the cast can allocate.
+    let mut owner = ConnectorRowMutationSourceBuilder::try_new(Arc::clone(schema))?;
+    let observed_input = ConnectorRowConversionFootprint::retained_batch_bytes(input)?;
+    let source_scratch = source.source_bytes().saturating_sub(observed_input);
+    // 32 MiB validator + 8 MiB bookkeeping coexist while collecting. The
+    // detached output factory can use its complete 32 MiB construction slice.
+    let other_live = assembly_bytes
+        .checked_add(40 * 1024 * 1024)
+        .and_then(|bytes| bytes.checked_add(MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES))
+        .ok_or_else(|| invalid_match("COW cast coexistence accounting overflowed"))?;
+    let footprint = CowSignedCastFootprint::for_batch(
+        schema,
+        input,
+        retained_selection,
+        source_scratch,
+        other_live,
+    )?;
+    tracing::trace!(
+        input_bytes = footprint.input_bytes,
+        output_bytes = footprint.output_bytes,
+        temporary_bytes = footprint.temporary_bytes,
+        copy_peak_bytes = footprint.copy_peak_bytes,
+        peak_bytes = footprint.peak_bytes,
+        "COW signed cast construction preflight"
+    );
+    let cast = cast_to_signed_selection(schema, input).map_err(invalid_match)?;
+    let mut columns = owner.children(schema.fields().len())?;
+    let mut node = 0;
+    for column in cast.columns() {
+        let data = column.to_data();
+        let copy = owner.copy_data(node, &data)?;
+        fn nodes(data: &arrow::array::ArrayData) -> usize {
+            1 + data.child_data().iter().map(nodes).sum::<usize>()
+        }
+        node += nodes(&data);
+        columns.push(copy)?;
+    }
+    owner.finish(cast.num_rows(), columns)
 }
 
 /// Collects a relayed CowSelectionArrowV1 stream into the bounded selection.
@@ -436,9 +556,23 @@ impl RelayedCowSelectionCollector {
                     message
                 })?;
             }
-            let Some(batch) = decoder
-                .apply_record(record)
-                .map_err(|error| format!("decode relayed COW selection record: {error}"))?
+            let Some(batch) = decoder.apply_owned_record(record).map_err(|error| {
+                let message = format!("decode relayed COW selection record: {error}");
+                if matches!(
+                    error,
+                    CowSelectionCodecError::SourceLimit
+                        | CowSelectionCodecError::SchemaLimit
+                        | CowSelectionCodecError::BatchLimit
+                        | CowSelectionCodecError::RecordLimit
+                        | CowSelectionCodecError::ScratchLimit
+                ) {
+                    collector_error = Some(ConnectorError::new(
+                        ConnectorErrorKind::ResourceExhausted,
+                        message.clone(),
+                    ));
+                }
+                message
+            })?
             else {
                 let width = decoder.schema().map_or(0, |relayed| relayed.fields().len());
                 if width != schema.fields().len() {
@@ -449,8 +583,18 @@ impl RelayedCowSelectionCollector {
                 }
                 return Ok(());
             };
-            let batch = cast_to_signed_selection(schema, &batch)?;
-            collector.push(batch).map_err(|error| {
+            let batch = cast_owned_to_signed_selection(
+                schema,
+                &batch,
+                collector.byte_count() as usize,
+                record.len(),
+            )
+            .map_err(|error| {
+                let message = error.to_string();
+                collector_error = Some(error);
+                message
+            })?;
+            collector.push_owned(batch).map_err(|error| {
                 let message = error.to_string();
                 collector_error = Some(error);
                 message
@@ -546,6 +690,14 @@ impl RowMutationMatchValidator {
             ConnectorRowConversionFootprint::for_fields(contract.uniqueness_tokens().iter().map(
                 |token| match_field(&contract, *token).expect("uniqueness fields were validated"),
             ))?;
+        // Digest/cast reserve this exact coexistence allowance for the live
+        // validator. Refuse before its converter is constructed.
+        if conversion_footprint.converter_bytes > 32 * 1024 * 1024 {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "COW validator converter exceeds its retained transform slice",
+            ));
+        }
         let seen = BoundedMutationKeys::new();
         let vector_bytes = contract
             .uniqueness_tokens()
@@ -1032,6 +1184,7 @@ mod tests {
             arrow.push(input.clone()).unwrap();
         }
         let expected = arrow.finish().unwrap();
+        assert!(!expected.has_owned_sources());
         for body in [1, 7, 33, stream.len()] {
             let mut relayed = RelayedCowSelectionCollector::try_new(
                 context(Arc::clone(&cancellation), 1 << 20),
@@ -1043,6 +1196,7 @@ mod tests {
                 relayed.push_body(piece).unwrap();
             }
             let selection = relayed.finish().unwrap();
+            assert!(selection.has_owned_sources());
             assert_eq!(selection.digest(), expected.digest(), "body size {body}");
             assert_eq!(selection.batches(), expected.batches());
         }
@@ -1057,6 +1211,43 @@ mod tests {
         .unwrap();
         assert_eq!(empty.schema(), &selection_schema());
         assert_eq!(empty.row_count(), 0);
+        assert!(empty.has_owned_sources());
+    }
+
+    #[test]
+    fn collection_refuses_carrier_changes_without_retaining_the_new_batch() {
+        let input = batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)]);
+        let stream = relayed_stream(std::slice::from_ref(&input));
+        let mut decoder = CowSelectionStreamDecoder::new();
+        let schema_len = CowSelectionRecordHeader::parse(&stream)
+            .unwrap()
+            .record_bytes() as usize;
+        assert!(
+            decoder
+                .apply_owned_record(&stream[..schema_len])
+                .unwrap()
+                .is_none()
+        );
+        let owned = decoder
+            .apply_owned_record(&stream[schema_len..])
+            .unwrap()
+            .unwrap();
+        let cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
+        let mut collector = BoundedRowMutationMatchCollector::try_new_with_schema(
+            context(cancellation, 1 << 20),
+            None,
+            selection_schema(),
+        )
+        .unwrap();
+        collector.push_owned(owned).unwrap();
+        let bytes = collector.byte_count();
+        assert_eq!(
+            collector.push(input).unwrap_err().kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+        assert_eq!(collector.byte_count(), bytes);
+        assert_eq!(collector.row_count(), 1);
+        assert!(collector.finish().unwrap().has_owned_sources());
     }
 
     #[test]

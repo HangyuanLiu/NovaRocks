@@ -281,9 +281,11 @@ pub use row_mutation::{
     ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
     ConnectorRowMutationRoute, ConnectorRowMutationScanBinding, ConnectorRowMutationSelection,
     ConnectorRowMutationSelectionOrdinal, ConnectorRowMutationSelectionView,
-    ConnectorRowMutationStrategy, ConnectorWriteRouteId,
+    ConnectorRowMutationSourceArray, ConnectorRowMutationSourceBatch,
+    ConnectorRowMutationSourceBuffer, ConnectorRowMutationSourceBuilder,
+    ConnectorRowMutationSourceChildren, ConnectorRowMutationStrategy, ConnectorWriteRouteId,
     MAX_CONNECTOR_ROW_CONVERSION_WORKSPACE_BYTES, MAX_CONNECTOR_ROW_MUTATION_ROUTES,
-    MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES,
+    MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES, MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES,
 };
 pub use scalar::{ConnectorScalarType, ConnectorScalarValue};
 pub use semantic_revision::{

@@ -59,7 +59,11 @@ use arrow::datatypes::{
 };
 use novarocks_result_contract::RootProfileV1;
 use novarocks_result_render::{RenderTurn, RenderTurnStatus};
-use novarocks_spi::connector::MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES;
+use novarocks_spi::connector::{
+    ConnectorRowMutationSourceArray, ConnectorRowMutationSourceBatch,
+    ConnectorRowMutationSourceBuilder, MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES,
+    MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES,
+};
 
 pub const COW_SELECTION_HEADER_BYTES: usize = 32;
 pub const COW_SELECTION_TURN_BYTES: usize = 64 * 1024;
@@ -118,6 +122,7 @@ pub enum CowSelectionCodecError {
     TrailingRecordBytes,
     MalformedSchema,
     MalformedBatch,
+    SourceLimit,
 }
 impl std::fmt::Display for CowSelectionCodecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -135,6 +140,7 @@ impl std::fmt::Display for CowSelectionCodecError {
             Self::TrailingRecordBytes => "COW selection record has trailing bytes",
             Self::MalformedSchema => "malformed COW selection schema record",
             Self::MalformedBatch => "malformed COW selection batch record",
+            Self::SourceLimit => "COW selection source exceeds its bounded ownership profile",
         })
     }
 }
@@ -922,12 +928,9 @@ impl CowSelectionDecoder {
         let nodes = header.nodes as usize;
         let buffers = header.buffers as usize;
         let directory = &record[COW_SELECTION_HEADER_BYTES..];
-        let word = |index: usize| {
-            u64::from_le_bytes(directory[8 * index..8 * index + 8].try_into().unwrap())
-        };
         let mut state = BatchState {
-            lengths: (0..nodes).map(word).collect(),
-            sizes: (nodes..nodes + buffers).map(word).collect(),
+            lengths: &directory[..8 * nodes],
+            sizes: &directory[8 * nodes..8 * (nodes + buffers)],
             payload: &record[COW_SELECTION_HEADER_BYTES + 8 * (nodes + buffers)..],
             node: 0,
             buffer: 0,
@@ -951,6 +954,61 @@ impl CowSelectionDecoder {
             &RecordBatchOptions::new().with_row_count(Some(rows)),
         )
         .map_err(|_| malformed)
+    }
+
+    /// The bounded source path copies and assembles every allocation through
+    /// the SPI owner. The receipt never adopts a caller-provided Arrow batch.
+    pub fn decode_batch_owned(
+        schema: &SchemaRef,
+        record: &[u8],
+    ) -> Result<ConnectorRowMutationSourceBatch, CowSelectionCodecError> {
+        let header = CowSelectionRecordHeader::parse(record)?;
+        header.validate_record_bytes(record.len())?;
+        if header.kind != CowSelectionRecordKind::Batch {
+            return Err(CowSelectionCodecError::MalformedBatch);
+        }
+        if record.len() > MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES
+            || header.rows > RootProfileV1::MAX_ELEMENTS_PER_ROW as u64
+        {
+            return Err(CowSelectionCodecError::SourceLimit);
+        }
+        let malformed = CowSelectionCodecError::MalformedBatch;
+        let nodes = header.nodes as usize;
+        let buffers = header.buffers as usize;
+        let directory = &record[COW_SELECTION_HEADER_BYTES..];
+        // Borrow directory words instead of holding a second directory copy
+        // alongside the source construction and complete assembled record.
+        let mut state = BatchState {
+            lengths: &directory[..8 * nodes],
+            sizes: &directory[8 * nodes..8 * (nodes + buffers)],
+            payload: &directory[8 * (nodes + buffers)..],
+            node: 0,
+            buffer: 0,
+            position: 0,
+        };
+        let mut owner = ConnectorRowMutationSourceBuilder::try_new(Arc::clone(schema))
+            .map_err(|_| CowSelectionCodecError::SourceLimit)?;
+        let rows = usize::try_from(header.rows).map_err(|_| malformed)?;
+        let mut columns = owner
+            .children(schema.fields().len())
+            .map_err(source_error)?;
+        for field in schema.fields() {
+            columns
+                .push(state.array_owned(field.data_type(), &mut owner)?)
+                .map_err(source_error)?;
+        }
+        if state.node != nodes || state.buffer != buffers || state.position != state.payload.len() {
+            return Err(malformed);
+        }
+        owner.finish(rows, columns).map_err(source_error)
+    }
+}
+
+fn source_error(error: novarocks_spi::connector::ConnectorError) -> CowSelectionCodecError {
+    if error.kind() == novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted {
+        CowSelectionCodecError::SourceLimit
+    } else {
+        CowSelectionCodecError::MalformedBatch
     }
 }
 
@@ -994,6 +1052,42 @@ impl CowSelectionStreamDecoder {
                     return Err(CowSelectionCodecError::BatchLimit);
                 }
                 let batch = CowSelectionDecoder::decode_batch(schema, record)?;
+                self.batches += 1;
+                Ok(Some(batch))
+            }
+        }
+    }
+
+    /// Preserve allocation provenance for the bounded COW consumer. The old
+    /// naked batch API remains only for its separately admitted transition.
+    pub fn apply_owned_record(
+        &mut self,
+        record: &[u8],
+    ) -> Result<Option<ConnectorRowMutationSourceBatch>, CowSelectionCodecError> {
+        let header = CowSelectionRecordHeader::parse(record)?;
+        if record.len() > MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES {
+            return Err(CowSelectionCodecError::SourceLimit);
+        }
+        match (header.kind, &self.schema) {
+            (CowSelectionRecordKind::Schema, None) => {
+                preflight_owned_schema(record)?;
+                let schema = CowSelectionDecoder::decode_schema(record)?;
+                // Source construction does not start until the complete
+                // decoded immutable schema passes its source-owner profile.
+                ConnectorRowMutationSourceBuilder::try_new(Arc::clone(&schema))
+                    .map_err(|_| CowSelectionCodecError::SourceLimit)?;
+                self.schema = Some(schema);
+                Ok(None)
+            }
+            (CowSelectionRecordKind::Schema, Some(_)) => {
+                Err(CowSelectionCodecError::MalformedSchema)
+            }
+            (CowSelectionRecordKind::Batch, None) => Err(CowSelectionCodecError::MalformedBatch),
+            (CowSelectionRecordKind::Batch, Some(schema)) => {
+                if self.batches >= MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES {
+                    return Err(CowSelectionCodecError::BatchLimit);
+                }
+                let batch = CowSelectionDecoder::decode_batch_owned(schema, record)?;
                 self.batches += 1;
                 Ok(Some(batch))
             }
@@ -1133,22 +1227,161 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Validate the borrowed schema before Reader allocates any String, Field,
+/// Arc or child vector. The codec carries no metadata; constructor coexistence
+/// includes the old Vec<Field> slots while Fields builds its Arc backing.
+fn preflight_owned_schema(record: &[u8]) -> Result<(), CowSelectionCodecError> {
+    let header = CowSelectionRecordHeader::parse(record)?;
+    header.validate_record_bytes(record.len())?;
+    if header.kind != CowSelectionRecordKind::Schema {
+        return Err(CowSelectionCodecError::MalformedSchema);
+    }
+    let mut reader = Reader::new(&record[COW_SELECTION_HEADER_BYTES..]);
+    let mut nodes = 0_usize;
+    let mut texts = 0_usize;
+    fn text(reader: &mut Reader<'_>, texts: &mut usize) -> Result<bool, CowSelectionCodecError> {
+        let len = reader.u32()? as usize;
+        if len > RootProfileV1::MAX_NAME_BYTES {
+            return Err(CowSelectionCodecError::SourceLimit);
+        }
+        *texts = texts
+            .checked_add(len)
+            .ok_or(CowSelectionCodecError::SourceLimit)?;
+        if *texts > RootProfileV1::SCHEMA_WIRE_BYTES {
+            return Err(CowSelectionCodecError::SourceLimit);
+        }
+        std::str::from_utf8(reader.take(len)?)
+            .map_err(|_| CowSelectionCodecError::MalformedSchema)?;
+        Ok(len == 0)
+    }
+    fn field(
+        reader: &mut Reader<'_>,
+        nodes: &mut usize,
+        texts: &mut usize,
+        depth: usize,
+    ) -> Result<u8, CowSelectionCodecError> {
+        if depth >= RootProfileV1::MAX_DEPTH || *nodes == RootProfileV1::MAX_COLUMNS {
+            return Err(CowSelectionCodecError::SourceLimit);
+        }
+        *nodes += 1;
+        let tag = reader.u8()?;
+        if reader.u8()? > 1 {
+            return Err(CowSelectionCodecError::MalformedSchema);
+        }
+        text(reader, texts)?;
+        match tag {
+            tag::NULL
+            | tag::BOOLEAN
+            | tag::INT8
+            | tag::INT16
+            | tag::INT32
+            | tag::INT64
+            | tag::UINT8
+            | tag::UINT16
+            | tag::UINT32
+            | tag::UINT64
+            | tag::FLOAT32
+            | tag::FLOAT64
+            | tag::DATE32
+            | tag::DATE64
+            | tag::UTF8
+            | tag::LARGE_UTF8
+            | tag::BINARY
+            | tag::LARGE_BINARY => {}
+            tag::DECIMAL128 | tag::DECIMAL256 => {
+                reader.take(2)?;
+            }
+            tag::TIME32 => {
+                if !matches!(reader.unit()?, TimeUnit::Second | TimeUnit::Millisecond) {
+                    return Err(CowSelectionCodecError::MalformedSchema);
+                }
+            }
+            tag::TIME64 => {
+                if !matches!(reader.unit()?, TimeUnit::Microsecond | TimeUnit::Nanosecond) {
+                    return Err(CowSelectionCodecError::MalformedSchema);
+                }
+            }
+            tag::TIMESTAMP => {
+                reader.unit()?;
+                let has_zone = reader.u8()?;
+                let empty = text(reader, texts)?;
+                if has_zone > 1 || (has_zone == 0 && !empty) {
+                    return Err(CowSelectionCodecError::MalformedSchema);
+                }
+            }
+            tag::FIXED_SIZE_BINARY => {
+                if i32::from_le_bytes(reader.take(4)?.try_into().unwrap()) < 0 {
+                    return Err(CowSelectionCodecError::MalformedSchema);
+                }
+            }
+            tag::LIST | tag::LARGE_LIST => {
+                field(reader, nodes, texts, depth + 1)?;
+            }
+            tag::STRUCT => {
+                let count = reader.u32()? as usize;
+                if count > RootProfileV1::MAX_COLUMNS - *nodes {
+                    return Err(CowSelectionCodecError::SourceLimit);
+                }
+                for _ in 0..count {
+                    field(reader, nodes, texts, depth + 1)?;
+                }
+            }
+            tag::DICTIONARY => {
+                if !matches!(
+                    field(reader, nodes, texts, depth + 1)?,
+                    tag::UTF8 | tag::LARGE_UTF8
+                ) {
+                    return Err(CowSelectionCodecError::MalformedSchema);
+                }
+            }
+            _ => return Err(CowSelectionCodecError::MalformedSchema),
+        }
+        Ok(tag)
+    }
+    while !reader.done() {
+        field(&mut reader, &mut nodes, &mut texts, 0)?;
+    }
+    if nodes != header.nodes as usize {
+        return Err(CowSelectionCodecError::MalformedSchema);
+    }
+    let per_node = std::mem::size_of::<Field>()
+        + std::mem::size_of::<DataType>()
+        + 8 * std::mem::size_of::<usize>();
+    let backing = nodes
+        .checked_mul(per_node)
+        .and_then(|n| n.checked_add(texts))
+        .and_then(|n| n.checked_add(1024))
+        .ok_or(CowSelectionCodecError::SourceLimit)?;
+    let coexist = nodes
+        .checked_mul(2048)
+        .and_then(|n| n.checked_add(backing))
+        .ok_or(CowSelectionCodecError::SourceLimit)?;
+    if backing > RootProfileV1::SCHEMA_BACKING_BYTES
+        || coexist > MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES
+    {
+        return Err(CowSelectionCodecError::SourceLimit);
+    }
+    Ok(())
+}
+
 struct BatchState<'a> {
-    lengths: Vec<u64>,
-    sizes: Vec<u64>,
+    lengths: &'a [u8],
+    sizes: &'a [u8],
     payload: &'a [u8],
     node: usize,
     buffer: usize,
     position: usize,
 }
-impl BatchState<'_> {
-    fn buffer(
+impl<'a> BatchState<'a> {
+    fn buffer_bytes(
         &mut self,
         expected: Option<usize>,
-    ) -> Result<Option<Buffer>, CowSelectionCodecError> {
+    ) -> Result<Option<&'a [u8]>, CowSelectionCodecError> {
         let malformed = CowSelectionCodecError::MalformedBatch;
-        let size = usize::try_from(*self.sizes.get(self.buffer).ok_or(malformed)?)
-            .map_err(|_| malformed)?;
+        let at = self.buffer.checked_mul(8).ok_or(malformed)?;
+        let word = self.sizes.get(at..at + 8).ok_or(malformed)?;
+        let size =
+            usize::try_from(u64::from_le_bytes(word.try_into().unwrap())).map_err(|_| malformed)?;
         self.buffer += 1;
         if expected.is_some_and(|expected| expected != size) {
             return Err(malformed);
@@ -1160,13 +1393,21 @@ impl BatchState<'_> {
             .ok_or(malformed)?;
         let bytes = &self.payload[self.position..end];
         self.position = end;
-        Ok((size != 0 || expected.is_some()).then(|| Buffer::from_slice_ref(bytes)))
+        Ok((size != 0 || expected.is_some()).then_some(bytes))
+    }
+    fn buffer(
+        &mut self,
+        expected: Option<usize>,
+    ) -> Result<Option<Buffer>, CowSelectionCodecError> {
+        Ok(self.buffer_bytes(expected)?.map(Buffer::from_slice_ref))
     }
     fn array(&mut self, data_type: &DataType) -> Result<ArrayData, CowSelectionCodecError> {
         let malformed = CowSelectionCodecError::MalformedBatch;
         let (_, shape) = shape(data_type).map_err(|_| malformed)?;
-        let len = usize::try_from(*self.lengths.get(self.node).ok_or(malformed)?)
-            .map_err(|_| malformed)?;
+        let at = self.node.checked_mul(8).ok_or(malformed)?;
+        let word = self.lengths.get(at..at + 8).ok_or(malformed)?;
+        let len =
+            usize::try_from(u64::from_le_bytes(word.try_into().unwrap())).map_err(|_| malformed)?;
         self.node += 1;
         let validity = self.buffer(None)?;
         // Non-nullable columns may still carry an all-valid bitmap; the
@@ -1231,5 +1472,232 @@ impl BatchState<'_> {
             _ => {}
         }
         builder.build().map_err(|_| malformed)
+    }
+
+    fn array_owned(
+        &mut self,
+        data_type: &DataType,
+        owner: &mut ConnectorRowMutationSourceBuilder,
+    ) -> Result<ConnectorRowMutationSourceArray, CowSelectionCodecError> {
+        let malformed = CowSelectionCodecError::MalformedBatch;
+        let (_, shape) = shape(data_type).map_err(|_| malformed)?;
+        let node = self.node;
+        let at = node.checked_mul(8).ok_or(malformed)?;
+        let word = self.lengths.get(at..at + 8).ok_or(malformed)?;
+        let len =
+            usize::try_from(u64::from_le_bytes(word.try_into().unwrap())).map_err(|_| malformed)?;
+        if len > RootProfileV1::MAX_ELEMENTS_PER_ROW {
+            return Err(CowSelectionCodecError::SourceLimit);
+        }
+        self.node += 1;
+        let copy = |bytes: Option<&[u8]>, owner: &mut ConnectorRowMutationSourceBuilder| {
+            bytes
+                .map(|bytes| owner.copy_buffer(bytes).map_err(source_error))
+                .transpose()
+        };
+        let validity_bytes = self.buffer_bytes(None)?;
+        if validity_bytes
+            .is_some_and(|bytes| bytes.len() != len.div_ceil(8) || matches!(shape, Shape::Null))
+        {
+            return Err(malformed);
+        }
+        let validity = copy(validity_bytes, owner)?;
+        let (first, second) = match shape {
+            Shape::Null | Shape::Struct => (None, None),
+            Shape::Boolean => (
+                copy(self.buffer_bytes(Some(len.div_ceil(8)))?, owner)?,
+                None,
+            ),
+            Shape::Fixed(width) | Shape::FixedBinary(width) => (
+                copy(
+                    self.buffer_bytes(Some(len.checked_mul(width).ok_or(malformed)?))?,
+                    owner,
+                )?,
+                None,
+            ),
+            Shape::Dictionary => (
+                copy(
+                    self.buffer_bytes(Some(len.checked_mul(4).ok_or(malformed)?))?,
+                    owner,
+                )?,
+                None,
+            ),
+            Shape::Bytes32 | Shape::List32 | Shape::Bytes64 | Shape::List64 => {
+                let width = if matches!(shape, Shape::Bytes32 | Shape::List32) {
+                    4
+                } else {
+                    8
+                };
+                let bytes = len
+                    .checked_add(1)
+                    .and_then(|n| n.checked_mul(width))
+                    .ok_or(malformed)?;
+                let first = copy(self.buffer_bytes(Some(bytes))?, owner)?;
+                let second = if matches!(shape, Shape::Bytes32 | Shape::Bytes64) {
+                    Some(
+                        owner
+                            .copy_buffer(self.buffer_bytes(None)?.unwrap_or(&[]))
+                            .map_err(source_error)?,
+                    )
+                } else {
+                    None
+                };
+                (first, second)
+            }
+        };
+        let count = match data_type {
+            DataType::List(_) | DataType::LargeList(_) | DataType::Dictionary(_, _) => 1,
+            DataType::Struct(fields) => fields.len(),
+            _ => 0,
+        };
+        let mut children = owner.children(count).map_err(source_error)?;
+        match data_type {
+            DataType::List(item) | DataType::LargeList(item) => children
+                .push(self.array_owned(item.data_type(), owner)?)
+                .map_err(source_error)?,
+            DataType::Struct(fields) => {
+                for child in fields {
+                    children
+                        .push(self.array_owned(child.data_type(), owner)?)
+                        .map_err(source_error)?;
+                }
+            }
+            DataType::Dictionary(_, value) => children
+                .push(self.array_owned(value, owner)?)
+                .map_err(source_error)?,
+            _ => {}
+        }
+        owner
+            .array(node, len, validity, first, second, children)
+            .map_err(source_error)
+    }
+}
+
+#[cfg(test)]
+mod owned_source_tests {
+    use super::*;
+    use arrow::array::{Int32Array, NullArray, StringArray, StructArray};
+
+    fn encode(batch: &RecordBatch) -> Vec<u8> {
+        let mut encoder =
+            CowSelectionEncoder::try_new(batch, CowSelectionTotals::default(), usize::MAX).unwrap();
+        let mut output = [0_u8; 8192];
+        let mut stream = Vec::new();
+        loop {
+            let turn = encoder.step(&mut output);
+            stream.extend_from_slice(&output[..turn.emitted_bytes]);
+            if turn.status == RenderTurnStatus::InputComplete {
+                return stream;
+            }
+        }
+    }
+
+    #[test]
+    fn owned_stream_preserves_legacy_wire_values_and_standard_source_backing() {
+        let fields: Fields = vec![
+            Field::new("number", DataType::Int32, true),
+            Field::new("text", DataType::Utf8, true),
+        ]
+        .into();
+        let structure = StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), None])),
+                Arc::new(StringArray::from(vec![Some("x"), Some("y")])),
+            ],
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(fields),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(structure)]).unwrap();
+        let stream = encode(&batch);
+        let mut legacy = CowSelectionStreamDecoder::new();
+        let mut owned = CowSelectionStreamDecoder::new();
+        let mut at = 0;
+        let mut batches = 0;
+        while at < stream.len() {
+            let header = CowSelectionRecordHeader::parse(&stream[at..]).unwrap();
+            let end = at + header.record_bytes() as usize;
+            let record = &stream[at..end];
+            let naked = legacy.apply_record(record).unwrap();
+            let receipt = owned.apply_owned_record(record).unwrap();
+            match (naked, receipt) {
+                (None, None) => {}
+                (Some(naked), Some(receipt)) => {
+                    assert_eq!(&naked, receipt.batch());
+                    assert!(receipt.source_bytes() >= receipt.batch().get_array_memory_size());
+                    assert!(receipt.source_bytes() <= MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES);
+                    let structure = receipt.batch().column(0).as_struct();
+                    let ptr = structure.column(1).as_string::<i32>().value_data().as_ptr();
+                    assert!(
+                        (ptr as usize) < stream.as_ptr() as usize
+                            || (ptr as usize) >= stream.as_ptr() as usize + stream.len()
+                    );
+                    batches += 1;
+                }
+                _ => panic!("owned and legacy stream phases differ"),
+            }
+            at = end;
+        }
+        assert_eq!(batches, 1);
+        assert_eq!(legacy.finish(), owned.finish());
+    }
+
+    #[test]
+    fn owned_schema_refuses_name_and_malformed_shape_before_materialization() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "n".repeat(RootProfileV1::MAX_NAME_BYTES + 1),
+            DataType::Null,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(NullArray::new(1))]).unwrap();
+        let stream = encode(&batch);
+        let header = CowSelectionRecordHeader::parse(&stream).unwrap();
+        let record = &stream[..header.record_bytes() as usize];
+        assert_eq!(
+            preflight_owned_schema(record),
+            Err(CowSelectionCodecError::SourceLimit)
+        );
+        assert!(CowSelectionDecoder::decode_schema(record).is_ok());
+        let mut malformed = record.to_vec();
+        malformed[COW_SELECTION_HEADER_BYTES + 1] = 2;
+        assert_eq!(
+            preflight_owned_schema(&malformed),
+            Err(CowSelectionCodecError::MalformedSchema)
+        );
+        let mut decoder = CowSelectionStreamDecoder::new();
+        assert_eq!(
+            decoder.apply_owned_record(record).unwrap_err(),
+            CowSelectionCodecError::SourceLimit
+        );
+        assert!(decoder.schema().is_none());
+    }
+
+    #[test]
+    fn owned_batch_refuses_large_null_row_declaration_and_foreign_first_batch() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Null, true)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(NullArray::new(1))]).unwrap();
+        let stream = encode(&batch);
+        let schema_header = CowSelectionRecordHeader::parse(&stream).unwrap();
+        let split = schema_header.record_bytes() as usize;
+        let mut record = stream[split..].to_vec();
+        let rows = RootProfileV1::MAX_ELEMENTS_PER_ROW as u64 + 1;
+        record[16..24].copy_from_slice(&rows.to_le_bytes());
+        record[COW_SELECTION_HEADER_BYTES..COW_SELECTION_HEADER_BYTES + 8]
+            .copy_from_slice(&rows.to_le_bytes());
+        let mut decoder = CowSelectionStreamDecoder::new();
+        assert_eq!(
+            decoder.apply_owned_record(&stream[split..]).unwrap_err(),
+            CowSelectionCodecError::MalformedBatch
+        );
+        decoder.apply_owned_record(&stream[..split]).unwrap();
+        assert_eq!(
+            decoder.apply_owned_record(&record).unwrap_err(),
+            CowSelectionCodecError::SourceLimit
+        );
+        assert_eq!(decoder.batches, 0);
     }
 }

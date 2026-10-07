@@ -55,3 +55,37 @@ receipt and bounded cast path are separate pending slices; this checkpoint
 does not authorize arbitrary Arrow ingress or retire the old FE quota. Domain
 execution positions, whole-window production funding, socket/1FE+3BE COW
 effect and P09 performance/transport gates also remain pending.
+
+
+## P06 构造 owner 与 signed cast（2026-10-07，当前切片）
+
+SPI 新增 opaque source builder/buffer/array/children/batch。只能由受限复制与组装工厂
+铸造 receipt；没有接受任意 RecordBatch、ArrayRef、Buffer 或 bool 的 adopter。
+每个 source 总计 32 MiB、schema backing 1 MiB、4096 nodes、depth 64、1,048,576 行。
+标准 buffer 按 64 B 对齐和 header 计量；私有 child/column 容器按实际 capacity 与
+构造重叠计量。预算不在构造过程中返还。借用 ArrayData 的整树复制预检在第一个
+payload copy 前完成，offset 非零拒绝；copy_data 不保存原 Buffer/ArrayData 别名。
+
+领域 codec 保持原 wire grammar。owned schema 先借用预检名称、节点、深度和
+构造 backing，再调用既有 schema decoder。batch directory 直接借用记录，buffer
+与 children 经工厂创建。只有成功 batch 才推进 count。旧 decode API 是切换期接口。
+
+FE 在调用任何 cast 前先检查 signed target 的 source-owner eligibility，再借用
+计算已有 source、assembly、retained selection、validator/bookkeeping、全部列的
+kernel output/temporary/copy 共存。支持的类型对使用原 cast，未证明的类型对明确
+拒绝；signed 输出经工厂重新复制，切断可能的 foreign/private backing。
+owned selection 只接收 source receipt，复制/验证保留 proof，不允许混用 carrier。
+validator converter 单独限定 32 MiB，digest 预检同时留出其与 bookkeeping 的
+40 MiB 共存额度；转换总 workspace 仍为 256 MiB，产品总界未提高。
+
+Source 闭集为普通 scalar、Utf8/Binary（含 Large）、Decimal128/256、合法
+Time/Timestamp、非负宽度 FixedSizeBinary、List/LargeList/Struct，以及
+Int32→Utf8/LargeUtf8 Dictionary。Map、FixedSizeList、view、union、run-end
+目标在 cast 之前拒绝。转换闭集独立更窄，不能因为 source 类型可表示就放行
+未证明的 kernel。已复制输出的 factory 拒绝不会改变已收集 selection。
+
+本切片的 SPI 341、Native owned codec 3、既有 codec integration 8 项通过。
+Frontend 全库 1,435 项通过，COW 定向 24 项通过。日志为
+`logs/mem-1-m07/p06-cow-source-{spi,native-unit,native-codec,fe-targeted,fe-final-trace}-20261007.log`。
+新增 cast footprint 未引入 dead-field warning：组件上界用于 trace 观察。该记录仍不证明完整 Internal window、
+有限 domain execution 位置、生产 V1 sink、1FE+3BE COW effect 或 P09 测量门。
