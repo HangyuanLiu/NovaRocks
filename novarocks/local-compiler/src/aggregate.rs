@@ -183,7 +183,7 @@ fn lower_core(
     }
     let result = package
         .result()
-        .filter(|result| result.output == node.output);
+        .filter(|result| result.output.columns == node.output.columns);
     let mut fields: Vec<Field> = Vec::new();
     reserve_vec(&mut fields, width, work)?;
     for (ordinal, value) in node.output.columns.iter().enumerate() {
@@ -194,7 +194,8 @@ fn lower_core(
             ))?
             .ty;
         // Full result labels are authoritative only when this aggregate's
-        // entire ordered output is the result port.
+        // entire ordered output is the result port's, whichever node
+        // publishes it.
         let name = match result {
             Some(result) => {
                 let field = result

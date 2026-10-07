@@ -863,10 +863,10 @@ fn named_layout(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<StaticLayout, FragmentCompileError> {
     // Full result labels are authoritative only when the entire ordered
-    // physical output is the result port.
+    // physical output is the result port's, whichever node publishes it.
     let result = package
         .result()
-        .filter(|result| labels && result.output == node.output);
+        .filter(|result| labels && result.output.columns == node.output.columns);
     let mut fields = Vec::new();
     reserve_vec(&mut fields, types.len(), work)?;
     for (ordinal, ty) in types.iter().enumerate() {

@@ -634,8 +634,22 @@ fn lower(
             NodeKind::NestLoopJoin { .. } if node.inputs.len() == 2 => Some(node.inputs[0]),
             _ => None,
         };
+        // A UnionAll concatenates the rows each driver already holds, so it is
+        // placed wherever all of its inputs are.
+        let union_placed = matches!(
+            node.kind,
+            NodeKind::SetOp {
+                kind: novarocks_physical_plan::SetOperationKind::UnionAll,
+                ..
+            }
+        ) && !node.inputs.is_empty()
+            && node
+                .inputs
+                .iter()
+                .all(|input| properties.get(input).is_some_and(|p| p.2));
         let scan_rooted = matches!(node.kind, NodeKind::Scan { .. })
             || partial_groups
+            || union_placed
             || ((transparent || partial_rows)
                 && node.inputs.len() == 1
                 && properties.get(&node.inputs[0]).is_some_and(|p| p.2))
@@ -646,9 +660,13 @@ fn lower(
         // descendant could consume.
         let writer_rooted = matches!(node.kind, NodeKind::TableWriter { .. });
         work.step()?;
-        if (unknown && !expanded && !changes && !scan_rooted && !writer_rooted)
-            || ((expanded || changes) && options.pipeline_dop.get() != 1)
-        {
+        if unknown && !expanded && !changes && !scan_rooted && !writer_rooted {
+            return Err(FragmentCompileError::Unsupported {
+                node: Some(id),
+                feature: "unconstrained distribution without a runtime-split scan placement",
+            });
+        }
+        if (expanded || changes) && options.pipeline_dop.get() != 1 {
             return Err(FragmentCompileError::Unsupported {
                 node: Some(id),
                 feature: "change-event source-chain distribution or driver count",
@@ -1322,26 +1340,31 @@ fn lower(
             (lowered.sink, Some(lowered.flow))
         }
         None => {
-            // A provider layout cannot be relabeled: its fields must equal the
-            // public schema. Publishing it as a result therefore requires the
-            // result labels to be exactly the provider names.
-            if scan_layouts.contains(&root) {
-                let result = result.ok_or(FragmentCompileError::Invalid("missing result port"))?;
-                let fields = root_layout.schema().fields();
-                if result.fields.len() != fields.len() {
-                    return Err(FragmentCompileError::Invalid(
-                        "result width differs from its root layout",
-                    ));
-                }
-                for (label, field) in result.fields.iter().zip(fields.iter()) {
-                    let same = label.alias.as_deref().unwrap_or(&label.name) == field.name();
-                    work.step()?;
-                    if !same {
-                        return Err(FragmentCompileError::Unsupported {
-                            node: Some(physical.root()),
-                            feature: "result labels differ from the provider scan layout",
-                        });
-                    }
+            // The published layout's names are the result's: the frontend
+            // checks them against the declared schema. Any root other than a
+            // provider scan publishes a layout some node labeled from the
+            // result port. A provider layout cannot be relabeled -- its fields
+            // must equal the public schema -- so its result labels must be
+            // exactly the provider names.
+            let result = result.ok_or(FragmentCompileError::Invalid("missing result port"))?;
+            let fields = root_layout.schema().fields();
+            if result.fields.len() != fields.len() {
+                return Err(FragmentCompileError::Invalid(
+                    "result width differs from its root layout",
+                ));
+            }
+            for (label, field) in result.fields.iter().zip(fields.iter()) {
+                let same = label.alias.as_deref().unwrap_or(&label.name) == field.name();
+                work.step()?;
+                if !same {
+                    return Err(FragmentCompileError::Unsupported {
+                        node: Some(physical.root()),
+                        feature: if scan_layouts.contains(&root) {
+                            "result labels differ from the provider scan layout"
+                        } else {
+                            "result labels differ from the published root layout"
+                        },
+                    });
                 }
             }
             requirement_entries.push(BindingRequirement::ResultSink {

@@ -274,7 +274,7 @@ fn lower_core(
         work.flush()?;
         let name = if package
             .result()
-            .is_some_and(|result| result.output == node.output)
+            .is_some_and(|result| result.output.columns == node.output.columns)
         {
             let field = package
                 .result()

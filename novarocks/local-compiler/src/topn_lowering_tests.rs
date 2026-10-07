@@ -1393,6 +1393,18 @@ mod scan_split {
         ));
         // Final: the frozen window over every gathered partial row.
         assert_eq!(window(&consumer), (0, Some(2), 1, false, true));
+        // The Final publishes the receiver's layout unchanged, so the
+        // receiver carries the result labels the frontend declared.
+        assert_eq!(
+            consumer.graph().nodes()[0]
+                .output_layout()
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            ["v0", "v1"]
+        );
         assert!(matches!(
             consumer.graph().sink(),
             Some(StaticSinkProgram::Result)

@@ -42,7 +42,7 @@ use novarocks_type_contract::{
     ExpressionInvocation, ExpressionUseId, ValueLogicalType, control_argument_semantics,
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     num::{NonZeroU64, NonZeroUsize},
     sync::Mutex,
     time::Duration,
@@ -59,6 +59,8 @@ const BUILD_EDGE: EdgeId = EdgeId::new(6);
 const BUILD_RECEIVER: NodeId = NodeId::new(12);
 const JOIN: NodeId = NodeId::new(13);
 const VALUES: NodeId = NodeId::new(30);
+const SCAN2: NodeId = NodeId::new(14);
+const UNION: NodeId = NodeId::new(15);
 
 struct FixtureControl;
 impl PureCompileControl for FixtureControl {
@@ -122,6 +124,8 @@ struct Spec {
     filter: bool,
     /// The scan probes a broadcast hash join whose build is `VALUES (7)`.
     join: bool,
+    /// The scan and a second plain scan of the same relation feed a UnionAll.
+    union: bool,
     kind: ConnectorReadRelationKind,
     sink: Sink,
 }
@@ -137,6 +141,7 @@ impl Spec {
             reordered: false,
             filter: false,
             join: false,
+            union: false,
             kind: ConnectorReadRelationKind::Table,
             sink: Sink::Gather,
         }
@@ -315,7 +320,7 @@ fn fixture(spec: Spec) -> Fixture {
             selection_digest: [7; 32],
             schema,
             predicate_guarantees,
-            provided_properties: properties,
+            provided_properties: properties.clone(),
             coverage_evidence: Box::from([4]),
         })
     } else {
@@ -325,7 +330,7 @@ fn fixture(spec: Spec) -> Fixture {
             selection_digest: [7; 32],
             schema,
             predicate_guarantees,
-            provided_properties: properties,
+            provided_properties: properties.clone(),
         })
     };
     builder
@@ -456,6 +461,96 @@ fn fixture(spec: Spec) -> Fixture {
             .unwrap();
         build_fragment = Some((fragment, column, imported));
         root = JOIN;
+    }
+    // `SELECT v0, v1 FROM t UNION ALL SELECT v0, v1 FROM t`: two runtime-split
+    // reads of one relation, concatenated on whichever driver holds them.
+    let mut second_scan = false;
+    if spec.union {
+        assert!(!spec.join && !spec.filter && !spec.derived && !spec.reordered);
+        let second = columns
+            .iter()
+            .map(|column| {
+                builder
+                    .add_value(
+                        int64(),
+                        ValueOrigin::ProviderField {
+                            scan_node: SCAN2,
+                            field: column.clone(),
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        builder
+            .add_scan(
+                SCAN2,
+                NodeKind::Scan {
+                    occurrence: ProviderReadOccurrenceId::new(1),
+                    relation: Box::new(Relation::Data(DataRelation {
+                        read: ProviderReadReference {
+                            binding: binding.clone(),
+                            input_version: ExactInputVersion::try_new([9]).unwrap(),
+                            relation: relation_payload.clone(),
+                        },
+                        work_source,
+                        selection_digest: [7; 32],
+                        schema: columns
+                            .iter()
+                            .map(|column| RelationField {
+                                column: column.clone(),
+                                ty: int64(),
+                            })
+                            .collect(),
+                        predicate_guarantees: Box::default(),
+                        provided_properties: properties.clone(),
+                    })),
+                    read_budget: ScanReadBudget {
+                        max_batch_rows: 100,
+                        max_batch_bytes: 4096,
+                    },
+                    provider_outputs: columns
+                        .iter()
+                        .cloned()
+                        .zip(second.iter().copied())
+                        .collect(),
+                    residuals: Box::default(),
+                    derived_values: Box::default(),
+                },
+                second.clone().into_boxed_slice(),
+            )
+            .unwrap();
+        let concatenated = (0..2u32)
+            .map(|ordinal| {
+                builder
+                    .add_value(
+                        int64(),
+                        ValueOrigin::NodeOutput {
+                            node: UNION,
+                            output_ordinal: ordinal,
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        builder
+            .add_row_consuming(
+                UNION,
+                Box::from([root, SCAN2]),
+                RequiredInputs::AsProduced,
+                Distribution::Unconstrained,
+                concatenated.clone().into_boxed_slice(),
+                NodeKind::SetOp {
+                    kind: SetOperationKind::UnionAll,
+                    input_mappings: Box::from([
+                        output.clone().into_boxed_slice(),
+                        second.into_boxed_slice(),
+                    ]),
+                },
+            )
+            .unwrap();
+        output = concatenated;
+        root = UNION;
+        second_scan = true;
     }
     let producer_sink = match spec.sink {
         Sink::Gather => FragmentSink::Stream { edge: EDGE },
@@ -630,10 +725,11 @@ fn fixture(spec: Spec) -> Fixture {
         vec![ValueLogicalType::Physical; 2],
     )
     .unwrap();
-    let scans = BTreeMap::from([(
-        ProviderReadOccurrenceId::new(0),
-        FrozenConnectorRead::try_new(scan, public).unwrap(),
-    )]);
+    let read = FrozenConnectorRead::try_new(scan, public).unwrap();
+    let mut scans = BTreeMap::from([(ProviderReadOccurrenceId::new(0), read.clone())]);
+    if second_scan {
+        scans.insert(ProviderReadOccurrenceId::new(1), read);
+    }
 
     let mut uses = BTreeMap::new();
     let mut calls = BTreeMap::new();
@@ -1101,6 +1197,37 @@ fn broadcast_join_probing_the_unconstrained_scan_inherits_its_placement() {
                 scan_node: SCAN.get(),
             },
         )])
+    );
+}
+
+#[test]
+fn union_all_of_two_runtime_split_scans_inherits_their_placement() {
+    let program = compile(Spec {
+        union: true,
+        ..Spec::slice()
+    })
+    .unwrap();
+    let graph = program.graph();
+    let scans = graph
+        .nodes()
+        .iter()
+        .filter(|node| matches!(node.kind(), ProgramNodeKind::Scan { .. }))
+        .count();
+    assert_eq!(scans, 2, "both reads compile as scans");
+    assert!(
+        graph
+            .nodes()
+            .iter()
+            .any(|node| matches!(node.kind(), ProgramNodeKind::UnionAll { .. })),
+        "the union compiles over the unconstrained scans"
+    );
+    assert_eq!(
+        program
+            .scan_inputs()
+            .values()
+            .map(|input| input.scan_node)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([SCAN.get(), SCAN2.get()])
     );
 }
 
