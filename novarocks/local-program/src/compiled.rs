@@ -59,6 +59,37 @@ pub struct CompiledScanInput {
     pub scan_node: u32,
 }
 
+/// Whether one compiled aggregate's emitted groups are complete for its task.
+/// This is the physical grouping guarantee, which a node's finalization flag
+/// does not imply: a merging distinct phase finalizes nothing yet must still
+/// emit each group once.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompiledAggregateGrouping {
+    /// A group may be emitted by several drivers, batches or instances; a
+    /// later phase merges them.
+    Partial,
+    /// Each group is emitted at most once by the whole task, so every driver
+    /// of the task that feeds this aggregate must reach one group owner.
+    Complete,
+}
+
+/// Compiled-only facts of one actual `Aggregate` node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompiledAggregate {
+    pub grouping: CompiledAggregateGrouping,
+}
+
+/// Every compiled-only fact the program carries beside its checked graph.
+/// Each map addresses exactly the graph nodes of its family; the final owner
+/// validates all of them against that one graph.
+#[derive(Clone, Debug, Default)]
+pub struct CompiledProgramFacts {
+    pub writes: BTreeMap<ProgramNodeId, ConnectorWriteRecipe>,
+    pub exchange_inputs: BTreeMap<ProgramNodeId, CompiledExchangeInput>,
+    pub scan_inputs: BTreeMap<ProgramNodeId, CompiledScanInput>,
+    pub aggregates: BTreeMap<ProgramNodeId, CompiledAggregate>,
+}
+
 #[derive(Clone, Debug)]
 pub struct LocalProgram {
     checked: ProgramLexicalBindings,
@@ -66,6 +97,7 @@ pub struct LocalProgram {
     writes: BTreeMap<ProgramNodeId, ConnectorWriteRecipe>,
     exchange_inputs: BTreeMap<ProgramNodeId, CompiledExchangeInput>,
     scan_inputs: BTreeMap<ProgramNodeId, CompiledScanInput>,
+    aggregates: BTreeMap<ProgramNodeId, CompiledAggregate>,
     arithmetic: BTreeMap<crate::ProgramUseRef, novarocks_functions::PreparedArithmeticRecipe>,
     casts: BTreeMap<crate::ProgramUseRef, novarocks_functions::PreparedCastRecipe>,
     comparisons: BTreeMap<ProgramComparisonSite, novarocks_functions::PreparedComparisonRecipe>,
@@ -87,6 +119,11 @@ pub enum LocalProgramCompileError {
     ScanInputMismatch(ProgramNodeId),
     /// Two compiled scan inputs name the same physical scan node.
     DuplicateScanNode(u32),
+    /// The compiled aggregate facts and the actual `Aggregate` nodes are not
+    /// the same node set.
+    AggregateMismatch(ProgramNodeId),
+    /// A finalizing aggregate declares only a partial grouping guarantee.
+    PartialFinalization(ProgramNodeId),
     Origins(CompiledOriginsError),
     Provider(ProviderLinkError),
     Primitive(ProgramPrimitiveError),
@@ -140,6 +177,16 @@ impl fmt::Display for LocalProgramCompileError {
             Self::DuplicateScanNode(scan) => {
                 write!(f, "compiled scan inputs share physical scan node {scan}")
             }
+            Self::AggregateMismatch(node) => write!(
+                f,
+                "compiled aggregate facts differ from the aggregate nodes at local node {}",
+                node.index()
+            ),
+            Self::PartialFinalization(node) => write!(
+                f,
+                "finalizing aggregate at local node {} declares a partial grouping",
+                node.index()
+            ),
         }
     }
 }
@@ -154,7 +201,9 @@ impl std::error::Error for LocalProgramCompileError {
             | Self::ExchangeInputMismatch(_)
             | Self::DuplicateExchangeReceiver(_)
             | Self::ScanInputMismatch(_)
-            | Self::DuplicateScanNode(_) => None,
+            | Self::DuplicateScanNode(_)
+            | Self::AggregateMismatch(_)
+            | Self::PartialFinalization(_) => None,
         }
     }
 }
@@ -167,15 +216,21 @@ impl LocalProgram {
     /// which are exactly its `ExchangeInput` requirements; receivers are unique.
     /// `scan_inputs` likewise addresses exactly its `Scan` nodes, which are
     /// exactly its `Scan` requirements; physical scan nodes are unique.
+    /// `aggregates` addresses exactly its `Aggregate` nodes, and a node whose
+    /// calls finalize declares a complete grouping.
     pub fn try_new(
         checked: ProgramLexicalBindings,
         operators: Vec<LocalOperatorProvenance>,
         allowed_sources: &BTreeSet<DiagnosticSourceNodeId>,
-        writes: BTreeMap<ProgramNodeId, ConnectorWriteRecipe>,
-        exchange_inputs: BTreeMap<ProgramNodeId, CompiledExchangeInput>,
-        scan_inputs: BTreeMap<ProgramNodeId, CompiledScanInput>,
+        facts: CompiledProgramFacts,
         control: &dyn PureCompileControl,
     ) -> Result<Self, LocalProgramCompileError> {
+        let CompiledProgramFacts {
+            writes,
+            exchange_inputs,
+            scan_inputs,
+            aggregates,
+        } = facts;
         let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
             control,
             novarocks_type_contract::CompilePhase::LowerProgram,
@@ -198,6 +253,7 @@ impl LocalProgram {
         crate::provider_links::validate_provider_links(&checked, &writes, control)?;
         validate_exchange_inputs(graph, &exchange_inputs, control)?;
         validate_scan_inputs(graph, &scan_inputs, control)?;
+        validate_aggregates(graph, &aggregates, control)?;
         let arithmetic = crate::primitives::compile_arithmetic(&checked, control)?;
         let casts = crate::primitives::compile_casts(&checked, control)?;
         let comparisons = crate::primitives::compile_comparisons(&checked, control)?;
@@ -211,6 +267,7 @@ impl LocalProgram {
             writes,
             exchange_inputs,
             scan_inputs,
+            aggregates,
             comparisons,
             null_safe_comparisons,
             arithmetic,
@@ -241,6 +298,10 @@ impl LocalProgram {
     /// Exact physical scan address of every `Scan` node in this program.
     pub fn scan_inputs(&self) -> &BTreeMap<ProgramNodeId, CompiledScanInput> {
         &self.scan_inputs
+    }
+    /// Exact grouping guarantee of every `Aggregate` node in this program.
+    pub fn aggregates(&self) -> &BTreeMap<ProgramNodeId, CompiledAggregate> {
+        &self.aggregates
     }
     pub fn comparison_recipe(
         &self,
@@ -336,6 +397,66 @@ fn validate_scan_inputs(
         },
         control,
     )
+}
+
+/// Require one fact per actual `Aggregate` node and no fact elsewhere. A node
+/// with finalizing calls emits final results, which the physical contract
+/// admits only under a complete grouping. A first control refusal stays
+/// primary.
+fn validate_aggregates(
+    graph: &LocalProgramGraph,
+    aggregates: &BTreeMap<ProgramNodeId, CompiledAggregate>,
+    control: &dyn PureCompileControl,
+) -> Result<(), LocalProgramCompileError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)
+        .map_err(LocalProgramCompileError::Control)?;
+    let result = validate_aggregates_core(graph, aggregates, &mut work);
+    if matches!(result, Err(LocalProgramCompileError::Control(_))) {
+        return result;
+    }
+    work.finish().map_err(LocalProgramCompileError::Control)?;
+    result
+}
+
+fn validate_aggregates_core(
+    graph: &LocalProgramGraph,
+    aggregates: &BTreeMap<ProgramNodeId, CompiledAggregate>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), LocalProgramCompileError> {
+    for (index, node) in graph.nodes().iter().enumerate() {
+        let id = ProgramNodeId::new(index);
+        let fact = aggregates.get(&id);
+        work.step().map_err(LocalProgramCompileError::Control)?;
+        match (node.kind(), fact) {
+            (
+                ProgramNodeKind::Aggregate {
+                    functions,
+                    need_finalize,
+                    ..
+                },
+                Some(fact),
+            ) => {
+                if *need_finalize
+                    && !functions.is_empty()
+                    && fact.grouping == CompiledAggregateGrouping::Partial
+                {
+                    return Err(LocalProgramCompileError::PartialFinalization(id));
+                }
+            }
+            (ProgramNodeKind::Aggregate { .. }, None) | (_, Some(_)) => {
+                return Err(LocalProgramCompileError::AggregateMismatch(id));
+            }
+            (_, None) => {}
+        }
+    }
+    for id in aggregates.keys() {
+        let present = id.index() < graph.nodes().len();
+        work.step().map_err(LocalProgramCompileError::Control)?;
+        if !present {
+            return Err(LocalProgramCompileError::AggregateMismatch(*id));
+        }
+    }
+    Ok(())
 }
 
 fn validate_addresses<A>(

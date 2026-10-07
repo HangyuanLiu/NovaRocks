@@ -373,7 +373,7 @@ impl ChunkSchema {
 
     /// A compiled layout carries each channel's complete type in its Arrow
     /// Field; there is no separate legacy slot metadata to thaw or guess.
-    pub(crate) fn from_compiled_layout(
+    pub fn from_compiled_layout(
         layout: &novarocks_local_program::StaticLayout,
     ) -> Result<ChunkSchemaRef, String> {
         let slots = layout

@@ -43,6 +43,8 @@ mod aggregate_extrema;
 mod aggregate_extrema_dispatch;
 mod aggregate_extrema_owner;
 mod aggregate_extrema_utf8;
+mod aggregate_sum;
+mod aggregate_sum_owner;
 mod bit_shift;
 mod bit_shift_owner;
 mod bitwise;

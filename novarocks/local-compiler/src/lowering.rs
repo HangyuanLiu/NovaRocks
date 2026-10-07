@@ -19,11 +19,14 @@
 
 use crate::{
     ProviderValidatedFragment,
+    aggregate::lower_aggregate,
     assert_rows::lower_assert_rows,
     change_events::lower_change_events,
     channels::{ChannelLoweringError, resolve_tree_channels},
     exchange::lower_exchange_source,
-    expressions::{ExpressionLoweringError, lower_expressions_with_unions, prepare_calls},
+    expressions::{
+        ExpressionLoweringError, lower_expressions_with_unions, prepare_calls_with_aggregates,
+    },
     repeat::{RepeatLoweringError, lower_repeat},
     scan::{admit_scan, lower_scan},
     sort::lower_sort,
@@ -475,7 +478,8 @@ fn lower(
             | NodeKind::AssertOneRow(_)
             | NodeKind::Repeat { .. }
             | NodeKind::Unpivot { .. }
-            | NodeKind::ChangeEventExpand { .. } => node.inputs.len() == 1,
+            | NodeKind::ChangeEventExpand { .. }
+            | NodeKind::Aggregate { .. } => node.inputs.len() == 1,
             NodeKind::Filter { predicates } => predicates.len() == 1 && node.inputs.len() == 1,
             // Every row-count TopN phase; a grouped-state reduction has no
             // local owner.
@@ -530,7 +534,10 @@ fn lower(
     // and driver, and only its transparent Project/Filter/Limit descendants
     // and a Partial row-count TopN inherit that placement. The partial keeps
     // a subset of each instance's rows where they already are; its Final
-    // reads them only through a checked gather.
+    // reads them only through a checked gather. A Partial-grouping aggregate
+    // is such a source too: it merges only the rows each driver already holds,
+    // so its output is placed wherever its input was, and the physical
+    // contract lets only an exchange-fed later phase complete its groups.
     let mut properties = BTreeMap::<NodeId, (bool, bool, bool)>::new();
     for &id in order.iter().rev() {
         let node = &physical.nodes()[&id];
@@ -553,7 +560,15 @@ fn lower(
                 ..
             }
         );
+        let partial_groups = matches!(
+            node.kind,
+            NodeKind::Aggregate {
+                grouping: novarocks_physical_plan::AggregateGrouping::Partial,
+                ..
+            }
+        );
         let scan_rooted = matches!(node.kind, NodeKind::Scan { .. })
+            || partial_groups
             || ((transparent || partial_rows)
                 && node.inputs.len() == 1
                 && properties.get(&node.inputs[0]).is_some_and(|p| p.2));
@@ -606,7 +621,19 @@ fn lower(
         work.control(),
     )?;
     work.flush()?;
-    let tokens = prepare_calls(package, &expressions, functions, work.control())?;
+    let local_nodes = channels_plan
+        .nodes
+        .iter()
+        .map(|(source, planned)| (*source, planned.local))
+        .collect::<BTreeMap<_, _>>();
+    work.flush()?;
+    let tokens = prepare_calls_with_aggregates(
+        package,
+        &expressions,
+        functions,
+        &local_nodes,
+        work.control(),
+    )?;
     let mut nodes: Vec<ProgramNode> = Vec::new();
     let mut local_ids = BTreeMap::new();
     let mut channels = Vec::new();
@@ -616,6 +643,7 @@ fn lower(
     let mut source_requirements = Vec::new();
     let mut exchange_inputs = BTreeMap::new();
     let mut scan_inputs = BTreeMap::new();
+    let mut aggregates = BTreeMap::new();
     // Local nodes whose layout is a provider scan layout unchanged.
     let mut scan_layouts = BTreeSet::new();
     crate::assert_rows::reserve_vec(&mut nodes, expanded_nodes, work)?;
@@ -775,6 +803,25 @@ fn lower(
                         &expressions.ids,
                         work.control(),
                     )?
+                }
+                NodeKind::Aggregate { .. } => {
+                    let child =
+                        *local_ids
+                            .get(&node.inputs[0])
+                            .ok_or(FragmentCompileError::Invalid(
+                                "missing lowered aggregate child",
+                            ))?;
+                    work.flush()?;
+                    let lowered = lower_aggregate(
+                        package,
+                        node,
+                        child,
+                        &expressions.ids,
+                        &planned.slots,
+                        work.control(),
+                    )?;
+                    aggregates.insert(id, lowered.fact);
+                    (lowered.kind, lowered.layout)
                 }
                 NodeKind::TopN { .. } => {
                     let child = *local_ids
@@ -1208,6 +1255,34 @@ fn lower(
             ExpressionRootRole::ValuesCell { row, column } => {
                 ProgramNodeExpressionRole::ValuesCell { row, column }
             }
+            ExpressionRootRole::AggregateGroup { group } => {
+                ProgramNodeExpressionRole::AggregateGroup { group }
+            }
+            ExpressionRootRole::AggregateArgument { call, argument } => {
+                ProgramNodeExpressionRole::AggregateInput { call, argument }
+            }
+            // Function ORDER channels follow the call's logical arguments.
+            ExpressionRootRole::AggregateOrder { call, key } => {
+                let NodeKind::Aggregate { calls, .. } = &physical.nodes()[&site.node].kind else {
+                    return Err(FragmentCompileError::Invalid(
+                        "aggregate order root outside an Aggregate",
+                    ));
+                };
+                let logical = calls
+                    .get(call as usize)
+                    .ok_or(FragmentCompileError::Invalid(
+                        "missing aggregate order call",
+                    ))?
+                    .arguments
+                    .len();
+                let argument = u32::try_from(logical)
+                    .ok()
+                    .and_then(|logical| logical.checked_add(key))
+                    .ok_or(FragmentCompileError::Invalid(
+                        "aggregate order channel exhausted",
+                    ))?;
+                ProgramNodeExpressionRole::AggregateInput { call, argument }
+            }
             _ => {
                 return Err(FragmentCompileError::Unsupported {
                     node: Some(site.node),
@@ -1272,9 +1347,12 @@ fn lower(
         lexical,
         operators,
         &allowed,
-        BTreeMap::new(),
-        exchange_inputs,
-        scan_inputs,
+        CompiledProgramFacts {
+            writes: BTreeMap::new(),
+            exchange_inputs,
+            scan_inputs,
+            aggregates,
+        },
         work.control(),
     )
     .map_err(Into::into)

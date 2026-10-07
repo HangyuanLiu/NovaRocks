@@ -18,6 +18,7 @@
 //! Pure fragment preparation. Provider validation is a distinct intermediate
 //! phase; its result is not a complete semantic validation or a LocalProgram.
 
+mod aggregate;
 mod assert_rows;
 mod change_events;
 

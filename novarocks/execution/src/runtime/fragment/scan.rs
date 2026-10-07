@@ -21,15 +21,151 @@
 //! the exact Task-local ScanSource capabilities and enriched scan ranges. At
 //! launch this module binds the latter to per-instance ScanOps keyed by native
 //! node ID. A shared FragmentProgram retains no provider runtime capability.
+//!
+//! A compiled program addresses each Scan by its physical scan node instead:
+//! the same node keys the Task's split queue, its range assignment and the
+//! bound operation the compiled pipeline polls.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use crate::exec::fragment::error::{
+    FragmentBindingError, FragmentBindingErrorKind, FragmentBindingTarget,
+};
 use crate::exec::fragment::program::{FragmentNodeId, FragmentProgram};
 use crate::exec::node::LocalRuntimeBindings;
+use crate::exec::node::scan::ScanSource;
 use crate::exec::pipeline::binding::ScanBindings;
 use crate::runtime::fragment::error::{
     FragmentLaunchError, FragmentLaunchErrorKind, FragmentLaunchStage,
 };
 use crate::runtime::fragment::instance::FragmentInstanceSpec;
-use novarocks_local_program::ProgramNodeKind;
+use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind};
+
+/// The Task-owned scan sources of one compiled program: exactly one per
+/// compiled Scan node. Each is bound to its instance assignment at launch.
+pub type CompiledScanSources = BTreeMap<ProgramNodeId, Arc<dyn ScanSource>>;
+
+/// Every compiled Scan's physical scan node, keyed by its local node. The
+/// program's scan addresses must name exactly its Scan nodes, once each.
+pub fn compiled_scan_nodes(
+    program: &LocalProgram,
+) -> Result<BTreeMap<ProgramNodeId, FragmentNodeId>, FragmentBindingError> {
+    let scans = program
+        .graph()
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| matches!(node.kind(), ProgramNodeKind::Scan { .. }))
+        .map(|(index, _)| ProgramNodeId::new(index))
+        .collect::<BTreeSet<_>>();
+    if scans != program.scan_inputs().keys().copied().collect() {
+        return Err(FragmentBindingError::new(
+            FragmentBindingTarget::Program,
+            FragmentBindingErrorKind::InvalidAssignment,
+            "compiled scan addresses do not match the program's scans",
+        ));
+    }
+    let mut nodes = BTreeMap::new();
+    let mut seen = BTreeSet::new();
+    for (id, input) in program.scan_inputs() {
+        let scan_node = i32::try_from(input.scan_node).map_err(|_| {
+            FragmentBindingError::new(
+                FragmentBindingTarget::Program,
+                FragmentBindingErrorKind::InvalidAssignment,
+                format!("compiled scan node {} exceeds i32", input.scan_node),
+            )
+        })?;
+        if !seen.insert(scan_node) {
+            return Err(FragmentBindingError::new(
+                FragmentBindingTarget::ScanNode(scan_node),
+                FragmentBindingErrorKind::InvalidAssignment,
+                "compiled scan node is addressed by more than one scan",
+            ));
+        }
+        nodes.insert(*id, FragmentNodeId::new(scan_node));
+    }
+    Ok(nodes)
+}
+
+/// A compiled submission's scan facts agree exactly: one Task source per
+/// compiled Scan, and one instance assignment per physical scan node, with
+/// nothing assigned to a node the program does not scan.
+pub(crate) fn validate_compiled_scan_sources(
+    program: &LocalProgram,
+    sources: &CompiledScanSources,
+    instance: &FragmentInstanceSpec,
+) -> Result<(), FragmentBindingError> {
+    let nodes = compiled_scan_nodes(program)?;
+    if let Some(id) = nodes.keys().find(|id| !sources.contains_key(id)) {
+        return Err(FragmentBindingError::new(
+            FragmentBindingTarget::ScanNode(nodes[id].get()),
+            FragmentBindingErrorKind::MissingAssignment,
+            "compiled scan has no Task scan source",
+        ));
+    }
+    if let Some(id) = sources.keys().find(|id| !nodes.contains_key(id)) {
+        return Err(FragmentBindingError::new(
+            FragmentBindingTarget::Program,
+            FragmentBindingErrorKind::ExtraAssignment,
+            format!(
+                "Task scan source targets local node {}, which is not a compiled scan",
+                id.index()
+            ),
+        ));
+    }
+    let scan_nodes = nodes.values().copied().collect::<BTreeSet<_>>();
+    if let Some(node) = scan_nodes
+        .iter()
+        .find(|node| instance.scan_assignments().get(node).is_none())
+    {
+        return Err(FragmentBindingError::new(
+            FragmentBindingTarget::ScanNode(node.get()),
+            FragmentBindingErrorKind::MissingAssignment,
+            "compiled scan has no instance scan assignment",
+        ));
+    }
+    if let Some((node, _)) = instance
+        .scan_assignments()
+        .iter()
+        .find(|(node, _)| !scan_nodes.contains(node))
+    {
+        return Err(FragmentBindingError::new(
+            FragmentBindingTarget::ScanNode(node.get()),
+            FragmentBindingErrorKind::ExtraAssignment,
+            "scan assignment names no compiled scan",
+        ));
+    }
+    Ok(())
+}
+
+/// Bind every compiled Scan's Task source to its instance assignment, keyed
+/// by physical scan node. ScanSource::bind checks the assignment variant.
+pub(crate) fn materialize_compiled_scan_bindings(
+    program: &LocalProgram,
+    sources: &CompiledScanSources,
+    instance: &FragmentInstanceSpec,
+) -> Result<ScanBindings, FragmentLaunchError> {
+    validate_compiled_scan_sources(program, sources, instance).map_err(|error| {
+        FragmentLaunchError::new(
+            FragmentLaunchStage::Materialize,
+            FragmentLaunchErrorKind::Materialization,
+            error.to_string(),
+        )
+    })?;
+    let nodes = compiled_scan_nodes(program).map_err(|error| {
+        FragmentLaunchError::new(
+            FragmentLaunchStage::Materialize,
+            FragmentLaunchErrorKind::Materialization,
+            error.to_string(),
+        )
+    })?;
+    let mut bindings = ScanBindings::default();
+    for (id, source) in sources {
+        bind_scan(source, nodes[id].get(), instance, &mut bindings)?;
+    }
+    Ok(bindings)
+}
 
 /// Bind the exact Task-owned scan sources validated by FragmentSubmission.
 /// ScanSource::bind checks the assignment variant before any pipeline runs.
@@ -99,6 +235,10 @@ fn bind_scan(
     bindings.insert(node_id, op);
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "compiled_scan_fixture.rs"]
+pub(crate) mod compiled_fixture;
 
 #[cfg(test)]
 mod tests {

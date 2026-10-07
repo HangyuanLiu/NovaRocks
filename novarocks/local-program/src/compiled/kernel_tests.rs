@@ -384,9 +384,12 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
         lexical,
         operators,
         &allowed,
-        BTreeMap::new(),
-        BTreeMap::new(),
-        BTreeMap::new(),
+        CompiledProgramFacts {
+            writes: BTreeMap::new(),
+            exchange_inputs: BTreeMap::new(),
+            scan_inputs: BTreeMap::new(),
+            aggregates: BTreeMap::new(),
+        },
         &control,
     )
     .unwrap();

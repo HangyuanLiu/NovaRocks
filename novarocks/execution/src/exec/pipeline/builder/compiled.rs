@@ -21,8 +21,9 @@
 //! a compiled processor is an explicit refusal, never a legacy fallback.
 //!
 //! Reuse boundary: families that evaluate expressions (Project, Filter, Sort
-//! and every row-count TopN phase, Unpivot, ChangeEventExpand) run compiled
-//! processors that own one instance per root and driver. Legacy operators are
+//! and every row-count TopN phase, Unpivot, ChangeEventExpand, Aggregate) run
+//! compiled processors that own one instance per root and driver; Aggregate
+//! reuses only the key table that owns group-key equivalence. Legacy operators are
 //! reused only where they evaluate nothing: the all-constant Values source,
 //! Limit, the local gather exchange, the row-count assertion and the UnionAll
 //! fan-in queue. A Values with dynamic cells evaluates each cell root once
@@ -34,6 +35,7 @@ use std::collections::BTreeSet;
 use super::*;
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::node::exchange_source::ExchangeSourceNode;
+use crate::exec::operators::compiled_aggregate::CompiledAggregateProcessorFactory;
 use crate::exec::operators::compiled_change_events::CompiledChangeEventProcessorFactory;
 use crate::exec::operators::compiled_expression::{
     CompiledFilterProcessorFactory, CompiledProjectProcessorFactory,
@@ -117,9 +119,67 @@ fn validate_compiled_exchange_bindings(
     Ok(())
 }
 
+/// The physical scan node a compiled Scan is addressed by: the key of its
+/// Task split queue and of the scan binding its Task materialized.
+fn scan_node_id(program: &LocalProgram, id: ProgramNodeId) -> Result<i32, String> {
+    let input = program.scan_inputs().get(&id).ok_or_else(|| {
+        format!(
+            "compiled scan at local node {} has no scan address",
+            id.index()
+        )
+    })?;
+    i32::try_from(input.scan_node)
+        .map_err(|_| format!("compiled scan node {} exceeds i32", input.scan_node))
+}
+
+/// The Task's scan bindings must cover exactly the program's compiled scans:
+/// no scan without its bound operation, no binding without a scan, and every
+/// binding keyed by the physical scan node it was bound for.
+fn validate_compiled_scan_bindings(
+    program: &LocalProgram,
+    bindings: &ScanBindings,
+) -> Result<(), String> {
+    let scans = program
+        .graph()
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| matches!(node.kind(), ProgramNodeKind::Scan { .. }))
+        .map(|(index, _)| ProgramNodeId::new(index))
+        .collect::<BTreeSet<_>>();
+    if scans != program.scan_inputs().keys().copied().collect() {
+        return Err("compiled scan addresses do not match the program's scans".to_string());
+    }
+    let mut scan_nodes = BTreeSet::new();
+    for id in &scans {
+        let scan_node = scan_node_id(program, *id)?;
+        if !scan_nodes.insert(scan_node) {
+            return Err(format!(
+                "compiled scan node {scan_node} is addressed by more than one scan"
+            ));
+        }
+        if bindings.get(scan_node).is_none() {
+            return Err(format!(
+                "missing scan binding for compiled scan node {scan_node}"
+            ));
+        }
+    }
+    if let Some(extra) = bindings.node_ids().find(|id| !scan_nodes.contains(id)) {
+        return Err(format!(
+            "scan binding for node {extra} has no compiled scan"
+        ));
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The compiled program and its Task capabilities are independent inputs"
+)]
 pub(crate) fn build_compiled_pipeline_graph(
     program: &Arc<LocalProgram>,
     exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
     dep_manager: DependencyManager,
     pipeline_dop: i32,
     root_sink_dop: Option<i32>,
@@ -135,13 +195,14 @@ pub(crate) fn build_compiled_pipeline_graph(
         return Err("legacy-lowered nodes cannot enter the compiled pipeline".to_string());
     }
     validate_compiled_exchange_bindings(program, &exchange_bindings)?;
+    validate_compiled_scan_bindings(program, &scan_bindings)?;
     let mut ctx = PipelineBuildContext {
         arena: Arc::new(ExprArena::default()),
         function_set,
         dep_manager,
         runtime_filter_execution: PipelineRuntimeFilterExecution { session: None },
         exchange_bindings,
-        scan_bindings: ScanBindings::default(),
+        scan_bindings,
         next_pipeline_id: 0,
         pipeline_dop: pipeline_dop.max(1),
         operator_buffer_chunks: 1,
@@ -229,6 +290,69 @@ fn build_node(
                 )?));
             Ok(build)
         }
+        ProgramNodeKind::Scan {
+            source,
+            runtime_filters,
+            conjunct_predicate,
+            limit,
+        } => {
+            if source.compiled().is_none() {
+                return Err(format!(
+                    "scan at local node {} carries no compiled provider read",
+                    id.index()
+                ));
+            }
+            if !runtime_filters.is_empty() {
+                return Err(format!(
+                    "compiled scan at local node {} with runtime-filter consumers is not executable yet",
+                    id.index()
+                ));
+            }
+            if limit.is_some() {
+                return Err(format!(
+                    "compiled scan at local node {} with a scan limit is not executable yet",
+                    id.index()
+                ));
+            }
+            let scan_node = scan_node_id(program, id)?;
+            let op = ctx.scan_bindings.get(scan_node).ok_or_else(|| {
+                format!("missing scan binding for compiled scan node {scan_node}")
+            })?;
+            // The residual is the scan's own TruthOnly root over its output;
+            // it is built first so a refused root binds no driver.
+            let residual = conjunct_predicate
+                .map(|_| {
+                    CompiledFilterProcessorFactory::try_new(
+                        Arc::clone(program),
+                        ProgramExpressionRootSite::Node {
+                            node: id,
+                            role: ProgramNodeExpressionRole::ScanResidual,
+                        },
+                        Arc::clone(error),
+                    )
+                })
+                .transpose()?;
+            // One driver owns the scan stream; the shared handoff restores the
+            // downstream DOP without duplicating the Task's reader capability.
+            let source: Box<dyn OperatorFactory> =
+                Box::new(StreamScanSourceFactory::new_compiled(node_id, op));
+            let pipeline = new_source_pipeline_with_dop(ctx, source, 1);
+            let mut build = PipelineBuildResult {
+                pipeline,
+                extra_pipelines: Vec::new(),
+                stream: StreamDesc::any(1),
+            };
+            let target_dop = ctx.pipeline_dop.max(1);
+            if target_dop > 1 {
+                build = hand_off_to_dop(build, ctx, node_id, target_dop);
+            }
+            // The residual filters every downstream driver's rows; a scan
+            // without one hands its rows on as read.
+            if let Some(residual) = residual {
+                build.pipeline.factories.push(Box::new(residual));
+            }
+            Ok(build)
+        }
         ProgramNodeKind::ExchangeSource {
             timeout,
             runtime_filters,
@@ -302,6 +426,28 @@ fn build_node(
         }
         ProgramNodeKind::UnionAll { inputs } => {
             build_union_all(program, id, node_id, inputs, ctx, error)
+        }
+        ProgramNodeKind::Aggregate { input, .. } => {
+            // A Complete aggregate owns each of its groups exactly once, so
+            // its instance input is gathered to one driver first. A Partial
+            // aggregate merges per driver; its later phase completes it.
+            let factory = CompiledAggregateProcessorFactory::try_new(
+                Arc::clone(program),
+                id,
+                Arc::clone(error),
+            )?;
+            let complete = factory.completes_groups();
+            let mut build = build_node(program, *input, ctx, error)?;
+            if complete {
+                build = gather_to_one(build, ctx, node_id);
+            }
+            build.pipeline.factories.push(Box::new(factory));
+            build.stream = if complete {
+                StreamDesc::single()
+            } else {
+                StreamDesc::any(build.pipeline.dop)
+            };
+            Ok(build)
         }
         ProgramNodeKind::AssertNumRows { input, mode } => {
             let factory = AssertNumRowsProcessorFactory::new(node_id, assertion_mode(mode))?;
@@ -479,6 +625,10 @@ mod tests;
 mod exchange_tests;
 
 #[cfg(test)]
+#[path = "compiled_scan_tests.rs"]
+mod scan_tests;
+
+#[cfg(test)]
 #[path = "compiled_family_fixture.rs"]
 mod family_fixture;
 
@@ -505,3 +655,11 @@ mod topn_split_tests;
 #[cfg(test)]
 #[path = "compiled_values_tests.rs"]
 mod values_tests;
+
+#[cfg(test)]
+#[path = "compiled_aggregate_fixture.rs"]
+mod aggregate_fixture;
+
+#[cfg(test)]
+#[path = "compiled_aggregate_tests.rs"]
+mod aggregate_tests;

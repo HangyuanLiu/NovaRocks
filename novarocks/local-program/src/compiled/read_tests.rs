@@ -380,9 +380,12 @@ fn finish_with(
             })
             .collect(),
         &(0..count).map(source_id).collect(),
-        BTreeMap::new(),
-        BTreeMap::new(),
-        scan_inputs,
+        CompiledProgramFacts {
+            writes: BTreeMap::new(),
+            exchange_inputs: BTreeMap::new(),
+            scan_inputs: scan_inputs,
+            aggregates: BTreeMap::new(),
+        },
         control,
     )
 }

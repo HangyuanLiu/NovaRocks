@@ -42,7 +42,8 @@ mod typed_expressions;
 mod values;
 
 pub use compiled::{
-    CompiledExchangeInput, CompiledScanInput, LocalProgram, LocalProgramCompileError,
+    CompiledAggregate, CompiledAggregateGrouping, CompiledExchangeInput, CompiledProgramFacts,
+    CompiledScanInput, LocalProgram, LocalProgramCompileError,
 };
 pub use compiled_origins::CompiledOriginsError;
 pub use contract::{

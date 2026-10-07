@@ -550,7 +550,9 @@ pub(crate) fn prepare_report_neutral_local_program_pipeline_execution(
 /// `sink` is the root sink materialized for the program's static sink, and
 /// `exchange_bindings` binds exactly its compiled exchange sources, keyed by
 /// receiver node. Every binding belongs to `exchange_finst_id`, the fragment
-/// instance this program runs as.
+/// instance this program runs as. The program reads no scan: a compiled scan
+/// runs only with its Task's bound operations, through
+/// [`prepare_compiled_program_pipeline_execution_with_profiler`].
 #[expect(
     clippy::too_many_arguments,
     reason = "The compiled program and its Task capabilities are independent inputs"
@@ -570,6 +572,7 @@ pub(crate) fn prepare_compiled_program_pipeline_execution(
         time_slice,
         sink,
         exchange_bindings,
+        ScanBindings::default(),
         exchange_finst_id,
         None,
         pipeline_dop,
@@ -579,7 +582,9 @@ pub(crate) fn prepare_compiled_program_pipeline_execution(
 }
 
 /// As [`prepare_compiled_program_pipeline_execution`], reporting into the
-/// Task's profiler.
+/// Task's profiler. `scan_bindings` binds exactly the program's compiled
+/// scans, keyed by physical scan node; the prepared execution retains their
+/// terminal hooks so an abort reaches parked readers.
 #[expect(
     clippy::too_many_arguments,
     reason = "The compiled program and its Task capabilities are independent inputs"
@@ -589,6 +594,7 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler(
     time_slice: Duration,
     sink: Box<dyn OperatorFactory>,
     exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
     exchange_finst_id: Option<(i64, i64)>,
     profiler: Option<Profiler>,
     pipeline_dop: i32,
@@ -631,9 +637,11 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler(
     let execution_runtime = runtime_state
         .execution_runtime()
         .ok_or_else(|| "compiled program execution requires an execution runtime".to_string())?;
+    let terminal_scan_ops = scan_bindings.terminal_ops();
     let graph = build_compiled_pipeline_graph(
         &program,
         exchange_bindings,
+        scan_bindings,
         DependencyManager::new(),
         pipeline_dop,
         root_sink_dop,
@@ -644,7 +652,7 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler(
         graph,
         time_slice,
         sink,
-        Vec::new(),
+        terminal_scan_ops,
         exchange_finst_id,
         profiler,
         pipeline_dop,
@@ -2786,12 +2794,17 @@ mod tests {
 
     #[test]
     fn mixed_merge_and_update_aggregates_work() {
+        // An integer SUM state is its exact DECIMAL(38, 0) intermediate.
         let schema = Arc::new(Schema::new(vec![
             Field::new("c1", DataType::Int32, false),
-            Field::new("sum_state", DataType::Int64, false),
+            Field::new("sum_state", DataType::Decimal128(38, 0), false),
         ]));
         let c1 = Arc::new(Int32Array::from(vec![1, 2])) as arrow::array::ArrayRef;
-        let sum_state = Arc::new(Int64Array::from(vec![30_i64, 5_i64])) as arrow::array::ArrayRef;
+        let sum_state = Arc::new(
+            arrow::array::Decimal128Array::from(vec![30_i128, 5_i128])
+                .with_precision_and_scale(38, 0)
+                .expect("decimal state"),
+        ) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![c1, sum_state]).expect("record batch");
         let chunk = {
             let batch = batch;
@@ -2805,7 +2818,10 @@ mod tests {
 
         let mut arena = ExprArena::default();
         let c1_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let sum_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Int64);
+        let sum_expr = arena.push_typed(
+            ExprNode::SlotId(SlotId::new(2)),
+            DataType::Decimal128(38, 0),
+        );
 
         let plan = ExecPlan {
             arena,

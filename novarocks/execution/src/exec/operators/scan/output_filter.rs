@@ -45,11 +45,17 @@ const ROWS_READ: &str = "RowsRead";
 /// ordered runtime filters, then blocking runtime filters.
 #[derive(Clone)]
 pub(super) struct ScanOutputFilter {
-    conjunct_predicate: Option<ExprId>,
-    conjunct_encoding_policy: Option<FilterEncodingPolicy>,
-    arena: Arc<ExprArena>,
+    conjunct: Option<ScanConjunct>,
     ordered_live: Option<NativeOrderedLiveConsumerSet>,
     blocking: Option<RuntimeFilterConsumerSet>,
+}
+
+/// A legacy scan conjunct and the arena it is evaluated against.
+#[derive(Clone)]
+struct ScanConjunct {
+    predicate: ExprId,
+    encoding_policy: FilterEncodingPolicy,
+    arena: Arc<ExprArena>,
 }
 
 impl ScanOutputFilter {
@@ -59,15 +65,25 @@ impl ScanOutputFilter {
         blocking: Option<RuntimeFilterConsumerSet>,
         ordered_live: Option<NativeOrderedLiveConsumerSet>,
     ) -> Self {
-        let conjunct_predicate = scan.conjunct_predicate();
-        let conjunct_encoding_policy = conjunct_predicate
-            .map(|predicate| FilterEncodingPolicy::from_predicate(&arena, predicate));
-        Self {
-            conjunct_predicate,
-            conjunct_encoding_policy,
+        let conjunct = scan.conjunct_predicate().map(|predicate| ScanConjunct {
+            predicate,
+            encoding_policy: FilterEncodingPolicy::from_predicate(&arena, predicate),
             arena,
+        });
+        Self {
+            conjunct,
             ordered_live,
             blocking,
+        }
+    }
+
+    /// A scan that hands every chunk it read downstream unchanged: it owns
+    /// no conjunct, no expression arena and no runtime-filter consumer.
+    pub(super) const fn pass_through() -> Self {
+        Self {
+            conjunct: None,
+            ordered_live: None,
+            blocking: None,
         }
     }
 
@@ -118,7 +134,7 @@ impl ScanOutputFilter {
         chunk: Chunk,
         profiles: Option<&OperatorProfiles>,
     ) -> Result<Option<Chunk>, String> {
-        let Some(predicate) = self.conjunct_predicate else {
+        let Some(conjunct) = self.conjunct.as_ref() else {
             return Ok(Some(chunk));
         };
         if chunk.is_empty() {
@@ -127,17 +143,15 @@ impl ScanOutputFilter {
 
         let input_rows = i64::try_from(chunk.len()).unwrap_or(i64::MAX);
 
-        let chunk = if let Some(policy) = self.conjunct_encoding_policy.as_ref() {
-            hydrate_dictionary_columns_except(&chunk, |slot_id, data_type| {
-                policy.accepts_encoded_column(slot_id, data_type)
-            })?
-        } else {
-            chunk
-        };
+        let chunk = hydrate_dictionary_columns_except(&chunk, |slot_id, data_type| {
+            conjunct
+                .encoding_policy
+                .accepts_encoded_column(slot_id, data_type)
+        })?;
 
-        let predicate_array = self
+        let predicate_array = conjunct
             .arena
-            .eval(predicate, &chunk)
+            .eval(conjunct.predicate, &chunk)
             .map_err(|e| e.to_string())?;
         let filter_mask = predicate_array
             .as_any()

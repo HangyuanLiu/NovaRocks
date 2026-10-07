@@ -253,9 +253,8 @@ impl AggregateSignatureResolver for BuiltinAggregateResolver {
             argument_types: update_argument_types.to_vec(),
             intermediate_type,
             output_type,
-            state_format: AggregateStateFormatIdentity::try_new(format!(
-                "novarocks/{}/state-v1",
-                declaration.name
+            state_format: AggregateStateFormatIdentity::try_new(builtin_aggregate_state_format(
+                declaration.name,
             ))
             .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))?,
         })
@@ -364,13 +363,12 @@ impl BuiltinAggregateResolver {
                 }
                 "max_by" | "min_by" | "percentile_cont" | "percentile_disc"
                 | "percentile_disc_lc" => output = first.clone(),
+                // An exact LARGEINT SUM keeps its result type; its state is
+                // the wider physical intermediate.
                 "sum" | "multi_distinct_sum"
                     if first.logical_type == ValueLogicalType::LargeInt =>
                 {
                     output = first.clone();
-                    if name == "sum" {
-                        intermediate = first.clone();
-                    }
                 }
                 "array_agg" | "array_agg_distinct" => {
                     output.data_type = DataType::List(Arc::new(value_field("item", first, true)));
@@ -534,6 +532,15 @@ fn same_argument_up_to_nested_nullability(
 
 fn builtin_aggregate_overload(name: &str) -> String {
     format!("builtin.aggregate/{name}/derived-v1")
+}
+
+/// How one builtin aggregate's state format is spelled. SUM's exact state is
+/// its second format: the first carried the result type as its intermediate.
+pub(crate) fn builtin_aggregate_state_format(name: &str) -> String {
+    match name {
+        "sum" => "novarocks/sum/state-v2".to_owned(),
+        name => format!("novarocks/{name}/state-v1"),
+    }
 }
 
 fn builtin_overload_identity(
@@ -2895,20 +2902,19 @@ pub fn contribute_builtin_functions(
                 subject: "builtin aggregate overload",
                 value: error.to_string().into(),
             })?;
-        let state_format = AggregateStateFormatIdentity::try_new(format!(
-            "novarocks/{}/state-v1",
-            declaration.name
-        ))
-        .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
-            subject: "builtin aggregate state format",
-            value: error.to_string().into(),
-        })?;
+        let state_format =
+            AggregateStateFormatIdentity::try_new(builtin_aggregate_state_format(declaration.name))
+                .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
+                    subject: "builtin aggregate state format",
+                    value: error.to_string().into(),
+                })?;
         let binding_declaration = FunctionBindingDeclaration::try_new(
             function_id,
             FunctionKind::Aggregate,
             [FunctionOverloadDeclaration {
                 effects: match declaration.name {
                     "count" => Some(super::aggregate_count_owner::effects()),
+                    "sum" => Some(super::aggregate_sum_owner::effects()),
                     name if super::aggregate_extrema_owner::operation(name).is_some() => {
                         Some(super::aggregate_extrema_owner::effects())
                     }
@@ -2942,6 +2948,14 @@ pub fn contribute_builtin_functions(
         let resolver = Arc::new(BuiltinAggregateResolver { declaration });
         if declaration.name == "count" {
             builder.register(super::aggregate_count_owner::definition(
+                declaration.name,
+                binding_declaration,
+                resolver,
+            )?)?;
+            continue;
+        }
+        if declaration.name == "sum" {
+            builder.register(super::aggregate_sum_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,

@@ -38,12 +38,17 @@ use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::exchange::materialize_compiled_exchange_receivers;
 use crate::runtime::fragment::instance::FragmentInstanceSpec;
+use crate::runtime::fragment::scan::{
+    CompiledScanSources, materialize_compiled_scan_bindings, validate_compiled_scan_sources,
+};
 use crate::runtime::fragment::sink::materialize_compiled_sink;
 
-/// One compiled fragment instance: a LocalProgram compiled for this Task and
-/// the instance facts it runs with.
+/// One compiled fragment instance: a LocalProgram compiled for this Task, the
+/// Task-owned source of each of its scans, and the instance facts it runs
+/// with.
 pub struct CompiledFragmentSubmission {
     program: Arc<LocalProgram>,
+    scans: CompiledScanSources,
     instance: FragmentInstanceSpec,
     sink_kind: FragmentSinkKind,
 }
@@ -53,6 +58,7 @@ impl std::fmt::Debug for CompiledFragmentSubmission {
         formatter
             .debug_struct("CompiledFragmentSubmission")
             .field("nodes", &self.program.graph().nodes().len())
+            .field("scans", &self.scans.len())
             .field("sink_kind", &self.sink_kind)
             .field("instance", &self.instance)
             .finish()
@@ -60,8 +66,11 @@ impl std::fmt::Debug for CompiledFragmentSubmission {
 }
 
 impl CompiledFragmentSubmission {
+    /// `scans` holds exactly one Task source per compiled Scan, and the
+    /// instance assigns exactly the physical scan nodes those Scans address.
     pub fn try_new(
         program: Arc<LocalProgram>,
+        scans: CompiledScanSources,
         instance: FragmentInstanceSpec,
     ) -> Result<Self, FragmentBindingError> {
         let expected_dop = program.graph().profile().pipeline_dop();
@@ -76,18 +85,13 @@ impl CompiledFragmentSubmission {
                 ),
             ));
         }
-        // Compiled scans have no runtime binder yet; a scan assignment or a
-        // compiled scan source is refused rather than run without its splits.
-        if !program.scan_inputs().is_empty() || !instance.scan_assignments().is_empty() {
-            return Err(FragmentBindingError::new(
-                FragmentBindingTarget::Program,
-                FragmentBindingErrorKind::WrongAssignmentKind,
-                "compiled scans are not executable yet",
-            ));
-        }
+        // A scan without its Task source, or a source or assignment without
+        // its scan, is refused before anything is registered.
+        validate_compiled_scan_sources(&program, &scans, &instance)?;
         let sink_kind = compiled_sink_kind(program.graph().sink())?;
         Ok(Self {
             program,
+            scans,
             instance,
             sink_kind,
         })
@@ -246,11 +250,14 @@ pub fn prepare_compiled_fragment(
             result_sink,
             context.edge_gates.clone(),
         )?;
+        let scan_bindings =
+            materialize_compiled_scan_bindings(program, &submission.scans, instance)?;
         prepare_compiled_program_pipeline_execution_with_profiler(
             Arc::clone(program),
             Duration::from_millis(50),
             sink,
             receivers.bindings,
+            scan_bindings,
             Some((finst_id.high(), finst_id.low())),
             context.profiler.clone(),
             pipeline_dop,

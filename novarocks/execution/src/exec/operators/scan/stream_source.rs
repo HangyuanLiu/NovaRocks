@@ -98,14 +98,14 @@ fn native_scan_consumers(
 
 /// The operator and profile name of a scan source, always carrying the plan
 /// node id.
-fn scan_source_name(scan: &ScanNode, op: &dyn ScanOp) -> String {
+fn scan_source_name(node_id: Option<i32>, op: &dyn ScanOp) -> String {
     let name = op
         .profile_name()
         .unwrap_or_else(|| "ScanSource".to_string());
     if name.contains("plan_node_id=") || name.contains("(id=") {
         return name;
     }
-    if let Some(node_id) = scan.node_id() {
+    if let Some(node_id) = node_id {
         // A scan op's profile name template does not carry the plan node id;
         // appending it keeps profile naming consistent.
         return format!("{name} (plan_node_id={node_id})");
@@ -164,11 +164,11 @@ impl Wake for SourceReadiness {
 /// Factory for the scan source of a scan that hands its driver one stream.
 pub(crate) struct StreamScanSourceFactory {
     name: String,
-    scan: ScanNode,
+    node_id: Option<i32>,
+    limit: Option<usize>,
     op: Arc<dyn ScanOp>,
     source: Arc<dyn ScanStreamSource>,
     filter: ScanOutputFilter,
-    blocking: RuntimeFilterConsumerSet,
 }
 
 impl StreamScanSourceFactory {
@@ -179,17 +179,33 @@ impl StreamScanSourceFactory {
     ) -> Result<Self, String> {
         let source = op.stream_source();
         let (blocking, ordered_live) = native_scan_consumers(&scan, &arena)?;
-        let name = scan_source_name(&scan, op.as_ref());
-        let filter =
-            ScanOutputFilter::new(&scan, arena, Some(blocking.clone()), Some(ordered_live));
+        let name = scan_source_name(scan.node_id(), op.as_ref());
+        let filter = ScanOutputFilter::new(&scan, arena, Some(blocking), Some(ordered_live));
         Ok(Self {
             name,
-            scan,
+            node_id: scan.node_id(),
+            limit: scan.limit(),
             op,
             source,
             filter,
-            blocking,
         })
+    }
+
+    /// Build the source of a compiled Scan (local-compiler output). It owns
+    /// no legacy expression arena, no conjunct and no runtime-filter
+    /// consumer: a compiled residual runs as a compiled filter after the
+    /// source, and a compiled scan has no scan-level limit. Every chunk the
+    /// stream delivers is handed downstream as read.
+    pub(crate) fn new_compiled(display_id: i32, op: Arc<dyn ScanOp>) -> Self {
+        let source = op.stream_source();
+        Self {
+            name: scan_source_name(Some(display_id), op.as_ref()),
+            node_id: Some(display_id),
+            limit: None,
+            op,
+            source,
+            filter: ScanOutputFilter::pass_through(),
+        }
     }
 }
 
@@ -202,10 +218,12 @@ impl OperatorFactory for StreamScanSourceFactory {
         let readiness = SourceReadiness::new();
         // A scan held at its runtime-filter gate waits on the same stable
         // source observable as a scan waiting for its stream.
-        forward_observable(&self.blocking.gate_observable(), &readiness.observable());
+        if let Some(blocking) = self.filter.blocking() {
+            forward_observable(&blocking.gate_observable(), &readiness.observable());
+        }
         Box::new(StreamScanSourceOperator {
             name: self.name.clone(),
-            scan: self.scan.clone(),
+            limit: self.limit,
             op: Arc::clone(&self.op),
             source: Arc::clone(&self.source),
             stage: StreamStage::Unclaimed,
@@ -220,7 +238,7 @@ impl OperatorFactory for StreamScanSourceFactory {
             runtime_error: None,
             output_tracker_label: format!(
                 "scan_stream_output node={} driver={driver_id}",
-                self.scan.node_id().unwrap_or(-1)
+                self.node_id.unwrap_or(-1)
             ),
             output_tracker: None,
             downstream_paused: false,
@@ -243,7 +261,8 @@ enum StreamStage {
 
 struct StreamScanSourceOperator {
     name: String,
-    scan: ScanNode,
+    /// Scan-level LIMIT: delivery ends once this many rows were emitted.
+    limit: Option<usize>,
     op: Arc<dyn ScanOp>,
     source: Arc<dyn ScanStreamSource>,
     stage: StreamStage,
@@ -444,7 +463,7 @@ impl ProcessorOperator for StreamScanSourceOperator {
                         continue;
                     };
                     let rows = chunk.len();
-                    match scan_limit_decision(self.scan.limit(), self.rows_emitted, rows) {
+                    match scan_limit_decision(self.limit, self.rows_emitted, rows) {
                         ScanLimitDecision::Stop => {
                             self.end_delivery();
                             return Ok(None);
@@ -963,6 +982,58 @@ mod tests {
             control.operations.is_sealed(),
             "the stop was requested; exit stays owned by the source's operations"
         );
+    }
+
+    // A compiled scan source owns no conjunct, runtime filter or limit: every
+    // nonempty chunk its stream delivers is handed on as read.
+    #[test]
+    fn a_compiled_scan_source_hands_every_chunk_on_as_read() {
+        let control = Arc::new(StreamControl::default());
+        let source = Arc::new(ScriptedSource {
+            control: Arc::clone(&control),
+            claims: AtomicUsize::new(0),
+        });
+        let op: Arc<dyn ScanOp> = Arc::new(StreamScanOp {
+            source: Arc::clone(&source),
+            backpressure: Arc::new(Mutex::new(Vec::new())),
+        });
+        let factory = StreamScanSourceFactory::new_compiled(3, op);
+        assert!(
+            factory.name().contains("plan_node_id=3"),
+            "{}",
+            factory.name()
+        );
+        let mut scan = factory.create(1, 0);
+        scan.bind_runtime_state(&RuntimeState::default())
+            .expect("bind compiled stream scan");
+        let values = Arc::new(Mutex::new(Vec::new()));
+        let mut driver = PipelineDriver::new(
+            1,
+            vec![
+                scan,
+                Box::new(CollectSink {
+                    values: Arc::clone(&values),
+                    finished: false,
+                    observable: Arc::new(Observable::new()),
+                }),
+            ],
+            None,
+            Vec::new(),
+            Arc::new(RuntimeState::default()),
+            None,
+        );
+        for value in [4, 5, 6] {
+            control.push(one_row(value));
+        }
+        control.ended.store(true, Ordering::Release);
+
+        let mut state = run_until_parked(&mut driver);
+        if matches!(state, DriverState::PendingFinish) {
+            state = driver.process(TURN);
+        }
+        assert!(matches!(state, DriverState::Finished), "{state:?}");
+        assert_eq!(*values.lock().expect("values"), vec![4, 5, 6]);
+        assert_eq!(source.claims.load(Ordering::Acquire), 1);
     }
 
     #[test]

@@ -302,9 +302,12 @@ fn final_owner_has_one_complete_chain_and_sparse_actual_graph_origins() {
         checked,
         operators(false, u32::MAX),
         &allowed(),
-        BTreeMap::new(),
-        BTreeMap::new(),
-        BTreeMap::new(),
+        CompiledProgramFacts {
+            writes: BTreeMap::new(),
+            exchange_inputs: BTreeMap::new(),
+            scan_inputs: BTreeMap::new(),
+            aggregates: BTreeMap::new(),
+        },
         &Control::default(),
     )
     .unwrap();
@@ -352,9 +355,12 @@ fn final_owner_rejects_foreign_origins_legacy_identity_and_missing_sink() {
                 checked(false, sink, legacy),
                 operators(false, source),
                 &allowed(),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
+                CompiledProgramFacts {
+                    writes: BTreeMap::new(),
+                    exchange_inputs: BTreeMap::new(),
+                    scan_inputs: BTreeMap::new(),
+                    aggregates: BTreeMap::new(),
+                },
                 &Control::default()
             )
             .unwrap_err(),
@@ -370,9 +376,12 @@ fn actual_writer_recipe_coverage_and_exact_projection_fields_are_mandatory() {
             checked(true, true, false),
             operators(true, u32::MAX),
             &allowed(),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeMap::new(),
+            CompiledProgramFacts {
+                writes: BTreeMap::new(),
+                exchange_inputs: BTreeMap::new(),
+                scan_inputs: BTreeMap::new(),
+                aggregates: BTreeMap::new(),
+            },
             &Control::default()
         )
         .unwrap_err(),
@@ -383,9 +392,12 @@ fn actual_writer_recipe_coverage_and_exact_projection_fields_are_mandatory() {
         checked(true, true, false),
         operators(true, u32::MAX),
         &allowed(),
-        BTreeMap::from([(id, exact.clone())]),
-        BTreeMap::new(),
-        BTreeMap::new(),
+        CompiledProgramFacts {
+            writes: BTreeMap::from([(id, exact.clone())]),
+            exchange_inputs: BTreeMap::new(),
+            scan_inputs: BTreeMap::new(),
+            aggregates: BTreeMap::new(),
+        },
         &Control::default(),
     )
     .unwrap();
@@ -395,9 +407,12 @@ fn actual_writer_recipe_coverage_and_exact_projection_fields_are_mandatory() {
             checked(false, true, false),
             operators(false, u32::MAX),
             &allowed(),
-            BTreeMap::from([(ProgramNodeId::new(0), exact)]),
-            BTreeMap::new(),
-            BTreeMap::new(),
+            CompiledProgramFacts {
+                writes: BTreeMap::from([(ProgramNodeId::new(0), exact)]),
+                exchange_inputs: BTreeMap::new(),
+                scan_inputs: BTreeMap::new(),
+                aggregates: BTreeMap::new(),
+            },
             &Control::default()
         )
         .unwrap_err(),
@@ -411,9 +426,12 @@ fn actual_writer_recipe_coverage_and_exact_projection_fields_are_mandatory() {
             checked(true, true, false),
             operators(true, u32::MAX),
             &allowed(),
-            BTreeMap::from([(id, renamed)]),
-            BTreeMap::new(),
-            BTreeMap::new(),
+            CompiledProgramFacts {
+                writes: BTreeMap::from([(id, renamed)]),
+                exchange_inputs: BTreeMap::new(),
+                scan_inputs: BTreeMap::new(),
+                aggregates: BTreeMap::new(),
+            },
             &Control::default()
         )
         .unwrap_err(),
@@ -430,12 +448,15 @@ fn every_final_author_callback_propagates_original_control_without_rechecking() 
         checked(true, true, false),
         operators(true, u32::MAX),
         &allowed(),
-        BTreeMap::from([(
-            ProgramNodeId::new(1),
-            recipe(Field::new("v", DataType::Int64, false)),
-        )]),
-        BTreeMap::new(),
-        BTreeMap::new(),
+        CompiledProgramFacts {
+            writes: BTreeMap::from([(
+                ProgramNodeId::new(1),
+                recipe(Field::new("v", DataType::Int64, false)),
+            )]),
+            exchange_inputs: BTreeMap::new(),
+            scan_inputs: BTreeMap::new(),
+            aggregates: BTreeMap::new(),
+        },
         &baseline,
     )
     .unwrap();
@@ -455,12 +476,15 @@ fn every_final_author_callback_propagates_original_control_without_rechecking() 
                 checked(true, true, false),
                 operators(true, u32::MAX),
                 &allowed(),
-                BTreeMap::from([(
-                    ProgramNodeId::new(1),
-                    recipe(Field::new("v", DataType::Int64, false)),
-                )]),
-                BTreeMap::new(),
-                BTreeMap::new(),
+                CompiledProgramFacts {
+                    writes: BTreeMap::from([(
+                        ProgramNodeId::new(1),
+                        recipe(Field::new("v", DataType::Int64, false)),
+                    )]),
+                    exchange_inputs: BTreeMap::new(),
+                    scan_inputs: BTreeMap::new(),
+                    aggregates: BTreeMap::new(),
+                },
                 &control,
             )
             .unwrap_err();
@@ -489,10 +513,13 @@ fn exchange_input_addresses_cover_exactly_the_actual_exchange_sources() {
                 checked(false, true, false),
                 operators(false, u32::MAX),
                 &allowed(),
-                BTreeMap::new(),
-                BTreeMap::from([(node, address)]),
-                BTreeMap::new(),
-                &Control::default(),
+                CompiledProgramFacts {
+                    writes: BTreeMap::new(),
+                    exchange_inputs: BTreeMap::from([(node, address)]),
+                    scan_inputs: BTreeMap::new(),
+                    aggregates: BTreeMap::new(),
+                },
+                &Control::default()
             )
             .unwrap_err(),
             LocalProgramCompileError::ExchangeInputMismatch(node)
@@ -502,9 +529,12 @@ fn exchange_input_addresses_cover_exactly_the_actual_exchange_sources() {
         checked(false, true, false),
         operators(false, u32::MAX),
         &allowed(),
-        BTreeMap::new(),
-        BTreeMap::new(),
-        BTreeMap::new(),
+        CompiledProgramFacts {
+            writes: BTreeMap::new(),
+            exchange_inputs: BTreeMap::new(),
+            scan_inputs: BTreeMap::new(),
+            aggregates: BTreeMap::new(),
+        },
         &Control::default(),
     )
     .unwrap();
@@ -518,12 +548,53 @@ fn scan_input_address_on_a_non_scan_node_is_refused() {
             checked(false, true, false),
             operators(false, u32::MAX),
             &allowed(),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeMap::from([(ProgramNodeId::new(0), CompiledScanInput { scan_node: 4 })]),
-            &Control::default(),
+            CompiledProgramFacts {
+                writes: BTreeMap::new(),
+                exchange_inputs: BTreeMap::new(),
+                scan_inputs: BTreeMap::from([(
+                    ProgramNodeId::new(0),
+                    CompiledScanInput { scan_node: 4 }
+                )]),
+                aggregates: BTreeMap::new(),
+            },
+            &Control::default()
         )
         .unwrap_err(),
         LocalProgramCompileError::ScanInputMismatch(ProgramNodeId::new(0))
     );
+}
+#[test]
+fn aggregate_facts_cover_exactly_the_actual_aggregate_nodes() {
+    // The Values root is not an Aggregate, and a node outside the graph is
+    // not one either: neither may carry a grouping guarantee.
+    for node in [ProgramNodeId::new(0), ProgramNodeId::new(9)] {
+        assert_eq!(
+            LocalProgram::try_new(
+                checked(false, true, false),
+                operators(false, u32::MAX),
+                &allowed(),
+                CompiledProgramFacts {
+                    aggregates: BTreeMap::from([(
+                        node,
+                        CompiledAggregate {
+                            grouping: CompiledAggregateGrouping::Complete,
+                        },
+                    )]),
+                    ..CompiledProgramFacts::default()
+                },
+                &Control::default(),
+            )
+            .unwrap_err(),
+            LocalProgramCompileError::AggregateMismatch(node)
+        );
+    }
+    let program = LocalProgram::try_new(
+        checked(false, true, false),
+        operators(false, u32::MAX),
+        &allowed(),
+        CompiledProgramFacts::default(),
+        &Control::default(),
+    )
+    .unwrap();
+    assert!(program.aggregates().is_empty());
 }

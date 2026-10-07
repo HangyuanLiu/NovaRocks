@@ -765,6 +765,7 @@ fn lower_core(
 /// facts. Ordinary eager/type-only and installed IF/COALESCE control calls
 /// keep their exact lifecycle. Other guarded, lambda and relational protocols
 /// remain explicit pending cases rather than becoming ordinary scalar calls.
+#[cfg(test)]
 pub(crate) fn prepare_calls(
     package: &FragmentPackage,
     lowered: &LoweredExpressions,
@@ -772,7 +773,22 @@ pub(crate) fn prepare_calls(
     control: &dyn PureCompileControl,
 ) -> Result<Vec<(ProgramCallSite, PureCallSpecialization)>, ExpressionLoweringError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
-    let result = prepare_core(package, lowered, functions, control, &mut work);
+    let result = prepare_core(package, lowered, functions, None, control, &mut work);
+    finish(result, &mut work)
+}
+
+/// Prepare every expression occurrence and then every relational Aggregate
+/// call. `nodes` names the local node each physical node lowers to; an
+/// aggregate call's argument effects are its prepared argument roots'.
+pub(crate) fn prepare_calls_with_aggregates(
+    package: &FragmentPackage,
+    lowered: &LoweredExpressions,
+    functions: &PureEngineFunctionCatalog,
+    nodes: &BTreeMap<novarocks_physical_plan::NodeId, novarocks_local_program::ProgramNodeId>,
+    control: &dyn PureCompileControl,
+) -> Result<Vec<(ProgramCallSite, PureCallSpecialization)>, ExpressionLoweringError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+    let result = prepare_core(package, lowered, functions, Some(nodes), control, &mut work);
     finish(result, &mut work)
 }
 
@@ -780,6 +796,9 @@ fn prepare_core(
     package: &FragmentPackage,
     lowered: &LoweredExpressions,
     functions: &PureEngineFunctionCatalog,
+    aggregate_nodes: Option<
+        &BTreeMap<novarocks_physical_plan::NodeId, novarocks_local_program::ProgramNodeId>,
+    >,
     control: &dyn PureCompileControl,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Vec<(ProgramCallSite, PureCallSpecialization)>, ExpressionLoweringError> {
@@ -977,8 +996,15 @@ fn prepare_core(
         work.step()?;
     }
     let flow = package.expression_uses().flow();
+    // Relational Aggregate calls are prepared after every expression
+    // occurrence; every other relational lifecycle stays explicit.
     for &site in package.calls().entries().keys() {
-        if !matches!(site, PhysicalCallSite::Expression(_)) {
+        let admitted = match site {
+            PhysicalCallSite::Expression(_) => true,
+            PhysicalCallSite::Aggregate { .. } => aggregate_nodes.is_some(),
+            _ => false,
+        };
+        if !admitted {
             return Err(ExpressionLoweringError::UnsupportedCall(site));
         }
         work.step()?;
@@ -1571,6 +1597,16 @@ fn prepare_core(
             stack.pop();
             work.step()?;
         }
+    }
+    if let Some(nodes) = aggregate_nodes {
+        crate::aggregate::prepare_aggregate_calls(
+            package,
+            functions,
+            &effects,
+            nodes,
+            &mut tokens,
+            work,
+        )?;
     }
     let mut result = Vec::with_capacity(tokens.len());
     for entry in tokens {

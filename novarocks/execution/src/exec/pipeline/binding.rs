@@ -69,6 +69,10 @@ impl ScanBindings {
     pub fn get(&self, node_id: i32) -> Option<Arc<dyn ScanOp>> {
         self.0.get(&node_id).cloned()
     }
+    /// Every bound scan node id, ascending.
+    pub fn node_ids(&self) -> impl Iterator<Item = i32> + '_ {
+        self.0.keys().copied()
+    }
 
     /// All instance-materialized scan operations owned by this fragment.
     ///

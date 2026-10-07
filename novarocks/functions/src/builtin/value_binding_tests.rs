@@ -369,14 +369,10 @@ fn largeint_anchor_has_exact_domain_and_numeric_results_are_owner_declared() {
         let binding = resolve(name, kind, &arguments);
         assert_eq!(output(&binding).logical_type, ValueLogicalType::LargeInt);
         if name == "sum" {
+            // The exact LARGEINT SUM state is a physical 76-digit decimal.
             assert_eq!(
-                binding
-                    .selected
-                    .aggregate
-                    .unwrap()
-                    .intermediate_type
-                    .logical_type,
-                ValueLogicalType::LargeInt
+                binding.selected.aggregate.unwrap().intermediate_type,
+                FunctionValueType::new(DataType::Decimal256(76, 0), true)
             );
         } else if name == "multi_distinct_sum" {
             assert_eq!(

@@ -798,7 +798,6 @@ fn validate_aggregate(
                     argument: u32::try_from(argument)
                         .map_err(|_| ProgramResolvedCallsError::TooManyItems)?,
                 },
-                token.call_contract().context(),
                 ty,
                 work,
             )?;
@@ -814,7 +813,6 @@ fn validate_aggregate(
                 call: ordinal,
                 argument: 0,
             },
-            token.call_contract().context(),
             contract
                 .state_input_type()
                 .ok_or(ProgramResolvedCallsError::WrongArguments)?,
@@ -874,11 +872,13 @@ fn check_order(
     Ok(())
 }
 
+/// A relational argument is an independent unguarded Value root. Its domain
+/// is its own: a relational call context never borrows an expression
+/// occurrence's domain, and the argument contributes only neutral effects.
 fn check_argument_root(
     snapshot: &ProgramRootControlBindings,
     node: ProgramNodeId,
     role: ProgramNodeExpressionRole,
-    context: ExpressionEffectContext,
     ty: &FunctionValueType,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ProgramResolvedCallsError> {
@@ -889,9 +889,11 @@ fn check_argument_root(
         .ok_or(ProgramResolvedCallsError::WrongArguments)?;
     let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
     let invocation = &flow.uses()[use_id];
-    if invocation.context.domain != context.domain
-        || invocation.context.demand != EvaluationDemand::Value
-    {
+    let unguarded = flow
+        .domains()
+        .get(&invocation.context.domain)
+        .is_some_and(|domain| domain.parent.is_none() && domain.guard.is_none());
+    if !unguarded || invocation.context.demand != EvaluationDemand::Value {
         return Err(ProgramResolvedCallsError::WrongContext);
     }
     let definition = snapshot.roots().arenas()[&ProgramExpressionArena::Main]
@@ -961,7 +963,6 @@ fn validate_window(
                 argument: u32::try_from(argument)
                     .map_err(|_| ProgramResolvedCallsError::TooManyItems)?,
             },
-            token.call_contract().context(),
             ty,
             work,
         )?;

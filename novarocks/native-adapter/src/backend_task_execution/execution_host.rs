@@ -42,7 +42,7 @@
 //! query-scoped fact it needs arrives through [`TaskQueryContextFacts`], which
 //! the query context half of execution implements.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -51,12 +51,14 @@ use novarocks_execution::connector::{
     SplitQueueConfig, SplitQueueError, SplitQueueErrorKind, SplitQueueRegistry,
     SplitSequenceEvidence, TaskAttemptKey, TaskAttemptSplitQueues,
 };
-use novarocks_execution::exec::fragment::program::FragmentSinkKind;
+use novarocks_execution::exec::fragment::program::{FragmentNodeId, FragmentSinkKind};
+use novarocks_execution::exec::node::scan::BoundScanRanges;
 use novarocks_execution::runtime::execution_runtime::ExecutionRuntime;
 use novarocks_execution::runtime::fragment::io::{
     ExchangeDestinationKey, ExchangeEdgeGates, ExchangeFrameTransmitter, ExchangeReceiverPort,
     FragmentCommitPort, FragmentEvent, FragmentEventSink, FragmentResultWriter,
 };
+use novarocks_execution::runtime::fragment::scan::compiled_scan_nodes;
 use novarocks_execution::runtime::fragment::{
     CompiledFragmentSubmission, DormantFragmentHandle, ExecutionFailureCause, FragmentCancelReason,
     FragmentExecutionError, FragmentInstanceSpec, FragmentLaunchError, FragmentOutcome,
@@ -97,11 +99,13 @@ use tracing::debug;
 use super::compiled_package::{
     CompiledPackageCompiler, CompiledPackageError, CompiledTaskOptions, TaskPreparationControl,
 };
-use crate::fragment_instance::project_task_instance;
+use crate::compiled_scan_binding::{CompiledScanTask, bind_compiled_scans};
+use crate::fragment_instance::{NativeFragmentInstanceInput, project_task_instance};
 use crate::fragment_request::NativeFragmentRequest;
 use crate::fragment_submission::compiled_fragment_sink_assignment;
 use crate::native_fragment_query::{NativeFragmentQueryRuntime, NativeFragmentRegistrationLease};
 use crate::task_protocol_fault as fault;
+use novarocks_local_program::LocalProgram;
 use novarocks_worker::read_attempt::{ReceivedReadSplit, TypedReadAttemptContext};
 use novarocks_worker::{
     CatalogReadExecutionResolver, CatalogWriteExecutionResolver, HostRejection, RunnableTask,
@@ -463,13 +467,6 @@ impl NativeTaskExecutionHost {
                 "task {identity} creation assignment is not a codec-produced assignment"
             ))
         })?;
-        // Compiled scans have no runtime binder yet: a task that names scan
-        // work is refused rather than run without its splits.
-        if !descriptor.split_plan_nodes().is_empty() {
-            return Err(protocol(format!(
-                "task {identity} names split-driven scans, which compiled programs cannot run yet"
-            )));
-        }
 
         let attempt = TaskAttemptKey::new(execution, kernel_key);
         let splits = self.split_queues.open_attempt(
@@ -478,10 +475,18 @@ impl NativeTaskExecutionHost {
                 max_queued_bytes: MAX_ASSIGNMENT_RETAINED_BYTES,
             },
         );
+        // The queue set is opened before the scans bind so a scan can start
+        // and block before its first split arrives; the lease rolls it back.
         let mut lease = SplitQueueLease::held(&self.split_queues, attempt);
         let task_stop = ConnectorStopOwner::new();
         let mut stop_guard = PreparationStopGuard::new(task_stop.clone());
         let read_context = Arc::new(TypedReadAttemptContext::new());
+        let typed_runtime = self.typed_scan_runtime(
+            execution,
+            kernel_key,
+            Arc::clone(&read_context),
+            Arc::clone(&splits),
+        )?;
 
         let control = TaskPreparationControl::new(task_stop.view());
         let program = compiler
@@ -518,11 +523,20 @@ impl NativeTaskExecutionHost {
                 "task {identity} assignment is not a legal instance: {error}"
             ))
         })?;
-        if !instance_input.raw_scan_ranges.is_empty() {
-            return Err(protocol(format!(
-                "task {identity} assigns scan ranges, which compiled programs cannot run yet"
-            )));
-        }
+        let scan_assignments =
+            compiled_scan_assignments(identity, descriptor, &program, &instance_input)?;
+        // Every compiled scan binds its typed source here, before anything is
+        // registered: a refusal leaves only this attempt's local state behind.
+        let scans = bind_compiled_scans(
+            &program,
+            &CompiledScanTask {
+                runtime: &typed_runtime,
+                fragment_instance_id: kernel_key,
+                query_options: &instance_input.query_options,
+                stop: task_stop.view(),
+            },
+        )
+        .map_err(|error| protocol(format!("task {identity} scan does not bind: {error}")))?;
         let sink_assignment = compiled_fragment_sink_assignment(
             sink,
             &instance_input.sink_edge_ids,
@@ -538,7 +552,7 @@ impl NativeTaskExecutionHost {
             novarocks_execution_contract::FragmentContractVersion::CURRENT,
             instance_input.query_id,
             instance_input.fragment_instance_id,
-            ScanAssignments::default(),
+            scan_assignments,
             instance_input.exchange_inputs,
             sink_assignment,
             FragmentRuntimeOptions::new(
@@ -550,8 +564,8 @@ impl NativeTaskExecutionHost {
         );
         let root_display_id = i32::try_from(program.graph().root().index())
             .map_err(|_| internal(format!("task {identity} compiled root index exceeds i32")))?;
-        let submission =
-            CompiledFragmentSubmission::try_new(Arc::new(program), instance).map_err(|error| {
+        let submission = CompiledFragmentSubmission::try_new(Arc::new(program), scans, instance)
+            .map_err(|error| {
                 protocol(format!(
                     "task {identity} compiled program does not fit its instance: {error}"
                 ))
@@ -604,6 +618,15 @@ impl NativeTaskExecutionHost {
             )
             .map_err(|error| {
                 resource_exhausted(format!("task {identity} could not be admitted: {error}"))
+            })?;
+        // Scan sources open their providers only when preparation binds them,
+        // which needs the admitted fragment tracker installed first.
+        typed_runtime
+            .install_connector_resource_tracker(admission.fragment_mem_tracker())
+            .map_err(|error| {
+                internal(format!(
+                    "task {identity} could not install connector resource accounting: {error}"
+                ))
             })?;
         let context = admission
             .into_prepare_context(
@@ -1856,6 +1879,67 @@ fn split_queue_rejection(error: SplitQueueError) -> HostRejection {
         return HostRejection::from_closed_queue(category, error.to_string());
     }
     HostRejection::new(category, error.to_string())
+}
+
+/// The instance scan assignments of a compiled program: an empty range
+/// binding for each compiled scan's physical node, because a compiled scan
+/// takes all of its work as runtime splits.
+///
+/// The descriptor must name exactly those nodes as split-driven: a scan it
+/// omits would never be told that no more splits come, and a node it adds
+/// has no source to read them. The assignment's initial ranges may name only
+/// those nodes, and none of them may carry a frozen range.
+fn compiled_scan_assignments(
+    identity: TaskIdentity,
+    descriptor: &TaskDescriptor,
+    program: &LocalProgram,
+    instance: &NativeFragmentInstanceInput,
+) -> Result<ScanAssignments, HostRejection> {
+    let scan_nodes = compiled_scan_nodes(program)
+        .map_err(|error| {
+            protocol(format!(
+                "task {identity} compiled scans are not addressable: {error}"
+            ))
+        })?
+        .into_values()
+        .collect::<BTreeSet<FragmentNodeId>>();
+    let split_nodes = descriptor
+        .split_plan_nodes()
+        .iter()
+        .map(|node| FragmentNodeId::new(node.get()))
+        .collect::<BTreeSet<_>>();
+    if split_nodes != scan_nodes {
+        return Err(protocol(format!(
+            "task {identity} names split-driven nodes {:?}, but its compiled scans are {:?}",
+            split_nodes
+                .iter()
+                .map(|node| node.get())
+                .collect::<Vec<_>>(),
+            scan_nodes.iter().map(|node| node.get()).collect::<Vec<_>>()
+        )));
+    }
+    for (node, ranges) in &instance.raw_scan_ranges {
+        if !scan_nodes.contains(node) {
+            return Err(protocol(format!(
+                "task {identity} assigns scan ranges to node {}, which is not a compiled scan",
+                node.get()
+            )));
+        }
+        if !ranges.is_empty() {
+            return Err(protocol(format!(
+                "task {identity} assigns frozen ranges to compiled scan node {}, whose work \
+                 arrives only as splits",
+                node.get()
+            )));
+        }
+    }
+    ScanAssignments::try_new(
+        scan_nodes
+            .into_iter()
+            .map(|node| (node, BoundScanRanges::None))
+            .collect(),
+    )
+    .map_err(|error| internal(format!("task {identity} scan assignments: {error}")))
 }
 
 /// The task's own stop stays primary; a package this interpreter refuses is
@@ -5263,8 +5347,13 @@ mod tests {
             )
         }
 
-        /// A single-driver producer task streaming to `receiver` over edge 3.
-        fn producer_descriptor(identity: TaskIdentity, receiver: u32) -> TaskDescriptor {
+        /// A single-driver producer task streaming to `receiver` over edge 3,
+        /// whose `split_nodes` take their work as runtime splits.
+        fn producer_descriptor(
+            identity: TaskIdentity,
+            receiver: u32,
+            split_nodes: &[i32],
+        ) -> TaskDescriptor {
             let node = FragmentNodeId::new(i32::try_from(receiver).expect("small node"));
             let destination = ExchangeDestination::new(
                 super::identity(70, 2, 1),
@@ -5291,17 +5380,29 @@ mod tests {
                 identity,
                 UniqueId::new(701, 702),
                 NonZeroUsize::new(1).expect("nonzero dop"),
-                Vec::new(),
+                split_nodes
+                    .iter()
+                    .map(|node| PlanNodeId::new(*node).expect("nonnegative node"))
+                    .collect(),
                 topology,
             )
             .expect("a legal descriptor")
         }
 
         fn producer_input(descriptor: &TaskDescriptor, carrier: FrozenBytes) -> TaskCreationInput {
+            scan_input(descriptor, carrier, Vec::new())
+        }
+
+        /// The producer's assignment, with `initial_scan_ranges` frozen in.
+        fn scan_input(
+            descriptor: &TaskDescriptor,
+            carrier: FrozenBytes,
+            initial_scan_ranges: Vec<proto::TaskScanRanges>,
+        ) -> TaskCreationInput {
             let assignment = decode_task_assignment(
                 proto::TaskAssignment {
                     instance_ordinal: 0,
-                    initial_scan_ranges: Vec::new(),
+                    initial_scan_ranges,
                     sink_edge_ids: vec![3],
                 },
                 descriptor,
@@ -5319,7 +5420,7 @@ mod tests {
             let facts = Arc::new(StubContextFacts::default());
             let host = compiled_host(Arc::clone(&facts));
             let identity = super::identity(70, 1, 1);
-            let descriptor = producer_descriptor(identity, receiver);
+            let descriptor = producer_descriptor(identity, receiver, &[]);
             let prepared = host
                 .install_receiver(
                     &descriptor,
@@ -5340,7 +5441,7 @@ mod tests {
             let (package, receiver) = select_one_producer();
             let compiled = compiled_host(Arc::new(StubContextFacts::default()));
             let identity = super::identity(71, 1, 1);
-            let descriptor = producer_descriptor(identity, receiver);
+            let descriptor = producer_descriptor(identity, receiver, &[]);
             let plan_tree = compiled
                 .install_receiver(
                     &descriptor,
@@ -5380,6 +5481,244 @@ mod tests {
                 "{garbage}"
             );
             assert!(compiled.task_runtime(identity).is_none());
+        }
+
+        /// A query context that leases the fixture catalog with its installed
+        /// read execution; every other fact is the stub's.
+        #[derive(Default)]
+        struct ScanContextFacts(StubContextFacts);
+
+        impl TaskQueryContextFacts for ScanContextFacts {
+            fn query_options(
+                &self,
+                execution: QueryExecutionId,
+            ) -> Result<QueryContextOptions, HostRejection> {
+                self.0.query_options(execution)
+            }
+
+            fn runtime_filter_session(
+                &self,
+                execution: QueryExecutionId,
+                fragment_instance_id: UniqueId,
+                expects_bindings: bool,
+            ) -> Result<Option<RuntimeFilterSessionRef>, HostRejection> {
+                self.0
+                    .runtime_filter_session(execution, fragment_instance_id, expects_bindings)
+            }
+
+            fn runtime_filter_event_sink(
+                &self,
+                execution: QueryExecutionId,
+                fragment_instance_id: UniqueId,
+            ) -> Arc<dyn FragmentEventSink> {
+                self.0
+                    .runtime_filter_event_sink(execution, fragment_instance_id)
+            }
+
+            fn bind_runtime_filter_feedback(
+                &self,
+                execution: QueryExecutionId,
+                carrier: TaskIdentity,
+                reporter: &TaskStatusReporter,
+            ) -> bool {
+                self.0
+                    .bind_runtime_filter_feedback(execution, carrier, reporter)
+            }
+
+            fn deliver_task_dynamic_filter(
+                &self,
+                execution: QueryExecutionId,
+                fragment_instance_id: UniqueId,
+                version: DomainVersion,
+                payload: &Arc<dyn CodecOwnedContent>,
+            ) -> Result<(), HostRejection> {
+                self.0.deliver_task_dynamic_filter(
+                    execution,
+                    fragment_instance_id,
+                    version,
+                    payload,
+                )
+            }
+
+            fn catalog_read_execution(
+                &self,
+                _execution: QueryExecutionId,
+                handle: &CatalogHandle,
+            ) -> Result<ConnectorExecutionReadBinding, String> {
+                let installed =
+                    crate::typed_connector_test_support::test_support::installed_read_execution();
+                if installed.binding().catalog_handle() == handle {
+                    Ok(installed)
+                } else {
+                    Err("this fixture leases only the fixture catalog".to_owned())
+                }
+            }
+
+            fn catalog_write_execution(
+                &self,
+                execution: QueryExecutionId,
+                handle: &CatalogHandle,
+            ) -> Result<ConnectorExecutionWriteBinding, String> {
+                self.0.catalog_write_execution(execution, handle)
+            }
+
+            fn storage_resolver(
+                &self,
+                execution: QueryExecutionId,
+            ) -> Result<Arc<dyn ConnectorStorageResolver>, HostRejection> {
+                self.0.storage_resolver(execution)
+            }
+        }
+
+        /// A compiled host whose provider catalog seals fixture reads.
+        fn scan_host(facts: Arc<ScanContextFacts>) -> NativeTaskExecutionHost {
+            let data_runtime =
+                novarocks_native_adapter::backend_test_support::test_backend_data_runtime();
+            let completion_supervisor =
+                TaskCompletionSupervisor::start(data_runtime.handle().clone(), 64);
+            NativeTaskExecutionHost::new(
+                NativeFragmentQueryRuntime::global(
+                    novarocks_native_adapter::backend_test_support::test_memory_authority(),
+                ),
+                facts,
+                TaskInboundCapabilities::new(),
+                novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
+                    data_runtime,
+                    Duration::from_millis(120_000),
+                ),
+                novarocks_native_adapter::fragment_result_writer::test_native_result_writer(),
+                Arc::new(UnavailableExchangeReceiverPort),
+                Arc::new(novarocks_worker::sink_commit::WorkerSinkCommitPort),
+                test_execution_runtime(),
+                novarocks_worker::ScanStreamHost::new(
+                    novarocks_worker::ScanPreparationConfig::default(),
+                    novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),
+                ),
+                completion_supervisor,
+            )
+            .with_compiled_package_compiler(Arc::new(CompiledPackageInterpreter::new(
+                FragmentDecodeResourceModel::try_new(&Unbounded).expect("decode model"),
+                decode_limits(),
+                Arc::new(sealed_rand_subset()),
+                Arc::new(crate::compiled_scan_binding::tests::fixture_providers()),
+                constants(),
+            )))
+        }
+
+        fn empty_scan_ranges(node: i32) -> proto::TaskScanRanges {
+            proto::TaskScanRanges {
+                plan_node_id: node,
+                ranges: Vec::new(),
+            }
+        }
+
+        // A compiled scan package is compiled, its scan bound to the
+        // installed read execution, and prepared; a split delivered to the
+        // task is decoded by that execution and read by the compiled scan's
+        // own driver, which reaches the fixture provider.
+        #[test]
+        fn a_compiled_host_runs_a_scan_package_from_its_delivered_splits() {
+            use crate::compiled_scan_binding::tests::{SCAN_NODE, scan_producer_package};
+            use novarocks_execution_contract::task_execution::status::TerminationDetail;
+
+            let (package, receiver) = scan_producer_package();
+            let host = scan_host(Arc::new(ScanContextFacts::default()));
+            let identity = super::identity(72, 1, 1);
+            let descriptor = producer_descriptor(identity, receiver, &[SCAN_NODE]);
+            let prepared = host
+                .install_receiver(
+                    &descriptor,
+                    scan_input(
+                        &descriptor,
+                        package_carrier(&package),
+                        vec![empty_scan_ranges(SCAN_NODE)],
+                    ),
+                )
+                .expect("the compiled scan producer installs");
+            assert_eq!(prepared.sink_kind(), FragmentSinkKind::DataStream);
+            host.install_inbound_capability(&descriptor)
+                .expect("installs");
+            let (owner, reporter) = reporter_for(identity);
+            submit_committed(&host, &descriptor, reporter);
+
+            host.apply_task_domain(
+                &descriptor,
+                &split_intent(
+                    PlanNodeId::new(SCAN_NODE).expect("nonnegative node"),
+                    SCAN_NODE,
+                    vec![
+                        crate::typed_connector_test_support::test_support::split_proto(
+                            SCAN_NODE, 1,
+                        ),
+                    ],
+                    SplitOffer::batch(SplitSequence::FIRST, SplitSequence::FIRST, true)
+                        .expect("one split"),
+                ),
+            )
+            .expect("the compiled scan's read execution decodes its split");
+            // The fixture provider refuses every page stream, so the read of
+            // that split is what ends the task.
+            assert_eq!(await_terminal(&owner), TaskState::Failed);
+            let status = owner.current();
+            let Some(TerminationDetail::Failed(failure)) = status.termination() else {
+                panic!("the provider's refusal is the task's terminal failure");
+            };
+            assert!(
+                failure
+                    .detail()
+                    .as_str()
+                    .contains("fixture page provider is never read"),
+                "{failure:?}"
+            );
+
+            host.remove_inbound_capability(&descriptor);
+            host.remove_receiver(&descriptor);
+            assert!(host.task_runtime(identity).is_none());
+        }
+
+        // The descriptor and the assignment must address exactly the compiled
+        // scans, and only with split-driven work; every refusal leaves no
+        // prepared task and no open split queue behind.
+        #[test]
+        fn a_compiled_scan_task_addresses_exactly_its_scans_by_splits() {
+            use crate::compiled_scan_binding::tests::{SCAN_NODE, scan_producer_package};
+
+            let (package, receiver) = scan_producer_package();
+            let host = scan_host(Arc::new(ScanContextFacts::default()));
+            let refusal = |identity: TaskIdentity, split_nodes: &[i32], initial| {
+                let descriptor = producer_descriptor(identity, receiver, split_nodes);
+                let rejection = host
+                    .install_receiver(
+                        &descriptor,
+                        scan_input(&descriptor, package_carrier(&package), initial),
+                    )
+                    .expect_err("the compiled scan task must be refused");
+                assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
+                assert!(host.task_runtime(identity).is_none());
+                assert!(host.split_queues.is_empty(), "the split lease rolled back");
+                rejection.detail().as_str().to_owned()
+            };
+
+            let unsplit = refusal(super::identity(73, 1, 1), &[], Vec::new());
+            assert!(
+                unsplit.contains("names split-driven nodes [], but its compiled scans are [10]"),
+                "{unsplit}"
+            );
+            let foreign = refusal(
+                super::identity(74, 1, 1),
+                &[SCAN_NODE, SCAN_NODE + 2],
+                Vec::new(),
+            );
+            assert!(foreign.contains("split-driven nodes [10, 12]"), "{foreign}");
+            let stray = refusal(
+                super::identity(75, 1, 1),
+                &[SCAN_NODE],
+                vec![empty_scan_ranges(SCAN_NODE + 2)],
+            );
+            assert!(
+                stray.contains("assigns scan ranges to node 12, which is not a compiled scan"),
+                "{stray}"
+            );
         }
     }
 }

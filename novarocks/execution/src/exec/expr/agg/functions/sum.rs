@@ -23,16 +23,31 @@ use novarocks_types::largeint;
 
 use super::super::*;
 use super::AggregateFunction;
-use super::common;
 
+/// SUM with the exact contract the pure owner implements (R-SUM-exact).
+///
+/// A group's value is the exact sum of its non-NULL inputs: integers
+/// accumulate in i128 and travel between phases as `Decimal128(38, 0)`;
+/// LARGEINT and DECIMAL accumulate in i256 and travel as `Decimal256(76, s)`.
+/// Only building the final value can overflow: BIGINT and LARGEINT report an
+/// error and DECIMAL reports one past 38 digits. This executor has no frozen
+/// decimal overflow policy, so it always reports. FLOAT/DOUBLE and DECIMAL256
+/// keep their previous accumulation.
 pub(super) struct SumAgg;
+
+/// Largest DECIMAL(38, s) magnitude, 10^38 - 1, as an unscaled value.
+const MAX_DECIMAL38: i128 = 99_999_999_999_999_999_999_999_999_999_999_999_999;
 
 fn sum_spec_from_type(data_type: &DataType) -> Result<AggSpec, String> {
     match data_type {
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => Ok(AggSpec {
+        DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64 => Ok(AggSpec {
             kind: AggKind::SumInt,
             output_type: DataType::Int64,
-            intermediate_type: DataType::Int64,
+            intermediate_type: DataType::Decimal128(38, 0),
             input_arg_type: None,
             count_all: false,
         }),
@@ -40,18 +55,11 @@ fn sum_spec_from_type(data_type: &DataType) -> Result<AggSpec, String> {
             Ok(AggSpec {
                 kind: AggKind::SumLargeInt,
                 output_type: DataType::FixedSizeBinary(*width),
-                intermediate_type: DataType::FixedSizeBinary(*width),
+                intermediate_type: DataType::Decimal256(76, 0),
                 input_arg_type: None,
                 count_all: false,
             })
         }
-        DataType::Boolean => Ok(AggSpec {
-            kind: AggKind::SumInt,
-            output_type: DataType::Int64,
-            intermediate_type: DataType::Int64,
-            input_arg_type: None,
-            count_all: false,
-        }),
         DataType::Float32 | DataType::Float64 => Ok(AggSpec {
             kind: AggKind::SumFloat,
             output_type: DataType::Float64,
@@ -65,10 +73,15 @@ fn sum_spec_from_type(data_type: &DataType) -> Result<AggSpec, String> {
             // carries an identical descriptor fleet-wide.
             let canonical = novarocks_type_contract::canonical_agg_decimal_type("sum", data_type)
                 .expect("sum decimal canonical type");
+            let DataType::Decimal128(_, scale) = canonical else {
+                return Err(format!(
+                    "sum canonical decimal is not 128-bit: {canonical:?}"
+                ));
+            };
             Ok(AggSpec {
                 kind: AggKind::SumDecimal128,
-                output_type: canonical.clone(),
-                intermediate_type: canonical,
+                output_type: canonical,
+                intermediate_type: DataType::Decimal256(76, scale),
                 input_arg_type: None,
                 count_all: false,
             })
@@ -87,12 +100,23 @@ fn sum_spec_from_type(data_type: &DataType) -> Result<AggSpec, String> {
 impl AggregateFunction for SumAgg {
     fn build_spec_from_type(
         &self,
-        _func: &AggFunction,
+        func: &AggFunction,
         input_type: Option<&DataType>,
-        _input_is_intermediate: bool,
+        input_is_intermediate: bool,
     ) -> Result<AggSpec, String> {
-        let data_type = input_type.ok_or_else(|| "sum input type missing".to_string())?;
-        sum_spec_from_type(data_type)
+        if !input_is_intermediate {
+            let data_type = input_type.ok_or_else(|| "sum input type missing".to_string())?;
+            return sum_spec_from_type(data_type);
+        }
+        // A merge reads the wider intermediate; its domain is the logical
+        // argument the selection names, never the state carrier. The merge
+        // view checks each actual state array against the intermediate.
+        let logical = func
+            .types
+            .as_ref()
+            .and_then(|types| types.input_arg_type.as_ref())
+            .ok_or_else(|| "sum merge requires its logical argument type".to_string())?;
+        sum_spec_from_type(logical)
     }
 
     fn state_layout_for(&self, kind: &AggKind) -> (usize, usize) {
@@ -101,15 +125,11 @@ impl AggregateFunction for SumAgg {
                 std::mem::size_of::<SumIntState>(),
                 std::mem::align_of::<SumIntState>(),
             ),
-            AggKind::SumLargeInt => (
-                std::mem::size_of::<I128State>(),
-                std::mem::align_of::<I128State>(),
-            ),
             AggKind::SumFloat => (
                 std::mem::size_of::<SumFloatState>(),
                 std::mem::align_of::<SumFloatState>(),
             ),
-            AggKind::SumDecimal128 => (
+            AggKind::SumLargeInt | AggKind::SumDecimal128 => (
                 std::mem::size_of::<SumDecimal128State>(),
                 std::mem::align_of::<SumDecimal128State>(),
             ),
@@ -174,8 +194,23 @@ impl AggregateFunction for SumAgg {
         spec: &AggSpec,
         array: &'a Option<ArrayRef>,
     ) -> Result<AggInputView<'a>, String> {
-        // sum merge uses the same update_* kernels. Its intermediate type matches its output type.
-        self.build_input_view(spec, array)
+        match spec.kind {
+            // The exact states travel in their wider decimal carriers.
+            AggKind::SumInt | AggKind::SumLargeInt | AggKind::SumDecimal128 => {
+                let arr = array
+                    .as_ref()
+                    .ok_or_else(|| "sum state input missing".to_string())?;
+                if arr.data_type() != &spec.intermediate_type {
+                    return Err(format!(
+                        "sum state input {:?} differs from its intermediate {:?}",
+                        arr.data_type(),
+                        spec.intermediate_type
+                    ));
+                }
+                Ok(AggInputView::Any(arr))
+            }
+            _ => self.build_input_view(spec, array),
+        }
     }
 
     fn init_state(&self, spec: &AggSpec, ptr: *mut u8) {
@@ -198,10 +233,7 @@ impl AggregateFunction for SumAgg {
                     },
                 );
             },
-            AggKind::SumLargeInt => unsafe {
-                std::ptr::write(ptr as *mut I128State, I128State::default());
-            },
-            AggKind::SumDecimal128 => unsafe {
+            AggKind::SumLargeInt | AggKind::SumDecimal128 => unsafe {
                 std::ptr::write(
                     ptr as *mut SumDecimal128State,
                     SumDecimal128State {
@@ -243,7 +275,9 @@ impl AggregateFunction for SumAgg {
             AggKind::SumLargeInt => update_sum_largeint(offset, state_ptrs, input),
             AggKind::SumFloat => update_sum_float(offset, state_ptrs, input),
             AggKind::SumDecimal128 => update_sum_decimal128(offset, state_ptrs, input),
-            AggKind::SumDecimal256 => update_sum_decimal256(offset, state_ptrs, input),
+            AggKind::SumDecimal256 => {
+                add_decimal256::<SumDecimal256State>(offset, state_ptrs, input)
+            }
             _ => Err("sum update kind mismatch".to_string()),
         }
     }
@@ -255,8 +289,14 @@ impl AggregateFunction for SumAgg {
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
     ) -> Result<(), String> {
-        // sum merge == sum update
-        self.update_batch(spec, offset, state_ptrs, input)
+        match spec.kind {
+            AggKind::SumInt => merge_sum_int(offset, state_ptrs, input),
+            // LARGEINT and DECIMAL states share the i256 state and carrier.
+            AggKind::SumLargeInt | AggKind::SumDecimal128 => {
+                add_decimal256::<SumDecimal128State>(offset, state_ptrs, input)
+            }
+            _ => self.update_batch(spec, offset, state_ptrs, input),
+        }
     }
 
     fn build_array(
@@ -264,21 +304,40 @@ impl AggregateFunction for SumAgg {
         spec: &AggSpec,
         offset: usize,
         group_states: &[AggStatePtr],
-        _output_intermediate: bool,
+        output_intermediate: bool,
     ) -> Result<ArrayRef, String> {
-        match spec.kind {
-            AggKind::SumInt => build_sum_int_array(offset, group_states),
-            AggKind::SumLargeInt => common::build_largeint_array(offset, group_states),
-            AggKind::SumFloat => build_sum_float_array(offset, group_states),
-            AggKind::SumDecimal128 => {
+        match (spec.kind.clone(), output_intermediate) {
+            (AggKind::SumInt, true) => build_sum_int_state_array(offset, group_states),
+            (AggKind::SumInt, false) => build_sum_int_array(offset, group_states),
+            (AggKind::SumLargeInt | AggKind::SumDecimal128, true) => {
+                build_decimal256_array::<SumDecimal128State>(
+                    offset,
+                    group_states,
+                    &spec.intermediate_type,
+                )
+            }
+            (AggKind::SumLargeInt, false) => build_sum_largeint_array(offset, group_states),
+            (AggKind::SumFloat, _) => build_sum_float_array(offset, group_states),
+            (AggKind::SumDecimal128, false) => {
                 build_sum_decimal128_array(offset, group_states, &spec.output_type)
             }
-            AggKind::SumDecimal256 => {
-                build_sum_decimal256_array(offset, group_states, &spec.output_type)
-            }
+            (AggKind::SumDecimal256, _) => build_decimal256_array::<SumDecimal256State>(
+                offset,
+                group_states,
+                &spec.output_type,
+            ),
             _ => Err("sum output kind mismatch".to_string()),
         }
     }
+}
+
+fn add_exact(state: &mut SumIntState, value: i128) -> Result<(), String> {
+    state.sum = state
+        .sum
+        .checked_add(value)
+        .ok_or_else(|| "sum exact state overflow".to_string())?;
+    state.has_value = true;
+    Ok(())
 }
 
 fn update_sum_int(
@@ -292,8 +351,7 @@ fn update_sum_int(
                 if let Some(v) = view.value_at(row) {
                     let state =
                         unsafe { &mut *((base as *mut u8).add(offset) as *mut SumIntState) };
-                    state.sum += v;
-                    state.has_value = true;
+                    add_exact(state, i128::from(v))?;
                 }
             }
             Ok(())
@@ -304,13 +362,34 @@ fn update_sum_int(
                     continue;
                 }
                 let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut SumIntState) };
-                state.sum += i64::from(arr.value(row));
-                state.has_value = true;
+                add_exact(state, i128::from(arr.value(row)))?;
             }
             Ok(())
         }
         _ => Err("sum int input type mismatch".to_string()),
     }
+}
+
+fn merge_sum_int(
+    offset: usize,
+    state_ptrs: &[AggStatePtr],
+    input: &AggInputView,
+) -> Result<(), String> {
+    let AggInputView::Any(array) = input else {
+        return Err("sum int state input type mismatch".to_string());
+    };
+    let arr = array
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .ok_or_else(|| "sum int state input downcast failed".to_string())?;
+    for (row, &base) in state_ptrs.iter().enumerate() {
+        if arr.is_null(row) {
+            continue;
+        }
+        let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut SumIntState) };
+        add_exact(state, arr.value(row))?;
+    }
+    Ok(())
 }
 
 fn update_sum_float(
@@ -332,6 +411,15 @@ fn update_sum_float(
         }
         _ => Err("sum float input type mismatch".to_string()),
     }
+}
+
+fn add_wide(state: &mut SumDecimal128State, value: i256) -> Result<(), String> {
+    state.sum = state
+        .sum
+        .checked_add(value)
+        .ok_or_else(|| "sum exact state overflow".to_string())?;
+    state.has_value = true;
+    Ok(())
 }
 
 fn update_sum_largeint(
@@ -358,12 +446,8 @@ fn update_sum_largeint(
             continue;
         }
         let value = largeint::i128_from_be_bytes(arr.value(row))?;
-        let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut I128State) };
-        state.value = state
-            .value
-            .checked_add(value)
-            .ok_or_else(|| "largeint overflow".to_string())?;
-        state.has_value = true;
+        let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut SumDecimal128State) };
+        add_wide(state, i256::from_i128(value))?;
     }
     Ok(())
 }
@@ -381,11 +465,7 @@ fn update_sum_decimal128(
                 }
                 let state =
                     unsafe { &mut *((base as *mut u8).add(offset) as *mut SumDecimal128State) };
-                state.sum = state
-                    .sum
-                    .checked_add(i256::from_i128(arr.value(row)))
-                    .ok_or_else(|| "decimal overflow".to_string())?;
-                state.has_value = true;
+                add_wide(state, i256::from_i128(arr.value(row)))?;
             }
             Ok(())
         }
@@ -394,7 +474,37 @@ fn update_sum_decimal128(
     }
 }
 
-fn update_sum_decimal256(
+/// One i256 sum state: the exact LARGEINT and DECIMAL states, and the
+/// DECIMAL256 one.
+trait WideSumState {
+    fn sum(&self) -> Option<i256>;
+    fn add(&mut self, value: i256) -> Result<(), String>;
+}
+impl WideSumState for SumDecimal128State {
+    fn sum(&self) -> Option<i256> {
+        self.has_value.then_some(self.sum)
+    }
+    fn add(&mut self, value: i256) -> Result<(), String> {
+        add_wide(self, value)
+    }
+}
+impl WideSumState for SumDecimal256State {
+    fn sum(&self) -> Option<i256> {
+        self.has_value.then_some(self.sum)
+    }
+    fn add(&mut self, value: i256) -> Result<(), String> {
+        self.sum = self
+            .sum
+            .checked_add(value)
+            .ok_or_else(|| "decimal overflow".to_string())?;
+        self.has_value = true;
+        Ok(())
+    }
+}
+
+/// Add Decimal256 values: DECIMAL256 inputs, or the exact LARGEINT and
+/// DECIMAL states.
+fn add_decimal256<S: WideSumState>(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
@@ -410,12 +520,8 @@ fn update_sum_decimal256(
         if arr.is_null(row) {
             continue;
         }
-        let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut SumDecimal256State) };
-        state.sum = state
-            .sum
-            .checked_add(arr.value(row))
-            .ok_or_else(|| "decimal overflow".to_string())?;
-        state.has_value = true;
+        let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut S) };
+        state.add(arr.value(row))?;
     }
     Ok(())
 }
@@ -425,12 +531,49 @@ fn build_sum_int_array(offset: usize, group_states: &[AggStatePtr]) -> Result<Ar
     for &base in group_states {
         let state = unsafe { &*((base as *mut u8).add(offset) as *const SumIntState) };
         if state.has_value {
-            builder.append_value(state.sum);
+            let value =
+                i64::try_from(state.sum).map_err(|_| "sum result overflows BIGINT".to_string())?;
+            builder.append_value(value);
         } else {
             builder.append_null();
         }
     }
     Ok(Arc::new(builder.finish()))
+}
+
+fn build_sum_int_state_array(
+    offset: usize,
+    group_states: &[AggStatePtr],
+) -> Result<ArrayRef, String> {
+    let mut values = Vec::with_capacity(group_states.len());
+    for &base in group_states {
+        let state = unsafe { &*((base as *mut u8).add(offset) as *const SumIntState) };
+        values.push(state.has_value.then_some(state.sum));
+    }
+    let array = Decimal128Array::from(values)
+        .with_precision_and_scale(38, 0)
+        .map_err(|e| e.to_string())?;
+    Ok(Arc::new(array))
+}
+
+fn build_sum_largeint_array(
+    offset: usize,
+    group_states: &[AggStatePtr],
+) -> Result<ArrayRef, String> {
+    let mut values = Vec::with_capacity(group_states.len());
+    for &base in group_states {
+        let state = unsafe { &*((base as *mut u8).add(offset) as *const SumDecimal128State) };
+        if !state.has_value {
+            values.push(None);
+            continue;
+        }
+        let sum = state
+            .sum
+            .to_i128()
+            .ok_or_else(|| "sum result overflows LARGEINT".to_string())?;
+        values.push(Some(sum));
+    }
+    largeint::array_from_i128(&values)
 }
 
 fn build_sum_float_array(offset: usize, group_states: &[AggStatePtr]) -> Result<ArrayRef, String> {
@@ -465,7 +608,8 @@ fn build_sum_decimal128_array(
         let sum = state
             .sum
             .to_i128()
-            .ok_or_else(|| "decimal overflow".to_string())?;
+            .filter(|sum| sum.unsigned_abs() <= MAX_DECIMAL38 as u128)
+            .ok_or_else(|| "sum result overflows DECIMAL(38)".to_string())?;
         values.push(Some(sum));
     }
     let array = Decimal128Array::from(values)
@@ -474,7 +618,7 @@ fn build_sum_decimal128_array(
     Ok(Arc::new(array))
 }
 
-fn build_sum_decimal256_array(
+fn build_decimal256_array<S: WideSumState>(
     offset: usize,
     group_states: &[AggStatePtr],
     output_type: &DataType,
@@ -485,8 +629,8 @@ fn build_sum_decimal256_array(
     };
     let mut values = Vec::with_capacity(group_states.len());
     for &base in group_states {
-        let state = unsafe { &*((base as *mut u8).add(offset) as *const SumDecimal256State) };
-        values.push(state.has_value.then_some(state.sum));
+        let state = unsafe { &*((base as *mut u8).add(offset) as *const S) };
+        values.push(state.sum());
     }
     let array = Decimal256Array::from(values)
         .with_precision_and_scale(precision, scale)

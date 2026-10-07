@@ -167,7 +167,8 @@ mod tests {
             err.contains("aggregate intermediate type signature mismatch"),
             "{err}"
         );
-        assert!(err.contains("Decimal128(38, 2)"), "{err}");
+        // SUM's exact DECIMAL state is the 76-digit intermediate.
+        assert!(err.contains("Decimal256(76, 2)"), "{err}");
         assert!(err.contains("Decimal128(20, 2)"), "{err}");
     }
 }

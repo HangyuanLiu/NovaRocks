@@ -421,9 +421,10 @@ mod aggregate_wire_tests {
             aggregate_intermediate_type(&agg_call("count", true, vec![DataType::Int64])).unwrap(),
             DataType::Binary
         );
+        // An integer SUM accumulates exactly and travels as DECIMAL(38, 0).
         assert_eq!(
             aggregate_intermediate_type(&agg_call("sum", false, vec![DataType::Int32])).unwrap(),
-            DataType::Int64
+            DataType::Decimal128(38, 0)
         );
     }
 }

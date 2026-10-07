@@ -37,23 +37,30 @@ pub fn infer_agg_function_types(
             Ok((DataType::Binary, Some(DataType::Binary)))
         }
         "count" => Ok((DataType::Int64, Some(DataType::Int64))),
-        "sum" => {
-            let out = match &first_arg {
-                DataType::Boolean
-                | DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64 => DataType::Int64,
-                DataType::Float32 | DataType::Float64 => DataType::Float64,
-                DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
-                    DataType::FixedSizeBinary(*width)
-                }
-                DataType::Decimal128(..) => canonical_agg_decimal_type("sum", &first_arg)
-                    .expect("sum decimal canonical type"),
-                _ => DataType::Float64,
-            };
-            Ok((out.clone(), Some(out)))
-        }
+        // An exact SUM accumulates wider than its result and checks only the
+        // final value: integers travel as DECIMAL(38, 0), LARGEINT and
+        // DECIMAL as DECIMAL(76, s). Floating SUM keeps its result type.
+        "sum" => Ok(match &first_arg {
+            DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64 => (DataType::Int64, Some(DataType::Decimal128(38, 0))),
+            DataType::Float32 | DataType::Float64 => (DataType::Float64, Some(DataType::Float64)),
+            DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => (
+                DataType::FixedSizeBinary(*width),
+                Some(DataType::Decimal256(76, 0)),
+            ),
+            DataType::Decimal128(..) => {
+                let out = canonical_agg_decimal_type("sum", &first_arg)
+                    .expect("sum decimal canonical type");
+                let DataType::Decimal128(_, scale) = out else {
+                    unreachable!("canonical SUM decimal is a 128-bit decimal")
+                };
+                (out, Some(DataType::Decimal256(76, scale)))
+            }
+            _ => (DataType::Float64, Some(DataType::Float64)),
+        }),
         "avg" | "multi_distinct_avg" => {
             if name == "multi_distinct_avg"
                 && !matches!(
@@ -408,7 +415,18 @@ mod tests {
         );
         assert_eq!(
             infer_agg_function_types("sum", &[DataType::Int32], false).unwrap(),
-            (DataType::Int64, Some(DataType::Int64))
+            (DataType::Int64, Some(DataType::Decimal128(38, 0)))
+        );
+        assert_eq!(
+            infer_agg_function_types("sum", &[DataType::FixedSizeBinary(16)], false).unwrap(),
+            (
+                DataType::FixedSizeBinary(16),
+                Some(DataType::Decimal256(76, 0))
+            )
+        );
+        assert_eq!(
+            infer_agg_function_types("sum", &[DataType::Float32], false).unwrap(),
+            (DataType::Float64, Some(DataType::Float64))
         );
         assert_eq!(
             infer_agg_function_types("avg", &[DataType::Float64], false).unwrap(),
@@ -421,9 +439,10 @@ mod tests {
         let input = DataType::Decimal128(20, 2);
         let sum = canonical_agg_decimal_type("sum", &input).unwrap();
         let distinct = canonical_agg_decimal_type("multi_distinct_sum", &input).unwrap();
+        assert_eq!(sum, DataType::Decimal128(38, 2));
         assert_eq!(
             infer_agg_function_types("sum", std::slice::from_ref(&input), false).unwrap(),
-            (sum.clone(), Some(sum))
+            (sum, Some(DataType::Decimal256(76, 2)))
         );
         assert_eq!(
             infer_agg_function_types("multi_distinct_sum", &[input], true).unwrap(),

@@ -31,6 +31,7 @@ mod analytic_source;
 mod assert_num_rows_processor;
 mod blocked_duration;
 mod change_event_expand_processor;
+pub(crate) mod compiled_aggregate;
 pub(crate) mod compiled_change_events;
 pub(crate) mod compiled_expression;
 pub(crate) mod compiled_repeat;

@@ -2984,7 +2984,7 @@ mod tests {
                     inputs: vec![v],
                     input_is_intermediate: true,
                     types: Some(AggTypeSignature {
-                        intermediate_type: Some(DataType::Int64),
+                        intermediate_type: Some(DataType::Decimal128(38, 0)),
                         output_type: Some(DataType::Int64),
                         input_arg_type: Some(DataType::Int32),
                     }),
@@ -3066,7 +3066,7 @@ mod tests {
                     inputs: vec![v],
                     input_is_intermediate: false,
                     types: Some(AggTypeSignature {
-                        intermediate_type: Some(DataType::Int64),
+                        intermediate_type: Some(DataType::Decimal128(38, 0)),
                         output_type: Some(DataType::Int64),
                         input_arg_type: Some(DataType::Int32),
                     }),
