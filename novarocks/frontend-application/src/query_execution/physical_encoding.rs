@@ -994,6 +994,58 @@ mod tests {
     /// The same completed statement freezes into one checked v2 package per
     /// fragment; the receiver reads each back through the original
     /// constructors and the sender reproduces the exact bytes.
+    /// Complete a table-free statement and freeze its v2 package bytes,
+    /// returning the plan's fragment ids beside them.
+    fn frozen_packages(
+        sql: &str,
+    ) -> (
+        Vec<novarocks_physical_plan::FragmentId>,
+        std::collections::BTreeMap<novarocks_physical_plan::FragmentId, Vec<u8>>,
+    ) {
+        use novarocks_plan_codec::physical_package_v2::test_support::encode_limits;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (_root, scope) = query_scope();
+        let completed = runtime
+            .block_on(
+                FinalPlanCompletionDriver::new(Arc::new(NoFacts))
+                    .complete(request_for(sql), &scope),
+            )
+            .unwrap_or_else(|error| panic!("{sql}: completes without facts: {error}"));
+        let control = SqlCompileControl::unbounded();
+        let admission = novarocks_physical_plan::FragmentPackageAdmission {
+            plan_limits: novarocks_physical_plan::PlanLimits::FROZEN,
+            // Within the test encode limits' source/coexistence envelope:
+            // the package's retained source floor travels in the sender's
+            // cumulative source invoice.
+            source_retained_bytes: 64 << 20,
+            property_projection_limits: novarocks_physical_plan::PropertyProofProjectionLimits {
+                max_request_bytes: 16 << 20,
+                max_coexisting_bytes: 256 << 20,
+                max_projection_work: 16 << 20,
+            },
+        };
+        let packages = crate::query_execution::package_freeze::freeze_fragment_packages(
+            completed.candidate(),
+            crate::application::test_constant_policy(),
+            &admission,
+            &encode_limits(),
+            &control,
+        )
+        .unwrap_or_else(|error| panic!("{sql}: checked v2 packages: {error}"));
+        let fragments = completed
+            .candidate()
+            .plan()
+            .fragments()
+            .keys()
+            .copied()
+            .collect();
+        (fragments, packages)
+    }
+
     #[test]
     fn a_completed_statement_freezes_v2_packages_that_roundtrip_through_the_receiver() {
         use novarocks_plan_codec::physical_package_v2::test_support::{
@@ -1005,41 +1057,9 @@ mod tests {
         use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
         use prost::Message;
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let (_root, scope) = query_scope();
-        let completed = runtime
-            .block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope))
-            .unwrap_or_else(|error| panic!("VALUES completes without facts: {error}"));
+        let (fragments, packages) = frozen_packages("SELECT 1");
         let control = SqlCompileControl::unbounded();
-        let admission = novarocks_physical_plan::FragmentPackageAdmission {
-            plan_limits: novarocks_physical_plan::PlanLimits::FROZEN,
-            source_retained_bytes: 2 << 30,
-            property_projection_limits: novarocks_physical_plan::PropertyProofProjectionLimits {
-                max_request_bytes: 512 << 20,
-                max_coexisting_bytes: 4 << 30,
-                max_projection_work: usize::MAX / 4,
-            },
-        };
-        let packages = crate::query_execution::package_freeze::freeze_fragment_packages(
-            completed.candidate(),
-            crate::application::test_constant_policy(),
-            &admission,
-            &encode_limits(),
-            &control,
-        )
-        .unwrap_or_else(|error| panic!("checked v2 packages: {error}"));
-        assert_eq!(
-            packages.keys().collect::<Vec<_>>(),
-            completed
-                .candidate()
-                .plan()
-                .fragments()
-                .keys()
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(packages.keys().copied().collect::<Vec<_>>(), fragments);
         let model = FragmentDecodeResourceModel::try_new(&control).expect("decode model");
         for (id, bytes) in &packages {
             let decoded = decode_fragment_package(bytes, &model, &decode_limits(), &control)
@@ -1052,6 +1072,171 @@ mod tests {
         }
     }
 
+    /// A real sealed RAND-only subset; a table-free statement binds no
+    /// function, but the compiler refuses an empty pure catalog. This is not
+    /// the Server catalogue.
+    fn sealed_rand_subset() -> novarocks_functions::PureEngineFunctionCatalog {
+        use novarocks_functions::{
+            EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
+            InstalledPureKernel, PureImplementationDeclaration, PureImplementationId,
+            PureKernelAbi,
+        };
+        let actual =
+            novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog()
+                .expect("builtin catalogue");
+        let mut builder = EngineFunctionCatalogBuilder::new();
+        builder
+            .register(
+                actual
+                    .definition("rand", FunctionKind::Scalar)
+                    .expect("rand definition")
+                    .clone(),
+            )
+            .expect("register rand");
+        builder
+            .seal_pure(
+                [
+                    "builtin.scalar/rand/()->f64;strict;legacy",
+                    "builtin.scalar/rand/(i64)->f64;strict;legacy",
+                ]
+                .into_iter()
+                .map(|overload| InstalledPureKernel {
+                    function: FunctionId::try_new("builtin.scalar/rand/v1").unwrap(),
+                    kind: FunctionKind::Scalar,
+                    implementation: PureImplementationDeclaration {
+                        overload: FunctionOverloadId::try_new(overload).unwrap(),
+                        implementation: PureImplementationId::try_new(
+                            "builtin.scalar/rand/selected-v1",
+                        )
+                        .unwrap(),
+                        abi: PureKernelAbi::ScalarV1,
+                    },
+                    aggregate_state_format: None,
+                }),
+            )
+            .expect("sealed rand subset")
+    }
+
+    /// Decode the FE's own v2 bytes and compile every fragment with the
+    /// independent local compiler, as a BE host would.
+    fn compiled_programs(
+        sql: &str,
+    ) -> std::collections::BTreeMap<
+        novarocks_physical_plan::FragmentId,
+        novarocks_local_program::LocalProgram,
+    > {
+        use novarocks_connector_contract::PureProviderProgramCatalog;
+        use novarocks_local_compiler::{
+            LocalCompileOptions, compile_fragment, validate_fragment_providers,
+        };
+        use novarocks_plan_codec::physical_package_v2::decode_fragment_package;
+        use novarocks_plan_codec::physical_package_v2::test_support::decode_limits;
+        use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
+        use std::num::NonZeroUsize;
+
+        let (_, packages) = frozen_packages(sql);
+        let control = SqlCompileControl::unbounded();
+        let model = FragmentDecodeResourceModel::try_new(&control).expect("decode model");
+        let functions = sealed_rand_subset();
+        let providers =
+            PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &control)
+                .expect("empty provider catalog");
+        packages
+            .iter()
+            .map(|(id, bytes)| {
+                let decoded = decode_fragment_package(bytes, &model, &decode_limits(), &control)
+                    .unwrap_or_else(|error| panic!("{sql}: fragment {id:?} receives: {error}"));
+                let result_sink = decoded.result().is_some();
+                let validated =
+                    validate_fragment_providers(Arc::new(decoded), &providers, &control)
+                        .unwrap_or_else(|error| {
+                            panic!("{sql}: fragment {id:?} validates providers: {error}")
+                        });
+                let options = LocalCompileOptions {
+                    pipeline_dop: NonZeroUsize::new(1).unwrap(),
+                    // The frozen profile places a result sink on one driver.
+                    root_sink_dop: result_sink.then(|| NonZeroUsize::new(1).unwrap()),
+                    kernel_abi: novarocks_local_program::KernelAbiVersion::CURRENT,
+                    constants: crate::application::test_constant_policy(),
+                    exchange_wait: std::time::Duration::from_secs(120),
+                };
+                let program = compile_fragment(validated, &functions, options, &control)
+                    .unwrap_or_else(|error| panic!("{sql}: fragment {id:?} compiles: {error}"));
+                (*id, program)
+            })
+            .collect()
+    }
+
+    // The packages a real FE plan freezes compile into local programs whose
+    // stream routing key is exactly the consumer's compiled receiver address.
+    #[test]
+    fn a_completed_statement_compiles_through_the_independent_local_compiler() {
+        use novarocks_local_program::StaticSinkProgram;
+
+        let programs = compiled_programs("SELECT 1");
+        assert_eq!(programs.len(), 2, "SELECT 1 plans a producer and a gather");
+        let mut routes = Vec::new();
+        let mut receivers = Vec::new();
+        for program in programs.values() {
+            match program.graph().sink() {
+                Some(StaticSinkProgram::DataStream { branch, .. }) => {
+                    routes.push(branch.dest_node_id())
+                }
+                Some(StaticSinkProgram::Result) => {
+                    receivers.extend(
+                        program
+                            .exchange_inputs()
+                            .values()
+                            .map(|input| i32::try_from(input.receiver_node).unwrap()),
+                    );
+                }
+                other => panic!("unexpected compiled sink {other:?}"),
+            }
+        }
+        assert_eq!(routes.len(), 1);
+        assert_eq!(
+            routes, receivers,
+            "producer routes to the compiled receiver"
+        );
+    }
+
+    // Real FE plans over table-free relations compile end to end.
+    #[test]
+    fn table_free_statements_compile_from_their_real_fe_packages() {
+        for sql in [
+            "SELECT 1 + 1",
+            "SELECT 'x'",
+            "SELECT a FROM (SELECT 1 AS a) t WHERE a > 0",
+            "SELECT a FROM (SELECT 1 AS a) t WHERE a > 0 AND a < 5 OR a IS NULL",
+            "SELECT CASE WHEN a > 1 THEN a ELSE 0 END FROM (SELECT 2 AS a) t",
+            "SELECT 1 AS a UNION ALL SELECT 2",
+            "SELECT a FROM (SELECT 1 AS a UNION ALL SELECT 2) t ORDER BY a",
+            "SELECT a FROM (SELECT 1 AS a UNION ALL SELECT 2) t LIMIT 1",
+            "SELECT a + 1 FROM (SELECT 1 AS a UNION ALL SELECT 2) t",
+            "SELECT 'x' AS b UNION ALL SELECT 'yy'",
+        ] {
+            assert_eq!(compiled_programs(sql).len(), 2, "{sql}");
+        }
+    }
+
+    // A multi-row VALUES keeps each literal at its analyzed type and assigns
+    // the common type through an explicit cast cell. The compiler has no
+    // runtime cell evaluation yet, so it refuses the dynamic cell explicitly.
+    #[test]
+    fn values_with_common_type_cast_cells_are_refused_by_the_compiler() {
+        let sql = "SELECT a FROM (VALUES (1), (2), (3)) AS t(a)";
+        let refused = std::panic::catch_unwind(|| compiled_programs(sql))
+            .expect_err("dynamic Values cells are not compiled yet");
+        let message = refused
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            message.contains("Values cell requires compile-time constant backing"),
+            "{message}"
+        );
+    }
+
     #[test]
     fn completed_encoding_observes_tail_after_freezing_and_preserves_first_control_failure() {
         use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
@@ -1059,15 +1244,17 @@ mod tests {
 
         struct CompletedTailControl {
             encode_checkpoints: AtomicUsize,
+            /// The Encode checkpoint that refuses; `None` only observes.
+            tail_at: Option<usize>,
             tail_error: CompileControlError,
             earlier_error: Option<CompileControlError>,
         }
         impl PureCompileControl for CompletedTailControl {
             fn checkpoint(&self, phase: CompilePhase, _: u32) -> Result<(), CompileControlError> {
-                // FE entry, codec entry, codec exit, then FE exit after the
-                // actual native fragment freezes and attempt-fact projection.
+                // The last Encode checkpoint is the FE exit, after the actual
+                // native fragment freezes and attempt-fact projection.
                 if phase == CompilePhase::Encode
-                    && self.encode_checkpoints.fetch_add(1, Ordering::SeqCst) == 3
+                    && Some(self.encode_checkpoints.fetch_add(1, Ordering::SeqCst)) == self.tail_at
                 {
                     return Err(self.tail_error);
                 }
@@ -1096,9 +1283,27 @@ mod tests {
                 )
                 .expect("the actual admitted VALUES plan completes");
             let fragments = completed.candidate().plan().fragments().len();
+            // Observe the actual Encode checkpoint sequence once, so the
+            // refusal lands on its true tail rather than a counted guess.
+            let observed = CompletedTailControl {
+                encode_checkpoints: AtomicUsize::new(0),
+                tail_at: None,
+                tail_error: error,
+                earlier_error: None,
+            };
+            encode_completed_plan(completed, &functions, None, false, &observed)
+                .expect("the observed encoding succeeds");
+            let encode_checkpoints = observed.encode_checkpoints.load(Ordering::SeqCst);
+            assert!(encode_checkpoints >= 4, "FE and codec entry/exit at least");
+            let completed = runtime
+                .block_on(
+                    FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope),
+                )
+                .expect("the actual admitted VALUES plan completes");
             let freezes = crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
             let control = CompletedTailControl {
                 encode_checkpoints: AtomicUsize::new(0),
+                tail_at: Some(encode_checkpoints - 1),
                 tail_error: error,
                 earlier_error: None,
             };
@@ -1106,7 +1311,10 @@ mod tests {
                 encode_completed_plan(completed, &functions, None, false, &control),
                 Err(novarocks_plan_codec::PhysicalEncodeError::Control(actual)) if actual == error,
             ));
-            assert_eq!(control.encode_checkpoints.load(Ordering::SeqCst), 4);
+            assert_eq!(
+                control.encode_checkpoints.load(Ordering::SeqCst),
+                encode_checkpoints
+            );
             assert_eq!(
                 crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread() - freezes,
                 fragments,
@@ -1120,6 +1328,7 @@ mod tests {
                 .unwrap();
             let first_failure = CompletedTailControl {
                 encode_checkpoints: AtomicUsize::new(0),
+                tail_at: Some(encode_checkpoints - 1),
                 tail_error: CompileControlError::ResourceExhausted,
                 earlier_error: Some(error),
             };
@@ -1221,9 +1430,25 @@ mod tests {
     }
 
     fn request() -> SqlFinalPlanCompileRequest {
+        request_with("SELECT 1", noop_constant_evaluator())
+    }
+
+    /// A request folding constants with the production Frontend evaluator,
+    /// so the frozen packages are the ones production would freeze.
+    fn request_for(sql: &str) -> SqlFinalPlanCompileRequest {
+        request_with(
+            sql,
+            crate::query_execution::constant_eval::constant_evaluator(),
+        )
+    }
+
+    fn request_with(
+        sql: &str,
+        constant_evaluator: &'static dyn novarocks_sql::compiler::SqlConstantEvaluator,
+    ) -> SqlFinalPlanCompileRequest {
         SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([9; 16]).expect("plan version"),
-            SqlStatementInput::sql("SELECT 1"),
+            SqlStatementInput::sql(sql),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
@@ -1233,7 +1458,7 @@ mod tests {
             },
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
-            noop_constant_evaluator(),
+            constant_evaluator,
             crate::application::test_constant_policy(),
             SqlCompileControl::unbounded(),
             PipelineDopDomain {

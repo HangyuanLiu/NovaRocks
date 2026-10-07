@@ -66,6 +66,9 @@ toml.workspace = true
 uuid = { workspace = true, features = ["v7", "serde"] }
 
 [dev-dependencies]
+novarocks-connector-contract.workspace = true
+novarocks-local-compiler.workspace = true
+novarocks-local-program.workspace = true
 novarocks-plan-codec = { workspace = true, features = ["test-support"] }
 novarocks-mv-application = { workspace = true, features = ["test-support"] }
 novarocks-catalog-application = { workspace = true, features = ["test-support"] }

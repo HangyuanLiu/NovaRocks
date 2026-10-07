@@ -218,7 +218,9 @@ pub fn encode_limits() -> PackageEncodeLimits {
             max_preparation_request_bytes: REQUEST,
             max_new_allocation_request_bytes: REQUEST,
             max_coexisting_source_and_request_bytes: COEXIST,
-            max_cumulative_library_work: 4 * 1024 * 1024 * 1024,
+            // The namespace work bound grows with records times the declared
+            // source size, so a fixed cap would refuse ordinary packages.
+            max_cumulative_library_work: WORK,
         },
         parameters: ParameterProjectionLimits {
             max_parameters: 100_000,
