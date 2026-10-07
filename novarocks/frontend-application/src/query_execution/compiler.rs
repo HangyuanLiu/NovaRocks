@@ -109,6 +109,8 @@ pub(crate) trait DmlQueryExecutionKernel:
 {
     fn function_catalog(&self) -> &novarocks_functions::EngineFunctionCatalog;
     fn constant_policy(&self) -> novarocks_functions::ConstantPolicy;
+    /// The static carrier the kernel's composition chose for every plan.
+    fn static_plan_carrier(&self) -> &crate::query_execution::package_freeze::StaticPlanCarrier;
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver;
     /// The statement's typed connector control registry, supplied once when
     /// the kernel was composed.
@@ -131,6 +133,10 @@ impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
 
     fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
         self.constant_policy()
+    }
+
+    fn static_plan_carrier(&self) -> &crate::query_execution::package_freeze::StaticPlanCarrier {
+        self.static_plan_carrier()
     }
 
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver {
@@ -171,6 +177,10 @@ impl DmlQueryExecutionKernel for domain::QueryPreparationKernel {
 
     fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
         self.constant_policy()
+    }
+
+    fn static_plan_carrier(&self) -> &crate::query_execution::package_freeze::StaticPlanCarrier {
+        self.static_plan_carrier()
     }
 
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver {
@@ -1537,6 +1547,8 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
         DmlQueryExecutionKernel::function_catalog(state),
+        DmlQueryExecutionKernel::static_plan_carrier(state),
+        DmlQueryExecutionKernel::constant_policy(state),
         Some(&write_target_facts),
         execution.sql_semantics().sql_mode().allow_throw_exception(),
         &completion_control,

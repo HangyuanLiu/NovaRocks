@@ -799,6 +799,8 @@ fn prepare_planned_ctas_connector_write(
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
         state.function_catalog().as_ref(),
+        state.static_plan_carrier(),
+        state.constant_policy(),
         Some(
             &crate::query_execution::physical_encoding::WriteTargetFacts {
                 sealed: &sealed,

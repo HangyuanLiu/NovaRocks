@@ -743,6 +743,7 @@ mod tests {
                 ),
                 Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
                 crate::application::test_constant_policy(),
+                crate::query_execution::package_freeze::StaticPlanCarrier::PlanTree,
             ),
             None,
             Arc::clone(&connector_control),

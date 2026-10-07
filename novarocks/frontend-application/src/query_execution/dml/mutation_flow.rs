@@ -540,6 +540,8 @@ fn compile_dml_change_stream_write(
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
         state.function_catalog().as_ref(),
+        state.static_plan_carrier(),
+        state.constant_policy(),
         Some(
             &crate::query_execution::physical_encoding::WriteTargetFacts {
                 sealed: &sealed_write_targets,
@@ -3108,6 +3110,8 @@ fn execute_exact_cow_match_query(
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
         state.function_catalog().as_ref(),
+        state.static_plan_carrier(),
+        state.constant_policy(),
         None,
         execution.sql_semantics().sql_mode().allow_throw_exception(),
         &completion_control,
@@ -4598,6 +4602,7 @@ mod tests {
                 ),
                 Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
                 crate::application::test_constant_policy(),
+                crate::query_execution::package_freeze::StaticPlanCarrier::PlanTree,
             ),
             None,
             Arc::clone(&connector_control),

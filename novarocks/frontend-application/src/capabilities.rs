@@ -39,6 +39,7 @@ use crate::query_execution::maintenance::{
     BackgroundMaintenanceAttempt, BackgroundMaintenanceAttemptFactory, BackgroundMaintenanceEngine,
     TableMaintenanceEngine, TableMaintenanceService,
 };
+use crate::query_execution::package_freeze::StaticPlanCarrier;
 use crate::query_execution::service::QueryExecutionService;
 use novarocks_catalog_application::CatalogApplicationPort;
 use novarocks_query_application::api::BackendTopologyService;
@@ -62,6 +63,7 @@ use crate::query::compiler::FrontendQueryCompiler;
 pub(crate) struct QueryCompilerPorts {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
+    static_plan_carrier: StaticPlanCarrier,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -97,10 +99,12 @@ impl QueryCompilerPorts {
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         connector_blocking_io: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
         constant_policy: novarocks_functions::ConstantPolicy,
+        static_plan_carrier: StaticPlanCarrier,
     ) -> Self {
         Self {
             functions,
             constant_policy,
+            static_plan_carrier,
             catalog_service,
             catalog_application,
             connector_control,
@@ -132,6 +136,7 @@ pub(crate) fn query_compiler(ports: QueryCompilerPorts) -> FrontendQueryCompiler
         ports.backend_topology.clone(),
         ports.exchange_port,
         ports.constant_policy,
+        ports.static_plan_carrier,
     );
     let view = domain::ViewExecutionKernel::new(
         Arc::clone(&ports.functions),
@@ -169,6 +174,7 @@ pub(crate) fn query_compiler(ports: QueryCompilerPorts) -> FrontendQueryCompiler
 pub struct DmlEnginePorts {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
+    static_plan_carrier: StaticPlanCarrier,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -195,10 +201,12 @@ impl DmlEnginePorts {
         connector_runtime: tokio::runtime::Handle,
         lake_publication_runtime_policy: novarocks_query_application::publication::LakePublicationRuntimePolicy,
         constant_policy: novarocks_functions::ConstantPolicy,
+        static_plan_carrier: StaticPlanCarrier,
     ) -> Self {
         Self {
             functions,
             constant_policy,
+            static_plan_carrier,
             catalog_service,
             catalog_application,
             connector_control,
@@ -217,6 +225,7 @@ impl DmlEnginePorts {
                 Arc::clone(&self.functions),
                 Arc::clone(&self.catalog_service),
                 self.constant_policy,
+                self.static_plan_carrier,
             ),
             self.catalog_application.clone(),
             Arc::clone(&self.connector_control),
@@ -354,6 +363,7 @@ pub fn iceberg_ref_command_executor(
 pub struct MaintenanceCommandPorts {
     constant_policy: novarocks_functions::ConstantPolicy,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    static_plan_carrier: StaticPlanCarrier,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -377,10 +387,12 @@ impl MaintenanceCommandPorts {
         service: Arc<dyn TableMaintenanceService>,
         runtime: Handle,
         constant_policy: novarocks_functions::ConstantPolicy,
+        static_plan_carrier: StaticPlanCarrier,
     ) -> Self {
         Self {
             constant_policy,
             functions,
+            static_plan_carrier,
             catalog_service,
             catalog_application,
             connector_control,
@@ -403,6 +415,7 @@ impl MaintenanceCommandPorts {
             self.query_execution.clone(),
             Arc::clone(&self.service),
             self.constant_policy,
+            self.static_plan_carrier,
         )
     }
 }
@@ -421,6 +434,7 @@ pub fn maintenance_command_executor(
             ports.query_execution,
             ports.service,
             ports.constant_policy,
+            ports.static_plan_carrier,
         ),
         ports.runtime,
     )
@@ -619,6 +633,7 @@ pub fn bind_catalog_runtime_projection(
 pub(crate) struct MvRefreshProviderActivationPorts {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
+    static_plan_carrier: StaticPlanCarrier,
     catalog_service: Arc<QueryCatalogService>,
     /// A durable MV refresh resolves an externally attached target while it
     /// recreates its write binding.  Unlike generic SQL kernels, this product
@@ -652,10 +667,12 @@ impl MvRefreshProviderActivationPorts {
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         mv_management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
         constant_policy: novarocks_functions::ConstantPolicy,
+        static_plan_carrier: StaticPlanCarrier,
     ) -> Self {
         Self {
             functions,
             constant_policy,
+            static_plan_carrier,
             catalog_service,
             catalog_application,
             connector_control,
@@ -688,6 +705,7 @@ pub(crate) fn mv_refresh_provider_activation(
         ports.backend_topology,
         ports.exchange_port,
         ports.constant_policy,
+        ports.static_plan_carrier,
     );
     let mv_ports = crate::mv::domain::iceberg_refresh::IcebergMvCorePorts::new(
         ports.functions,
@@ -715,6 +733,7 @@ pub(crate) fn mv_refresh_provider_activation(
 #[derive(Clone)]
 pub struct StatisticsAttemptExecutorPorts {
     constant_policy: novarocks_functions::ConstantPolicy,
+    static_plan_carrier: StaticPlanCarrier,
     execution_role: novarocks_types::ClusterRole,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
@@ -736,9 +755,11 @@ impl StatisticsAttemptExecutorPorts {
         attempt_timeout: Duration,
         runtime: tokio::runtime::Handle,
         constant_policy: novarocks_functions::ConstantPolicy,
+        static_plan_carrier: StaticPlanCarrier,
     ) -> Self {
         Self {
             constant_policy,
+            static_plan_carrier,
             execution_role,
             connector_control,
             typed_connector_control,
@@ -769,6 +790,7 @@ pub(crate) fn statistics_three_phase_attempt_executor(
                 ports.attempt_timeout,
                 ports.runtime,
                 ports.constant_policy,
+                ports.static_plan_carrier,
             ),
         ),
     )

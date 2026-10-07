@@ -371,6 +371,7 @@ async fn build_frontend_role_products(
                 .management_entrance()
                 .expect("serving MV product owns document-management authority"),
             host.constant_policy(),
+            host.static_plan_carrier(),
         ),
     );
     let mv_service = Arc::new(
@@ -428,6 +429,7 @@ async fn build_frontend_role_products(
         Arc::clone(&maintenance_service),
         Handle::current(),
         host.constant_policy(),
+        host.static_plan_carrier(),
     );
     let maintenance_engine = core_capabilities::background_maintenance_engine(
         maintenance_ports.clone(),
@@ -468,6 +470,7 @@ async fn build_frontend_role_products(
                         .max_attempt_duration(),
                     Handle::current(),
                     host.constant_policy(),
+                    host.static_plan_carrier(),
                 ),
             ),
             Handle::current(),
@@ -554,6 +557,7 @@ fn build_frontend_query_session_factory_from_role_products(
             Arc::clone(&mv_storage_observation),
             host.connector_blocking_io_supervisor(),
             host.constant_policy(),
+            host.static_plan_carrier(),
         ));
     let session_catalog_resolver =
         core_capabilities::session_catalog_resolver(core_capabilities::SessionCatalogPorts::new(
@@ -637,6 +641,7 @@ fn build_frontend_query_session_factory_from_role_products(
         Handle::current(),
         host.lake_publication_runtime_policy(),
         host.constant_policy(),
+        host.static_plan_carrier(),
     ));
     let query_service = Arc::new(crate::query::FrontendQueryService::new(
         session_catalog_resolver,

@@ -252,6 +252,7 @@ pub struct CompletedStatisticsPlanningServices<'a> {
     constant_policy: novarocks_functions::ConstantPolicy,
     typed_connector_control: &'a Arc<novarocks_catalog_application::ConnectorControlHost>,
     functions: &'a novarocks_functions::EngineFunctionCatalog,
+    static_plan_carrier: &'a crate::query_execution::package_freeze::StaticPlanCarrier,
 }
 
 impl<'a> CompletedStatisticsPlanningServices<'a> {
@@ -259,11 +260,13 @@ impl<'a> CompletedStatisticsPlanningServices<'a> {
         typed_connector_control: &'a Arc<novarocks_catalog_application::ConnectorControlHost>,
         functions: &'a novarocks_functions::EngineFunctionCatalog,
         constant_policy: novarocks_functions::ConstantPolicy,
+        static_plan_carrier: &'a crate::query_execution::package_freeze::StaticPlanCarrier,
     ) -> Self {
         Self {
             constant_policy,
             typed_connector_control,
             functions,
+            static_plan_carrier,
         }
     }
 }
@@ -297,6 +300,7 @@ pub fn prepare_completed_statistics_collection(
         typed_connector_control,
         functions,
         constant_policy,
+        static_plan_carrier,
     } = services;
     let live = execution.topology().targets().len();
     if live == 0 {
@@ -393,6 +397,8 @@ pub fn prepare_completed_statistics_collection(
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
         functions,
+        static_plan_carrier,
+        constant_policy,
         None,
         execution.sql_semantics().sql_mode().allow_throw_exception(),
         &completion_control,

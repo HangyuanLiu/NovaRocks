@@ -685,6 +685,7 @@ pub struct FrontendApplicationHost {
     mv_startup_isolation: Option<crate::mv::startup_isolation_file::StartupIsolationSource>,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
+    static_plan_carrier: crate::query_execution::package_freeze::StaticPlanCarrier,
 }
 
 /// Matches the historical `[runtime] optimizer_query_mem_limit_bytes` default.
@@ -773,6 +774,10 @@ pub struct FrontendExecutionConfig {
     native_compatibility_id: NativeCompatibilityId,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
+    /// The one static carrier every completed plan of this process is frozen
+    /// into. It travels with the function catalog to every owner that
+    /// encodes a plan, and is never chosen per statement.
+    static_plan_carrier: crate::query_execution::package_freeze::StaticPlanCarrier,
     mv_scheduler: MvSchedulerConfig,
     mv_maintenance: MaintenanceCoordinatorConfig,
     mv_remote_effect_policy: novarocks_mv_application::management::RemoteEffectPolicy,
@@ -837,6 +842,10 @@ impl FrontendExecutionConfig {
             native_compatibility_id,
             function_catalog,
             constant_policy,
+            // Production freezes plan trees; a compiled-package composition
+            // selects its carrier explicitly.
+            static_plan_carrier:
+                crate::query_execution::package_freeze::StaticPlanCarrier::PlanTree,
             mv_scheduler: MvSchedulerConfig::default(),
             mv_maintenance: MaintenanceCoordinatorConfig::default(),
             mv_remote_effect_policy:
@@ -913,6 +922,18 @@ impl FrontendExecutionConfig {
 
     pub const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
         self.constant_policy
+    }
+
+    /// Select the static carrier this process freezes every completed plan
+    /// into. The composition that selects the compiled package carrier must
+    /// also compose a backend that interprets it; nothing here falls back to
+    /// the plan tree.
+    pub fn with_static_plan_carrier(
+        mut self,
+        carrier: crate::query_execution::package_freeze::StaticPlanCarrier,
+    ) -> Self {
+        self.static_plan_carrier = carrier;
+        self
     }
 
     pub fn with_query_control_timeouts(mut self, timeouts: FrontendQueryControlTimeouts) -> Self {
@@ -1194,6 +1215,7 @@ impl FrontendApplicationHost {
             mv_startup_isolation: execution.mv_startup_isolation.clone(),
             function_catalog: execution.function_catalog(),
             constant_policy: execution.constant_policy,
+            static_plan_carrier: execution.static_plan_carrier,
         };
 
         if let Some(state_store) = state_store
@@ -1613,6 +1635,14 @@ impl FrontendApplicationHost {
 
     pub fn function_catalog(&self) -> Arc<novarocks_functions::EngineFunctionCatalog> {
         Arc::clone(&self.function_catalog)
+    }
+
+    /// The static carrier every owner that encodes a completed plan receives
+    /// beside the function catalog.
+    pub(crate) const fn static_plan_carrier(
+        &self,
+    ) -> crate::query_execution::package_freeze::StaticPlanCarrier {
+        self.static_plan_carrier
     }
 
     pub fn connector_control_registry(

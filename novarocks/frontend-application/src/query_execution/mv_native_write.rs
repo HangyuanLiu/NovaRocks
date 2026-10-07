@@ -219,6 +219,8 @@ pub(crate) fn prepare_completed_mv_write(
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
         kernel.function_catalog().as_ref(),
+        kernel.static_plan_carrier(),
+        kernel.constant_policy(),
         Some(
             &crate::query_execution::physical_encoding::WriteTargetFacts {
                 sealed: &sealed,

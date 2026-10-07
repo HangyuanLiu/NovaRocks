@@ -27,6 +27,7 @@ use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::connector::unified_statistics::UnifiedStatisticsResolver;
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::query_execution::maintenance::TableMaintenanceService;
+use crate::query_execution::package_freeze::StaticPlanCarrier;
 use crate::query_execution::service::QueryExecutionService;
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use novarocks_catalog_application::CatalogApplicationPort;
@@ -48,6 +49,7 @@ use novarocks_spi::connector::MvStorageObservationPort;
 pub struct QueryPreparationKernel {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
+    static_plan_carrier: StaticPlanCarrier,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -111,10 +113,12 @@ impl QueryPreparationKernel {
         backend_topology: BackendTopologyService,
         exchange_port: u16,
         constant_policy: novarocks_functions::ConstantPolicy,
+        static_plan_carrier: StaticPlanCarrier,
     ) -> Self {
         Self {
             functions,
             constant_policy,
+            static_plan_carrier,
             catalog_service,
             catalog_application,
             connector_control,
@@ -132,6 +136,11 @@ impl QueryPreparationKernel {
 
     pub(crate) fn function_catalog(&self) -> &Arc<novarocks_functions::EngineFunctionCatalog> {
         &self.functions
+    }
+
+    /// The static carrier this kernel freezes completed plans into.
+    pub(crate) const fn static_plan_carrier(&self) -> &StaticPlanCarrier {
+        &self.static_plan_carrier
     }
 
     /// The typed connector controls this statement may resolve, frozen with
@@ -181,6 +190,7 @@ impl QueryPreparationKernel {
 pub struct DmlExecutionKernel {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
+    static_plan_carrier: StaticPlanCarrier,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -198,6 +208,7 @@ pub struct DmlExecutionKernel {
 pub struct DmlPlanningServices {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
+    static_plan_carrier: StaticPlanCarrier,
     catalog_service: Arc<QueryCatalogService>,
 }
 
@@ -206,10 +217,12 @@ impl DmlPlanningServices {
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
         constant_policy: novarocks_functions::ConstantPolicy,
+        static_plan_carrier: StaticPlanCarrier,
     ) -> Self {
         Self {
             functions,
             constant_policy,
+            static_plan_carrier,
             catalog_service,
         }
     }
@@ -232,11 +245,13 @@ impl DmlExecutionKernel {
         let DmlPlanningServices {
             functions,
             constant_policy,
+            static_plan_carrier,
             catalog_service,
         } = planning;
         Self {
             functions,
             constant_policy,
+            static_plan_carrier,
             catalog_service,
             catalog_application,
             connector_control,
@@ -277,6 +292,11 @@ impl DmlExecutionKernel {
 
     pub(crate) fn function_catalog(&self) -> &Arc<novarocks_functions::EngineFunctionCatalog> {
         &self.functions
+    }
+
+    /// The static carrier this kernel freezes completed plans into.
+    pub(crate) const fn static_plan_carrier(&self) -> &StaticPlanCarrier {
+        &self.static_plan_carrier
     }
 
     /// The typed connector controls this statement may resolve.
@@ -442,6 +462,7 @@ impl ViewExecutionKernel {
 pub struct MaintenanceExecutionKernel {
     constant_policy: novarocks_functions::ConstantPolicy,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    static_plan_carrier: StaticPlanCarrier,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -463,10 +484,12 @@ impl MaintenanceExecutionKernel {
         query_execution: QueryExecutionService,
         service: Arc<dyn TableMaintenanceService>,
         constant_policy: novarocks_functions::ConstantPolicy,
+        static_plan_carrier: StaticPlanCarrier,
     ) -> Self {
         Self {
             constant_policy,
             functions,
+            static_plan_carrier,
             catalog_service,
             catalog_application,
             connector_control,
@@ -479,6 +502,11 @@ impl MaintenanceExecutionKernel {
 
     pub(crate) fn function_catalog(&self) -> &Arc<novarocks_functions::EngineFunctionCatalog> {
         &self.functions
+    }
+
+    /// The static carrier this kernel freezes completed plans into.
+    pub(crate) const fn static_plan_carrier(&self) -> &StaticPlanCarrier {
+        &self.static_plan_carrier
     }
 
     /// The typed connector controls a maintenance-owned read may resolve.

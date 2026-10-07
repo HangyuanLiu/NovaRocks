@@ -53,6 +53,7 @@ use novarocks_spi::connector::{
 #[derive(Clone)]
 pub(crate) struct StatisticsAttemptExecutionPorts {
     constant_policy: novarocks_functions::ConstantPolicy,
+    static_plan_carrier: crate::query_execution::package_freeze::StaticPlanCarrier,
     execution_role: novarocks_types::ClusterRole,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     /// The composition root's single typed control registry. A collection is
@@ -77,9 +78,11 @@ impl StatisticsAttemptExecutionPorts {
         attempt_timeout: Duration,
         runtime: tokio::runtime::Handle,
         constant_policy: novarocks_functions::ConstantPolicy,
+        static_plan_carrier: crate::query_execution::package_freeze::StaticPlanCarrier,
     ) -> Self {
         Self {
             constant_policy,
+            static_plan_carrier,
             execution_role,
             connector_control,
             typed_connector_control,
@@ -450,6 +453,7 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
                         &self.ports.typed_connector_control,
                         self.ports.function_catalog.as_ref(),
                         self.ports.constant_policy,
+                        &self.ports.static_plan_carrier,
                     ),
                     &execution,
                     context,
