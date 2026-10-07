@@ -15,7 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Ordinary Single TopN uses the sole ordered-key projection and local sort owner.
+//! Ordinary row-count TopN uses the sole ordered-key projection and local sort owner.
+//!
+//! Every phase of a `Rows` reduction lowers to the same local operation: the
+//! rows `[offset, offset + limit)` of this instance's input under the frozen
+//! ordering. The phase is a cross-instance fact the checked physical contract
+//! already discharges, so no phase or sequence identity reaches the program:
+//!
+//! - `Single` and `Final` read one Singleton, single-copy input, so their
+//!   instance input is the whole relation and the window is the answer.
+//! - `Partial` keeps its input distribution and carries offset 0 with the
+//!   limit `final.limit + final.offset` its sequence trace proves. Each
+//!   instance keeps its own top `limit` rows. A row with fewer than `limit`
+//!   rows strictly ahead of it in the relation has fewer in its own instance,
+//!   so that prefix keeps it or an equal-keyed row in its place. The union of
+//!   the instance prefixes therefore holds a complete window under the frozen
+//!   ordering, ties resolved per instance, and the Final over the gathered
+//!   union selects it.
+//!
+//! `GroupedStates` merges partial states by the full group key (spec §5.8)
+//! and is refused here; it has no local owner yet.
 
 use crate::{lowering::FragmentCompileError, sort::lower_sort_keys};
 use novarocks_local_program::{
@@ -51,15 +70,18 @@ fn lower_core(
         order_by,
         limit,
         offset,
-        phase: TopNPhase::Single,
+        phase,
         reduction: TopNReduction::Rows,
     } = &node.kind
     else {
         return Err(FragmentCompileError::Unsupported {
             node: Some(node.id),
-            feature: "non-Single or grouped TopN",
+            feature: "grouped-state TopN",
         });
     };
+    // A partial prefix is cut before global completion, so an offset there
+    // would drop rows the final window may need.
+    let partial_offset = matches!(phase, TopNPhase::Partial { .. }) && *offset != 0;
     let shape = node.inputs.len() == 1
         && !order_by.is_empty()
         && node.output.columns.len() == layout.slots().len();
@@ -69,6 +91,11 @@ fn lower_core(
     if !shape {
         return Err(FragmentCompileError::Invalid(
             "ordinary TopN input, keys or output width differs",
+        ));
+    }
+    if partial_offset {
+        return Err(FragmentCompileError::Invalid(
+            "partial TopN carries an offset before global completion",
         ));
     }
     let limit =
@@ -81,8 +108,9 @@ fn lower_core(
         "TopN limit and offset exceed host range",
     ))?;
     let keys = lower_sort_keys(order_by, expressions, work)?;
-    // These are the original ordinary row-count TopN fields. No buffering cap,
-    // partition rank semantics or task parallelism is authored here.
+    // These are the original ordinary row-count TopN fields for every phase.
+    // No buffering cap, partition rank semantics or task parallelism is
+    // authored here; the phase stays a checked physical fact.
     Ok((
         ProgramNodeKind::Sort {
             input,

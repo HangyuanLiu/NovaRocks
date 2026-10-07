@@ -325,10 +325,12 @@ fn compiled_sort_factory_refuses_a_node_that_is_not_a_sort() {
     assert!(error.contains("is not a Sort"), "{error}");
 }
 
-// A partial TopN (including the grouped-state partial that must merge by full
-// group key) is refused by the compiler, so no executor shape exists for it.
+// A row-count partial TopN is the ordinary local TopN of its own instance:
+// the top `limit` rows with offset 0, emitted as one ordered stream. Its
+// pairing with a Final is a whole-plan fact (see `compiled_topn_split_tests`);
+// a grouped-state partial is refused by the compiler.
 #[test]
-fn partial_topn_never_reaches_the_compiled_pipeline() {
+fn partial_topn_runs_as_its_instance_prefix() {
     let mut builder = FragmentBuilder::new(FragmentId::new(32));
     let source = NodeId::new(0);
     let topn = NodeId::new(1);
@@ -345,16 +347,25 @@ fn partial_topn_never_reaches_the_compiled_pipeline() {
             topn,
             source,
             Box::from([sort_expr(key, A_ASC_NULLS_FIRST)]),
-            2,
+            3,
             0,
             TopNPhase::Partial {
                 sequence: TopNSequenceId::new(1),
             },
         )
         .unwrap();
-    let error = match try_compile(package(builder, topn, ConstantPools::empty(), 1), 1) {
-        Ok(_) => panic!("partial TopN must be refused before execution"),
-        Err(error) => error,
+    let program = try_compile(package(builder, topn, ConstantPools::empty(), 1), 1)
+        .unwrap_or_else(|error| panic!("a row-count partial TopN compiles: {error}"));
+    let ProgramNodeKind::Sort {
+        use_top_n,
+        limit,
+        offset,
+        ..
+    } = program.graph().nodes()[1].kind()
+    else {
+        panic!("the compiler lowers a partial TopN into the local Sort owner");
     };
-    assert!(error.contains("node family or occurrence shape"), "{error}");
+    assert_eq!((*use_top_n, *limit, *offset), (true, Some(3), 0));
+    let rows = int64_rows(&run(&program));
+    assert_eq!(rows, oracle(&ROWS, &[A_ASC_NULLS_FIRST], Some(3), 0));
 }

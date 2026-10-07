@@ -545,6 +545,7 @@ impl ExecutionExchangeRegistry {
                 &chunk.batch,
                 &wire_meta,
                 column_binding.prefers_wire_slot_ids(),
+                column_binding == ExchangeColumnBinding::Positional,
             )?;
             let mut retagged = chunk_from_exchange_batch(batch, chunk_schema).map_err(|e| {
                 format!(
@@ -1546,11 +1547,16 @@ fn chunk_from_exchange_batch(
 /// Descriptor-authoritative decode: the receiver's registered chunk schema is
 /// the exact Arrow type contract. Decoded columns may be rebuilt to the
 /// receiver's field metadata and slot namespace, but type drift fails here.
+/// `exact_expected_fields` is set for a compiled positional receiver: each
+/// decoded column must already be the receiver's frozen carrier, and the
+/// chunk presents exactly the receiver's frozen fields -- name, metadata and
+/// nullability -- because compiled roots check their input port exactly.
 fn materialize_chunk_for_wire_meta(
     expected_chunk_schema: Option<&ChunkSchemaRef>,
     batch: &RecordBatch,
     wire_meta: &ExchangeWireMeta,
     prefer_wire_slot_ids: bool,
+    exact_expected_fields: bool,
 ) -> Result<(RecordBatch, ChunkSchemaRef), String> {
     if wire_meta.slot_ids_by_index.len() != batch.num_columns() {
         return Err(format!(
@@ -1648,6 +1654,32 @@ fn materialize_chunk_for_wire_meta(
                     }
                 }
             }
+        }
+
+        if exact_expected_fields {
+            let expected_field = expected_slot.field();
+            if out_column.data_type() != expected_field.data_type() {
+                return Err(format!(
+                    "compiled exchange column {idx} arrives as {:?}, expected {:?}",
+                    out_column.data_type(),
+                    expected_field.data_type()
+                ));
+            }
+            if !expected_field.is_nullable() && out_column.null_count() > 0 {
+                return Err(format!(
+                    "compiled exchange column {idx} carries NULL into a non-null receiver field"
+                ));
+            }
+            if out_field != *expected_field {
+                out_field = expected_field.clone();
+                any_materialized = true;
+            }
+            slots.push(
+                expected_slot.with_field_and_slot_id(expected_slot.slot_id(), out_field.clone())?,
+            );
+            out_fields.push(Arc::new(out_field));
+            columns.push(out_column);
+            continue;
         }
 
         // Reconcile nullability against the expected slot the same way the
@@ -1804,8 +1836,13 @@ pub fn decode_root_result_chunks(
     let mut chunks = Vec::with_capacity(batches.len());
     for batch in batches {
         let batch = restore_zero_column_batch_if_needed(batch, &wire_meta)?;
-        let (batch, chunk_schema) =
-            materialize_chunk_for_wire_meta(expected_chunk_schema, &batch, &wire_meta, false)?;
+        let (batch, chunk_schema) = materialize_chunk_for_wire_meta(
+            expected_chunk_schema,
+            &batch,
+            &wire_meta,
+            false,
+            false,
+        )?;
         chunks.push(Chunk::try_new_with_chunk_schema(batch, chunk_schema)?);
     }
     Ok(chunks)
@@ -1893,6 +1930,9 @@ impl ExecutionExchangeRegistry {
         let prefer_wire_slot_ids = expected
             .as_ref()
             .is_some_and(|expected| expected.column_binding.prefers_wire_slot_ids());
+        let exact_expected_fields = expected
+            .as_ref()
+            .is_some_and(|expected| expected.column_binding == ExchangeColumnBinding::Positional);
         let batches = decode_arrow_ipc_batches(arrow_payload)?;
         let mut chunks = Vec::with_capacity(batches.len());
         for batch in batches {
@@ -1902,6 +1942,7 @@ impl ExecutionExchangeRegistry {
                 &batch,
                 &wire_meta,
                 prefer_wire_slot_ids,
+                exact_expected_fields,
             )?;
             chunks.push(chunk_from_exchange_batch(batch, chunk_schema)?);
         }

@@ -470,8 +470,8 @@ fn resolve_core(
                 mode: novarocks_physical_plan::SortMode::Global,
                 ..
             } => passthrough(fragment, node, &nodes, &ports, work)?,
+            // Every row-count TopN phase passes its input occurrences through.
             NodeKind::TopN {
-                phase: novarocks_physical_plan::TopNPhase::Single,
                 reduction: novarocks_physical_plan::TopNReduction::Rows,
                 ..
             } => passthrough(fragment, node, &nodes, &ports, work)?,

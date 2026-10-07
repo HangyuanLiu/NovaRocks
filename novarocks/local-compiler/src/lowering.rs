@@ -440,6 +440,8 @@ fn lower(
         // Sort, Single/Final TopN, Limit, global row-count assertion) reach
         // here only over the Singleton input the checked physical contract
         // requires, and a per-key assertion only over a key-colocated one. A
+        // Partial row-count TopN prunes each instance's own rows wherever they
+        // are placed; its gather-and-Final sequence is a checked plan fact. A
         // family that consumes per-driver key co-location must author its own
         // local partitioning instead of relying on this. Copied rows and
         // broadcast placement stay refused.
@@ -475,12 +477,13 @@ fn lower(
             | NodeKind::Unpivot { .. }
             | NodeKind::ChangeEventExpand { .. } => node.inputs.len() == 1,
             NodeKind::Filter { predicates } => predicates.len() == 1 && node.inputs.len() == 1,
+            // Every row-count TopN phase; a grouped-state reduction has no
+            // local owner.
             NodeKind::Sort {
                 mode: novarocks_physical_plan::SortMode::Global,
                 ..
             }
             | NodeKind::TopN {
-                phase: novarocks_physical_plan::TopNPhase::Single,
                 reduction: novarocks_physical_plan::TopNReduction::Rows,
                 ..
             } => node.inputs.len() == 1,
@@ -525,7 +528,9 @@ fn lower(
     // actual expansion can consume that uncertainty. A runtime-split scan is
     // an unconstrained source in its own right: its rows land on any instance
     // and driver, and only its transparent Project/Filter/Limit descendants
-    // inherit that placement.
+    // and a Partial row-count TopN inherit that placement. The partial keeps
+    // a subset of each instance's rows where they already are; its Final
+    // reads them only through a checked gather.
     let mut properties = BTreeMap::<NodeId, (bool, bool, bool)>::new();
     for &id in order.iter().rev() {
         let node = &physical.nodes()[&id];
@@ -540,8 +545,16 @@ fn lower(
             node.kind,
             NodeKind::Project { .. } | NodeKind::Filter { .. } | NodeKind::Limit { .. }
         );
+        let partial_rows = matches!(
+            node.kind,
+            NodeKind::TopN {
+                phase: novarocks_physical_plan::TopNPhase::Partial { .. },
+                reduction: novarocks_physical_plan::TopNReduction::Rows,
+                ..
+            }
+        );
         let scan_rooted = matches!(node.kind, NodeKind::Scan { .. })
-            || (transparent
+            || ((transparent || partial_rows)
                 && node.inputs.len() == 1
                 && properties.get(&node.inputs[0]).is_some_and(|p| p.2));
         let unknown = node.output_properties.distribution == Distribution::Unconstrained;
@@ -554,13 +567,15 @@ fn lower(
                 feature: "change-event source-chain distribution or driver count",
             });
         }
+        // Every row-count TopN phase emits its instance's window as one
+        // ordered stream on one driver, so its declared ordering holds for
+        // the whole instance output, as the property law states it.
         let global = matches!(
             node.kind,
             NodeKind::Sort {
                 mode: novarocks_physical_plan::SortMode::Global,
                 ..
             } | NodeKind::TopN {
-                phase: novarocks_physical_plan::TopNPhase::Single,
                 reduction: novarocks_physical_plan::TopNReduction::Rows,
                 ..
             }

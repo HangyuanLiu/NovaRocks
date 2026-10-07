@@ -21,11 +21,12 @@
 //! a compiled processor is an explicit refusal, never a legacy fallback.
 //!
 //! Reuse boundary: families that evaluate expressions (Project, Filter, Sort
-//! and TopN, Unpivot, ChangeEventExpand) run compiled processors that own one
-//! instance per root and driver. Legacy operators are reused only where they
-//! evaluate nothing: the Values source, Limit, the local gather exchange, the
-//! row-count assertion and the UnionAll fan-in queue. Repeat is a compiled
-//! processor too, because the legacy one re-derives its output schema.
+//! and every row-count TopN phase, Unpivot, ChangeEventExpand) run compiled
+//! processors that own one instance per root and driver. Legacy operators are
+//! reused only where they evaluate nothing: the Values source, Limit, the
+//! local gather exchange, the row-count assertion and the UnionAll fan-in
+//! queue. Repeat is a compiled processor too, because the legacy one
+//! re-derives its output schema.
 
 use std::collections::BTreeSet;
 
@@ -270,8 +271,16 @@ fn build_node(
             Ok(build)
         }
         ProgramNodeKind::Sort { input, .. } => {
-            // Global Sort and Single TopN order the whole instance input on
-            // one driver.
+            // Global Sort and every row-count TopN phase order the whole
+            // instance input on one driver. Single and Final read a Singleton
+            // input, so the instance input is the relation. A Partial keeps
+            // its input distribution and declares its order keys as its
+            // output ordering, which the TopN sequence trace matches against
+            // the Final; one gathered driver is what makes the instance's
+            // output one stream in that order. A per-driver partial would
+            // still merge correctly at the Final, but it would emit DOP
+            // interleaved runs the declared ordering does not describe, and
+            // re-pruning them locally would evaluate a key twice.
             let factory =
                 CompiledSortProcessorFactory::try_new(Arc::clone(program), id, Arc::clone(error))?;
             let build = build_node(program, *input, ctx, error)?;
@@ -474,3 +483,7 @@ mod assert_tests;
 #[cfg(test)]
 #[path = "compiled_expand_tests.rs"]
 mod expand_tests;
+
+#[cfg(test)]
+#[path = "compiled_topn_split_tests.rs"]
+mod topn_split_tests;

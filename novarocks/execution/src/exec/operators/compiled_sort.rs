@@ -19,9 +19,16 @@
 //!
 //! The local compiler emits exactly two shapes of the local Sort vocabulary:
 //! a global sort (`use_top_n = false`, no limit, offset 0) and an ordinary
-//! Single/Rows TopN (`use_top_n = true`, `limit`, `offset`, RowNumber). Both
+//! row-count TopN (`use_top_n = true`, `limit`, `offset`, RowNumber). Both
 //! have no partition keys and no buffering cap. Every other Sort shape is an
 //! explicit refusal here.
+//!
+//! The TopN shape serves every phase of a `Rows` reduction alike, because
+//! each is the window of its own instance input. Single and Final read the
+//! whole relation through a Singleton input. A Partial carries offset 0 and
+//! the whole final window (`final.limit + final.offset`) as its limit, so it
+//! keeps its instance's top rows and the gathered Final selects the window.
+//! A grouped-state partial never reaches this operator.
 //!
 //! Evaluation boundary: each ORDER BY key is a compiled `SortOrder` root,
 //! evaluated by this driver's own instance exactly once per input row, on

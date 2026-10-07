@@ -136,6 +136,19 @@ fn package(
     limit: u64,
     offset: u64,
 ) -> Arc<FragmentPackage> {
+    phased(source, keys, tail, limit, offset, TopNPhase::Single)
+}
+/// The same ordinary TopN package with its frozen phase replaced. A partial or
+/// final phase without its pair is a checked single-fragment package; only
+/// whole-plan validation pairs a sequence.
+fn phased(
+    source: &ConstantPool,
+    keys: usize,
+    tail: bool,
+    limit: u64,
+    offset: u64,
+    phase: TopNPhase,
+) -> Arc<FragmentPackage> {
     let base = super::sort_lowering_tests::package(source, keys, tail, SortMode::Global, true);
     let mut input = (*base).clone().into_input();
     let root = input.fragment.root();
@@ -152,6 +165,7 @@ fn package(
             let NodeKind::TopN {
                 limit: old_limit,
                 offset: old_offset,
+                phase: old_phase,
                 ..
             } = &mut node.kind
             else {
@@ -159,6 +173,7 @@ fn package(
             };
             *old_limit = limit;
             *old_offset = offset;
+            *old_phase = phase;
         }
         builder.insert_node_unchecked(node).unwrap();
     }
@@ -459,7 +474,7 @@ fn topn_duplicate_passthrough_occurrences_keep_independent_slots_and_nested_fiel
 }
 
 #[test]
-fn actual_closed_partial_final_topn_package_stays_unsupported_and_keeps_original_control_prefixes()
+fn actual_closed_partial_final_topn_package_lowers_both_phases_and_keeps_original_control_prefixes()
 {
     let base =
         super::sort_lowering_tests::package(&integer_pool(), 1, false, SortMode::Global, true);
@@ -516,9 +531,63 @@ fn actual_closed_partial_final_topn_package_stays_unsupported_and_keeps_original
     input.result = None;
     let package = complete(input, builder, final_node).unwrap();
     let baseline = Control::good();
-    assert!(
-        matches!(compile(package.clone(),&baseline),Err(FragmentCompileError::Unsupported{node:Some(node),..}) if node==final_node)
+    let program = compile(package.clone(), &baseline).unwrap();
+    // Partial keeps the top `final.limit + final.offset` rows without an
+    // offset; Final applies the frozen window over the partial's rows.
+    let windows = program
+        .graph()
+        .nodes()
+        .iter()
+        .filter_map(|node| match node.kind() {
+            ProgramNodeKind::Sort {
+                input,
+                use_top_n: true,
+                order_by,
+                limit,
+                offset,
+                topn_type: SortTopNType::RowNumber,
+                max_buffered_rows: None,
+                max_buffered_bytes: None,
+                partition_exprs,
+                partition_limit: None,
+            } if partition_exprs.is_empty() => Some((
+                input.index(),
+                *limit,
+                *offset,
+                order_by
+                    .iter()
+                    .map(|key| (key.asc, key.nulls_first))
+                    .collect::<Vec<_>>(),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        windows,
+        [
+            (0, Some(3), 0, vec![(false, true)]),
+            (1, Some(2), 1, vec![(false, true)])
+        ]
     );
+    assert_eq!(program.graph().root().index(), 2);
+    let snapshot = program
+        .checked()
+        .channels()
+        .expressions()
+        .resolved_calls()
+        .snapshot();
+    let orders = snapshot
+        .bindings()
+        .keys()
+        .filter_map(|site| match site {
+            ProgramExpressionRootSite::Node {
+                node,
+                role: ProgramNodeExpressionRole::SortOrder { key },
+            } => Some((node.index(), *key)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(orders, [(1, 0), (2, 0)]);
     let trace = baseline.trace();
     for at in 1..=trace.len() {
         for cause in [
@@ -610,5 +679,732 @@ fn topn_320_order_occurrences_cross_real_quantum_and_sample_entry_boundary_tail_
             ));
             assert_eq!(control.trace(), trace[..at]);
         }
+    }
+}
+
+/// The lowered local TopN fields of program node 1, the TopN over Values.
+fn lowered_window(
+    program: &novarocks_local_program::LocalProgram,
+) -> (Option<usize>, usize, Vec<(bool, bool)>) {
+    let ProgramNodeKind::Sort {
+        input,
+        use_top_n,
+        order_by,
+        limit,
+        offset,
+        topn_type,
+        max_buffered_rows,
+        max_buffered_bytes,
+        partition_exprs,
+        partition_limit,
+    } = program.graph().nodes()[1].kind()
+    else {
+        panic!("actual local TopN sort")
+    };
+    assert_eq!(input.index(), 0);
+    assert!(*use_top_n);
+    assert_eq!(*topn_type, SortTopNType::RowNumber);
+    assert_eq!((*max_buffered_rows, *max_buffered_bytes), (None, None));
+    assert!(partition_exprs.is_empty());
+    assert_eq!(*partition_limit, None);
+    let keys = order_by.iter().map(|k| (k.asc, k.nulls_first)).collect();
+    (*limit, *offset, keys)
+}
+
+#[test]
+fn partial_and_final_topn_lower_to_the_ordinary_window_with_no_phase_state() {
+    let sequence = TopNSequenceId::new(7);
+    // Partial: the frozen `final.limit + final.offset` row budget, offset 0.
+    let partial = compile(
+        phased(
+            &integer_pool(),
+            2,
+            false,
+            3,
+            0,
+            TopNPhase::Partial { sequence },
+        ),
+        &Control::good(),
+    )
+    .unwrap();
+    let (limit, offset, keys) = lowered_window(&partial);
+    assert_eq!((limit, offset), (Some(3), 0));
+    assert_eq!(keys, [(false, true), (true, false)]);
+    assert_eq!(
+        partial.graph().nodes()[0].output_layout().slots(),
+        partial.graph().nodes()[1].output_layout().slots()
+    );
+    // Final: the frozen window over its gathered Singleton input.
+    let fin = compile(
+        phased(
+            &integer_pool(),
+            2,
+            false,
+            2,
+            1,
+            TopNPhase::Final { sequence },
+        ),
+        &Control::good(),
+    )
+    .unwrap();
+    let (limit, offset, keys) = lowered_window(&fin);
+    assert_eq!((limit, offset), (Some(2), 1));
+    assert_eq!(keys, [(false, true), (true, false)]);
+    // Every phase lowers to exactly the Single owner fields of its window.
+    for (limit, offset, phase) in [
+        (3, 0, TopNPhase::Partial { sequence }),
+        (2, 1, TopNPhase::Final { sequence }),
+        (0, 0, TopNPhase::Partial { sequence }),
+    ] {
+        let single = compile(
+            package(&integer_pool(), 2, false, limit, offset),
+            &Control::good(),
+        )
+        .unwrap();
+        let phased = compile(
+            phased(&integer_pool(), 2, false, limit, offset, phase),
+            &Control::good(),
+        )
+        .unwrap();
+        let roots = |program: &novarocks_local_program::LocalProgram| {
+            program
+                .checked()
+                .channels()
+                .expressions()
+                .resolved_calls()
+                .snapshot()
+                .bindings()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(roots(&single), roots(&phased));
+        let single = lowered_window(&single);
+        let phased = lowered_window(&phased);
+        assert_eq!(single, phased);
+    }
+}
+
+#[test]
+fn partial_and_final_topn_keep_one_sort_order_root_per_occurrence() {
+    for phase in [
+        TopNPhase::Partial {
+            sequence: TopNSequenceId::new(1),
+        },
+        TopNPhase::Final {
+            sequence: TopNSequenceId::new(1),
+        },
+    ] {
+        let offset = u64::from(matches!(phase, TopNPhase::Final { .. }));
+        let program = compile(
+            phased(&integer_pool(), 3, false, 2, offset, phase),
+            &Control::good(),
+        )
+        .unwrap();
+        let snapshot = program
+            .checked()
+            .channels()
+            .expressions()
+            .resolved_calls()
+            .snapshot();
+        let roles = snapshot
+            .bindings()
+            .keys()
+            .filter_map(|site| match site {
+                ProgramExpressionRootSite::Node {
+                    node,
+                    role: ProgramNodeExpressionRole::SortOrder { key },
+                } if node.index() == 1 => Some(*key),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(roles, [0, 1, 2]);
+    }
+}
+
+#[test]
+fn topn_owner_refuses_a_partial_offset_and_a_grouped_state_reduction() {
+    let package = package(&integer_pool(), 1, false, 2, 1);
+    let program = compile(package.clone(), &Control::good()).unwrap();
+    let layout = program.graph().nodes()[0].output_layout();
+    let original = &package.fragment().nodes()[&NodeId::new(0)];
+    let NodeKind::TopN { order_by, .. } = &original.kind else {
+        panic!("actual ordinary TopN")
+    };
+    let ids = order_by
+        .iter()
+        .map(|key| (key.expr, novarocks_local_program::ProgramExprId::new(0)))
+        .collect::<BTreeMap<_, _>>();
+    let sequence = TopNSequenceId::new(3);
+    // A partial offset would drop rows the final window needs.
+    let mut node = original.clone();
+    let NodeKind::TopN { phase, offset, .. } = &mut node.kind else {
+        unreachable!()
+    };
+    *phase = TopNPhase::Partial { sequence };
+    *offset = 1;
+    assert!(matches!(
+        lower_topn(&node, ProgramNodeId::new(0), layout, &ids, &Control::good()),
+        Err(FragmentCompileError::Invalid(
+            "partial TopN carries an offset before global completion"
+        ))
+    ));
+    // A grouped-state reduction merges by the full group key and has no
+    // local owner in any phase.
+    for phase in [TopNPhase::Partial { sequence }, TopNPhase::Single] {
+        let mut node = original.clone();
+        let NodeKind::TopN {
+            phase: actual,
+            offset,
+            reduction,
+            ..
+        } = &mut node.kind
+        else {
+            unreachable!()
+        };
+        *actual = phase;
+        *offset = 0;
+        *reduction = novarocks_physical_plan::TopNReduction::GroupedStates {
+            group_by: Box::default(),
+            calls: Box::default(),
+            comparator: novarocks_type_contract::OrderedComparisonAlgorithm::NativeScalarOrderV1,
+        };
+        assert!(matches!(
+            lower_topn(&node, ProgramNodeId::new(0), layout, &ids, &Control::good()),
+            Err(FragmentCompileError::Unsupported {
+                node: Some(id),
+                feature: "grouped-state TopN",
+            }) if id == NodeId::new(0)
+        ));
+    }
+}
+
+/// `SELECT v0, v1 FROM lake ORDER BY v0 DESC NULLS FIRST LIMIT 2 OFFSET 1`
+/// as the planner splits it: a runtime-split provider scan pruned by a
+/// Partial TopN, gathered, and finished by its Final TopN. The whole plan is
+/// validated, so the sequence pairing is a checked fact, and each fragment
+/// compiles on its own.
+mod scan_split {
+    use crate::{
+        FragmentCompileError, LocalCompileOptions, compile_fragment, validate_fragment_providers,
+    };
+    use arrow_schema::{DataType, Field, Schema};
+    use bytes::Bytes;
+    use novarocks_connector_contract::*;
+    use novarocks_local_program::{
+        KernelAbiVersion, LocalProgram, ProgramNodeKind, SortTopNType, StaticSinkProgram,
+    };
+    use novarocks_physical_plan::*;
+    use novarocks_type_contract::{
+        CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, EvaluationDomainId,
+        ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
+        ExpressionInvocation, ExpressionUseId, PureCompileControl, ValueLogicalType,
+    };
+    use std::{
+        collections::{BTreeMap, HashMap},
+        num::{NonZeroU64, NonZeroUsize},
+        sync::Arc,
+        time::Duration,
+    };
+
+    const PRODUCER: FragmentId = FragmentId::new(1);
+    const CONSUMER: FragmentId = FragmentId::new(2);
+    const EDGE: EdgeId = EdgeId::new(5);
+    const SCAN: NodeId = NodeId::new(10);
+    const PARTIAL: NodeId = NodeId::new(11);
+    const RECEIVER: NodeId = NodeId::new(20);
+    const FINAL: NodeId = NodeId::new(21);
+    const SEQUENCE: TopNSequenceId = TopNSequenceId::new(4);
+
+    struct Good;
+    impl PureCompileControl for Good {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+
+    fn int64() -> ValueType {
+        ValueType::new(DataType::Int64, false)
+    }
+    fn binding() -> ConnectorReadBinding {
+        let instance = ConnectorInstanceId::parse("lake").unwrap();
+        ConnectorReadBinding::new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("alpha").unwrap(),
+                instance_id: instance.clone(),
+            },
+            CatalogHandle::new(instance, CatalogVersion::from_bytes([3; 32])),
+        )
+    }
+    fn payload(
+        binding: &ConnectorReadBinding,
+        category: ConnectorCodecCategory,
+        value: &'static [u8],
+    ) -> ConnectorEncodedPayload {
+        ConnectorEncodedPayload::new(
+            ConnectorEnvelopeHeader::new(
+                binding.descriptor().provider_id.clone(),
+                binding.catalog_handle().clone(),
+                category,
+                ConnectorCodecRevision::try_new(1).unwrap(),
+            ),
+            Bytes::from_static(value),
+        )
+    }
+    fn public_schema() -> Schema {
+        Schema::new_with_metadata(
+            ["v0", "v1"]
+                .into_iter()
+                .enumerate()
+                .map(|(id, name)| {
+                    Field::new(name, DataType::Int64, false).with_metadata(HashMap::from([(
+                        "provider.field-id".into(),
+                        (id + 1).to_string(),
+                    )]))
+                })
+                .collect::<Vec<_>>(),
+            HashMap::new(),
+        )
+    }
+
+    /// Canonicalizes private bytes only; the public facts are borrowed.
+    struct Port;
+    impl ConnectorReadProgramCompiler for Port {
+        type Error = ConnectorError;
+        fn compile_private(
+            &self,
+            input: &FrozenConnectorRead,
+            control: &dyn PureCompileControl,
+        ) -> Result<ConnectorReadRelationRecipeDraft, PureProviderCompileError<ConnectorError>>
+        {
+            let mut work = CompileCheckpoints::try_new(control, CompilePhase::ProviderValidation)?;
+            let original = input.scan().recipe();
+            work.step()?;
+            work.finish()?;
+            ConnectorReadRelationRecipeDraft::try_new(
+                original.binding().clone(),
+                original.relation().clone(),
+                original.columns().to_vec(),
+            )
+            .map_err(|error| {
+                PureProviderCompileError::Provider(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    error.to_string(),
+                ))
+            })
+        }
+    }
+    fn providers() -> PureProviderProgramCatalog<ConnectorError> {
+        let provider = ConnectorProviderId::parse("alpha").unwrap();
+        PureProviderProgramCatalog::try_new(
+            &[PureProviderManifestEntry::new(
+                provider.clone(),
+                true,
+                false,
+            )],
+            vec![PureProviderProgramDefinition::new(
+                provider,
+                Some(Arc::new(Port)
+                    as Arc<
+                        dyn ConnectorReadProgramCompiler<Error = ConnectorError>,
+                    >),
+                None,
+            )],
+            &Good,
+        )
+        .unwrap()
+    }
+
+    /// Every root here is a value read; each gets one eager use.
+    fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
+        let roots = PhysicalExpressionRoots::try_new(fragment, &Good).unwrap();
+        let domain = EvaluationDomainId::new(0);
+        let mut uses = Vec::new();
+        let mut bindings = Vec::new();
+        for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
+            let id = ExpressionUseId::new(u32::try_from(ordinal).unwrap());
+            uses.push(ExpressionInvocation {
+                context: ExpressionEffectContext {
+                    use_id: id,
+                    domain,
+                    demand: root.demand,
+                },
+                definition: root.expr,
+                control: ControlShape::Eager,
+                arguments: Box::default(),
+            });
+            bindings.push((*site, id));
+        }
+        let flow = ExpressionControlFlow::try_new(
+            vec![ExpressionEvaluationDomain {
+                id: domain,
+                parent: None,
+                guard: None,
+            }],
+            uses,
+            fragment.expressions(),
+            CompilePhase::Validate,
+            &Good,
+        )
+        .unwrap();
+        PhysicalRootUses::try_new(fragment, flow, bindings, &Good).unwrap()
+    }
+
+    fn descending(expr: ExprId) -> Box<[SortExpr]> {
+        Box::from([SortExpr {
+            expr,
+            direction: SortDirection::Descending,
+            null_ordering: NullOrdering::First,
+        }])
+    }
+
+    fn packages(partial_limit: u64) -> Result<BTreeMap<FragmentId, FragmentPackage>, String> {
+        let binding = binding();
+        let relation = ConnectorReadRelationPayload::new(
+            ConnectorReadRelationKind::Table,
+            payload(&binding, ConnectorCodecCategory::ReadTable, b"table"),
+            payload(&binding, ConnectorCodecCategory::ReadView, b"view"),
+        );
+        let columns = [b"c0" as &'static [u8], b"c1"].map(|bytes| ProviderColumnReference {
+            column_payload: payload(&binding, ConnectorCodecCategory::ReadColumn, bytes),
+        });
+        let mut producer = FragmentBuilder::new(PRODUCER);
+        let provider = columns
+            .iter()
+            .map(|column| {
+                producer
+                    .add_value(
+                        int64(),
+                        ValueOrigin::ProviderField {
+                            scan_node: SCAN,
+                            field: column.clone(),
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let schema = columns
+            .iter()
+            .map(|column| RelationField {
+                column: column.clone(),
+                ty: int64(),
+            })
+            .collect::<Box<[_]>>();
+        producer
+            .add_scan(
+                SCAN,
+                NodeKind::Scan {
+                    occurrence: ProviderReadOccurrenceId::new(0),
+                    relation: Box::new(Relation::Data(DataRelation {
+                        read: ProviderReadReference {
+                            binding: binding.clone(),
+                            input_version: ExactInputVersion::try_new([9]).unwrap(),
+                            relation: relation.clone(),
+                        },
+                        work_source: ConnectorReadWorkSource::RuntimeSplits,
+                        selection_digest: [7; 32],
+                        schema,
+                        predicate_guarantees: Box::default(),
+                        // Runtime splits land on any instance and driver.
+                        provided_properties: PhysicalProperties {
+                            distribution: Distribution::Unconstrained,
+                            row_multiplicity: RowMultiplicity::SingleCopy,
+                            ordering: Box::default(),
+                        },
+                    })),
+                    read_budget: ScanReadBudget {
+                        max_batch_rows: 100,
+                        max_batch_bytes: 4096,
+                    },
+                    provider_outputs: columns
+                        .iter()
+                        .cloned()
+                        .zip(provider.iter().copied())
+                        .collect(),
+                    residuals: Box::default(),
+                    derived_values: Box::default(),
+                },
+                provider.clone().into_boxed_slice(),
+            )
+            .unwrap();
+        let key = producer
+            .add_expression(PARTIAL, int64(), ExprKind::Value(provider[0]))
+            .unwrap();
+        producer
+            .add_top_n(
+                PARTIAL,
+                SCAN,
+                descending(key),
+                partial_limit,
+                0,
+                TopNPhase::Partial { sequence: SEQUENCE },
+            )
+            .map_err(|error| error.to_string())?;
+        let dop = PipelineDopDomain {
+            min: 1,
+            max: 1,
+            requires_power_of_two: false,
+        };
+        let producer = producer
+            .finish_definition(PARTIAL, FragmentSink::Stream { edge: EDGE }, dop)
+            .map_err(|error| error.to_string())?;
+
+        let mut consumer = FragmentBuilder::new(CONSUMER);
+        let imports = provider
+            .iter()
+            .map(|&source| {
+                let imported = consumer
+                    .add_value(
+                        int64(),
+                        ValueOrigin::ExchangeImport {
+                            edge: EDGE,
+                            source_value: source,
+                        },
+                    )
+                    .unwrap();
+                (source, imported)
+            })
+            .collect::<Vec<_>>();
+        let received = imports
+            .iter()
+            .map(|(_, imported)| *imported)
+            .collect::<Box<[_]>>();
+        consumer
+            .add_exchange_source(
+                RECEIVER,
+                EDGE,
+                imports.clone().into_boxed_slice(),
+                received.clone(),
+                Distribution::Singleton,
+                RowMultiplicity::SingleCopy,
+            )
+            .unwrap();
+        let key = consumer
+            .add_expression(FINAL, int64(), ExprKind::Value(received[0]))
+            .unwrap();
+        consumer
+            .add_top_n(
+                FINAL,
+                RECEIVER,
+                descending(key),
+                2,
+                1,
+                TopNPhase::Final { sequence: SEQUENCE },
+            )
+            .map_err(|error| error.to_string())?;
+        let consumer = consumer
+            .finish_definition(FINAL, FragmentSink::Result, dop)
+            .map_err(|error| error.to_string())?;
+
+        let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
+        plan.add_fragment(producer).unwrap();
+        plan.add_fragment(consumer).unwrap();
+        plan.add_edge(Edge {
+            id: EDGE,
+            kind: EdgeKind::Stream,
+            source: EdgeSource {
+                fragment: PRODUCER,
+                projection: provider.clone().into_boxed_slice(),
+            },
+            destination: EdgeDestination {
+                fragment: CONSUMER,
+                node: RECEIVER,
+                receive_mapping: imports.into_boxed_slice(),
+            },
+            // Gather: the edge carries every partial row to one Final.
+            partitioning: EdgePartitioning {
+                source: Distribution::Singleton,
+                source_multiplicity: RowMultiplicity::SingleCopy,
+                destination: Distribution::Singleton,
+                destination_multiplicity: RowMultiplicity::SingleCopy,
+            },
+        })
+        .unwrap();
+        plan.set_result_port(ResultPort {
+            fragment: CONSUMER,
+            output: OutputPort {
+                node: FINAL,
+                columns: received.clone(),
+            },
+            fields: ["v0", "v1"]
+                .iter()
+                .zip(received.iter())
+                .map(|(name, value)| ResultField {
+                    name: (*name).into(),
+                    alias: None,
+                    value: *value,
+                    ty: int64(),
+                })
+                .collect(),
+        })
+        .unwrap();
+        let plan = plan.finish().map_err(|error| format!("{error:?}"))?;
+
+        let draft = ConnectorReadRelationRecipeDraft::try_new(
+            binding,
+            relation,
+            columns
+                .iter()
+                .map(|column| column.column_payload.clone())
+                .collect(),
+        )
+        .unwrap();
+        let scan = FrozenConnectorScan::try_new(
+            draft,
+            ["v0", "v1"]
+                .into_iter()
+                .map(|name| StaticScanAssignment::new(Arc::from(name), ConnectorValueType::BigInt))
+                .collect(),
+            TupleDomain::all(),
+            TupleDomain::all(),
+            None,
+            vec![],
+            NonZeroU64::new(100).unwrap(),
+            NonZeroU64::new(4096).unwrap(),
+            ConnectorReadWorkSource::RuntimeSplits,
+        )
+        .unwrap();
+        let source = ConnectorReadStaticFacts::try_new(
+            ConnectorReadInputVersion::try_new([9]).unwrap(),
+            [7; 32],
+            ConnectorReadProperties::try_new(ConnectorReadDistribution::Unconstrained, vec![])
+                .unwrap(),
+            ConnectorReadArtifactCoverage::NoArtifactInputs,
+            vec![],
+        )
+        .unwrap();
+        let public = ConnectorReadPublicFacts::try_new(
+            source,
+            None,
+            public_schema(),
+            vec![ValueLogicalType::Physical; 2],
+        )
+        .unwrap();
+        let scans = BTreeMap::from([(
+            ProviderReadOccurrenceId::new(0),
+            FrozenConnectorRead::try_new(scan, public).unwrap(),
+        )]);
+        let mut uses = BTreeMap::new();
+        let mut calls = BTreeMap::new();
+        let mut pruning = BTreeMap::new();
+        let mut admissions = BTreeMap::new();
+        for (&id, fragment) in plan.fragments() {
+            let root_uses = root_uses(fragment);
+            calls.insert(
+                id,
+                FrozenFragmentCalls::try_new(fragment, &root_uses, vec![], &Good).unwrap(),
+            );
+            uses.insert(id, root_uses);
+            pruning.insert(
+                id,
+                FrozenFragmentPruning::try_new(id, vec![], &Good).unwrap(),
+            );
+            admissions.insert(id, super::package_admission());
+        }
+        extract_fragment_packages(
+            &plan,
+            &scans,
+            &BTreeMap::new(),
+            &uses,
+            &calls,
+            &pruning,
+            &admissions,
+            &Good,
+        )
+        .map_err(|error| format!("{error:?}"))
+    }
+
+    fn compile(
+        package: FragmentPackage,
+        root_sink_dop: Option<usize>,
+    ) -> Result<LocalProgram, FragmentCompileError> {
+        let validated = validate_fragment_providers(Arc::new(package), &providers(), &Good)
+            .expect("pure provider validation");
+        compile_fragment(
+            validated,
+            &super::functions(),
+            LocalCompileOptions {
+                pipeline_dop: NonZeroUsize::new(1).unwrap(),
+                root_sink_dop: root_sink_dop.map(|dop| NonZeroUsize::new(dop).unwrap()),
+                kernel_abi: KernelAbiVersion::CURRENT,
+                exchange_wait: Duration::from_millis(1_000),
+                constants: super::policy(),
+            },
+            &Good,
+        )
+    }
+
+    /// The single local TopN of a compiled split half: input, limit, offset.
+    fn window(program: &LocalProgram) -> (usize, Option<usize>, usize, bool, bool) {
+        let windows = program
+            .graph()
+            .nodes()
+            .iter()
+            .filter_map(|node| match node.kind() {
+                ProgramNodeKind::Sort {
+                    input,
+                    use_top_n: true,
+                    order_by,
+                    limit,
+                    offset,
+                    topn_type: SortTopNType::RowNumber,
+                    max_buffered_rows: None,
+                    max_buffered_bytes: None,
+                    partition_exprs,
+                    partition_limit: None,
+                } if partition_exprs.is_empty() && order_by.len() == 1 => Some((
+                    input.index(),
+                    *limit,
+                    *offset,
+                    order_by[0].asc,
+                    order_by[0].nulls_first,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(windows.len(), 1, "one local TopN per split half");
+        windows[0]
+    }
+
+    #[test]
+    fn scan_rooted_partial_topn_and_its_gathered_final_compile_as_the_checked_split() {
+        let mut packages = packages(3).expect("the split sequence validates");
+        let producer = compile(packages.remove(&PRODUCER).unwrap(), None)
+            .expect("a runtime-split scan feeds its partial TopN");
+        assert_eq!(producer.graph().nodes().len(), 2);
+        assert!(matches!(
+            producer.graph().nodes()[0].kind(),
+            ProgramNodeKind::Scan { .. }
+        ));
+        // Partial: the top `limit + offset` rows of each instance, no offset.
+        assert_eq!(window(&producer), (0, Some(3), 0, false, true));
+        assert_eq!(producer.graph().root().index(), 1);
+        assert!(matches!(
+            producer.graph().sink(),
+            Some(StaticSinkProgram::DataStream { .. })
+        ));
+
+        let consumer = compile(packages.remove(&CONSUMER).unwrap(), Some(1))
+            .expect("the gathered final TopN compiles");
+        assert!(matches!(
+            consumer.graph().nodes()[0].kind(),
+            ProgramNodeKind::ExchangeSource { .. }
+        ));
+        // Final: the frozen window over every gathered partial row.
+        assert_eq!(window(&consumer), (0, Some(2), 1, false, true));
+        assert!(matches!(
+            consumer.graph().sink(),
+            Some(StaticSinkProgram::Result)
+        ));
+    }
+
+    #[test]
+    fn a_partial_budget_short_of_the_final_window_never_reaches_the_compiler() {
+        // The physical sequence trace, not the compiler, owns the pairing.
+        let error = packages(2).expect_err("partial limit must equal limit + offset");
+        assert!(
+            error.contains("TopN partial paths do not reduce exactly into their matching final"),
+            "{error}"
+        );
     }
 }
