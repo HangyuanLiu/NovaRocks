@@ -27,8 +27,9 @@ use crate::cancellation::{
 use crate::client_connection::ClientConnectionToken;
 use novarocks_workload_control::{
     BusinessPermit, CancellationReason, CancellationView, QueryConcurrencyPermit, ResultClosingCut,
-    RootAdmissionHandle, WorkCancellationRequestOutcome, WorkClass, WorkError, WorkOwner,
-    WorkRequest, WorkScope, WorkSuccessSealer,
+    ResultWindowAlias, ResultWindowClass, ResultWindowGrant, RootAdmissionHandle,
+    WorkCancellationRequestOutcome, WorkClass, WorkError, WorkOwner, WorkRequest, WorkScope,
+    WorkSuccessSealer,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -428,6 +429,50 @@ impl QueryControlService {
         timeout_ms: Option<u64>,
         statement_text: Option<Arc<str>>,
     ) -> Result<GovernedQueryStatementOwner, GovernedQueryStatementBeginError> {
+        self.begin_queued(
+            session,
+            admission,
+            deadline,
+            timeout_ms,
+            statement_text,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::begin_queued_governed_query_statement`], but the warehouse
+    /// dequeue also takes one complete result window of `class` together with
+    /// the computation permit, before any dispatch. The owner retains the
+    /// window through the protocol's terminal outcome and its last alias.
+    pub async fn begin_queued_governed_query_statement_with_result(
+        &self,
+        session: SessionToken,
+        admission: &RootAdmissionHandle,
+        deadline: Option<Instant>,
+        timeout_ms: Option<u64>,
+        statement_text: Option<Arc<str>>,
+        class: ResultWindowClass,
+    ) -> Result<GovernedQueryStatementOwner, GovernedQueryStatementBeginError> {
+        self.begin_queued(
+            session,
+            admission,
+            deadline,
+            timeout_ms,
+            statement_text,
+            Some(class),
+        )
+        .await
+    }
+
+    async fn begin_queued(
+        &self,
+        session: SessionToken,
+        admission: &RootAdmissionHandle,
+        deadline: Option<Instant>,
+        timeout_ms: Option<u64>,
+        statement_text: Option<Arc<str>>,
+        window: Option<ResultWindowClass>,
+    ) -> Result<GovernedQueryStatementOwner, GovernedQueryStatementBeginError> {
         let mut request = WorkRequest::new(WorkClass::Query);
         request.deadline = deadline;
         let root = admission
@@ -452,7 +497,20 @@ impl QueryControlService {
             }
         };
         let scope = root.owner.scope();
-        let query_admission = match scope.admit_query() {
+        let admitted = match window {
+            None => scope.admit_query().map(|admission| {
+                Box::pin(async move { admission.await.map(|permit| (permit, None)) })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
+            }),
+            Some(class) => scope.admit_query_with_result(class).map(|admission| {
+                Box::pin(async move {
+                    admission
+                        .await
+                        .map(|(permit, window)| (permit, Some(window)))
+                }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
+            }),
+        };
+        let query_admission = match admitted {
             Ok(admission) => admission,
             Err(error) => {
                 root.owner.complete_after_terminal_cancel_settled();
@@ -460,8 +518,8 @@ impl QueryControlService {
                 return Err(GovernedQueryStatementBeginError::Admission(error));
             }
         };
-        let permit = match query_admission.await {
-            Ok(permit) => permit,
+        let (permit, result_window) = match query_admission.await {
+            Ok(admitted) => admitted,
             Err(error) => {
                 if matches!(error, WorkError::Cancelled(_)) {
                     root.owner.complete_after_terminal_cancel_settled();
@@ -480,6 +538,7 @@ impl QueryControlService {
             execution_owner: Some(root.owner),
             business: None,
             query_concurrency: Some(permit),
+            result_window,
             accepted_delivery_cut: None,
             timeout_ms,
             success_visibility_sealed: false,
@@ -536,6 +595,7 @@ impl QueryControlService {
             execution_owner: Some(root.owner),
             business: Some(root.business),
             query_concurrency: None,
+            result_window: None,
             accepted_delivery_cut: None,
             timeout_ms,
             success_visibility_sealed: false,
@@ -653,6 +713,9 @@ pub struct GovernedQueryStatementOwner {
     execution_owner: Option<WorkOwner>,
     business: Option<BusinessPermit>,
     query_concurrency: Option<QueryConcurrencyPermit>,
+    /// The complete result window taken with the permit, when the statement
+    /// declared one. Its position follows the last alias, not this owner.
+    result_window: Option<ResultWindowGrant>,
     accepted_delivery_cut: Option<ResultClosingCut>,
     timeout_ms: Option<u64>,
     success_visibility_sealed: bool,
@@ -674,6 +737,14 @@ impl GovernedQueryStatementOwner {
 
     pub const fn timeout_ms(&self) -> Option<u64> {
         self.timeout_ms
+    }
+
+    /// An alias of the statement's result window for one relay or delivery
+    /// owner; `None` when the statement took no window at admission.
+    pub fn result_window_alias(&self) -> Option<ResultWindowAlias> {
+        self.result_window
+            .as_ref()
+            .map(ResultWindowGrant::retain_alias)
     }
 
     /// Transfer the unique root owner into `QueryExecutionClient::start`.

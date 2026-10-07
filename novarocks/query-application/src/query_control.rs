@@ -811,6 +811,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn result_statement_takes_its_window_with_the_permit_and_keeps_it_for_aliases() {
+        use novarocks_workload_control::{ResultCapacityConfig, ResultWindowClass};
+        let control = Arc::new(QueryApplicationControl::default());
+        let service = QueryControlService::new(control.clone());
+        let workload = WorkloadControl::try_new(
+            WorkloadConfig {
+                query_concurrency_limit: 1,
+                ..WorkloadConfig::default()
+            },
+            ResourceConfig {
+                total_bytes: 1024,
+                control_bytes: 128,
+                per_scope_bytes: 896,
+            },
+        )
+        .unwrap();
+        let capacity = workload
+            .configure_result_capacity(ResultCapacityConfig {
+                positions: [1; 4],
+                client_compute_positions: 1,
+                client_short_tail_positions: 0,
+                supported_cancel_burst: 0,
+                sustained_cancels_per_second: 0,
+                ..ResultCapacityConfig::V1
+            })
+            .unwrap();
+        workload.mark_ready().unwrap();
+        let session = register(&control, 7, 1, "root");
+        let mut statement = service
+            .begin_queued_governed_query_statement_with_result(
+                session,
+                &workload.root_admission(),
+                None,
+                None,
+                None,
+                ResultWindowClass::Client,
+            )
+            .await
+            .unwrap();
+        assert_eq!(workload.snapshot().admitted_queries, 1);
+        assert_eq!(capacity.snapshot().held_positions, [1, 0, 0, 0]);
+        let alias = statement
+            .result_window_alias()
+            .expect("a result statement owns its window");
+        assert_eq!(alias.class(), ResultWindowClass::Client);
+        // An accepted cancel cut returns only the computation permit.
+        assert_eq!(
+            control.kill_query(session, 7),
+            QueryCancelOutcome::Requested
+        );
+        assert!(statement.accept_cancel_delivery_cut().unwrap());
+        assert_eq!(workload.snapshot().admitted_queries, 0);
+        assert_eq!(capacity.snapshot().held_positions, [1, 0, 0, 0]);
+        // The owner's exit does not free the position while an alias lives.
+        drop(statement);
+        assert_eq!(capacity.snapshot().held_positions, [1, 0, 0, 0]);
+        drop(alias);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        // A plain statement takes no window.
+        let plain = service
+            .begin_queued_governed_query_statement(
+                session,
+                &workload.root_admission(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(plain.result_window_alias().is_none());
+    }
+
+    #[tokio::test]
     async fn delivery_cut_returns_compute_only_and_closing_retains_generation_and_aliases() {
         use crate::protocol_delivery::{ClosingDelivery, GovernedProtocolOwner};
         use novarocks_workload_control::{ResultCapacityConfig, ResultClosingCut};
