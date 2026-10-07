@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "archived_on": "2026-10-07",
+  "reason": "Revision 6 retired the original patched transport implementations. These manifests are immutable historical inputs, not current build workspaces. Content hashes are unchanged; historical source-pin paths resolve through this mapping.",
+  "entries": [
+    {
+      "historical_path": "p04-original-channel-worker/channel-probe/Cargo.toml",
+      "reference_path": "p04-original-channel-worker/channel-probe/Cargo.toml.reference",
+      "sha256": "4e1e24b685f5913e5f142a21c69e4a2207f9f55551a74200bef62a15a432a056"
+    },
+    {
+      "historical_path": "p04-original-channel-worker/http1-probe/Cargo.toml",
+      "reference_path": "p04-original-channel-worker/http1-probe/Cargo.toml.reference",
+      "sha256": "9d05abb642ddeb3028c45af3058257ab7467addbb40b2867600adea5b5e02eec"
+    },
+    {
+      "historical_path": "p04-original-connection-driver/channel-probe/Cargo.toml",
+      "reference_path": "p04-original-connection-driver/channel-probe/Cargo.toml.reference",
+      "sha256": "4e1e24b685f5913e5f142a21c69e4a2207f9f55551a74200bef62a15a432a056"
+    },
+    {
+      "historical_path": "p04-original-protocol-task/channel-probe/Cargo.toml",
+      "reference_path": "p04-original-protocol-task/channel-probe/Cargo.toml.reference",
+      "sha256": "4e1e24b685f5913e5f142a21c69e4a2207f9f55551a74200bef62a15a432a056"
+    },
+    {
+      "historical_path": "p04-original-request-tasks/channel-probe/Cargo.toml",
+      "reference_path": "p04-original-request-tasks/channel-probe/Cargo.toml.reference",
+      "sha256": "4e1e24b685f5913e5f142a21c69e4a2207f9f55551a74200bef62a15a432a056"
+    },
+    {
+      "historical_path": "p04-original-request-tasks/http1-probe/Cargo.toml",
+      "reference_path": "p04-original-request-tasks/http1-probe/Cargo.toml.reference",
+      "sha256": "9d05abb642ddeb3028c45af3058257ab7467addbb40b2867600adea5b5e02eec"
+    }
+  ]
+}
