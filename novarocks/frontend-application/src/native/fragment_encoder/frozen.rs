@@ -170,6 +170,7 @@ impl FragmentArtifact {
             carries_runtime_filter_bindings,
         };
         let frozen = wire::FrozenFragment {
+            package: Default::default(),
             plan_version: header.plan_version.as_bytes().to_vec(),
             plan_contract_revision: header.plan_contract_revision,
             fragment_contract_version: u32::from(FragmentContractVersion::CURRENT.get()),

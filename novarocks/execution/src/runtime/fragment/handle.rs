@@ -1140,6 +1140,12 @@ impl Drop for RunningFragmentInner {
     }
 }
 
+#[path = "compiled_prepare.rs"]
+mod compiled_prepare;
+pub use compiled_prepare::{
+    CompiledFragmentSubmission, compiled_sink_kind, prepare_compiled_fragment,
+};
+
 pub fn prepare_fragment(
     submission: FragmentSubmission,
     context: FragmentPrepareContext,

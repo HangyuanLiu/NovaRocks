@@ -51,6 +51,7 @@ fn main() {
         ".novarocks.FetchResultResponse.result_arrow_ipc",
         ".novarocks.CreateTaskRequest.frozen_fragment",
         ".novarocks.CreateTaskRequest.creation_metadata",
+        ".novarocks.FrozenFragment.package",
     ]);
     let descriptors = config
         .load_fds(&proto_paths, &[PathBuf::from(IDL_DIR)])

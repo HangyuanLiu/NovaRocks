@@ -267,6 +267,14 @@ pub fn decode_static_fragment(
 ) -> Result<DecodedStaticFragment, ProtocolError> {
     let frozen = novarocks::FrozenFragment::decode(bytes.to_bytes())
         .map_err(|error| invalid(path.clone(), format!("invalid frozen fragment: {error}")))?;
+    // One carrier per fragment: a compiled package is never read by the
+    // plan-tree interpreter, and is never silently ignored by it either.
+    if !frozen.package.is_empty() {
+        return Err(invalid(
+            path.clone().field("package"),
+            "a compiled fragment package is not a plan-tree carrier",
+        ));
+    }
     if frozen.plan_version.len() != 16 || frozen.plan_version.iter().all(|byte| *byte == 0) {
         return Err(invalid(
             path.clone().field("plan_version"),
@@ -311,6 +319,59 @@ pub fn decode_static_fragment(
     })?;
     let sink_kind = decode_sink_kind(sink, path.field("plan").field("sink"))?;
     Ok(DecodedStaticFragment { frozen, sink_kind })
+}
+
+/// One fragment's compiled-package carrier, decoded by the backend that won a
+/// task's creation.
+///
+/// Only the carrier law is proved here. The package bytes are interpreted by
+/// the package receiver, after its generated resource preflight.
+#[derive(Debug)]
+pub struct DecodedStaticPackage {
+    package: prost::bytes::Bytes,
+}
+
+impl DecodedStaticPackage {
+    pub fn package(&self) -> &prost::bytes::Bytes {
+        &self.package
+    }
+
+    pub fn into_package(self) -> prost::bytes::Bytes {
+        self.package
+    }
+}
+
+/// Decodes one fragment's compiled-package carrier.
+///
+/// The package owns its plan version, contract revision and parallelism
+/// domain, so a carrier that also states any plan-tree fact is refused rather
+/// than reconciled: each fact keeps exactly one owner.
+pub fn decode_static_package(
+    bytes: &FrozenBytes,
+    path: FieldPath,
+) -> Result<DecodedStaticPackage, ProtocolError> {
+    let frozen = novarocks::FrozenFragment::decode(bytes.to_bytes())
+        .map_err(|error| invalid(path.clone(), format!("invalid frozen fragment: {error}")))?;
+    if frozen.package.is_empty() {
+        return Err(missing(
+            path.field("package"),
+            "a compiled carrier requires its fragment package",
+        ));
+    }
+    if !frozen.plan_version.is_empty()
+        || frozen.plan_contract_revision != 0
+        || frozen.fragment_contract_version != 0
+        || frozen.pipeline_dop_domain.is_some()
+        || frozen.plan.is_some()
+    {
+        return Err(invalid(
+            path,
+            "a compiled carrier cannot restate plan-tree facts its package owns",
+        ));
+    }
+    Ok(DecodedStaticPackage {
+        package: frozen.package,
+    })
 }
 
 fn decode_sink_kind(
@@ -413,6 +474,76 @@ mod tests {
         novarocks::TaskScanRanges {
             plan_node_id: node,
             ranges: Vec::new(),
+        }
+    }
+
+    fn frozen(fragment: novarocks::FrozenFragment) -> FrozenBytes {
+        FrozenBytes::freeze(Bytes::from(fragment.encode_to_vec()))
+    }
+
+    // Exactly one carrier per fragment: the package interpreter reads only a
+    // package, and the plan-tree interpreter refuses one instead of ignoring it.
+    #[test]
+    fn a_compiled_package_carrier_has_exactly_one_owner_for_every_fact() {
+        let package = Bytes::from_static(b"opaque fragment package");
+        let carrier = novarocks::FrozenFragment {
+            package: package.clone(),
+            ..Default::default()
+        };
+        let decoded = decode_static_package(&frozen(carrier.clone()), FieldPath::root("f"))
+            .expect("package carrier");
+        assert_eq!(decoded.package(), &package);
+        assert_eq!(decoded.into_package(), package);
+
+        let refused = decode_static_fragment(&frozen(carrier.clone()), FieldPath::root("f"))
+            .expect_err("a plan-tree interpreter refuses a package");
+        assert!(
+            refused.to_string().contains("not a plan-tree carrier"),
+            "{refused}"
+        );
+
+        let empty = decode_static_package(
+            &frozen(novarocks::FrozenFragment::default()),
+            FieldPath::root("f"),
+        )
+        .expect_err("a compiled carrier needs its package");
+        assert!(
+            empty.to_string().contains("requires its fragment package"),
+            "{empty}"
+        );
+
+        for restated in [
+            novarocks::FrozenFragment {
+                plan_version: vec![7; 16],
+                ..carrier.clone()
+            },
+            novarocks::FrozenFragment {
+                plan_contract_revision: 1,
+                ..carrier.clone()
+            },
+            novarocks::FrozenFragment {
+                fragment_contract_version: 1,
+                ..carrier.clone()
+            },
+            novarocks::FrozenFragment {
+                pipeline_dop_domain: Some(novarocks::PipelineDopDomain {
+                    min: 1,
+                    max: 1,
+                    requires_power_of_two: false,
+                }),
+                ..carrier.clone()
+            },
+            novarocks::FrozenFragment {
+                plan: Some(plan::PlanFragment::default()),
+                ..carrier.clone()
+            },
+        ] {
+            let error = decode_static_package(&frozen(restated), FieldPath::root("f"))
+                .expect_err("a restated plan-tree fact");
+            assert!(
+                error.to_string().contains("cannot restate plan-tree facts"),
+                "{error}"
+            );
         }
     }
 
@@ -530,6 +661,7 @@ mod tests {
     #[test]
     fn a_static_fragment_header_is_proved_before_its_plan_is_used() {
         let frozen = novarocks::FrozenFragment {
+            package: Default::default(),
             plan_version: vec![1; 16],
             plan_contract_revision: 1,
             fragment_contract_version: u32::from(FragmentContractVersion::CURRENT.get()),

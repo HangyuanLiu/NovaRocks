@@ -265,6 +265,46 @@ pub fn decode_fragment_sink_assignment(
     }
 }
 
+/// Binds a compiled program's static sink to the task's frozen outbound
+/// edges, with the same edge law as [`decode_fragment_sink_assignment`]: each
+/// branch's destination node and partitioning come from the compiled static
+/// sink, never from a legacy plan tree.
+pub fn compiled_fragment_sink_assignment(
+    sink: &novarocks_local_program::StaticSinkProgram,
+    sink_edge_ids: &[u32],
+    source: UniqueId,
+    topology: &ExchangeTopology,
+) -> Result<FragmentSinkAssignment, ProtocolError> {
+    use novarocks_local_program::StaticSinkProgram;
+    let path = FieldPath::root("fragment_package").field("sink");
+    let expected = match sink {
+        StaticSinkProgram::DataStream { branch, .. } => {
+            vec![(branch.dest_node_id(), branch.partition_type())]
+        }
+        StaticSinkProgram::Result | StaticSinkProgram::Noop => Vec::new(),
+        StaticSinkProgram::MultiCastDataStream { .. }
+        | StaticSinkProgram::SplitDataStream { .. } => {
+            return Err(error(
+                path,
+                ProtocolErrorKind::InvalidValue,
+                "compiled multicast and router sinks are not executable yet",
+            ));
+        }
+    };
+    let edges = decode_sink_edges(&expected, sink_edge_ids, topology, path)?;
+    let mut groups = edges
+        .into_iter()
+        .map(|edge| decode_edge_destinations(edge, source))
+        .collect::<Result<Vec<_>, _>>()?;
+    match sink {
+        StaticSinkProgram::DataStream { .. } => Ok(FragmentSinkAssignment::StreamDestinations {
+            destinations: groups.pop().expect("one stream edge was validated"),
+            sender_id: None,
+        }),
+        _ => Ok(FragmentSinkAssignment::None),
+    }
+}
+
 fn decode_sink_edges<'a>(
     expected: &[(i32, DataStreamPartitionType)],
     sink_edge_ids: &[u32],
@@ -393,8 +433,8 @@ fn error(path: FieldPath, kind: ProtocolErrorKind, detail: impl Into<String>) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_fragment_sink_assignment, decode_scan_source_contracts, require_root, require_sink,
-        validate_scan_range_nodes,
+        compiled_fragment_sink_assignment, decode_fragment_sink_assignment,
+        decode_scan_source_contracts, require_root, require_sink, validate_scan_range_nodes,
     };
     use std::collections::BTreeMap;
     use std::num::NonZeroU32;
@@ -637,6 +677,124 @@ mod tests {
                 "each destination reads the edge's producer position"
             );
         }
+    }
+
+    fn compiled_stream(
+        dest_node_id: i32,
+        partitioning: DataStreamPartitionType,
+    ) -> novarocks_local_program::StaticSinkProgram {
+        novarocks_local_program::StaticSinkProgram::DataStream {
+            branch: novarocks_local_program::StaticStreamBranch::try_new(
+                dest_node_id,
+                partitioning,
+                Vec::new(),
+                vec![novarocks_types::SlotId::new(0)],
+                None,
+            )
+            .expect("compiled stream branch"),
+            arena: std::sync::Arc::new(
+                novarocks_local_program::ImmutableExpressions::try_new(
+                    Vec::new(),
+                    false,
+                    std::collections::HashMap::new(),
+                    None,
+                )
+                .expect("empty sink arena"),
+            ),
+        }
+    }
+
+    fn one_edge_topology(partitioning: DataStreamPartitionType) -> ExchangeTopology {
+        let execution = execution();
+        let edge = ExchangeEdge::try_new(
+            ExchangeEdgeId::new(3).expect("nonzero edge"),
+            FragmentNodeId::new(9),
+            partitioning,
+            (1..=2)
+                .map(|task_id| {
+                    ExchangeDestination::new(
+                        task(execution, task_id),
+                        UniqueId::new(i64::from(task_id), 1),
+                        RuntimeEndpoint::new("be.local", 8060).expect("endpoint"),
+                        FragmentNodeId::new(9),
+                    )
+                })
+                .collect(),
+            0,
+            NonZeroU32::new(1).expect("sender count"),
+        )
+        .expect("edge");
+        ExchangeTopology::try_new(vec![edge], vec![]).expect("topology")
+    }
+
+    // The compiled static sink binds to the frozen outbound edge by the same
+    // law as a legacy plan sink: destination node and partitioning must agree.
+    #[test]
+    fn compiled_stream_sink_binds_its_one_edge_by_node_and_partitioning() {
+        let topology = one_edge_topology(DataStreamPartitionType::Unpartitioned);
+        let assignment = compiled_fragment_sink_assignment(
+            &compiled_stream(9, DataStreamPartitionType::Unpartitioned),
+            &[3],
+            SOURCE,
+            &topology,
+        )
+        .expect("the compiled branch binds the one edge");
+        let FragmentSinkAssignment::StreamDestinations { destinations, .. } = assignment else {
+            panic!("a stream sink binds one destination list");
+        };
+        assert_eq!(destinations.len(), 2);
+        assert!(
+            destinations
+                .iter()
+                .all(|destination| destination.source_finst_id() == SOURCE)
+        );
+
+        let wrong_node = compiled_fragment_sink_assignment(
+            &compiled_stream(8, DataStreamPartitionType::Unpartitioned),
+            &[3],
+            SOURCE,
+            &topology,
+        )
+        .expect_err("destination node mismatch");
+        assert!(
+            wrong_node
+                .to_string()
+                .contains("destination node disagrees"),
+            "{wrong_node}"
+        );
+        let wrong_partitioning = compiled_fragment_sink_assignment(
+            &compiled_stream(9, DataStreamPartitionType::HashPartitioned),
+            &[3],
+            SOURCE,
+            &topology,
+        )
+        .expect_err("partitioning mismatch");
+        assert!(
+            wrong_partitioning
+                .to_string()
+                .contains("partitioning disagrees"),
+            "{wrong_partitioning}"
+        );
+    }
+
+    #[test]
+    fn compiled_result_sink_binds_no_edge_and_refuses_a_stray_one() {
+        let assignment = compiled_fragment_sink_assignment(
+            &novarocks_local_program::StaticSinkProgram::Result,
+            &[],
+            SOURCE,
+            &ExchangeTopology::default(),
+        )
+        .expect("a result sink has no outbound edge");
+        assert!(matches!(assignment, FragmentSinkAssignment::None));
+        let stray = compiled_fragment_sink_assignment(
+            &novarocks_local_program::StaticSinkProgram::Result,
+            &[3],
+            SOURCE,
+            &one_edge_topology(DataStreamPartitionType::Unpartitioned),
+        )
+        .expect_err("a result sink cannot own an outbound edge");
+        assert!(stray.to_string().contains("exactly once"), "{stray}");
     }
 
     #[test]

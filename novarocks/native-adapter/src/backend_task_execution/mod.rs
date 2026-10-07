@@ -38,11 +38,15 @@
 //! task protocol owner is bound directly to these execution hosts.
 // Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
 
+mod compiled_package;
 mod context_host;
 mod execution_host;
 
 #[cfg(test)]
 mod tests;
 
+pub use compiled_package::{
+    CompiledPackageCompiler, CompiledPackageError, CompiledPackageInterpreter, CompiledTaskOptions,
+};
 pub use context_host::NativeQueryContextHost;
 pub use execution_host::{NativeTaskExecutionHost, TaskQueryContextFacts};

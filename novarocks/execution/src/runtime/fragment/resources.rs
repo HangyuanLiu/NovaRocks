@@ -234,6 +234,33 @@ impl ExchangeRegistration {
         Ok(Some(registration))
     }
 
+    /// Register a compiled program's receivers, already projected for this
+    /// instance, under the same rollback and cleanup owner as legacy ones.
+    pub(crate) fn acquire_registrations(
+        port: Arc<dyn ExchangeReceiverPort>,
+        registrations: Vec<ExchangeReceiverRegistration>,
+        cleanup_should_fail: bool,
+    ) -> Result<Option<Self>, FragmentLaunchError> {
+        if registrations.is_empty() {
+            return Ok(None);
+        }
+        let mut registration = Self {
+            port,
+            keys: Vec::with_capacity(registrations.len()),
+            active: true,
+            cleanup_should_fail,
+        };
+        for entry in registrations {
+            let key = entry.key;
+            if let Err(error) = registration.port.register(entry) {
+                let diagnostics = registration.rollback().err().into_iter().collect();
+                return Err(registration_error(error).with_cleanup_diagnostics(diagnostics));
+            }
+            registration.keys.push(key);
+        }
+        Ok(Some(registration))
+    }
+
     fn rollback(&mut self) -> Result<(), String> {
         if self.active {
             for key in self.keys.drain(..).rev() {
@@ -318,7 +345,17 @@ impl FragmentResources {
         writer: &Arc<dyn FragmentResultWriter>,
         spec: ResultWriteSpec,
     ) -> Result<(), FragmentLaunchError> {
-        if program.sink_kind() != FragmentSinkKind::Result {
+        self.acquire_result_for(program.sink_kind(), writer, spec)
+    }
+
+    /// Open the result session exactly when the static sink is a result sink.
+    pub(crate) fn acquire_result_for(
+        &mut self,
+        sink_kind: FragmentSinkKind,
+        writer: &Arc<dyn FragmentResultWriter>,
+        spec: ResultWriteSpec,
+    ) -> Result<(), FragmentLaunchError> {
+        if sink_kind != FragmentSinkKind::Result {
             return Ok(());
         }
         self.result = Some(ResultRegistration::acquire(
@@ -354,6 +391,18 @@ impl FragmentResources {
             Arc::clone(&self.exchange_receiver_port),
             program,
             instance,
+            self.cleanup_faults.should_fail(ResourceKind::Exchange),
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn acquire_compiled_exchange(
+        &mut self,
+        registrations: Vec<ExchangeReceiverRegistration>,
+    ) -> Result<(), FragmentLaunchError> {
+        self.exchange = ExchangeRegistration::acquire_registrations(
+            Arc::clone(&self.exchange_receiver_port),
+            registrations,
             self.cleanup_faults.should_fail(ResourceKind::Exchange),
         )?;
         Ok(())

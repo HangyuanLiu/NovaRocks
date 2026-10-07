@@ -58,9 +58,10 @@ use novarocks_execution::runtime::fragment::io::{
     FragmentCommitPort, FragmentEvent, FragmentEventSink, FragmentResultWriter,
 };
 use novarocks_execution::runtime::fragment::{
-    DormantFragmentHandle, ExecutionFailureCause, FragmentCancelReason, FragmentExecutionError,
-    FragmentLaunchError, FragmentOutcome, FragmentTerminalFact, RunningFragmentHandle,
-    prepare_fragment,
+    CompiledFragmentSubmission, DormantFragmentHandle, ExecutionFailureCause, FragmentCancelReason,
+    FragmentExecutionError, FragmentInstanceSpec, FragmentLaunchError, FragmentOutcome,
+    FragmentRuntimeOptions, FragmentTerminalFact, RunningFragmentHandle, ScanAssignments,
+    compiled_sink_kind, prepare_compiled_fragment, prepare_fragment,
 };
 use novarocks_execution::runtime::operator_statistics::project_operator_statistics;
 use novarocks_execution::runtime::profile::{Profiler, RuntimeProfileTree, fragment_root_profiler};
@@ -85,14 +86,20 @@ use novarocks_spi::connector::{
     CatalogHandle, ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding,
     ConnectorStopOwner, ConnectorStorageResolver, read_stack::ConnectorSession,
 };
-use novarocks_task_codec::creation::{decode_static_fragment, take_task_assignment};
+use novarocks_task_codec::creation::{
+    decode_static_fragment, decode_static_package, take_task_assignment,
+};
 use novarocks_task_codec::domain::stored_message;
 use novarocks_types::{QueryExecutionId, UniqueId};
 use novarocks_worker::{TaskCompletionSignal, TaskCompletionSupervisor, TaskInboundCapabilities};
 use tracing::debug;
 
+use super::compiled_package::{
+    CompiledPackageCompiler, CompiledPackageError, CompiledTaskOptions, TaskPreparationControl,
+};
 use crate::fragment_instance::project_task_instance;
 use crate::fragment_request::NativeFragmentRequest;
+use crate::fragment_submission::compiled_fragment_sink_assignment;
 use crate::native_fragment_query::{NativeFragmentQueryRuntime, NativeFragmentRegistrationLease};
 use crate::task_protocol_fault as fault;
 use novarocks_worker::read_attempt::{ReceivedReadSplit, TypedReadAttemptContext};
@@ -208,6 +215,10 @@ pub struct NativeTaskExecutionHost {
     /// gets a fresh queue set and can never inherit a sequence space.
     split_queues: Arc<SplitQueueRegistry<ReceivedReadSplit>>,
     tasks: Mutex<HashMap<TaskIdentity, Arc<TaskRuntime>>>,
+    /// The one static plan interpreter this process composed: the plan-tree
+    /// decoder when absent, otherwise the compiled-package compiler. A task's
+    /// carrier never selects it.
+    compiled: Option<Arc<dyn CompiledPackageCompiler>>,
 }
 
 impl fmt::Debug for NativeTaskExecutionHost {
@@ -412,7 +423,229 @@ impl NativeTaskExecutionHost {
             completion_supervisor,
             split_queues: Arc::new(SplitQueueRegistry::new()),
             tasks: Mutex::new(HashMap::new()),
+            compiled: None,
         }
+    }
+
+    /// Composes the compiled-package interpreter instead of the plan-tree
+    /// decoder. Composition makes this choice once per process.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "composed by the candidate island and tests only")
+    )]
+    pub(crate) fn with_compiled_package_compiler(
+        mut self,
+        compiler: Arc<dyn CompiledPackageCompiler>,
+    ) -> Self {
+        self.compiled = Some(compiler);
+        self
+    }
+
+    /// The compiled-package half of `install_receiver`: the task's package is
+    /// received, provider-validated and compiled into a LocalProgram, then
+    /// prepared into the same dormant handle and task runtime as a plan-tree
+    /// task. Every refusal here precedes registration and rolls back.
+    fn install_compiled_receiver(
+        &self,
+        descriptor: &TaskDescriptor,
+        input: TaskCreationInput,
+        compiler: &dyn CompiledPackageCompiler,
+    ) -> Result<PreparedTaskFacts, HostRejection> {
+        let identity = descriptor.identity();
+        let execution = identity.query_execution_id();
+        let kernel_key = descriptor.fragment_instance_id();
+        let (static_fragment, assignment) = input.into_parts();
+        let carrier = decode_static_package(&static_fragment, FieldPath::root("frozen_fragment"))
+            .map_err(|error| {
+            protocol(format!(
+                "task {identity} static package is not decodable: {error}"
+            ))
+        })?;
+        drop(static_fragment);
+        let assignment = take_task_assignment(assignment).ok_or_else(|| {
+            internal(format!(
+                "task {identity} creation assignment is not a codec-produced assignment"
+            ))
+        })?;
+        // Compiled scans have no runtime binder yet: a task that names scan
+        // work is refused rather than run without its splits.
+        if !descriptor.split_plan_nodes().is_empty() {
+            return Err(protocol(format!(
+                "task {identity} names split-driven scans, which compiled programs cannot run yet"
+            )));
+        }
+
+        let attempt = TaskAttemptKey::new(execution, kernel_key);
+        let splits = self.split_queues.open_attempt(
+            attempt,
+            SplitQueueConfig {
+                max_queued_bytes: MAX_ASSIGNMENT_RETAINED_BYTES,
+            },
+        );
+        let mut lease = SplitQueueLease::held(&self.split_queues, attempt);
+        let task_stop = ConnectorStopOwner::new();
+        let mut stop_guard = PreparationStopGuard::new(task_stop.clone());
+        let read_context = Arc::new(TypedReadAttemptContext::new());
+
+        let control = TaskPreparationControl::new(task_stop.view());
+        let program = compiler
+            .compile(
+                carrier.package(),
+                CompiledTaskOptions {
+                    pipeline_dop: descriptor.pipeline_dop(),
+                    exchange_wait: Duration::from_millis(
+                        self.execution_runtime.config().exchange_wait_ms,
+                    ),
+                },
+                &control,
+            )
+            .map_err(|error| compiled_package_rejection(identity, error))?;
+        let sink = program.graph().sink().ok_or_else(|| {
+            internal(format!(
+                "task {identity} compiled program has no static sink"
+            ))
+        })?;
+        let sink_kind = compiled_sink_kind(Some(sink))
+            .map_err(|error| internal(format!("task {identity} compiled sink: {error}")))?;
+
+        let context_options = self.context_facts.query_options(execution)?;
+        let instance_input = project_task_instance(
+            descriptor,
+            assignment
+                .into_wire()
+                .map_err(|error| internal(format!("restore validated task assignment: {error}")))?,
+            context_options.runtime().as_ref().clone(),
+            sink_kind,
+        )
+        .map_err(|error| {
+            protocol(format!(
+                "task {identity} assignment is not a legal instance: {error}"
+            ))
+        })?;
+        if !instance_input.raw_scan_ranges.is_empty() {
+            return Err(protocol(format!(
+                "task {identity} assigns scan ranges, which compiled programs cannot run yet"
+            )));
+        }
+        let sink_assignment = compiled_fragment_sink_assignment(
+            sink,
+            &instance_input.sink_edge_ids,
+            kernel_key,
+            descriptor.topology(),
+        )
+        .map_err(|error| {
+            protocol(format!(
+                "task {identity} sink edges do not bind its compiled sink: {error}"
+            ))
+        })?;
+        let instance = FragmentInstanceSpec::new_native(
+            novarocks_execution_contract::FragmentContractVersion::CURRENT,
+            instance_input.query_id,
+            instance_input.fragment_instance_id,
+            ScanAssignments::default(),
+            instance_input.exchange_inputs,
+            sink_assignment,
+            FragmentRuntimeOptions::new(
+                instance_input.query_options,
+                instance_input.typed_result_sink,
+            ),
+            instance_input.pipeline_dop,
+            instance_input.backend_num,
+        );
+        let root_display_id = i32::try_from(program.graph().root().index())
+            .map_err(|_| internal(format!("task {identity} compiled root index exceeds i32")))?;
+        let submission =
+            CompiledFragmentSubmission::try_new(Arc::new(program), instance).map_err(|error| {
+                protocol(format!(
+                    "task {identity} compiled program does not fit its instance: {error}"
+                ))
+            })?;
+
+        let (delivery_expire, query_expire) =
+            novarocks_execution::runtime::query_options::query_expire_durations(Some(
+                context_options.runtime().as_ref(),
+            ));
+        let exec_mem_limit = context_options.runtime().exec_mem_limit();
+        let profiler = context_options
+            .runtime()
+            .enable_profile()
+            .then(|| fragment_root_profiler(root_display_id));
+        let edges = ExchangeEdgeGates::from_frozen_edges(descriptor.topology().outbound())
+            .map_err(|error| {
+                protocol(format!(
+                    "task {identity} outbound topology has no legal gate set: {error}"
+                ))
+            })?;
+        let operator_statistics = Arc::new(TaskOperatorStatisticsSink::new(
+            kernel_key,
+            profiler.clone(),
+        ));
+        let event_sink: Arc<dyn FragmentEventSink> =
+            Arc::new(CompositeFragmentEventSink::new(vec![
+                self.context_facts
+                    .runtime_filter_event_sink(execution, kernel_key),
+                Arc::clone(&operator_statistics) as Arc<dyn FragmentEventSink>,
+            ]));
+        // Compiled programs bind no runtime filter yet.
+        let runtime_filter = self
+            .context_facts
+            .runtime_filter_session(execution, kernel_key, false)?;
+        let registration = self
+            .queries
+            .register_fragment_execution(execution, kernel_key, delivery_expire, query_expire)
+            .map_err(|error| {
+                resource_exhausted(format!("task {identity} could not be registered: {error}"))
+            })?;
+        let admission = self
+            .queries
+            .prepare_admission_execution(
+                execution,
+                kernel_key,
+                delivery_expire,
+                query_expire,
+                exec_mem_limit,
+                runtime_filter,
+            )
+            .map_err(|error| {
+                resource_exhausted(format!("task {identity} could not be admitted: {error}"))
+            })?;
+        let context = admission
+            .into_prepare_context(
+                profiler,
+                Arc::clone(&self.exchange_transmitter),
+                Arc::clone(&self.result_writer),
+                event_sink,
+            )
+            .with_fragment_commit_port(Arc::clone(&self.commit_port))
+            .with_exchange_receiver_port(Arc::clone(&self.exchange_receiver_port))
+            .with_execution_runtime(Arc::clone(&self.execution_runtime))
+            .with_result_identity(identity)
+            .with_edge_gates(Arc::clone(&edges));
+        let dormant = prepare_compiled_fragment(submission, context)
+            .map_err(|error| preparation_failure_to_host(identity, &error))?;
+
+        crate::task_execution_observation::emit_prepared_task_dop(
+            identity,
+            descriptor.fragment_instance_id(),
+            descriptor.pipeline_dop().get(),
+        );
+        self.tasks.lock().expect(TASK_LOCK).insert(
+            identity,
+            Arc::new(TaskRuntime {
+                attempt,
+                stop: task_stop,
+                sink_kind,
+                dormant: Mutex::new(Some(dormant)),
+                edges,
+                splits,
+                read_context,
+                registration: Mutex::new(Some(registration)),
+                operator_statistics,
+            }),
+        );
+        lease.retain();
+        stop_guard.transfer_to_task();
+        Ok(PreparedTaskFacts::new(sink_kind))
     }
 
     fn task_runtime(&self, identity: TaskIdentity) -> Option<Arc<TaskRuntime>> {
@@ -686,6 +919,9 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         }
 
         crate::task_protocol_fault::hold_native_task_preparation(identity).map_err(internal)?;
+        if let Some(compiler) = self.compiled.clone() {
+            return self.install_compiled_receiver(descriptor, input, compiler.as_ref());
+        }
         let (static_fragment, assignment) = input.into_parts();
         let fragment = decode_static_fragment(&static_fragment, FieldPath::root("frozen_fragment"))
             .map_err(|error| {
@@ -1626,6 +1862,28 @@ fn split_queue_rejection(error: SplitQueueError) -> HostRejection {
     HostRejection::new(category, error.to_string())
 }
 
+/// The task's own stop stays primary; a package this interpreter refuses is
+/// content a peer of the same island must not have sent.
+fn compiled_package_rejection(
+    identity: TaskIdentity,
+    error: CompiledPackageError,
+) -> HostRejection {
+    use novarocks_type_contract::CompileControlError;
+    let category = match &error {
+        CompiledPackageError::Control(CompileControlError::ResourceExhausted) => {
+            TaskFailureCategory::ResourceExhausted
+        }
+        CompiledPackageError::Control(
+            CompileControlError::Cancelled | CompileControlError::DeadlineExceeded,
+        ) => TaskFailureCategory::Execution,
+        CompiledPackageError::Refused(_) => TaskFailureCategory::Protocol,
+    };
+    HostRejection::new(
+        category,
+        format!("task {identity} package could not be compiled: {error}"),
+    )
+}
+
 /// An invariant violation inside this binary rather than something a peer can
 /// cause.
 fn internal(detail: impl AsRef<str>) -> HostRejection {
@@ -1769,6 +2027,7 @@ mod tests {
         fn with_sink(pipeline_dop: u32, sink: plan::DataSink, sink_edge_ids: Vec<u32>) -> Self {
             Self {
                 frozen: proto::FrozenFragment {
+                    package: Default::default(),
                     plan_version: vec![1; 16],
                     plan_contract_revision: 1,
                     fragment_contract_version: 1,
@@ -4793,5 +5052,338 @@ mod tests {
         );
         assert!(response.message.is_empty() && response.result_arrow_ipc.is_empty());
         assert!(!response.eos);
+    }
+    /// Hosts composed with the compiled-package interpreter: the static
+    /// carrier is a physical package, received, provider-validated and
+    /// compiled during preparation.
+    mod compiled_package_host {
+        use super::*;
+        use std::collections::BTreeMap;
+
+        use crate::backend_task_execution::compiled_package::CompiledPackageInterpreter;
+        use novarocks_connector_contract::PureProviderProgramCatalog;
+        use novarocks_functions::{
+            ConstantPolicy, EngineFunctionCatalogBuilder, FunctionId, FunctionKind,
+            FunctionOverloadId, InstalledPureKernel, PureEngineFunctionCatalog,
+            PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
+        };
+        use novarocks_physical_plan::{
+            FragmentId, FragmentPackageAdmission, FragmentSink, MAX_SCAN_BATCH_BYTES,
+            MAX_SCAN_BATCH_ROWS, NodeKind, PipelineDopDomain, PlanLimits, PlanVersionId,
+            PropertyProofProjectionLimits, ScanReadBudget, extract_fragment_packages,
+        };
+        use novarocks_plan_codec::physical_package_v2::encode_fragment_package;
+        use novarocks_plan_codec::physical_package_v2::test_support::{
+            decode_limits, encode_limits,
+        };
+        use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
+        use novarocks_sql::compiler::{
+            DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl,
+            SqlCompileIntent, SqlCompiler, SqlFinalPlanCompileRequest, SqlPlanningEnvironment,
+            SqlSessionContext, SqlStatementInput, author_fragment_package_semantics,
+            builtin_sql_function_catalog, noop_constant_evaluator,
+        };
+        use novarocks_task_codec::creation::decode_task_assignment;
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+
+        struct Unbounded;
+        impl PureCompileControl for Unbounded {
+            fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                Ok(())
+            }
+        }
+
+        // Explicit fixture admission; these values are not production defaults.
+        fn constants() -> ConstantPolicy {
+            ConstantPolicy {
+                max_rows: 16,
+                max_array_nodes: 128,
+                max_logical_elements: 1024,
+                max_retained_buffer_bytes: 1 << 20,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 1 << 20,
+                max_library_validation_work: 1 << 20,
+                max_library_validation_bytes: 1 << 20,
+            }
+        }
+
+        /// A real sealed RAND-only subset; `SELECT 1` binds no function, but
+        /// the compiler refuses an empty pure catalog. Not the Server catalogue.
+        fn sealed_rand_subset() -> PureEngineFunctionCatalog {
+            let actual =
+                novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog()
+                    .expect("builtin catalogue");
+            let mut builder = EngineFunctionCatalogBuilder::new();
+            builder
+                .register(
+                    actual
+                        .definition("rand", FunctionKind::Scalar)
+                        .expect("rand")
+                        .clone(),
+                )
+                .expect("register rand");
+            builder
+                .seal_pure(
+                    [
+                        "builtin.scalar/rand/()->f64;strict;legacy",
+                        "builtin.scalar/rand/(i64)->f64;strict;legacy",
+                    ]
+                    .into_iter()
+                    .map(|overload| InstalledPureKernel {
+                        function: FunctionId::try_new("builtin.scalar/rand/v1").unwrap(),
+                        kind: FunctionKind::Scalar,
+                        implementation: PureImplementationDeclaration {
+                            overload: FunctionOverloadId::try_new(overload).unwrap(),
+                            implementation: PureImplementationId::try_new(
+                                "builtin.scalar/rand/selected-v1",
+                            )
+                            .unwrap(),
+                            abi: PureKernelAbi::ScalarV1,
+                        },
+                        aggregate_state_format: None,
+                    }),
+                )
+                .expect("sealed rand subset")
+        }
+
+        fn compiled_host(facts: Arc<StubContextFacts>) -> NativeTaskExecutionHost {
+            let providers =
+                PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &Unbounded)
+                    .expect("empty provider catalog");
+            host(facts).with_compiled_package_compiler(Arc::new(CompiledPackageInterpreter::new(
+                FragmentDecodeResourceModel::try_new(&Unbounded).expect("decode model"),
+                decode_limits(),
+                Arc::new(sealed_rand_subset()),
+                Arc::new(providers),
+                constants(),
+            )))
+        }
+
+        /// The producer fragment of a real `SELECT 1` in v2 bytes, and the
+        /// consumer exchange node it streams to.
+        fn select_one_producer() -> (Vec<u8>, u32) {
+            let control = SqlCompileControl::unbounded();
+            let request = SqlFinalPlanCompileRequest::new(
+                PlanVersionId::try_new([9; 16]).expect("plan version"),
+                SqlStatementInput::sql("SELECT 1"),
+                SqlCompileIntent::Query,
+                SqlSessionContext {
+                    sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+                    current_catalog: Some("iceberg".to_string()),
+                    current_database: "db".to_string(),
+                    optimizer_settings: SessionOptimizerSettings::default(),
+                },
+                SqlPlanningEnvironment::Distributed,
+                builtin_sql_function_catalog().snapshot(),
+                noop_constant_evaluator(),
+                constants(),
+                SqlCompileControl::unbounded(),
+                PipelineDopDomain {
+                    min: 1,
+                    max: 8,
+                    requires_power_of_two: true,
+                },
+                ScanReadBudget {
+                    max_batch_rows: MAX_SCAN_BATCH_ROWS,
+                    max_batch_bytes: MAX_SCAN_BATCH_BYTES,
+                },
+                DEFAULT_COMPLETION_LIMITS,
+            )
+            .try_into_completion()
+            .expect("completion request");
+            let owner = SqlCompiler::start(request, &control)
+                .expect("table-free statement")
+                .into_complete()
+                .expect("no observation need")
+                .into_parts()
+                .0;
+            let semantics = author_fragment_package_semantics(&owner, constants(), &control)
+                .expect("package semantics");
+            let mut uses = BTreeMap::new();
+            let mut calls = BTreeMap::new();
+            let mut pruning = BTreeMap::new();
+            let mut admissions = BTreeMap::new();
+            for (id, authored) in semantics {
+                uses.insert(id, authored.expression_uses);
+                calls.insert(id, authored.calls);
+                pruning.insert(id, authored.pruning);
+                admissions.insert(
+                    id,
+                    FragmentPackageAdmission {
+                        plan_limits: PlanLimits::FROZEN,
+                        source_retained_bytes: 64 << 20,
+                        property_projection_limits: PropertyProofProjectionLimits {
+                            max_request_bytes: 16 << 20,
+                            max_coexisting_bytes: 256 << 20,
+                            max_projection_work: 16 << 20,
+                        },
+                    },
+                );
+            }
+            let plan = owner.plan();
+            let mut packages = extract_fragment_packages(
+                plan,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &uses,
+                &calls,
+                &pruning,
+                &admissions,
+                &control,
+            )
+            .expect("checked packages");
+            let producer = plan
+                .fragments()
+                .iter()
+                .find(|(_, fragment)| matches!(fragment.sink(), FragmentSink::Stream { .. }))
+                .map(|(id, _)| *id)
+                .expect("a stream producer");
+            let receiver = plan
+                .fragments()
+                .values()
+                .flat_map(|fragment| fragment.nodes().values())
+                .find(|node| matches!(node.kind, NodeKind::ExchangeSource { .. }))
+                .map(|node| node.id.get())
+                .expect("a gather receiver");
+            let package: novarocks_physical_plan::FragmentPackage =
+                packages.remove(&producer).expect("producer package");
+            let _: FragmentId = producer;
+            let bytes = encode_fragment_package(&package, &encode_limits(), &control)
+                .expect("v2 bytes")
+                .encode_to_vec();
+            (bytes, receiver)
+        }
+
+        fn package_carrier(package: &[u8]) -> FrozenBytes {
+            FrozenBytes::freeze(
+                proto::FrozenFragment {
+                    package: bytes::Bytes::copy_from_slice(package),
+                    ..Default::default()
+                }
+                .encode_to_vec()
+                .into(),
+            )
+        }
+
+        /// A single-driver producer task streaming to `receiver` over edge 3.
+        fn producer_descriptor(identity: TaskIdentity, receiver: u32) -> TaskDescriptor {
+            let node = FragmentNodeId::new(i32::try_from(receiver).expect("small node"));
+            let destination = ExchangeDestination::new(
+                super::identity(70, 2, 1),
+                UniqueId::new(900, 901),
+                RuntimeEndpoint::new("127.0.0.1", 9060).expect("a legal endpoint"),
+                node,
+            );
+            let topology = ExchangeTopology::try_new(
+                vec![
+                    ExchangeEdge::try_new(
+                        ExchangeEdgeId::new(3).expect("nonzero edge"),
+                        node,
+                        DataStreamPartitionType::Unpartitioned,
+                        vec![destination],
+                        0,
+                        NonZeroU32::new(1).expect("nonzero"),
+                    )
+                    .expect("a legal edge"),
+                ],
+                Vec::new(),
+            )
+            .expect("a legal topology");
+            TaskDescriptor::try_new(
+                identity,
+                UniqueId::new(701, 702),
+                NonZeroUsize::new(1).expect("nonzero dop"),
+                Vec::new(),
+                topology,
+            )
+            .expect("a legal descriptor")
+        }
+
+        fn producer_input(descriptor: &TaskDescriptor, carrier: FrozenBytes) -> TaskCreationInput {
+            let assignment = decode_task_assignment(
+                proto::TaskAssignment {
+                    instance_ordinal: 0,
+                    initial_scan_ranges: Vec::new(),
+                    sink_edge_ids: vec![3],
+                },
+                descriptor,
+                FieldPath::root("assignment"),
+            )
+            .expect("a structurally legal assignment");
+            TaskCreationInput::new(carrier, Box::new(assignment))
+        }
+
+        // The FE's own producer package is received, compiled and prepared
+        // by the compiled host into an ordinary task runtime.
+        #[test]
+        fn a_compiled_host_installs_the_fes_own_stream_producer_package() {
+            let (package, receiver) = select_one_producer();
+            let facts = Arc::new(StubContextFacts::default());
+            let host = compiled_host(Arc::clone(&facts));
+            let identity = super::identity(70, 1, 1);
+            let descriptor = producer_descriptor(identity, receiver);
+            let prepared = host
+                .install_receiver(
+                    &descriptor,
+                    producer_input(&descriptor, package_carrier(&package)),
+                )
+                .expect("the compiled producer installs");
+            assert_eq!(prepared.sink_kind(), FragmentSinkKind::DataStream);
+            assert!(host.task_runtime(identity).is_some());
+            host.remove_receiver(&descriptor);
+            assert!(host.task_runtime(identity).is_none());
+        }
+
+        // Exactly one interpreter per process: neither host reads the other
+        // interpreter's carrier, and a package it cannot compile is refused
+        // as content, before anything is prepared.
+        #[test]
+        fn each_host_refuses_the_other_interpreters_carrier() {
+            let (package, receiver) = select_one_producer();
+            let compiled = compiled_host(Arc::new(StubContextFacts::default()));
+            let identity = super::identity(71, 1, 1);
+            let descriptor = producer_descriptor(identity, receiver);
+            let plan_tree = compiled
+                .install_receiver(
+                    &descriptor,
+                    producer_input(&descriptor, Body::values(1).frozen_bytes()),
+                )
+                .expect_err("a compiled host reads no plan tree");
+            assert_eq!(plan_tree.category(), TaskFailureCategory::Protocol);
+            assert!(
+                plan_tree
+                    .detail()
+                    .as_str()
+                    .contains("static package is not decodable"),
+                "{plan_tree}"
+            );
+
+            let legacy = host(Arc::new(StubContextFacts::default()));
+            let refused = legacy
+                .install_receiver(
+                    &descriptor,
+                    producer_input(&descriptor, package_carrier(&package)),
+                )
+                .expect_err("a plan-tree host reads no package");
+            assert_eq!(refused.category(), TaskFailureCategory::Protocol);
+
+            let garbage = compiled
+                .install_receiver(
+                    &descriptor,
+                    producer_input(&descriptor, package_carrier(b"not a package")),
+                )
+                .expect_err("an unreceivable package");
+            assert_eq!(garbage.category(), TaskFailureCategory::Protocol);
+            assert!(
+                garbage
+                    .detail()
+                    .as_str()
+                    .contains("package could not be compiled"),
+                "{garbage}"
+            );
+            assert!(compiled.task_runtime(identity).is_none());
+        }
     }
 }

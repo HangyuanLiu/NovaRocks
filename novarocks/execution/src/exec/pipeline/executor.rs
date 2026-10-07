@@ -565,6 +565,36 @@ pub(crate) fn prepare_compiled_program_pipeline_execution(
     runtime_state: Arc<RuntimeState>,
     event_sink: Arc<dyn FragmentEventSink>,
 ) -> ExecutionResult<PreparedPipelineExecution> {
+    prepare_compiled_program_pipeline_execution_with_profiler(
+        program,
+        time_slice,
+        sink,
+        exchange_bindings,
+        exchange_finst_id,
+        None,
+        pipeline_dop,
+        runtime_state,
+        event_sink,
+    )
+}
+
+/// As [`prepare_compiled_program_pipeline_execution`], reporting into the
+/// Task's profiler.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The compiled program and its Task capabilities are independent inputs"
+)]
+pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler(
+    program: Arc<novarocks_local_program::LocalProgram>,
+    time_slice: Duration,
+    sink: Box<dyn OperatorFactory>,
+    exchange_bindings: ExchangeBindings,
+    exchange_finst_id: Option<(i64, i64)>,
+    profiler: Option<Profiler>,
+    pipeline_dop: i32,
+    runtime_state: Arc<RuntimeState>,
+    event_sink: Arc<dyn FragmentEventSink>,
+) -> ExecutionResult<PreparedPipelineExecution> {
     for node_id in exchange_bindings.node_ids() {
         let binding = exchange_bindings
             .get(node_id)
@@ -616,7 +646,7 @@ pub(crate) fn prepare_compiled_program_pipeline_execution(
         sink,
         Vec::new(),
         exchange_finst_id,
-        None,
+        profiler,
         pipeline_dop,
         runtime_state,
         None,

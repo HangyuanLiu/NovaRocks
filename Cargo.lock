@@ -4144,6 +4144,7 @@ dependencies = [
  "novarocks-execution-contract",
  "novarocks-failpoint",
  "novarocks-functions",
+ "novarocks-local-compiler",
  "novarocks-local-program",
  "novarocks-memory",
  "novarocks-native-trust",

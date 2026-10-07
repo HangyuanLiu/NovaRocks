@@ -664,6 +664,13 @@ message FrozenFragment {
   // introduce a new field; this number and name are never reused.
   reserved 6;
   reserved "required_providers";
+  // The exact bytes of one physical_package_v2.FragmentPackage. A carrier is
+  // either the plan tree (fields 1-5) or this package, never both: the package
+  // owns its plan version, contract revision and DOP domain. It is kept as
+  // opaque bytes so the receiver's generated resource preflight runs before
+  // any message is materialized. Only a compiled-package interpreter accepts
+  // it; the plan-tree interpreter refuses it.
+  bytes package = 7;
 }
 
 message PipelineDopDomain {
