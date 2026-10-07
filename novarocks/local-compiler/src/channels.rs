@@ -259,6 +259,31 @@ fn resolve_core(
                 work.flush()?;
                 (slots, port)
             }
+            NodeKind::Scan { .. } if node.inputs.is_empty() => {
+                // Each provider output occurrence is its own fresh channel in
+                // the public schema order. A repeated provider value is one
+                // read column, so its first ordinal represents it.
+                let mut slots = Vec::new();
+                reserve_vec(&mut slots, node.output.columns.len(), work)?;
+                let mut port = Port::new();
+                for (ordinal, &value) in node.output.columns.iter().enumerate() {
+                    if !fragment.values().contains_key(&value) {
+                        return Err(ChannelLoweringError::Invalid("missing Scan output value"));
+                    }
+                    let slot = u32::try_from(next_slot)
+                        .map_err(|_| ChannelLoweringError::Invalid("slot identity exhausted"))?;
+                    next_slot = next_slot
+                        .checked_add(1)
+                        .ok_or(ChannelLoweringError::Invalid("slot identity exhausted"))?;
+                    slots.push(SlotId::new(slot));
+                    port.entry(value).or_insert(ordinal);
+                    work.step()?;
+                }
+                work.flush()?;
+                let slots: Arc<[SlotId]> = Arc::from(slots);
+                work.flush()?;
+                (slots, port)
+            }
             NodeKind::SetOp {
                 kind: novarocks_physical_plan::SetOperationKind::UnionAll,
                 input_mappings,
@@ -559,16 +584,23 @@ fn resolve_core(
                     .ok_or(ChannelLoweringError::Invalid(
                         "missing value-reference owner",
                     ))?;
-            if owner.inputs.len() != 1 {
-                return Err(ChannelLoweringError::Invalid(
-                    "value reference requires one exact input",
-                ));
-            }
-            let child = owner.inputs[0];
-            let child_channels = nodes.get(&child).ok_or(ChannelLoweringError::Invalid(
+            // A scan-owned root reads the scan's own output port, exactly the
+            // input layout that root binding names; every other owner reads
+            // its one exact input.
+            let scope = if matches!(owner.kind, NodeKind::Scan { .. }) {
+                definition.owner
+            } else {
+                if owner.inputs.len() != 1 {
+                    return Err(ChannelLoweringError::Invalid(
+                        "value reference requires one exact input",
+                    ));
+                }
+                owner.inputs[0]
+            };
+            let scope_channels = nodes.get(&scope).ok_or(ChannelLoweringError::Invalid(
                 "value input is outside the source tree",
             ))?;
-            let input = resolve_input(value, child_channels, &ports[&child])?;
+            let input = resolve_input(value, scope_channels, &ports[&scope])?;
             let source_type = &fragment
                 .values()
                 .get(&value)

@@ -386,6 +386,7 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
         &allowed,
         BTreeMap::new(),
         BTreeMap::new(),
+        BTreeMap::new(),
         &control,
     )
     .unwrap();

@@ -49,12 +49,23 @@ pub struct CompiledExchangeInput {
     pub source_fragment: u32,
 }
 
+/// Compiled-only physical address of one actual provider `Scan` node. A
+/// compiled node has no legacy native identity, so the program names the
+/// physical node that keys the task's runtime split queue, range scope and
+/// scan assignment instead of deriving it from a node ID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompiledScanInput {
+    /// Physical NodeId of the scan; runtime splits are addressed to it.
+    pub scan_node: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct LocalProgram {
     checked: ProgramLexicalBindings,
     provenance: ProgramProvenance,
     writes: BTreeMap<ProgramNodeId, ConnectorWriteRecipe>,
     exchange_inputs: BTreeMap<ProgramNodeId, CompiledExchangeInput>,
+    scan_inputs: BTreeMap<ProgramNodeId, CompiledScanInput>,
     arithmetic: BTreeMap<crate::ProgramUseRef, novarocks_functions::PreparedArithmeticRecipe>,
     casts: BTreeMap<crate::ProgramUseRef, novarocks_functions::PreparedCastRecipe>,
     comparisons: BTreeMap<ProgramComparisonSite, novarocks_functions::PreparedComparisonRecipe>,
@@ -71,6 +82,11 @@ pub enum LocalProgramCompileError {
     ExchangeInputMismatch(ProgramNodeId),
     /// Two compiled exchange inputs name the same physical receiver.
     DuplicateExchangeReceiver(u32),
+    /// The compiled scan addresses, the actual `Scan` nodes and their `Scan`
+    /// requirements are not the same node set.
+    ScanInputMismatch(ProgramNodeId),
+    /// Two compiled scan inputs name the same physical scan node.
+    DuplicateScanNode(u32),
     Origins(CompiledOriginsError),
     Provider(ProviderLinkError),
     Primitive(ProgramPrimitiveError),
@@ -116,6 +132,14 @@ impl fmt::Display for LocalProgramCompileError {
                 f,
                 "compiled exchange inputs share physical receiver node {receiver}"
             ),
+            Self::ScanInputMismatch(node) => write!(
+                f,
+                "compiled scan input addresses differ from the scan nodes at local node {}",
+                node.index()
+            ),
+            Self::DuplicateScanNode(scan) => {
+                write!(f, "compiled scan inputs share physical scan node {scan}")
+            }
         }
     }
 }
@@ -128,7 +152,9 @@ impl std::error::Error for LocalProgramCompileError {
             Self::Primitive(error) => Some(error),
             Self::MissingSink
             | Self::ExchangeInputMismatch(_)
-            | Self::DuplicateExchangeReceiver(_) => None,
+            | Self::DuplicateExchangeReceiver(_)
+            | Self::ScanInputMismatch(_)
+            | Self::DuplicateScanNode(_) => None,
         }
     }
 }
@@ -139,12 +165,15 @@ impl LocalProgram {
     /// output guarantees and the existence of synthetic non-node entities.
     /// `exchange_inputs` addresses exactly the graph's `ExchangeSource` nodes,
     /// which are exactly its `ExchangeInput` requirements; receivers are unique.
+    /// `scan_inputs` likewise addresses exactly its `Scan` nodes, which are
+    /// exactly its `Scan` requirements; physical scan nodes are unique.
     pub fn try_new(
         checked: ProgramLexicalBindings,
         operators: Vec<LocalOperatorProvenance>,
         allowed_sources: &BTreeSet<DiagnosticSourceNodeId>,
         writes: BTreeMap<ProgramNodeId, ConnectorWriteRecipe>,
         exchange_inputs: BTreeMap<ProgramNodeId, CompiledExchangeInput>,
+        scan_inputs: BTreeMap<ProgramNodeId, CompiledScanInput>,
         control: &dyn PureCompileControl,
     ) -> Result<Self, LocalProgramCompileError> {
         let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
@@ -168,6 +197,7 @@ impl LocalProgram {
             crate::compiled_origins::compile_origins(graph, operators, allowed_sources, control)?;
         crate::provider_links::validate_provider_links(&checked, &writes, control)?;
         validate_exchange_inputs(graph, &exchange_inputs, control)?;
+        validate_scan_inputs(graph, &scan_inputs, control)?;
         let arithmetic = crate::primitives::compile_arithmetic(&checked, control)?;
         let casts = crate::primitives::compile_casts(&checked, control)?;
         let comparisons = crate::primitives::compile_comparisons(&checked, control)?;
@@ -180,6 +210,7 @@ impl LocalProgram {
             provenance,
             writes,
             exchange_inputs,
+            scan_inputs,
             comparisons,
             null_safe_comparisons,
             arithmetic,
@@ -206,6 +237,10 @@ impl LocalProgram {
     /// Exact receiver address of every `ExchangeSource` node in this program.
     pub fn exchange_inputs(&self) -> &BTreeMap<ProgramNodeId, CompiledExchangeInput> {
         &self.exchange_inputs
+    }
+    /// Exact physical scan address of every `Scan` node in this program.
+    pub fn scan_inputs(&self) -> &BTreeMap<ProgramNodeId, CompiledScanInput> {
+        &self.scan_inputs
     }
     pub fn comparison_recipe(
         &self,
@@ -244,6 +279,17 @@ impl LocalProgram {
     }
 }
 
+/// One compiled-only source address family: which nodes it addresses, which
+/// requirement declares such a node, the physical identity that must be unique
+/// and the errors naming a coverage gap or a shared physical identity.
+struct AddressFamily<A> {
+    addressed: fn(&ProgramNodeKind) -> bool,
+    declared: fn(&BindingRequirement) -> Option<ProgramNodeId>,
+    physical: fn(&A) -> u32,
+    mismatch: fn(ProgramNodeId) -> LocalProgramCompileError,
+    duplicate: fn(u32) -> LocalProgramCompileError,
+}
+
 /// Require one address per actual exchange receiver and per declared exchange
 /// input, and no address elsewhere. A first control refusal stays primary.
 fn validate_exchange_inputs(
@@ -251,9 +297,56 @@ fn validate_exchange_inputs(
     exchange_inputs: &BTreeMap<ProgramNodeId, CompiledExchangeInput>,
     control: &dyn PureCompileControl,
 ) -> Result<(), LocalProgramCompileError> {
+    validate_addresses(
+        graph,
+        exchange_inputs,
+        AddressFamily {
+            addressed: |kind| matches!(kind, ProgramNodeKind::ExchangeSource { .. }),
+            declared: |requirement| match requirement {
+                BindingRequirement::ExchangeInput { node, .. } => Some(*node),
+                _ => None,
+            },
+            physical: |input| input.receiver_node,
+            mismatch: LocalProgramCompileError::ExchangeInputMismatch,
+            duplicate: LocalProgramCompileError::DuplicateExchangeReceiver,
+        },
+        control,
+    )
+}
+
+/// Require one address per actual scan and per declared scan requirement, and
+/// no address elsewhere. A first control refusal stays primary.
+fn validate_scan_inputs(
+    graph: &LocalProgramGraph,
+    scan_inputs: &BTreeMap<ProgramNodeId, CompiledScanInput>,
+    control: &dyn PureCompileControl,
+) -> Result<(), LocalProgramCompileError> {
+    validate_addresses(
+        graph,
+        scan_inputs,
+        AddressFamily {
+            addressed: |kind| matches!(kind, ProgramNodeKind::Scan { .. }),
+            declared: |requirement| match requirement {
+                BindingRequirement::Scan { node, .. } => Some(*node),
+                _ => None,
+            },
+            physical: |input| input.scan_node,
+            mismatch: LocalProgramCompileError::ScanInputMismatch,
+            duplicate: LocalProgramCompileError::DuplicateScanNode,
+        },
+        control,
+    )
+}
+
+fn validate_addresses<A>(
+    graph: &LocalProgramGraph,
+    addresses: &BTreeMap<ProgramNodeId, A>,
+    family: AddressFamily<A>,
+    control: &dyn PureCompileControl,
+) -> Result<(), LocalProgramCompileError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)
         .map_err(LocalProgramCompileError::Control)?;
-    let result = validate_exchange_inputs_core(graph, exchange_inputs, &mut work);
+    let result = validate_addresses_core(graph, addresses, &family, &mut work);
     if matches!(result, Err(LocalProgramCompileError::Control(_))) {
         return result;
     }
@@ -261,15 +354,16 @@ fn validate_exchange_inputs(
     result
 }
 
-fn validate_exchange_inputs_core(
+fn validate_addresses_core<A>(
     graph: &LocalProgramGraph,
-    exchange_inputs: &BTreeMap<ProgramNodeId, CompiledExchangeInput>,
+    addresses: &BTreeMap<ProgramNodeId, A>,
+    family: &AddressFamily<A>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), LocalProgramCompileError> {
     let mut required = BTreeSet::new();
     for requirement in graph.requirements().entries() {
-        if let BindingRequirement::ExchangeInput { node, .. } = requirement {
-            required.insert(*node);
+        if let Some(node) = (family.declared)(requirement) {
+            required.insert(node);
         }
         work.step().map_err(LocalProgramCompileError::Control)?;
     }
@@ -278,36 +372,35 @@ fn validate_exchange_inputs_core(
         let present = node.index() < graph.nodes().len();
         work.step().map_err(LocalProgramCompileError::Control)?;
         if !present {
-            return Err(LocalProgramCompileError::ExchangeInputMismatch(*node));
+            return Err((family.mismatch)(*node));
         }
     }
-    let mut receivers = BTreeSet::new();
+    let mut physical = BTreeSet::new();
     for (index, node) in graph.nodes().iter().enumerate() {
         let id = ProgramNodeId::new(index);
-        let exchange = matches!(node.kind(), ProgramNodeKind::ExchangeSource { .. });
+        let addressed = (family.addressed)(node.kind());
         let declared = required.contains(&id);
-        let address = exchange_inputs.get(&id);
+        let address = addresses.get(&id);
         work.step().map_err(LocalProgramCompileError::Control)?;
-        match (exchange, declared, address) {
+        match (addressed, declared, address) {
             (true, true, Some(input)) => {
-                let unique = receivers.insert(input.receiver_node);
+                let identity = (family.physical)(input);
+                let unique = physical.insert(identity);
                 work.step().map_err(LocalProgramCompileError::Control)?;
                 if !unique {
-                    return Err(LocalProgramCompileError::DuplicateExchangeReceiver(
-                        input.receiver_node,
-                    ));
+                    return Err((family.duplicate)(identity));
                 }
             }
             (false, false, None) => {}
-            _ => return Err(LocalProgramCompileError::ExchangeInputMismatch(id)),
+            _ => return Err((family.mismatch)(id)),
         }
     }
     // An address for a node outside the graph cannot be hidden either.
-    for id in exchange_inputs.keys() {
+    for id in addresses.keys() {
         let present = id.index() < graph.nodes().len();
         work.step().map_err(LocalProgramCompileError::Control)?;
         if !present {
-            return Err(LocalProgramCompileError::ExchangeInputMismatch(*id));
+            return Err((family.mismatch)(*id));
         }
     }
     Ok(())

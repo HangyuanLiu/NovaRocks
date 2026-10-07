@@ -25,6 +25,7 @@ use crate::{
     exchange::lower_exchange_source,
     expressions::{ExpressionLoweringError, lower_expressions_with_unions, prepare_calls},
     repeat::{RepeatLoweringError, lower_repeat},
+    scan::{admit_scan, lower_scan},
     sort::lower_sort,
     stream_sink::lower_stream_sink,
     topn::lower_topn,
@@ -210,7 +211,9 @@ fn lower(
     options: LocalCompileOptions,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<LocalProgram, FragmentCompileError> {
-    let package = input.package();
+    // Each validated provider recipe moves into its one lowered owner.
+    let (package, mut reads, writes) = input.into_parts();
+    let package = &package;
     let physical = package.fragment();
     let dop = u32::try_from(options.pipeline_dop.get())
         .map_err(|_| FragmentCompileError::Invalid("DOP exceeds physical domain"))?;
@@ -292,14 +295,15 @@ fn lower(
             });
         }
     }
-    if !input.reads().is_empty()
-        || !input.writes().is_empty()
+    // Provider reads are admitted per scan below; writers and runtime-filter
+    // graphs remain explicit.
+    if !writes.is_empty()
         || !package.cuts().runtime_filters.is_empty()
         || !physical.runtime_filters().is_empty()
     {
         return Err(FragmentCompileError::Unsupported {
             node: None,
-            feature: "provider or runtime-filter graph",
+            feature: "provider writer or runtime-filter graph",
         });
     }
     // The result port exists exactly for a Result sink; a stream producer
@@ -317,6 +321,7 @@ fn lower(
     // node has one execution owner; shared subgraphs remain unsupported.
     let mut order = Vec::new();
     let mut visited = BTreeSet::new();
+    let mut scans = BTreeSet::new();
     let mut stack = Vec::new();
     let mut expanded_nodes = physical.nodes().len();
     let mut derived_definitions = 0usize;
@@ -457,7 +462,9 @@ fn lower(
             }
         );
         let supported = match &node.kind {
-            NodeKind::Values { .. } | NodeKind::ExchangeSource { .. } => node.inputs.is_empty(),
+            NodeKind::Values { .. } | NodeKind::ExchangeSource { .. } | NodeKind::Scan { .. } => {
+                node.inputs.is_empty()
+            }
             NodeKind::Project { .. }
             | NodeKind::Limit { .. }
             | NodeKind::AssertOneRow(_)
@@ -486,6 +493,10 @@ fn lower(
                 feature: "node family or occurrence shape",
             });
         }
+        if matches!(node.kind, NodeKind::Scan { .. }) {
+            admit_scan(node, reads.get(&id), work)?;
+            scans.insert(id);
+        }
         stack.push((id, true, depth));
         for &child in node.inputs.iter().rev() {
             stack.push((child, false, depth + if union { 2 } else { 1 }));
@@ -498,10 +509,21 @@ fn lower(
             "unrepresented physical nodes",
         ));
     }
+    // Each admitted scan found its recipe; a recipe for any other node is
+    // never silently left behind.
+    work.step()?;
+    if reads.len() != scans.len() {
+        return Err(FragmentCompileError::Invalid(
+            "provider read recipe names no admitted scan node",
+        ));
+    }
     // Expansion conservatively loses distribution knowledge. It still has
-    // the exact singleton child and one driver; no exchange/scan is admitted.
-    // Only descendants of this actual expansion can consume that uncertainty.
-    let mut properties = BTreeMap::<NodeId, (bool, bool)>::new();
+    // the exact singleton child and one driver; only descendants of this
+    // actual expansion can consume that uncertainty. A runtime-split scan is
+    // an unconstrained source in its own right: its rows land on any instance
+    // and driver, and only its transparent Project/Filter/Limit descendants
+    // inherit that placement.
+    let mut properties = BTreeMap::<NodeId, (bool, bool, bool)>::new();
     for &id in order.iter().rev() {
         let node = &physical.nodes()[&id];
         let mut expanded = false;
@@ -511,9 +533,17 @@ fn lower(
         }
         let sorted = node.inputs.len() == 1 && properties.get(&node.inputs[0]).is_some_and(|p| p.1);
         let changes = matches!(node.kind, NodeKind::ChangeEventExpand { .. });
+        let transparent = matches!(
+            node.kind,
+            NodeKind::Project { .. } | NodeKind::Filter { .. } | NodeKind::Limit { .. }
+        );
+        let scan_rooted = matches!(node.kind, NodeKind::Scan { .. })
+            || (transparent
+                && node.inputs.len() == 1
+                && properties.get(&node.inputs[0]).is_some_and(|p| p.2));
         let unknown = node.output_properties.distribution == Distribution::Unconstrained;
         work.step()?;
-        if (unknown && !expanded && !changes)
+        if (unknown && !expanded && !changes && !scan_rooted)
             || ((expanded || changes) && options.pipeline_dop.get() != 1)
         {
             return Err(FragmentCompileError::Unsupported {
@@ -532,17 +562,20 @@ fn lower(
                 ..
             }
         );
-        let transparent = matches!(
-            node.kind,
-            NodeKind::Project { .. } | NodeKind::Filter { .. } | NodeKind::Limit { .. }
-        );
         if !(node.output_properties.ordering.is_empty() || global || (sorted && transparent)) {
             return Err(FragmentCompileError::Unsupported {
                 node: Some(id),
                 feature: "ordering lacks supported global-sort source",
             });
         }
-        properties.insert(id, (expanded || changes, global || (sorted && transparent)));
+        properties.insert(
+            id,
+            (
+                expanded || changes,
+                global || (sorted && transparent),
+                scan_rooted,
+            ),
+        );
     }
     work.flush()?;
     let channels_plan = resolve_tree_channels(package, &order, work.control())?;
@@ -562,8 +595,11 @@ fn lower(
     let mut operators = Vec::new();
     let mut allowed = BTreeSet::new();
     let mut union_roots = Vec::new();
-    let mut exchange_requirements = Vec::new();
+    let mut source_requirements = Vec::new();
     let mut exchange_inputs = BTreeMap::new();
+    let mut scan_inputs = BTreeMap::new();
+    // Local nodes whose layout is a provider scan layout unchanged.
+    let mut scan_layouts = BTreeSet::new();
     crate::assert_rows::reserve_vec(&mut nodes, expanded_nodes, work)?;
     crate::assert_rows::reserve_vec(&mut operators, expanded_nodes, work)?;
     crate::assert_rows::reserve_vec(&mut channels, channel_count, work)?;
@@ -684,11 +720,29 @@ fn lower(
                         options.exchange_wait,
                         work.control(),
                     )?;
-                    exchange_requirements.push(BindingRequirement::ExchangeInput {
+                    source_requirements.push(BindingRequirement::ExchangeInput {
                         node: id,
                         layout: lowered.layout.clone(),
                     });
                     exchange_inputs.insert(id, lowered.input);
+                    (lowered.kind, lowered.layout)
+                }
+                NodeKind::Scan { .. } => {
+                    let recipe = reads.remove(&source).ok_or(FragmentCompileError::Invalid(
+                        "missing provider read recipe",
+                    ))?;
+                    work.flush()?;
+                    let lowered = lower_scan(
+                        node,
+                        id,
+                        recipe,
+                        &planned.slots,
+                        &expressions.ids,
+                        work.control(),
+                    )?;
+                    source_requirements.push(lowered.requirement);
+                    scan_inputs.insert(id, lowered.input);
+                    scan_layouts.insert(id);
                     (lowered.kind, lowered.layout)
                 }
                 NodeKind::Sort { .. } => {
@@ -937,6 +991,21 @@ fn lower(
                 "output occurrence width changed",
             ));
         }
+        // A one-input family that reuses the child's provider schema object
+        // still publishes the provider's field names, not SQL labels.
+        if let [child] = node.inputs.as_ref() {
+            let inherited = local_ids.get(child).is_some_and(|child| {
+                scan_layouts.contains(child)
+                    && Arc::ptr_eq(
+                        layout.schema(),
+                        nodes[child.index()].output_layout().schema(),
+                    )
+            });
+            work.step()?;
+            if inherited {
+                scan_layouts.insert(id);
+            }
+        }
         for (ordinal, value) in node.output.columns.iter().enumerate() {
             work.step()?;
             let ty: FunctionValueType = physical
@@ -973,10 +1042,16 @@ fn lower(
         });
         nodes.push(ProgramNode::new_local(id, vec![source_id], kind, layout));
     }
-    // Each inbound cut is consumed by exactly one lowered receiver.
+    // Each inbound cut is consumed by exactly one lowered receiver, and each
+    // provider recipe by exactly one lowered scan.
     if exchange_inputs.len() != package.cuts().inbound.len() {
         return Err(FragmentCompileError::Invalid(
             "inbound exchange cut has no lowered receiver",
+        ));
+    }
+    if !reads.is_empty() {
+        return Err(FragmentCompileError::Invalid(
+            "provider read recipe has no lowered scan",
         ));
     }
     let root = local_ids[&physical.root()];
@@ -988,7 +1063,7 @@ fn lower(
         root_layout.identity_for_compile(work.control())?,
         options.kernel_abi,
     );
-    let mut requirement_entries = exchange_requirements;
+    let mut requirement_entries = source_requirements;
     let (sink, stream) = match stream_cut {
         Some(cut) => {
             work.flush()?;
@@ -997,6 +1072,28 @@ fn lower(
             (lowered.sink, Some(lowered.flow))
         }
         None => {
+            // A provider layout cannot be relabeled: its fields must equal the
+            // public schema. Publishing it as a result therefore requires the
+            // result labels to be exactly the provider names.
+            if scan_layouts.contains(&root) {
+                let result = result.ok_or(FragmentCompileError::Invalid("missing result port"))?;
+                let fields = root_layout.schema().fields();
+                if result.fields.len() != fields.len() {
+                    return Err(FragmentCompileError::Invalid(
+                        "result width differs from its root layout",
+                    ));
+                }
+                for (label, field) in result.fields.iter().zip(fields.iter()) {
+                    let same = label.alias.as_deref().unwrap_or(&label.name) == field.name();
+                    work.step()?;
+                    if !same {
+                        return Err(FragmentCompileError::Unsupported {
+                            node: Some(physical.root()),
+                            feature: "result labels differ from the provider scan layout",
+                        });
+                    }
+                }
+            }
             requirement_entries.push(BindingRequirement::ResultSink {
                 layout: root_layout.clone(),
             });
@@ -1081,6 +1178,9 @@ fn lower(
             ExpressionRootRole::FilterPredicate { predicate: 0 } => {
                 ProgramNodeExpressionRole::FilterPredicate
             }
+            ExpressionRootRole::ScanResidual { predicate: 0 } => {
+                ProgramNodeExpressionRole::ScanResidual
+            }
             ExpressionRootRole::SortOrder { key } => ProgramNodeExpressionRole::SortOrder { key },
             ExpressionRootRole::TopNOrder { key } => ProgramNodeExpressionRole::SortOrder { key },
             ExpressionRootRole::ProjectOutput { expression } => {
@@ -1152,6 +1252,7 @@ fn lower(
         &allowed,
         BTreeMap::new(),
         exchange_inputs,
+        scan_inputs,
         work.control(),
     )
     .map_err(Into::into)

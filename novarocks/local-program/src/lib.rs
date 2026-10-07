@@ -41,7 +41,9 @@ mod typed_channels;
 mod typed_expressions;
 mod values;
 
-pub use compiled::{CompiledExchangeInput, LocalProgram, LocalProgramCompileError};
+pub use compiled::{
+    CompiledExchangeInput, CompiledScanInput, LocalProgram, LocalProgramCompileError,
+};
 pub use compiled_origins::CompiledOriginsError;
 pub use contract::{
     CompileProfile, FragmentProgramOptions, FragmentSinkAssignmentKind,

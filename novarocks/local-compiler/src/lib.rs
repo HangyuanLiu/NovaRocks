@@ -29,6 +29,7 @@ mod expressions;
 mod lowering;
 mod original_requests;
 mod repeat;
+mod scan;
 mod union;
 mod union_flow;
 mod unpivot;
@@ -72,6 +73,18 @@ impl ProviderValidatedFragment {
     }
     pub fn writes(&self) -> &BTreeMap<NodeId, ConnectorWriteRecipe> {
         &self.writes
+    }
+    /// Lowering moves each validated recipe into its one scan or writer owner
+    /// instead of copying it beside the retained package.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Arc<FragmentPackage>,
+        BTreeMap<NodeId, ConnectorReadProgramRecipe>,
+        BTreeMap<NodeId, ConnectorWriteRecipe>,
+    ) {
+        (self.package, self.reads, self.writes)
     }
 }
 
@@ -203,6 +216,9 @@ mod values;
 
 #[cfg(test)]
 mod exchange_lowering_tests;
+
+#[cfg(test)]
+mod scan_lowering_tests;
 
 #[cfg(test)]
 mod union_flow_tests;

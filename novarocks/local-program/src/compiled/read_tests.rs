@@ -231,14 +231,36 @@ pub(super) fn checked(
     schema: Schema,
     logical: ValueLogicalType,
 ) -> ProgramLexicalBindings {
+    checked_scans(vec![source], schema, logical)
+}
+/// Each local node keeps its own distinct diagnostic source; node 0 keeps the
+/// sparse maximum used by the single-scan fixture.
+fn source_id(index: usize) -> DiagnosticSourceNodeId {
+    DiagnosticSourceNodeId::new(u32::MAX - index as u32)
+}
+/// One scan as the root, or several scans under one UnionAll root. Every node
+/// shares the one exact public layout; no runtime split is represented.
+fn checked_scans(
+    sources: Vec<ProgramScanSource>,
+    schema: Schema,
+    logical: ValueLogicalType,
+) -> ProgramLexicalBindings {
     let control = Control::default();
     let ty = value_type(logical, schema.field(0));
     let layout = StaticLayout::try_new(Arc::new(schema), Arc::from([SlotId::new(1)])).unwrap();
-    let header = source.relation_header().clone();
-    let graph = LocalProgramGraph::try_new_with_sink(
-        vec![ProgramNode::new_local(
-            ProgramNodeId::new(0),
-            vec![DiagnosticSourceNodeId::new(u32::MAX)],
+    let mut nodes = Vec::new();
+    let mut requirements = Vec::new();
+    for (index, source) in sources.into_iter().enumerate() {
+        requirements.push(BindingRequirement::Scan {
+            node: ProgramNodeId::new(index),
+            kind: ScanSourceKind::TypedConnector {
+                relation: source.relation_header().clone(),
+            },
+            layout: layout.clone(),
+        });
+        nodes.push(ProgramNode::new_local(
+            ProgramNodeId::new(index),
+            vec![source_id(index)],
             ProgramNodeKind::Scan {
                 source,
                 runtime_filters: vec![],
@@ -246,8 +268,24 @@ pub(super) fn checked(
                 limit: None,
             },
             layout.clone(),
-        )],
-        ProgramNodeId::new(0),
+        ));
+    }
+    if nodes.len() > 1 {
+        let inputs = (0..nodes.len()).map(ProgramNodeId::new).collect();
+        nodes.push(ProgramNode::new_local(
+            ProgramNodeId::new(nodes.len()),
+            vec![source_id(nodes.len())],
+            ProgramNodeKind::UnionAll { inputs },
+            layout.clone(),
+        ));
+    }
+    let count = nodes.len();
+    requirements.push(BindingRequirement::ResultSink {
+        layout: layout.clone(),
+    });
+    let graph = LocalProgramGraph::try_new_with_sink(
+        nodes,
+        ProgramNodeId::new(count - 1),
         Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap()),
         CompileProfile::new(
             NonZeroUsize::new(1).unwrap(),
@@ -255,15 +293,7 @@ pub(super) fn checked(
             layout.identity().unwrap(),
             KernelAbiVersion::CURRENT,
         ),
-        BindingRequirements::try_new(vec![
-            BindingRequirement::Scan {
-                node: ProgramNodeId::new(0),
-                kind: ScanSourceKind::TypedConnector { relation: header },
-                layout: layout.clone(),
-            },
-            BindingRequirement::ResultSink { layout },
-        ])
-        .unwrap(),
+        BindingRequirements::try_new(requirements).unwrap(),
         Some(StaticSinkProgram::Result),
     )
     .unwrap();
@@ -294,14 +324,18 @@ pub(super) fn checked(
     let expressions = ProgramTypedExpressions::try_new(calls, types, &control).unwrap();
     let channels = ProgramTypedChannels::try_new(
         expressions,
-        vec![(
-            ProgramChannelSite::Layout {
-                node: ProgramNodeId::new(0),
-                role: ProgramChannelLayoutRole::NodeOutput,
-                ordinal: 0,
-            },
-            ty,
-        )],
+        (0..count)
+            .map(|index| {
+                (
+                    ProgramChannelSite::Layout {
+                        node: ProgramNodeId::new(index),
+                        role: ProgramChannelLayoutRole::NodeOutput,
+                        ordinal: 0,
+                    },
+                    ty.clone(),
+                )
+            })
+            .collect(),
         &control,
     )
     .unwrap();
@@ -311,23 +345,44 @@ fn finish(
     checked: ProgramLexicalBindings,
     control: &dyn PureCompileControl,
 ) -> Result<LocalProgram, LocalProgramCompileError> {
+    finish_with(checked, scan_address(0, u32::MAX), control)
+}
+fn scan_address(node: usize, scan_node: u32) -> BTreeMap<ProgramNodeId, CompiledScanInput> {
+    BTreeMap::from([(ProgramNodeId::new(node), CompiledScanInput { scan_node })])
+}
+fn finish_with(
+    checked: ProgramLexicalBindings,
+    scan_inputs: BTreeMap<ProgramNodeId, CompiledScanInput>,
+    control: &dyn PureCompileControl,
+) -> Result<LocalProgram, LocalProgramCompileError> {
+    let count = checked
+        .channels()
+        .expressions()
+        .resolved_calls()
+        .snapshot()
+        .program()
+        .nodes()
+        .len();
     LocalProgram::try_new(
         checked,
-        vec![LocalOperatorProvenance {
-            id: LocalOperatorId::new(0),
-            lowered_nodes: Box::from([ProgramNodeId::new(0)]),
-            sources: Box::from([DiagnosticSourceNodeId::new(u32::MAX)]),
-            origin: LocalOperatorOrigin::Direct,
-            cost_owner: LocalOperatorId::new(0),
-            metrics: OperatorMetricAggregation {
-                cpu_time: MetricAggregation::Sum,
-                wall_time: MetricAggregation::Maximum,
-                peak_retained_bytes: MetricAggregation::Maximum,
-            },
-        }],
-        &BTreeSet::from([DiagnosticSourceNodeId::new(u32::MAX)]),
+        (0..count)
+            .map(|index| LocalOperatorProvenance {
+                id: LocalOperatorId::new(index as u32),
+                lowered_nodes: Box::from([ProgramNodeId::new(index)]),
+                sources: Box::from([source_id(index)]),
+                origin: LocalOperatorOrigin::Direct,
+                cost_owner: LocalOperatorId::new(index as u32),
+                metrics: OperatorMetricAggregation {
+                    cpu_time: MetricAggregation::Sum,
+                    wall_time: MetricAggregation::Maximum,
+                    peak_retained_bytes: MetricAggregation::Maximum,
+                },
+            })
+            .collect(),
+        &(0..count).map(source_id).collect(),
         BTreeMap::new(),
         BTreeMap::new(),
+        scan_inputs,
         control,
     )
 }
@@ -498,4 +553,50 @@ fn actual_final_scan_owner_refusals_keep_original_control_at_every_callback() {
             );
         }
     }
+}
+
+#[test]
+fn scan_input_addresses_cover_exactly_the_actual_scans() {
+    let source = checked(recipe().into(), schema(), ValueLogicalType::Json);
+    // A scan without an address cannot borrow a legacy native node ID.
+    assert_eq!(
+        finish_with(source.clone(), BTreeMap::new(), &Control::default()).unwrap_err(),
+        LocalProgramCompileError::ScanInputMismatch(ProgramNodeId::new(0))
+    );
+    // An address for a node outside the graph is not hidden by the node walk.
+    let mut outside = scan_address(0, u32::MAX);
+    outside.insert(ProgramNodeId::new(9), CompiledScanInput { scan_node: 3 });
+    assert_eq!(
+        finish_with(source.clone(), outside, &Control::default()).unwrap_err(),
+        LocalProgramCompileError::ScanInputMismatch(ProgramNodeId::new(9))
+    );
+    let program = finish(source, &Control::default()).unwrap();
+    assert_eq!(program.scan_inputs(), &scan_address(0, u32::MAX));
+    assert!(program.exchange_inputs().is_empty());
+}
+
+#[test]
+fn two_scans_never_share_one_physical_scan_node_and_the_union_is_not_addressed() {
+    let source = checked_scans(
+        vec![recipe().into(), recipe().into()],
+        schema(),
+        ValueLogicalType::Json,
+    );
+    let mut shared = scan_address(0, 5);
+    shared.insert(ProgramNodeId::new(1), CompiledScanInput { scan_node: 5 });
+    assert_eq!(
+        finish_with(source.clone(), shared, &Control::default()).unwrap_err(),
+        LocalProgramCompileError::DuplicateScanNode(5)
+    );
+    let mut distinct = scan_address(0, 5);
+    distinct.insert(ProgramNodeId::new(1), CompiledScanInput { scan_node: 6 });
+    // The non-scan UnionAll root is never an addressed scan.
+    let mut union = distinct.clone();
+    union.insert(ProgramNodeId::new(2), CompiledScanInput { scan_node: 7 });
+    assert_eq!(
+        finish_with(source.clone(), union, &Control::default()).unwrap_err(),
+        LocalProgramCompileError::ScanInputMismatch(ProgramNodeId::new(2))
+    );
+    let program = finish_with(source, distinct.clone(), &Control::default()).unwrap();
+    assert_eq!(program.scan_inputs(), &distinct);
 }
