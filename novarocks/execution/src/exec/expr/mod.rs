@@ -28,6 +28,8 @@ pub mod dict_peel;
 pub mod function;
 mod in_pred;
 mod literal;
+#[cfg(test)]
+pub(crate) mod pure_differential;
 mod slot;
 pub(crate) mod static_program;
 mod struct_expr;
