@@ -190,6 +190,8 @@ impl RuntimeFilterLifecycleView {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DistributedQueryIntent {
     Result,
+    /// Signed bounded selection, validated before external COW write admission.
+    CowMatch,
     Write,
     Profile,
     /// Internal collection execution. Its completion carries typed evidence,
@@ -204,6 +206,7 @@ pub enum DistributedQueryIntent {
 /// capabilities.
 pub struct DistributedQueryRequest {
     result_window: Option<novarocks_workload_control::ResultWindowAlias>,
+    cow_match: Option<crate::query_execution::row_mutation::CowMatchRootConsumer>,
     payload: DistributedQueryPayload,
     topology: novarocks_query_application::api::BackendTopologySnapshot,
     deadline: Option<Instant>,
@@ -248,6 +251,7 @@ impl RestartableReadExecution {
     ) -> DistributedQueryRequest {
         DistributedQueryRequest {
             result_window: None,
+            cow_match: None,
             payload: DistributedQueryPayload::RestartableRead(Arc::clone(self)),
             topology: execution.topology().clone(),
             deadline: execution.deadline(),
@@ -266,6 +270,20 @@ impl RestartableReadExecution {
 }
 
 impl DistributedQueryRequest {
+    pub(crate) fn with_cow_match_consumer(
+        mut self,
+        consumer: crate::query_execution::row_mutation::CowMatchRootConsumer,
+    ) -> Result<Self, DistributedQueryError> {
+        if self.intent() != DistributedQueryIntent::CowMatch || self.cow_match.is_some() {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "COW match consumer requires its dedicated single-use intent",
+            ));
+        }
+        self.cow_match = Some(consumer);
+        Ok(self)
+    }
+
     /// Bind runtime capacity supplied by statement admission. This never enters
     /// the frozen semantic description or constructs a new result allowance.
     pub(crate) fn with_result_window(
@@ -356,6 +374,7 @@ impl DistributedQueryRequest {
         };
         DistributedQueryRequestParts {
             result_window: self.result_window,
+            cow_match: self.cow_match,
             description,
             artifacts,
             options,
@@ -374,6 +393,7 @@ impl DistributedQueryRequest {
 /// `Clone`, or inverse recombination API.
 pub struct DistributedQueryRequestParts {
     pub(crate) result_window: Option<novarocks_workload_control::ResultWindowAlias>,
+    pub(crate) cow_match: Option<crate::query_execution::row_mutation::CowMatchRootConsumer>,
     pub description: Arc<FrozenExecutionDescription>,
     pub artifacts: PreparedDistributedQuery,
     pub options: Arc<ResolvedQueryOptions>,
@@ -427,6 +447,7 @@ pub(crate) fn build_request_from_finalized_execution(
     };
     Ok(DistributedQueryRequest {
         result_window: None,
+        cow_match: None,
         payload,
         topology: execution.topology().clone(),
         deadline: execution.deadline(),

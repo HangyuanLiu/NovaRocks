@@ -552,6 +552,10 @@ impl FrontendDistributedQueryCoordinator {
                 (parts.completion.intent(), kind),
                 (DistributedQueryIntent::Profile, K::CountOnly)
                     | (
+                        DistributedQueryIntent::CowMatch,
+                        K::InternalFacts(D::CowSelectionArrowV1)
+                    )
+                    | (
                         DistributedQueryIntent::Write,
                         K::InternalFacts(D::PreparedWriteCommitV1)
                     )
@@ -565,6 +569,13 @@ impl FrontendDistributedQueryCoordinator {
                     "distributed root kind differs from its internal consumer",
                 ));
             }
+        }
+        if (parts.completion.intent() == DistributedQueryIntent::CowMatch)
+            != parts.cow_match.is_some()
+        {
+            return Err(failed(
+                "COW match intent and signed consumer must be present together",
+            ));
         }
         let write_stack_session = parts.write_stack_session.clone();
         let intent = parts.completion.intent();
@@ -756,6 +767,7 @@ impl FrontendDistributedQueryCoordinator {
             completion: parts.completion,
             topology: parts.topology,
             statistics_decoder,
+            cow_match: parts.cow_match,
             write_decoder,
             write_stack_session,
             backend_services,
@@ -800,6 +812,7 @@ impl FrontendDistributedQueryCoordinator {
             // failure is judged against.
             topology: captured_topology,
             mut statistics_decoder,
+            mut cow_match,
             mut write_decoder,
             write_stack_session,
             backend_services,
@@ -990,7 +1003,10 @@ impl FrontendDistributedQueryCoordinator {
         };
         let mut relayed_end = None;
 
-        let root_status_source = if intent == DistributedQueryIntent::Result {
+        let root_status_source = if matches!(
+            intent,
+            DistributedQueryIntent::Result | DistributedQueryIntent::CowMatch
+        ) {
             Some(
                 round
                     .take_root_status_source()
@@ -1073,6 +1089,7 @@ impl FrontendDistributedQueryCoordinator {
         let mut last_root_poll = RootResultPoll::default();
         let mut root_batch_count = 0_u64;
         let mut root_row_count = 0_u64;
+        let mut cow_selection = None;
         // Taken before the loop because the polls run beside it: the schema
         // is shared, immutable and only read, while `expected_output` itself
         // is consumed by this attempt's answer.
@@ -1151,7 +1168,11 @@ impl FrontendDistributedQueryCoordinator {
             }
 
             let advanced = advance_task_round(&mut round, &split_delivery);
-            if intent == DistributedQueryIntent::Result && round.accepted_root_success_sealed() {
+            if matches!(
+                intent,
+                DistributedQueryIntent::Result | DistributedQueryIntent::CowMatch
+            ) && round.accepted_root_success_sealed()
+            {
                 if let Err(error) = &advanced {
                     tracing::warn!(%error, "Task failure after the accepted root seal belongs to cleanup");
                 }
@@ -1369,6 +1390,8 @@ impl FrontendDistributedQueryCoordinator {
                             decoder.apply_relay_body(body)
                         } else if let Some(decoder) = write_decoder.as_mut() {
                             decoder.apply_relay_body(body)
+                        } else if let Some(consumer) = cow_match.as_mut() {
+                            consumer.push_body(body)
                         } else {
                             Err("relayed data has no typed internal consumer".into())
                         };
@@ -1420,6 +1443,8 @@ impl FrontendDistributedQueryCoordinator {
                             decoder.check_relay_end(end.output_rows)
                         } else if let Some(decoder) = write_decoder.as_ref() {
                             decoder.check_relay_end(end.output_rows)
+                        } else if let Some(consumer) = cow_match.as_ref() {
+                            consumer.check_end(end.output_rows)
                         } else {
                             Ok(())
                         };
@@ -1573,6 +1598,23 @@ impl FrontendDistributedQueryCoordinator {
                                     error,
                                 ));
                             }
+                        } else if let Some(consumer) = cow_match.as_mut() {
+                            batch_rows = match consumer.push_decoded(batch) {
+                                Ok(rows) => rows,
+                                Err(error) => {
+                                    break Err(self.fail_task_round_with_root_reader(
+                                        &mut relayed_reader,
+                                        &mut root_result_polls,
+                                        root_task,
+                                        query_id,
+                                        &mut round,
+                                        &split_delivery,
+                                        classification,
+                                        QueryFailureCause::FrontendExecution,
+                                        error,
+                                    ));
+                                }
+                            };
                         } else {
                             batches.push(batch);
                         }
@@ -1711,6 +1753,24 @@ impl FrontendDistributedQueryCoordinator {
                                 QueryFailureCause::FrontendExecution,
                                 error,
                             ));
+                        }
+                        if let Some(consumer) = cow_match.take() {
+                            match consumer.finish() {
+                                Ok(selection) => cow_selection = Some(selection),
+                                Err(error) => {
+                                    break Err(self.fail_task_round_with_root_reader(
+                                        &mut relayed_reader,
+                                        &mut root_result_polls,
+                                        root_task,
+                                        query_id,
+                                        &mut round,
+                                        &split_delivery,
+                                        classification,
+                                        QueryFailureCause::FrontendExecution,
+                                        error,
+                                    ));
+                                }
+                            }
                         }
                         emit_distributed_write_phase_marker(
                             intent,
@@ -1855,7 +1915,11 @@ impl FrontendDistributedQueryCoordinator {
                         // task set to reach terminals before classifying those
                         // terminals as success-compatible or failed.
                     }
-                    None if intent == DistributedQueryIntent::Result => {
+                    None if matches!(
+                        intent,
+                        DistributedQueryIntent::Result | DistributedQueryIntent::CowMatch
+                    ) =>
+                    {
                         if root_seal_reply.is_none() {
                             let source = root_status_source
                                 .as_ref()
@@ -1865,7 +1929,19 @@ impl FrontendDistributedQueryCoordinator {
                                     root_seal_reply = Some(reply);
                                     moved = true;
                                 }
-                                Err(error) => break Err(failed(error.to_string())),
+                                Err(error) => {
+                                    break Err(self.fail_task_round_with_root_reader(
+                                        &mut relayed_reader,
+                                        &mut root_result_polls,
+                                        root_task,
+                                        query_id,
+                                        &mut round,
+                                        &split_delivery,
+                                        classification,
+                                        QueryFailureCause::FrontendExecution,
+                                        error.to_string(),
+                                    ));
+                                }
                             }
                         }
                     }
@@ -2089,6 +2165,16 @@ impl FrontendDistributedQueryCoordinator {
         }
 
         let outcome = (|| match intent {
+            DistributedQueryIntent::CowMatch => {
+                if !batches.is_empty() {
+                    return Err(failed("COW match retained unbounded result batches"));
+                }
+                completion.cow_match(
+                    cow_selection
+                        .take()
+                        .ok_or_else(|| failed("COW match lost its validated selection"))?,
+                )
+            }
             DistributedQueryIntent::Result => {
                 completion.result(expected_output.into_query_result(batches)?)
             }
@@ -4072,6 +4158,7 @@ struct RoundHandoff<'a> {
     completion: QueryOutcomeFactory,
     topology: BackendTopologySnapshot,
     statistics_decoder: Option<crate::query_execution::statistics::StatisticsRootResultDecoder>,
+    cow_match: Option<crate::query_execution::row_mutation::CowMatchRootConsumer>,
     write_decoder: Option<crate::query_execution::write_result::RootWriteResultDecoder>,
     write_stack_session: Option<Arc<crate::query_execution::write_session::ConnectorWriteSession>>,
     backend_services: QueryBackendServices,

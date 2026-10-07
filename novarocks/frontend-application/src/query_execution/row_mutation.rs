@@ -285,7 +285,10 @@ impl RelayedCowSelectionCollector {
             exec_mem_limit,
             Arc::clone(&schema),
         )?;
-        let record_bound = collector.max_bytes().min(COW_SELECTION_MAX_RECORD_BYTES);
+        let record_bound = collector
+            .max_bytes()
+            .min(COW_SELECTION_MAX_RECORD_BYTES)
+            .min(32 * 1024 * 1024);
         let record_bound = usize::try_from(record_bound).unwrap_or(usize::MAX);
         Ok(Self {
             assembly: RootRecordAssembly::new(RootRecordDomain::CowSelection, record_bound),
@@ -293,6 +296,24 @@ impl RelayedCowSelectionCollector {
             schema,
             collector,
         })
+    }
+
+    pub fn push_decoded(&mut self, batch: FetchedQueryBatch) -> Result<usize, ConnectorError> {
+        let batch = cast_to_signed_selection(&self.schema, &batch.into_chunk().batch)
+            .map_err(invalid_match)?;
+        let rows = batch.num_rows();
+        self.collector.push(batch)?;
+        Ok(rows)
+    }
+
+    pub fn check_end(&self, output_rows: u64) -> Result<(), ConnectorError> {
+        self.assembly.finish().map_err(invalid_match)?;
+        if self.collector.row_count() != output_rows {
+            return Err(invalid_match(
+                "COW selection row count differs from Root End",
+            ));
+        }
+        Ok(())
     }
 
     /// Bytes held by the bounded collector.
@@ -347,6 +368,53 @@ impl RelayedCowSelectionCollector {
     pub fn finish(self) -> Result<ConnectorRowMutationSelection, ConnectorError> {
         self.assembly.finish().map_err(invalid_match)?;
         self.collector.finish()
+    }
+}
+
+/// One signed COW consumer for decoded transition batches and relayed records.
+/// Its selection is validated before the coordinator can seal root success.
+pub(crate) struct CowMatchRootConsumer {
+    collector: RelayedCowSelectionCollector,
+    validator: RowMutationMatchValidator,
+}
+
+impl CowMatchRootConsumer {
+    pub(crate) fn try_new(
+        context: ConnectorRequestContext,
+        schema: SchemaRef,
+        contract: ConnectorMutationMatchContract,
+        intent: ConnectorRowMutationIntent,
+    ) -> Result<Self, ConnectorError> {
+        Ok(Self {
+            collector: RelayedCowSelectionCollector::try_new(context, None, schema)?,
+            validator: RowMutationMatchValidator::try_new(contract, intent)?,
+        })
+    }
+
+    pub(crate) fn push_decoded(&mut self, batch: FetchedQueryBatch) -> Result<usize, String> {
+        self.collector
+            .push_decoded(batch)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn push_body(&mut self, body: &[u8]) -> Result<(), String> {
+        self.collector
+            .push_body(body)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn check_end(&self, output_rows: u64) -> Result<(), String> {
+        self.collector
+            .check_end(output_rows)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn finish(mut self) -> Result<ConnectorRowMutationSelection, String> {
+        let selection = self.collector.finish().map_err(|error| error.to_string())?;
+        self.validator
+            .validate_selection(&selection)
+            .map_err(|error| error.to_string())?;
+        Ok(selection)
     }
 }
 
@@ -909,6 +977,47 @@ mod tests {
             cancelled.push_body(&stream).unwrap_err().kind(),
             ConnectorErrorKind::Cancelled
         );
+    }
+
+    #[test]
+    fn cow_consumer_checks_end_and_validates_target_uniqueness_before_handoff() {
+        let make = || {
+            CowMatchRootConsumer::try_new(
+                context(
+                    Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
+                    1 << 20,
+                ),
+                selection_schema(),
+                contract(),
+                ConnectorRowMutationIntent::Merge {
+                    effects: vec![ConnectorRowMutationEffect::Replace],
+                },
+            )
+            .unwrap()
+        };
+        let mut consumer = make();
+        let stream = relayed_stream(&[batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)])]);
+        for body in stream.chunks(7) {
+            consumer.push_body(body).unwrap();
+        }
+        assert!(consumer.check_end(0).is_err());
+        consumer.check_end(1).unwrap();
+        assert_eq!(consumer.finish().unwrap().row_count(), 1);
+
+        let mut duplicate = make();
+        duplicate
+            .push_body(&relayed_stream(&[batch(vec![
+                (1, 10, Some(11), REPLACE_EFFECT_TAG),
+                (1, 10, Some(12), REPLACE_EFFECT_TAG),
+            ])]))
+            .unwrap();
+        duplicate.check_end(2).unwrap();
+        assert!(duplicate.finish().unwrap_err().contains("more than once"));
+
+        let mut partial = make();
+        partial.push_body(&stream[..stream.len() - 1]).unwrap();
+        assert!(partial.check_end(1).is_err());
+        assert!(partial.finish().is_err());
     }
 
     #[test]

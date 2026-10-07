@@ -884,6 +884,7 @@ fn cow_selection_layout(
     Ok((Arc::new(Schema::new(fields)), roles))
 }
 
+#[cfg(test)]
 fn cow_selection_from_query_result(
     result: QueryResult,
     preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
@@ -1284,17 +1285,13 @@ pub(crate) fn stage_prepared_update_mutation(
                 source_sql.as_deref(),
                 &cow_preparations.preparation,
             )?;
-            let matched = execute_exact_cow_match_query(
+            let selection = execute_exact_cow_match_query(
                 state,
                 &target,
                 &query,
                 &execution,
                 &connector_context,
-            )?;
-            let selection = cow_selection_from_query_result(
-                matched,
                 &cow_preparations.preparation,
-                connector_context.clone(),
             )?;
             if selection.row_count() == 0 {
                 return Ok(MutationStagedWrite::NoOp);
@@ -2968,7 +2965,19 @@ fn execute_exact_cow_match_query(
     query: &novarocks_parser::ast::Query,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<QueryResult, crate::dml::error::DmlExecutionError> {
+    preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
+) -> Result<
+    novarocks_spi::connector::ConnectorRowMutationSelection,
+    crate::dml::error::DmlExecutionError,
+> {
+    let (schema, _) = cow_selection_layout(preparation)?;
+    let consumer = crate::query_execution::row_mutation::CowMatchRootConsumer::try_new(
+        connector_context.clone(),
+        schema,
+        preparation.match_contract().clone(),
+        preparation.intent().clone(),
+    )
+    .map_err(|error| error.to_string())?;
     let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
     let catalog_service_snapshot =
         crate::catalog_application::query_catalog::catalog_service_snapshot(state);
@@ -3097,16 +3106,16 @@ fn execute_exact_cow_match_query(
             template,
         ),
         None,
-        crate::query_execution::contract::DistributedQueryIntent::Result,
+        crate::query_execution::contract::DistributedQueryIntent::CowMatch,
         execution,
         None,
     )
+    .and_then(|request| request.with_cow_match_consumer(consumer))
     .map_err(|error| error.to_string())?;
     Ok(state
         .query_execution()
         .execute(request)
-        .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_result)
-        .map(crate::query_execution::outcome::ResultExecutionOutcome::into_query_result)
+        .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_cow_match)
         .map_err(|error| error.to_string())?)
 }
 
@@ -3609,12 +3618,13 @@ pub(crate) fn stage_prepared_merge_mutation(
         insert_columns_resolved.as_deref(),
         &cow_preparations.preparation,
     )?;
-    let matched =
-        execute_exact_cow_match_query(state, &target, &query, &execution, &connector_context)?;
-    let selection = cow_selection_from_query_result(
-        matched,
+    let selection = execute_exact_cow_match_query(
+        state,
+        &target,
+        &query,
+        &execution,
+        &connector_context,
         &cow_preparations.preparation,
-        connector_context.clone(),
     )?;
     if selection.row_count() == 0 {
         return Ok(MutationStagedWrite::NoOp);
