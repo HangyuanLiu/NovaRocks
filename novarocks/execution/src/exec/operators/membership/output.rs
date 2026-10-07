@@ -22,6 +22,12 @@
 //! accounting owner, and one new nullable Boolean whose bitmaps are task
 //! allocations owned by their last Arrow buffer. Every Arrow management
 //! allocation of the assembly is admitted, by a bound, before it is made.
+//!
+//! Charging boundary: these owners keep the exact charges above for as long
+//! as any derived buffer lives. A later pipeline edge that moves this output
+//! under Scheme S charges its buffers once more for that edge's holding
+//! period; that conservative duplicate across chunks is the existing chunk
+//! accounting, not skipped or reconciled here.
 
 use std::ptr::NonNull;
 use std::sync::Arc;
