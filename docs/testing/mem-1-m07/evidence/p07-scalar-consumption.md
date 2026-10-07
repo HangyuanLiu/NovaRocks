@@ -33,3 +33,21 @@ P08 production switch. Immediate/legacy Arrow literal conversion still uses the
 existing conversion path; its private scratch bound is not established by these
 typed-consumer tests. Native socket, source-purpose and 1FE+3BE evidence remains
 pending. Nothing here proves the P09 performance or transport measurement gates.
+
+## Exact child window delegation (2026-10-07)
+
+SET delegates its admitted window to the exact live direct child WorkScope.
+The workload owner checks both the authority and parent identity before retaining
+the child. Delegation preserves the original window class, envelope and position;
+it does not acquire another pool position. Clones share one child responsibility
+holder, released only when the final alias exits, even after child completion.
+Foreign hosts, siblings, completed scopes and Closing windows are refused.
+
+Validation: Workload Control 21 unit, 74 integration and 8 doc tests passed in
+`logs/mem-1-m07/p07-child-window-workload-all-20261007.log`. Frontend COW
+consumer tests passed (10) in
+`logs/mem-1-m07/p06-cow-row-preflight-fe-third-20261007.log`; compilation covers
+the SET caller. Independent read-only lifetime review found no concrete issue.
+This is a delegation foundation: production SET root-purpose/window acquisition
+and native socket verification remain pending. No result-window cutover, full
+workspace, performance or transport gate is claimed.

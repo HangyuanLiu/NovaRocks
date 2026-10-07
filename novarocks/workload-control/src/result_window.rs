@@ -337,22 +337,84 @@ impl ResultWindowGrant {
     pub fn retain_alias(&self) -> ResultWindowAlias {
         ResultWindowAlias {
             holder: Arc::clone(&self.holder),
+            execution_scope: None,
         }
     }
 }
 #[derive(Clone)]
 pub struct ResultWindowAlias {
     holder: Arc<WindowHolder>,
+    execution_scope: Option<Arc<WindowExecutionScope>>,
+}
+
+// A delegated alias holds the exact child's responsibility through real exit.
+// It consumes no second result position and cannot change the admitted class.
+struct WindowExecutionScope {
+    scope: WorkScope,
+}
+impl Drop for WindowExecutionScope {
+    fn drop(&mut self) {
+        self.scope.inner.update(|state| {
+            let node = state
+                .nodes
+                .get_mut(&self.scope.id)
+                .expect("delegated window alias retains its child scope");
+            node.resource_holders -= 1;
+            state.collect(self.scope.id);
+        });
+    }
 }
 impl ResultWindowAlias {
     /// Numeric scope identities are local to one host. Capacity must match
     /// both the exact scope and the runtime that admitted it.
     pub fn is_for_scope(&self, scope: &WorkScope) -> bool {
-        self.holder.scope.id == scope.id && Arc::ptr_eq(&self.holder.scope.inner, &scope.inner)
+        self.execution_scope().id == scope.id
+            && Arc::ptr_eq(&self.execution_scope().inner, &scope.inner)
     }
     pub fn scope_id(&self) -> WorkId {
-        self.holder.scope.id()
+        self.execution_scope().id()
     }
+    fn execution_scope(&self) -> &WorkScope {
+        self.execution_scope
+            .as_ref()
+            .map_or(&self.holder.scope, |owner| &owner.scope)
+    }
+
+    /// Authorize one live direct child to use this already-admitted window.
+    /// Exact parent/host identity is checked before recording its holder; a
+    /// sibling, foreign host or completed scope cannot obtain this capability.
+    pub fn for_child(&self, child: &WorkScope) -> Result<Self, WorkError> {
+        let parent = self.execution_scope();
+        if !Arc::ptr_eq(&parent.inner, &child.inner) {
+            return Err(WorkError::ForeignAuthority);
+        }
+        if self.holder.class == ResultWindowClass::Closing {
+            return Err(WorkError::Conflict);
+        }
+        child.inner.update(|state| {
+            state
+                .nodes
+                .get(&parent.id)
+                .ok_or(WorkError::Released)?
+                .check()?;
+            let node = state.nodes.get_mut(&child.id).ok_or(WorkError::Released)?;
+            node.check()?;
+            if node.parent != Some(parent.id) {
+                return Err(WorkError::Conflict);
+            }
+            node.resource_holders = node
+                .resource_holders
+                .checked_add(1)
+                .ok_or(WorkError::ArithmeticOverflow)?;
+            Ok(Self {
+                holder: Arc::clone(&self.holder),
+                execution_scope: Some(Arc::new(WindowExecutionScope {
+                    scope: child.clone(),
+                })),
+            })
+        })
+    }
+
     pub fn class(&self) -> ResultWindowClass {
         self.holder.class
     }
@@ -395,6 +457,77 @@ mod tests {
         control.mark_ready().unwrap();
         (control, handle)
     }
+    #[test]
+    fn delegated_window_keeps_exact_child_and_one_position_until_last_alias_exit() {
+        let (control, capacity) = control();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let child = root
+            .owner
+            .scope()
+            .child(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let sibling = root
+            .owner
+            .scope()
+            .child(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let child_scope = child.scope();
+        let window = capacity
+            .try_acquire(&root.owner.scope(), ResultWindowClass::Internal)
+            .unwrap();
+        let alias = window.retain_alias().for_child(&child_scope).unwrap();
+        assert!(alias.is_for_scope(&child_scope));
+        assert!(!alias.is_for_scope(&root.owner.scope()));
+        assert!(alias.for_child(&sibling.scope()).is_err());
+        let (foreign, _) = self::control();
+        let other = foreign
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        assert!(alias.for_child(&other.owner.scope()).is_err());
+        assert_eq!(
+            capacity.snapshot().held_positions[ResultWindowClass::Internal.index()],
+            1
+        );
+        child.complete();
+        assert!(
+            child_scope
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .nodes
+                .contains_key(&child_scope.id)
+        );
+        drop(window);
+        let late = alias.clone();
+        drop(alias);
+        assert_eq!(
+            capacity.snapshot().held_positions[ResultWindowClass::Internal.index()],
+            1
+        );
+        drop(late);
+        assert!(
+            !child_scope
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .nodes
+                .contains_key(&child_scope.id)
+        );
+        assert_eq!(
+            capacity.snapshot().held_positions[ResultWindowClass::Internal.index()],
+            0
+        );
+        sibling.complete();
+        root.owner.complete();
+        root.business.release();
+        other.owner.complete();
+        other.business.release();
+    }
+
     #[test]
     fn alias_rejects_same_numeric_scope_from_a_different_host() {
         let (first, capacity) = control();

@@ -1498,14 +1498,24 @@ impl FrontendQuerySession {
             }
             PreparedQueryOperation::LogicalRead(read) => {
                 let scalar_schema = read.scalar_schema().cloned();
+                let result_window = match statement.result_window_alias() {
+                    Some(window) => match window.for_child(&child.scope()) {
+                        Ok(window) => Some(window),
+                        Err(error) => {
+                            child.complete();
+                            return Err(internal_error(format!(
+                                "bind SET scalar child result window: {error}"
+                            )));
+                        }
+                    },
+                    None => None,
+                };
                 let start = {
                     let _observation_scope =
                         crate::preparation_diagnostics::enter_bound_statement(statement.token());
-                    self.service.logical_read_launcher.start(
-                        read,
-                        child,
-                        statement.result_window_alias(),
-                    )
+                    self.service
+                        .logical_read_launcher
+                        .start(read, child, result_window)
                 };
                 let started = start.await;
                 let mut execution = match started {
