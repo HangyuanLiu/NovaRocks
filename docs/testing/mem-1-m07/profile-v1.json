@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "status": "frozen-target-v1",
-  "source_revision": "eb35251de575e071ad3657d0ce0fc1fc95d1a91a",
-  "product_enforcement": "NOT_IMPLEMENTED",
+  "status": "frozen-v1-geometry-v6-transport-measurement-pending",
+  "source_revision": "d1fc5dcb16864efb4ba2d198e19ae49fe9356631",
+  "product_enforcement": "PARTIAL_P07;COMPLETE_PRODUCTION_SWITCH_NOT_RUN",
   "measurement_gate": "OLD_BASELINE_PARTIAL;CANDIDATE_NOT_RUN",
   "client_rows": {
     "data_positions": 2,
@@ -81,10 +81,6 @@
     "h2_connection_receive_window_bytes": 1048576,
     "h2_stream_receive_window_bytes": 262144,
     "h2_pending_resets": 32,
-    "connection_all_independent_backings_bytes": 2097152,
-    "stream_bookkeeping_bytes": 4096,
-    "idle_decoder_bytes": 8192,
-    "header_raw_and_expanded_bytes": 32768,
     "nonroot_producer_positions": 64,
     "nonroot_encode_positions": 64,
     "nonroot_decode_positions": 64,
@@ -93,7 +89,6 @@
     "nonroot_decoded_expanded_bytes": 4194304,
     "nonroot_wire_logical_bytes": 1052672,
     "nonroot_compression": false,
-    "frontend_native_additional_bytes": 3221225472,
     "data_handshake_positions": 32,
     "control_handshake_positions": 8,
     "legal_frontend_identity_reuse": "only after exact old holders exit",
@@ -102,7 +97,25 @@
     "exchange_inflight_per_peer": 32,
     "exchange_short_tails_per_peer": 32,
     "runtime_filter_inflight_per_peer": 8,
-    "runtime_filter_short_tails_per_peer": 8
+    "runtime_filter_short_tails_per_peer": 8,
+    "accounting_revision": 6,
+    "connecting_positions_per_lane": 1,
+    "closing_positions_per_lane": 1,
+    "exchange_connecting_positions_per_peer": 1,
+    "exchange_closing_positions_per_peer": 1,
+    "runtime_filter_connecting_positions_per_peer": 1,
+    "runtime_filter_closing_positions_per_peer": 1,
+    "client_public_defaults": {
+      "send_buffer_bytes_per_stream": 1048576,
+      "frame_bytes": 16384,
+      "header_table_bytes": 4096,
+      "concurrent_reset_streams": 50,
+      "pending_accept_reset_streams": 20,
+      "local_error_reset_streams": 1024
+    },
+    "structural_envelope": "transport-envelope-v1.json",
+    "measured_coefficients_status": "NOT_FROZEN",
+    "measurement_evidence_status": "NOT_RUN"
   },
   "linux_verification": "USER_MANUAL_AFTER_LOCAL_IMPLEMENTATION",
   "local_source": {
@@ -170,8 +183,17 @@
     "control_connection_all_objects_bytes": 2097152,
     "frontend_minimum_open_file_limit": 2048,
     "backend_minimum_open_file_limit": 1024,
-    "frontend_declared_result_envelope_bytes": 17179869184,
     "envelope_scope": "result/local/internal/input/session/control/native holders only; not total FE RSS or a MEM-backed admission grant"
   },
-  "growth_and_release_contract": "See owner-envelopes-v1.md; every cap applies before allocation/copy/clone, exact capacity and aliases retained until actual last release. Frozen target is a proof obligation, not current implementation evidence."
+  "growth_and_release_contract": "See owner-envelopes-v1.md. NovaRocks-owned objects are admitted before growth and retained until last owner exit; third-party transport uses public configuration, external count admission and public exit events, with structural arithmetic and a pending measurement gate. No RSS or MEM capacity grant is claimed.",
+  "historical_v5_transport_targets": {
+    "status": "RETIRED_BY_SPEC_REVISION_6_NOT_A_CAPACITY_GRANT",
+    "connection_all_independent_backings_bytes": 2097152,
+    "stream_bookkeeping_bytes": 4096,
+    "idle_decoder_bytes": 8192,
+    "header_raw_and_expanded_bytes": 32768,
+    "frontend_native_additional_bytes": 3221225472,
+    "frontend_declared_result_envelope_bytes": 17179869184
+  },
+  "original_p00_source_revision": "eb35251de575e071ad3657d0ce0fc1fc95d1a91a"
 }

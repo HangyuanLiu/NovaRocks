@@ -1,6 +1,6 @@
 # M07 profile v1 的物件包络与退出合同
 
-本页与 profile-v1.json 是 P00 冻结的实施目标。全部数值是 allocation 前要落实的上限；目前产品没有实施这些新限制。本页不是 RSS 上限、MEM 账本、默认硬件容量或测试通过证明。Linux 正式测试由用户后续手动执行；本地旧路径的错误/拒绝样本是基线事实，不从分母删除。
+本页与 profile-v1.json 记录 approved revision 6 的实施目标。自有对象在增长前取得有限能力；第三方 transport 使用公开配置与库外准入，字节只作结构上界并待测量。具体实施与验证状态见 coverage 和 evidence，不从目标算术推出产品完成。本页不是 RSS 上限、MEM 账本、默认硬件容量或测试通过证明。Linux 正式测试由用户后续手动执行；本地旧路径的错误/拒绝样本是基线事实，不从分母删除。
 
 ## FE 共存
 
@@ -14,21 +14,30 @@
 | control connection | 32 × 2MiB | 独立connection/input/framing界；不借ordinary已耗尽的位置 | 实际command/write/socket结束 |
 | control owner | 128MiB | 有限control operation/observation/诊断队列，所有独立clone/快照计入；payload生成前取得 | RPC/status/诊断作业与最后clone退出 |
 | waiters | 64MiB | ordinary最多4096个payload-free waiter，每个4KiB；连接command已归connection owner；有限其他identity/generation/counter metadata | 准入handoff、取消出队与实际持有者退出 |
-| Native附加 | 3GiB | 下节2724.5MiB，剩余为固定owner/cache/close metadata，禁止另藏大payload | 每exact process/lane/generation的queue/body/stream/connection/codec最后holder退出 |
+| Native 自有 nonroot workspace | 768MiB | producer/encode/decode 的有限自有对象目标，增长前检查；不能以第三方 stream receipt 代替自有 backing 退出 | codec/job 与最后 payload alias 退出 |
+| Native 第三方 transport | E_native_transport | 公开配置 × 数量 + 待测 c_*；详见下节。不是独立字节钱包 | connection IO wrapper、body EOF/RST/Drop、DNS closure 返回等公开事件；差额用测量门验证 |
 
-上述共存小计13056MiB =12.75GiB，小于此profile声明的16GiB结果相关物件包络。其他FE planner/cache/catalog/allocator以及内核socket内存不属于这个小计；仍需另外部署容量，不能把它称为进程RSS保证。所有尺寸按actual capacity、真实backing identity和独立copy计算。共享backing不因slice缩小，移交不代表free。
+自有对象目标小计10752MiB =10.5GiB，另加 E_native_transport。revision 6 不沿用 v5 的 Native 3GiB 和整体16GiB目标；完整传输系数尚未测量，不能宣称总包络已冻结或成立。其他FE planner/cache/catalog/allocator以及内核socket内存不属于这个小计；仍需另外部署容量，不能把它称为进程RSS保证。所有尺寸按actual capacity、真实backing identity和独立copy计算。共享backing不因slice缩小，移交不代表free。
 
 ## Native 物理承载
 
-每FE对全部32BE：normal/dial/closing分别为352/128/128，总608connections。每connection全部内部独立backing最多2MiB；dial阶段禁止携payload stream。各lane为 Result4+1+1、Observation4+1+1、Submission2+1+1、Control1+1+1。cache以process+endpoint+lane+generation定位，single-flight；超旧generation还未退出时仍计同cap。
+按 [第 6 版结构算术](transport-envelope-v1.md) 与 JSON 复算，Native 不再承诺逐连接全部内部
+backing≤2MiB，也不通过第三方 vendor 接缝逐字节授权。FE outgoing live/dial/closing 总608个，
+另含96个 incoming Membership连接；各连接最多128 stream位置，公开 receive window、
+header list 与服务端 send buffer 有限。客户端 send buffer使用批准的hyper默认1MiB/stream。
 
-FE root stream总量320，不能再乘BE数。Observation最多32×(320+32+32)=12288，Submission和Control分别32×64=2048，总16704。持续订阅空闲只持bookkeeping/idle scratch；frame生成需要全局真实holder。每stream最多4KiB bookkeeping、8KiB idle decoder、两份16KiB raw/expanded header。保守tonic pending为608×8×4KiB metadata；payload继续持原owner能力，不深clone成另一个队列。
+`E_native_transport = Σ N_conn × [conn_window + N_stream × (stream_window + send_buf + header_list)]
++ N_conn×c_conn + N_stream_total×c_stream + N_handshake×c_handshake + N_queue×c_queue`。
+当前FE结构项103232MiB（100.8125GiB），加自有目标为111.3125GiB且还不含c_*；这是保守配置
+结构算术，不是驻留预测或默认硬件需求。c_*与线性/回落测量仍未冻结/执行，不能用空系数当零。
 
-nonroot producer/encode/decode各64个全局真实位置；producer全部展开≤4MiB，encode actual backing≤2MiB，decode actual wire≤2MiB并且展开≤4MiB；logical wire≤1MiB+4KiB，不压缩。必须在生成、读取声明长度、reserve、protobuf decode/encode、copy/clone前取得；等待时不归还尚未消费的receive credit、不另排body。大型submit/status事实只有准确既有分段合同或明确拒绝，不能先构造再超限。preflight按元素/深度/Vec与String capacity限制展开，不以wire大小乘常数代替。
+nonroot producer/encode/decode各64个全局真实位置的自有对象目标保留：producer展开≤4MiB，
+encode实际backing≤2MiB，decode wire≤2MiB且展开≤4MiB；合计768MiB。
+自有payload/copy/clone仍先取得能力，最后alias退出才归还。第三方连接/stream在库外限制数量，
+公开退出事件归还位置；DNS阻塞closure实际返回前保留permit；测量门验证事件后内部析构差额。
 
-checked小计为1216MiB connections +768MiB nonroot +65.25MiB bookkeeping +130.5MiB idle +522MiB headers +19MiB pending +3.75MiB root请求 =2724.5MiB。root receive/compact以及closing另归前节，不能再次分配未计费carrier。
-
-2MiB connection界必须包含真实H2 frame/read/write slabs、TLS、HPACK、control/reset状态；1MiB H2 receive credit本身不是这个证明。P04/P05须在Native owner以及必要的vendor transport接缝限制actual buffer capacity、frame/holder数量和partial header/zero/tiny DATA；仅设frame16KiB、header16KiB、reset32不足。若任一库内部增长不能由准确owner限制，禁止P08切换，继续修owner；不将未证明的2MiB当已实施事实。
+P00b还必须冻结真实lane grid、系数、轮次、容差和当前main旧路径基线，P09进行测量门。
+不得把现有Cargo测试、配置算术或已实现计数准入当成传输测量通过；P08仍依赖全生产保护闭合。
 
 同一BE最多2个合法FE，准确身份槽等旧holder全部退出才复用。BE对每peer有Exchange2+1dial+1closing、filter1+1+1，实际peer数P=B−1，最多31。data与control独立listener、handshake(32/8)、关闭、FD及推进位置；control不等待data握手位置。FE FD保守608 Native outbound +544 client +160 Native inbound/handshake/close +4 listener +64 files +256余量=1636，要求limit≥2048；BE按准确topology计算并要求≥1024。TLS与防火墙必须覆盖两个准确端点。
 

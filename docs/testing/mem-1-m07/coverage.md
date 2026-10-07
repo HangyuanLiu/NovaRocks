@@ -63,7 +63,7 @@ Hive/Hadoop 的 view listing 实际沿 SDK 默认 `FeatureUnsupported`；没有�
 | REST tables：`connector/iceberg/src/catalog/rest.rs:138,165` → SHOW/system facts/document discovery | 请求 page_entries，经 `ConnectorListingCollector::accept_page` 逐页检查后 retain，token/页数错误在下一页前拒绝；临时 SDK 页/names 退出，最终 Vec 跟 SQL consumer 到最后引用退出 | SDK 已先 receive/deserialize 一页，未证明响应字节上限。`5d54685ee` 已修复忽略 pageSize 的 server：无 continuation 的最终页按累计总条数/名称字节界接受；带 continuation 的超请求页在下次读取前拒绝。document discovery 仍在 table loads 前独立检查页/总界；HTTP mock 9 项通过，生产 SQL 验收待 P09 |
 | REST namespace/view、Hive namespace/table：`connector/iceberg/src/catalog/delegate.rs:98,132` → metadata/SHOW/system facts | SDK 返回后在 push 自有 collector 前检查条数/名称量，拒绝完整列表；临时 SDK Vec 退出，保留 Vec 随 consumer 最后引用退出 | SDK 无对应公开分页/limit 时完整 list 已在内部形成；没有反序列化事前 bounded 证据。自有 retain 受界不证明 SDK 峰值闭合；需公开配置/准入证据或明确拒绝不可支持规模 |
 | Hadoop：`connector/iceberg/src/{fs_io,hadoop_catalog}.rs` / `catalog/hadoop.rs` → metadata/SHOW/system facts | 公开 lister 流中先借用过滤/去重，再检查名称与 String/Vec old+new workspace，保留排序与完整探测。namespace marker/层级/表回退共用 remaining workspace；root 输出 bound 与内部 V1 table source bound 分开。普通 delegate/admitted read 都使用 exact binding 重建有界 FileIO。listing 错误投影复制前限 message ≤4 KiB，保持 limit/cancel/deadline typed kind，不 render SDK source chain | 1176 lib tests PASS；custom FileIO 无 binding 的公共构造不能证明 source owner，listing 事前 Unsupported；new_with_binding 的 listing 按 binding 重建 IO，repo 内生产全同形，外部自定义装饰器行为可能变化。page limit 只约束请求，远端 body/XML 未闭合；evidence/p06-hadoop-stream-source.md |
-| Paimon：`connector/paimon/src/catalog.rs` / `catalog_listing.rs` → role metadata → SHOW/system facts | 每次调用用公开 FileIO read-only decorator：在 yielded FileStatus 进入 SDK Vec 前累计检查 32 MiB source workspace；全部物理条目、path capacity、SDK statuses/dirs/names 的 old+new 与嵌套 schema fallback 共用预算。保持原过滤、探测与排序，取消/deadline 原 typed 错误；超界整批拒绝，最终 entries 随 consumer 退出 | 47 lib tests PASS，包含 SDK oracle、drop/N+1 poll、nested/cancel/deadline 与 65,536 项恰好边界。底层 FS URI format 与 OpenDAL page receive/XML decode 在此接缝之前，仍未闭合；不能声称所有反序列化受界。未扩大 ADR-0138 vendor 修改范围；evidence/p06-paimon-sdk-source.md |
+| Paimon：`connector/paimon/src/{catalog,catalog_listing,io}.rs` → role metadata → SHOW/system facts | 每次调用用公开 FileIO read-only decorator：在 yielded FileStatus 进入 SDK Vec 前累计检查 32 MiB source workspace；全部物理条目、path capacity、SDK statuses/dirs/names 的 old+new 与嵌套 schema fallback 共用预算。具体 host 显式绑定 bounded FS；URI 构造和 fresh schema HEAD 的 <2MiB auxiliary 在同一 workspace 内。clone 共享 admitted inventory，metadata probe 不增长 scan cache。保持原过滤、探测与排序，取消/deadline 原 typed 错误；超界整批拒绝 | FS 144 / Paimon 55 lib tests PASS，包含 SDK oracle、drop/N+1 poll、nested/cancel/deadline、fresh stat/cache 与独立 row/workspace 边界。OpenDAL page receive/XML decode 仍未闭合；不能声称所有反序列化受界。未扩大 ADR-0138 vendor 修改范围；evidence/p06-fs-paimon-source.md、evidence/p06-paimon-sdk-source.md |
 
 ### 后续收敛要求
 
@@ -75,18 +75,21 @@ Hive/Hadoop 的 view listing 实际沿 SDK 默认 `FeatureUnsupported`；没有�
 3. SPI listing 接口已改变，收敛点需 workspace 全量验证；C6 定向结果与 P07/P09 原生
    1FE+3BE 功能/取消/业务效果收据分开，source review/all-in-one smoke 不替代产品验收。
 
-## Native 与真实 holder
+## Native 与真实 holder（revision 6）
 
-| 对象 | 当前事实 | 待安装与退出 oracle |
+自有 payload 以最后 backing alias 退出为准；第三方内部按公开配置、库外准入和公开退出事件。
+配置结构算术见 [transport-envelope-v1.md](transport-envelope-v1.md)，系数与测量门尚未完成。
+不沿用历史 v5 的逐连接2MiB断言或vendor task/allocator接缝。
+
+| 对象 / owner | 当前接点与数量边界 | 退出与后续验收 |
 |---|---|---|
-| root placement | `novarocks/frontend-application/src/coordinator/scheduler.rs:251,259–272` root count=1；preferred 按 query id 选择，但没有跨查询均衡合同 | 每 BE 可集中全部已放行 root；多 FE 聚合与 rpc tails 单独 checked，不使用 C/3 |
-| FE fetch gate | `native/data_runtime.rs:20` 16；`fragment_transport.rs:457–485` 包住 channel/RPC/分类 | 原放行事务预承诺完整 transport；fetch/可选 ACK 单在途，普通窗持到短 transport/alias 实际退出 |
-| FE Channel | `native/data_runtime.rs:40,143–188` endpoint-only cache；generation 防旧驱逐 | process+endpoint+lane+connection generation，single-flight；每 lane 连接/队列/stream/reconnect/closing 上界，body EOF/RST/实际退出后还 stream |
-| BE listener | `novarocks/native-adapter/src/native_server.rs:331–393` accept 后直接 spawn；TLS accept 无 timeout | data/control 独立 accept/handshake/closing；认证前取位置，绝对期限不随滴流延长；真实 task/connection 退出后还位，保留 control FD/headroom |
-| ingress | ordinary8+8/control4+4；status/Exchange 建立后普通 permit 释放 | result/submission/observation/lifecycle 准确 route；持续 stream 另持真实 stream 位置；新工作不借控制保底 |
-| response aliases | `native_ingress.rs:605–663` `OwnedResponseBytes` 持所有权到最后 backing Drop | 复用真正正确的 unary ownership；new prost Bytes/body/replay/ACK-pop 不能脱离实际 input/scratch/backing 防护 |
-| BE→BE | `native_client.rs:138–199,221–262` ExchangeUnary / filter 与 endpoint cache；旧 streaming Exchange 每流 4096 队列（`backend_rpc_service.rs:111–162`） | 数据 listener 聚合界包括准确 registry/task topology 的 BE→BE 连接/frame/alias/reconnect；旧 streaming route 必须有界或明确拒绝，不能漏记 |
-| producer retirement | `novarocks/worker/src/task_registry.rs` 当前 task 退休删除结果 | 新 producer Finish=End 发布+编码退出+context 接管；task horizon 不删除通道。Release 先封 fetch/replay/drop/wake，再等 holder，不能自等尚未关闭的 long poll |
+| root placement | live registry冻结exact process；单BE可集中全部root。NativeResultSupportGeometry承载320 roots/FE/BE，不使用C/3 | P08 caller窗口/生产门与P09集中placement、真实退出证据仍需闭合 |
+| FE fetch | `native/data_runtime.rs` / `fragment_transport.rs` 的旧16 gate保留至P08；R2 ResultData独立lane已有承载接口 | root只一个fetch/ACK在途；新窗口及body alias实际退出。旧gate退出只能在完整切换 |
+| Channel / DNS | `frontend-application/src/native/transport.rs`、`native-adapter/src/native_channel_cache.rs`、`native-trust/src/adapter.rs`：exact process/endpoint/lane缓存、single-flight、连接/handshake/FD、有限DNS | IO wrapper Drop归还连接，DNS closure返回归还permit；body EOF/RST/Drop归还stream。GOAWAY不可见阶段继续算live |
+| listener / ingress | `native_server.rs` / `native_transport_admission.rs`：Data/Control独立listener、认证前数量准入、绝对握手期限、身份封印与per-lane stream gate | 不借control reserve；持续response body持位到公开退出；半开、多FE重连风暴与真实控制进展属P00b/P09 |
+| response payload | 自有root payload通过Bytes owner维持实际backing与send aliases；ACK/EOS不等于最后alias退出 | 第三方内部copy不授自有容量；公开buffer/window常量进入结构式，析构差额由测量门验证 |
+| BE→BE | exact peer process/endpoint/lane有限缓存；Exchange/RuntimeFilter数量按live registry与冻结geometry | 双方向dial/closing位置有限；不能以单进程测试推断生产退出或跳过真实peer数量 |
+| producer / context | P04b统一root channel具有独立context ownership；task FINISHED与FE消费End/成功seal各自汇合 | release封fetch/replay并wake，等待实际holder；晚originating failure及生产SQL属后续原生验收 |
 
 ## 编码语义调查
 

@@ -1,0 +1,141 @@
+{
+  "schema_version": 1,
+  "status": "STRUCTURAL_ARITHMETIC_ONLY_COEFFICIENTS_NOT_FROZEN",
+  "source_contract": "native_transport_geometry::envelope; NativeResultSupportGeometry::V1",
+  "roles": {
+    "frontend": {
+      "lanes": [
+        {
+          "lane": "result",
+          "direction": "outgoing",
+          "connections": 192,
+          "streams": 24576,
+          "stream_bytes": 1327104,
+          "structural_bytes": 32816234496
+        },
+        {
+          "lane": "observation",
+          "direction": "outgoing",
+          "connections": 192,
+          "streams": 24576,
+          "stream_bytes": 1327104,
+          "structural_bytes": 32816234496
+        },
+        {
+          "lane": "submission",
+          "direction": "outgoing",
+          "connections": 128,
+          "streams": 16384,
+          "stream_bytes": 1327104,
+          "structural_bytes": 21877489664
+        },
+        {
+          "lane": "lifecycle_control",
+          "direction": "outgoing",
+          "connections": 96,
+          "streams": 12288,
+          "stream_bytes": 1327104,
+          "structural_bytes": 16408117248
+        },
+        {
+          "lane": "membership",
+          "direction": "incoming",
+          "connections": 96,
+          "streams": 12288,
+          "stream_bytes": 344064,
+          "structural_bytes": 4328521728
+        }
+      ],
+      "connections": 704,
+      "streams": 90112,
+      "handshake_positions": 128,
+      "queued_requests": 4864,
+      "structural_bytes": 108246597632,
+      "coefficients": null,
+      "total_bytes": null
+    },
+    "backend": {
+      "lanes": [
+        {
+          "lane": "result",
+          "direction": "incoming",
+          "connections": 12,
+          "streams": 1536,
+          "stream_bytes": 344064,
+          "structural_bytes": 541065216
+        },
+        {
+          "lane": "observation",
+          "direction": "incoming",
+          "connections": 12,
+          "streams": 1536,
+          "stream_bytes": 344064,
+          "structural_bytes": 541065216
+        },
+        {
+          "lane": "submission",
+          "direction": "incoming",
+          "connections": 8,
+          "streams": 1024,
+          "stream_bytes": 344064,
+          "structural_bytes": 360710144
+        },
+        {
+          "lane": "lifecycle_control",
+          "direction": "incoming",
+          "connections": 6,
+          "streams": 768,
+          "stream_bytes": 344064,
+          "structural_bytes": 270532608
+        },
+        {
+          "lane": "exchange",
+          "direction": "incoming",
+          "connections": 128,
+          "streams": 16384,
+          "stream_bytes": 344064,
+          "structural_bytes": 5771362304
+        },
+        {
+          "lane": "runtime_filter",
+          "direction": "incoming",
+          "connections": 96,
+          "streams": 12288,
+          "stream_bytes": 344064,
+          "structural_bytes": 4328521728
+        },
+        {
+          "lane": "exchange",
+          "direction": "outgoing",
+          "connections": 128,
+          "streams": 16384,
+          "stream_bytes": 1327104,
+          "structural_bytes": 21877489664
+        },
+        {
+          "lane": "runtime_filter",
+          "direction": "outgoing",
+          "connections": 96,
+          "streams": 12288,
+          "stream_bytes": 1327104,
+          "structural_bytes": 16408117248
+        },
+        {
+          "lane": "membership",
+          "direction": "outgoing",
+          "connections": 6,
+          "streams": 768,
+          "stream_bytes": 1327104,
+          "structural_bytes": 1025507328
+        }
+      ],
+      "connections": 492,
+      "streams": 62976,
+      "handshake_positions": 40,
+      "queued_requests": 1840,
+      "structural_bytes": 51124371456,
+      "coefficients": null,
+      "total_bytes": null
+    }
+  }
+}

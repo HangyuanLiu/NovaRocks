@@ -8,6 +8,12 @@
 
 spec 与 plan 已改为第 6 版并获批：计量边界改为 NovaRocks 自有对象；撤回十个第三方 vendor patch，Native 传输只用上游公开配置与库外准入（ADR-0168）。执行在同一分支继续，先合入 main（`f008e2682`），再剥离 v5 的传输计费。R1 已删除的模块：`native_transport_capacity`、`native_response`、`native_task_executor`、`native_channel_worker_capacity` 及专测补丁的集成测试；保留并迁移的 D12 行为：Data/Control 独立 listener 与拒绝不失败的 accept 循环、端点方法分类、按 peer process/endpoint/lane 的单飞有界 channel 缓存、调用方进程签名与连接封印。R2 待补：每 lane 的 FE 连接数与 stream 位置持有到 body 退出、DNS 在自有阻塞闭包中解析、FD 上限、lane 指标与 NIG-1 交接口径。下文第 5 版记录保留为历史。
 
+2026-10-08 P00b 部分输出：[结构算术](transport-envelope-v1.md) / [JSON](transport-envelope-v1.json)
+按当前 R2 geometry 复算；profile 与 check_profile 不再使用 v5 每连接2MiB、Native3GiB/整体16GiB
+断言。这些旧数值归入 historical_v5_transport_targets，不能被当作当前容量 grant。
+R2 计数/公开退出接缝已有模块验证；系数、lane grid、repeatability、soak 与当前 main 旧路径基线
+尚未完成，结构算术不是测量通过。后续 P07/P08/P09/P10 仍在执行，未发布。
+
 ## 批准与基线
 
 - 2026-10-01 用户批准已落盘 plan 第 5 版，并授权 sub-agent。
