@@ -39,6 +39,7 @@ mod limit_processor;
 mod local_exchange_sink;
 mod local_exchange_source;
 pub(crate) mod local_exchanger;
+pub(crate) mod membership;
 mod multi_cast_data_stream_sink;
 mod nljoin;
 mod noop_sink;

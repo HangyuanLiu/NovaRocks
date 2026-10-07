@@ -18,7 +18,12 @@
 //! Allocation-free, borrowed Variant JSON byte generation for the default JSON
 //! parser. Callers own the fallible traversal stack; every step handles bounded
 //! work, and the existing default JSON recursion policy is retained.
-use chrono::{DateTime, FixedOffset, Local, NaiveDate, Offset, Utc};
+//!
+//! The cursor never reads the system local time zone. The caller supplies the
+//! offset that timestamp-with-time-zone values render with, resolved exactly
+//! when a conversion starts.
+use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
+use std::convert::Infallible;
 use std::fmt::{self, Write};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,17 +143,34 @@ impl VariantJsonCursor {
             metadata_width: 0,
             dictionary: 0,
             offset: FixedOffset::east_opt(0).unwrap(),
-            failed: false,
+            // A cursor that never started a conversion has nothing to emit.
+            failed: true,
             utf8_left: 0,
             utf8_value: 0,
             utf8_min: 0,
         }
     }
-    /// Captures Local offset exactly once, at conversion start.
-    pub fn start(&mut self, raw: &[u8]) -> bool {
-        self.start_with_offset(raw, Local::now().offset().fix())
-    }
+    /// Starts one conversion that renders local timestamps with `offset`.
     pub fn start_with_offset(&mut self, raw: &[u8], offset: FixedOffset) -> bool {
+        match self.start_resolving_offset(raw, || Ok::<_, Infallible>(offset)) {
+            Ok(started) => started,
+            Err(never) => match never {},
+        }
+    }
+
+    /// Starts one conversion, resolving the local offset only once the
+    /// serialized header has been accepted.
+    ///
+    /// This is the conversion start of the ungoverned path, which reads the
+    /// local offset only after `VariantValue::from_serialized` succeeded. An
+    /// input that is not a serialized Variant therefore never resolves an
+    /// offset. Returns `Ok(false)` for a rejected header and the resolver's
+    /// error unchanged; neither leaves a started conversion behind.
+    pub fn start_resolving_offset<E>(
+        &mut self,
+        raw: &[u8],
+        offset: impl FnOnce() -> Result<FixedOffset, E>,
+    ) -> Result<bool, E> {
         self.depth = 0;
         self.push = None;
         self.mode = Mode::Idle;
@@ -156,52 +178,47 @@ impl VariantJsonCursor {
         self.next_value = None;
         self.key = None;
         self.colon = false;
+        // Until a conversion is fully started, stepping reports Invalid.
+        self.failed = true;
+        let Some((end, metadata_end, width, dictionary)) = Self::accept_header(raw) else {
+            return Ok(false);
+        };
+        self.offset = offset()?;
         self.failed = false;
-        self.offset = offset;
-        let Some(size) = le(raw, 0, 4) else {
-            return false;
-        };
-        if size > 16 * 1024 * 1024 {
-            return false;
-        }
-        let Some(end) = size.checked_add(4).filter(|v| *v <= raw.len()) else {
-            return false;
-        };
-        let Some(header) = raw.get(4).copied().filter(|_| size > 0) else {
-            return false;
-        };
-        if header & 15 != 1 {
-            return false;
-        }
-        let width = usize::from((header >> 6) + 1);
-        let Some(dictionary) = le(&raw[..end], 5, width) else {
-            return false;
-        };
-        let Some(last) = dictionary
-            .checked_mul(width)
-            .and_then(|n| n.checked_add(5 + width))
-        else {
-            return false;
-        };
-        let Some(data_size) = le(&raw[..end], last, width) else {
-            return false;
-        };
-        let Some(metadata_end) = last
-            .checked_add(width)
-            .and_then(|v| v.checked_add(data_size))
-            .filter(|v| *v <= end)
-        else {
-            return false;
-        };
-        if metadata_end < 7 {
-            return false;
-        }
         self.end = end;
         self.metadata_end = metadata_end;
         self.metadata_width = width;
         self.dictionary = dictionary;
         self.next_value = Some(metadata_end);
-        true
+        Ok(true)
+    }
+
+    /// Validates the serialized size, metadata header and dictionary bounds,
+    /// returning `(end, metadata_end, offset_width, dictionary_size)`.
+    fn accept_header(raw: &[u8]) -> Option<(usize, usize, usize, usize)> {
+        let size = le(raw, 0, 4)?;
+        if size > 16 * 1024 * 1024 {
+            return None;
+        }
+        let end = size.checked_add(4).filter(|v| *v <= raw.len())?;
+        let header = raw.get(4).copied().filter(|_| size > 0)?;
+        if header & 15 != 1 {
+            return None;
+        }
+        let width = usize::from((header >> 6) + 1);
+        let dictionary = le(&raw[..end], 5, width)?;
+        let last = dictionary
+            .checked_mul(width)
+            .and_then(|n| n.checked_add(5 + width))?;
+        let data_size = le(&raw[..end], last, width)?;
+        let metadata_end = last
+            .checked_add(width)
+            .and_then(|v| v.checked_add(data_size))
+            .filter(|v| *v <= end)?;
+        if metadata_end < 7 {
+            return None;
+        }
+        Some((end, metadata_end, width, dictionary))
     }
     fn fixed(&mut self, text: &str) -> bool {
         self.buffer.clear();
@@ -682,6 +699,9 @@ mod tests {
         if !cursor.start_with_offset(raw, offset) {
             return None;
         }
+        drain(&mut cursor, raw)
+    }
+    fn drain(cursor: &mut VariantJsonCursor, raw: &[u8]) -> Option<String> {
         let mut frames = Vec::new();
         let mut bytes = Vec::new();
         for _ in 0..10_000_000 {
@@ -706,11 +726,106 @@ mod tests {
             .serialize()
     }
     fn parity(raw: &[u8]) {
-        let offset = FixedOffset::east_opt(5 * 3600 + 1800).unwrap();
+        parity_at(raw, FixedOffset::east_opt(5 * 3600 + 1800).unwrap());
+    }
+    fn parity_at(raw: &[u8], offset: FixedOffset) {
         let expected = VariantValue::from_serialized(raw)
             .ok()
             .and_then(|v| v.to_json(Some(offset)).ok());
-        assert_eq!(generated(raw, offset), expected, "raw={raw:?}");
+        assert_eq!(
+            generated(raw, offset),
+            expected,
+            "raw={raw:?} offset={offset}"
+        );
+    }
+    #[test]
+    fn variant_json_cursor_local_timestamps_follow_the_supplied_offset() {
+        for micros in [
+            0i64,
+            -1,
+            1_234_567,
+            1_700_000_000_123_400,
+            -62_135_596_800_000_000,
+            i64::MIN,
+            i64::MAX,
+        ] {
+            let raw = serialized(12, &micros.to_le_bytes());
+            for seconds in [
+                -86_399,
+                -12 * 3600,
+                -(3 * 3600 + 1800),
+                -89,
+                -31,
+                -30,
+                -1,
+                0,
+                1,
+                29,
+                30,
+                31,
+                89,
+                5 * 3600 + 45 * 60,
+                8 * 3600 + 5 * 60 + 43,
+                14 * 3600,
+                86_399,
+            ] {
+                parity_at(&raw, FixedOffset::east_opt(seconds).unwrap());
+            }
+        }
+    }
+    #[test]
+    fn variant_json_cursor_resolves_offset_only_after_accepted_header() {
+        let mut cursor = VariantJsonCursor::new();
+        assert_eq!(cursor.step(b"", None), VariantJsonStep::Invalid);
+        let resolved = std::cell::Cell::new(0);
+        let offset = FixedOffset::east_opt(-7 * 3600).unwrap();
+        let resolve = || {
+            resolved.set(resolved.get() + 1);
+            Ok::<_, &str>(offset)
+        };
+        for raw in [
+            b"plain".as_slice(),
+            b"",
+            b"\x04\x00\x00\x00\x02\x00\x00\x00",
+            b"\x09\x00\x00\x00\x01",
+        ] {
+            assert_eq!(cursor.start_resolving_offset(raw, resolve), Ok(false));
+            assert_eq!(cursor.step(raw, None), VariantJsonStep::Invalid);
+        }
+        assert_eq!(resolved.get(), 0, "no conversion started");
+
+        let raw = serialized(12, &1_234_567i64.to_le_bytes());
+        assert_eq!(
+            cursor.start_resolving_offset(&raw, || Err::<FixedOffset, _>("expired")),
+            Err("expired")
+        );
+        assert_eq!(cursor.step(&raw, None), VariantJsonStep::Invalid);
+
+        assert_eq!(cursor.start_resolving_offset(&raw, resolve), Ok(true));
+        assert_eq!(resolved.get(), 1);
+        let expected = VariantValue::from_serialized(&raw)
+            .unwrap()
+            .to_json(Some(offset))
+            .unwrap();
+        assert_eq!(drain(&mut cursor, &raw), Some(expected));
+    }
+    #[test]
+    fn variant_json_cursor_rejects_unknown_primitives_like_the_original() {
+        for kind in 17u8..=63 {
+            let mut value = vec![kind << 2];
+            value.extend_from_slice(&[0; 16]);
+            let metadata = VariantMetadata::empty();
+            let mut raw = u32::try_from(metadata.raw().len() + value.len())
+                .unwrap()
+                .to_le_bytes()
+                .to_vec();
+            raw.extend_from_slice(metadata.raw());
+            raw.extend_from_slice(&value);
+            parity(&raw);
+            if kind != 20 {
+                assert!(generated(&raw, FixedOffset::east_opt(0).unwrap()).is_none());
+            }
+        }
     }
     #[test]
     fn variant_json_cursor_all_existing_primitive_renderers() {

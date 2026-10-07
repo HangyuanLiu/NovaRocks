@@ -716,8 +716,58 @@ fn build_pipeline_for_program_node(
         .ok_or_else(|| format!("missing local program node {}", id.index()))?;
     let node_id = node.native_node_id();
     match node.kind() {
-        lp::ProgramNodeKind::Membership { .. } => {
-            Err("membership runtime integration is not installed".into())
+        lp::ProgramNodeKind::Membership { probe, build, spec } => {
+            use crate::exec::operators::membership::{
+                MembershipBuildSinkFactory, MembershipProbeFactory, MembershipShared,
+            };
+            match spec.comparison {
+                lp::MembershipComparison::JsonInListV1 => {}
+            }
+            // Singleton and BroadcastBuild differ only in how the FE places
+            // RHS producers; locally the build input is whatever the frozen
+            // senders deliver to this exact Task.
+            match spec.distribution {
+                lp::MembershipDistribution::Singleton
+                | lp::MembershipDistribution::BroadcastBuild => {}
+            }
+            let probe_schema =
+                ChunkSchema::from_static_layout(program.nodes()[probe.index()].output_layout())?;
+            let build_schema =
+                ChunkSchema::from_static_layout(program.nodes()[build.index()].output_layout())?;
+            let output_schema = ChunkSchema::from_static_layout(node.output_layout())?;
+            let build_input = build_pipeline_for_program_node(program, bindings, *build, ctx)?;
+            // One local build driver owns this node's RHS for the Task.
+            let mut build_input = gather_to_one(build_input, ctx, node_id);
+            let mut probe_input = build_pipeline_for_program_node(program, bindings, *probe, ctx)?;
+            let shared = MembershipShared::try_new(
+                node_id,
+                spec.build,
+                &build_schema,
+                probe_input.pipeline.dop.max(1) as usize,
+                &ctx.dep_manager,
+            )?;
+            build_input
+                .pipeline
+                .factories
+                .push(Box::new(MembershipBuildSinkFactory::new(Arc::clone(
+                    &shared,
+                ))));
+            build_input.pipeline.needs_sink = false;
+            probe_input
+                .pipeline
+                .factories
+                .push(Box::new(MembershipProbeFactory::try_new(
+                    shared,
+                    spec,
+                    &probe_schema,
+                    output_schema,
+                )?));
+            probe_input
+                .extra_pipelines
+                .append(&mut build_input.extra_pipelines);
+            probe_input.extra_pipelines.push(build_input.pipeline);
+            probe_input.stream = StreamDesc::any(probe_input.pipeline.dop);
+            Ok(probe_input)
         }
         lp::ProgramNodeKind::QuotaPreclaim {
             demand,
@@ -1608,11 +1658,6 @@ fn build_pipeline_for_program_node(
             expr_slot_schemas,
             output_indices,
         } => {
-            if *retention_admission != lp::ProjectRetentionAdmission::Existing {
-                return Err(
-                    "checked Project retention runtime integration is not installed".into(),
-                );
-            }
             let mut build = build_pipeline_for_program_node(program, bindings, *input, ctx)?;
             let schemas = expr_slot_schemas
                 .as_ref()
@@ -1630,10 +1675,8 @@ fn build_pipeline_for_program_node(
                         .collect::<Result<Vec<_>, _>>()
                 })
                 .transpose()?;
-            build
-                .pipeline
-                .factories
-                .push(Box::new(ProjectProcessorFactory::new(
+            build.pipeline.factories.push(Box::new(
+                ProjectProcessorFactory::new(
                     node_id,
                     *is_subordinate,
                     Arc::clone(&ctx.arena),
@@ -1642,7 +1685,9 @@ fn build_pipeline_for_program_node(
                     schemas,
                     output_indices.clone(),
                     ChunkSchema::from_static_layout(node.output_layout())?,
-                )));
+                )
+                .with_retention_admission(*retention_admission),
+            ));
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
         }
@@ -2508,6 +2553,258 @@ mod tests {
                 .unwrap_err()
                 .contains("reuses runtime-capability node")
         );
+    }
+
+    /// A Json-marked Utf8 layout, or a plain one for `json == false`.
+    fn membership_layout(slots: &[(u32, DataType, bool)]) -> lp::StaticLayout {
+        use novarocks_types::logical::LogicalType;
+        lp::StaticLayout::try_new_exact(
+            Arc::new(Schema::new(
+                slots
+                    .iter()
+                    .map(|(slot, data_type, _)| {
+                        Field::new(format!("c{slot}"), data_type.clone(), true)
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            slots
+                .iter()
+                .map(|(slot, _, _)| SlotId::new(*slot))
+                .collect::<Vec<_>>()
+                .into(),
+            slots
+                .iter()
+                .map(|(slot, _, json)| {
+                    (
+                        lp::StaticFieldSchema::new(json.then_some(LogicalType::Json), vec![]),
+                        json.then_some(*slot as i32),
+                    )
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn membership_values(
+        layout: &lp::StaticLayout,
+        columns: Vec<arrow::array::ArrayRef>,
+        node_id: i32,
+    ) -> ExecNode {
+        let schema = ChunkSchema::from_static_layout(layout).unwrap();
+        let batch = RecordBatch::try_new(schema.arrow_schema_ref(), columns).unwrap();
+        ExecNode {
+            kind: ExecNodeKind::Values(ValuesNode {
+                chunk: Chunk::try_new_with_chunk_schema(batch, schema).unwrap(),
+                node_id,
+            }),
+        }
+    }
+
+    fn checked_identity_project(
+        arena: &mut ExprArena,
+        input: ExecNode,
+        layout: &lp::StaticLayout,
+        node_id: i32,
+    ) -> ExecNode {
+        let schema = ChunkSchema::from_static_layout(layout).unwrap();
+        let exprs = schema
+            .slots()
+            .iter()
+            .map(|slot| {
+                arena.push_typed(ExprNode::SlotId(slot.slot_id()), slot.data_type().clone())
+            })
+            .collect();
+        ExecNode {
+            kind: ExecNodeKind::Project(ProjectNode {
+                retention_admission: lp::ProjectRetentionAdmission::CheckedTask,
+                input: Box::new(input),
+                node_id,
+                is_subordinate: false,
+                exprs,
+                expr_slot_ids: schema.slot_ids().to_vec(),
+                expr_slot_schemas: None,
+                output_indices: None,
+                output_chunk_schema: schema,
+            }),
+        }
+    }
+
+    #[test]
+    fn membership_local_program_runs_checked_projects_and_all_rhs_senders_end_to_end() {
+        use crate::exec::expr::json_in_pair::JsonPairTruth;
+        use crate::exec::expr::json_in_pair::test_support::{
+            old_in_list_pair, shared_runtime, task_state,
+        };
+        use crate::exec::node::limit::LimitNode;
+        use crate::exec::node::membership::{
+            MembershipComparison, MembershipDistribution, MembershipNode, MembershipSpec,
+        };
+        use crate::exec::node::union_all::UnionAllNode;
+        use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
+        use crate::runtime::mem_tracker::MemTracker;
+        use arrow::array::{Array, BooleanArray, StringArray};
+        use novarocks_execution_contract::TaskIdentity;
+        use novarocks_types::identity::{AttemptId, QueryExecutionId, QueryId};
+        use novarocks_types::{BackendProcessId, StageId, TaskId};
+
+        let probe_layout =
+            membership_layout(&[(1, DataType::Utf8, true), (2, DataType::Int64, false)]);
+        let build_layout = membership_layout(&[(3, DataType::Utf8, true)]);
+        let output_layout = membership_layout(&[
+            (1, DataType::Utf8, true),
+            (2, DataType::Int64, false),
+            (4, DataType::Boolean, false),
+        ]);
+        let probe_values = vec![
+            Some("1"),
+            Some("[1,2]"),
+            None,
+            Some(r#""x""#),
+            Some(r#"{"b":2,"a":1}"#),
+        ];
+        let senders: Vec<Vec<Option<&str>>> = vec![
+            vec![Some("1.0")],
+            vec![Some(" [1, 2] "), Some(r#"{"a":1,"b":2}"#)],
+            vec![],
+        ];
+        for (negated, limit) in [(false, None), (true, None), (false, Some(2))] {
+            let mut arena = ExprArena::default();
+            let probe = membership_values(
+                &probe_layout,
+                vec![
+                    Arc::new(StringArray::from(probe_values.clone())),
+                    Arc::new(Int64Array::from_iter_values(0..probe_values.len() as i64)),
+                ],
+                1,
+            );
+            let probe = checked_identity_project(&mut arena, probe, &probe_layout, 2);
+            let inputs = senders
+                .iter()
+                .enumerate()
+                .map(|(index, values)| {
+                    membership_values(
+                        &build_layout,
+                        vec![Arc::new(StringArray::from(values.clone()))],
+                        10 + index as i32,
+                    )
+                })
+                .collect();
+            let build = ExecNode {
+                kind: ExecNodeKind::UnionAll(UnionAllNode { inputs, node_id: 3 }),
+            };
+            let build = checked_identity_project(&mut arena, build, &build_layout, 4);
+            let membership = ExecNode {
+                kind: ExecNodeKind::Membership(MembershipNode {
+                    probe: Box::new(probe),
+                    build: Box::new(build),
+                    node_id: 5,
+                    spec: MembershipSpec {
+                        probe: SlotId::new(1),
+                        build: SlotId::new(3),
+                        result: SlotId::new(4),
+                        negated,
+                        comparison: MembershipComparison::JsonInListV1,
+                        distribution: MembershipDistribution::BroadcastBuild,
+                    },
+                    output_chunk_schema: ChunkSchema::from_static_layout(&output_layout).unwrap(),
+                }),
+            };
+            let root = match limit {
+                Some(limit) => ExecNode {
+                    kind: ExecNodeKind::Limit(LimitNode {
+                        input: Box::new(membership),
+                        node_id: 6,
+                        limit: Some(limit),
+                        offset: 0,
+                    }),
+                },
+                None => membership,
+            };
+            let profile = lp::CompileProfile::new(
+                NonZeroUsize::new(1).unwrap(),
+                None,
+                output_layout.identity().unwrap(),
+                lp::KernelAbiVersion::CURRENT,
+            );
+            let (program, bindings) = ExecPlan { arena, root }
+                .into_local_program_and_bindings(
+                    profile,
+                    BTreeMap::new(),
+                    vec![ExternalSinkRequirement::Result],
+                    FragmentSinkProgram::Result.into_static().unwrap(),
+                )
+                .unwrap();
+            let tracker = MemTracker::new_root("membership-local-program");
+            let identity = TaskIdentity::new(
+                QueryExecutionId::new(QueryId::new(7, 9), AttemptId::new(1).unwrap()).unwrap(),
+                StageId::new(1).unwrap(),
+                TaskId::new(1).unwrap(),
+                BackendProcessId::new_v7(),
+            );
+            let state = Arc::new(task_state(
+                identity,
+                Arc::clone(&tracker),
+                Some(shared_runtime()),
+            ));
+            let output = ResultSinkHandle::new();
+            crate::exec::pipeline::executor::prepare_report_neutral_local_program_pipeline_execution(
+                &program,
+                &bindings,
+                false,
+                Duration::from_millis(10),
+                Box::new(ResultSinkFactory::new(output.clone())),
+                ExchangeBindings::default(),
+                ScanBindings::default(),
+                None,
+                None,
+                1,
+                Arc::clone(&state),
+                None,
+                None,
+                Arc::new(crate::runtime::fragment::io::NoopFragmentEventSink),
+            )
+            .unwrap()
+            .start()
+            .join()
+            .unwrap();
+            let rhs = senders.iter().flatten().copied().collect::<Vec<_>>();
+            let expected = probe_values
+                .iter()
+                .map(|lhs| {
+                    let mut unknown = false;
+                    for candidate in &rhs {
+                        match old_in_list_pair(*lhs, *candidate) {
+                            JsonPairTruth::True => return Some(!negated),
+                            JsonPairTruth::Unknown => unknown = true,
+                            JsonPairTruth::False => {}
+                        }
+                    }
+                    if unknown { None } else { Some(negated) }
+                })
+                .take(limit.unwrap_or(usize::MAX))
+                .collect::<Vec<_>>();
+            let chunks = output.take_chunks();
+            let actual = chunks
+                .iter()
+                .flat_map(|chunk| {
+                    chunk.columns()[2]
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .unwrap()
+                        .iter()
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "negated={negated} limit={limit:?}");
+            assert_eq!(
+                expected[1],
+                Some(!negated),
+                "a JSON-equal candidate matches"
+            );
+            drop(chunks);
+            drop(program);
+            assert_eq!(tracker.current(), 0, "negated={negated} limit={limit:?}");
+        }
     }
 
     #[test]

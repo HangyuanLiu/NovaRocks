@@ -990,6 +990,24 @@ pub(super) fn json_value_from_text_or_variant(text: &str) -> Option<JsonValue> {
         .or_else(|| variant_json_value(text.as_bytes()))
 }
 
+/// The ungoverned conversion above with its conversion-start offset made
+/// explicit: `to_json_local` is `to_json` with the offset `Local::now()`
+/// reads, so this is the differential oracle for a governed conversion that
+/// was given `offset`.
+#[cfg(test)]
+pub(super) fn json_value_from_text_or_variant_at(
+    text: &str,
+    offset: chrono::FixedOffset,
+) -> Option<JsonValue> {
+    serde_json::from_str(text).ok().or_else(|| {
+        let text = VariantValue::from_serialized(text.as_bytes())
+            .ok()?
+            .to_json(Some(offset))
+            .ok()?;
+        serde_json::from_str(&text).ok()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1552,5 +1570,75 @@ mod tests {
         assert!(result.value(0));
         assert!(result.is_null(1));
         assert!(result.is_null(2));
+    }
+
+    /// The explicit-offset oracle is the local entry once both read the same
+    /// offset, so governed differential tests may fix the offset.
+    #[test]
+    fn json_in_list_explicit_offset_oracle_matches_the_local_entry() {
+        use chrono::Offset;
+        let variant = crate::exec::expr::json_in_pair::test_support::ascii_timestamp_variant(&[
+            0x0011_2233_4455_6677,
+            0x0123_4567_0000,
+        ]);
+        for text in [variant.as_str(), r#"{"a":[1,2.5,"x"]}"#, "plain"] {
+            let offset = chrono::Local::now().offset().fix();
+            assert_eq!(
+                json_value_from_text_or_variant_at(text, offset),
+                json_value_from_text_or_variant(text),
+                "text={text:?}"
+            );
+        }
+        let utc = chrono::FixedOffset::east_opt(0).unwrap();
+        let tokyo = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
+        let at_utc = json_value_from_text_or_variant_at(&variant, utc).expect("Variant JSON");
+        let at_tokyo = json_value_from_text_or_variant_at(&variant, tokyo).expect("Variant JSON");
+        assert_ne!(at_utc, at_tokyo, "the offset is part of the rendered value");
+    }
+
+    /// A serialized Variant reaches the old IN-list through the UTF8 carrier,
+    /// including the serialized Variant null, and compares by JSON value.
+    #[test]
+    fn utf8_json_in_list_reaches_serialized_variant_fallback() {
+        let null = std::str::from_utf8(&[4, 0, 0, 0, 1, 0, 0, 0]).unwrap();
+        let array = String::from_utf8(
+            novarocks_types::value::variant_encode::encode_json_text_to_variant_bytes(
+                "[null,true,false]",
+            )
+            .unwrap(),
+        )
+        .expect("a low-byte Variant is valid UTF8");
+        let values = Arc::new(StringArray::from(vec![
+            Some(null),
+            Some(array.as_str()),
+            Some("plain"),
+            Some("[ null , true , false ]"),
+        ])) as ArrayRef;
+        let chunk = chunk_from_arrays(vec![(SlotId::new(1), "json_col", values)]);
+        let mut arena = ExprArena::default();
+        let child = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let json_null = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8("null".to_string())),
+            DataType::Utf8,
+        );
+        let json_array = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8("[null,true,false]".to_string())),
+            DataType::Utf8,
+        );
+        let expr = arena.push_typed(
+            ExprNode::In {
+                child,
+                values: vec![json_null, json_array],
+                is_not_in: false,
+            },
+            DataType::Boolean,
+        );
+
+        let result = arena.eval(expr, &chunk).expect("JSON text IN list");
+
+        assert_eq!(
+            bool_values(&result),
+            vec![Some(true), Some(true), Some(false), Some(true)]
+        );
     }
 }

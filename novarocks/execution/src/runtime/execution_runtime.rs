@@ -7,6 +7,7 @@ use crate::runtime::exchange::ExecutionExchangeRegistry;
 use crate::runtime::execution_services::ExecutionServices;
 use crate::runtime::fragment::io::exchange_queue::ExchangeSendQueue;
 use crate::runtime::io::IoExecutor;
+use crate::runtime::local_offset::{ChronoLocalRules, LocalOffsetOwner};
 use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
 use novarocks_memory::MemoryAuthority;
 
@@ -89,6 +90,9 @@ pub struct ExecutionRuntime {
     exchange_registry: Arc<ExecutionExchangeRegistry>,
     driver_executor: Arc<GlobalDriverExecutor>,
     exchange_send_queue: Arc<ExchangeSendQueue>,
+    /// The process's system local time zone offset, maintained outside every
+    /// task. Governed conversion reads it instead of calling chrono `Local`.
+    local_offset: Arc<LocalOffsetOwner>,
 }
 
 /// A real, small memory authority for tests that need to build an
@@ -116,6 +120,10 @@ impl ExecutionRuntime {
         memory_authority: Arc<MemoryAuthority>,
     ) -> Result<Self, ExecutionRuntimeConfigError> {
         config.validate()?;
+        // Publishes the first snapshot before this constructor returns, so
+        // one exists before the process accepts any task.
+        let local_offset = LocalOffsetOwner::start(ChronoLocalRules)
+            .map_err(|error| ExecutionRuntimeConfigError::runtime(error.to_string()))?;
         let services =
             ExecutionServices::new(&config).map_err(ExecutionRuntimeConfigError::runtime)?;
         let driver_executor = Arc::new(GlobalDriverExecutor::new(config.driver_threads));
@@ -136,6 +144,7 @@ impl ExecutionRuntime {
             exchange_registry: Arc::new(ExecutionExchangeRegistry::default()),
             driver_executor,
             exchange_send_queue,
+            local_offset,
         })
     }
 
@@ -181,6 +190,19 @@ impl ExecutionRuntime {
 
     pub fn exchange_send_queue(&self) -> Arc<ExchangeSendQueue> {
         Arc::clone(&self.exchange_send_queue)
+    }
+
+    /// Returns the process-level owner of the system local time zone offset.
+    pub fn local_offset_owner(&self) -> &Arc<LocalOffsetOwner> {
+        &self.local_offset
+    }
+
+    /// Replaces the production local offset owner with one built from
+    /// injected rules.
+    #[cfg(test)]
+    pub(crate) fn with_local_offset_owner(mut self, owner: Arc<LocalOffsetOwner>) -> Self {
+        self.local_offset = owner;
+        self
     }
 }
 
@@ -258,6 +280,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{ExecutionRuntime, ExecutionRuntimeConfig, test_execution_function_set};
+    use crate::runtime::local_offset::{
+        LocalOffsetOwner, LocalOffsetStepRules, unix_seconds_floor,
+    };
+    use chrono::{FixedOffset, Local, TimeZone};
 
     fn wait_until(timeout: Duration, predicate: impl Fn() -> bool) -> bool {
         let deadline = Instant::now() + timeout;
@@ -362,6 +388,73 @@ mod tests {
             .expect("repeated driver shutdown");
 
         assert!(probes.all_exited());
+    }
+
+    #[test]
+    fn execution_runtime_publishes_local_offset_before_returning() {
+        let runtime = ExecutionRuntime::new(
+            config(),
+            test_execution_function_set(),
+            crate::runtime::execution_runtime::test_memory_authority(),
+        )
+        .expect("valid runtime config");
+
+        let now = unix_seconds_floor(std::time::SystemTime::now());
+        let snapshot = runtime.local_offset_owner().snapshot();
+        assert!(snapshot.valid_from_utc() <= now && now < snapshot.valid_until_utc());
+        let expected = *Local
+            .timestamp_opt(now, 0)
+            .single()
+            .expect("a UTC instant maps to one local time")
+            .offset();
+        assert_eq!(snapshot.offset_at(now), Ok(expected));
+    }
+
+    #[test]
+    fn execution_runtime_drop_stops_local_offset_refresher() {
+        let runtime = ExecutionRuntime::new(
+            config(),
+            test_execution_function_set(),
+            crate::runtime::execution_runtime::test_memory_authority(),
+        )
+        .expect("valid runtime config");
+        let probe = runtime.local_offset_owner().refresher_exit_probe();
+        let clone = runtime.clone();
+
+        drop(runtime);
+        assert!(!probe.exited(), "a runtime clone still owns the snapshot");
+        drop(clone);
+
+        assert!(wait_until(Duration::from_secs(2), || probe.exited()));
+    }
+
+    #[test]
+    fn execution_runtime_serves_an_injected_local_offset_owner() {
+        let now = unix_seconds_floor(std::time::SystemTime::now());
+        let east = |secs| FixedOffset::east_opt(secs).expect("valid test offset");
+        let owner = LocalOffsetOwner::start(LocalOffsetStepRules {
+            transition_at_utc: now + 30,
+            before: east(-7 * 3600),
+            after: east(-6 * 3600),
+        })
+        .expect("start owner");
+        let runtime = ExecutionRuntime::new(
+            config(),
+            test_execution_function_set(),
+            crate::runtime::execution_runtime::test_memory_authority(),
+        )
+        .expect("valid runtime config")
+        .with_local_offset_owner(std::sync::Arc::clone(&owner));
+
+        assert!(std::sync::Arc::ptr_eq(runtime.local_offset_owner(), &owner));
+        assert_eq!(
+            runtime.local_offset_owner().offset_at(now + 29),
+            Ok(east(-7 * 3600))
+        );
+        assert_eq!(
+            runtime.local_offset_owner().offset_at(now + 30),
+            Ok(east(-6 * 3600))
+        );
     }
 
     /// The execution runtime owns a branch, not a second root. A root here
