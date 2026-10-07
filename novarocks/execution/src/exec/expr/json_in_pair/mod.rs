@@ -25,6 +25,8 @@
 mod compare;
 mod interface;
 mod number;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod text;
 mod tree;
 pub(crate) use interface::*;
@@ -102,11 +104,19 @@ impl Side {
                 ParseStep::Invalid => {
                     self.pending = None;
                     self.parser = Parser::new(task);
-                    if self.source == Source::Text && self.variant.start(input.as_bytes()) {
-                        self.source = Source::Variant;
+                    // The offset is read from the process snapshot only when a
+                    // serialized Variant conversion actually starts; an
+                    // expired snapshot fails the pair instead of selecting
+                    // the raw-text comparison.
+                    self.source = if self.source == Source::Text
+                        && self
+                            .variant
+                            .start_resolving_offset(input.as_bytes(), || task.conversion_offset())?
+                    {
+                        Source::Variant
                     } else {
-                        self.source = Source::Invalid;
-                    }
+                        Source::Invalid
+                    };
                 }
             }
         } else if self.source == Source::Text {
@@ -263,28 +273,48 @@ impl JsonPairCursor {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::{
+        EMPTY_METADATA, ascii_timestamp_variant, ascii_variant, runtime_with_offset_owner,
+        shared_runtime, task_state, variant_array, variant_primitive, with_admission_witness,
+    };
     use super::*;
+    use crate::runtime::execution_runtime::ExecutionRuntime;
+    use crate::runtime::local_offset::{
+        LocalOffsetOwner, LocalOffsetStepRules, LocalRulesSource, unix_seconds_floor,
+    };
     use crate::runtime::mem_tracker::MemTracker;
     use crate::runtime::runtime_state::RuntimeState;
-    use crate::runtime::verification::TaskVerificationHolder;
+    use chrono::FixedOffset;
     use novarocks_execution_contract::{TaskFailureCategory, TaskIdentity};
     use novarocks_types::identity::{AttemptId, QueryExecutionId, QueryId};
+    use novarocks_types::value::variant::VariantValue;
     use novarocks_types::{BackendProcessId, StageId, TaskId};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     };
+    use std::time::{Duration, Instant, SystemTime};
 
-    pub(super) fn task(tracker: Arc<MemTracker>) -> JsonPairTask {
-        let identity = TaskIdentity::new(
+    fn identity() -> TaskIdentity {
+        TaskIdentity::new(
             QueryExecutionId::new(QueryId::new(7, 9), AttemptId::new(1).unwrap()).unwrap(),
             StageId::new(1).unwrap(),
             TaskId::new(1).unwrap(),
             BackendProcessId::new_v7(),
-        );
-        let state = RuntimeState::new(None, None, None, None, None, Some(tracker), None)
-            .with_verification(Arc::new(TaskVerificationHolder::new(identity)));
-        JsonPairTask::try_bind(&state).unwrap()
+        )
+    }
+    /// Binds a task on the shared runtime with the production local offset
+    /// owner, the same offset source the old IN-list path reads.
+    pub(super) fn task(tracker: Arc<MemTracker>) -> JsonPairTask {
+        bound_task(tracker, shared_runtime()).1
+    }
+    fn bound_task(
+        tracker: Arc<MemTracker>,
+        runtime: Arc<ExecutionRuntime>,
+    ) -> (RuntimeState, JsonPairTask) {
+        let state = task_state(identity(), tracker, Some(runtime));
+        let task = JsonPairTask::try_bind(&state).unwrap();
+        (state, task)
     }
     pub(super) fn limited_task() -> (Arc<MemTracker>, JsonPairTask) {
         let tracker = MemTracker::new_root("allocation-witness");
@@ -323,12 +353,17 @@ mod tests {
             rhs,
         }
     }
-    fn oracle(lhs: Option<&str>, rhs: Option<&str>) -> JsonPairTruth {
+    /// The old IN-list pair rule over the old conversion `convert`.
+    fn decide(
+        lhs: Option<&str>,
+        rhs: Option<&str>,
+        convert: impl Fn(&str) -> Option<serde_json::Value>,
+    ) -> JsonPairTruth {
         let (Some(lhs), Some(rhs)) = (lhs, rhs) else {
             return JsonPairTruth::Unknown;
         };
-        let a = super::super::in_pred::json_value_from_text_or_variant(lhs);
-        let b = super::super::in_pred::json_value_from_text_or_variant(rhs);
+        let a = convert(lhs);
+        let b = convert(rhs);
         let equal = if a.is_some() && b.is_some() {
             a == b
         } else {
@@ -339,6 +374,20 @@ mod tests {
         } else {
             JsonPairTruth::False
         }
+    }
+    /// The unchanged old IN-list entry, which reads chrono `Local` itself.
+    fn oracle(lhs: Option<&str>, rhs: Option<&str>) -> JsonPairTruth {
+        decide(
+            lhs,
+            rhs,
+            super::super::in_pred::json_value_from_text_or_variant,
+        )
+    }
+    /// The old IN-list conversion given the conversion-start offset.
+    fn oracle_at(lhs: Option<&str>, rhs: Option<&str>, offset: FixedOffset) -> JsonPairTruth {
+        decide(lhs, rhs, |text| {
+            super::super::in_pred::json_value_from_text_or_variant_at(text, offset)
+        })
     }
     fn finish(
         cursor: &mut JsonPairCursor,
@@ -626,6 +675,11 @@ mod tests {
     fn json_in_pair_every_allocation_turn_replays_typed_refusal() {
         let lhs = r#"{"a":["long decoded string with \u00e9",{"deep":[1,2,3]}],"a":[true,false],"b":{"x":null}}"#;
         let rhs = r#"{"b":{"x":null},"a":[true,false]}"#;
+        every_allocation_turn_replays_typed_refusal(lhs, rhs);
+    }
+    /// Refuses each allocating turn of one full pair in turn and requires the
+    /// typed capacity cause, never a parse result.
+    fn every_allocation_turn_replays_typed_refusal(lhs: &str, rhs: &str) {
         let (tracker, task) = limited_task();
         let mut cursor = JsonPairCursor::new(&task);
         cursor.start(input(Some(lhs), Some(rhs))).unwrap();
@@ -696,7 +750,10 @@ mod tests {
         let text = std::str::from_utf8(&raw).expect("low-byte Variant is a real UTF8 input");
         let (tracker, task) = limited_task();
         let mut side = Side::new(&task);
-        assert!(side.variant.start(raw.as_slice()));
+        assert!(
+            side.variant
+                .start_with_offset(raw.as_slice(), task.conversion_offset().unwrap())
+        );
         side.source = Source::Variant;
         let mut events = Vec::new();
         for step in 0..100_000 {
@@ -716,7 +773,10 @@ mod tests {
         for event in events {
             let (tracker, task) = limited_task();
             let mut side = Side::new(&task);
-            assert!(side.variant.start(&raw));
+            assert!(
+                side.variant
+                    .start_with_offset(&raw, task.conversion_offset().unwrap())
+            );
             side.source = Source::Variant;
             for _ in 0..event {
                 side.step(&task, text).unwrap();
@@ -731,5 +791,576 @@ mod tests {
             drop(side);
             assert_eq!(tracker.current(), 0);
         }
+    }
+
+    /// TimestampTz micros whose little-endian bytes are all ASCII, with and
+    /// without a fractional second.
+    const STAMPS: [i64; 3] = [0x0011_2233_4455_6677, 0x0123_4567_0000, 0];
+
+    fn constant_owner(offset: FixedOffset) -> Arc<LocalOffsetOwner> {
+        LocalOffsetOwner::start(LocalOffsetStepRules {
+            transition_at_utc: i64::MAX,
+            before: offset,
+            after: offset,
+        })
+        .unwrap()
+    }
+    /// The old renderer's JSON text for a serialized Variant at `offset`.
+    fn rendered_at(variant: &str, offset: FixedOffset) -> String {
+        VariantValue::from_serialized(variant.as_bytes())
+            .unwrap()
+            .to_json(Some(offset))
+            .unwrap()
+    }
+
+    #[test]
+    fn json_in_pair_variant_local_timestamps_admit_every_allocation() {
+        let offset = FixedOffset::east_opt(5 * 3600 + 45 * 60).unwrap();
+        let variant = ascii_timestamp_variant(&STAMPS);
+        let reordered = ascii_timestamp_variant(&[STAMPS[1], STAMPS[0], STAMPS[2]]);
+        let rendered = rendered_at(&variant, offset);
+        let tracker = MemTracker::new_root("witness-pair-task");
+        let (_state, task) = bound_task(
+            Arc::clone(&tracker),
+            runtime_with_offset_owner(constant_owner(offset)),
+        );
+        let mut cursor = JsonPairCursor::new(&task);
+        // The task's error state is a std Mutex. On macOS std boxes a pthread
+        // mutex lazily at its first lock, once per task error state and
+        // independent of any pair; Linux futex mutexes never allocate. Lock
+        // it once here so the witness measures the conversion path alone.
+        JsonPairContext {
+            task: &task,
+            stopped: &AtomicBool::new(false),
+        }
+        .check_running()
+        .unwrap();
+        for (lhs, rhs) in [
+            (&variant, &rendered),
+            (&variant, &variant),
+            (&rendered, &variant),
+            (&variant, &reordered),
+        ] {
+            for credit in [1, 64] {
+                let (result, report) = with_admission_witness(&tracker, || {
+                    finish(&mut cursor, &task, Some(lhs), Some(rhs), credit)
+                });
+                assert_eq!(
+                    result.unwrap().0,
+                    oracle_at(Some(lhs), Some(rhs), offset),
+                    "lhs={lhs:?} rhs={rhs:?} credit={credit}"
+                );
+                assert_eq!(
+                    report.non_admitted_allocations, 0,
+                    "lhs={lhs:?} rhs={rhs:?} credit={credit} report={report:?}"
+                );
+                assert!(
+                    report.admitted_bytes > 0,
+                    "the pair parses into tracked trees"
+                );
+            }
+        }
+        assert_eq!(
+            finish(&mut cursor, &task, Some(&variant), Some(&rendered), 64)
+                .unwrap()
+                .0,
+            JsonPairTruth::True
+        );
+        cursor.clear();
+        assert_eq!(tracker.current(), 0);
+
+        // The witness does see the ungoverned path: the old conversion
+        // allocates outside task admission.
+        let (_, report) = with_admission_witness(&tracker, || {
+            oracle_at(Some(&variant), Some(&rendered), offset)
+        });
+        assert!(report.non_admitted_allocations > 0, "report={report:?}");
+        // And on a fresh driver-like thread, the first chrono `Local` read
+        // loads the zone outside admission; the snapshot read above did not.
+        let fresh = Arc::clone(&tracker);
+        let report =
+            std::thread::spawn(move || with_admission_witness(&fresh, chrono::Local::now).1)
+                .join()
+                .unwrap();
+        assert!(report.non_admitted_allocations > 0, "report={report:?}");
+    }
+
+    #[test]
+    fn json_in_pair_injected_local_offset_matches_old_in_list_oracle() {
+        let variant = ascii_timestamp_variant(&STAMPS);
+        let serialized_null = std::str::from_utf8(&[4, 0, 0, 0, 1, 0, 0, 0])
+            .unwrap()
+            .to_owned();
+        let offsets = [
+            -12 * 3600,
+            -(3 * 3600 + 1800),
+            0,
+            5 * 3600 + 45 * 60,
+            14 * 3600,
+        ]
+        .map(|seconds| FixedOffset::east_opt(seconds).unwrap());
+        let mut inputs = vec![
+            variant.clone(),
+            serialized_null,
+            "null".to_owned(),
+            "plain".to_owned(),
+        ];
+        inputs.extend(offsets.iter().map(|offset| rendered_at(&variant, *offset)));
+        for offset in offsets {
+            let tracker = MemTracker::new_root("injected-offset-task");
+            let (_state, task) = bound_task(
+                Arc::clone(&tracker),
+                runtime_with_offset_owner(constant_owner(offset)),
+            );
+            let mut cursor = JsonPairCursor::new(&task);
+            for lhs in &inputs {
+                for rhs in &inputs {
+                    for credit in [1, 64] {
+                        assert_eq!(
+                            finish(&mut cursor, &task, Some(lhs), Some(rhs), credit)
+                                .unwrap()
+                                .0,
+                            oracle_at(Some(lhs), Some(rhs), offset),
+                            "offset={offset} lhs={lhs:?} rhs={rhs:?} credit={credit}"
+                        );
+                    }
+                }
+            }
+            // The governed conversion follows the injected owner.
+            assert_eq!(
+                finish(
+                    &mut cursor,
+                    &task,
+                    Some(&variant),
+                    Some(&rendered_at(&variant, offset)),
+                    64
+                )
+                .unwrap()
+                .0,
+                JsonPairTruth::True
+            );
+            cursor.clear();
+            assert_eq!(tracker.current(), 0);
+        }
+    }
+
+    #[test]
+    fn json_in_pair_production_local_offset_matches_unchanged_old_entry() {
+        let variant = ascii_timestamp_variant(&STAMPS);
+        let local = super::super::in_pred::json_value_from_text_or_variant(&variant)
+            .expect("the old entry converts the Variant")
+            .to_string();
+        let utc = rendered_at(&variant, FixedOffset::east_opt(0).unwrap());
+        for lhs in [&variant, &local, &utc] {
+            for rhs in [&variant, &local, &utc] {
+                parity(lhs, rhs);
+            }
+        }
+    }
+
+    /// Rules that hold one offset until `stable_until` and then change every
+    /// second, so no later window establishes a unique transition.
+    struct FlappingRules {
+        stable_until: i64,
+    }
+    impl LocalRulesSource for FlappingRules {
+        fn offset_at(&self, utc_secs: i64) -> Option<FixedOffset> {
+            let shifted = utc_secs > self.stable_until && (utc_secs - self.stable_until) % 2 == 1;
+            FixedOffset::east_opt(if shifted { 7200 } else { 3600 })
+        }
+    }
+    /// An owner whose newest snapshot no longer covers the wall clock.
+    fn expired_owner() -> Arc<LocalOffsetOwner> {
+        for _ in 0..5 {
+            let now = unix_seconds_floor(SystemTime::now());
+            // The first window ends at the second transition, `now + 2`.
+            let Ok(owner) = LocalOffsetOwner::start(FlappingRules { stable_until: now }) else {
+                continue;
+            };
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while owner.offset_now().is_ok() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the snapshot did not expire: {:?}",
+                    owner.snapshot()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            return owner;
+        }
+        panic!("the flapping owner could not publish its first snapshot");
+    }
+
+    #[test]
+    fn json_in_pair_expired_local_offset_is_typed_failure_not_fallback() {
+        let owner = expired_owner();
+        let tracker = MemTracker::new_root("expired-offset-task");
+        let (_state, task) = bound_task(Arc::clone(&tracker), runtime_with_offset_owner(owner));
+        let variant = ascii_timestamp_variant(&STAMPS);
+        let mut cursor = JsonPairCursor::new(&task);
+        for credit in [1, 64] {
+            // Raw equality would answer TRUE for the first pair; an expired
+            // snapshot must fail instead of selecting any comparison.
+            for (lhs, rhs) in [
+                (variant.as_str(), variant.as_str()),
+                (variant.as_str(), "plain"),
+                ("[1]", variant.as_str()),
+            ] {
+                let result = finish(&mut cursor, &task, Some(lhs), Some(rhs), credit);
+                assert!(
+                    matches!(
+                        result,
+                        Err(JsonPairError::Failed(ref failure))
+                            if failure.category() == TaskFailureCategory::ResourceExhausted
+                                && failure
+                                    .detail()
+                                    .as_str()
+                                    .contains("local time zone offset snapshot")
+                    ),
+                    "lhs={lhs:?} rhs={rhs:?} credit={credit} result={result:?}"
+                );
+            }
+            // A pair that never starts a Variant conversion never reads it.
+            for (lhs, rhs) in [
+                ("plain", "plain"),
+                (r#"{"a":1}"#, r#"{"a": 1}"#),
+                ("plain", "[1]"),
+            ] {
+                assert_eq!(
+                    finish(&mut cursor, &task, Some(lhs), Some(rhs), credit)
+                        .unwrap()
+                        .0,
+                    oracle(Some(lhs), Some(rhs))
+                );
+            }
+            assert_eq!(
+                finish(&mut cursor, &task, None, Some(&variant), credit)
+                    .unwrap()
+                    .0,
+                JsonPairTruth::Unknown
+            );
+        }
+        cursor.clear();
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn json_in_pair_variant_every_allocation_turn_replays_typed_refusal() {
+        let variant = ascii_timestamp_variant(&STAMPS);
+        let rendered = super::super::in_pred::json_value_from_text_or_variant(&variant)
+            .expect("the old entry converts the Variant")
+            .to_string();
+        every_allocation_turn_replays_typed_refusal(&variant, &rendered);
+        every_allocation_turn_replays_typed_refusal(&rendered, &variant);
+    }
+
+    #[test]
+    fn json_in_pair_variant_primitive_rejections_keep_raw_fallback() {
+        // TimeNtz, the nanosecond timestamps and unassigned primitive ids are
+        // rejected by the old renderer, top-level or nested.
+        for kind in [17, 18, 19, 21, 25, 31] {
+            let primitive = variant_primitive(kind, &[0; 16]);
+            let top = ascii_variant(&EMPTY_METADATA, &primitive);
+            let nested = ascii_variant(
+                &EMPTY_METADATA,
+                &variant_array(&[variant_primitive(0, &[]), primitive]),
+            );
+            for value in [&top, &nested] {
+                parity(value, value);
+                parity(value, "null");
+                parity(value, "[null,null]");
+                parity("[null]", value);
+            }
+        }
+        // Every convertible primitive id whose encoding fits the UTF8 carrier.
+        for (kind, payload) in [
+            (0u8, vec![]),
+            (1, vec![]),
+            (2, vec![]),
+            (3, vec![0x7f]),
+            (4, 0x1234i16.to_le_bytes().to_vec()),
+            (5, 0x0102_0304i32.to_le_bytes().to_vec()),
+            (6, 0x0102_0304_0506_0708i64.to_le_bytes().to_vec()),
+            (7, 0x3f40_0000_0000_0000u64.to_le_bytes().to_vec()),
+            (8, [2, 0x10, 0x27, 0, 0].to_vec()),
+            (9, [3, 0x10, 0x27, 0, 0, 0, 0, 0, 0].to_vec()),
+            (
+                10,
+                [4, 0x10, 0x27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0].to_vec(),
+            ),
+            (11, 0x4e20i32.to_le_bytes().to_vec()),
+            (12, STAMPS[0].to_le_bytes().to_vec()),
+            (13, STAMPS[0].to_le_bytes().to_vec()),
+            (14, 0x3f40_0000u32.to_le_bytes().to_vec()),
+            (15, [3, 0, 0, 0, b'a', b'b', b'c'].to_vec()),
+            (16, [3, 0, 0, 0, b'x', b'"', b'\\'].to_vec()),
+            (20, (0u8..16).collect()),
+        ] {
+            let value = ascii_variant(&EMPTY_METADATA, &variant_primitive(kind, &payload));
+            let rendered = super::super::in_pred::json_value_from_text_or_variant(&value)
+                .unwrap_or_else(|| panic!("kind {kind} converts"))
+                .to_string();
+            parity(&value, &rendered);
+            parity(&value, &value);
+            parity(&value, "0");
+        }
+        // A short string is its own basic type: length in the header byte.
+        let short = ascii_variant(&EMPTY_METADATA, &[(3 << 2) | 1, b'a', b'"', b'c']);
+        parity(&short, r#""a\"c""#);
+        parity(&short, &short);
+    }
+
+    #[test]
+    fn json_in_pair_task_failure_stops_pair_without_parse_result() {
+        let tracker = MemTracker::new_root("pair-task");
+        let (state, task) = bound_task(Arc::clone(&tracker), shared_runtime());
+        let mut cursor = JsonPairCursor::new(&task);
+        let text = format!("\"{}\"", "a".repeat(1000));
+        let stopped = AtomicBool::new(false);
+        cursor.start(input(Some(&text), Some(&text))).unwrap();
+        let poll = |cursor: &mut JsonPairCursor| {
+            cursor.poll(
+                input(Some(&text), Some(&text)),
+                JsonPairContext {
+                    task: &task,
+                    stopped: &stopped,
+                },
+                &mut JsonPairWork::new(16),
+            )
+        };
+        assert_eq!(poll(&mut cursor).unwrap(), JsonPairPoll::Yield);
+        state.error_state().set_error("peer task failed".to_owned());
+        assert!(matches!(poll(&mut cursor), Err(JsonPairError::Stopped)));
+        cursor.clear();
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn json_in_pair_escape_control_and_exponent_boundaries() {
+        let cases = [
+            r#""\/""#,
+            r#""/""#,
+            r#""\b\f\n\r\t""#,
+            "\"\u{8}\u{c}\n\r\t\"",
+            r#""é""#,
+            r#""é""#,
+            r#""😀""#,
+            r#""\ud83d""#,
+            r#""\ud83d\""#,
+            r#""\ud83dx""#,
+            r#""\u12""#,
+            r#""\u12G4""#,
+            r#""\u0000""#,
+            "\"\u{1}\"",
+            "\"\u{7f}\"",
+            " 1 ",
+            "\t[\n1\r]",
+            "1\u{a0}",
+            "\u{feff}1",
+            "1e2147483647",
+            "1e2147483648",
+            "0e2147483648",
+            "1e-2147483648",
+            "1e-2147483649",
+            "-1e-400",
+            "1E+2",
+            "1e+0",
+            "1e-0",
+            "123.456e-2",
+            "0.1e1",
+            "100000000000000000000e-20",
+            "9007199254740993",
+            "1.7976931348623157e308",
+            "1.7976931348623158e308",
+            "1.8e308",
+            "4.9e-324",
+            "2e-324",
+            r#"{"a":{"b":1},"a":{"c":2}}"#,
+            r#"{"a":{"c":2}}"#,
+            r#"{"":1}"#,
+            r#"{"a":1 , "b" : 2 }"#,
+            r#"{"a"}"#,
+            r#"{"a":}"#,
+            r#"{,}"#,
+            r#"{"a":1"b":2}"#,
+        ];
+        for a in cases {
+            for b in cases {
+                parity(a, b);
+            }
+        }
+        for depth in [126, 127, 128] {
+            let object = format!("{}1{}", r#"{"a":"#.repeat(depth), "}".repeat(depth));
+            parity(&object, &object.replace(':', " : "));
+        }
+    }
+
+    /// Deterministic xorshift for generated documents.
+    struct Generator(u64);
+    impl Generator {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next() % bound as u64) as usize
+        }
+        fn pick<'a>(&mut self, values: &[&'a str]) -> &'a str {
+            values[self.below(values.len())]
+        }
+        fn space(&mut self, out: &mut String) {
+            out.push_str(self.pick(&["", "", " ", "\n", " \t"]));
+        }
+        fn document(&mut self, depth: usize, out: &mut String) {
+            self.space(out);
+            match self.below(if depth >= 4 { 4 } else { 6 }) {
+                0 => out.push_str(self.pick(&["null", "true", "false"])),
+                1 => out.push_str(self.pick(&[
+                    "0",
+                    "-0",
+                    "1",
+                    "-1",
+                    "1.5",
+                    "1e3",
+                    "1E-3",
+                    "-0.0",
+                    "0.1",
+                    "1.25e+2",
+                    "9007199254740993",
+                    "18446744073709551615",
+                    "18446744073709551616",
+                    "-9223372036854775808",
+                    "123456789012345678901234567890",
+                ])),
+                2 | 3 => {
+                    out.push('"');
+                    for _ in 0..self.below(4) {
+                        out.push_str(self.pick(&[
+                            "a",
+                            "é",
+                            "😀",
+                            "\\n",
+                            "\\\"",
+                            "\\\\",
+                            "\\/",
+                            "\\u00e9",
+                            "\\u00E9",
+                            "\\ud83d\\ude00",
+                            "\\b",
+                            "\\t",
+                            " ",
+                        ]));
+                    }
+                    out.push('"');
+                }
+                4 => {
+                    out.push('[');
+                    for index in 0..self.below(4) {
+                        if index > 0 {
+                            out.push(',');
+                        }
+                        self.document(depth + 1, out);
+                    }
+                    self.space(out);
+                    out.push(']');
+                }
+                _ => {
+                    out.push('{');
+                    for index in 0..self.below(4) {
+                        if index > 0 {
+                            out.push(',');
+                        }
+                        self.space(out);
+                        out.push_str(self.pick(&[r#""a""#, r#""b""#, r#""a""#, r#""é""#, r#""""#]));
+                        self.space(out);
+                        out.push(':');
+                        self.document(depth + 1, out);
+                    }
+                    self.space(out);
+                    out.push('}');
+                }
+            }
+            self.space(out);
+        }
+        fn mutate(&mut self, document: &str) -> String {
+            let ascii: Vec<usize> = document
+                .char_indices()
+                .filter(|(_, c)| c.is_ascii())
+                .map(|(index, _)| index)
+                .collect();
+            match self.below(4) {
+                0 => {
+                    let mut end = self.below(document.len() + 1);
+                    while !document.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    document[..end].to_owned()
+                }
+                1 if !ascii.is_empty() => {
+                    let at = ascii[self.below(ascii.len())];
+                    let replacement = self.pick(&["x", ",", "}", "]", "\"", "\\", "\u{1}", " "]);
+                    format!("{}{replacement}{}", &document[..at], &document[at + 1..])
+                }
+                2 => format!("{document}{}", self.pick(&["x", " ", ",", "]", "1"])),
+                _ => format!("{document}{document}"),
+            }
+        }
+    }
+
+    #[test]
+    fn json_in_pair_generated_document_mutation_differential() {
+        let mut generator = Generator(0x9e37_79b9_7f4a_7c15);
+        let mut previous = String::from("null");
+        let (mut valid, mut invalid, mut nested) = (0, 0, 0);
+        for _ in 0..150 {
+            let mut document = String::new();
+            generator.document(0, &mut document);
+            // An independent serde rendering of the same value, when valid.
+            let canonical = serde_json::from_str::<serde_json::Value>(&document)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|_| document.clone());
+            let mutated = generator.mutate(&document);
+            let mutated_again = generator.mutate(&mutated);
+            for text in [&document, &mutated, &mutated_again] {
+                if serde_json::from_str::<serde_json::Value>(text).is_ok() {
+                    valid += 1;
+                } else {
+                    invalid += 1;
+                }
+            }
+            fn depth(value: &serde_json::Value) -> usize {
+                match value {
+                    serde_json::Value::Array(items) => {
+                        1 + items.iter().map(depth).max().unwrap_or(0)
+                    }
+                    serde_json::Value::Object(fields) => {
+                        1 + fields.values().map(depth).max().unwrap_or(0)
+                    }
+                    _ => 0,
+                }
+            }
+            if serde_json::from_str::<serde_json::Value>(&document).is_ok_and(|v| depth(&v) >= 2) {
+                nested += 1;
+            }
+            for (lhs, rhs) in [
+                (&document, &document),
+                (&document, &canonical),
+                (&canonical, &document),
+                (&document, &mutated),
+                (&mutated, &mutated_again),
+                (&mutated, &mutated),
+                (&document, &previous),
+            ] {
+                parity(lhs, rhs);
+            }
+            previous = document;
+        }
+        // The generator must keep producing both outcomes and real nesting.
+        assert!(
+            valid >= 100 && invalid >= 50 && nested >= 10,
+            "valid={valid} invalid={invalid} nested={nested}"
+        );
     }
 }
