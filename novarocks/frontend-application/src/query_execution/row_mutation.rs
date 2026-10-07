@@ -36,7 +36,8 @@ use novarocks_spi::connector::{
 use crate::native::fragment_transport::FetchedQueryBatch;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_native_adapter::root_cow_selection_codec::{
-    COW_SELECTION_MAX_RECORD_BYTES, CowSelectionStreamDecoder,
+    COW_SELECTION_MAX_RECORD_BYTES, CowSelectionRecordHeader, CowSelectionRecordKind,
+    CowSelectionStreamDecoder,
 };
 use novarocks_native_adapter::root_record_assembly::{RootRecordAssembly, RootRecordDomain};
 
@@ -44,9 +45,13 @@ const DELETE_EFFECT_TAG: i8 = 1;
 const REPLACE_EFFECT_TAG: i8 = 2;
 const INSERT_EFFECT_TAG: i8 = 3;
 
+// Frozen MEM-1 M07 Internal profile. Connector/session budgets may only lower it.
+const COW_SELECTION_BYTES: u64 = 64 * 1024 * 1024;
+const COW_SELECTION_ROWS: u64 = 1024 * 1024;
+
 /// A non-concatenating collector for a Copy-on-Write match result.
 ///
-/// The row budget is intentionally capped by the byte budget: every retained
+/// The row budget is capped by the frozen row profile and the byte budget: every retained
 /// row consumes at least one byte of the result budget, while Arrow's actual
 /// allocation cost is accounted independently through `get_array_memory_size`.
 #[allow(
@@ -114,7 +119,9 @@ impl BoundedRowMutationMatchCollector {
             .and_then(|limit| u64::try_from(limit).ok())
             .filter(|limit| *limit > 0)
             .unwrap_or(connector_budget);
-        let max_bytes = connector_budget.min(effective_memory_budget);
+        let max_bytes = connector_budget
+            .min(effective_memory_budget)
+            .min(COW_SELECTION_BYTES);
         if max_bytes == 0 {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::ResourceExhausted,
@@ -123,7 +130,7 @@ impl BoundedRowMutationMatchCollector {
         }
         Ok(Self {
             context,
-            max_rows: max_bytes,
+            max_rows: max_bytes.min(COW_SELECTION_ROWS),
             max_bytes,
             row_count: 0,
             byte_count: 0,
@@ -148,9 +155,26 @@ impl BoundedRowMutationMatchCollector {
         self.byte_count
     }
 
+    fn check_next_batch(&self, rows: u64) -> Result<(), ConnectorError> {
+        self.check_control()?;
+        if self.batches.len()
+            >= novarocks_spi::connector::MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES
+            || self
+                .row_count
+                .checked_add(rows)
+                .is_none_or(|total| total > self.max_rows)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "row-mutation match exceeds its frozen row or batch profile",
+            ));
+        }
+        Ok(())
+    }
+
     /// Retains one result batch without concatenating it with prior batches.
     pub fn push(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
-        self.check_control()?;
+        self.check_next_batch(batch.num_rows() as u64)?;
         match &self.schema {
             Some(schema) if batch.schema_ref() != schema => {
                 return Err(ConnectorError::new(
@@ -299,8 +323,9 @@ impl RelayedCowSelectionCollector {
     }
 
     pub fn push_decoded(&mut self, batch: FetchedQueryBatch) -> Result<usize, ConnectorError> {
-        let batch = cast_to_signed_selection(&self.schema, &batch.into_chunk().batch)
-            .map_err(invalid_match)?;
+        let input = batch.into_chunk().batch;
+        self.collector.check_next_batch(input.num_rows() as u64)?;
+        let batch = cast_to_signed_selection(&self.schema, &input).map_err(invalid_match)?;
         let rows = batch.num_rows();
         self.collector.push(batch)?;
         Ok(rows)
@@ -338,6 +363,16 @@ impl RelayedCowSelectionCollector {
         // budget) rather than flattening it through the assembly sink.
         let mut collector_error = None;
         let pushed = assembly.push(body, |record| {
+            let header =
+                CowSelectionRecordHeader::parse(record).map_err(|error| error.to_string())?;
+            if header.kind() == CowSelectionRecordKind::Batch {
+                // Refuse the declaration before the private codec creates Arrow buffers.
+                collector.check_next_batch(header.rows()).map_err(|error| {
+                    let message = error.to_string();
+                    collector_error = Some(error);
+                    message
+                })?;
+            }
             let Some(batch) = decoder
                 .apply_record(record)
                 .map_err(|error| format!("decode relayed COW selection record: {error}"))?
@@ -977,6 +1012,47 @@ mod tests {
             cancelled.push_body(&stream).unwrap_err().kind(),
             ConnectorErrorKind::Cancelled
         );
+    }
+
+    #[test]
+    fn frozen_cow_rows_refuse_before_decode_and_empty_batches_cannot_escape_the_count_bound() {
+        let cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
+        let mut collector = BoundedRowMutationMatchCollector::try_new_with_schema(
+            context(Arc::clone(&cancellation), COW_SELECTION_BYTES as usize),
+            None,
+            selection_schema(),
+        )
+        .unwrap();
+        assert_eq!(collector.max_bytes(), COW_SELECTION_BYTES);
+        assert_eq!(collector.max_rows(), COW_SELECTION_ROWS);
+        for _ in 0..novarocks_spi::connector::MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES {
+            collector.push(batch(vec![])).unwrap();
+        }
+        assert_eq!(
+            collector.push(batch(vec![])).unwrap_err().kind(),
+            ConnectorErrorKind::ResourceExhausted
+        );
+
+        let stream = relayed_stream(&[batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)])]);
+        let schema_bytes = CowSelectionRecordHeader::parse(&stream)
+            .unwrap()
+            .record_bytes() as usize;
+        let mut relayed = RelayedCowSelectionCollector::try_new(
+            context(cancellation, COW_SELECTION_BYTES as usize),
+            None,
+            selection_schema(),
+        )
+        .unwrap();
+        relayed.push_body(&stream[..schema_bytes]).unwrap();
+        let mut declared = stream[schema_bytes..].to_vec();
+        declared[16..24].copy_from_slice(&(COW_SELECTION_ROWS + 1).to_le_bytes());
+        // The payload still describes one row. ResourceExhausted proves the
+        // declaration was rejected before the decoder would report malformed data.
+        assert_eq!(
+            relayed.push_body(&declared).unwrap_err().kind(),
+            ConnectorErrorKind::ResourceExhausted
+        );
+        assert_eq!(relayed.byte_count(), 0);
     }
 
     #[test]
