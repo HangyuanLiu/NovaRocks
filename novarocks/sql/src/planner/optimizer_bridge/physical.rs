@@ -64,6 +64,7 @@ impl BridgeCtx<'_> {
         let output_columns = physical_node_output_columns(node)?;
 
         Ok(PhysicalPlanNode {
+            logical_kinds: node.execution_props.logical_kinds.clone(),
             kind,
             children,
             output_columns,
@@ -91,6 +92,7 @@ impl BridgeCtx<'_> {
                 predicate: materialize(self.scalars, op.predicate),
             })),
             Operator::PhysicalProject(op) => Ok(PhysicalPlanKind::Project(PlanProjectNode {
+                retention_admission: op.retention_admission,
                 items: materialize_project_items(self.scalars, &op.items),
                 output_qualifier: op.output_qualifier.clone(),
             })),
@@ -278,6 +280,7 @@ impl BridgeCtx<'_> {
                 }))
             }
             Operator::PhysicalQuotaPreclaim(op) => Ok(PhysicalPlanKind::QuotaPreclaim(op.clone())),
+            Operator::PhysicalMembership(op) => Ok(PhysicalPlanKind::Membership(op.clone())),
             Operator::PhysicalQuotaTrim(op) => Ok(PhysicalPlanKind::QuotaTrim(op.clone())),
             Operator::PhysicalFanoutConsume(op) => Ok(PhysicalPlanKind::FanoutConsume(op.clone())),
             Operator::PhysicalFanoutAnchor(op) => Ok(PhysicalPlanKind::FanoutAnchor(
@@ -537,6 +540,7 @@ fn validate_shape(node: &OptimizedOperatorNode) -> Result<(), String> {
         | Operator::PhysicalFanoutAnchor(_)
         | Operator::PhysicalQuotaPreclaim(_)
         | Operator::PhysicalQuotaTrim(_)
+        | Operator::PhysicalMembership(_)
         | Operator::PhysicalCTEAnchor(_) => expect_arity(node, operator_name(&node.op), 2),
 
         Operator::PhysicalUnion(op) => {
@@ -606,6 +610,7 @@ fn operator_name(op: &Operator) -> &'static str {
         Operator::PhysicalDistribution(_) => "PhysicalDistribution",
         Operator::PhysicalQuotaPreclaim(_) => "PhysicalQuotaPreclaim",
         Operator::PhysicalQuotaTrim(_) => "PhysicalQuotaTrim",
+        Operator::PhysicalMembership(_) => "PhysicalMembership",
         Operator::PhysicalFanoutAnchor(_) => "PhysicalFanoutAnchor",
         Operator::PhysicalFanoutConsume(_) => "PhysicalFanoutConsume",
         Operator::PhysicalCTEAnchor(_) => "PhysicalCTEAnchor",
@@ -926,6 +931,7 @@ mod tests {
             explain_stats: Default::default(),
             output_columns: vec![],
             execution_props: PlanExecutionProps {
+                logical_kinds: Default::default(),
                 output_property: PhysicalPropertySet::gather(),
                 child_output_properties: vec![],
                 join_distribution: None,
@@ -1736,6 +1742,7 @@ mod tests {
         };
         let mut plan = OptimizedOperatorNode {
             op: Operator::PhysicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items,
                 output_qualifier: None,
             }),

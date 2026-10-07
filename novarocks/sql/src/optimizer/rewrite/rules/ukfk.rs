@@ -268,6 +268,7 @@ impl LogicalRewriteRule for EliminateUniqueAggregate {
 
         Ok(RewriteResult::Changed(OptExpr {
             op: Operator::LogicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items,
                 output_qualifier: project.output_qualifier,
             }),
@@ -755,6 +756,7 @@ mod tests {
     fn empty_project(input: OptExpr) -> OptExpr {
         OptExpr::new(
             Operator::LogicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![],
                 output_qualifier: None,
             }),

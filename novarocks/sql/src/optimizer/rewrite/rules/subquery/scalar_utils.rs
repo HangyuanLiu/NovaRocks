@@ -705,6 +705,7 @@ pub(super) fn left_project_items(
 pub(super) fn simple_project(child: OptExpr, items: Vec<ScalarProjectItem>) -> OptExpr {
     OptExpr::new(
         Operator::LogicalProject(crate::optimizer::operator::ProjectOp {
+            retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
             items,
             output_qualifier: None,
         }),

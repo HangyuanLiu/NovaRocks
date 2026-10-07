@@ -883,6 +883,7 @@ mod tests {
     fn project_over_aggregate(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![
                     ProjectItem {
                         expr: col_expr(1, "region"),
@@ -933,6 +934,7 @@ mod tests {
     fn project_over_filter(name: &str, first_id: u32) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![
                     ProjectItem {
                         expr: col_expr(first_id, "region"),

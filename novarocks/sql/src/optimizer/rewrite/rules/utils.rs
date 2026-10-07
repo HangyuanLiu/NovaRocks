@@ -302,6 +302,7 @@ pub(crate) fn collect_output_ids_ordered_opt(expr: &OptExpr) -> Vec<ColumnId> {
             ids.extend(collect_output_ids_ordered_opt(expr.right()));
             ids
         }
+        Operator::LogicalMembership(o) => o.output_columns.iter().map(|c| c.column_id).collect(),
         Operator::LogicalQuotaPreclaim(o) => o.output_columns.iter().map(|c| c.column_id).collect(),
         Operator::LogicalQuotaTrim(o) => o.output_columns.iter().map(|c| c.column_id).collect(),
         Operator::LogicalFanoutConsume(o) => o.output_columns.iter().map(|c| c.column_id).collect(),
@@ -661,6 +662,9 @@ mod typed_legacy {
                 ids.extend(collect_output_ids_ordered(plan.right()));
                 ids
             }
+            LogicalPlanKind::Membership(o) => {
+                o.output_columns.iter().map(|c| c.column_id).collect()
+            }
             LogicalPlanKind::QuotaPreclaim(o) => {
                 o.output_columns.iter().map(|c| c.column_id).collect()
             }
@@ -731,6 +735,11 @@ mod typed_legacy {
             LogicalPlanKind::Values(v) => {
                 for c in &v.columns {
                     out.insert((None, c.name.to_lowercase()));
+                }
+            }
+            LogicalPlanKind::Membership(o) => {
+                for column in &o.output_columns {
+                    out.insert((None, column.name.to_lowercase()));
                 }
             }
             LogicalPlanKind::QuotaPreclaim(o) => {
@@ -1131,6 +1140,7 @@ mod column_id_helper_tests {
 
         let plan = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![passthrough_item, computed_item],
                 output_qualifier: None,
             }),
@@ -1172,6 +1182,7 @@ mod column_id_helper_tests {
 
         let plan = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![real_item, unset_item],
                 output_qualifier: None,
             }),
@@ -1496,6 +1507,7 @@ mod column_id_helper_tests {
     ) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {

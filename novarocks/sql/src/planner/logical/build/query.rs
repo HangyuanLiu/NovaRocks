@@ -442,6 +442,7 @@ fn apply_query_modifiers(
     if let Some(items) = final_projection {
         body_plan = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items,
                 output_qualifier: None,
             }),

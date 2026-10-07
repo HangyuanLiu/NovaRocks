@@ -103,6 +103,7 @@ pub(crate) fn compute_cost(
         | Operator::LogicalTableFunction(_)
         | Operator::LogicalRepeat(_)
         | Operator::LogicalChangeEventExpand(_)
+        | Operator::LogicalMembership(_)
         | Operator::LogicalQuotaPreclaim(_)
         | Operator::LogicalQuotaTrim(_)
         | Operator::LogicalFanoutAnchor(_)
@@ -220,6 +221,11 @@ pub(crate) fn compute_cost(
 
         Operator::PhysicalAssertOneRow(_) => 0.01,
 
+        Operator::PhysicalMembership(_) => {
+            let probe = child_stats.first().map(|s| s.output_row_count).unwrap_or(0.0);
+            let build = child_stats.get(1).map(|s| s.output_row_count).unwrap_or(0.0);
+            probe * build + child_stats.get(1).map(|s| s.compute_size()).unwrap_or(0.0)
+        }
         Operator::PhysicalQuotaPreclaim(_) | Operator::PhysicalQuotaTrim(_) => {
             child_stats.iter().map(|stats| stats.compute_size()).sum::<f64>() * 0.1
         }
@@ -1134,6 +1140,38 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
             memory_cost: 0.0,
             network_cost: 0.0,
         },
+        Operator::PhysicalMembership(op) => {
+            let probe = input
+                .child_stats
+                .first()
+                .map(|s| cost_row_count(s))
+                .unwrap_or(0.0);
+            let build = input
+                .child_stats
+                .get(1)
+                .map(|s| cost_row_count(s))
+                .unwrap_or(0.0);
+            let build_size = input
+                .child_stats
+                .get(1)
+                .map(|s| safe_compute_size(s))
+                .unwrap_or(0.0);
+            let copies = if op.distribution
+                == novarocks_physical_plan::MembershipDistribution::BroadcastBuild
+            {
+                normalized_effective_backend_count(input.options.profile.effective_backend_count)
+            } else {
+                1.0
+            };
+            CostEstimate {
+                cpu_cost: finite_non_negative_cost(probe * build),
+                memory_cost: finite_non_negative_cost(build_size * copies),
+                // Native broadcast sends to every destination, including same-BE
+                // receivers. The RHS enforcer already charges one copy; add only
+                // the remaining copies estimated from the live cluster profile.
+                network_cost: finite_non_negative_cost(build_size * (copies - 1.0).max(0.0)),
+            }
+        }
         Operator::PhysicalHashJoin(join) => estimate_hash_join_cost(input, join),
         Operator::PhysicalNestLoopJoin(_) => estimate_nested_loop_join_cost(input),
         Operator::PhysicalHashAggregate(agg) => estimate_aggregate_cost(input, agg),
@@ -1378,6 +1416,7 @@ mod tests {
             })
             .collect();
         let op = Operator::PhysicalProject(ProjectOp {
+            retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
             items: exprs
                 .iter()
                 .enumerate()
@@ -2136,6 +2175,89 @@ mod tests {
         ));
 
         assert!(!feasibility_is_advisory_only(&scan_op(), &[]));
+    }
+
+    #[test]
+    fn membership_cost_counts_live_broadcast_copies_without_double_charging_enforcer() {
+        use crate::analysis::OutputColumn;
+        use crate::planner::membership::PlanMembershipNode;
+        use arrow::datatypes::DataType;
+        use novarocks_physical_plan::{MembershipComparison, MembershipDistribution};
+
+        let probe = stats(100.0, 16.0);
+        let build = stats(20.0, 32.0);
+        let own = stats(100.0, 17.0);
+        let probe_column = OutputColumn {
+            column_id: ColumnId(1),
+            name: "probe".into(),
+            data_type: DataType::Utf8,
+            nullable: true,
+            is_internal: false,
+        };
+        let result_column = OutputColumn {
+            column_id: ColumnId(3),
+            name: "result".into(),
+            data_type: DataType::Boolean,
+            nullable: true,
+            is_internal: false,
+        };
+        let child_stats = [&probe, &build];
+        let required = PhysicalPropertySet::any();
+        let build_size = safe_compute_size(&build);
+        for backends in [1.0, 3.0, 5.0] {
+            let mut options = CostOptions::default();
+            options.apply_profile(ClusterResourceProfile {
+                effective_backend_count: backends,
+                ..ClusterResourceProfile::default()
+            });
+            for distribution in [
+                MembershipDistribution::Singleton,
+                MembershipDistribution::BroadcastBuild,
+            ] {
+                let op = Operator::PhysicalMembership(PlanMembershipNode {
+                    probe: probe_column.column_id,
+                    build: ColumnId(2),
+                    result: result_column.clone(),
+                    output_columns: vec![probe_column.clone(), result_column.clone()],
+                    negated: false,
+                    comparison: MembershipComparison::JsonInListV1,
+                    distribution,
+                });
+                let child_properties = [
+                    PhysicalPropertySet::any(),
+                    if distribution == MembershipDistribution::BroadcastBuild {
+                        PhysicalPropertySet::broadcast()
+                    } else {
+                        PhysicalPropertySet::gather()
+                    },
+                ];
+                let child_outputs = [&child_properties[0], &child_properties[1]];
+                let estimate = compute_cost_estimate(&CostInput {
+                    op: &op,
+                    own_stats: &own,
+                    child_stats: &child_stats,
+                    child_outputs: &child_outputs,
+                    required_output: &required,
+                    alt_kind: &PropertyAlternativeKind::Default,
+                    scalars: None,
+                    stats_input: None,
+                    options: &options,
+                });
+                assert_eq!(estimate.cpu_cost, 100.0 * 20.0);
+                if distribution == MembershipDistribution::BroadcastBuild {
+                    assert_eq!(estimate.memory_cost, build_size * backends);
+                    assert_eq!(estimate.network_cost, build_size * (backends - 1.0));
+                    let enforcer = estimate_distribution_cost_estimate(&build, &options);
+                    assert_eq!(
+                        enforcer.network_cost + estimate.network_cost,
+                        build_size * backends
+                    );
+                } else {
+                    assert_eq!(estimate.memory_cost, build_size);
+                    assert_eq!(estimate.network_cost, 0.0);
+                }
+            }
+        }
     }
 
     #[test]

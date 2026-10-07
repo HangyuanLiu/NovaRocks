@@ -439,6 +439,7 @@ fn branch_scoped_old_input(
     );
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Project(PlanProjectNode {
+            retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
             items: aggregate_old_state_passthrough_items(layout, &old_outputs)?,
             output_qualifier: None,
         }),
@@ -690,6 +691,7 @@ fn delta_state_with_row_id(
 
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Project(PlanProjectNode {
+            retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
             items,
             output_qualifier: None,
         }),
@@ -843,6 +845,7 @@ fn aggregate_change_stream_project(
 
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Project(PlanProjectNode {
+            retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
             items,
             output_qualifier: None,
         }),
@@ -1717,6 +1720,7 @@ fn signed_aggregate(
     );
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Project(PlanProjectNode {
+            retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
             items: project_items,
             output_qualifier: None,
         }),

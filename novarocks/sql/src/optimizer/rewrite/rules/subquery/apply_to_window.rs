@@ -983,6 +983,7 @@ mod tests {
         );
         let projected_right = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![
                     // passthrough: l_partkey
                     ProjectItem {

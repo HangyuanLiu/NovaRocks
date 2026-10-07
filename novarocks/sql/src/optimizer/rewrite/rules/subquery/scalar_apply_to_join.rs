@@ -495,6 +495,7 @@ fn ensure_exposes_columns(
         .ok_or_else(|| "LogicalProject must have one child".to_string())?;
     Ok(OptExpr::new(
         Operator::LogicalProject(ProjectOp {
+            retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
             items: new_items,
             output_qualifier: project.output_qualifier.clone(),
         }),
@@ -786,6 +787,7 @@ mod tests {
         // Inner: Project(v2) over Scan — not provably ≤1 row.
         let inner = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: col_ref(T2_V2, "v2", DataType::Int64),
                     output_name: "v2".to_string(),

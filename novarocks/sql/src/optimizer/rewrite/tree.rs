@@ -58,6 +58,11 @@ fn apply_rule_to_node(
     rule: &dyn LogicalRewriteRule,
     ctx: &mut RewriteContext,
 ) -> Result<(OptExpr, bool), String> {
+    if matches!(&plan.op, crate::optimizer::operator::Operator::LogicalProject(op)
+        if op.retention_admission == novarocks_physical_plan::ProjectRetentionAdmission::CheckedTask)
+    {
+        return Ok((plan, false));
+    }
     if super::tree_binder::bind_tree(&rule.pattern(), &plan).is_none() {
         return Ok((plan, false));
     }
@@ -75,6 +80,11 @@ fn apply_rule_to_node(
     match rule.apply(plan, ctx) {
         Ok(RewriteResult::Unchanged) => Ok((original, false)),
         Ok(RewriteResult::Changed(next)) => {
+            // A rewrite above the boundary may change independent structure, but
+            // it may not duplicate/drop a materializer or change its row domain.
+            if !checked_materializations_equal(&original, &next) {
+                return Ok((original, false));
+            }
             ctx.trace_mut()
                 .rule_changed(phase, rule_name, start.elapsed().as_micros());
             Ok((next, true))
@@ -119,6 +129,34 @@ fn rewrite_plan_list(
         rewritten.push(input);
     }
     Ok((rewritten, changed))
+}
+
+fn checked_materializations_equal(before: &OptExpr, after: &OptExpr) -> bool {
+    fn collect<'a>(plan: &'a OptExpr, output: &mut Vec<&'a OptExpr>) {
+        if matches!(&plan.op, crate::optimizer::operator::Operator::LogicalProject(op)
+            if op.retention_admission == novarocks_physical_plan::ProjectRetentionAdmission::CheckedTask)
+        {
+            output.push(plan);
+        }
+        for child in &plan.children {
+            collect(child, output);
+        }
+    }
+    fn same_tree(a: &OptExpr, b: &OptExpr) -> bool {
+        super::super::op_equal(&a.op, &b.op)
+            && a.children.len() == b.children.len()
+            && a.children
+                .iter()
+                .zip(&b.children)
+                .all(|(a, b)| same_tree(a, b))
+    }
+    let mut a = Vec::new();
+    let mut b = Vec::new();
+    collect(before, &mut a);
+    collect(after, &mut b);
+    a.len() == b.len()
+        && a.iter()
+            .all(|source| b.iter().filter(|target| same_tree(source, target)).count() == 1)
 }
 
 #[cfg(test)]
@@ -316,6 +354,7 @@ mod tests {
         let expr_id = intern_typed(&mut arena, &col_expr);
         OptExpr::new(
             Operator::LogicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ScalarProjectItem {
                     expr: expr_id,
                     output_name: "c1".to_string(),
@@ -486,6 +525,7 @@ mod tests {
                 | Operator::LogicalTableFunction(_)
                 | Operator::LogicalRepeat(_)
                 | Operator::LogicalChangeEventExpand(_)
+                | Operator::LogicalMembership(_)
                 | Operator::LogicalQuotaPreclaim(_)
                 | Operator::LogicalQuotaTrim(_)
                 | Operator::LogicalFanoutAnchor(_)
@@ -511,6 +551,7 @@ mod tests {
                 | Operator::PhysicalTopN(_)
                 | Operator::PhysicalWindow(_)
                 | Operator::PhysicalDistribution(_)
+                | Operator::PhysicalMembership(_)
                 | Operator::PhysicalQuotaPreclaim(_)
                 | Operator::PhysicalQuotaTrim(_)
                 | Operator::PhysicalFanoutAnchor(_)
@@ -581,5 +622,71 @@ mod tests {
             panic!("expected scan on join right side (under project)");
         };
         assert_eq!(right_scan.table.name, "after");
+    }
+    struct MoveOrDropCheckedProject(bool);
+    impl LogicalRewriteRule for MoveOrDropCheckedProject {
+        fn name(&self) -> &'static str {
+            "MoveOrDropCheckedProject"
+        }
+        fn phase(&self) -> RewritePhase {
+            RewritePhase::StructuralRewrite
+        }
+        fn matches(&self, plan: &OptExpr, _ctx: &RewriteContext) -> bool {
+            matches!(plan.op, Operator::LogicalLimit(_))
+        }
+        fn apply(
+            &self,
+            mut plan: OptExpr,
+            _ctx: &mut RewriteContext,
+        ) -> Result<RewriteResult, String> {
+            let mut checked = plan.children.remove(0);
+            if self.0 {
+                plan.children.push(checked.children.remove(0));
+                checked.children.push(plan);
+                Ok(RewriteResult::Changed(checked))
+            } else {
+                plan.children.push(checked.children.remove(0));
+                Ok(RewriteResult::Changed(plan))
+            }
+        }
+    }
+
+    #[test]
+    fn membership_checked_materializer_prevents_move_drop_and_column_pruning() {
+        let mut checked = project_over_scan("before");
+        let Operator::LogicalProject(project) = &mut checked.op else {
+            unreachable!();
+        };
+        project.retention_admission =
+            novarocks_physical_plan::ProjectRetentionAdmission::CheckedTask;
+        let tagged = crate::optimizer::rewrite::required_columns::tag_required_columns(
+            checked.clone(),
+            &crate::optimizer::scalar::ScalarArena::new(),
+            Some(Default::default()),
+        );
+        assert!(tagged.required_output_columns.is_none());
+        assert!(
+            tagged.children[0]
+                .required_output_columns
+                .as_ref()
+                .is_none_or(|ids| !ids.is_empty())
+        );
+        let plan = OptExpr::new(
+            Operator::LogicalLimit(crate::optimizer::operator::LimitOp {
+                limit: Some(1),
+                offset: None,
+            }),
+            vec![checked],
+        );
+        for move_below in [false, true] {
+            let (rewritten, changed) = rewrite_with_rule(
+                plan.clone(),
+                &MoveOrDropCheckedProject(move_below),
+                &mut RewriteContext::for_query(Vec::<String>::new()),
+            )
+            .unwrap();
+            assert!(!changed);
+            assert_eq!(format!("{rewritten:?}"), format!("{plan:?}"));
+        }
     }
 }

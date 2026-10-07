@@ -277,6 +277,7 @@ mod tests {
         let scan = make_scan(&[(id_a, "a"), (id_b, "b"), (id_c, "c")]);
         let project = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: col_ref(id_a, "a"),
                     output_name: "a".to_string(),
@@ -335,6 +336,7 @@ mod tests {
         );
         let project = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: col_ref(id_a, "a"),
                     output_name: "a".to_string(),
@@ -428,6 +430,7 @@ mod tests {
         // only the selected group-key dependency {b@2} to the Scan.
         let proj = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     output_column_id: ColumnId::new_for_test(901),
                     output_name: "b".to_string(),

@@ -83,6 +83,7 @@ fn apply_pre_expand_keyed_assert_in_node(
     let child = node.children.pop().expect("validated single child");
     let output_columns = child.output_columns.clone();
     node.children.push(PhysicalPlanNode {
+        logical_kinds: Default::default(),
         kind: PhysicalPlanKind::AssertOneRow(PlanAssertOneRowNode::per_key_at_most_one(
             "DML change-stream matched row uniqueness",
             vec![key_column_id],

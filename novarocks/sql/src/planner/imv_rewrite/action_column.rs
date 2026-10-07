@@ -563,6 +563,7 @@ mod tests {
         let scan = delta_scan_with(Some(ImvActionColumn::output_column(ColumnId(100))));
         let project = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {
@@ -697,6 +698,7 @@ mod tests {
         scan.columns[0].column_id = user_col_id;
         LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![
                     column_ref_item(user_col_id, "k", DataType::Int64, false, "k", user_col_id),
                     column_ref_item(
@@ -720,6 +722,7 @@ mod tests {
         scan.columns[0].column_id = user_col_id;
         LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![column_ref_item(
                     user_col_id,
                     "k",

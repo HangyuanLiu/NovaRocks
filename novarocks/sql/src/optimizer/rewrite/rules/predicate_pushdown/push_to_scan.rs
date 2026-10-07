@@ -339,6 +339,7 @@ mod tests {
         let scan = scan_opt(&mut arena, &["a"]);
         let project = OptExpr::new(
             Operator::LogicalProject(crate::optimizer::operator::ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![],
                 output_qualifier: None,
             }),

@@ -847,6 +847,7 @@ mod tests {
         let proj_expr = intern_typed(&mut arena, &col_ref_typed("k", DataType::Int64));
         let project = OptExpr::new(
             Operator::LogicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ScalarProjectItem {
                     expr: proj_expr,
                     output_name: "k".into(),

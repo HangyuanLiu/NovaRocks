@@ -673,7 +673,9 @@ impl<'a> super::AnalyzerContext<'a> {
                     // is dropped before the subquery is planned so we cannot
                     // wait until later.
                     let in_expr_typed = self.analyze_expr(&in_subquery.expr, scope)?;
-                    if is_json_in_subquery_operand(&in_expr_typed, scope) {
+                    if is_json_in_subquery_operand(&in_expr_typed, scope)
+                        && !self.json_membership_enabled
+                    {
                         return Err(AnalyzeError::unsupported_expression(
                             "In predicate of JSON does not support subquery",
                             in_subquery.span,

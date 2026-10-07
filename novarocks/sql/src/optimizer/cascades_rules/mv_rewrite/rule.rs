@@ -293,6 +293,8 @@ fn try_rewrite(
             set_mv_scan_required_columns(memo, scan_group, &scan_columns, &required_columns);
             Some(NewExpr {
                 op: Operator::LogicalProject(ProjectOp {
+                    retention_admission:
+                        novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                     items,
                     output_qualifier: None,
                 }),
@@ -383,6 +385,8 @@ fn try_rewrite(
                     );
                     Some(NewExpr {
                         op: Operator::LogicalProject(ProjectOp {
+                            retention_admission:
+                                novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                             items,
                             output_qualifier: None,
                         }),
@@ -522,6 +526,8 @@ fn try_rewrite(
                         .collect::<Option<Vec<_>>>()?;
                     Some(NewExpr {
                         op: Operator::LogicalProject(ProjectOp {
+                            retention_admission:
+                                novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                             items,
                             output_qualifier: None,
                         }),

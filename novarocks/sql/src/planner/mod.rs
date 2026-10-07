@@ -25,6 +25,7 @@
 pub(crate) mod distributed;
 pub(crate) mod imv_rewrite;
 pub(crate) mod logical;
+pub(crate) mod membership;
 pub(crate) mod optimizer_bridge;
 pub(crate) mod ordering;
 pub(crate) mod payload;

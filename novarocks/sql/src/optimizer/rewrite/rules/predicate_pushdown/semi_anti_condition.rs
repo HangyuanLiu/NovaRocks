@@ -376,6 +376,7 @@ mod tests {
         use crate::optimizer::operator::{ProjectOp, ScalarProjectItem};
         let right = OptExpr::new(
             Operator::LogicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ScalarProjectItem {
                     expr: intern_typed(
                         &mut arena,

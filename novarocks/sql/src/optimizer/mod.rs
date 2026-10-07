@@ -359,6 +359,7 @@ fn optimize_with_root_property(
         &mut memo.factory,
         &options,
     );
+    optimized_tree::attach_logical_kinds(&mut optimized_tree, &memo.factory)?;
     optimized_tree::attach_scalar_arena(&mut optimized_tree, Arc::new(memo.scalars.clone()));
 
     Ok(optimized_tree)
@@ -464,6 +465,22 @@ fn check_deadline(deadline: Instant) -> Result<(), String> {
 /// - Wall-clock deadline exceeded
 const EXPLORE_MAX_ITERATIONS: usize = 16;
 
+fn memo_has_checked_materialization(
+    memo: &Memo,
+    expr: &MExpr,
+    seen: &mut std::collections::HashSet<usize>,
+) -> bool {
+    matches!(&expr.op, crate::optimizer::operator::Operator::LogicalProject(op)
+        if op.retention_admission == novarocks_physical_plan::ProjectRetentionAdmission::CheckedTask)
+        || expr.children.iter().any(|id| {
+            seen.insert(*id)
+                && memo.groups[*id]
+                    .logical_exprs
+                    .iter()
+                    .any(|child| memo_has_checked_materialization(memo, child, seen))
+        })
+}
+
 fn explore(
     memo: &mut Memo,
     rules: &[Box<dyn Rule>],
@@ -502,6 +519,13 @@ fn explore(
                         && (memo.reorder_owned_groups.contains(&group_id)
                             || memo.groups.len() > 200)
                     {
+                        continue;
+                    }
+                    if memo_has_checked_materialization(
+                        memo,
+                        expr,
+                        &mut std::collections::HashSet::new(),
+                    ) {
                         continue;
                     }
                     if rule.matches(&expr.op) {
@@ -1316,6 +1340,7 @@ mod is_known_rule_name_tests {
             .collect();
         let query = OptExpr::new(
             Operator::LogicalProject(crate::optimizer::operator::ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: project_items,
                 output_qualifier: None,
             }),

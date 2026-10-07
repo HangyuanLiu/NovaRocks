@@ -875,6 +875,7 @@ pub(crate) fn collect_provider_needs(
         offer_predicates: bool,
     ) -> Result<PhysicalPlanNode, SqlCompileError> {
         let PhysicalPlanNode {
+            logical_kinds,
             kind,
             children,
             output_columns,
@@ -938,6 +939,7 @@ pub(crate) fn collect_provider_needs(
             kind => kind,
         };
         Ok(PhysicalPlanNode {
+            logical_kinds,
             kind,
             children,
             output_columns,

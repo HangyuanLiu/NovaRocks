@@ -379,6 +379,7 @@ pub(crate) fn normalize_branch_output(
     let input_columns = plan_output_columns(&input)?;
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Project(PlanProjectNode {
+            retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
             output_qualifier: None,
             items: normalize_branch_project_items(&input_columns, output_columns)?,
         }),
@@ -497,6 +498,7 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputCo
         }
         LogicalPlanKind::Window(window) => window.output_columns.clone(),
         LogicalPlanKind::Repeat(_) => plan_output_columns(plan.unary_input())?,
+        LogicalPlanKind::Membership(node) => node.output_columns.clone(),
         LogicalPlanKind::QuotaPreclaim(node) => node.output_columns.clone(),
         LogicalPlanKind::QuotaTrim(node) => node.output_columns.clone(),
         LogicalPlanKind::FanoutConsume(node) => node.output_columns.clone(),
@@ -1191,6 +1193,7 @@ mod tests {
     fn project_payload_only(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ProjectItem {
                     expr: col_expr(1, "payload"),
                     output_name: "payload".to_string(),
@@ -1210,6 +1213,7 @@ mod tests {
         };
         LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: columns
                     .into_iter()
                     .map(|column| ProjectItem {

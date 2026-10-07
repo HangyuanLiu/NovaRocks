@@ -362,6 +362,7 @@ fn build_synthetic_scan_plan(
         )),
     };
     FrozenConnectorScanPlan(crate::planner::physical::PhysicalPlanNode {
+        logical_kinds: Default::default(),
         kind: crate::planner::physical::PhysicalPlanKind::Scan(
             PlanScanNode {
                 database: identity.namespace().to_string(),

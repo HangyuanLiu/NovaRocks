@@ -462,6 +462,7 @@ impl Rule for ProjectToPhysical {
         };
         vec![NewExpr {
             op: Operator::PhysicalProject(ProjectOp {
+                retention_admission: op.retention_admission,
                 items: op.items.clone(),
                 output_qualifier: op.output_qualifier.clone(),
             }),
@@ -892,6 +893,38 @@ impl Rule for WindowToPhysical {
             }),
             children: vec![child_group],
         }]
+    }
+}
+
+pub(crate) struct MembershipToPhysical;
+impl Rule for MembershipToPhysical {
+    fn name(&self) -> &str {
+        "MembershipToPhysical"
+    }
+    fn rule_type(&self) -> RuleType {
+        RuleType::Implementation
+    }
+    fn matches(&self, op: &Operator) -> bool {
+        matches!(op, Operator::LogicalMembership(_))
+    }
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+        let Operator::LogicalMembership(op) = &expr.op else {
+            return vec![];
+        };
+        [
+            novarocks_physical_plan::MembershipDistribution::Singleton,
+            novarocks_physical_plan::MembershipDistribution::BroadcastBuild,
+        ]
+        .into_iter()
+        .map(|distribution| {
+            let mut op = op.clone();
+            op.distribution = distribution;
+            NewExpr {
+                op: Operator::PhysicalMembership(op),
+                children: expr.children.clone(),
+            }
+        })
+        .collect()
     }
 }
 

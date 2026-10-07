@@ -131,6 +131,8 @@ impl LogicalRewriteRule for VariantPathPushdownRule {
                 }
                 if changed {
                     expr.op = Operator::LogicalProject(ProjectOp {
+                        retention_admission:
+                            novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                         items,
                         output_qualifier: project_op.output_qualifier,
                     });

@@ -213,6 +213,7 @@ pub(crate) struct PlanFilterNode {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct PlanProjectNode {
+    pub retention_admission: novarocks_physical_plan::ProjectRetentionAdmission,
     pub items: Vec<ProjectItem>,
     pub output_qualifier: Option<String>,
 }

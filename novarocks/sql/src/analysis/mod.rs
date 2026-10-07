@@ -776,6 +776,7 @@ pub(crate) struct ApplyScalarSpec {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct ApplyPredicateSpec {
+    pub execution_kind: PredicateExecutionKind,
     /// Placeholder id this spec replaced (matches the original SubqueryInfo.id).
     pub subquery_id: usize,
     /// EXISTS{negated} or InSubquery{negated}. Maps to the planner ApplyKind.
@@ -797,6 +798,13 @@ pub(crate) struct ApplyPredicateSpec {
     pub use_semi_anti: bool,
     /// Original subquery SQL text (diagnostics).
     pub subquery_text: String,
+}
+
+/// The analyzer chooses an execution owner before any Apply rewrite runs.
+#[derive(Clone, Debug)]
+pub(crate) enum PredicateExecutionKind {
+    Apply,
+    JsonMembership { probe_column: OutputColumn },
 }
 
 /// A collected subquery from expression analysis, ready for rewriting.

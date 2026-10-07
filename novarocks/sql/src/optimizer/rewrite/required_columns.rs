@@ -62,7 +62,22 @@ pub(crate) fn tag_required_columns(
     parent_needed: Option<HashSet<ColumnId>>,
 ) -> OptExpr {
     match &expr.op {
-        Operator::LogicalQuotaPreclaim(_)
+        Operator::LogicalProject(op)
+            if op.retention_admission
+                == novarocks_physical_plan::ProjectRetentionAdmission::CheckedTask =>
+        {
+            OptExpr {
+                op: expr.op,
+                children: expr
+                    .children
+                    .into_iter()
+                    .map(|child| tag_required_columns(child, arena, None))
+                    .collect(),
+                required_output_columns: None,
+            }
+        }
+        Operator::LogicalMembership(_)
+        | Operator::LogicalQuotaPreclaim(_)
         | Operator::LogicalQuotaTrim(_)
         | Operator::LogicalFanoutAnchor(_)
         | Operator::LogicalFanoutConsume(_) => OptExpr {
@@ -1115,6 +1130,7 @@ mod tests {
 
         let project = OptExpr::new(
             Operator::LogicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![
                     ScalarProjectItem {
                         output_column_id: ColumnId::new_for_test(101),
@@ -1164,6 +1180,7 @@ mod tests {
 
         let project = OptExpr::new(
             Operator::LogicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![
                     ScalarProjectItem {
                         output_column_id: ColumnId::new_for_test(101),
@@ -2344,6 +2361,7 @@ mod tests {
 
         let plan = OptExpr::new(
             Operator::LogicalProject(ProjectOp {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: vec![ScalarProjectItem {
                     output_column_id: ColumnId::new_for_test(101),
                     output_name: "a".to_string(),

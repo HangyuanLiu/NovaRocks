@@ -376,6 +376,7 @@ pub(crate) fn rewrite(
     );
     Ok(OptExpr::new(
         Operator::LogicalProject(ProjectOp {
+            retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
             items: project_items,
             output_qualifier: None,
         }),

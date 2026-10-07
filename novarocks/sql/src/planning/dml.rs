@@ -2224,6 +2224,7 @@ fn build_statistics_connector_physical(
         .finalize_provider_read_occurrence(scan_occurrence)
         .map_err(|error| format!("finalize ANALYZE scan occurrence: {error}"))?;
     let scan = crate::planner::physical::PhysicalPlanNode {
+        logical_kinds: Default::default(),
         kind: crate::planner::physical::PhysicalPlanKind::Scan(physical_scan),
         children: Vec::new(),
         output_columns: scan_columns,
@@ -2383,6 +2384,7 @@ fn build_statistics_connector_physical(
         broadcast_decision: None,
     };
     let local = crate::planner::physical::PhysicalPlanNode {
+        logical_kinds: Default::default(),
         kind: crate::planner::physical::PhysicalPlanKind::HashAggregate(Box::new(
             crate::planner::physical::PhysicalHashAggregateNode {
                 mode: crate::planner::physical::AggMode::Local,
@@ -2403,6 +2405,7 @@ fn build_statistics_connector_physical(
         probe_runtime_filters: Vec::new(),
     };
     let gather = crate::planner::physical::PhysicalPlanNode {
+        logical_kinds: Default::default(),
         kind: crate::planner::physical::PhysicalPlanKind::Redistribute(
             crate::planner::physical::RedistributeNode {
                 mode: crate::planner::physical::RedistributeMode::Gather,
@@ -2416,6 +2419,7 @@ fn build_statistics_connector_physical(
         probe_runtime_filters: Vec::new(),
     };
     let global = crate::planner::physical::PhysicalPlanNode {
+        logical_kinds: Default::default(),
         kind: crate::planner::physical::PhysicalPlanKind::HashAggregate(Box::new(
             crate::planner::physical::PhysicalHashAggregateNode {
                 mode: crate::planner::physical::AggMode::Global,
@@ -2533,6 +2537,7 @@ fn build_statistics_connector_physical(
         novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES,
     )?;
     let unpivot = crate::planner::physical::PhysicalPlanNode {
+        logical_kinds: Default::default(),
         kind: crate::planner::physical::PhysicalPlanKind::Unpivot(unpivot),
         children: vec![global],
         output_columns: unpivot_columns,
@@ -2540,8 +2545,10 @@ fn build_statistics_connector_physical(
         probe_runtime_filters: Vec::new(),
     };
     let physical = crate::planner::physical::PhysicalPlanNode {
+        logical_kinds: Default::default(),
         kind: crate::planner::physical::PhysicalPlanKind::Project(
             crate::planner::payload::PlanProjectNode {
+                retention_admission: novarocks_physical_plan::ProjectRetentionAdmission::Existing,
                 items: root_columns
                     .iter()
                     .map(|column| crate::analysis::ProjectItem {
