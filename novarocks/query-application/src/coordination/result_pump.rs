@@ -1889,10 +1889,13 @@ pub(crate) async fn run_root_relay(
                         Ok(super::RootRelayStep::AwaitTerminalControl) => {
                             break RelayExit::AwaitTerminalControl;
                         }
+                        Ok(super::RootRelayStep::NotReady) => {
+                            // A port that answers NotReady without its long
+                            // poll must not starve the delivery or the runtime.
+                            tokio::task::yield_now().await;
+                        }
                         Ok(
-                            super::RootRelayStep::EndKnown(_)
-                            | super::RootRelayStep::NotReady
-                            | super::RootRelayStep::Acknowledged,
+                            super::RootRelayStep::EndKnown(_) | super::RootRelayStep::Acknowledged,
                         ) => {}
                     }
                 }
@@ -5197,7 +5200,11 @@ mod tests {
                 accepted_consumed: request.consumed(),
                 outcome,
             };
+            let long_poll = matches!(reply.outcome, RootReadOutcome::NotReady);
             Box::pin(async move {
+                if long_poll {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
                 RetainedRootReply::try_new(reply, physical_guard, 64 * 1024).map_err(|error| {
                     contract_failure(contract_error(format!("retain root reply: {error}")))
                 })
@@ -5445,7 +5452,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "OPEN (M07 P05): hangs after a failed relayed delivery; the attempt decision path is not yet settled for the relay"]
     async fn relay_failed_delivery_fails_the_attempt_without_acknowledging_it() {
         let (
             Harness {
