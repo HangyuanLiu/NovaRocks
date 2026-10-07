@@ -71,6 +71,7 @@ mod native_incoming_key_capacity;
 pub mod native_lane;
 pub mod root_cow_selection_codec;
 mod root_producer_pool;
+pub mod root_record_assembly;
 pub mod root_result_reader;
 pub mod root_result_session;
 pub mod root_result_unary;
