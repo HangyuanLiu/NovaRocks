@@ -23,7 +23,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorListingBound, ConnectorListingCollector,
+    ConnectorError, ConnectorErrorKind, ConnectorListingBound, ConnectorListingBudget,
+    ConnectorListingCollector,
 };
 
 use super::delegate::CatalogDelegate;
@@ -132,9 +133,9 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         self.delegate.namespace_exists(&namespace).await
     }
 
-    /// Page through the REST listing with pages of at most
-    /// `bound.page_entries`, checking every page before it is retained and
-    /// before its continuation is followed.
+    /// Request bounded REST pages, checking every response before retention
+    /// and continuation. An oversized final response from a server ignoring
+    /// pageSize is admitted only within the remaining whole-listing bound.
     async fn list_tables(
         &self,
         namespace: CatalogNamespaceName,
@@ -149,12 +150,31 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
                     bound.page_entries,
                 )
                 .await?;
+            ConnectorListingBudget::new(ConnectorListingBound {
+                entries: bound.entries - collector.len(),
+                total_name_bytes: bound.total_name_bytes - collector.total_name_bytes(),
+                ..bound
+            })?
+            .admit_names(page.tables.iter().map(|table| table.name.as_ref()))?;
+            let oversized_final =
+                page.tables.len() > bound.page_entries && page.next_page_token.is_none();
             let names = page
                 .tables
                 .into_iter()
                 .map(|table| table.name.to_string())
                 .collect();
-            collector.accept_page(names, page.next_page_token.map(|token| token.to_string()))?;
+            if oversized_final {
+                // The response is a complete tail, not a compliant source page.
+                // Keep page accounting and whole-listing limits without relaxing
+                // the paged collector's contract for other providers.
+                collector.accept_page(Vec::new(), None)?;
+                for name in names {
+                    collector.push(name)?;
+                }
+            } else {
+                collector
+                    .accept_page(names, page.next_page_token.map(|token| token.to_string()))?;
+            }
             if collector.continuation_token().is_none() {
                 break;
             }
@@ -174,9 +194,10 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
             .list_tables_page(&ident, page_token.as_deref(), page_size)
             .await
             .map_err(|error| super::error::map_read_error(&error))?;
-        // A server without pagination support may ignore the requested page
-        // size. The page is then over the caller's bound, not corrupt.
-        if page.identifiers.len() > page_size {
+        // A server without pagination support may ignore pageSize and return
+        // a complete listing. A continuing oversized page still violates the
+        // page contract; every response must fit the frozen whole-listing bound.
+        if page.identifiers.len() > page_size && page.next_page_token.is_some() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::ResourceExhausted,
                 format!(
@@ -185,6 +206,8 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
                 ),
             ));
         }
+        ConnectorListingBudget::new(ConnectorListingBound::V1)?
+            .admit_names(page.identifiers.iter().map(|table| table.name.as_str()))?;
         let mut seen = std::collections::HashSet::with_capacity(page.identifiers.len());
         if page
             .identifiers
@@ -524,7 +547,11 @@ mod tests {
     }
 
     impl PagedTablesServer {
-        fn start(pages: Vec<Vec<&'static str>>) -> Self {
+        fn start(pages: Vec<Vec<&str>>) -> Self {
+            let pages: Vec<Vec<String>> = pages
+                .into_iter()
+                .map(|page| page.into_iter().map(str::to_string).collect())
+                .collect();
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind paged REST catalog");
             listener
                 .set_nonblocking(true)
@@ -617,7 +644,7 @@ mod tests {
         }
     }
 
-    fn list_tables_body(pages: &[Vec<&'static str>], target: &str) -> String {
+    fn list_tables_body(pages: &[Vec<String>], target: &str) -> String {
         let index = target
             .split_once("pageToken=p")
             .map(|(_, token)| token.parse::<usize>().expect("scripted token"))
@@ -719,13 +746,95 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_page_larger_than_requested_is_refused() {
-        let server = PagedTablesServer::start(vec![vec!["t1", "t2", "t3"]]);
+    async fn a_continuing_page_larger_than_requested_is_refused() {
+        let server = PagedTablesServer::start(vec![vec!["t1", "t2", "t3"], vec!["t4"]]);
         let bound = ConnectorListingBound {
             page_entries: 2,
             ..ConnectorListingBound::V1
         };
         assert_refused(list(&server, bound).await.unwrap_err(), "page_entries");
         assert_eq!(server.list_requests(), [page_request(2, None)]);
+    }
+
+    #[tokio::test]
+    async fn an_unpaged_server_may_return_more_than_the_v1_page_size() {
+        let names: Vec<String> = (0..257).map(|index| format!("t{index:03}")).collect();
+        let server = PagedTablesServer::start(vec![names.iter().map(String::as_str).collect()]);
+        assert_eq!(
+            list(&server, ConnectorListingBound::V1).await.unwrap(),
+            names
+        );
+        assert_eq!(server.list_requests(), [page_request(256, None)]);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_final_page_is_admitted_at_the_whole_listing_bounds() {
+        let server = PagedTablesServer::start(vec![vec!["t1", "t2", "t3"]]);
+        let bound = ConnectorListingBound {
+            entries: 3,
+            page_entries: 2,
+            pages: 1,
+            total_name_bytes: 6,
+            ..ConnectorListingBound::V1
+        };
+        assert_eq!(list(&server, bound).await.unwrap(), ["t1", "t2", "t3"]);
+        assert_eq!(server.list_requests(), [page_request(2, None)]);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_final_page_keeps_the_preceding_pages_charged() {
+        let server = PagedTablesServer::start(vec![vec!["t1"], vec!["t2", "t3", "t4"]]);
+        let bound = ConnectorListingBound {
+            entries: 4,
+            page_entries: 2,
+            pages: 2,
+            total_name_bytes: 8,
+            ..ConnectorListingBound::V1
+        };
+        assert_eq!(
+            list(&server, bound).await.unwrap(),
+            ["t1", "t2", "t3", "t4"]
+        );
+        assert_eq!(
+            server.list_requests(),
+            [page_request(2, None), page_request(2, Some("p1"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_final_page_is_refused_whole_when_any_listing_bound_is_exceeded() {
+        for (bound, exceeded) in [
+            (
+                ConnectorListingBound {
+                    entries: 3,
+                    page_entries: 2,
+                    ..ConnectorListingBound::V1
+                },
+                "entries",
+            ),
+            (
+                ConnectorListingBound {
+                    name_bytes: 1,
+                    page_entries: 2,
+                    ..ConnectorListingBound::V1
+                },
+                "name_bytes",
+            ),
+            (
+                ConnectorListingBound {
+                    total_name_bytes: 4,
+                    page_entries: 2,
+                    ..ConnectorListingBound::V1
+                },
+                "total_name_bytes",
+            ),
+        ] {
+            let server = PagedTablesServer::start(vec![vec!["a"], vec!["b", "cc", "d"]]);
+            assert_refused(list(&server, bound).await.unwrap_err(), exceeded);
+            assert_eq!(
+                server.list_requests(),
+                [page_request(2, None), page_request(2, Some("p1"))]
+            );
+        }
     }
 }
