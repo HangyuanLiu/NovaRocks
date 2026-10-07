@@ -3,6 +3,8 @@
 当前只复核公开配置推导的结构项。`c_conn/c_stream/c_handshake/c_queue` 尚未测量或冻结；
 完整 E_native_transport、repeatability、soak、P09 测量门均未通过。JSON 中 coefficients 与
 total_bytes 为 null，禁止把结构项或空系数当成完整容量承诺。
+生产 FE Membership incoming 的数量准入尚未接入，见
+[具体缺口](evidence/p00b-membership-ingress-gap.md)；其96连接项只是目标，不是当前已实施硬界。
 
 规范来自 accepted spec revision 6 §5.8/§5.9、approved plan §2.4/§2.8/P00b。
 代码事实为 `native-adapter/src/native_transport_geometry.rs` 的 `envelope` 与

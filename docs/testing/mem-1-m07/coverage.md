@@ -87,6 +87,7 @@ Hive/Hadoop 的 view listing 实际沿 SDK 默认 `FeatureUnsupported`；没有�
 | FE fetch | `native/data_runtime.rs` / `fragment_transport.rs` 的旧16 gate保留至P08；R2 ResultData独立lane已有承载接口 | root只一个fetch/ACK在途；新窗口及body alias实际退出。旧gate退出只能在完整切换 |
 | Channel / DNS | `frontend-application/src/native/transport.rs`、`native-adapter/src/native_channel_cache.rs`、`native-trust/src/adapter.rs`：exact process/endpoint/lane缓存、single-flight、连接/handshake/FD、有限DNS | IO wrapper Drop归还连接，DNS closure返回归还permit；body EOF/RST/Drop归还stream。GOAWAY不可见阶段继续算live |
 | listener / ingress | `native_server.rs` / `native_transport_admission.rs`：Data/Control独立listener、认证前数量准入、绝对握手期限、身份封印与per-lane stream gate | 不借control reserve；持续response body持位到公开退出；半开、多FE重连风暴与真实控制进展属P00b/P09 |
+| FE Membership incoming（OPEN） | `frontend-application/src/native/report_server.rs`调用未传admission的start；FE incoming_lane_stream_limit=0。上述BE listener准入不能外推到FE | 96 incoming连接目前只是目标算术，未接全进程连接/握手/stream/key gate；须补齐并复核handshake/FD/metrics后测量，evidence/p00b-membership-ingress-gap.md |
 | response payload | 自有root payload通过Bytes owner维持实际backing与send aliases；ACK/EOS不等于最后alias退出 | 第三方内部copy不授自有容量；公开buffer/window常量进入结构式，析构差额由测量门验证 |
 | BE→BE | exact peer process/endpoint/lane有限缓存；Exchange/RuntimeFilter数量按live registry与冻结geometry | 双方向dial/closing位置有限；不能以单进程测试推断生产退出或跳过真实peer数量 |
 | producer / context | P04b统一root channel具有独立context ownership；task FINISHED与FE消费End/成功seal各自汇合 | release封fetch/replay并wake，等待实际holder；晚originating failure及生产SQL属后续原生验收 |
