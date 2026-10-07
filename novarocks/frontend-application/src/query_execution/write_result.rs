@@ -39,6 +39,7 @@
 //!
 //! Design: ADR-0136 (docs/adr/ADR-0136-ordinary-aggregate-statistics-dataflow.md)
 
+use novarocks_native_adapter::root_record_assembly::{RootRecordAssembly, RootRecordDomain};
 use std::collections::{BTreeMap, BTreeSet};
 
 use arrow::array::{
@@ -201,6 +202,7 @@ struct RootWriteRow<'a> {
 }
 
 pub(crate) struct RootWriteResultDecoder {
+    relay_assembly: RootRecordAssembly,
     contract: RootWriteDecodeContract,
     rows: WriteRowCountAccumulator,
     ledger: PreparedWriteSetLedger,
@@ -215,6 +217,10 @@ pub(crate) struct RootWriteResultDecoder {
 impl RootWriteResultDecoder {
     pub(crate) fn new(contract: RootWriteDecodeContract) -> Self {
         Self {
+            relay_assembly: RootRecordAssembly::new(
+                RootRecordDomain::WriteCommit,
+                32 * 1024 * 1024,
+            ),
             contract,
             rows: WriteRowCountAccumulator::new(),
             ledger: PreparedWriteSetLedger::new(),
@@ -327,6 +333,21 @@ impl RootWriteResultDecoder {
             })?;
         }
         Ok(())
+    }
+
+    /// Accept a relayed body into the prepaid 32 MiB assembly share. A complete
+    /// record is validated before this call returns and its receipt may finish.
+    pub(crate) fn apply_relay_body(&mut self, body: &[u8]) -> Result<(), String> {
+        if self.root_eof {
+            return Err("write Root emitted a trailing body after EOF".into());
+        }
+        let mut assembly = std::mem::replace(
+            &mut self.relay_assembly,
+            RootRecordAssembly::new(RootRecordDomain::WriteCommit, 32 * 1024 * 1024),
+        );
+        let result = assembly.push(body, |record| self.apply_record(record));
+        self.relay_assembly = assembly;
+        result
     }
 
     /// Apply one complete PreparedWriteCommitV1 record relayed from the
@@ -486,6 +507,7 @@ impl RootWriteResultDecoder {
     }
 
     pub(crate) fn observe_root_eof(&mut self) -> Result<(), String> {
+        self.relay_assembly.finish()?;
         if std::mem::replace(&mut self.root_eof, true) {
             return Err("write Root emitted duplicate EOF".into());
         }
@@ -782,12 +804,33 @@ mod tests {
         let from_chunk = finish(from_chunk).unwrap();
         let mut from_records = exact_decoder();
         for record in records(rows()) {
-            from_records.apply_record(&record).unwrap();
+            for body in record.chunks(3) {
+                from_records.apply_relay_body(body).unwrap();
+            }
         }
         let from_records = finish(from_records).unwrap();
         assert_eq!(from_records.row_count, from_chunk.row_count);
         assert_eq!(from_records.fragments, from_chunk.fragments);
         assert_eq!(from_records.statistics, from_chunk.statistics);
+    }
+
+    #[test]
+    fn relayed_body_end_refuses_partial_record_without_publishing_eof() {
+        let record = records(vec![fragment(0, 5)]).remove(0);
+        let mut decoder = new_decoder(1);
+        decoder.apply_relay_body(&record[..7]).unwrap();
+        assert!(
+            decoder
+                .observe_root_eof()
+                .unwrap_err()
+                .contains("unfinished")
+        );
+        assert!(!decoder.root_eof);
+        decoder.apply_relay_body(&record[7..]).unwrap();
+        let tail = records(vec![summary(5)]).remove(0);
+        decoder.apply_relay_body(&tail).unwrap();
+        let prepared = finish(decoder).unwrap();
+        assert_eq!(prepared.row_count(), 5);
     }
 
     #[test]

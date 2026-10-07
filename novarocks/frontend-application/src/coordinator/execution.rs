@@ -1881,7 +1881,7 @@ impl FrontendDistributedQueryCoordinator {
                     )?;
                 }
                 builder.apply_split_assignment_profile(split_assignment_profile);
-                completion.profile(result, builder.finish())
+                completion.profile(result.row_count() as u64, builder.finish())
             }
             DistributedQueryIntent::Statistics => {
                 if let Some(error) = statistics_all_success_error(&round) {

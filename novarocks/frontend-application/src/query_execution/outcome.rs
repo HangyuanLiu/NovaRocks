@@ -161,7 +161,7 @@ impl FragmentProfileSet {
 }
 
 pub struct ProfileExecutionOutcome {
-    result: QueryResult,
+    output_rows: u64,
     profiles: FragmentProfileSet,
 }
 
@@ -179,8 +179,8 @@ impl StatisticsExecutionOutcome {
 }
 
 impl ProfileExecutionOutcome {
-    pub(crate) fn into_parts(self) -> (QueryResult, FragmentProfileSet) {
-        (self.result, self.profiles)
+    pub(crate) fn into_parts(self) -> (u64, FragmentProfileSet) {
+        (self.output_rows, self.profiles)
     }
 }
 
@@ -307,7 +307,10 @@ impl QueryOutcomeFactory {
                         "Profile outcome cannot contain a write session completion",
                     ));
                 }
-                self.profile(query_result, FragmentProfileSet::new(fragment_profiles))
+                self.profile(
+                    query_result.row_count() as u64,
+                    FragmentProfileSet::new(fragment_profiles),
+                )
             }
             DistributedQueryIntent::Result => {
                 if write_session.is_some() || !fragment_profiles.is_empty() {
@@ -337,12 +340,12 @@ impl QueryOutcomeFactory {
 
     pub fn profile(
         self,
-        result: QueryResult,
+        output_rows: u64,
         profiles: FragmentProfileSet,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         self.require_intent(DistributedQueryIntent::Profile)?;
         Ok(DistributedQueryOutcome::Profile(ProfileExecutionOutcome {
-            result,
+            output_rows,
             profiles,
         }))
     }

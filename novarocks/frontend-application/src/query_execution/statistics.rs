@@ -22,6 +22,7 @@
 //! unpivot/result operators. This module retains the frozen expectations and
 //! validates the Root result stream before the provider session may finish.
 
+use novarocks_native_adapter::root_record_assembly::{RootRecordAssembly, RootRecordDomain};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -507,6 +508,7 @@ fn admit_statistics_scan_binding(
 /// for ANALYZE; the provider session validates the compact body and derives
 /// provider metadata while consuming `finish`.
 pub struct StatisticsRootResultDecoder {
+    relay_assembly: RootRecordAssembly,
     expected: BTreeSet<StatisticsArtifactIdentity>,
     observed: BTreeMap<StatisticsArtifactIdentity, StatisticsArtifactDraft>,
     body_bytes: usize,
@@ -517,6 +519,7 @@ pub struct StatisticsRootResultDecoder {
 impl StatisticsRootResultDecoder {
     fn new(expected: impl IntoIterator<Item = StatisticsArtifactIdentity>) -> Self {
         Self {
+            relay_assembly: RootRecordAssembly::new(RootRecordDomain::Statistics, 32 * 1024 * 1024),
             expected: expected.into_iter().collect(),
             observed: BTreeMap::new(),
             body_bytes: 0,
@@ -619,6 +622,21 @@ impl StatisticsRootResultDecoder {
 
     /// Apply one complete StatisticsArtifactV1 record relayed from the
     /// Backend, under the same identity, membership and body rules.
+    /// Accept a relayed body into the prepaid 32 MiB assembly share. A complete
+    /// record is validated before this call returns and its receipt may finish.
+    pub(crate) fn apply_relay_body(&mut self, body: &[u8]) -> Result<(), String> {
+        if self.root_eof {
+            return Err("statistics Root emitted a trailing body after EOF".into());
+        }
+        let mut assembly = std::mem::replace(
+            &mut self.relay_assembly,
+            RootRecordAssembly::new(RootRecordDomain::Statistics, 32 * 1024 * 1024),
+        );
+        let result = assembly.push(body, |record| self.apply_record(record));
+        self.relay_assembly = assembly;
+        result
+    }
+
     pub fn apply_record(&mut self, record: &[u8]) -> Result<(), String> {
         if self.root_eof {
             return Err("statistics Root emitted a trailing record after EOF".into());
@@ -668,6 +686,7 @@ impl StatisticsRootResultDecoder {
     }
 
     pub fn observe_root_eof(&mut self) -> Result<(), String> {
+        self.relay_assembly.finish()?;
         if std::mem::replace(&mut self.root_eof, true) {
             return Err("statistics Root emitted duplicate EOF".into());
         }
@@ -822,6 +841,29 @@ mod tests {
     }
 
     #[test]
+    fn relayed_body_end_refuses_partial_record_and_preserves_all_success_gate() {
+        let record = statistics_records(&chunk(&[(&[1], "theta-v1", b"one", &[])])).remove(0);
+        let expected = StatisticsArtifactIdentity::try_new(vec![1], "theta-v1").unwrap();
+        let mut decoder = StatisticsRootResultDecoder::new([expected.clone()]);
+        decoder.apply_relay_body(&record[..7]).unwrap();
+        assert!(
+            decoder
+                .observe_root_eof()
+                .unwrap_err()
+                .contains("unfinished")
+        );
+        assert!(!decoder.root_eof);
+        decoder.apply_relay_body(&record[7..]).unwrap();
+        decoder.observe_root_eof().unwrap();
+        assert!(decoder.finish().unwrap_err().contains("all-success"));
+        let mut decoder = StatisticsRootResultDecoder::new([expected]);
+        decoder.apply_relay_body(&record).unwrap();
+        decoder.observe_root_eof().unwrap();
+        decoder.observe_execution_success().unwrap();
+        assert_eq!(decoder.finish().unwrap().len(), 1);
+    }
+
+    #[test]
     fn relayed_statistics_records_match_the_arrow_relation() {
         let rows = chunk(&[
             (&[1], "apache-datasketches-theta-v1", b"one", &[]),
@@ -841,7 +883,9 @@ mod tests {
         from_chunk.observe_execution_success().unwrap();
         let mut from_records = expected();
         for record in statistics_records(&rows) {
-            from_records.apply_record(&record).unwrap();
+            for body in record.chunks(3) {
+                from_records.apply_relay_body(body).unwrap();
+            }
         }
         from_records.observe_root_eof().unwrap();
         from_records.observe_execution_success().unwrap();

@@ -462,7 +462,7 @@ fn complete_profile(
         .into_profile()
         .map(crate::query_execution::outcome::ProfileExecutionOutcome::into_parts)
         .map_err(|error| error.to_string())?;
-    let (query_result, fragment_profiles) = outcome;
+    let (output_rows, fragment_profiles) = outcome;
     let fragment_profiles = fragment_profiles.into_profiles();
     if fragment_profiles.is_empty() {
         return Err("EXPLAIN ANALYZE completed without fragment runtime profiles".into());
@@ -489,7 +489,7 @@ fn complete_profile(
         "Planning: {} / Execution: {} / Rows: {}",
         format_explain_analyze_duration(formatter.planning_elapsed),
         format_explain_analyze_duration(formatter.execution_started_at.elapsed()),
-        query_result.row_count()
+        output_rows
     ));
     lines.push(format_distributed_profile_summary(&profile_summary));
     if let Some(apply) =
