@@ -1,0 +1,31 @@
+-- query 3
+id
+1
+
+-- query 4
+id	id_type
+1	bigint
+
+-- query 5
+id
+1
+
+-- query 6
+id	future
+1	NULL
+
+-- query 7
+snapshot_count
+1
+
+-- query 10
+snapshot_count
+1
+
+-- query 11
+id	future
+1	NULL
+
+-- query 12
+id
+1

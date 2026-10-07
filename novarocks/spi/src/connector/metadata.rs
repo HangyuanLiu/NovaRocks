@@ -290,6 +290,13 @@ pub enum ConnectorColumnDefault {
 /// Provider-neutral planning facts for one Arrow schema field. The ordinal is
 /// deliberately explicit so Core can project facts without inspecting a
 /// provider-private table-handle payload.
+///
+/// The read facts (visibility, semantic kind, role) are readable on every
+/// planning-facts value. The two write facts a provider may attach with
+/// [`Self::with_write_default`] and [`Self::with_write_target_type`] are
+/// construction input only: [`ConnectorTablePlanningFacts::try_new`] moves them
+/// into the table's [`ConnectorTableCurrentWriteFacts`], and they are read back
+/// exclusively through [`ConnectorTablePlanningFacts::current_write_facts`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorTableColumnPlanningFact {
     field_ordinal: u32,
@@ -319,9 +326,12 @@ impl ConnectorTableColumnPlanningFact {
 
     /// Attach the value this column receives when a write omits it.
     ///
-    /// The value is validated together with the owning
-    /// [`ConnectorTablePlanningFacts`], not here, so that bound violations are
-    /// reported against the same request budget as the rest of the facts.
+    /// This is Current write authority: only
+    /// [`ConnectorTablePlanningFacts::try_new`] accepts it, and historical
+    /// read-only facts reject a column fact that carries it. The value is
+    /// validated together with the owning [`ConnectorTablePlanningFacts`], not
+    /// here, so that bound violations are reported against the same request
+    /// budget as the rest of the facts.
     #[must_use]
     pub fn with_write_default(mut self, write_default: Option<ConnectorColumnDefault>) -> Self {
         self.write_default = write_default;
@@ -349,21 +359,25 @@ impl ConnectorTableColumnPlanningFact {
     ///
     /// `None` means "identical to the frozen schema field", which is the only
     /// shape a provider needs unless its physical write encoding for a type is
-    /// deliberately not the same as its read encoding.
+    /// deliberately not the same as its read encoding. Like a write default,
+    /// this is Current write authority accepted only by
+    /// [`ConnectorTablePlanningFacts::try_new`].
     #[must_use]
     pub fn with_write_target_type(mut self, write_target_type: Option<DataType>) -> Self {
         self.write_target_type = write_target_type;
         self
     }
 
-    pub const fn write_default(&self) -> Option<&ConnectorColumnDefault> {
-        self.write_default.as_ref()
+    fn carries_write_facts(&self) -> bool {
+        self.write_default.is_some() || self.write_target_type.is_some()
     }
 
-    /// The write-target Arrow type override, or `None` when the frozen read
-    /// schema field already describes the write target.
-    pub const fn write_target_type(&self) -> Option<&DataType> {
-        self.write_target_type.as_ref()
+    /// Move this column's write facts out, leaving only its read facts.
+    fn take_write_fact(&mut self) -> ConnectorTableColumnWriteFact {
+        ConnectorTableColumnWriteFact {
+            write_default: self.write_default.take(),
+            write_target_type: self.write_target_type.take(),
+        }
     }
 }
 
@@ -420,25 +434,150 @@ impl ConnectorTableForeignKeyConstraint {
     }
 }
 
+/// The authority one set of table planning facts was built under.
+///
+/// A provider builds planning facts for exactly one resolved read selector.
+/// Facts for the table's Current metadata carry the Current write authority;
+/// facts for a historical selector describe only how that snapshot reads and
+/// carry no write authority at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorTablePlanningScope {
+    /// Built from the table's Current metadata (current schema and default
+    /// partition spec). Write defaults, write-target types and partition
+    /// source membership are available through
+    /// [`ConnectorTablePlanningFacts::current_write_facts`].
+    Current,
+    /// Built from the schema of a historical snapshot selected for reading.
+    /// SQL visibility, semantic markers, roles and constraints describe that
+    /// snapshot; no write fact is defined for it.
+    HistoricalReadOnly,
+}
+
+/// Typed refusal returned when Current write authority is requested from
+/// historical read-only planning facts.
+///
+/// Historical facts answer this way instead of with empty write facts: an
+/// empty partition-source list means "the table declares no partition
+/// sources", and handing it to a write path would silently lift the DML
+/// restrictions the Current table actually imposes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectorWriteAuthorityRefusal;
+
+impl fmt::Display for ConnectorWriteAuthorityRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(
+            "connector table planning facts are historical read-only and carry no current write authority",
+        )
+    }
+}
+
+impl std::error::Error for ConnectorWriteAuthorityRefusal {}
+
+impl From<ConnectorWriteAuthorityRefusal> for ConnectorError {
+    fn from(refusal: ConnectorWriteAuthorityRefusal) -> Self {
+        ConnectorError::new(
+            super::ConnectorErrorKind::InvalidRequest,
+            refusal.to_string(),
+        )
+    }
+}
+
+/// Write facts of one schema column, owned by the Current write authority.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ConnectorTableColumnWriteFact {
+    write_default: Option<ConnectorColumnDefault>,
+    write_target_type: Option<DataType>,
+}
+
+/// The Current write authority of one table: per-column write defaults,
+/// write-target type overrides and partition-source membership.
+///
+/// Only [`ConnectorTablePlanningFacts::try_new`] (and [`ConnectorTablePlanningFacts::empty`])
+/// can produce a value of this type, so holding one proves the facts were
+/// built from Current metadata.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ConnectorTableCurrentWriteFacts {
+    /// Aligned with the planning facts' column facts; empty exactly when the
+    /// provider published no column facts.
+    column_write_facts: Vec<ConnectorTableColumnWriteFact>,
+    partition_source_column_ordinals: Vec<u32>,
+}
+
+impl ConnectorTableCurrentWriteFacts {
+    /// The value the column at `ordinal` receives when a write omits it, or
+    /// `None` when the provider declares no write default for it.
+    pub fn write_default(&self, ordinal: usize) -> Option<&ConnectorColumnDefault> {
+        self.column_write_facts
+            .get(ordinal)
+            .and_then(|fact| fact.write_default.as_ref())
+    }
+
+    /// The write-target Arrow type override of the column at `ordinal`, or
+    /// `None` when the frozen read schema field already describes the write
+    /// target.
+    pub fn write_target_type(&self, ordinal: usize) -> Option<&DataType> {
+        self.column_write_facts
+            .get(ordinal)
+            .and_then(|fact| fact.write_target_type.as_ref())
+    }
+
+    /// Ascending, de-duplicated schema ordinals of the columns the table's
+    /// Current default partition spec derives its partitioning from.
+    ///
+    /// This is a membership fact only: it says which columns participate, never
+    /// how they are transformed. An empty slice means the provider declares no
+    /// partition source columns, which is not the same as "unknown" — a
+    /// provider that cannot state this fact must fail its metadata request
+    /// rather than return an empty list.
+    pub fn partition_source_column_ordinals(&self) -> &[u32] {
+        &self.partition_source_column_ordinals
+    }
+}
+
+/// Which write facts one planning-facts value carries. Historical facts have
+/// no storage for write facts, so no accessor can read an empty value off them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ConnectorTableWriteAuthority {
+    Current(ConnectorTableCurrentWriteFacts),
+    HistoricalReadOnly,
+}
+
+impl Default for ConnectorTableWriteAuthority {
+    fn default() -> Self {
+        Self::Current(ConnectorTableCurrentWriteFacts::default())
+    }
+}
+
 /// Bounded provider-neutral facts needed by Core to materialize SQL table
-/// columns and optimizer UK/FK facts. Providers that have no additional facts
-/// return [`Self::empty`].
+/// columns and optimizer UK/FK facts, plus — for Current facts only — the
+/// Current write authority.
+///
+/// Providers that have no additional facts return [`Self::empty`], which is
+/// Current facts declaring no column facts, no write facts and no partition
+/// source columns. A historical read selector is answered with
+/// [`Self::try_new_historical_read_only`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ConnectorTablePlanningFacts {
     column_facts: Vec<ConnectorTableColumnPlanningFact>,
     unique_constraints: Vec<ConnectorTableUniqueConstraint>,
     foreign_key_constraints: Vec<ConnectorTableForeignKeyConstraint>,
-    partition_source_column_ordinals: Vec<u32>,
+    write_authority: ConnectorTableWriteAuthority,
 }
 
 impl ConnectorTablePlanningFacts {
+    /// Current facts that declare nothing: no column facts, no constraints, no
+    /// write facts and no partition source columns.
     pub fn empty() -> Self {
         Self::default()
     }
 
+    /// Build Current planning facts from the table's Current metadata.
+    ///
+    /// Column write defaults and write-target types attached to `column_facts`
+    /// and the partition source ordinals become the Current write authority.
     pub fn try_new(
         schema: &SchemaRef,
-        column_facts: Vec<ConnectorTableColumnPlanningFact>,
+        mut column_facts: Vec<ConnectorTableColumnPlanningFact>,
         mut unique_constraints: Vec<ConnectorTableUniqueConstraint>,
         mut foreign_key_constraints: Vec<ConnectorTableForeignKeyConstraint>,
         mut partition_source_column_ordinals: Vec<u32>,
@@ -456,19 +595,75 @@ impl ConnectorTablePlanningFacts {
             &partition_source_column_ordinals,
         )
         .saturating_add(write_default_bytes);
-        if bytes > context.max_total_payload_bytes() {
+        charge_planning_facts_budget(bytes, context)?;
+
+        let column_write_facts = column_facts
+            .iter_mut()
+            .map(ConnectorTableColumnPlanningFact::take_write_fact)
+            .collect();
+        Ok(Self {
+            column_facts,
+            unique_constraints,
+            foreign_key_constraints,
+            write_authority: ConnectorTableWriteAuthority::Current(
+                ConnectorTableCurrentWriteFacts {
+                    column_write_facts,
+                    partition_source_column_ordinals,
+                },
+            ),
+        })
+    }
+
+    /// Build read-only planning facts for a historical read selector.
+    ///
+    /// `schema` is the selected snapshot's schema. The facts carry SQL
+    /// visibility, semantic markers, roles and constraints for that snapshot,
+    /// and no write authority: a column fact that carries a write default or a
+    /// write-target type is rejected, and there is no partition-source input.
+    pub fn try_new_historical_read_only(
+        schema: &SchemaRef,
+        column_facts: Vec<ConnectorTableColumnPlanningFact>,
+        mut unique_constraints: Vec<ConnectorTableUniqueConstraint>,
+        mut foreign_key_constraints: Vec<ConnectorTableForeignKeyConstraint>,
+        context: &ConnectorRequestContext,
+    ) -> Result<Self, ConnectorError> {
+        if column_facts
+            .iter()
+            .any(ConnectorTableColumnPlanningFact::carries_write_facts)
+        {
             return Err(ConnectorError::new(
-                super::ConnectorErrorKind::ResourceExhausted,
-                "connector table planning facts exceed request total payload budget",
+                super::ConnectorErrorKind::CorruptData,
+                "historical read-only planning facts cannot carry column write defaults or write-target types",
             ));
         }
+        validate_column_facts(schema, &column_facts)?;
+        validate_unique_constraints(schema, &mut unique_constraints)?;
+        validate_foreign_key_constraints(schema, &mut foreign_key_constraints)?;
+
+        let bytes = planning_facts_bytes(
+            &column_facts,
+            &unique_constraints,
+            &foreign_key_constraints,
+            &[],
+        );
+        charge_planning_facts_budget(bytes, context)?;
 
         Ok(Self {
             column_facts,
             unique_constraints,
             foreign_key_constraints,
-            partition_source_column_ordinals,
+            write_authority: ConnectorTableWriteAuthority::HistoricalReadOnly,
         })
+    }
+
+    /// The authority these facts were built under.
+    pub const fn scope(&self) -> ConnectorTablePlanningScope {
+        match self.write_authority {
+            ConnectorTableWriteAuthority::Current(_) => ConnectorTablePlanningScope::Current,
+            ConnectorTableWriteAuthority::HistoricalReadOnly => {
+                ConnectorTablePlanningScope::HistoricalReadOnly
+            }
+        }
     }
 
     pub fn column_facts(&self) -> &[ConnectorTableColumnPlanningFact] {
@@ -483,17 +678,46 @@ impl ConnectorTablePlanningFacts {
         &self.foreign_key_constraints
     }
 
-    /// Ascending, de-duplicated schema ordinals of the columns the provider
-    /// currently derives its partitioning from.
+    /// The Current write authority: write defaults, write-target types and
+    /// partition source membership.
     ///
-    /// This is a membership fact only: it says which columns participate, never
-    /// how they are transformed. An empty slice means the provider declares no
-    /// partition source columns, which is not the same as "unknown" — a
-    /// provider that cannot state this fact must fail its metadata request
-    /// rather than return an empty list.
-    pub fn partition_source_column_ordinals(&self) -> &[u32] {
-        &self.partition_source_column_ordinals
+    /// Historical read-only facts refuse with
+    /// [`ConnectorWriteAuthorityRefusal`]; they never answer with empty write
+    /// facts.
+    pub const fn current_write_facts(
+        &self,
+    ) -> Result<&ConnectorTableCurrentWriteFacts, ConnectorWriteAuthorityRefusal> {
+        match &self.write_authority {
+            ConnectorTableWriteAuthority::Current(facts) => Ok(facts),
+            ConnectorTableWriteAuthority::HistoricalReadOnly => Err(ConnectorWriteAuthorityRefusal),
+        }
     }
+
+    /// Current partition source membership; see
+    /// [`ConnectorTableCurrentWriteFacts::partition_source_column_ordinals`].
+    ///
+    /// Historical read-only facts refuse with
+    /// [`ConnectorWriteAuthorityRefusal`] rather than return an empty slice,
+    /// which would declare that the table has no partition sources.
+    pub fn partition_source_column_ordinals(
+        &self,
+    ) -> Result<&[u32], ConnectorWriteAuthorityRefusal> {
+        self.current_write_facts()
+            .map(ConnectorTableCurrentWriteFacts::partition_source_column_ordinals)
+    }
+}
+
+fn charge_planning_facts_budget(
+    bytes: usize,
+    context: &ConnectorRequestContext,
+) -> Result<(), ConnectorError> {
+    if bytes > context.max_total_payload_bytes() {
+        return Err(ConnectorError::new(
+            super::ConnectorErrorKind::ResourceExhausted,
+            "connector table planning facts exceed request total payload budget",
+        ));
+    }
+    Ok(())
 }
 
 /// Validate the per-column facts against the frozen schema and return the byte
@@ -1167,7 +1391,9 @@ pub struct ConnectorTableMetadata {
     pub identity: ConnectorTableIdentity,
     pub schema: SchemaRef,
     /// Bounded provider-neutral facts aligned to `schema`. Empty facts retain
-    /// the historical provider-neutral defaults.
+    /// the provider-neutral defaults and are Current facts. A load for a
+    /// historical read selector returns historical read-only facts, which
+    /// carry no write authority.
     pub planning_facts: ConnectorTablePlanningFacts,
     /// Bounded SQL definition facts loaded from this exact provider
     /// generation. Empty facts mean SHOW CREATE is unsupported.
@@ -1483,6 +1709,8 @@ pub trait ConnectorMetadata: Send + Sync {
         ))
     }
 
+    /// Load the table's Current metadata. Its planning facts are Current facts
+    /// and carry the Current write authority.
     fn load_table(
         &self,
         request: ConnectorTableRequest,
@@ -1492,6 +1720,11 @@ pub trait ConnectorMetadata: Send + Sync {
     /// relation from a single provider metadata observation. Historical reads
     /// must return their selected schema, field identities and planning facts
     /// together; changing only the later scan selector is insufficient.
+    ///
+    /// A historical selector is answered with historical read-only planning
+    /// facts: write defaults, write-target types and partition source
+    /// membership belong to the Current metadata only and are never derived
+    /// against a historical schema.
     fn load_table_for_read(
         &self,
         request: ConnectorTableRequest,
@@ -1881,8 +2114,9 @@ mod tests {
         for variant in variants {
             let facts = facts_with_write_default(variant.clone(), 8_192)
                 .unwrap_or_else(|error| panic!("variant {variant:?} rejected: {error}"));
-            assert_eq!(facts.column_facts()[0].write_default(), Some(&variant));
-            assert_eq!(facts.column_facts()[1].write_default(), None);
+            let write = facts.current_write_facts().expect("Current facts");
+            assert_eq!(write.write_default(0), Some(&variant));
+            assert_eq!(write.write_default(1), None);
         }
     }
 
@@ -2008,6 +2242,184 @@ mod tests {
         assert!(facts.column_facts().is_empty());
     }
 
+    /// `empty()` keeps its meaning for every provider that returns it: Current
+    /// facts that declare no write default, no write-target type and no
+    /// partition source columns.
+    #[test]
+    fn uea7b3_empty_facts_are_current_and_declare_no_partition_sources() {
+        let facts = ConnectorTablePlanningFacts::empty();
+
+        assert_eq!(facts.scope(), ConnectorTablePlanningScope::Current);
+        let write = facts
+            .current_write_facts()
+            .expect("empty facts are Current facts");
+        assert_eq!(write.partition_source_column_ordinals(), &[] as &[u32]);
+        assert_eq!(write.write_default(0), None);
+        assert_eq!(write.write_target_type(0), None);
+        assert_eq!(facts.partition_source_column_ordinals(), Ok(&[] as &[u32]));
+    }
+
+    fn historical_facts(
+        column_facts: Vec<ConnectorTableColumnPlanningFact>,
+    ) -> Result<ConnectorTablePlanningFacts, ConnectorError> {
+        ConnectorTablePlanningFacts::try_new_historical_read_only(
+            &planning_schema(),
+            column_facts,
+            vec![ConnectorTableUniqueConstraint::new(vec![0])],
+            Vec::new(),
+            &context(4_096),
+        )
+    }
+
+    #[test]
+    fn uea7b3_historical_facts_keep_read_facts_and_refuse_write_authority() {
+        let facts = historical_facts(vec![
+            ordinary_fact(0),
+            ConnectorTableColumnPlanningFact::new(
+                1,
+                ConnectorTableColumnVisibility::Sql,
+                ConnectorTableColumnSemanticKind::Hll,
+                ConnectorTableColumnRole::Ordinary,
+            ),
+            ConnectorTableColumnPlanningFact::new(
+                2,
+                ConnectorTableColumnVisibility::Hidden,
+                ConnectorTableColumnSemanticKind::None,
+                ConnectorTableColumnRole::RowLineageSystem,
+            ),
+        ])
+        .expect("historical read-only facts");
+
+        assert_eq!(
+            facts.scope(),
+            ConnectorTablePlanningScope::HistoricalReadOnly
+        );
+        // Read facts describe the selected snapshot exactly.
+        assert_eq!(
+            facts.column_facts()[1].semantic_kind(),
+            ConnectorTableColumnSemanticKind::Hll
+        );
+        assert_eq!(
+            facts.column_facts()[2].visibility(),
+            ConnectorTableColumnVisibility::Hidden
+        );
+        assert_eq!(
+            facts.column_facts()[2].role(),
+            ConnectorTableColumnRole::RowLineageSystem
+        );
+        assert_eq!(facts.unique_constraints()[0].column_ordinals(), &[0]);
+        // Write authority is a typed refusal, never an empty answer.
+        assert_eq!(
+            facts.current_write_facts(),
+            Err(ConnectorWriteAuthorityRefusal)
+        );
+        assert_eq!(
+            facts.partition_source_column_ordinals(),
+            Err(ConnectorWriteAuthorityRefusal)
+        );
+        let error = ConnectorError::from(ConnectorWriteAuthorityRefusal);
+        assert_eq!(
+            error.kind(),
+            super::super::ConnectorErrorKind::InvalidRequest
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("historical read-only and carry no current write authority"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn uea7b3_historical_facts_reject_column_write_facts() {
+        let with_default = historical_facts(vec![
+            ordinary_fact(0).with_write_default(Some(ConnectorColumnDefault::Int64(7))),
+            ordinary_fact(1),
+            ordinary_fact(2),
+        ])
+        .expect_err("a historical write default must be rejected");
+        assert_eq!(
+            with_default.kind(),
+            super::super::ConnectorErrorKind::CorruptData
+        );
+
+        let with_type = historical_facts(vec![
+            ordinary_fact(0),
+            ordinary_fact(1).with_write_target_type(Some(DataType::LargeBinary)),
+            ordinary_fact(2),
+        ])
+        .expect_err("a historical write-target type must be rejected");
+        assert_eq!(
+            with_type.kind(),
+            super::super::ConnectorErrorKind::CorruptData
+        );
+    }
+
+    #[test]
+    fn uea7b3_historical_facts_validate_read_facts_and_budget() {
+        let misaligned =
+            historical_facts(vec![ordinary_fact(0), ordinary_fact(0), ordinary_fact(2)])
+                .expect_err("misaligned historical column facts must be rejected");
+        assert_eq!(
+            misaligned.kind(),
+            super::super::ConnectorErrorKind::CorruptData
+        );
+
+        let over_budget = ConnectorTablePlanningFacts::try_new_historical_read_only(
+            &planning_schema(),
+            vec![ordinary_fact(0), ordinary_fact(1), ordinary_fact(2)],
+            Vec::new(),
+            Vec::new(),
+            &context(8),
+        )
+        .expect_err("historical facts are charged to the request budget");
+        assert_eq!(
+            over_budget.kind(),
+            super::super::ConnectorErrorKind::ResourceExhausted
+        );
+    }
+
+    /// Current facts keep the existing exact write facts after the column
+    /// write inputs move into the Current write authority.
+    #[test]
+    fn uea7b3_current_facts_expose_write_authority_and_read_only_column_facts() {
+        let facts = ConnectorTablePlanningFacts::try_new(
+            &planning_schema(),
+            vec![
+                ordinary_fact(0).with_write_default(Some(ConnectorColumnDefault::Int64(7))),
+                ordinary_fact(1).with_write_target_type(Some(DataType::LargeBinary)),
+                ordinary_fact(2),
+            ],
+            Vec::new(),
+            Vec::new(),
+            vec![1],
+            &context(4_096),
+        )
+        .expect("Current facts");
+
+        assert_eq!(facts.scope(), ConnectorTablePlanningScope::Current);
+        let write = facts
+            .current_write_facts()
+            .expect("Current write authority");
+        assert_eq!(
+            write.write_default(0),
+            Some(&ConnectorColumnDefault::Int64(7))
+        );
+        assert_eq!(write.write_default(1), None);
+        assert_eq!(write.write_target_type(1), Some(&DataType::LargeBinary));
+        assert_eq!(write.write_target_type(2), None);
+        // Out-of-range ordinals declare nothing, exactly like a missing fact.
+        assert_eq!(write.write_default(3), None);
+        assert_eq!(write.partition_source_column_ordinals(), &[1]);
+        assert_eq!(
+            facts.partition_source_column_ordinals(),
+            Ok(&[1_u32] as &[u32])
+        );
+        // The read-only column facts no longer carry the write inputs.
+        assert_eq!(facts.column_facts()[0], ordinary_fact(0));
+        assert_eq!(facts.column_facts()[1], ordinary_fact(1));
+    }
+
     #[test]
     fn spi5ef_table_planning_facts_canonicalize_constraints() {
         let facts = ConnectorTablePlanningFacts::try_new(
@@ -2108,7 +2520,10 @@ mod tests {
         )
         .expect("partition source ordinals must be accepted");
 
-        assert_eq!(facts.partition_source_column_ordinals(), &[0, 2]);
+        assert_eq!(
+            facts.partition_source_column_ordinals(),
+            Ok(&[0_u32, 2] as &[u32])
+        );
     }
 
     #[test]
@@ -2172,11 +2587,9 @@ mod tests {
         )
         .expect("write-target type override must be accepted");
 
-        assert_eq!(facts.column_facts()[0].write_target_type(), None);
-        assert_eq!(
-            facts.column_facts()[1].write_target_type(),
-            Some(&DataType::LargeBinary)
-        );
+        let write = facts.current_write_facts().expect("Current facts");
+        assert_eq!(write.write_target_type(0), None);
+        assert_eq!(write.write_target_type(1), Some(&DataType::LargeBinary));
 
         // Same facts, but a budget that only covers the three plain column
         // facts: the override must be what pushes the request over.

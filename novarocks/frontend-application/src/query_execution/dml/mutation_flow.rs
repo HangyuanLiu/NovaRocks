@@ -1048,21 +1048,9 @@ pub(crate) fn prepare_update_mutation(
         } else {
             target_binding.dml_target_columns()
         };
-    let partition_source_columns = target_binding
-        .metadata()
-        .planning_facts
-        .partition_source_column_ordinals()
-        .iter()
-        .map(|ordinal| {
-            target_columns
-                .get(*ordinal as usize)
-                .map(|column| column.name.clone())
-                .ok_or_else(|| {
-                    "connector write target has a partition source ordinal outside its admitted schema"
-                        .to_string()
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    // Partition source membership is Current write authority; the binding
+    // exists only for Current facts and resolves the ordinals in its own schema.
+    let partition_source_columns = target_binding.partition_source_column_names()?;
     validate_update_assignments(
         &stmt.assignments,
         &target_columns,
@@ -1208,21 +1196,8 @@ pub(crate) fn prepare_merge_mutation(
     } else {
         target_binding.dml_target_columns()
     };
-    let partition_source_columns = target_binding
-        .metadata()
-        .planning_facts
-        .partition_source_column_ordinals()
-        .iter()
-        .map(|ordinal| {
-            target_columns
-                .get(*ordinal as usize)
-                .map(|column| column.name.clone())
-                .ok_or_else(|| {
-                    "connector write target has a partition source ordinal outside its admitted schema"
-                        .to_string()
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    // Same Current write authority as UPDATE; see `prepare_update_mutation`.
+    let partition_source_columns = target_binding.partition_source_column_names()?;
     if let Some(clause) = stmt.matched.as_ref()
         && let PreparedMergeMatchedAction::Update { assignments } = &clause.action
     {
@@ -5399,6 +5374,48 @@ mod tests {
         )
         .expect_err("must reject");
         assert!(err.contains("partition column"), "{err}");
+    }
+
+    /// UPDATE and MERGE both take the partition source set from the Current
+    /// write authority of their target binding; assigning that column is still
+    /// rejected while an ordinary column stays assignable.
+    #[test]
+    fn current_partition_source_from_the_write_target_rejects_its_assignment() {
+        use crate::connector::write_target::{ConnectorWriteTargetBinding, tests};
+
+        let binding = ConnectorWriteTargetBinding::try_new(
+            tests::future_partition_metadata(false),
+            tests::test_lease(),
+        )
+        .expect("Current binding");
+        let target_columns = binding.dml_target_columns();
+        let partition_columns = binding
+            .partition_source_column_names()
+            .expect("partition source names");
+        assert_eq!(partition_columns, vec!["future".to_string()]);
+
+        let err = validate_update_assignments(
+            &[PreparedMutationAssignment {
+                column: "FUTURE".to_string(),
+                value_sql: "7".to_string(),
+            }],
+            &target_columns,
+            &partition_columns,
+        )
+        .expect_err("a Current partition source must not be assigned");
+        assert!(
+            err.contains("UPDATE cannot modify Iceberg partition column `FUTURE`"),
+            "{err}"
+        );
+        validate_update_assignments(
+            &[PreparedMutationAssignment {
+                column: "id".to_string(),
+                value_sql: "2".to_string(),
+            }],
+            &target_columns,
+            &partition_columns,
+        )
+        .expect("a non-partition column stays assignable");
     }
 
     #[test]

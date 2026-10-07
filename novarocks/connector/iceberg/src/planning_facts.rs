@@ -26,7 +26,7 @@ use novarocks_spi::connector::{
     ConnectorInstanceId, ConnectorRequestContext, ConnectorTableColumnPlanningFact,
     ConnectorTableColumnRole, ConnectorTableColumnSemanticKind, ConnectorTableColumnVisibility,
     ConnectorTableForeignKeyConstraint, ConnectorTableIdentity, ConnectorTablePlanningFacts,
-    ConnectorTableUniqueConstraint,
+    ConnectorTablePlanningScope, ConnectorTableUniqueConstraint,
 };
 
 use crate::scan_model::{IcebergDataFileInfo, IcebergDeleteFileContent, IcebergTableInfo};
@@ -150,15 +150,21 @@ fn corrupt<T>(message: String) -> Result<T, ConnectorError> {
     ))
 }
 
-/// Derives the planning facts exposed by `ConnectorMetadata::load_table`.
+/// Derives the planning facts exposed by `ConnectorMetadata::load_table` and
+/// `ConnectorMetadata::load_table_for_read`.
 ///
 /// The serialized metadata is parsed only inside the Iceberg provider.  The
 /// returned facts intentionally contain no table UUID, snapshot, file, or
 /// provider payload detail.
 pub struct IcebergTablePlanningFactsInput<'a> {
+    /// The resolved read selector's authority. `Current` builds the Current
+    /// write authority from the current schema and default partition spec;
+    /// `HistoricalReadOnly` builds only the selected snapshot's read facts.
+    pub scope: ConnectorTablePlanningScope,
     pub schema: &'a SchemaRef,
     /// Authoritative Iceberg schema behind `schema`, used only to read each
-    /// column's write default.
+    /// column's write default and write-target type, and to resolve the default
+    /// partition spec's sources. Only Current facts consult it.
     ///
     /// Metadata tables have a synthetic Arrow schema with no Iceberg column
     /// behind it, so they pass `None` and expose no write defaults.
@@ -209,10 +215,7 @@ pub fn table_planning_facts(
             } else {
                 ConnectorTableColumnRole::Ordinary
             };
-            let write_default = iceberg_write_default(input.iceberg_schema, field.name())?;
-            let write_target_type =
-                iceberg_write_target_type(input.iceberg_schema, field.name(), field.data_type());
-            Ok(ConnectorTableColumnPlanningFact::new(
+            let fact = ConnectorTableColumnPlanningFact::new(
                 u32::try_from(ordinal).map_err(|_| {
                     ConnectorError::new(
                         ConnectorErrorKind::CorruptData,
@@ -222,9 +225,23 @@ pub fn table_planning_facts(
                 visibility,
                 semantic_kind,
                 role,
-            )
-            .with_write_default(write_default)
-            .with_write_target_type(write_target_type))
+            );
+            match input.scope {
+                ConnectorTablePlanningScope::Current => {
+                    let write_default = iceberg_write_default(input.iceberg_schema, field.name())?;
+                    let write_target_type = iceberg_write_target_type(
+                        input.iceberg_schema,
+                        field.name(),
+                        field.data_type(),
+                    );
+                    Ok(fact
+                        .with_write_default(write_default)
+                        .with_write_target_type(write_target_type))
+                }
+                // A historical snapshot is read, never written: its schema
+                // defines no write default or write-target type.
+                ConnectorTablePlanningScope::HistoricalReadOnly => Ok(fact),
+            }
         })
         .collect::<Result<Vec<_>, ConnectorError>>()?;
     let metadata = input
@@ -248,22 +265,38 @@ pub fn table_planning_facts(
             )
         })
         .unwrap_or_default();
-    let partition_source_column_ordinals = match (metadata.as_ref(), input.iceberg_schema) {
-        (Some(metadata), Some(iceberg_schema)) => {
-            iceberg_partition_source_ordinals(metadata, iceberg_schema, input.schema)?
+    match input.scope {
+        ConnectorTablePlanningScope::Current => {
+            let partition_source_column_ordinals = match (metadata.as_ref(), input.iceberg_schema) {
+                (Some(metadata), Some(iceberg_schema)) => {
+                    iceberg_partition_source_ordinals(metadata, iceberg_schema, input.schema)?
+                }
+                // A metadata table has no Iceberg schema behind its synthetic
+                // Arrow schema, and therefore no partitioning to report.
+                _ => Vec::new(),
+            };
+            ConnectorTablePlanningFacts::try_new(
+                input.schema,
+                column_facts,
+                unique_constraints,
+                foreign_key_constraints,
+                partition_source_column_ordinals,
+                input.context,
+            )
         }
-        // A metadata table has no Iceberg schema behind its synthetic Arrow
-        // schema, and therefore no partitioning to report.
-        _ => Vec::new(),
-    };
-    ConnectorTablePlanningFacts::try_new(
-        input.schema,
-        column_facts,
-        unique_constraints,
-        foreign_key_constraints,
-        partition_source_column_ordinals,
-        input.context,
-    )
+        // The current default partition spec is Current write authority. It
+        // may legally reference columns a historical snapshot's schema never
+        // had, so it is never resolved against that schema.
+        ConnectorTablePlanningScope::HistoricalReadOnly => {
+            ConnectorTablePlanningFacts::try_new_historical_read_only(
+                input.schema,
+                column_facts,
+                unique_constraints,
+                foreign_key_constraints,
+                input.context,
+            )
+        }
+    }
 }
 
 /// The Arrow type this column takes as a row-DML write target, when that is not
@@ -527,20 +560,28 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
         let instance_id = ConnectorInstanceId::parse("ice").unwrap();
         let context = context();
-        let error = table_planning_facts(IcebergTablePlanningFactsInput {
-            schema: &schema,
-            iceberg_schema: None,
-            metadata_columns: &[],
-            hidden_columns: &[],
-            logical_type_columns: &BTreeMap::new(),
-            serialized_metadata: Some("{\"schemas\":[]} trailing"),
-            namespace: &Arc::from("db"),
-            instance_id: &instance_id,
-            context: &context,
-        })
-        .unwrap_err();
-        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
-        assert!(error.to_string().contains("trailing JSON"));
+        // Historical facts still decode the frozen metadata for their read
+        // facts, so a malformed document fails closed under either scope.
+        for scope in [
+            ConnectorTablePlanningScope::Current,
+            ConnectorTablePlanningScope::HistoricalReadOnly,
+        ] {
+            let error = table_planning_facts(IcebergTablePlanningFactsInput {
+                scope,
+                schema: &schema,
+                iceberg_schema: None,
+                metadata_columns: &[],
+                hidden_columns: &[],
+                logical_type_columns: &BTreeMap::new(),
+                serialized_metadata: Some("{\"schemas\":[]} trailing"),
+                namespace: &Arc::from("db"),
+                instance_id: &instance_id,
+                context: &context,
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+            assert!(error.to_string().contains("trailing JSON"));
+        }
     }
 
     #[test]
@@ -562,6 +603,7 @@ mod tests {
         let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
         let context = context();
         let facts = table_planning_facts(IcebergTablePlanningFactsInput {
+            scope: ConnectorTablePlanningScope::Current,
             schema: &schema,
             iceberg_schema: None,
             metadata_columns: &metadata_columns,
@@ -666,16 +708,31 @@ mod tests {
         iceberg_schema: Option<&crate::iceberg::spec::Schema>,
         arrow_schema: &SchemaRef,
     ) -> Result<ConnectorTablePlanningFacts, ConnectorError> {
+        scoped_facts(
+            ConnectorTablePlanningScope::Current,
+            iceberg_schema,
+            arrow_schema,
+            None,
+        )
+    }
+
+    fn scoped_facts(
+        scope: ConnectorTablePlanningScope,
+        iceberg_schema: Option<&crate::iceberg::spec::Schema>,
+        arrow_schema: &SchemaRef,
+        serialized_metadata: Option<&str>,
+    ) -> Result<ConnectorTablePlanningFacts, ConnectorError> {
         let namespace = Arc::from("db");
         let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
         let context = context();
         table_planning_facts(IcebergTablePlanningFactsInput {
+            scope,
             schema: arrow_schema,
             iceberg_schema,
             metadata_columns: &[],
             hidden_columns: &[],
             logical_type_columns: &BTreeMap::new(),
-            serialized_metadata: None,
+            serialized_metadata,
             namespace: &namespace,
             instance_id: &instance_id,
             context: &context,
@@ -698,11 +755,12 @@ mod tests {
         let facts =
             write_default_facts(Some(&iceberg_schema), &arrow_schema).expect("planning facts");
 
+        let write = facts.current_write_facts().expect("Current facts");
         assert_eq!(
-            facts.column_facts()[0].write_default(),
+            write.write_default(0),
             Some(&ConnectorColumnDefault::String(Arc::from("fallback")))
         );
-        assert_eq!(facts.column_facts()[1].write_default(), None);
+        assert_eq!(write.write_default(1), None);
     }
 
     #[test]
@@ -714,11 +772,54 @@ mod tests {
 
         let facts = write_default_facts(None, &arrow_schema).expect("planning facts");
 
+        let write = facts.current_write_facts().expect("Current facts");
+        assert!(
+            (0..arrow_schema.fields().len()).all(|ordinal| write.write_default(ordinal).is_none())
+        );
+    }
+
+    /// A historical selector's schema is read, never written: even when it
+    /// declares a write default and a type whose write encoding differs, the
+    /// historical facts carry no write authority to expose them through.
+    #[test]
+    fn uea7b3_historical_scope_builds_read_facts_without_write_authority() {
+        use crate::iceberg::spec::{Literal, PrimitiveType, Type};
+
+        let iceberg_schema = write_default_schema(
+            Type::Primitive(PrimitiveType::String),
+            Literal::string("fallback"),
+        );
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("with_default", DataType::Utf8, true),
+            Field::new("plain", DataType::Int64, true),
+        ]));
+
+        let facts = scoped_facts(
+            ConnectorTablePlanningScope::HistoricalReadOnly,
+            Some(&iceberg_schema),
+            &arrow_schema,
+            None,
+        )
+        .expect("historical facts");
+
+        assert_eq!(
+            facts.scope(),
+            ConnectorTablePlanningScope::HistoricalReadOnly
+        );
+        assert_eq!(facts.column_facts().len(), 2);
         assert!(
             facts
                 .column_facts()
                 .iter()
-                .all(|fact| fact.write_default().is_none())
+                .all(|fact| fact.visibility() == ConnectorTableColumnVisibility::Sql)
+        );
+        assert_eq!(
+            facts.current_write_facts(),
+            Err(novarocks_spi::connector::ConnectorWriteAuthorityRefusal)
+        );
+        assert_eq!(
+            facts.partition_source_column_ordinals(),
+            Err(novarocks_spi::connector::ConnectorWriteAuthorityRefusal)
         );
     }
 
@@ -764,7 +865,13 @@ mod tests {
         let facts =
             write_default_facts(Some(&iceberg_schema), &arrow_schema).expect("planning facts");
 
-        assert_eq!(facts.column_facts()[2].write_default(), None);
+        assert_eq!(
+            facts
+                .current_write_facts()
+                .expect("Current facts")
+                .write_default(2),
+            None
+        );
     }
 
     /// Iceberg schema holding one variant, one binary and one plain column.
@@ -807,12 +914,10 @@ mod tests {
         let facts = write_default_facts(Some(&write_target_type_schema()), &arrow_schema)
             .expect("planning facts");
 
-        assert_eq!(
-            facts.column_facts()[0].write_target_type(),
-            Some(&DataType::LargeBinary)
-        );
-        assert_eq!(facts.column_facts()[1].write_target_type(), None);
-        assert_eq!(facts.column_facts()[2].write_target_type(), None);
+        let write = facts.current_write_facts().expect("Current facts");
+        assert_eq!(write.write_target_type(0), Some(&DataType::LargeBinary));
+        assert_eq!(write.write_target_type(1), None);
+        assert_eq!(write.write_target_type(2), None);
     }
 
     #[test]
@@ -827,16 +932,23 @@ mod tests {
         let facts = write_default_facts(Some(&write_target_type_schema()), &arrow_schema)
             .expect("planning facts");
 
-        assert_eq!(facts.column_facts()[3].write_target_type(), None);
+        assert_eq!(
+            facts
+                .current_write_facts()
+                .expect("Current facts")
+                .write_target_type(3),
+            None
+        );
         // A metadata table has no Iceberg schema at all.
         let metadata_table = write_default_facts(None, &arrow_schema).expect("planning facts");
+        let write = metadata_table
+            .current_write_facts()
+            .expect("metadata tables are Current facts");
         assert!(
-            metadata_table
-                .column_facts()
-                .iter()
-                .all(|fact| fact.write_target_type().is_none())
+            (0..arrow_schema.fields().len())
+                .all(|ordinal| write.write_target_type(ordinal).is_none())
         );
-        assert!(metadata_table.partition_source_column_ordinals().is_empty());
+        assert!(write.partition_source_column_ordinals().is_empty());
     }
 
     #[test]
@@ -893,6 +1005,7 @@ mod tests {
         let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
         let context = context();
         let facts = table_planning_facts(IcebergTablePlanningFactsInput {
+            scope: ConnectorTablePlanningScope::Current,
             schema: &arrow_schema,
             iceberg_schema: Some(iceberg_schema.as_ref()),
             metadata_columns: &[],
@@ -905,7 +1018,10 @@ mod tests {
         })
         .expect("planning facts");
 
-        assert_eq!(facts.partition_source_column_ordinals(), &[1]);
+        assert_eq!(
+            facts.partition_source_column_ordinals(),
+            Ok(&[1_u32] as &[u32])
+        );
     }
 
     #[test]
@@ -958,6 +1074,7 @@ mod tests {
         let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
         let context = context();
         let error = table_planning_facts(IcebergTablePlanningFactsInput {
+            scope: ConnectorTablePlanningScope::Current,
             schema: &arrow_schema,
             iceberg_schema: Some(iceberg_schema.as_ref()),
             metadata_columns: &[],
@@ -971,5 +1088,114 @@ mod tests {
         .expect_err("missing partition source column must fail closed");
 
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+    }
+
+    /// The current default spec is sourced on `future`, a column the selected
+    /// historical schema never had. Historical facts must not resolve the
+    /// current spec against that schema; Current facts still do.
+    #[test]
+    fn uea7b3_historical_scope_never_resolves_the_current_default_spec() {
+        use crate::iceberg::spec::Schema as IcebergSchema;
+        use crate::iceberg::spec::{
+            FormatVersion, NestedField, PartitionSpec, PrimitiveType, SortOrder,
+            TableMetadataBuilder, Transform, Type,
+        };
+
+        let historical_schema = IcebergSchema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .expect("historical schema");
+        let current_schema = Arc::new(
+            IcebergSchema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    Arc::new(NestedField::required(
+                        1,
+                        "id",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::optional(
+                        2,
+                        "future",
+                        Type::Primitive(PrimitiveType::Int),
+                    )),
+                ])
+                .build()
+                .expect("current schema"),
+        );
+        let future_spec = PartitionSpec::builder(current_schema.clone())
+            .with_spec_id(0)
+            .add_partition_field("future", "future_partition", Transform::Identity)
+            .expect("partition field")
+            .build()
+            .expect("spec");
+        let metadata = TableMetadataBuilder::new(
+            current_schema.as_ref().clone(),
+            future_spec,
+            SortOrder::builder().build_unbound().expect("sort"),
+            "file:///tmp/x".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .expect("builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let serialized = serde_json::to_string(&metadata).expect("serialize metadata");
+
+        let historical_arrow =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let historical = scoped_facts(
+            ConnectorTablePlanningScope::HistoricalReadOnly,
+            Some(&historical_schema),
+            &historical_arrow,
+            Some(&serialized),
+        )
+        .expect("historical facts do not consult the current default spec");
+        assert_eq!(
+            historical.scope(),
+            ConnectorTablePlanningScope::HistoricalReadOnly
+        );
+        assert_eq!(historical.column_facts().len(), 1);
+        assert!(historical.current_write_facts().is_err());
+
+        // The same frozen metadata under Current scope against the historical
+        // schema is an inconsistent Current table, which stays CorruptData.
+        let error = scoped_facts(
+            ConnectorTablePlanningScope::Current,
+            Some(&historical_schema),
+            &historical_arrow,
+            Some(&serialized),
+        )
+        .expect_err("a Current spec referencing a missing source stays CorruptData");
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        assert!(
+            error.to_string().contains(
+                "Iceberg partition field 'future_partition' references missing source id 2"
+            ),
+            "{error}"
+        );
+
+        // Current facts against the current schema declare the exact ordinal.
+        let current_arrow = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("future", DataType::Int32, true),
+        ]));
+        let current = scoped_facts(
+            ConnectorTablePlanningScope::Current,
+            Some(current_schema.as_ref()),
+            &current_arrow,
+            Some(&serialized),
+        )
+        .expect("Current facts");
+        assert_eq!(
+            current.partition_source_column_ordinals(),
+            Ok(&[1_u32] as &[u32])
+        );
     }
 }

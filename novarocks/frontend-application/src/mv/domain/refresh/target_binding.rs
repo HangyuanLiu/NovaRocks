@@ -244,6 +244,9 @@ fn mv_target_physical_write_schema(
             read_schema.fields().len()
         ));
     }
+    let write_facts = planning_facts
+        .current_write_facts()
+        .map_err(|refusal| format!("MV refresh target is not Current metadata: {refusal}"))?;
 
     let fields = read_schema
         .fields()
@@ -254,8 +257,8 @@ fn mv_target_physical_write_schema(
             if fact.is_some_and(|fact| fact.role() == ConnectorTableColumnRole::RowLineageSystem) {
                 return None;
             }
-            let data_type = fact
-                .and_then(|fact| fact.write_target_type())
+            let data_type = write_facts
+                .write_target_type(ordinal)
                 .cloned()
                 .unwrap_or_else(|| field.data_type().clone());
             Some(Arc::new(field.as_ref().clone().with_data_type(data_type)))
