@@ -1674,3 +1674,101 @@ fn zero_sized_high_alignment_state_requires_actual_alignment_and_drops_exactly_o
     assert_eq!(ZERO_CREATE.load(Ordering::Relaxed), 1);
     assert_eq!(ZERO_DROP.load(Ordering::Relaxed), 1);
 }
+
+/// Counts the host's block traffic and can refuse one allocation.
+#[derive(Default)]
+struct CountingAllocator {
+    allocated: AtomicUsize,
+    released: AtomicUsize,
+    refuse_at: Option<usize>,
+}
+impl crate::AggregateStateAllocator for CountingAllocator {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, KernelFailure> {
+        let at = self.allocated.load(Ordering::Relaxed);
+        if self.refuse_at == Some(at) {
+            return Err(KernelFailure::ResourceExhausted);
+        }
+        let block = crate::UnaccountedAggregateStateAllocator.allocate(layout)?;
+        self.allocated.fetch_add(1, Ordering::Relaxed);
+        Ok(block)
+    }
+    unsafe fn release(&self, block: NonNull<u8>, layout: Layout) {
+        self.released.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: forwarded exactly as this allocator received it.
+        unsafe { crate::UnaccountedAggregateStateAllocator.release(block, layout) }
+    }
+}
+
+// An owned column grows across blocks, updates groups that live in different
+// blocks, emits in requested order, and destroys every typed state exactly
+// once before returning every block to the host.
+#[test]
+fn owned_state_column_grows_across_blocks_and_releases_after_destroying_states() {
+    let owner = Owner::new(1, false);
+    let runtime = RuntimeControl::default();
+    let allocator = Arc::new(CountingAllocator::default());
+    let handle = prepared_handle(&owner, AggregateKernelPhase::Partial);
+    let mut column = crate::AggregateStateColumn::try_new(
+        handle.clone(),
+        allocator.clone(),
+        std::num::NonZeroUsize::new(2).unwrap(),
+    )
+    .unwrap();
+    for expected in 0..3 {
+        assert_eq!(column.push(&runtime).unwrap(), expected);
+    }
+    assert_eq!(column.len(), 3);
+    assert_eq!(allocator.allocated.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        column.backing_bytes(),
+        2 * 2 * handle.state_layout().pad_to_align().size()
+    );
+
+    let values = value_array();
+    let args = [EvaluatedArgument::Column(&values)];
+    let selection = Selection::all(5);
+    let mapping = [0, 1, 2, 0, 2];
+    let input =
+        SelectedAggregateUpdateInput::try_new(handle.contract(), selection, &args, &[], &runtime)
+            .unwrap();
+    let mut frame = column
+        .prepare_update_batch(&mapping, input, &runtime)
+        .unwrap();
+    frame.run(&runtime).unwrap();
+    drop(frame);
+    assert_eq!(
+        integers(&column.emit(&[2, 0, 1], 3, &runtime).unwrap()),
+        [80, 50, 20]
+    );
+
+    let destroyed = owner.counts.drop.load(Ordering::Relaxed);
+    drop(column);
+    assert_eq!(owner.counts.drop.load(Ordering::Relaxed), destroyed + 3);
+    assert_eq!(allocator.released.load(Ordering::Relaxed), 2);
+}
+
+// A refused block initializes nothing; earlier states and blocks are still
+// destroyed and released exactly once.
+#[test]
+fn owned_state_column_refused_block_leaves_prior_states_intact() {
+    let owner = Owner::new(1, false);
+    let runtime = RuntimeControl::default();
+    let allocator = Arc::new(CountingAllocator {
+        refuse_at: Some(1),
+        ..CountingAllocator::default()
+    });
+    let handle = prepared_handle(&owner, AggregateKernelPhase::Partial);
+    let mut column = crate::AggregateStateColumn::try_new(
+        handle,
+        allocator.clone(),
+        std::num::NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(column.push(&runtime).unwrap(), 0);
+    assert_eq!(column.push(&runtime), Err(KernelFailure::ResourceExhausted));
+    assert_eq!(column.len(), 1);
+    let destroyed = owner.counts.drop.load(Ordering::Relaxed);
+    drop(column);
+    assert_eq!(owner.counts.drop.load(Ordering::Relaxed), destroyed + 1);
+    assert_eq!(allocator.released.load(Ordering::Relaxed), 1);
+}

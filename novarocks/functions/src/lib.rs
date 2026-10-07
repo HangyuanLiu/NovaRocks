@@ -32,6 +32,7 @@ use sha2::{Digest, Sha256};
 
 mod aggregate_call;
 mod aggregate_erasure;
+mod aggregate_state_column;
 mod aggregate_kernel;
 pub mod aggregate_types;
 mod arithmetic;
@@ -69,6 +70,7 @@ mod window_kernel;
 
 pub use aggregate_call::*;
 pub use aggregate_erasure::*;
+pub use aggregate_state_column::*;
 pub use aggregate_kernel::*;
 pub use arithmetic::*;
 pub use binding::*;
