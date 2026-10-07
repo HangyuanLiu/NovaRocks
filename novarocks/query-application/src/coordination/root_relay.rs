@@ -248,6 +248,22 @@ impl RootRelayFrontier {
                         let after = validated.after();
                         (after, after.completed_rows() - self.cursor.completed_rows())
                     }
+                    None if self.kind
+                        == RootOutputKind::InternalFacts(
+                            novarocks_result_contract::InternalResultDomain::ScalarValueV1,
+                        ) =>
+                    {
+                        // ScalarValueV1 publishes one complete record together
+                        // with its sealed End. Its typed consumer validates the
+                        // value/NoRows count before completing the receipt.
+                        let end = data
+                            .end_after_data()
+                            .ok_or(RootRelayError::UnexpectedOutcome)?;
+                        if self.delivered_through != 0 || end.output_rows > 1 {
+                            return Err(RootRelayError::EndMismatch);
+                        }
+                        (self.cursor, end.output_rows)
+                    }
                     None => (self.cursor, 0),
                 };
                 if let Some(end) = data.end_after_data() {
@@ -266,6 +282,14 @@ impl RootRelayFrontier {
             (RootReadOutcome::End(end), Some(wanted)) => {
                 if end.sequence != wanted {
                     return Err(RootRelayError::Sequence);
+                }
+                if self.kind
+                    == RootOutputKind::InternalFacts(
+                        novarocks_result_contract::InternalResultDomain::ScalarValueV1,
+                    )
+                {
+                    // NoRows is an explicit record, never an empty stream.
+                    return Err(RootRelayError::UnexpectedOutcome);
                 }
                 self.check_end(*end, self.cursor, wanted.get())?;
                 self.end = Some(*end);
@@ -574,6 +598,77 @@ mod tests {
             frontier.accept(&reply(root, 0, RootReadOutcome::NotReady), None),
             Err(RootRelayError::UnexpectedOutcome)
         );
+    }
+
+    #[test]
+    fn scalar_data_uses_its_sealed_end_count_and_requires_the_explicit_record() {
+        use novarocks_result_contract::InternalResultDomain;
+        let kind = RootOutputKind::InternalFacts(InternalResultDomain::ScalarValueV1);
+        for rows in [0, 1, 2] {
+            let root = root();
+            let mut frontier = RootRelayFrontier::new(root, RootProfileId::V1, kind, None).unwrap();
+            let read = frontier.next_read().unwrap();
+            frontier.sent(read);
+            let outcome = RootReadOutcome::Data(
+                RootResultData::try_new(
+                    kind,
+                    seq(1),
+                    Bytes::from_static(b"domain consumer validates the record"),
+                    Some(RootResultEnd {
+                        sequence: seq(2),
+                        output_rows: rows,
+                    }),
+                )
+                .unwrap(),
+            );
+            let reply = RootResultReply {
+                root_task: root,
+                profile: RootProfileId::V1,
+                kind,
+                accepted_consumed: 0,
+                outcome,
+            };
+            let accepted = frontier.accept(&reply, Some(b"domain consumer validates the record"));
+            if rows <= 1 {
+                assert!(
+                    matches!(accepted, Ok(RootRelayStep::Deliver { rows: actual, .. }) if actual == rows)
+                );
+                assert!(frontier.end_consumed().is_none());
+                frontier.receipt(seq(1)).unwrap();
+                assert_eq!(frontier.end_consumed().unwrap().output_rows, rows);
+            } else {
+                assert_eq!(accepted, Err(RootRelayError::EndMismatch));
+            }
+        }
+        for outcome in [
+            end(1, 0),
+            RootReadOutcome::Data(
+                RootResultData::try_new(kind, seq(1), Bytes::from_static(b"unsealed"), None)
+                    .unwrap(),
+            ),
+        ] {
+            let root = root();
+            let mut frontier = RootRelayFrontier::new(root, RootProfileId::V1, kind, None).unwrap();
+            let read = frontier.next_read().unwrap();
+            frontier.sent(read);
+            let body = if let RootReadOutcome::Data(data) = &outcome {
+                Some(data.body().as_ref())
+            } else {
+                None
+            };
+            let reply = RootResultReply {
+                root_task: root,
+                profile: RootProfileId::V1,
+                kind,
+                accepted_consumed: 0,
+                outcome: outcome.clone(),
+            };
+            assert_eq!(
+                frontier.accept(&reply, body),
+                Err(RootRelayError::UnexpectedOutcome)
+            );
+            assert_eq!(frontier.delivered_through, 0);
+        }
     }
 
     #[test]

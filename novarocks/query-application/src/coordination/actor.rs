@@ -206,11 +206,34 @@ impl RootResultObserver {
         root: TaskIdentity,
         sequence: ResultPacketSequence,
     ) -> Result<(), LogicalExecutionActorError> {
+        self.observe_root_end(root, sequence, None).await
+    }
+
+    pub(crate) async fn observe_local_root_end(
+        &self,
+        root: TaskIdentity,
+        end: novarocks_execution_contract::root_result::RootResultEnd,
+    ) -> Result<(), LogicalExecutionActorError> {
+        self.observe_root_end(
+            root,
+            ResultPacketSequence::new(end.sequence.get() - 1),
+            Some(end.output_rows),
+        )
+        .await
+    }
+
+    async fn observe_root_end(
+        &self,
+        root: TaskIdentity,
+        sequence: ResultPacketSequence,
+        root_output_rows: Option<u64>,
+    ) -> Result<(), LogicalExecutionActorError> {
         request(&self.mailbox, |reply| ActorCommand::ObserveRootEosAck {
             activation: self.activation,
             root,
             expected_root: self.root,
             sequence,
+            root_output_rows,
             reply,
         })
         .await
@@ -1343,6 +1366,7 @@ struct RootSuccessGate {
     status: Option<TaskStatus>,
     terminal_failure: RootTerminalFailure,
     final_eos_ack: Option<ResultPacketSequence>,
+    root_output_rows: Option<u64>,
 }
 
 struct RootTerminalObservation {
@@ -1470,6 +1494,7 @@ enum ActorCommand {
         root: TaskIdentity,
         expected_root: TaskIdentity,
         sequence: ResultPacketSequence,
+        root_output_rows: Option<u64>,
         reply: ActorReply<()>,
     },
     FinishResultStream {
@@ -3469,8 +3494,14 @@ fn apply_result_capacity(
                 conclude_consumed_handoff_as_failed(state, pending.permit, pending.reply);
                 return;
             }
-            let (delivery, receipt) =
-                EndDelivery::success_eof(activation.execution(), pending.sequence);
+            let (delivery, receipt) = EndDelivery::success_eof_with_root_rows(
+                activation.execution(),
+                pending.sequence,
+                runtime
+                    .root_success
+                    .as_ref()
+                    .and_then(|gate| gate.root_output_rows),
+            );
             runtime
                 .transport
                 .enqueue(slot, ResultDelivery::End(delivery));
@@ -4025,6 +4056,7 @@ fn handle_command(
                         status: None,
                         terminal_failure: RootTerminalFailure::Unspecified,
                         final_eos_ack: None,
+                        root_output_rows: None,
                     });
                     *root_terminal_receiver = Some(terminal_receiver);
                     let _ = reply.send(Ok(()));
@@ -4099,6 +4131,7 @@ fn handle_command(
             root,
             expected_root,
             sequence,
+            root_output_rows,
             reply,
         } => {
             let Some(runtime) = result_runtime else {
@@ -4113,6 +4146,15 @@ fn handle_command(
             }
             if verify_result_observation_activation(state, activation).is_err() {
                 let _ = reply.send(Err(LogicalExecutionActorError::StaleAuthority));
+                return;
+            }
+            if matches!(
+                runtime.carrier,
+                crate::api::ResultRowCarrier::Relayed { .. }
+            ) != root_output_rows.is_some()
+            {
+                fail_result_observation(state, runtime);
+                reply_result_failure(state, reply);
                 return;
             }
             let expected = ResultPacketSequence::new(state.accepted_result_packets());
@@ -4140,9 +4182,10 @@ fn handle_command(
             match gate.final_eos_ack {
                 None => {
                     gate.final_eos_ack = Some(sequence);
+                    gate.root_output_rows = root_output_rows;
                     let _ = reply.send(Ok(()));
                 }
-                Some(held) if held == sequence => {
+                Some(held) if held == sequence && gate.root_output_rows == root_output_rows => {
                     let _ = reply.send(Ok(()));
                 }
                 Some(_) => {

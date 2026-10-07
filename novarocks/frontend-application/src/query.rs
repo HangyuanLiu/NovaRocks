@@ -1501,7 +1501,11 @@ impl FrontendQuerySession {
                 let start = {
                     let _observation_scope =
                         crate::preparation_diagnostics::enter_bound_statement(statement.token());
-                    self.service.logical_read_launcher.start(read, child)
+                    self.service.logical_read_launcher.start(
+                        read,
+                        child,
+                        statement.result_window_alias(),
+                    )
                 };
                 let started = start.await;
                 let mut execution = match started {
@@ -1619,7 +1623,9 @@ impl FrontendQuerySession {
         let start = {
             let _observation_scope =
                 crate::preparation_diagnostics::enter_bound_statement(statement.token());
-            self.service.logical_read_launcher.start(read, owner)
+            self.service
+                .logical_read_launcher
+                .start(read, owner, statement.result_window_alias())
         };
         let execution = match start.await {
             Ok(execution) => execution,

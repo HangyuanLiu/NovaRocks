@@ -2628,6 +2628,8 @@ mod completion_catalog;
 mod completion_driver;
 mod completion_predicate;
 pub(crate) mod root_output;
+mod root_render_type;
 mod root_scalar_type;
 pub use completion::*;
+pub use root_render_type::client_render_schema;
 pub(crate) mod mv_rewrite;

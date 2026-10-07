@@ -122,7 +122,7 @@ enum Kind {
 // Match the existing logical helper's trim/case normalization without a
 // temporary String during source preflight. Unknown markers never become a
 // plain field. Other provider decorations are not semantic type facts.
-fn marker(field: &Field) -> Result<Option<L>, String> {
+pub(super) fn marker(field: &Field) -> Result<Option<L>, String> {
     let Some(value) = field.metadata().get(NR_LOGICAL_TYPE_KEY) else {
         return Ok(None);
     };
@@ -257,7 +257,7 @@ fn child_logical(logical: Option<&T>, index: usize) -> Option<&T> {
     }
 }
 
-fn map_children(entries: &Field) -> Result<(&Field, &Field), String> {
+pub(super) fn map_children(entries: &Field) -> Result<(&Field, &Field), String> {
     if entries.name() != "entries" || entries.is_nullable() || marker(entries)?.is_some() {
         return Err(invalid());
     }

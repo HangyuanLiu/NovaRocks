@@ -768,6 +768,7 @@ impl Drop for BatchDelivery {
 pub struct EndDelivery {
     execution_id: QueryExecutionId,
     sequence: ResultPacketSequence,
+    root_output_rows: Option<u64>,
     signal: DeliverySignal,
 }
 
@@ -776,15 +777,30 @@ impl EndDelivery {
         execution_id: QueryExecutionId,
         sequence: ResultPacketSequence,
     ) -> (Self, ResultDeliveryReceipt) {
+        Self::success_eof_with_root_rows(execution_id, sequence, None)
+    }
+
+    pub(crate) fn success_eof_with_root_rows(
+        execution_id: QueryExecutionId,
+        sequence: ResultPacketSequence,
+        root_output_rows: Option<u64>,
+    ) -> (Self, ResultDeliveryReceipt) {
         let (signal, receipt) = DeliverySignal::channel();
         (
             Self {
                 execution_id,
                 sequence,
+                root_output_rows,
                 signal,
             },
             receipt,
         )
+    }
+
+    /// Checked row count of the original root plan, carried by its locally
+    /// consumed V1 End. Legacy decoded streams have no such root fact.
+    pub const fn root_output_rows(&self) -> Option<u64> {
+        self.root_output_rows
     }
 
     pub const fn execution_id(&self) -> QueryExecutionId {
@@ -887,7 +903,9 @@ impl RootSegmentDelivery {
     pub const fn sequence(&self) -> ResultPacketSequence {
         self.sequence
     }
-    /// Rows this item completes.
+    /// Rows this item completes. Client rows follow validated payload boundaries;
+    /// ScalarValueV1 uses its sealed End count, checked by the typed consumer
+    /// before the receipt completes. Other internal domains carry zero here.
     pub const fn rows(&self) -> u64 {
         self.rows
     }

@@ -1948,12 +1948,7 @@ pub(crate) async fn run_root_relay(
         });
     }
     // The local End consumption proof: every data item's delivery completed.
-    let sequence = ResultPacketSequence::new(end.sequence.get() - 1);
-    if let Err(error) = runtime
-        .observer
-        .observe_final_worker_eos_ack(root, sequence)
-        .await
-    {
+    if let Err(error) = runtime.observer.observe_local_root_end(root, end).await {
         return Err(bound_actor_failure(
             &observer_owner,
             permit,
@@ -5271,9 +5266,14 @@ mod tests {
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let scope = work.owner.scope();
-        let window = capacity
-            .try_acquire(&scope, ResultWindowClass::Client)
-            .unwrap();
+        let class = match carrier {
+            crate::api::ResultRowCarrier::Relayed {
+                kind: RootOutputKind::InternalFacts(_) | RootOutputKind::CountOnly,
+                ..
+            } => ResultWindowClass::Internal,
+            _ => ResultWindowClass::Client,
+        };
+        let window = capacity.try_acquire(&scope, class).unwrap();
         let stage = scope.try_acquire(Stage::Execution).unwrap();
         let execution = execution(tag);
         let config = LogicalExecutionActorConfig::single_attempt_completion(
@@ -5487,6 +5487,7 @@ mod tests {
         let ResultDelivery::End(end) = stream.next().await.unwrap().unwrap() else {
             panic!("local End consumption and root Finished produce EOF");
         };
+        assert_eq!(end.root_output_rows(), Some(2));
         end.complete();
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), relay)
@@ -5497,6 +5498,166 @@ mod tests {
             LogicalConclusion::Succeeded
         );
         assert_eq!(&port.requests()[..2], &[(Some(1), 0), (Some(2), 0)]);
+        drop((stream, actor, owner, window));
+    }
+
+    #[tokio::test]
+    async fn scalar_relay_delivers_value_and_no_rows_counts_before_success_seal() {
+        use novarocks_result_contract::{
+            BorrowedScalarLeaf, InternalResultDomain, ScalarField, ScalarLeafCursor, ScalarRecord,
+            ScalarSchema, ScalarValueType,
+        };
+        let schema = ScalarSchema::try_new(ScalarField {
+            nullable: true,
+            value_type: ScalarValueType::SignedInteger(64),
+        })
+        .unwrap();
+        let kind = RootOutputKind::InternalFacts(InternalResultDomain::ScalarValueV1);
+        for (tag, value) in [
+            (71, BorrowedScalarLeaf::NoRows),
+            (72, BorrowedScalarLeaf::Null),
+            (73, BorrowedScalarLeaf::SignedInteger { bits: 64, value: 7 }),
+        ] {
+            let (
+                Harness {
+                    control: _control,
+                    scope,
+                    actor,
+                    owner,
+                    permit,
+                    mut stream,
+                    root,
+                },
+                window,
+            ) = relay_harness_with(
+                tag,
+                crate::api::ResultRowCarrier::relayed(kind, None).unwrap(),
+            )
+            .await;
+            let cursor = ScalarLeafCursor::try_new(&schema, value).unwrap();
+            let rows = cursor.rows();
+            let mut body = vec![0; cursor.encoded_len()];
+            cursor.copy_range(0, &mut body).unwrap();
+            let port = ScriptedRootPort::new(vec![RootReadOutcome::Data(
+                RootResultData::try_new(
+                    kind,
+                    NonZeroU64::MIN,
+                    bytes::Bytes::from(body),
+                    Some(RootResultEnd {
+                        sequence: NonZeroU64::new(2).unwrap(),
+                        output_rows: rows,
+                    }),
+                )
+                .unwrap(),
+            )]);
+            let seal_port = Arc::new(TestSuccessSealPort::default());
+            let (status_sender, statuses) = accepted_root_status_projection_with_control_port(
+                root,
+                Arc::clone(&seal_port) as Arc<dyn AcceptedRootControlPort>,
+            );
+            status_sender.publish(finished(root)).unwrap();
+            let (_terminal_sender, terminal) = native_attempt_terminal_channel();
+            let binding = RootRelayBinding {
+                port: port.clone(),
+                window: window.retain_alias(),
+                frontier: super::super::RootRelayFrontier::new(root, RootProfileId::V1, kind, None)
+                    .unwrap(),
+                max_wait: Duration::from_millis(5),
+            };
+            let relay = tokio::spawn(run_root_relay(
+                permit, root, scope, binding, statuses, terminal,
+            ));
+            let segment = next_segment(&mut stream).await;
+            assert_eq!(segment.rows(), rows);
+            let record = ScalarRecord::decode(&schema, segment.body()).unwrap();
+            assert_eq!(
+                u64::from(matches!(record, ScalarRecord::Value(_))),
+                segment.rows()
+            );
+            drop(record);
+            assert!(seal_port.requests.lock().unwrap().is_empty());
+            segment.complete();
+            seal_port.next().await.accept(status_sender).unwrap();
+            let ResultDelivery::End(end) = stream.next().await.unwrap().unwrap() else {
+                panic!("end")
+            };
+            assert_eq!(end.root_output_rows(), Some(rows));
+            end.complete();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), relay)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                LogicalConclusion::Succeeded
+            );
+            drop((stream, actor, owner, window));
+        }
+    }
+
+    #[tokio::test]
+    async fn count_only_relay_preserves_end_rows_after_success_seal() {
+        let kind = RootOutputKind::CountOnly;
+        let (
+            Harness {
+                control: _control,
+                scope,
+                actor,
+                owner,
+                permit,
+                mut stream,
+                root,
+            },
+            window,
+        ) = relay_harness_with(
+            74,
+            crate::api::ResultRowCarrier::relayed(kind, None).unwrap(),
+        )
+        .await;
+        let port = ScriptedRootPort::new(vec![RootReadOutcome::End(RootResultEnd {
+            sequence: NonZeroU64::MIN,
+            output_rows: 42,
+        })]);
+        let seal_port = Arc::new(TestSuccessSealPort::default());
+        let (status_sender, statuses) = accepted_root_status_projection_with_control_port(
+            root,
+            Arc::clone(&seal_port) as Arc<dyn AcceptedRootControlPort>,
+        );
+        status_sender.publish(finished(root)).unwrap();
+        let (_terminal_sender, terminal) = native_attempt_terminal_channel();
+        let binding = RootRelayBinding {
+            port: port.clone(),
+            window: window.retain_alias(),
+            frontier: super::super::RootRelayFrontier::new(root, RootProfileId::V1, kind, None)
+                .unwrap(),
+            max_wait: Duration::from_millis(5),
+        };
+        let relay = tokio::spawn(run_root_relay(
+            permit, root, scope, binding, statuses, terminal,
+        ));
+        let seal = seal_port.next().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), stream.next())
+                .await
+                .is_err()
+        );
+        seal.accept(status_sender).unwrap();
+        let ResultDelivery::End(end) = stream.next().await.unwrap().unwrap() else {
+            panic!("CountOnly must produce End without a data segment");
+        };
+        assert_eq!(end.root_output_rows(), Some(42));
+        end.complete();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), relay)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            LogicalConclusion::Succeeded
+        );
+        let requests = port.requests();
+        assert_eq!(requests[0], (Some(1), 0));
+        assert!(requests[1..].iter().all(|request| *request == (None, 0)));
         drop((stream, actor, owner, window));
     }
 
