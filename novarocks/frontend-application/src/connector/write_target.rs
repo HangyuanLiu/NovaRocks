@@ -40,15 +40,19 @@ use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorControlResolver, ConnectorRequestContext,
     ConnectorRowMutationIntent, ConnectorRowMutationPreparation,
     ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
-    ConnectorTableColumnRole, ConnectorTableColumnVisibility, ConnectorTableHandle,
-    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableResolution, ConnectorWriteLease,
-    ConnectorWriteOperationId, ConnectorWriteTargetRef,
+    ConnectorTableColumnRole, ConnectorTableColumnVisibility, ConnectorTableCurrentWriteFacts,
+    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableResolution,
+    ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWriteTargetRef,
 };
 
 /// One write target, resolved once against a single provider generation.
 ///
 /// Cloning is cheap: the metadata's schema is an `Arc` and the lease is a
 /// handle onto an already-resolved generation.
+///
+/// A binding exists only for Current metadata: construction requires the
+/// planning facts to carry the Current write authority and retains it, so a
+/// historical read-only load can never become a write target.
 ///
 /// Deliberately not `Debug`: neither [`ConnectorTableMetadata`] nor
 /// [`ConnectorControlPlanningLease`] is `Debug`, precisely so an opaque
@@ -57,14 +61,64 @@ use novarocks_spi::connector::{
 pub struct ConnectorWriteTargetBinding {
     metadata: ConnectorTableMetadata,
     lease: ConnectorControlPlanningLease,
+    /// The Current write authority of `metadata`, proven at construction.
+    write_facts: ConnectorTableCurrentWriteFacts,
 }
 
 impl ConnectorWriteTargetBinding {
-    pub const fn new(
+    /// Bind a write target to the metadata one generation produced.
+    ///
+    /// Historical read-only planning facts carry no write authority and are
+    /// refused here, before any write lease, preparation or provider call.
+    pub fn try_new(
         metadata: ConnectorTableMetadata,
         lease: ConnectorControlPlanningLease,
-    ) -> Self {
-        Self { metadata, lease }
+    ) -> Result<Self, String> {
+        let write_facts = metadata
+            .planning_facts
+            .current_write_facts()
+            .map_err(|refusal| {
+                format!(
+                    "connector write target `{}.{}` is not Current metadata: {refusal}",
+                    metadata.identity.namespace, metadata.identity.table
+                )
+            })?
+            .clone();
+        Ok(Self {
+            metadata,
+            lease,
+            write_facts,
+        })
+    }
+
+    /// The Current write authority: write defaults, write-target types and
+    /// partition source membership of this target.
+    pub const fn current_write_facts(&self) -> &ConnectorTableCurrentWriteFacts {
+        &self.write_facts
+    }
+
+    /// Names of the Current partition source columns.
+    ///
+    /// The ordinals index the target's own frozen schema, the schema the
+    /// provider aligned them to, so each one is resolved there rather than
+    /// against a filtered or strategy-specific column list.
+    pub fn partition_source_column_names(&self) -> Result<Vec<String>, String> {
+        self.write_facts
+            .partition_source_column_ordinals()
+            .iter()
+            .map(|ordinal| {
+                self.metadata
+                    .schema
+                    .fields()
+                    .get(*ordinal as usize)
+                    .map(|field| field.name().to_string())
+                    .ok_or_else(|| {
+                        format!(
+                            "connector write target partition source ordinal {ordinal} is outside its frozen schema"
+                        )
+                    })
+            })
+            .collect()
     }
 
     /// The exact generation that produced every fact in this binding.
@@ -122,8 +176,9 @@ impl ConnectorWriteTargetBinding {
                 }
                 Some(novarocks_types::schema::ColumnDef {
                     name: field.name().to_string(),
-                    data_type: fact
-                        .and_then(|fact| fact.write_target_type())
+                    data_type: self
+                        .write_facts
+                        .write_target_type(ordinal)
                         .cloned()
                         .unwrap_or_else(|| field.data_type().clone()),
                     nullable: field.is_nullable(),
@@ -222,7 +277,8 @@ impl ConnectorWriteTargetBinding {
 ///
 /// Mirrors `load_mv_target_binding`: acquire one planning lease, then load the
 /// table metadata through that same lease, so the schema, planning facts and
-/// opaque handle cannot drift apart.
+/// opaque handle cannot drift apart. The load is the Current load, and the
+/// binding refuses anything but Current facts.
 pub fn load_write_target_binding(
     controls: &dyn ConnectorControlResolver,
     catalog: &str,
@@ -235,7 +291,7 @@ pub fn load_write_target_binding(
     let metadata = super::metadata_load_connector_table_with_planning_lease(
         &lease, context, namespace, table, resolution,
     )?;
-    Ok(ConnectorWriteTargetBinding::new(metadata, lease))
+    ConnectorWriteTargetBinding::try_new(metadata, lease)
 }
 
 /// Derive the NCP-6 write-stack lease from a retained planning generation.
@@ -305,5 +361,281 @@ pub(crate) fn write_input_request_for_shape(
                 equality_fields: requests(equality_fields),
             }
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use arrow::datatypes::{DataType, Field, Schema};
+    use bytes::Bytes;
+    use novarocks_spi::connector::{
+        ConnectorBeginScanRequest, ConnectorColumnDefault, ConnectorControlBinding, ConnectorError,
+        ConnectorErrorKind, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
+        ConnectorInstanceId, ConnectorListTablesRequest, ConnectorMetadata,
+        ConnectorNamespaceRequest, ConnectorProviderBinding, ConnectorProviderId, ConnectorScan,
+        ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplitPlanningRequest,
+        ConnectorSplitPlanningResult, ConnectorTableColumnPlanningFact,
+        ConnectorTableDefinitionFacts, ConnectorTablePlanningFacts, ConnectorTableRequest,
+        ConnectorWriteAuthorityRefusal, ProviderBindingEpoch,
+    };
+
+    use super::*;
+
+    const CATALOG: &str = "ice";
+
+    fn fact(ordinal: u32, role: ConnectorTableColumnRole) -> ConnectorTableColumnPlanningFact {
+        let visibility = match role {
+            ConnectorTableColumnRole::RowLineageSystem => ConnectorTableColumnVisibility::Hidden,
+            _ => ConnectorTableColumnVisibility::Sql,
+        };
+        ConnectorTableColumnPlanningFact::new(
+            ordinal,
+            visibility,
+            novarocks_spi::connector::ConnectorTableColumnSemanticKind::None,
+            role,
+        )
+    }
+
+    /// Metadata of `db.orders(id BIGINT, future INT)` plus one hidden
+    /// row-lineage column. Current facts declare `future` as the only
+    /// partition source and a write default on `id`; historical facts describe
+    /// the same columns read-only.
+    pub(crate) fn future_partition_metadata(historical: bool) -> ConnectorTableMetadata {
+        let instance_id = ConnectorInstanceId::parse(CATALOG).expect("instance ID");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("future", DataType::Int32, true),
+            Field::new("_row_id", DataType::Int64, true),
+        ]));
+        let context = crate::connector::test_request_context();
+        let planning_facts = if historical {
+            ConnectorTablePlanningFacts::try_new_historical_read_only(
+                &schema,
+                vec![
+                    fact(0, ConnectorTableColumnRole::Ordinary),
+                    fact(1, ConnectorTableColumnRole::Ordinary),
+                    fact(2, ConnectorTableColumnRole::RowLineageSystem),
+                ],
+                Vec::new(),
+                Vec::new(),
+                &context,
+            )
+        } else {
+            ConnectorTablePlanningFacts::try_new(
+                &schema,
+                vec![
+                    fact(0, ConnectorTableColumnRole::Ordinary)
+                        .with_write_default(Some(ConnectorColumnDefault::Int64(7))),
+                    fact(1, ConnectorTableColumnRole::Ordinary),
+                    fact(2, ConnectorTableColumnRole::RowLineageSystem),
+                ],
+                Vec::new(),
+                Vec::new(),
+                vec![1],
+                &context,
+            )
+        }
+        .expect("planning facts");
+        ConnectorTableMetadata {
+            identity: ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: Arc::from("db"),
+                table: Arc::from("orders"),
+            },
+            schema,
+            planning_facts,
+            definition_facts: ConnectorTableDefinitionFacts::empty(),
+            version: None,
+            statistics_data_version: None,
+            table: ConnectorTableHandle::try_new(instance_id, Bytes::from_static(b"orders"))
+                .expect("table handle"),
+        }
+    }
+
+    pub(crate) fn test_lease() -> ConnectorControlPlanningLease {
+        ConnectorControlPlanningLease::new(
+            Arc::new(
+                novarocks_catalog_application::test_support::test_control_binding_for(
+                    ConnectorInstanceId::parse(CATALOG).expect("instance ID"),
+                    7,
+                ),
+            ),
+            || {},
+        )
+    }
+
+    #[test]
+    fn a_current_binding_retains_the_current_write_authority() {
+        let binding =
+            ConnectorWriteTargetBinding::try_new(future_partition_metadata(false), test_lease())
+                .expect("Current metadata binds");
+
+        assert_eq!(
+            binding
+                .current_write_facts()
+                .partition_source_column_ordinals(),
+            &[1]
+        );
+        assert_eq!(
+            binding.partition_source_column_names(),
+            Ok(vec!["future".to_string()])
+        );
+        assert_eq!(
+            binding
+                .dml_target_columns()
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "future"]
+        );
+        assert_eq!(
+            binding.current_write_facts().write_default(0),
+            Some(&ConnectorColumnDefault::Int64(7))
+        );
+    }
+
+    #[test]
+    fn a_historical_load_can_never_become_a_write_target() {
+        let error =
+            ConnectorWriteTargetBinding::try_new(future_partition_metadata(true), test_lease())
+                .err()
+                .expect("historical read-only facts carry no write authority");
+
+        assert!(
+            error.contains("connector write target `db.orders` is not Current metadata"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&ConnectorWriteAuthorityRefusal.to_string()),
+            "{error}"
+        );
+    }
+
+    /// A provider whose Current load wrongly answers with historical facts.
+    /// It counts loads and installs no write capability: the refusal must
+    /// happen while binding, before any lease or preparation exists.
+    struct HistoricalAnsweringProvider {
+        instance_id: ConnectorInstanceId,
+        incarnation: ProviderBindingEpoch,
+        loads: AtomicUsize,
+    }
+
+    fn unsupported() -> ConnectorError {
+        ConnectorError::new(ConnectorErrorKind::Unsupported, "not used by this test")
+    }
+
+    impl ConnectorMetadata for HistoricalAnsweringProvider {
+        fn instance_id(&self) -> &ConnectorInstanceId {
+            &self.instance_id
+        }
+
+        fn namespace_exists(
+            &self,
+            _request: ConnectorNamespaceRequest,
+        ) -> Result<bool, ConnectorError> {
+            Err(unsupported())
+        }
+
+        fn table_exists(&self, _request: ConnectorTableRequest) -> Result<bool, ConnectorError> {
+            Err(unsupported())
+        }
+
+        fn list_tables(
+            &self,
+            _request: ConnectorListTablesRequest,
+        ) -> Result<Vec<ConnectorTableIdentity>, ConnectorError> {
+            Err(unsupported())
+        }
+
+        fn load_table(
+            &self,
+            _request: ConnectorTableRequest,
+        ) -> Result<ConnectorTableMetadata, ConnectorError> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            Ok(future_partition_metadata(true))
+        }
+    }
+
+    impl ConnectorScanPlanning for HistoricalAnsweringProvider {
+        fn instance_id(&self) -> &ConnectorInstanceId {
+            &self.instance_id
+        }
+
+        fn begin_scan(
+            &self,
+            _table: &ConnectorTableHandle,
+            _request: ConnectorBeginScanRequest,
+        ) -> Result<ConnectorScan, ConnectorError> {
+            Err(unsupported())
+        }
+
+        fn plan_splits(
+            &self,
+            _scan: &ConnectorScanHandle,
+            _request: ConnectorSplitPlanningRequest,
+        ) -> Result<ConnectorSplitPlanningResult, ConnectorError> {
+            Err(unsupported())
+        }
+    }
+
+    impl ConnectorExecutionDistribution for HistoricalAnsweringProvider {
+        fn declaration(
+            &self,
+            _context: &ConnectorRequestContext,
+        ) -> Result<ConnectorProviderBinding, ConnectorError> {
+            ConnectorProviderBinding::iceberg(
+                self.instance_id.as_str(),
+                self.incarnation.to_bytes(),
+                "default",
+            )
+            .map_err(|error| {
+                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+            })
+        }
+    }
+
+    #[test]
+    fn load_write_target_binding_refuses_historical_facts_before_any_effect() {
+        let provider = Arc::new(HistoricalAnsweringProvider {
+            instance_id: ConnectorInstanceId::parse(CATALOG).expect("instance ID"),
+            incarnation: ProviderBindingEpoch::from_bytes([9; 16]),
+            loads: AtomicUsize::new(0),
+        });
+        let binding = ConnectorControlBinding::try_new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
+                instance_id: provider.instance_id.clone(),
+            },
+            provider.incarnation,
+            provider.clone(),
+            provider.clone(),
+            provider.clone(),
+            None,
+        )
+        .expect("control binding");
+        let registry = crate::connector::fixture::FixtureConnectorRegistry::new();
+        registry.register_fixture_control(binding);
+        let controls = crate::connector::fixture::FixtureControlResolver::new(registry);
+
+        let error = load_write_target_binding(
+            &controls,
+            CATALOG,
+            "db",
+            "orders",
+            ConnectorTableResolution::StrictBaseTable,
+            crate::connector::test_request_context(),
+        )
+        .err()
+        .expect("a write path given historical facts is refused");
+
+        assert!(
+            error.contains("is not Current metadata")
+                && error.contains("historical read-only and carry no current write authority"),
+            "{error}"
+        );
+        assert_eq!(provider.loads.load(Ordering::SeqCst), 1);
     }
 }

@@ -482,7 +482,12 @@ fn equality_delete_key_columns(
         }
     }
 
-    let column_facts = table_metadata.planning_facts.column_facts();
+    let write_facts = table_metadata
+        .planning_facts
+        .current_write_facts()
+        .map_err(|refusal| {
+            format!("ADD EQUALITY DELETE target is not Current metadata: {refusal}")
+        })?;
     let mut delete_columns = Vec::with_capacity(column_names.len());
     for column_name in column_names {
         let (ordinal, field) = table_metadata
@@ -492,9 +497,8 @@ fn equality_delete_key_columns(
             .enumerate()
             .find(|(_, field)| field.name().eq_ignore_ascii_case(column_name))
             .ok_or_else(|| format!("column `{column_name}` not found in iceberg table schema"))?;
-        let data_type = column_facts
-            .get(ordinal)
-            .and_then(|fact| fact.write_target_type())
+        let data_type = write_facts
+            .write_target_type(ordinal)
             .cloned()
             .unwrap_or_else(|| field.data_type().clone());
         ensure_supported_equality_key_type(&data_type, field.name())?;

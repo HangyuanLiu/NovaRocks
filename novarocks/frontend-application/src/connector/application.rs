@@ -667,20 +667,27 @@ pub(crate) fn sql_columns_from_connector_schema(
         .collect()
 }
 
-/// Read the write default a provider published for one frozen schema ordinal.
+/// Project the write default one SQL relation column advertises.
 ///
 /// Facts are optional by contract: a provider with no column defaults returns
 /// empty facts, and the column then behaves exactly as it did before defaults
 /// were expressible.
+///
+/// This is a relation projection, not write admission. Current facts
+/// advertise the Current write default. A historical read-only relation is
+/// never a write target, so its columns advertise none; write paths never
+/// reach this projection and read their defaults from the Current write
+/// authority instead.
 pub fn connector_write_default_at(
     planning_facts: &novarocks_spi::connector::ConnectorTablePlanningFacts,
     ordinal: usize,
 ) -> Option<novarocks_types::schema::ColumnDefault> {
-    planning_facts
-        .column_facts()
-        .get(ordinal)
-        .and_then(|fact| fact.write_default())
-        .map(connector_default_to_column_default)
+    match planning_facts.current_write_facts() {
+        Ok(write_facts) => write_facts
+            .write_default(ordinal)
+            .map(connector_default_to_column_default),
+        Err(novarocks_spi::connector::ConnectorWriteAuthorityRefusal) => None,
+    }
 }
 
 /// Project the sealed SPI default value onto the neutral catalog value.

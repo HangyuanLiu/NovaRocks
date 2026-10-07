@@ -451,4 +451,86 @@ object MetadataHistoryFixture {
       "historical_bag" -> bagFact(bag(t, tag(t, "domain_before_promotion"), historical))))
     println("FIELD_DOMAIN_PROMOTION_READY")
   }
+
+  // Spec 5.4.8: a legal metadata-only evolution after one real append. S0 is
+  // written under schema0 (`id` only) and tagged; afterwards `future INT` is
+  // added and identity(future) becomes the default partition spec. Neither
+  // evolution step commits a snapshot, so S0 stays the only and current
+  // snapshot while the Current schema and default spec reference `future`.
+  // `novarocks.update.mode=merge-on-read` keeps NovaRocks UPDATE target columns
+  // on the Current schema, so its rejection is the partition-source rule.
+  val FutureSourceName = "future_partition_source"
+  val FutureSourceTag = "future_before_partition"
+  def futureSourceTable(ns: String): Table = {
+    checkNamespace(ns)
+    val t = catalog("ice_rest").loadTable(TableIdentifier.of(ns, FutureSourceName)); t.refresh(); t
+  }
+  def futureSourceFacts(t: Table, s0: Long, schema0: Schema, spec0: Int): (Map[String, Int], Map[String, Int]) = {
+    val futureField = t.schema().findField("future")
+    require(futureField != null && futureField.isOptional() &&
+      futureField.`type`() == Types.IntegerType.get() && t.schema().schemaId() != schema0.schemaId(),
+      "Current schema does not carry exactly one optional future INT after schema0")
+    require(t.currentSnapshot() != null && t.currentSnapshot().snapshotId() == s0 &&
+      t.snapshots().asScala.size == 1 && t.history().size() == 1 &&
+      t.history().get(0).snapshotId() == s0 && tag(t, FutureSourceTag) == s0,
+      "Metadata-only evolution created, moved or dropped a snapshot")
+    val snapshot0 = snapshotSchema(t, s0)
+    require(snapshot0.schemaId() == schema0.schemaId() && snapshot0.findField("future") == null &&
+      RecursiveTypeFixture.facts(snapshot0) == RecursiveTypeFixture.facts(schema0),
+      "S0 no longer freezes the exact schema0")
+    val spec = t.spec()
+    require(spec.specId() != spec0 && spec.fields().size() == 1 &&
+      spec.fields().get(0).sourceId() == futureField.fieldId() &&
+      spec.fields().get(0).transform().isIdentity() && t.specs().get(spec0).isUnpartitioned(),
+      "The default spec is not exactly identity(future) over the retained unpartitioned spec0")
+    val historicalBag = bag(t, s0, schema0)
+    require(historicalBag == Map("{\"id\":1}" -> 1), "S0 complete bag differs from its one written row")
+    val currentBag = bag(t, s0, t.schema())
+    require(currentBag == Map("{\"id\":1,\"future\":null}" -> 1),
+      "Current projection of S0 does not read future as NULL")
+    (historicalBag, currentBag)
+  }
+  def futureSourceInitialize(ns: String): Unit = {
+    checkNamespace(ns)
+    val requested = new Schema(Types.NestedField.required(1, "id", Types.LongType.get()))
+    val allocated = fresh(requested)
+    val properties = Map("format-version" -> "3", "write.row-lineage" -> "true",
+      "novarocks.update.mode" -> "merge-on-read")
+    val t = catalog("ice_rest").createTable(TableIdentifier.of(ns, FutureSourceName), allocated,
+      PartitionSpec.unpartitioned(), properties.asJava)
+    require(t.currentSnapshot() == null && t.spec().isUnpartitioned() &&
+      RecursiveTypeFixture.facts(t.schema()) == RecursiveTypeFixture.facts(allocated),
+      "CREATE changed schema0 or its unpartitioned spec")
+    val schema0 = t.schema(); val spec0 = t.spec().specId(); val uuid = metadata(t).uuid()
+    val row = GenericRecord.create(schema0); row.setField("id", Long.box(1))
+    append(t, Vector(row), "future-s0")
+    val s0 = t.currentSnapshot().snapshotId()
+    createTag(t, FutureSourceTag)
+    require(bag(t, s0, schema0) == Map("{\"id\":1}" -> 1), "S0 complete bag differs from its one written row")
+    t.updateSchema().addColumn("future", Types.IntegerType.get()).commit(); t.refresh()
+    t.updateSpec().addField("future").commit(); t.refresh()
+    require(metadata(t).uuid() == uuid, "Evolution replaced the exact table")
+    val (historicalBag, currentBag) = futureSourceFacts(t, s0, schema0, spec0)
+    RecursiveTypeFixture.boundedEmit(obj("record" -> "future_partition_source_evolved",
+      "table_uuid" -> uuid.toString, "metadata_file" -> metadata(t).metadataFileLocation(),
+      "snapshot" -> s0, "snapshot_schema_id" -> schema0.schemaId(),
+      "schema0_json" -> SchemaParser.toJson(schema0), "current_schema_json" -> SchemaParser.toJson(t.schema()),
+      "historical_spec_id" -> spec0, "default_spec_json" -> PartitionSpecParser.toJson(t.spec()),
+      "historical_bag" -> bagFact(historicalBag), "current_bag" -> bagFact(currentBag)))
+    println("FUTURE_PARTITION_SOURCE_READY")
+  }
+  // Independent SDK oracle after the rejected NovaRocks DML: the same table,
+  // snapshot set, schemas, default spec and complete bags as before.
+  def futureSourceObserveUnchanged(ns: String): Unit = {
+    val t = futureSourceTable(ns)
+    val s0 = tag(t, FutureSourceTag)
+    val schema0 = snapshotSchema(t, s0)
+    val spec0 = t.specs().asScala.collectFirst { case (id, spec) if spec.isUnpartitioned() => id.intValue() }
+      .getOrElse(throw new IllegalStateException("The unpartitioned spec0 was not retained"))
+    val (historicalBag, currentBag) = futureSourceFacts(t, s0, schema0, spec0)
+    RecursiveTypeFixture.boundedEmit(obj("record" -> "future_partition_source_unchanged",
+      "table_uuid" -> metadata(t).uuid().toString, "metadata_file" -> metadata(t).metadataFileLocation(),
+      "snapshot" -> s0, "historical_bag" -> bagFact(historicalBag), "current_bag" -> bagFact(currentBag)))
+    println("FUTURE_PARTITION_SOURCE_UNCHANGED")
+  }
 }

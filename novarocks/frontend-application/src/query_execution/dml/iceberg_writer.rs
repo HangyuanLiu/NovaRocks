@@ -124,7 +124,7 @@ pub(crate) fn prepare_iceberg_write_with_options(
     // commit must not be able to split one statement across two generations.
     // What comes back is neutral -- Arrow schema, bounded planning facts and an
     // opaque handle -- so this layer no longer holds a concrete Iceberg table.
-    let write_target = crate::connector::write_target::ConnectorWriteTargetBinding::new(
+    let write_target = crate::connector::write_target::ConnectorWriteTargetBinding::try_new(
         crate::connector::metadata_load_connector_table_with_planning_lease(
             &planning_lease,
             connector_context.clone(),
@@ -133,7 +133,7 @@ pub(crate) fn prepare_iceberg_write_with_options(
             novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
         )?,
         planning_lease,
-    );
+    )?;
 
     // 2. Write-support validation belongs to the Provider.
     //
@@ -184,13 +184,8 @@ fn prepare_iceberg_distributed_write(
     attempt_reservation: crate::query_execution::completion::QueryAttemptReservation,
 ) -> Result<PreparedIcebergWrite, String> {
     let write_lease = write_target.derive_write_lease()?;
-    let (query, write_columns) = build_iceberg_write_plan(
-        target,
-        resolved,
-        insert_columns,
-        source,
-        write_target.metadata(),
-    )?;
+    let (query, write_columns) =
+        build_iceberg_write_plan(target, resolved, insert_columns, source, write_target)?;
     let intent = match overwrite_mode {
         IcebergWriteMode::Append => ConnectorWriteIntent::Append,
         IcebergWriteMode::FullTableOverwrite => ConnectorWriteIntent::Overwrite,
@@ -555,10 +550,10 @@ pub(crate) fn build_iceberg_write_plan(
     resolved: &ResolvedTable,
     insert_columns: &[String],
     source: &Query,
-    metadata: &novarocks_spi::connector::ConnectorTableMetadata,
+    write_target: &crate::connector::write_target::ConnectorWriteTargetBinding,
 ) -> Result<(Query, Vec<ColumnDef>), String> {
     let write_columns = insert_columns_from_connector_metadata(
-        metadata,
+        write_target,
         &write_defaults_by_name(&resolved.columns),
     );
     let source_columns = sql_write_source_columns(&resolved.columns, &write_columns);
@@ -724,15 +719,18 @@ fn source_index_for_write_column(
 ///   *marked* in the planning facts rather than filtered out of the schema, so
 ///   the field set here is the same one `current_schema()` produced.
 /// - `write_target_type` is the provider-signed DML write type for variant and
-///   binary columns (ADR-0055 decision 5). The provider only signs it when it
-///   differs from the read type, so falling back to the Arrow field type
-///   reproduces the previous inline override exactly.
+///   binary columns (ADR-0055 decision 5), read from the binding's Current write
+///   authority. The provider only signs it when it differs from the read type,
+///   so falling back to the Arrow field type reproduces the previous inline
+///   override exactly.
 ///
 /// Write defaults keep coming from the resolved SQL table columns, unchanged.
 fn insert_columns_from_connector_metadata(
-    metadata: &novarocks_spi::connector::ConnectorTableMetadata,
+    write_target: &crate::connector::write_target::ConnectorWriteTargetBinding,
     write_defaults: &HashMap<String, ColumnDefault>,
 ) -> Vec<ColumnDef> {
+    let metadata = write_target.metadata();
+    let write_facts = write_target.current_write_facts();
     let column_facts = metadata.planning_facts.column_facts();
     metadata
         .schema
@@ -752,9 +750,8 @@ fn insert_columns_from_connector_metadata(
         })
         .map(|(ordinal, field)| ColumnDef {
             name: field.name().clone(),
-            data_type: column_facts
-                .get(ordinal)
-                .and_then(|fact| fact.write_target_type())
+            data_type: write_facts
+                .write_target_type(ordinal)
                 .cloned()
                 .unwrap_or_else(|| field.data_type().clone()),
             nullable: field.is_nullable(),

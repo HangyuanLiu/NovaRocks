@@ -312,6 +312,9 @@ impl InsertEngine for DmlExecutionKernel {
             &target.table,
             novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
         )?;
+        // Shaping requires the Current write authority, so a load that is not
+        // Current is refused here, before any guard, lease or write work.
+        let columns = insert_columns_from_connector_metadata(&metadata)?;
         crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context(
             self.mv_storage_observation().as_ref(),
             &planning_lease,
@@ -319,7 +322,6 @@ impl InsertEngine for DmlExecutionKernel {
             crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Insert,
             connector_context,
         )?;
-        let columns = insert_columns_from_connector_metadata(&metadata);
         Ok(ResolvedInsertTarget {
             catalog: target.catalog,
             namespace: target.namespace,
@@ -469,16 +471,27 @@ impl InsertEngine for DmlExecutionKernel {
 /// - `ConnectorTableMetadata::schema` is the full physical Arrow schema. Hidden
 ///   columns are *marked* in the planning facts rather than removed from the
 ///   schema, so this field set is the provider's whole current schema.
-/// - `write_target_type()` is the provider-signed DML write type, published only
-///   where it differs from the read type, so falling back to the Arrow field
-///   type reproduces the read-side type exactly.
-/// - `write_default()` is the value a write omitting the column receives; it
-///   projects onto the neutral catalog vocabulary variant-for-variant.
+/// - The write-target type and the write default come from the Current write
+///   authority. The write type is published only where it differs from the read
+///   type, so falling back to the Arrow field type reproduces the read-side
+///   type exactly; the default is the value a write omitting the column
+///   receives, projected onto the neutral catalog vocabulary variant-for-variant.
+///
+/// Historical read-only facts carry no write authority and are refused.
 fn insert_columns_from_connector_metadata(
     metadata: &novarocks_spi::connector::ConnectorTableMetadata,
-) -> Vec<ColumnDef> {
+) -> Result<Vec<ColumnDef>, String> {
+    let write_facts = metadata
+        .planning_facts
+        .current_write_facts()
+        .map_err(|refusal| {
+            format!(
+                "INSERT target `{}.{}` is not Current metadata: {refusal}",
+                metadata.identity.namespace, metadata.identity.table
+            )
+        })?;
     let column_facts = metadata.planning_facts.column_facts();
-    metadata
+    Ok(metadata
         .schema
         .fields()
         .iter()
@@ -496,19 +509,17 @@ fn insert_columns_from_connector_metadata(
         })
         .map(|(ordinal, field)| ColumnDef {
             name: field.name().clone(),
-            data_type: column_facts
-                .get(ordinal)
-                .and_then(|fact| fact.write_target_type())
+            data_type: write_facts
+                .write_target_type(ordinal)
                 .cloned()
                 .unwrap_or_else(|| field.data_type().clone()),
             nullable: field.is_nullable(),
-            write_default: crate::connector::connector_write_default_at(
-                &metadata.planning_facts,
-                ordinal,
-            ),
+            write_default: write_facts
+                .write_default(ordinal)
+                .map(crate::connector::connector_default_to_column_default),
             logical_type: None,
         })
-        .collect()
+        .collect())
 }
 
 fn downcast_prepared(
@@ -714,5 +725,115 @@ mod tests {
         });
 
         assert!(matches!(report, IcebergWriteReport::NoOp));
+    }
+
+    fn insert_target_metadata(
+        historical: bool,
+    ) -> novarocks_spi::connector::ConnectorTableMetadata {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use novarocks_spi::connector::{
+            ConnectorColumnDefault, ConnectorInstanceId, ConnectorTableColumnPlanningFact,
+            ConnectorTableColumnRole, ConnectorTableColumnSemanticKind,
+            ConnectorTableColumnVisibility, ConnectorTableHandle, ConnectorTableIdentity,
+            ConnectorTablePlanningFacts,
+        };
+
+        let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Utf8, true),
+            Field::new("_row_id", DataType::Int64, true),
+        ]));
+        let fact = |ordinal, role| {
+            ConnectorTableColumnPlanningFact::new(
+                ordinal,
+                ConnectorTableColumnVisibility::Sql,
+                ConnectorTableColumnSemanticKind::None,
+                role,
+            )
+        };
+        let context = crate::connector::test_request_context();
+        let planning_facts = if historical {
+            ConnectorTablePlanningFacts::try_new_historical_read_only(
+                &schema,
+                vec![
+                    fact(0, ConnectorTableColumnRole::Ordinary),
+                    fact(1, ConnectorTableColumnRole::Ordinary),
+                    fact(2, ConnectorTableColumnRole::RowLineageSystem),
+                ],
+                Vec::new(),
+                Vec::new(),
+                &context,
+            )
+        } else {
+            ConnectorTablePlanningFacts::try_new(
+                &schema,
+                vec![
+                    fact(0, ConnectorTableColumnRole::Ordinary)
+                        .with_write_default(Some(ConnectorColumnDefault::Int64(7))),
+                    fact(1, ConnectorTableColumnRole::Ordinary)
+                        .with_write_target_type(Some(DataType::LargeBinary)),
+                    fact(2, ConnectorTableColumnRole::RowLineageSystem),
+                ],
+                Vec::new(),
+                Vec::new(),
+                vec![1],
+                &context,
+            )
+        }
+        .expect("planning facts");
+        novarocks_spi::connector::ConnectorTableMetadata {
+            identity: ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: Arc::from("db"),
+                table: Arc::from("orders"),
+            },
+            schema,
+            planning_facts,
+            definition_facts: novarocks_spi::connector::ConnectorTableDefinitionFacts::empty(),
+            version: None,
+            statistics_data_version: None,
+            table: ConnectorTableHandle::try_new(instance_id, bytes::Bytes::from_static(b"t"))
+                .expect("table handle"),
+        }
+    }
+
+    #[test]
+    fn insert_shaping_reads_the_current_write_authority() {
+        let columns =
+            insert_columns_from_connector_metadata(&insert_target_metadata(false)).expect("shape");
+
+        assert_eq!(
+            columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "v"]
+        );
+        assert_eq!(
+            columns[0].write_default,
+            Some(novarocks_types::schema::ColumnDefault::Int64(7))
+        );
+        assert_eq!(columns[1].write_default, None);
+        assert_eq!(columns[0].data_type, arrow::datatypes::DataType::Int64);
+        assert_eq!(
+            columns[1].data_type,
+            arrow::datatypes::DataType::LargeBinary
+        );
+    }
+
+    #[test]
+    fn insert_shaping_refuses_historical_read_only_facts() {
+        let error = insert_columns_from_connector_metadata(&insert_target_metadata(true))
+            .expect_err("historical facts carry no write authority");
+
+        assert!(
+            error.contains("INSERT target `db.orders` is not Current metadata"),
+            "{error}"
+        );
+        assert!(
+            error.contains("historical read-only and carry no current write authority"),
+            "{error}"
+        );
     }
 }

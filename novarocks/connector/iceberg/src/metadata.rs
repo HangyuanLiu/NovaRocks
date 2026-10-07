@@ -45,8 +45,9 @@ use novarocks_spi::connector::{
     ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
     ConnectorTableObjectBinding, ConnectorTableObjectBindingFailure,
     ConnectorTableObjectCaptureRequest, ConnectorTableObjectId, ConnectorTableObjectRebindRequest,
-    ConnectorTableObjectSelector, ConnectorTablePlanningFacts, ConnectorTableRequest,
-    ConnectorTableResolution, ProviderBindingEpoch, validate_static_predicates,
+    ConnectorTableObjectSelector, ConnectorTablePlanningFacts, ConnectorTablePlanningScope,
+    ConnectorTableRequest, ConnectorTableResolution, ProviderBindingEpoch,
+    validate_static_predicates,
 };
 use serde::{Deserialize, Serialize};
 
@@ -601,15 +602,22 @@ impl ConnectorMetadata for IcebergMetadata {
         // Schema, field domains and all planning facts come from this one
         // loaded metadata generation. Use the reader's existing historical
         // projection policy, including its identity-preserving rename case.
-        let definition_schema = match selector {
-            ConnectorReadSelector::Current => metadata.current_schema().clone(),
-            ConnectorReadSelector::SnapshotId(_) | ConnectorReadSelector::TimestampMicros(_) => {
+        // Only the Current selector carries write authority: a historical
+        // selector's facts are read-only and never resolve the current default
+        // partition spec against the selected snapshot's schema.
+        let (definition_schema, planning_scope) = match selector {
+            ConnectorReadSelector::Current => (
+                metadata.current_schema().clone(),
+                ConnectorTablePlanningScope::Current,
+            ),
+            ConnectorReadSelector::SnapshotId(_) | ConnectorReadSelector::TimestampMicros(_) => (
                 crate::typed_boundary::projection_schema_for_pinned_snapshot(
                     metadata,
                     snapshot_id
                         .ok_or_else(|| corrupt("historical Iceberg read has no snapshot"))?,
-                )?
-            }
+                )?,
+                ConnectorTablePlanningScope::HistoricalReadOnly,
+            ),
         };
         let table_comment = metadata.properties().get("comment").cloned();
         let mut base_schema =
@@ -728,10 +736,13 @@ impl ConnectorMetadata for IcebergMetadata {
                 base_schema.metadata().clone(),
             ))
         };
+        // Metadata aliases are admitted only for the Current selector above, so
+        // their empty facts are Current facts declaring no write facts.
         let planning_facts = if payload.metadata_table_type.is_some() {
             ConnectorTablePlanningFacts::empty()
         } else {
             table_planning_facts(IcebergTablePlanningFactsInput {
+                scope: planning_scope,
                 schema: &schema,
                 iceberg_schema: Some(definition_schema.as_ref()),
                 metadata_columns: &payload.metadata_columns,
@@ -2433,6 +2444,300 @@ mod plan_splits_pruning_tests {
         (metadata, activation)
     }
 
+    /// Build the legal metadata-only evolution of spec §5.4.8: snapshot 101
+    /// freezes schema0 (`id` only); afterwards `future INT` is added and a
+    /// partition spec sourced on `future` becomes the default, all without a
+    /// new snapshot. With `corrupt_current_spec`, the stored document instead
+    /// points the default spec at a source id the current schema lacks.
+    fn write_future_partition_source_metadata(
+        warehouse: &std::path::Path,
+        corrupt_current_spec: bool,
+    ) -> (crate::iceberg::spec::TableMetadata, Arc<Schema>, i32) {
+        let location = warehouse.join("db/orders");
+        let initial_schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .unwrap();
+        let initial = TableMetadataBuilder::new(
+            initial_schema,
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            location.display().to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let old_schema_id = initial.current_schema_id();
+        let old_spec_id = initial.default_partition_spec_id();
+        assert!(initial.default_partition_spec().is_unpartitioned());
+        let old_snapshot = Snapshot::builder()
+            .with_snapshot_id(101)
+            .with_sequence_number(1)
+            .with_timestamp_ms(initial.last_updated_ms())
+            .with_manifest_list(
+                location
+                    .join("metadata/manifest-101.avro")
+                    .display()
+                    .to_string(),
+            )
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .with_schema_id(old_schema_id)
+            .build();
+        let before = initial
+            .into_builder(None)
+            .add_snapshot(old_snapshot)
+            .unwrap()
+            .set_ref(
+                "main",
+                SnapshotReference::new(101, SnapshotRetention::branch(None, None, None)),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let old_schema = before.current_schema().clone();
+        let future_id = before.last_column_id().checked_add(1).unwrap();
+        let mut fields = old_schema.as_struct().fields().to_vec();
+        fields.push(Arc::new(NestedField::optional(
+            future_id,
+            "future",
+            Type::Primitive(PrimitiveType::Int),
+        )));
+        let new_schema = Schema::builder()
+            .with_schema_id(old_schema_id + 1)
+            .with_fields(fields)
+            .build()
+            .unwrap();
+        let future_spec = PartitionSpec::builder(Arc::new(new_schema.clone()))
+            .add_partition_field(
+                "future",
+                "future_partition",
+                crate::iceberg::spec::Transform::Identity,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let evolved = before
+            .clone()
+            .into_builder(None)
+            .add_current_schema(new_schema)
+            .unwrap()
+            .add_partition_spec(future_spec.into_unbound())
+            .unwrap()
+            // LAST_ADDED is intentional: adding a spec alone is not proof
+            // that the later spec became the current default partition spec.
+            .set_default_partition_spec(-1)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        assert_eq!(evolved.uuid(), before.uuid());
+        assert_eq!(evolved.current_snapshot_id(), Some(101));
+        assert_eq!(
+            evolved.snapshot_by_id(101).unwrap().schema_id(),
+            Some(old_schema_id)
+        );
+        let selected = evolved
+            .snapshot_by_id(101)
+            .unwrap()
+            .schema(&evolved)
+            .unwrap();
+        assert_eq!(selected.as_ref(), old_schema.as_ref());
+        assert!(selected.field_by_id(future_id).is_none());
+        assert_eq!(
+            evolved
+                .current_schema()
+                .field_by_id(future_id)
+                .unwrap()
+                .name,
+            "future"
+        );
+        assert_ne!(evolved.current_schema_id(), old_schema_id);
+        assert_ne!(evolved.default_partition_spec_id(), old_spec_id);
+        assert_eq!(evolved.default_partition_spec().fields().len(), 1);
+        assert_eq!(
+            evolved.default_partition_spec().fields()[0].source_id,
+            future_id
+        );
+        assert!(
+            evolved
+                .partition_spec_by_id(old_spec_id)
+                .unwrap()
+                .fields()
+                .is_empty()
+        );
+        let mut document = serde_json::to_value(&evolved).unwrap();
+        if corrupt_current_spec {
+            // The SDK builder refuses to bind such a spec, so the corruption is
+            // applied to the stored document: same evolution, but the default
+            // spec's only field names a source id no schema contains.
+            let default_spec_id = document["default-spec-id"].clone();
+            let spec = document["partition-specs"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|spec| spec["spec-id"] == default_spec_id)
+                .unwrap();
+            spec["fields"][0]["source-id"] = serde_json::json!(future_id + 1);
+        }
+        let directory = location.join("metadata");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("v1.metadata.json"),
+            serde_json::to_vec(&document).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(directory.join("version-hint.text"), b"1\n").unwrap();
+        (evolved, old_schema, future_id)
+    }
+
+    // Permanent form of the 2026-10-03 diagnostic probe. The metadata loads
+    // below do not open the synthetic manifest-list path, so this proves the
+    // planning-facts boundary only; the S0 row bag is covered by the
+    // `novarocks_history_future_partition_source` SQL case.
+    #[test]
+    fn historical_read_after_metadata_only_future_partition_source_keeps_old_schema_without_write_authority()
+     {
+        let (_runtime, warehouse, provider) = provider();
+        let (evolved, old_schema, future_id) =
+            write_future_partition_source_metadata(warehouse.path(), false);
+
+        // Current: exact schema, exact partition source ordinal and the Current
+        // write authority.
+        let current = provider
+            .load_table_for_read(
+                historical_metadata_request(),
+                ConnectorReadSelector::Current,
+            )
+            .unwrap();
+        assert_eq!(current.schema.field(1).name(), "future");
+        assert_eq!(
+            current.schema.field(1).data_type(),
+            &arrow::datatypes::DataType::Int32
+        );
+        assert_eq!(
+            current.planning_facts.scope(),
+            ConnectorTablePlanningScope::Current
+        );
+        assert_eq!(
+            current
+                .planning_facts
+                .current_write_facts()
+                .unwrap()
+                .partition_source_column_ordinals(),
+            &[1]
+        );
+        assert_eq!(
+            current.version.as_ref().unwrap().as_ref(),
+            &evolved.current_schema_id().to_le_bytes()
+        );
+        let payload = provider.table_payload(&current.table).unwrap();
+        let info = payload.table_info.as_ref().unwrap();
+        assert_eq!(info.current_snapshot_id, Some(101));
+        assert_eq!(info.schema_id, evolved.current_schema_id());
+        assert_eq!(info.schema.fields[1].field_id, future_id);
+        // `load_table` is the Current load and agrees exactly.
+        let loaded = provider.load_table(historical_metadata_request()).unwrap();
+        assert_eq!(loaded.planning_facts, current.planning_facts);
+
+        // Historical selectors of the same snapshot read schema0 and carry no
+        // write authority, instead of failing on the current default spec.
+        let timestamp_micros = evolved.snapshot_by_id(101).unwrap().timestamp_ms() * 1000;
+        for selector in [
+            ConnectorReadSelector::SnapshotId(101),
+            ConnectorReadSelector::TimestampMicros(timestamp_micros),
+        ] {
+            let historical = provider
+                .load_table_for_read(historical_metadata_request(), selector)
+                .unwrap_or_else(|error| panic!("historical read {selector:?} failed: {error}"));
+            assert!(historical.schema.field_with_name("future").is_err());
+            assert_eq!(historical.schema.field(0).name(), "id");
+            assert_eq!(
+                historical.schema.field(0).data_type(),
+                &arrow::datatypes::DataType::Int64
+            );
+            assert!(!historical.schema.field(0).is_nullable());
+            assert_eq!(
+                historical.version.as_ref().unwrap().as_ref(),
+                &old_schema.schema_id().to_le_bytes()
+            );
+            assert_eq!(
+                historical.planning_facts.scope(),
+                ConnectorTablePlanningScope::HistoricalReadOnly
+            );
+            assert_eq!(
+                historical.planning_facts.column_facts().len(),
+                historical.schema.fields().len()
+            );
+            assert_eq!(
+                historical.planning_facts.current_write_facts(),
+                Err(novarocks_spi::connector::ConnectorWriteAuthorityRefusal)
+            );
+            assert_eq!(
+                historical.planning_facts.partition_source_column_ordinals(),
+                Err(novarocks_spi::connector::ConnectorWriteAuthorityRefusal)
+            );
+            let payload = provider.table_payload(&historical.table).unwrap();
+            let info = payload.table_info.as_ref().unwrap();
+            assert_eq!(info.current_snapshot_id, Some(101));
+            assert_eq!(info.schema_id, old_schema.schema_id());
+            assert_eq!(info.schema, iceberg_schema_def(&old_schema));
+            assert_eq!(historical.definition_facts.columns().len(), 1);
+        }
+    }
+
+    /// A Current default spec that names a missing source is a corrupt table,
+    /// not "historical, therefore not applicable": every selector of that
+    /// metadata generation fails closed. The SDK refuses to decode such a
+    /// document, so the refusal happens before any planning fact is built;
+    /// the planning-facts CorruptData for the same shape is covered by
+    /// `planning_facts::tests::uea7b3_historical_scope_never_resolves_the_current_default_spec`.
+    #[test]
+    fn corrupt_current_default_spec_fails_closed_for_every_selector() {
+        let (_runtime, warehouse, provider) = provider();
+        let (evolved, _old_schema, future_id) =
+            write_future_partition_source_metadata(warehouse.path(), true);
+        let missing_source = future_id + 1;
+        assert!(
+            evolved
+                .current_schema()
+                .field_by_id(missing_source)
+                .is_none()
+        );
+        let expected = format!("No column with source column id {missing_source} in schema");
+
+        let timestamp_micros = evolved.snapshot_by_id(101).unwrap().timestamp_ms() * 1000;
+        for selector in [
+            ConnectorReadSelector::Current,
+            ConnectorReadSelector::SnapshotId(101),
+            ConnectorReadSelector::TimestampMicros(timestamp_micros),
+        ] {
+            let error = provider
+                .load_table_for_read(historical_metadata_request(), selector)
+                .err()
+                .unwrap_or_else(|| panic!("{selector:?} must fail closed on a corrupt spec"));
+            assert!(
+                error.to_string().contains(&expected),
+                "{selector:?}: {error}"
+            );
+        }
+        let error = provider
+            .load_table(historical_metadata_request())
+            .err()
+            .expect("load_table is the same Current load");
+        assert!(error.to_string().contains(&expected), "{error}");
+    }
+
     #[test]
     fn historical_load_table_for_read_preserves_nested_domains_payload_and_snapshot_statistics() {
         use arrow::datatypes::DataType;
@@ -2510,6 +2815,18 @@ mod plan_splits_pruning_tests {
         assert_eq!(
             historical.planning_facts.column_facts().len(),
             historical.schema.fields().len()
+        );
+        assert_eq!(
+            current.planning_facts.scope(),
+            ConnectorTablePlanningScope::Current
+        );
+        assert_eq!(
+            historical.planning_facts.scope(),
+            ConnectorTablePlanningScope::HistoricalReadOnly
+        );
+        assert_eq!(
+            timestamp_read.planning_facts.scope(),
+            ConnectorTablePlanningScope::HistoricalReadOnly
         );
         assert_eq!(historical.definition_facts.columns().len(), 1);
         assert!(
