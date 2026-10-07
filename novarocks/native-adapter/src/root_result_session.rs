@@ -139,6 +139,10 @@ struct ProducerState {
     /// record stays in the unpublished segment until the sealed normal End.
     scalar_rows: u8,
     sealed: bool,
+    /// The producer published its normal End. Its terminal is final: a later
+    /// cancel (for example a pool shutdown racing the job's removal) cannot
+    /// turn a completed producer into a failed one.
+    completed: bool,
     failed: Option<&'static str>,
     producer: Option<RootProducerExit>,
     cleanup_panic: Option<Box<dyn std::any::Any + Send>>,
@@ -240,6 +244,7 @@ impl NativeRootResultSession {
                 cow_totals: CowSelectionTotals::default(),
                 scalar_rows: 0,
                 sealed: false,
+                completed: false,
                 failed: None,
                 producer: None,
                 cleanup_panic: None,
@@ -760,6 +765,9 @@ impl RootResultSession for NativeRootResultSession {
     }
     fn abort(&self, _reason: ResultAbort) {
         let mut state = self.state();
+        if state.completed {
+            return;
+        }
         state.failed.get_or_insert("root producer was cancelled");
         state.sealed = true;
         state.cleanup(|| self.authority.close());
@@ -770,7 +778,12 @@ impl RootResultSession for NativeRootResultSession {
 }
 impl RootProducerJob for NativeRootResultSession {
     fn turn(&self) -> RootProducerTurn {
-        self.advance(&mut self.state())
+        let mut state = self.state();
+        let turn = self.advance(&mut state);
+        if turn == RootProducerTurn::Complete && state.failed.is_none() {
+            state.completed = true;
+        }
+        turn
     }
     fn cancel(&self) {
         self.abort(ResultAbort::Cancelled(String::new()));

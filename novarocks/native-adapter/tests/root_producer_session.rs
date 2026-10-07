@@ -629,6 +629,25 @@ async fn count_only_panicking_input_credit_observer_cannot_strand_shutdown_or_gr
 }
 
 #[tokio::test]
+async fn cancel_after_a_normal_end_keeps_the_completed_terminal() {
+    let fixture = Fixture::new(client(1));
+    fixture.session.finish_input().unwrap();
+    wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
+    wait_until(|| fixture.session.producer_exited()).await;
+    // A pool shutdown can still reach a job whose slot it has not yet
+    // removed; cancelling a completed producer must not rewrite its End.
+    fixture
+        .session
+        .abort(ResultAbort::Cancelled("late shutdown cancel".into()));
+    assert_eq!(
+        fixture.session.producer_state(),
+        RootProducerState::ContextHeld
+    );
+    assert_end(&read(&fixture.channel, Some(1), 0).await, 1, 0);
+    shutdown(&fixture.pool).await;
+}
+
+#[tokio::test]
 async fn exit_hook_notification_panic_cannot_hide_completed_producer_exit() {
     let fixture = Fixture::new(client(1));
     let fired = Arc::new(AtomicBool::new(false));
@@ -1013,6 +1032,8 @@ async fn write_commit_records_cross_inputs_and_end_after_their_summary() {
         match &delivery.reply().outcome {
             RootReadOutcome::Data(data) => bytes.extend_from_slice(data.body().as_ref()),
             RootReadOutcome::End(end) => break end.output_rows,
+            // The 1 ms long poll can expire before the producer publishes.
+            RootReadOutcome::NotReady => continue,
             other => panic!("unexpected root outcome {other:?}"),
         }
         sequence += 1;
@@ -1145,6 +1166,8 @@ async fn cow_selection_records_decode_back_to_their_batches() {
         match &delivery.reply().outcome {
             RootReadOutcome::Data(data) => bytes.extend_from_slice(data.body().as_ref()),
             RootReadOutcome::End(end) => break end.output_rows,
+            // The 1 ms long poll can expire before the producer publishes.
+            RootReadOutcome::NotReady => continue,
             other => panic!("unexpected root outcome {other:?}"),
         }
         sequence += 1;
