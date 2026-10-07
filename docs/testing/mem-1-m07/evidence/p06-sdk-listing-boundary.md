@@ -1,8 +1,8 @@
 # P06 SDK listing 公开接口边界待裁决（2026-10-07）
 
 本记录是当前代码与SDK公开API的只读证据，不改变provider能力或accepted spec。
-Hadoop/Paimon可在既有provider/FileIO接缝中限制自有String/Vec与SDK全量收集，已实施的
-模块切片还待main Cargo验证。下表中的REST/Hive调用不能仅用事后collector证明事前构造界。
+Hadoop/Paimon可在既有provider/FileIO接缝中限制自有String/Vec与SDK全量收集；后续主agent
+已完成定向和共享接口验证。下表中的REST/Hive调用不能仅用事后collector证明事前构造界。
 
 | 接口 | 当前SDK实际行为 / 公开接缝 | 产品影响 |
 |---|---|---|
@@ -28,3 +28,8 @@ OpenDAL公开lister limit只是每次请求的page limit；忽略limit的服务�
 [FS / Paimon source接入](p06-fs-paimon-source.md)补齐URI与schema HEAD。底层page/XML反序列化
 仍未闭合。公开HttpFetch/HttpClient接缝若用于此缺口，需独立body/shape预检证据，
 不扩ADR-0138 vendor patch。
+
+2026-10-08验证补充：FS144 / Paimon55 / Iceberg1176 / Frontend1436的相关定向全库通过；
+`543759140` cargo-only CI 12232 PASS。此证据验证已有实现兼容，不补齐以上 SDK 源头接缝，
+不改变待裁决状态。FE membership incoming数量门的独立实现缺口另见
+[P00b只读审查](p00b-membership-ingress-gap.md)。

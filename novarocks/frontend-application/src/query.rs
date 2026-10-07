@@ -795,14 +795,15 @@ where
     }
 }
 
-/// The profile coordinator waits synchronously for native task progress. Keep
-/// that wait on the bounded blocking executor so the data runtime can poll its
-/// admission and observation RPCs, including a single backend's first send.
+/// Keep EXPLAIN dispatch and its result alias on the bounded blocking executor.
+/// The profile coordinator waits synchronously for native task progress, so the
+/// data runtime must remain free to poll admission and observation RPCs.
 async fn execute_prepared_explain_statement<P, Execute>(
     executor: QueryBlockingExecutor,
     cancellation: QueryCancellationView,
     diagnostic_statement: StatementToken,
     execution_owner: WorkOwner,
+    result_window: Option<ResultWindowAlias>,
     prepared: Result<P, RoutedExecutionError>,
     execute: Execute,
 ) -> Result<(Result<StatementResult, RoutedExecutionError>, WorkOwner), String>
@@ -811,23 +812,22 @@ where
     Execute: FnOnce(P) -> Result<StatementResult, RoutedExecutionError> + Send + 'static,
 {
     match prepared {
-        Ok(prepared) => {
-            executor
-                .execute(move || {
-                    let _diagnostic_scope =
-                        crate::preparation_diagnostics::enter_statement(diagnostic_statement);
-                    let result = if cancellation.is_cancelled() {
-                        Err(RoutedExecutionError::Engine(
-                            "typed statement was cancelled before prepared query execution began"
-                                .to_owned(),
-                        ))
-                    } else {
-                        execute(prepared)
-                    };
-                    (result, execution_owner)
-                })
-                .await
-        }
+        Ok(prepared) => executor
+            .execute(move || {
+                let _diagnostic_scope =
+                    crate::preparation_diagnostics::enter_statement(diagnostic_statement);
+                let result = if cancellation.is_cancelled() {
+                    Err(RoutedExecutionError::Engine(
+                        "typed statement was cancelled before prepared query execution began"
+                            .to_owned(),
+                    ))
+                } else {
+                    execute(prepared)
+                };
+                (result, execution_owner, result_window)
+            })
+            .await
+            .map(|(result, owner, _window)| (result, owner)),
         Err(error) => Ok((Err(error), execution_owner)),
     }
 }
@@ -1715,7 +1715,27 @@ impl FrontendQuerySession {
         let timeout_ms = timeout_duration.map(timeout_message_millis);
         let token = self.token()?;
         let work_class = typed_statement_work_class(&parsed_statement);
-        let mut statement = if work_class == WorkClass::Query {
+        // Plain EXPLAIN produces a bounded FE-local result. Keep warehouse
+        // queueing, but acquire its complete Local window before compilation.
+        // ANALYZE's CountOnly/internal handoff is installed at the full cut.
+        let local_explain = matches!(
+            &parsed_statement,
+            ParsedStatement::ExplainQuery(explain)
+                if explain.format != ast::ExplainFormat::Analyze
+        );
+        let mut statement = if local_explain {
+            self.service
+                .query_control
+                .begin_queued_governed_query_statement_with_result(
+                    token,
+                    &self.service.workload_root_admission,
+                    deadline.map(tokio::time::Instant::from_std),
+                    timeout_ms,
+                    Some(Arc::from(sql.as_str())),
+                    ResultWindowClass::Local,
+                )
+                .await
+        } else if work_class == WorkClass::Query {
             self.service
                 .query_control
                 .begin_queued_governed_query_statement(
@@ -1870,7 +1890,7 @@ impl FrontendQuerySession {
         let mut worker: Pin<Box<dyn Future<Output = _> + Send>> = match parsed_statement {
             statement @ ParsedStatement::ExplainQuery(_) => Box::pin(async move {
                 let execution_cancellation = worker_cancellation.clone();
-                let (prepared, execution_owner) = query_cpu_executor
+                let (prepared, execution_owner, producer_window) = query_cpu_executor
                     .run(move || {
                         let _diagnostic_scope =
                             crate::preparation_diagnostics::enter_statement(diagnostic_statement);
@@ -1896,7 +1916,9 @@ impl FrontendQuerySession {
                                     }
                                 })
                         };
-                        (result, execution_owner)
+                        // The result receipt retains the alias even when its
+                        // awaiting session disappears before CPU work exits.
+                        (result, execution_owner, producer_window)
                     })
                     .await?;
                 execute_prepared_explain_statement(
@@ -1904,6 +1926,7 @@ impl FrontendQuerySession {
                     execution_cancellation,
                     diagnostic_statement,
                     execution_owner,
+                    producer_window,
                     prepared,
                     move |operation| {
                         execute_prepared_query(operation, &query_execution)
@@ -3671,8 +3694,7 @@ mod tests {
         (workload, root, cancellation)
     }
 
-    #[tokio::test]
-    async fn abandoned_synchronous_command_retains_its_window_until_actual_worker_exit() {
+    async fn assert_abandoned_synchronous_window(for_explain: bool) {
         use novarocks_query_application::cpu::{
             QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
         };
@@ -3691,15 +3713,31 @@ mod tests {
             .configure_result_capacity(ResultCapacityConfig::V1)
             .unwrap();
         workload.mark_ready().unwrap();
-        let (root, window) = workload
-            .root_admission()
-            .try_begin_root_with_result(
-                WorkRequest::new(WorkClass::Management),
-                ResultWindowClass::Local,
-            )
-            .unwrap();
+        let (owner, business, query_permit, window) = if for_explain {
+            let root = workload
+                .root_admission()
+                .begin_query_root(WorkRequest::new(WorkClass::Query))
+                .unwrap();
+            let (permit, window) = root
+                .owner
+                .scope()
+                .admit_query_with_result(ResultWindowClass::Local)
+                .unwrap()
+                .await
+                .unwrap();
+            (root.owner, None, Some(permit), window)
+        } else {
+            let (root, window) = workload
+                .root_admission()
+                .try_begin_root_with_result(
+                    WorkRequest::new(WorkClass::Management),
+                    ResultWindowClass::Local,
+                )
+                .unwrap();
+            (root.owner, Some(root.business), None, window)
+        };
         let cancellation =
-            QueryCancellationView::governed(root.owner.scope().cancellation().unwrap(), None);
+            QueryCancellationView::governed(owner.scope().cancellation().unwrap(), None);
         let mut blocking = QueryBlockingExecutorOwner::try_new(QueryBlockingExecutorConfig::new(
             std::num::NonZeroUsize::new(1).unwrap(),
             std::num::NonZeroUsize::new(1).unwrap(),
@@ -3711,31 +3749,47 @@ mod tests {
         let worker_gate = Arc::clone(&gate);
         let (started, running) = tokio::sync::oneshot::channel();
         let caller = tokio::spawn(async move {
-            execute_synchronous_stage(
-                executor,
-                cancellation,
-                StatementToken::new(SessionToken::new(91, 1), 1),
-                root.owner,
-                Some(alias),
-                move || {
-                    started.send(()).unwrap();
-                    let (open, changed) = &*worker_gate;
-                    let (open, _) = changed
-                        .wait_timeout_while(open.lock().unwrap(), Duration::from_secs(5), |open| {
-                            !*open
-                        })
-                        .unwrap();
-                    assert!(*open, "test worker gate timed out");
-                    Ok(StatementResult::Ok)
-                },
-            )
-            .await
+            let produce = move || {
+                started.send(()).unwrap();
+                let (open, changed) = &*worker_gate;
+                let (open, _) = changed
+                    .wait_timeout_while(open.lock().unwrap(), Duration::from_secs(5), |open| !*open)
+                    .unwrap();
+                assert!(*open, "test worker gate timed out");
+                Ok(StatementResult::Ok)
+            };
+            if for_explain {
+                execute_prepared_explain_statement(
+                    executor,
+                    cancellation,
+                    StatementToken::new(SessionToken::new(91, 1), 1),
+                    owner,
+                    Some(alias),
+                    Ok(()),
+                    move |()| produce(),
+                )
+                .await
+            } else {
+                execute_synchronous_stage(
+                    executor,
+                    cancellation,
+                    StatementToken::new(SessionToken::new(91, 1), 1),
+                    owner,
+                    Some(alias),
+                    produce,
+                )
+                .await
+                .map(|(result, owner, _window)| (result, owner))
+            }
         });
         tokio::time::timeout(Duration::from_secs(2), running)
             .await
             .unwrap()
             .unwrap();
-        root.business.release();
+        if let Some(business) = business {
+            business.release();
+        }
+        drop(query_permit);
         drop(window);
         caller.abort();
         assert!(matches!(caller.await, Err(error) if error.is_cancelled()));
@@ -3748,6 +3802,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+    }
+
+    #[tokio::test]
+    async fn abandoned_synchronous_command_retains_its_window_until_actual_worker_exit() {
+        assert_abandoned_synchronous_window(false).await;
+    }
+
+    #[tokio::test]
+    async fn abandoned_explain_dispatch_retains_local_window_until_actual_worker_exit() {
+        assert_abandoned_synchronous_window(true).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -3770,6 +3834,7 @@ mod tests {
                 cancellation,
                 StatementToken::new(SessionToken::new(91, 1), 1),
                 root.owner,
+                None,
                 Ok(()),
                 move |()| {
                     let signal = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
@@ -3832,6 +3897,7 @@ mod tests {
             cancellation,
             StatementToken::new(SessionToken::new(91, 1), 1),
             root.owner,
+            None,
             Ok(()),
             |()| panic!("cancelled profile must not dispatch prepared execution"),
         )
