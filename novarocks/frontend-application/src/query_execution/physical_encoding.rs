@@ -1730,6 +1730,27 @@ mod tests {
         assert_eq!(compiled_programs(sql).len(), 2, "{sql}");
     }
 
+    // Every literal cell of a multi-row VALUES adds type roots to the sender's
+    // cumulative source invoice, which starts at the declared source floor,
+    // and each constant record's writer charges whole-source metadata scans
+    // against that invoice. Seven three-column rows, the shape the candidate
+    // island first refused, take that charge past a fixed 1 GiB per-record
+    // cap; record work is sized like its namespace's, so the statement
+    // freezes under the compiled carrier and compiles on the receiver.
+    #[test]
+    fn multi_row_values_freeze_past_a_fixed_record_work_cap() {
+        for sql in [
+            "SELECT a, b, c FROM (VALUES (1, 10, 5), (2, 10, 7), (3, 20, 7), (4, 20, 8), \
+             (5, 20, 1), (6, 3, 2), (7, 30, 9)) AS t(a, b, c)",
+            "SELECT a, b FROM (VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), \
+             (7, 7), (8, 8), (9, 9), (10, 10), (11, 11), (12, 12)) AS t(a, b)",
+        ] {
+            let (_, encoded) = encode_with(sql, &compiled_carrier());
+            encoded.unwrap_or_else(|error| panic!("{sql}: the compiled carrier encodes: {error}"));
+            assert_eq!(compiled_programs(sql).len(), 2, "{sql}");
+        }
+    }
+
     #[test]
     fn completed_encoding_observes_tail_after_freezing_and_preserves_first_control_failure() {
         use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};

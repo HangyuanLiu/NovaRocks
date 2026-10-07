@@ -108,7 +108,10 @@ fn flat() -> FlatPoolWriteLimits {
         },
         max_new_allocation_request_bytes: REQUEST,
         max_coexisting_source_and_request_bytes: COEXIST,
-        max_cumulative_library_work: 1024 * 1024 * 1024,
+        // A record writer's work bound scans whole-source metadata, so it
+        // grows with the declared source size from the package's retained
+        // floor upward; a fixed cap would refuse ordinary packages.
+        max_cumulative_library_work: WORK,
     }
 }
 

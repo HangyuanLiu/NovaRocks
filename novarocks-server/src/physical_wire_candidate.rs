@@ -256,7 +256,8 @@ const SOURCE: usize = 128 * MIB;
 const REQUEST: usize = 512 * MIB;
 const COEXIST: usize = SOURCE + REQUEST;
 /// Work bounds: some namespace work grows with records times declared source
-/// bytes, so a fixed cap would refuse ordinary packages.
+/// bytes, and one constant record's with the declared source bytes alone, so
+/// a fixed cap would refuse ordinary packages.
 const WORK: usize = usize::MAX / 4;
 
 fn properties() -> PhysicalPropertyProjectionLimits {
@@ -340,7 +341,10 @@ fn flat_pool() -> FlatPoolWriteLimits {
         schema: ipc_schema(),
         max_new_allocation_request_bytes: REQUEST,
         max_coexisting_source_and_request_bytes: COEXIST,
-        max_cumulative_library_work: GIB,
+        // A record writer's work bound scans whole-source metadata, so it
+        // grows with the declared source size from the package's retained
+        // floor upward; a fixed cap would refuse ordinary packages.
+        max_cumulative_library_work: WORK,
     }
 }
 
@@ -672,7 +676,8 @@ mod tests {
     /// The frontend author and the backend receiver share one admission,
     /// whose source floor is exactly the sender's invoiced source and whose
     /// property projection fits the shared coexistence envelope. Namespace
-    /// library work is not capped below records times declared source size.
+    /// library work is not capped below records times declared source size,
+    /// and no record writer's work is capped below its whole-source scans.
     #[test]
     fn candidate_sender_and_receiver_limits_are_mutually_consistent() {
         let admission = candidate_package_admission();
@@ -701,6 +706,12 @@ mod tests {
         assert_eq!(decode.constant_policy, candidate_constant_policy());
         assert_eq!(encode.constants.max_cumulative_library_work, usize::MAX / 4);
         assert_eq!(decode.constants.max_cumulative_library_work, usize::MAX / 4);
+        for record in [
+            encode.constant_records.flat,
+            encode.constant_records.recursive.flat,
+        ] {
+            assert_eq!(record.max_cumulative_library_work, usize::MAX / 4);
+        }
         let FrontendStaticPlanCarrier::CompiledPackage {
             admission: frontend,
             limits,
