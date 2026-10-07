@@ -1776,31 +1776,35 @@ pub(crate) async fn run_root_relay(
     }
 
     let exit = {
-        // A validated item waiting for the previous delivery to finish.
-        let mut ready: Option<(
-            NonZeroU64,
-            RetainedRootReply,
-            Option<(
-                novarocks_result_contract::ClientRowProfile,
-                novarocks_result_contract::ClientRowStreamCursor,
-            )>,
-            u64,
-        )> = None;
+        // This slot survives a pump cancellation while its delivered item
+        // still owns the window; only the protocol cut may take it for closing.
+        let resident = crate::api::RootRelayResidentWindow::default();
         let mut delivering: Option<(NonZeroU64, DeliveryFuture<'_>)> = None;
         let mut reading: Option<ReadFuture> = None;
         loop {
             if delivering.is_none()
-                && let Some((sequence, reply, client_rows, rows)) = ready.take()
+                && let Some(crate::api::ResidentRootSegment {
+                    sequence,
+                    reply,
+                    client_rows,
+                    rows,
+                }) = resident.take()
             {
                 let packet = ResultPacketSequence::new(sequence.get() - 1);
                 delivering = Some((
                     sequence,
-                    Box::pin(permit.deliver_root_segment(packet, reply, client_rows, rows)),
+                    Box::pin(permit.deliver_root_segment(
+                        packet,
+                        reply,
+                        client_rows,
+                        rows,
+                        resident.clone(),
+                    )),
                 ));
             }
             if let Some(end) = frontier.end_consumed()
                 && delivering.is_none()
-                && ready.is_none()
+                && resident.is_empty()
                 && reading.is_none()
             {
                 // The final ACK-only read is optional and never awaited here.
@@ -1859,6 +1863,7 @@ pub(crate) async fn run_root_relay(
                     if let Err(error) = result {
                         break RelayExit::Actor("deliver root segment", error);
                     }
+                    resident.retire(sequence);
                     if let Err(error) = frontier.receipt(sequence) {
                         break RelayExit::Failure(contract_failure(contract_error(
                             error.to_string(),
@@ -1884,7 +1889,14 @@ pub(crate) async fn run_root_relay(
                             )));
                         }
                         Ok(super::RootRelayStep::Deliver { sequence, rows, .. }) => {
-                            ready = Some((sequence, reply, client_rows, rows));
+                            if !resident.publish(crate::api::ResidentRootSegment {
+                                sequence,
+                                reply: Arc::new(reply),
+                                client_rows,
+                                rows,
+                            }) {
+                                break RelayExit::AwaitTerminalControl;
+                            }
                         }
                         Ok(super::RootRelayStep::AwaitTerminalControl) => {
                             break RelayExit::AwaitTerminalControl;
@@ -5336,6 +5348,84 @@ mod tests {
         match stream.next().await.unwrap().unwrap() {
             ResultDelivery::Segment(segment) => segment,
             _ => panic!("expected a relayed root segment"),
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_cancel_cut_retains_validated_coverage_across_actor_handoff_without_ack() {
+        for complete_first in [false, true] {
+            let (
+                Harness {
+                    control,
+                    scope,
+                    actor,
+                    owner,
+                    permit,
+                    mut stream,
+                    root,
+                },
+                window,
+            ) = relay_harness(40 + i64::from(complete_first)).await;
+            let (status_sender, statuses) = accepted_root_status_projection_with_control_port(
+                root,
+                Arc::new(TestSuccessSealPort::default()),
+            );
+            status_sender.publish(finished(root)).unwrap();
+            let port = ScriptedRootPort::new(vec![
+                rows_data(1, &[5, 0, 0, 0, b'a', b'b'], None),
+                rows_data(2, &[b'c', b'd', b'e', 1, 0, 0, 0, b'f'], Some((3, 2))),
+            ]);
+            let (_terminal_sender, terminal) = native_attempt_terminal_channel();
+            let relay = tokio::spawn(run_root_relay(
+                permit,
+                root,
+                scope.clone(),
+                relay_binding(root, port.clone(), &window),
+                statuses,
+                terminal,
+            ));
+            let mut first = Some(next_segment(&mut stream).await);
+            let coverage = first.as_ref().unwrap().resident_window().unwrap();
+            // Barrier: the second response must have passed frontier validation,
+            // not merely have been dispatched by the read port.
+            while coverage.is_empty() {
+                tokio::task::yield_now().await;
+            }
+            if complete_first {
+                first.take().unwrap().complete();
+                // Force the second item out of ready and through the actor's
+                // queue before the protocol has acquired its next delivery.
+                while !coverage.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            }
+            assert_eq!(
+                control.cancel_active_roots(CancellationReason::Requested),
+                1
+            );
+            let items = coverage.freeze();
+            let payloads = items
+                .iter()
+                .flatten()
+                .flat_map(|item| {
+                    item.client_rows()
+                        .unwrap()
+                        .payload_spans()
+                        .map(|span| span.bytes.to_vec())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            assert!(payloads.iter().any(|part| part == b"cde"));
+            assert!(coverage.freeze().into_iter().all(|item| item.is_none()));
+            if let Some(first) = first {
+                first.fail(contract_error("cancelled during a partial write"));
+            }
+            assert!(relay.await.unwrap().is_err());
+            assert_eq!(port.requests(), vec![(Some(1), 0), (Some(2), 0)]);
+            drop(items);
+            drop(stream);
+            drop(actor);
+            drop(owner);
         }
     }
 

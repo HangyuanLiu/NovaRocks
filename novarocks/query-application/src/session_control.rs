@@ -747,6 +747,12 @@ impl GovernedQueryStatementOwner {
             .map(ResultWindowGrant::retain_alias)
     }
 
+    pub(crate) fn release_transferred_result_window(&mut self) {
+        // Fetch and transport aliases retain their own short-tail position.
+        // The protocol has already moved its owned bytes into closing capacity.
+        self.result_window.take();
+    }
+
     /// Transfer the unique root owner into `QueryExecutionClient::start`.
     /// The statement generation and business permit stay with this protocol owner.
     pub fn take_execution_owner(&mut self) -> Option<WorkOwner> {

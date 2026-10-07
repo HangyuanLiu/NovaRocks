@@ -712,10 +712,12 @@ async fn run_logical_execution(
         }
     };
     let actor_config = match actor_config {
-        Ok(actor_config) => actor_config.with_abort_query_context_effect_port(
-            session.abort_effect_port(),
-            max_establish_authorizations,
-        ),
+        Ok(actor_config) => actor_config
+            .with_result_row_carrier(description.row_carrier())
+            .with_abort_query_context_effect_port(
+                session.abort_effect_port(),
+                max_establish_authorizations,
+            ),
         Err(error) => {
             let _ = reply.send(Err(actor_error(error)));
             return Ok(());

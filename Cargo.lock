@@ -4051,6 +4051,7 @@ dependencies = [
  "mysql_common 0.32.4",
  "novarocks-parser",
  "novarocks-query-application",
+ "novarocks-result-contract",
  "novarocks-sql",
  "novarocks-types",
  "novarocks-user-error",

@@ -930,3 +930,59 @@ async fn temporal_preflight_rejects_before_execute_callback_and_next_read() {
     assert_eq!(*executions.lock().unwrap(), 0);
     assert_eq!(*consumed.lock().unwrap(), end_of_bad);
 }
+
+#[tokio::test]
+async fn closing_lease_restores_the_connection_only_after_err_flush() {
+    let socket = Socket::default();
+    let evidence = socket.clone();
+    let mut slot =
+        crate::packet_writer::PacketWriter::with_limits(socket, ProtocolLimits::default());
+    slot.set_seq(254);
+    let result =
+        crate::QueryResultWriter::new(&mut slot, false, crate::CapabilityFlags::CLIENT_PROTOCOL_41);
+    let mut lease = result.into_streaming_result().await.unwrap();
+    lease.writer().start_row(3).unwrap();
+    lease.writer().write_slice(b"a").await.unwrap();
+    let tail = vec![ResidentTailPart::new(Arc::from(b"bc".as_slice()), 0..2).unwrap()];
+    let mut closing = lease
+        .into_closing_lease(tail, ErrorKind::ER_QUERY_INTERRUPTED, b"cancelled")
+        .map_err(|(_, error)| error)
+        .unwrap();
+    evidence.0.lock().unwrap().flush_blocked = true;
+    {
+        let mut future = Box::pin(closing.finish());
+        assert!(poll_once(&mut future).await.is_pending());
+        // Dropping the pending closing operation closes its IO. The inert
+        // connection slot must stay detached, rather than become reusable.
+    }
+    drop(closing);
+    assert!(slot.is_detached());
+    let state = evidence.0.lock().unwrap();
+    let frames = packets(&state.bytes);
+    assert_eq!(frames[0], (254, b"abc".as_slice()));
+    assert_eq!(frames[1].0, 255);
+    assert_eq!(frames[1].1[0], 0xff);
+    drop(state);
+
+    let socket = Socket::default();
+    let mut slot =
+        crate::packet_writer::PacketWriter::with_limits(socket, ProtocolLimits::default());
+    slot.set_seq(255);
+    let result =
+        crate::QueryResultWriter::new(&mut slot, false, crate::CapabilityFlags::CLIENT_PROTOCOL_41);
+    let lease = result.into_streaming_result().await.unwrap();
+    let mut closing = lease
+        .into_closing_lease(Vec::new(), ErrorKind::ER_QUERY_INTERRUPTED, b"cancelled")
+        .map_err(|(_, error)| error)
+        .unwrap();
+    closing
+        .finish()
+        .await
+        .unwrap()
+        .no_more_results()
+        .await
+        .unwrap();
+    drop(closing);
+    assert!(!slot.is_detached());
+    assert_eq!(slot.next_sequence(), 0);
+}

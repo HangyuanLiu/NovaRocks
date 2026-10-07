@@ -180,6 +180,24 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
         self.client_capabilities
     }
 
+    pub fn protocol_limits(&self) -> crate::ProtocolLimits {
+        self.writer.limits()
+    }
+
+    pub fn is_binary(&self) -> bool {
+        self.is_bin
+    }
+
+    /// Finalize the preceding result, if any, before detaching its IO for the
+    /// next streaming result. This preserves negotiated multi-result flags.
+    #[allow(clippy::result_large_err)]
+    pub async fn into_streaming_result(
+        mut self,
+    ) -> io::Result<crate::StreamingResponseLease<'a, W>> {
+        self.finalize(true).await?;
+        self.into_streaming().map_err(|(_, error)| error)
+    }
+
     async fn finalize(&mut self, more_exists: bool) -> io::Result<()> {
         let mut status = StatusFlags::empty();
         if more_exists {

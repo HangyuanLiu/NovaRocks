@@ -35,6 +35,41 @@ pub enum OutputContract {
 }
 
 impl OutputContract {
+    /// The completed root sink is the authority for the row carrier. Keep the
+    /// legacy carrier only for plans whose sink has not yet been migrated.
+    fn row_carrier_from_plan(
+        plan: &novarocks_physical_plan::PhysicalPlan,
+    ) -> Result<crate::api::ResultRowCarrier, String> {
+        use novarocks_physical_plan::FragmentSink;
+        use novarocks_result_contract::{ClientRowProfile, RootOutputKind, RootProfileV1};
+        let sink = plan
+            .result_port()
+            .and_then(|port| plan.fragments().get(&port.fragment))
+            .map(|fragment| fragment.sink());
+        match sink {
+            Some(FragmentSink::RootResult(contract)) => {
+                contract
+                    .validate_purpose()
+                    .map_err(|error| error.to_string())?;
+                let profile = if contract.kind() == RootOutputKind::ClientRows {
+                    Some(
+                        ClientRowProfile::try_new(
+                            RootProfileV1::SEGMENT_BYTES,
+                            RootProfileV1::ROW_PAYLOAD_BYTES,
+                        )
+                        .map_err(|error| error.to_string())?,
+                    )
+                } else {
+                    None
+                };
+                crate::api::ResultRowCarrier::relayed(contract.kind(), profile)
+                    .map_err(|error| error.to_string())
+            }
+            Some(FragmentSink::Result) | None => Ok(crate::api::ResultRowCarrier::DecodedBatches),
+            _ => Err("completed result port does not name a result sink".into()),
+        }
+    }
+
     /// The same contract, from a completed plan's own result port.
     ///
     /// A completed plan states what it delivers as part of being complete:
@@ -259,6 +294,7 @@ pub struct FrozenExecutionDescription {
     kind: QueryExecutionKind,
     scan_identities: Arc<[crate::api::PlanScanIdentity]>,
     output: OutputContract,
+    row_carrier: crate::api::ResultRowCarrier,
     effect: ExecutionEffect,
     recovery: RecoveryMode,
     residuals: Arc<[ResidualResponsibility]>,
@@ -283,6 +319,7 @@ impl FrozenExecutionDescription {
         validate_effect_recovery(effect, recovery)?;
         let plan = candidate.plan().version();
         let expected_output = OutputContract::from_completed_plan(kind, candidate.plan())?;
+        let row_carrier = OutputContract::row_carrier_from_plan(candidate.plan())?;
         if output.fields() != expected_output.fields()
             || matches!(output, OutputContract::CompletionOnly)
                 != matches!(expected_output, OutputContract::CompletionOnly)
@@ -328,6 +365,7 @@ impl FrozenExecutionDescription {
             kind,
             scan_identities: scan_identities.into(),
             output,
+            row_carrier,
             effect,
             recovery,
             residuals: residuals.into(),
@@ -358,6 +396,9 @@ impl FrozenExecutionDescription {
 
     pub const fn output(&self) -> &OutputContract {
         &self.output
+    }
+    pub const fn row_carrier(&self) -> crate::api::ResultRowCarrier {
+        self.row_carrier
     }
     pub const fn effect(&self) -> ExecutionEffect {
         self.effect
@@ -408,6 +449,34 @@ fn validate_effect_recovery(effect: ExecutionEffect, recovery: RecoveryMode) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn row_carrier_is_frozen_from_the_completed_root_sink() {
+        use novarocks_result_contract::{
+            FrozenRootOutput, InternalResultDomain, RootOutputContract, RootProfileId,
+        };
+        let completed = crate::completed_plan_fixture::completed_values_plan([42; 16]).await;
+        let plan = completed.candidate().plan();
+        assert_eq!(
+            OutputContract::row_carrier_from_plan(plan).unwrap(),
+            crate::api::ResultRowCarrier::DecodedBatches
+        );
+        for output in [
+            FrozenRootOutput::CountOnly,
+            FrozenRootOutput::InternalFacts(InternalResultDomain::CowSelectionArrowV1),
+        ] {
+            let kind = output.kind();
+            let plan = plan
+                .as_ref()
+                .clone()
+                .with_root_output(RootOutputContract::new(RootProfileId::V1, output))
+                .unwrap();
+            assert_eq!(
+                OutputContract::row_carrier_from_plan(&plan).unwrap(),
+                crate::api::ResultRowCarrier::relayed(kind, None).unwrap()
+            );
+        }
+    }
 
     #[tokio::test]
     async fn m07_completed_output_preserves_exact_producer_domains() {

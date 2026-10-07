@@ -48,6 +48,7 @@ use crate::{ClientDisconnectWatcher, MysqlClientConnectionRegistry, spawn_discon
 async fn write_negotiated_statement<'writer, W: AsyncWrite + Unpin>(
     statement: StatementResult,
     results: QueryResultWriter<'writer, W>,
+    more_results: bool,
 ) -> io::Result<crate::MysqlStatementWriteOutcome<'writer, W>> {
     match statement {
         StatementResult::Query(result) => crate::write_query_result_one(result, results)
@@ -57,7 +58,12 @@ async fn write_negotiated_statement<'writer, W: AsyncWrite + Unpin>(
             crate::write_governed_query_result_one(result, results).await
         }
         StatementResult::StreamingQuery(result) => {
-            crate::write_streaming_query_result_one(result, results).await
+            crate::governed_result_writer::write_streaming_query_result_with_more(
+                result,
+                results,
+                more_results,
+            )
+            .await
         }
         StatementResult::GovernedCompletion(result) => {
             crate::write_governed_terminal_ok_one(result.into_protocol(), results).await
@@ -443,7 +449,8 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
         };
         if statements.len() > 1 {
             let mut results = results;
-            for statement_sql in statements {
+            let count = statements.len();
+            for (index, statement_sql) in statements.into_iter().enumerate() {
                 let statement = match session.execute_statement(statement_sql).await {
                     Ok(statement) => statement,
                     Err(error) => {
@@ -453,7 +460,8 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
                     }
                 };
                 let (statement, terminal) = statement.into_parts();
-                let outcome = write_negotiated_statement(statement, results).await;
+                let outcome =
+                    write_negotiated_statement(statement, results, index + 1 < count).await;
                 terminal.complete();
                 match outcome? {
                     crate::MysqlStatementWriteOutcome::Continue(next) => results = next,

@@ -38,9 +38,13 @@ reader grows input buffers without an explicit limit. This patch adds:
    authentication input, and prepared-statement long data, checked before any
    buffer grows; client-triggered assertions become protocol errors.
 8. `resultset.rs`, `writers.rs`, `lib.rs`, `tls.rs`: entry points
-   (`into_streaming`, `run_with_limits`, `init_before_ssl_with_limits`) that
+   (`into_streaming`, `into_streaming_result`, `run_with_limits`, `init_before_ssl_with_limits`) that
    expose the streaming lease and limits while leaving the existing APIs and
-   their behavior unchanged.
+   their behavior unchanged. `into_streaming_result` first flushes a preceding
+   legacy result's pending terminator with the multi-result flag. A
+   `ClosingResponseLease` keeps the detached return slot inert until the full
+   ERR and socket flush succeed; partial failure or a dropped finish future
+   closes its IO and leaves that slot unusable.
 
 The patch concerns MySQL protocol behavior and NovaRocks-owned buffers only.
 It does not instrument or account allocator use inside the crate. Exit

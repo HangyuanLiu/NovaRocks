@@ -235,6 +235,16 @@ impl GovernedProtocolOwner {
             .accept_failed_delivery_cut()
     }
 
+    fn closing_capacity(
+        &self,
+        cut: novarocks_workload_control::ResultClosingCut,
+    ) -> Result<ResultWindowGrant, WorkError> {
+        let statement = self.statement.as_ref().ok_or(WorkError::Released)?;
+        self.resources
+            .result_capacity()?
+            .try_acquire_closing(statement.scope(), cut)
+    }
+
     pub fn complete(&mut self) -> GovernedStatementFinishOutcome {
         self.settled = true;
         self.statement
@@ -580,6 +590,70 @@ impl StreamingStatementResult {
 
     pub fn seal_success_visibility(&mut self) -> GovernedStatementVisibilitySealOutcome {
         self.protocol.seal_success_visibility()
+    }
+
+    /// Fix the delivery verdict and return computation capacity before a
+    /// possibly slow protocol tail. Closing admission is a single try.
+    pub fn try_closing_capacity(
+        &mut self,
+        cancelled: bool,
+    ) -> Result<ResultWindowGrant, WorkError> {
+        let _ = self.execution.request_cancel();
+        let cut = if cancelled {
+            self.protocol.accept_cancel_delivery_cut()?;
+            novarocks_workload_control::ResultClosingCut::AcceptedCancellation
+        } else {
+            self.protocol.accept_failed_delivery_cut()?;
+            novarocks_workload_control::ResultClosingCut::OriginatingFailure
+        };
+        self.protocol.closing_capacity(cut)
+    }
+
+    /// Transfer only after the independent capacity proves the complete tail.
+    /// A rejected handoff returns every original owner intact.
+    #[allow(clippy::result_large_err)]
+    pub fn into_closing_delivery<W>(
+        mut self,
+        writer: W,
+        capacity: ResultWindowGrant,
+        simultaneously_live_backing_bytes: u64,
+    ) -> Result<ClosingDelivery<W>, (Self, W, ResultWindowGrant)> {
+        let _ = self.execution.request_cancel();
+        self.settled = true;
+        let protocol = std::mem::replace(
+            &mut self.protocol,
+            GovernedProtocolOwner {
+                statement: None,
+                resources: self.resources.clone(),
+                settled: true,
+            },
+        );
+        match ClosingDelivery::try_new(
+            writer,
+            protocol,
+            capacity,
+            simultaneously_live_backing_bytes,
+        ) {
+            Ok(mut closing) => {
+                let tail = std::sync::Arc::get_mut(
+                    closing.tail.as_mut().expect("new closing retains tail"),
+                )
+                .expect("new closing has no aliases");
+                tail.protocol
+                    .as_mut()
+                    .expect("new closing retains protocol")
+                    .statement
+                    .as_mut()
+                    .expect("closing protocol retains statement")
+                    .release_transferred_result_window();
+                Ok(closing)
+            }
+            Err((writer, protocol, capacity)) => {
+                self.protocol = protocol;
+                self.settled = false;
+                Err((self, writer, capacity))
+            }
+        }
     }
 
     pub fn complete(mut self) -> GovernedStatementFinishOutcome {

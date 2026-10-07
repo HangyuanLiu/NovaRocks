@@ -441,8 +441,16 @@ pub async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
 }
 
 pub async fn write_streaming_query_result_one<'writer, W: AsyncWrite + Unpin>(
+    result: StreamingStatementResult,
+    results: QueryResultWriter<'writer, W>,
+) -> io::Result<MysqlStatementWriteOutcome<'writer, W>> {
+    write_streaming_query_result_with_more(result, results, false).await
+}
+
+pub(crate) async fn write_streaming_query_result_with_more<'writer, W: AsyncWrite + Unpin>(
     mut result: StreamingStatementResult,
     results: QueryResultWriter<'writer, W>,
+    more_results: bool,
 ) -> io::Result<MysqlStatementWriteOutcome<'writer, W>> {
     let schema_delivery = match result.begin_schema() {
         Some(delivery) => delivery,
@@ -453,6 +461,17 @@ pub async fn write_streaming_query_result_one<'writer, W: AsyncWrite + Unpin>(
             ));
         }
     };
+    if schema_delivery.row_carrier()
+        != novarocks_query_application::api::ResultRowCarrier::DecodedBatches
+    {
+        return crate::relay_result_writer::write_relay_result_one(
+            result,
+            schema_delivery,
+            results,
+            more_results,
+        )
+        .await;
+    }
     let mut failure = match result.failure_view() {
         Some(failure) => failure,
         None => {
@@ -930,7 +949,9 @@ async fn write_governed_batch<W: AsyncWrite + Unpin>(
         })
 }
 
-fn result_schema_to_query_result_columns(schema: &ResultSchema) -> Vec<QueryResultColumn> {
+pub(crate) fn result_schema_to_query_result_columns(
+    schema: &ResultSchema,
+) -> Vec<QueryResultColumn> {
     schema.fields().to_vec()
 }
 
@@ -1379,14 +1400,14 @@ fn failed_query_result_delivery(message: impl Into<String>) -> QueryExecutionErr
     QueryExecutionError::new(QueryExecutionErrorKind::Failed, message.into())
 }
 
-fn is_terminal_cancellation(error: &QueryExecutionError) -> bool {
+pub(crate) fn is_terminal_cancellation(error: &QueryExecutionError) -> bool {
     matches!(
         error.kind(),
         QueryExecutionErrorKind::Cancelled | QueryExecutionErrorKind::DeadlineExceeded
     )
 }
 
-async fn wait_terminal_result_failure(
+pub(crate) async fn wait_terminal_result_failure(
     failure: &mut ResultFailureView,
     cancellation: &QueryCancellationView,
 ) -> QueryExecutionError {

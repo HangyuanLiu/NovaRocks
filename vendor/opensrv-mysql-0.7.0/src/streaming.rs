@@ -238,6 +238,9 @@ impl<W> OwnedStreamingMysqlWriter<W> {
     pub fn receipt(&self) -> FramingCursor {
         self.cursor
     }
+    pub fn protocol_limits(&self) -> ProtocolLimits {
+        self.limits
+    }
     pub fn buffer_capacity(&self) -> usize {
         self.buffer.len()
     }
@@ -643,6 +646,10 @@ impl<W> ClosingMysqlWriter<W> {
 }
 impl<W: AsyncWrite + Unpin> ClosingMysqlWriter<W> {
     pub async fn finish(mut self) -> io::Result<W> {
+        self.finish_in_place().await?;
+        Ok(self.writer.into_inner())
+    }
+    async fn finish_in_place(&mut self) -> io::Result<()> {
         self.writer.finish_metadata().await?;
         self.writer.flush_pending().await?;
         for part in &self.tail {
@@ -659,7 +666,7 @@ impl<W: AsyncWrite + Unpin> ClosingMysqlWriter<W> {
         )?;
         self.writer.write_slice(&self.error_payload).await?;
         self.writer.flush_socket().await?;
-        Ok(self.writer.into_inner())
+        Ok(())
     }
 }
 fn invalid(message: &'static str) -> io::Error {
@@ -707,6 +714,63 @@ impl<'a, W> StreamingResponseLease<'a, W> {
         message: &[u8],
     ) -> Result<ClosingMysqlWriter<W>, (OwnedStreamingMysqlWriter<W>, io::Error)> {
         self.owned.into_closing(tail, kind, message)
+    }
+
+    /// Keep only the inert connection return slot beside the independent
+    /// closing writer. No result fetch or query capability is retained here.
+    #[allow(clippy::result_large_err)]
+    pub fn into_closing_lease(
+        self,
+        tail: Vec<ResidentTailPart>,
+        kind: ErrorKind,
+        message: &[u8],
+    ) -> Result<ClosingResponseLease<'a, W>, (Self, io::Error)> {
+        match self.owned.into_closing(tail, kind, message) {
+            Ok(owned) => Ok(ClosingResponseLease {
+                slot: Some(self.slot),
+                owned: Some(owned),
+                is_bin: self.is_bin,
+                capabilities: self.capabilities,
+            }),
+            Err((owned, error)) => Err((
+                Self {
+                    slot: self.slot,
+                    owned,
+                    is_bin: self.is_bin,
+                    capabilities: self.capabilities,
+                },
+                error,
+            )),
+        }
+    }
+}
+
+/// A frozen closing response and an inert slot for restoring the next command
+/// only after the complete ERR and socket flush actually succeed.
+pub struct ClosingResponseLease<'a, W> {
+    slot: Option<&'a mut crate::packet_writer::PacketWriter<W>>,
+    owned: Option<ClosingMysqlWriter<W>>,
+    is_bin: bool,
+    capabilities: crate::CapabilityFlags,
+}
+impl<'a, W: AsyncWrite + Unpin> ClosingResponseLease<'a, W> {
+    pub async fn finish(&mut self) -> io::Result<crate::QueryResultWriter<'a, W>> {
+        let mut owned = self
+            .owned
+            .take()
+            .ok_or_else(|| invalid("closing response already exited"))?;
+        owned.finish_in_place().await?;
+        let sequence = owned.receipt().sequence;
+        let slot = self
+            .slot
+            .take()
+            .ok_or_else(|| invalid("closing response has no return slot"))?;
+        slot.restore(owned.into_inner(), sequence)?;
+        Ok(crate::QueryResultWriter::new(
+            slot,
+            self.is_bin,
+            self.capabilities,
+        ))
     }
 }
 impl<'a, W: AsyncWrite + Unpin> StreamingResponseLease<'a, W> {

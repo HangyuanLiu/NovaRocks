@@ -570,9 +570,10 @@ impl RunningAttemptPermit {
     pub(crate) async fn deliver_root_segment(
         &self,
         sequence: ResultPacketSequence,
-        segment: RetainedRootReply,
+        segment: Arc<RetainedRootReply>,
         client_rows: Option<(ClientRowProfile, ClientRowStreamCursor)>,
         rows: u64,
+        resident_window: crate::api::RootRelayResidentWindow,
     ) -> Result<(), LogicalExecutionActorError> {
         request(self.mailbox(), |reply| ActorCommand::DeliverRootSegment {
             activation: self.identity(),
@@ -580,6 +581,7 @@ impl RunningAttemptPermit {
             segment,
             client_rows,
             rows,
+            resident_window,
             reply,
         })
         .await
@@ -1440,9 +1442,10 @@ enum ActorCommand {
     DeliverRootSegment {
         activation: AttemptActivationIdentity,
         sequence: ResultPacketSequence,
-        segment: RetainedRootReply,
+        segment: Arc<RetainedRootReply>,
         client_rows: Option<(ClientRowProfile, ClientRowStreamCursor)>,
         rows: u64,
+        resident_window: crate::api::RootRelayResidentWindow,
         reply: ActorReply<()>,
     },
     BindRootResult {
@@ -3894,6 +3897,7 @@ fn handle_command(
             segment,
             client_rows,
             rows,
+            resident_window,
             reply,
         } => {
             // The same admission guards as a decoded batch: one ordered item
@@ -3966,6 +3970,7 @@ fn handle_command(
                 reply_result_failure(state, reply);
                 return;
             };
+            let delivery = delivery.with_resident_window(resident_window);
             if start_schema_delivery(state, runtime, activation).is_err() {
                 drop(delivery);
                 conclude_failed(state, "schema delivery could not be started");

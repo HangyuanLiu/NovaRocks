@@ -36,20 +36,98 @@ const COLUMN_LENGTH: u32 = 1024;
 /// Length of the fixed-length fields that follow the names.
 const FIXED_FIELDS_LENGTH: u64 = 0x0c;
 
+/// Check borrowed schema names before converting or copying column metadata.
+pub(crate) fn preflight_result_schema(
+    schema: &novarocks_query_application::api::ResultSchema,
+    capabilities: CapabilityFlags,
+    limits: ProtocolLimits,
+) -> io::Result<()> {
+    let limits = limits.validate()?;
+    let count = schema.fields().len();
+    let refused = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "MySQL schema exceeds its protocol limits",
+        )
+    };
+    if count == 0 || count > limits.columns {
+        return Err(refused());
+    }
+    let overhead = 2 * std::mem::size_of::<usize>() + 4;
+    let mut total = (limits.columns + 2)
+        .checked_mul(std::mem::size_of::<std::sync::Arc<[u8]>>())
+        .and_then(|total| total.checked_add(lenenc_size(count as u64) + overhead))
+        .ok_or_else(refused)?;
+    for field in schema.fields() {
+        let size = 21usize
+            .checked_add(lenenc_size(field.name().len() as u64))
+            .and_then(|size| size.checked_add(field.name().len()))
+            .ok_or_else(refused)?;
+        total = total
+            .checked_add(size + overhead)
+            .filter(|total| *total <= limits.metadata_bytes)
+            .ok_or_else(refused)?;
+    }
+    if !capabilities.contains(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
+        total = total.checked_add(5 + overhead).ok_or_else(refused)?;
+    }
+    if total > limits.metadata_bytes {
+        return Err(refused());
+    }
+    Ok(())
+}
+
 /// Builds the frozen metadata of one result.
 pub(crate) fn frozen_result_metadata(
     columns: &[Column],
     capabilities: CapabilityFlags,
     limits: ProtocolLimits,
 ) -> io::Result<FrozenMetadata> {
-    if columns.is_empty() {
+    let limits = limits.validate()?;
+    if columns.is_empty() || columns.len() > limits.columns {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "a MySQL result set needs at least one column",
+            "MySQL result column count exceeds its protocol limits",
+        ));
+    }
+    // Check the complete retained set and the largest temporary packet before
+    // constructing either. The temporary is reused without geometric growth.
+    let overhead = 2 * std::mem::size_of::<usize>() + 4;
+    let mut total = (limits.columns + 2) * std::mem::size_of::<std::sync::Arc<[u8]>>();
+    let mut largest = lenenc_size(columns.len() as u64);
+    total += largest + overhead;
+    for column in columns {
+        let size = 20usize
+            .checked_add(lenenc_size(column.table.len() as u64))
+            .and_then(|size| size.checked_add(column.table.len()))
+            .and_then(|size| size.checked_add(lenenc_size(column.column.len() as u64)))
+            .and_then(|size| size.checked_add(column.column.len()))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "MySQL metadata size overflow")
+            })?;
+        total = total
+            .checked_add(size + overhead)
+            .filter(|total| *total <= limits.metadata_bytes)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "MySQL metadata exceeds its byte limit",
+                )
+            })?;
+        largest = largest.max(size);
+    }
+    if !capabilities.contains(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
+        total = total.checked_add(5 + overhead).unwrap_or(usize::MAX);
+        largest = largest.max(5);
+    }
+    if total > limits.metadata_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "MySQL metadata exceeds its byte limit",
         ));
     }
     let mut metadata = FrozenMetadata::builder(limits)?;
-    let mut packet = Vec::new();
+    let mut packet = Vec::with_capacity(largest);
     write_lenenc_int(&mut packet, columns.len() as u64);
     metadata.try_push_bytes(&packet)?;
     for column in columns {
@@ -74,6 +152,18 @@ pub(crate) fn frozen_result_metadata(
         metadata.try_push_bytes(&[0xFE, 0x00, 0x00, 0x00, 0x00])?;
     }
     Ok(metadata)
+}
+
+fn lenenc_size(value: u64) -> usize {
+    if value < 251 {
+        1
+    } else if value < 1 << 16 {
+        3
+    } else if value < 1 << 24 {
+        4
+    } else {
+        9
+    }
 }
 
 fn write_lenenc_int(output: &mut Vec<u8>, value: u64) {

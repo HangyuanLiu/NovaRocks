@@ -192,6 +192,19 @@ impl ResultCapacityHandle {
     }
 }
 
+impl crate::LocalResourceAuthority {
+    /// Observe the already-installed host capacity. This never creates a
+    /// fallback pool or changes the admission geometry.
+    pub fn result_capacity(&self) -> Result<ResultCapacityHandle, WorkError> {
+        if self.inner.state.lock().unwrap().result_capacity.is_none() {
+            return Err(WorkError::NotReady);
+        }
+        Ok(ResultCapacityHandle {
+            inner: Arc::clone(&self.inner),
+        })
+    }
+}
+
 pub(crate) fn reserve_window(
     state: &mut State,
     scope: &WorkScope,

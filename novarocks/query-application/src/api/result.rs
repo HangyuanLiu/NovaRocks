@@ -809,14 +809,16 @@ impl EndDelivery {
 
 /// Move-only ownership of one validated Backend-encoded root data item and
 /// the window alias covering its backing. Completing it is the in-order
-/// delivery receipt that lets the relay acknowledge the item; the backing and
-/// its alias exit before that receipt is observed.
+/// delivery receipt that lets the relay acknowledge the item. A shared window
+/// owner may retain the backing through that receipt handoff for a closing cut;
+/// capacity remains held until its last actual owner exits.
 pub struct RootSegmentDelivery {
     execution_id: QueryExecutionId,
     sequence: ResultPacketSequence,
-    reply: Option<RetainedRootReply>,
+    reply: Option<Arc<RetainedRootReply>>,
     client_rows: Option<(ClientRowProfile, ClientRowStreamCursor)>,
     rows: u64,
+    resident_window: Option<super::RootRelayResidentWindow>,
     signal: DeliverySignal,
 }
 
@@ -826,10 +828,11 @@ impl RootSegmentDelivery {
     pub(crate) fn try_new(
         execution_id: QueryExecutionId,
         sequence: ResultPacketSequence,
-        reply: RetainedRootReply,
+        reply: impl Into<Arc<RetainedRootReply>>,
         client_rows: Option<(ClientRowProfile, ClientRowStreamCursor)>,
         rows: u64,
     ) -> Result<(Self, ResultDeliveryReceipt), QueryExecutionError> {
+        let reply = reply.into();
         let body = match reply.outcome() {
             RootReplyView::Data { body, .. } => body,
             _ => {
@@ -861,10 +864,21 @@ impl RootSegmentDelivery {
                 reply: Some(reply),
                 client_rows,
                 rows,
+                resident_window: None,
                 signal,
             },
             receipt,
         ))
+    }
+
+    pub(crate) fn with_resident_window(mut self, window: super::RootRelayResidentWindow) -> Self {
+        self.resident_window = Some(window);
+        self
+    }
+    /// Retains the bounded window through between-delivery protocol phases.
+    /// This shares ownership and exposes no independently clonable bytes.
+    pub fn resident_window(&self) -> Option<super::RootRelayResidentWindow> {
+        self.resident_window.clone()
     }
 
     pub const fn execution_id(&self) -> QueryExecutionId {
@@ -901,7 +915,8 @@ impl RootSegmentDelivery {
                 .expect("a root segment validated at construction"),
         )
     }
-    /// Delivery completed: the backing and its alias exit first.
+    /// Complete protocol consumption. The relay then retires its shared owner
+    /// before acknowledging this receipt to the Backend.
     pub fn complete(mut self) {
         drop(self.reply.take());
         self.signal.finish(ResultDeliveryDisposition::Completed);

@@ -26,6 +26,7 @@ mod listener;
 mod listener_settings;
 mod query_application_shim;
 mod relay_metadata;
+mod relay_result_writer;
 mod result_encoding;
 mod result_value;
 mod result_writer;

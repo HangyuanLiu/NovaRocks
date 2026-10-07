@@ -50,7 +50,7 @@ mod packet_writer;
 mod streaming;
 pub use limits::ProtocolLimits;
 pub use streaming::{
-    ClosingMysqlWriter, FramingCursor, FrozenMetadata, OwnedStreamingMysqlWriter, ResidentTailPart,
+    ClosingMysqlWriter, ClosingResponseLease, FramingCursor, FrozenMetadata, OwnedStreamingMysqlWriter, ResidentTailPart,
     StreamingResponseLease, WritePhase,
 };
 mod params;

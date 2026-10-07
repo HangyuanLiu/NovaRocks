@@ -884,6 +884,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_closing_transfer_releases_ordinary_window_after_last_alias_exit() {
+        use crate::api::{
+            ExecutionHandle, ExecutionOutput, QueryResultStream, ResultField, ResultRowCarrier,
+            ResultSchema,
+        };
+        use crate::protocol_delivery::StreamingStatementResult;
+        use novarocks_workload_control::{ResultCapacityConfig, ResultWindowClass};
+        let control = Arc::new(QueryApplicationControl::default());
+        let service = QueryControlService::new(control.clone());
+        let workload = WorkloadControl::try_new(
+            WorkloadConfig {
+                query_concurrency_limit: 1,
+                ..WorkloadConfig::default()
+            },
+            ResourceConfig {
+                total_bytes: 1024,
+                control_bytes: 128,
+                per_scope_bytes: 896,
+            },
+        )
+        .unwrap();
+        let capacity = workload
+            .configure_result_capacity(ResultCapacityConfig {
+                positions: [1; 4],
+                client_compute_positions: 1,
+                client_short_tail_positions: 0,
+                supported_cancel_burst: 0,
+                sustained_cancels_per_second: 0,
+                ..ResultCapacityConfig::V1
+            })
+            .unwrap();
+        workload.mark_ready().unwrap();
+        let session = register(&control, 7, 1, "root");
+        let mut statement = service
+            .begin_queued_governed_query_statement_with_result(
+                session,
+                &workload.root_admission(),
+                None,
+                None,
+                None,
+                ResultWindowClass::Client,
+            )
+            .await
+            .unwrap();
+        let native_alias = statement.result_window_alias().unwrap();
+        let owner = statement.take_execution_owner().unwrap();
+        let (_transport, _receipt, _failure, stream) = QueryResultStream::try_channel(
+            novarocks_types::identity::QueryId::new(71, 1),
+            ResultSchema::new(vec![ResultField::new(
+                "value",
+                arrow::datatypes::DataType::Int32,
+                false,
+                None,
+            )]),
+            ResultRowCarrier::DecodedBatches,
+            1,
+        )
+        .unwrap();
+        let execution = ExecutionHandle::new(
+            owner.cancellation_requester(),
+            ExecutionOutput::Rows(stream),
+        );
+        let mut result = StreamingStatementResult::try_from_execution(
+            execution,
+            workload.resources(),
+            statement,
+        )
+        .unwrap();
+        control.kill_query(session, 7);
+        let grant = result.try_closing_capacity(true).unwrap();
+        assert_eq!(workload.snapshot().admitted_queries, 0);
+        let closing = result
+            .into_closing_delivery((), grant, 1024)
+            .unwrap_or_else(|_| panic!("valid transfer"));
+        assert_eq!(
+            capacity.snapshot().held_positions[0],
+            1,
+            "Native short tail retains the original window"
+        );
+        drop(native_alias);
+        assert_eq!(
+            capacity.snapshot().held_positions[0],
+            0,
+            "closing owns no ordinary window after actual alias exit"
+        );
+        assert_eq!(capacity.snapshot().held_positions[3], 1);
+        assert!(matches!(
+            service.begin_statement(session),
+            Err(QueryControlError::StatementBusy)
+        ));
+        owner.complete();
+        assert!(matches!(
+            closing.settle_after_writer_exit().await,
+            GovernedStatementFinishOutcome::Cancelled(_)
+        ));
+        assert_eq!(capacity.snapshot().held_positions[3], 0);
+        assert!(service.begin_statement(session).is_ok());
+    }
+
+    #[tokio::test]
     async fn delivery_cut_returns_compute_only_and_closing_retains_generation_and_aliases() {
         use crate::protocol_delivery::{ClosingDelivery, GovernedProtocolOwner};
         use novarocks_workload_control::{ResultCapacityConfig, ResultClosingCut};
