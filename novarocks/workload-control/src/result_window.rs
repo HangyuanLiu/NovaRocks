@@ -38,7 +38,7 @@ pub enum ResultClosingCut {
     OriginatingFailure,
 }
 impl ResultWindowClass {
-    const fn index(self) -> usize {
+    pub(crate) const fn index(self) -> usize {
         match self {
             Self::Client => 0,
             Self::Local => 1,
@@ -200,37 +200,74 @@ pub(crate) fn reserve_window(
     if state.closed {
         return Err(WorkError::Closed);
     }
-    let config = state.result_capacity.ok_or(WorkError::NotReady)?;
-    let index = class.index();
     let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
     // Closing keeps the original responsibility after cancellation. It does
     // not admit new computation and must not clear its cancellation reason.
     if class != ResultWindowClass::Closing {
         node.check()?;
     }
+    let all_objects_bytes = count_window(state, scope.id, class)?;
+    Ok(adopt_window(scope, class, all_objects_bytes))
+}
+
+/// Whether one more complete position of `class` fits right now.
+pub(crate) fn window_room(
+    capacity: &Option<ResultCapacityConfig>,
+    held: &ResultCapacitySnapshot,
+    class: ResultWindowClass,
+) -> bool {
+    capacity
+        .is_some_and(|config| held.held_positions[class.index()] < config.positions[class.index()])
+}
+
+/// Count one complete position for `scope` under the authority transaction and
+/// return its all-objects envelope. The caller turns the counted position into
+/// exactly one grant, or gives it back with [`uncount_window`].
+pub(crate) fn count_window(
+    state: &mut State,
+    scope: WorkId,
+    class: ResultWindowClass,
+) -> Result<u64, WorkError> {
+    let config = state.result_capacity.ok_or(WorkError::NotReady)?;
+    let index = class.index();
     if state.result_windows.held_positions[index] >= config.positions[index] {
         return Err(WorkError::Capacity("complete result window"));
     }
-    let holders = node
+    let node = state.nodes.get_mut(&scope).ok_or(WorkError::Released)?;
+    node.resource_holders = node
         .resource_holders
         .checked_add(1)
         .ok_or(WorkError::ArithmeticOverflow)?;
-    state.nodes.get_mut(&scope.id).unwrap().resource_holders = holders;
-    state
-        .nodes
-        .get_mut(&scope.id)
-        .unwrap()
-        .result_windows
-        .held_positions[index] += 1;
+    node.result_windows.held_positions[index] += 1;
     state.result_windows.held_positions[index] += 1;
-    Ok(ResultWindowGrant {
+    Ok(config.all_objects_bytes[index])
+}
+
+/// Give back a counted position that never became a grant.
+pub(crate) fn uncount_window(state: &mut State, scope: WorkId, class: ResultWindowClass) {
+    state.result_windows.held_positions[class.index()] -= 1;
+    let node = state
+        .nodes
+        .get_mut(&scope)
+        .expect("a counted window retains its responsibility");
+    node.resource_holders -= 1;
+    node.result_windows.held_positions[class.index()] -= 1;
+}
+
+/// The unique grant for a position already counted for `scope`.
+pub(crate) fn adopt_window(
+    scope: &WorkScope,
+    class: ResultWindowClass,
+    all_objects_bytes: u64,
+) -> ResultWindowGrant {
+    ResultWindowGrant {
         holder: Arc::new(WindowHolder {
             scope: scope.clone(),
             class,
-            all_objects_bytes: config.all_objects_bytes[index],
+            all_objects_bytes,
         }),
         closing_cut: None,
-    })
+    }
 }
 
 struct WindowHolder {
@@ -241,18 +278,7 @@ struct WindowHolder {
 impl Drop for WindowHolder {
     fn drop(&mut self) {
         self.scope.inner.update(|state| {
-            state.result_windows.held_positions[self.class.index()] -= 1;
-            state
-                .nodes
-                .get_mut(&self.scope.id)
-                .expect("window retains its responsibility")
-                .resource_holders -= 1;
-            state
-                .nodes
-                .get_mut(&self.scope.id)
-                .unwrap()
-                .result_windows
-                .held_positions[self.class.index()] -= 1;
+            uncount_window(state, self.scope.id, self.class);
             state.collect(self.scope.id);
         });
     }
@@ -400,6 +426,175 @@ mod tests {
         drop(alias);
         assert_eq!(capacity.snapshot().held_positions, [0; 4]);
     }
+    /// Two query permits but one Client window, so the window decides.
+    fn window_bound_control() -> (WorkloadControl, ResultCapacityHandle) {
+        let control = WorkloadControl::try_new(
+            WorkloadConfig {
+                query_concurrency_limit: 2,
+                ..WorkloadConfig::default()
+            },
+            ResourceConfig {
+                total_bytes: 1024 * 1024,
+                control_bytes: 1024,
+                per_scope_bytes: 1024 * 1024 - 1024,
+            },
+        )
+        .unwrap();
+        let handle = control
+            .configure_result_capacity(ResultCapacityConfig {
+                client_compute_positions: 2,
+                client_short_tail_positions: 0,
+                supported_cancel_burst: 0,
+                sustained_cancels_per_second: 0,
+                positions: [2, 1, 1, 1],
+                ..ResultCapacityConfig::V1
+            })
+            .unwrap();
+        control.mark_ready().unwrap();
+        (control, handle)
+    }
+    fn admitted_queries(control: &WorkloadControl) -> usize {
+        control.inner.state.lock().unwrap().admitted_queries
+    }
+    async fn pending<F: std::future::Future + Unpin>(future: &mut F) -> bool {
+        tokio::time::timeout(std::time::Duration::from_millis(20), future)
+            .await
+            .is_err()
+    }
+
+    #[tokio::test]
+    async fn permit_and_window_are_one_dequeue_transaction() {
+        let (control, capacity) = window_bound_control();
+        let first = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let second = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let other = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        // Another owner already holds one of the two Client windows.
+        let held = capacity
+            .try_acquire(&other.owner.scope(), ResultWindowClass::Client)
+            .unwrap();
+        let (permit, window) = first
+            .owner
+            .scope()
+            .admit_query_with_result(ResultWindowClass::Client)
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(window.class(), ResultWindowClass::Client);
+        assert!(window.is_for_scope(&first.owner.scope()));
+        assert_eq!(capacity.snapshot().held_positions, [2, 0, 0, 0]);
+        assert_eq!(admitted_queries(&control), 1);
+        // A permit is free but no Client window is: the second query waits
+        // without taking its permit.
+        let mut waiting = second
+            .owner
+            .scope()
+            .admit_query_with_result(ResultWindowClass::Client)
+            .unwrap();
+        assert!(pending(&mut waiting).await);
+        assert_eq!(admitted_queries(&control), 1);
+        // A query of another class is not blocked behind it.
+        let (local_permit, local) = other
+            .owner
+            .scope()
+            .admit_query_with_result(ResultWindowClass::Local)
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(admitted_queries(&control), 2);
+        drop((local_permit, local));
+        // Returning the permit alone does not admit the waiter; the window
+        // it needs must exit too.
+        drop(permit);
+        assert!(pending(&mut waiting).await);
+        drop(window);
+        let (second_permit, second_window) = waiting.await.unwrap();
+        assert!(second_window.is_for_scope(&second.owner.scope()));
+        assert_eq!(capacity.snapshot().held_positions, [2, 0, 0, 0]);
+        drop((second_permit, second_window, held));
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        assert_eq!(admitted_queries(&control), 0);
+    }
+
+    #[tokio::test]
+    async fn abandoned_or_cancelled_admission_returns_both_parts() {
+        let (control, capacity) = window_bound_control();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        // Granted by dispatch but never received: dropping returns both.
+        let admission = root
+            .owner
+            .scope()
+            .admit_query_with_result(ResultWindowClass::Client)
+            .unwrap();
+        assert_eq!(capacity.snapshot().held_positions, [1, 0, 0, 0]);
+        assert_eq!(admitted_queries(&control), 1);
+        drop(admission);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        assert_eq!(admitted_queries(&control), 0);
+        // Cancelled while granted but unreceived.
+        let admission = root
+            .owner
+            .scope()
+            .admit_query_with_result(ResultWindowClass::Internal)
+            .unwrap();
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        root.owner.cancel(crate::CancellationReason::Requested);
+        assert!(matches!(admission.await, Err(WorkError::Cancelled(_))));
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        assert_eq!(admitted_queries(&control), 0);
+    }
+
+    #[tokio::test]
+    async fn result_admission_requires_profile_and_an_ordinary_class() {
+        let (control, _) = window_bound_control();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        assert!(matches!(
+            root.owner
+                .scope()
+                .admit_query_with_result(ResultWindowClass::Closing),
+            Err(WorkError::Conflict)
+        ));
+        let pending = root
+            .owner
+            .scope()
+            .admit_query_with_result(ResultWindowClass::Client)
+            .unwrap();
+        // One query admission per root: this one was already granted.
+        assert!(matches!(
+            root.owner.scope().admit_query(),
+            Err(WorkError::AlreadyAdmitted)
+        ));
+        drop(pending);
+        let unconfigured = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024 * 1024,
+                control_bytes: 1024,
+                per_scope_bytes: 1024 * 1024 - 1024,
+            },
+        )
+        .unwrap();
+        unconfigured.mark_ready().unwrap();
+        let root = unconfigured
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        assert!(matches!(
+            root.owner
+                .scope()
+                .admit_query_with_result(ResultWindowClass::Client),
+            Err(WorkError::NotReady)
+        ));
+    }
+
     #[test]
     fn capacity_is_explicit_startup_only_and_foreign_scopes_reject() {
         let (owner, capacity) = control();

@@ -74,7 +74,9 @@ mod resource;
 mod result_window;
 mod scope;
 
-pub use admission::{QueryAdmission, Stage, StageAdmission, StagePermit, StageRequest};
+pub use admission::{
+    QueryAdmission, ResultQueryAdmission, Stage, StageAdmission, StagePermit, StageRequest,
+};
 pub use cancellation::{CancellationReason, CancellationView};
 pub use observation::{
     ControlIntent, ControlIntents, ControlPermit, Obligation, ObligationEndSnapshot, ObligationKey,
