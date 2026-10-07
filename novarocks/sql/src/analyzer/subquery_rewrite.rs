@@ -326,13 +326,15 @@ impl<'a> AnalyzerContext<'a> {
         }
         let probe = self.analyze_expr(source, scope)?;
         if self.logical_output_type(Some(source), &probe, scope)? != Some(SqlType::Json) {
+            // A JSON operand whose logical type is not proven cannot become
+            // JSON membership, and must not fall through to ordinary text IN.
+            if super::resolve_expr::is_json_in_subquery_operand(&probe, scope) {
+                return Err(AnalyzeError::unsupported_expression(
+                    "In predicate of JSON does not support subquery",
+                    source.span(),
+                ));
+            }
             return Ok(false);
-        }
-        if !self.json_membership_enabled {
-            return Err(AnalyzeError::unsupported_expression(
-                "In predicate of JSON does not support subquery",
-                source.span(),
-            ));
         }
         let clause = locate_scalar_placeholder_clause(select, info.id).ok_or_else(|| {
             AnalyzeError::unsupported_query_shape(
@@ -2946,7 +2948,6 @@ impl<'a> AnalyzerContext<'a> {
         outer_scope: &AnalyzerScope,
     ) -> Result<(ResolvedQuery, AnalyzerScope), AnalyzeError> {
         let child_ctx = AnalyzerContext {
-            json_membership_enabled: self.json_membership_enabled,
             catalog: self.catalog,
             current_database: self.current_database,
             function_catalog: self.function_catalog,

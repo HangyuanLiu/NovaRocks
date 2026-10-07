@@ -221,34 +221,6 @@ fn analyze_with_factory_and_function_catalog_inner(
     ),
     AnalyzeError,
 > {
-    analyze_membership_candidate_inner(
-        query,
-        catalog,
-        current_database,
-        factory,
-        function_catalog,
-        sql_semantics,
-        false,
-    )
-}
-
-// P32 opens the production route only after wire/runtime integration.
-fn analyze_membership_candidate_inner(
-    query: &ast::Query,
-    catalog: &dyn PlannerTableProvider,
-    current_database: &str,
-    factory: crate::column_id::ColumnRefFactory,
-    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-    sql_semantics: &crate::sql_mode::SqlSemanticSettings,
-    json_membership_enabled: bool,
-) -> Result<
-    (
-        ResolvedQuery,
-        crate::analysis::cte::CTERegistry,
-        crate::column_id::ColumnRefFactory,
-    ),
-    AnalyzeError,
-> {
     let query = crate::sql_mode::normalize_concat_query(query.clone(), sql_semantics)?;
     let query = query_prepass::preanalyze(query)?;
     let factory = std::rc::Rc::new(std::cell::RefCell::new(factory));
@@ -257,7 +229,6 @@ fn analyze_membership_candidate_inner(
         current_database,
         function_catalog,
         sql_semantics: sql_semantics.clone(),
-        json_membership_enabled,
         factory: factory.clone(),
         ctes: std::collections::HashMap::new(),
         pending_ctes: std::collections::HashSet::new(),
@@ -287,14 +258,13 @@ pub(crate) fn analyze_json_membership_candidate(
     ),
     AnalyzeError,
 > {
-    analyze_membership_candidate_inner(
+    analyze_with_factory_and_function_catalog_inner(
         query,
         catalog,
         current_database,
         crate::column_id::ColumnRefFactory::new(),
         crate::functions::builtin_sql_function_catalog(),
         &crate::sql_mode::SqlSemanticSettings::default(),
-        true,
     )
 }
 
@@ -303,7 +273,6 @@ pub(crate) fn analyze_json_membership_candidate(
 // ---------------------------------------------------------------------------
 
 pub(super) struct AnalyzerContext<'a> {
-    pub(super) json_membership_enabled: bool,
     pub(super) catalog: &'a dyn PlannerTableProvider,
     pub(super) current_database: &'a str,
     pub(super) function_catalog: &'a dyn crate::compiler::SqlFunctionCatalog,
@@ -341,7 +310,6 @@ impl<'a> AnalyzerContext<'a> {
             current_database: self.current_database,
             function_catalog: self.function_catalog,
             sql_semantics: settings,
-            json_membership_enabled: self.json_membership_enabled,
             factory: self.factory.clone(),
             ctes: self.ctes.clone(),
             pending_ctes: self.pending_ctes.clone(),
@@ -418,7 +386,6 @@ impl<'a> AnalyzerContext<'a> {
             current_database: self.current_database,
             function_catalog: self.function_catalog,
             sql_semantics: self.sql_semantics.clone(),
-            json_membership_enabled: self.json_membership_enabled,
             factory: self.factory.clone(),
             ctes: self.ctes.clone(),
             pending_ctes: pending_ctes.clone(),

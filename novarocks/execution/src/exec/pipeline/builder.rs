@@ -1022,8 +1022,10 @@ fn build_pipeline_for_node(
     ctx: &mut PipelineBuildContext,
 ) -> Result<PipelineBuildResult, String> {
     match &node.kind {
+        // Membership's shared RHS owner and its allocations belong to one
+        // exact native task, which only LocalRuntimeBindings can supply.
         ExecNodeKind::Membership(_) => {
-            Err("membership runtime integration is not installed".into())
+            Err("JSON membership execution requires exact LocalRuntimeBindings".into())
         }
         ExecNodeKind::QuotaPreclaim(_) | ExecNodeKind::QuotaTrim(_) => {
             Err("quota execution requires exact LocalRuntimeBindings".into())
@@ -1090,9 +1092,9 @@ fn build_pipeline_for_node(
         }) => {
             if *retention_admission != novarocks_local_program::ProjectRetentionAdmission::Existing
             {
-                return Err(
-                    "checked Project retention runtime integration is not installed".into(),
-                );
+                // Checked retention charges pending output to one exact native
+                // task, which only LocalRuntimeBindings can supply.
+                return Err("checked Project retention requires exact LocalRuntimeBindings".into());
             }
             let mut build = build_pipeline_for_node(input, ctx)?;
             build

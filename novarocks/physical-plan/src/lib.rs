@@ -60,7 +60,10 @@ pub use validation::*;
 /// Exact revision of the semantic plan contract implemented by this crate.
 ///
 /// It is part of the repository's complete Native compatibility material.
-pub const PLAN_CONTRACT_REVISION: u32 = 8;
+/// Revision 9 adds JSON value membership with its checked Project retention,
+/// and carries every SQL type and exact Arrow schema as a flat bounded node
+/// tree; a revision-8 peer can decode neither.
+pub const PLAN_CONTRACT_REVISION: u32 = 9;
 
 #[cfg(test)]
 mod tests;

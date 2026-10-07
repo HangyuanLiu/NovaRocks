@@ -673,14 +673,6 @@ impl<'a> super::AnalyzerContext<'a> {
                     // is dropped before the subquery is planned so we cannot
                     // wait until later.
                     let in_expr_typed = self.analyze_expr(&in_subquery.expr, scope)?;
-                    if is_json_in_subquery_operand(&in_expr_typed, scope)
-                        && !self.json_membership_enabled
-                    {
-                        return Err(AnalyzeError::unsupported_expression(
-                            "In predicate of JSON does not support subquery",
-                            in_subquery.span,
-                        ));
-                    }
                     if let Some(logical) = scope
                         .logical_type_of_expr(&in_expr_typed)
                         .filter(is_bitmap_or_hll_type)
@@ -4269,7 +4261,9 @@ fn json_semantic_group_by_type_name(expr: &TypedExpr) -> Option<String> {
     }
 }
 
-fn is_json_in_subquery_operand(expr: &TypedExpr, scope: &AnalyzerScope) -> bool {
+/// Whether an IN-subquery operand is JSON by its proven logical type or by
+/// the semantics of the function producing it.
+pub(super) fn is_json_in_subquery_operand(expr: &TypedExpr, scope: &AnalyzerScope) -> bool {
     matches!(
         scope.logical_type_of_expr(expr),
         Some(novarocks_types::schema::SqlType::Json)

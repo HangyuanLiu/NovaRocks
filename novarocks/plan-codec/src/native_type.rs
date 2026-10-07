@@ -553,6 +553,20 @@ mod tests {
         assert!(decode_type(&empty).is_err());
     }
 
+    /// A peer still sending the retired recursive grammar (field 1 carried a
+    /// scalar directly) produces a descriptor without nodes, which is refused
+    /// rather than read as some default type.
+    #[test]
+    fn retired_recursive_payload_is_refused() {
+        use prost::Message;
+        // TypeDesc { scalar (field 1) = ScalarType { type (field 1) = INT } }
+        let retired = [0x0a, 0x02, 0x08, common::PrimitiveType::Int as u8];
+        let desc =
+            common::TypeDesc::decode(retired.as_slice()).expect("unknown fields are skipped");
+        assert!(desc.nodes.is_empty());
+        assert!(decode_type(&desc).is_err());
+    }
+
     #[test]
     fn deep_descriptor_decodes_under_the_default_protobuf_recursion_limit() {
         use prost::Message;

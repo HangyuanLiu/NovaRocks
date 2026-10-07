@@ -122,15 +122,22 @@ mod tests {
     }
 
     #[test]
-    fn membership_public_analyzer_guard_remains_closed() {
+    fn membership_public_analyzer_admits_proven_json_value_membership() {
         let statements =
             novarocks_parser::parse("SELECT parse_json('1') IN (SELECT parse_json('1'))").unwrap();
         let [Statement::Query(query)] = statements.as_slice() else {
             panic!("query expected");
         };
-        assert!(
-            crate::analyzer::analyze(query, &PlannerMemoryCatalog::default(), "default").is_err()
-        );
+        let (query, _, _) =
+            crate::analyzer::analyze(query, &PlannerMemoryCatalog::default(), "default")
+                .expect("the public analyzer admits proven JSON value membership");
+        let QueryBody::Select(select) = query.body else {
+            panic!("select expected");
+        };
+        assert!(matches!(
+            select.predicate_apply_specs.as_slice(),
+            [spec] if matches!(spec.execution_kind, PredicateExecutionKind::JsonMembership { .. })
+        ));
         // Utf8 alone is not JSON evidence; the existing String path remains available.
         let (query, _, _) = analyzed("SELECT 'a' IN (SELECT 'a')").unwrap();
         let QueryBody::Select(select) = query.body else {

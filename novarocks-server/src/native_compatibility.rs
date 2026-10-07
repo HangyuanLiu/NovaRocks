@@ -402,9 +402,11 @@ mod tests {
         );
         // Revision 4 lacks expression overflow policy. Revision 5 has that
         // policy but predates the visible-bag/quota semantic vocabulary.
-        // Keep every other compatibility owner equal to isolate each plan
-        // semantic contract, independently of the descriptor's wire shape.
-        let peers = [4, 5].map(|revision| {
+        // Revision 8 predates JSON value membership and the flat type
+        // carriers, so it can decode neither. Keep every other compatibility
+        // owner equal to isolate each plan semantic contract, independently
+        // of the descriptor's wire shape.
+        let peers = [4, 5, 8].map(|revision| {
             novarocks_version::derive_repository_native_compatibility_material(
                 native_carrier_declarations(manifest.contracts()).unwrap(),
                 [0x31; 32],
@@ -428,14 +430,24 @@ mod tests {
                 prior.execution_implementation_manifest_digest()
             );
         }
-        // The two retired semantic contracts remain distinct from each other,
-        // as well as from the current visible-bag/quota contract.
+        // The retired semantic contracts remain distinct from each other, as
+        // well as from the current membership and flat-carrier contract.
         assert_eq!(peers[0].plan_contract_revision(), 4);
         assert_eq!(peers[1].plan_contract_revision(), 5);
-        assert_ne!(
-            peers[0].plan_contract_digest(),
-            peers[1].plan_contract_digest()
-        );
-        assert_ne!(peers[0].id(), peers[1].id());
+        assert_eq!(peers[2].plan_contract_revision(), 8);
+        for (index, left) in peers.iter().enumerate() {
+            for right in &peers[index + 1..] {
+                assert_ne!(left.plan_contract_digest(), right.plan_contract_digest());
+                assert_ne!(left.id(), right.id());
+            }
+        }
+        // The plan revision moves alone: the Iceberg provider contract stays
+        // at revision 4, so its private carriers are unchanged.
+        let iceberg = current
+            .carriers()
+            .iter()
+            .find(|carrier| carrier.provider_id() == "iceberg")
+            .expect("the server manifest declares Iceberg");
+        assert_eq!(iceberg.contract_revision(), 4);
     }
 }
