@@ -919,3 +919,307 @@ fn complete_read_success_publication_tail_and_ordinary_error_tail_preserve_three
         }
     }
 }
+
+/// The read stage of `validate_fragment_providers`: one installed pure catalog
+/// carrying only the Iceberg read compiler.
+fn iceberg_catalog() -> novarocks_connector_contract::PureProviderProgramCatalog<ConnectorCodecError>
+{
+    use novarocks_connector_contract::{PureProviderManifestEntry, PureProviderProgramDefinition};
+    let provider = ConnectorProviderId::parse(crate::PROVIDER_ID).unwrap();
+    novarocks_connector_contract::PureProviderProgramCatalog::try_new(
+        &[PureProviderManifestEntry::new(
+            provider.clone(),
+            true,
+            false,
+        )],
+        vec![PureProviderProgramDefinition::new(
+            provider,
+            Some(Arc::new(IcebergReadRecipeCompiler)),
+            None,
+        )],
+        &Control::accept(),
+    )
+    .unwrap()
+}
+
+/// The fixture with its public fields replaced by the provider's own published
+/// schema for the same relation and columns.
+fn published(fixture: &Fixture) -> Fixture {
+    let schema = match &fixture.relation {
+        IcebergRuntimeRelation::SystemTable(reference) => {
+            let output = crate::typed_read::system_relation_schema(
+                reference.system_table_type(),
+                &partitioned_schema(),
+                &[PartitionSpec::unpartition_spec()],
+            )
+            .unwrap();
+            crate::typed_read::codec::system_public_read_schema(
+                reference.system_table_type(),
+                &fixture.columns,
+                &output,
+            )
+            .unwrap()
+        }
+        relation => {
+            crate::typed_read::codec::public_read_schema(relation, &fixture.columns).unwrap()
+        }
+    };
+    let mut published = fixture.clone();
+    published.fields = schema.schema().fields().to_vec();
+    // The fixture freezes logical types derived from its fields; they must be
+    // exactly the published ones, so the frozen read carries the author's.
+    assert_eq!(
+        schema.logical_types(),
+        published
+            .fields
+            .iter()
+            .map(|field| novarocks_type_contract::field_logical_type(field).unwrap())
+            .collect::<Vec<_>>()
+    );
+    published
+}
+
+#[test]
+fn every_final_relation_kind_publishes_a_schema_its_pure_compiler_accepts() {
+    let catalog = iceberg_catalog();
+    let mut fixtures = vec![Fixture::table(), window_fixture(), rewrite_fixture()];
+    for kind in [
+        IcebergSystemTableType::Files,
+        IcebergSystemTableType::Entries,
+        IcebergSystemTableType::Snapshots,
+        IcebergSystemTableType::History,
+        IcebergSystemTableType::Refs,
+        IcebergSystemTableType::Manifests,
+        IcebergSystemTableType::Partitions,
+    ] {
+        let mut fixture = system_fixture(kind);
+        // Reordered output with a repeat keeps each column's own field.
+        fixture.columns.reverse();
+        fixture.columns.push(fixture.columns[0].clone());
+        fixtures.push(fixture);
+    }
+    for fixture in fixtures {
+        let frozen = published(&fixture).build();
+        let recipe = catalog
+            .compile_read(&frozen, &Control::accept())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{:?} public schema refused: {error}",
+                    fixture.relation.kind()
+                )
+            });
+        assert_eq!(recipe.frozen(), &frozen);
+    }
+}
+
+#[test]
+fn published_schema_carries_ids_defaults_and_nested_domains_and_passes_the_pure_catalog() {
+    use crate::iceberg::spec::{ListType, Literal, MapType, StructType};
+    use crate::typed_read::schema_binding::IcebergMetadataColumn;
+
+    let schema = Schema::builder()
+        .with_fields(vec![
+            Arc::new(
+                NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long))
+                    .with_initial_default(Literal::long(7)),
+            ),
+            Arc::new(NestedField::optional(
+                2,
+                "point",
+                Type::Struct(StructType::new(vec![
+                    Arc::new(NestedField::required(
+                        3,
+                        "x",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::optional(
+                        4,
+                        "label",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                ])),
+            )),
+            Arc::new(NestedField::optional(
+                5,
+                "tags",
+                Type::List(ListType::new(Arc::new(NestedField::list_element(
+                    6,
+                    Type::Primitive(PrimitiveType::String),
+                    false,
+                )))),
+            )),
+            Arc::new(NestedField::optional(
+                7,
+                "attrs",
+                Type::Map(MapType::new(
+                    Arc::new(NestedField::map_key_element(
+                        8,
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                    Arc::new(NestedField::map_value_element(
+                        9,
+                        Type::Primitive(PrimitiveType::Long),
+                        false,
+                    )),
+                )),
+            )),
+        ])
+        .build()
+        .unwrap();
+    let base = |id| IcebergColumnHandle::base_column_of(&schema, id).unwrap();
+    let file = crate::typed_read::table_execute::rewrite_position_delete_pseudo_column(
+        "_file",
+        IcebergMetadataColumn::Path,
+    )
+    .unwrap();
+    let columns = vec![
+        base(1),
+        base(2),
+        base(2).dereference(&[3]).unwrap(),
+        base(5),
+        base(7),
+        file,
+        base(1),
+    ];
+    let relation = IcebergRuntimeRelation::Table(
+        IcebergTableHandle::try_new(table_handle_params(&schema, None)).unwrap(),
+    );
+    let schema_out = crate::typed_read::codec::public_read_schema(&relation, &columns).unwrap();
+    let fields = schema_out.schema().fields();
+    let id = |field: &arrow::datatypes::Field| field.metadata()[PARQUET_FIELD_ID_META_KEY].clone();
+    let children = |field: &arrow::datatypes::Field| match field.data_type() {
+        DataType::Struct(children) => children.iter().map(|child| id(child)).collect::<Vec<_>>(),
+        DataType::List(element) => vec![id(element)],
+        DataType::Map(entries, _) => match entries.data_type() {
+            DataType::Struct(children) => children.iter().map(|child| id(child)).collect(),
+            other => panic!("map entries are {other:?}"),
+        },
+        other => panic!("not nested: {other:?}"),
+    };
+
+    // Names and field IDs are the source's own, at the root and inside every
+    // nested domain; the initial default travels with its field.
+    assert_eq!(
+        fields.iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+        ["id", "point", "x", "tags", "attrs", "_file", "id"]
+    );
+    assert_eq!(
+        fields.iter().map(|f| id(f)).collect::<Vec<_>>(),
+        [
+            "1".to_string(),
+            "2".into(),
+            "3".into(),
+            "5".into(),
+            "7".into(),
+            IcebergMetadataColumn::Path.field_id().to_string(),
+            "1".into(),
+        ]
+    );
+    assert_eq!(
+        fields[0].metadata()[crate::default_value::ICEBERG_INITIAL_DEFAULT_META_KEY],
+        "7"
+    );
+    assert_eq!(children(&fields[1]), ["3", "4"]);
+    assert_eq!(children(&fields[3]), ["6"]);
+    assert_eq!(children(&fields[4]), ["8", "9"]);
+    // A required child read through an optional parent is nullable.
+    assert!(schema.field_by_id(3).unwrap().required);
+    assert!(fields[2].is_nullable());
+    assert!(
+        schema_out
+            .logical_types()
+            .iter()
+            .all(|logical| *logical == novarocks_type_contract::ValueLogicalType::Physical)
+    );
+
+    // The catalog projection the plan's engine types come from agrees with
+    // the read author on every base column's exact nested domain.
+    let projected = crate::schema_mapping::annotate_read_schema_from_scan_model(
+        &crate::scalar_integer_domain::sql_schema(&schema, &HashMap::new()).unwrap(),
+        &crate::schema_facts::iceberg_schema_def(&schema),
+    )
+    .unwrap();
+    for (ordinal, name) in [(0, "id"), (1, "point"), (3, "tags"), (4, "attrs")] {
+        let catalog = projected.field_with_name(name).unwrap();
+        assert!(
+            novarocks_type_contract::arrow_data_types_exact(
+                fields[ordinal].data_type(),
+                catalog.data_type()
+            ),
+            "{name}: published {:?} differs from catalog {:?}",
+            fields[ordinal].data_type(),
+            catalog.data_type()
+        );
+        assert_eq!(fields[ordinal].is_nullable(), catalog.is_nullable());
+    }
+
+    let fixture = Fixture {
+        source: source_for(&relation),
+        fields: fields.to_vec(),
+        relation,
+        columns,
+        metadata: None,
+        work_source: ConnectorReadWorkSource::RuntimeSplits,
+    };
+    let frozen = published(&fixture).build();
+    let recipe = iceberg_catalog()
+        .compile_read(&frozen, &Control::accept())
+        .unwrap();
+    assert_eq!(recipe.frozen(), &frozen);
+}
+
+#[test]
+fn relations_without_a_public_field_author_refuse_explicitly() {
+    let base = crate::typed_boundary::final_static_facts_tests::table_handle();
+    let schema = base.parse_table_schema().unwrap();
+    let column = IcebergColumnHandle::base_column_of(&schema, 1).unwrap();
+    let function = TableChangesFunctionHandle::try_new(TableChangesFunctionHandleParams {
+        schema_table_name: base.schema_table_name().clone(),
+        table_schema_json: base.table_schema_json().into(),
+        columns: vec![column.clone()],
+        name_mapping_json: None,
+        start_snapshot_id: 40,
+        end_snapshot_id: 41,
+    })
+    .unwrap();
+    let insert = IcebergInsertTableHandle::try_new(IcebergInsertTableHandleParams {
+        schema_table_name: base.schema_table_name().clone(),
+        table_schema_json: base.table_schema_json().into(),
+        table_location: base.table_location().into(),
+        format_version: base.format_version(),
+        spec_id: None,
+    })
+    .unwrap();
+    let merge = IcebergMergeTableHandle::try_new(base.clone(), insert).unwrap();
+    let system = system_fixture(IcebergSystemTableType::Snapshots).relation;
+    // A metadata relation is authored from its frozen system schema only.
+    for relation in [
+        IcebergRuntimeRelation::TableFunction(function),
+        IcebergRuntimeRelation::MergeTable(merge),
+        system,
+    ] {
+        let error =
+            crate::typed_read::codec::public_read_schema(&relation, std::slice::from_ref(&column))
+                .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            ConnectorErrorKind::Unsupported,
+            "{:?}",
+            relation.kind()
+        );
+    }
+
+    // A column the frozen source does not have is not authored by guess.
+    let foreign = IcebergColumnHandle::base_column(&NestedField::required(
+        99,
+        "ghost",
+        Type::Primitive(PrimitiveType::Long),
+    ))
+    .unwrap();
+    let error = crate::typed_read::codec::public_read_schema(
+        &IcebergRuntimeRelation::Table(base),
+        &[column, foreign],
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+}

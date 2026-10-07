@@ -40,6 +40,7 @@ use super::{HiveTransactionHandle, IcebergColumnHandle, IcebergReadSplit, Iceber
 mod program_fields;
 mod program_recipe;
 mod recipe;
+pub(crate) use program_fields::{public_read_schema, system_public_read_schema};
 pub use recipe::IcebergReadRecipeCompiler;
 
 pub(crate) use crate::contract_revision::ICEBERG_CONTRACT_REVISION as ICEBERG_READ_CODEC_REVISION;

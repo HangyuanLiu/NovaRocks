@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Pure correspondence of private column facts and the frozen public source.
+//! Pure correspondence of private column facts and the frozen public source,
+//! and the one author of the public fields that correspondence accepts.
 //! Unknown public metadata remains owned by the original snapshot. This leaf
 //! neither loads a file/schema nor decides file evolution/default/delete rules.
 
@@ -28,17 +29,19 @@ use crate::typed_read::schema_binding::{
 };
 use crate::typed_read::{
     ColumnIdentity, ICEBERG_CHANGE_OP_FIELD_ID, IcebergColumnHandle, IcebergRuntimeRelation,
-    IcebergTableExecuteProcedureHandle, IcebergTableHandle, REWRITE_POSITION_DELETE_OUTPUT_COLUMNS,
-    change_op_column_handle,
+    IcebergSystemTableType, IcebergTableExecuteProcedureHandle, IcebergTableHandle,
+    REWRITE_POSITION_DELETE_OUTPUT_COLUMNS, change_op_column_handle,
 };
 use arrow::datatypes::{DataType, Field, FieldRef};
 use novarocks_connector_contract::{ConnectorReadPublicFacts, PureProviderCompileError};
+use novarocks_spi::connector::read_stack::ConnectorReadPublicSchema;
 use novarocks_spi::connector::{
     ConnectorCodecError, ConnectorCodecErrorKind, ConnectorError, ConnectorErrorKind,
     ConnectorFieldPath,
 };
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, FunctionValueType, ValueLogicalType, ValueTypeError,
+    CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
+    ValueLogicalType, ValueTypeError,
 };
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use std::{collections::BTreeMap, sync::Arc};
@@ -63,93 +66,30 @@ pub(super) fn validate_program_columns(
             return Err(invalid("private/public read column count differs"));
         }
         match relation {
-            IcebergRuntimeRelation::Table(table) => validate_table(table, columns, public, work),
-            IcebergRuntimeRelation::ChangeWindow(window) => {
-                let schema = opaque_source(work, || window.parse_table_schema())?;
-                let arrow = opaque_source(work, || annotated_read_schema(&schema))?;
-                let index = source_index(&schema, &arrow, work)?;
-                let window_columns = column_index(window.columns(), work)?;
-                for (ordinal, column) in columns.iter().enumerate() {
-                    if column.base_field_id() == ICEBERG_CHANGE_OP_FIELD_ID {
-                        let expected = opaque_source(work, change_op_column_handle)?;
-                        compare_handle(column, &expected, work)?;
-                        let field = projected_field(&expected, work)?;
-                        compare_public(&field, column.nullable(), ordinal, public, work)?;
-                    } else {
-                        // The frozen window owns the requested to-schema column
-                        // handles, including its exact narrow-integer domains.
-                        let path = observed_path(column.field_id_path(), work)?;
-                        let expected = window_columns.get(&(column.base_field_id(), path)).copied();
-                        work.step()?;
-                        let expected = expected.ok_or_else(|| {
-                            invalid("column is absent from frozen change-window columns")
-                        })?;
-                        compare_handle(column, expected, work)?;
-                        validate_source_column(column, &index, None, ordinal, public, work)?;
-                    }
-                    work.step()?;
-                }
-                Ok(())
-            }
             IcebergRuntimeRelation::SystemTable(reference) => {
                 // System Arrow schemas have their own exact timestamp/map/JSON
                 // source. Mirror them through the same original forward author,
                 // rather than applying ordinary Iceberg table storage mapping.
                 for (ordinal, column) in columns.iter().enumerate() {
-                    let field = &public.schema().fields()[ordinal];
-                    let mirrored =
-                        crate::typed_read::system_page_source::system_column_field_for_compile(
-                            reference.system_table_type(),
-                            column,
-                            field,
-                            public.logical_types()[ordinal],
-                            work,
-                        )
-                        .map_err(|failure| match failure {
-                            PureProviderCompileError::Control(cause) => Failure::Control(cause),
-                            PureProviderCompileError::Provider(error) => source_error(error),
-                        })?;
-                    let expected =
-                        opaque_source(work, || IcebergColumnHandle::base_column(&mirrored))?;
-                    compare_handle(column, &expected, work)?;
+                    check_system_column(
+                        reference.system_table_type(),
+                        column,
+                        &public.schema().fields()[ordinal],
+                        public.logical_types()[ordinal],
+                        work,
+                    )?;
                     work.step()?;
                 }
                 Ok(())
             }
-            IcebergRuntimeRelation::TableExecute(execute) => match execute.procedure_handle() {
-                Some(IcebergTableExecuteProcedureHandle::Optimize(optimize)) => {
-                    validate_table(optimize.table_handle(), columns, public, work)
-                }
-                Some(IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(_)) => {
-                    for (ordinal, column) in columns.iter().enumerate() {
-                        let mut expected = None;
-                        for (name, metadata) in REWRITE_POSITION_DELETE_OUTPUT_COLUMNS {
-                            if column.base_field_id() == metadata.field_id() {
-                                expected = Some(opaque_source(work, || {
-                                    crate::typed_read::table_execute::rewrite_position_delete_pseudo_column(name, metadata)
-                                })?);
-                            }
-                            work.step()?;
-                        }
-                        let expected = expected.ok_or_else(|| {
-                            invalid("rewrite-position reader has no such output column")
-                        })?;
-                        compare_handle(column, &expected, work)?;
-                        let field = projected_field(&expected, work)?;
-                        compare_public(&field, expected.nullable(), ordinal, public, work)?;
-                        work.step()?;
-                    }
-                    Ok(())
-                }
-                None => Err(unsupported(
-                    "Iceberg table execute has no static read schema",
-                )),
-            },
-            IcebergRuntimeRelation::TableFunction(_) | IcebergRuntimeRelation::MergeTable(_) => {
-                Err(unsupported(
-                    "Iceberg relation does not publish final static read facts",
-                ))
-            }
+            _ => visit_source_fields(
+                relation,
+                columns,
+                work,
+                &mut |ordinal, field, nullable, work| {
+                    compare_public(field, nullable, ordinal, public, work)
+                },
+            ),
         }
     })();
     if matches!(&result, Err(Failure::Control(_))) {
@@ -159,17 +99,225 @@ pub(super) fn validate_program_columns(
     result
 }
 
-fn validate_table(
+/// The public schema of a frozen read of `columns` from an ordinary relation.
+///
+/// This is the single Iceberg author of public read fields: it runs the exact
+/// per-column source derivation that `validate_program_columns` compares a
+/// frozen public field against, and publishes that field with the column's
+/// frozen NULL contract. A schema published here is therefore accepted by the
+/// pure read compiler for the same relation and columns, field IDs, initial
+/// defaults and nested domains included. A metadata relation's fields come from
+/// its frozen system schema instead; see `system_public_read_schema`.
+///
+/// Legacy table-property declarations of a nominal domain (HLL, BITMAP,
+/// LARGEINT) are not frozen into the read handle, so their columns publish the
+/// physical storage domain the handle proves.
+pub(crate) fn public_read_schema(
+    relation: &IcebergRuntimeRelation,
+    columns: &[IcebergColumnHandle],
+) -> Result<ConnectorReadPublicSchema, ConnectorError> {
+    let mut fields = Vec::with_capacity(columns.len());
+    let mut logical_types = Vec::with_capacity(columns.len());
+    author(|work| {
+        visit_source_fields(relation, columns, work, &mut |_, field, nullable, _| {
+            let field = field.clone().with_nullable(nullable);
+            logical_types.push(source_logical_type(&field)?);
+            fields.push(Arc::new(field));
+            Ok(())
+        })
+    })?;
+    ConnectorReadPublicSchema::try_new(
+        Arc::new(arrow::datatypes::Schema::new(fields)),
+        logical_types,
+    )
+}
+
+/// The public schema of a frozen read of `columns` from a metadata relation.
+///
+/// `system` is the relation's frozen output schema, authored by the original
+/// system-table field author from the pinned table metadata the reference
+/// verifies. Each column takes its field by name and is then checked through
+/// the same mirror the pure read compiler applies to a frozen public field.
+pub(crate) fn system_public_read_schema(
+    kind: IcebergSystemTableType,
+    columns: &[IcebergColumnHandle],
+    system: &arrow::datatypes::Schema,
+) -> Result<ConnectorReadPublicSchema, ConnectorError> {
+    let mut fields = Vec::with_capacity(columns.len());
+    let mut logical_types = Vec::with_capacity(columns.len());
+    author(|work| {
+        for column in columns {
+            let field = system
+                .fields()
+                .iter()
+                .find(|field| field.name() == column.base_column_identity().name())
+                .ok_or_else(|| unsupported("system relation has no such output column"))?;
+            let logical = source_logical_type(field)?;
+            check_system_column(kind, column, field, logical, work)?;
+            fields.push(Arc::clone(field));
+            logical_types.push(logical);
+            work.step()?;
+        }
+        Ok(())
+    })?;
+    ConnectorReadPublicSchema::try_new(
+        Arc::new(arrow::datatypes::Schema::new(fields)),
+        logical_types,
+    )
+}
+
+/// Runs a field author outside pure compilation. The author is the same code
+/// the compiler runs; its checkpoints have no caller budget to observe here.
+fn author(
+    run: impl FnOnce(&mut CompileCheckpoints<'_>) -> Result<(), Failure>,
+) -> Result<(), ConnectorError> {
+    struct Unobserved;
+    impl PureCompileControl for Unobserved {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+    let mut work = CompileCheckpoints::try_new(&Unobserved, CompilePhase::ProviderValidation)
+        .map_err(|cause| author_error(Failure::Control(cause)))?;
+    run(&mut work).map_err(author_error)?;
+    work.finish()
+        .map_err(|cause| author_error(Failure::Control(cause)))
+}
+
+fn author_error(failure: Failure) -> ConnectorError {
+    match failure {
+        Failure::Provider(error) => ConnectorError::new(
+            match error.kind() {
+                ConnectorCodecErrorKind::Unsupported => ConnectorErrorKind::Unsupported,
+                ConnectorCodecErrorKind::Capacity => ConnectorErrorKind::ResourceExhausted,
+                _ => ConnectorErrorKind::InvalidRequest,
+            },
+            format!("Iceberg public read schema: {}", error.detail()),
+        ),
+        Failure::Control(cause) => ConnectorError::new(
+            ConnectorErrorKind::Internal,
+            format!("Iceberg public read schema author was interrupted: {cause}"),
+        ),
+    }
+}
+
+fn source_logical_type(field: &Field) -> Result<ValueLogicalType, Failure> {
+    novarocks_type_contract::field_logical_type(field)
+        .map_err(|_| invalid("source field has invalid logical identity"))
+}
+
+/// Receives each column's frozen source field and NULL contract, in column
+/// order, at the point the column has been proven against its frozen source.
+type SourceFieldVisitor<'v> =
+    dyn FnMut(usize, &Field, bool, &mut CompileCheckpoints<'_>) -> Result<(), Failure> + 'v;
+
+/// The per-column source derivation shared by the pure compiler and the public
+/// field author, for every relation whose fields are derived from its own
+/// frozen source. Metadata relations are mirrored from their system schema.
+fn visit_source_fields(
+    relation: &IcebergRuntimeRelation,
+    columns: &[IcebergColumnHandle],
+    work: &mut CompileCheckpoints<'_>,
+    visit: &mut SourceFieldVisitor<'_>,
+) -> Result<(), Failure> {
+    match relation {
+        IcebergRuntimeRelation::Table(table) => visit_table(table, columns, work, visit),
+        IcebergRuntimeRelation::ChangeWindow(window) => {
+            let schema = opaque_source(work, || window.parse_table_schema())?;
+            let arrow = opaque_source(work, || annotated_read_schema(&schema))?;
+            let index = source_index(&schema, &arrow, work)?;
+            let window_columns = column_index(window.columns(), work)?;
+            for (ordinal, column) in columns.iter().enumerate() {
+                if column.base_field_id() == ICEBERG_CHANGE_OP_FIELD_ID {
+                    let expected = opaque_source(work, change_op_column_handle)?;
+                    compare_handle(column, &expected, work)?;
+                    let field = projected_field(&expected, work)?;
+                    visit(ordinal, &field, column.nullable(), work)?;
+                } else {
+                    // The frozen window owns the requested to-schema column
+                    // handles, including its exact narrow-integer domains.
+                    let path = observed_path(column.field_id_path(), work)?;
+                    let expected = window_columns.get(&(column.base_field_id(), path)).copied();
+                    work.step()?;
+                    let expected = expected.ok_or_else(|| {
+                        invalid("column is absent from frozen change-window columns")
+                    })?;
+                    compare_handle(column, expected, work)?;
+                    let (field, nullable) = source_column_field(column, &index, None, work)?;
+                    visit(ordinal, &field, nullable, work)?;
+                }
+                work.step()?;
+            }
+            Ok(())
+        }
+        IcebergRuntimeRelation::SystemTable(_) => Err(unsupported(
+            "Iceberg metadata relation fields are mirrored from their frozen system schema",
+        )),
+        IcebergRuntimeRelation::TableExecute(execute) => match execute.procedure_handle() {
+            Some(IcebergTableExecuteProcedureHandle::Optimize(optimize)) => {
+                visit_table(optimize.table_handle(), columns, work, visit)
+            }
+            Some(IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(_)) => {
+                for (ordinal, column) in columns.iter().enumerate() {
+                    let mut expected = None;
+                    for (name, metadata) in REWRITE_POSITION_DELETE_OUTPUT_COLUMNS {
+                        if column.base_field_id() == metadata.field_id() {
+                            expected = Some(opaque_source(work, || {
+                                crate::typed_read::table_execute::rewrite_position_delete_pseudo_column(name, metadata)
+                            })?);
+                        }
+                        work.step()?;
+                    }
+                    let expected = expected.ok_or_else(|| {
+                        invalid("rewrite-position reader has no such output column")
+                    })?;
+                    compare_handle(column, &expected, work)?;
+                    let field = projected_field(&expected, work)?;
+                    visit(ordinal, &field, expected.nullable(), work)?;
+                    work.step()?;
+                }
+                Ok(())
+            }
+            None => Err(unsupported(
+                "Iceberg table execute has no static read schema",
+            )),
+        },
+        IcebergRuntimeRelation::TableFunction(_) | IcebergRuntimeRelation::MergeTable(_) => Err(
+            unsupported("Iceberg relation does not publish final static read facts"),
+        ),
+    }
+}
+
+fn check_system_column(
+    kind: IcebergSystemTableType,
+    column: &IcebergColumnHandle,
+    field: &Field,
+    logical: ValueLogicalType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), Failure> {
+    let mirrored = crate::typed_read::system_page_source::system_column_field_for_compile(
+        kind, column, field, logical, work,
+    )
+    .map_err(|failure| match failure {
+        PureProviderCompileError::Control(cause) => Failure::Control(cause),
+        PureProviderCompileError::Provider(error) => source_error(error),
+    })?;
+    let expected = opaque_source(work, || IcebergColumnHandle::base_column(&mirrored))?;
+    compare_handle(column, &expected, work)
+}
+
+fn visit_table(
     table: &IcebergTableHandle,
     columns: &[IcebergColumnHandle],
-    public: &ConnectorReadPublicFacts,
     work: &mut CompileCheckpoints<'_>,
+    visit: &mut SourceFieldVisitor<'_>,
 ) -> Result<(), Failure> {
     let schema = opaque_source(work, || table.parse_table_schema())?;
     let arrow = opaque_source(work, || annotated_read_schema(&schema))?;
     let index = source_index(&schema, &arrow, work)?;
     for (ordinal, column) in columns.iter().enumerate() {
-        validate_source_column(column, &index, Some(table), ordinal, public, work)?;
+        let (field, nullable) = source_column_field(column, &index, Some(table), work)?;
+        visit(ordinal, &field, nullable, work)?;
         work.step()?;
     }
     Ok(())
@@ -188,17 +336,17 @@ fn source_index<'a>(
     }
     Ok(index)
 }
-fn validate_source_column(
+/// One column's frozen source field and NULL contract, after the column is
+/// proven to be exactly the handle its frozen source would author.
+fn source_column_field(
     column: &IcebergColumnHandle,
     index: &SourceIndex<'_>,
     table: Option<&IcebergTableHandle>,
-    ordinal: usize,
-    public: &ConnectorReadPublicFacts,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(), Failure> {
+) -> Result<(FieldRef, bool), Failure> {
     if let Some(metadata) = IcebergMetadataColumn::from_field_id(column.base_field_id()) {
         let field = opaque_source(work, || metadata_target_field(column, metadata))?;
-        return compare_public(&field, column.nullable(), ordinal, public, work);
+        return Ok((field, column.nullable()));
     }
     let source = index.get(&column.base_field_id()).copied();
     work.step()?;
@@ -225,7 +373,7 @@ fn validate_source_column(
             Arc::new(field.as_ref().clone().with_data_type(domain.data_type()))
         })?;
     }
-    compare_public(&field, expected.nullable(), ordinal, public, work)
+    Ok((field, expected.nullable()))
 }
 
 fn observed_path(path: &[i32], work: &mut CompileCheckpoints<'_>) -> Result<Vec<i32>, Failure> {

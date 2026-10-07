@@ -52,12 +52,12 @@ use novarocks_spi::connector::read_stack::{
     ConnectorMvTargetPartitionSelection, ConnectorReadAttemptAccessMint,
     ConnectorReadAttemptAccessReacquirer, ConnectorReadAttemptAccessSealer,
     ConnectorReadAttemptAccessSource, ConnectorReadAttemptRuntime, ConnectorReadChangeWindow,
-    ConnectorReadMetadataRequest, ConnectorReadMetadataVersion, ConnectorReadRelationVersion,
-    ConnectorReadRequestControl, ConnectorReadRequestControlFactory, ConnectorReadStaticFacts,
-    ConnectorReadTableHandle, ConnectorSession, ConnectorSplitBatch, ConnectorSplitSource,
-    ConnectorTableHandle as _, ConnectorValue, ConnectorValueType, Constraint, Domain,
-    DynamicFilterSnapshot, OrderedAssignments, Range, SchemaTableName, SplitWeight,
-    SystemTableDistribution, TupleDomain, ValueSet,
+    ConnectorReadMetadataRequest, ConnectorReadMetadataVersion, ConnectorReadPublicSchema,
+    ConnectorReadRelationVersion, ConnectorReadRequestControl, ConnectorReadRequestControlFactory,
+    ConnectorReadStaticFacts, ConnectorReadTableHandle, ConnectorSession, ConnectorSplitBatch,
+    ConnectorSplitSource, ConnectorTableHandle as _, ConnectorValue, ConnectorValueType,
+    Constraint, Domain, DynamicFilterSnapshot, OrderedAssignments, Range, SchemaTableName,
+    SplitWeight, SystemTableDistribution, TupleDomain, ValueSet,
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorOperationControl,
@@ -83,6 +83,7 @@ use crate::scan_model::{
     IcebergPhysicalPredicateValue,
 };
 use crate::schema_facts::row_lineage_enabled;
+use crate::typed_read::codec::{public_read_schema, system_public_read_schema};
 use crate::typed_read::column_handle::{corrupt, invalid, unsupported};
 #[cfg(test)]
 use crate::typed_read::read_static_facts::decode_sha256_hex;
@@ -101,7 +102,7 @@ use crate::typed_read::{
     IcebergTableExecuteProcedureHandle, IcebergTableHandle, IcebergTableHandleParams,
     REWRITE_POSITION_DELETE_OUTPUT_COLUMNS, ROW_LINEAGE_METADATA_COLUMNS, TrinoManifestFile,
     bounds_row_type, change_op_column_handle, derived_row_type_json, files_relation_schema_json,
-    partition_row_type, plan_change_window_splits, system_relation_columns,
+    partition_row_type, plan_change_window_splits, system_relation_columns, system_relation_schema,
 };
 #[cfg(test)]
 use novarocks_spi::connector::read_stack::{
@@ -1056,6 +1057,30 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
         table: &crate::typed_read::IcebergRuntimeRelation,
     ) -> Result<ConnectorReadStaticFacts<Self::Column>, ConnectorError> {
         iceberg_final_static_facts(table)
+    }
+
+    fn read_public_schema(
+        &self,
+        _session: &ConnectorSession,
+        table: &crate::typed_read::IcebergRuntimeRelation,
+        columns: &[IcebergColumnHandle],
+    ) -> Result<ConnectorReadPublicSchema, ConnectorError> {
+        match table {
+            // A metadata relation's columns come from its system schema, which
+            // the reference does not carry: author it from the same pinned
+            // metadata, verified against the reference, its columns were bound
+            // from.
+            crate::typed_read::IcebergRuntimeRelation::SystemTable(reference) => {
+                let metadata = self.system_relation_metadata(reference)?;
+                let system = system_relation_schema(
+                    reference.system_table_type(),
+                    metadata.current_schema(),
+                    &partition_specs_of(&metadata),
+                )?;
+                system_public_read_schema(reference.system_table_type(), columns, &system)
+            }
+            relation => public_read_schema(relation, columns),
+        }
     }
 
     fn apply_filter(
@@ -3286,6 +3311,135 @@ pub(crate) mod final_static_facts_tests {
                 0, 0, 0, 1,
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod public_read_schema_tests {
+    use std::sync::Arc;
+
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_spi::connector::read_stack::ConnectorReadMetadata;
+    use novarocks_spi::connector::read_stack::adapter::ReadRuntimeAdapter;
+    use novarocks_spi::connector::{
+        CatalogHandle, CatalogVersion, ConnectorInstanceId, ConnectorProviderId,
+    };
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+
+    use super::*;
+
+    fn installed_adapter(
+        runtime: &tokio::runtime::Runtime,
+        warehouse: &tempfile::TempDir,
+    ) -> ReadRuntimeAdapter<IcebergTypedBoundary> {
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[(
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.path().display().to_string(),
+            )],
+        )
+        .expect("configuration");
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        );
+        let resources =
+            crate::resources::IcebergMetadataResources::new(binding, runtime.handle().clone());
+        let metadata_context = Arc::new(
+            IcebergMetadataContext::try_new(
+                crate::catalog_control::IcebergCatalogControlState::new(configuration),
+                resources,
+            )
+            .expect("metadata context"),
+        );
+        let catalog_id = ConnectorInstanceId::parse("ice").expect("catalog ID");
+        Arc::new(IcebergTypedBoundary::new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse(crate::PROVIDER_ID).expect("provider ID"),
+                instance_id: catalog_id.clone(),
+            },
+            ProviderBindingEpoch::new(),
+            CatalogHandle::new(catalog_id, CatalogVersion::from_bytes([1; 32])),
+            HiveTransactionHandle::new(true, [2; 16]),
+            metadata_context,
+        ))
+        .read_runtime_adapter()
+    }
+
+    fn session() -> ConnectorSession {
+        ConnectorSession::try_new("q", "u", "UTC", "en_US", std::time::SystemTime::UNIX_EPOCH)
+            .expect("session")
+    }
+
+    /// What the installed metadata publishes through the type-erased boundary
+    /// is exactly the provider author's schema for the same frozen read.
+    #[test]
+    fn installed_read_metadata_publishes_the_provider_authored_schema() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let adapter = installed_adapter(&runtime, &warehouse);
+        let handle = final_static_facts_tests::table_handle();
+        let schema = handle.parse_table_schema().expect("schema");
+        let columns = vec![IcebergColumnHandle::base_column_of(&schema, 1).expect("id"); 2];
+        let relation = crate::typed_read::IcebergRuntimeRelation::Table(handle);
+        let expected = public_read_schema(&relation, &columns).expect("provider schema");
+
+        let table = adapter.wrap_table(relation);
+        let columns = columns
+            .into_iter()
+            .map(|column| adapter.wrap_column(column))
+            .collect::<Vec<_>>();
+        let published =
+            ConnectorReadMetadata::read_public_schema(&adapter, &session(), &table, &columns)
+                .expect("published schema");
+        assert_eq!(published, expected);
+        assert_eq!(
+            published
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| (
+                    field.name().as_str(),
+                    field.metadata()[PARQUET_FIELD_ID_META_KEY].as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [("id", "1"), ("id", "1")]
+        );
+    }
+
+    #[test]
+    fn installed_read_metadata_refuses_a_relation_without_a_field_author() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let adapter = installed_adapter(&runtime, &warehouse);
+        let base = final_static_facts_tests::table_handle();
+        let schema = base.parse_table_schema().expect("schema");
+        let column = IcebergColumnHandle::base_column_of(&schema, 1).expect("id");
+        let function = crate::typed_read::TableChangesFunctionHandle::try_new(
+            crate::typed_read::TableChangesFunctionHandleParams {
+                schema_table_name: base.schema_table_name().clone(),
+                table_schema_json: base.table_schema_json().into(),
+                columns: vec![column.clone()],
+                name_mapping_json: None,
+                start_snapshot_id: 40,
+                end_snapshot_id: 41,
+            },
+        )
+        .expect("table function");
+        let table = adapter.wrap_table(crate::typed_read::IcebergRuntimeRelation::TableFunction(
+            function,
+        ));
+        let error = ConnectorReadMetadata::read_public_schema(
+            &adapter,
+            &session(),
+            &table,
+            &[adapter.wrap_column(column)],
+        )
+        .expect_err("a table-function relation has no public read schema");
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
     }
 }
 

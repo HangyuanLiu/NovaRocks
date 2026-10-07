@@ -562,6 +562,27 @@ pub trait ConnectorReadMetadata: Send + Sync {
         ))
     }
 
+    /// The exact public schema of a frozen read's assignment columns.
+    ///
+    /// Asked at freeze, with the frozen handle and the assignment columns in
+    /// assignment order, repeats included. The answer has one field per column
+    /// and is an immutable fact of that read: the provider's pure read compiler
+    /// later checks the frozen public schema against this same author, so a
+    /// caller carries it unchanged and never derives one from SQL names or
+    /// engine types. Like `freeze`, this enumerates no splits and returns no
+    /// runtime capability.
+    fn read_public_schema(
+        &self,
+        _session: &ConnectorSession,
+        _table: &ConnectorReadTableHandle,
+        _columns: &[ConnectorReadColumnHandle],
+    ) -> Result<super::ConnectorReadPublicSchema, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "connector read generation does not publish a public read schema",
+        ))
+    }
+
     /// Offer a provider an ordered list of pushdowns and learn what it takes on.
     ///
     /// This is the one way a caller asks that question. It is pure and

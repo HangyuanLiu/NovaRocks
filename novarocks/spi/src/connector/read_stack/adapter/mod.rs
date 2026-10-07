@@ -52,9 +52,9 @@ use super::runtime::{
 use super::{
     Assignment, BoundsMatch, ColumnHandle, ColumnValueBounds, ConnectorExpression,
     ConnectorMvTargetPartitionSelection, ConnectorReadDistribution, ConnectorReadOrderingKey,
-    ConnectorReadProperties, ConnectorReadStaticFacts, ConnectorSession, ConnectorSplit,
-    ConnectorSplitBatch, Constraint, DynamicFilter, DynamicFilterSnapshot, PageSourceMetrics,
-    SchemaTableName, SourcePage, SystemTableDistribution, TupleDomain,
+    ConnectorReadProperties, ConnectorReadPublicSchema, ConnectorReadStaticFacts, ConnectorSession,
+    ConnectorSplit, ConnectorSplitBatch, Constraint, DynamicFilter, DynamicFilterSnapshot,
+    PageSourceMetrics, SchemaTableName, SourcePage, SystemTableDistribution, TupleDomain,
 };
 use crate::connector::{
     CatalogHandle, ConnectorError, ConnectorExecutionResources, ConnectorInstanceDescriptor,
@@ -242,6 +242,22 @@ pub trait ProviderReadMetadata: ProviderReadRuntime {
         Err(ConnectorError::new(
             crate::connector::ConnectorErrorKind::Unsupported,
             "provider read generation does not publish final static facts",
+        ))
+    }
+
+    /// One public field per column, in the given order, authored by the same
+    /// field derivation this provider's pure read compiler checks a frozen
+    /// public schema against. A provider has exactly one such author; it never
+    /// takes a field name from a SQL alias or a type from an engine type.
+    fn read_public_schema(
+        &self,
+        _session: &ConnectorSession,
+        _table: &Self::Table,
+        _columns: &[Self::Column],
+    ) -> Result<ConnectorReadPublicSchema, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "provider read generation does not publish a public read schema",
         ))
     }
 
@@ -875,6 +891,34 @@ impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
                 request.handle.binding().clone(),
             ),
         )
+    }
+
+    fn read_public_schema(
+        &self,
+        session: &ConnectorSession,
+        table: &ConnectorReadTableHandle,
+        columns: &[ConnectorReadColumnHandle],
+    ) -> Result<ConnectorReadPublicSchema, ConnectorError> {
+        let table = self.table(table)?;
+        let columns = columns
+            .iter()
+            .map(|column| self.column(column).cloned())
+            .collect::<Result<Vec<_>, _>>()?;
+        let schema = self.provider.read_public_schema(session, table, &columns)?;
+        // The fields are positional facts of the columns asked about. An answer
+        // of any other arity cannot be paired back with them, so it is refused
+        // here rather than left for a later ordinal check to misattribute.
+        if schema.schema().fields().len() != columns.len() {
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::InvalidRequest,
+                format!(
+                    "provider published {} public read fields for {} columns",
+                    schema.schema().fields().len(),
+                    columns.len()
+                ),
+            ));
+        }
+        Ok(schema)
     }
 
     fn get_system_table_plan(
@@ -1517,6 +1561,8 @@ mod tests {
         }
     }
 
+    const PUBLIC_SCHEMA_EXTRA_FIELD: u8 = 99;
+
     struct Probe {
         descriptor: ConnectorInstanceDescriptor,
         catalog_handle: CatalogHandle,
@@ -1580,6 +1626,42 @@ mod tests {
             _table: &Self::Table,
         ) -> Result<Vec<ProviderReadColumnBinding<Self::Column>>, ConnectorError> {
             Ok(Vec::new())
+        }
+
+        /// One field per column named after it; the column numbered
+        /// `PUBLIC_SCHEMA_EXTRA_FIELD` answers with a field too many.
+        fn read_public_schema(
+            &self,
+            _session: &ConnectorSession,
+            _table: &Self::Table,
+            columns: &[Self::Column],
+        ) -> Result<ConnectorReadPublicSchema, ConnectorError> {
+            let mut fields = columns
+                .iter()
+                .map(|column| {
+                    arrow::datatypes::Field::new(
+                        format!("c{}", column.0),
+                        arrow::datatypes::DataType::Int64,
+                        true,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if columns
+                .iter()
+                .any(|column| column.0 == PUBLIC_SCHEMA_EXTRA_FIELD)
+            {
+                fields.push(arrow::datatypes::Field::new(
+                    "extra",
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                ));
+            }
+            let logical_types =
+                vec![novarocks_type_contract::ValueLogicalType::Physical; fields.len()];
+            ConnectorReadPublicSchema::try_new(
+                Arc::new(arrow::datatypes::Schema::new(fields)),
+                logical_types,
+            )
         }
 
         fn apply_filter(
@@ -1758,6 +1840,62 @@ mod tests {
         let table = adapter.wrap_table(Table);
         let split = adapter.wrap_split(Split);
         (adapter, filter, table, split)
+    }
+
+    fn test_session() -> ConnectorSession {
+        ConnectorSession::try_new("q", "u", "UTC", "en_US", SystemTime::UNIX_EPOCH)
+            .expect("session")
+    }
+
+    #[test]
+    fn public_read_schema_answers_the_frozen_columns_in_assignment_order() {
+        let adapter = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
+        let table = adapter.wrap_table(Table);
+        let columns = [2, 1, 2].map(|id| adapter.wrap_column(Column(id)));
+        let schema =
+            ConnectorReadMetadata::read_public_schema(&adapter, &test_session(), &table, &columns)
+                .expect("public schema");
+        assert_eq!(
+            schema
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            ["c2", "c1", "c2"]
+        );
+        assert_eq!(
+            schema.logical_types(),
+            [novarocks_type_contract::ValueLogicalType::Physical; 3]
+        );
+    }
+
+    #[test]
+    fn public_read_schema_refuses_an_answer_that_cannot_be_paired_with_its_columns() {
+        let adapter = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
+        let table = adapter.wrap_table(Table);
+        let columns = [adapter.wrap_column(Column(PUBLIC_SCHEMA_EXTRA_FIELD))];
+        let error =
+            ConnectorReadMetadata::read_public_schema(&adapter, &test_session(), &table, &columns)
+                .expect_err("one field too many is refused");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn public_read_schema_refuses_a_column_of_another_generation() {
+        let adapter = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
+        let mut other = Probe::new();
+        other.catalog_handle = CatalogHandle::new(
+            ConnectorInstanceId::parse("catalog").expect("instance ID"),
+            crate::connector::CatalogVersion::from_bytes([4; 32]),
+        );
+        let other = ReadRuntimeAdapter::new(Arc::new(other));
+        let table = adapter.wrap_table(Table);
+        let foreign = [other.wrap_column(Column(1))];
+        let error =
+            ConnectorReadMetadata::read_public_schema(&adapter, &test_session(), &table, &foreign)
+                .expect_err("a column of another admitted generation is refused");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
     }
 
     #[test]

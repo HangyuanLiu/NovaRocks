@@ -37,6 +37,7 @@ pub mod page_source;
 pub mod page_stream;
 pub mod predicate;
 pub mod projection;
+pub mod public_schema;
 pub mod runtime;
 pub mod session;
 pub mod split;
@@ -76,6 +77,7 @@ pub use projection::{
     Assignment, ConstraintApplicationResult, LimitApplicationResult, MAX_PROJECTION_ASSIGNMENTS,
     OrderedAssignments, ProjectionApplicationResult,
 };
+pub use public_schema::ConnectorReadPublicSchema;
 pub use runtime::{
     ConnectorAdmittedReadProviderFactory, ConnectorReadAttemptAccessMint,
     ConnectorReadAttemptAccessReacquirer, ConnectorReadAttemptAccessSealer,

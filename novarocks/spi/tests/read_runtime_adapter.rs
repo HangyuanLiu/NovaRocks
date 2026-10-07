@@ -520,3 +520,37 @@ fn frozen_facts_are_unreachable_until_they_are_shown_to_answer_the_request() {
     assert!(frozen.clone().into_verified(&mismatched).is_err());
     assert!(frozen.into_verified(&request).is_ok());
 }
+
+/// A provider that has no public read-field author says so.
+///
+/// The public schema is a provider fact its pure read compiler checks; a
+/// provider that cannot author it must refuse explicitly rather than let a
+/// caller fill the gap from SQL names or engine types.
+#[test]
+fn a_provider_without_a_public_field_author_refuses_explicitly() {
+    let provider = Arc::new(FakeProvider::new(AlphaTable, AlphaColumn(1)));
+    let adapter = ReadRuntimeAdapter::new(provider);
+    let metadata = &adapter as &dyn ConnectorReadMetadata;
+    let table = metadata
+        .get_table_handle(
+            &session(),
+            &name(),
+            ConnectorReadRelationVersion::Current,
+            None,
+        )
+        .expect("table call")
+        .expect("table handle");
+    let column = metadata
+        .get_column_bindings(&session(), &table)
+        .expect("columns")[0]
+        .column()
+        .clone();
+
+    let error = metadata
+        .read_public_schema(&session(), &table, &[column])
+        .expect_err("the owner default refuses");
+    assert_eq!(
+        error.kind(),
+        novarocks_spi::connector::ConnectorErrorKind::Unsupported
+    );
+}

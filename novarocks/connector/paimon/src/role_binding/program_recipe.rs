@@ -18,8 +18,9 @@
 //! Full frozen-input validation, independent of Paimon runtime capabilities.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use bytes::Bytes;
 use novarocks_connector_contract::{
     ConnectorReadArtifactCoverage, ConnectorReadBinding, ConnectorReadDistribution,
@@ -27,10 +28,11 @@ use novarocks_connector_contract::{
     ConnectorReadWorkSource, FrozenConnectorRead, MAX_CONNECTOR_RECIPE_PAYLOAD_BYTES,
     PureProviderCompileError,
 };
+use novarocks_spi::connector::read_stack::ConnectorReadPublicSchema;
 use novarocks_spi::connector::{
     ConnectorCodecCategory, ConnectorCodecError, ConnectorCodecErrorKind, ConnectorCodecRevision,
     ConnectorDecodeContext, ConnectorDecodeLedger, ConnectorDecodeLimits, ConnectorEncodedPayload,
-    ConnectorFieldPath, ConnectorReadRelationPayload,
+    ConnectorError, ConnectorErrorKind, ConnectorFieldPath, ConnectorReadRelationPayload,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, PureCompileControl, ValueLogicalType,
@@ -372,6 +374,37 @@ fn digest_bytes(
         work.step()?;
     }
     Ok(())
+}
+
+/// The public schema of a frozen Paimon read of `columns`.
+///
+/// Each field comes from `column_field`, the same author the pure compiler
+/// requires every public field to equal exactly, with the PAI-1 physical
+/// logical domain and no schema metadata. A column must be one of the frozen
+/// table's own catalog-visible columns; its alias never names its field.
+pub(super) fn public_read_schema(
+    table_columns: &[PaimonColumn],
+    columns: &[PaimonColumn],
+) -> Result<ConnectorReadPublicSchema, ConnectorError> {
+    if let Some(foreign) = columns
+        .iter()
+        .find(|column| !table_columns.contains(column))
+    {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            format!(
+                "Paimon column {} (field ID {}) is not a column of its frozen table",
+                foreign.name(),
+                foreign.field_id()
+            ),
+        ));
+    }
+    ConnectorReadPublicSchema::try_new(
+        Arc::new(Schema::new(
+            columns.iter().map(column_field).collect::<Vec<_>>(),
+        )),
+        vec![ValueLogicalType::Physical; columns.len()],
+    )
 }
 
 /// The admitted PAI-1 projection of the SDK build_target_arrow_schema author.
@@ -818,6 +851,68 @@ mod tests {
         );
         assert_eq!(result.frozen().scan().dynamic_filters()[0].filter_id(), 37);
         assert!(!result.frozen().scan().unenforced_predicate().is_all());
+    }
+
+    #[test]
+    fn published_public_schema_is_the_sdk_field_author_and_passes_the_pure_catalog() {
+        let catalog = pure_catalog();
+        let mut fixture = Fixture::projected();
+        // The frozen table owns `id` and `value`; the read projects them
+        // reordered with a repeat, so a field follows its column, not an alias.
+        let published = public_read_schema(&fixture.columns, &fixture.columns).unwrap();
+        assert!(published.schema().metadata().is_empty());
+        assert_eq!(published.schema().fields().len(), fixture.fields.len());
+        for (ordinal, (field, sdk)) in published
+            .schema()
+            .fields()
+            .iter()
+            .zip(&fixture.fields)
+            .enumerate()
+        {
+            assert!(
+                arrow_fields_exact(field, sdk),
+                "field {ordinal} differs from the SDK author"
+            );
+            assert_eq!(
+                field.metadata()[FIELD_ID_KEY],
+                fixture.columns[ordinal].field_id().to_string()
+            );
+            assert_eq!(field.name(), fixture.columns[ordinal].name());
+        }
+        assert_eq!(
+            published.logical_types(),
+            [ValueLogicalType::Physical; 3].as_slice()
+        );
+
+        fixture.fields = published
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect();
+        fixture.logical = published.logical_types().to_vec();
+        let frozen = fixture.frozen();
+        let recipe = catalog.compile_read(&frozen, &Control::default()).unwrap();
+        assert_eq!(recipe.frozen(), &frozen);
+    }
+
+    #[test]
+    fn public_schema_refuses_a_column_outside_its_frozen_table() {
+        let fixture = Fixture::projected();
+        let foreign = PaimonColumn::try_new(77, "ghost", PaimonDataType::Int64, true, 9).unwrap();
+        let error = public_read_schema(&fixture.columns, &[fixture.columns[0].clone(), foreign])
+            .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        // A frozen column whose descriptor was altered is not that column.
+        let renamed = PaimonColumn::try_new(
+            fixture.columns[0].field_id(),
+            "renamed",
+            fixture.columns[0].data_type(),
+            fixture.columns[0].nullable(),
+            fixture.columns[0].output_ordinal(),
+        )
+        .unwrap();
+        assert!(public_read_schema(&fixture.columns, &[renamed]).is_err());
     }
 
     #[test]
