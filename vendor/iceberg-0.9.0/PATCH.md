@@ -323,3 +323,13 @@ the existing file read and gzip detection/decompression. `read_from` retains
 its original default serde policy. NovaRocks uses the callback to check every
 retained schema before SDK indexes are materialized, then decode admitted
 depth-64 metadata. This adds no whole-file or decompression budget claim.
+
+## Bounded manifest schema decode
+
+`ManifestMetadata::parse` decodes the schema embedded in a manifest without
+serde's default 128-level recursion limit, after a structural scan has bounded
+its JSON nesting to 256 levels. A legitimate 64-level logical type needs about
+193 JSON levels, which the default limit refused when any reader or commit
+loaded such a table's manifests. The bound keeps the decoder's stack bounded;
+the table's logical type budget remains enforced where NovaRocks admits table
+metadata.

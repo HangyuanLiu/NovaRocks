@@ -157,6 +157,7 @@ version = "1.0.219"
 
 [dependencies.serde_json]
 version = "1.0.142"
+features = ["unbounded_depth"]
 
 [dependencies.serde_repr]
 version = "0.1.16"

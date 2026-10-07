@@ -18,6 +18,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use serde::Deserialize;
+
 use typed_builder::TypedBuilder;
 
 use super::{FormatVersion, ManifestContentType, PartitionSpec, Schema};
@@ -41,6 +43,68 @@ pub struct ManifestMetadata {
     pub content: ManifestContentType,
 }
 
+/// JSON nesting admitted for the schema embedded in a manifest. A legitimate
+/// 64-level logical type needs about 193 JSON levels (a struct level is an
+/// object, its `fields` array and the field object), which serde's default
+/// recursion limit of 128 refuses. Decoding without that limit is safe only
+/// after a structural scan has bounded the nesting, which keeps the decoder's
+/// stack bounded; the table's logical type budget is enforced where the
+/// provider admits table metadata, not here.
+const MAX_MANIFEST_SCHEMA_JSON_DEPTH: usize = 256;
+
+/// Whether `bytes` never nests JSON objects or arrays deeper than `max`.
+/// Brackets inside strings, including escaped quotes, are not structure.
+fn json_nesting_within(bytes: &[u8], max: usize) -> bool {
+    let mut depth = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in bytes {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > max {
+                    return false;
+                }
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    true
+}
+
+fn parse_manifest_schema(bytes: &[u8]) -> Result<Schema> {
+    if !json_nesting_within(bytes, MAX_MANIFEST_SCHEMA_JSON_DEPTH) {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            "Manifest schema exceeds the JSON nesting depth limit",
+        ));
+    }
+    let invalid = |err: serde_json::Error| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            "Fail to parse schema in manifest metadata",
+        )
+        .with_source(err)
+    };
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    decoder.disable_recursion_limit();
+    let schema = Schema::deserialize(&mut decoder).map_err(invalid)?;
+    decoder.end().map_err(invalid)?;
+    Ok(schema)
+}
+
 impl ManifestMetadata {
     /// Parse from metadata in avro file.
     pub fn parse(meta: &HashMap<String, Vec<u8>>) -> Result<Self> {
@@ -51,13 +115,7 @@ impl ManifestMetadata {
                     "schema is required in manifest metadata but not found",
                 )
             })?;
-            serde_json::from_slice::<Schema>(bs).map_err(|err| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    "Fail to parse schema in manifest metadata",
-                )
-                .with_source(err)
-            })?
+            parse_manifest_schema(bs)?
         });
         let schema_id: i32 = meta
             .get("schema-id")
@@ -155,5 +213,50 @@ impl ManifestMetadata {
     /// Get the type of content files tracked by manifest
     pub fn content(&self) -> &ManifestContentType {
         &self.content
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Iceberg schema JSON with `levels` nested struct containers around an
+    /// int leaf: logical depth `levels + 1`.
+    fn nested_struct_schema_json(levels: usize) -> String {
+        let mut field_type = "\"int\"".to_string();
+        for level in (1..=levels).rev() {
+            field_type = format!(
+                "{{\"type\":\"struct\",\"fields\":[{{\"id\":{},\"name\":\"n{level}\",\"required\":false,\"type\":{field_type}}}]}}",
+                level + 1
+            );
+        }
+        format!(
+            "{{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{{\"id\":1,\"name\":\"deep\",\"required\":false,\"type\":{field_type}}}]}}"
+        )
+    }
+
+    #[test]
+    fn manifest_schema_at_logical_depth_64_decodes() {
+        let json = nested_struct_schema_json(63);
+        assert!(serde_json::from_str::<Schema>(&json).is_err(), "default serde limit refuses it");
+        let schema = parse_manifest_schema(json.as_bytes()).expect("bounded decode admits depth 64");
+        assert!(schema.field_by_name("deep").is_some());
+    }
+
+    #[test]
+    fn manifest_schema_nesting_beyond_the_bound_is_refused() {
+        let json = nested_struct_schema_json(MAX_MANIFEST_SCHEMA_JSON_DEPTH);
+        let error = parse_manifest_schema(json.as_bytes()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(error.to_string().contains("nesting depth limit"), "{error}");
+    }
+
+    #[test]
+    fn brackets_inside_strings_are_not_structure() {
+        let nested = "[".repeat(MAX_MANIFEST_SCHEMA_JSON_DEPTH + 1);
+        let json = format!("{{\"doc\":\"{nested}\\\"{nested}\"}}");
+        assert!(json_nesting_within(json.as_bytes(), 1));
+        assert!(!json_nesting_within(b"[[[]]]", 2));
+        assert!(json_nesting_within(b"[[[]]]", 3));
     }
 }
