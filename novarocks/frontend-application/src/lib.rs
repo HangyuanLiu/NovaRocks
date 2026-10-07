@@ -38,6 +38,7 @@ pub(crate) mod query;
 mod query_execution;
 pub(crate) mod runtime_filter;
 pub(crate) mod server;
+pub use metrics::FrontendProcessMemoryObservation;
 pub use server::{
     FrontendApplicationOpenConfig, FrontendManagementConfig, FrontendServingConfig,
     open_frontend_application_for_server, serve_ready_frontend_session_factory,

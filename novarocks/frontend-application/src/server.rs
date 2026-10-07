@@ -107,6 +107,9 @@ pub struct FrontendManagementConfig {
     /// The one memory capacity authority this OS process was given, so the
     /// management surface can report its facts without owning any of them.
     pub memory_authority: Arc<novarocks_memory::MemoryAuthority>,
+    /// This process's allocator and physical memory readings for `/metrics`;
+    /// `None` exports no process memory series.
+    pub process_memory: Option<crate::metrics::FrontendProcessMemoryObservation>,
 }
 
 /// Inputs for serving one ready Frontend application through native and MySQL
@@ -771,7 +774,8 @@ pub fn start_frontend_management_server(
     config: &FrontendManagementConfig,
 ) -> Result<FrontendManagementServer, FrontendApplicationError> {
     let metrics_registry =
-        crate::metrics::FrontendMetricsRegistry::new().map_err(FrontendApplicationError::server)?;
+        crate::metrics::FrontendMetricsRegistry::with_process_memory(config.process_memory.clone())
+            .map_err(FrontendApplicationError::server)?;
     let serving_reader = Arc::new(LateBoundFrontendServingSnapshotReader::default());
     let island_reader = Arc::new(crate::topology::LateBoundBackendIslandSnapshotReader::new(
         config.native_compatibility_id,

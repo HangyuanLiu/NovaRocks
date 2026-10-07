@@ -587,6 +587,17 @@ fn backend_process_memory_observation(
     }
 }
 
+/// What the Frontend `/metrics` endpoint reports about this process's memory:
+/// the allocator and its physical readings. The Frontend has no memory ledger;
+/// these readings serve the measured bound of its third-party internals.
+fn frontend_process_memory_observation()
+-> novarocks_frontend_application::FrontendProcessMemoryObservation {
+    novarocks_frontend_application::FrontendProcessMemoryObservation {
+        allocator: crate::memory_observation::process_allocator().label(),
+        sample: std::sync::Arc::new(crate::memory_observation::sample_physical),
+    }
+}
+
 /// Resolve every Frontend startup input from the application wire configuration.
 pub fn compose_frontend_role_config(
     config: &NovaRocksConfig,
@@ -781,6 +792,7 @@ pub fn compose_frontend_role_config(
             http_port: config.server.http_port,
             native_compatibility_id,
             memory_authority: std::sync::Arc::clone(&memory_authority),
+            process_memory: Some(frontend_process_memory_observation()),
         },
         serving: FrontendServingConfig {
             report_bind_host: config.server.host.clone(),
