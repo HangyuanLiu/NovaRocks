@@ -34,12 +34,12 @@ use novarocks_execution::runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_physical_plan::{
     ChangeEventSpec, ChangeStreamRoute, Distribution, Edge, EdgeDestination, EdgeId, EdgeKind,
     EdgePartitioning, EdgeSource, ExprKind, FragmentBuilder, FragmentId, FragmentSink,
-    JoinDistribution, JoinKey, JoinKind, JoinSide, LiteralValue, NestLoopJoinDistribution,
-    NodeKind, OutputPort, PhysicalNode, PhysicalPlan, PhysicalProperties, PipelineDopDomain,
-    PlanBuilder, PlanVersionId, ROOT_WRITE_RESULT_SCHEMA_REVISION, ResultField, ResultPort,
-    RowMultiplicity, SetOperationKind, ValueId, ValueOrigin, ValueType,
-    WRITER_MULTIPLEX_SCHEMA_REVISION, WriterDerivedKind, WriterFinishSpec, WriterRelationField,
-    WriterRelationFieldRole, WriterRelationSchema, WriterTarget, WriterTargetField,
+    JoinDistribution, JoinKey, JoinKind, JoinSide, NestLoopJoinDistribution, NodeKind, OutputPort,
+    PhysicalNode, PhysicalPlan, PhysicalProperties, PipelineDopDomain, PlanBuilder, PlanVersionId,
+    ROOT_WRITE_RESULT_SCHEMA_REVISION, ResultField, ResultPort, RowMultiplicity, SetOperationKind,
+    ValueId, ValueOrigin, ValueType, WRITER_MULTIPLEX_SCHEMA_REVISION, WriterDerivedKind,
+    WriterFinishSpec, WriterRelationField, WriterRelationFieldRole, WriterRelationSchema,
+    WriterTarget, WriterTargetField,
 };
 use novarocks_plan_codec::{PhysicalV1PrivateFacts, PhysicalV1WriteFact};
 use novarocks_proto_models::{connector_write, plan};
@@ -78,6 +78,60 @@ fn singleton_properties() -> PhysicalProperties {
     }
 }
 
+/// A fixture's Int64 literal as a checked constant: v1 encoding refuses legacy
+/// literals. Each value has its own one-row pool, keyed by the value.
+fn i64_constant(value: i64) -> ExprKind {
+    ExprKind::Constant(novarocks_physical_plan::ConstantReference {
+        pool: fixture_pool(value),
+        ordinal: 0,
+    })
+}
+
+fn fixture_pool(value: i64) -> novarocks_physical_plan::ConstantPoolId {
+    novarocks_physical_plan::ConstantPoolId::new(
+        7000 + u32::try_from(value).expect("fixture literals are small and nonnegative"),
+    )
+}
+
+/// Registers exactly the fixture pools `fragment` refers to: the closed-pool
+/// publication law refuses a pool nothing references.
+fn register_constant_pools(
+    builder: &mut PlanBuilder,
+    fragment: &novarocks_physical_plan::Fragment,
+) {
+    for (_, expression) in fragment.expressions().iter() {
+        let ExprKind::Constant(reference) = expression.kind else {
+            continue;
+        };
+        if builder.constants().entries().contains_key(&reference.pool) {
+            continue;
+        }
+        let value = i64::from(reference.pool.get() - 7000);
+        let ty = novarocks_type_contract::FunctionValueType::new(DataType::Int64, false);
+        let pool = novarocks_physical_plan::ConstantPool::try_new(
+            Arc::new(ty.try_to_field("literal").unwrap()),
+            ty,
+            Int64Array::from(vec![value]).to_data(),
+            novarocks_functions::ConstantPolicy {
+                max_rows: 16,
+                max_array_nodes: 128,
+                max_logical_elements: 1024,
+                max_retained_buffer_bytes: 1 << 20,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 1 << 20,
+                max_library_validation_work: 1 << 20,
+                max_library_validation_bytes: 1 << 20,
+            },
+            novarocks_type_contract::CompilePhase::Validate,
+            compile_control(),
+        )
+        .unwrap();
+        builder.insert_constant_pool(reference.pool, pool).unwrap();
+    }
+}
+
 fn unconstrained_properties() -> PhysicalProperties {
     PhysicalProperties {
         distribution: Distribution::Unconstrained,
@@ -93,11 +147,7 @@ fn append_i64_values(
     let node = builder.reserve_node_id().unwrap();
     let ty = ValueType::new(DataType::Int64, false);
     let literal = builder
-        .add_expression(
-            node,
-            ty.clone(),
-            ExprKind::Literal(LiteralValue::Int64(literal_value)),
-        )
+        .add_expression(node, ty.clone(), i64_constant(literal_value))
         .unwrap();
     let value = builder
         .add_value(
@@ -188,12 +238,12 @@ fn finish_hash_join_plan(
     let join = builder.reserve_node_id().unwrap();
     let ty = ValueType::new(DataType::Int64, false);
     let left_key_kind = if output == HashJoinFixtureOutput::ReorderedPair {
-        ExprKind::Literal(LiteralValue::Int64(1))
+        i64_constant(1)
     } else {
         ExprKind::Value(left_value)
     };
     let right_key_kind = if output == HashJoinFixtureOutput::ReorderedPair {
-        ExprKind::Literal(LiteralValue::Int64(1))
+        i64_constant(1)
     } else {
         ExprKind::Value(right_value)
     };
@@ -327,6 +377,7 @@ fn finish_result_plan(
         .collect();
     let mut plan_builder =
         PlanBuilder::new(PlanVersionId::try_new([fragment_id.get() as u8; 16]).unwrap());
+    register_constant_pools(&mut plan_builder, &fragment);
     plan_builder.add_fragment(fragment).unwrap();
     plan_builder
         .set_result_port(ResultPort {
@@ -338,7 +389,7 @@ fn finish_result_plan(
             fields,
         })
         .unwrap();
-    plan_builder.finish().unwrap()
+    plan_builder.finish_observed(compile_control()).unwrap()
 }
 
 #[derive(Clone, Default)]
@@ -944,6 +995,9 @@ fn finish_duplicate_router_plan() -> (PhysicalPlan, OneWriteFact) {
         .unwrap();
 
     let mut plan_builder = PlanBuilder::new(PlanVersionId::try_new([81; 16]).unwrap());
+    for fragment in [&source, &writer_stage, &finish_stage] {
+        register_constant_pools(&mut plan_builder, fragment);
+    }
     plan_builder.add_fragment(source).unwrap();
     plan_builder.add_fragment(writer_stage).unwrap();
     plan_builder.add_fragment(finish_stage).unwrap();
@@ -1007,7 +1061,7 @@ fn finish_duplicate_router_plan() -> (PhysicalPlan, OneWriteFact) {
                 .collect(),
         })
         .unwrap();
-    let physical = plan_builder.finish().unwrap();
+    let physical = plan_builder.finish_observed(compile_control()).unwrap();
     let fact = PhysicalV1WriteFact {
         handle: connector_write::ConnectorWriterHandle {
             provider_payload: Some(
@@ -1029,11 +1083,7 @@ fn physical_plan_finish_encode_decode_preserves_transparent_duplicate_layout() {
     let values = builder.reserve_node_id().unwrap();
     let ty = ValueType::new(DataType::Int64, false);
     let literal = builder
-        .add_expression(
-            values,
-            ty.clone(),
-            ExprKind::Literal(LiteralValue::Int64(7)),
-        )
+        .add_expression(values, ty.clone(), i64_constant(7))
         .unwrap();
     let value = builder
         .add_value(
@@ -1109,6 +1159,7 @@ fn physical_plan_finish_encode_decode_preserves_transparent_duplicate_layout() {
         )
         .unwrap();
     let mut plan_builder = PlanBuilder::new(PlanVersionId::try_new([71; 16]).unwrap());
+    register_constant_pools(&mut plan_builder, &fragment);
     plan_builder.add_fragment(fragment).unwrap();
     plan_builder
         .set_result_port(ResultPort {
@@ -1133,7 +1184,7 @@ fn physical_plan_finish_encode_decode_preserves_transparent_duplicate_layout() {
             ]),
         })
         .unwrap();
-    let physical = plan_builder.finish().unwrap();
+    let physical = plan_builder.finish_observed(compile_control()).unwrap();
     let catalog = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
     let encoded = novarocks_plan_codec::encode_physical_plan_v1(
         &physical,
@@ -1207,6 +1258,7 @@ fn physical_plan_finish_encode_decode_preserves_set_op_fresh_output_layout() {
         )
         .unwrap();
     let mut plan_builder = PlanBuilder::new(PlanVersionId::try_new([72; 16]).unwrap());
+    register_constant_pools(&mut plan_builder, &fragment);
     plan_builder.add_fragment(fragment).unwrap();
     plan_builder
         .set_result_port(ResultPort {
@@ -1223,7 +1275,7 @@ fn physical_plan_finish_encode_decode_preserves_set_op_fresh_output_layout() {
             }]),
         })
         .unwrap();
-    let physical = plan_builder.finish().unwrap();
+    let physical = plan_builder.finish_observed(compile_control()).unwrap();
     let catalog = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
     let encoded = novarocks_plan_codec::encode_physical_plan_v1(
         &physical,
