@@ -1346,13 +1346,21 @@ fn lower(
                             .ok_or(FragmentCompileError::Invalid(
                                 "missing lowered table finish child",
                             ))?;
+                    let statistics_slots = channels_plan.finish_statistics.get(&source).ok_or(
+                        FragmentCompileError::Invalid("missing planned finish statistics"),
+                    )?;
                     work.flush()?;
                     let lowered = crate::writer::lower_finish(
+                        package,
                         node,
                         id,
-                        child,
-                        nodes[child.index()].output_layout(),
-                        &planned.slots,
+                        crate::writer::FinishLoweringInput {
+                            child,
+                            child_layout: nodes[child.index()].output_layout(),
+                            slots: &planned.slots,
+                            statistics_slots,
+                            expressions: &expressions.ids,
+                        },
                         work.control(),
                     )?;
                     source_requirements.push(lowered.requirement);
@@ -1614,6 +1622,11 @@ fn lower(
             }
             ExpressionRootRole::UnpivotConstant { mapping, constant } => {
                 ProgramNodeExpressionRole::UnpivotConstant { mapping, constant }
+            }
+            // A grouped Unpivot keeps the frozen mapping order, so a mapping
+            // ordinal names the same mapping on both sides.
+            ExpressionRootRole::FinishUnpivotConstant { mapping, constant } => {
+                ProgramNodeExpressionRole::FinishUnpivotConstant { mapping, constant }
             }
             ExpressionRootRole::FilterPredicate { predicate: 0 } => {
                 ProgramNodeExpressionRole::FilterPredicate

@@ -43,6 +43,10 @@ pub(crate) struct PlannedChannels {
     /// Fresh slots of each TableWriter's projected provider input, in target
     /// field order. Its output slots are its multiplex relation's.
     pub writer_projections: BTreeMap<NodeId, Arc<[SlotId]>>,
+    /// Fresh internal slots of each TableFinish's statistics: the grouped
+    /// Unpivot's grouping output followed by one final output per call.
+    /// Empty without statistics.
+    pub finish_statistics: BTreeMap<NodeId, Arc<[SlotId]>>,
     /// Each join's planned channels. A join whose physical output is not
     /// canonical also has one selection branch in `unions`.
     pub joins: BTreeMap<NodeId, crate::join::PlannedJoin>,
@@ -184,6 +188,7 @@ fn resolve_core(
     let mut next_node = 0usize;
     let mut unions = BTreeMap::new();
     let mut writer_projections = BTreeMap::new();
+    let mut finish_statistics = BTreeMap::new();
     let mut joins = BTreeMap::new();
     let mut table_functions = BTreeMap::new();
     for &source in root_first.iter().rev() {
@@ -658,10 +663,18 @@ fn resolve_core(
                 writer_projections.insert(source, projection);
                 fresh_relation(fragment, node, &mut next_slot, work)?
             }
-            // A finish produces its root relation itself.
-            NodeKind::TableFinish(_) => {
+            // A finish produces its root relation itself, and its statistics
+            // their internal grouping and final channels.
+            NodeKind::TableFinish(spec) => {
                 single_child(&node.inputs)?;
-                fresh_relation(fragment, node, &mut next_slot, work)?
+                let relation = fresh_relation(fragment, node, &mut next_slot, work)?;
+                let statistics = fresh_slots(
+                    crate::writer_statistics::finish_statistics_slots(spec),
+                    &mut next_slot,
+                    work,
+                )?;
+                finish_statistics.insert(source, statistics);
+                relation
             }
             // A join produces its canonical output itself; a selection
             // Project, when present, publishes the physical output.
@@ -784,6 +797,7 @@ fn resolve_core(
         assertion_keys,
         unions,
         writer_projections,
+        finish_statistics,
         joins,
         join_values,
         table_functions,

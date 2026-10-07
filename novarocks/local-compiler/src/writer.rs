@@ -32,9 +32,11 @@
 //! feeding a non-null target field is the writer's row obligation, checked by
 //! the executor before any provider I/O.
 //!
-//! Writer statistics (partial aggregates, final aggregates and the grouped
-//! Unpivot) are not compiled yet and are refused explicitly, as are multi-writer
-//! finishes and a partitioned writer input at more than one driver.
+//! Writer statistics are compiled by `writer_statistics`: a writer's partial
+//! calls write its multiplex relation's auxiliary channels, and a finish's
+//! final calls and grouped Unpivot expand them into Root artifact rows.
+//! Multi-writer finishes and a partitioned writer input at more than one
+//! driver remain explicit refusals.
 
 use crate::{assert_rows::reserve_vec, lowering::FragmentCompileError};
 use arrow_schema::Schema;
@@ -44,10 +46,10 @@ use novarocks_local_program::{
     ProgramChannelSite, ProgramControlFlow, ProgramEvaluationDomain, ProgramExprId,
     ProgramExpressionArena, ProgramExpressionRootSite, ProgramExpressionUse, ProgramLexicalSource,
     ProgramNodeId, ProgramNodeKind, ProgramRootUseBinding, ProgramSlotBinding, ProgramUseRef,
-    StaticExprKind, StaticExprNode, StaticLayout, StaticWriterProjection, WriterFinalAggregatePlan,
+    StaticExprKind, StaticExprNode, StaticLayout, StaticWriterProjection,
 };
 use novarocks_physical_plan::{
-    Distribution, EdgeKind, FragmentPackage, FragmentSink, NodeKind, OutboundFragmentCut,
+    Distribution, EdgeKind, ExprId, FragmentPackage, FragmentSink, NodeKind, OutboundFragmentCut,
     PhysicalNode, ValueId, WriterRelationSchema,
 };
 use novarocks_type_contract::{
@@ -56,28 +58,31 @@ use novarocks_type_contract::{
     FunctionValueType, PureCompileControl,
 };
 use novarocks_types::SlotId;
-use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
-
-/// Statistics refusal shared by the writer and the finish: the compiled path
-/// has no writer statistics owner yet.
-const STATISTICS: &str = "writer statistics (collect-on-write aggregates) are not compiled yet; \
-     the target must disable collect-on-write statistics";
+use std::{
+    collections::{BTreeMap, HashMap},
+    num::NonZeroUsize,
+    sync::Arc,
+};
 
 /// Additional typed channels one writer-family node owns beyond its output
 /// occurrences: the writer's projection and multiplex roles, or the finish's
-/// multiplex and root-result roles.
+/// multiplex and root-result roles and one final output per final call.
 pub(crate) fn extra_channels(package: &FragmentPackage, node: &PhysicalNode) -> Option<usize> {
     match &node.kind {
         NodeKind::TableWriter { target } => {
             node.output.columns.len().checked_add(target.input.len())
         }
-        NodeKind::TableFinish(_) => {
+        NodeKind::TableFinish(spec) => {
             let input = node
                 .inputs
                 .first()
                 .and_then(|input| package.fragment().nodes().get(input))
                 .map_or(0, |input| input.output.columns.len());
-            node.output.columns.len().checked_add(input)
+            node.output
+                .columns
+                .len()
+                .checked_add(input)?
+                .checked_add(spec.final_aggregates.len())
         }
         _ => Some(0),
     }
@@ -85,10 +90,10 @@ pub(crate) fn extra_channels(package: &FragmentPackage, node: &PhysicalNode) -> 
 
 /// Admit one writer-family node before channels or expressions exist.
 ///
-/// A `TableWriter` is the one root of its fragment, streams exactly its
-/// writer relation and carries no statistics; a partitioned input runs on one
-/// driver only. A `TableFinish` is the root of a Result fragment over exactly
-/// one writer-result receiver and carries no statistics.
+/// A `TableWriter` is the one root of its fragment and streams exactly its
+/// writer relation; a partitioned input runs on one driver only. A
+/// `TableFinish` is the root of a Result fragment over exactly one
+/// writer-result receiver. Statistics are admitted by their own owner.
 pub(crate) fn admit_writer_family(
     package: &FragmentPackage,
     node: &PhysicalNode,
@@ -111,9 +116,6 @@ pub(crate) fn admit_writer_family(
         NodeKind::TableWriter { target } => {
             if !matches!(fragment.sink(), FragmentSink::Stream { .. }) {
                 return Err(unsupported("table writer without a writer-result stream"));
-            }
-            if !target.partial_aggregates.is_empty() {
-                return Err(unsupported(STATISTICS));
             }
             // A partitioned input is co-located per instance only; the legacy
             // writer re-shuffles it per driver. Without a compiled local
@@ -147,14 +149,12 @@ pub(crate) fn admit_writer_family(
                     ));
                 }
             }
-            require_relation_output(node, &target.output_schema, work)
+            require_relation_output(node, &target.output_schema, work)?;
+            crate::writer_statistics::admit_partial_calls(node, target, work)
         }
         NodeKind::TableFinish(spec) => {
             if !matches!(fragment.sink(), FragmentSink::Result) {
                 return Err(unsupported("table finish without a Result sink"));
-            }
-            if !spec.final_aggregates.is_empty() || spec.grouped_unpivot.is_some() {
-                return Err(unsupported(STATISTICS));
             }
             let [input] = node.inputs.as_ref() else {
                 return Err(FragmentCompileError::Invalid(
@@ -195,7 +195,7 @@ pub(crate) fn admit_writer_family(
                     "table finish result port differs from its root relation",
                 ));
             }
-            Ok(())
+            crate::writer_statistics::admit_finish_statistics(node, spec, work)
         }
         _ => Err(FragmentCompileError::Invalid("writer family kind differs")),
     }
@@ -479,6 +479,12 @@ fn lower_writer_core(
         ));
         work.step()?;
     }
+    let partial_aggregates = crate::writer_statistics::lower_partial_calls(
+        target,
+        input.projection_slots,
+        input.output_slots,
+        work,
+    )?;
     let arena_id = ProgramExpressionArena::WriterProjection(id);
     let flow = projection_flow(id, input.child, arena_id, &ordinals, work)?;
     work.flush()?;
@@ -493,7 +499,7 @@ fn lower_writer_core(
                 layout: projection_layout,
             },
             writer_multiplex_layout: multiplex.clone(),
-            partial_aggregates: Vec::new(),
+            partial_aggregates,
         },
         requirement: BindingRequirement::TableWriter {
             node: id,
@@ -583,19 +589,34 @@ pub(crate) struct LoweredFinish {
     pub kind: ProgramNodeKind,
     pub layout: StaticLayout,
     pub requirement: BindingRequirement,
-    /// Typed channels of the finish's multiplex and root-result roles.
+    /// Typed channels of the finish's multiplex and root-result roles and of
+    /// each final call's output.
     pub channels: Vec<(ProgramChannelSite, FunctionValueType)>,
+}
+
+/// The finish's actual input and the slots its relations and statistics own.
+pub(crate) struct FinishLoweringInput<'a> {
+    pub child: ProgramNodeId,
+    pub child_layout: &'a StaticLayout,
+    /// Fresh slots of the Root relation, in field order.
+    pub slots: &'a [SlotId],
+    /// Fresh internal slots of the statistics: the grouped Unpivot's
+    /// grouping output followed by one final output per call; empty without
+    /// statistics.
+    pub statistics_slots: &'a [SlotId],
+    /// The Main-arena definition of each physical expression, read by the
+    /// grouped Unpivot's scalar constants.
+    pub expressions: &'a BTreeMap<ExprId, ProgramExprId>,
 }
 
 /// Lower one admitted finish over its one writer-result receiver. The finish
 /// reads the receiver's layout unchanged as its multiplex relation and
 /// publishes its root relation with the frozen relation names.
 pub(crate) fn lower_finish(
+    package: &FragmentPackage,
     node: &PhysicalNode,
     id: ProgramNodeId,
-    child: ProgramNodeId,
-    child_layout: &StaticLayout,
-    slots: &[SlotId],
+    input: FinishLoweringInput<'_>,
     control: &dyn PureCompileControl,
 ) -> Result<LoweredFinish, FragmentCompileError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
@@ -603,6 +624,7 @@ pub(crate) fn lower_finish(
         let NodeKind::TableFinish(spec) = &node.kind else {
             return Err(FragmentCompileError::Invalid("TableFinish kind differs"));
         };
+        let (child, child_layout, slots) = (input.child, input.child_layout, input.slots);
         if child_layout.slots().len() != spec.input_schema.fields.len() {
             return Err(FragmentCompileError::Invalid(
                 "table finish input layout differs from its input relation",
@@ -610,6 +632,18 @@ pub(crate) fn lower_finish(
         }
         work.flush()?;
         let root = relation_layout(&spec.output_schema, slots, work.control())?;
+        let statistics = crate::writer_statistics::lower_finish_statistics(
+            package,
+            spec,
+            crate::writer_statistics::FinishStatisticsChannels {
+                node: id,
+                input_slots: child_layout.slots(),
+                root_slots: slots,
+                statistics_slots: input.statistics_slots,
+                expressions: input.expressions,
+            },
+            &mut work,
+        )?;
         let mut channels = Vec::new();
         reserve_vec(
             &mut channels,
@@ -617,6 +651,7 @@ pub(crate) fn lower_finish(
                 .fields
                 .len()
                 .checked_add(spec.output_schema.fields.len())
+                .and_then(|count| count.checked_add(statistics.channels.len()))
                 .ok_or(CompileControlError::ResourceExhausted)?,
             &mut work,
         )?;
@@ -643,6 +678,7 @@ pub(crate) fn lower_finish(
                 work.step()?;
             }
         }
+        channels.extend(statistics.channels);
         work.flush()?;
         Ok(LoweredFinish {
             kind: ProgramNodeKind::TableFinish {
@@ -650,10 +686,7 @@ pub(crate) fn lower_finish(
                 expected_targets: spec.expected_target_ordinals.to_vec(),
                 writer_multiplex_layout: child_layout.clone(),
                 root_result_layout: root.clone(),
-                final_aggregates: WriterFinalAggregatePlan {
-                    calls: Vec::new(),
-                    unpivot: None,
-                },
+                final_aggregates: statistics.plan,
             },
             requirement: BindingRequirement::TableFinish {
                 node: id,

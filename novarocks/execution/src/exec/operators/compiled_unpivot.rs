@@ -31,6 +31,11 @@
 //! Reused legacy pieces are array code only: segment flattening, owned part
 //! concatenation and the budget search. The legacy ExprArena constant
 //! evaluation is not used.
+//!
+//! The expansion itself -- per-channel producers over one input batch and its
+//! evaluated constants, emitted under the frozen budgets -- is the reusable
+//! `UnpivotExpansion` core; the writer's grouped Unpivot runs it once per
+//! target with that target's own mappings.
 
 use std::sync::Arc;
 
@@ -56,8 +61,8 @@ use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 
 /// The frozen source of one literal channel for one mapping.
 #[derive(Clone)]
-enum LiteralSource {
-    /// Index of a compiled scalar constant root.
+pub(crate) enum LiteralSource {
+    /// Index of an evaluated scalar constant column.
     Root(usize),
     /// A frozen Int32 list, materialized with the channel's list item field.
     Int32List(Arc<[i32]>),
@@ -67,7 +72,7 @@ enum LiteralSource {
 
 /// The producer of one output channel, in output order.
 #[derive(Clone)]
-enum Producer {
+pub(crate) enum Producer {
     Passthrough {
         input: usize,
     },
@@ -95,14 +100,14 @@ pub struct CompiledUnpivotProcessorFactory {
     error: Arc<RuntimeErrorState>,
 }
 
-fn list_item_field(data_type: &DataType) -> Option<&FieldRef> {
+pub(crate) fn list_item_field(data_type: &DataType) -> Option<&FieldRef> {
     match data_type {
         DataType::List(item) if item.data_type() == &DataType::Int32 => Some(item),
         _ => None,
     }
 }
 
-fn map_entries_field(data_type: &DataType) -> Option<(&FieldRef, bool)> {
+pub(crate) fn map_entries_field(data_type: &DataType) -> Option<(&FieldRef, bool)> {
     let DataType::Map(entries, sorted) = data_type else {
         return None;
     };
@@ -293,16 +298,15 @@ impl OperatorFactory for CompiledUnpivotProcessorFactory {
             program: Arc::clone(&self.program),
             input_schema: Arc::clone(&self.input),
             sites: self.sites.clone(),
-            producers: Arc::clone(&self.producers),
-            mappings: self.mappings,
-            max_output_rows: self.max_output_rows,
-            max_output_bytes: self.max_output_bytes,
-            output: Arc::clone(&self.output),
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
             instances: None,
-            input: None,
-            cursor: 0,
-            hint: None,
+            expansion: UnpivotExpansion::new(
+                Arc::clone(&self.producers),
+                Arc::clone(&self.output),
+                self.mappings,
+                self.max_output_rows,
+                self.max_output_bytes,
+            ),
             mem_tracker: None,
             finishing: false,
             finished: false,
@@ -316,21 +320,119 @@ struct Expanding {
     constants: Vec<ArrayRef>,
 }
 
-struct CompiledUnpivotProcessor {
-    name: String,
-    program: Arc<LocalProgram>,
-    input_schema: SchemaRef,
-    sites: Vec<ProgramExpressionRootSite>,
+/// The reusable Unpivot expansion: each input row becomes one output row per
+/// mapping, mapping-major, every output batch within the frozen row and byte
+/// budgets. It owns at most one input batch at a time.
+pub(crate) struct UnpivotExpansion {
     producers: Arc<[Producer]>,
     mappings: usize,
     max_output_rows: usize,
     max_output_bytes: usize,
     output: ChunkSchemaRef,
-    control: RuntimeKernelControl,
-    instances: Option<Vec<CompiledExpressionInstance>>,
     input: Option<Expanding>,
     cursor: usize,
     hint: Option<usize>,
+}
+
+impl UnpivotExpansion {
+    pub(crate) fn new(
+        producers: Arc<[Producer]>,
+        output: ChunkSchemaRef,
+        mappings: usize,
+        max_output_rows: usize,
+        max_output_bytes: usize,
+    ) -> Self {
+        Self {
+            producers,
+            mappings,
+            max_output_rows,
+            max_output_bytes,
+            output,
+            input: None,
+            cursor: 0,
+            hint: None,
+        }
+    }
+
+    /// Whether an input batch is still being expanded.
+    pub(crate) fn is_expanding(&self) -> bool {
+        self.input.is_some()
+    }
+
+    /// Start expanding one input batch with its evaluated scalar constant
+    /// columns, one per `LiteralSource::Root` index.
+    pub(crate) fn start(
+        &mut self,
+        batch: RecordBatch,
+        constants: Vec<ArrayRef>,
+    ) -> ExecutionResult<()> {
+        if self.input.is_some() {
+            return Err("compiled Unpivot received input while expanding".into());
+        }
+        // A scalar constant must already carry its literal channel's type.
+        for producer in self.producers.iter().enumerate() {
+            let (ordinal, Producer::Literal { sources }) = producer else {
+                continue;
+            };
+            let expected = self.output.arrow_schema_ref();
+            let expected = expected.field(ordinal).data_type();
+            for source in sources {
+                if let LiteralSource::Root(root) = source {
+                    let constant = constants.get(*root).ok_or_else(|| {
+                        ExecutionFailure::from("compiled Unpivot constant is absent")
+                    })?;
+                    if constant.data_type() != expected {
+                        return Err(ExecutionFailure::from(format!(
+                            "compiled Unpivot constant has type {:?}, not {expected:?}",
+                            constant.data_type()
+                        )));
+                    }
+                }
+            }
+        }
+        self.input = Some(Expanding { batch, constants });
+        self.cursor = 0;
+        Ok(())
+    }
+
+    /// The next bounded output batch of the current input, if any.
+    pub(crate) fn next(
+        &mut self,
+        mem_tracker: Option<&Arc<MemTracker>>,
+    ) -> ExecutionResult<Option<Chunk>> {
+        let Some(input) = self.input.as_ref() else {
+            return Ok(None);
+        };
+        let total =
+            input.batch.num_rows().checked_mul(self.mappings).ok_or(
+                "ResourceExhausted: unpivot expanded row count exceeds addressable memory",
+            )?;
+        let (producers, output, cursor) = (&self.producers, &self.output, self.cursor);
+        let (chunk, rows) = next_bounded_output(
+            total - cursor,
+            self.max_output_rows,
+            self.max_output_bytes,
+            &mut self.hint,
+            mem_tracker,
+            |len| build_output(producers, output, input, cursor, len),
+        )?;
+        self.cursor += rows;
+        if self.cursor == total {
+            self.input = None;
+            self.cursor = 0;
+        }
+        Ok(Some(chunk))
+    }
+}
+
+struct CompiledUnpivotProcessor {
+    name: String,
+    program: Arc<LocalProgram>,
+    input_schema: SchemaRef,
+    sites: Vec<ProgramExpressionRootSite>,
+    control: RuntimeKernelControl,
+    instances: Option<Vec<CompiledExpressionInstance>>,
+    expansion: UnpivotExpansion,
     mem_tracker: Option<Arc<MemTracker>>,
     finishing: bool,
     finished: bool,
@@ -456,13 +558,13 @@ impl Operator for CompiledUnpivotProcessor {
 
 impl ProcessorOperator for CompiledUnpivotProcessor {
     fn need_input(&self) -> bool {
-        !self.finishing && !self.finished && self.input.is_none()
+        !self.finishing && !self.finished && !self.expansion.is_expanding()
     }
     fn has_output(&self) -> bool {
-        self.input.is_some()
+        self.expansion.is_expanding()
     }
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        if self.input.is_some() {
+        if self.expansion.is_expanding() {
             return Err("compiled Unpivot received input while expanding".into());
         }
         if chunk.is_empty() {
@@ -482,64 +584,24 @@ impl ProcessorOperator for CompiledUnpivotProcessor {
         for (instance, site) in instances.iter_mut().zip(&self.sites) {
             constants.push(evaluate_all(instance, *site, &chunk.batch, &self.control)?);
         }
-        // A scalar constant must already carry its literal channel's type.
-        for producer in self.producers.iter().enumerate() {
-            let (ordinal, Producer::Literal { sources }) = producer else {
-                continue;
-            };
-            let expected = self.output.arrow_schema_ref();
-            let expected = expected.field(ordinal).data_type();
-            for source in sources {
-                if let LiteralSource::Root(root) = source
-                    && constants[*root].data_type() != expected
-                {
-                    return Err(ExecutionFailure::from(format!(
-                        "compiled Unpivot constant has type {:?}, not {expected:?}",
-                        constants[*root].data_type()
-                    )));
-                }
-            }
-        }
-        self.input = Some(Expanding {
-            batch: chunk.batch,
-            constants,
-        });
-        self.cursor = 0;
-        Ok(())
+        self.expansion.start(chunk.batch, constants)
     }
     fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        let Some(input) = self.input.as_ref() else {
+        if !self.expansion.is_expanding() {
             if self.finishing {
                 self.finished = true;
             }
             return Ok(None);
-        };
-        let total =
-            input.batch.num_rows().checked_mul(self.mappings).ok_or(
-                "ResourceExhausted: unpivot expanded row count exceeds addressable memory",
-            )?;
-        let (producers, output, cursor) = (&self.producers, &self.output, self.cursor);
-        let (chunk, rows) = next_bounded_output(
-            total - cursor,
-            self.max_output_rows,
-            self.max_output_bytes,
-            &mut self.hint,
-            self.mem_tracker.as_ref(),
-            |len| build_output(producers, output, input, cursor, len),
-        )?;
-        self.cursor += rows;
-        if self.cursor == total {
-            self.input = None;
-            self.cursor = 0;
-            if self.finishing {
-                self.finished = true;
-            }
         }
-        Ok(Some(chunk))
+        let chunk = self.expansion.next(self.mem_tracker.as_ref())?;
+        if !self.expansion.is_expanding() && self.finishing {
+            self.finished = true;
+        }
+        Ok(chunk)
     }
     fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         self.finishing = true;
-        if self.input.is_none() {
+        if !self.expansion.is_expanding() {
             self.finished = true;
         }
         Ok(())

@@ -95,7 +95,11 @@ struct TableWriterPlan {
     request_context: ConnectorRequestContext,
     fragment_encoder: Arc<dyn ConnectorCommitFragmentEncoder>,
     writer_multiplex_schema: WriterMultiplexRelationSchema,
-    partial_aggregate_factory: Option<AggregateProcessorFactory>,
+    /// Each driver's partial aggregate over its projected pages, emitting one
+    /// state row whose auxiliary channels the writer packs as sparse
+    /// `AGGREGATE_PARTIAL` rows. A plan-tree writer binds it from the
+    /// process function set; a compiled writer from its prepared calls.
+    partial_aggregate_factory: Option<Arc<dyn OperatorFactory>>,
     #[cfg(debug_assertions)]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
 }
@@ -164,7 +168,8 @@ impl TableWriterOperatorFactory {
             partial_aggregate_calls,
             &writer_multiplex_schema,
             function_set,
-        )?;
+        )?
+        .map(|factory| Arc::new(factory) as Arc<dyn OperatorFactory>);
         let name = if node_id >= 0 {
             format!("TABLE_WRITER (id={node_id})")
         } else {
@@ -190,14 +195,16 @@ impl TableWriterOperatorFactory {
     }
 
     /// A compiled writer: its projection evaluates the program's
-    /// WriterProjection roots onto the exact provider schema, and it carries
-    /// no statistics, so it binds no aggregate and reads no function set.
+    /// WriterProjection roots onto the exact provider schema, and its
+    /// statistics, if any, run the program's prepared partial calls. It reads
+    /// no function set. The sparse packer, guard and row limits are shared.
     pub(crate) fn try_new_compiled(
         node_id: i32,
         target: WriteTargetOrdinal,
         expected_schema: arrow::datatypes::SchemaRef,
         projection: Arc<dyn WriterProjectionFactory>,
         writer_multiplex_schema: WriterMultiplexRelationSchema,
+        partial_aggregate_factory: Option<Arc<dyn OperatorFactory>>,
         binding: &TableWriterRuntimeBinding,
     ) -> Result<Self, String> {
         if binding.execution.catalog_handle() != binding.handle.binding().catalog_handle() {
@@ -223,7 +230,7 @@ impl TableWriterOperatorFactory {
                 request_context: binding.request_context.clone(),
                 fragment_encoder: Arc::clone(&binding.fragment_encoder),
                 writer_multiplex_schema,
-                partial_aggregate_factory: None,
+                partial_aggregate_factory,
                 #[cfg(debug_assertions)]
                 aggregate_guard: Arc::clone(&binding.aggregate_guard),
             }),
@@ -246,7 +253,8 @@ impl TableWriterOperatorFactory {
             &node.partial_aggregate_plan().calls,
             node.writer_multiplex_schema(),
             function_set,
-        )?;
+        )?
+        .map(|factory| Arc::new(factory) as Arc<dyn OperatorFactory>);
         Ok(Self {
             name,
             plan: Arc::new(TableWriterPlan {

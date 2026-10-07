@@ -41,6 +41,7 @@ mod union_flow;
 mod unpivot;
 mod window;
 mod writer;
+mod writer_statistics;
 
 #[cfg(test)]
 mod window_lowering_tests;

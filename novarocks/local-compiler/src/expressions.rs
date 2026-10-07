@@ -1066,7 +1066,7 @@ fn prepare_core(
         work.step()?;
     }
     let flow = package.expression_uses().flow();
-    // Relational Aggregate, Table and Window calls are prepared after every
+    // Relational Aggregate, Table, Window and writer calls are prepared after every
     // expression occurrence; every other relational lifecycle stays explicit.
     for &site in package.calls().entries().keys() {
         let admitted = match site {
@@ -1082,9 +1082,10 @@ fn prepare_core(
                 });
                 !window || aggregate_nodes.is_some()
             }
-            PhysicalCallSite::Aggregate { .. } | PhysicalCallSite::Table { .. } => {
-                aggregate_nodes.is_some()
-            }
+            PhysicalCallSite::Aggregate { .. }
+            | PhysicalCallSite::Table { .. }
+            | PhysicalCallSite::WriterPartial { .. }
+            | PhysicalCallSite::WriterFinal { .. } => aggregate_nodes.is_some(),
             _ => false,
         };
         if !admitted {
@@ -1710,6 +1711,13 @@ fn prepare_core(
             package,
             functions,
             &effects,
+            nodes,
+            &mut tokens,
+            work,
+        )?;
+        crate::writer_statistics::prepare_writer_calls(
+            package,
+            functions,
             nodes,
             &mut tokens,
             work,

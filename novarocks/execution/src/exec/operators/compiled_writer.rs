@@ -31,8 +31,10 @@
 //! * both relations are the program's positional layouts, carried by its own
 //!   slots rather than by the SPI's reserved relation slot IDs.
 //!
-//! Writer statistics (partial and final aggregates, grouped Unpivot) are not
-//! compiled yet; the compiler refuses them and so does this owner.
+//! Writer statistics run the program's prepared writer calls: the writer's
+//! partial processor feeds the existing sparse `AGGREGATE_PARTIAL` packer, and
+//! the finish's compiled statistics owner replaces the plan-tree final
+//! aggregate and grouped Unpivot behind the finish's own coverage checks.
 
 use std::sync::Arc;
 
@@ -52,8 +54,12 @@ use crate::exec::node::table_write_relation::{
 };
 use crate::exec::node::table_writer::TableWriterRuntimeBinding;
 use crate::exec::operators::compiled_expression::{RuntimeKernelControl, evaluate_all, instances};
+use crate::exec::operators::compiled_writer_statistics::{
+    CompiledFinishStatistics, CompiledWriterPartialFactory,
+};
 use crate::exec::operators::table_writer::{WriterPageProjection, WriterProjectionFactory};
 use crate::exec::operators::{TableFinishOperatorFactory, TableWriterOperatorFactory};
+use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::ExecutionResult;
 use crate::runtime::runtime_state::RuntimeErrorState;
 
@@ -74,18 +80,14 @@ pub(crate) fn compiled_table_writer_factory(
     let ProgramNodeKind::TableWriter {
         target,
         writer_multiplex_layout,
-        partial_aggregates,
         ..
     } = node.kind()
     else {
         return Err(format!("compiled node {} is not a TableWriter", id.index()));
     };
-    if !partial_aggregates.is_empty() {
-        return Err(format!(
-            "compiled table writer at local node {} carries writer statistics, which are not executable yet",
-            id.index()
-        ));
-    }
+    let partial_aggregate_factory =
+        CompiledWriterPartialFactory::try_new(program, id, Arc::clone(error))?
+            .map(|factory| Arc::new(factory) as Arc<dyn OperatorFactory>);
     let projection = CompiledWriterProjection::try_new(Arc::clone(program), id, Arc::clone(error))?;
     let relation =
         WriterMultiplexRelationSchema::try_from_compiled_layout(writer_multiplex_layout)?;
@@ -101,6 +103,7 @@ pub(crate) fn compiled_table_writer_factory(
         Arc::clone(&projection.schema),
         Arc::new(projection),
         relation,
+        partial_aggregate_factory,
         binding,
     )
 }
@@ -108,10 +111,11 @@ pub(crate) fn compiled_table_writer_factory(
 /// Build the compiled finish of local node `id` over the Task's exact
 /// validation authority.
 pub(crate) fn compiled_table_finish_factory(
-    program: &LocalProgram,
+    program: &Arc<LocalProgram>,
     id: ProgramNodeId,
     display_id: i32,
     binding: &TableFinishRuntimeBinding,
+    error: &Arc<RuntimeErrorState>,
 ) -> Result<TableFinishOperatorFactory, String> {
     let node = program
         .graph()
@@ -123,17 +127,11 @@ pub(crate) fn compiled_table_finish_factory(
         expected_targets,
         writer_multiplex_layout,
         root_result_layout,
-        final_aggregates,
+        ..
     } = node.kind()
     else {
         return Err(format!("compiled node {} is not a TableFinish", id.index()));
     };
-    if !final_aggregates.calls.is_empty() || final_aggregates.unpivot.is_some() {
-        return Err(format!(
-            "compiled table finish at local node {} carries writer statistics, which are not executable yet",
-            id.index()
-        ));
-    }
     let [input] = inputs.as_slice() else {
         return Err(format!(
             "compiled table finish at local node {} reads more than one writer input",
@@ -154,11 +152,21 @@ pub(crate) fn compiled_table_finish_factory(
             id.index()
         ));
     }
+    let statistics = CompiledFinishStatistics::try_new(program, id, Arc::clone(error))?.map(
+        |(coverage, statistics)| {
+            (
+                coverage,
+                statistics
+                    as Arc<dyn crate::exec::operators::table_finish::FinishStatisticsFactory>,
+            )
+        },
+    );
     TableFinishOperatorFactory::new_compiled(
         display_id,
         expected_targets.clone(),
         WriterMultiplexRelationSchema::try_from_compiled_layout(writer_multiplex_layout)?,
         RootWriteResultRelationSchema::try_from_compiled_layout(root_result_layout)?,
+        statistics,
         binding,
     )
 }

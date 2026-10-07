@@ -66,7 +66,7 @@ pub(super) fn build_table_finish(
             id.index()
         )
     })?;
-    let factory = compiled_table_finish_factory(program, id, node_id, binding)?;
+    let factory = compiled_table_finish_factory(program, id, node_id, binding, error)?;
     let [input] = inputs else {
         return Err(format!(
             "compiled table finish at local node {} reads more than one writer input",

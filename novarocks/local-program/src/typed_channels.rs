@@ -543,14 +543,17 @@ impl ProgramTypedChannels {
                             true,
                             work,
                         )?;
+                        // The auxiliary channel carries this state on the
+                        // writer's aggregate rows only and is NULL on every
+                        // other row, so it may widen the state's nullability.
                         same_value(
+                            contract.intermediate_type(),
                             self.actual_slot(
                                 node_id,
                                 Role::WriterMultiplex,
                                 source.intermediate_slot_id,
                             )?,
-                            contract.intermediate_type(),
-                            false,
+                            true,
                             work,
                         )?;
                     }

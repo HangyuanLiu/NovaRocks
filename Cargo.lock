@@ -4028,6 +4028,7 @@ dependencies = [
  "arrow-select",
  "bytes",
  "novarocks-connector-contract",
+ "novarocks-connector-iceberg-functions",
  "novarocks-functions",
  "novarocks-local-program",
  "novarocks-physical-plan",

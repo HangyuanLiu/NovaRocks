@@ -82,6 +82,71 @@ use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::profile::{OperatorProfiles, ProfileUnit};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 
+/// The slot facts a finish's statistics are checked against: each final
+/// call's intermediate input and final output channel, in call order, and
+/// each grouped Unpivot mapping's target and the final output it reads.
+/// Coverage, completeness and channel mapping are judged from these alone,
+/// identically for every statistics owner.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FinishStatisticsCoverage {
+    calls: Vec<(novarocks_types::SlotId, novarocks_types::SlotId)>,
+    mappings: Option<Vec<(u32, novarocks_types::SlotId)>>,
+}
+
+impl FinishStatisticsCoverage {
+    pub(crate) fn new(
+        calls: Vec<(novarocks_types::SlotId, novarocks_types::SlotId)>,
+        mappings: Option<Vec<(u32, novarocks_types::SlotId)>>,
+    ) -> Self {
+        Self { calls, mappings }
+    }
+
+    fn from_plan(plan: &WriterFinalAggregatePlan) -> Self {
+        Self {
+            calls: plan
+                .calls
+                .iter()
+                .map(|call| (call.intermediate_input_slot_id, call.final_output_slot_id))
+                .collect(),
+            mappings: plan.unpivot.as_ref().map(|unpivot| {
+                unpivot
+                    .mappings
+                    .iter()
+                    .map(|mapping| (mapping.grouping_key, mapping.input_value_slot_id))
+                    .collect()
+            }),
+        }
+    }
+}
+
+/// An owner of a finish's statistics other than the plan-tree build from the
+/// process function set and the decoder's expression arena: it supplies the
+/// final aggregate over every `AGGREGATE_PARTIAL` row and the grouped Unpivot
+/// of each batch that aggregate emits.
+pub(crate) trait FinishStatisticsFactory: Send + Sync {
+    /// The final aggregate. It takes the finish's filtered `AGGREGATE_PARTIAL`
+    /// rows and emits each target group's final values once.
+    fn final_aggregate(&self, state: &RuntimeState) -> Result<Box<dyn Operator>, String>;
+
+    /// The grouped Unpivot of one final aggregate batch, emitting Root
+    /// artifact rows.
+    fn grouped_unpivot(
+        &self,
+        final_chunk: Chunk,
+        root_schema: crate::exec::chunk::ChunkSchemaRef,
+        tracker: Option<Arc<MemTracker>>,
+    ) -> Result<Box<dyn GroupedUnpivotSource>, String>;
+}
+
+/// The Root artifact rows of one final aggregate batch, one target at a time.
+pub(crate) trait GroupedUnpivotSource: Send {
+    /// The batch's targets, each at most once.
+    fn targets(&self) -> Vec<u32>;
+    fn pull(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>>;
+    fn is_finished(&self) -> bool;
+    fn source_observable(&self) -> Arc<Observable>;
+}
+
 /// Factory for the single-driver table finish operator.
 pub struct TableFinishOperatorFactory {
     name: String,
@@ -89,7 +154,11 @@ pub struct TableFinishOperatorFactory {
     fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
     writer_schema: WriterMultiplexRelationSchema,
     root_schema: RootWriteResultRelationSchema,
+    /// The plan-tree statistics, built from the process function set and
+    /// `arena` when `statistics` is absent.
     final_plan: WriterFinalAggregatePlan,
+    coverage: FinishStatisticsCoverage,
+    statistics: Option<Arc<dyn FinishStatisticsFactory>>,
     #[cfg(debug_assertions)]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
     arena: Arc<ExprArena>,
@@ -122,24 +191,28 @@ impl TableFinishOperatorFactory {
             fragment_validator: Arc::clone(&binding.fragment_validator),
             writer_schema,
             root_schema,
+            coverage: FinishStatisticsCoverage::from_plan(&final_plan),
             final_plan,
+            statistics: None,
             #[cfg(debug_assertions)]
             aggregate_guard: Arc::clone(&binding.aggregate_guard),
             arena,
         })
     }
 
-    /// A compiled finish over the program's positional relations. It carries
-    /// no statistics, so it binds no aggregate and evaluates no expression:
-    /// the empty arena is never consulted.
+    /// A compiled finish over the program's positional relations. Its
+    /// statistics, if any, are the compiled owner's, checked against its
+    /// coverage facts exactly as the plan-tree statistics are; no function
+    /// set is read and the empty arena is never consulted.
     pub(crate) fn new_compiled(
         node_id: i32,
         expected_targets: Vec<WriteTargetOrdinal>,
         writer_schema: WriterMultiplexRelationSchema,
         root_schema: RootWriteResultRelationSchema,
+        statistics: Option<(FinishStatisticsCoverage, Arc<dyn FinishStatisticsFactory>)>,
         binding: &TableFinishRuntimeBinding,
     ) -> Result<Self, String> {
-        Self::new_local(
+        let mut factory = Self::new_local(
             node_id,
             expected_targets,
             writer_schema,
@@ -147,7 +220,12 @@ impl TableFinishOperatorFactory {
             WriterFinalAggregatePlan::default(),
             binding,
             Arc::new(ExprArena::default()),
-        )
+        )?;
+        if let Some((coverage, statistics)) = statistics {
+            factory.coverage = coverage;
+            factory.statistics = Some(statistics);
+        }
+        Ok(factory)
     }
 
     /// Construct the NCP-8 composite with the same immutable expression arena
@@ -165,6 +243,8 @@ impl TableFinishOperatorFactory {
             writer_schema: node.writer_multiplex_schema().clone(),
             root_schema: node.root_result_schema().clone(),
             final_plan: node.final_aggregate_plan().clone(),
+            coverage: FinishStatisticsCoverage::from_plan(node.final_aggregate_plan()),
+            statistics: None,
             #[cfg(debug_assertions)]
             aggregate_guard: Arc::clone(node.aggregate_guard()),
             arena,
@@ -190,6 +270,8 @@ impl TableFinishOperatorFactory {
             writer_schema: self.writer_schema.clone(),
             root_schema: self.root_schema.clone(),
             final_plan: self.final_plan.clone(),
+            coverage: self.coverage.clone(),
+            statistics: self.statistics.clone(),
             #[cfg(debug_assertions)]
             aggregate_guard: Arc::clone(&self.aggregate_guard),
             channel_to_call: self
@@ -198,10 +280,10 @@ impl TableFinishOperatorFactory {
                 .auxiliary_channels()
                 .iter()
                 .map(|channel| {
-                    self.final_plan
+                    self.coverage
                         .calls
                         .iter()
-                        .position(|call| call.intermediate_input_slot_id.0 == channel.slot_id())
+                        .position(|(input, _)| input.0 == channel.slot_id())
                 })
                 .collect(),
             arena: Arc::clone(&self.arena),
@@ -473,6 +555,8 @@ struct TableFinishOperator {
     writer_schema: WriterMultiplexRelationSchema,
     root_schema: RootWriteResultRelationSchema,
     final_plan: WriterFinalAggregatePlan,
+    coverage: FinishStatisticsCoverage,
+    statistics: Option<Arc<dyn FinishStatisticsFactory>>,
     #[cfg(debug_assertions)]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
     channel_to_call: Vec<Option<usize>>,
@@ -484,7 +568,7 @@ struct TableFinishOperator {
     aggregate: Option<Box<dyn Operator>>,
     aggregate_coverage: HashMap<u32, Vec<bool>>,
     final_groups_seen: HashSet<u32>,
-    grouped_unpivot: Option<GroupedUnpivotDriver>,
+    grouped_unpivot: Option<Box<dyn GroupedUnpivotSource>>,
     prefix_output: Option<PrefixOutputDriver>,
     phase: FinishPhase,
     mem_tracker: Option<Arc<MemTracker>>,
@@ -510,7 +594,12 @@ impl TableFinishOperator {
         self.aggregate = Some(aggregate);
     }
 
-    fn install_grouped_unpivot(&mut self, driver: GroupedUnpivotDriver) {
+    #[cfg(test)]
+    fn install_grouped_unpivot(&mut self, driver: impl GroupedUnpivotSource + 'static) {
+        self.install_grouped_unpivot_source(Box::new(driver));
+    }
+
+    fn install_grouped_unpivot_source(&mut self, driver: Box<dyn GroupedUnpivotSource>) {
         forward_observable(&driver.source_observable(), &self.source_observable);
         self.grouped_unpivot = Some(driver);
     }
@@ -643,7 +732,7 @@ impl TableFinishOperator {
                 Ok(())
             }
             WriterRowKind::AggregatePartial => {
-                if self.final_plan.calls.is_empty() {
+                if self.coverage.calls.is_empty() {
                     return Err(
                         "table finish received aggregate partials without a final aggregate plan"
                             .to_string(),
@@ -652,7 +741,7 @@ impl TableFinishOperator {
                 let coverage = self
                     .aggregate_coverage
                     .entry(target.get())
-                    .or_insert_with(|| vec![false; self.final_plan.calls.len()]);
+                    .or_insert_with(|| vec![false; self.coverage.calls.len()]);
                 for (channel, non_null) in auxiliary_non_null.into_iter().enumerate() {
                     if non_null {
                         let index = self.channel_to_call[channel].ok_or_else(|| {
@@ -668,37 +757,37 @@ impl TableFinishOperator {
     }
 
     fn validate_coverage(&self) -> Result<(), String> {
-        let Some(unpivot) = self.final_plan.unpivot.as_ref() else {
-            return if self.final_plan.calls.is_empty() {
+        let Some(mappings) = self.coverage.mappings.as_ref() else {
+            return if self.coverage.calls.is_empty() {
                 Ok(())
             } else {
                 Err("table finish final aggregates are missing grouped Unpivot".to_string())
             };
         };
         let call_by_output = self
-            .final_plan
+            .coverage
             .calls
             .iter()
             .enumerate()
-            .map(|(index, call)| (call.final_output_slot_id, index))
+            .map(|(index, (_, output))| (*output, index))
             .collect::<HashMap<_, _>>();
-        for mapping in &unpivot.mappings {
+        for (grouping_key, input_value_slot_id) in mappings {
             let call = call_by_output
-                .get(&mapping.input_value_slot_id)
+                .get(input_value_slot_id)
                 .copied()
                 .ok_or_else(|| {
                     "table finish grouped Unpivot references an unknown final output".to_string()
                 })?;
             if !self
                 .aggregate_coverage
-                .get(&mapping.grouping_key)
+                .get(grouping_key)
                 .and_then(|coverage| coverage.get(call))
                 .copied()
                 .unwrap_or(false)
             {
                 return Err(format!(
                     "table finish target {} has no non-null aggregate partial for channel {}",
-                    mapping.grouping_key, call
+                    grouping_key, call
                 ));
             }
         }
@@ -736,18 +825,26 @@ impl TableFinishOperator {
     }
 
     fn start_grouped_unpivot(&mut self, final_chunk: Chunk) -> Result<(), String> {
-        let arena = Arc::clone(&self.arena);
-        let plan =
-            self.final_plan.unpivot.as_ref().cloned().ok_or_else(|| {
-                "table finish final aggregate is missing grouped Unpivot".to_string()
-            })?;
-        let driver = GroupedUnpivotDriver::try_new(
-            arena,
-            plan,
-            Arc::clone(self.root_schema.chunk_schema()),
-            final_chunk,
-            self.output_tracker.as_ref().map(Arc::clone),
-        )?;
+        let driver: Box<dyn GroupedUnpivotSource> = match self.statistics.as_ref() {
+            Some(statistics) => statistics.grouped_unpivot(
+                final_chunk,
+                Arc::clone(self.root_schema.chunk_schema()),
+                self.output_tracker.as_ref().map(Arc::clone),
+            )?,
+            None => {
+                let arena = Arc::clone(&self.arena);
+                let plan = self.final_plan.unpivot.as_ref().cloned().ok_or_else(|| {
+                    "table finish final aggregate is missing grouped Unpivot".to_string()
+                })?;
+                Box::new(GroupedUnpivotDriver::try_new(
+                    arena,
+                    plan,
+                    Arc::clone(self.root_schema.chunk_schema()),
+                    final_chunk,
+                    self.output_tracker.as_ref().map(Arc::clone),
+                )?)
+            }
+        };
         for target in driver.targets() {
             if !self.final_groups_seen.insert(target) {
                 return Err(format!(
@@ -755,17 +852,17 @@ impl TableFinishOperator {
                 ));
             }
         }
-        self.install_grouped_unpivot(driver);
+        self.install_grouped_unpivot_source(driver);
         Ok(())
     }
 
     fn validate_final_groups_complete(&self) -> Result<(), String> {
         let expected = self
-            .final_plan
-            .unpivot
-            .as_ref()
-            .into_iter()
-            .flat_map(|plan| plan.mappings.iter().map(|mapping| mapping.grouping_key))
+            .coverage
+            .mappings
+            .iter()
+            .flatten()
+            .map(|(grouping_key, _)| *grouping_key)
             .collect::<HashSet<_>>();
         if expected == self.final_groups_seen {
             return Ok(());
@@ -973,10 +1070,6 @@ impl GroupedUnpivotDriver {
         self.active = Some(active);
     }
 
-    fn targets(&self) -> impl Iterator<Item = u32> + '_ {
-        self.rows.iter().map(|(target, _)| *target)
-    }
-
     fn output_schema(&self, target: u32) -> Result<crate::exec::chunk::ChunkSchemaRef, String> {
         let slots = [
             self.plan.passthrough_output_slot_id,
@@ -1098,6 +1191,16 @@ impl GroupedUnpivotDriver {
             self.next_row += 1;
         }
     }
+}
+
+impl GroupedUnpivotSource for GroupedUnpivotDriver {
+    fn targets(&self) -> Vec<u32> {
+        self.rows.iter().map(|(target, _)| *target).collect()
+    }
+
+    fn pull(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+        GroupedUnpivotDriver::pull(self, state)
+    }
 
     fn is_finished(&self) -> bool {
         self.next_row == self.rows.len() && self.active.is_none()
@@ -1108,7 +1211,10 @@ impl GroupedUnpivotDriver {
     }
 }
 
-fn root_artifact_chunk(
+/// Validate one grouped Unpivot artifact batch and lift it onto the Root
+/// relation: every row is an `ARTIFACT_DRAFT` of its target, with the
+/// relation's own carriers.
+pub(crate) fn root_artifact_chunk(
     artifact: Chunk,
     root_schema: &crate::exec::chunk::ChunkSchemaRef,
     tracker: Option<&Arc<MemTracker>>,
@@ -1225,7 +1331,7 @@ impl Operator for TableFinishOperator {
             self.phase = FinishPhase::Failed;
             return Err(error.into());
         }
-        if self.final_plan.calls.is_empty() != self.final_plan.unpivot.is_none() {
+        if self.coverage.calls.is_empty() != self.coverage.mappings.is_none() {
             self.phase = FinishPhase::Failed;
             return Err(
                 "table finish final aggregate and grouped Unpivot must be both empty or both present"
@@ -1233,7 +1339,7 @@ impl Operator for TableFinishOperator {
             );
         }
         if self.channel_to_call.iter().any(Option::is_none)
-            || self.channel_to_call.len() != self.final_plan.calls.len()
+            || self.channel_to_call.len() != self.coverage.calls.len()
         {
             self.phase = FinishPhase::Failed;
             return Err(
@@ -1258,17 +1364,23 @@ impl Operator for TableFinishOperator {
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.runtime_error = Some(state.error_state());
-        if self.final_plan.calls.is_empty() {
+        if self.coverage.calls.is_empty() {
             return Ok(());
         }
-        let arena = Arc::clone(&self.arena);
-        let function_set = state
-            .execution_runtime()
-            .map(|runtime| Arc::clone(runtime.function_set()))
-            .ok_or_else(|| {
-                "table finish aggregate plan requires the execution function set".to_string()
-            })?;
-        let mut aggregate = build_final_aggregate(&self.final_plan, &arena, function_set, -1)?;
+        let mut aggregate = match self.statistics.as_ref() {
+            Some(statistics) => statistics.final_aggregate(state)?,
+            None => {
+                let arena = Arc::clone(&self.arena);
+                let function_set = state
+                    .execution_runtime()
+                    .map(|runtime| Arc::clone(runtime.function_set()))
+                    .ok_or_else(|| {
+                        "table finish aggregate plan requires the execution function set"
+                            .to_string()
+                    })?;
+                build_final_aggregate(&self.final_plan, &arena, function_set, -1)?
+            }
+        };
         if let Some(tracker) = self.mem_tracker.as_ref() {
             aggregate.set_mem_tracker(MemTracker::new_child("TableFinishFinalAggregate", tracker));
         }
