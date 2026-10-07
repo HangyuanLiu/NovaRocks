@@ -8562,14 +8562,14 @@ mod tests {
             error.to_string().contains("Limit limit exceeds i64"),
             "{error}"
         );
+        // Refuse on the observed sequence's own tail rather than a counted
+        // guess: the encoder may add checkpoints without changing this law.
+        let observed_checkpoints = observed
+            .encode_checkpoints
+            .load(std::sync::atomic::Ordering::SeqCst);
         let mut control =
             EncodeTailControl::new(novarocks_type_contract::CompileControlError::Cancelled);
-        control.refuse_at = Some(
-            observed
-                .encode_checkpoints
-                .load(std::sync::atomic::Ordering::SeqCst)
-                - 1,
-        );
+        control.refuse_at = Some(observed_checkpoints - 1);
         assert_eq!(
             encode_physical_plan_v1(
                 &physical,
@@ -8587,7 +8587,7 @@ mod tests {
             control
                 .encode_checkpoints
                 .load(std::sync::atomic::Ordering::SeqCst),
-            2
+            observed_checkpoints
         );
     }
 
