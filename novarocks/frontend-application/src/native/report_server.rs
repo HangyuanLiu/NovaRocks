@@ -602,6 +602,13 @@ impl NovaRocksGrpc for FrontendReportService {
     ) -> Result<tonic::Response<proto::FetchResultResponse>, tonic::Status> {
         Err(Self::rejected("FetchTaskResult"))
     }
+
+    async fn fetch_root_result(
+        &self,
+        _request: tonic::Request<proto::FetchRootResultRequest>,
+    ) -> Result<tonic::Response<proto::FetchRootResultResponse>, tonic::Status> {
+        Err(Self::rejected("FetchRootResult"))
+    }
 }
 
 fn status_from_contract_error(error: ProtocolError) -> tonic::Status {

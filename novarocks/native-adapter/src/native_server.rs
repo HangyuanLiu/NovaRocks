@@ -119,6 +119,8 @@ impl Default for NativeIngressConfig {
 pub(crate) struct ListenerAdmission {
     pub(crate) admission: NativeTransportAdmission,
     pub(crate) class: TransportClass,
+    /// The Backend data listener's bounded root reader, if it serves roots.
+    pub(crate) root_results: Option<Arc<crate::root_result_reader::NativeRootResultReader>>,
 }
 
 /// Instance-owned native gRPC listener lifecycle.
@@ -191,6 +193,7 @@ impl NativeRpcServerHandle {
         ingress_config: NativeIngressConfig,
         admission: NativeTransportAdmission,
         class: TransportClass,
+        root_results: Option<Arc<crate::root_result_reader::NativeRootResultReader>>,
     ) -> Result<Self, String>
     where
         S: NovaRocksGrpc + Clone + Send + Sync + 'static,
@@ -209,7 +212,11 @@ impl NativeRpcServerHandle {
             on_authentication_failure,
             on_transport_handshake_failure,
             ingress_config,
-            Some(ListenerAdmission { admission, class }),
+            Some(ListenerAdmission {
+                admission,
+                class,
+                root_results,
+            }),
         )
     }
 
@@ -330,9 +337,24 @@ impl NativeRpcServerHandle {
                             "/{}/ApplyTaskControlOperations",
                             <NovaRocksGrpcServer<S> as NamedService>::NAME
                         );
+                        let mut router = Router::new()
+                            .route_service(&control_path, AxumGrpcService::new(control_service));
+                        // Bounded root reads bypass the generated service: the
+                        // root reader keeps each response body's owner until
+                        // the body exits.
+                        if let Some(reader) = admission
+                            .as_ref()
+                            .and_then(|listener| listener.root_results.clone())
+                        {
+                            router = router.route_service(
+                                novarocks_proto_codec::native_rpc::NativeRpcMethod::FetchRootResult
+                                    .contract()
+                                    .path,
+                                RootResultRoute { reader },
+                            );
+                        }
                         let app = tower::ServiceExt::<axum::http::Request<axum::body::Body>>::map_response(
-                            Router::new()
-                                .route_service(&control_path, AxumGrpcService::new(control_service))
+                            router
                                 .route_service(&grpc_path, AxumGrpcService::new(ordinary_service))
                                 .fallback(grpc_unimplemented_fallback),
                             box_native_response as NativeResponseMapper,
@@ -965,6 +987,35 @@ async fn grpc_unimplemented_fallback(
     tonic::Status::new(tonic::Code::Unimplemented, "")
         .into_http()
         .map(axum::body::Body::new)
+}
+
+/// Serves `FetchRootResult` from the Backend's bounded root reader.
+#[derive(Clone)]
+struct RootResultRoute {
+    reader: Arc<crate::root_result_reader::NativeRootResultReader>,
+}
+
+impl Service<axum::http::Request<axum::body::Body>> for RootResultRoute {
+    type Response = axum::http::Response<tonic::body::BoxBody>;
+    type Error = std::convert::Infallible;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: axum::http::Request<axum::body::Body>) -> Self::Future {
+        let reader = Arc::clone(&self.reader);
+        Box::pin(async move {
+            Ok(
+                crate::root_result_unary::root_result_unary(&reader, request)
+                    .await
+                    .map(boxed),
+            )
+        })
+    }
 }
 
 #[derive(Clone)]

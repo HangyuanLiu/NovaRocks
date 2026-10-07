@@ -84,6 +84,10 @@ service NovaRocksGrpc {
       returns (GetFinalTaskInfoResponse);
   // Root result poll, fenced against an exact task and backend process.
   rpc FetchTaskResult(FetchTaskResultRequest) returns (FetchResultResponse);
+  // M07 context-owned bounded root read on the ResultData lane. One RPC per
+  // root stream in flight; served by the Backend's root reader, never by a
+  // decoded Arrow packet path.
+  rpc FetchRootResult(FetchRootResultRequest) returns (FetchRootResultResponse);
 }
 
 // Immutable identity for one physical execution attempt of a logical query.

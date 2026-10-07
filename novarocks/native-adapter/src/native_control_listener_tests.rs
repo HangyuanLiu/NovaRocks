@@ -162,6 +162,12 @@ impl NovaRocksGrpc for ProbeService {
     ) -> Result<tonic::Response<proto::FetchResultResponse>, tonic::Status> {
         panic!("unexpected generated handler: fetch_task_result")
     }
+    async fn fetch_root_result(
+        &self,
+        _request: tonic::Request<proto::FetchRootResultRequest>,
+    ) -> Result<tonic::Response<proto::FetchRootResultResponse>, tonic::Status> {
+        panic!("unexpected generated handler: fetch_root_result")
+    }
 }
 
 fn stock() -> (NativeTransportAdmission, (), ()) {
@@ -196,6 +202,7 @@ fn start(
         },
         factory.clone(),
         class,
+        None,
     )
     .unwrap()
 }
@@ -564,6 +571,7 @@ fn mismatched_domain_and_stock_class_refuse_before_address_resolution() {
             NativeIngressConfig::default(),
             factory.clone(),
             class,
+            None,
         );
         assert_eq!(
             outcome.err().unwrap(),

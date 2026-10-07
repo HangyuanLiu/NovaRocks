@@ -801,6 +801,133 @@ impl TaskResultTransport for NativeTaskResultTransport {
     }
 }
 
+/// The Frontend side of `FetchRootResult` for one frozen attempt: bounded
+/// root reads relayed without decode. Each reply retains the caller's window
+/// alias until its delivery exits. The result window granted at admission is
+/// this read's carrier commitment, so no separate fetch permit is taken.
+pub(crate) struct NativeBoundedRootReadPort {
+    transport: Arc<NativeTaskResultTransport>,
+    sealed: std::sync::atomic::AtomicBool,
+}
+
+impl NativeBoundedRootReadPort {
+    pub(crate) fn new(transport: Arc<NativeTaskResultTransport>) -> Self {
+        Self {
+            transport,
+            sealed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl novarocks_query_application::api::BoundedRootReadPort for NativeBoundedRootReadPort {
+    fn read(
+        &self,
+        request: novarocks_execution_contract::root_result::RootResultRead,
+        physical_guard: novarocks_workload_control::ResultWindowAlias,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        novarocks_query_application::api::RetainedRootReply,
+                        RootResultFetchFailure,
+                    >,
+                > + Send
+                + 'static,
+        >,
+    > {
+        let root = request.root_task();
+        let backend = root.backend_process_id();
+        let sealed = self.sealed.load(std::sync::atomic::Ordering::Acquire);
+        let route = self
+            .transport
+            .client_of(root)
+            .map(|(client, address)| (client.clone(), address));
+        let grace = self.transport.grace;
+        Box::pin(async move {
+            if sealed {
+                return Err(NativeRootResultFetchError::contract(format!(
+                    "root reads for task {root} are sealed"
+                ))
+                .into_pump_failure());
+            }
+            let (client, address) = route
+                .map_err(|error| NativeRootResultFetchError::contract(error).into_pump_failure())?;
+            let wire = novarocks_task_codec::root_result::encode_read(&request);
+            let wait = request.max_wait();
+            let deadline = grace.deadline_for(wait);
+            let expires_at = tokio::time::Instant::now() + deadline;
+            let mut grpc = tokio::time::timeout_at(
+                expires_at,
+                client.grpc_with_channel_error(NativeRpcMethod::FetchRootResult),
+            )
+            .await
+            .map_err(|_| {
+                NativeRootResultFetchError::infrastructure(format!(
+                    "{address}: root read for task {root} could not acquire a channel within \
+                     {deadline:?}"
+                ))
+                .into_pump_failure_for_backend(backend)
+            })?
+            .map_err(|error| {
+                NativeRootResultFetchError::infrastructure(error.to_string())
+                    .into_pump_failure_for_backend(backend)
+            })?;
+            let response = tokio::time::timeout_at(expires_at, grpc.fetch_root_result(wire))
+                .await
+                .map_err(|_| {
+                    NativeRootResultFetchError::infrastructure(format!(
+                        "{address}: root read for task {root} did not answer within \
+                         {deadline:?}; it was asked to wait at most {wait:?}"
+                    ))
+                    .into_pump_failure_for_backend(backend)
+                })?
+                .map(tonic::Response::into_inner)
+                .map_err(|status| {
+                    classify_fetch_task_result_rpc_status(status)
+                        .into_pump_failure_for_backend(backend)
+                })?;
+            let reply = novarocks_task_codec::root_result::decode_reply(
+                response,
+                &request,
+                request.consumed(),
+                FieldPath::root("fetch_root_result"),
+            )
+            .map_err(|error| {
+                NativeRootResultFetchError::contract(format!("{address}: {error}"))
+                    .into_pump_failure()
+            })?;
+            // The decoded body and its message envelope live together until
+            // the delivery exits; both are covered by the window grant.
+            let live = match &reply.outcome {
+                novarocks_execution_contract::root_result::RootReadOutcome::Data(data) => {
+                    data.body().len() as u64
+                }
+                _ => 0,
+            } + novarocks_result_contract::RootProfileV1::ENVELOPE_BYTES as u64;
+            novarocks_query_application::api::RetainedRootReply::try_new(
+                reply,
+                physical_guard,
+                live,
+            )
+            .map_err(|error| {
+                NativeRootResultFetchError::contract(format!(
+                    "{address}: root reply exceeds its window: {error}"
+                ))
+                .into_pump_failure()
+            })
+        })
+    }
+
+    fn seal(
+        &self,
+        _sealed: novarocks_execution_contract::root_lifetime::RootReadSealed,
+    ) -> Result<(), QueryExecutionError> {
+        self.sealed
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+}
+
 /// Binds one frozen Native result transport to the query application's sole
 /// fetch/decode/ACK pump. The binding preserves the exact request identity and
 /// bounds; it does not create a second polling or acknowledgement authority.

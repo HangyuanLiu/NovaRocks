@@ -57,6 +57,7 @@ pub enum NativeBodyKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum NativeRpcMethod {
     FetchTaskResult,
+    FetchRootResult,
     ApplyTaskOperations,
     ApplyTaskControlOperations,
     SubscribeTaskStatus,
@@ -93,10 +94,18 @@ macro_rules! contract {
 }
 use FrontendNativeLane::{LifecycleControl, Observation, ResultData, Submission};
 use NativeTrafficClass::Frontend;
-pub const NATIVE_METHODS: [NativeMethodContract; 13] = [
+pub const NATIVE_METHODS: [NativeMethodContract; 14] = [
     contract!(
         FetchTaskResult,
         "FetchTaskResult",
+        Frontend(ResultData),
+        BackendData,
+        FrontendToBackend,
+        Unary
+    ),
+    contract!(
+        FetchRootResult,
+        "FetchRootResult",
         Frontend(ResultData),
         BackendData,
         FrontendToBackend,
@@ -275,6 +284,14 @@ mod tests {
         assert!(!NativeRpcMethod::Heartbeat.is_allowed_at(NativeEndpointDomain::BackendData));
         assert!(
             !NativeRpcMethod::FetchTaskResult.is_allowed_at(NativeEndpointDomain::BackendControl)
+        );
+        assert!(NativeRpcMethod::FetchRootResult.is_allowed_at(NativeEndpointDomain::BackendData));
+        assert!(
+            !NativeRpcMethod::FetchRootResult.is_allowed_at(NativeEndpointDomain::BackendControl)
+        );
+        assert_eq!(
+            NativeRpcMethod::FetchRootResult.contract().traffic,
+            NativeTrafficClass::Frontend(FrontendNativeLane::ResultData)
         );
         assert!(!NativeRpcMethod::RetiredExchange.is_allowed_at(NativeEndpointDomain::BackendData));
     }

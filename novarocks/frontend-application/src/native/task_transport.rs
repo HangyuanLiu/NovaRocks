@@ -3390,6 +3390,13 @@ mod tests {
             Err(Self::rejected("FetchTaskResult"))
         }
 
+        async fn fetch_root_result(
+            &self,
+            _request: Request<proto::FetchRootResultRequest>,
+        ) -> Result<Response<proto::FetchRootResultResponse>, Status> {
+            Err(Self::rejected("FetchRootResult"))
+        }
+
         async fn exchange(
             &self,
             _request: Request<tonic::Streaming<proto::ExchangeRequest>>,

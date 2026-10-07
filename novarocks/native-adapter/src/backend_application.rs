@@ -901,6 +901,11 @@ impl BackendApplicationHost {
             native_ingress,
             transport_admission.clone(),
             TransportClass::Data,
+            Some(Arc::new(
+                novarocks_native_adapter::root_result_reader::NativeRootResultReader::new(
+                    Arc::clone(&services.task_execution_registry),
+                ),
+            )),
         ) {
             Ok(server) => server,
             Err(error) => {
@@ -930,6 +935,7 @@ impl BackendApplicationHost {
             native_ingress,
             transport_admission,
             TransportClass::Control,
+            None,
         ) {
             Ok(server) => server,
             Err(error) => {

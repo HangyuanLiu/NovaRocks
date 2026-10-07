@@ -519,6 +519,12 @@ impl NovaRocksGrpc for LaneProbe {
     ) -> Result<tonic::Response<proto::FetchResultResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("probe"))
     }
+    async fn fetch_root_result(
+        &self,
+        _request: tonic::Request<proto::FetchRootResultRequest>,
+    ) -> Result<tonic::Response<proto::FetchRootResultResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("probe"))
+    }
 }
 
 fn frontend_trust() -> Arc<NativeTrust> {
@@ -553,6 +559,7 @@ fn data_listener(
         },
         admission.clone(),
         TransportClass::Data,
+        None,
     )
     .unwrap()
 }

@@ -37,6 +37,7 @@ novarocks-proto-codec.workspace = true
 novarocks-proto-models.workspace = true
 novarocks-physical-plan.workspace = true
 novarocks-query-application.workspace = true
+novarocks-result-contract.workspace = true
 novarocks-parser.workspace = true
 novarocks-plan-codec.workspace = true
 novarocks-spi.workspace = true
