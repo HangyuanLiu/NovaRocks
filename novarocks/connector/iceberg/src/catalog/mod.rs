@@ -66,7 +66,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use novarocks_spi::connector::ConnectorError;
+use novarocks_spi::connector::{ConnectorError, ConnectorListingBound};
 
 use self::error::{CatalogOutcome, CatalogUnsupported};
 
@@ -387,14 +387,24 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     }
 
     // ---- A. Reads -------------------------------------------------------
+    //
+    // Every enumeration is bounded at its source by the caller's
+    // `ConnectorListingBound`: a listing that would exceed it is refused with
+    // `ResourceExhausted`, never truncated. A source that can page does so
+    // with pages no larger than `bound.page_entries`; a source that cannot is
+    // checked as one complete listing.
 
-    async fn list_namespaces(&self) -> Result<Vec<String>, ConnectorError>;
+    async fn list_namespaces(
+        &self,
+        bound: ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError>;
 
     async fn list_namespaces_for_read(
         &self,
         _binding: crate::access_binding::IcebergReadBinding,
+        bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        self.list_namespaces().await
+        self.list_namespaces(bound).await
     }
 
     async fn namespace_exists(
@@ -413,14 +423,16 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     async fn list_tables(
         &self,
         namespace: CatalogNamespaceName,
+        bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError>;
 
     async fn list_tables_for_read(
         &self,
         namespace: CatalogNamespaceName,
         _binding: crate::access_binding::IcebergReadBinding,
+        bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        self.list_tables(namespace).await
+        self.list_tables(namespace, bound).await
     }
 
     async fn list_tables_page(
@@ -474,6 +486,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     async fn list_views(
         &self,
         namespace: CatalogNamespaceName,
+        bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError>;
 
     async fn load_view(

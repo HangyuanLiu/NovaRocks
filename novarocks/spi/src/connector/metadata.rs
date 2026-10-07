@@ -1232,15 +1232,21 @@ pub struct ConnectorTableObjectRebindRequest {
     pub context: ConnectorRequestContext,
 }
 
+/// Enumerate one namespace's tables. The provider refuses a listing that
+/// would exceed `bound`; it never truncates one.
 #[derive(Clone)]
 pub struct ConnectorListTablesRequest {
     pub namespace: ConnectorNamespaceIdentity,
+    pub bound: super::ConnectorListingBound,
     pub context: ConnectorRequestContext,
 }
 
+/// Enumerate one catalog's namespaces. The provider refuses a listing that
+/// would exceed `bound`; it never truncates one.
 #[derive(Clone)]
 pub struct ConnectorListNamespacesRequest {
     pub instance_id: ConnectorInstanceId,
+    pub bound: super::ConnectorListingBound,
     pub context: ConnectorRequestContext,
 }
 

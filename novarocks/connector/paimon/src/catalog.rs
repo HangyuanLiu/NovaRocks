@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use novarocks_spi::connector::read_stack::SchemaTableName;
-use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorListingBound};
 use paimon::catalog::Identifier;
 use paimon::io::FileIO;
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
@@ -83,27 +83,38 @@ impl PaimonFileSystemCatalog {
         self.inner.warehouse()
     }
 
-    pub async fn list_databases(&self) -> Result<PaimonCatalogEntries, ConnectorError> {
+    /// List the warehouse's databases. The SDK filesystem listing has no
+    /// paging, so its complete result is refused as a whole when it exceeds
+    /// `bound`.
+    pub async fn list_databases(
+        &self,
+        bound: ConnectorListingBound,
+    ) -> Result<PaimonCatalogEntries, ConnectorError> {
+        bound.validate()?;
         self.control.checkpoint()?;
         let entries = self
             .inner
             .list_databases_plain()
             .await
             .map_err(map_sdk_error)?;
-        self.retain_listing(entries)
+        self.retain_listing(entries, bound)
     }
 
+    /// List one database's tables. The SDK filesystem listing has no paging,
+    /// so its complete result is refused as a whole when it exceeds `bound`.
     pub async fn list_tables(
         &self,
         database: &str,
+        bound: ConnectorListingBound,
     ) -> Result<PaimonCatalogEntries, ConnectorError> {
+        bound.validate()?;
         self.control.checkpoint()?;
         let entries = self
             .inner
             .list_tables_plain(database)
             .await
             .map_err(map_sdk_error)?;
-        self.retain_listing(entries)
+        self.retain_listing(entries, bound)
     }
 
     /// Load and freeze one table. Snapshot discovery happens exactly once in
@@ -133,10 +144,15 @@ impl PaimonFileSystemCatalog {
         rebind_table(self.inner.file_io().clone(), recipe, self.control.clone()).map(Arc::new)
     }
 
-    fn retain_listing(&self, entries: Vec<String>) -> Result<PaimonCatalogEntries, ConnectorError> {
+    fn retain_listing(
+        &self,
+        entries: Vec<String>,
+        bound: ConnectorListingBound,
+    ) -> Result<PaimonCatalogEntries, ConnectorError> {
         if entries.iter().any(|entry| entry.is_empty()) {
             return Err(invalid("Paimon catalog entry name is empty"));
         }
+        bound.check_complete_listing(&entries)?;
         self.control.checkpoint()?;
         Ok(PaimonCatalogEntries { entries })
     }
@@ -286,7 +302,10 @@ mod tests {
             Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
             1,
         );
-        let entries = catalog.list_databases().await.unwrap();
+        let entries = catalog
+            .list_databases(ConnectorListingBound::V1)
+            .await
+            .unwrap();
         assert_eq!(entries.entries(), &["db".to_string()]);
         let identities = entries.map(|entries| {
             entries
@@ -298,14 +317,111 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fe_listing_crosses_the_old_entry_limit() {
+    async fn fe_listing_admits_exactly_the_v1_entry_bound() {
+        let catalog = catalog(
+            Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
+            65_536,
+        );
+        let entries = catalog
+            .list_databases(ConnectorListingBound::V1)
+            .await
+            .unwrap();
+        assert_eq!(entries.entries().len(), 65_536);
+        assert!(entries.entries().contains(&"db65535".to_string()));
+    }
+
+    #[tokio::test]
+    async fn fe_listing_over_the_v1_entry_bound_is_refused_not_truncated() {
         let catalog = catalog(
             Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
             65_537,
         );
-        let entries = catalog.list_databases().await.unwrap();
-        assert_eq!(entries.entries().len(), 65_537);
-        assert!(entries.entries().contains(&"db65536".to_string()));
+        let error = catalog
+            .list_databases(ConnectorListingBound::V1)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+        assert!(error.message().contains("entries bound"), "{error}");
+    }
+
+    /// A warehouse on local disk, listed through the host's authorized
+    /// filesystem access.
+    fn local_catalog(directory: &tempfile::TempDir, databases: &[&str]) -> PaimonFileSystemCatalog {
+        let warehouse = directory.path().join("warehouse");
+        for database in databases {
+            std::fs::create_dir_all(warehouse.join(format!("{database}.db")))
+                .expect("database directory");
+        }
+        let warehouse = warehouse.to_string_lossy().to_string();
+        let access = novarocks_fs::FsAccessResolver::new()
+            .resolve_location(
+                novarocks_spi::connector::StorageAccessDomainId::from_bytes([3; 32]),
+                &warehouse,
+                None,
+            )
+            .expect("local access");
+        let host_io = PaimonHostFileIo::try_new(
+            access,
+            &warehouse,
+            novarocks_fs::FileCancellation::new(),
+            Arc::new(crate::io::PaimonFsAuthorizedListing),
+        )
+        .expect("host file io");
+        let control = PaimonRequestControl::new(
+            Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()).view(),
+            Instant::now() + Duration::from_secs(60),
+        );
+        PaimonFileSystemCatalog::try_new(&warehouse, host_io, control).expect("catalog")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_filesystem_listing_over_its_bound_is_refused_whole() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let catalog = local_catalog(&directory, &["sales", "ops", "hr"]);
+        let exact = ConnectorListingBound {
+            entries: 3,
+            total_name_bytes: 10,
+            ..ConnectorListingBound::V1
+        };
+        let mut names = catalog
+            .list_databases(exact)
+            .await
+            .expect("listing at its exact bound")
+            .entries()
+            .to_vec();
+        names.sort();
+        assert_eq!(names, ["hr", "ops", "sales"]);
+
+        for (bound, exceeded) in [
+            (
+                ConnectorListingBound {
+                    entries: 2,
+                    ..exact
+                },
+                "entries",
+            ),
+            (
+                ConnectorListingBound {
+                    total_name_bytes: 9,
+                    ..exact
+                },
+                "total_name_bytes",
+            ),
+            (
+                ConnectorListingBound {
+                    name_bytes: 4,
+                    ..exact
+                },
+                "name_bytes",
+            ),
+        ] {
+            let error = catalog.list_databases(bound).await.unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+            assert!(
+                error.message().contains(&format!("{exceeded} bound")),
+                "{error}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -313,7 +429,10 @@ mod tests {
         let cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
         let catalog = catalog(Arc::clone(&cancellation), 1);
         cancellation.request_stop();
-        let error = catalog.list_databases().await.unwrap_err();
+        let error = catalog
+            .list_databases(ConnectorListingBound::V1)
+            .await
+            .unwrap_err();
         assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
     }
 }

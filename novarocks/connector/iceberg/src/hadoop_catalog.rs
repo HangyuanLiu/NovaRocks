@@ -242,10 +242,13 @@ impl HadoopFileSystemCatalog {
         namespace: &NamespaceIdent,
         file_io: &FileIO,
         control: &Option<Arc<dyn novarocks_spi::connector::ConnectorOperationControl>>,
+        bound: novarocks_spi::connector::ConnectorListingBound,
     ) -> Result<Vec<TableIdent>> {
         let namespace_location = self.namespace_location(namespace);
+        let children = file_io.list_directories(&namespace_location).await?;
+        check_directory_listing_bound(&children, bound)?;
         let mut tables = Vec::new();
-        for table in file_io.list_directories(&namespace_location).await? {
+        for table in children {
             check_catalog_read_control(control)?;
             if file_io
                 .exists(Self::version_hint_path(&format!(
@@ -263,15 +266,21 @@ impl HadoopFileSystemCatalog {
         Ok(tables)
     }
 
+    /// Enumerate namespaces for one admitted read. The warehouse directory
+    /// listing is refused as a whole when it exceeds `bound`, before any child
+    /// is probed.
     pub(crate) async fn list_namespaces_for_read(
         &self,
         binding: crate::access_binding::IcebergReadBinding,
+        bound: novarocks_spi::connector::ConnectorListingBound,
     ) -> Result<Vec<NamespaceIdent>> {
         let control = binding.operation_control();
         check_catalog_read_control(&control)?;
         let file_io = crate::fs_io::build_file_io_for_location(&self.warehouse_location, binding);
+        let children = file_io.list_directories(&self.warehouse_location).await?;
+        check_directory_listing_bound(&children, bound)?;
         let mut namespaces = Vec::new();
-        for child in file_io.list_directories(&self.warehouse_location).await? {
+        for child in children {
             check_catalog_read_control(&control)?;
             if child.starts_with('.') {
                 continue;
@@ -304,8 +313,15 @@ impl HadoopFileSystemCatalog {
         if exists {
             return Ok(true);
         }
+        // An existence probe that has to enumerate the namespace is a listing
+        // like any other and observes the production listing bound.
         Ok(!self
-            .external_tables_for_read(namespace, file_io, control)
+            .external_tables_for_read(
+                namespace,
+                file_io,
+                control,
+                novarocks_spi::connector::ConnectorListingBound::V1,
+            )
             .await?
             .is_empty())
     }
@@ -321,15 +337,19 @@ impl HadoopFileSystemCatalog {
             .await
     }
 
+    /// Enumerate one namespace's tables for an admitted read. The namespace
+    /// directory listing is refused as a whole when it exceeds `bound`, before
+    /// any child is probed for a version hint.
     pub(crate) async fn list_tables_for_read(
         &self,
         namespace: &NamespaceIdent,
         binding: crate::access_binding::IcebergReadBinding,
+        bound: novarocks_spi::connector::ConnectorListingBound,
     ) -> Result<Vec<TableIdent>> {
         let control = binding.operation_control();
         check_catalog_read_control(&control)?;
         let file_io = crate::fs_io::build_file_io_for_location(&self.warehouse_location, binding);
-        self.external_tables_for_read(namespace, &file_io, &control)
+        self.external_tables_for_read(namespace, &file_io, &control, bound)
             .await
     }
 
@@ -856,6 +876,22 @@ fn hex_digest(bytes: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Refuse a directory listing that exceeds the caller's listing bound. The
+/// refusal is carried as the typed source so the catalog owner can keep its
+/// `ResourceExhausted` classification.
+fn check_directory_listing_bound(
+    children: &[String],
+    bound: novarocks_spi::connector::ConnectorListingBound,
+) -> Result<()> {
+    bound.check_complete_listing(children).map_err(|refusal| {
+        Error::new(
+            ErrorKind::Unexpected,
+            "Hadoop catalog directory listing refused by its listing bound",
+        )
+        .with_source(refusal)
+    })
+}
+
 fn check_catalog_read_control(
     control: &Option<Arc<dyn novarocks_spi::connector::ConnectorOperationControl>>,
 ) -> Result<()> {
@@ -1255,7 +1291,10 @@ mod tests {
         assert_eq!(
             stopped_kind(
                 &catalog
-                    .list_namespaces_for_read(cancelled_binding.clone())
+                    .list_namespaces_for_read(
+                        cancelled_binding.clone(),
+                        novarocks_spi::connector::ConnectorListingBound::V1,
+                    )
                     .await
                     .expect_err("cancelled namespace list"),
             ),
@@ -1273,7 +1312,11 @@ mod tests {
         assert_eq!(
             stopped_kind(
                 &catalog
-                    .list_tables_for_read(&namespace, cancelled_binding.clone())
+                    .list_tables_for_read(
+                        &namespace,
+                        cancelled_binding.clone(),
+                        novarocks_spi::connector::ConnectorListingBound::V1,
+                    )
                     .await
                     .expect_err("cancelled table list"),
             ),

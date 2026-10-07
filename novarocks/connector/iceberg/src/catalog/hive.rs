@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use novarocks_spi::connector::ConnectorError;
+use novarocks_spi::connector::{ConnectorError, ConnectorListingBound};
 
 use super::delegate::CatalogDelegate;
 use super::error::{CatalogOutcome, CatalogUnsupported};
@@ -77,8 +77,11 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         }
     }
 
-    async fn list_namespaces(&self) -> Result<Vec<String>, ConnectorError> {
-        self.delegate.list_namespaces().await
+    async fn list_namespaces(
+        &self,
+        bound: ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
+        self.delegate.list_namespaces(bound).await
     }
 
     async fn namespace_exists(
@@ -91,8 +94,9 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
     async fn list_tables(
         &self,
         namespace: CatalogNamespaceName,
+        bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        self.delegate.list_tables(&namespace).await
+        self.delegate.list_tables(&namespace, bound).await
     }
 
     async fn table_exists(&self, table: CatalogTableName) -> Result<bool, ConnectorError> {
@@ -118,8 +122,9 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
     async fn list_views(
         &self,
         namespace: CatalogNamespaceName,
+        bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        self.delegate.list_views(&namespace).await
+        self.delegate.list_views(&namespace, bound).await
     }
 
     async fn load_view(

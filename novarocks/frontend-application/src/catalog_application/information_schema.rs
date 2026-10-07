@@ -115,6 +115,9 @@ fn materialized_view_rows(
     let projections = readiness
         .list_ready_projections()
         .map_err(|e| format!("load materialized view metadata failed: {e}"))?;
+    novarocks_query_application::api::LocalResultBound::V1
+        .admit(projections.len(), 0)
+        .map_err(|error| format!("information_schema.materialized_views: {error}"))?;
     Ok(projections
         .iter()
         .map(|loaded| materialized_view_row(&loaded.projection))

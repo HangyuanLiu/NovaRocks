@@ -354,10 +354,17 @@ fn execute_operation(
             policy,
         } => {
             ensure_owner(provider, &view.instance_id)?;
+            // The collision probe enumerates the namespace and observes the
+            // production listing bound: an over-bound namespace refuses the
+            // create instead of answering from a partial listing.
             if provider
                 .runtime()
-                .list_tables_for_request(&view.namespace, context)
-                .map_err(unavailable)?
+                .list_tables_for_request(
+                    &view.namespace,
+                    context,
+                    novarocks_spi::connector::ConnectorListingBound::V1,
+                )
+                .map_err(|(kind, message)| ConnectorError::new(kind, message))?
                 .iter()
                 .any(|table| table.eq_ignore_ascii_case(&view.view))
             {

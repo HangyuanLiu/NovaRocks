@@ -329,6 +329,7 @@ impl ViewEngine for FrontendViewEngine {
                     instance_id,
                     namespace: Arc::from(database),
                 },
+                bound: novarocks_spi::connector::ConnectorListingBound::V1,
                 context: context.clone(),
             })
             .map(|views| {

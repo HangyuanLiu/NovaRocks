@@ -53,14 +53,14 @@ use novarocks_spi::connector::{
     ConnectorEnvelopeHeader, ConnectorError, ConnectorErrorKind, ConnectorExecutionDistribution,
     ConnectorExecutionResources, ConnectorFieldPath, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorListNamespacesRequest, ConnectorListTablesRequest,
-    ConnectorMetadata, ConnectorNamespaceIdentity, ConnectorNamespaceRequest,
-    ConnectorPinnedFileSet, ConnectorProviderBinding, ConnectorProviderId,
-    ConnectorReadRelationPayload, ConnectorReadSplitCategory, ConnectorReadSplitPayload,
-    ConnectorReadWireDecoder, ConnectorReadWireEncoder, ConnectorRequestContext, ConnectorScan,
-    ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplitPlanningRequest,
-    ConnectorSplitPlanningResult, ConnectorTableDefinitionFacts, ConnectorTableHandle,
-    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTablePlanningFacts,
-    ConnectorTableRequest, ProviderBindingEpoch,
+    ConnectorListingBound, ConnectorMetadata, ConnectorNamespaceIdentity,
+    ConnectorNamespaceRequest, ConnectorPinnedFileSet, ConnectorProviderBinding,
+    ConnectorProviderId, ConnectorReadRelationPayload, ConnectorReadSplitCategory,
+    ConnectorReadSplitPayload, ConnectorReadWireDecoder, ConnectorReadWireEncoder,
+    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
+    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorTableDefinitionFacts,
+    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
+    ConnectorTablePlanningFacts, ConnectorTableRequest, ProviderBindingEpoch,
 };
 use novarocks_spi::connector::{
     ConnectorControlReadBinding, ConnectorControlRoleBinding, ConnectorControlRoleBindingFactory,
@@ -691,9 +691,10 @@ impl ConnectorMetadata for PaimonGenericControl {
         self.ensure_instance(&request.instance_id)?;
         let resources = PaimonRequestControl::from_request(&request.context);
         let catalog = self.catalog(&request.context)?;
-        let entries = self
-            .async_runtime
-            .block_on(&resources, async move { catalog.list_databases().await })??;
+        let bound = request.bound;
+        let entries = self.async_runtime.block_on(&resources, async move {
+            catalog.list_databases(bound).await
+        })??;
         Ok(entries.map(|entries| {
             entries
                 .into_iter()
@@ -707,9 +708,12 @@ impl ConnectorMetadata for PaimonGenericControl {
 
     fn namespace_exists(&self, request: ConnectorNamespaceRequest) -> Result<bool, ConnectorError> {
         self.ensure_instance(&request.namespace.instance_id)?;
+        // Existence is answered from a database listing, which observes the
+        // production listing bound like any other enumeration.
         Ok(self
             .list_namespaces(ConnectorListNamespacesRequest {
                 instance_id: request.namespace.instance_id.clone(),
+                bound: ConnectorListingBound::V1,
                 context: request.context,
             })?
             .iter()
@@ -721,8 +725,12 @@ impl ConnectorMetadata for PaimonGenericControl {
         let resources = PaimonRequestControl::from_request(&request.context);
         let catalog = self.catalog(&request.context)?;
         let namespace = request.table.namespace.clone();
+        // Existence is answered from a table listing, which observes the
+        // production listing bound like any other enumeration.
         let entries = self.async_runtime.block_on(&resources, async move {
-            catalog.list_tables(&namespace).await
+            catalog
+                .list_tables(&namespace, ConnectorListingBound::V1)
+                .await
         })??;
         Ok(entries
             .entries()
@@ -738,8 +746,9 @@ impl ConnectorMetadata for PaimonGenericControl {
         let resources = PaimonRequestControl::from_request(&request.context);
         let catalog = self.catalog(&request.context)?;
         let namespace = request.namespace.namespace.clone();
+        let bound = request.bound;
         let entries = self.async_runtime.block_on(&resources, async move {
-            catalog.list_tables(&namespace).await
+            catalog.list_tables(&namespace, bound).await
         })??;
         Ok(entries.map(|entries| {
             entries

@@ -779,18 +779,14 @@ impl IcebergMetadataContext {
             .map_err(|error| (error.kind(), error.to_string()))
     }
 
-    pub(crate) fn list_namespaces(&self) -> Result<Vec<String>, String> {
-        let owner = Arc::clone(self.novarocks_catalog());
-        self.resources
-            .catalog_runtime()
-            .block_on(async move { owner.list_namespaces().await })?
-            .map_err(|error| format!("list Iceberg namespaces: {error}"))
-    }
-
+    /// Enumerate namespaces for one request, refused as a whole when the
+    /// listing would exceed `bound`. The catalog's classification survives,
+    /// so a bound refusal stays `ResourceExhausted`.
     pub(crate) fn list_namespaces_for_request(
         &self,
         request: &ConnectorRequestContext,
-    ) -> Result<Vec<String>, String> {
+        bound: novarocks_spi::connector::ConnectorListingBound,
+    ) -> Result<Vec<String>, (ConnectorErrorKind, String)> {
         let owner = Arc::clone(self.novarocks_catalog());
         let binding = self
             .resources
@@ -798,8 +794,14 @@ impl IcebergMetadataContext {
             .for_request(request.clone());
         self.resources
             .catalog_runtime()
-            .block_on(async move { owner.list_namespaces_for_read(binding).await })?
-            .map_err(|error| format!("list Iceberg namespaces: {error}"))
+            .block_on(async move { owner.list_namespaces_for_read(binding, bound).await })
+            .map_err(|error| (ConnectorErrorKind::Unavailable, error))?
+            .map_err(|error| {
+                (
+                    error.kind(),
+                    format!("list Iceberg namespaces: {}", error.message()),
+                )
+            })
     }
 
     pub(crate) fn namespace_exists(&self, namespace: &str) -> Result<bool, String> {
@@ -832,23 +834,17 @@ impl IcebergMetadataContext {
             .map_err(|error| format!("check Iceberg namespace {namespace_label}: {error}"))
     }
 
-    pub(crate) fn list_tables(&self, namespace: &str) -> Result<Vec<String>, String> {
-        let namespace = NamespaceIdent::new(normalize_identifier(namespace)?);
-        let namespace_label = namespace.to_string();
-        let owner = Arc::clone(self.novarocks_catalog());
-        let target = crate::catalog::CatalogNamespaceName::new(namespace.to_url_string());
-        self.resources
-            .catalog_runtime()
-            .block_on(async move { owner.list_tables(target).await })?
-            .map_err(|error| format!("list Iceberg tables in {namespace_label}: {error}"))
-    }
-
+    /// Enumerate one namespace's tables for one request, refused as a whole
+    /// when the listing would exceed `bound`. The catalog's classification
+    /// survives, so a bound refusal stays `ResourceExhausted`.
     pub(crate) fn list_tables_for_request(
         &self,
         namespace: &str,
         request: &ConnectorRequestContext,
-    ) -> Result<Vec<String>, String> {
-        let namespace = NamespaceIdent::new(normalize_identifier(namespace)?);
+        bound: novarocks_spi::connector::ConnectorListingBound,
+    ) -> Result<Vec<String>, (ConnectorErrorKind, String)> {
+        let namespace =
+            NamespaceIdent::new(normalize_identifier(namespace).map_err(invalid_request)?);
         let namespace_label = namespace.to_string();
         let owner = Arc::clone(self.novarocks_catalog());
         let target = crate::catalog::CatalogNamespaceName::new(namespace.to_url_string());
@@ -858,8 +854,17 @@ impl IcebergMetadataContext {
             .for_request(request.clone());
         self.resources
             .catalog_runtime()
-            .block_on(async move { owner.list_tables_for_read(target, binding).await })?
-            .map_err(|error| format!("list Iceberg tables in {namespace_label}: {error}"))
+            .block_on(async move { owner.list_tables_for_read(target, binding, bound).await })
+            .map_err(|error| (ConnectorErrorKind::Unavailable, error))?
+            .map_err(|error| {
+                (
+                    error.kind(),
+                    format!(
+                        "list Iceberg tables in {namespace_label}: {}",
+                        error.message()
+                    ),
+                )
+            })
     }
 
     pub(crate) fn table_exists(&self, namespace: &str, table: &str) -> Result<bool, String> {

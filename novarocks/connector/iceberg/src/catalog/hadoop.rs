@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use novarocks_spi::connector::ConnectorError;
+use novarocks_spi::connector::{ConnectorError, ConnectorListingBound};
 
 use super::delegate::CatalogDelegate;
 use super::error::{CatalogOutcome, CatalogUnsupported};
@@ -86,6 +86,23 @@ impl NovaRocksHadoopCatalog {
     }
 }
 
+/// Classify a bounded Hadoop read. A listing-bound refusal travels through the
+/// vendored error type as its typed source and keeps its `ResourceExhausted`
+/// kind; every other failure keeps the ordinary read classification.
+fn map_bounded_read_error(error: &crate::iceberg::Error) -> ConnectorError {
+    match std::error::Error::source(error)
+        .and_then(|source| source.downcast_ref::<ConnectorError>())
+    {
+        Some(refusal)
+            if refusal.kind()
+                == novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted =>
+        {
+            refusal.clone()
+        }
+        _ => super::error::map_read_error(error),
+    }
+}
+
 #[async_trait]
 impl NovaRocksCatalog for NovaRocksHadoopCatalog {
     fn implementation_name(&self) -> &'static str {
@@ -106,27 +123,33 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         }
     }
 
-    async fn list_namespaces(&self) -> Result<Vec<String>, ConnectorError> {
-        self.delegate.list_namespaces().await
+    async fn list_namespaces(
+        &self,
+        bound: ConnectorListingBound,
+    ) -> Result<Vec<String>, ConnectorError> {
+        self.delegate.list_namespaces(bound).await
     }
 
+    /// The warehouse directory listing is checked against the bound before any
+    /// child is probed, so neither the probes nor the retained names can
+    /// exceed it.
     async fn list_namespaces_for_read(
         &self,
         binding: crate::access_binding::IcebergReadBinding,
+        bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
         let namespaces = self
             .client
-            .list_namespaces_for_read(binding)
+            .list_namespaces_for_read(binding, bound)
             .await
-            .map_err(|error| super::error::map_read_error(&error))?;
-        let mut names = namespaces
-            .into_iter()
-            .flat_map(|ident| ident.inner())
-            .filter(|name| !name.starts_with('.'))
-            .collect::<Vec<_>>();
-        names.sort();
-        names.dedup();
-        Ok(names)
+            .map_err(|error| map_bounded_read_error(&error))?;
+        Ok(super::delegate::sorted_unique(
+            namespaces
+                .into_iter()
+                .flat_map(|ident| ident.inner())
+                .filter(|name| !name.starts_with('.'))
+                .collect(),
+        ))
     }
 
     async fn namespace_exists(
@@ -151,28 +174,28 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
     async fn list_tables(
         &self,
         namespace: CatalogNamespaceName,
+        bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        self.delegate.list_tables(&namespace).await
+        self.delegate.list_tables(&namespace, bound).await
     }
 
+    /// The namespace directory listing is checked against the bound before
+    /// any child is probed for a version hint.
     async fn list_tables_for_read(
         &self,
         namespace: CatalogNamespaceName,
         binding: crate::access_binding::IcebergReadBinding,
+        bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
         let ident = super::delegate::namespace_ident(&namespace)?;
         let tables = self
             .client
-            .list_tables_for_read(&ident, binding)
+            .list_tables_for_read(&ident, binding, bound)
             .await
-            .map_err(|error| super::error::map_read_error(&error))?;
-        let mut names = tables
-            .into_iter()
-            .map(|ident| ident.name)
-            .collect::<Vec<_>>();
-        names.sort();
-        names.dedup();
-        Ok(names)
+            .map_err(|error| map_bounded_read_error(&error))?;
+        Ok(super::delegate::sorted_unique(
+            tables.into_iter().map(|ident| ident.name).collect(),
+        ))
     }
 
     async fn table_exists(&self, table: CatalogTableName) -> Result<bool, ConnectorError> {
@@ -228,8 +251,9 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
     async fn list_views(
         &self,
         namespace: CatalogNamespaceName,
+        bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        self.delegate.list_views(&namespace).await
+        self.delegate.list_views(&namespace, bound).await
     }
 
     async fn load_view(

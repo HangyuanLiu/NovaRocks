@@ -100,7 +100,7 @@ mod tests {
     use crate::iceberg::TableCreation;
     use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
-    use novarocks_spi::connector::ConnectorErrorKind;
+    use novarocks_spi::connector::{ConnectorErrorKind, ConnectorListingBound};
 
     /// Build a catalog for a test the way production does.
     ///
@@ -189,7 +189,10 @@ mod tests {
         assert_eq!(exists.kind(), ConnectorErrorKind::Unsupported);
 
         let listed = catalog
-            .list_views(CatalogNamespaceName::new("db"))
+            .list_views(
+                CatalogNamespaceName::new("db"),
+                novarocks_spi::connector::ConnectorListingBound::V1,
+            )
             .await
             .expect_err("list_views must not answer with an empty list");
         assert_eq!(listed.kind(), ConnectorErrorKind::Unsupported);
@@ -199,6 +202,62 @@ mod tests {
             .await
             .expect_err("load_view must not answer not-found");
         assert_eq!(loaded.kind(), ConnectorErrorKind::Unsupported);
+    }
+
+    /// Hadoop enumeration has no paging, so its directory listing is bounded
+    /// as a whole: an over-bound namespace is refused with its typed bound on
+    /// both the generation path and the admitted-read path, never truncated.
+    #[tokio::test]
+    async fn hadoop_table_listing_over_its_bound_is_refused_not_truncated() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        for table in ["a", "b", "c"] {
+            let metadata = warehouse.path().join("db").join(table).join("metadata");
+            std::fs::create_dir_all(&metadata).expect("metadata directory");
+            std::fs::write(metadata.join("version-hint.text"), b"1\n").expect("version hint");
+        }
+        let catalog = adopted(&hadoop_configuration(warehouse.path()))
+            .await
+            .expect("catalog");
+        let runtime = tokio::runtime::Handle::current();
+        let binding = || {
+            crate::access_binding::IcebergReadBinding::new(
+                None,
+                FsAccessResolver::new(),
+                Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+                Arc::new(TokioFileTaskSpawner::new(runtime.clone())),
+            )
+        };
+        let namespace = || CatalogNamespaceName::new("db");
+        let exact = ConnectorListingBound {
+            entries: 3,
+            ..ConnectorListingBound::V1
+        };
+        let over = ConnectorListingBound {
+            entries: 2,
+            ..exact
+        };
+
+        assert_eq!(
+            catalog.list_tables(namespace(), exact).await.unwrap(),
+            ["a", "b", "c"]
+        );
+        assert_eq!(
+            catalog
+                .list_tables_for_read(namespace(), binding(), exact)
+                .await
+                .unwrap(),
+            ["a", "b", "c"]
+        );
+        for error in [
+            catalog.list_tables(namespace(), over).await.unwrap_err(),
+            catalog
+                .list_tables_for_read(namespace(), binding(), over)
+                .await
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+            assert!(error.message().contains("entries bound"), "{error}");
+        }
     }
 
     /// Absence must be readable from the error's kind alone.

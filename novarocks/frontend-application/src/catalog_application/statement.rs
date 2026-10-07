@@ -584,6 +584,7 @@ pub(crate) fn execute_drop_database_statement(
             .metadata()
             .list_tables(novarocks_spi::connector::ConnectorListTablesRequest {
                 namespace: namespace_identity.clone(),
+                bound: novarocks_spi::connector::ConnectorListingBound::V1,
                 context: connector_context.clone(),
             })
             .map_err(|error| error.to_string())?
@@ -600,6 +601,7 @@ pub(crate) fn execute_drop_database_statement(
         let mut views = view_metadata
             .list_views(novarocks_spi::connector::ConnectorListViewsRequest {
                 namespace: namespace_identity,
+                bound: novarocks_spi::connector::ConnectorListingBound::V1,
                 context: connector_context.clone(),
             })
             .map_err(|error| error.to_string())?

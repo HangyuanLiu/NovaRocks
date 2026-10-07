@@ -132,6 +132,11 @@ pub(crate) fn list_mv_rows_with_ports(
     let projections = readiness
         .list_listable_projections()
         .map_err(|e| format!("load materialized view Accelerator projections failed: {e}"))?;
+    // Every listed projection may become a row and costs a dependency read;
+    // refuse a listing beyond the local result bound before either.
+    novarocks_query_application::api::LocalResultBound::V1
+        .admit(projections.len(), 0)
+        .map_err(|error| format!("SHOW MATERIALIZED VIEWS: {error}"))?;
 
     let mut rows = Vec::new();
     for listed in &projections {
@@ -363,30 +368,35 @@ pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, St
         ("RetryAfterTime", true),
         ("Manageability", false),
     ];
-    let rows = rows
-        .iter()
-        .map(|row| {
-            vec![
-                Some(row.name.clone()),
-                Some(row.database.clone()),
-                Some(row.storage_engine.clone()),
-                Some(row.refresh_mode.clone()),
-                row.last_refresh_time.clone(),
-                row.last_refresh_rows.clone(),
-                Some(row.base_tables.clone()),
-                Some(row.select_text.clone()),
-                Some(row.dependencies.clone()),
-                Some(row.refresh_paused.clone()),
-                row.next_refresh_time.clone(),
-                row.last_scheduler_error.clone(),
-                row.max_staleness_ms.clone(),
-                Some(row.refresh_state.clone()),
-                row.retry_after_time.clone(),
-                Some(row.manageability.clone()),
-            ]
-        })
-        .collect();
-    build_utf8_table_query_result(COLUMNS, rows)
+    let mut table = novarocks_query_application::api::LocalTableBuilder::try_new(
+        COLUMNS,
+        novarocks_query_application::api::LocalResultBound::V1,
+    )
+    .map_err(|error| format!("build SHOW MATERIALIZED VIEWS batch failed: {error}"))?;
+    for row in rows {
+        table
+            .push_row(&[
+                Some(row.name.as_str()),
+                Some(row.database.as_str()),
+                Some(row.storage_engine.as_str()),
+                Some(row.refresh_mode.as_str()),
+                row.last_refresh_time.as_deref(),
+                row.last_refresh_rows.as_deref(),
+                Some(row.base_tables.as_str()),
+                Some(row.select_text.as_str()),
+                Some(row.dependencies.as_str()),
+                Some(row.refresh_paused.as_str()),
+                row.next_refresh_time.as_deref(),
+                row.last_scheduler_error.as_deref(),
+                row.max_staleness_ms.as_deref(),
+                Some(row.refresh_state.as_str()),
+                row.retry_after_time.as_deref(),
+                Some(row.manageability.as_str()),
+            ])
+            .map_err(|error| format!("build SHOW MATERIALIZED VIEWS batch failed: {error}"))?;
+    }
+    table
+        .finish()
         .map_err(|error| format!("build SHOW MATERIALIZED VIEWS batch failed: {error}"))
 }
 

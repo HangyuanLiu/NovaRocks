@@ -463,10 +463,12 @@ pub fn metadata_table_exists_with_planning_lease(
 
 /// Enumerate namespaces through an admission-frozen connector control lease.
 /// Ordering and duplicate handling stay application-owned so providers only
-/// expose their authoritative catalog facts.
+/// expose their authoritative catalog facts. The provider refuses a listing
+/// that would exceed `bound`.
 pub fn metadata_list_namespaces_with_planning_lease(
     binding: novarocks_spi::connector::ConnectorControlPlanningLease,
     context: ConnectorRequestContext,
+    bound: novarocks_spi::connector::ConnectorListingBound,
 ) -> Result<Vec<ConnectorNamespaceIdentity>, String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
     let context = context_for_planning_lease(&binding, context)?;
@@ -475,6 +477,7 @@ pub fn metadata_list_namespaces_with_planning_lease(
         .metadata()
         .list_namespaces(ConnectorListNamespacesRequest {
             instance_id,
+            bound,
             context,
         })
         .map_err(|error| error.to_string())
@@ -485,11 +488,13 @@ pub fn metadata_list_namespaces_with_planning_lease(
 ///
 /// This is what makes a namespace's contents knowable to SQL. Without it a
 /// caller can only drop children it can already name, which is no help to
-/// anyone who did not create them.
+/// anyone who did not create them. The provider refuses a listing that would
+/// exceed `bound`.
 pub fn metadata_list_tables_with_planning_lease(
     binding: &novarocks_spi::connector::ConnectorControlPlanningLease,
     context: ConnectorRequestContext,
     namespace: &str,
+    bound: novarocks_spi::connector::ConnectorListingBound,
 ) -> Result<Vec<String>, String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
     let context = context_for_planning_lease(binding, context)?;
@@ -501,6 +506,7 @@ pub fn metadata_list_tables_with_planning_lease(
                 instance_id,
                 namespace: Arc::from(namespace),
             },
+            bound,
             context,
         })
         .map_err(|error| error.to_string())?

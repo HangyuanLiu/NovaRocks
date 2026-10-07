@@ -423,6 +423,7 @@ fn discover_managed_mv_targets(
     let namespaces = crate::connector::metadata_list_namespaces_with_planning_lease(
         planning.clone(),
         context.clone(),
+        novarocks_spi::connector::ConnectorListingBound::V1,
     )
     .map_err(|error| {
         ConnectorError::new(

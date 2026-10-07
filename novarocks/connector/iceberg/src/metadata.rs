@@ -427,10 +427,12 @@ impl ConnectorMetadata for IcebergMetadata {
     ) -> Result<Vec<ConnectorNamespaceIdentity>, ConnectorError> {
         self.validate_context(&request.context)?;
         self.ensure_owner(&request.instance_id)?;
-        let namespaces = self.runtime.list_namespaces_for_request(&request.context);
+        let namespaces = self
+            .runtime
+            .list_namespaces_for_request(&request.context, request.bound);
         self.validate_context(&request.context)?;
         namespaces
-            .map_err(unavailable)?
+            .map_err(classified_control_error)?
             .into_iter()
             .map(|namespace| {
                 self.validate_context(&request.context)?;
@@ -481,12 +483,14 @@ impl ConnectorMetadata for IcebergMetadata {
     ) -> Result<Vec<ConnectorTableIdentity>, ConnectorError> {
         self.validate_context(&request.context)?;
         self.ensure_owner(&request.namespace.instance_id)?;
-        let tables = self
-            .runtime
-            .list_tables_for_request(&request.namespace.namespace, &request.context);
+        let tables = self.runtime.list_tables_for_request(
+            &request.namespace.namespace,
+            &request.context,
+            request.bound,
+        );
         self.validate_context(&request.context)?;
         tables
-            .map_err(unavailable)?
+            .map_err(classified_control_error)?
             .into_iter()
             .map(|table| {
                 self.validate_context(&request.context)?;

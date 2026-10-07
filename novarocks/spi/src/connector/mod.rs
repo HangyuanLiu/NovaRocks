@@ -33,6 +33,7 @@ mod error;
 mod execution;
 mod handle;
 mod identity;
+mod listing;
 mod metadata;
 mod metadata_maintenance;
 mod mutation;
@@ -166,6 +167,7 @@ pub use handle::{
 pub use identity::{
     ConnectorIdentityError, ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
 };
+pub use listing::{ConnectorListingBound, ConnectorListingBudget, ConnectorListingCollector};
 pub use metadata::{
     CONNECTOR_FIELD_HIDDEN_FROM_SQL, CONNECTOR_MV_APPLY_KEY_COLUMN_PROPERTY,
     CONNECTOR_MV_HIDDEN_COLUMNS_PROPERTY, ConnectorColumnDefault, ConnectorListNamespacesRequest,
