@@ -271,9 +271,13 @@ impl RegistryTaskExecutionIngress {
                 // Read after the release settled: the completion pass inside
                 // it is what hands the shared facts back to the host and seals
                 // this evidence.
-                let evidence = self.registry.released_context_evidence(request.context());
+                let empty = novarocks_worker::ReleasedContextEvidence::none();
+                let evidence = receipt
+                    .acknowledgement()
+                    .and_then(|ack| ack.evidence())
+                    .unwrap_or(&empty);
                 let runtime_filter =
-                    crate::task_shared_facts::release_runtime_filter_telemetry(&evidence)
+                    crate::task_shared_facts::release_runtime_filter_telemetry(evidence)
                         .map_err(host_rejection_status)?;
                 encode_operation_receipt(&receipt, |ack| {
                     let mut encoded = encode_release_ack(
@@ -282,6 +286,9 @@ impl RegistryTaskExecutionIngress {
                         ack.state(),
                         runtime_filter.as_ref(),
                     )?;
+                    encoded.verification = evidence
+                        .verification()
+                        .map(novarocks_task_codec::status::encode_verification);
                     encoded.termination_cause =
                         ack.termination_cause().map(encode_abort_cause_field);
                     Some(ReceiptAck::ReleaseQueryContext(encoded))
@@ -1341,6 +1348,47 @@ mod tests {
         let replay_status = replay.current_status.as_ref().expect("current status");
         assert_eq!(replay_status.identity, original_status.identity);
         assert!(replay_status.status_version >= original_status.status_version);
+    }
+
+    #[test]
+    fn peer_before_bounded_mv_failures_is_rejected_before_admission() {
+        use novarocks_version::{
+            NativeCarrierDeclaration, derive_repository_native_compatibility_material,
+        };
+        let material = |revision| {
+            derive_repository_native_compatibility_material(
+                [NativeCarrierDeclaration::try_new("iceberg", 2).unwrap()],
+                [0x31; 32],
+                [0x41; 32],
+                revision,
+            )
+            .unwrap()
+        };
+        let current = material(novarocks_physical_plan::PLAN_CONTRACT_REVISION);
+        let legacy = material(5);
+        assert_ne!(current.id(), legacy.id());
+        assert_eq!(current.descriptor_digest(), legacy.descriptor_digest());
+        let mut fixture = Fixture::new();
+        fixture.native_compatibility_id = current.id();
+        fixture.ingress =
+            RegistryTaskExecutionIngress::new(Arc::clone(&fixture.registry), current.id());
+        let context = fixture.context();
+        let response = fixture.apply(vec![acquire_ticket(
+            context,
+            TaskOperationId::new_v7(),
+            legacy.id(),
+            fixture.registry.admission_epoch_capability(),
+        )]);
+        assert_eq!(
+            outcome_of(&response.receipts[0]),
+            proto::TaskOperationOutcome::CompatibilityMismatch
+        );
+        assert!(response.receipts[0].ack.is_none());
+        assert_eq!(fixture.registry.admission_reservation_count(), 0);
+        assert_eq!(
+            fixture.registry.context_state(context),
+            QueryContextState::Absent
+        );
     }
 
     #[test]

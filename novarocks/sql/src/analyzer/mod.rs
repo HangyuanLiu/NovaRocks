@@ -3258,6 +3258,7 @@ mod tests {
                 SqlScanKind::Delta { .. } => 5,
                 SqlScanKind::MvTargetState { .. } => 6,
                 SqlScanKind::MvTargetLocator { .. } => 7,
+                SqlScanKind::MvTargetBag { .. } => 8,
             }])
         {
             ordinal = ordinal.wrapping_mul(16_777_619) ^ u32::from(byte);

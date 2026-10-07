@@ -239,6 +239,7 @@ struct TaskRuntime {
     /// This task's metrics owner, retained so `submit_runnable` can hand it
     /// the status reporter that only exists once the task is runnable.
     operator_statistics: Arc<TaskOperatorStatisticsSink>,
+    verification: Arc<novarocks_execution::runtime::verification::TaskVerificationHolder>,
 }
 
 /// A failed preparation must wake any provider work before resources roll
@@ -843,6 +844,9 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                     "task {identity} could not install connector resource accounting: {error}"
                 ))
             })?;
+        let verification = Arc::new(
+            novarocks_execution::runtime::verification::TaskVerificationHolder::new(identity),
+        );
         let context = admission
             .into_prepare_context(
                 profiler,
@@ -854,6 +858,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             .with_exchange_receiver_port(Arc::clone(&self.exchange_receiver_port))
             .with_execution_runtime(Arc::clone(&self.execution_runtime))
             .with_result_identity(identity)
+            .with_verification(Arc::clone(&verification))
             // Binding the gates here is what makes the closed-edge barrier
             // real: the sinks this fragment builds consult them before every
             // send, so a producer cannot reach a destination that has not
@@ -885,6 +890,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                 read_context,
                 registration: Mutex::new(Some(registration)),
                 operator_statistics,
+                verification,
             }),
         );
         lease.retain();
@@ -899,6 +905,16 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
     /// is still parked and its drop rolls the registrations back; in the
     /// second it was taken by `submit_runnable` and the running fragment
     /// already finished them.
+    fn verification_facts(
+        &self,
+        identity: TaskIdentity,
+    ) -> novarocks_execution_contract::TaskVerificationFacts {
+        self.task_runtime(identity).map_or_else(
+            || novarocks_execution_contract::TaskVerificationFacts::unavailable(identity),
+            |runtime| runtime.verification.seal(),
+        )
+    }
+
     fn remove_receiver(&self, descriptor: &TaskDescriptor) {
         let removed = self
             .tasks
@@ -1487,10 +1503,12 @@ fn report_terminal(
         match (stand_down, fact.outcome()) {
             (StandDown::Quiesce, FragmentOutcome::Failed(error)) => report_failure(
                 reporter,
-                TaskFailure::new(
-                    TaskFailureCategory::Execution,
-                    SafeDetail::truncating(&error.to_string()),
-                ),
+                error.task_failure().cloned().unwrap_or_else(|| {
+                    TaskFailure::new(
+                        TaskFailureCategory::Execution,
+                        SafeDetail::truncating(&error.to_string()),
+                    )
+                }),
             ),
             _ => {
                 reporter.conclude_termination(stand_down.proposal(), output);
@@ -1541,10 +1559,12 @@ fn report_terminal(
         FragmentOutcome::Failed(error) => {
             report_failure(
                 reporter,
-                TaskFailure::new(
-                    TaskFailureCategory::Execution,
-                    SafeDetail::truncating(&error.to_string()),
-                ),
+                error.task_failure().cloned().unwrap_or_else(|| {
+                    TaskFailure::new(
+                        TaskFailureCategory::Execution,
+                        SafeDetail::truncating(&error.to_string()),
+                    )
+                }),
             );
         }
     }
@@ -1646,8 +1666,8 @@ mod tests {
         ReleaseQueryContext, TaskDomainUpdate, UpdateQueryContext,
     };
     use novarocks_execution_contract::task_execution::status::{
-        AbortCause, CancelReason, TaskFailureCategory, TaskOutputFacts, TaskState,
-        TerminationDetail,
+        AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
+        TaskState, TerminationDetail,
     };
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_models::{connector_read as connector_dto, novarocks as proto, plan};
@@ -1755,6 +1775,7 @@ mod tests {
                     }),
                 },
                 assignment: proto::TaskAssignment {
+                    quota_domain_bindings: Vec::new(),
                     instance_ordinal: 3,
                     initial_scan_ranges: Vec::new(),
                     sink_edge_ids,
@@ -3431,6 +3452,35 @@ mod tests {
     }
 
     #[test]
+    fn bounded_mv_failure_survives_fragment_terminal_and_worker_reporting() {
+        let failure =
+            TaskFailure::mv_apply_consistency(5, 2, SafeDetail::new("bounded tuple").unwrap());
+        for stand_down in [None, Some(StandDown::Quiesce)] {
+            let task = identity(391, 1, 1);
+            let (owner, reporter) = reporter_for(task);
+            owner.note_installed();
+            reporter.running();
+            report_terminal(
+                &reporter,
+                FragmentSinkKind::Noop,
+                &terminal_fact(FragmentOutcome::Failed(
+                    FragmentExecutionError::new(
+                        FragmentExecutionErrorKind::Pipeline,
+                        "wrapped operator failure",
+                    )
+                    .with_task_failure(Some(failure.clone())),
+                )),
+                stand_down,
+            );
+            assert_eq!(owner.state(), TaskState::Failed);
+            assert_eq!(
+                owner.current().termination(),
+                Some(&TerminationDetail::Failed(failure.clone()))
+            );
+        }
+    }
+
+    #[test]
     fn a_failing_fragment_reaches_a_terminal_status_rather_than_stalling() {
         let task = identity(31, 1, 1);
         let (owner, reporter) = reporter_for(task);
@@ -4071,7 +4121,7 @@ mod tests {
     /// asked for. Profiling is the query's decision, and a task that was not
     /// asked to measure must report nothing rather than zeroes.
     #[test]
-    fn an_unprofiled_task_reports_no_operator_statistics() {
+    fn verification_is_available_for_an_unprofiled_task_with_no_operator_statistics() {
         let facts = Arc::new(StubContextFacts::default());
         let host = host(Arc::clone(&facts));
         let task = identity(43, 1, 1);
@@ -4084,6 +4134,14 @@ mod tests {
 
         let final_info = owner.final_info().expect("a terminal task has final info");
         assert!(final_info.operator_statistics().is_empty());
+
+        let verification = host.verification_facts(task);
+        assert_eq!(verification.identity, task);
+        assert_eq!(
+            verification.observation,
+            novarocks_execution_contract::TaskVerificationObservation::Available(Vec::new())
+        );
+        assert_eq!(host.verification_facts(task), verification);
 
         host.remove_receiver(&descriptor);
     }

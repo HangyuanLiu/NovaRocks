@@ -253,23 +253,14 @@ pub fn connector_table_materialization_from_metadata(
     metadata: novarocks_spi::connector::ConnectorTableMetadata,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<ConnectorQueryTableMaterialization, String> {
-    use novarocks_spi::connector::{
-        ConnectorTableColumnRole, ConnectorTableColumnSemanticKind, ConnectorTableColumnVisibility,
-    };
+    use novarocks_spi::connector::{ConnectorTableColumnRole, ConnectorTableColumnVisibility};
 
     let mut columns = Vec::new();
     let mut row_lineage_metadata_columns = Vec::new();
     for (ordinal, field) in metadata.schema.fields().iter().enumerate() {
         let fact = metadata.planning_facts.column_facts().get(ordinal);
-        let logical_type = match fact.map(|fact| fact.semantic_kind()) {
-            Some(ConnectorTableColumnSemanticKind::Bitmap) => {
-                Some(novarocks_types::schema::SqlType::Bitmap)
-            }
-            Some(ConnectorTableColumnSemanticKind::Hll) => {
-                Some(novarocks_types::schema::SqlType::Hll)
-            }
-            _ => None,
-        };
+        let logical_type =
+            connector_column_logical_type(field, fact.map(|fact| fact.semantic_kind()))?;
         let column = novarocks_types::schema::ColumnDef {
             name: field.name().to_string(),
             data_type: field.data_type().clone(),
@@ -323,6 +314,43 @@ pub fn connector_table_materialization_from_metadata(
         statistics_pin,
         planning_lease,
     })
+}
+
+fn connector_column_logical_type(
+    field: &arrow::datatypes::Field,
+    semantic_kind: Option<novarocks_spi::connector::ConnectorTableColumnSemanticKind>,
+) -> Result<Option<novarocks_types::schema::SqlType>, String> {
+    use novarocks_spi::connector::ConnectorTableColumnSemanticKind as Kind;
+    use novarocks_types::logical_type::{LogicalType, logical_field_from_engine_arrow};
+    use novarocks_types::schema::SqlType;
+
+    let logical = logical_field_from_engine_arrow(field)?;
+    let legacy = match semantic_kind {
+        Some(Kind::Bitmap) => Some((LogicalType::Bitmap, SqlType::Bitmap, "bitmap")),
+        Some(Kind::Hll) => Some((LogicalType::Hll, SqlType::Hll, "hll")),
+        _ => None,
+    };
+    if let Some((expected, sql_type, marker)) = legacy {
+        let actual = if field
+            .metadata()
+            .contains_key(novarocks_types::logical::NR_LOGICAL_TYPE_KEY)
+        {
+            logical.data_type
+        } else {
+            // The provider's explicit legacy fact supplies root semantics.
+            let mut metadata = field.metadata().clone();
+            metadata.insert(
+                novarocks_types::logical::NR_LOGICAL_TYPE_KEY.into(),
+                marker.into(),
+            );
+            logical_field_from_engine_arrow(&field.clone().with_metadata(metadata))?.data_type
+        };
+        if actual != expected {
+            return Err("connector root logical marker conflicts with its planning fact".into());
+        }
+        return Ok(Some(sql_type));
+    }
+    Ok(matches!(logical.data_type, LogicalType::Json).then_some(SqlType::Json))
 }
 
 #[derive(Clone, Debug)]
@@ -520,9 +548,101 @@ pub fn drop_local_table_registration_if_exists(
 
 #[cfg(test)]
 mod typed_resolution_tests {
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field};
     use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
-    use super::{CatalogResolutionError, connector_table_resolution_error};
+    use super::{
+        CatalogResolutionError, connector_column_logical_type, connector_table_resolution_error,
+    };
+
+    fn marked_field(data_type: DataType, marker: &str) -> Field {
+        Field::new("value", data_type, true).with_metadata(
+            [(
+                novarocks_types::logical::NR_LOGICAL_TYPE_KEY.into(),
+                marker.into(),
+            )]
+            .into(),
+        )
+    }
+
+    #[test]
+    fn connector_json_semantics_require_an_explicit_field_marker() {
+        use novarocks_types::schema::SqlType;
+        let field = marked_field(DataType::Utf8, "json");
+        assert_eq!(
+            connector_column_logical_type(&field, None).unwrap(),
+            Some(SqlType::Json)
+        );
+        assert_eq!(
+            connector_column_logical_type(&Field::new("value", DataType::Utf8, true), None)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            field.metadata()[novarocks_types::logical::NR_LOGICAL_TYPE_KEY],
+            "json"
+        );
+    }
+
+    #[test]
+    fn connector_legacy_binary_semantics_require_consistent_planning_facts() {
+        use novarocks_spi::connector::ConnectorTableColumnSemanticKind as Kind;
+        use novarocks_types::schema::SqlType;
+        for carrier in [DataType::Binary, DataType::LargeBinary] {
+            let field = Field::new("value", carrier, true);
+            assert_eq!(
+                connector_column_logical_type(&field, Some(Kind::Bitmap)).unwrap(),
+                Some(SqlType::Bitmap)
+            );
+            assert_eq!(
+                connector_column_logical_type(&field, Some(Kind::Hll)).unwrap(),
+                Some(SqlType::Hll)
+            );
+            assert!(field.metadata().is_empty());
+        }
+        assert!(
+            connector_column_logical_type(
+                &marked_field(DataType::Binary, "hll"),
+                Some(Kind::Bitmap)
+            )
+            .is_err()
+        );
+        assert!(
+            connector_column_logical_type(&marked_field(DataType::Utf8, "json"), Some(Kind::Hll))
+                .is_err()
+        );
+        assert!(
+            connector_column_logical_type(
+                &Field::new("value", DataType::Utf8, true),
+                Some(Kind::Bitmap)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn connector_logical_projection_validates_the_complete_field_tree() {
+        assert!(
+            connector_column_logical_type(&marked_field(DataType::Int32, "json"), None).is_err()
+        );
+        assert!(
+            connector_column_logical_type(&marked_field(DataType::Utf8, "unknown"), None).is_err()
+        );
+        let nested = Field::new(
+            "value",
+            DataType::List(Arc::new(marked_field(DataType::Utf8, "json"))),
+            true,
+        );
+        assert_eq!(connector_column_logical_type(&nested, None).unwrap(), None);
+        let invalid = Field::new(
+            "value",
+            DataType::Struct(vec![Arc::new(marked_field(DataType::Int16, "json"))].into()),
+            true,
+        );
+        assert!(connector_column_logical_type(&invalid, None).is_err());
+    }
 
     #[test]
     fn connector_not_found_is_the_only_missing_resolution() {

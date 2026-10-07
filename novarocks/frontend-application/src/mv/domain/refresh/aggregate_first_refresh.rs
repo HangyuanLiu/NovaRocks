@@ -662,16 +662,10 @@ fn validate_aggregate_layout_compatibility(
         .enumerate()
     {
         if source.column().data_type != target.column().data_type {
-            return mismatch(&format!("physical column {column_index} SQL type"));
+            return mismatch(&format!("physical column {column_index} logical type"));
         }
         if source.column().nullable != target.column().nullable {
             return mismatch(&format!("physical column {column_index} nullability"));
-        }
-        if source.column().aggregation != target.column().aggregation {
-            return mismatch(&format!("physical column {column_index} aggregation role"));
-        }
-        if source.column().default != target.column().default {
-            return mismatch(&format!("physical column {column_index} default"));
         }
         if source.visible() != target.visible() {
             return mismatch(&format!("physical column {column_index} visibility role"));
@@ -874,16 +868,18 @@ mod tests {
             "select {group_key}, count(*) as c from ice.sales.fact group by {group_key}"
         ));
         let outputs = vec![
-            SqlMvOutputColumnFacts {
-                name: group_key.to_string(),
-                data_type: DataType::Utf8,
-                nullable: group_key_nullable,
-            },
-            SqlMvOutputColumnFacts {
-                name: "c".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-            },
+            SqlMvOutputColumnFacts::from_logical(
+                group_key.to_string(),
+                novarocks_types::logical_type::LogicalType::Utf8,
+                group_key_nullable,
+            )
+            .unwrap(),
+            SqlMvOutputColumnFacts::from_logical(
+                "c".to_string(),
+                novarocks_types::logical_type::LogicalType::Int64,
+                false,
+            )
+            .unwrap(),
         ];
         let facts =
             SqlMvAggregateLayoutFacts::from_aggregate_calls_and_outputs(&calls, &outputs, &[None])

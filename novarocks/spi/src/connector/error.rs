@@ -17,4 +17,5 @@
 
 pub use novarocks_connector_contract::{
     ConnectorError, ConnectorErrorKind, ConnectorTableObjectBindingFailure,
+    ConnectorTargetDeleteKind, ConnectorTargetFormatUnsupported,
 };

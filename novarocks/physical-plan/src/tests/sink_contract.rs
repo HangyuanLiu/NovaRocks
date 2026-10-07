@@ -1241,11 +1241,13 @@ fn independent_fragment_rejects_router_cut_projection_drift() {
             kind: EdgeKind::ChangeStreamRouter,
             destination_fragment: FragmentId::new(722),
             projection: Box::from([CutValue {
+                logical_kind: None,
                 value: effect,
                 ty: ty(DataType::Int8, false),
             }]),
             destination_imports: Box::from([CutImport {
                 source: CutValue {
+                    logical_kind: None,
                     value: effect,
                     ty: ty(DataType::Int8, false),
                 },

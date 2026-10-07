@@ -239,15 +239,23 @@ struct ProjectionReservation {
 /// Single-use deletion expectation captured before the provider effect.
 pub struct MvProjectionDeleteGuard {
     reservation: ProjectionReservation,
+    drop_expected: Option<Option<crate::repository::LoadedMvDropProjection>>,
+    drop_object: Option<novarocks_spi::connector::ConnectorTableObjectId>,
 }
 impl MvProjectionDeleteGuard {
     pub fn has_projection(&self) -> bool {
-        self.reservation.expected.is_some()
+        self.drop_expected
+            .as_ref()
+            .is_some_and(|expected| expected.is_some())
+            || self.reservation.expected.is_some()
     }
 
     pub fn expected_target_object_id(
         &self,
     ) -> Option<&novarocks_spi::connector::ConnectorTableObjectId> {
+        if let Some(object) = &self.drop_object {
+            return Some(object);
+        }
         self.reservation
             .expected
             .as_ref()
@@ -265,6 +273,8 @@ impl MvProjectionDeleteGuard {
                 managed: false,
                 installed_before: None,
             },
+            drop_expected: None,
+            drop_object: None,
         }
     }
 }
@@ -636,8 +646,60 @@ impl MvReadinessService {
     ) -> Result<MvProjectionDeleteGuard, MvProjectionError> {
         Ok(MvProjectionDeleteGuard {
             reservation: self.reserve(target).await?,
+            drop_expected: None,
+            drop_object: None,
         })
     }
+    /// Explicit DROP preflight uses a sealed Current descriptor and keeps its
+    /// own raw root reservation; it never installs ordinary readiness.
+    pub async fn prepare_current_drop(
+        &self,
+        descriptor: &crate::persistence::documents::MvCurrentDropDescriptor,
+    ) -> Result<MvDropReadiness, MvProjectionError> {
+        let source = descriptor.source_revision();
+        let target = MvTarget::try_new(
+            Some(source.target.instance_id.as_str().into()),
+            source.target.namespace.to_string(),
+            source.target.table.to_string(),
+        )
+        .map_err(|e| {
+            MvProjectionError::new(MvProjectionErrorKind::SourceConflict, e.to_string())
+        })?;
+        self.repository
+            .ensure_no_drop_downstream_dependencies(&source.target_object_id)
+            .await?;
+        let order = self.runtime.projection_order(target.clone());
+        let mut cell = order.lock().await;
+        let expected = self.repository.find_drop_projection(&target).await?;
+        if expected
+            .as_ref()
+            .is_some_and(|root| root.source_revision.target_object_id != source.target_object_id)
+        {
+            return Err(MvProjectionError::new(
+                MvProjectionErrorKind::SourceConflict,
+                "DROP Accelerator root belongs to another target object",
+            ));
+        }
+        let generation = cell.advance()?;
+        cell.installed = None;
+        cell.pending = Some(generation);
+        self.runtime
+            .set_unavailable(target.clone(), "explicit MV DROP reserved".into());
+        drop(cell);
+        Ok(MvDropReadiness::ReadyToDrop(MvProjectionDeleteGuard {
+            reservation: ProjectionReservation {
+                target,
+                generation,
+                expected: None,
+                order,
+                managed: false,
+                installed_before: None,
+            },
+            drop_expected: Some(expected),
+            drop_object: Some(source.target_object_id.clone()),
+        }))
+    }
+
     pub async fn delete_after_provider_drop(
         &self,
         operation_id: Uuid,
@@ -649,6 +711,31 @@ impl MvReadinessService {
             return Ok(MvProjectionInstallOutcome::Superseded);
         }
         cell.settle(reservation.generation);
+        if let Some(expected) = guard.drop_expected {
+            let current = self
+                .repository
+                .find_drop_projection(&reservation.target)
+                .await?;
+            if current != expected {
+                return Ok(MvProjectionInstallOutcome::Superseded);
+            }
+            let removed = match expected {
+                Some(expected) => {
+                    self.repository
+                        .delete_drop_projection(operation_id, expected)
+                        .await?
+                }
+                None => false,
+            };
+            cell.installed = None;
+            self.runtime
+                .set_unavailable(reservation.target, "MV target was removed".into());
+            return Ok(if removed {
+                MvProjectionInstallOutcome::Removed
+            } else {
+                MvProjectionInstallOutcome::AlreadyAbsent
+            });
+        }
         if !self.matches_repository(&reservation).await? {
             return Ok(MvProjectionInstallOutcome::Superseded);
         }

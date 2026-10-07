@@ -311,3 +311,119 @@ async fn whole_family_wipe_removes_an_unknown_current_record_without_decoding_it
     assert!(read.get(&key).await.unwrap().is_none());
     read.abort().await.unwrap();
 }
+
+#[tokio::test]
+async fn retired_root_is_drop_only_and_deleted_with_exact_root_and_dependency_cas() {
+    let (store, repository) = repository().await;
+    let created = repository
+        .create_projection(
+            uuid::Uuid::now_v7(),
+            projection_request("retired", b"old-object", 9, "orders"),
+        )
+        .await
+        .unwrap();
+    let key = super::key::projection_by_id_key(created.projection.mv_id).unwrap();
+    let value =
+        super::codec::encode_retired_projection_for_test(uuid::Uuid::now_v7(), &created.projection);
+    let (attempt, _) = store.attempts().reserve().unwrap();
+    let mut tx = store
+        .begin_write(attempt, "install historical nonaggregate fixture")
+        .await
+        .unwrap();
+    tx.put(
+        key.clone(),
+        value,
+        Precondition::Version(created.version.store_version().clone()),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(tx.commit().await, CommitOutcome::Committed(_)));
+    assert!(
+        repository.find_by_target(&target("retired")).await.is_err(),
+        "ordinary decoder stays strict"
+    );
+    let raw = repository
+        .find_drop_projection(&target("retired"))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut wrong_object = raw.clone();
+    wrong_object.source_revision.target_object_id = object_id(b"recreated-object");
+    assert_eq!(
+        repository
+            .delete_drop_projection(uuid::Uuid::now_v7(), wrong_object)
+            .await
+            .unwrap_err()
+            .kind(),
+        MvRepositoryErrorKind::Conflict
+    );
+    let stale = raw.clone();
+    let value =
+        super::codec::encode_retired_projection_for_test(uuid::Uuid::now_v7(), &created.projection);
+    let (attempt, _) = store.attempts().reserve().unwrap();
+    let mut tx = store
+        .begin_write(attempt, "replace historical root after DROP reservation")
+        .await
+        .unwrap();
+    tx.put(
+        key,
+        value,
+        Precondition::Version(raw.version.store_version().clone()),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(tx.commit().await, CommitOutcome::Committed(_)));
+    assert_eq!(
+        repository
+            .delete_drop_projection(uuid::Uuid::now_v7(), stale)
+            .await
+            .unwrap_err()
+            .kind(),
+        MvRepositoryErrorKind::Conflict
+    );
+    let exact = repository
+        .find_drop_projection(&target("retired"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        repository
+            .delete_drop_projection(uuid::Uuid::now_v7(), exact)
+            .await
+            .unwrap()
+    );
+    assert!(
+        repository
+            .find_drop_projection(&target("retired"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repository
+            .list_dependencies_by_downstream(created.projection.mv_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // CREATE reuses only the released logical locator, never the retired object.
+    repository
+        .create_projection(
+            uuid::Uuid::now_v7(),
+            projection_request("retired", b"new-object", 11, "customers"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        repository
+            .find_by_target(&target("retired"))
+            .await
+            .unwrap()
+            .unwrap()
+            .projection
+            .facts
+            .source_revision()
+            .target_object_id,
+        object_id(b"new-object")
+    );
+}

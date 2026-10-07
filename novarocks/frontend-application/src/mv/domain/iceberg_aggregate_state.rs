@@ -312,29 +312,31 @@ fn validate_physical_aggregate_schema(
                 actual.name()
             ));
         }
-        let expected_type = novarocks_sql::literal::sql_type_to_arrow_type(
-            &expected_column.column().data_type,
-        )
-                .map_err(|e| {
-                    format!(
-                        "{context}: convert expected physical aggregate column `{expected_name}` type failed: {e}"
+        let actual_type =
+            novarocks_types::logical_type::logical_value_from_engine_arrow(actual)?.data_type;
+        let expected_type = expected_column.logical_type();
+        let opaque_state = layout.runtime_layout().state_columns().iter().any(|state| {
+            state.name() == expected_name
+                && state.state_role()
+                    != novarocks_types::mv_aggregate_layout::MvAggregateStateRole::RetractionCount
+                && matches!(state.data_type(), DataType::Binary | DataType::LargeBinary)
+        });
+        let type_matches =
+            novarocks_mv_application::persistence::validation::output_type_matches_iceberg_physical(
+                expected_type,
+                &actual_type,
+            ) || (opaque_state
+                && !expected_column.column().nullable
+                && matches!(
+                    (expected_type, &actual_type),
+                    (
+                        novarocks_types::logical_type::LogicalType::Binary,
+                        novarocks_types::logical_type::LogicalType::Variant
+                    ) | (
+                        novarocks_types::logical_type::LogicalType::Variant,
+                        novarocks_types::logical_type::LogicalType::Binary
                     )
-                })?;
-        // Use a metadata-ignoring shape comparison instead of strict `!=`.
-        // Map<K, V> columns scanned from Iceberg parquet carry
-        // `PARQUET:field_id` metadata on inner Struct fields that the
-        // layout-derived `expected_type` does not have, and the Iceberg map
-        // convention uses non-null inner key fields while the
-        // `sql_type_to_arrow_type`-derived expected uses nullable inner key
-        // fields. Both are semantically the same shape. Top-level column
-        // nullability is still enforced by the `is_nullable` check below.
-        let type_matches = novarocks_sql::literal::arrow_type_equals_ignoring_metadata(
-            actual.data_type(),
-            &expected_type,
-        ) || matches!(
-            (actual.data_type(), &expected_type),
-            (DataType::LargeBinary, DataType::Binary) | (DataType::Binary, DataType::LargeBinary)
-        );
+                ));
         if !type_matches {
             return Err(format!(
                 "{context}: physical aggregate schema column {idx} `{expected_name}` type mismatch: got {:?} expected {:?}",
@@ -527,16 +529,18 @@ mod tests {
         };
         let calls = extract_aggregate_sql_calls(query).expect("extract aggregate calls");
         let outputs = vec![
-            SqlMvOutputColumnFacts {
-                name: "region".to_string(),
-                data_type: DataType::Utf8,
-                nullable: true,
-            },
-            SqlMvOutputColumnFacts {
-                name: "c".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-            },
+            SqlMvOutputColumnFacts::from_logical(
+                "region".to_string(),
+                novarocks_types::logical_type::LogicalType::Utf8,
+                true,
+            )
+            .unwrap(),
+            SqlMvOutputColumnFacts::from_logical(
+                "c".to_string(),
+                novarocks_types::logical_type::LogicalType::Int64,
+                false,
+            )
+            .unwrap(),
         ];
         let facts =
             SqlMvAggregateLayoutFacts::from_aggregate_calls_and_outputs(&calls, &outputs, &[None])

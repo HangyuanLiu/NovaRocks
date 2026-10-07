@@ -198,6 +198,8 @@ use state_combinators::count_distinct::{CountDistinctStateAgg, CountDistinctStat
 use state_combinators::min_max::{MinMaxStateAgg, MinMaxStateSignedAgg};
 use state_combinators::opaque_merge::OpaqueStateMergeAgg;
 use state_combinators::sum::{SumStateAgg, SumStateMergeAgg, SumStateSignedAgg};
+pub(super) mod mv_weight_sum;
+use mv_weight_sum::MvWeightSumAgg;
 use sum::SumAgg;
 use sum_map::SumMapAgg;
 use variance::VarStdAgg;
@@ -272,6 +274,27 @@ pub(super) trait AggregateFunction: Send + Sync {
         input: &AggInputView,
     ) -> Result<(), String>;
 
+    fn update_batch_typed(
+        &self,
+        spec: &AggSpec,
+        offset: usize,
+        state_ptrs: &[AggStatePtr],
+        input: &AggInputView,
+    ) -> Result<(), super::registry::PreparedAggregateError> {
+        self.update_batch(spec, offset, state_ptrs, input)
+            .map_err(super::registry::PreparedAggregateError::Update)
+    }
+    fn merge_batch_typed(
+        &self,
+        spec: &AggSpec,
+        offset: usize,
+        state_ptrs: &[AggStatePtr],
+        input: &AggInputView,
+    ) -> Result<(), super::registry::PreparedAggregateError> {
+        self.merge_batch(spec, offset, state_ptrs, input)
+            .map_err(super::registry::PreparedAggregateError::Merge)
+    }
+
     fn build_array(
         &self,
         spec: &AggSpec,
@@ -297,6 +320,7 @@ static COUNT_DISTINCT: CountDistinctAgg = CountDistinctAgg;
 static COUNT_IF: CountIfAgg = CountIfAgg;
 static GROUP_CONCAT: GroupConcatAgg = GroupConcatAgg;
 static SUM: SumAgg = SumAgg;
+static MV_WEIGHT_SUM: MvWeightSumAgg = MvWeightSumAgg;
 static COUNT_STATE_MERGE: OpaqueStateMergeAgg = OpaqueStateMergeAgg::new(
     "count_state_merge",
     AggKind::CountStateMerge,
@@ -419,6 +443,7 @@ static BUILTIN_AGGREGATE_IMPLEMENTATIONS: &[BuiltinAggregateImplementation] = &[
     builtin_aggregate!("group_concat", &GROUP_CONCAT),
     builtin_aggregate!("string_agg", &GROUP_CONCAT),
     builtin_aggregate!("sum", &SUM),
+    builtin_aggregate!("mv_weight_sum", &MV_WEIGHT_SUM),
     builtin_aggregate!("count_state_merge", &COUNT_STATE_MERGE),
     builtin_aggregate!("avg_state_merge", &AVG_STATE_MERGE),
     builtin_aggregate!("min_state_merge", &MIN_STATE_MERGE),
@@ -718,7 +743,7 @@ mod registry_tests {
         assert_eq!(names.len(), BUILTIN_AGGREGATE_IMPLEMENTATIONS.len());
         assert_eq!(
             names.len(),
-            86,
+            87,
             "update the executable-policy matrix deliberately"
         );
 

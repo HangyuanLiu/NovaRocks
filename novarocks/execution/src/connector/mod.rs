@@ -15,23 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Execution-side adapters for the typed connector read stack.
+//! Execution-side adapters for typed connector reads and writes.
 //!
-//! Two provider-neutral pieces live here, matching the two runtime boundaries a
-//! typed connector scan crosses:
+//! Provider-neutral adapters cover the runtime boundaries a connector crosses:
 //!
 //! - [`scan_queue`] owns the split stream a scan receives after its plan was
 //!   frozen, one queue per (task attempt, plan node).
 //! - [`page_adapter`] owns the `SourcePage` to [`Chunk`](crate::exec::chunk::Chunk)
-//!   conversion on the way out of a connector.
+//!   conversion on the way out of a connector;
+//! - [`writer_resources`] binds writer reservations to the exact task tracker.
 //!
-//! Neither interprets a provider variant, holds an opaque payload, or names a
-//! provider, so this module compiles with no provider crate in the dependency
-//! graph. Neither owns a lifecycle: both are created by, and die with, the
-//! query-scoped state that already owns the attempt.
+//! These adapters interpret no provider variant and hold no opaque provider
+//! payload, so this module compiles with no provider crate in its dependency
+//! graph. Their capabilities live with the exact task owners.
 
 pub mod page_adapter;
 pub mod scan_queue;
+pub mod writer_resources;
+pub use writer_resources::WriterResourceLedger;
 
 pub use page_adapter::{
     PageAdapterError, PageAdapterErrorKind, SourcePageConverter, source_page_to_chunk,

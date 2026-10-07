@@ -21,7 +21,7 @@
 //! filesystem so that "missing", "corrupt", and "stale" are genuine I/O
 //! outcomes rather than mocked verdicts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -3131,6 +3131,23 @@ fn scalar_integer_fields() -> Vec<novarocks_spi::connector::ConnectorWriteFieldR
     .collect()
 }
 
+fn frozen_scalar_integer_fields() -> Vec<Field> {
+    vec![
+        Field::new("id", DataType::Int8, false).with_metadata(HashMap::from([(
+            parquet::arrow::PARQUET_FIELD_ID_META_KEY.into(),
+            "1".into(),
+        )])),
+        Field::new("small", DataType::Int16, true).with_metadata(HashMap::from([(
+            parquet::arrow::PARQUET_FIELD_ID_META_KEY.into(),
+            "2".into(),
+        )])),
+        Field::new("plain", DataType::Int32, false).with_metadata(HashMap::from([(
+            parquet::arrow::PARQUET_FIELD_ID_META_KEY.into(),
+            "3".into(),
+        )])),
+    ]
+}
+
 #[test]
 fn real_prepare_and_begin_preserve_the_same_scalar_integer_fields() {
     use novarocks_spi::connector::write_stack::session::ConnectorWriteControl;
@@ -3173,13 +3190,24 @@ fn real_prepare_and_begin_preserve_the_same_scalar_integer_fields() {
             ),
             Arc::clone(&runtime),
         );
+        // Begin consumes the provider's prepared fields, including exact IDs;
+        // caller hints are used only by the preceding preparation step.
+        request.input = ConnectorWriteInputRequest::Data {
+            fields: prepared
+                .input()
+                .fields()
+                .iter()
+                .map(|binding| {
+                    novarocks_spi::connector::ConnectorWriteFieldRequest::new(
+                        binding.field().clone(),
+                    )
+                })
+                .collect(),
+        };
         let session = control
             .begin_write(request)
             .expect("begin with authoritative scalar fields");
-        let expected = scalar_integer_fields()
-            .iter()
-            .map(|f| f.field().clone())
-            .collect::<Vec<_>>();
+        let expected = frozen_scalar_integer_fields();
         let prepared_fields = prepared
             .input()
             .fields()
@@ -3199,6 +3227,111 @@ fn real_prepare_and_begin_preserve_the_same_scalar_integer_fields() {
         );
         // Staged create deliberately has no collect-on-write aggregates. The
         // exact input-domain admission still applies before that eligibility gate.
+        assert!(session.targets()[0].statistics().is_empty());
+    }
+}
+
+#[test]
+fn real_prepare_and_begin_accept_exact_and_read_recursive_map_carriers() {
+    use novarocks_spi::connector::write_stack::session::ConnectorWriteControl;
+    use novarocks_spi::connector::{
+        ConnectorProviderBindingKey, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
+        ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
+    };
+    let incarnation = ProviderBindingEpoch::new();
+    let (_executor, runtime) = unreachable_rest_runtime();
+    let metadata = super::control::statistics_contract_tests::recursive_statistics_metadata();
+    let read =
+        crate::field_domain::metadata_sql_schema(&metadata, metadata.current_schema()).unwrap();
+    let table = crate::iceberg::table::Table::builder()
+        .identifier(crate::iceberg::TableIdent::from_strs(["db", "staged"]).unwrap())
+        .file_io(crate::fs_io::build_file_io_for_location(
+            metadata.location(),
+            runtime.resources().planning_binding().clone(),
+        ))
+        .metadata(metadata)
+        .build()
+        .unwrap();
+    let provider = crate::metadata::IcebergMetadata::new(
+        descriptor("unit"),
+        incarnation,
+        Arc::clone(&runtime),
+    );
+    let target = provider
+        .staged_write_table_handle(
+            &table,
+            novarocks_spi::connector::ConnectorMutationOperationId::new(),
+            &request_context(),
+        )
+        .unwrap();
+    let read_fields = read
+        .fields()
+        .iter()
+        .map(|field| ConnectorWriteFieldRequest::new(field.as_ref().clone()))
+        .collect::<Vec<_>>();
+    let mut request = staged_begin_request(target.clone());
+    request.input = ConnectorWriteInputRequest::Data {
+        fields: read_fields.clone(),
+    };
+    let ConnectorWritePreparationOutcome::Prepared(prepared) =
+        crate::commit::write_preparation::prepare_write(
+            ConnectorWritePreparationRequest {
+                table: target,
+                target_ref: request.target_ref.clone(),
+                intent: request.intent,
+                purpose: request.purpose,
+                input: request.input.clone(),
+                context: request_context(),
+            },
+            &ConnectorProviderBindingKey {
+                instance_id: ConnectorInstanceId::parse("unit").unwrap(),
+                incarnation,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("prepared")
+    };
+    let exact = prepared
+        .input()
+        .fields()
+        .iter()
+        .map(|binding| ConnectorWriteFieldRequest::new(binding.field().clone()))
+        .collect::<Vec<_>>();
+    assert_ne!(
+        read_fields[1].field().data_type(),
+        exact[1].field().data_type(),
+        "read Map key is widened; exact write key is required"
+    );
+    let control = super::control::IcebergWriteSessionControl::new(
+        descriptor("unit"),
+        incarnation,
+        CatalogHandle::new(
+            ConnectorInstanceId::parse("unit").unwrap(),
+            CatalogVersion::from_bytes([1; 32]),
+        ),
+        Arc::clone(&runtime),
+    );
+    for fields in [exact, read_fields] {
+        request.input = ConnectorWriteInputRequest::Data {
+            fields: fields.clone(),
+        };
+        let session = control.begin_write(request.clone()).unwrap();
+        assert_eq!(session.targets().len(), 1);
+        assert_eq!(
+            session.targets()[0]
+                .input()
+                .fields()
+                .iter()
+                .map(|binding| binding.field().clone())
+                .collect::<Vec<_>>(),
+            fields
+                .iter()
+                .map(|request| request.field().clone())
+                .collect::<Vec<_>>()
+        );
+        // Staged CREATE has no collect-on-write output, but it still validates
+        // the complete declared recursive carrier before freezing its recipe.
         assert!(session.targets()[0].statistics().is_empty());
     }
 }
@@ -3245,7 +3378,7 @@ fn real_begin_rejects_storage_i32_forgery_even_when_statistics_are_disabled() {
             };
             assert_eq!(
                 prepared.input().fields()[forged_ordinal].field(),
-                scalar_integer_fields()[forged_ordinal].field()
+                &frozen_scalar_integer_fields()[forged_ordinal]
             );
             let control = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
                 descriptor("unit"),
@@ -3267,4 +3400,35 @@ fn real_begin_rejects_storage_i32_forgery_even_when_statistics_are_disabled() {
             );
         }
     }
+}
+
+#[test]
+fn visible_bag_freeze_refuses_legacy_delete_formats_before_writer_dispatch() {
+    use crate::commit::write_stack::control::frozen_old_delete_references;
+    use novarocks_spi::connector::ConnectorTargetDeleteKind;
+    let path = "s3://b/wh/db/t/data/p/f.parquet";
+    for (kind, format, expected) in [
+        (
+            crate::scan_model::IcebergDeleteFileContent::Equality,
+            crate::scan_model::IcebergDeleteFileFormat::Parquet,
+            ConnectorTargetDeleteKind::Equality,
+        ),
+        (
+            crate::scan_model::IcebergDeleteFileContent::Position,
+            crate::scan_model::IcebergDeleteFileFormat::Parquet,
+            ConnectorTargetDeleteKind::ParquetPosition,
+        ),
+    ] {
+        let mut delete = rewrite_deletion_vector("s3://b/old", path);
+        delete.file_content = kind;
+        delete.file_format = format;
+        let file = rewrite_data_file("p", vec![delete]);
+        let error = frozen_old_delete_references(&file, true).unwrap_err();
+        let fact = error.target_format_failure().expect("typed format refusal");
+        assert_eq!(fact.data_file, path);
+        assert_eq!(fact.delete_kind, expected);
+        assert!(!error.retryable_before_progress());
+    }
+    let file = rewrite_data_file("p", vec![rewrite_deletion_vector("s3://b/old", path)]);
+    assert_eq!(frozen_old_delete_references(&file, true).unwrap().len(), 1);
 }

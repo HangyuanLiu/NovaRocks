@@ -29,6 +29,9 @@ use crate::readiness::{MvDropReadiness, MvProjectionDeleteGuard};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MvProviderFailureKind {
     InvalidRequest,
+    ConsistencyFailed,
+    CapacityRefused,
+    TargetRefused,
     Unavailable,
     KnownUncommitted,
     CommitUnknown,
@@ -63,6 +66,9 @@ impl MvProviderFailure {
     pub fn into_product_error(self) -> MvProductError {
         let kind = match self.kind {
             MvProviderFailureKind::InvalidRequest => MvProductErrorKind::InvalidRequest,
+            MvProviderFailureKind::ConsistencyFailed => MvProductErrorKind::ConsistencyFailed,
+            MvProviderFailureKind::CapacityRefused => MvProductErrorKind::CapacityRefused,
+            MvProviderFailureKind::TargetRefused => MvProductErrorKind::TargetRefused,
             MvProviderFailureKind::Unavailable => MvProductErrorKind::Unavailable,
             MvProviderFailureKind::KnownUncommitted => MvProductErrorKind::ProviderKnownUncommitted,
             MvProviderFailureKind::CommitUnknown => MvProductErrorKind::CommitUnknown,
@@ -221,5 +227,32 @@ mod tests {
             .into_product_error();
         assert_eq!(error.kind(), MvProductErrorKind::CommitUnknown);
         assert_eq!(error.message(), "lost reply");
+    }
+
+    #[test]
+    fn typed_apply_failures_survive_the_provider_product_bridge() {
+        for (provider, product) in [
+            (
+                MvProviderFailureKind::ConsistencyFailed,
+                MvProductErrorKind::ConsistencyFailed,
+            ),
+            (
+                MvProviderFailureKind::CapacityRefused,
+                MvProductErrorKind::CapacityRefused,
+            ),
+            (
+                MvProviderFailureKind::TargetRefused,
+                MvProductErrorKind::TargetRefused,
+            ),
+        ] {
+            let error =
+                MvProviderFailure::new(provider, "unavailable commit unknown capacity consistency")
+                    .into_product_error();
+            assert_eq!(error.kind(), product);
+            assert_eq!(
+                error.message(),
+                "unavailable commit unknown capacity consistency"
+            );
+        }
     }
 }

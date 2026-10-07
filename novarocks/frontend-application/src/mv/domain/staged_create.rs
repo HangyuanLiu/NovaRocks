@@ -536,6 +536,18 @@ pub(crate) fn readmit_declared_target(
     permits: Vec<novarocks_mv_application::management::ReadmissionPermit>,
     context: ConnectorRequestContext,
 ) -> Result<(), String> {
+    if readmit_legacy_drop_target(
+        entrance,
+        connector_control,
+        &catalog,
+        &target,
+        &previous_incarnation,
+        &permits,
+        &context,
+    )? {
+        readiness.quarantine(target.clone(), "legacy nonaggregate MV is admitted only for DROP; DROP and recreate the materialized view".into()).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
     install_committed_current_projection(
         entrance,
         readiness,
@@ -554,6 +566,208 @@ pub(crate) fn readmit_declared_target(
         context,
         "readmitted",
     )
+}
+
+/// Retired L participates only in the existing permit-backed management
+/// readmission and configuration/marker CAS. It never enters readiness install.
+#[allow(clippy::too_many_arguments)]
+fn readmit_legacy_drop_target(
+    entrance: &ManagementEntrance,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    catalog: &CatalogHandle,
+    target: &novarocks_mv_application::product::MvTarget,
+    previous_incarnation: &ProcessIncarnation,
+    permits: &[novarocks_mv_application::management::ReadmissionPermit],
+    context: &ConnectorRequestContext,
+) -> Result<bool, String> {
+    use novarocks_mv_application::management::{
+        ManagementContinuation, ManagementObservationPhase, ManagementObservationRequestId,
+    };
+    use novarocks_spi::connector::document_storage::{
+        ConnectorDocumentObservationRequest, ConnectorDocumentStorageBudget,
+        ConnectorDocumentStorageLimits,
+    };
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(
+        target
+            .catalog()
+            .ok_or("legacy DROP readmission requires a catalog")?,
+    )
+    .map_err(|e| e.to_string())?;
+    let lease = controls
+        .acquire_current(&instance_id)
+        .map_err(|e| e.to_string())?;
+    if lease
+        .binding()
+        .catalog_handle()
+        .map_err(|e| e.to_string())?
+        != catalog
+    {
+        return Err("legacy DROP readmission catalog generation changed".into());
+    }
+    let table = ConnectorTableIdentity {
+        instance_id,
+        namespace: Arc::from(target.namespace()),
+        table: Arc::from(target.name()),
+    };
+    let binding = lease
+        .binding()
+        .metadata()
+        .capture_table_object_binding(
+            novarocks_spi::connector::ConnectorTableObjectCaptureRequest {
+                table: table.clone(),
+                resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+                selector: novarocks_spi::connector::ConnectorTableObjectSelector::Current,
+                context: context.clone(),
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    if binding.metadata.identity != table {
+        return Err("legacy DROP readmission bound another logical target".into());
+    }
+    let documents_lease = lease
+        .derive_document_storage_lease()
+        .map_err(|e| e.to_string())?;
+    let observe = |context: ConnectorRequestContext| {
+        let request = ConnectorDocumentObservationRequest::try_new(
+            documents_lease.owner().clone(),
+            documents_lease.catalog_handle().clone(),
+            table.clone(),
+            binding.object_id.clone(),
+            ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::spec_default()),
+            context,
+        )
+        .map_err(|e| e.to_string())?;
+        novarocks_mv_application::persistence::documents::observe_current_drop_descriptor(
+            &documents_lease,
+            request,
+            novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
+        )
+        .map_err(|e| e.to_string())
+    };
+    let (observation, descriptor) = observe(context.clone())?;
+    if !descriptor.is_legacy_nonaggregate() {
+        return Ok(false);
+    }
+    let mut state = entrance
+        .begin_readmission(
+            &table,
+            ManagementContinuation::SameOwner {
+                previous_incarnation: previous_incarnation.clone(),
+            },
+        )
+        .map_err(|e| format!("begin legacy DROP readmission: {e:?}"))?;
+    let result = (|| {
+        for permit in permits {
+            state
+                .accept_readmission_permit(permit.clone())
+                .map_err(|e| format!("accept legacy DROP readmission permit: {e:?}"))?;
+        }
+        let pending = state
+            .begin_current_observation(ManagementObservationRequestId::from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            ))
+            .map_err(|e| format!("begin legacy DROP Current observation: {e:?}"))?;
+        let phase = state
+            .complete_current_observation(pending, &observation)
+            .map_err(|e| format!("complete legacy DROP Current observation: {e:?}"))?;
+        let descriptor = if matches!(phase, ManagementObservationPhase::RegistrationRequired(_)) {
+            let source = CommittedTargetCurrentSource {
+                entrance,
+                connector_control: controls,
+                published: None,
+                retained_statistics: None,
+                convergence: MvConvergence::Readmission {
+                    previous_incarnation: previous_incarnation.clone(),
+                    permits: permits.to_vec(),
+                },
+            };
+            source
+                .register_incarnation(
+                    &mut state,
+                    &lease,
+                    &documents_lease,
+                    &observation,
+                    descriptor.configuration(),
+                    context,
+                )
+                .map_err(|e| e.to_string())?;
+            let pending = state
+                .begin_current_observation(ManagementObservationRequestId::from_bytes(
+                    *uuid::Uuid::now_v7().as_bytes(),
+                ))
+                .map_err(|e| format!("begin registered legacy DROP observation: {e:?}"))?;
+            let (registered, descriptor) = observe(context.clone().after_external_effect())?;
+            state
+                .complete_current_observation(pending, &registered)
+                .map_err(|e| format!("complete registered legacy DROP observation: {e:?}"))?;
+            descriptor
+        } else {
+            descriptor
+        };
+        entrance
+            .install_observed_drop_target(&state, &descriptor, lease.control_runtime_id())
+            .map_err(|e| format!("admit legacy MV for DROP only: {e}"))?;
+        Ok(true)
+    })();
+    if result.is_err() {
+        // Unknown registration already transferred its exact responsibility
+        // to the entrance and invalidated this token. Other failures release
+        // the token while retaining their original barriers.
+        let _ = entrance.abandon_observation(state);
+    }
+    result
+}
+
+/// Establish a DROP-only entrance from Current without overriding any existing
+/// responsibility. An old incarnation receives the normal recovery barrier.
+pub(crate) fn establish_current_drop_management(
+    entrance: &ManagementEntrance,
+    observation: &novarocks_spi::connector::document_storage::ConnectorDocumentManagementObservation,
+    descriptor: &novarocks_mv_application::persistence::documents::MvCurrentDropDescriptor,
+    runtime: novarocks_spi::connector::ConnectorControlRuntimeId,
+) -> Result<(), String> {
+    use novarocks_mv_application::management::{
+        EffectTerminalFact, ManagementContinuation, MvManagementPhase,
+    };
+    let source = descriptor.source_revision();
+    if source.deployment_owner != *entrance.owner() {
+        return Err("MV DROP target belongs to another deployment owner".into());
+    }
+    if entrance.management_phase(observation.target()) != MvManagementPhase::NotObserved {
+        return Ok(());
+    }
+    if source.process_incarnation != *entrance.incarnation() {
+        let target = ManagedMvTarget::from_observation(observation)
+            .map_err(|e| format!("bind recovered DROP target: {e:?}"))?;
+        let barrier = EffectResponsibility::new(
+            EffectIdentity::from_bytes(*uuid::Uuid::now_v7().as_bytes()),
+            target.clone(),
+            source.process_incarnation.clone(),
+            EffectScope::CATALOG_AND_OBJECT_DELETION,
+            ManagementTimestamp::from_unix_millis(0),
+        );
+        let EffectTerminalFact::CommitUnknown(barrier) =
+            barrier.record_terminal(EffectDisposition::CommitUnknown)
+        else {
+            unreachable!("explicit Unknown")
+        };
+        let state = entrance
+            .begin_recovered_target(
+                target,
+                ManagementContinuation::SameOwner {
+                    previous_incarnation: source.process_incarnation.clone(),
+                },
+                barrier,
+            )
+            .map_err(|e| format!("close recovered DROP management: {e:?}"))?;
+        entrance
+            .abandon_observation(state)
+            .map_err(|e| format!("release recovered DROP observation: {e:?}"))?;
+        return Err("MV Current marker names another process incarnation; declare and resume management before DROP and recreate".into());
+    }
+    entrance
+        .install_fresh_drop_target(observation, descriptor, runtime)
+        .map_err(|e| format!("admit fresh Current for DROP only: {e}"))
 }
 
 /// The output one publication committed, as the committing statement knows it.
@@ -652,7 +866,7 @@ impl CommittedTargetCurrentSource<'_> {
         lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
         documents_lease: &ConnectorDocumentStorageLease,
         observation: &novarocks_spi::connector::document_storage::ConnectorDocumentManagementObservation,
-        documents: &novarocks_mv_application::persistence::documents::MvObservedCurrentDocuments,
+        configuration: &novarocks_mv_application::persistence::codec::ConfigurationDocument,
         context: &ConnectorRequestContext,
     ) -> Result<(), novarocks_mv_application::readiness::MvProjectionError> {
         use novarocks_mv_application::readiness::{MvProjectionError, MvProjectionErrorKind};
@@ -689,7 +903,7 @@ impl CommittedTargetCurrentSource<'_> {
                 ConnectorPrepareDocumentsRequest::try_new(
                     admission,
                     novarocks_mv_application::persistence::documents::configuration_document_set(
-                        documents.configuration(),
+                        configuration,
                     )
                     .map_err(|error| {
                         conflict(format!("encode the MV registration set: {error}"))
@@ -747,8 +961,18 @@ impl CommittedTargetCurrentSource<'_> {
                 EffectDisposition::CommitUnknown
             }
         };
+        let terminal = responsibility.record_terminal(disposition);
+        if matches!(self.convergence, MvConvergence::Readmission { .. }) {
+            self.entrance
+                .record_readmission_registration_terminal(state, &terminal)
+                .map_err(|error| {
+                    conflict(format!(
+                        "retain the MV registration responsibility: {error}"
+                    ))
+                })?;
+        }
         state
-            .record_registration_terminal(responsibility.record_terminal(disposition))
+            .record_registration_terminal(terminal)
             .map_err(|error| conflict(format!("record the MV registration: {error:?}")))?;
         if disposition == EffectDisposition::KnownCommitted {
             return Ok(());
@@ -957,7 +1181,7 @@ impl novarocks_mv_application::readiness::MvCurrentProjectionSource
                 &lease,
                 &documents_lease,
                 &observation,
-                &documents,
+                documents.configuration(),
                 request.context(),
             )?;
             let pending = state
@@ -1096,11 +1320,197 @@ pub(crate) struct AdmittedMvPublication {
     definition: DefinitionDocument,
     interpretation: InterpretationDocument,
     repartitioned: bool,
+    eligibility: Option<novarocks_mv_application::persistence::eligibility::EligibilityDocument>,
+    publication_dispatched: bool,
+    validation_attempt: Option<novarocks_types::QueryExecutionId>,
+    eligibility_projection:
+        Option<novarocks_mv_application::readiness::MvCurrentProjectionObservation>,
+    retained_statistics:
+        Option<novarocks_mv_application::persistence::projection::MvOutputStatistics>,
 }
 
 impl AdmittedMvPublication {
     pub(crate) const fn admission(&self) -> &ConnectorDocumentManagementAdmission {
         &self.admission
+    }
+
+    fn observe_eligibility(
+        &mut self,
+        planning: &ConnectorControlPlanningLease,
+        context: &ConnectorRequestContext,
+    ) -> Result<
+        Option<novarocks_mv_application::persistence::eligibility::EligibilityDocument>,
+        String,
+    > {
+        let (_, documents) =
+            super::eligibility_document::observe_current(planning, &self.source_revision, context)?;
+        if documents.eligibility_revision() != self.source_revision.eligibility_revision {
+            return Err("MV eligibility changed during publication admission".into());
+        }
+        self.eligibility = documents.eligibility().cloned();
+        Ok(self.eligibility.clone())
+    }
+
+    fn update_eligibility(
+        &mut self,
+        planning: &ConnectorControlPlanningLease,
+        next: novarocks_mv_application::persistence::eligibility::EligibilityDocument,
+        context: &ConnectorRequestContext,
+    ) -> Result<(), super::eligibility_document::ValidationUpdateError> {
+        if self.publication_dispatched {
+            return Err(
+                "MV eligibility cannot settle before its dispatched publication is reconciled"
+                    .into(),
+            );
+        }
+        let (observation, documents) =
+            super::eligibility_document::observe_current(planning, &self.source_revision, context)?;
+        if documents.eligibility_revision() != self.source_revision.eligibility_revision
+            || documents.eligibility() != self.eligibility.as_ref()
+        {
+            return Err("MV eligibility changed before its conditional transition".into());
+        }
+        if let novarocks_mv_application::persistence::eligibility::EligibilityState::ValidationPending { ref target_snapshot, .. } = next.state {
+            if observation.metadata_version().snapshot_id().map(|snapshot| snapshot.to_be_bytes().to_vec()).as_deref()
+                != Some(target_snapshot.as_bytes()) {
+                return Err("MV validation fence does not bind the exact Current target snapshot".into());
+            }
+        }
+        let document_lease = planning
+            .derive_document_storage_lease()
+            .map_err(|error| format!("derive MV validation document lease: {error}"))?;
+        let operation_id =
+            ConnectorMutationOperationId::from_bytes(*uuid::Uuid::now_v7().as_bytes());
+        let context = context.clone().after_external_effect();
+        let admission = document_lease
+            .admit_management(
+                ConnectorDocumentManagementAdmissionRequest::try_new(
+                    document_lease.owner().clone(),
+                    document_lease.catalog_handle().clone(),
+                    operation_id,
+                    self.source_revision.target.clone(),
+                    Some(self.source_revision.target_object_id.clone()),
+                    ConnectorDocumentManagementOperation::SingleTargetUpdate,
+                    context.clone(),
+                )
+                .map_err(|error| format!("prepare MV validation document admission: {error}"))?,
+            )
+            .map_err(|error| format!("admit MV validation documents: {error}"))?;
+        let prepared = document_lease
+            .prepare_documents(
+                ConnectorPrepareDocumentsRequest::try_new(
+                    admission,
+                    novarocks_mv_application::persistence::documents::eligibility_document_set(
+                        &next,
+                    )
+                    .map_err(|error| format!("encode MV validation eligibility: {error}"))?,
+                    context.clone(),
+                )
+                .map_err(|error| format!("prepare MV validation documents: {error}"))?,
+            )
+            .map_err(|error| format!("prepare MV validation document payload: {error}"))?;
+        let baseline_snapshot = observation.metadata_version().snapshot_id();
+        let intent = ConnectorDocumentUpdateIntent::try_new(
+            prepared,
+            observation,
+            ConnectorManagedObjectMarkerChange::Preserve,
+        )
+        .map_err(|error| format!("bind conditional MV validation update: {error}"))?;
+        let mutation = planning
+            .derive_mutation_lease()
+            .map_err(|error| format!("derive MV validation mutation lease: {error}"))?;
+        let mut expected = self.source_revision.clone();
+        expected.eligibility_revision = Some(
+            novarocks_mv_application::persistence::eligibility::encode_eligibility(&next)
+                .map_err(|error| format!("bind committed MV eligibility revision: {error}"))?
+                .revision(),
+        );
+        self.management
+            .mark_dispatched(EffectResponsibility::new(
+                EffectIdentity::from_bytes(operation_id.to_bytes()),
+                self.managed_target.clone(),
+                self.incarnation.clone(),
+                EffectScope::CATALOG_COMMIT,
+                now_management_timestamp()?,
+            ))
+            .map_err(|error| format!("dispatch MV validation effect: {error:?}"))?;
+        let resolved = crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
+            &mutation, operation_id,
+            novarocks_spi::connector::ConnectorCatalogMutationOperation::UpdateApplicationDocuments { intent },
+            context.clone(),
+        );
+        use crate::connector::mutation::{MutationDispatchState, ResolvedCatalogMutation};
+        let disposition = match resolved {
+            ResolvedCatalogMutation::KnownCommitted(_) => EffectDisposition::KnownCommitted,
+            ResolvedCatalogMutation::KnownUncommitted { .. }
+            | ResolvedCatalogMutation::ContractFailure {
+                dispatch: MutationDispatchState::ConfirmedNotDispatched,
+                ..
+            } => EffectDisposition::KnownUncommitted,
+            ResolvedCatalogMutation::CommitUnknown { .. }
+            | ResolvedCatalogMutation::ContractFailure {
+                dispatch: MutationDispatchState::PossiblyDispatched,
+                ..
+            } => EffectDisposition::CommitUnknown,
+        };
+        let mut observed = None;
+        let mut observation_error = None;
+        let management_admission = self.management.record_intermediate_terminal(disposition, || {
+            let result = super::eligibility_document::observe_current(planning, &expected, &context)
+                .and_then(|(observation, documents)| {
+                    if documents.eligibility_revision() != expected.eligibility_revision
+                        || documents.eligibility() != Some(&next)
+                        || observation.metadata_version().snapshot_id() != baseline_snapshot {
+                        return Err("committed MV validation eligibility does not match its exact transition".into());
+                    }
+                    observed = Some(documents.clone());
+                    Ok((observation, documents))
+                });
+            result.map_err(|error| {
+                observation_error = Some(error);
+                novarocks_mv_application::management::ManagementAdmissionError::ReadmissionIncomplete
+            })
+        }).map_err(|error| {
+            let message = observation_error.unwrap_or_else(|| format!("settle MV validation metadata effect: {error:?}"));
+            use super::eligibility_document::ValidationUpdateError;
+            match disposition {
+                EffectDisposition::CommitUnknown => ValidationUpdateError::CommitUnknown(message),
+                EffectDisposition::KnownCommitted => ValidationUpdateError::CommittedProjectionFailed(message),
+                EffectDisposition::KnownUncommitted => ValidationUpdateError::KnownUncommitted(message),
+            }
+        })?;
+        if disposition != EffectDisposition::KnownCommitted {
+            return Err(
+                super::eligibility_document::ValidationUpdateError::KnownUncommitted(
+                    "MV validation metadata update did not commit".into(),
+                ),
+            );
+        }
+        let documents = observed.ok_or_else(|| {
+            super::eligibility_document::ValidationUpdateError::CommittedProjectionFailed(
+                "MV validation commit lost its exact observation".into(),
+            )
+        })?;
+        let output_statistics = retained_output_statistics(
+            self.retained_statistics.as_ref(),
+            documents.target_object_id(),
+            documents.publication_output_version(),
+        );
+        let projection = novarocks_mv_application::persistence::projection::MvDocumentProjection::try_from_current(documents.clone(), output_statistics.clone()).map_err(super::eligibility_document::ValidationUpdateError::CommittedProjectionFailed)?;
+        self.eligibility_projection = Some(
+            novarocks_mv_application::readiness::MvCurrentProjectionObservation {
+                documents,
+                management_admission: management_admission.ok_or_else(|| {
+                    super::eligibility_document::ValidationUpdateError::CommittedProjectionFailed(
+                        "MV validation commit lost its management admission".into(),
+                    )
+                })?,
+                output_statistics,
+            },
+        );
+        self.source_revision = projection.source_revision().clone();
+        self.eligibility = Some(next);
+        Ok(())
     }
 
     /// Reobserve provider Current after computation, while this entrance still
@@ -1171,11 +1581,19 @@ impl AdmittedMvPublication {
         if documents.definition_revision() != self.source_revision.definition_revision
             || documents.interpretation_revision() != self.source_revision.interpretation_revision
             || documents.publication_revision() != self.source_revision.publication_revision
+            || documents.eligibility_revision() != self.source_revision.eligibility_revision
         {
             return Err(
-                "MV definition, interpretation or publication changed after computation"
+                "MV definition, interpretation, publication or eligibility changed after computation"
                     .to_string(),
             );
+        }
+        if let Some(novarocks_mv_application::persistence::eligibility::EligibilityDocument {
+            state: novarocks_mv_application::persistence::eligibility::EligibilityState::ValidationPending { target_snapshot, .. }, ..
+        }) = self.eligibility.as_ref() {
+            if observation.metadata_version().snapshot_id().map(|snapshot| snapshot.to_be_bytes().to_vec()).as_deref() != Some(target_snapshot.as_bytes()) {
+                return Err("MV validation target snapshot changed after computation".into());
+            }
         }
         Ok(())
     }
@@ -1198,7 +1616,9 @@ impl AdmittedMvPublication {
                 EffectScope::CATALOG_COMMIT,
                 now_management_timestamp()?,
             ))
-            .map_err(|error| format!("dispatch the MV publication effect: {error:?}"))
+            .map_err(|error| format!("dispatch the MV publication effect: {error:?}"))?;
+        self.publication_dispatched = true;
+        Ok(())
     }
 
     pub(crate) const fn definition(&self) -> &DefinitionDocument {
@@ -1276,7 +1696,20 @@ impl AdmittedMvPublication {
                 &publication,
             )
         };
-        set.map_err(|error| format!("encode the MV publication document set: {error}"))
+        let set =
+            set.map_err(|error| format!("encode the MV publication document set: {error}"))?;
+        if !self.interpretation.aggregates.is_empty() {
+            return Ok(set);
+        }
+        let eligibility = super::eligibility_document::for_publication(
+            self.eligibility.as_ref(),
+            &self.definition,
+            &publication,
+            result.kind,
+            self.repartitioned,
+            self.validation_attempt,
+        )?;
+        super::eligibility_document::with_eligibility(set, &eligibility)
     }
 
     /// Close the publication's responsibility with the outcome the provider
@@ -1298,6 +1731,111 @@ pub(crate) struct AdmittedMvDataPublication {
 }
 
 impl AdmittedMvDataPublication {
+    /// The caller must have the provider's definite uncommitted data outcome.
+    /// Retain this turn so complete verification may conditionally settle its fence.
+    pub(crate) fn record_known_uncommitted_data_effect(&mut self) -> Result<(), String> {
+        if !self.publication.publication_dispatched {
+            return Err("MV data publication has no dispatched effect to settle".into());
+        }
+        self.publication
+            .management
+            .record_intermediate_terminal(EffectDisposition::KnownUncommitted, || {
+                Err(novarocks_mv_application::management::ManagementAdmissionError::InvalidEffect)
+            })
+            .map_err(|error| format!("settle uncommitted MV data effect: {error:?}"))?;
+        self.publication.publication_dispatched = false;
+        Ok(())
+    }
+
+    /// Install the very Current used to re-admit this retained management turn.
+    pub(crate) fn install_eligibility_projection(
+        &mut self,
+        readiness: &crate::mv::domain::readiness::MvReadinessPort,
+        context: &ConnectorRequestContext,
+    ) -> Result<(), String> {
+        let observation = self
+            .publication
+            .eligibility_projection
+            .take()
+            .ok_or_else(|| "MV validation has no fresh projection handoff".to_string())?;
+        let facts = novarocks_mv_application::persistence::projection::MvDocumentProjection::try_from_current(
+            observation.documents.clone(), observation.output_statistics.clone(),
+        )?;
+        if facts.source_revision() != &self.publication.source_revision {
+            return Err(
+                "MV validation projection handoff does not match its admitted revision".into(),
+            );
+        }
+        let table = &self.publication.source_revision.target;
+        let request = novarocks_mv_application::readiness::MvCurrentProjectionRequest::try_new(
+            self.publication.managed_target.catalog().clone(),
+            novarocks_mv_application::product::MvTarget::from_parts(
+                Some(table.instance_id.as_str()),
+                table.namespace.as_ref(),
+                table.table.as_ref(),
+            ),
+            context.clone().after_external_effect(),
+            novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
+        )
+        .map_err(|error| format!("prepare MV eligibility projection handoff: {error}"))?;
+        let source =
+            super::eligibility_document::FrozenEligibilityProjectionSource::new(observation);
+        readiness
+            .observe_current_and_install(uuid::Uuid::now_v7(), request, &source)
+            .map(|_| ())
+            .map_err(|error| format!("install MV eligibility projection handoff: {error}"))
+    }
+
+    pub(crate) fn observe_eligibility(
+        &mut self,
+        planning: &ConnectorControlPlanningLease,
+        context: &ConnectorRequestContext,
+    ) -> Result<
+        Option<novarocks_mv_application::persistence::eligibility::EligibilityDocument>,
+        String,
+    > {
+        self.publication.observe_eligibility(planning, context)
+    }
+
+    pub(crate) fn begin_validation(
+        &mut self,
+        planning: &ConnectorControlPlanningLease,
+        execution_id: novarocks_types::QueryExecutionId,
+        target_snapshot: i64,
+        context: &ConnectorRequestContext,
+    ) -> Result<(), super::eligibility_document::ValidationUpdateError> {
+        if !self.publication.interpretation.aggregates.is_empty() {
+            return Err("aggregate MV publications do not use visible-bag validation".into());
+        }
+        let eligibility = self
+            .publication
+            .observe_eligibility(planning, context)?
+            .ok_or_else(|| "MV validation baseline has no eligibility fact".to_string())?;
+        let next =
+            super::eligibility_document::pending(&eligibility, execution_id, target_snapshot)?;
+        self.publication
+            .update_eligibility(planning, next, context)?;
+        self.publication.validation_attempt = Some(execution_id);
+        Ok(())
+    }
+
+    pub(crate) fn finish_validation(
+        &mut self,
+        planning: &ConnectorControlPlanningLease,
+        completion: super::eligibility_document::ValidationCompletion<'_>,
+        context: &ConnectorRequestContext,
+    ) -> Result<(), super::eligibility_document::ValidationUpdateError> {
+        let eligibility = self
+            .publication
+            .eligibility
+            .as_ref()
+            .ok_or_else(|| "MV validation has no retained pending eligibility".to_string())?;
+        let next = super::eligibility_document::completed(eligibility, completion)?;
+        self.publication
+            .update_eligibility(planning, next, context)?;
+        self.publication.validation_attempt = None;
+        Ok(())
+    }
     /// Freeze the watermark against the D this publication was admitted for.
     pub(crate) fn try_new(
         publication: AdmittedMvPublication,
@@ -1411,7 +1949,7 @@ pub(crate) fn admit_mv_publication(
             .map_err(|error| format!("build MV publication document admission: {error}"))?,
         )
         .map_err(|error| format!("admit MV publication document management: {error}"))?;
-    Ok(AdmittedMvPublication {
+    let mut admitted = AdmittedMvPublication {
         management,
         admission,
         managed_target: ManagedMvTarget::try_new(
@@ -1429,7 +1967,21 @@ pub(crate) fn admit_mv_publication(
         definition: projection.facts.definition().clone(),
         interpretation: projection.facts.interpretation().clone(),
         repartitioned: false,
-    })
+        eligibility: None,
+        publication_dispatched: false,
+        validation_attempt: None,
+        eligibility_projection: None,
+        retained_statistics: match projection.facts.publication() {
+            novarocks_mv_application::persistence::projection::MvPublicationState::Published(published) => published.storage_rows().map(|storage_rows| novarocks_mv_application::persistence::projection::MvOutputStatistics {
+                object_id: source.target_object_id.clone(),
+                output_version: published.output_version().clone(),
+                storage_rows,
+            }),
+            novarocks_mv_application::persistence::projection::MvPublicationState::NeverPublished => None,
+        },
+    };
+    admitted.observe_eligibility(planning_lease, context)?;
+    Ok(admitted)
 }
 
 #[cfg(test)]

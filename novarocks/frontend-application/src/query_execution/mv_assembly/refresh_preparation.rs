@@ -273,6 +273,50 @@ fn build_aggregate_layout_for_refresh_select_sql(
     novarocks_sql::planning::mv_aggregate_layout::build_sql_mv_aggregate_physical_layout(&facts)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefreshEligibilityMode {
+    RequireEligible,
+    ExplicitRebuild,
+    PreserveManagedQualification,
+}
+
+fn refresh_eligibility_mode(
+    explicit_full: bool,
+    managed_repartition: bool,
+) -> RefreshEligibilityMode {
+    if managed_repartition {
+        RefreshEligibilityMode::PreserveManagedQualification
+    } else if explicit_full {
+        RefreshEligibilityMode::ExplicitRebuild
+    } else {
+        RefreshEligibilityMode::RequireEligible
+    }
+}
+
+fn requires_current_eligibility(
+    facts: &novarocks_mv_application::persistence::projection::MvDocumentProjection,
+    mode: RefreshEligibilityMode,
+) -> bool {
+    mode == RefreshEligibilityMode::RequireEligible
+        && facts.interpretation().aggregates.is_empty()
+        && matches!(
+            facts.publication(),
+            novarocks_mv_application::persistence::projection::MvPublicationState::Published(_)
+        )
+}
+
+fn validate_preparation_eligibility(
+    facts: &novarocks_mv_application::persistence::projection::MvDocumentProjection,
+    mode: RefreshEligibilityMode,
+    eligibility: Option<&novarocks_mv_application::persistence::eligibility::EligibilityDocument>,
+) -> Result<(), String> {
+    if requires_current_eligibility(facts, mode) {
+        crate::mv::domain::eligibility_document::require_eligible(facts, eligibility)
+    } else {
+        Ok(())
+    }
+}
+
 impl MvRefreshPreparationService for FrontendMvRefreshPreparationService<'_> {
     fn prepare_step(
         &self,
@@ -283,6 +327,50 @@ impl MvRefreshPreparationService for FrontendMvRefreshPreparationService<'_> {
             return Err(RefreshError::user(
                 "MV refresh preparation statement does not match the admitted SQL request",
             ));
+        }
+        // Eligibility is checked before every automatic or ordinary refresh decision,
+        // including source-selected full rebuild and empty/metadata-only decisions.
+        let eligibility_mode =
+            refresh_eligibility_mode(self.statement.full, self.repartition_fields.is_some());
+        if eligibility_mode == RefreshEligibilityMode::RequireEligible {
+            let target = IcebergMvTarget {
+                catalog: request.target.catalog.clone().ok_or_else(|| {
+                    RefreshError::user("MV refresh target has no connector catalog")
+                })?,
+                namespace: request.target.database.clone(),
+                table: request.target.name.clone(),
+            };
+            let projection =
+                load_iceberg_mv_definition_by_target(self.source.readiness().as_ref(), &target)
+                    .map_err(|error| {
+                        // Diagnose exact Current documents without installing a projection or
+                        // reopening management. A valid observation retains the admission error.
+                        let diagnostic =
+                    crate::mv::domain::iceberg_refresh::observe_current_mv_management_documents(
+                        self.source,
+                        &target,
+                        self.connector_context,
+                    );
+                        RefreshError::user(diagnostic.err().unwrap_or(error))
+                    })?;
+            if requires_current_eligibility(&projection.facts, eligibility_mode) {
+                let binding = load_iceberg_mv_target_binding(
+                    self.source.connector_control(),
+                    self.source.storage_observation(),
+                    &target,
+                    self.connector_context,
+                )
+                .map_err(RefreshError::user)?;
+                let eligibility = crate::mv::domain::eligibility_document::observe_current_eligibility_for_projection(
+                    binding.lease(),&projection.facts,self.connector_context,
+                ).map_err(RefreshError::user)?;
+                validate_preparation_eligibility(
+                    &projection.facts,
+                    eligibility_mode,
+                    eligibility.as_ref(),
+                )
+                .map_err(RefreshError::user)?;
+            }
         }
         let mut plan = plan_iceberg_mv_refresh_with_connector_context(
             self.source,
@@ -1731,8 +1819,8 @@ fn prepare_frontend_incremental_write(
                 from: right_from,
                 to: right_to,
             },
-            left_facts.has_inserts || left_facts.has_deletes,
-            right_facts.has_inserts || right_facts.has_deletes,
+            left_facts.content_net_zero.is_none(),
+            right_facts.content_net_zero.is_none(),
         );
         if branches.is_empty() {
             return Ok(PreparedIncrementalRefreshWork::MetadataOnly);
@@ -1988,4 +2076,180 @@ fn prepare_frontend_incremental_write(
         publication_intent,
     )
     .map(|write| PreparedIncrementalRefreshWork::ChangeStream(write, admitted_publication))
+}
+
+#[cfg(test)]
+mod eligibility_gate_tests {
+    use super::*;
+    use crate::mv::domain::eligibility_document::{for_publication, pending, published_binding};
+    use novarocks_mv_application::persistence::codec::{
+        PhysicalFieldLogicalIdentity, PublicationKind,
+    };
+    use novarocks_mv_application::persistence::eligibility::{
+        EligibilityDocument, EligibilityEvidence, EligibilityState,
+    };
+    use novarocks_mv_application::persistence::projection::{
+        MvDocumentProjection, MvPublicationState,
+    };
+    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
+    use novarocks_mv_application::product::MvTarget;
+    use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
+
+    fn visible_baseline(snapshot: Option<i64>) -> MvDocumentProjection {
+        let mut fixture =
+            ProjectionFixture::new(MvTarget::from_parts(Some("iceberg"), "db", "mv"), snapshot);
+        fixture.interpretation.aggregates.clear();
+        fixture.interpretation.state_slots.clear();
+        fixture.interpretation.apply_key = None;
+        fixture.interpretation.branches.clear();
+        fixture.interpretation.target.fields.retain(|field| {
+            matches!(
+                field.logical_identity,
+                PhysicalFieldLogicalIdentity::Output(_)
+            )
+        });
+        fixture.build().unwrap()
+    }
+
+    fn baseline_states(facts: &MvDocumentProjection) -> [EligibilityDocument; 3] {
+        let MvPublicationState::Published(publication) = facts.publication() else {
+            panic!("published fixture")
+        };
+        let eligible = EligibilityDocument {
+            binding: published_binding(facts.definition(), publication.document(), 1).unwrap(),
+            state: EligibilityState::Eligible,
+        };
+        let attempt =
+            QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(1).unwrap()).unwrap();
+        let pending = pending(&eligible, attempt, 201).unwrap();
+        let mut invalid = pending.clone();
+        invalid.binding.generation += 1;
+        invalid.state = EligibilityState::Invalid {
+            evidence: EligibilityEvidence {
+                requested: 9,
+                matched: 8,
+                samples: vec![],
+            },
+        };
+        [eligible, pending, invalid]
+    }
+
+    #[test]
+    fn every_ordinary_refresh_route_requires_exact_eligible_published_baseline() {
+        let facts = visible_baseline(Some(201));
+        let [eligible, pending, invalid] = baseline_states(&facts);
+        // Source-selected full computation is an ordinary request. Decisions
+        // (including the no-op cases) cannot grant the explicit rebuild mode.
+        for route in [
+            "background",
+            "manual incremental",
+            "append-only",
+            "metadata-only",
+            "skip-empty",
+            "source FullRebuild",
+        ] {
+            let mode = refresh_eligibility_mode(false, false);
+            assert_eq!(mode, RefreshEligibilityMode::RequireEligible, "{route}");
+            assert!(requires_current_eligibility(&facts, mode), "{route}");
+            assert!(
+                validate_preparation_eligibility(&facts, mode, Some(&eligible)).is_ok(),
+                "{route}"
+            );
+            assert!(
+                validate_preparation_eligibility(&facts, mode, Some(&pending)).is_err(),
+                "{route}"
+            );
+            assert!(
+                validate_preparation_eligibility(&facts, mode, Some(&invalid)).is_err(),
+                "{route}"
+            );
+            assert!(
+                validate_preparation_eligibility(&facts, mode, None).is_err(),
+                "{route}"
+            );
+        }
+        let mut wrong_p = eligible.clone();
+        wrong_p.binding.publication_revision =
+            novarocks_mv_application::persistence::identity::DocumentRevision::from_canonical_bytes(
+                b"different P",
+            );
+        assert!(
+            validate_preparation_eligibility(
+                &facts,
+                RefreshEligibilityMode::RequireEligible,
+                Some(&wrong_p)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_full_and_first_publication_are_the_only_refresh_gate_exemptions() {
+        let facts = visible_baseline(Some(201));
+        let states = baseline_states(&facts);
+        let mode = refresh_eligibility_mode(true, false);
+        assert_eq!(mode, RefreshEligibilityMode::ExplicitRebuild);
+        for blocked in &states[1..] {
+            let original = blocked.clone();
+            assert!(validate_preparation_eligibility(&facts, mode, Some(blocked)).is_ok());
+            assert_eq!(blocked, &original, "admission never restores qualification");
+        }
+        let first = visible_baseline(None);
+        assert!(!requires_current_eligibility(
+            &first,
+            RefreshEligibilityMode::RequireEligible
+        ));
+        assert!(
+            validate_preparation_eligibility(&first, RefreshEligibilityMode::RequireEligible, None)
+                .is_ok()
+        );
+        let aggregate = ProjectionFixture::new(
+            MvTarget::from_parts(Some("iceberg"), "db", "agg_mv"),
+            Some(201),
+        )
+        .build()
+        .unwrap();
+        assert!(!requires_current_eligibility(
+            &aggregate,
+            RefreshEligibilityMode::RequireEligible
+        ));
+    }
+
+    #[test]
+    fn repartition_allows_management_but_preserves_blocked_cause_on_new_p() {
+        let facts = visible_baseline(Some(201));
+        let states = baseline_states(&facts);
+        let MvPublicationState::Published(publication) = facts.publication() else {
+            panic!("published fixture")
+        };
+        let mut new_p = publication.document().clone();
+        new_p.publication_id =
+            novarocks_mv_application::persistence::identity::PublicationIdentity::try_new(vec![99])
+                .unwrap();
+        for explicit_full in [false, true] {
+            let mode = refresh_eligibility_mode(explicit_full, true);
+            assert_eq!(mode, RefreshEligibilityMode::PreserveManagedQualification);
+            for blocked in &states[1..] {
+                assert!(validate_preparation_eligibility(&facts, mode, Some(blocked)).is_ok());
+                let next = for_publication(
+                    Some(blocked),
+                    facts.definition(),
+                    &new_p,
+                    PublicationKind::FullRefresh,
+                    true,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(&next, blocked);
+                assert!(
+                    validate_preparation_eligibility(
+                        &facts,
+                        RefreshEligibilityMode::RequireEligible,
+                        Some(&next)
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
 }

@@ -472,6 +472,7 @@ fn decode_ack(
                 receipt: QueryContextReceipt::new(acked, decoded.state),
                 outcome: decoded.outcome,
                 runtime_filter: decoded.runtime_filter,
+                verification: decoded.verification,
             })
         }
         (kind, _, _) => Err(format!(

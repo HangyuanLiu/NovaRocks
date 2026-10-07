@@ -319,6 +319,9 @@ pub struct QueryMeta {
     /// One bounded runner-owned fault for the next matching standard Iceberg
     /// REST publication request. The SQL case never names an operation id.
     pub publication_catalog_fault: Option<PublicationCatalogFaultDirective>,
+    pub publication_catalog_fault_target: Option<PublicationCatalogFaultTarget>,
+    /// Release a retained corruption window after this step's assertions.
+    pub publication_catalog_fault_clear: bool,
     /// Exact REST table and actor for a server-side post-requirements hold.
     pub publication_service_hold: Option<PublicationServiceHoldDirective>,
     /// One cross-engine shell command executed after a runner proxy or real
@@ -482,6 +485,8 @@ pub enum PublicationCatalogFault {
     IncompleteDiscovery,
     /// Return malformed bytes for exactly one standard table package read.
     CorruptPackage,
+    /// Corrupt only the exact table until explicit release or its deadline.
+    CorruptPackageUntilClear,
 }
 
 impl PublicationCatalogFault {
@@ -498,6 +503,7 @@ impl PublicationCatalogFault {
             Self::AfterCommitHoldForFrontendKill => "after-commit-hold-for-frontend-kill",
             Self::IncompleteDiscovery => "incomplete-discovery",
             Self::CorruptPackage => "corrupt-package",
+            Self::CorruptPackageUntilClear => "corrupt-package-until-clear",
         }
     }
 
@@ -512,6 +518,12 @@ impl PublicationCatalogFault {
                 | Self::BeforeRequirementCheckHoldForConcurrentShell
         )
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationCatalogFaultTarget {
+    pub namespace: String,
+    pub table: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

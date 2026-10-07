@@ -205,6 +205,12 @@ struct TestTaskHost {
     domains_applied: AtomicUsize,
     reporters: Mutex<Vec<TaskStatusReporter>>,
     retired_executions: Mutex<Vec<QueryContextRef>>,
+    verification: Mutex<
+        std::collections::BTreeMap<
+            TaskIdentity,
+            novarocks_execution_contract::TaskVerificationFacts,
+        >,
+    >,
     cancel_calls: Arc<AtomicUsize>,
 }
 
@@ -218,6 +224,20 @@ impl TestTaskHost {
 }
 
 impl TaskExecutionHost for TestTaskHost {
+    fn verification_facts(
+        &self,
+        identity: TaskIdentity,
+    ) -> novarocks_execution_contract::TaskVerificationFacts {
+        self.verification
+            .lock()
+            .unwrap()
+            .get(&identity)
+            .cloned()
+            .unwrap_or_else(|| {
+                novarocks_execution_contract::TaskVerificationFacts::unavailable(identity)
+            })
+    }
+
     fn close_context_admission(&self, _context: QueryContextRef) {}
 
     fn retire_context_execution(&self, context: QueryContextRef) {
@@ -3317,4 +3337,158 @@ fn preparation_rollback_concludes_on_the_stand_down_that_won() {
             );
         }
     }
+}
+
+#[test]
+fn release_verification_survives_task_reclamation_and_replays_the_sealed_snapshot() {
+    use novarocks_execution_contract::{
+        TaskVerificationFacts, TaskVerificationObservation, VerificationInstance,
+        VerificationRecord, VerificationState,
+    };
+    let fixture = Fixture::with_config(TestTaskHost::default(), |config| {
+        config.retained_task_capacity = 1
+    });
+    let execution = execution(80_001);
+    let context = fixture.context(execution);
+    establish(&fixture.registry, context);
+    let instance = VerificationInstance {
+        plan_node_id: 8,
+        local_instance_id: 0,
+    };
+    let mut expected = Vec::new();
+    for task_id in [1, 2] {
+        let identity = TaskIdentity::new(
+            execution,
+            StageId::new(1).unwrap(),
+            TaskId::new(task_id).unwrap(),
+            fixture.backend,
+        );
+        expected.push((identity, instance));
+        fixture.task_host.verification.lock().unwrap().insert(
+            identity,
+            TaskVerificationFacts {
+                identity,
+                observation: TaskVerificationObservation::Available(vec![VerificationRecord {
+                    instance,
+                    state: VerificationState::Completed {
+                        requested: 5,
+                        matched: 5,
+                    },
+                }]),
+            },
+        );
+        assert_eq!(
+            fixture
+                .registry
+                .create_task(
+                    &fixture.create(descriptor(identity), Vec::new()),
+                    body(STREAM_PLAN)
+                )
+                .outcome(),
+            OperationOutcome::Accepted
+        );
+        let reporter = fixture
+            .task_host
+            .reporters
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        reporter.running();
+        reporter.finished(novarocks_execution_contract::TaskOutputFacts::new(true));
+        reporter.release_output();
+        reporter.note_actual_stopped();
+        reporter.note_resources_converged();
+        fixture.registry.advance_deadlines();
+    }
+    fixture
+        .registry
+        .quiesce_query_context(&QuiesceQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+        ));
+    let request = ReleaseQueryContext::new(TaskOperationId::new_v7(), context);
+    let released = fixture.registry.release_query_context(&request);
+    let sealed = released
+        .acknowledgement()
+        .unwrap()
+        .evidence()
+        .unwrap()
+        .verification()
+        .unwrap()
+        .clone();
+    assert_eq!(sealed.tasks.len(), 2);
+    assert!(sealed.permits_rollback(&expected));
+    fixture.task_host.verification.lock().unwrap().clear();
+    let replay = fixture.registry.release_query_context(&request);
+    assert_eq!(
+        replay
+            .acknowledgement()
+            .unwrap()
+            .evidence()
+            .unwrap()
+            .verification(),
+        Some(&sealed)
+    );
+    // This receipt continues to hold its exact snapshot after its context is reaped.
+    assert_eq!(
+        released
+            .acknowledgement()
+            .unwrap()
+            .evidence()
+            .unwrap()
+            .verification(),
+        Some(&sealed)
+    );
+}
+
+#[test]
+fn release_verification_missing_runtime_is_unavailable_and_not_ready_seals_nothing() {
+    use novarocks_execution_contract::TaskVerificationObservation;
+    let fixture = Fixture::new(TestTaskHost::default());
+    let execution = execution(80_002);
+    let context = fixture.context(execution);
+    establish(&fixture.registry, context);
+    let identity = task(execution, fixture.backend);
+    fixture.registry.create_task(
+        &fixture.create(descriptor(identity), Vec::new()),
+        body(STREAM_PLAN),
+    );
+    fixture
+        .registry
+        .quiesce_query_context(&QuiesceQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+        ));
+    let request = ReleaseQueryContext::new(TaskOperationId::new_v7(), context);
+    let not_ready = fixture.registry.release_query_context(&request);
+    assert!(
+        not_ready
+            .acknowledgement()
+            .unwrap()
+            .evidence()
+            .unwrap()
+            .verification()
+            .is_none()
+    );
+    let reporter = fixture.task_host.reporters.lock().unwrap()[0].clone();
+    reporter.canceled(CancelReason::UpstreamNoLongerNeeded);
+    reporter.release_output();
+    reporter.note_actual_stopped();
+    reporter.note_resources_converged();
+    fixture.registry.advance_deadlines();
+    let released = fixture.registry.release_query_context(&request);
+    let facts = released
+        .acknowledgement()
+        .unwrap()
+        .evidence()
+        .unwrap()
+        .verification()
+        .unwrap();
+    assert_eq!(facts.tasks.len(), 1);
+    assert_eq!(
+        facts.tasks[0].observation,
+        TaskVerificationObservation::Unavailable
+    );
 }

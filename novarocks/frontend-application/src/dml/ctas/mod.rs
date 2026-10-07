@@ -594,7 +594,7 @@ mod tests {
                     execution_identity: [9; 32],
                     output_columns: vec![ConnectorColumnDefinition {
                         name: Arc::from("x"),
-                        data_type: ConnectorDataType::Int,
+                        data_type: ConnectorDataType::Int32,
                         nullable: false,
                         aggregation: None,
                         default: None,

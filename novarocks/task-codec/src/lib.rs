@@ -213,6 +213,7 @@ mod tests {
 
     fn simple_assignment() -> novarocks::TaskAssignment {
         novarocks::TaskAssignment {
+            quota_domain_bindings: Vec::new(),
             instance_ordinal: 0,
             initial_scan_ranges: Vec::new(),
             sink_edge_ids: Vec::new(),
@@ -789,6 +790,7 @@ mod tests {
                     context(process),
                     descriptor,
                     novarocks::TaskAssignment {
+                        quota_domain_bindings: Vec::new(),
                         sink_edge_ids,
                         ..simple_assignment()
                     },
@@ -846,6 +848,79 @@ mod tests {
                 .kind(),
             ProtocolErrorKind::OutOfRange
         );
+    }
+
+    #[test]
+    fn bounded_mv_failures_round_trip_and_reject_malformed_payloads() {
+        let failures = [
+            TaskFailure::capacity_refused(
+                SafeDetail::new("delta resident bytes").unwrap(),
+                u64::MAX,
+                128,
+            ),
+            TaskFailure::mv_apply_consistency(7, 3, SafeDetail::new("tuple sample").unwrap()),
+            TaskFailure::target_format_unsupported(
+                SafeDetail::new("data.parquet").unwrap(),
+                SafeDetail::new("equality-delete").unwrap(),
+            ),
+        ];
+        for failure in failures {
+            let status = TaskStatus::try_new(
+                identity(2, 3, backend()),
+                TaskStatusVersion::FIRST,
+                TaskState::Failed,
+                Some(TerminationDetail::Failed(failure)),
+                TaskOutputFacts::default(),
+            )
+            .unwrap();
+            let encoded = encode_task_status(&status);
+            assert_eq!(
+                decode_task_status(&encoded, FieldPath::root("status")),
+                Ok(status)
+            );
+            let mut missing_payload = encoded.clone();
+            let Some(novarocks::task_termination::Cause::Failed(failure)) =
+                missing_payload.termination.as_mut().unwrap().cause.as_mut()
+            else {
+                panic!("failure required")
+            };
+            failure.bounded_payload = None;
+            assert!(decode_task_status(&missing_payload, FieldPath::root("status")).is_err());
+            let mut unknown = encoded.clone();
+            let Some(novarocks::task_termination::Cause::Failed(failure)) =
+                unknown.termination.as_mut().unwrap().cause.as_mut()
+            else {
+                panic!("failure required")
+            };
+            failure.category = 999;
+            assert!(decode_task_status(&unknown, FieldPath::root("status")).is_err());
+            let mut oversized = encoded.clone();
+            let Some(novarocks::task_termination::Cause::Failed(failure)) =
+                oversized.termination.as_mut().unwrap().cause.as_mut()
+            else {
+                panic!("failure required")
+            };
+            match failure.bounded_payload.as_mut().unwrap() {
+                novarocks::task_failure::BoundedPayload::CapacityRefused(v) => {
+                    v.resource = "x".repeat(513)
+                }
+                novarocks::task_failure::BoundedPayload::MvApplyConsistency(v) => {
+                    v.sample = "x".repeat(513)
+                }
+                novarocks::task_failure::BoundedPayload::TargetFormatUnsupported(v) => {
+                    v.data_file = "x".repeat(513)
+                }
+            }
+            assert!(decode_task_status(&oversized, FieldPath::root("status")).is_err());
+            let mut mismatch = encoded;
+            let Some(novarocks::task_termination::Cause::Failed(failure)) =
+                mismatch.termination.as_mut().unwrap().cause.as_mut()
+            else {
+                panic!("failure required")
+            };
+            failure.category = novarocks::TaskFailureCategory::Execution as i32;
+            assert!(decode_task_status(&mismatch, FieldPath::root("status")).is_err());
+        }
     }
 
     #[test]

@@ -24,47 +24,65 @@
 
 use std::collections::HashSet;
 
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::DataType;
+use novarocks_types::logical_type::LogicalType;
 use novarocks_types::mv_aggregate_layout::{
     MvAggregateRuntimeKind, MvAggregateRuntimeLayout, MvAggregateStateColumn, MvAggregateStateRole,
     MvAggregateVisibleColumn,
 };
 use novarocks_types::naming::normalize_identifier;
-use novarocks_types::schema::SqlType;
 
 use crate::mv_refresh::AggregateFunctionKind;
 use crate::planning::mv::SqlMvAggregateLayoutFacts;
-use crate::semantic::TableColumnDef;
 
 pub const MV_AGGREGATE_ROW_ID_COLUMN: &str = "__row_id__";
 pub const MV_AGGREGATE_STATE_PREFIX: &str = "__agg_state_";
 pub const MV_AGGREGATE_RETRACTION_COUNT_STATE_COLUMN: &str = "__agg_state___ivm_row_count";
 
+/// Complete logical declaration for one aggregate target column.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlMvAggregateColumnFacts {
+    pub name: String,
+    pub data_type: LogicalType,
+    pub nullable: bool,
+}
+
 /// One target-table column emitted by the aggregate MV physical-layout builder.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SqlMvAggregatePhysicalColumn {
-    column: TableColumnDef,
+    column: SqlMvAggregateColumnFacts,
     visible: bool,
     is_key: bool,
 }
 
 impl SqlMvAggregatePhysicalColumn {
-    pub fn new(column: TableColumnDef, visible: bool, is_key: bool) -> Self {
+    pub fn new(
+        name: String,
+        logical_type: LogicalType,
+        nullable: bool,
+        visible: bool,
+        is_key: bool,
+    ) -> Self {
         Self {
-            column,
+            column: SqlMvAggregateColumnFacts {
+                name,
+                data_type: logical_type,
+                nullable,
+            },
             visible,
             is_key,
         }
     }
 
-    pub fn column(&self) -> &TableColumnDef {
+    pub fn logical_type(&self) -> &LogicalType {
+        &self.column.data_type
+    }
+    pub fn column(&self) -> &SqlMvAggregateColumnFacts {
         &self.column
     }
-
     pub fn visible(&self) -> bool {
         self.visible
     }
-
     pub fn is_key(&self) -> bool {
         self.is_key
     }
@@ -94,9 +112,9 @@ impl SqlMvAggregatePhysicalLayout {
 
 /// Build the aggregate MV target layout in one SQL-owned transaction.
 ///
-/// Validation intentionally follows the historical builder order: input-count,
-/// group-key indexes, visible type mapping, each aggregate's visible type, and
-/// then state-column validation.  The hidden retraction-count state is appended
+/// Validation checks input counts, group-key indexes, each aggregate's visible
+/// type, and state-column contracts. Visible declarations retain complete
+/// logical facts without a weaker SQL syntax projection.  The hidden retraction-count state is appended
 /// only after every explicit aggregate state has been accepted.
 pub fn build_sql_mv_aggregate_physical_layout(
     facts: &SqlMvAggregateLayoutFacts,
@@ -116,7 +134,7 @@ pub fn build_sql_mv_aggregate_physical_layout(
 
     let row_id_column = physical_column(
         MV_AGGREGATE_ROW_ID_COLUMN.to_string(),
-        SqlType::String,
+        LogicalType::Utf8,
         false,
         false,
         true,
@@ -135,10 +153,9 @@ pub fn build_sql_mv_aggregate_physical_layout(
         .iter()
         .enumerate()
         .map(|(source_index, column)| {
-            let sql_type = mv_arrow_data_type_to_sql_type(&column.data_type)?;
-            physical_columns.push(physical_column(
+            physical_columns.push(SqlMvAggregatePhysicalColumn::new(
                 column.name.clone(),
-                sql_type,
+                column.logical_type().clone(),
                 column.nullable,
                 true,
                 false,
@@ -187,7 +204,7 @@ pub fn build_sql_mv_aggregate_physical_layout(
                 validate_state_column_type(call.function(), role, &state_data_type, &state_name)?;
                 physical_columns.push(physical_column(
                     state_name.clone(),
-                    SqlType::Binary,
+                    LogicalType::Binary,
                     false,
                     false,
                     false,
@@ -212,7 +229,7 @@ pub fn build_sql_mv_aggregate_physical_layout(
             )?;
             physical_columns.push(physical_column(
                 state_name.clone(),
-                SqlType::Binary,
+                LogicalType::Binary,
                 false,
                 false,
                 false,
@@ -242,7 +259,7 @@ pub fn build_sql_mv_aggregate_physical_layout(
         )?;
         physical_columns.push(physical_column(
             MV_AGGREGATE_RETRACTION_COUNT_STATE_COLUMN.to_string(),
-            SqlType::BigInt,
+            LogicalType::Int64,
             false,
             false,
             false,
@@ -273,66 +290,6 @@ pub fn build_sql_mv_aggregate_physical_layout(
     })
 }
 
-/// Keep aggregate-MV's schema mapper distinct from the generic CTAS mapper.
-///
-/// Their supported Arrow forms and diagnostic contracts differ deliberately.
-pub fn mv_arrow_data_type_to_sql_type(data_type: &DataType) -> Result<SqlType, String> {
-    match data_type {
-        DataType::Boolean => Ok(SqlType::Boolean),
-        DataType::Int8 => Ok(SqlType::TinyInt),
-        DataType::Int16 => Ok(SqlType::SmallInt),
-        DataType::Int32 => Ok(SqlType::Int),
-        DataType::Int64 => Ok(SqlType::BigInt),
-        DataType::Float32 => Ok(SqlType::Float),
-        DataType::Float64 => Ok(SqlType::Double),
-        DataType::Utf8 => Ok(SqlType::String),
-        DataType::Binary => Ok(SqlType::Binary),
-        DataType::Date32 => Ok(SqlType::Date),
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => Ok(SqlType::DateTimeNs),
-        DataType::Timestamp(_, _) => Ok(SqlType::DateTime),
-        DataType::Time64(_) => Ok(SqlType::Time),
-        DataType::FixedSizeBinary(width)
-            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
-        {
-            Ok(SqlType::LargeInt)
-        }
-        DataType::Decimal128(precision, scale) => Ok(SqlType::Decimal {
-            precision: *precision,
-            scale: *scale,
-        }),
-        DataType::List(field) => Ok(SqlType::Array(Box::new(mv_arrow_data_type_to_sql_type(
-            field.data_type(),
-        )?))),
-        DataType::Struct(fields) => Ok(SqlType::Struct(
-            fields
-                .iter()
-                .map(|field| {
-                    Ok((
-                        field.name().clone(),
-                        mv_arrow_data_type_to_sql_type(field.data_type())?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, String>>()?,
-        )),
-        DataType::Map(entries, _) => {
-            let DataType::Struct(fields) = entries.data_type() else {
-                return Err("MAP output type must use struct entries".to_string());
-            };
-            let (_, key) = fields
-                .find("key")
-                .ok_or_else(|| "MAP output type is missing key field".to_string())?;
-            let (_, value) = fields
-                .find("value")
-                .ok_or_else(|| "MAP output type is missing value field".to_string())?;
-            Ok(SqlType::Map(
-                Box::new(mv_arrow_data_type_to_sql_type(key.data_type())?),
-                Box::new(mv_arrow_data_type_to_sql_type(value.data_type())?),
-            ))
-        }
-        other => Err(format!("unsupported MV output type: {other}")),
-    }
-}
-
 /// Reject duplicate physical names using StarRocks identifier normalization.
 pub fn validate_unique_aggregate_physical_column_names(
     physical_columns: &[SqlMvAggregatePhysicalColumn],
@@ -351,22 +308,12 @@ pub fn validate_unique_aggregate_physical_column_names(
 
 fn physical_column(
     name: String,
-    data_type: SqlType,
+    data_type: LogicalType,
     nullable: bool,
     visible: bool,
     is_key: bool,
 ) -> SqlMvAggregatePhysicalColumn {
-    SqlMvAggregatePhysicalColumn::new(
-        TableColumnDef {
-            name,
-            data_type,
-            nullable,
-            aggregation: None,
-            default: None,
-        },
-        visible,
-        is_key,
-    )
+    SqlMvAggregatePhysicalColumn::new(name, data_type, nullable, visible, is_key)
 }
 
 fn runtime_kind(function: AggregateFunctionKind) -> MvAggregateRuntimeKind {
@@ -456,102 +403,105 @@ fn sanitize_state_column_name(name: &str) -> String {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::datatypes::{Field, Fields, TimeUnit};
+    use arrow::datatypes::Field;
 
     use super::*;
 
     #[test]
-    fn mv_arrow_mapper_preserves_nested_shape_and_diagnostic_contract() {
-        let map_entries = DataType::Struct(Fields::from(vec![
-            Arc::new(Field::new("key", DataType::Utf8, false)),
-            Arc::new(Field::new("value", DataType::Int64, true)),
-        ]));
-        assert_eq!(
-            mv_arrow_data_type_to_sql_type(&DataType::Map(
-                Arc::new(Field::new("entries", map_entries, false)),
-                false,
-            ))
-            .expect("MV map type"),
-            SqlType::Map(Box::new(SqlType::String), Box::new(SqlType::BigInt))
+    fn aggregate_physical_columns_preserve_exact_visible_logical_facts() {
+        use novarocks_types::logical_type::LogicalType;
+        let statements =
+            novarocks_parser::parse("SELECT items, SUM(v) AS s FROM t GROUP BY items").unwrap();
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("query");
+        };
+        let calls = crate::planning::mv::extract_aggregate_sql_calls(query).unwrap();
+        let field = Field::new(
+            "items",
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, false))),
+            true,
         );
-        assert_eq!(
-            mv_arrow_data_type_to_sql_type(&DataType::Null),
-            Err("unsupported MV output type: Null".to_string())
-        );
-    }
-
-    #[test]
-    fn mv_arrow_mapper_preserves_scalar_contract() {
-        let cases = [
-            (DataType::Boolean, SqlType::Boolean),
-            (DataType::Int8, SqlType::TinyInt),
-            (DataType::Int16, SqlType::SmallInt),
-            (DataType::Int32, SqlType::Int),
-            (DataType::Int64, SqlType::BigInt),
-            (
-                DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH),
-                SqlType::LargeInt,
-            ),
-            (
-                DataType::Decimal128(38, -2),
-                SqlType::Decimal {
-                    precision: 38,
-                    scale: -2,
-                },
-            ),
-            (
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                SqlType::DateTimeNs,
-            ),
+        let nested =
+            crate::planning::mv::SqlMvOutputColumnFacts::from_engine_field(&field).unwrap();
+        let outputs = vec![
+            nested.clone(),
+            crate::planning::mv::SqlMvOutputColumnFacts::from_logical(
+                "s".into(),
+                LogicalType::Int64,
+                true,
+            )
+            .unwrap(),
         ];
-
-        for (arrow_type, expected) in cases {
-            assert_eq!(
-                mv_arrow_data_type_to_sql_type(&arrow_type).expect("supported scalar type"),
-                expected,
-                "Arrow type {arrow_type:?}"
-            );
+        let facts = SqlMvAggregateLayoutFacts::from_aggregate_calls_and_outputs(
+            &calls,
+            &outputs,
+            &[Some(DataType::Int64)],
+        )
+        .unwrap();
+        let layout = build_sql_mv_aggregate_physical_layout(&facts).unwrap();
+        let visible = layout
+            .physical_columns()
+            .iter()
+            .find(|column| column.column().name == "items")
+            .unwrap();
+        assert_eq!(visible.logical_type(), nested.logical_type());
+        let LogicalType::Array { element, .. } = visible.logical_type() else {
+            panic!("array");
+        };
+        assert!(!element.nullable);
+        assert_eq!(layout.row_id_column().logical_type(), &LogicalType::Utf8);
+        for state in layout
+            .physical_columns()
+            .iter()
+            .filter(|column| column.column().name.starts_with(MV_AGGREGATE_STATE_PREFIX))
+        {
+            let expected = if state.column().name == MV_AGGREGATE_RETRACTION_COUNT_STATE_COLUMN {
+                LogicalType::Int64
+            } else {
+                LogicalType::Binary
+            };
+            assert_eq!(state.logical_type(), &expected);
         }
     }
 
     #[test]
-    fn mv_arrow_mapper_preserves_nested_shape_and_order() {
-        let map_entries = DataType::Struct(Fields::from(vec![
-            Arc::new(Field::new("key", DataType::Utf8, false)),
-            Arc::new(Field::new("value", DataType::Decimal128(20, -3), true)),
-        ]));
-        let nested = DataType::Struct(Fields::from(vec![
-            Arc::new(Field::new(
-                "ts",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
+    fn aggregate_physical_declaration_accepts_fixed_binary_without_sql_syntax_gate() {
+        let statements =
+            novarocks_parser::parse("SELECT k, SUM(v) AS s FROM t GROUP BY k").unwrap();
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("query");
+        };
+        let calls = crate::planning::mv::extract_aggregate_sql_calls(query).unwrap();
+        let outputs = vec![
+            crate::planning::mv::SqlMvOutputColumnFacts::from_logical(
+                "k".into(),
+                LogicalType::FixedSizeBinary(32),
+                false,
+            )
+            .unwrap(),
+            crate::planning::mv::SqlMvOutputColumnFacts::from_logical(
+                "s".into(),
+                LogicalType::Int64,
                 true,
-            )),
-            Arc::new(Field::new(
-                "attrs",
-                DataType::List(Arc::new(Field::new(
-                    "item",
-                    DataType::Map(Arc::new(Field::new("entries", map_entries, false)), false),
-                    true,
-                ))),
-                true,
-            )),
-        ]));
-
+            )
+            .unwrap(),
+        ];
+        let facts = SqlMvAggregateLayoutFacts::from_aggregate_calls_and_outputs(
+            &calls,
+            &outputs,
+            &[Some(DataType::Int64)],
+        )
+        .unwrap();
+        let layout = build_sql_mv_aggregate_physical_layout(&facts).unwrap();
+        let key = layout
+            .physical_columns()
+            .iter()
+            .find(|column| column.column().name == "k")
+            .unwrap();
+        assert_eq!(key.column().data_type, LogicalType::FixedSizeBinary(32));
         assert_eq!(
-            mv_arrow_data_type_to_sql_type(&nested).expect("supported nested type"),
-            SqlType::Struct(vec![
-                ("ts".to_string(), SqlType::DateTimeNs),
-                (
-                    "attrs".to_string(),
-                    SqlType::Array(Box::new(SqlType::Map(
-                        Box::new(SqlType::String),
-                        Box::new(SqlType::Decimal {
-                            precision: 20,
-                            scale: -3,
-                        }),
-                    ))),
-                ),
-            ])
+            layout.runtime_layout().visible_columns()[0].data_type(),
+            &DataType::FixedSizeBinary(32)
         );
     }
 
@@ -560,14 +510,14 @@ mod tests {
         let columns = vec![
             physical_column(
                 "Visible_Output".to_string(),
-                SqlType::BigInt,
+                LogicalType::Int64,
                 false,
                 true,
                 false,
             ),
             physical_column(
                 "`visible_output`".to_string(),
-                SqlType::BigInt,
+                LogicalType::Int64,
                 false,
                 true,
                 false,

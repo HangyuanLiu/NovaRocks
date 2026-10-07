@@ -119,6 +119,7 @@ impl OperatorFactory for TableFunctionProcessorFactory {
             ret_types: self.ret_types.clone(),
             output_chunk_schema: Arc::clone(&self.output_chunk_schema),
             output_slot_sources: self.output_slot_sources.clone(),
+            series_cursor: None,
             output_chunk: None,
             output_offset: 0,
             emit_empty_once: false,
@@ -140,6 +141,7 @@ struct TableFunctionProcessorOperator {
     ret_types: Vec<DataType>,
     output_chunk_schema: ChunkSchemaRef,
     output_slot_sources: Vec<TableFunctionOutputSlot>,
+    series_cursor: Option<GenerateSeriesCursor>,
     output_chunk: Option<Chunk>,
     output_offset: usize,
     emit_empty_once: bool,
@@ -167,14 +169,18 @@ impl Operator for TableFunctionProcessorOperator {
 
 impl ProcessorOperator for TableFunctionProcessorOperator {
     fn need_input(&self) -> bool {
-        !self.finishing && !self.finished && self.output_chunk.is_none() && !self.emit_empty_once
+        !self.finishing
+            && !self.finished
+            && self.output_chunk.is_none()
+            && self.series_cursor.is_none()
+            && !self.emit_empty_once
     }
 
     fn has_output(&self) -> bool {
         if self.finished {
             return false;
         }
-        if self.emit_empty_once {
+        if self.emit_empty_once || self.series_cursor.is_some() {
             return true;
         }
         self.output_chunk
@@ -195,6 +201,15 @@ impl ProcessorOperator for TableFunctionProcessorOperator {
             return Ok(());
         }
 
+        if self.function_name.eq_ignore_ascii_case("generate_series") {
+            let cursor = self.prepare_series_cursor(chunk)?;
+            if cursor.rows.iter().all(|row| row.remaining == 0) {
+                self.emit_empty_once = true;
+            } else {
+                self.series_cursor = Some(cursor);
+            }
+            return Ok(());
+        }
         let output = self.build_output_chunk(&chunk)?;
         if output.is_empty() {
             self.emit_empty_once = true;
@@ -219,6 +234,23 @@ impl ProcessorOperator for TableFunctionProcessorOperator {
             return Ok(Some(self.empty_output_chunk()?));
         }
 
+        if let Some(mut cursor) = self.series_cursor.take() {
+            let (values, indices) = cursor.take_batch(state.chunk_size())?;
+            let outer = self.build_outer_columns(&cursor.input, &indices)?;
+            let results = if self.fn_result_required {
+                vec![self.generate_series_result_column(values)?]
+            } else {
+                Vec::new()
+            };
+            let output = self.assemble_output_chunk(outer, results)?;
+            if cursor.has_remaining() {
+                self.series_cursor = Some(cursor);
+            } else if self.finishing {
+                self.finished = true;
+            }
+            return Ok(Some(output));
+        }
+
         let Some(output) = self.output_chunk.as_ref() else {
             return Ok(None);
         };
@@ -241,7 +273,7 @@ impl ProcessorOperator for TableFunctionProcessorOperator {
 
     fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
         self.finishing = true;
-        if self.output_chunk.is_none() && !self.emit_empty_once {
+        if self.output_chunk.is_none() && self.series_cursor.is_none() && !self.emit_empty_once {
             self.finished = true;
         }
         Ok(())
@@ -280,7 +312,7 @@ impl TableFunctionProcessorOperator {
             "unnest" => self.build_output_chunk_unnest(chunk),
             "unnest_bitmap" => self.build_output_chunk_unnest_bitmap(chunk),
             "subdivide_bitmap" => self.build_output_chunk_subdivide_bitmap(chunk),
-            "generate_series" => self.build_output_chunk_generate_series(chunk),
+            "generate_series" => Err("generate_series must use its pull cursor".into()),
             _ => Err(format!(
                 "unsupported table function: {}",
                 self.function_name
@@ -314,9 +346,9 @@ impl TableFunctionProcessorOperator {
         } else {
             self.row_counts_multi(&list_args)?
         };
-        let total_output_rows: usize = row_counts.iter().sum();
-        if total_output_rows > u32::MAX as usize {
-            return Err("table function output too large".to_string());
+        let mut total_output_rows = 0;
+        for count in &row_counts {
+            checked_add_table_function_rows(&mut total_output_rows, *count)?;
         }
         if total_output_rows == 0 {
             return self.empty_output_chunk();
@@ -394,9 +426,9 @@ impl TableFunctionProcessorOperator {
             row_values.push(Some(values));
         }
 
-        let total_output_rows: usize = row_counts.iter().sum();
-        if total_output_rows > u32::MAX as usize {
-            return Err("table function output too large".to_string());
+        let mut total_output_rows = 0;
+        for count in &row_counts {
+            checked_add_table_function_rows(&mut total_output_rows, *count)?;
         }
         if total_output_rows == 0 {
             return self.empty_output_chunk();
@@ -492,9 +524,9 @@ impl TableFunctionProcessorOperator {
             row_values.push(Some(splits));
         }
 
-        let total_output_rows: usize = row_counts.iter().sum();
-        if total_output_rows > u32::MAX as usize {
-            return Err("table function output too large".to_string());
+        let mut total_output_rows = 0;
+        for count in &row_counts {
+            checked_add_table_function_rows(&mut total_output_rows, *count)?;
         }
         if total_output_rows == 0 {
             return self.empty_output_chunk();
@@ -534,12 +566,9 @@ impl TableFunctionProcessorOperator {
         self.assemble_output_chunk(outer_columns, result_columns)
     }
 
-    fn build_output_chunk_generate_series(&self, chunk: &Chunk) -> Result<Chunk, String> {
+    fn prepare_series_cursor(&self, chunk: Chunk) -> Result<GenerateSeriesCursor, String> {
         if !(self.param_slots.len() == 2 || self.param_slots.len() == 3) {
-            return Err(format!(
-                "table function generate_series expects 2 or 3 args, got {}",
-                self.param_slots.len()
-            ));
+            return Err("table function generate_series expects 2 or 3 args".into());
         }
         let start_col = chunk.column_by_slot_id(self.param_slots[0])?;
         let end_col = chunk.column_by_slot_id(self.param_slots[1])?;
@@ -548,81 +577,46 @@ impl TableFunctionProcessorOperator {
         } else {
             None
         };
-
-        let num_rows = chunk.len();
-        let mut row_counts = Vec::with_capacity(num_rows);
-        let mut series_values: Vec<Option<i128>> = Vec::new();
-        let mut total_output_rows = 0usize;
-        for row in 0..num_rows {
+        let mut rows = Vec::with_capacity(chunk.len());
+        for row in 0..chunk.len() {
             let start = self.int_like_arg_to_i128(&start_col, row, 0, "generate_series")?;
             let end = self.int_like_arg_to_i128(&end_col, row, 1, "generate_series")?;
-            let step = match step_col.as_ref() {
+            let step = match &step_col {
                 Some(col) => self.int_like_arg_to_i128(col, row, 2, "generate_series")?,
                 None => Some(1),
             };
-            match (start, end, step) {
+            let (current, step, count) = match (start, end, step) {
                 (Some(start), Some(end), Some(step)) => {
-                    if step == 0 {
-                        return Err("table function generate_series step size cannot equal zero"
-                            .to_string());
-                    }
                     let count = generate_series_count(start, end, step)?;
-                    if count == 0 {
-                        if self.is_left_join {
-                            checked_add_table_function_rows(&mut total_output_rows, 1)?;
-                            row_counts.push(1);
-                            series_values.push(None);
-                        } else {
-                            row_counts.push(0);
-                        }
-                        continue;
+                    // The original implementation validates the increment after the last value.
+                    if count > 0 {
+                        series_after_n(start, step, count)?;
                     }
-
-                    checked_add_table_function_rows(&mut total_output_rows, count)?;
-                    row_counts.push(count);
-                    let mut current = start;
-                    for _ in 0..count {
-                        series_values.push(Some(current));
-                        current = current.checked_add(step).ok_or_else(|| {
-                            format!(
-                                "table function generate_series value overflow: current={} step={}",
-                                current, step
-                            )
-                        })?;
-                    }
+                    (Some(start), step, count)
                 }
-                _ => {
-                    if self.is_left_join {
-                        checked_add_table_function_rows(&mut total_output_rows, 1)?;
-                        row_counts.push(1);
-                        series_values.push(None);
-                    } else {
-                        row_counts.push(0);
-                    }
-                }
-            }
+                _ => (None, 1, 0),
+            };
+            let remaining = if count == 0 && self.is_left_join {
+                1
+            } else {
+                count
+            };
+            // Only the input row index and each pulled batch need bounded sizes.
+            // Logical multiplicity is kept per row without summing the expanded result.
+            rows.push(SeriesRow {
+                current: if count == 0 { None } else { current },
+                step,
+                remaining,
+            });
         }
-
-        if total_output_rows == 0 {
-            return self.empty_output_chunk();
+        if self.fn_result_required {
+            self.generate_series_result_column(Vec::new())?;
         }
-        if series_values.len() != total_output_rows {
-            return Err(format!(
-                "table function generate_series internal output size mismatch: values={} rows={}",
-                series_values.len(),
-                total_output_rows
-            ));
-        }
-
-        let row_indices = build_row_indices(&row_counts)?;
-        let outer_columns = self.build_outer_columns(chunk, &row_indices)?;
-        let result_columns = if self.fn_result_required {
-            vec![self.generate_series_result_column(series_values)?]
-        } else {
-            Vec::new()
-        };
-
-        self.assemble_output_chunk(outer_columns, result_columns)
+        Ok(GenerateSeriesCursor {
+            input: chunk,
+            rows,
+            row: 0,
+        })
     }
 
     fn assemble_output_chunk(
@@ -1123,24 +1117,81 @@ fn split_bitmap_values(values: &[u64], batch_size: usize) -> Vec<Vec<u64>> {
     out
 }
 
-fn generate_series_count(start: i128, end: i128, step: i128) -> Result<usize, String> {
-    if step > 0 {
-        if start > end {
-            return Ok(0);
-        }
-        let diff = end - start;
-        let count = diff / step + 1;
-        usize::try_from(count)
-            .map_err(|_| format!("table function generate_series count overflow: {count}"))
+fn generate_series_count(start: i128, end: i128, step: i128) -> Result<u128, String> {
+    if step == 0 {
+        return Err("table function generate_series step size cannot equal zero".into());
+    }
+    if (step > 0 && start > end) || (step < 0 && start < end) {
+        return Ok(0);
+    }
+    // Unsigned distances cover the full i128 domain without subtraction overflow.
+    let distance = if step > 0 {
+        end.abs_diff(start)
     } else {
-        if start < end {
-            return Ok(0);
+        start.abs_diff(end)
+    };
+    let count = distance
+        .checked_div(step.unsigned_abs())
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(|| "table function generate_series count overflow".to_string())?;
+    Ok(count)
+}
+
+fn series_after_n(start: i128, step: i128, count: u128) -> Result<i128, String> {
+    let distance = step
+        .unsigned_abs()
+        .checked_mul(count)
+        .ok_or_else(|| "table function generate_series value overflow".to_string())?;
+    let biased = (start as u128) ^ (1u128 << 127);
+    let end = if step > 0 {
+        biased.checked_add(distance)
+    } else {
+        biased.checked_sub(distance)
+    }
+    .ok_or_else(|| "table function generate_series value overflow".to_string())?;
+    Ok((end ^ (1u128 << 127)) as i128)
+}
+
+struct SeriesRow {
+    current: Option<i128>,
+    step: i128,
+    remaining: u128,
+}
+struct GenerateSeriesCursor {
+    input: Chunk,
+    rows: Vec<SeriesRow>,
+    row: usize,
+}
+impl GenerateSeriesCursor {
+    fn has_remaining(&self) -> bool {
+        self.rows[self.row..].iter().any(|row| row.remaining > 0)
+    }
+    fn take_batch(&mut self, limit: usize) -> Result<(Vec<Option<i128>>, Vec<u32>), String> {
+        if limit == 0 {
+            return Err("table function output chunk size must be positive".into());
         }
-        let diff = start - end;
-        let step_abs = step.abs();
-        let count = diff / step_abs + 1;
-        usize::try_from(count)
-            .map_err(|_| format!("table function generate_series count overflow: {count}"))
+        let mut values = Vec::with_capacity(limit);
+        let mut indices = Vec::with_capacity(limit);
+        while values.len() < limit && self.row < self.rows.len() {
+            let row = &mut self.rows[self.row];
+            if row.remaining == 0 {
+                self.row += 1;
+                continue;
+            }
+            values.push(row.current);
+            indices.push(
+                u32::try_from(self.row)
+                    .map_err(|_| "table function input too large".to_string())?,
+            );
+            row.remaining -= 1;
+            if let Some(current) = row.current {
+                row.current =
+                    Some(current.checked_add(row.step).ok_or_else(|| {
+                        "table function generate_series value overflow".to_string()
+                    })?);
+            }
+        }
+        Ok((values, indices))
     }
 }
 
@@ -1157,6 +1208,223 @@ fn checked_add_table_function_rows(total: &mut usize, rows: usize) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn input_series(
+        start: Vec<Option<i64>>,
+        end: Vec<Option<i64>>,
+        step: Vec<Option<i64>>,
+    ) -> Chunk {
+        use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+        use arrow::datatypes::Schema;
+        use arrow::record_batch::RecordBatch;
+        let fields = (0..3)
+            .map(|i| Field::new(format!("p{i}"), DataType::Int64, true))
+            .collect::<Vec<_>>();
+        let schema = Arc::new(
+            ChunkSchema::try_new(
+                fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        ChunkSlotSchema::from_field(SlotId::new(i as u32 + 1), f, None).unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        let arrays = vec![
+            Arc::new(Int64Array::from(start)) as ArrayRef,
+            Arc::new(Int64Array::from(end)) as ArrayRef,
+            Arc::new(Int64Array::from(step)) as ArrayRef,
+        ];
+        Chunk::try_new_with_chunk_schema(
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap(),
+            schema,
+        )
+        .unwrap()
+    }
+    fn series_factory(left: bool) -> TableFunctionProcessorFactory {
+        use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+        let field = Field::new("series", DataType::Int64, true);
+        let schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::from_field(SlotId::new(4), &field, None).unwrap(),
+            ])
+            .unwrap(),
+        );
+        TableFunctionProcessorFactory::new(
+            1,
+            "generate_series".into(),
+            vec![SlotId::new(1), SlotId::new(2), SlotId::new(3)],
+            Vec::new(),
+            vec![SlotId::new(4)],
+            true,
+            left,
+            vec![DataType::Int64; 3],
+            vec![DataType::Int64],
+            schema,
+            vec![TableFunctionOutputSlot::Result { index: 0 }],
+        )
+    }
+    #[test]
+    fn table_function_series_large_count_retains_one_input_and_bounded_pull() {
+        let factory = series_factory(false);
+        let mut operator = factory.create(1, 0);
+        let state = RuntimeState::default();
+        let processor = operator.as_processor_mut().unwrap();
+        processor
+            .push_chunk(
+                &state,
+                input_series(
+                    vec![Some(1)],
+                    vec![Some(i64::from(u32::MAX) + 1)],
+                    vec![Some(1)],
+                ),
+            )
+            .unwrap();
+        assert!(!processor.need_input());
+        for batch in 0..3 {
+            let output = processor.pull_chunk(&state).unwrap().unwrap();
+            assert_eq!(output.len(), state.chunk_size());
+            let values = output.column_by_slot_id(SlotId::new(4)).unwrap();
+            let values = values.as_any().downcast_ref::<Int64Array>().unwrap();
+            assert_eq!(values.value(0), (batch * state.chunk_size() + 1) as i64);
+        }
+        // The logical result exceeds u32::MAX, but each output allocation is batch-sized.
+        assert!(processor.has_output());
+    }
+    #[test]
+    fn table_function_series_multiple_maximum_weights_have_no_total_row_bound() {
+        let factory = series_factory(false);
+        let mut operator = factory.create(1, 0);
+        let state = RuntimeState::default();
+        let processor = operator.as_processor_mut().unwrap();
+        // The input's combined multiplicity exceeds both u32 and u64.
+        processor
+            .push_chunk(
+                &state,
+                input_series(vec![Some(1); 3], vec![Some(i64::MAX); 3], vec![Some(1); 3]),
+            )
+            .unwrap();
+        processor.set_finishing(&state).unwrap();
+        for batch in 0..3 {
+            let output = processor.pull_chunk(&state).unwrap().unwrap();
+            assert_eq!(output.len(), state.chunk_size());
+            let values = output.column_by_slot_id(SlotId::new(4)).unwrap();
+            let values = values.as_any().downcast_ref::<Int64Array>().unwrap();
+            assert_eq!(values.value(0), (batch * state.chunk_size() + 1) as i64);
+            assert_eq!(
+                values.value(values.len() - 1),
+                ((batch + 1) * state.chunk_size()) as i64
+            );
+        }
+        assert!(processor.has_output());
+        assert!(!processor.need_input());
+        assert!(!operator.is_finished());
+        assert_eq!(
+            generate_series_count(1, i128::from(i64::MAX), 1).unwrap(),
+            i64::MAX as u128
+        );
+        assert_eq!(
+            series_after_n(1, 1, i64::MAX as u128).unwrap(),
+            i128::from(i64::MAX) + 1
+        );
+    }
+
+    #[test]
+    fn table_function_series_i64_tail_preserves_outer_values_and_eos() {
+        use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+        let mut factory = series_factory(false);
+        let outer_slot = SlotId::new(2);
+        let result_slot = SlotId::new(4);
+        factory.outer_slots = vec![outer_slot];
+        factory.output_slot_sources = vec![
+            TableFunctionOutputSlot::Outer { slot: outer_slot },
+            TableFunctionOutputSlot::Result { index: 0 },
+        ];
+        factory.output_chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::from_field(
+                    outer_slot,
+                    &Field::new("visible", DataType::Int64, false),
+                    None,
+                )
+                .unwrap(),
+                ChunkSlotSchema::from_field(
+                    result_slot,
+                    &Field::new("series", DataType::Int64, true),
+                    None,
+                )
+                .unwrap(),
+            ])
+            .unwrap(),
+        );
+        let mut operator = factory.create(1, 0);
+        let state = RuntimeState::default();
+        let processor = operator.as_processor_mut().unwrap();
+        processor
+            .push_chunk(
+                &state,
+                input_series(
+                    vec![Some(i64::MAX - 2), Some(7)],
+                    vec![Some(i64::MAX), Some(8)],
+                    vec![Some(1); 2],
+                ),
+            )
+            .unwrap();
+        processor.set_finishing(&state).unwrap();
+        let output = processor.pull_chunk(&state).unwrap().unwrap();
+        let values = output.column_by_slot_id(result_slot).unwrap();
+        let values = values.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(
+            values.values().as_ref(),
+            &[i64::MAX - 2, i64::MAX - 1, i64::MAX, 7, 8]
+        );
+        let outer = output.column_by_slot_id(outer_slot).unwrap();
+        let outer = outer.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(
+            outer.values().as_ref(),
+            &[i64::MAX, i64::MAX, i64::MAX, 8, 8]
+        );
+        assert!(!processor.has_output());
+        assert!(processor.pull_chunk(&state).unwrap().is_none());
+        assert!(operator.is_finished());
+    }
+
+    #[test]
+    fn table_function_series_null_left_join_descending_and_finish() {
+        let factory = series_factory(true);
+        let mut operator = factory.create(1, 0);
+        let state = RuntimeState::default();
+        let processor = operator.as_processor_mut().unwrap();
+        processor
+            .push_chunk(
+                &state,
+                input_series(
+                    vec![Some(3), None, Some(9)],
+                    vec![Some(1), Some(2), Some(1)],
+                    vec![Some(-1), Some(1), Some(1)],
+                ),
+            )
+            .unwrap();
+        processor.set_finishing(&state).unwrap();
+        let output = processor.pull_chunk(&state).unwrap().unwrap();
+        let column = output.column_by_slot_id(SlotId::new(4)).unwrap();
+        let values = column.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(
+            values.iter().collect::<Vec<_>>(),
+            vec![Some(3), Some(2), Some(1), None, None]
+        );
+        assert!(!processor.has_output());
+        assert!(operator.is_finished());
+        assert!(generate_series_count(0, 1, 0).is_err());
+        assert!(generate_series_count(i128::MIN, i128::MAX, 1).is_err());
+        assert!(series_after_n(i128::MAX, 1, 1).is_err());
+        assert_eq!(
+            series_after_n(i128::MIN, i128::MAX, 2).unwrap(),
+            i128::MAX - 1
+        );
+    }
 
     #[test]
     fn generate_series_count_handles_descending_steps() {

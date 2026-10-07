@@ -88,13 +88,15 @@ impl ReassignFieldIds {
                 let mut key_field = Arc::unwrap_or_clone(m.key_field);
                 key_field.id = self.next_field_id;
                 self.increase_next_field_id()?;
-                *key_field.field_type = self.reassign_ids_visit_type(*key_field.field_type)?;
 
                 self.old_to_new_id
                     .insert(m.value_field.id, self.next_field_id);
                 let mut value_field = Arc::unwrap_or_clone(m.value_field);
                 value_field.id = self.next_field_id;
                 self.increase_next_field_id()?;
+                // Match Iceberg Java AssignFreshIds: both map child IDs are
+                // allocated before descending into either child subtree.
+                *key_field.field_type = self.reassign_ids_visit_type(*key_field.field_type)?;
                 *value_field.field_type = self.reassign_ids_visit_type(*value_field.field_type)?;
 
                 Ok(Type::Map(MapType {
@@ -155,6 +157,78 @@ impl ReassignFieldIds {
 mod tests {
     use super::*;
     use crate::spec::schema::tests::table_schema_nested;
+    use crate::spec::{Literal, PrimitiveLiteral};
+
+    #[test]
+    fn test_reassign_complex_map_children_matches_java_fresh_ids() {
+        // Iceberg Java 1.11 AssignFreshIds allocates key/value together. A
+        // complex key must not displace the value ID with its first child.
+        let key = Type::Struct(StructType::new(vec![
+            NestedField::optional(301, "a", Type::Primitive(PrimitiveType::Int))
+                .with_initial_default(Literal::Primitive(PrimitiveLiteral::Int(7)))
+                .into(),
+            NestedField::optional(
+                302,
+                "items",
+                Type::List(ListType::new(
+                    NestedField::list_element(303, Type::Primitive(PrimitiveType::String), false)
+                        .into(),
+                )),
+            )
+            .into(),
+        ]));
+        let value = Type::Struct(StructType::new(vec![
+            NestedField::required(401, "b", Type::Primitive(PrimitiveType::Int)).into(),
+        ]));
+        let schema = Schema::builder()
+            .with_identifier_field_ids(vec![900])
+            .with_alias(BiHashMap::from_iter(vec![("leaf_alias".to_string(), 301)]))
+            .with_fields(vec![
+                NestedField::optional(
+                    100,
+                    "m",
+                    Type::Map(MapType::new(
+                        NestedField::map_key_element(200, key).into(),
+                        NestedField::map_value_element(400, value, false).into(),
+                    )),
+                )
+                .into(),
+                NestedField::required(900, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+        let actual = schema
+            .into_builder()
+            .with_reassigned_field_ids(1)
+            .build()
+            .unwrap();
+        for (name, id) in [
+            ("m", 1),
+            ("id", 2),
+            ("m.key", 3),
+            ("m.value", 4),
+            ("m.key.a", 5),
+            ("m.key.items", 6),
+            ("m.key.items.element", 7),
+            ("m.value.b", 8),
+        ] {
+            assert_eq!(actual.field_by_name(name).unwrap().id, id, "{name}");
+        }
+        assert_eq!(actual.identifier_field_ids().collect::<Vec<_>>(), vec![2]);
+        assert_eq!(
+            actual.field_by_id(5).unwrap().initial_default,
+            Some(Literal::Primitive(PrimitiveLiteral::Int(7)))
+        );
+        assert!(actual.field_by_id(3).unwrap().required);
+        assert!(actual.field_by_id(8).unwrap().required);
+        let again = actual
+            .clone()
+            .into_builder()
+            .with_reassigned_field_ids(1)
+            .build()
+            .unwrap();
+        assert_eq!(actual, again);
+    }
 
     #[test]
     fn test_reassign_ids() {

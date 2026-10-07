@@ -84,7 +84,9 @@ use crate::runtime_filter::compiler::{
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::task_execution::completion::{WriteCompletionTracker, WriteVerdict, accept_final_info};
 use crate::task_execution::error::TaskExecutionError;
-use crate::task_execution::execution::ReleasedRuntimeFilterContributions;
+use crate::task_execution::execution::{
+    ReleasedRuntimeFilterContributions, ReleasedVerificationFacts,
+};
 use crate::task_execution::feedback_pump::TaskDynamicFilterReads;
 use crate::task_execution::graph::TaskNode;
 use crate::task_execution::remote_task::RemoteTaskState;
@@ -506,10 +508,11 @@ impl FrontendDistributedQueryCoordinator {
         request: DistributedQueryRequest,
         reservation: QueryAttemptReservation,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
-        let statement_deadline = statement_deadline_for_request(&request)?;
         let intent = request.intent();
         let query_id = reservation.query_id();
         let execution_id = reservation.execution_id();
+        let statement_deadline = statement_deadline_for_request(&request)
+            .map_err(|error| error.with_attempt_verification(execution_id, None))?;
         self.execute_round(
             query_id,
             execution_id,
@@ -538,208 +541,214 @@ impl FrontendDistributedQueryCoordinator {
         retry_boundary: Option<&dyn PreReadyRetryBoundary>,
         credential_lease_source: RoundCredentialLeaseSource,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
-        let parts = request.into_parts();
-        let write_stack_session = parts.write_stack_session.clone();
-        let intent = parts.completion.intent();
-        let write_decoder = parts
-            .write_root_decode_contract
-            .clone()
-            .map(crate::query_execution::write_result::RootWriteResultDecoder::new);
-        // Statistics collection enters only with its Core-owned typed program.
-        // It never falls through to client-result construction.
-        if intent == DistributedQueryIntent::Statistics && parts.statistics_program.is_none() {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "statistics execution requires a typed StatisticsCollectionProgram",
-            ));
-        }
-        if (intent == DistributedQueryIntent::Write)
-            != (write_stack_session.is_some() && write_decoder.is_some())
-        {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "distributed write intent, session, and Root decode contract must be present together",
-            ));
-        }
-        self.backend_topology
-            .validate_snapshot(&parts.topology)
-            .map_err(pre_ready_topology_validation_error)?;
-        #[cfg(test)]
-        let backend_services = match &self.backend_services {
-            Some(services) => services.resolve(parts.topology.targets())?,
-            None => production_backend_services(parts.topology.targets())?,
-        };
-        #[cfg(not(test))]
-        let backend_services = production_backend_services(parts.topology.targets())?;
-        let _query = self.registry.register(query_id, intent)?;
-        let schedule = crate::preparation_diagnostics::observe_result(
-            "attempt_instantiation",
-            "schedule_attempt",
-            "not-applicable",
-            Some(execution_id),
-            || {
-                backend_services
-                    .scheduler
-                    .schedule(&parts.artifacts.scheduling_facts(), execution_id)
-            },
-        )?;
-        let scheduled_backend_ownership = backend_services
-            .scheduler
-            .scheduled_backend_ownership(&schedule.backend_ids())?;
-        self.backend_topology
-            .validate_snapshot(&parts.topology)
-            .map_err(pre_ready_topology_validation_error)?;
-        self.registry
-            .set_scheduled_backend_ownership(query_id, &scheduled_backend_ownership)?;
-        // Split sources and the lifecycle barrier share this one stable,
-        // attempt-local feedback object.  It is populated from the sealed
-        // deployment below, before either control readers or the pump starts.
-        let feedback_state = Arc::new(
-            RuntimeFilterFeedbackState::new(execution_id, Default::default())
-                .expect("empty runtime filter feedback declaration is valid"),
-        );
-        let connector_context = crate::connector::query_connector_request_context_on_runtime(
-            self.data_runtime.handle(),
-            statement_deadline,
-            parts.cancellation.clone(),
-        )
-        .map_err(failed)?;
-        let connector_context =
-            credential_lease_source.connector_request_context(connector_context);
-        let initializing = AttemptInitializing::new(
-            execution_id,
-            parts.artifacts,
-            schedule,
-            self.task_update_retry_policy,
-            Arc::clone(&feedback_state),
-            self.connector_split_initial_dynamic_filter_wait_cap,
-            connector_context,
-            parts.cancellation.clone(),
-            self.data_runtime.clone(),
-            credential_lease_source,
-        )?;
-        // The synchronous statement worker is the remaining T12 bridge. The
-        // async initializer performs no Connector I/O on that worker and adds
-        // no semaphore-waiter helper task, but this bridge still waits on the
-        // actor and therefore does not complete the per-query thread cut.
-        let ready = self
-            .data_runtime
-            .block_on(initializing.initialize())
-            .map_err(failed)??;
-        let (
-            ready_execution_id,
-            artifacts,
-            schedule,
-            ready_feedback_state,
-            split_assignment_plan,
-            credential_leases,
-        ) = ready.into_parts();
-        if ready_execution_id != execution_id
-            || !Arc::ptr_eq(&ready_feedback_state, &feedback_state)
-        {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "attempt initializer returned readiness for another attempt",
-            ));
-        }
-        self.backend_topology
-            .validate_snapshot(&parts.topology)
-            .map_err(pre_ready_topology_validation_error)?;
-        let scheduled = crate::runtime_filter::plan_encoder::bind_runtime_filters(artifacts)?
-            .bind_schedule(schedule)?;
-        let deployment = compile_scheduled_runtime_filter_deployment(
-            scheduled.runtime_filter_scheduled_view()?,
-            FrontendRuntimeFilterDeploymentCompilerConfig::from_query_lifecycle(
-                parts.options.runtime_filter_lifecycle(),
-                self.runtime_filter_worker_count.get(),
-            )?,
-        )?;
-        let feedback_declaration = deployment.feedback_declaration().clone();
-        feedback_state
-            .configure(feedback_declaration.clone())
-            .map_err(|error| {
-                DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
-            })?;
-        let runtime_filter_attachment =
-            scheduled.seal_runtime_filter_deployment(deployment.contributions())?;
-        let runtime_filter_ready =
-            scheduled.attach_runtime_filter_deployment(runtime_filter_attachment)?;
-        let timeout_ms = parts
-            .statistics_program
-            .as_ref()
-            .map(|program| {
-                program
-                    .policy()
-                    .attempt_timeout()
-                    .as_millis()
-                    .max(1)
-                    .min(i64::MAX as u128) as i64
-            })
-            .unwrap_or_else(|| parts.options.timeout_ms().max(0));
-        let statistics_decoder = parts
-            .statistics_program
-            .as_ref()
-            .map(|program| program.result_decoder());
-        let remaining_budget = statement_deadline.saturating_duration_since(Instant::now());
-        if remaining_budget.is_zero() {
-            return Err(failed(
-                "query deadline elapsed before native lifecycle initialization",
-            ));
-        }
-        let init_options = QueryInitOptions::new(
-            execution_id,
-            self.native_compatibility_id,
-            backend_services.live_backends.clone(),
-            &parts.options,
-            ProtocolQueryOptions::from_proto(encode_query_options(parts.options.runtime_options())),
-        )?
-        .with_credential_leases(credential_leases);
-        // A write session's catalog is a materialization input like any typed
-        // scan's. Nothing else contributes it: a writer node names its catalog
-        // by handle, and the backend leases a catalog from its properties, so a
-        // query whose only use of a catalog is writing to it would reach a
-        // backend that never materialized it and could not resolve a write
-        // runtime for the handle its own plan carries.
-        let init_options = match write_stack_session.as_ref() {
-            Some(session) => {
-                let backend_catalog = session
-                    .catalog_properties()
-                    .backend_execution_projection()
-                    .map_err(|error| {
-                        failed(format!(
-                            "project write catalog for backend execution: {error}"
-                        ))
-                    })?;
-                let catalog_set =
-                    novarocks_proto_codec::catalog::CatalogSet::new([backend_catalog]).map_err(
-                        |error| failed(format!("write session catalog set is invalid: {error}")),
-                    )?;
-                init_options.with_catalog_set(catalog_set)
+        let outcome = (|| {
+            let parts = request.into_parts();
+            let write_stack_session = parts.write_stack_session.clone();
+            let intent = parts.completion.intent();
+            let write_decoder = parts
+                .write_root_decode_contract
+                .clone()
+                .map(crate::query_execution::write_result::RootWriteResultDecoder::new);
+            // Statistics collection enters only with its Core-owned typed program.
+            // It never falls through to client-result construction.
+            if intent == DistributedQueryIntent::Statistics && parts.statistics_program.is_none() {
+                return Err(DistributedQueryError::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    "statistics execution requires a typed StatisticsCollectionProgram",
+                ));
             }
-            None => init_options,
-        };
-        let handoff = RoundHandoff {
-            query_id,
-            execution_id,
-            statement_deadline,
-            timeout_ms,
-            intent,
-            cancellation: parts.cancellation,
-            completion: parts.completion,
-            topology: parts.topology,
-            statistics_decoder,
-            write_decoder,
-            write_stack_session,
-            backend_services,
-            retry_boundary,
-            runtime_filter_ready,
-            init_options,
-            feedback_declaration,
-            feedback_state,
-            split_assignment_plan,
-            scheduled_backend_ownership,
-        };
-        self.execute_round_on_task_protocol(handoff)
+            if (intent == DistributedQueryIntent::Write)
+                != (write_stack_session.is_some() && write_decoder.is_some())
+            {
+                return Err(DistributedQueryError::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    "distributed write intent, session, and Root decode contract must be present together",
+                ));
+            }
+            self.backend_topology
+                .validate_snapshot(&parts.topology)
+                .map_err(pre_ready_topology_validation_error)?;
+            #[cfg(test)]
+            let backend_services = match &self.backend_services {
+                Some(services) => services.resolve(parts.topology.targets())?,
+                None => production_backend_services(parts.topology.targets())?,
+            };
+            #[cfg(not(test))]
+            let backend_services = production_backend_services(parts.topology.targets())?;
+            let _query = self.registry.register(query_id, intent)?;
+            let schedule = crate::preparation_diagnostics::observe_result(
+                "attempt_instantiation",
+                "schedule_attempt",
+                "not-applicable",
+                Some(execution_id),
+                || {
+                    backend_services
+                        .scheduler
+                        .schedule(&parts.artifacts.scheduling_facts(), execution_id)
+                },
+            )?;
+            let scheduled_backend_ownership = backend_services
+                .scheduler
+                .scheduled_backend_ownership(&schedule.backend_ids())?;
+            self.backend_topology
+                .validate_snapshot(&parts.topology)
+                .map_err(pre_ready_topology_validation_error)?;
+            self.registry
+                .set_scheduled_backend_ownership(query_id, &scheduled_backend_ownership)?;
+            // Split sources and the lifecycle barrier share this one stable,
+            // attempt-local feedback object.  It is populated from the sealed
+            // deployment below, before either control readers or the pump starts.
+            let feedback_state = Arc::new(
+                RuntimeFilterFeedbackState::new(execution_id, Default::default())
+                    .expect("empty runtime filter feedback declaration is valid"),
+            );
+            let connector_context = crate::connector::query_connector_request_context_on_runtime(
+                self.data_runtime.handle(),
+                statement_deadline,
+                parts.cancellation.clone(),
+            )
+            .map_err(failed)?;
+            let connector_context =
+                credential_lease_source.connector_request_context(connector_context);
+            let initializing = AttemptInitializing::new(
+                execution_id,
+                parts.artifacts,
+                schedule,
+                self.task_update_retry_policy,
+                Arc::clone(&feedback_state),
+                self.connector_split_initial_dynamic_filter_wait_cap,
+                connector_context,
+                parts.cancellation.clone(),
+                self.data_runtime.clone(),
+                credential_lease_source,
+            )?;
+            // The synchronous statement worker is the remaining T12 bridge. The
+            // async initializer performs no Connector I/O on that worker and adds
+            // no semaphore-waiter helper task, but this bridge still waits on the
+            // actor and therefore does not complete the per-query thread cut.
+            let ready = self
+                .data_runtime
+                .block_on(initializing.initialize())
+                .map_err(failed)??;
+            let (
+                ready_execution_id,
+                artifacts,
+                schedule,
+                ready_feedback_state,
+                split_assignment_plan,
+                credential_leases,
+            ) = ready.into_parts();
+            if ready_execution_id != execution_id
+                || !Arc::ptr_eq(&ready_feedback_state, &feedback_state)
+            {
+                return Err(DistributedQueryError::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    "attempt initializer returned readiness for another attempt",
+                ));
+            }
+            self.backend_topology
+                .validate_snapshot(&parts.topology)
+                .map_err(pre_ready_topology_validation_error)?;
+            let scheduled = crate::runtime_filter::plan_encoder::bind_runtime_filters(artifacts)?
+                .bind_schedule(schedule)?;
+            let deployment = compile_scheduled_runtime_filter_deployment(
+                scheduled.runtime_filter_scheduled_view()?,
+                FrontendRuntimeFilterDeploymentCompilerConfig::from_query_lifecycle(
+                    parts.options.runtime_filter_lifecycle(),
+                    self.runtime_filter_worker_count.get(),
+                )?,
+            )?;
+            let feedback_declaration = deployment.feedback_declaration().clone();
+            feedback_state
+                .configure(feedback_declaration.clone())
+                .map_err(|error| {
+                    DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
+                })?;
+            let runtime_filter_attachment =
+                scheduled.seal_runtime_filter_deployment(deployment.contributions())?;
+            let runtime_filter_ready =
+                scheduled.attach_runtime_filter_deployment(runtime_filter_attachment)?;
+            let timeout_ms = parts
+                .statistics_program
+                .as_ref()
+                .map(|program| {
+                    program
+                        .policy()
+                        .attempt_timeout()
+                        .as_millis()
+                        .max(1)
+                        .min(i64::MAX as u128) as i64
+                })
+                .unwrap_or_else(|| parts.options.timeout_ms().max(0));
+            let statistics_decoder = parts
+                .statistics_program
+                .as_ref()
+                .map(|program| program.result_decoder());
+            let remaining_budget = statement_deadline.saturating_duration_since(Instant::now());
+            if remaining_budget.is_zero() {
+                return Err(failed(
+                    "query deadline elapsed before native lifecycle initialization",
+                ));
+            }
+            let init_options = QueryInitOptions::new(
+                execution_id,
+                self.native_compatibility_id,
+                backend_services.live_backends.clone(),
+                &parts.options,
+                ProtocolQueryOptions::from_proto(encode_query_options(
+                    parts.options.runtime_options(),
+                )),
+            )?
+            .with_credential_leases(credential_leases);
+            // A write session's catalog is a materialization input like any typed
+            // scan's. Nothing else contributes it: a writer node names its catalog
+            // by handle, and the backend leases a catalog from its properties, so a
+            // query whose only use of a catalog is writing to it would reach a
+            // backend that never materialized it and could not resolve a write
+            // runtime for the handle its own plan carries.
+            let init_options = match write_stack_session.as_ref() {
+                Some(session) => {
+                    let backend_catalog = session
+                        .catalog_properties()
+                        .backend_execution_projection()
+                        .map_err(|error| {
+                            failed(format!(
+                                "project write catalog for backend execution: {error}"
+                            ))
+                        })?;
+                    let catalog_set =
+                        novarocks_proto_codec::catalog::CatalogSet::new([backend_catalog])
+                            .map_err(|error| {
+                                failed(format!("write session catalog set is invalid: {error}"))
+                            })?;
+                    init_options.with_catalog_set(catalog_set)
+                }
+                None => init_options,
+            };
+            let handoff = RoundHandoff {
+                query_id,
+                execution_id,
+                statement_deadline,
+                timeout_ms,
+                intent,
+                cancellation: parts.cancellation,
+                completion: parts.completion,
+                topology: parts.topology,
+                statistics_decoder,
+                write_decoder,
+                write_stack_session,
+                backend_services,
+                retry_boundary,
+                runtime_filter_ready,
+                init_options,
+                feedback_declaration,
+                feedback_state,
+                split_assignment_plan,
+                scheduled_backend_ownership,
+            };
+            self.execute_round_on_task_protocol(handoff)
+        })();
+        outcome.map_err(|error| error.with_attempt_verification(execution_id, None))
     }
 
     /// The production execution path: one attempt's tasks on the task protocol.
@@ -1642,7 +1651,24 @@ impl FrontendDistributedQueryCoordinator {
         // renews for itself does so only when a request needs material, so an
         // attempt with no reader left starts nothing (CAD-1 D3).
         feedback_state.close();
-        outcome?;
+        if let Err(error) = outcome {
+            let error = if error.task_failure().is_some() {
+                error
+            } else {
+                error.with_task_failure(match round.failure_cause() {
+                    Some(TerminationDetail::Failed(failure)) => Some(failure.clone()),
+                    _ => None,
+                })
+            };
+            root_result_polls.take();
+            let receipt = converge_failed_verification(
+                &mut round,
+                &split_delivery,
+                &wake,
+                self.transport_budget.frontend_queue_residence(),
+            );
+            return Err(error.with_attempt_verification(execution_id, Some(receipt)));
+        }
 
         // A write cannot stop its Worker producers until the Root stream has
         // yielded a complete, committable prepared set. Freeze that evidence
@@ -1712,7 +1738,18 @@ impl FrontendDistributedQueryCoordinator {
                         &mut round,
                         "distributed write prepared set was not committable",
                     );
-                    return Err(self.fail_and_cancel(query_id, error.to_string()));
+                    let _ = self.registry.latch_failure(
+                        query_id,
+                        QueryFailureCause::FrontendExecution,
+                        error.message().to_owned(),
+                    );
+                    let receipt = converge_failed_verification(
+                        &mut round,
+                        &split_delivery,
+                        &wake,
+                        self.transport_budget.frontend_queue_residence(),
+                    );
+                    return Err(error.with_attempt_verification(execution_id, Some(receipt)));
                 }
             }
         } else {
@@ -1766,6 +1803,7 @@ impl FrontendDistributedQueryCoordinator {
         let runtime_filter_contributions =
             round.execution().released_runtime_filter_contributions();
         self.publish_task_round_convergence(execution_id, &runtime_filter_contributions);
+        let verification_receipt = Arc::new(round.execution().released_verification_facts());
 
         // The split worker blocks on acknowledgements the drain above settles,
         // so joining it is safe only now that it has stopped. A worker still
@@ -1796,10 +1834,15 @@ impl FrontendDistributedQueryCoordinator {
                         profile
                     }
                     Err(error) => {
-                        return Err(self.fail_and_cancel(
-                            query_id,
-                            format!("split assignment did not finish: {error}"),
-                        ));
+                        return Err(self
+                            .fail_and_cancel(
+                                query_id,
+                                format!("split assignment did not finish: {error}"),
+                            )
+                            .with_attempt_verification(
+                                execution_id,
+                                Some(Arc::clone(&verification_receipt)),
+                            ));
                     }
                 }
             }
@@ -1822,6 +1865,14 @@ impl FrontendDistributedQueryCoordinator {
                 completion.result(expected_output.into_query_result(batches)?)
             }
             DistributedQueryIntent::Write => {
+                // Every Task has already reached its own terminal state and
+                // released its exact facts. A local deficit must not abort
+                // peers before their verification frontiers can close.
+                if let Some(error) =
+                    completed_verification_deficit_error(execution_id, &verification_receipt)
+                {
+                    return Err(error);
+                }
                 let session = write_stack_session.ok_or_else(|| {
                     DistributedQueryError::new(
                         DistributedQueryErrorKind::ContractViolation,
@@ -1906,9 +1957,13 @@ impl FrontendDistributedQueryCoordinator {
                 QueryFailureCause::FrontendExecution,
                 error.message().to_string(),
             );
-            return Err(DistributedQueryError::new(error.kind(), error.message()));
+            return Err(error
+                .clone()
+                .with_attempt_verification(execution_id, Some(verification_receipt)));
         }
-        outcome
+        outcome.and_then(|outcome| {
+            outcome.with_attempt_verification(execution_id, verification_receipt)
+        })
     }
 
     /// Publishes this task-protocol attempt's immutable convergence evidence.
@@ -1982,6 +2037,10 @@ impl FrontendDistributedQueryCoordinator {
         cause: QueryFailureCause,
         message: impl Into<String>,
     ) -> DistributedQueryError {
+        let task_failure = match round.failure_cause() {
+            Some(TerminationDetail::Failed(failure)) => Some(failure.clone()),
+            _ => None,
+        };
         let message = message.into();
         split_delivery.abandon(message.clone());
         // Released to the transport before any judgement below, and released
@@ -1998,6 +2057,7 @@ impl FrontendDistributedQueryCoordinator {
             Some(classified) => classified,
             None => self.fail_and_cancel_with_cause(query_id, cause, message),
         }
+        .with_task_failure(task_failure)
     }
 
     /// Stands down a task round for a failure the registry already selected.
@@ -2015,7 +2075,12 @@ impl FrontendDistributedQueryCoordinator {
     ) -> DistributedQueryError {
         split_delivery.abandon(message.clone());
         abort_task_round(round, &message);
-        failed(self.registry.first_failure(query_id).unwrap_or(message))
+        failed(self.registry.first_failure(query_id).unwrap_or(message)).with_task_failure(
+            match round.failure_cause() {
+                Some(TerminationDetail::Failed(failure)) => Some(failure.clone()),
+                _ => None,
+            },
+        )
     }
 
     fn fail_and_cancel(
@@ -2163,7 +2228,8 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
         };
         let query_id = reservation.query_id();
         let first_execution_id = reservation.execution_id();
-        let retry_deadline = statement_deadline_for_request(&first_request)?;
+        let retry_deadline = statement_deadline_for_request(&first_request)
+            .map_err(|error| error.with_attempt_verification(first_execution_id, None))?;
         self.execute_round(
             query_id,
             first_execution_id,
@@ -2203,13 +2269,19 @@ fn fail_closed_one_shot_topology_retry(
         // exact target/base/publication binding and rebuild the complete write
         // layout under a positive zero-effect permit, it must not reuse this
         // request or silently enter the read-query replan controller.
-        return DistributedQueryError::topology_retry_unsupported(
+        let converted = DistributedQueryError::topology_retry_unsupported(
             outcome,
             format!(
                 "distributed write cannot retry pre-ready topology change without a whole-round semantic binding and effect-free permit: {}",
                 error.message()
             ),
-        );
+        ).with_task_failure(error.task_failure().cloned());
+        return match error.execution_id() {
+            Some(execution_id) => {
+                converted.with_attempt_verification(execution_id, error.verification_receipt_arc())
+            }
+            None => converted,
+        };
     }
     error
 }
@@ -2393,6 +2465,37 @@ fn failed(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
 }
 
+fn completed_verification_deficit_error(
+    execution_id: QueryExecutionId,
+    receipt: &Arc<ReleasedVerificationFacts>,
+) -> Option<DistributedQueryError> {
+    if receipt.execution_id() != execution_id {
+        return Some(
+            DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "verification receipt does not belong to the exact write execution attempt",
+            )
+            .with_attempt_verification(execution_id, None),
+        );
+    }
+    let deficit = receipt.completed_deficit_evidence()?;
+    // TaskFailure is the shared typed error vocabulary, not an assertion that
+    // a Task failed. This conclusion belongs to the fully drained statement.
+    Some(
+        failed("complete exact quota verification found insufficient target occurrences")
+            .with_task_failure(Some(
+                novarocks_execution_contract::TaskFailure::mv_apply_consistency(
+                    deficit.requested,
+                    deficit.matched,
+                    novarocks_execution_contract::SafeDetail::truncating(
+                        "complete exact quota verification deficit",
+                    ),
+                ),
+            ))
+            .with_attempt_verification(execution_id, Some(Arc::clone(receipt))),
+    )
+}
+
 fn execution_id_for_round(
     query_id: QueryId,
     attempt: u32,
@@ -2541,9 +2644,9 @@ mod tests {
     use super::{
         FrontendBackendSnapshot, FrontendDistributedQueryCoordinator, FrontendFragmentScheduler,
         QueryIdSource, ResultByteLimit, ResultPacketSequence, StatisticsTaskCompletionFact,
-        TEST_RESULT_FETCH_BYTE_LIMIT, UniqueQueryIdSource, distributed_write_phase_marker,
-        fail_closed_one_shot_topology_retry, pre_ready_topology_validation_error,
-        statistics_all_success_failure_message,
+        TEST_RESULT_FETCH_BYTE_LIMIT, UniqueQueryIdSource, completed_verification_deficit_error,
+        distributed_write_phase_marker, fail_closed_one_shot_topology_retry,
+        pre_ready_topology_validation_error, statistics_all_success_failure_message,
     };
     use crate::connector::{
         FixtureConnectorRegistry, FixtureControlResolver, test_request_context,
@@ -2579,6 +2682,127 @@ mod tests {
     use novarocks_types::{AttemptId, QueryExecutionId};
     use novarocks_types::{BackendProcessId, ClusterRole, QueryId, QueryProcessNamespace};
     use novarocks_version::native_build_identity;
+
+    fn quota_release_receipt(
+        states: [novarocks_execution_contract::VerificationState; 3],
+        complete: bool,
+    ) -> Arc<crate::task_execution::execution::ReleasedVerificationFacts> {
+        use novarocks_execution_contract::{
+            ContextVerificationFacts, QueryContextRef, TaskVerificationFacts,
+            TaskVerificationObservation, VerificationInstance, VerificationRecord,
+        };
+        let execution =
+            QueryExecutionId::new(QueryId::new(7, 11), AttemptId::new(2).unwrap()).unwrap();
+        let frontend = novarocks_types::FrontendProcessId::new_v7();
+        let mut contexts = std::collections::BTreeMap::new();
+        let mut expected = Vec::new();
+        for (index, state) in states.into_iter().enumerate() {
+            let backend = BackendProcessId::new_v7();
+            let context = QueryContextRef::new(execution, frontend, backend);
+            let identity = TaskIdentity::new(
+                execution,
+                StageId::new(1).unwrap(),
+                TaskId::new(index as u32 + 1).unwrap(),
+                backend,
+            );
+            let instance = VerificationInstance {
+                plan_node_id: 17,
+                local_instance_id: 0,
+            };
+            expected.push((identity, instance));
+            contexts.insert(
+                context,
+                ContextVerificationFacts {
+                    context,
+                    truncated: false,
+                    tasks: vec![TaskVerificationFacts {
+                        identity,
+                        observation: TaskVerificationObservation::Available(vec![
+                            VerificationRecord { instance, state },
+                        ]),
+                    }],
+                },
+            );
+        }
+        Arc::new(
+            crate::task_execution::execution::ReleasedVerificationFacts::for_test(
+                execution, contexts, expected, complete,
+            ),
+        )
+    }
+
+    #[test]
+    fn completed_verification_deficit_is_an_owned_typed_statement_error() {
+        use novarocks_execution_contract::VerificationState;
+        let receipt = quota_release_receipt(
+            [
+                VerificationState::Completed {
+                    requested: 2,
+                    matched: 1,
+                },
+                VerificationState::Completed {
+                    requested: 2,
+                    matched: 2,
+                },
+                VerificationState::Completed {
+                    requested: 0,
+                    matched: 0,
+                },
+            ],
+            true,
+        );
+        let execution = receipt.execution_id();
+        let error = completed_verification_deficit_error(execution, &receipt).unwrap();
+        assert_eq!(error.kind(), DistributedQueryErrorKind::Failed);
+        assert_eq!(error.execution_id(), Some(execution));
+        assert!(Arc::ptr_eq(
+            &receipt,
+            &error.verification_receipt_arc().unwrap()
+        ));
+        assert!(matches!(
+            error.task_failure().unwrap().category(),
+            TaskFailureCategory::MvApplyConsistency {
+                requested: 4,
+                matched: 3,
+                ..
+            }
+        ));
+        assert_eq!(error.verification_receipt(), Some(receipt.as_ref()));
+        // Retained facts remain the BE's exact completed observations. The
+        // coordinator adds only a statement error, never a Task terminal.
+        assert!(receipt.completed_deficit_evidence().is_some());
+    }
+
+    #[test]
+    fn completed_verification_deficit_requires_all_exact_domains_to_complete() {
+        use novarocks_execution_contract::VerificationState;
+        let deficit = VerificationState::Completed {
+            requested: 2,
+            matched: 1,
+        };
+        let equal = VerificationState::Completed {
+            requested: 2,
+            matched: 2,
+        };
+        for (states, complete) in [
+            ([equal; 3], true),
+            ([deficit, equal, VerificationState::Started], true),
+            ([deficit, equal, VerificationState::NotStarted], true),
+            ([deficit, equal, equal], false),
+        ] {
+            let receipt = quota_release_receipt(states, complete);
+            assert!(
+                completed_verification_deficit_error(receipt.execution_id(), &receipt).is_none()
+            );
+        }
+        let receipt = quota_release_receipt([deficit, equal, equal], true);
+        let other = QueryExecutionId::new(QueryId::new(7, 11), AttemptId::new(3).unwrap()).unwrap();
+        let error = completed_verification_deficit_error(other, &receipt).unwrap();
+        assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
+        assert_eq!(error.execution_id(), Some(other));
+        assert!(error.verification_receipt().is_none());
+        assert!(error.task_failure().is_none());
+    }
 
     #[test]
     fn write_phase_marker_identifies_attempt_phase_and_bounded_root_counts() {
@@ -4252,6 +4476,38 @@ fn drain_task_round(
         final_task_info.observe(round);
         wake.wait(TASK_ROUND_IDLE_WAIT);
     }
+}
+
+/// Abort owns cleanup; a separate exact Release request owns verification.
+/// Cleanup receives the transport's bounded residence budget even when the
+/// statement already timed out. Neither a terminal status nor an Abort ACK
+/// can substitute for the missing release facts.
+fn converge_failed_verification(
+    round: &mut TaskRound,
+    split_delivery: &SplitDeliveryBridge,
+    wake: &CondvarWake,
+    budget: Duration,
+) -> Arc<crate::task_execution::execution::ReleasedVerificationFacts> {
+    split_delivery.abandon("failed attempt is converging its verification receipts");
+    round.begin_terminal_cleanup();
+    round.execution_mut().request_verification_release();
+    let now = Instant::now();
+    let deadline = now.checked_add(budget).unwrap_or(now);
+    loop {
+        abort_task_round(round, "failed attempt verification release");
+        if !round.execution().verification_release_pending() || Instant::now() >= deadline {
+            break;
+        }
+        if let Err(error) = round.turn() {
+            tracing::warn!(error = %error,
+                "failed attempt could not collect every verification release receipt");
+            break;
+        }
+        if round.execution().verification_release_pending() {
+            wake.wait(TASK_ROUND_IDLE_WAIT.min(deadline.saturating_duration_since(Instant::now())));
+        }
+    }
+    Arc::new(round.execution().released_verification_facts())
 }
 
 /// Stands every query context of a failed attempt down.

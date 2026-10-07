@@ -34,6 +34,7 @@ use crate::runtime_filter_membership::{MembershipContractDecodeError, decode_mem
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProducerBindingTarget {
     JoinBuildKey { ordinal: usize },
+    QuotaContentField { ordinal: usize, witness: u32 },
     AggregateTopNKey { ordinal: usize, limit: NonZeroU32 },
 }
 
@@ -72,8 +73,15 @@ pub enum DecodedBindingRole {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DecodedConsumerBindingTarget {
-    DirectInput { input_ordinal: usize },
+    DirectInput {
+        input_ordinal: usize,
+    },
     SourceBoundary,
+    QuotaContentScanField {
+        producer_witness: u32,
+        ordinal: usize,
+        preclaim_node: i32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,6 +174,180 @@ impl NativeRuntimeFilterDecodeLedger {
             records,
             consumed: BTreeMap::new(),
         })
+    }
+
+    /// Replay exact quota attachment facts against the complete local wire tree.
+    pub fn validate_quota_attachments(
+        &self,
+        root: &plan::DistributedNode,
+    ) -> Result<(), NativeFragmentDecodeError> {
+        let path = FieldPath::root("plan_fragment").field("runtime_filter_bindings");
+        if !self.records.values().any(|record| {
+            matches!(
+                record.role,
+                DecodedBindingRole::Producer {
+                    target: ProducerBindingTarget::QuotaContentField { .. },
+                    ..
+                } | DecodedBindingRole::Consumer {
+                    target: DecodedConsumerBindingTarget::QuotaContentScanField { .. },
+                    ..
+                }
+            )
+        }) {
+            return Ok(());
+        }
+        let mut witnesses = BTreeSet::new();
+        for record in self.records.values() {
+            if let DecodedBindingRole::Producer {
+                target: ProducerBindingTarget::QuotaContentField { witness, .. },
+                ..
+            } = record.role
+                && !witnesses.insert(witness)
+            {
+                return Err(NativeFragmentDecodeError::inconsistent(
+                    path.clone(),
+                    "quota producer witnesses must be unique in the exact fragment",
+                ));
+            }
+        }
+        let mut nodes = BTreeMap::new();
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            if nodes.insert(node.node_id, node).is_some() {
+                return Err(NativeFragmentDecodeError::inconsistent(
+                    path.clone(),
+                    "quota content witness cannot resolve duplicate native node identities",
+                ));
+            }
+            pending.extend(&node.children);
+        }
+        for record in self.records.values() {
+            if matches!(record.role, DecodedBindingRole::Consumer { .. })
+                && self.records.values().any(|producer| {
+                    producer.channel_id == record.channel_id
+                        && matches!(
+                            producer.role,
+                            DecodedBindingRole::Producer {
+                                target: ProducerBindingTarget::QuotaContentField { .. },
+                                ..
+                            }
+                        )
+                })
+                && !matches!(
+                    record.role,
+                    DecodedBindingRole::Consumer {
+                        target: DecodedConsumerBindingTarget::QuotaContentScanField { .. },
+                        ..
+                    }
+                )
+            {
+                return Err(NativeFragmentDecodeError::inconsistent(
+                    path.clone(),
+                    "quota content channel consumers require an exact quota field witness",
+                ));
+            }
+        }
+        for record in self.records.values() {
+            let DecodedBindingRole::Consumer {
+                contract,
+                target:
+                    DecodedConsumerBindingTarget::QuotaContentScanField {
+                        producer_witness,
+                        ordinal,
+                        preclaim_node,
+                    },
+            } = &record.role
+            else {
+                continue;
+            };
+            let producer=self.records.values().find(|binding|matches!(binding.role,DecodedBindingRole::Producer{target:ProducerBindingTarget::QuotaContentField{witness,..},..} if witness==*producer_witness)).ok_or_else(||NativeFragmentDecodeError::inconsistent(path.clone(),"quota content consumer has no exact local producer witness"))?;
+            let DecodedBindingRole::Producer {
+                contract: producer_contract,
+                target:
+                    ProducerBindingTarget::QuotaContentField {
+                        ordinal: producer_ordinal,
+                        ..
+                    },
+            } = &producer.role
+            else {
+                unreachable!()
+            };
+            if producer.node_id != *preclaim_node
+                || ordinal != producer_ordinal
+                || record.channel_id != producer.channel_id
+                || contract.contract() != producer_contract.contract()
+            {
+                return Err(NativeFragmentDecodeError::inconsistent(
+                    path.clone(),
+                    "quota content consumer witness, field, channel or contract differs from its exact producer",
+                ));
+            }
+            let preclaim = nodes.get(preclaim_node).ok_or_else(|| {
+                NativeFragmentDecodeError::inconsistent(
+                    path.clone(),
+                    "quota content producer Preclaim is absent from the exact fragment",
+                )
+            })?;
+            let Some(plan::distributed_node::Payload::Physical(physical)) = &preclaim.payload
+            else {
+                return Err(NativeFragmentDecodeError::inconsistent(
+                    path.clone(),
+                    "quota producer is not physical",
+                ));
+            };
+            let Some(plan::plan_node::Kind::QuotaPreclaim(quota)) = &physical.kind else {
+                return Err(NativeFragmentDecodeError::inconsistent(
+                    path.clone(),
+                    "quota producer witness is not a QuotaPreclaim",
+                ));
+            };
+            if plan::ResultContentEquivalence::try_from(quota.content_equivalence)
+                != Ok(plan::ResultContentEquivalence::NativeResultContentV1)
+                || quota.demand_value_column_ids.len() != quota.target_value_column_ids.len()
+                || quota.demand_value_column_ids.get(*ordinal).copied()
+                    != quota_expression_column(&producer.expression)
+            {
+                return Err(NativeFragmentDecodeError::inconsistent(
+                    path.clone(),
+                    "quota producer field differs from the exact content tuple contract",
+                ));
+            }
+            let target = preclaim.children.get(1).ok_or_else(|| {
+                NativeFragmentDecodeError::inconsistent(
+                    path.clone(),
+                    "quota producer has no target input",
+                )
+            })?;
+            let target_column = quota.target_value_column_ids.get(*ordinal).ok_or_else(|| {
+                NativeFragmentDecodeError::inconsistent(
+                    path.clone(),
+                    "quota content field is absent from the target tuple",
+                )
+            })?;
+            let scan = quota_scan_field(target, *target_column).ok_or_else(|| {
+                NativeFragmentDecodeError::inconsistent(
+                    path.clone(),
+                    "quota target field has no exact identity lineage to a local scan",
+                )
+            })?;
+            if scan
+                != (
+                    record.node_id,
+                    quota_expression_column(&record.expression).ok_or_else(|| {
+                        NativeFragmentDecodeError::inconsistent(
+                            path.clone(),
+                            "quota content consumer must read one exact scan field",
+                        )
+                    })?,
+                )
+            {
+                return Err(NativeFragmentDecodeError::inconsistent(
+                    path.clone(),
+                    "quota content consumer reads the wrong target scan field",
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn lookup_for_node(
@@ -811,6 +993,10 @@ fn decode_wire_role(
                     ),
                 )
             })? {
+                plan::runtime_filter_producer_role::Target::QuotaContentField(quota) => {
+                    decode_quota_content_equivalence(quota.content_equivalence,target_path.clone().field("quota_content_field").field("content_equivalence"))?;
+                    ProducerBindingTarget::QuotaContentField { ordinal: usize::try_from(quota.field_ordinal).map_err(|_|NativeFragmentDecodeError::invalid_value(target_path.clone(),"quota field ordinal exceeds this platform"))?, witness:quota.witness_id }
+                }
                 plan::runtime_filter_producer_role::Target::JoinBuildKey(join) => {
                     ProducerBindingTarget::JoinBuildKey {
                         ordinal: usize::try_from(join.ordinal).map_err(|_| {
@@ -894,6 +1080,11 @@ fn decode_wire_role(
                     ),
                 )
             })? {
+                plan::runtime_filter_consumer_role::Target::QuotaContentScanField(quota) => {
+                    decode_quota_content_equivalence(quota.content_equivalence,target_path.clone().field("quota_content_scan_field").field("content_equivalence"))?;
+                    if quota.preclaim_node_id<0 {return Err(NativeFragmentDecodeError::invalid_value(target_path.clone(),"quota content consumer requires a nonnegative Preclaim node"));}
+                    DecodedConsumerBindingTarget::QuotaContentScanField { producer_witness:quota.producer_witness_id, ordinal: usize::try_from(quota.field_ordinal).map_err(|_|NativeFragmentDecodeError::invalid_value(target_path.clone(),"quota field ordinal exceeds this platform"))?,preclaim_node:quota.preclaim_node_id }
+                }
                 plan::runtime_filter_consumer_role::Target::DirectInputOrdinal(raw) => {
                     DecodedConsumerBindingTarget::DirectInput {
                         input_ordinal: usize::try_from(*raw).map_err(|_| {
@@ -944,6 +1135,37 @@ fn validate_role_contract(
             ));
         }
     }
+    let quota = matches!(
+        role,
+        DecodedWireBindingRole::Producer {
+            target: ProducerBindingTarget::QuotaContentField { .. },
+            ..
+        } | DecodedWireBindingRole::Consumer {
+            target: DecodedConsumerBindingTarget::QuotaContentScanField { .. },
+            ..
+        }
+    );
+    if quota {
+        let execution::RuntimeFilterExecutionContract::Membership(schema) = contract else {
+            return Err("quota content filter requires membership semantics".into());
+        };
+        if schema.null_semantics() != execution::RuntimeFilterNullSemantics::NullSafeEqual
+            || !novarocks_type_contract::quota_content_runtime_filter_type_supported(
+                schema.data_type(),
+            )
+            || reduction != execution::RuntimeFilterReduction::SetUnion
+        {
+            return Err(
+                "quota content filter requires its exact conservative null-safe field contract"
+                    .into(),
+            );
+        }
+        if matches!(role,DecodedWireBindingRole::Producer{completion_requirement,..} if *completion_requirement!=execution::RuntimeFilterCompletion::ProducerClosed)
+        {
+            return Err("quota content producer must close on complete demand EOS".into());
+        }
+    }
+
     match role {
         DecodedWireBindingRole::Consumer { capabilities, .. } => {
             let expected = match contract {
@@ -2069,5 +2291,213 @@ mod tests {
         ledger.commit_consumed(1).expect("consumer consumed");
 
         ledger.finish().expect("all bindings consumed");
+    }
+    fn quota_pair() -> Vec<plan::RuntimeFilterBinding> {
+        let mut producer = membership_binding(1, 20);
+        producer.apply_point = plan::RuntimeFilterApplyPoint::NodeOutput as i32;
+        producer.expression = Some(expression(1));
+        let mut consumer = membership_binding(2, 11);
+        consumer.expression = Some(expression(4));
+        for binding in [&mut producer, &mut consumer] {
+            let Some(plan::runtime_filter_contract::Kind::Membership(schema)) =
+                &mut binding.contract.as_mut().unwrap().kind
+            else {
+                panic!("membership")
+            };
+            schema.null_semantics =
+                plan::RuntimeFilterMembershipNullSemantics::NullSafeEqual as i32;
+        }
+        producer.role = Some(producer_role_with_target(Some(
+            plan::runtime_filter_producer_role::Target::QuotaContentField(
+                plan::RuntimeFilterQuotaContentField {
+                    field_ordinal: 0,
+                    content_equivalence: plan::ResultContentEquivalence::NativeResultContentV1
+                        as i32,
+                    witness_id: 17,
+                },
+            ),
+        )));
+        let Some(plan::runtime_filter_binding::Role::Consumer(role)) = &mut consumer.role else {
+            panic!("consumer")
+        };
+        role.target = Some(
+            plan::runtime_filter_consumer_role::Target::QuotaContentScanField(
+                plan::RuntimeFilterQuotaContentScanField {
+                    producer_witness_id: 17,
+                    field_ordinal: 0,
+                    content_equivalence: plan::ResultContentEquivalence::NativeResultContentV1
+                        as i32,
+                    preclaim_node_id: 20,
+                },
+            ),
+        );
+        vec![producer, consumer]
+    }
+    fn quota_tree() -> plan::DistributedNode {
+        let column = |id| novarocks_proto_models::common::OutputColumn {
+            column_id: id,
+            r#type: Some(int64_type()),
+            ..Default::default()
+        };
+        let scan = plan::DistributedNode {
+            node_id: 11,
+            fragment_id: 7,
+            payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
+                output_columns: vec![column(4)],
+                kind: Some(plan::plan_node::Kind::Scan(plan::ScanNode::default())),
+            })),
+            ..Default::default()
+        };
+        plan::DistributedNode {
+            node_id: 20,
+            fragment_id: 7,
+            children: vec![
+                plan::DistributedNode {
+                    node_id: 10,
+                    fragment_id: 7,
+                    ..Default::default()
+                },
+                scan,
+            ],
+            payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
+                output_columns: Vec::new(),
+                kind: Some(plan::plan_node::Kind::QuotaPreclaim(
+                    plan::QuotaPreclaimNode {
+                        demand_value_column_ids: vec![1],
+                        target_value_column_ids: vec![4],
+                        content_equivalence: plan::ResultContentEquivalence::NativeResultContentV1
+                            as i32,
+                        ..Default::default()
+                    },
+                )),
+            })),
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn quota_content_witness_replays_exact_local_target_field_and_contract() {
+        let ledger =
+            NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, quota_pair()))).unwrap();
+        ledger.validate_quota_attachments(&quota_tree()).unwrap();
+        let mut tree = quota_tree();
+        let Some(plan::distributed_node::Payload::Physical(physical)) =
+            &mut tree.children[1].payload
+        else {
+            panic!("scan")
+        };
+        physical.output_columns[0].column_id = 5;
+        assert!(ledger.validate_quota_attachments(&tree).is_err());
+        let mut bindings = quota_pair();
+        bindings[1].channel_id = 10;
+        let ledger = NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, bindings))).unwrap();
+        assert!(ledger.validate_quota_attachments(&quota_tree()).is_err());
+        let mut bindings = quota_pair();
+        bindings[1].expression = Some(expression(5));
+        let ledger = NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, bindings))).unwrap();
+        assert!(ledger.validate_quota_attachments(&quota_tree()).is_err());
+    }
+    #[test]
+    fn quota_content_witness_rejects_wrong_content_and_null_contract() {
+        let mut bindings = quota_pair();
+        let Some(plan::runtime_filter_binding::Role::Producer(role)) = &mut bindings[0].role else {
+            panic!("producer")
+        };
+        let Some(plan::runtime_filter_producer_role::Target::QuotaContentField(quota)) =
+            &mut role.target
+        else {
+            panic!("quota")
+        };
+        quota.content_equivalence = 0;
+        assert!(NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, bindings))).is_err());
+        let mut bindings = quota_pair();
+        let Some(plan::runtime_filter_contract::Kind::Membership(schema)) =
+            &mut bindings[0].contract.as_mut().unwrap().kind
+        else {
+            panic!("membership")
+        };
+        schema.null_semantics = plan::RuntimeFilterMembershipNullSemantics::NeverMatches as i32;
+        assert!(NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, bindings))).is_err());
+        let mut bindings = quota_pair();
+        let Some(plan::runtime_filter_binding::Role::Consumer(role)) = &mut bindings[1].role else {
+            panic!("consumer")
+        };
+        let Some(plan::runtime_filter_consumer_role::Target::QuotaContentScanField(quota)) =
+            &mut role.target
+        else {
+            panic!("quota")
+        };
+        quota.producer_witness_id = 18;
+        let ledger = NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, bindings))).unwrap();
+        assert!(ledger.validate_quota_attachments(&quota_tree()).is_err());
+    }
+    #[test]
+    fn quota_content_allows_unfiltered_start_until_the_complete_snapshot() {
+        let mut bindings = quota_pair();
+        let Some(plan::runtime_filter_binding::Role::Consumer(role)) = &mut bindings[1].role else {
+            panic!("consumer")
+        };
+        role.activation = Some(plan::RuntimeFilterConsumerActivation {
+            kind: Some(
+                plan::runtime_filter_consumer_activation::Kind::NonBlockingLive(
+                    plan::RuntimeFilterLateApplyGranularity::Batch as i32,
+                ),
+            ),
+        });
+        let ledger = NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, bindings))).unwrap();
+        ledger.validate_quota_attachments(&quota_tree()).unwrap();
+    }
+}
+
+fn decode_quota_content_equivalence(
+    raw: i32,
+    path: FieldPath,
+) -> Result<(), NativeFragmentDecodeError> {
+    if plan::ResultContentEquivalence::try_from(raw)
+        != Ok(plan::ResultContentEquivalence::NativeResultContentV1)
+    {
+        return Err(NativeFragmentDecodeError::invalid_value(
+            path,
+            "quota content filter requires NativeResultContentV1",
+        ));
+    }
+    Ok(())
+}
+
+fn quota_expression_column(expression: &expr::Expr) -> Option<u32> {
+    match expression.kind.as_ref()? {
+        expr::expr::Kind::ColumnRef(column) => Some(column.column_id),
+        _ => None,
+    }
+}
+fn quota_scan_field(mut node: &plan::DistributedNode, mut column: u32) -> Option<(i32, u32)> {
+    loop {
+        let plan::distributed_node::Payload::Physical(physical) = node.payload.as_ref()? else {
+            return None;
+        };
+        if !physical
+            .output_columns
+            .iter()
+            .any(|value| value.column_id == column)
+        {
+            return None;
+        }
+        match physical.kind.as_ref()? {
+            plan::plan_node::Kind::Scan(_) => return Some((node.node_id, column)),
+            plan::plan_node::Kind::Project(project) => {
+                let item = project
+                    .items
+                    .iter()
+                    .find(|item| item.output_column_id == column)?;
+                column = quota_expression_column(item.expr.as_ref()?)?;
+            }
+            plan::plan_node::Kind::Filter(_)
+            | plan::plan_node::Kind::Sort(_)
+            | plan::plan_node::Kind::Limit(_) => {}
+            _ => return None,
+        }
+        if node.children.len() != 1 {
+            return None;
+        }
+        node = &node.children[0];
     }
 }

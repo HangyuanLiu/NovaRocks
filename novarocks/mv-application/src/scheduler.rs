@@ -308,6 +308,18 @@ impl MvRefreshScheduler {
         self.runtime.record(&mv_id, disposition, now_ms)
     }
 
+    pub fn clear_automatic_stop_after_manual_success(&mut self, mv_id: i64) -> bool {
+        self.runtime
+            .clear_automatic_stop_after_manual_success(&mv_id)
+    }
+
+    pub fn automatic_stop(
+        &self,
+        mv_id: i64,
+    ) -> Option<&crate::scheduler_runtime::MvAutomaticRefreshStop> {
+        self.runtime.automatic_stop(&mv_id)
+    }
+
     fn apply_semantic_decision(
         &mut self,
         projection: StoredMvProjection,

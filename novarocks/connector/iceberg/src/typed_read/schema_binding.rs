@@ -265,6 +265,14 @@ pub struct IcebergBoundColumn {
     /// The Arrow field of the base column, which a dereference walks into.
     base_target: FieldRef,
     source: IcebergColumnSource,
+    domain_binding: Option<IcebergColumnDomainBinding>,
+}
+
+#[derive(Clone, Debug)]
+struct IcebergColumnDomainBinding {
+    base_storage: Arc<NestedField>,
+    leaf_storage: Arc<NestedField>,
+    logical_base: FieldRef,
 }
 
 impl IcebergBoundColumn {
@@ -355,7 +363,11 @@ impl IcebergSchemaBinding {
             retained += size_of::<IcebergBoundColumn>()
                 + column.handle.base_type_json().len()
                 + column.handle.type_json().len()
-                + size_of_val(column.handle.field_id_path());
+                + size_of_val(column.handle.field_id_path())
+                + column.handle.retained_field_domains_bytes();
+            if let Some(binding) = &column.domain_binding {
+                retained += size_of::<IcebergColumnDomainBinding>() + binding.logical_base.size();
+            }
         }
         retained as u64
     }
@@ -401,19 +413,33 @@ impl IcebergSchemaBinding {
                     })?;
                     let base =
                         adapt_array(batch.column(index), bound.base_target.as_ref(), facts.path)?;
-                    let value =
-                        dereference_struct_path(&base, bound.base_target.as_ref(), dereference)?;
-                    match bound.handle.scalar_integer_domain() {
-                        Some(domain) => domain.array(&value)?,
-                        None => value,
-                    }
+                    let (base, base_target) = match &bound.domain_binding {
+                        Some(binding) => (
+                            crate::field_domain::restore_array(
+                                &base,
+                                binding.base_storage.as_ref(),
+                                binding.logical_base.as_ref(),
+                                bound.handle.field_domains(),
+                            )?,
+                            binding.logical_base.as_ref(),
+                        ),
+                        None => (base, bound.base_target.as_ref()),
+                    };
+                    dereference_struct_path(&base, base_target, dereference)?
                 }
                 IcebergColumnSource::IdentityPartitionConstant(value) => {
-                    partition_constant(value.as_ref(), bound.target.as_ref(), row_count)?
+                    let physical_target =
+                        dereference_target_field(&bound.base_target, bound.handle.field_id_path())?;
+                    let value =
+                        partition_constant(value.as_ref(), physical_target.as_ref(), row_count)?;
+                    restore_bound_leaf(bound, value)?
                 }
                 IcebergColumnSource::InitialDefault => {
-                    build_iceberg_default_array(bound.target.as_ref(), row_count)
-                        .map_err(|error| corrupt(format!("iceberg initial default: {error}")))?
+                    let physical_target =
+                        dereference_target_field(&bound.base_target, bound.handle.field_id_path())?;
+                    let value = build_iceberg_default_array(physical_target.as_ref(), row_count)
+                        .map_err(|error| corrupt(format!("iceberg initial default: {error}")))?;
+                    restore_bound_leaf(bound, value)?
                 }
                 IcebergColumnSource::TypedNull => {
                     arrow::array::new_null_array(bound.target.data_type(), row_count)
@@ -439,6 +465,21 @@ impl IcebergSchemaBinding {
             });
         }
         Ok(columns)
+    }
+}
+
+fn restore_bound_leaf(
+    bound: &IcebergBoundColumn,
+    value: ArrayRef,
+) -> Result<ArrayRef, ConnectorError> {
+    match &bound.domain_binding {
+        Some(binding) => crate::field_domain::restore_array(
+            &value,
+            binding.leaf_storage.as_ref(),
+            bound.target.as_ref(),
+            bound.handle.field_domains(),
+        ),
+        None => Ok(value),
     }
 }
 
@@ -490,7 +531,7 @@ pub fn bind_scan_columns(
     let mut columns = Vec::with_capacity(request.columns.len());
     let mut physical_base_field_ids = Vec::new();
     for handle in request.columns {
-        let bound = bind_one_column(
+        let mut bound = bind_one_column(
             handle,
             &read_schema,
             &physical,
@@ -498,6 +539,33 @@ pub fn bind_scan_columns(
             &identity_partitions,
             stored_row_lineage,
         )?;
+        if !handle.field_domains().is_empty() {
+            let base_storage = request
+                .table_schema
+                .field_by_id(handle.base_field_id())
+                .ok_or_else(|| {
+                    corrupt("domain column base field is absent from the frozen schema")
+                })?
+                .clone();
+            let leaf_storage = request
+                .table_schema
+                .field_by_id(handle.field_id())
+                .ok_or_else(|| {
+                    corrupt("domain column leaf field is absent from the frozen schema")
+                })?
+                .clone();
+            let logical_base = Arc::new(crate::field_domain::apply_field(
+                bound.base_target.as_ref(),
+                base_storage.as_ref(),
+                handle.field_domains(),
+            )?);
+            bound.target = dereference_target_field(&logical_base, handle.field_id_path())?;
+            bound.domain_binding = Some(IcebergColumnDomainBinding {
+                base_storage,
+                leaf_storage,
+                logical_base,
+            });
+        }
         let projected = match &bound.source {
             IcebergColumnSource::Physical { base_field_id, .. } => Some(*base_field_id),
             IcebergColumnSource::StoredRowLineage(column) => Some(column.field_id()),
@@ -739,15 +807,12 @@ fn bind_one_column(
             ))
         })?;
     let target = dereference_target_field(&base_target, handle.field_id_path())?;
-    let target = match handle.scalar_integer_domain() {
-        Some(domain) => Arc::new(target.as_ref().clone().with_data_type(domain.data_type())),
-        None => target,
-    };
 
     // 1. a physical field with the same field id in the file schema.
     if let Some(index) = physical.index_of(base_field_id) {
         let _ = index;
         return Ok(IcebergBoundColumn {
+            domain_binding: None,
             handle: handle.clone(),
             target,
             base_target,
@@ -763,6 +828,7 @@ fn bind_one_column(
         && let Some(value) = identity_partitions.get(&base_field_id)
     {
         return Ok(IcebergBoundColumn {
+            domain_binding: None,
             handle: handle.clone(),
             target,
             base_target,
@@ -775,6 +841,7 @@ fn bind_one_column(
         && mapped.index_of(base_field_id).is_some()
     {
         return Ok(IcebergBoundColumn {
+            domain_binding: None,
             handle: handle.clone(),
             target,
             base_target,
@@ -791,6 +858,7 @@ fn bind_one_column(
         .contains_key(ICEBERG_INITIAL_DEFAULT_META_KEY)
     {
         return Ok(IcebergBoundColumn {
+            domain_binding: None,
             handle: handle.clone(),
             target,
             base_target,
@@ -801,6 +869,7 @@ fn bind_one_column(
     // 5. a typed null, for a nullable field only.
     if handle.nullable() {
         return Ok(IcebergBoundColumn {
+            domain_binding: None,
             handle: handle.clone(),
             target,
             base_target,
@@ -868,6 +937,7 @@ fn bind_metadata_column(
         Some(_) | None => IcebergColumnSource::Metadata(metadata),
     };
     Ok(IcebergBoundColumn {
+        domain_binding: None,
         handle: handle.clone(),
         target: Arc::clone(&field),
         base_target: field,
@@ -1383,6 +1453,120 @@ mod tests {
     }
 
     #[test]
+    fn recursive_domain_restore_respects_parent_nulls_slices_and_json_markers() {
+        use crate::field_domain::{FieldDomain, PersistedFieldDomains};
+        use crate::iceberg::spec::StructType;
+        use arrow::array::{Int8Array, Int32Array, StringArray, StructArray};
+        use arrow::buffer::NullBuffer;
+        use novarocks_spi::connector::ConnectorErrorKind;
+        use std::collections::BTreeMap;
+        let schema = IcebergSchema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                20,
+                "payload",
+                Type::Struct(StructType::new(vec![
+                    Arc::new(NestedField::required(
+                        21,
+                        "tiny",
+                        Type::Primitive(PrimitiveType::Int),
+                    )),
+                    Arc::new(NestedField::required(
+                        22,
+                        "json",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                ])),
+            ))])
+            .build()
+            .unwrap();
+        let domains = PersistedFieldDomains::FieldDomainsV1(BTreeMap::from([
+            (21, FieldDomain::Int8),
+            (22, FieldDomain::Json),
+        ]));
+        let base = handle(&schema, 20)
+            .with_table_field_domains(&domains)
+            .unwrap();
+        let columns = [
+            base.clone(),
+            base.dereference(&[21]).unwrap(),
+            base.dereference(&[22]).unwrap(),
+        ];
+        let physical_schema = annotated_read_schema(&schema).unwrap();
+        let DataType::Struct(children) = physical_schema.field(0).data_type() else {
+            panic!("struct");
+        };
+        let array: ArrayRef = Arc::new(StructArray::new(
+            children.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1000, -128, 127])),
+                Arc::new(StringArray::from(vec!["hidden", "{ \"x\": 1 }", "null"])),
+            ],
+            Some(NullBuffer::from(vec![false, true, true])),
+        ));
+        let batch = RecordBatch::try_new(physical_schema.clone(), vec![array]).unwrap();
+        let binding =
+            bind_scan_columns(empty_binding_request(&schema, &physical_schema, &columns)).unwrap();
+        let facts = IcebergSplitFacts {
+            path: "source.parquet",
+            file_first_row_id: None,
+            data_sequence_number: None,
+        };
+        let restored = binding.materialize(&batch, None, &facts).unwrap();
+        assert_eq!(
+            restored[1]
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![None, Some(-128), Some(127)]
+        );
+        assert_eq!(
+            restored[2]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![None, Some("{ \"x\": 1 }"), Some("null")]
+        );
+        let logical = novarocks_types::logical_type::logical_value_from_engine_arrow(
+            binding.columns()[2].target(),
+        )
+        .unwrap()
+        .data_type;
+        assert_eq!(logical, novarocks_types::logical_type::LogicalType::Json);
+        let sliced = binding
+            .materialize(&batch.slice(1, 2), None, &facts)
+            .unwrap();
+        assert_eq!(
+            sliced[1]
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(-128), Some(127)]
+        );
+        let bad = RecordBatch::try_new(
+            physical_schema.clone(),
+            vec![Arc::new(StructArray::new(
+                children.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![128])),
+                    Arc::new(StringArray::from(vec!["{}"])),
+                ],
+                None,
+            ))],
+        )
+        .unwrap();
+        assert_eq!(
+            binding.materialize(&bad, None, &facts).unwrap_err().kind(),
+            ConnectorErrorKind::CorruptData
+        );
+    }
+
+    #[test]
     fn a_matching_field_id_binds_to_the_physical_field() {
         let schema = table_schema();
         let file_schema: SchemaRef = Arc::new(ArrowSchema::new(vec![
@@ -1829,6 +2013,33 @@ mod tests {
             Type::Primitive(metadata.declared_type()),
         ))
         .expect("metadata column handle")
+    }
+
+    #[test]
+    fn visible_bag_target_scan_projects_visible_fields_and_row_locators() {
+        let schema = table_schema();
+        let file_schema: SchemaRef = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(field_id_metadata(1)),
+            Field::new(ICEBERG_ROW_ID_COL, DataType::Int64, true)
+                .with_metadata(field_id_metadata(ICEBERG_RESERVED_FIELD_ID_ROW_ID)),
+        ]));
+        let columns = vec![
+            handle(&schema, 1),
+            metadata_handle(IcebergMetadataColumn::Path),
+            metadata_handle(IcebergMetadataColumn::RowPosition),
+        ];
+        let binding = bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns))
+            .expect("target visible tuple and physical locators");
+        assert_eq!(binding.physical_base_field_ids(), &[1]);
+        assert!(binding.requires_row_positions());
+        assert!(matches!(
+            binding.columns()[1].source(),
+            IcebergColumnSource::Metadata(IcebergMetadataColumn::Path)
+        ));
+        assert!(matches!(
+            binding.columns()[2].source(),
+            IcebergColumnSource::Metadata(IcebergMetadataColumn::RowPosition)
+        ));
     }
 
     /// Whether a row-lineage column is stored is a fact of one file, and each

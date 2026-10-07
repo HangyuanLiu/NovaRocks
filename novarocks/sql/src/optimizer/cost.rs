@@ -103,6 +103,10 @@ pub(crate) fn compute_cost(
         | Operator::LogicalTableFunction(_)
         | Operator::LogicalRepeat(_)
         | Operator::LogicalChangeEventExpand(_)
+        | Operator::LogicalQuotaPreclaim(_)
+        | Operator::LogicalQuotaTrim(_)
+        | Operator::LogicalFanoutAnchor(_)
+        | Operator::LogicalFanoutConsume(_)
         | Operator::LogicalCTEAnchor(_)
         | Operator::LogicalCTEProduce(_)
         | Operator::LogicalCTEConsume(_)
@@ -216,6 +220,11 @@ pub(crate) fn compute_cost(
 
         Operator::PhysicalAssertOneRow(_) => 0.01,
 
+        Operator::PhysicalQuotaPreclaim(_) | Operator::PhysicalQuotaTrim(_) => {
+            child_stats.iter().map(|stats| stats.compute_size()).sum::<f64>() * 0.1
+        }
+        Operator::PhysicalFanoutAnchor(_) => 0.0,
+        Operator::PhysicalFanoutConsume(_) => own_stats.output_row_count * 0.01,
         Operator::PhysicalCTEAnchor(_) => 0.0,
 
         // Window, Repeat, Union, Intersect, Except, Values, GenerateSeries,

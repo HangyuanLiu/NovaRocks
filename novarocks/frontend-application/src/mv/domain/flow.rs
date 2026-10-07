@@ -318,12 +318,15 @@ pub fn list_mvs_with_backend(
     mv_backend: &IcebergMvBackend,
     current_catalog: Option<&str>,
     stmt: &MvShowStatement,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+    product_service: &novarocks_mv_application::service::MvProductService,
 ) -> Result<StatementResult, String> {
     let req = ListMvsRequest {
         stmt: stmt.clone(),
         current_catalog: current_catalog.map(str::to_string),
+        connector_context: context.clone(),
     };
-    let mut rows = mv_backend.list_mvs(req)?;
+    let mut rows = mv_backend.list_mvs(req, product_service)?;
     rows.sort_by(|left, right| {
         left.database
             .cmp(&right.database)

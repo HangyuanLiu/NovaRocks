@@ -47,7 +47,7 @@ pub(crate) struct SqlMvLineageSchema {
 pub(crate) struct SqlMvLineageField {
     pub(crate) field_id: i32,
     pub(crate) name_at_create: String,
-    pub(crate) type_signature: String,
+    pub(crate) logical_type: novarocks_types::logical_type::LogicalType,
     pub(crate) required: bool,
 }
 
@@ -151,7 +151,7 @@ pub(crate) fn build_projection_filter_lineage(
                 .or_insert_with(|| SqlMvLineageField {
                     field_id: field.field_id,
                     name_at_create: field.name_at_create.clone(),
-                    type_signature: field.type_signature.clone(),
+                    logical_type: field.logical_type.clone(),
                     required: field.required,
                 });
         }
@@ -181,7 +181,7 @@ pub(crate) fn build_projection_filter_lineage(
                 .or_insert_with(|| SqlMvLineageField {
                     field_id: field.field_id,
                     name_at_create: field.name_at_create.clone(),
-                    type_signature: field.type_signature.clone(),
+                    logical_type: field.logical_type.clone(),
                     required: field.required,
                 });
         }
@@ -354,7 +354,7 @@ impl<'a> QualifiedLineageCollector<'a> {
             .or_insert_with(|| SqlMvLineageField {
                 field_id: field.field_id,
                 name_at_create: field.name_at_create.clone(),
-                type_signature: field.type_signature.clone(),
+                logical_type: field.logical_type.clone(),
                 required: field.required,
             });
         Ok(SqlMvQualifiedFieldLineage {
@@ -751,18 +751,19 @@ mod tests {
     use crate::planner::table::{
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
     };
+    use novarocks_types::logical_type::LogicalType;
     use novarocks_types::schema::ColumnDef;
     use std::num::{NonZeroU32, NonZeroU64};
 
-    fn sql_schema(fields: &[(i32, &str, &str, bool)]) -> SqlMvLineageSchema {
+    fn sql_schema(fields: &[(i32, &str, LogicalType, bool)]) -> SqlMvLineageSchema {
         SqlMvLineageSchema {
             fields: fields
                 .iter()
                 .map(
-                    |(field_id, name_at_create, type_signature, required)| SqlMvLineageField {
+                    |(field_id, name_at_create, logical_type, required)| SqlMvLineageField {
                         field_id: *field_id,
                         name_at_create: (*name_at_create).to_string(),
-                        type_signature: (*type_signature).to_string(),
+                        logical_type: logical_type.clone(),
                         required: *required,
                     },
                 )
@@ -772,9 +773,9 @@ mod tests {
 
     fn base_schema() -> SqlMvLineageSchema {
         sql_schema(&[
-            (1, "id", "long", true),
-            (2, "region", "string", true),
-            (3, "amount", "double", false),
+            (1, "id", LogicalType::Int64, true),
+            (2, "region", LogicalType::Utf8, true),
+            (3, "amount", LogicalType::Float64, false),
         ])
     }
 
@@ -880,13 +881,13 @@ mod tests {
         fn new() -> Self {
             Self {
                 left_schema: sql_schema(&[
-                    (10, "id", "long", true),
-                    (11, "payload", "string", false),
+                    (10, "id", LogicalType::Int64, true),
+                    (11, "payload", LogicalType::Utf8, false),
                 ]),
                 right_schema: sql_schema(&[
-                    (20, "id", "long", true),
-                    (21, "payload", "string", false),
-                    (22, "amount", "double", false),
+                    (20, "id", LogicalType::Int64, true),
+                    (21, "payload", LogicalType::Utf8, false),
+                    (22, "amount", LogicalType::Float64, false),
                 ]),
             }
         }
@@ -1172,7 +1173,10 @@ mod tests {
         let s = base_schema();
         let f = resolve_field(&s, "REGION").expect("find region");
         assert_eq!(f.field_id, 2);
-        assert_eq!(f.type_signature, "string");
+        assert_eq!(
+            f.logical_type,
+            novarocks_types::logical_type::LogicalType::Utf8
+        );
     }
 
     #[test]

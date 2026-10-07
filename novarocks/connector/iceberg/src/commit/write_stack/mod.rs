@@ -45,6 +45,8 @@ pub mod control;
 pub(crate) mod copy_on_write;
 pub mod domain;
 pub mod execution;
+#[cfg(debug_assertions)]
+pub(crate) mod fixture_seed;
 pub(crate) mod flavor;
 pub mod old_delete;
 pub mod planning;

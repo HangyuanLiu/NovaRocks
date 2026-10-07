@@ -679,22 +679,38 @@ fn open_relation(
             target_snapshot_id, ..
         } => {
             let selection = match admitted {
-                AdmittedRead::Relation(read) => read.mv_partition_selection.as_ref(),
+                AdmittedRead::Relation(read) => read.mv_target_candidates.as_ref(),
                 AdmittedRead::Cohort(_) => None,
             };
             let opened = match selection {
-                Some(selection) => {
-                    metadata.get_mv_target_partition_handle(session, table, selection)
-                }
-                None => metadata.get_table_handle(
+                Some(selection) => metadata.get_mv_target_candidate_handle(
                     session,
                     table,
-                    target_snapshot_id.map_or(
-                        ConnectorReadRelationVersion::Current,
-                        ConnectorReadRelationVersion::SnapshotId,
-                    ),
-                    None,
+                    target_snapshot_id.ok_or_else(|| {
+                        "frozen MV target candidates have no exact snapshot".to_string()
+                    })?,
+                    selection,
                 ),
+                None => match admitted {
+                    AdmittedRead::Relation(read) if read.mv_partition_selection.is_some() => {
+                        metadata.get_mv_target_partition_handle(
+                            session,
+                            table,
+                            read.mv_partition_selection
+                                .as_ref()
+                                .expect("partition selection checked"),
+                        )
+                    }
+                    _ => metadata.get_table_handle(
+                        session,
+                        table,
+                        target_snapshot_id.map_or(
+                            ConnectorReadRelationVersion::Current,
+                            ConnectorReadRelationVersion::SnapshotId,
+                        ),
+                        None,
+                    ),
+                },
             };
             opened
                 .map_err(|error| {

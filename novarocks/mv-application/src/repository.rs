@@ -144,6 +144,25 @@ pub struct DeleteMvProjectionRequest {
     pub expected_source_revision: MvAcceleratorSourceRevision,
 }
 
+/// Closed root identity used only by an exact DROP reservation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoadedMvDropProjection {
+    pub(crate) mv_id: i64,
+    pub(crate) target: MvTarget,
+    pub(crate) source_revision: MvAcceleratorSourceRevision,
+    pub(crate) version: MvProjectionVersion,
+}
+impl From<LoadedMvProjection> for LoadedMvDropProjection {
+    fn from(loaded: LoadedMvProjection) -> Self {
+        Self {
+            mv_id: loaded.projection.mv_id,
+            target: loaded.projection.facts.target().clone(),
+            source_revision: loaded.projection.facts.source_revision().clone(),
+            version: loaded.version,
+        }
+    }
+}
+
 /// Asynchronous application port. Durable state is reached through an async
 /// StateStore, and this boundary says so rather than hiding a blocking bridge
 /// behind a synchronous signature. No raw key or transaction crosses it.
@@ -173,6 +192,55 @@ pub trait MvRepository: Send + Sync {
         &self,
         target: &MvTarget,
     ) -> Result<Option<LoadedMvProjection>, MvRepositoryError>;
+
+    /// Reads a root only for explicit DROP; it cannot become planner facts.
+    async fn find_drop_projection(
+        &self,
+        target: &MvTarget,
+    ) -> Result<Option<LoadedMvDropProjection>, MvRepositoryError> {
+        Ok(self.find_by_target(target).await?.map(Into::into))
+    }
+
+    /// Checks exact source object identities without granting row interpretation.
+    async fn ensure_no_drop_downstream_dependencies(
+        &self,
+        object: &novarocks_spi::connector::ConnectorTableObjectId,
+    ) -> Result<(), MvRepositoryError> {
+        for loaded in self.list_projections().await? {
+            for occurrence in &loaded.projection.facts.definition().relation_occurrences {
+                if crate::persistence::exact_revision::persisted_object_names(
+                    &occurrence.object_id,
+                    object,
+                )
+                .map_err(|e| {
+                    MvRepositoryError::new(MvRepositoryErrorKind::Corruption, e.to_string())
+                })? {
+                    return Err(MvRepositoryError::new(
+                        MvRepositoryErrorKind::Conflict,
+                        "exact object has downstream materialized views",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Deletes only the exact root reserved before the provider DROP effect.
+    async fn delete_drop_projection(
+        &self,
+        operation_id: Uuid,
+        expected: LoadedMvDropProjection,
+    ) -> Result<bool, MvRepositoryError> {
+        self.delete_projection(
+            operation_id,
+            DeleteMvProjectionRequest {
+                mv_id: expected.mv_id,
+                expected_version: expected.version,
+                expected_source_revision: expected.source_revision,
+            },
+        )
+        .await
+    }
 
     async fn list_projections(&self) -> Result<Vec<LoadedMvProjection>, MvRepositoryError>;
 

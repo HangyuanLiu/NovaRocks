@@ -376,7 +376,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             2 | 4 | 6 => singular(Scalar),
             3 => repeated(PackedVarint),
             5 => singular(Varint),
-            7 => singular(Scalar),
+            7 | 8 => singular(Scalar),
             _ => return None,
         },
         Transaction => match field {
@@ -401,7 +401,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
         Table => match field {
             1 => singular(Message(SchemaName)),
             2 | 4 | 6 | 9 => singular(Varint),
-            3 | 11 | 12 => singular(Scalar),
+            3 | 11 | 12 | 17 => singular(Scalar),
             5 | 16 => repeated(MapI32String),
             7 | 8 => singular(Message(TupleDomain)),
             10 => repeated(Message(Column)),
@@ -412,7 +412,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
         },
         TableFunction => match field {
             1 => singular(Message(SchemaName)),
-            2 | 4 => singular(Scalar),
+            2 | 4 | 7 => singular(Scalar),
             3 => repeated(Message(Column)),
             5 | 6 => singular(Varint),
             _ => return None,
@@ -420,7 +420,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
         ChangeWindowHandle => match field {
             8 | 9 => singular(Message(ReadDomain)),
             1 => singular(Message(SchemaName)),
-            2 | 4 => singular(Scalar),
+            2 | 4 | 10 => singular(Scalar),
             3 => repeated(Message(Column)),
             5 | 6 => singular(Varint),
             7 => repeated(MapI32String),
@@ -614,7 +614,54 @@ fn scan_message(
                 let len = usize::try_from(read_varint(&mut input, &path)?)
                     .map_err(|_| malformed(&path))?;
                 context.ledger().charge_scalar(len)?;
-                take(&mut input, len, &path)?;
+                let bytes = take(&mut input, len, &path)?;
+                if matches!(
+                    (schema, field),
+                    (Schema::Column, 8)
+                        | (Schema::Table, 17)
+                        | (Schema::TableFunction, 7)
+                        | (Schema::ChangeWindowHandle, 10)
+                ) {
+                    if bytes.len() > crate::field_domain::MAX_BYTES {
+                        return Err(ConnectorCodecError::new(
+                            field_path,
+                            ConnectorCodecErrorKind::InvalidValue,
+                            "Iceberg field-domain payload exceeds its byte budget",
+                        ));
+                    }
+                    let json = std::str::from_utf8(bytes).map_err(|error| {
+                        ConnectorCodecError::new(
+                            field_path.clone(),
+                            ConnectorCodecErrorKind::InvalidValue,
+                            error.to_string(),
+                        )
+                    })?;
+                    // The closed, hard-bounded domain parser runs before any SDK
+                    // type/schema construction. Charge its retained map separately
+                    // from protobuf text and each independently held column map.
+                    let fields = crate::field_domain::decode(json).map_err(|error| {
+                        ConnectorCodecError::new(
+                            field_path.clone(),
+                            ConnectorCodecErrorKind::InvalidValue,
+                            error.to_string(),
+                        )
+                    })?;
+                    context.ledger().charge_items(fields.len())?;
+                    let retained =
+                        crate::field_domain::retained_bytes(&fields).map_err(|error| {
+                            ConnectorCodecError::new(
+                                field_path.clone(),
+                                ConnectorCodecErrorKind::InvalidValue,
+                                error.to_string(),
+                            )
+                        })?;
+                    context.ledger().charge_retained(retained)?;
+                    if matches!(schema, Schema::Table) {
+                        // The standard handle also retains a cached integer-only
+                        // map; the complete map bound conservatively covers it.
+                        context.ledger().charge_retained(retained)?;
+                    }
+                }
             }
             WireValue::PackedVarint => {
                 let len = usize::try_from(read_varint(&mut input, &path)?)
@@ -1126,9 +1173,13 @@ fn encode_column(value: &IcebergColumnHandle) -> dto::IcebergColumnHandle {
         type_json: value.type_json().to_string(),
         nullable: value.nullable(),
         comment: value.comment().map(str::to_string),
-        scalar_integer_domain: value
-            .scalar_integer_domain()
-            .map(|domain| domain.name().to_string()),
+        scalar_integer_domain: match value.persisted_field_domains() {
+            crate::field_domain::PersistedFieldDomains::LegacyTopIntegerV1(_) => value
+                .scalar_integer_domain()
+                .map(|domain| domain.name().to_string()),
+            _ => None,
+        },
+        field_domains_json: value.field_domains_json(),
     }
 }
 
@@ -1142,6 +1193,12 @@ fn decode_column(
             "Iceberg column requires its base identity",
         )
     })?;
+    let declarations = IcebergColumnHandle::decode_wire_field_domains(
+        identity.field_id,
+        raw.scalar_integer_domain.as_deref(),
+        raw.field_domains_json.as_deref(),
+    )
+    .map_err(|error| domain_error("iceberg_column.field_domains", error))?;
     IcebergColumnHandle::try_new(IcebergColumnHandleParams {
         base_column_identity: decode_identity(identity)?,
         base_type_json: raw.base_type_json.clone(),
@@ -1150,14 +1207,7 @@ fn decode_column(
         nullable: raw.nullable,
         comment: raw.comment.clone(),
     })
-    .and_then(|column| {
-        column.with_scalar_integer_domain(
-            raw.scalar_integer_domain
-                .as_deref()
-                .map(crate::scalar_integer_domain::ScalarIntegerDomain::parse)
-                .transpose()?,
-        )
-    })
+    .and_then(|column| column.with_field_domains(declarations))
     .map_err(|error| domain_error("iceberg_column", error))
 }
 
@@ -1386,11 +1436,16 @@ fn decode_transaction(
 
 fn encode_table(value: &IcebergTableHandle) -> dto::IcebergTableHandle {
     dto::IcebergTableHandle {
-        scalar_integer_domains: value
-            .scalar_integer_domains()
-            .iter()
-            .map(|(id, domain)| (*id, domain.name().to_string()))
-            .collect(),
+        scalar_integer_domains: if value.field_domains_json().is_some() {
+            Default::default()
+        } else {
+            value
+                .scalar_integer_domains()
+                .iter()
+                .map(|(id, domain)| (*id, domain.name().to_string()))
+                .collect()
+        },
+        field_domains_json: value.field_domains_json(),
         read_domain: value.read_domain().map(|domain| encode_read_domain(domain)),
         schema_table_name: Some(encode_schema_name(value.schema_table_name())),
         snapshot_id: value.snapshot_id(),
@@ -1426,6 +1481,11 @@ fn encode_table(value: &IcebergTableHandle) -> dto::IcebergTableHandle {
 }
 
 fn decode_table(raw: &dto::IcebergTableHandle) -> Result<IcebergTableHandle, ConnectorCodecError> {
+    let declarations = IcebergTableHandle::decode_wire_field_domains(
+        &raw.scalar_integer_domains,
+        raw.field_domains_json.as_deref(),
+    )
+    .map_err(|error| domain_error("iceberg_table.field_domains", error))?;
     let projected_columns = raw
         .projected_columns
         .iter()
@@ -1491,19 +1551,7 @@ fn decode_table(raw: &dto::IcebergTableHandle) -> Result<IcebergTableHandle, Con
             .collect(),
         pinned_data_files,
     })
-    .and_then(|table| {
-        table.with_scalar_integer_domains(
-            raw.scalar_integer_domains
-                .iter()
-                .map(|(id, value)| {
-                    Ok((
-                        *id,
-                        crate::scalar_integer_domain::ScalarIntegerDomain::parse(value)?,
-                    ))
-                })
-                .collect::<Result<_, novarocks_spi::connector::ConnectorError>>()?,
-        )
-    })
+    .and_then(|table| table.with_field_domains(declarations))
     .map_err(|error| domain_error("iceberg_table", error))
 }
 
@@ -1515,12 +1563,16 @@ fn encode_table_function(value: &TableChangesFunctionHandle) -> dto::TableChange
         name_mapping_json: value.name_mapping_json().map(str::to_string),
         start_snapshot_id: value.start_snapshot_id(),
         end_snapshot_id: value.end_snapshot_id(),
+        field_domains_json: value.field_domains_json(),
     }
 }
 
 fn decode_table_function(
     raw: &dto::TableChangesFunctionHandle,
 ) -> Result<TableChangesFunctionHandle, ConnectorCodecError> {
+    let declarations =
+        TableChangesFunctionHandle::decode_wire_field_domains(raw.field_domains_json.as_deref())
+            .map_err(|error| domain_error("relation.field_domains", error))?;
     TableChangesFunctionHandle::try_new(TableChangesFunctionHandleParams {
         schema_table_name: decode_schema_name(raw.schema_table_name.as_ref().ok_or_else(
             || {
@@ -1541,11 +1593,13 @@ fn decode_table_function(
         start_snapshot_id: raw.start_snapshot_id,
         end_snapshot_id: raw.end_snapshot_id,
     })
+    .and_then(|handle| handle.with_decoded_wire_field_domains(declarations))
     .map_err(|error| domain_error("table_changes", error))
 }
 
 fn encode_change_window(value: &IcebergChangeWindowHandle) -> dto::IcebergChangeWindowHandle {
     dto::IcebergChangeWindowHandle {
+        field_domains_json: value.field_domains_json(),
         from_read_domain: Some(encode_read_domain(value.from_read_domain())),
         to_read_domain: Some(encode_read_domain(value.to_read_domain())),
         schema_table_name: Some(encode_schema_name(value.schema_table_name())),
@@ -1565,6 +1619,9 @@ fn encode_change_window(value: &IcebergChangeWindowHandle) -> dto::IcebergChange
 fn decode_change_window(
     raw: &dto::IcebergChangeWindowHandle,
 ) -> Result<IcebergChangeWindowHandle, ConnectorCodecError> {
+    let declarations =
+        IcebergChangeWindowHandle::decode_wire_field_domains(raw.field_domains_json.as_deref())
+            .map_err(|error| domain_error("relation.field_domains", error))?;
     IcebergChangeWindowHandle::try_new(IcebergChangeWindowHandleParams {
         from_read_domain: decode_read_domain(raw.from_read_domain.as_ref().ok_or_else(|| {
             codec_error(
@@ -1606,6 +1663,7 @@ fn decode_change_window(
             .map(|(key, value)| (*key, value.clone()))
             .collect(),
     })
+    .and_then(|handle| handle.with_decoded_wire_field_domains(declarations))
     .map_err(|error| domain_error("change_window", error))
 }
 
@@ -2518,7 +2576,14 @@ mod tests {
     }
 
     fn limits() -> ConnectorDecodeLimits {
-        ConnectorDecodeLimits::try_new(1 << 20, 1 << 20, 1 << 20, 100_000, 64).unwrap()
+        ConnectorDecodeLimits::try_new(
+            1 << 20,
+            1 << 20,
+            1 << 20,
+            100_000,
+            crate::typed_read::codec::MAX_PRIVATE_CARRIER_DEPTH,
+        )
+        .unwrap()
     }
 
     fn decode_with<T>(
@@ -2933,6 +2998,7 @@ mod tests {
             nullable: true,
             comment: None,
             scalar_integer_domain: None,
+            field_domains_json: None,
         }
         .encode_to_vec();
         let header = header(ConnectorCodecCategory::ReadColumn);
@@ -2972,6 +3038,236 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn private_table_and_predicate_carriers_preserve_depth_64_but_not_65() {
+        use crate::delete_semantics::{PinnedEndpointFacts, ReadDomain, ReadObservationId};
+        use crate::field_domain::PersistedFieldDomains;
+        fn nested(depth: usize) -> String {
+            let mut ty = "\"int\"".to_string();
+            for id in (2..=depth).rev() {
+                ty = format!(
+                    "{{\"type\":\"struct\",\"fields\":[{{\"id\":{id},\"name\":\"child\",\"required\":false,\"type\":{ty}}}]}}"
+                );
+            }
+            format!(
+                "{{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{{\"id\":1,\"name\":\"nested\",\"required\":false,\"type\":{ty}}}]}}"
+            )
+        }
+        let schema = crate::typed_read::column_handle::parse_schema(&nested(64)).unwrap();
+        let empty = PersistedFieldDomains::FieldDomainsV1(BTreeMap::new());
+        let column = IcebergColumnHandle::base_column_of(&schema, 1)
+            .unwrap()
+            .with_table_field_domains(&empty)
+            .unwrap();
+        let predicate_column = column.dereference(&(2..=64).collect::<Vec<_>>()).unwrap();
+        let predicate = TupleDomain::with_column_domains(BTreeMap::from([(
+            predicate_column,
+            Domain::new(ValueSet::all(ConnectorValueType::Integer), false),
+        )]))
+        .unwrap();
+        let domain = Arc::new(ReadDomain::new(
+            ReadObservationId::try_new([17; 16]).unwrap(),
+            PinnedEndpointFacts::try_new(
+                uuid::Uuid::from_u128(17),
+                "metadata.json",
+                11,
+                &schema,
+                &[],
+            )
+            .unwrap(),
+        ));
+        let table = IcebergTableHandle::try_new(IcebergTableHandleParams {
+            schema_table_name: SchemaTableName::try_new("db", "deep").unwrap(),
+            snapshot_id: Some(11),
+            read_domain: Some(domain.clone()),
+            table_schema_json: domain.endpoint().schema_json().to_string(),
+            spec_id: None,
+            partition_spec_jsons: BTreeMap::new(),
+            format_version: 2,
+            unenforced_predicate: predicate,
+            enforced_predicate: TupleDomain::all(),
+            limit: None,
+            projected_columns: std::collections::BTreeSet::from([column]),
+            name_mapping_json: None,
+            table_location: "s3://warehouse/deep".into(),
+            storage_properties: BTreeMap::new(),
+            pinned_data_files: None,
+        })
+        .unwrap()
+        .with_field_domains(empty)
+        .unwrap();
+        let payload = IcebergReadWireCodec
+            .encode_private(&IcebergRuntimeRelation::Table(table.clone()))
+            .unwrap();
+        let decoded: IcebergRuntimeRelation =
+            decode_with(ConnectorCodecCategory::ReadTable, &payload).unwrap();
+        let IcebergRuntimeRelation::Table(decoded) = decoded else {
+            panic!("table");
+        };
+        assert_eq!(decoded, table);
+        let table_header = header(ConnectorCodecCategory::ReadTable);
+        let binding = novarocks_connector_contract::ConnectorReadBinding::new(
+            novarocks_connector_contract::ConnectorInstanceDescriptor {
+                provider_id: table_header.provider_id().clone(),
+                instance_id: table_header.catalog().catalog_name().clone(),
+            },
+            table_header.catalog().clone(),
+        );
+        let envelope = |category, bytes| {
+            novarocks_connector_contract::ConnectorEncodedPayload::new(header(category), bytes)
+        };
+        let draft = novarocks_connector_contract::ConnectorReadRelationRecipeDraft::try_new(
+            binding.clone(),
+            novarocks_connector_contract::ConnectorReadRelationPayload::new(
+                novarocks_connector_contract::ConnectorReadRelationKind::Table,
+                envelope(ConnectorCodecCategory::ReadTable, payload),
+                envelope(
+                    ConnectorCodecCategory::ReadView,
+                    IcebergReadWireCodec
+                        .encode_private(&IcebergReadView::new(HiveTransactionHandle::new(
+                            true, [3; 16],
+                        )))
+                        .unwrap(),
+                ),
+            ),
+            vec![envelope(
+                ConnectorCodecCategory::ReadColumn,
+                IcebergReadWireCodec
+                    .encode_private(table.projected_columns().first().unwrap())
+                    .unwrap(),
+            )],
+        )
+        .unwrap();
+        let recipe =
+            novarocks_connector_contract::ConnectorReadRelationRecipe::try_compile_with_provider(
+                &draft,
+                &crate::typed_read::codec::IcebergReadRecipeCompiler,
+            )
+            .unwrap();
+        assert_eq!(recipe.validate_binding(&binding), Ok(()));
+        assert_eq!(recipe.draft(), &draft);
+        let wrapped = dto::IcebergReadTablePayload {
+            relation: Some(dto::iceberg_read_table_payload::Relation::TableExecute(
+                dto::IcebergTableExecuteHandle {
+                    procedure_handle: Some(
+                        dto::iceberg_table_execute_handle::ProcedureHandle::Optimize(
+                            dto::IcebergOptimizeHandle {
+                                table_handle: Some(encode_table(&table)),
+                                min_file_size_bytes: 1,
+                            },
+                        ),
+                    ),
+                    ..Default::default()
+                },
+            )),
+        };
+        let header = header(ConnectorCodecCategory::ReadTable);
+        let mut ledger = ConnectorDecodeLedger::new(limits());
+        let _: dto::IcebergReadTablePayload = decode_root(
+            &wrapped.encode_to_vec(),
+            &mut ConnectorDecodeContext::new(&header, &mut ledger),
+            ConnectorFieldPath::root("table"),
+            Schema::ReadTable,
+        )
+        .unwrap();
+        let mut too_deep = encode_table(&table);
+        too_deep.table_schema_json = nested(65);
+        assert!(
+            decode_table(&too_deep)
+                .unwrap_err()
+                .to_string()
+                .contains("budget")
+        );
+        let mut beyond_carrier = encode_column(table.projected_columns().first().unwrap());
+        let mut identity = dto::ColumnIdentity {
+            field_id: 99,
+            name: "leaf".into(),
+            category: dto::ColumnIdentityCategory::Primitive as i32,
+            children: vec![],
+        };
+        for id in (1..=crate::typed_read::codec::MAX_PRIVATE_CARRIER_DEPTH).rev() {
+            identity = dto::ColumnIdentity {
+                field_id: id as i32,
+                name: "child".into(),
+                category: dto::ColumnIdentityCategory::Struct as i32,
+                children: vec![identity],
+            };
+        }
+        beyond_carrier.base_column_identity = Some(identity);
+        let error = decode_with::<IcebergColumnHandle>(
+            ConnectorCodecCategory::ReadColumn,
+            &beyond_carrier.encode_to_vec(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ConnectorCodecErrorKind::Capacity);
+    }
+
+    #[test]
+    fn formal_domain_private_wire_precharges_maps_and_rejects_grammar_before_sdk_types() {
+        use crate::field_domain::{FieldDomain, PersistedFieldDomains};
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
+        let schema = IcebergSchema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                17,
+                "json",
+                Type::Primitive(PrimitiveType::String),
+            ))])
+            .build()
+            .unwrap();
+        let column = IcebergColumnHandle::base_column_of(&schema, 17)
+            .unwrap()
+            .with_field_domains(PersistedFieldDomains::FieldDomainsV1(BTreeMap::from([(
+                17,
+                FieldDomain::Json,
+            )])))
+            .unwrap();
+        let payload = IcebergReadWireCodec.encode_private(&column).unwrap();
+        let decoded: IcebergColumnHandle =
+            decode_with(ConnectorCodecCategory::ReadColumn, &payload).unwrap();
+        assert_eq!(decoded, column);
+        let raw = encode_column(&column);
+        let header = header(ConnectorCodecCategory::ReadColumn);
+        let mut ledger = ConnectorDecodeLedger::new(limits());
+        let _: dto::IcebergColumnHandle = decode_root(
+            &payload,
+            &mut ConnectorDecodeContext::new(&header, &mut ledger),
+            ConnectorFieldPath::root("column"),
+            Schema::Column,
+        )
+        .unwrap();
+        assert!(
+            ledger.retained_bytes() >= 256,
+            "parsed field-domain nodes are retained-byte charged before semantic decode"
+        );
+        let low_limits =
+            ConnectorDecodeLimits::try_new(1 << 20, ledger.retained_bytes() - 1, 1 << 20, 1000, 64)
+                .unwrap();
+        let mut low_ledger = ConnectorDecodeLedger::new(low_limits);
+        let error =
+            <IcebergReadWireCodec as ConnectorPrivateDecoder<IcebergColumnHandle>>::decode_private(
+                &IcebergReadWireCodec,
+                &payload,
+                &mut ConnectorDecodeContext::new(&header, &mut low_ledger),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), ConnectorCodecErrorKind::Capacity);
+        for bad in [
+            "{\"version\":2,\"fields\":{}}",
+            "{\"version\":1,\"fields\":{\"17\":\"json\",\"17\":\"json\"}}",
+            "{\"version\":1,\"fields\":{\"17\":\"not-a-domain\"}}",
+        ] {
+            let mut bad_raw = raw.clone();
+            bad_raw.base_type_json = "not-a-type".into();
+            bad_raw.type_json = "not-a-type".into();
+            bad_raw.field_domains_json = Some(bad.into());
+            let error = decode_column(&bad_raw).unwrap_err();
+            assert!(
+                error.to_string().contains("domain"),
+                "formal grammar must fail before SDK type parsing: {error}"
+            );
+        }
+    }
+
     #[test]
     fn scalar_integer_private_payload_roundtrip_is_closed_and_preserves_authority() {
         use crate::iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};

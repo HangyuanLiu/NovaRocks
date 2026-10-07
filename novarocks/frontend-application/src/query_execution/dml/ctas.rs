@@ -1586,23 +1586,31 @@ impl CtasEngine for DmlExecutionKernel {
             source_columns
                 .iter()
                 .map(|column| {
-                    arrow::datatypes::Field::new(
+                    let field = novarocks_types::logical_type::engine_arrow_field_from_logical(
                         &column.name,
-                        column.data_type.clone(),
-                        column.nullable,
-                    )
+                        &novarocks_types::logical_type::LogicalValue {
+                            data_type: column.logical_type().clone(),
+                            nullable: column.nullable,
+                        },
+                    )?
+                    .with_data_type(column.data_type.clone());
+                    if novarocks_types::logical_type::logical_value_from_engine_arrow(&field)?
+                        .data_type
+                        != *column.logical_type()
+                    {
+                        return Err(
+                            "CTAS physical output differs from its frozen logical type".to_string()
+                        );
+                    }
+                    Ok(field)
                 })
-                .collect::<Vec<_>>(),
+                .collect::<Result<Vec<_>, String>>()
+                .map_err(internal_failure)?,
         ));
-        let table_columns =
-            crate::query_execution::dml::iceberg_ctas::arrow_schema_to_table_column_defs(
+        let output_columns =
+            crate::query_execution::dml::iceberg_ctas::arrow_schema_to_connector_columns(
                 output_schema.as_ref(),
             )
-            .map_err(internal_failure)?;
-        let output_columns = table_columns
-            .iter()
-            .map(crate::catalog_application::statement::connector_column)
-            .collect::<Result<Vec<_>, _>>()
             .map_err(internal_failure)?;
         let schema_text = format!("{output_schema:?}");
         let optimized_fingerprint = planned.source.capture_fingerprint();

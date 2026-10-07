@@ -61,7 +61,7 @@ pub struct RuntimeRelationOccurrenceFacts {
 pub struct RuntimeSourceFieldFacts {
     pub field_id: FieldIdentity,
     pub name_at_binding: String,
-    pub type_signature: String,
+    pub data_type: crate::persistence::codec::MvLogicalType,
     pub nullable: bool,
 }
 
@@ -69,7 +69,7 @@ pub struct RuntimeSourceFieldFacts {
 pub struct RuntimeOutputFacts {
     pub output_id: OutputIdentity,
     pub name: String,
-    pub type_signature: String,
+    pub data_type: crate::persistence::codec::MvLogicalType,
     pub nullable: bool,
     pub expression_kind: ExpressionKind,
     pub function_identity: Option<String>,
@@ -88,7 +88,7 @@ pub struct RuntimeInterpretationFacts {
     pub computation_identity: ComputationIdentity,
     pub output_bindings: Vec<RuntimeOutputBindingFacts>,
     pub aggregate_layout: RuntimeAggregateLayoutFacts,
-    pub apply_key: RuntimeApplyKeyFacts,
+    pub apply_key: Option<RuntimeApplyKeyFacts>,
     /// The complete ordered branch identity set derived while compiling D.
     /// It is checked against `branches` so an adapter cannot silently omit a
     /// UNION arm while constructing L.
@@ -101,7 +101,7 @@ pub struct RuntimeInterpretationFacts {
 pub struct RuntimeOutputBindingFacts {
     pub output_id: OutputIdentity,
     pub target_field_id: FieldIdentity,
-    pub type_signature: String,
+    pub data_type: crate::persistence::codec::MvLogicalType,
     pub nullable: bool,
 }
 
@@ -115,7 +115,7 @@ pub struct RuntimeAggregateLayoutFacts {
 pub struct RuntimeStateSlotFacts {
     pub slot_id: StateSlotIdentity,
     pub target_field_id: FieldIdentity,
-    pub type_signature: String,
+    pub data_type: crate::persistence::codec::MvLogicalType,
     pub nullable: bool,
     pub role: StateRole,
     pub encoding: StateEncoding,
@@ -164,7 +164,7 @@ pub struct RuntimeTargetFacts {
 pub struct RuntimePhysicalFieldFacts {
     pub logical_identity: PhysicalFieldLogicalIdentity,
     pub target_field_id: FieldIdentity,
-    pub type_signature: String,
+    pub data_type: crate::persistence::codec::MvLogicalType,
     pub nullable: bool,
 }
 
@@ -193,7 +193,7 @@ impl TryFrom<RuntimeDefinitionFacts> for DefinitionDocument {
                         .map(|field| SourceFieldBinding {
                             field_id: field.field_id,
                             name_at_binding: field.name_at_binding,
-                            type_signature: field.type_signature,
+                            data_type: field.data_type,
                             nullable: field.nullable,
                         })
                         .collect(),
@@ -205,7 +205,7 @@ impl TryFrom<RuntimeDefinitionFacts> for DefinitionDocument {
                 .map(|output| OutputDefinition {
                     output_id: output.output_id,
                     name: output.name,
-                    type_signature: output.type_signature,
+                    data_type: output.data_type,
                     nullable: output.nullable,
                     expression: ExpressionShape {
                         kind: output.expression_kind,
@@ -250,7 +250,7 @@ impl TryFrom<&DefinitionDocument> for RuntimeDefinitionFacts {
                         .map(|field| RuntimeSourceFieldFacts {
                             field_id: field.field_id.clone(),
                             name_at_binding: field.name_at_binding.clone(),
-                            type_signature: field.type_signature.clone(),
+                            data_type: field.data_type.clone(),
                             nullable: field.nullable,
                         })
                         .collect(),
@@ -262,7 +262,7 @@ impl TryFrom<&DefinitionDocument> for RuntimeDefinitionFacts {
                 .map(|output| RuntimeOutputFacts {
                     output_id: output.output_id.clone(),
                     name: output.name.clone(),
-                    type_signature: output.type_signature.clone(),
+                    data_type: output.data_type.clone(),
                     nullable: output.nullable,
                     expression_kind: output.expression.kind,
                     function_identity: output.expression.function_identity.clone(),
@@ -290,7 +290,9 @@ impl TryFrom<RuntimeInterpretationFacts> for InterpretationDocument {
             .iter()
             .map(|branch| branch.branch_id.clone())
             .collect::<Vec<_>>();
-        if value.definition_branch_identities != actual_branch_identities {
+        if !value.aggregate_layout.aggregates.is_empty()
+            && value.definition_branch_identities != actual_branch_identities
+        {
             return Err(
                 "runtime interpretation branches do not match the complete ordered definition branch identity set"
                     .to_string(),
@@ -305,7 +307,7 @@ impl TryFrom<RuntimeInterpretationFacts> for InterpretationDocument {
                 .map(|output| OutputBinding {
                     output_id: output.output_id,
                     target_field_id: output.target_field_id,
-                    type_signature: output.type_signature,
+                    data_type: output.data_type,
                     nullable: output.nullable,
                 })
                 .collect(),
@@ -316,16 +318,15 @@ impl TryFrom<RuntimeInterpretationFacts> for InterpretationDocument {
                 .map(|slot| StateSlot {
                     slot_id: slot.slot_id,
                     target_field_id: slot.target_field_id,
-                    type_signature: slot.type_signature,
+                    data_type: slot.data_type,
                     nullable: slot.nullable,
                     role: slot.role,
                     encoding: slot.encoding,
                 })
                 .collect(),
-            apply_key: ApplyKey {
-                kind: value.apply_key.kind,
-                components: value
-                    .apply_key
+            apply_key: value.apply_key.map(|key| ApplyKey {
+                kind: key.kind,
+                components: key
                     .ordered_components
                     .into_iter()
                     .map(|component| ApplyKeyComponent {
@@ -333,7 +334,7 @@ impl TryFrom<RuntimeInterpretationFacts> for InterpretationDocument {
                         target_field_id: component.target_field_id,
                     })
                     .collect(),
-            },
+            }),
             aggregates: value
                 .aggregate_layout
                 .aggregates
@@ -373,7 +374,7 @@ impl TryFrom<RuntimeInterpretationFacts> for InterpretationDocument {
                     .map(|field| PhysicalFieldBinding {
                         logical_identity: field.logical_identity,
                         target_field_id: field.target_field_id,
-                        type_signature: field.type_signature,
+                        data_type: field.data_type,
                         nullable: field.nullable,
                     })
                     .collect(),
@@ -394,7 +395,7 @@ impl From<&InterpretationDocument> for RuntimeInterpretationFacts {
                 .map(|output| RuntimeOutputBindingFacts {
                     output_id: output.output_id.clone(),
                     target_field_id: output.target_field_id.clone(),
-                    type_signature: output.type_signature.clone(),
+                    data_type: output.data_type.clone(),
                     nullable: output.nullable,
                 })
                 .collect(),
@@ -405,7 +406,7 @@ impl From<&InterpretationDocument> for RuntimeInterpretationFacts {
                     .map(|slot| RuntimeStateSlotFacts {
                         slot_id: slot.slot_id.clone(),
                         target_field_id: slot.target_field_id.clone(),
-                        type_signature: slot.type_signature.clone(),
+                        data_type: slot.data_type.clone(),
                         nullable: slot.nullable,
                         role: slot.role,
                         encoding: slot.encoding,
@@ -430,10 +431,9 @@ impl From<&InterpretationDocument> for RuntimeInterpretationFacts {
                     })
                     .collect(),
             },
-            apply_key: RuntimeApplyKeyFacts {
-                kind: value.apply_key.kind,
-                ordered_components: value
-                    .apply_key
+            apply_key: value.apply_key.as_ref().map(|key| RuntimeApplyKeyFacts {
+                kind: key.kind,
+                ordered_components: key
                     .components
                     .iter()
                     .map(|component| RuntimeApplyKeyComponentFacts {
@@ -441,7 +441,7 @@ impl From<&InterpretationDocument> for RuntimeInterpretationFacts {
                         target_field_id: component.target_field_id.clone(),
                     })
                     .collect(),
-            },
+            }),
             definition_branch_identities: value
                 .branches
                 .iter()
@@ -467,7 +467,7 @@ impl From<&InterpretationDocument> for RuntimeInterpretationFacts {
                     .map(|field| RuntimePhysicalFieldFacts {
                         logical_identity: field.logical_identity.clone(),
                         target_field_id: field.target_field_id.clone(),
-                        type_signature: field.type_signature.clone(),
+                        data_type: field.data_type.clone(),
                         nullable: field.nullable,
                     })
                     .collect(),

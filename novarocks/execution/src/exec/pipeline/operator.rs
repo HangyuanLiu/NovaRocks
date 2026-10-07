@@ -215,6 +215,14 @@ impl FinishingWait {
 
 /// Extended operator contract for processor stages with push/pull semantics.
 pub trait ProcessorOperator: Operator {
+    /// A resumable local computation exhausted this driver's turn allowance.
+    /// The driver must return Ready before consulting external blockers. This
+    /// request is separate from output readiness and normal end of stream.
+    /// Implementations retain it until consumed; begin_turn refills work.
+    fn take_yield_request(&mut self) -> bool {
+        false
+    }
+
     fn need_input(&self) -> bool;
 
     /// Non-blocking admission for the exact chunk currently retained on the

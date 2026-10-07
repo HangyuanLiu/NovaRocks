@@ -2871,3 +2871,354 @@ fn one_bounded_path_does_not_bound_an_effect_that_spans_two() {
         ReadmissionMode::OperatorDeclarationOnly
     );
 }
+
+/// These registration tests cross the production lease seal. A provider DTO
+/// alone is deliberately insufficient for Current management admission.
+fn sealed_registration_observation(
+    target: &ManagedMvTarget,
+    marker_owner: &str,
+    marker_incarnation: &str,
+    metadata: u8,
+) -> ConnectorDocumentManagementObservation {
+    use novarocks_spi::connector::document_storage::*;
+    use novarocks_spi::connector::{
+        CatalogProperties, ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
+        ConnectorInstanceDescriptor, ConnectorProviderId,
+    };
+    struct Current {
+        descriptor: ConnectorInstanceDescriptor,
+        marker: ConnectorManagedObjectMarker,
+        metadata: ConnectorCommittedVersion,
+    }
+    impl ConnectorDocumentStorageObservation for Current {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+        fn incarnation(&self) -> ProviderBindingEpoch {
+            ProviderBindingEpoch::from_bytes([1; 16])
+        }
+        fn observe_documents(
+            &self,
+            _request: ConnectorDocumentObservationRequest,
+        ) -> Result<FrozenConnectorDocumentObservation, ConnectorError> {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "registration test observes Current only",
+            ))
+        }
+        fn load_document(
+            &self,
+            _request: ConnectorDocumentLoadRequest,
+        ) -> Result<ConnectorDocument, ConnectorError> {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "registration test has no deferred body",
+            ))
+        }
+        fn discover_documents(
+            &self,
+            _request: ConnectorDocumentDiscoveryRequest,
+        ) -> Result<ConnectorDocumentDiscoveryPage, ConnectorError> {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "registration test does not discover",
+            ))
+        }
+        fn observe_current_management(
+            &self,
+            request: ConnectorDocumentObservationRequest,
+        ) -> Result<ConnectorDocumentManagementObservation, ConnectorError> {
+            ConnectorDocumentManagementObservation::try_new(
+                &request,
+                self.metadata.clone(),
+                self.marker.clone(),
+                vec![],
+            )
+        }
+    }
+    let descriptor = ConnectorInstanceDescriptor {
+        provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+        instance_id: target.table().instance_id.clone(),
+    };
+    let current = Arc::new(Current {
+        descriptor: descriptor.clone(),
+        marker: ConnectorManagedObjectMarker::try_new(
+            "materialized-view",
+            marker_owner,
+            marker_incarnation,
+        )
+        .unwrap(),
+        metadata: ConnectorCommittedVersion::try_new(
+            Bytes::from(vec![metadata]),
+            Some(i64::from(metadata) + 1),
+        )
+        .unwrap(),
+    });
+    let documents = ConnectorDocumentStorageBinding::try_new(
+        descriptor,
+        ProviderBindingEpoch::from_bytes([1; 16]),
+        Some(current),
+        None,
+    )
+    .unwrap();
+    let control = novarocks_catalog_application::test_support::test_control_binding_for(
+        target.table().instance_id.clone(),
+        1,
+    )
+    .with_catalog_properties(
+        CatalogProperties::new(
+            target.catalog().clone(),
+            ConnectorProviderId::parse("iceberg").unwrap(),
+            1,
+            vec![],
+            vec![],
+        )
+        .unwrap(),
+    )
+    .unwrap()
+    .try_with_document_storage(Some(documents))
+    .unwrap();
+    let lease = ConnectorControlPlanningLease::new(Arc::new(control), || {})
+        .derive_document_storage_lease()
+        .unwrap();
+    let request = ConnectorDocumentObservationRequest::try_new(
+        lease.owner().clone(),
+        lease.catalog_handle().clone(),
+        target.table().clone(),
+        target.object_id().clone(),
+        ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::default()),
+        request_context(),
+    )
+    .unwrap();
+    lease.observe_current_management(request).unwrap()
+}
+
+fn permitted_registration_turn() -> (
+    ManagementEntrance,
+    ManagedMvTarget,
+    ManagementObservationState,
+    UnsettledEffect,
+) {
+    let target = target("registration_retry", b"registration-object");
+    let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("new"));
+    let original = unknown_effect(
+        &target,
+        201,
+        "old",
+        EffectScope::CATALOG_AND_OBJECT_DELETION,
+        1_000,
+    );
+    let mut state = entrance
+        .begin_recovered_target(
+            target.clone(),
+            ManagementContinuation::SameOwner {
+                previous_incarnation: incarnation("old"),
+            },
+            original.clone(),
+        )
+        .unwrap();
+    let completion = ActualCompletionEvidence::try_new(
+        original.responsibility().identity(),
+        target.clone(),
+        EffectScope::CATALOG_AND_OBJECT_DELETION,
+        ManagementTimestamp::from_unix_millis(1_200),
+        "exact original provider effect closure",
+    )
+    .unwrap();
+    let permit = ReadmissionEvaluator::default()
+        .from_actual_completion(&original, &isolation(&target, "old", 1_100), &completion)
+        .unwrap();
+    state.accept_readmission_permit(permit).unwrap();
+    let pending = state
+        .begin_current_observation(ManagementObservationRequestId::from_bytes([202; 16]))
+        .unwrap();
+    assert_eq!(
+        state
+            .complete_current_observation(
+                pending,
+                &sealed_registration_observation(&target, "deployment-a", "old", 2)
+            )
+            .unwrap(),
+        ManagementObservationPhase::RegistrationRequired(RegistrationRequirement::Incarnation)
+    );
+    (entrance, target, state, original)
+}
+
+#[test]
+fn registration_unknown_keeps_exact_new_responsibility_and_retries_sealed_old_marker() {
+    let (entrance, target, state, original) = permitted_registration_turn();
+    let terminal = catalog_terminal(&target, 203, "new", EffectDisposition::CommitUnknown);
+    entrance
+        .record_readmission_registration_terminal(&state, &terminal)
+        .unwrap();
+    let effects = entrance.unsettled_effects(target.table());
+    assert_eq!(effects.len(), 1);
+    let EffectTerminalFact::CommitUnknown(registration) = &terminal else {
+        unreachable!()
+    };
+    assert_eq!(&effects[0], registration);
+    assert_eq!(
+        original.original_disposition(),
+        EffectDisposition::CommitUnknown
+    );
+    let mut retry = entrance
+        .begin_readmission(
+            target.table(),
+            ManagementContinuation::SameOwner {
+                previous_incarnation: incarnation("new"),
+            },
+        )
+        .unwrap();
+    let completion = ActualCompletionEvidence::try_new(
+        registration.responsibility().identity(),
+        target.clone(),
+        EffectScope::CATALOG_COMMIT,
+        ManagementTimestamp::from_unix_millis(1_500),
+        "exact registration provider terminal receipt",
+    )
+    .unwrap();
+    let permit = ReadmissionEvaluator::default()
+        .from_actual_completion(registration, &isolation(&target, "new", 1_400), &completion)
+        .unwrap();
+    retry.accept_readmission_permit(permit).unwrap();
+    let pending = retry
+        .begin_current_observation(ManagementObservationRequestId::from_bytes([204; 16]))
+        .unwrap();
+    // Unknown registration may have left the original sealed marker unchanged.
+    assert_eq!(
+        retry
+            .complete_current_observation(
+                pending,
+                &sealed_registration_observation(&target, "deployment-a", "old", 2)
+            )
+            .unwrap(),
+        ManagementObservationPhase::RegistrationRequired(RegistrationRequirement::Incarnation)
+    );
+    let committed = catalog_terminal(&target, 205, "new", EffectDisposition::KnownCommitted);
+    entrance
+        .record_readmission_registration_terminal(&retry, &committed)
+        .unwrap();
+    retry.record_registration_terminal(committed).unwrap();
+    let pending = retry
+        .begin_current_observation(ManagementObservationRequestId::from_bytes([206; 16]))
+        .unwrap();
+    retry
+        .complete_current_observation(
+            pending,
+            &sealed_registration_observation(&target, "deployment-a", "new", 3),
+        )
+        .unwrap();
+    entrance
+        .install_observed_target(
+            &retry,
+            ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(1)),
+        )
+        .unwrap();
+    assert!(entrance.unsettled_effects(target.table()).is_empty());
+    assert_eq!(
+        registration.original_disposition(),
+        EffectDisposition::CommitUnknown
+    );
+}
+
+#[test]
+fn registration_known_uncommitted_releases_token_without_erasing_original_barrier() {
+    let (entrance, target, state, original) = permitted_registration_turn();
+    entrance
+        .record_readmission_registration_terminal(
+            &state,
+            &catalog_terminal(&target, 210, "new", EffectDisposition::KnownUncommitted),
+        )
+        .unwrap();
+    assert_eq!(entrance.unsettled_effects(target.table()), vec![original]);
+    assert!(
+        entrance
+            .begin_readmission(
+                target.table(),
+                ManagementContinuation::SameOwner {
+                    previous_incarnation: incarnation("old")
+                }
+            )
+            .is_ok()
+    );
+}
+
+#[test]
+fn registration_terminal_requires_complete_exact_permits_and_rejects_another_marker() {
+    let target = target("registration_wrong", b"registration-object");
+    let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("new"));
+    let original = unknown_effect(
+        &target,
+        211,
+        "old",
+        EffectScope::CATALOG_AND_OBJECT_DELETION,
+        1_000,
+    );
+    let incomplete = entrance
+        .begin_recovered_target(
+            target.clone(),
+            ManagementContinuation::SameOwner {
+                previous_incarnation: incarnation("old"),
+            },
+            original.clone(),
+        )
+        .unwrap();
+    assert!(
+        entrance
+            .record_readmission_registration_terminal(
+                &incomplete,
+                &catalog_terminal(&target, 212, "new", EffectDisposition::CommitUnknown)
+            )
+            .is_err()
+    );
+    assert_eq!(entrance.unsettled_effects(target.table()), vec![original]);
+
+    let (entrance, target, state, _) = permitted_registration_turn();
+    assert!(
+        entrance
+            .record_readmission_registration_terminal(
+                &state,
+                &catalog_terminal(&target, 213, "unrelated", EffectDisposition::CommitUnknown)
+            )
+            .is_err()
+    );
+    let terminal = catalog_terminal(&target, 214, "new", EffectDisposition::CommitUnknown);
+    entrance
+        .record_readmission_registration_terminal(&state, &terminal)
+        .unwrap();
+    let EffectTerminalFact::CommitUnknown(effect) = terminal else {
+        unreachable!()
+    };
+    let completion = ActualCompletionEvidence::try_new(
+        effect.responsibility().identity(),
+        target.clone(),
+        EffectScope::CATALOG_COMMIT,
+        ManagementTimestamp::from_unix_millis(1_500),
+        "exact registration provider terminal receipt",
+    )
+    .unwrap();
+    let permit = ReadmissionEvaluator::default()
+        .from_actual_completion(&effect, &isolation(&target, "new", 1_400), &completion)
+        .unwrap();
+    let mut retry = entrance
+        .begin_readmission(
+            target.table(),
+            ManagementContinuation::SameOwner {
+                previous_incarnation: incarnation("new"),
+            },
+        )
+        .unwrap();
+    retry.accept_readmission_permit(permit).unwrap();
+    let pending = retry
+        .begin_current_observation(ManagementObservationRequestId::from_bytes([215; 16]))
+        .unwrap();
+    assert!(
+        retry
+            .complete_current_observation(
+                pending,
+                &sealed_registration_observation(&target, "deployment-a", "unrelated", 2)
+            )
+            .is_err(),
+        "an arbitrary incarnation is never a registration predecessor"
+    );
+}

@@ -21,10 +21,10 @@
 //! action, so this is a custom `TransactionAction` (depends on the
 //! `vendor/iceberg-0.9.0` patch). The action:
 //!
-//! 1. Walks the base snapshot's manifest list and collects every live data
+//! 1. Walks the base snapshot's manifest list and collects every live data/delete
 //!    file (status ∈ {Added, Existing}) along with its original sequence
 //!    numbers — required to mark each as DELETED faithfully.
-//! 2. Writes a v2/v3 data manifest containing one DELETED entry per base data
+//! 2. Writes v2/v3 data/delete manifests containing one DELETED entry per base
 //!    file via `ManifestWriter::add_delete_file` (which the Task 1 spike
 //!    confirmed is the only public path to status=Deleted entries).
 //! 3. Writes a v2/v3 data manifest containing the freshly-written data files
@@ -75,6 +75,7 @@ impl IcebergCommitAction for OverwriteCommit {
             "Overwrite",
             None,
             ctx.snapshot_properties,
+            ctx.metadata_updates,
         )
         .await
         {
@@ -244,35 +245,47 @@ impl TransactionAction for OverwriteTxnAction {
     async fn commit(self: Arc<Self>, table: &Table) -> crate::iceberg::Result<ActionCommit> {
         let m = table.metadata();
         let format_version = m.format_version();
-        let new_seq = m.last_sequence_number() + 1;
+        let new_seq = m
+            .last_sequence_number()
+            .checked_add(1)
+            .ok_or_else(|| to_iceberg_unexpected("overwrite sequence number overflow".into()))?;
         let new_snapshot_id = generate_snapshot_id();
         let target_ref = &self.target_ref;
         let parent_snapshot_id = target_ref_snapshot_id(m, target_ref);
         let metadata_dir = metadata_dir(table);
 
         // 1. Enumerate live data files in the base snapshot.
-        let existing_entries =
-            enumerate_live_data_file_entries_at_snapshot(table, &self.file_io, parent_snapshot_id)
-                .await
-                .map_err(to_iceberg_unexpected)?;
+        let all_entries = enumerate_live_files_filtered_at_snapshot(
+            table,
+            &self.file_io,
+            parent_snapshot_id,
+            |_| true,
+        )
+        .await
+        .map_err(to_iceberg_unexpected)?;
+        let (existing_entries, delete_entries): (Vec<_>, Vec<_>) = all_entries
+            .into_iter()
+            .partition(|entry| entry.data_file.content_type() == DataContentType::Data);
         let existing = live_data_entries_as_delete_entries(&existing_entries);
+        let retired_deletes = live_data_entries_as_delete_entries(&delete_entries);
 
         // Ordinary empty input over an empty base is a no-op. Managed
         // publication and operation-recovery properties require a real empty
         // overwrite snapshot, so a non-empty provider property set must flow
         // through the normal snapshot construction below.
-        if self.written.is_empty() && existing.is_empty() && self.snapshot_properties.is_empty() {
+        if self.written.is_empty()
+            && existing.is_empty()
+            && retired_deletes.is_empty()
+            && self.snapshot_properties.is_empty()
+        {
             return Ok(ActionCommit::new(vec![], vec![]));
         }
 
         let parent_summary =
             snapshot_summary(m, parent_snapshot_id).map_err(to_iceberg_unexpected)?;
         let additional_properties = merge_snapshot_summary_properties(
-            finalize_snapshot_summary(
-                overwrite_summary(&self.written, &existing),
-                parent_summary,
-                false,
-            ),
+            overwrite_summary(&self.written, &existing, &retired_deletes, parent_summary)
+                .map_err(to_iceberg_unexpected)?,
             &self.snapshot_properties,
             m.uuid(),
             new_snapshot_id,
@@ -319,6 +332,39 @@ impl TransactionAction for OverwriteTxnAction {
             .await
             .map_err(to_iceberg_unexpected)?;
             new_manifests.push(mf);
+        }
+
+        // Full replacement retires every old delete artifact as well. Preserve
+        // its original spec and sequence identities in DELETED-only manifests;
+        // no base manifest is inherited into the replacement snapshot.
+        for (spec_id, entries) in group_live_data_entries_by_partition_spec(&delete_entries) {
+            let path = format!(
+                "{metadata_dir}/{}-overwrite-deleted-deletes-spec-{spec_id}.avro",
+                self.commit_uuid
+            );
+            self.abort_handle.record_manifest(path.clone());
+            self.manifest_paths_out
+                .lock()
+                .expect("manifest_paths_out poisoned")
+                .push(path.clone());
+            let spec = m.partition_spec_by_id(spec_id).cloned().ok_or_else(|| {
+                to_iceberg_unexpected(format!(
+                    "Overwrite delete artifact references unknown partition spec id {spec_id}"
+                ))
+            })?;
+            new_manifests.push(
+                write_truncate_deletes_manifest(
+                    &self.file_io,
+                    &path,
+                    &live_data_entries_as_delete_entries(&entries),
+                    spec,
+                    m.current_schema().clone(),
+                    new_snapshot_id,
+                    format_version,
+                )
+                .await
+                .map_err(to_iceberg_unexpected)?,
+            );
         }
 
         // 3. Write the added-data manifest, if any rows were written.
@@ -453,9 +499,8 @@ struct LiveDataFileEntry {
 /// sequence numbers are needed verbatim by `add_delete_file` to faithfully
 /// preserve the original commit identity.
 ///
-/// INSERT OVERWRITE intentionally preserves delete manifests (they keep
-/// applying against any rows preserved from the base table), so this walker
-/// skips manifests with content type `Deletes`.
+/// This data-only inspection skips delete manifests. The overwrite action
+/// itself enumerates both contents to retire every old artifact.
 #[allow(dead_code)]
 pub(super) async fn enumerate_live_data_files(
     table: &Table,
@@ -758,43 +803,80 @@ pub(super) fn build_minimal_data_file(f: &WrittenFile) -> Result<DataFile, Strin
 fn overwrite_summary(
     added: &[WrittenFile],
     deleted: &[(DataFile, i64, Option<i64>)],
-) -> HashMap<String, String> {
+    retired_deletes: &[(DataFile, i64, Option<i64>)],
+    previous: Option<&Summary>,
+) -> Result<HashMap<String, String>, String> {
+    fn count(values: impl IntoIterator<Item = u64>, label: &str) -> Result<u64, String> {
+        let value = values.into_iter().try_fold(0u64, |total, value| {
+            total
+                .checked_add(value)
+                .ok_or_else(|| format!("overwrite {label} overflow"))
+        })?;
+        i64::try_from(value)
+            .map_err(|_| format!("overwrite {label} exceeds Iceberg int64 range"))?;
+        Ok(value)
+    }
+    let added_rows = count(added.iter().map(|file| file.record_count), "added records")?;
+    let added_bytes = count(
+        added.iter().map(|file| file.file_size_in_bytes),
+        "added bytes",
+    )?;
+    let removed_rows = count(
+        deleted.iter().map(|(file, _, _)| file.record_count()),
+        "deleted records",
+    )?;
+    let removed_bytes = count(
+        deleted
+            .iter()
+            .chain(retired_deletes)
+            .map(|(file, _, _)| file.file_size_in_bytes()),
+        "removed bytes",
+    )?;
+    let removed_positions = count(
+        retired_deletes
+            .iter()
+            .filter(|(file, _, _)| file.content_type() == DataContentType::PositionDeletes)
+            .map(|(file, _, _)| file.record_count()),
+        "removed position deletes",
+    )?;
+    let removed_equalities = count(
+        retired_deletes
+            .iter()
+            .filter(|(file, _, _)| file.content_type() == DataContentType::EqualityDeletes)
+            .map(|(file, _, _)| file.record_count()),
+        "removed equality deletes",
+    )?;
+    for (file, _, _) in retired_deletes {
+        if file.content_type() == DataContentType::Data {
+            return Err("overwrite retired-delete set contains a data file".into());
+        }
+    }
     let mut p = HashMap::new();
     p.insert("added-data-files".to_string(), added.len().to_string());
-    p.insert(
-        "added-records".to_string(),
-        added
-            .iter()
-            .map(|f| f.record_count)
-            .sum::<u64>()
-            .to_string(),
-    );
-    p.insert(
-        "added-files-size".to_string(),
-        added
-            .iter()
-            .map(|f| f.file_size_in_bytes)
-            .sum::<u64>()
-            .to_string(),
-    );
+    p.insert("added-records".into(), added_rows.to_string());
+    p.insert("added-files-size".into(), added_bytes.to_string());
     p.insert("deleted-data-files".to_string(), deleted.len().to_string());
+    p.insert("deleted-records".into(), removed_rows.to_string());
+    p.insert("removed-files-size".into(), removed_bytes.to_string());
     p.insert(
-        "deleted-records".to_string(),
-        deleted
-            .iter()
-            .map(|(df, _, _)| df.record_count())
-            .sum::<u64>()
-            .to_string(),
+        "removed-delete-files".into(),
+        retired_deletes.len().to_string(),
     );
     p.insert(
-        "removed-files-size".to_string(),
-        deleted
-            .iter()
-            .map(|(df, _, _)| df.file_size_in_bytes())
-            .sum::<u64>()
-            .to_string(),
+        "removed-position-deletes".into(),
+        removed_positions.to_string(),
     );
-    p
+    p.insert(
+        "removed-equality-deletes".into(),
+        removed_equalities.to_string(),
+    );
+    // A complete overwrite has no surviving base files, so totals are exact
+    // even when the parent has missing, stale, or foreign summary statistics.
+    let mut p = finalize_snapshot_summary(p, previous, true);
+    p.insert("total-data-files".into(), added.len().to_string());
+    p.insert("total-records".into(), added_rows.to_string());
+    p.insert("total-files-size".into(), added_bytes.to_string());
+    Ok(p)
 }
 
 fn to_iceberg_unexpected(s: String) -> crate::iceberg::Error {
@@ -922,6 +1004,194 @@ mod tests {
         }
     }
 
+    #[test]
+    fn full_overwrite_summary_rejects_overflow_and_out_of_range_counts() {
+        let mut written = synthetic_data_file("memory:///new".into());
+        written.record_count = i64::MAX as u64 + 1;
+        assert!(
+            overwrite_summary(&[written.clone()], &[], &[], None)
+                .unwrap_err()
+                .contains("int64")
+        );
+        written.record_count = u64::MAX;
+        assert!(
+            overwrite_summary(&[written.clone(), written.clone()], &[], &[], None)
+                .unwrap_err()
+                .contains("overflow")
+        );
+        written.record_count = 1;
+        written.file_size_in_bytes = u64::MAX;
+        assert!(
+            overwrite_summary(&[written], &[], &[], None)
+                .unwrap_err()
+                .contains("int64")
+        );
+    }
+
+    #[tokio::test]
+    async fn full_overwrite_retires_all_delete_artifacts_and_resets_exact_totals() {
+        for format in [FormatVersion::V2, FormatVersion::V3] {
+            for empty in [false, true] {
+                let fixture = empty_local_table(format).await;
+                let table = fixture
+                    .catalog
+                    .load_table(&fixture.table_ident)
+                    .await
+                    .unwrap();
+                let old_data_path = format!("{}/data/old.parquet", table.metadata().location());
+                append_synthetic_data(&fixture, &table, "main", old_data_path.clone()).await;
+                let table = fixture
+                    .catalog
+                    .load_table(&fixture.table_ident)
+                    .await
+                    .unwrap();
+                let collector = collector_for(&fixture, &table, CommitOpKind::RowDelta);
+                let mut equality =
+                    synthetic_data_file(format!("{}/data/eq.parquet", table.metadata().location()));
+                equality.content = DataContentType::EqualityDeletes;
+                equality.equality_ids = Some(vec![1]);
+                equality.record_count = 2;
+                equality.file_size_in_bytes = 11;
+                collector.inject_written_file(equality);
+                let mut position =
+                    synthetic_data_file(format!("{}/data/pos", table.metadata().location()));
+                position.content = DataContentType::PositionDeletes;
+                position.record_count = 3;
+                position.file_size_in_bytes = 17;
+                position.referenced_data_file = Some(old_data_path);
+                if format == FormatVersion::V3 {
+                    position.format = DataFileFormat::Puffin;
+                    position.content_offset = Some(4);
+                    position.content_size_in_bytes = Some(10);
+                    position.cardinality = Some(3);
+                }
+                collector.inject_written_file(position);
+                let properties = BTreeMap::new();
+                super::super::row_delta::RowDeltaCommit
+                    .commit(CommitCtx {
+                        collector: &collector,
+                        table: &table,
+                        catalog: fixture.catalog.as_ref(),
+                        file_io: table.file_io(),
+                        commit_uuid: Uuid::now_v7(),
+                        abort_handle: collector.abort_log.clone(),
+                        target_ref: "main",
+                        snapshot_properties: &properties,
+                        metadata_updates: &[],
+                    })
+                    .await
+                    .unwrap();
+                let table = fixture
+                    .catalog
+                    .load_table(&fixture.table_ident)
+                    .await
+                    .unwrap();
+                let old_entries = enumerate_live_all_files(&table, table.file_io())
+                    .await
+                    .unwrap();
+                assert_eq!(old_entries.len(), 3);
+                let old_identity = old_entries
+                    .iter()
+                    .map(|(file, sequence, file_sequence)| {
+                        (file.file_path().to_owned(), (*sequence, *file_sequence))
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let old_snapshot = table.metadata().current_snapshot_id().unwrap();
+                let old_sequence = table.metadata().last_sequence_number();
+                let collector = collector_for(&fixture, &table, CommitOpKind::Overwrite);
+                let new_path = format!("{}/data/new.parquet", table.metadata().location());
+                if !empty {
+                    collector.inject_written_file(synthetic_data_file(new_path.clone()));
+                }
+                let prepared = prepare_overwrite_action(&CommitCtx {
+                    collector: &collector,
+                    table: &table,
+                    catalog: fixture.catalog.as_ref(),
+                    file_io: table.file_io(),
+                    commit_uuid: Uuid::now_v7(),
+                    abort_handle: collector.abort_log.clone(),
+                    target_ref: "main",
+                    snapshot_properties: &properties,
+                    metadata_updates: &[],
+                })
+                .unwrap();
+                let mut action = prepared.action.commit(&table).await.unwrap();
+                let requirements = action.take_requirements();
+                assert!(requirements.iter().any(|requirement| matches!(requirement, TableRequirement::RefSnapshotIdMatch { r#ref, snapshot_id } if r#ref == "main" && *snapshot_id == Some(old_snapshot))));
+                assert!(requirements.iter().any(|requirement| matches!(requirement, TableRequirement::UuidMatch { uuid } if *uuid == table.metadata().uuid())));
+                let updates = action.take_updates();
+                let snapshot = updates
+                    .iter()
+                    .find_map(|update| {
+                        if let TableUpdate::AddSnapshot { snapshot } = update {
+                            Some(snapshot)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap();
+                assert_eq!(snapshot.sequence_number(), old_sequence + 1);
+                let totals = &snapshot.summary().additional_properties;
+                for key in [
+                    "total-delete-files",
+                    "total-equality-deletes",
+                    "total-position-deletes",
+                ] {
+                    assert_eq!(totals[key], "0", "{key}");
+                }
+                assert_eq!(totals["total-data-files"], if empty { "0" } else { "1" });
+                assert_eq!(totals["total-records"], if empty { "0" } else { "1" });
+                assert_eq!(totals["total-files-size"], if empty { "0" } else { "1" });
+                assert_eq!(totals["removed-delete-files"], "2");
+                assert_eq!(totals["removed-equality-deletes"], "2");
+                assert_eq!(totals["removed-position-deletes"], "3");
+                assert_eq!(totals["removed-files-size"], "29");
+                let bytes = table
+                    .file_io()
+                    .new_input(snapshot.manifest_list())
+                    .unwrap()
+                    .read()
+                    .await
+                    .unwrap();
+                let list = ManifestList::parse_with_version(&bytes, format).unwrap();
+                let mut retired = BTreeMap::new();
+                let mut live = BTreeSet::new();
+                for manifest_file in list.entries() {
+                    assert_eq!(manifest_file.partition_spec_id, 0);
+                    let manifest = manifest_file.load_manifest(table.file_io()).await.unwrap();
+                    for entry in manifest.entries() {
+                        if entry.is_alive() {
+                            live.insert(entry.data_file().file_path().to_owned());
+                        } else {
+                            assert_eq!(entry.status(), ManifestStatus::Deleted);
+                            retired.insert(
+                                entry.data_file().file_path().to_owned(),
+                                (
+                                    entry
+                                        .sequence_number()
+                                        .unwrap_or(manifest_file.sequence_number),
+                                    entry.file_sequence_number,
+                                ),
+                            );
+                        }
+                    }
+                }
+                assert_eq!(
+                    retired, old_identity,
+                    "retirement must retain original file sequences"
+                );
+                assert_eq!(
+                    live,
+                    if empty {
+                        BTreeSet::new()
+                    } else {
+                        BTreeSet::from([new_path])
+                    }
+                );
+            }
+        }
+    }
+
     async fn append_synthetic_data(
         fixture: &LocalTableFixture,
         table: &Table,
@@ -942,6 +1212,8 @@ mod tests {
                 abort_handle,
                 target_ref,
                 snapshot_properties: &snapshot_properties,
+
+                metadata_updates: &[],
             })
             .await
             .expect("append synthetic data file")
@@ -1030,6 +1302,8 @@ mod tests {
                 abort_handle,
                 target_ref: "main",
                 snapshot_properties: &snapshot_properties,
+
+                metadata_updates: &[],
             })
             .await
             .expect("empty overwrite must succeed as a no-op");
@@ -1084,6 +1358,8 @@ mod tests {
             abort_handle,
             target_ref: "main",
             snapshot_properties: &snapshot_properties,
+
+            metadata_updates: &[],
         })
         .await
         .expect("publish metadata-only application documents");
@@ -1152,6 +1428,8 @@ mod tests {
             abort_handle,
             target_ref: "main",
             snapshot_properties: &snapshot_properties,
+
+            metadata_updates: &[],
         })
         .await
         .expect("publish metadata-only documents over populated base");
@@ -1205,6 +1483,8 @@ mod tests {
                 abort_handle,
                 target_ref: "main",
                 snapshot_properties: &snapshot_properties,
+
+                metadata_updates: &[],
             })
             .await
             .expect("zero-row insert remains a no-op");
@@ -1311,6 +1591,8 @@ mod tests {
             abort_handle: marker_abort,
             target_ref: "main",
             snapshot_properties: &marker_properties,
+
+            metadata_updates: &[],
         })
         .await
         .expect("publish the marker snapshot");
@@ -1343,6 +1625,8 @@ mod tests {
                 abort_handle,
                 target_ref: "main",
                 snapshot_properties: &snapshot_properties,
+
+                metadata_updates: &[],
             })
             .await
             .expect("empty overwrite over a populated base must succeed");

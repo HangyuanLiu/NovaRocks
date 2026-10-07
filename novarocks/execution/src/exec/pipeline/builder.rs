@@ -657,9 +657,12 @@ fn ensure_hash_on_input_slots(
 
 pub fn output_chunk_schema_for_node(node: &ExecNode) -> Option<crate::exec::chunk::ChunkSchemaRef> {
     match &node.kind {
+        ExecNodeKind::Membership(n) => Some(Arc::clone(&n.output_chunk_schema)),
         ExecNodeKind::AssertNumRows(AssertNumRowsNode { input, .. }) => {
             output_chunk_schema_for_node(input)
         }
+        ExecNodeKind::QuotaPreclaim(n) => Some(Arc::clone(&n.output_chunk_schema)),
+        ExecNodeKind::QuotaTrim(n) => Some(Arc::clone(&n.output_chunk_schema)),
         ExecNodeKind::Values(values) => Some(values.chunk.chunk_schema_ref()),
         ExecNodeKind::Project(project) => Some(Arc::clone(&project.output_chunk_schema)),
         ExecNodeKind::Unpivot(unpivot) => Some(Arc::clone(&unpivot.output_chunk_schema)),
@@ -1019,6 +1022,12 @@ fn build_pipeline_for_node(
     ctx: &mut PipelineBuildContext,
 ) -> Result<PipelineBuildResult, String> {
     match &node.kind {
+        ExecNodeKind::Membership(_) => {
+            Err("membership runtime integration is not installed".into())
+        }
+        ExecNodeKind::QuotaPreclaim(_) | ExecNodeKind::QuotaTrim(_) => {
+            Err("quota execution requires exact LocalRuntimeBindings".into())
+        }
         ExecNodeKind::RuntimeFilterConsumer(consumer) => {
             validate_native_consumer_specs(&consumer.bindings, ctx)?;
             let mut build = build_pipeline_for_node(&consumer.input, ctx)?;
@@ -1069,6 +1078,7 @@ fn build_pipeline_for_node(
             Ok(build)
         }
         ExecNodeKind::Project(ProjectNode {
+            retention_admission,
             input,
             node_id,
             is_subordinate,
@@ -1078,6 +1088,12 @@ fn build_pipeline_for_node(
             output_indices,
             output_chunk_schema,
         }) => {
+            if *retention_admission != novarocks_local_program::ProjectRetentionAdmission::Existing
+            {
+                return Err(
+                    "checked Project retention runtime integration is not installed".into(),
+                );
+            }
             let mut build = build_pipeline_for_node(input, ctx)?;
             build
                 .pipeline

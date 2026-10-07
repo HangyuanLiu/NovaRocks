@@ -318,6 +318,7 @@ pub enum AckPayload {
         /// An unavailable variant means it held one and could not publish its
         /// contribution; neither is an empty contribution.
         runtime_filter: Option<QueryTerminalProfileContributionTelemetry>,
+        verification: Option<novarocks_execution_contract::ContextVerificationFacts>,
     },
 }
 

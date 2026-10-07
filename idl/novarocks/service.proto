@@ -701,6 +701,14 @@ message TaskAssignment {
   // In static sink/route order, each entry names the outbound topology edge
   // whose destination set serves that sink or route.
   repeated uint32 sink_edge_ids = 3;  // <= 256
+  // Exact placed Task count of the referenced preclaim fragment, in ascending
+  // domain-node order. These counts are frozen after the task graph is built.
+  repeated TaskQuotaDomainBinding quota_domain_bindings = 4;  // <= 256
+}
+
+message TaskQuotaDomainBinding {
+  int32 preclaim_node_id = 1;  // nonnegative
+  uint32 task_count = 2;       // nonzero
 }
 
 // The initial scan ranges of one scan plan node.
@@ -1164,6 +1172,27 @@ enum ReleaseQueryContextOutcome {
   RELEASE_QUERY_CONTEXT_OUTCOME_ALREADY_TERMINAL = 3;
 }
 
+// Always-on facts from exact operator instances. Numeric states are closed.
+message VerificationRecord {
+  int32 plan_node_id = 1;
+  uint32 local_instance_id = 2;
+  // 1 = NotStarted, 2 = Started, 3 = Completed.
+  uint32 state = 3;
+  optional uint64 requested = 4;
+  optional uint64 matched = 5;
+}
+message TaskVerificationFacts {
+  TaskIdentity task = 1;
+  // 1 = Available, 2 = Truncated, 3 = Unavailable.
+  uint32 observation = 2;
+  repeated VerificationRecord records = 3;
+}
+message ContextVerificationFacts {
+  QueryContextRef query_context = 1;
+  repeated TaskVerificationFacts tasks = 2;
+  bool truncated = 3;
+}
+
 message ReleaseQueryContextAck {
   QueryContextRef query_context = 1;
   ReleaseQueryContextOutcome outcome = 2;
@@ -1183,6 +1212,7 @@ message ReleaseQueryContextAck {
   // that found one and could not seal it reports the unavailable variant with
   // its stage and code, never an empty contribution.
   optional QueryTerminalProfileContributionTelemetry runtime_filter = 5;
+  optional ContextVerificationFacts verification = 6;
 }
 
 // The receipt of exactly one operation from a batch.
@@ -1231,6 +1261,9 @@ enum TaskFailureCategory {
   TASK_FAILURE_CATEGORY_EXCHANGE = 3;
   TASK_FAILURE_CATEGORY_PROTOCOL = 4;
   TASK_FAILURE_CATEGORY_INTERNAL = 5;
+  TASK_FAILURE_CATEGORY_CAPACITY_REFUSED = 6;
+  TASK_FAILURE_CATEGORY_MV_APPLY_CONSISTENCY = 7;
+  TASK_FAILURE_CATEGORY_TARGET_FORMAT_UNSUPPORTED = 8;
 }
 
 enum TaskFailurePhase {
@@ -1239,10 +1272,29 @@ enum TaskFailurePhase {
   TASK_FAILURE_PHASE_EXECUTION = 2;
 }
 
+message TaskCapacityRefused {
+  string resource = 1;  // <= 512 bytes, redacted
+  uint64 requested = 2;
+  uint64 limit = 3;
+}
+message TaskMvApplyConsistency {
+  uint64 requested = 1;
+  uint64 matched = 2;
+  string sample = 3;  // <= 512 bytes, redacted
+}
+message TaskTargetFormatUnsupported {
+  string data_file = 1;  // <= 512 bytes, redacted
+  string delete_kind = 2;  // <= 512 bytes, redacted
+}
 message TaskFailure {
   TaskFailureCategory category = 1;
   string safe_detail = 2;  // <= 512 bytes, redacted by the producer
   TaskFailurePhase phase = 3;
+  oneof bounded_payload {
+    TaskCapacityRefused capacity_refused = 4;
+    TaskMvApplyConsistency mv_apply_consistency = 5;
+    TaskTargetFormatUnsupported target_format_unsupported = 6;
+  }
 }
 
 // The cause a terminating or terminal state must carry. FINISHED carries none.

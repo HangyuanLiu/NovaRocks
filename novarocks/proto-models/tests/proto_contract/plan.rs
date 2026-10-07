@@ -488,6 +488,8 @@ fn classify_plan_node_kind(kind: plan::plan_node::Kind) -> &'static str {
         plan::plan_node::Kind::CteConsume(_) => "cte_consume",
         plan::plan_node::Kind::Redistribute(_) => "redistribute",
         plan::plan_node::Kind::Unpivot(_) => "unpivot",
+        plan::plan_node::Kind::QuotaPreclaim(_) => "quota_preclaim",
+        plan::plan_node::Kind::QuotaTrim(_) => "quota_trim",
     }
 }
 
@@ -549,13 +551,124 @@ fn plan_node_kind_match_is_exhaustive_over_current_oneof() {
         Kind::CteProduce(plan::CteProduceNode::default()),
         Kind::CteConsume(plan::CteConsumeNode::default()),
         Kind::Redistribute(plan::RedistributeNode::default()),
+        Kind::Unpivot(plan::UnpivotNode::default()),
+        Kind::QuotaPreclaim(plan::QuotaPreclaimNode::default()),
+        Kind::QuotaTrim(plan::QuotaTrimNode::default()),
     ];
 
     let names = kinds
         .into_iter()
         .map(classify_plan_node_kind)
         .collect::<Vec<_>>();
-    assert_eq!(names.len(), 22);
+    assert_eq!(names.len(), 25);
     assert!(names.contains(&"scan"));
     assert!(names.contains(&"redistribute"));
+}
+
+#[test]
+fn quota_signed_need_domain_and_content_fields_survive_wire_roundtrip() {
+    let semantic = plan::ResultContentEquivalence::NativeResultContentV1 as i32;
+    let node = plan::PlanNode {
+        output_columns: vec![],
+        kind: Some(plan::plan_node::Kind::QuotaPreclaim(
+            plan::QuotaPreclaimNode {
+                demand_entry_id_column_id: 1,
+                demand_key_column_id: 2,
+                demand_need: Some(plan::QuotaNeed {
+                    kind: Some(plan::quota_need::Kind::NegativeWeightColumnId(3)),
+                }),
+                target_value_column_ids: vec![4, 5],
+                target_file_column_id: 6,
+                target_position_column_id: 7,
+                content_equivalence: semantic,
+                preselection_domain_node_id: 11,
+                max_state_bytes: 8192,
+                demand_value_column_ids: vec![8, 9],
+            },
+        )),
+    };
+    let decoded: plan::PlanNode = roundtrip_message(&node);
+    assert_eq!(node, decoded);
+    let trim = plan::PlanNode {
+        output_columns: vec![],
+        kind: Some(plan::plan_node::Kind::QuotaTrim(plan::QuotaTrimNode {
+            seed_entry_id_column_id: 1,
+            seed_need: Some(plan::QuotaNeed {
+                kind: Some(plan::quota_need::Kind::NegativeWeightColumnId(3)),
+            }),
+            candidate_entry_id_column_id: 4,
+            candidate_file_column_id: 5,
+            candidate_position_column_id: 6,
+            content_equivalence: semantic,
+            preselection_domain_node_id: 11,
+            max_state_bytes: 16384,
+        })),
+    };
+    assert_eq!(trim, roundtrip_message(&trim));
+    let fanout = plan::PredicateFanoutSink {
+        branches: vec![
+            plan::PredicateFanoutBranch {
+                stream: Some(plan::DataStreamSink {
+                    dest_node_id: 31,
+                    target_fragment_id: 4,
+                    output_columns: vec![1, 2],
+                    ..Default::default()
+                }),
+                predicate: Some(expr::Expr::default()),
+            },
+            plan::PredicateFanoutBranch {
+                stream: Some(plan::DataStreamSink {
+                    dest_node_id: 32,
+                    target_fragment_id: 5,
+                    output_columns: vec![2],
+                    ..Default::default()
+                }),
+                predicate: Some(expr::Expr::default()),
+            },
+        ],
+    };
+    assert_eq!(fanout, roundtrip_message(&fanout));
+}
+
+#[test]
+fn quota_runtime_filter_exact_witness_and_field_contract_survive_wire_roundtrip() {
+    let semantic = plan::ResultContentEquivalence::NativeResultContentV1 as i32;
+    let producer = plan::RuntimeFilterProducerRole {
+        contribution_kinds: vec![
+            plan::RuntimeFilterContributionKind::ValueDomainDelta as i32,
+            plan::RuntimeFilterContributionKind::ProducerClosed as i32,
+        ],
+        completion_requirement: plan::RuntimeFilterCompletionRequirement::ProducerClosed as i32,
+        target: Some(
+            plan::runtime_filter_producer_role::Target::QuotaContentField(
+                plan::RuntimeFilterQuotaContentField {
+                    field_ordinal: 2,
+                    content_equivalence: semantic,
+                    witness_id: 41,
+                },
+            ),
+        ),
+    };
+    assert_eq!(producer, roundtrip_message(&producer));
+    let consumer = plan::RuntimeFilterConsumerRole {
+        capabilities: vec![plan::RuntimeFilterArtifactCapability::Membership as i32],
+        activation: Some(plan::RuntimeFilterConsumerActivation {
+            kind: Some(
+                plan::runtime_filter_consumer_activation::Kind::NonBlockingLive(
+                    plan::RuntimeFilterLateApplyGranularity::Batch as i32,
+                ),
+            ),
+        }),
+        target: Some(
+            plan::runtime_filter_consumer_role::Target::QuotaContentScanField(
+                plan::RuntimeFilterQuotaContentScanField {
+                    producer_witness_id: 41,
+                    field_ordinal: 2,
+                    content_equivalence: semantic,
+                    preclaim_node_id: 71,
+                },
+            ),
+        ),
+    };
+    assert_eq!(consumer, roundtrip_message(&consumer));
 }

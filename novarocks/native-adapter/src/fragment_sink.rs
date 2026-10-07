@@ -38,6 +38,57 @@ use novarocks_types::SlotId;
 use crate::fragment_error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
 use crate::fragment_expression::{NativeExpressionInputLayout, decode_expr_at};
 
+/// Check fanout predicates and partition expressions against the actual lowered
+/// producer output, before runtime preparation can allocate or send a branch.
+pub(crate) fn validate_predicate_fanout_input(
+    fragment: &plan::PlanFragment,
+    layout: &SlotLayout,
+    schema: &novarocks_execution::exec::chunk::ChunkSchemaRef,
+) -> Result<(), NativeFragmentDecodeError> {
+    let Some(plan::data_sink::Kind::PredicateFanout(fanout)) =
+        fragment.sink.as_ref().and_then(|sink| sink.kind.as_ref())
+    else {
+        return Ok(());
+    };
+    let path = FieldPath::root("plan_fragment")
+        .field("sink")
+        .field("predicate_fanout")
+        .field("branches");
+    for (index, branch) in fanout.branches.iter().enumerate() {
+        let branch_path = path.clone().index(index);
+        if let Some(predicate) = &branch.predicate {
+            crate::fragment_plan_decode::validate_input_column_refs_exact(
+                "native predicate fanout",
+                predicate,
+                layout,
+                schema,
+                branch_path.clone().field("predicate"),
+            )?;
+        }
+        if let Some(partition) = branch
+            .stream
+            .as_ref()
+            .and_then(|stream| stream.output_partition.as_ref())
+        {
+            for (index, expression) in partition.exprs.iter().enumerate() {
+                crate::fragment_plan_decode::validate_input_column_refs_exact(
+                    "native predicate fanout partition",
+                    expression,
+                    layout,
+                    schema,
+                    branch_path
+                        .clone()
+                        .field("stream")
+                        .field("output_partition")
+                        .field("exprs")
+                        .index(index),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn decode_fragment_sink_program(
     fragment: &plan::PlanFragment,
     layout: &SlotLayout,
@@ -83,6 +134,59 @@ pub fn decode_fragment_sink_program(
             branch
                 .into_program(partition_arena)
                 .map(FragmentSinkProgram::DataStream)
+                .map_err(NativeFragmentDecodeError::from)
+        }
+        plan::data_sink::Kind::PredicateFanout(fanout) => {
+            let branch_path = path.clone().field("predicate_fanout").field("branches");
+            if fanout.branches.is_empty() {
+                return Err(NativeFragmentDecodeError::invalid_value(
+                    branch_path,
+                    "predicate fanout requires nonempty branches",
+                ));
+            }
+            let mut arena = ExprArena::default();
+            let mut streams = Vec::with_capacity(fanout.branches.len());
+            let mut predicates = Vec::with_capacity(fanout.branches.len());
+            for (index, branch) in fanout.branches.iter().enumerate() {
+                let branch_path = branch_path.clone().index(index);
+                let stream = branch.stream.as_ref().ok_or_else(|| {
+                    NativeFragmentDecodeError::missing(
+                        branch_path.clone().field("stream"),
+                        "fanout branch requires its exact stream",
+                    )
+                })?;
+                let predicate = branch.predicate.as_ref().ok_or_else(|| {
+                    NativeFragmentDecodeError::missing(
+                        branch_path.clone().field("predicate"),
+                        "fanout branch requires a predicate",
+                    )
+                })?;
+                streams.push(
+                    decode_data_stream_branch(
+                        stream,
+                        &mut arena,
+                        layout,
+                        "native PREDICATE_FANOUT_SINK",
+                    )
+                    .map_err(|error| error.into_native(branch_path.clone().field("stream")))?,
+                );
+                let id = decode_sink_expression(
+                    predicate,
+                    &mut arena,
+                    layout,
+                    branch_path.clone().field("predicate"),
+                )?;
+                if arena.data_type(id) != Some(&arrow::datatypes::DataType::Boolean) {
+                    return Err(NativeFragmentDecodeError::invalid_value(
+                        branch_path.field("predicate"),
+                        "fanout predicate must be Boolean",
+                    ));
+                }
+                novarocks_execution::exec::operators::SplitDataStreamSinkFactory::validate_predicate(&arena,id).map_err(|error|NativeFragmentDecodeError::unsupported(branch_path.clone().field("predicate"),error))?;
+                predicates.push(id);
+            }
+            SplitDataStreamSinkProgram::try_new_with_fanout(streams, predicates, arena, true)
+                .map(FragmentSinkProgram::SplitDataStream)
                 .map_err(NativeFragmentDecodeError::from)
         }
         plan::data_sink::Kind::MultiCastDataStream(grouped) => {
@@ -915,5 +1019,146 @@ mod tests {
             protocol.detail(),
             "native CHANGE_STREAM_ROUTER_SINK repeats write target ordinal 0"
         );
+    }
+}
+
+#[cfg(test)]
+mod predicate_fanout_tests {
+    use super::*;
+    use arrow::datatypes::DataType;
+    fn column(id: u32, ty: DataType) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(novarocks_plan_codec::encode_native_type(&ty).unwrap()),
+            nullable: false,
+            kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
+                column_id: id,
+                ..Default::default()
+            })),
+        }
+    }
+    fn fanout() -> plan::PlanFragment {
+        let predicates = [
+            column(1, DataType::Boolean),
+            column(1, DataType::Boolean),
+            column(1, DataType::Boolean),
+        ];
+        let partitions = [
+            plan::PartitionKind::Random,
+            plan::PartitionKind::Unpartitioned,
+            plan::PartitionKind::Hash,
+        ];
+        let branches = predicates
+            .into_iter()
+            .zip(partitions)
+            .enumerate()
+            .map(|(i, (predicate, kind))| plan::PredicateFanoutBranch {
+                stream: Some(plan::DataStreamSink {
+                    dest_node_id: i as i32 + 10,
+                    output_partition: Some(plan::DataPartition {
+                        kind: kind as i32,
+                        exprs: if kind == plan::PartitionKind::Hash {
+                            vec![column(2, DataType::Binary)]
+                        } else {
+                            Vec::new()
+                        },
+                    }),
+                    output_columns: vec![1, 2],
+                    limit: None,
+                    target_fragment_id: i as u32 + 2,
+                }),
+                predicate: Some(predicate),
+            })
+            .collect();
+        plan::PlanFragment {
+            sink: Some(plan::DataSink {
+                kind: Some(plan::data_sink::Kind::PredicateFanout(
+                    plan::PredicateFanoutSink { branches },
+                )),
+            }),
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn predicate_fanout_decodes_three_exact_partitions_over_shared_output() {
+        let fragment = fanout();
+        let program = decode_fragment_sink_program(
+            &fragment,
+            &SlotLayout::for_slots([SlotId::new(1), SlotId::new(2)]),
+        )
+        .unwrap();
+        let FragmentSinkProgram::SplitDataStream(split) = program else {
+            panic!("split")
+        };
+        assert!(split.fanout());
+        assert_eq!(split.split_exprs().len(), 3);
+        assert_eq!(
+            split.sinks()[0].output_partition_type(),
+            DataStreamPartitionType::Random
+        );
+        assert_eq!(
+            split.sinks()[1].output_partition_type(),
+            DataStreamPartitionType::Unpartitioned
+        );
+        assert_eq!(
+            split.sinks()[2].output_partition_type(),
+            DataStreamPartitionType::HashPartitioned
+        );
+    }
+    #[test]
+    fn predicate_fanout_rejects_missing_or_wrong_predicate_and_stream() {
+        let layout = SlotLayout::for_slots([SlotId::new(1), SlotId::new(2)]);
+        for fault in 0..3 {
+            let mut fragment = fanout();
+            let Some(plan::data_sink::Kind::PredicateFanout(fanout)) =
+                &mut fragment.sink.as_mut().unwrap().kind
+            else {
+                panic!("fanout")
+            };
+            match fault {
+                0 => fanout.branches[0].predicate = None,
+                1 => fanout.branches[0].stream = None,
+                _ => fanout.branches[0].predicate = Some(column(2, DataType::Binary)),
+            };
+            assert!(decode_fragment_sink_program(&fragment, &layout).is_err());
+        }
+    }
+    #[test]
+    fn predicate_fanout_validates_actual_root_field_metadata_before_prepare() {
+        use arrow::datatypes::{Field, Schema};
+        use novarocks_execution::exec::chunk::ChunkSchema;
+        let layout = SlotLayout::for_slots([SlotId::new(1), SlotId::new(2)]);
+        let schema = Schema::new(vec![
+            Field::new("selected", DataType::Boolean, false),
+            Field::new("entry_id", DataType::Binary, false),
+        ]);
+        let schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            &schema,
+            &[SlotId::new(1), SlotId::new(2)],
+        )
+        .unwrap();
+        validate_predicate_fanout_input(&fanout(), &layout, &schema).unwrap();
+        for fault in 0..3 {
+            let mut fragment = fanout();
+            let Some(plan::data_sink::Kind::PredicateFanout(fanout)) =
+                &mut fragment.sink.as_mut().unwrap().kind
+            else {
+                panic!("fanout")
+            };
+            match fault {
+                0 => fanout.branches[0].predicate = Some(column(2, DataType::Boolean)),
+                1 => fanout.branches[0].predicate.as_mut().unwrap().nullable = true,
+                _ => {
+                    fanout.branches[2]
+                        .stream
+                        .as_mut()
+                        .unwrap()
+                        .output_partition
+                        .as_mut()
+                        .unwrap()
+                        .exprs[0] = column(2, DataType::Int64)
+                }
+            };
+            assert!(validate_predicate_fanout_input(&fragment, &layout, &schema).is_err());
+        }
     }
 }

@@ -864,6 +864,12 @@ pub(super) fn provider_relation_need_from_sql_scan(
                 crate::planner::table::SqlMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired
             ),
         },
+        SqlScanKind::MvTargetBag { facts } => ProviderReadRelationNeed::MvTarget {
+            relation,
+            target_table_uuid: facts.target_table_uuid.clone(),
+            target_snapshot_id: facts.target_snapshot_id,
+            use_affected_partitions: true,
+        },
         SqlScanKind::MvTargetLocator { facts } => ProviderReadRelationNeed::MvTarget {
             relation,
             target_table_uuid: facts.target_table_uuid.clone(),

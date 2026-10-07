@@ -50,6 +50,22 @@ use super::split::{
 };
 use super::table_handle::{IcebergTableHandle, identity_partition_source_field_ids};
 
+/// Float bounds use SQL ordering and cannot prove NativeResultContentV1
+/// absence for NaN payloads or signed zero. Unknown type facts fail open too.
+fn content_filter_column_safe(column: &IcebergColumnHandle) -> bool {
+    if column.field_domain() == Some(crate::field_domain::FieldDomain::Json) {
+        return false;
+    }
+    match super::column_handle::parse_type(column.type_json(), "type_json") {
+        Ok(Type::Primitive(
+            crate::iceberg::spec::PrimitiveType::Float
+            | crate::iceberg::spec::PrimitiveType::Double,
+        ))
+        | Err(_) => false,
+        Ok(_) => true,
+    }
+}
+
 /// The Iceberg default target split size.
 pub const DEFAULT_TARGET_SPLIT_SIZE_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -115,6 +131,7 @@ pub struct IcebergSplitSource {
     /// Set when planning already proved the scan reads nothing.
     exhausted: bool,
     effective_predicate: TupleDomain<IcebergColumnHandle>,
+    has_floating_projection: bool,
     /// Projected base-column field IDs, or `None` when the projection contains
     /// a nested field and the partition-only fast path can never apply.
     projected_base_field_ids: Option<BTreeSet<i32>>,
@@ -176,6 +193,10 @@ impl IcebergSplitSource {
             None
         };
 
+        let has_floating_projection = table_handle
+            .projected_columns()
+            .iter()
+            .any(|column| !content_filter_column_safe(column));
         let effective_predicate = table_handle.effective_predicate()?;
         // Three planning outcomes read nothing at all. Recording them here
         // keeps `next_batch` from walking a file list that cannot contribute.
@@ -202,6 +223,7 @@ impl IcebergSplitSource {
             closed: false,
             exhausted,
             effective_predicate,
+            has_floating_projection,
             projected_base_field_ids,
             identity_partition_source_field_ids: identity_partition_ids,
             partition_types,
@@ -227,10 +249,15 @@ impl IcebergSplitSource {
         if static_file_domain.is_none() {
             return Ok(FilePruningDecision::Static);
         }
-        if static_file_domain
-            .intersect(dynamic_filter.current_predicate())?
-            .is_none()
-        {
+        let conservative =
+            if dynamic_filter.current_predicate().is_none() && self.has_floating_projection {
+                TupleDomain::all()
+            } else {
+                dynamic_filter
+                    .current_predicate()
+                    .filter_columns(content_filter_column_safe)
+            };
+        if static_file_domain.intersect(&conservative)?.is_none() {
             return Ok(FilePruningDecision::Dynamic);
         }
         Ok(FilePruningDecision::Keep)
@@ -482,7 +509,7 @@ impl ConnectorSplitSource for IcebergSplitSource {
         }
         // An unsatisfiable snapshot finishes immediately. Otherwise each
         // unexpanded file observes this batch's immutable snapshot below.
-        if dynamic_filter.current_predicate().is_none() {
+        if dynamic_filter.current_predicate().is_none() && !self.has_floating_projection {
             self.exhausted = true;
             return Ok(ConnectorSplitBatch::finished());
         }
@@ -1459,6 +1486,78 @@ mod tests {
                 splits_emitted: 1,
             },
             "static pruning must not be reported as runtime-filter avoided work"
+        );
+    }
+
+    #[test]
+    fn floating_content_dynamic_filter_is_fail_open_even_when_nan_collapse_is_empty() {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Schema};
+        let mut fields = partitioned_schema().as_struct().fields().to_vec();
+        fields.push(std::sync::Arc::new(NestedField::required(
+            4,
+            "floating",
+            Type::Primitive(PrimitiveType::Double),
+        )));
+        let schema = Schema::builder().with_fields(fields).build().unwrap();
+        let spec = identity_partition_spec(&schema);
+        let column = IcebergColumnHandle::base_column_of(&schema, 4).unwrap();
+        assert!(!content_filter_column_safe(&column));
+        let mut params = table_handle_params(&schema, Some(&spec));
+        params.projected_columns = BTreeSet::from([column.clone()]);
+        let handle = IcebergTableHandle::try_new(params).unwrap();
+        let mut file = planned(read_file("nan.parquet", 100, 10));
+        let data = crate::delete_semantics::DataFileFact::try_new(
+            file.read_file.path.as_str(),
+            crate::delete_semantics::DataSequenceNumber::try_new(9).unwrap(),
+            crate::delete_semantics::TypedPartition::bind(
+                &spec,
+                &schema,
+                file.read_file.partition_values.as_ref().unwrap(),
+            )
+            .unwrap(),
+            10,
+            crate::delete_semantics::FileMetrics::default(),
+        )
+        .unwrap();
+        let index = crate::delete_semantics::DeleteCandidateIndex::try_new(
+            handle.read_domain().unwrap().clone(),
+            crate::delete_semantics::DeleteObservation::from_manifests([]).unwrap(),
+        )
+        .unwrap();
+        file.read_file.deletes = index
+            .for_data(&data)
+            .unwrap()
+            .load_view(crate::delete_semantics::StatisticsPolicy::Disabled);
+        let domain = |value| {
+            Domain::new(
+                ValueSet::of_values(
+                    ConnectorValueType::Double,
+                    vec![ConnectorValue::Double(value)],
+                )
+                .unwrap(),
+                false,
+            )
+        };
+        file.file_statistics_domain =
+            TupleDomain::with_column_domains(BTreeMap::from([(column.clone(), domain(0.0))]))
+                .unwrap();
+        let filter = DynamicFilterSnapshot::new(
+            TupleDomain::with_column_domains(BTreeMap::from([(column, domain(100.0))])).unwrap(),
+            true,
+        );
+        let mut source = split_source_for(&handle, vec![file.clone()]);
+        assert_eq!(
+            source.next_batch(8, &filter).unwrap().into_splits().len(),
+            1
+        );
+        let mut source = split_source_for(&handle, vec![file]);
+        assert_eq!(
+            source
+                .next_batch(8, &DynamicFilterSnapshot::new(TupleDomain::none(), true))
+                .unwrap()
+                .into_splits()
+                .len(),
+            1
         );
     }
 

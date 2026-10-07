@@ -264,9 +264,9 @@ pub(crate) fn preflight_fragment_cut_resources(
         }
         for (source_value, _) in &edge.destination.receive_mapping {
             let ty = &source.values().get(source_value)?.ty;
-            usage.add_value_type(ty, &path, errors);
+            usage.add_cut_value_type(ty, &path, errors);
             if is_outbound {
-                usage.add_value_type(ty, &path, errors);
+                usage.add_cut_value_type(ty, &path, errors);
             }
         }
         if let Some(proof) = derivation.change_stream_writer(edge.id) {
@@ -340,6 +340,7 @@ pub(crate) fn fragment_cuts_with_provenance(
                         source: CutValue {
                             value: *source_value,
                             ty: source.values().get(source_value)?.ty.clone(),
+                            logical_kind: source.values().get(source_value)?.logical_kind,
                         },
                         destination: *destination,
                     })
@@ -375,6 +376,7 @@ pub(crate) fn fragment_cuts_with_provenance(
                     Some(CutValue {
                         value: *value,
                         ty: fragment.values().get(value)?.ty.clone(),
+                        logical_kind: fragment.values().get(value)?.logical_kind,
                     })
                 })
                 .collect::<Option<Vec<_>>>()?;
@@ -392,6 +394,7 @@ pub(crate) fn fragment_cuts_with_provenance(
                             source: CutValue {
                                 value: *source,
                                 ty: fragment.values().get(source)?.ty.clone(),
+                                logical_kind: fragment.values().get(source)?.logical_kind,
                             },
                             destination: *destination,
                         })
@@ -546,6 +549,10 @@ pub(crate) fn extend_runtime_filter_build_dependencies(
         (
             crate::RuntimeFilterProducerTarget::AggregateTopNKey { .. },
             NodeKind::Aggregate { .. },
+        ) => node.inputs.first().copied(),
+        (
+            crate::RuntimeFilterProducerTarget::QuotaContentField { .. },
+            NodeKind::QuotaPreclaim { .. },
         ) => node.inputs.first().copied(),
         _ => None,
     };
@@ -705,6 +712,10 @@ pub(crate) fn extend_runtime_filter_proof_hull(
                         | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField {
                             lineage,
                             ..
+                        }
+                        | crate::RuntimeFilterConsumerTarget::QuotaContentScanField {
+                            lineage,
+                            ..
                         } => lineage.len(),
                     })
                 }));
@@ -750,6 +761,9 @@ pub(crate) fn extend_runtime_filter_proof_hull(
                 let lineage = match &consumer.target {
                     crate::RuntimeFilterConsumerTarget::ScanField { lineage, .. }
                     | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField {
+                        lineage, ..
+                    }
+                    | crate::RuntimeFilterConsumerTarget::QuotaContentScanField {
                         lineage, ..
                     } => lineage,
                     crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => continue,
@@ -938,6 +952,7 @@ pub(crate) fn validate_fragment_cuts_into(
                 Some(value)
                     if value.ty.data_type == import.source.ty.data_type
                         && (value.ty.nullable || !import.source.ty.nullable)
+                        && value.logical_kind == import.source.logical_kind
                         && import_origin_matches(
                             &value.origin,
                             cut.edge,
@@ -1072,10 +1087,14 @@ pub(crate) fn validate_fragment_cuts_into(
         }
         for projected in &cut.projection {
             match fragment.values().get(&projected.value) {
-                Some(value) if value.ty != projected.ty => errors.push(ValidationError::new(
-                    &path,
-                    "outbound cut type differs from its source value",
-                )),
+                Some(value)
+                    if value.ty != projected.ty || value.logical_kind != projected.logical_kind =>
+                {
+                    errors.push(ValidationError::new(
+                        &path,
+                        "outbound cut type differs from its source value",
+                    ))
+                }
                 Some(_) => {}
                 None => errors.push(ValidationError::new(
                     &path,
@@ -1143,6 +1162,7 @@ pub(crate) fn validate_fragment_cuts_into(
     let sink_edges = match fragment.sink() {
         FragmentSink::Stream { edge } => vec![*edge],
         FragmentSink::Multicast { edges } => edges.to_vec(),
+        FragmentSink::PredicateFanout { branches } => branches.iter().map(|b| b.edge).collect(),
         FragmentSink::Router { routes, .. } => routes.iter().map(|route| route.edge).collect(),
         FragmentSink::Result | FragmentSink::SealedArtifact(_) | FragmentSink::Noop => Vec::new(),
     };
@@ -1899,6 +1919,7 @@ pub(crate) fn validate_runtime_filter_proof_graph(
     }
     validate_runtime_filter_proof_edge_source_sinks(&proof_plan, path, errors);
     for filter in proof_plan.runtime_filters().values() {
+        validate_quota_runtime_filter_key_homology(&proof_plan, filter, path, errors);
         if !validate_runtime_filter_shape(filter, path, errors) {
             continue;
         }

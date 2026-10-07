@@ -26,7 +26,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
+use super::mv_storage_observation::{legacy_scalar_type_bytes, logical_type_bytes};
 use bytes::Bytes;
+use novarocks_type_contract::LogicalType;
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -58,12 +60,103 @@ fn digest_bytes(hasher: &mut Sha256, value: &[u8]) {
     hasher.update(value);
 }
 
+// Canonical structural hashing is only the ephemeral prepared-handle binding;
+// MV persistence serialization remains owned by the MV application.
+fn digest_logical_type(hasher: &mut Sha256, ty: &LogicalType) {
+    use LogicalType::*;
+    let tag: u8 = match ty {
+        Null => 0,
+        Boolean => 1,
+        Int8 => 2,
+        Int16 => 3,
+        Int32 => 4,
+        Int64 => 5,
+        UInt8 => 6,
+        UInt16 => 7,
+        UInt32 => 8,
+        UInt64 => 9,
+        LargeInt => 10,
+        Float32 => 11,
+        Float64 => 12,
+        Decimal { .. } => 13,
+        Utf8 => 14,
+        Binary => 15,
+        FixedSizeBinary(_) => 16,
+        Uuid => 17,
+        Json => 18,
+        Bitmap => 19,
+        Hll => 20,
+        Object => 21,
+        Percentile => 22,
+        Variant => 23,
+        Date32 => 24,
+        Date64 => 25,
+        Time { .. } => 26,
+        Timestamp { .. } => 27,
+        Array { .. } => 28,
+        Map { .. } => 29,
+        Struct(_) => 30,
+    };
+    hasher.update([tag]);
+    let unit = |unit: &arrow::datatypes::TimeUnit| match unit {
+        arrow::datatypes::TimeUnit::Second => 0u8,
+        arrow::datatypes::TimeUnit::Millisecond => 1,
+        arrow::datatypes::TimeUnit::Microsecond => 2,
+        arrow::datatypes::TimeUnit::Nanosecond => 3,
+    };
+    match ty {
+        Decimal {
+            bits,
+            precision,
+            scale,
+        } => {
+            hasher.update(bits.to_be_bytes());
+            hasher.update([*precision, *scale as u8]);
+        }
+        FixedSizeBinary(n) => hasher.update(n.to_be_bytes()),
+        Time { bits, unit: u } => hasher.update([*bits, unit(u)]),
+        Timestamp { unit: u, timezone } => {
+            hasher.update([unit(u), u8::from(timezone.is_some())]);
+            if let Some(zone) = timezone {
+                digest_bytes(hasher, zone.as_bytes());
+            }
+        }
+        Array {
+            element,
+            fixed_length,
+        } => {
+            hasher.update([u8::from(fixed_length.is_some()), u8::from(element.nullable)]);
+            if let Some(n) = fixed_length {
+                hasher.update(n.to_be_bytes());
+            }
+            digest_logical_type(hasher, &element.data_type);
+        }
+        Map { key, value } => {
+            for v in [key, value] {
+                hasher.update([u8::from(v.nullable)]);
+                digest_logical_type(hasher, &v.data_type);
+            }
+        }
+        Struct(fields) => {
+            hasher.update((fields.len() as u64).to_be_bytes());
+            for f in fields {
+                digest_bytes(hasher, f.name.as_bytes());
+                hasher.update([u8::from(f.nullable)]);
+                digest_logical_type(hasher, &f.data_type);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct ConnectorPreparedCreateFieldBinding {
     request_ordinal: u32,
     provider_field_id: Bytes,
     name: String,
-    type_signature: String,
+    logical_type: LogicalType,
+    legacy_scalar_type: Option<LogicalType>,
+    provider_type_binding: Bytes,
     nullable: bool,
 }
 
@@ -74,7 +167,11 @@ impl std::fmt::Debug for ConnectorPreparedCreateFieldBinding {
             .field("request_ordinal", &self.request_ordinal)
             .field("provider_field_id_bytes", &self.provider_field_id.len())
             .field("name", &self.name)
-            .field("type_signature", &self.type_signature)
+            .field("logical_type", &self.logical_type)
+            .field(
+                "provider_type_binding_bytes",
+                &self.provider_type_binding.len(),
+            )
             .field("nullable", &self.nullable)
             .finish()
     }
@@ -85,23 +182,30 @@ impl ConnectorPreparedCreateFieldBinding {
         request_ordinal: u32,
         provider_field_id: Bytes,
         name: String,
-        type_signature: String,
+        logical_type: LogicalType,
+        legacy_scalar_type: Option<LogicalType>,
+        provider_type_binding: Bytes,
         nullable: bool,
     ) -> Result<Self, ConnectorError> {
         if provider_field_id.is_empty()
             || provider_field_id.len() > MAX_PREPARED_CREATE_FIELD_ID_BYTES
             || name.trim().is_empty()
-            || type_signature.trim().is_empty()
+            || provider_type_binding.is_empty()
+            || provider_type_binding.len() > 64 * 1024
         {
             return Err(invalid(
                 "prepared create field binding is empty or exceeds its byte limit",
             ));
         }
+        logical_type_bytes(&logical_type)?;
+        legacy_scalar_type_bytes(legacy_scalar_type.as_ref())?;
         Ok(Self {
             request_ordinal,
             provider_field_id,
             name,
-            type_signature,
+            logical_type,
+            legacy_scalar_type,
+            provider_type_binding,
             nullable,
         })
     }
@@ -118,8 +222,18 @@ impl ConnectorPreparedCreateFieldBinding {
         &self.name
     }
 
-    pub fn type_signature(&self) -> &str {
-        &self.type_signature
+    pub fn logical_type(&self) -> &LogicalType {
+        &self.logical_type
+    }
+
+    /// An exact provider projection of the historical scalar domain, when
+    /// available. This is a comparison fact, never durable type authority.
+    pub fn legacy_scalar_type(&self) -> Option<&LogicalType> {
+        self.legacy_scalar_type.as_ref()
+    }
+
+    pub fn provider_type_binding(&self) -> &Bytes {
+        &self.provider_type_binding
     }
 
     pub const fn nullable(&self) -> bool {
@@ -206,7 +320,17 @@ impl ConnectorPreparedCreateDocumentTarget {
                         .checked_add(std::mem::size_of::<u32>())
                         .and_then(|bytes| bytes.checked_add(field.provider_field_id().len()))
                         .and_then(|bytes| bytes.checked_add(field.name().len()))
-                        .and_then(|bytes| bytes.checked_add(field.type_signature().len()))
+                        .and_then(|bytes| {
+                            bytes.checked_add(
+                                logical_type_bytes(field.logical_type())
+                                    .ok()?
+                                    .saturating_add(
+                                        legacy_scalar_type_bytes(field.legacy_scalar_type())
+                                            .ok()?,
+                                    )
+                                    .saturating_add(field.provider_type_binding().len()),
+                            )
+                        })
                 })
             })
             .and_then(|bytes| {
@@ -314,7 +438,15 @@ impl ConnectorPreparedCreateDocumentTarget {
             hasher.update(field.request_ordinal.to_be_bytes());
             digest_bytes(hasher, &field.provider_field_id);
             digest_bytes(hasher, field.name().as_bytes());
-            digest_bytes(hasher, field.type_signature().as_bytes());
+            digest_logical_type(hasher, field.logical_type());
+            match field.legacy_scalar_type() {
+                Some(ty) => {
+                    hasher.update([1]);
+                    digest_logical_type(hasher, ty);
+                }
+                None => hasher.update([0]),
+            }
+            digest_bytes(hasher, field.provider_type_binding());
             hasher.update([u8::from(field.nullable())]);
         }
         hasher.update((self.partition_fields.len() as u64).to_be_bytes());
@@ -1999,7 +2131,9 @@ mod tests {
                     1,
                     Bytes::from_static(b"field-id"),
                     "field".to_string(),
-                    "int".to_string(),
+                    LogicalType::Int32,
+                    None,
+                    Bytes::from_static(b"exact-provider-field"),
                     false,
                 )
                 .unwrap(),
@@ -2035,7 +2169,9 @@ mod tests {
                     0,
                     Bytes::from_static(b"field-id"),
                     "field".to_string(),
-                    "int".to_string(),
+                    LogicalType::Int32,
+                    None,
+                    Bytes::from_static(b"exact-provider-field"),
                     false,
                 )
                 .unwrap(),
@@ -2071,7 +2207,9 @@ mod tests {
                     0,
                     Bytes::from_static(b"field-id"),
                     "field".to_string(),
-                    "int".to_string(),
+                    LogicalType::Int32,
+                    None,
+                    Bytes::from_static(b"exact-provider-field"),
                     false,
                 )
                 .unwrap(),
@@ -2110,7 +2248,9 @@ mod tests {
                             0,
                             Bytes::from_static(b"field-id"),
                             "field".to_string(),
-                            "int".to_string(),
+                            LogicalType::Int32,
+                            None,
+                            Bytes::from_static(b"exact-provider-field"),
                             false,
                         )
                         .unwrap(),
@@ -3242,5 +3382,45 @@ mod tests {
             .unwrap();
         assert_eq!(capability.publishes.load(Ordering::SeqCst), 1);
         assert_eq!(capability.aborts.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn prepared_binding_digest_preserves_child_constraints_and_provider_identity() {
+        use novarocks_type_contract::LogicalValue;
+        let hash = |nullable| {
+            let mut h = Sha256::new();
+            digest_logical_type(
+                &mut h,
+                &LogicalType::Array {
+                    element: Box::new(LogicalValue {
+                        data_type: LogicalType::Int64,
+                        nullable,
+                    }),
+                    fixed_length: None,
+                },
+            );
+            h.finalize()
+        };
+        assert_ne!(hash(true), hash(false));
+        let a = ConnectorPreparedCreateFieldBinding::try_new(
+            0,
+            Bytes::from_static(b"id"),
+            "x".into(),
+            LogicalType::Int64,
+            None,
+            Bytes::from_static(b"provider-1"),
+            false,
+        )
+        .unwrap();
+        let b = ConnectorPreparedCreateFieldBinding::try_new(
+            0,
+            Bytes::from_static(b"id"),
+            "x".into(),
+            LogicalType::Int64,
+            None,
+            Bytes::from_static(b"provider-2"),
+            false,
+        )
+        .unwrap();
+        assert_ne!(a, b);
     }
 }

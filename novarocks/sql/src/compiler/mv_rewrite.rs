@@ -360,6 +360,44 @@ impl SqlImvTargetColumnsFacts {
 /// The value-only foundation of a sealed IMV rewrite snapshot.  Additional
 /// contract facts are supplied by the SQL-owned builder; applications can
 /// never recover or mutate the resulting planner snapshot.
+/// Source change facts and the application's admitted resident-state cap.
+/// The kind is frozen from every relation occurrence; SQL cannot infer it
+/// from a table name, profiling, or whether a scan happened to return rows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SqlImvVisibleApplyKind {
+    AppendOnly,
+    PotentialDeletes,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SqlImvVisibleApplyFacts {
+    pub(crate) kind: SqlImvVisibleApplyKind,
+    pub(crate) max_state_bytes: u64,
+}
+impl SqlImvVisibleApplyFacts {
+    /// Append-only application owns no quota resident state.
+    pub const fn append_only() -> Self {
+        Self {
+            kind: SqlImvVisibleApplyKind::AppendOnly,
+            max_state_bytes: 0,
+        }
+    }
+    pub fn try_new(kind: SqlImvVisibleApplyKind, max_state_bytes: u64) -> Result<Self, String> {
+        if kind == SqlImvVisibleApplyKind::AppendOnly {
+            return Ok(Self::append_only());
+        }
+        if max_state_bytes == 0 || max_state_bytes > i64::MAX as u64 {
+            return Err(
+                "visible-bag apply requires a representable positive admitted state budget".into(),
+            );
+        }
+        Ok(Self {
+            kind,
+            max_state_bytes,
+        })
+    }
+}
+
 pub struct SqlImvRewriteSnapshotBuilder {
     target: novarocks_types::naming::TableIdentity,
     target_binding: SqlTableBindingId,
@@ -369,6 +407,7 @@ pub struct SqlImvRewriteSnapshotBuilder {
     refresh_history: Option<SqlImvRefreshHistoryFacts>,
     schema_contract: Option<SqlImvSchemaContractFacts>,
     aggregate_execution: Option<SqlImvAggregateExecutionFacts>,
+    visible_apply: Option<SqlImvVisibleApplyFacts>,
 }
 
 impl SqlImvRewriteSnapshotBuilder {
@@ -389,6 +428,7 @@ impl SqlImvRewriteSnapshotBuilder {
             refresh_history: None,
             schema_contract: None,
             aggregate_execution: None,
+            visible_apply: None,
         })
     }
 
@@ -464,6 +504,14 @@ impl SqlImvRewriteSnapshotBuilder {
         Ok(())
     }
 
+    pub fn set_visible_apply(&mut self, facts: SqlImvVisibleApplyFacts) -> Result<(), String> {
+        if self.visible_apply.is_some() {
+            return Err("visible-bag apply facts were submitted twice".into());
+        }
+        self.visible_apply = Some(facts);
+        Ok(())
+    }
+
     /// Seal the submitted copied facts.  The returned handle intentionally has
     /// no accessors for the planner snapshot or its private graph vocabulary.
     pub fn build(mut self) -> Result<SqlImvRewriteSnapshotHandle, String> {
@@ -488,7 +536,7 @@ impl SqlImvRewriteSnapshotBuilder {
             return Err("IMV snapshot/schema facts must cover the same definition occurrences in definition order".to_string());
         }
         let aggregate_execution = self.aggregate_execution.take().map(|facts| facts.inner);
-        let snapshot = SqlImvRewriteSnapshot::from_frozen_parts(
+        let mut snapshot = SqlImvRewriteSnapshot::from_frozen_parts(
             self.target,
             self.target_binding,
             self.mv_id,
@@ -501,6 +549,13 @@ impl SqlImvRewriteSnapshotBuilder {
             Arc::new(schema_contract.inner),
             aggregate_execution,
         )?;
+        if snapshot.schema_contract.aggregate.is_none() {
+            snapshot.visible_apply = Some(self.visible_apply.take().ok_or_else(|| {
+                "non-aggregate IMV snapshot has no frozen visible-bag apply facts".to_string()
+            })?);
+        } else if self.visible_apply.is_some() {
+            return Err("aggregate IMV snapshot cannot carry visible-bag apply facts".into());
+        }
         Ok(SqlImvRewriteSnapshotHandle(Arc::new(snapshot)))
     }
 
@@ -679,7 +734,7 @@ pub(crate) struct SqlImvOutputColumnLineage {
 pub(crate) struct SqlImvBaseField {
     pub(crate) field_id: bytes::Bytes,
     pub(crate) name_at_create: String,
-    pub(crate) data_type: arrow::datatypes::DataType,
+    pub(crate) logical_type: novarocks_types::logical_type::LogicalType,
     pub(crate) nullable: bool,
 }
 
@@ -719,7 +774,7 @@ pub(crate) enum SqlImvAggregateStateRoleContract {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SqlImvAggregateStateColumnContract {
     pub(crate) column_name: String,
-    pub(crate) type_signature: String,
+    pub(crate) logical_type: novarocks_types::logical_type::LogicalType,
     pub(crate) role: SqlImvAggregateStateRoleContract,
 }
 
@@ -791,7 +846,7 @@ pub(crate) struct SqlImvPartitionDerivationField {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SqlImvTargetContract {
     pub(crate) visible_columns: Vec<SqlImvTargetVisibleColumn>,
-    pub(crate) hidden_apply_key: SqlImvHiddenApplyKey,
+    pub(crate) hidden_apply_key: Option<SqlImvHiddenApplyKey>,
     pub(crate) partition: Option<SqlImvPartitionContract>,
 }
 
@@ -918,17 +973,18 @@ impl SqlImvBaseFieldFacts {
     pub fn try_new(
         field_id: bytes::Bytes,
         name_at_create: String,
-        data_type: arrow::datatypes::DataType,
+        logical_type: novarocks_types::logical_type::LogicalType,
         nullable: bool,
     ) -> Result<Self, String> {
         if field_id.is_empty() || name_at_create.trim().is_empty() {
             return Err("IMV base field facts are invalid".to_string());
         }
+        logical_type.validate(novarocks_types::logical_type::LogicalTypeLimits::default())?;
         Ok(Self {
             inner: SqlImvBaseField {
                 field_id,
                 name_at_create,
-                data_type,
+                logical_type,
                 nullable,
             },
         })
@@ -1041,16 +1097,17 @@ pub struct SqlImvAggregateStateColumnFacts {
 impl SqlImvAggregateStateColumnFacts {
     pub fn try_new(
         column_name: String,
-        type_signature: String,
+        logical_type: novarocks_types::logical_type::LogicalType,
         role: SqlImvAggregateStateRoleFacts,
     ) -> Result<Self, String> {
-        if column_name.trim().is_empty() || type_signature.trim().is_empty() {
+        if column_name.trim().is_empty() {
             return Err("IMV aggregate state column facts are invalid".to_string());
         }
+        logical_type.validate(novarocks_types::logical_type::LogicalTypeLimits::default())?;
         Ok(Self {
             inner: SqlImvAggregateStateColumnContract {
                 column_name,
-                type_signature,
+                logical_type,
                 role: match role {
                     SqlImvAggregateStateRoleFacts::Single => {
                         SqlImvAggregateStateRoleContract::Single
@@ -1248,12 +1305,13 @@ pub struct SqlImvTargetContractFacts {
 impl SqlImvTargetContractFacts {
     pub fn try_new(
         visible_columns: Vec<SqlImvTargetVisibleColumnFacts>,
-        hidden_apply_key_column_name: String,
-        hidden_apply_key_source: SqlImvApplyKeySourceFacts,
+        hidden_apply_key: Option<(String, SqlImvApplyKeySourceFacts)>,
         partition: Option<SqlImvPartitionFacts>,
     ) -> Result<Self, String> {
         if visible_columns.is_empty()
-            || hidden_apply_key_column_name.trim().is_empty()
+            || hidden_apply_key.as_ref().is_some_and(|(name, source)| {
+                name.trim().is_empty() || *source != SqlImvApplyKeySourceFacts::GroupRowId
+            })
             || visible_columns.iter().enumerate().any(|(index, column)| {
                 visible_columns[..index].iter().any(|other| {
                     other
@@ -1275,20 +1333,10 @@ impl SqlImvTargetContractFacts {
                     .into_iter()
                     .map(|facts| facts.inner)
                     .collect(),
-                hidden_apply_key: SqlImvHiddenApplyKey {
-                    column_name: hidden_apply_key_column_name,
-                    source: match hidden_apply_key_source {
-                        SqlImvApplyKeySourceFacts::BaseRowId => {
-                            crate::planner::vocabulary::ApplyKeySource::BaseRowId
-                        }
-                        SqlImvApplyKeySourceFacts::JoinRowKey => {
-                            crate::planner::vocabulary::ApplyKeySource::JoinRowKey
-                        }
-                        SqlImvApplyKeySourceFacts::GroupRowId => {
-                            crate::planner::vocabulary::ApplyKeySource::GroupRowId
-                        }
-                    },
-                },
+                hidden_apply_key: hidden_apply_key.map(|(column_name, _)| SqlImvHiddenApplyKey {
+                    column_name,
+                    source: crate::planner::vocabulary::ApplyKeySource::GroupRowId,
+                }),
                 partition: partition.map(|facts| facts.inner),
             },
         })
@@ -1339,6 +1387,11 @@ impl SqlImvSchemaContractFacts {
             })
         {
             return Err("IMV schema contract facts are incomplete or duplicate".to_string());
+        }
+        if aggregate.is_some() != target.inner.hidden_apply_key.is_some()
+            || (aggregate.is_none() && branch.is_some())
+        {
+            return Err("nonaggregate IMV targets must contain only visible outputs".to_string());
         }
         if join.is_some() && bases.len() < 2 {
             return Err("IMV join contract requires at least two bases".to_string());
@@ -1549,6 +1602,7 @@ pub(crate) struct SqlImvRewriteSnapshot {
     /// Aggregate shape/layout was derived from the admitted MV definition by
     /// application before compiler entry.  Non-aggregate refreshes use None.
     pub(crate) aggregate_execution: Option<SqlImvAggregateExecutionLayout>,
+    pub(crate) visible_apply: Option<SqlImvVisibleApplyFacts>,
 }
 
 impl SqlImvRewriteSnapshot {
@@ -1615,6 +1669,7 @@ impl SqlImvRewriteSnapshot {
             target_columns,
             schema_contract,
             aggregate_execution,
+            visible_apply: None,
         })
     }
 
@@ -1675,48 +1730,51 @@ pub(crate) fn test_incremental_snapshot() -> Arc<SqlImvRewriteSnapshot> {
         SqlMvRelationOccurrenceId::new(7),
         test_object_id("object-b"),
     );
-    Arc::new(
-        SqlImvRewriteSnapshot::from_frozen_parts(
-            target,
-            test_target_binding(),
-            1,
-            Arc::from(vec![SqlImvBaseSnapshot {
-                occurrence_id: SqlMvRelationOccurrenceId::new(7),
-                table: base,
-                qualifier_at_binding: "b".to_string(),
-                snapshot_id: 22,
-                table_object_id: test_object_id("object-b"),
-            }]),
-            previous_snapshot_ids,
-            previous_table_object_ids,
-            Some(1),
-            "target-uuid".to_string(),
-            Arc::from(vec![novarocks_types::schema::ColumnDef {
-                name: "k".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
-                write_default: None,
-                logical_type: None,
-            }]),
-            Arc::new(SqlImvSchemaContract {
-                bases: Vec::new(),
-                output_columns: Vec::new(),
-                join: None,
-                aggregate: None,
-                branch: None,
-                target: SqlImvTargetContract {
-                    visible_columns: Vec::new(),
-                    hidden_apply_key: SqlImvHiddenApplyKey {
-                        column_name: "__nova_base_row_id".to_string(),
-                        source: crate::planner::vocabulary::ApplyKeySource::BaseRowId,
-                    },
-                    partition: None,
-                },
-            }),
-            None,
-        )
-        .expect("SQL-only test IMV snapshot"),
+    let mut snapshot = SqlImvRewriteSnapshot::from_frozen_parts(
+        target,
+        test_target_binding(),
+        1,
+        Arc::from(vec![SqlImvBaseSnapshot {
+            occurrence_id: SqlMvRelationOccurrenceId::new(7),
+            table: base,
+            qualifier_at_binding: "b".to_string(),
+            snapshot_id: 22,
+            table_object_id: test_object_id("object-b"),
+        }]),
+        previous_snapshot_ids,
+        previous_table_object_ids,
+        Some(1),
+        "target-uuid".to_string(),
+        Arc::from(vec![novarocks_types::schema::ColumnDef {
+            name: "k".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        }]),
+        Arc::new(SqlImvSchemaContract {
+            bases: Vec::new(),
+            output_columns: Vec::new(),
+            join: None,
+            aggregate: None,
+            branch: None,
+            target: SqlImvTargetContract {
+                visible_columns: vec![SqlImvTargetVisibleColumn {
+                    output_name: "k".to_string(),
+                    target_field_id: bytes::Bytes::from_static(b"field-100"),
+                }],
+                hidden_apply_key: None,
+                partition: None,
+            },
+        }),
+        None,
     )
+    .expect("SQL-only test IMV snapshot");
+    snapshot.visible_apply = Some(
+        SqlImvVisibleApplyFacts::try_new(SqlImvVisibleApplyKind::PotentialDeletes, 1024 * 1024)
+            .expect("test visible apply policy"),
+    );
+    Arc::new(snapshot)
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1824,6 +1882,7 @@ pub(crate) fn test_aggregate_snapshot(
     branch: Option<SqlImvBranchContract>,
 ) -> Arc<SqlImvRewriteSnapshot> {
     let mut snapshot = (*test_incremental_snapshot()).clone();
+    snapshot.visible_apply = None;
     snapshot.schema_contract = Arc::new(SqlImvSchemaContract {
         bases: vec![SqlImvBaseContract {
             occurrence_id: SqlMvRelationOccurrenceId::new(7),
@@ -1833,13 +1892,13 @@ pub(crate) fn test_aggregate_snapshot(
                 SqlImvBaseField {
                     field_id: bytes::Bytes::from_static(b"field-1"),
                     name_at_create: "k".to_string(),
-                    data_type: arrow::datatypes::DataType::Int64,
+                    logical_type: novarocks_types::logical_type::LogicalType::Int64,
                     nullable: false,
                 },
                 SqlImvBaseField {
                     field_id: bytes::Bytes::from_static(b"field-2"),
                     name_at_create: "v".to_string(),
-                    data_type: arrow::datatypes::DataType::Int64,
+                    logical_type: novarocks_types::logical_type::LogicalType::Int64,
                     nullable: true,
                 },
             ],
@@ -1863,10 +1922,10 @@ pub(crate) fn test_aggregate_snapshot(
                     target_field_id: bytes::Bytes::from_static(b"field-101"),
                 },
             ],
-            hidden_apply_key: SqlImvHiddenApplyKey {
+            hidden_apply_key: Some(SqlImvHiddenApplyKey {
                 column_name: "__row_id__".to_string(),
                 source: crate::planner::vocabulary::ApplyKeySource::GroupRowId,
-            },
+            }),
             partition,
         },
     });
@@ -1897,7 +1956,9 @@ pub(crate) fn test_aggregate_snapshot(
                 .enumerate()
                 .map(|(index, column)| SqlImvAggregateStateColumn {
                     name: column.column_name.clone(),
-                    data_type: if column.type_signature == "long" {
+                    data_type: if column.logical_type
+                        == novarocks_types::logical_type::LogicalType::Int64
+                    {
                         arrow::datatypes::DataType::Int64
                     } else {
                         arrow::datatypes::DataType::Binary
@@ -1962,7 +2023,9 @@ pub(crate) fn test_aggregate_snapshot(
             .iter()
             .map(|column| novarocks_types::schema::ColumnDef {
                 name: column.column_name.clone(),
-                data_type: if column.type_signature == "long" {
+                data_type: if column.logical_type
+                    == novarocks_types::logical_type::LogicalType::Int64
+                {
                     arrow::datatypes::DataType::Int64
                 } else {
                     arrow::datatypes::DataType::Binary
@@ -2008,13 +2071,13 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
             SqlImvBaseField {
                 field_id: bytes::Bytes::from_static(b"field-1"),
                 name_at_create: "k".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
+                logical_type: novarocks_types::logical_type::LogicalType::Int64,
                 nullable: false,
             },
             SqlImvBaseField {
                 field_id: bytes::Bytes::from_static(b"field-2"),
                 name_at_create: "v".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
+                logical_type: novarocks_types::logical_type::LogicalType::Int64,
                 nullable: true,
             },
         ],
@@ -2022,16 +2085,16 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
     let state_columns = vec![
         SqlImvAggregateStateColumnContract {
             column_name: "__agg_state_s".to_string(),
-            type_signature: "binary".to_string(),
+            logical_type: novarocks_types::logical_type::LogicalType::Binary,
             role: SqlImvAggregateStateRoleContract::Single,
         },
         SqlImvAggregateStateColumnContract {
             column_name: "__agg_state___ivm_row_count".to_string(),
-            type_signature: "long".to_string(),
+            logical_type: novarocks_types::logical_type::LogicalType::Int64,
             role: SqlImvAggregateStateRoleContract::RetractionCount,
         },
     ];
-    let schema_contract = Arc::new(SqlImvSchemaContract {
+    let mut schema_contract = Arc::new(SqlImvSchemaContract {
         bases: vec![
             base_contract("ice.db.l", "l"),
             base_contract("ice.db.r", "r"),
@@ -2076,10 +2139,10 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
                     target_field_id: bytes::Bytes::from_static(b"field-101"),
                 },
             ],
-            hidden_apply_key: SqlImvHiddenApplyKey {
+            hidden_apply_key: Some(SqlImvHiddenApplyKey {
                 column_name: "__row_id__".to_string(),
                 source: crate::planner::vocabulary::ApplyKeySource::GroupRowId,
-            },
+            }),
             partition: None,
         },
     });
@@ -2110,7 +2173,9 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
                 .enumerate()
                 .map(|(aggregate_index, column)| SqlImvAggregateStateColumn {
                     name: column.column_name.clone(),
-                    data_type: if column.type_signature == "long" {
+                    data_type: if column.logical_type
+                        == novarocks_types::logical_type::LogicalType::Int64
+                    {
                         arrow::datatypes::DataType::Int64
                     } else {
                         arrow::datatypes::DataType::Binary
@@ -2182,7 +2247,9 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
             .iter()
             .map(|column| novarocks_types::schema::ColumnDef {
                 name: column.column_name.clone(),
-                data_type: if column.type_signature == "long" {
+                data_type: if column.logical_type
+                    == novarocks_types::logical_type::LogicalType::Int64
+                {
                     arrow::datatypes::DataType::Int64
                 } else {
                     arrow::datatypes::DataType::Binary
@@ -2192,49 +2259,61 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
                 logical_type: None,
             }),
     );
-    Arc::new(
-        SqlImvRewriteSnapshot::from_frozen_parts(
-            novarocks_types::naming::TableIdentity::new("ice", "db", "mv"),
-            test_target_binding(),
-            42,
-            Arc::from(vec![
-                SqlImvBaseSnapshot {
-                    occurrence_id: SqlMvRelationOccurrenceId::new(7),
-                    table: novarocks_types::naming::TableIdentity::new("ice", "db", "l"),
-                    qualifier_at_binding: "l".to_string(),
-                    snapshot_id: 22,
-                    table_object_id: test_object_id("object-l"),
-                },
-                SqlImvBaseSnapshot {
-                    occurrence_id: SqlMvRelationOccurrenceId::new(42),
-                    table: novarocks_types::naming::TableIdentity::new("ice", "db", "r"),
-                    qualifier_at_binding: "r".to_string(),
-                    snapshot_id: 44,
-                    table_object_id: test_object_id("object-r"),
-                },
-            ]),
-            BTreeMap::from([
-                (SqlMvRelationOccurrenceId::new(7), 11),
-                (SqlMvRelationOccurrenceId::new(42), 33),
-            ]),
-            BTreeMap::from([
-                (
-                    SqlMvRelationOccurrenceId::new(7),
-                    test_object_id("object-l"),
-                ),
-                (
-                    SqlMvRelationOccurrenceId::new(42),
-                    test_object_id("object-r"),
-                ),
-            ]),
-            Some(99),
-            "uuid-tgt".to_string(),
-            Arc::from(target_columns),
-            schema_contract,
-            aggregate_execution,
-        )
-        .expect("SQL-only join test snapshot"),
+    if !aggregate {
+        let target = &mut Arc::make_mut(&mut schema_contract).target;
+        target.hidden_apply_key = None;
+        target.visible_columns[1].output_name = "v".to_string();
+        target_columns.truncate(2);
+        target_columns[1].name = "v".to_string();
+    }
+    let mut snapshot = SqlImvRewriteSnapshot::from_frozen_parts(
+        novarocks_types::naming::TableIdentity::new("ice", "db", "mv"),
+        test_target_binding(),
+        42,
+        Arc::from(vec![
+            SqlImvBaseSnapshot {
+                occurrence_id: SqlMvRelationOccurrenceId::new(7),
+                table: novarocks_types::naming::TableIdentity::new("ice", "db", "l"),
+                qualifier_at_binding: "l".to_string(),
+                snapshot_id: 22,
+                table_object_id: test_object_id("object-l"),
+            },
+            SqlImvBaseSnapshot {
+                occurrence_id: SqlMvRelationOccurrenceId::new(42),
+                table: novarocks_types::naming::TableIdentity::new("ice", "db", "r"),
+                qualifier_at_binding: "r".to_string(),
+                snapshot_id: 44,
+                table_object_id: test_object_id("object-r"),
+            },
+        ]),
+        BTreeMap::from([
+            (SqlMvRelationOccurrenceId::new(7), 11),
+            (SqlMvRelationOccurrenceId::new(42), 33),
+        ]),
+        BTreeMap::from([
+            (
+                SqlMvRelationOccurrenceId::new(7),
+                test_object_id("object-l"),
+            ),
+            (
+                SqlMvRelationOccurrenceId::new(42),
+                test_object_id("object-r"),
+            ),
+        ]),
+        Some(99),
+        "uuid-tgt".to_string(),
+        Arc::from(target_columns),
+        schema_contract,
+        aggregate_execution,
     )
+    .expect("SQL-only join test snapshot");
+    if !aggregate {
+        snapshot.visible_apply = Some(
+            SqlImvVisibleApplyFacts::try_new(SqlImvVisibleApplyKind::PotentialDeletes, 1024 * 1024)
+                .expect("test visible apply policy"),
+        );
+    }
+    Arc::new(snapshot)
 }
 
 #[cfg(test)]
@@ -2243,12 +2322,12 @@ pub(crate) fn test_branch_union_snapshot() -> Arc<SqlImvRewriteSnapshot> {
         vec![
             SqlImvAggregateStateColumnContract {
                 column_name: "__agg_state_s".to_string(),
-                type_signature: "binary".to_string(),
+                logical_type: novarocks_types::logical_type::LogicalType::Binary,
                 role: SqlImvAggregateStateRoleContract::Single,
             },
             SqlImvAggregateStateColumnContract {
                 column_name: "__agg_state___ivm_row_count".to_string(),
-                type_signature: "long".to_string(),
+                logical_type: novarocks_types::logical_type::LogicalType::Int64,
                 role: SqlImvAggregateStateRoleContract::RetractionCount,
             },
         ],
@@ -2267,13 +2346,13 @@ pub(crate) fn test_branch_union_snapshot() -> Arc<SqlImvRewriteSnapshot> {
                 SqlImvBaseField {
                     field_id: bytes::Bytes::from_static(b"field-1"),
                     name_at_create: "region".to_string(),
-                    data_type: arrow::datatypes::DataType::Int64,
+                    logical_type: novarocks_types::logical_type::LogicalType::Int64,
                     nullable: false,
                 },
                 SqlImvBaseField {
                     field_id: bytes::Bytes::from_static(b"field-2"),
                     name_at_create: "amount".to_string(),
-                    data_type: arrow::datatypes::DataType::Int64,
+                    logical_type: novarocks_types::logical_type::LogicalType::Int64,
                     nullable: false,
                 },
             ],
@@ -2293,10 +2372,10 @@ pub(crate) fn test_branch_union_snapshot() -> Arc<SqlImvRewriteSnapshot> {
                     target_field_id: bytes::Bytes::from_static(b"field-101"),
                 },
             ],
-            hidden_apply_key: SqlImvHiddenApplyKey {
+            hidden_apply_key: Some(SqlImvHiddenApplyKey {
                 column_name: "__row_id__".to_string(),
                 source: crate::planner::vocabulary::ApplyKeySource::GroupRowId,
-            },
+            }),
             partition: None,
         },
     });
@@ -3423,6 +3502,33 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn visible_bag_test_snapshots_preserve_nonaggregate_and_state_contracts() {
+        for snapshot in [test_incremental_snapshot(), test_join_snapshot(false)] {
+            assert!(snapshot.schema_contract.aggregate.is_none());
+            assert!(snapshot.schema_contract.target.hidden_apply_key.is_none());
+            assert_eq!(
+                snapshot.visible_apply.as_ref().unwrap().kind,
+                SqlImvVisibleApplyKind::PotentialDeletes
+            );
+            assert_eq!(
+                snapshot.target_columns.len(),
+                snapshot.schema_contract.target.visible_columns.len()
+            );
+            for (column, contract) in snapshot
+                .target_columns
+                .iter()
+                .zip(&snapshot.schema_contract.target.visible_columns)
+            {
+                assert_eq!(column.name, contract.output_name);
+            }
+        }
+        let aggregate = test_join_snapshot(true);
+        assert!(aggregate.schema_contract.aggregate.is_some());
+        assert!(aggregate.schema_contract.target.hidden_apply_key.is_some());
+        assert!(aggregate.visible_apply.is_none());
+    }
+
     fn test_query(sql: &str) -> Query {
         let statements = novarocks_parser::parse(sql).expect("parse query");
         let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
@@ -4186,7 +4292,7 @@ mod tests {
                 SqlImvBaseFieldFacts::try_new(
                     bytes::Bytes::from_static(b"field-1"),
                     "k".to_string(),
-                    arrow::datatypes::DataType::Int64,
+                    novarocks_types::logical_type::LogicalType::Int64,
                     false,
                 )
                 .expect("base field"),
@@ -4216,8 +4322,7 @@ mod tests {
                 )
                 .expect("visible target"),
             ],
-            "__nova_base_row_id".to_string(),
-            SqlImvApplyKeySourceFacts::BaseRowId,
+            None,
             None,
         )
         .expect("target contract");
@@ -4234,6 +4339,15 @@ mod tests {
                 .expect("schema contract"),
             )
             .expect("schema contract accepted");
+        builder
+            .set_visible_apply(
+                SqlImvVisibleApplyFacts::try_new(
+                    SqlImvVisibleApplyKind::PotentialDeletes,
+                    1024 * 1024,
+                )
+                .expect("visible apply facts"),
+            )
+            .expect("visible apply accepted");
         let sealed = builder.build().expect("complete facts seal");
         assert_eq!(sealed.snapshot().target, target);
     }

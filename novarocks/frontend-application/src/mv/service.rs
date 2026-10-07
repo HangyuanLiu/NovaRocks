@@ -103,6 +103,7 @@ impl FrontendMvProductAdapter {
                 query_execution,
                 connector_control: Arc::clone(&connector_control),
                 provider_activation: Arc::clone(&provider_activation),
+                readiness: Arc::clone(&readiness),
             },
             readiness: Arc::clone(&readiness),
             product_service,
@@ -224,7 +225,13 @@ impl FrontendMvProductAdapter {
                 "MV refresh preparation changed the frontend-reserved attempt identity",
             ));
         }
-        self.execute_prepared_refresh(prepared, connector_context, execution)
+        let mv_id = prepared.finalize.mv_id;
+        let outcome = self.execute_prepared_refresh(prepared, connector_context, execution);
+        if outcome.is_ok() && owner == MvActivityOwner::ManualRefresh {
+            self.product_service
+                .clear_automatic_refresh_stop_after_manual_success(mv_id);
+        }
+        outcome
     }
 
     /// Run one foreground DDL path under the same per-target FIFO gate as
@@ -274,6 +281,9 @@ fn preparation_application_error(
 
     let kind = match error.kind {
         RefreshErrorKind::PreCommitFailed => MvApplicationErrorKind::Unavailable,
+        RefreshErrorKind::ConsistencyFailed => MvApplicationErrorKind::ConsistencyFailed,
+        RefreshErrorKind::CapacityRefused => MvApplicationErrorKind::CapacityRefused,
+        RefreshErrorKind::TargetRefused => MvApplicationErrorKind::TargetRefused,
         RefreshErrorKind::UserError => MvApplicationErrorKind::InvalidRequest,
         RefreshErrorKind::CommitFailedKnownUncommitted => MvApplicationErrorKind::TerminalFailure,
         RefreshErrorKind::CommitFailedKnownCommitted | RefreshErrorKind::MetadataFinalizeFailed => {
@@ -564,6 +574,8 @@ fn scheduler_outcome_log_fields(
         ScheduledRefreshDisposition::InvalidDefinition(reason) => {
             Some(("invalid_definition", reason))
         }
+        ScheduledRefreshDisposition::CapacityRefused(reason) => Some(("capacity_refused", reason)),
+        ScheduledRefreshDisposition::TargetRefused(reason) => Some(("target_refused", reason)),
         ScheduledRefreshDisposition::TerminalFailure(reason) => Some(("terminal_failure", reason)),
         ScheduledRefreshDisposition::Corruption(reason) => Some(("corruption", reason)),
         ScheduledRefreshDisposition::InvariantViolation(reason) => {
@@ -741,6 +753,15 @@ fn repository_disposition(
 fn application_disposition(error: MvApplicationError) -> ScheduledRefreshDisposition {
     use crate::mv::domain::application::MvApplicationErrorKind;
     match error.kind() {
+        MvApplicationErrorKind::CapacityRefused => {
+            ScheduledRefreshDisposition::CapacityRefused(error.message().to_owned())
+        }
+        MvApplicationErrorKind::TargetRefused => {
+            ScheduledRefreshDisposition::TargetRefused(error.message().to_owned())
+        }
+        MvApplicationErrorKind::ConsistencyFailed => {
+            ScheduledRefreshDisposition::TerminalFailure(error.message().to_owned())
+        }
         MvApplicationErrorKind::AlreadyActive => ScheduledRefreshDisposition::AlreadyActive,
         MvApplicationErrorKind::TargetGone => ScheduledRefreshDisposition::TargetGone,
         MvApplicationErrorKind::Unavailable | MvApplicationErrorKind::BindingInvalidated => {

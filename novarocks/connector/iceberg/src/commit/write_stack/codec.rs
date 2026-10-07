@@ -75,7 +75,7 @@ use crate::commit::write_stack::old_delete::{
 };
 use crate::commit::write_stack::runtime::IcebergWriteAdapter;
 use crate::delete_file::{IcebergFileContent, IcebergFileFormat};
-use crate::scan_model::IcebergSchemaDef;
+
 use crate::wire::dto;
 use crate::write_descriptor::{IcebergPartitionDescriptor, IcebergPartitionValueDescriptor};
 
@@ -90,6 +90,50 @@ use crate::write_descriptor::{IcebergPartitionDescriptor, IcebergPartitionValueD
 struct IcebergWriteCodec {
     adapter: IcebergWriteAdapter,
     owner: Arc<str>,
+}
+
+const EXACT_WRITER_SCHEMA_PREFIX: &str = "novarocks.iceberg.writer-schema.v2:";
+const EXACT_WRITER_SCHEMA_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+fn exact_writer_schema_json(schema: &crate::iceberg::spec::Schema) -> Result<String, String> {
+    struct Bounded(Vec<u8>);
+    impl std::io::Write for Bounded {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.0.len().checked_add(bytes.len()).is_none_or(|n| {
+                n > EXACT_WRITER_SCHEMA_MAX_BYTES - EXACT_WRITER_SCHEMA_PREFIX.len()
+            }) {
+                return Err(std::io::Error::other(
+                    "exact writer schema exceeds its byte bound",
+                ));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct CanonicalSchema<'a> {
+        schema_id: i32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        identifier_field_ids: Option<Vec<i32>>,
+        #[serde(flatten)]
+        fields: &'a crate::iceberg::spec::StructType,
+    }
+    // SDK Schema owns identifier IDs as a HashSet. This is a semantic set,
+    // unlike ordered Struct children, so freeze its one canonical ordering.
+    let mut identifiers = schema.identifier_field_ids().collect::<Vec<_>>();
+    identifiers.sort_unstable();
+    let canonical = CanonicalSchema {
+        schema_id: schema.schema_id(),
+        identifier_field_ids: (!identifiers.is_empty()).then_some(identifiers),
+        fields: schema.as_struct(),
+    };
+    let mut output = Bounded(Vec::new());
+    serde_json::to_writer(&mut output, &canonical).map_err(|e| e.to_string())?;
+    String::from_utf8(output.0).map_err(|e| e.to_string())
 }
 
 impl IcebergWriteCodec {
@@ -555,22 +599,39 @@ impl IcebergWriteCodec {
         recipe: &IcebergDataBranchRecipe,
         path: FieldPath,
     ) -> Result<dto::IcebergDataBranchRecipe, ConnectorWriteCodecError> {
-        // The schema's own definition makes JSON its serialized form: the two
-        // `Literal` convenience fields are `#[serde(skip)]` and their durable
-        // spellings travel as `initial_default_json` / `write_default_json`.
+        // The versioned private grammar carries the complete SDK schema.
+        // Old field-ID-only JSON is deliberately not a decoding alternative.
         let input_schema_json = recipe
             .input_schema()
             .map(|schema| {
-                serde_json::to_string(schema).map_err(|error| {
+                crate::schema_mapping::validate_exact_schema(schema)
+                    .map_err(|error| self.invalid(path.field("input_schema_json"), error))?;
+                let json = exact_writer_schema_json(schema).map_err(|error| {
                     self.invalid(
                         path.field("input_schema_json"),
                         format!("encode Iceberg data writer input schema failed: {error}"),
                     )
-                })
+                })?;
+                if json.len() > EXACT_WRITER_SCHEMA_MAX_BYTES - EXACT_WRITER_SCHEMA_PREFIX.len() {
+                    return Err(self.invalid(
+                        path.field("input_schema_json"),
+                        "exact writer schema exceeds its byte bound",
+                    ));
+                }
+                // Producer and consumer enforce the same bounded JSON shape,
+                // including opaque defaults, before publishing the recipe.
+                crate::schema_preflight::preflight_schema(&json)
+                    .map_err(|error| self.invalid(path.field("input_schema_json"), error))?;
+                Ok(format!("{EXACT_WRITER_SCHEMA_PREFIX}{json}"))
             })
             .transpose()?;
+        let field_domains_json = Some(
+            crate::field_domain::encode(recipe.field_domains())
+                .map_err(|error| self.rejected(path.field("field_domains_json"), &error))?,
+        );
         Ok(dto::IcebergDataBranchRecipe {
             input_schema_json,
+            field_domains_json,
             partition_source_column_names: recipe.partition_source_column_names().to_vec(),
             partition_column_names: recipe.partition_column_names().to_vec(),
             transform_exprs: recipe.transform_exprs().to_vec(),
@@ -582,6 +643,7 @@ impl IcebergWriteCodec {
         &self,
         recipe: Option<&dto::IcebergDataBranchRecipe>,
         path: FieldPath,
+        context: &mut ConnectorDecodeContext<'_>,
     ) -> Result<IcebergDataBranchRecipe, ConnectorWriteCodecError> {
         let recipe = recipe.ok_or_else(|| {
             self.missing(
@@ -589,24 +651,97 @@ impl IcebergWriteCodec {
                 "an Iceberg data branch requires its data recipe",
             )
         })?;
+        let raw_domains = recipe.field_domains_json.as_deref().ok_or_else(|| {
+            self.missing(
+                path.field("field_domains_json"),
+                "exact writer requires complete domain facts",
+            )
+        })?;
+        let field_domains = crate::field_domain::decode(raw_domains)
+            .map_err(|error| self.rejected(path.field("field_domains_json"), &error))?;
+        if crate::field_domain::encode(&field_domains)
+            .map_err(|error| self.rejected(path.field("field_domains_json"), &error))?
+            != raw_domains
+        {
+            return Err(self.invalid(
+                path.field("field_domains_json"),
+                "writer domains are not canonical",
+            ));
+        }
+        let retained = crate::field_domain::retained_bytes(&field_domains)
+            .map_err(|error| self.rejected(path.field("field_domains_json"), &error))?;
+        context
+            .ledger()
+            .charge_retained(retained)
+            .map_err(|error| {
+                ConnectorWriteCodecError::new(
+                    &self.owner,
+                    ProtocolError::new(
+                        path.field("field_domains_json"),
+                        ProtocolErrorKind::Capacity,
+                        error.to_string(),
+                    ),
+                )
+            })?;
         let input_schema = recipe
             .input_schema_json
             .as_deref()
             .map(|json| {
-                serde_json::from_str::<IcebergSchemaDef>(json).map_err(|error| {
-                    self.invalid(
+                if json.len() > EXACT_WRITER_SCHEMA_MAX_BYTES {
+                    return Err(self.invalid(
                         path.field("input_schema_json"),
-                        format!("decode Iceberg data writer input schema failed: {error}"),
-                    )
-                })
+                        "exact writer schema exceeds its byte bound",
+                    ));
+                }
+                let json = json
+                    .strip_prefix(EXACT_WRITER_SCHEMA_PREFIX)
+                    .ok_or_else(|| {
+                        self.invalid(
+                            path.field("input_schema_json"),
+                            "unsupported or weak Iceberg writer schema grammar",
+                        )
+                    })?;
+                crate::schema_preflight::preflight_schema(json)
+                    .map_err(|error| self.invalid(path.field("input_schema_json"), error))?;
+                let mut decoder = serde_json::Deserializer::from_str(json);
+                // Disable the library structural limit only after both
+                // independent JSON and semantic preflight.
+                // Logical depth 64 can require >128 JSON containers.
+                decoder.disable_recursion_limit();
+                let schema =
+                    <crate::iceberg::spec::Schema as serde::Deserialize>::deserialize(&mut decoder)
+                        .map_err(|error| {
+                            self.invalid(
+                                path.field("input_schema_json"),
+                                format!("decode exact Iceberg writer schema failed: {error}"),
+                            )
+                        })?;
+                decoder.end().map_err(|error| {
+                    self.invalid(path.field("input_schema_json"), error.to_string())
+                })?;
+                crate::schema_mapping::validate_exact_schema(&schema)
+                    .map_err(|error| self.invalid(path.field("input_schema_json"), error))?;
+                // SDK serde can ignore unknown members. Exact canonical
+                // re-encoding rejects them rather than silently discarding facts.
+                let canonical = exact_writer_schema_json(&schema).map_err(|error| {
+                    self.invalid(path.field("input_schema_json"), error.to_string())
+                })?;
+                if canonical != json {
+                    return Err(self.invalid(
+                        path.field("input_schema_json"),
+                        "exact writer schema is not canonical or contains unknown fields",
+                    ));
+                }
+                Ok(Arc::new(schema))
             })
             .transpose()?;
-        IcebergDataBranchRecipe::try_new(
+        IcebergDataBranchRecipe::try_new_with_field_domains(
             input_schema,
             recipe.partition_source_column_names.clone(),
             recipe.partition_column_names.clone(),
             recipe.transform_exprs.clone(),
             recipe.row_lineage,
+            field_domains,
         )
         .map_err(|error| self.rejected(path, &error))
     }
@@ -789,6 +924,7 @@ impl IcebergWriteCodec {
     fn decode_writer_handle_value(
         &self,
         iceberg: &dto::IcebergWriterHandle,
+        context: &mut ConnectorDecodeContext<'_>,
     ) -> Result<IcebergWriterHandle, ConnectorWriteCodecError> {
         let path = FieldPath::root("writer_handle").field("iceberg");
         let branch = self.decode_branch(iceberg.branch, path.field("branch"))?;
@@ -796,7 +932,8 @@ impl IcebergWriteCodec {
         let output = self.decode_output(iceberg.output.as_ref(), path.field("output"))?;
         match branch {
             IcebergWriteBranch::Data => {
-                let recipe = self.decode_recipe(iceberg.data.as_ref(), path.field("data"))?;
+                let recipe =
+                    self.decode_recipe(iceberg.data.as_ref(), path.field("data"), context)?;
                 // `try_new_data` owns "a data writer produces Parquet".
                 IcebergWriterHandle::try_new_data(table, output, recipe)
                     .map_err(|error| self.rejected(path, &error))
@@ -1048,7 +1185,7 @@ impl ConnectorPrivateDecoder<IcebergWriterHandle> for IcebergWriteHandleDecoder 
             .validate_private_header(context, ConnectorCodecCategory::WriteHandle)?;
         let value = crate::wire::write::decode_writer_handle(payload, context)?;
         self.0
-            .decode_writer_handle_value(&value)
+            .decode_writer_handle_value(&value, context)
             .map_err(spi_codec_error)
     }
 }
@@ -1197,7 +1334,6 @@ mod tests {
         equality_delete_recipe, merge_target, parquet_ref, puffin_ref, sample_metrics,
         sample_partition, table_facts,
     };
-    use crate::scan_model::IcebergSchemaFieldDef;
 
     fn adapter(catalog: &str, version: u8) -> IcebergWriteAdapter {
         let instance_id = ConnectorInstanceId::parse(catalog).expect("instance id");
@@ -1317,18 +1453,18 @@ mod tests {
         IcebergWriterOutput::try_new(format, Compression::SNAPPY, None).expect("output")
     }
 
-    fn schema() -> IcebergSchemaDef {
-        IcebergSchemaDef {
-            fields: vec![IcebergSchemaFieldDef {
-                field_id: 1,
-                name: "k1".to_string(),
-                initial_default: None,
-                write_default: None,
-                initial_default_json: Some("7".to_string()),
-                write_default_json: None,
-                children: Vec::new(),
-            }],
-        }
+    fn schema() -> crate::iceberg::spec::Schema {
+        let mut field = crate::iceberg::spec::NestedField::optional(
+            1,
+            "k1",
+            crate::iceberg::spec::Type::Primitive(crate::iceberg::spec::PrimitiveType::Int),
+        );
+        field.initial_default = Some(crate::iceberg::spec::Literal::int(7));
+        crate::iceberg::spec::Schema::builder()
+            .with_schema_id(table_facts().schema_id())
+            .with_fields(vec![Arc::new(field)])
+            .build()
+            .unwrap()
     }
 
     fn data_handle() -> IcebergWriterHandle {
@@ -1341,7 +1477,7 @@ mod tests {
             )
             .expect("output"),
             IcebergDataBranchRecipe::try_new(
-                Some(schema()),
+                Some(Arc::new(schema())),
                 vec!["d".to_string()],
                 vec!["d_day".to_string()],
                 vec!["day(d)".to_string()],
@@ -1506,6 +1642,7 @@ mod tests {
             (None, None) => {}
             (Some(left), Some(right)) => {
                 assert_eq!(left.input_schema(), right.input_schema());
+                assert_eq!(left.field_domains(), right.field_domains());
                 assert_eq!(
                     left.partition_source_column_names(),
                     right.partition_source_column_names()
@@ -1891,6 +2028,256 @@ mod tests {
         );
     }
 
+    fn private_with_schema_json(json: &str) -> (Facets, Vec<u8>) {
+        let facets = generation();
+        let bytes = facets
+            .handle_encoder
+            .encode_private(&data_handle())
+            .unwrap();
+        let mut private = dto::IcebergWriterHandle::decode(bytes).unwrap();
+        private.data.as_mut().unwrap().input_schema_json =
+            Some(format!("{EXACT_WRITER_SCHEMA_PREFIX}{json}"));
+        (facets, private.encode_to_vec())
+    }
+
+    fn nested_exact_schema(depth: usize) -> crate::iceberg::spec::Schema {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, StructType, Type};
+        let mut ty = Type::Primitive(PrimitiveType::Long);
+        for id in (1..=depth).rev() {
+            ty = Type::Struct(StructType::new(vec![Arc::new(NestedField::required(
+                i32::try_from(id).unwrap(),
+                format!("n{id}"),
+                ty,
+            ))]));
+        }
+        let Type::Struct(fields) = ty else {
+            unreachable!()
+        };
+        crate::iceberg::spec::Schema::builder()
+            .with_schema_id(table_facts().schema_id())
+            .with_fields(fields.fields().iter().cloned())
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn frozen_private_writer_schema_preflights_before_sdk_indexes() {
+        // This valid shape is below the 8 MiB wire bound, but would build 4097
+        // NestedFields plus SDK name/ID/accessor indexes if SDK ran first.
+        let fields = (1..=4097)
+            .map(|id| {
+                format!("{{\"id\":{id},\"name\":\"f{id}\",\"required\":true,\"type\":\"long\"}}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            "{{\"schema-id\":{},\"type\":\"struct\",\"fields\":[{fields}]}}",
+            table_facts().schema_id()
+        );
+        assert!(json.len() < EXACT_WRITER_SCHEMA_MAX_BYTES);
+        let (facets, bytes) = private_with_schema_json(&json);
+        let error = decode_private_handle(&facets, &bytes, private_limits()).unwrap_err();
+        assert!(
+            error
+                .detail()
+                .contains("preflight: semantic budget exceeded before SDK decode"),
+            "{error}"
+        );
+        let too_long_name = format!(
+            "{{\"schema-id\":{},\"type\":\"struct\",\"fields\":[{{\"id\":1,\"name\":\"{}\",\"required\":true,\"type\":\"long\"}}]}}",
+            table_facts().schema_id(),
+            "x".repeat(65537)
+        );
+        let (facets, bytes) = private_with_schema_json(&too_long_name);
+        let error = decode_private_handle(&facets, &bytes, private_limits()).unwrap_err();
+        assert!(
+            error
+                .detail()
+                .contains("semantic name budget exceeded before SDK decode")
+        );
+        let unknown = format!(
+            "{{\"schema-id\":0,\"type\":\"struct\",\"fields\":[],\"unknown\":{}0{}}}",
+            "[".repeat(257),
+            "]".repeat(257)
+        );
+        let (facets, bytes) = private_with_schema_json(&unknown);
+        let error = decode_private_handle(&facets, &bytes, private_limits()).unwrap_err();
+        assert!(error.detail().contains("independent JSON budget exceeded"));
+    }
+
+    #[test]
+    fn frozen_private_writer_schema_accepts_exact_depth64_and_rejects65() {
+        let exact = nested_exact_schema(64);
+        let json = exact_writer_schema_json(&exact).unwrap();
+        let (facets, bytes) = private_with_schema_json(&json);
+        let decoded = decode_private_handle(&facets, &bytes, private_limits()).unwrap();
+        assert_eq!(
+            decoded
+                .data()
+                .unwrap()
+                .input_schema()
+                .unwrap()
+                .field_by_id(64)
+                .unwrap()
+                .name,
+            "n64"
+        );
+        let json = exact_writer_schema_json(&nested_exact_schema(65)).unwrap();
+        let (facets, bytes) = private_with_schema_json(&json);
+        let error = decode_private_handle(&facets, &bytes, private_limits()).unwrap_err();
+        assert!(
+            error
+                .detail()
+                .contains("preflight: semantic budget exceeded before SDK decode"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn frozen_private_writer_schema_rejects_negative_or_foreign_schema_ids() {
+        let source = schema();
+        for id in [-1, table_facts().schema_id() + 1] {
+            let foreign = crate::iceberg::spec::Schema::builder()
+                .with_schema_id(id)
+                .with_fields(source.as_struct().fields().iter().cloned())
+                .build()
+                .unwrap();
+            let json = exact_writer_schema_json(&foreign).unwrap();
+            let (facets, bytes) = private_with_schema_json(&json);
+            let error = decode_private_handle(&facets, &bytes, private_limits()).unwrap_err();
+            assert!(
+                error.detail().contains(if id < 0 {
+                    "nonnegative"
+                } else {
+                    "schema ID differs"
+                }),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn frozen_private_writer_schema_rejects_prior_provider_revisions() {
+        let facets = generation();
+        let bytes = facets
+            .handle_encoder
+            .encode_private(&data_handle())
+            .unwrap();
+        for revision in [2, 3] {
+            let header = ConnectorEnvelopeHeader::new(
+                ConnectorProviderId::parse(crate::PROVIDER_ID).unwrap(),
+                CatalogHandle::new(
+                    ConnectorInstanceId::parse("catalog.iceberg").unwrap(),
+                    CatalogVersion::from_bytes([1; 32]),
+                ),
+                ConnectorCodecCategory::WriteHandle,
+                ConnectorCodecRevision::try_new(revision).unwrap(),
+            );
+            let mut ledger = ConnectorDecodeLedger::new(private_limits());
+            let mut context = ConnectorDecodeContext::new(&header, &mut ledger);
+            assert!(
+                facets
+                    .handle_decoder
+                    .decode_private(&bytes, &mut context)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn frozen_private_writer_schema_identifier_sets_have_stable_bytes() {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Type};
+        let schema = Arc::new(
+            crate::iceberg::spec::Schema::builder()
+                .with_schema_id(table_facts().schema_id())
+                .with_fields(vec![
+                    Arc::new(NestedField::required(
+                        1,
+                        "first",
+                        Type::Primitive(PrimitiveType::Int),
+                    )),
+                    Arc::new(NestedField::required(
+                        2,
+                        "second",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                ])
+                .with_identifier_field_ids([2, 1])
+                .build()
+                .unwrap(),
+        );
+        let handle = IcebergWriterHandle::try_new_data(
+            table_facts(),
+            output(IcebergFileFormat::Parquet),
+            IcebergDataBranchRecipe::try_new(Some(schema), vec![], vec![], vec![], false).unwrap(),
+        )
+        .unwrap();
+        let facets = generation();
+        let frozen = facets.handle_encoder.encode_private(&handle).unwrap();
+        let private = dto::IcebergWriterHandle::decode(frozen.clone()).unwrap();
+        let json = private.data.unwrap().input_schema_json.unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(json.strip_prefix(EXACT_WRITER_SCHEMA_PREFIX).unwrap()).unwrap();
+        assert_eq!(value["identifier-field-ids"], serde_json::json!([1, 2]));
+        // Each SDK decode creates a new randomly seeded HashSet. Re-encoding
+        // must still produce the identical canonical provider payload bytes.
+        for _ in 0..64 {
+            let recovered = decode_private_handle(&facets, &frozen, private_limits()).unwrap();
+            assert_eq!(
+                facets.handle_encoder.encode_private(&recovered).unwrap(),
+                frozen
+            );
+            assert!(
+                recovered
+                    .data()
+                    .unwrap()
+                    .input_schema()
+                    .unwrap()
+                    .field_by_id(1)
+                    .unwrap()
+                    .required
+            );
+        }
+    }
+
+    #[test]
+    fn frozen_private_writer_schema_rejects_weak_unknown_and_noncanonical_payloads() {
+        let facets = generation();
+        let encoded = facets
+            .handle_encoder
+            .encode_private(&data_handle())
+            .unwrap();
+        let original = dto::IcebergWriterHandle::decode(encoded.clone()).unwrap();
+        let canonical = original
+            .data
+            .as_ref()
+            .unwrap()
+            .input_schema_json
+            .as_ref()
+            .unwrap();
+        let json = canonical.strip_prefix(EXACT_WRITER_SCHEMA_PREFIX).unwrap();
+        for bad in [
+            "{\"fields\":[]}".to_string(),
+            format!("novarocks.iceberg.writer-schema.v3:{json}"),
+            format!("{EXACT_WRITER_SCHEMA_PREFIX} {{}}"),
+            format!(
+                "{EXACT_WRITER_SCHEMA_PREFIX}{{\"unknown-provider-fact\":true,{}",
+                &json[1..]
+            ),
+            format!("{EXACT_WRITER_SCHEMA_PREFIX} {json}"),
+        ] {
+            let mut private = original.clone();
+            private.data.as_mut().unwrap().input_schema_json = Some(bad);
+            let error = decode_private_handle(&facets, &private.encode_to_vec(), private_limits())
+                .expect_err(
+                    "weak, future, unknown or noncanonical provider facts must fail closed",
+                );
+            assert_eq!(error.kind(), ConnectorCodecErrorKind::InvalidValue);
+        }
+        let decoded = decode_private_handle(&facets, &encoded, private_limits()).unwrap();
+        assert_eq!(decoded.data().unwrap().input_schema(), Some(&schema()));
+    }
+
     #[test]
     fn a_data_branch_handle_round_trips_through_its_carrier() {
         let facets = generation();
@@ -2274,5 +2661,115 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn frozen_writer_domains_are_mandatory_active_canonical_and_bounded() {
+        use crate::field_domain::FieldDomain;
+        let facets = generation();
+        let handle = IcebergWriterHandle::try_new_data(
+            table_facts(),
+            output(IcebergFileFormat::Parquet),
+            IcebergDataBranchRecipe::try_new_with_field_domains(
+                Some(Arc::new(schema())),
+                vec![],
+                vec![],
+                vec![],
+                false,
+                std::collections::BTreeMap::from([(1, FieldDomain::Int8)]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let encoded = facets.handle_encoder.encode_private(&handle).unwrap();
+        let original = dto::IcebergWriterHandle::decode(encoded.clone()).unwrap();
+        assert_eq!(
+            original
+                .data
+                .as_ref()
+                .unwrap()
+                .field_domains_json
+                .as_deref(),
+            Some("{\"version\":1,\"fields\":{\"1\":\"tinyint\"}}")
+        );
+        let restored = decode_private_handle(&facets, &encoded, private_limits()).unwrap();
+        assert_eq!(
+            restored.data().unwrap().field_domains(),
+            handle.data().unwrap().field_domains()
+        );
+        for bad in [
+            None,
+            Some("{\"version\":2,\"fields\":{}}".into()),
+            Some("{\"version\":1,\"fields\":{\"1\":\"json\"}}".into()),
+            Some("{\"version\":1,\"fields\":{\"99\":\"tinyint\"}}".into()),
+            Some("{\"version\":1,\"fields\":{\"1\":\"tinyint\",\"1\":\"smallint\"}}".into()),
+            Some(" {\"version\":1,\"fields\":{}}".into()),
+            Some(" ".repeat(crate::field_domain::MAX_BYTES + 1)),
+        ] {
+            let mut private = original.clone();
+            private.data.as_mut().unwrap().field_domains_json = bad;
+            assert!(
+                decode_private_handle(&facets, &private.encode_to_vec(), private_limits()).is_err()
+            );
+        }
+        let mut private = original.clone();
+        private.data.as_mut().unwrap().input_schema_json = None;
+        assert!(
+            decode_private_handle(&facets, &private.encode_to_vec(), private_limits()).is_err()
+        );
+    }
+    #[test]
+    fn frozen_writer_domain_protobuf_field_rejects_duplicate_and_future_tags() {
+        let facets = generation();
+        let raw = facets
+            .handle_encoder
+            .encode_private(&data_handle())
+            .unwrap();
+        let original = dto::IcebergWriterHandle::decode(raw).unwrap();
+        for tag in [6, 7] {
+            let mut private = original.clone();
+            let mut recipe = private.data.take().unwrap().encode_to_vec();
+            push_length_delimited(&mut recipe, tag, b"{\"version\":1,\"fields\":{}}");
+            let mut bytes = private.encode_to_vec();
+            push_length_delimited(&mut bytes, 4, &recipe);
+            let error = decode_private_handle(&facets, &bytes, private_limits()).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if tag == 6 {
+                    ConnectorCodecErrorKind::DuplicateField
+                } else {
+                    ConnectorCodecErrorKind::UnknownField
+                }
+            );
+        }
+    }
+    #[test]
+    fn frozen_writer_domain_map_charges_retained_ledger_before_sdk_decode() {
+        let facets = generation();
+        let raw = facets
+            .handle_encoder
+            .encode_private(&data_handle())
+            .unwrap();
+        let mut private = dto::IcebergWriterHandle::decode(raw).unwrap();
+        private.data.as_mut().unwrap().field_domains_json =
+            Some("{\"version\":1,\"fields\":{\"1\":\"tinyint\"}}".into());
+        // A weak SDK payload must not be reached when semantic retention fails.
+        private.data.as_mut().unwrap().input_schema_json = Some("weak-schema".into());
+        let bytes = private.encode_to_vec();
+        let header = private_header("catalog.iceberg", 1, ConnectorCodecCategory::WriteHandle);
+        let mut ledger = ConnectorDecodeLedger::new(private_limits());
+        let mut context = ConnectorDecodeContext::new(&header, &mut ledger);
+        crate::wire::write::decode_writer_handle(&bytes, &mut context).unwrap();
+        let dto_retained = ledger.retained_bytes();
+        let limits = ConnectorDecodeLimits::try_new(
+            MAX_CONNECTOR_WRITER_HANDLE_BYTES,
+            dto_retained,
+            MAX_CONNECTOR_WRITER_HANDLE_BYTES,
+            1_000_000,
+            64,
+        )
+        .unwrap();
+        let error = decode_private_handle(&facets, &bytes, limits).unwrap_err();
+        assert_eq!(error.kind(), ConnectorCodecErrorKind::Capacity);
+        assert!(error.to_string().contains("field_domains_json"), "{error}");
     }
 }

@@ -251,7 +251,7 @@ fn bind_first_refresh_write_dataflow(
     let target_name = prepared.target_name().to_string();
     let current_catalog = prepared.current_catalog().map(str::to_string);
     let current_database = prepared.current_database().to_string();
-    let root_hash_column = prepared.root_hash_column().to_string();
+    let root_hash_column = prepared.root_hash_column().map(str::to_owned);
     let write_target = sole_publication_write_target(write_session)?;
     let write_target_ordinal = write_target.ordinal();
     // The recipes are sealed once, here, and travel with the plan they were
@@ -365,6 +365,7 @@ fn bind_first_refresh_write_dataflow(
                     planning_lease,
                     connector_context,
                     Some(&facts.affected_partitions),
+                    None,
                 )?;
             let write_target_binding = admit_session_connector_write_target(
                 bindings.as_ref(),
@@ -407,7 +408,13 @@ fn bind_first_refresh_write_dataflow(
             let analyzed =
                 analyze_join_first_refresh_connector_write(SqlMvJoinFirstRefreshAnalyzeContext {
                     canonical_query: Box::new((*refresh_rewrite.canonical_select_query).clone()),
-                    rewrite_snapshot: refresh_rewrite.to_sql_rewrite_snapshot(target_binding)?,
+                    rewrite_snapshot: refresh_rewrite.to_sql_rewrite_snapshot(
+                        target_binding,
+                        refresh_rewrite.visible_apply_facts(
+                            novarocks_sql::compiler::SqlImvVisibleApplyKind::AppendOnly,
+                            None,
+                        )?,
+                    )?,
                     expected_root_hash_column: root_hash_column,
                     current_catalog: current_catalog.clone(),
                     current_database: current_database.clone(),

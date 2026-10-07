@@ -1140,6 +1140,7 @@ fn frozen_fragment_and_creation_metadata_keep_their_exact_fact_owners() {
         ("instance_ordinal", 1),
         ("initial_scan_ranges", 2),
         ("sink_edge_ids", 3),
+        ("quota_domain_bindings", 4),
     ] {
         assert_eq!(
             assignment.get_field_by_name(name).expect(name).number(),
@@ -1148,9 +1149,70 @@ fn frozen_fragment_and_creation_metadata_keep_their_exact_fact_owners() {
     }
     assert_eq!(
         assignment.fields().count(),
-        3,
+        4,
         "the assignment owns only these facts"
     );
+    let quota_domains = assignment
+        .get_field_by_name("quota_domain_bindings")
+        .expect("placed quota domain bindings");
+    assert!(quota_domains.is_list() && !quota_domains.is_map());
+    assert_eq!(
+        quota_domains
+            .kind()
+            .as_message()
+            .expect("typed quota domain binding")
+            .full_name(),
+        "novarocks.TaskQuotaDomainBinding"
+    );
+    let quota_domain = pool
+        .get_message_by_name("novarocks.TaskQuotaDomainBinding")
+        .expect("TaskQuotaDomainBinding descriptor");
+    assert_eq!(quota_domain.fields().count(), 2);
+    let preclaim = quota_domain
+        .get_field_by_name("preclaim_node_id")
+        .expect("exact preclaim node");
+    assert_eq!(preclaim.number(), 1);
+    assert!(matches!(preclaim.kind(), prost_reflect::Kind::Int32));
+    assert!(!preclaim.is_list() && !preclaim.is_map());
+    let count = quota_domain
+        .get_field_by_name("task_count")
+        .expect("placed Task count");
+    assert_eq!(count.number(), 2);
+    assert!(matches!(count.kind(), prost_reflect::Kind::Uint32));
+    assert!(!count.is_list() && !count.is_map());
+    let generated_assignment = novarocks::TaskAssignment::default();
+    let _: Vec<novarocks::TaskQuotaDomainBinding> = generated_assignment.quota_domain_bindings;
+    let generated_domain = novarocks::TaskQuotaDomainBinding::default();
+    let _: i32 = generated_domain.preclaim_node_id;
+    let _: u32 = generated_domain.task_count;
+    // Shared static plans name the exact preclaim domain. Only placement can
+    // freeze its Task count, including Tasks assigned no initial scan work.
+    // The count belongs to the assignment, not frozen fragment bytes or a
+    // second creation/descriptor owner.
+    for owner in [&frozen, &metadata] {
+        assert!(owner.get_field_by_name("quota_domain_bindings").is_none());
+    }
+    for (node_name, domain_tag) in [("QuotaPreclaimNode", 8), ("QuotaTrimNode", 7)] {
+        let node = pool
+            .get_message_by_name(&format!("novarocks.plan.{node_name}"))
+            .expect("static quota node descriptor");
+        let domain = node
+            .get_field_by_name("preselection_domain_node_id")
+            .expect("static preclaim reference");
+        assert_eq!(domain.number(), domain_tag);
+        assert!(matches!(domain.kind(), prost_reflect::Kind::Int32));
+        assert!(!domain.is_list() && !domain.is_map());
+        for absent in [
+            "task_count",
+            "preselection_domains",
+            "quota_domain_bindings",
+        ] {
+            assert!(
+                node.get_field_by_name(absent).is_none(),
+                "{node_name} must not guess placement facts"
+            );
+        }
+    }
     for absent in [
         "query_id",
         "fragment_instance_id",
@@ -1188,6 +1250,11 @@ fn frozen_fragment_and_creation_metadata_keep_their_exact_fact_owners() {
         .get_message_by_name("novarocks.TaskDescriptor")
         .expect("TaskDescriptor descriptor");
     assert!(descriptor.get_field_by_name("fragment").is_none());
+    assert!(
+        descriptor
+            .get_field_by_name("quota_domain_bindings")
+            .is_none()
+    );
     assert!(descriptor.reserved_ranges().any(|range| range.contains(&6)));
     assert!(descriptor.reserved_names().any(|name| name == "fragment"));
 }

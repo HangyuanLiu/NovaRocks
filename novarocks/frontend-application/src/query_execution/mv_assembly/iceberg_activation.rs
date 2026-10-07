@@ -37,7 +37,7 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
     PreparedMvRefreshWrite, PreparedMvRefreshWriteArtifact,
 };
 use crate::query_execution::mv_native_write::{
-    MvRefreshProviderActivation, PreparedMvNativeWriteAssembly,
+    MvRefreshProviderActivation, MvWritePreparationError, PreparedMvNativeWriteAssembly,
 };
 use novarocks_mv_application::product::MvIncrementalWriteMode;
 use novarocks_mv_application::publication::{
@@ -72,7 +72,7 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
         exact_lease: &ConnectorWriteLease,
         execution: &QueryExecutionContext,
         connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<PreparedMvNativeWriteAssembly, String> {
+    ) -> Result<PreparedMvNativeWriteAssembly, MvWritePreparationError> {
         match prepared.into_assembly_artifact() {
             PreparedMvRefreshWriteArtifact::FirstRefresh(prepared) => {
                 super::first_refresh_staging::bind_prepared_mv_first_refresh_staging(
@@ -84,6 +84,7 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
                     execution,
                     connector_context,
                 )
+                .map_err(MvWritePreparationError::from)
             }
             PreparedMvRefreshWriteArtifact::Incremental(prepared) => {
                 super::incremental_staging::bind_prepared_mv_incremental_staging(
@@ -270,6 +271,7 @@ pub(crate) fn begin_first_refresh_connector_write_session(
             novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
                 declaration,
                 shape: novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape::Data,
+                target_candidates: None,
             },
             connector_context,
         )?,
@@ -351,6 +353,7 @@ pub(crate) fn begin_metadata_only_connector_write_session(
             novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
                 declaration,
                 shape: novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape::Data,
+                target_candidates: None,
             },
             connector_context,
         )?,
@@ -368,6 +371,7 @@ pub(crate) fn begin_metadata_only_connector_write_session(
 fn incremental_publication_write_input(
     mode: MvIncrementalWriteMode,
     target_write_fields: &[arrow::datatypes::Field],
+    strict_visible_bag: bool,
 ) -> Result<
     (
         novarocks_spi::connector::ConnectorWriteIntent,
@@ -402,20 +406,20 @@ fn incremental_publication_write_input(
             ConnectorManagedPublicationShape::InsertOnlyChangeStream,
         ),
         MvIncrementalWriteMode::RowDelta => {
-            // The v3 lineage columns travel with the after-image so a replaced
-            // row keeps the identity it already had instead of being re-minted
-            // as a fresh row. They are nullable because an inserted row has no
-            // prior identity to carry.
-            data_fields.push(field(
-                ICEBERG_ROW_ID_COL,
-                arrow::datatypes::DataType::Int64,
-                true,
-            ));
-            data_fields.push(field(
-                ICEBERG_LAST_UPDATED_SEQ_COL,
-                arrow::datatypes::DataType::Int64,
-                true,
-            ));
+            if !strict_visible_bag {
+                // Aggregate state replacement retains its existing v3 lineage.
+                // Visible-bag apply identifies deletions only by file/position.
+                data_fields.push(field(
+                    ICEBERG_ROW_ID_COL,
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                ));
+                data_fields.push(field(
+                    ICEBERG_LAST_UPDATED_SEQ_COL,
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                ));
+            }
             (
                 novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
                 ConnectorWriteInputRequest::RowLineage {
@@ -473,11 +477,18 @@ pub(crate) fn begin_incremental_connector_write_session(
     publication_intent: &MvRefreshPublicationIntent,
     mode: MvIncrementalWriteMode,
     target_write_fields: &[arrow::datatypes::Field],
+    strict_visible_bag: bool,
+    target_candidates: Option<
+        novarocks_spi::connector::write_stack::ConnectorMvTargetCandidateSelection,
+    >,
     connector_context: ConnectorRequestContext,
     exact_lease: &ConnectorWriteLease,
     planning_lease: &ConnectorControlPlanningLease,
     typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
-) -> Result<std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>, String> {
+) -> Result<
+    std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+    MvWritePreparationError,
+> {
     let target = crate::catalog_application::resolver::TargetBackend {
         provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
             .expect("static Iceberg provider ID"),
@@ -485,7 +496,8 @@ pub(crate) fn begin_incremental_connector_write_session(
         namespace: request.target_namespace.clone(),
         table: request.target_name.clone(),
     };
-    let (intent, input, shape) = incremental_publication_write_input(mode, target_write_fields)?;
+    let (intent, input, shape) =
+        incremental_publication_write_input(mode, target_write_fields, strict_visible_bag)?;
     let base = publication_write_base(
         exact_lease,
         target_table,
@@ -501,7 +513,7 @@ pub(crate) fn begin_incremental_connector_write_session(
         base.clone(),
         ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
     )?;
-    crate::query_execution::write_session::begin_connector_application_document_write_session_pending(
+    crate::query_execution::write_session::begin_connector_application_document_write_session_pending_typed(
         crate::connector::write_target::derive_write_stack_lease(
             typed_connector_control,
             planning_lease,
@@ -517,10 +529,11 @@ pub(crate) fn begin_incremental_connector_write_session(
             novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
                 declaration,
                 shape,
+                target_candidates,
             },
             connector_context,
         )?,
-    )
+    ).map_err(MvWritePreparationError::from)
 }
 
 /// Release a session that will never reach its commit.
@@ -647,6 +660,7 @@ mod tests {
         let (intent, input, shape) = incremental_publication_write_input(
             MvIncrementalWriteMode::FastAppend,
             &target_write_fields(),
+            false,
         )
         .expect("fast-append declares its publication shape");
 
@@ -673,6 +687,7 @@ mod tests {
         let (intent, input, shape) = incremental_publication_write_input(
             MvIncrementalWriteMode::RowDelta,
             &target_write_fields(),
+            false,
         )
         .expect("row-delta declares its publication shape");
 
@@ -710,6 +725,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn visible_bag_row_delta_signs_only_visible_data_and_file_pos_identity() {
+        let visible = target_write_fields();
+        let (intent, input, shape) =
+            incremental_publication_write_input(MvIncrementalWriteMode::RowDelta, &visible, true)
+                .expect("visible-bag row-delta write input");
+        assert_eq!(intent, ConnectorWriteIntent::RowDelta);
+        assert_eq!(shape, ConnectorManagedPublicationShape::RowMutation);
+        let ConnectorWriteInputRequest::RowLineage {
+            data_fields,
+            row_identity_fields,
+        } = input
+        else {
+            panic!("file/position deletes require a row-lineage input");
+        };
+        assert_eq!(
+            data_fields
+                .iter()
+                .map(|f| f.field())
+                .cloned()
+                .collect::<Vec<_>>(),
+            visible
+        );
+        assert_eq!(field_names(&row_identity_fields), vec!["_file", "_pos"]);
+        assert_eq!(row_identity_fields[0].field().data_type(), &DataType::Utf8);
+        assert_eq!(row_identity_fields[1].field().data_type(), &DataType::Int64);
+        assert!(row_identity_fields.iter().all(|f| !f.field().is_nullable()));
+        assert!(data_fields.iter().all(|f| !matches!(
+            f.field().name().as_str(),
+            "_row_id" | "_last_updated_sequence_number"
+        )));
+    }
+
     /// A signed input with no fields would seal a branch no row could satisfy.
     #[test]
     fn an_incremental_refresh_without_target_write_fields_is_refused() {
@@ -718,7 +766,7 @@ mod tests {
             MvIncrementalWriteMode::RowDelta,
         ] {
             assert!(
-                incremental_publication_write_input(mode, &[]).is_err(),
+                incremental_publication_write_input(mode, &[], false).is_err(),
                 "{mode:?} must not sign an empty write input"
             );
         }

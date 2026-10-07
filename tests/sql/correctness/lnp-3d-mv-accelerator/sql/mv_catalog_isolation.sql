@@ -12,8 +12,9 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=mv,iceberg,rest,minio,lnp-3d,accelerator,package-isolation
--- A corrupt document package quarantines only its exact target. SHOW keeps
--- a diagnostic row with UNAVAILABLE; a fault-free sweep restores it.
+-- An exact table-load corruption window survives startup metadata reads.
+-- SHOW keeps the target diagnostic row with UNAVAILABLE; explicit release
+-- followed by a fault-free sweep restores it.
 
 -- query 1
 -- @skip_result_check=true
@@ -50,14 +51,18 @@ AS SELECT k1, v1 FROM z_source;
 REFRESH MATERIALIZED VIEW a_mv;
 
 -- query 2
--- `a_mv` sorts before `z_source` in the namespace enumeration, so the one
--- proxy fault corrupts precisely the MV package rather than a base table.
--- @publication_catalog_fault=table-load,corrupt-package
+-- Every matching read of this exact target is corrupt until query 3 completes.
+-- Other namespace/table reads cannot consume the fault.
+-- @publication_catalog_fault=table-load,corrupt-package-until-clear
+-- @publication_catalog_fault_target=ns_${uuid0},a_mv
 -- @restart_fe_after_step=true
 -- @skip_result_check=true
 SELECT 1;
 
 -- query 3
+-- @publication_catalog_fault_clear=true
+-- @retry_count=40
+-- @retry_interval_ms=250
 -- @skip_result_check=true
 -- @result_contains=a_mv
 -- @result_contains=UNAVAILABLE
@@ -71,8 +76,11 @@ SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
 SELECT 1;
 
 -- query 5
+-- @retry_count=40
+-- @retry_interval_ms=250
 -- @skip_result_check=true
 -- @result_contains=a_mv
+-- @result_not_contains=UNAVAILABLE
 SET CATALOG lnp3d_pkg_${uuid0};
 USE ns_${uuid0};
 SHOW MATERIALIZED VIEWS FROM ns_${uuid0};

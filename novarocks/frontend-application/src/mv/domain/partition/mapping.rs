@@ -106,8 +106,8 @@ pub(crate) fn map_connector_partition_to_mv_key(
             .iter()
             .find(|field| field.field_id == *source_id)
             .ok_or("direct target partition source is absent from the exact observation")?;
-        if source_field.type_signature != output.type_signature
-            || output_binding.type_signature != output.type_signature
+        if source_field.data_type != output.data_type
+            || output_binding.data_type != output.data_type
         {
             return Err("direct target partition source changes its value type".into());
         }
@@ -249,7 +249,9 @@ mod tests {
                     MvObservedSourceField::try_new(
                         Bytes::from_static(&[1]),
                         "order_id".to_string(),
-                        "bigint".to_string(),
+                        novarocks_types::logical_type::LogicalType::Int64,
+                        Some(novarocks_types::logical_type::LogicalType::Int64),
+                        Bytes::from_static(b"fixture-schema-binding"),
                         false,
                     )
                     .unwrap(),
@@ -284,7 +286,9 @@ mod tests {
             ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), None);
         fixture.definition.relation_occurrences.truncate(1);
         fixture.definition.outputs[0].name = "order_id".into();
-        fixture.definition.outputs[0].type_signature = "bigint".into();
+        fixture.definition.outputs[0].data_type =
+            novarocks_mv_application::persistence::codec::MvLogicalType::decode_signature("bigint")
+                .unwrap();
         fixture.definition.outputs[0].nullable = false;
         fixture.definition.outputs[0].expression = ExpressionShape {
             kind: ExpressionKind::Field,
@@ -294,19 +298,23 @@ mod tests {
                 field_id: FieldIdentity::try_new(vec![1]).unwrap(),
             }],
         };
-        fixture.interpretation.outputs[0].type_signature = "bigint".into();
+        fixture.interpretation.outputs[0].data_type =
+            novarocks_mv_application::persistence::codec::MvLogicalType::decode_signature("bigint")
+                .unwrap();
         fixture.interpretation.outputs[0].nullable = false;
         fixture.interpretation.aggregates.clear();
         fixture.interpretation.state_slots.clear();
         fixture.interpretation.branches.clear();
-        fixture.interpretation.apply_key.kind = ApplyKeyKind::BaseRowId;
+        fixture.interpretation.apply_key = None;
         fixture.interpretation.target.fields.retain(|field| {
             matches!(
                 field.logical_identity,
-                PhysicalFieldLogicalIdentity::Output(_) | PhysicalFieldLogicalIdentity::ApplyKey(_)
+                PhysicalFieldLogicalIdentity::Output(_)
             )
         });
-        fixture.interpretation.target.fields[0].type_signature = "bigint".into();
+        fixture.interpretation.target.fields[0].data_type =
+            novarocks_mv_application::persistence::codec::MvLogicalType::decode_signature("bigint")
+                .unwrap();
         fixture.interpretation.target.fields[0].nullable = false;
         fixture.interpretation.target.partition_fields = vec![TargetPartitionFieldBinding {
             partition_field_id: FieldIdentity::try_new(vec![90]).unwrap(),

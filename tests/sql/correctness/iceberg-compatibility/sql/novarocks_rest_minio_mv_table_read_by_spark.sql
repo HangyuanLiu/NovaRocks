@@ -20,9 +20,9 @@
 -- Validate the external-engine read interop contract for Iceberg MVs (W5 of
 -- the IMV lake-native umbrella): after NovaRocks creates and refreshes an
 -- Iceberg MV in a REST catalog, an external engine (Spark) can read the MV
--- table's visible materialized columns directly. The same Iceberg table also
--- carries NovaRocks internal columns, which are visible at schema level and
--- intentionally outside the public read-column contract. See
+-- table's visible materialized columns directly. A non-aggregate MV persists
+-- only its complete visible output schema; transient apply identities do not
+-- become Iceberg target columns. See
 -- docker/iceberg-rest/README.md#external-engine-mv-read-interop for the
 -- narrative walkthrough of this contract.
 
@@ -81,8 +81,7 @@ SPARK_SQL
 view_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql")"
 echo "$view_out" | tr -s '[:space:]' ' ' | grep -F "2 20" >/dev/null
 echo "$view_out" | tr -s '[:space:]' ' ' | grep -F "3 30" >/dev/null
-# A visible-column read must not return the internal apply-key column that the
-# MV table physically carries.
+# The non-aggregate MV stores only its visible output columns.
 if echo "$view_out" | grep -F "__nova_base_row_id" >/dev/null; then
   echo "visible-column MV read leaked internal column __nova_base_row_id" >&2
   exit 1
@@ -90,9 +89,7 @@ fi
 printf 'SPARK_MV_TABLE_READ_OK\n'
 
 -- query 8
--- Contrast: the same MV table exposes the internal apply-key
--- column at schema level. Uses DESCRIBE rather than SELECT * so the assertion
--- is stable against column ordering/formatting rather than parsing data rows.
+-- Spark DESCRIBE must expose the visible schema without persisted identity columns.
 -- @result_contains=SPARK_MV_SCHEMA_OK
 shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-spark-mv-schema-XXXXXX.sql")"
@@ -100,8 +97,13 @@ trap 'rm -f "$tmp_sql"' EXIT
 cat > "$tmp_sql" <<'SPARK_SQL'
 DESCRIBE ice_rest.nr_compat_${suite_uuid0}.mv_nr_interop_${uuid0};
 SPARK_SQL
-"${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql" \
-  | grep -F "__nova_base_row_id" >/dev/null
+describe_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql")"
+if printf '%s\n' "$describe_out" | grep -Eq '(^|[[:space:]])(__nova_base_row_id|__nova_join_row_key|__branch_id__)([[:space:]]|$)'; then
+  printf 'non-aggregate MV schema contains a persisted identity column\n' >&2
+  exit 1
+fi
+printf '%s\n' "$describe_out" | grep -Eq '(^|[[:space:]])id([[:space:]]|$)'
+printf '%s\n' "$describe_out" | grep -Eq '(^|[[:space:]])amount([[:space:]]|$)'
 printf 'SPARK_MV_SCHEMA_OK\n'
 
 -- query 9

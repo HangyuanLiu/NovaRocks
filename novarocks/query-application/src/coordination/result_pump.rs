@@ -1958,9 +1958,13 @@ fn classify_root_termination(
                 TaskFailureCategory::ResourceExhausted => {
                     AttemptFailureClass::RecoverableInfrastructure
                 }
-                TaskFailureCategory::Execution | TaskFailureCategory::Exchange => {
-                    AttemptFailureClass::ExecutionFailure
+                TaskFailureCategory::CapacityRefused { .. } => {
+                    AttemptFailureClass::ResourceGovernance
                 }
+                TaskFailureCategory::MvApplyConsistency { .. }
+                | TaskFailureCategory::TargetFormatUnsupported { .. }
+                | TaskFailureCategory::Execution
+                | TaskFailureCategory::Exchange => AttemptFailureClass::ExecutionFailure,
                 TaskFailureCategory::Protocol | TaskFailureCategory::Internal => {
                     AttemptFailureClass::ContractViolation
                 }
@@ -1977,7 +1981,12 @@ fn classify_root_termination(
     };
     Some(RootResultFetchFailure::new(
         class,
-        QueryExecutionError::new(QueryExecutionErrorKind::Failed, message),
+        QueryExecutionError::new(QueryExecutionErrorKind::Failed, message).with_task_failure(
+            match detail {
+                TerminationDetail::Failed(failure) => Some(failure.clone()),
+                _ => None,
+            },
+        ),
     ))
 }
 
@@ -2322,6 +2331,34 @@ mod tests {
             AttemptFailureClass::RecoverableInfrastructure,
             QueryExecutionError::new(QueryExecutionErrorKind::Failed, message),
         ))
+    }
+
+    #[test]
+    fn bounded_mv_root_failure_preserves_payload_and_refuses_infrastructure_retry() {
+        let failures = [
+            TaskFailure::capacity_refused(SafeDetail::new("delta").unwrap(), 9, 4),
+            TaskFailure::mv_apply_consistency(5, 2, SafeDetail::new("tuple").unwrap()),
+            TaskFailure::target_format_unsupported(
+                SafeDetail::new("data.parquet").unwrap(),
+                SafeDetail::new("equality").unwrap(),
+            ),
+        ];
+        for failure in failures {
+            let status = TaskStatus::try_new(
+                root_task(execution(994)),
+                TaskStatusVersion::FIRST,
+                TaskState::Failed,
+                Some(TerminationDetail::Failed(failure.clone())),
+                TaskOutputFacts::default(),
+            )
+            .unwrap();
+            let result = classify_root_termination(&status, None).unwrap();
+            assert_eq!(result.error().task_failure(), Some(&failure));
+            assert_ne!(
+                result.class(),
+                AttemptFailureClass::RecoverableInfrastructure
+            );
+        }
     }
 
     #[test]

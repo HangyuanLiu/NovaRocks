@@ -914,15 +914,13 @@ fn publication_metadata_updates(
         .transpose()?
         .flatten();
     if let Some(metadata_properties) = metadata_properties {
-        let updates = updates.as_mut().ok_or_else(|| {
-            invalid("metadata-attached publication documents require an atomic managed repartition")
-        })?;
+        let updates = updates.get_or_insert_with(Vec::new);
         match updates.last_mut() {
             Some(crate::iceberg::TableUpdate::SetProperties { updates }) => {
                 for (key, value) in metadata_properties {
                     if updates.insert(key, value).is_some() {
                         return Err(invalid(
-                            "metadata-attached publication documents conflict with repartition properties",
+                            "metadata-attached publication documents conflict with atomic publication properties",
                         ));
                     }
                 }
@@ -1385,12 +1383,12 @@ impl IcebergWriteSessionControl {
                 None => facts.target_ref().to_string(),
             },
             snapshot_properties,
-            atomic_partition_replacement: publication_metadata_updates(
+            atomic_publication_updates: publication_metadata_updates(
                 handle.repartition(),
                 document_publication,
                 &metadata,
             )?
-            .map(crate::commit::run::AtomicPartitionReplacement::try_new)
+            .map(crate::commit::run::AtomicPublicationUpdates::try_new)
             .transpose()
             .map_err(invalid)?,
         };
@@ -1551,6 +1549,29 @@ impl IcebergWriteSessionControl {
             return Err(invalid(
                 "Iceberg write target no longer matches its sealed table generation/schema",
             ));
+        }
+        #[cfg(debug_assertions)]
+        let equality_seed = if document_publication.is_some()
+            && facts.target_ref() == "main"
+            && handle.commit_op_kind() == CommitOpKind::Overwrite
+            && initial.metadata().current_snapshot_id().is_none()
+        {
+            match crate::candidate_fixture::root()
+                .map(|root| super::fixture_seed::FixtureEqualitySeed::claim(&initial, &root))
+                .transpose()
+            {
+                Ok(seed) => seed.flatten().map(Arc::new),
+                Err(error) => {
+                    cleanup_session();
+                    return Err(invalid(error));
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(debug_assertions)]
+        if let Some(seed) = equality_seed.as_ref() {
+            session_abort.record_data_file(seed.artifact_path().to_owned());
         }
         let observed_head = crate::ref_snapshot::resolve_branch_head_snapshot_id(
             initial.metadata(),
@@ -1755,11 +1776,24 @@ impl IcebergWriteSessionControl {
                 "runtime_bridge_enter",
                 phase_started,
             );
+            #[cfg(debug_assertions)]
+            let attempt_equality_seed = equality_seed.clone();
             let attempt_result = self
                 .runtime
                 .resources()
                 .catalog_runtime()
                 .block_on(async move {
+                    #[cfg(debug_assertions)]
+                    let data_snapshot_properties = {
+                        let mut properties = snapshot_properties.clone();
+                        if attempt_equality_seed.is_some() {
+                            // Only the final seed snapshot identifies the committed session.
+                            properties.remove(ICEBERG_WRITE_SESSION_MARKER_PROPERTY);
+                        }
+                        properties
+                    };
+                    #[cfg(not(debug_assertions))]
+                    let data_snapshot_properties = &snapshot_properties;
                     let ctx = crate::commit::action::CommitCtx {
                         collector: &collector,
                         table: &table,
@@ -1768,7 +1802,9 @@ impl IcebergWriteSessionControl {
                         commit_uuid,
                         abort_handle,
                         target_ref: &target_ref,
-                        snapshot_properties: &snapshot_properties,
+                        snapshot_properties: &data_snapshot_properties,
+
+                        metadata_updates: &[],
                     };
                     emit_iceberg_write_phase_marker(
                         session_id,
@@ -1776,9 +1812,13 @@ impl IcebergWriteSessionControl {
                         "data_stage_enter",
                         phase_started,
                     );
-                    let (mut transaction, data_outcome) = match operation {
+                    let (transaction, data_outcome) = match operation {
                         CommitOpKind::FastAppend => {
-                            crate::commit::fast_append::stage_eager_fast_append(ctx).await?
+                            crate::commit::fast_append::stage_eager_fast_append(
+                                ctx,
+                                initial_updates,
+                            )
+                            .await?
                         }
                         CommitOpKind::Overwrite => {
                             crate::commit::overwrite::stage_eager_overwrite(ctx, initial_updates)
@@ -1786,6 +1826,18 @@ impl IcebergWriteSessionControl {
                         }
                         _ => unreachable!("eager write path only accepts append/overwrite"),
                     };
+                    #[cfg(debug_assertions)]
+                    let (transaction, data_outcome) = if let Some(seed) = attempt_equality_seed {
+                        let original_snapshot = data_outcome.new_snapshot_id;
+                        let (transaction, data_outcome) = seed.stage(
+                            transaction, data_outcome, file_io.clone(),
+                            Arc::clone(&collector.abort_log), &snapshot_properties,
+                        ).await?;
+                        println!("NOVAROCKS_MV_EQUALITY_SEED token={} table_uuid={} original_snapshot={} final_snapshot={}",
+                            seed.token(), table.metadata().uuid(), original_snapshot, data_outcome.new_snapshot_id);
+                        (transaction, data_outcome)
+                    } else { (transaction, data_outcome) };
+                    let mut transaction = transaction;
                     emit_iceberg_write_phase_marker(
                         session_id,
                         attempt_number,
@@ -2718,16 +2770,18 @@ fn write_statistics_contract(
         return WriteStatisticsContract::try_new(input, Vec::new());
     };
     if let Some(metadata) = metadata {
-        let declarations = crate::scalar_integer_domain::of_schema(
+        let declarations = crate::field_domain::active(
             metadata.current_schema(),
-            &crate::scalar_integer_domain::metadata_declarations(metadata)?,
+            crate::field_domain::metadata_declarations(metadata)?.fields(),
         )?;
         for binding in input.fields() {
             let field = binding.field();
             if let Some(storage) = metadata
                 .current_schema()
                 .field_by_name_case_insensitive(field.name())
-                && let Some(domain) = declarations.get(&storage.id)
+                && let Some(domain) = declarations
+                    .get(&storage.id)
+                    .and_then(|domain| domain.integer())
                 && field.data_type() != &domain.data_type()
             {
                 return Err(invalid(
@@ -2736,19 +2790,41 @@ fn write_statistics_contract(
             }
         }
     }
-    if !enabled {
+    let Some(metadata) = metadata else {
+        if enabled {
+            return Err(invalid(
+                "Iceberg collect-on-write requires authoritative table metadata",
+            ));
+        }
         return WriteStatisticsContract::try_new(input, Vec::new());
-    }
-    let metadata = metadata
-        .ok_or_else(|| invalid("Iceberg collect-on-write requires authoritative table metadata"))?;
+    };
     let iceberg_schema = metadata.current_schema();
-    // The engine binds the SQL read carrier at admission, so that is what a
-    // write input's columns are shaped by and what this gate has to compare
-    // against. Converting the Iceberg schema again here restated the carrier
-    // rule shallowly -- it adapted the top-level primitives and cloned every
-    // nested type verbatim -- and the two statements drifted apart the moment
-    // one of them said something about a nested field.
-    let arrow_schema = crate::scalar_integer_domain::metadata_sql_schema(metadata, iceberg_schema)?;
+    // Statistics consume the signed input carrier, but admission is checked
+    // against the same exact WRITE projection used by preparation. SQL read
+    // Map keys and timestamptz have explicit carrier bridges; they are not
+    // physical writer schema facts.
+    let requests = iceberg_schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| {
+            ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
+                &field.name,
+                arrow::datatypes::DataType::Null,
+                !field.required,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let arrow_schema = arrow::datatypes::Schema::new(
+        crate::commit::write_shared::exact_requested_write_fields_at_schema(
+            metadata,
+            iceberg_schema,
+            &requests,
+        )?
+        .into_iter()
+        .map(|request| request.field().clone())
+        .collect::<Vec<_>>(),
+    );
     let mut requirements = Vec::new();
     for (ordinal, binding) in input.fields().into_iter().enumerate() {
         let field = binding.field();
@@ -2761,7 +2837,9 @@ fn write_statistics_contract(
         else {
             continue;
         };
-        if !novarocks_connector_iceberg_functions::supports_theta_input_type(field.data_type()) {
+        if !enabled
+            || !novarocks_connector_iceberg_functions::supports_theta_input_type(field.data_type())
+        {
             continue;
         }
         let input = StatisticsScanColumn::try_new(
@@ -2820,14 +2898,88 @@ fn resolve_statistics_field(
             )));
         }
     };
-    let expected_arrow = arrow_schema.field(schema_ordinal).data_type();
-    if field.data_type() != expected_arrow || field.is_nullable() == iceberg_field.required {
+    let expected_arrow = arrow_schema.field(schema_ordinal);
+    if !statistics_carrier_matches(field, expected_arrow, false, true)
+        || field.is_nullable() == iceberg_field.required
+    {
         return Err(invalid(format!(
             "Iceberg statistics input column `{}` does not match the authoritative table field type/nullability",
             field.name()
         )));
     }
     Ok(Some(iceberg_field.id))
+}
+
+/// Admit only the existing SQL read-to-write representation differences.
+/// Provider field IDs/defaults are independent facts; all semantic metadata,
+/// Struct names/order and non-key child nullability remain exact.
+fn statistics_carrier_matches(
+    input: &arrow::datatypes::Field,
+    expected: &arrow::datatypes::Field,
+    map_key: bool,
+    bookkeeping_name: bool,
+) -> bool {
+    use arrow::datatypes::DataType;
+    let metadata = |field: &arrow::datatypes::Field| {
+        field
+            .metadata()
+            .iter()
+            .filter(|(key, _)| {
+                key.as_str() != parquet::arrow::PARQUET_FIELD_ID_META_KEY
+                    && key.as_str() != crate::default_value::ICEBERG_INITIAL_DEFAULT_META_KEY
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    if (!bookkeeping_name && input.name() != expected.name())
+        || (input.is_nullable() != expected.is_nullable()
+            && !(map_key && input.is_nullable() && !expected.is_nullable()))
+        || metadata(input) != metadata(expected)
+    {
+        return false;
+    }
+    match (input.data_type(), expected.data_type()) {
+        (DataType::Struct(left), DataType::Struct(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| statistics_carrier_matches(left, right, false, false))
+        }
+        (DataType::List(left), DataType::List(right))
+        | (DataType::LargeList(left), DataType::LargeList(right)) => {
+            statistics_carrier_matches(left, right, false, true)
+        }
+        (DataType::Map(left, left_sorted), DataType::Map(right, right_sorted)) => {
+            let (DataType::Struct(left_fields), DataType::Struct(right_fields)) =
+                (left.data_type(), right.data_type())
+            else {
+                return false;
+            };
+            left_sorted == right_sorted
+                && left.is_nullable() == right.is_nullable()
+                && metadata(left) == metadata(right)
+                && left_fields.len() == 2
+                && right_fields.len() == 2
+                && statistics_carrier_matches(&left_fields[0], &right_fields[0], true, true)
+                && statistics_carrier_matches(&left_fields[1], &right_fields[1], false, true)
+        }
+        (
+            DataType::Timestamp(left_unit, input_zone),
+            DataType::Timestamp(right_unit, Some(zone)),
+        ) => {
+            // SQL read uses no timezone; planned write input can use UTC. The
+            // SDK emits +00:00 for that same UTC role. Plain timestamps have no
+            // bridge in the opposite direction.
+            let canonical_utc = |value: &str| matches!(value, "UTC" | "+00:00");
+            left_unit == right_unit
+                && canonical_utc(zone.as_ref())
+                && input_zone
+                    .as_ref()
+                    .is_none_or(|zone| canonical_utc(zone.as_ref()))
+        }
+        (left, right) => left == right,
+    }
 }
 
 impl IcebergWriteSessionControl {
@@ -2896,8 +3048,11 @@ impl IcebergWriteSessionControl {
                 (Some(table), metadata)
             }
         };
-        if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, shape } =
-            &request.flavor
+        if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
+            declaration,
+            shape,
+            ..
+        } = &request.flavor
         {
             let admitted_target = declaration.admission().target();
             if admitted_target.namespace.as_ref() != namespace
@@ -2972,8 +3127,11 @@ impl IcebergWriteSessionControl {
             None => crate::ref_snapshot::resolve_branch_head_snapshot_id(&metadata, target_ref)
                 .map_err(|error| invalid(error.to_string()))?,
         };
-        if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, shape } =
-            &request.flavor
+        if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
+            declaration,
+            shape,
+            ..
+        } = &request.flavor
         {
             // A publication's base comes from the publication's own write
             // preparation, whichever branch shape it goes on to seal. The
@@ -3122,7 +3280,18 @@ impl IcebergWriteSessionControl {
                 let table = table.as_ref().ok_or_else(|| {
                     invalid("Iceberg row-level write requires a loaded target table")
                 })?;
-                self.freeze_old_delete_references(table, &metadata, snapshot_id)?
+                self.freeze_old_delete_references(
+                    table,
+                    &metadata,
+                    snapshot_id,
+                    match &request.flavor {
+                        ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
+                            target_candidates,
+                            ..
+                        } => target_candidates.as_ref(),
+                        _ => None,
+                    },
+                )?
             } else {
                 Vec::new()
             },
@@ -3151,12 +3320,14 @@ impl IcebergWriteSessionControl {
             ConnectorWriteSessionFlavor::ManagedPublication { intent, shape } => {
                 plan_managed_publication_branches(&material, publication_facts(intent, *shape)?)?
             }
-            ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, shape } => {
-                plan_document_publication_branches(
-                    &material,
-                    IcebergDocumentPublicationFacts::new(declaration.clone(), *shape),
-                )?
-            }
+            ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
+                declaration,
+                shape,
+                ..
+            } => plan_document_publication_branches(
+                &material,
+                IcebergDocumentPublicationFacts::new(declaration.clone(), *shape),
+            )?,
             ConnectorWriteSessionFlavor::RowMutation => plan_row_mutation_branches(&material)?,
             ConnectorWriteSessionFlavor::DistributedRewrite(shape) => {
                 let table = table.as_ref().ok_or_else(|| {
@@ -3364,6 +3535,9 @@ impl IcebergWriteSessionControl {
         table: &crate::iceberg::table::Table,
         metadata: &TableMetadata,
         snapshot_id: i64,
+        candidates: Option<
+            &novarocks_spi::connector::write_stack::ConnectorMvTargetCandidateSelection,
+        >,
     ) -> Result<Vec<IcebergOldDeleteMergeTarget>, ConnectorError> {
         let owned = table.clone();
         let files = self
@@ -3375,18 +3549,74 @@ impl IcebergWriteSessionControl {
             })
             .map_err(|error| unavailable(error.to_string()))?
             .map_err(unavailable)?;
-        let mut targets = Vec::with_capacity(files.len());
-        for file in files {
-            let references = frozen_old_delete_references(&file)?;
-            targets.push(frozen_delete_merge_target(
-                &file,
-                metadata,
-                snapshot_id,
-                references,
-            )?);
-        }
+        let targets = freeze_target_delete_references(files, metadata, snapshot_id, candidates)?;
+        #[cfg(debug_assertions)]
+        crate::candidate_fixture::record(
+            metadata,
+            snapshot_id,
+            "writer-frozen",
+            targets
+                .iter()
+                .map(|target| target.data_file_path().to_owned()),
+        )
+        .map_err(invalid)?;
         Ok(targets)
     }
+}
+
+/// Freeze exactly the same candidate baseline admitted by target scanning.
+pub(crate) fn freeze_target_delete_references(
+    files: Vec<crate::manifest::DataFileWithStats>,
+    metadata: &TableMetadata,
+    snapshot_id: i64,
+    candidates: Option<&novarocks_spi::connector::write_stack::ConnectorMvTargetCandidateSelection>,
+) -> Result<Vec<IcebergOldDeleteMergeTarget>, ConnectorError> {
+    let selected = match candidates {
+        Some(
+            novarocks_spi::connector::write_stack::ConnectorMvTargetCandidateSelection::Partitions(
+                selection,
+            ),
+        ) => {
+            crate::mv_target_candidates::validate_mv_target_partition_selection(
+                metadata, selection,
+            )?;
+            if selection.snapshot_id() != snapshot_id {
+                return Err(invalid(
+                    "MV candidate selection and write base snapshots disagree",
+                ));
+            }
+            crate::mv_target_candidates::select_mv_target_file_paths(
+                metadata,
+                Some(snapshot_id),
+                files.iter().map(|file| {
+                    (
+                        file.path.as_str(),
+                        file.partition_spec_id,
+                        file.partition_values.as_ref(),
+                    )
+                }),
+                selection,
+            )
+        }
+        _ => None,
+    };
+    let mut targets = Vec::with_capacity(files.len());
+    for file in files {
+        if selected
+            .as_ref()
+            .is_some_and(|selected| !selected.contains(&file.path))
+        {
+            continue;
+        }
+        let references = frozen_old_delete_references(&file, candidates.is_some())?;
+        targets.push(frozen_delete_merge_target(
+            &file,
+            metadata,
+            snapshot_id,
+            references,
+        )?);
+    }
+    Ok(targets)
 }
 
 /// Freeze one data file's delete-branch merge target.
@@ -3459,8 +3689,9 @@ fn frozen_delete_merge_target(
 
 /// Freeze exact references to every position-delete artifact attached to one
 /// data file. It records what exists; it never opens one of those artifacts.
-fn frozen_old_delete_references(
+pub(crate) fn frozen_old_delete_references(
     file: &crate::manifest::DataFileWithStats,
+    strict_visible_bag: bool,
 ) -> Result<Vec<IcebergOldDeleteArtifactRef>, ConnectorError> {
     let partition_spec_id = file.partition_spec_id.ok_or_else(|| {
         corrupt(format!(
@@ -3470,6 +3701,24 @@ fn frozen_old_delete_references(
     })?;
     let mut references = Vec::new();
     for delete in &file.delete_files {
+        if strict_visible_bag {
+            use crate::scan_model::{IcebergDeleteFileContent, IcebergDeleteFileFormat};
+            let kind = match (&delete.file_content, &delete.file_format) {
+                (IcebergDeleteFileContent::Equality, _) => {
+                    Some(novarocks_spi::connector::ConnectorTargetDeleteKind::Equality)
+                }
+                (IcebergDeleteFileContent::Position, IcebergDeleteFileFormat::Parquet) => {
+                    Some(novarocks_spi::connector::ConnectorTargetDeleteKind::ParquetPosition)
+                }
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                return Err(ConnectorError::target_format_unsupported(
+                    file.path.clone(),
+                    kind,
+                ));
+            }
+        }
         if !matches!(
             delete.file_content,
             crate::scan_model::IcebergDeleteFileContent::Position
@@ -3834,12 +4083,16 @@ fn data_branch_recipe(
         names.push(field.name.clone());
         transforms.push(field.transform.to_string());
     }
-    IcebergDataBranchRecipe::try_new(
-        Some(crate::schema_facts::iceberg_schema_def(schema)),
+    IcebergDataBranchRecipe::try_new_with_field_domains(
+        Some(schema.clone()),
         sources,
         names,
         transforms,
         row_lineage,
+        crate::field_domain::active(
+            schema,
+            crate::field_domain::metadata_declarations(metadata)?.fields(),
+        )?,
     )
 }
 
@@ -3958,7 +4211,7 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
 }
 
 #[cfg(test)]
-mod statistics_contract_tests {
+pub(super) mod statistics_contract_tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -4030,6 +4283,346 @@ mod statistics_contract_tests {
         ] {
             assert!(resolve_statistics_field(&iceberg, &arrow, &field, false).is_err());
         }
+    }
+
+    pub(in crate::commit::write_stack) fn recursive_statistics_metadata()
+    -> crate::iceberg::spec::TableMetadata {
+        use crate::iceberg::spec::{
+            FormatVersion, ListType, MapType, PartitionSpec, SortOrder, StructType,
+            TableMetadataBuilder,
+        };
+        let primitive = |ty| Type::Primitive(ty);
+        let iceberg = schema(vec![
+            Arc::new(NestedField::required(
+                1,
+                "id",
+                primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::optional(
+                2,
+                "m",
+                Type::Map(MapType::new(
+                    Arc::new(NestedField::required(
+                        3,
+                        "key",
+                        primitive(PrimitiveType::String),
+                    )),
+                    Arc::new(NestedField::required(
+                        4,
+                        "value",
+                        Type::Struct(StructType::new(vec![
+                            Arc::new(NestedField::required(
+                                5,
+                                "j",
+                                primitive(PrimitiveType::String),
+                            )),
+                            Arc::new(NestedField::required(
+                                6,
+                                "tiny",
+                                primitive(PrimitiveType::Int),
+                            )),
+                            Arc::new(NestedField::optional(
+                                7,
+                                "items",
+                                Type::List(ListType::new(Arc::new(NestedField::optional(
+                                    8,
+                                    "element",
+                                    primitive(PrimitiveType::Int),
+                                )))),
+                            )),
+                        ])),
+                    )),
+                )),
+            )),
+        ]);
+        let metadata = TableMetadataBuilder::new(
+            iceberg,
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            "file:///statistics-carriers".into(),
+            FormatVersion::V3,
+            Default::default(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let domains = [
+            ("m.value.j", crate::field_domain::FieldDomain::Json),
+            ("m.value.tiny", crate::field_domain::FieldDomain::Int8),
+            (
+                "m.value.items.element",
+                crate::field_domain::FieldDomain::Int16,
+            ),
+        ]
+        .into_iter()
+        .map(|(name, domain)| {
+            (
+                metadata.current_schema().field_by_name(name).unwrap().id,
+                domain,
+            )
+        })
+        .collect();
+        metadata
+            .into_builder(None)
+            .set_properties(std::collections::HashMap::from([(
+                crate::field_domain::PROPERTY.into(),
+                crate::field_domain::encode(&domains).unwrap(),
+            )]))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata
+    }
+
+    #[test]
+    fn statistics_admits_prepared_write_and_ctas_read_map_carriers_without_domain_loss() {
+        use super::*;
+        let metadata = recursive_statistics_metadata();
+        let storage = metadata.current_schema();
+        let read = crate::field_domain::metadata_sql_schema(&metadata, storage).unwrap();
+        let requests = read
+            .fields()
+            .iter()
+            .map(|f| ConnectorWriteFieldRequest::new(f.as_ref().clone()))
+            .collect::<Vec<_>>();
+        let prepared =
+            crate::commit::write_shared::exact_requested_write_fields(&metadata, &requests)
+                .unwrap();
+        let facts = IcebergWriteTableFacts::try_new(
+            metadata.uuid().to_string(),
+            "db".into(),
+            "t".into(),
+            metadata.location().into(),
+            metadata.location().into(),
+            "main".into(),
+            None,
+            metadata.last_sequence_number(),
+            metadata.current_schema_id(),
+            metadata.default_partition_spec_id(),
+            3,
+        )
+        .unwrap();
+        let writer = crate::commit::write_stack::domain::IcebergWriterHandle::try_new_data(
+            facts.clone(),
+            IcebergWriterOutput::try_new(
+                crate::delete_file::IcebergFileFormat::Parquet,
+                parquet::basic::Compression::SNAPPY,
+                None,
+            )
+            .unwrap(),
+            data_branch_recipe(&metadata, false).unwrap(),
+        )
+        .unwrap();
+        for fields in [prepared.clone(), requests.clone()] {
+            let input =
+                sign_input_shape(&facts, &ConnectorWriteInputRequest::Data { fields }).unwrap();
+            for enabled in [true, false] {
+                let contract =
+                    write_statistics_contract(&writer, &input, Some(&metadata), enabled).unwrap();
+                assert_eq!(contract.requirements().len(), usize::from(enabled));
+            }
+        }
+        // The key widening bridge does not relax value nullability, a declared
+        // nested integer domain, JSON semantics or arbitrary child metadata.
+        let original = prepared[1].field();
+        let DataType::Map(entries, sorted) = original.data_type() else {
+            panic!("map")
+        };
+        let DataType::Struct(pair) = entries.data_type() else {
+            panic!("entries")
+        };
+        let DataType::Struct(children) = pair[1].data_type() else {
+            panic!("value")
+        };
+        let mut forgeries = Vec::new();
+        let mut changed = children.to_vec();
+        changed[1] = Arc::new(changed[1].as_ref().clone().with_data_type(DataType::Int32));
+        forgeries.push(
+            pair[1]
+                .as_ref()
+                .clone()
+                .with_data_type(DataType::Struct(changed.into())),
+        );
+        let mut changed = children.to_vec();
+        changed[0] = Arc::new(
+            changed[0]
+                .as_ref()
+                .clone()
+                .with_metadata(Default::default()),
+        );
+        forgeries.push(
+            pair[1]
+                .as_ref()
+                .clone()
+                .with_data_type(DataType::Struct(changed.into())),
+        );
+        forgeries.push(pair[1].as_ref().clone().with_nullable(true));
+        let mut changed = children.to_vec();
+        let mut tags = changed[1].metadata().clone();
+        tags.insert("unexpected_semantics".into(), "wrong".into());
+        changed[1] = Arc::new(changed[1].as_ref().clone().with_metadata(tags));
+        forgeries.push(
+            pair[1]
+                .as_ref()
+                .clone()
+                .with_data_type(DataType::Struct(changed.into())),
+        );
+        for value in forgeries {
+            let ty = DataType::Map(
+                Arc::new(entries.as_ref().clone().with_data_type(DataType::Struct(
+                    vec![pair[0].clone(), Arc::new(value)].into(),
+                ))),
+                *sorted,
+            );
+            let mut fields = prepared.clone();
+            fields[1] = ConnectorWriteFieldRequest::new(original.clone().with_data_type(ty));
+            let input =
+                sign_input_shape(&facts, &ConnectorWriteInputRequest::Data { fields }).unwrap();
+            for enabled in [true, false] {
+                assert!(
+                    write_statistics_contract(&writer, &input, Some(&metadata), enabled).is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn statistics_sdk_timestamptz_read_and_write_carriers_share_the_exact_utc_role() {
+        use super::*;
+        use crate::iceberg::spec::{
+            FormatVersion, PartitionSpec, SortOrder, StructType, TableMetadataBuilder,
+        };
+        use arrow::datatypes::TimeUnit;
+        let zoned = |id, name, primitive| {
+            Arc::new(NestedField::required(id, name, Type::Primitive(primitive)))
+        };
+        let schema = schema(vec![
+            zoned(1, "ts", PrimitiveType::Timestamptz),
+            zoned(2, "ns", PrimitiveType::TimestamptzNs),
+            Arc::new(NestedField::optional(
+                3,
+                "nested",
+                Type::Struct(StructType::new(vec![
+                    zoned(4, "ts", PrimitiveType::Timestamptz),
+                    zoned(5, "ns", PrimitiveType::TimestamptzNs),
+                ])),
+            )),
+        ]);
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            "file:///sdk-utc-statistics".into(),
+            FormatVersion::V3,
+            Default::default(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let read =
+            crate::field_domain::metadata_sql_schema(&metadata, metadata.current_schema()).unwrap();
+        let requests = read
+            .fields()
+            .iter()
+            .map(|field| ConnectorWriteFieldRequest::new(field.as_ref().clone()))
+            .collect::<Vec<_>>();
+        let exact = crate::commit::write_shared::exact_requested_write_fields(&metadata, &requests)
+            .unwrap();
+        for (ordinal, unit) in [(0, TimeUnit::Microsecond), (1, TimeUnit::Nanosecond)] {
+            assert_eq!(
+                read.field(ordinal).data_type(),
+                &DataType::Timestamp(unit.clone(), None)
+            );
+            // This is the SDK's actual canonical carrier, not a hand-built UTC label.
+            assert_eq!(
+                exact[ordinal].field().data_type(),
+                &DataType::Timestamp(unit, Some("+00:00".into()))
+            );
+        }
+        let facts = IcebergWriteTableFacts::try_new(
+            metadata.uuid().to_string(),
+            "db".into(),
+            "t".into(),
+            metadata.location().into(),
+            metadata.location().into(),
+            "main".into(),
+            None,
+            metadata.last_sequence_number(),
+            metadata.current_schema_id(),
+            metadata.default_partition_spec_id(),
+            3,
+        )
+        .unwrap();
+        let writer = crate::commit::write_stack::domain::IcebergWriterHandle::try_new_data(
+            facts.clone(),
+            IcebergWriterOutput::try_new(
+                crate::delete_file::IcebergFileFormat::Parquet,
+                parquet::basic::Compression::SNAPPY,
+                None,
+            )
+            .unwrap(),
+            data_branch_recipe(&metadata, false).unwrap(),
+        )
+        .unwrap();
+        let mut sql_utc = exact.clone();
+        for (ordinal, unit) in [(0, TimeUnit::Microsecond), (1, TimeUnit::Nanosecond)] {
+            sql_utc[ordinal] = ConnectorWriteFieldRequest::new(
+                sql_utc[ordinal]
+                    .field()
+                    .clone()
+                    .with_data_type(DataType::Timestamp(unit, Some("UTC".into()))),
+            );
+        }
+        for fields in [requests, exact, sql_utc] {
+            let input =
+                sign_input_shape(&facts, &ConnectorWriteInputRequest::Data { fields }).unwrap();
+            for enabled in [true, false] {
+                write_statistics_contract(&writer, &input, Some(&metadata), enabled).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn statistics_utc_bridge_is_directional_and_preserves_other_parameters() {
+        use arrow::datatypes::TimeUnit;
+        let target = Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        );
+        let read = Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        );
+        assert!(super::statistics_carrier_matches(
+            &read, &target, false, true
+        ));
+        assert!(!super::statistics_carrier_matches(
+            &target, &read, false, true
+        ));
+        let named = Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("Europe/Paris".into())),
+            false,
+        );
+        assert!(!super::statistics_carrier_matches(
+            &named, &target, false, true
+        ));
+        let alias = Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("Etc/UTC".into())),
+            false,
+        );
+        assert!(!super::statistics_carrier_matches(
+            &alias, &target, false, true
+        ));
+        let nanos = Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false);
+        assert!(!super::statistics_carrier_matches(
+            &nanos, &target, false, true
+        ));
     }
 
     #[test]
@@ -4581,8 +5174,8 @@ mod eager_attempt_io_tests {
         let abort_handle = Arc::clone(&collector.abort_log);
         let commit_uuid = uuid::Uuid::from_bytes([attempt; 16]);
         let properties = BTreeMap::new();
-        let (mut transaction, outcome) =
-            crate::commit::fast_append::stage_eager_fast_append(crate::commit::action::CommitCtx {
+        let (mut transaction, outcome) = crate::commit::fast_append::stage_eager_fast_append(
+            crate::commit::action::CommitCtx {
                 collector: &collector,
                 table: &table,
                 catalog: &fixture.catalog,
@@ -4591,9 +5184,13 @@ mod eager_attempt_io_tests {
                 abort_handle,
                 target_ref: "main",
                 snapshot_properties: &properties,
-            })
-            .await
-            .expect("eager append stage");
+
+                metadata_updates: &[],
+            },
+            Vec::new(),
+        )
+        .await
+        .expect("eager append stage");
         let staged_metadata = transaction.staged_table().metadata().clone();
         let artifacts = artifacts_for_staged_snapshot(
             &table,

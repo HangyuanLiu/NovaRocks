@@ -17,4 +17,6 @@
 
 //! One revision authority for every private Iceberg codec.
 
-pub(crate) const ICEBERG_CONTRACT_REVISION: u32 = 2;
+// Exact field domains are mandatory in frozen read and writer recipes. Older
+// peers must be rejected at the provider compatibility boundary.
+pub(crate) const ICEBERG_CONTRACT_REVISION: u32 = 4;

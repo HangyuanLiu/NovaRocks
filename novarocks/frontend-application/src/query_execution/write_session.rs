@@ -976,8 +976,24 @@ pub(crate) fn begin_connector_application_document_write_session_pending(
     write_lease: &novarocks_spi::connector::ConnectorWriteLease,
     request: ConnectorWriteBeginRequest,
 ) -> Result<std::sync::Arc<ConnectorWriteSession>, String> {
+    begin_connector_application_document_write_session_pending_typed(lease, write_lease, request)
+        .map_err(|error| {
+            format!("begin connector write session with pending application documents: {error}")
+        })
+}
+
+/// Open a pending document-publication session without erasing provider errors.
+/// MV preparation uses the exact typed target-format refusal before dispatch.
+pub(crate) fn begin_connector_application_document_write_session_pending_typed(
+    lease: ConnectorWriteStackLease,
+    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
+    request: ConnectorWriteBeginRequest,
+) -> Result<std::sync::Arc<ConnectorWriteSession>, ConnectorError> {
     let catalog_properties = write_lease.catalog_properties().cloned().ok_or_else(|| {
-        "connector write lease has no immutable catalog runtime identity".to_string()
+        ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "connector write lease has no immutable catalog runtime identity",
+        )
     })?;
     ConnectorWriteSession::begin_pending_application_document_publication(
         lease,
@@ -985,9 +1001,6 @@ pub(crate) fn begin_connector_application_document_write_session_pending(
         request,
     )
     .map(std::sync::Arc::new)
-    .map_err(|error| {
-        format!("begin connector write session with pending application documents: {error}")
-    })
 }
 
 /// Open a distributed write whose terminal commit must attach one exact
@@ -1238,6 +1251,7 @@ pub(crate) mod tests {
     #[derive(Default)]
     pub(crate) struct Recorded {
         pub(crate) begin: usize,
+        begin_error: Option<ConnectorError>,
         pub(crate) finish: usize,
         pub(crate) abort: usize,
         pub(crate) reconcile: usize,
@@ -1268,7 +1282,13 @@ pub(crate) mod tests {
             &self,
             _request: ConnectorWriteBeginRequest,
         ) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
-            self.recorded.lock().expect("recorded").begin += 1;
+            {
+                let mut recorded = self.recorded.lock().expect("recorded");
+                recorded.begin += 1;
+                if let Some(error) = &recorded.begin_error {
+                    return Err(error.clone());
+                }
+            }
             let commit = self.adapter.wrap_commit_handle(FakeCommit);
             let targets = (0..self.targets)
                 .map(|index| {
@@ -1718,6 +1738,7 @@ pub(crate) mod tests {
                 declaration,
                 shape:
                     novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape::Data,
+                target_candidates: None,
             },
             context: request_context(),
         }
@@ -2007,6 +2028,58 @@ pub(crate) mod tests {
             fixture.recorded.lock().expect("recorded").publication,
             Some(expected)
         );
+    }
+
+    #[test]
+    fn typed_pending_document_begin_preserves_target_format_refusal_before_session_creation() {
+        struct ExactLeaseControl(ConnectorProviderBindingKey);
+        impl LegacyWriteControl for ExactLeaseControl {
+            fn binding_key(&self) -> &ConnectorProviderBindingKey {
+                &self.0
+            }
+        }
+        for delete_kind in [
+            novarocks_spi::connector::ConnectorTargetDeleteKind::Equality,
+            novarocks_spi::connector::ConnectorTargetDeleteKind::ParquetPosition,
+        ] {
+            let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+            let expected = ConnectorError::target_format_unsupported(
+                "file:///frozen-candidate.parquet",
+                delete_kind,
+            );
+            recorded.lock().expect("recorded").begin_error = Some(expected.clone());
+            let binding = ConnectorProviderBindingKey {
+                instance_id: catalog_handle().catalog_name().clone(),
+                incarnation: novarocks_spi::connector::ProviderBindingEpoch::new(),
+            };
+            let write_lease = novarocks_spi::connector::ConnectorWriteLease::new(
+                binding.clone(),
+                Arc::new(ExactLeaseControl(binding)),
+                || {},
+            )
+            .expect("exact write lease")
+            .with_catalog_properties(catalog_properties())
+            .expect("catalog identity");
+            let (declaration, _) = application_document_publication();
+            let error = match begin_connector_application_document_write_session_pending_typed(
+                lease,
+                &write_lease,
+                application_document_begin_request(declaration),
+            ) {
+                Ok(_) => panic!("unsupported target must refuse session creation"),
+                Err(error) => error,
+            };
+            assert_eq!(error, expected);
+            let preparation =
+                crate::query_execution::mv_native_write::MvWritePreparationError::from(error);
+            assert!(matches!(preparation,
+                crate::query_execution::mv_native_write::MvWritePreparationError::Connector(ref error)
+                    if error.target_format_failure() == expected.target_format_failure()));
+            let recorded = recorded.lock().expect("recorded");
+            assert_eq!(recorded.begin, 1);
+            assert_eq!(recorded.finish, 0);
+            assert_eq!(recorded.abort, 0);
+        }
     }
 
     #[test]

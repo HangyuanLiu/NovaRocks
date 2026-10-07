@@ -17,6 +17,7 @@
 use crate::exec::chunk::Chunk;
 use crate::exec::chunk::type_compatibility::{check_exact, retag_column};
 use crate::exec::expr::function::compare_values_with_null;
+use crate::exec::expr::json_in_pair::{JsonPairDecision, json_pair_decision};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, cast_with_special_rules};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Decimal128Array, Decimal256Array,
@@ -341,13 +342,12 @@ fn eq_with_candidate(
                 }
                 let lhs = input.value(i);
                 let rhs = values.value(value_idx);
-                if let (Some(lhs_json), Some(rhs_json)) = (
-                    json_value_from_text_or_variant(lhs),
-                    json_value_from_text_or_variant(rhs),
-                ) {
-                    builder.append_value(lhs_json == rhs_json);
-                } else {
-                    builder.append_value(lhs == rhs);
+                let lhs_json = json_value_from_text_or_variant(lhs);
+                let rhs_json = json_value_from_text_or_variant(rhs);
+                match json_pair_decision(false, false, lhs_json.is_some(), rhs_json.is_some()) {
+                    JsonPairDecision::Parsed => builder.append_value(lhs_json == rhs_json),
+                    JsonPairDecision::Raw => builder.append_value(lhs == rhs),
+                    JsonPairDecision::Unknown => unreachable!("SQL NULL was handled above"),
                 }
             }
             Ok(builder.finish())
@@ -984,7 +984,7 @@ fn variant_json_value(bytes: &[u8]) -> Option<JsonValue> {
     serde_json::from_str(&text).ok()
 }
 
-fn json_value_from_text_or_variant(text: &str) -> Option<JsonValue> {
+pub(super) fn json_value_from_text_or_variant(text: &str) -> Option<JsonValue> {
     serde_json::from_str(text)
         .ok()
         .or_else(|| variant_json_value(text.as_bytes()))

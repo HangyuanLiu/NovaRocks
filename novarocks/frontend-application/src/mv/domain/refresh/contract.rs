@@ -35,7 +35,7 @@ pub(crate) struct ImvRefreshContract {
     /// Ordered, one entry per base scan, in the definition's own canonical
     /// relation order. Two entries may name one table.
     pub(crate) base_refs: Vec<ImvBaseRelationOccurrence>,
-    pub(crate) apply_key: ApplyKeyContract,
+    pub(crate) apply_key: Option<ApplyKeyContract>,
     pub(crate) aggregate: Option<AggregateRefreshContract>,
     pub(crate) join: Option<JoinRefreshContract>,
     pub(crate) branch: Option<BranchRefreshContract>,

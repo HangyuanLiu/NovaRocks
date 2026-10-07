@@ -119,6 +119,7 @@ pub enum QueryExecutionErrorKind {
 pub struct QueryExecutionError {
     kind: QueryExecutionErrorKind,
     message: Arc<str>,
+    task_failure: Option<novarocks_execution_contract::TaskFailure>,
 }
 
 impl QueryExecutionError {
@@ -126,7 +127,20 @@ impl QueryExecutionError {
         Self {
             kind,
             message: message.into(),
+            task_failure: None,
         }
+    }
+
+    pub fn with_task_failure(
+        mut self,
+        failure: Option<novarocks_execution_contract::TaskFailure>,
+    ) -> Self {
+        self.task_failure = failure;
+        self
+    }
+
+    pub fn task_failure(&self) -> Option<&novarocks_execution_contract::TaskFailure> {
+        self.task_failure.as_ref()
     }
 
     pub const fn kind(&self) -> QueryExecutionErrorKind {

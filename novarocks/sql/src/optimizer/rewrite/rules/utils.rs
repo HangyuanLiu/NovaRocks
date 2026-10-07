@@ -302,6 +302,10 @@ pub(crate) fn collect_output_ids_ordered_opt(expr: &OptExpr) -> Vec<ColumnId> {
             ids.extend(collect_output_ids_ordered_opt(expr.right()));
             ids
         }
+        Operator::LogicalQuotaPreclaim(o) => o.output_columns.iter().map(|c| c.column_id).collect(),
+        Operator::LogicalQuotaTrim(o) => o.output_columns.iter().map(|c| c.column_id).collect(),
+        Operator::LogicalFanoutConsume(o) => o.output_columns.iter().map(|c| c.column_id).collect(),
+        Operator::LogicalFanoutAnchor(_) => collect_output_ids_ordered_opt(expr.child(1)),
         Operator::LogicalCTEAnchor(_) => collect_output_ids_ordered_opt(expr.child(1)),
         Operator::LogicalAssertOneRow(_) => collect_output_ids_ordered_opt(expr.unary_input()),
         // Physical operators and any other variants are not expected during the RBO phase.
@@ -657,6 +661,14 @@ mod typed_legacy {
                 ids.extend(collect_output_ids_ordered(plan.right()));
                 ids
             }
+            LogicalPlanKind::QuotaPreclaim(o) => {
+                o.output_columns.iter().map(|c| c.column_id).collect()
+            }
+            LogicalPlanKind::QuotaTrim(o) => o.output_columns.iter().map(|c| c.column_id).collect(),
+            LogicalPlanKind::FanoutConsume(o) => {
+                o.output_columns.iter().map(|c| c.column_id).collect()
+            }
+            LogicalPlanKind::FanoutAnchor(_) => collect_output_ids_ordered(plan.child(1)),
             LogicalPlanKind::CTEAnchor(_) => collect_output_ids_ordered(plan.child(1)),
             LogicalPlanKind::Apply(a) => {
                 let mut ids = collect_output_ids_ordered(plan.left());
@@ -720,6 +732,24 @@ mod typed_legacy {
                 for c in &v.columns {
                     out.insert((None, c.name.to_lowercase()));
                 }
+            }
+            LogicalPlanKind::QuotaPreclaim(o) => {
+                for column in &o.output_columns {
+                    out.insert((None, column.name.to_lowercase()));
+                }
+            }
+            LogicalPlanKind::QuotaTrim(o) => {
+                for column in &o.output_columns {
+                    out.insert((None, column.name.to_lowercase()));
+                }
+            }
+            LogicalPlanKind::FanoutConsume(o) => {
+                for column in &o.output_columns {
+                    out.insert((None, column.name.to_lowercase()));
+                }
+            }
+            LogicalPlanKind::FanoutAnchor(_) => {
+                collect_qualified_output_columns_inner(plan.child(1), out)
             }
             LogicalPlanKind::CTEAnchor(_) => {
                 collect_qualified_output_columns_inner(plan.child(1), out);

@@ -30,6 +30,7 @@ pub(crate) mod ordering;
 pub(crate) mod payload;
 pub(crate) mod physical;
 pub(crate) mod pipeline;
+pub(crate) mod quota;
 pub(crate) mod runtime_filter;
 pub(crate) mod table;
 pub mod vocabulary;

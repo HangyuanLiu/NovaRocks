@@ -99,6 +99,15 @@ impl PreparedMvRefreshWrite {
         }
     }
 
+    pub(crate) fn requires_visible_validation(&self) -> bool {
+        match &self.artifact {
+            PreparedMvRefreshWriteArtifact::FirstRefresh(_) => false,
+            PreparedMvRefreshWriteArtifact::Incremental(write) => {
+                write.requires_visible_validation()
+            }
+        }
+    }
+
     pub fn operation_id(&self) -> ConnectorWriteOperationId {
         match &self.artifact {
             PreparedMvRefreshWriteArtifact::FirstRefresh(write) => write.operation_id(),

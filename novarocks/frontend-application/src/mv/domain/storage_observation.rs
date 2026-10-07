@@ -71,7 +71,10 @@ impl MvTargetCreationObservation {
         let mut field_names = HashSet::with_capacity(fields.len());
         for field in &fields {
             require_non_empty(&field.name, "created MV target field name")?;
-            require_non_empty(&field.type_signature, "created MV target field type")?;
+            field
+                .data_type
+                .validate(Default::default())
+                .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
             if !field_ids.insert(field.field_id) {
                 return corrupt(format!(
                     "created MV target observation has duplicate field ID {}",
@@ -141,7 +144,7 @@ impl MvSchemaValidationObservation {
 pub(crate) struct MvObservedTargetField {
     pub field_id: i32,
     pub name: String,
-    pub type_signature: String,
+    pub data_type: novarocks_types::logical_type::LogicalType,
     pub nullable: bool,
 }
 
@@ -851,7 +854,15 @@ pub(crate) fn schema_validation_from_spi(
                 )?,
                 name: field.name().to_owned(),
                 ordinal: *ordinal,
-                type_signature: field.type_signature().to_owned(),
+                data_type:
+                    novarocks_mv_application::persistence::codec::MvLogicalType::from_schema_type(
+                        field.logical_type().clone(),
+                        field.provider_type_binding().clone(),
+                    )
+                    .map_err(|error| {
+                        ConnectorError::new(ConnectorErrorKind::CorruptData, error.to_string())
+                    })?,
+                legacy_scalar_type: field.legacy_scalar_type().cloned(),
                 nullable: field.nullable(),
             })
         })
@@ -1055,7 +1066,7 @@ fn observed_fields_from_spi(fields: &[SpiObservedField]) -> Vec<MvObservedTarget
         .map(|field| MvObservedTargetField {
             field_id: field.field_id(),
             name: field.name().to_string(),
-            type_signature: field.type_signature().to_string(),
+            data_type: field.logical_type().clone(),
             nullable: field.nullable(),
         })
         .collect()
@@ -1320,7 +1331,7 @@ mod tests {
                             fields: vec![BaseFieldRecord {
                                 field_id: 1,
                                 name_at_create: "c1".to_string(),
-                                type_signature: "int".to_string(),
+                                data_type: novarocks_mv_application::persistence::codec::MvLogicalType::decode_signature("int").unwrap(),
                                 required: true,
                             }],
                         },
@@ -1346,14 +1357,10 @@ mod tests {
                         visible_columns: vec![TargetVisibleColumn {
                             output_name: "c1".to_string(),
                             target_field_id: 1,
-                            type_signature: "int".to_string(),
+                            data_type: novarocks_mv_application::persistence::codec::MvLogicalType::decode_signature("int").unwrap(),
                             nullable: false,
                         }],
-                        hidden_apply_key: HiddenApplyKeyContract {
-                            column_name: "__nova_base_row_id".to_string(),
-                            target_field_id: 2,
-                            source: novarocks_sql::planning::mv::ApplyKeySource::BaseRowId,
-                        },
+                        hidden_apply_key: None,
                         partition: None,
                     },
                 },
@@ -1374,7 +1381,7 @@ mod tests {
         vec![MvObservedTargetField {
             field_id: 1,
             name: "c1".to_string(),
-            type_signature: "int".to_string(),
+            data_type: novarocks_types::logical_type::LogicalType::Int32,
             nullable: false,
         }]
     }
@@ -1414,7 +1421,7 @@ mod tests {
         duplicated.push(MvObservedTargetField {
             field_id: 1,
             name: "c2".to_string(),
-            type_signature: "bigint".to_string(),
+            data_type: novarocks_types::logical_type::LogicalType::Int64,
             nullable: true,
         });
         let err = MvTargetCreationObservation::try_new(
@@ -1465,7 +1472,9 @@ mod tests {
         let field = MvObservedSourceField::try_new(
             Bytes::from_static(&[0xff, 7]),
             "physical_name".into(),
-            "int".into(),
+            novarocks_types::logical_type::LogicalType::Int32,
+            Some(novarocks_types::logical_type::LogicalType::Int32),
+            Bytes::from_static(b"exact-provider-int32"),
             false,
         )
         .unwrap();
@@ -1744,7 +1753,9 @@ mod tests {
             vec![SpiObservedField::new(
                 1,
                 "c1".to_string(),
-                "int".to_string(),
+                novarocks_types::logical_type::LogicalType::Int32,
+                Some(novarocks_types::logical_type::LogicalType::Int32),
+                Bytes::from_static(b"exact-provider-int32"),
                 false,
             )],
             partition,

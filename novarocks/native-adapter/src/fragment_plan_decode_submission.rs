@@ -126,6 +126,11 @@ pub(crate) fn decode_fragment_submission(
     ledger.finish()?;
     let scan_assignments = ScanAssignments::try_new(context.take_captured_scan_ranges())
         .map_err(NativeFragmentDecodeError::Binding)?;
+    crate::fragment_sink::validate_predicate_fanout_input(
+        fragment,
+        &decoded_root.layout,
+        &decoded_root.output_schema,
+    )?;
     let sink_program = decode_fragment_sink_program(fragment, &decoded_root.layout)?;
     let static_sink = sink_program.into_static().map_err(|error| {
         NativeFragmentDecodeError::invalid_value(
@@ -169,7 +174,7 @@ pub(crate) fn decode_fragment_submission(
                 error,
             )
         })?;
-    let (local_program, runtime_bindings) = plan
+    let (local_program, mut runtime_bindings) = plan
         .into_local_program_and_bindings(
             profile,
             context.take_captured_static_scans(),
@@ -182,6 +187,18 @@ pub(crate) fn decode_fragment_submission(
                 error,
             )
         })?;
+    for (domain, count) in instance.quota_domains {
+        runtime_bindings
+            .bind_quota_domain(domain, count)
+            .map_err(|detail| {
+                NativeFragmentDecodeError::invalid_value(
+                    FieldPath::root("creation_metadata")
+                        .field("assignment")
+                        .field("quota_domain_bindings"),
+                    detail,
+                )
+            })?;
+    }
     let program = FragmentProgram::try_new(
         Arc::new(local_program),
         FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
@@ -311,6 +328,7 @@ mod tests {
             exchange_inputs: ExchangeInputAssignments::new(BTreeMap::new()),
             typed_result_sink: false,
             sink_edge_ids: Vec::new(),
+            quota_domains: BTreeMap::new(),
         }
     }
 

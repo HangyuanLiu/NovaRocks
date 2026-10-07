@@ -26,7 +26,7 @@ use novarocks_sql::planning::mv::{
     SqlMvOutputColumnFacts, SqlResolvedMvRefreshInput, SqlResolvedMvRefreshInputSource,
     strip_catalog_from_three_part_names,
 };
-use novarocks_sql::semantic::{IcebergPartitionFieldExpr, ObjectName, TableColumnDef};
+use novarocks_sql::semantic::{IcebergPartitionFieldExpr, ObjectName};
 use novarocks_types::naming::normalize_identifier;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,17 +112,20 @@ fn prepare_mv_select_with_catalog_paths(
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-pub(crate) fn finish_mv_analysis<T>(prepared: PreparedMvSelect, source: T) -> MvAnalysis
+pub(crate) fn finish_mv_analysis<T>(
+    prepared: PreparedMvSelect,
+    source: T,
+) -> Result<MvAnalysis, String>
 where
     T: SqlResolvedMvRefreshInputSource,
 {
-    let refresh_input = SqlResolvedMvRefreshInput::from_analysis(source);
+    let refresh_input = SqlResolvedMvRefreshInput::from_analysis(source)?;
     let output_columns = refresh_input.analysis_facts().output_columns;
-    MvAnalysis {
+    Ok(MvAnalysis {
         resolved_refs: prepared.resolved_refs,
         output_columns,
         refresh_input,
-    }
+    })
 }
 
 #[allow(
@@ -144,7 +147,7 @@ where
     let prepared = prepare_mv_select(query, current_catalog, current_database)?;
     register(prepared.resolved_refs())?;
     let source = analyze(prepared.query_for_analysis())?;
-    Ok(finish_mv_analysis(prepared, source))
+    finish_mv_analysis(prepared, source)
 }
 
 fn validate_mv_select_raw_query_clauses(query: &Query) -> Result<(), String> {
@@ -611,12 +614,13 @@ fn has_three_part_refs(resolved_refs: &[ResolvedTableRef]) -> bool {
         .any(|table_ref| matches!(table_ref, ResolvedTableRef::Iceberg { .. }))
 }
 
-pub(crate) fn output_column_to_table_column(
+pub(crate) fn output_column_to_connector_column(
     column: &SqlMvOutputColumnFacts,
-) -> Result<TableColumnDef, String> {
-    Ok(TableColumnDef {
-        name: column.name.clone(),
-        data_type: novarocks_sql::literal::arrow_data_type_to_sql_type(&column.data_type)?,
+) -> Result<novarocks_spi::connector::ConnectorColumnDefinition, String> {
+    column.logical_type().validate(Default::default())?;
+    Ok(novarocks_spi::connector::ConnectorColumnDefinition {
+        name: std::sync::Arc::from(column.name.as_str()),
+        data_type: column.logical_type().clone(),
         nullable: column.nullable,
         aggregation: None,
         default: None,

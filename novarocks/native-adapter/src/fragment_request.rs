@@ -213,6 +213,7 @@ mod tests {
         let instance = project_task_instance(
             &descriptor,
             proto::TaskAssignment {
+                quota_domain_bindings: Vec::new(),
                 instance_ordinal: 3,
                 ..Default::default()
             },

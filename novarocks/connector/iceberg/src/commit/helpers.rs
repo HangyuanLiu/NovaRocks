@@ -27,7 +27,7 @@ use crate::iceberg::spec::{
 };
 use crate::iceberg::table::Table;
 use crate::iceberg::transaction::{ActionCommit, TransactionAction};
-use crate::iceberg::{Catalog, TableCommit, TableIdent, TableRequirement};
+use crate::iceberg::{Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -116,7 +116,8 @@ pub(super) async fn submit_occ_action<A>(
 where
     A: TransactionAction + 'static,
 {
-    submit_occ_action_with_rebase_policy(catalog, base, action, label, before_attempt, true).await
+    submit_occ_action_with_rebase_policy(catalog, base, action, label, before_attempt, true, &[])
+        .await
 }
 
 /// Submit a snapshot action while preserving an application-document
@@ -137,6 +138,7 @@ pub(super) async fn submit_snapshot_occ_action<A>(
     label: &str,
     before_attempt: Option<&(dyn Fn(&Table) -> Result<(), String> + Send + Sync)>,
     snapshot_properties: &BTreeMap<String, String>,
+    metadata_updates: &[TableUpdate],
 ) -> Result<OccSubmit, OccSubmitError>
 where
     A: TransactionAction + 'static,
@@ -147,7 +149,8 @@ where
         action,
         label,
         before_attempt,
-        permits_occ_rebase(snapshot_properties),
+        permits_occ_rebase(snapshot_properties) && metadata_updates.is_empty(),
+        metadata_updates,
     )
     .await
 }
@@ -168,6 +171,7 @@ async fn submit_occ_action_with_rebase_policy<A>(
     label: &str,
     before_attempt: Option<&(dyn Fn(&Table) -> Result<(), String> + Send + Sync)>,
     permit_rebase: bool,
+    metadata_updates: &[TableUpdate],
 ) -> Result<OccSubmit, OccSubmitError>
 where
     A: TransactionAction + 'static,
@@ -198,6 +202,30 @@ where
             .map_err(|error| OccSubmitError::Failed {
                 detail: format!("{label} stage failed: {error}"),
             })?;
+        let mut staged = staged;
+        if !metadata_updates.is_empty() {
+            let mut updates = metadata_updates.to_vec();
+            updates.extend(staged.take_updates());
+            let mut requirements = staged.take_requirements();
+            if !requirements
+                .iter()
+                .any(|requirement| matches!(requirement, TableRequirement::UuidMatch { .. }))
+            {
+                requirements.push(TableRequirement::UuidMatch {
+                    uuid: base.metadata().uuid(),
+                });
+            }
+            if !requirements.iter().any(|requirement| {
+                matches!(requirement,
+                TableRequirement::RefSnapshotIdMatch { r#ref, .. } if r#ref == "main")
+            }) {
+                requirements.push(TableRequirement::RefSnapshotIdMatch {
+                    r#ref: "main".to_string(),
+                    snapshot_id: base.metadata().current_snapshot_id(),
+                });
+            }
+            staged = ActionCommit::new(updates, requirements);
+        }
         match submit_action_commit(catalog, ident.clone(), staged, Vec::new()).await {
             Ok(Some(table)) => return Ok(OccSubmit::Committed(table)),
             Ok(None) => return Ok(OccSubmit::NoOp),

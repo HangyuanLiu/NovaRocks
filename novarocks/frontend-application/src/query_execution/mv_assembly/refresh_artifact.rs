@@ -90,8 +90,8 @@ impl MvFirstRefreshLogicalArtifact {
         self.context
     }
 
-    pub(crate) const fn root_hash_column(&self) -> &str {
-        MV_JOIN_APPLY_KEY_COLUMN_NAME
+    pub(crate) const fn root_hash_column(&self) -> Option<&str> {
+        None
     }
 }
 
@@ -105,7 +105,7 @@ pub(crate) enum MvFirstRefreshExecutionArtifact {
 }
 
 impl MvFirstRefreshExecutionArtifact {
-    pub(crate) fn root_hash_column(&self) -> &str {
+    pub(crate) fn root_hash_column(&self) -> Option<&str> {
         match self {
             Self::Sql(sql) => sql.root_hash_column(),
             Self::Logical(logical) => logical.root_hash_column(),
@@ -246,7 +246,7 @@ impl PreparedMvFirstRefreshWrite {
         self.request.write_input_fields()
     }
 
-    pub(crate) fn root_hash_column(&self) -> &str {
+    pub(crate) fn root_hash_column(&self) -> Option<&str> {
         self.artifact.root_hash_column()
     }
 
@@ -462,6 +462,11 @@ pub struct PreparedMvIncrementalWrite {
 }
 
 impl PreparedMvIncrementalWrite {
+    pub(crate) fn requires_visible_validation(&self) -> bool {
+        self.mode == MvIncrementalWriteMode::RowDelta
+            && self.logical_context.analysis.aggregate.is_none()
+    }
+
     pub fn operation_id(&self) -> ConnectorWriteOperationId {
         self.request.operation_id
     }

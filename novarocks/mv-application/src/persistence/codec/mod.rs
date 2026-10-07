@@ -18,8 +18,11 @@
 //! Canonical, bounded conversion between runtime values and private generated
 //! persistence DTOs. No function in this module performs I/O.
 
+pub mod logical_type;
 mod model;
-mod wire;
+pub use logical_type::{MvLogicalType, TypeCodecError};
+
+pub(crate) mod wire;
 
 #[cfg(test)]
 mod tests;
@@ -61,12 +64,14 @@ impl EncodedDocument {
 
 #[derive(Debug)]
 pub enum PersistenceCodecError {
+    LogicalType(TypeCodecError),
     ResourceBudget {
         resource: &'static str,
         maximum: usize,
         actual: usize,
     },
     MalformedWire(String),
+    LegacyNonAggregateInterpretation,
     UnknownFormatVersion {
         document: &'static str,
         version: u32,
@@ -84,6 +89,7 @@ pub enum PersistenceCodecError {
 impl std::fmt::Display for PersistenceCodecError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::LogicalType(error) => error.fmt(formatter),
             Self::ResourceBudget {
                 resource,
                 maximum,
@@ -91,6 +97,10 @@ impl std::fmt::Display for PersistenceCodecError {
             } => write!(
                 formatter,
                 "MV persistence {resource} uses {actual} bytes/items, exceeding the limit {maximum}"
+            ),
+            Self::LegacyNonAggregateInterpretation => write!(
+                formatter,
+                "legacy nonaggregate MV interpretation is unsupported; DROP the materialized view and recreate it"
             ),
             Self::MalformedWire(message) => write!(formatter, "malformed MV protobuf: {message}"),
             Self::UnknownFormatVersion { document, version } => write!(
@@ -119,6 +129,12 @@ impl std::fmt::Display for PersistenceCodecError {
 }
 
 impl std::error::Error for PersistenceCodecError {}
+
+impl From<TypeCodecError> for PersistenceCodecError {
+    fn from(value: TypeCodecError) -> Self {
+        Self::LogicalType(value)
+    }
+}
 
 impl From<ValidationError> for PersistenceCodecError {
     fn from(value: ValidationError) -> Self {
@@ -267,6 +283,24 @@ pub fn preflight_current_document_set(
     configuration: &[u8],
     budget: PersistenceDecodeBudget,
 ) -> Result<(), PersistenceCodecError> {
+    preflight_current_document_set_with_eligibility(
+        definition,
+        interpretation,
+        publication,
+        configuration,
+        None,
+        budget,
+    )
+}
+
+pub fn preflight_current_document_set_with_eligibility(
+    definition: &[u8],
+    interpretation: &[u8],
+    publication: Option<&[u8]>,
+    configuration: &[u8],
+    eligibility: Option<&[u8]>,
+    budget: PersistenceDecodeBudget,
+) -> Result<(), PersistenceCodecError> {
     let required = [
         (definition, wire::Schema::DefinitionDocument),
         (interpretation, wire::Schema::InterpretationDocument),
@@ -278,6 +312,7 @@ pub fn preflight_current_document_set(
     for (bytes, schema) in required
         .into_iter()
         .chain(publication.map(|bytes| (bytes, wire::Schema::PublicationDocument)))
+        .chain(eligibility.map(|bytes| (bytes, wire::Schema::EligibilityDocument)))
     {
         let usage = wire::preflight(bytes, schema, budget)?;
         encoded_bytes = encoded_bytes.saturating_add(usage.encoded_bytes);
@@ -308,7 +343,9 @@ pub fn preflight_current_document_set(
     Ok(())
 }
 
-fn encode_message(message: impl Message) -> Result<EncodedDocument, PersistenceCodecError> {
+pub(crate) fn encode_message(
+    message: impl Message,
+) -> Result<EncodedDocument, PersistenceCodecError> {
     let encoded_len = message.encoded_len();
     let maximum = PersistenceDecodeBudget::default().max_document_bytes;
     if encoded_len > maximum {
@@ -328,7 +365,10 @@ fn encode_message(message: impl Message) -> Result<EncodedDocument, PersistenceC
     })
 }
 
-fn ensure_canonical(source: &[u8], message: impl Message) -> Result<(), PersistenceCodecError> {
+pub(crate) fn ensure_canonical(
+    source: &[u8],
+    message: impl Message,
+) -> Result<(), PersistenceCodecError> {
     if message.encode_to_vec() != source {
         return Err(PersistenceCodecError::MalformedWire(
             "document does not use canonical field and set ordering".to_string(),
@@ -337,7 +377,7 @@ fn ensure_canonical(source: &[u8], message: impl Message) -> Result<(), Persiste
     Ok(())
 }
 
-fn require_version(
+pub(crate) fn require_version(
     document: &'static str,
     version: Option<u32>,
 ) -> Result<(), PersistenceCodecError> {
@@ -348,7 +388,10 @@ fn require_version(
     Ok(())
 }
 
-fn required<T>(value: Option<T>, field: &'static str) -> Result<T, PersistenceCodecError> {
+pub(crate) fn required<T>(
+    value: Option<T>,
+    field: &'static str,
+) -> Result<T, PersistenceCodecError> {
     value.ok_or(PersistenceCodecError::MissingField(field))
 }
 
@@ -419,14 +462,14 @@ fn preflight_definition_source(document: &DefinitionDocument) -> Result<(), Pers
             bytes = bytes
                 .saturating_add(field.field_id.as_bytes().len())
                 .saturating_add(field.name_at_binding.len())
-                .saturating_add(field.type_signature.len());
+                .saturating_add(field.data_type.encoded_len());
         }
     }
     for output in &document.outputs {
         bytes = bytes
             .saturating_add(output.output_id.as_bytes().len())
             .saturating_add(output.name.len())
-            .saturating_add(output.type_signature.len())
+            .saturating_add(output.data_type.encoded_len())
             .saturating_add(
                 output
                     .expression
@@ -454,20 +497,23 @@ fn preflight_interpretation_source(
         + document.branches.len()
         + document.target.fields.len()
         + document.target.partition_fields.len()
-        + document.apply_key.components.len();
+        + document
+            .apply_key
+            .as_ref()
+            .map_or(0, |key| key.components.len());
     for output in &document.outputs {
         bytes = bytes
             .saturating_add(output.output_id.as_bytes().len())
             .saturating_add(output.target_field_id.as_bytes().len())
-            .saturating_add(output.type_signature.len());
+            .saturating_add(output.data_type.encoded_len());
     }
     for slot in &document.state_slots {
         bytes = bytes
             .saturating_add(slot.slot_id.as_bytes().len())
             .saturating_add(slot.target_field_id.as_bytes().len())
-            .saturating_add(slot.type_signature.len());
+            .saturating_add(slot.data_type.encoded_len());
     }
-    for component in &document.apply_key.components {
+    for component in document.apply_key.iter().flat_map(|key| &key.components) {
         bytes = bytes
             .saturating_add(component.logical_id.as_bytes().len())
             .saturating_add(component.target_field_id.as_bytes().len());
@@ -499,7 +545,7 @@ fn preflight_interpretation_source(
         bytes = bytes
             .saturating_add(field.logical_identity.as_bytes().len())
             .saturating_add(field.target_field_id.as_bytes().len())
-            .saturating_add(field.type_signature.len());
+            .saturating_add(field.data_type.encoded_len());
     }
     for field in &document.target.partition_fields {
         bytes = bytes
@@ -575,7 +621,7 @@ fn definition_to_proto(document: &DefinitionDocument) -> proto::DefinitionDocume
                     .map(|field| proto::SourceFieldBinding {
                         field_id: Some(field.field_id.as_bytes().to_vec()),
                         name_at_binding: Some(field.name_at_binding.clone()),
-                        type_signature: Some(field.type_signature.clone()),
+                        type_signature: Some(field.data_type.encode_signature()),
                         nullable: Some(field.nullable),
                     })
                     .collect(),
@@ -587,7 +633,7 @@ fn definition_to_proto(document: &DefinitionDocument) -> proto::DefinitionDocume
             .map(|output| proto::OutputDefinition {
                 output_id: Some(output.output_id.as_bytes().to_vec()),
                 name: Some(output.name.clone()),
-                type_signature: Some(output.type_signature.clone()),
+                type_signature: Some(output.data_type.encode_signature()),
                 nullable: Some(output.nullable),
                 expression: Some(proto::ExpressionShape {
                     kind: Some(match output.expression.kind {
@@ -696,10 +742,10 @@ fn relation_from_proto(
                         field.name_at_binding,
                         "definition.relation.field.name_at_binding",
                     )?,
-                    type_signature: required(
+                    data_type: MvLogicalType::decode_signature(&required(
                         field.type_signature,
                         "definition.relation.field.type_signature",
-                    )?,
+                    )?)?,
                     nullable: required(field.nullable, "definition.relation.field.nullable")?,
                 })
             })
@@ -717,7 +763,10 @@ fn output_from_proto(
             "definition.output.output_id",
         )?)?,
         name: required(value.name, "definition.output.name")?,
-        type_signature: required(value.type_signature, "definition.output.type_signature")?,
+        data_type: MvLogicalType::decode_signature(&required(
+            value.type_signature,
+            "definition.output.type_signature",
+        )?)?,
         nullable: required(value.nullable, "definition.output.nullable")?,
         expression: ExpressionShape {
             kind: enum_value(
@@ -766,7 +815,7 @@ fn interpretation_to_proto(document: &InterpretationDocument) -> proto::Interpre
             .map(|value| proto::OutputBinding {
                 output_id: Some(value.output_id.as_bytes().to_vec()),
                 target_field_id: Some(value.target_field_id.as_bytes().to_vec()),
-                type_signature: Some(value.type_signature.clone()),
+                type_signature: Some(value.data_type.encode_signature()),
                 nullable: Some(value.nullable),
             })
             .collect(),
@@ -776,7 +825,7 @@ fn interpretation_to_proto(document: &InterpretationDocument) -> proto::Interpre
             .map(|value| proto::StateSlot {
                 slot_id: Some(value.slot_id.as_bytes().to_vec()),
                 target_field_id: Some(value.target_field_id.as_bytes().to_vec()),
-                type_signature: Some(value.type_signature.clone()),
+                type_signature: Some(value.data_type.encode_signature()),
                 nullable: Some(value.nullable),
                 role: Some(match value.role {
                     StateRole::Single => 1,
@@ -789,14 +838,11 @@ fn interpretation_to_proto(document: &InterpretationDocument) -> proto::Interpre
                 }),
             })
             .collect(),
-        apply_key: Some(proto::ApplyKey {
-            kind: Some(match document.apply_key.kind {
-                ApplyKeyKind::BaseRowId => 1,
-                ApplyKeyKind::JoinRowKey => 2,
+        apply_key: document.apply_key.as_ref().map(|key| proto::ApplyKey {
+            kind: Some(match key.kind {
                 ApplyKeyKind::GroupRowId => 3,
             }),
-            components: document
-                .apply_key
+            components: key
                 .components
                 .iter()
                 .map(|component| proto::ApplyKeyComponent {
@@ -859,7 +905,7 @@ fn interpretation_to_proto(document: &InterpretationDocument) -> proto::Interpre
                     }),
                     logical_id: Some(value.logical_identity.as_bytes().to_vec()),
                     target_field_id: Some(value.target_field_id.as_bytes().to_vec()),
-                    type_signature: Some(value.type_signature.clone()),
+                    type_signature: Some(value.data_type.encode_signature()),
                     nullable: Some(value.nullable),
                 })
                 .collect(),
@@ -895,7 +941,22 @@ fn interpretation_to_proto(document: &InterpretationDocument) -> proto::Interpre
 fn interpretation_from_proto(
     dto: proto::InterpretationDocument,
 ) -> Result<InterpretationDocument, PersistenceCodecError> {
-    let apply_key = required(dto.apply_key, "interpretation.apply_key")?;
+    if dto
+        .apply_key
+        .as_ref()
+        .is_some_and(|key| matches!(key.kind, Some(1 | 2)))
+        || (dto.aggregates.is_empty()
+            && (!dto.branches.is_empty()
+                || dto.target.as_ref().is_some_and(|target| {
+                    target
+                        .fields
+                        .iter()
+                        .any(|field| matches!(field.kind, Some(3 | 4)))
+                })))
+    {
+        return Err(PersistenceCodecError::LegacyNonAggregateInterpretation);
+    }
+    let apply_key = dto.apply_key;
     let target = required(dto.target, "interpretation.target")?;
     Ok(InterpretationDocument {
         definition_revision: DocumentRevision::try_from_bytes(&required(
@@ -919,10 +980,10 @@ fn interpretation_from_proto(
                         value.target_field_id,
                         "interpretation.output.target_field_id",
                     )?)?,
-                    type_signature: required(
+                    data_type: MvLogicalType::decode_signature(&required(
                         value.type_signature,
                         "interpretation.output.type_signature",
-                    )?,
+                    )?)?,
                     nullable: required(value.nullable, "interpretation.output.nullable")?,
                 })
             })
@@ -940,10 +1001,10 @@ fn interpretation_from_proto(
                         value.target_field_id,
                         "interpretation.state_slot.target_field_id",
                     )?)?,
-                    type_signature: required(
+                    data_type: MvLogicalType::decode_signature(&required(
                         value.type_signature,
                         "interpretation.state_slot.type_signature",
-                    )?,
+                    )?)?,
                     nullable: required(value.nullable, "interpretation.state_slot.nullable")?,
                     role: enum_value(value.role, "interpretation.state_slot.role", |value| {
                         Some(match value {
@@ -962,32 +1023,34 @@ fn interpretation_from_proto(
                 })
             })
             .collect::<Result<_, PersistenceCodecError>>()?,
-        apply_key: ApplyKey {
-            kind: enum_value(apply_key.kind, "interpretation.apply_key.kind", |value| {
-                Some(match value {
-                    1 => ApplyKeyKind::BaseRowId,
-                    2 => ApplyKeyKind::JoinRowKey,
-                    3 => ApplyKeyKind::GroupRowId,
-                    _ => return None,
+        apply_key: apply_key
+            .map(|apply_key| {
+                Ok::<_, PersistenceCodecError>(ApplyKey {
+                    kind: enum_value(apply_key.kind, "interpretation.apply_key.kind", |value| {
+                        Some(match value {
+                            3 => ApplyKeyKind::GroupRowId,
+                            _ => return None,
+                        })
+                    })?,
+                    components: apply_key
+                        .components
+                        .into_iter()
+                        .map(|component| {
+                            Ok(ApplyKeyComponent {
+                                logical_id: ApplyKeyIdentity::try_new(required(
+                                    component.logical_id,
+                                    "interpretation.apply_key.component.logical_id",
+                                )?)?,
+                                target_field_id: FieldIdentity::try_new(required(
+                                    component.target_field_id,
+                                    "interpretation.apply_key.component.target_field_id",
+                                )?)?,
+                            })
+                        })
+                        .collect::<Result<_, PersistenceCodecError>>()?,
                 })
-            })?,
-            components: apply_key
-                .components
-                .into_iter()
-                .map(|component| {
-                    Ok(ApplyKeyComponent {
-                        logical_id: ApplyKeyIdentity::try_new(required(
-                            component.logical_id,
-                            "interpretation.apply_key.component.logical_id",
-                        )?)?,
-                        target_field_id: FieldIdentity::try_new(required(
-                            component.target_field_id,
-                            "interpretation.apply_key.component.target_field_id",
-                        )?)?,
-                    })
-                })
-                .collect::<Result<_, PersistenceCodecError>>()?,
-        },
+            })
+            .transpose()?,
         aggregates: dto
             .aggregates
             .into_iter()
@@ -1090,10 +1153,10 @@ fn interpretation_from_proto(
                             value.target_field_id,
                             "interpretation.target.field.target_field_id",
                         )?)?,
-                        type_signature: required(
+                        data_type: MvLogicalType::decode_signature(&required(
                             value.type_signature,
                             "interpretation.target.field.type_signature",
-                        )?,
+                        )?)?,
                         nullable: required(value.nullable, "interpretation.target.field.nullable")?,
                     })
                 })

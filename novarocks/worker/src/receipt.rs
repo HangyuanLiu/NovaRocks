@@ -99,15 +99,44 @@ impl<T> OperationReceipt<T> {
 }
 
 /// The acknowledgement body of a context release.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ReleaseAcknowledgement {
     context: QueryContextRef,
     release: ReleaseOutcome,
     state: QueryContextState,
     termination_cause: Option<AbortCause>,
+    evidence: Option<Arc<crate::ReleasedContextEvidence>>,
 }
 
+impl PartialEq for ReleaseAcknowledgement {
+    fn eq(&self, other: &Self) -> bool {
+        self.context == other.context
+            && self.release == other.release
+            && self.state == other.state
+            && self.termination_cause == other.termination_cause
+            && match (&self.evidence, &other.evidence) {
+                (None, None) => true,
+                (Some(left), Some(right)) => {
+                    left.verification() == right.verification()
+                        && left.runtime_filter_observation() == right.runtime_filter_observation()
+                        && left.runtime_filter().map(|content| content.fingerprint())
+                            == right.runtime_filter().map(|content| content.fingerprint())
+                }
+                _ => false,
+            }
+    }
+}
+impl Eq for ReleaseAcknowledgement {}
+
 impl ReleaseAcknowledgement {
+    pub fn with_evidence(mut self, evidence: crate::ReleasedContextEvidence) -> Self {
+        self.evidence = Some(Arc::new(evidence));
+        self
+    }
+    pub fn evidence(&self) -> Option<&crate::ReleasedContextEvidence> {
+        self.evidence.as_deref()
+    }
+
     pub const fn new(
         context: QueryContextRef,
         release: ReleaseOutcome,
@@ -119,22 +148,23 @@ impl ReleaseAcknowledgement {
             release,
             state,
             termination_cause,
+            evidence: None,
         }
     }
 
-    pub const fn context(self) -> QueryContextRef {
+    pub const fn context(&self) -> QueryContextRef {
         self.context
     }
 
-    pub const fn release(self) -> ReleaseOutcome {
+    pub const fn release(&self) -> ReleaseOutcome {
         self.release
     }
 
-    pub const fn state(self) -> QueryContextState {
+    pub const fn state(&self) -> QueryContextState {
         self.state
     }
 
-    pub const fn termination_cause(self) -> Option<AbortCause> {
+    pub const fn termination_cause(&self) -> Option<AbortCause> {
         self.termination_cause
     }
 }

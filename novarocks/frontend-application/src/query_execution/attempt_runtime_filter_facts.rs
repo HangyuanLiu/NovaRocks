@@ -126,8 +126,17 @@ pub(crate) enum AttemptRuntimeFilterLateApplyGranularity {
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum AttemptRuntimeFilterProducerTarget {
-    JoinBuildKey { ordinal: u32 },
-    AggregateTopNKey { group_key_ordinal: u32, limit: u32 },
+    QuotaContentField {
+        field_ordinal: u32,
+        content_equivalence: novarocks_type_contract::ResultContentEquivalence,
+    },
+    JoinBuildKey {
+        ordinal: u32,
+    },
+    AggregateTopNKey {
+        group_key_ordinal: u32,
+        limit: u32,
+    },
 }
 #[derive(Clone, Debug)]
 pub(crate) enum AttemptRuntimeFilterConsumerTarget {
@@ -246,7 +255,8 @@ impl AttemptRuntimeFilterFacts {
                 PhysicalV1RuntimeFilterBindingRole::Consumer(index) => {
                     let consumer = &filter.consumers[index];
                     let scan_type = match consumer.target {
-                        novarocks_physical_plan::RuntimeFilterConsumerTarget::ScanField { .. }
+                        novarocks_physical_plan::RuntimeFilterConsumerTarget::QuotaContentScanField { .. }
+                        | novarocks_physical_plan::RuntimeFilterConsumerTarget::ScanField { .. }
                         | novarocks_physical_plan::RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => {
                             let value = consumer.endpoint.values.first().ok_or_else(|| {
                                 format!("runtime filter {} scan consumer has no value", filter.id.get())
@@ -465,7 +475,8 @@ fn completed_reduction(
                 .iter()
                 .find_map(|producer| match producer.target {
                     PhysicalProducerTarget::AggregateTopNKey { limit, .. } => Some(limit),
-                    PhysicalProducerTarget::JoinBuildKey { .. } => None,
+                    PhysicalProducerTarget::JoinBuildKey { .. }
+                    | PhysicalProducerTarget::QuotaContentField { .. } => None,
                 })
                 .ok_or_else(|| {
                     format!(
@@ -554,6 +565,13 @@ fn completed_producer_role(
     use novarocks_physical_plan::RuntimeFilterCompletion;
 
     let target = match producer.target {
+        PhysicalProducerTarget::QuotaContentField {
+            field_ordinal,
+            content_equivalence,
+        } => AttemptRuntimeFilterProducerTarget::QuotaContentField {
+            field_ordinal,
+            content_equivalence,
+        },
         PhysicalProducerTarget::JoinBuildKey { equality } => {
             let witness = filter
                 .equality_witnesses
@@ -658,7 +676,8 @@ fn completed_consumer_role(
                 },
             }
         }
-        PhysicalConsumerTarget::ScanField { .. }
+        PhysicalConsumerTarget::QuotaContentScanField { .. }
+        | PhysicalConsumerTarget::ScanField { .. }
         | PhysicalConsumerTarget::AggregateTopNScanField { .. } => {
             scan_type.ok_or_else(|| {
                 "a completed scan runtime filter has no pinned output type".to_string()

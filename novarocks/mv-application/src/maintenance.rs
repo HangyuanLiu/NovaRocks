@@ -204,6 +204,8 @@ pub trait AutomaticMaintenanceRunner {
 /// it without observing a provider, query, or Native transport type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MvBackgroundEngineErrorKind {
+    CapacityRefused,
+    TargetRefused,
     TargetGone,
     TransientUnavailable,
     InvalidDefinition,
@@ -380,7 +382,9 @@ impl MaintenancePolicyState {
                 }
             }
             MvBackgroundEngineErrorKind::ShutdownCancelled => {}
-            MvBackgroundEngineErrorKind::TargetGone
+            MvBackgroundEngineErrorKind::CapacityRefused
+            | MvBackgroundEngineErrorKind::TargetRefused
+            | MvBackgroundEngineErrorKind::TargetGone
             | MvBackgroundEngineErrorKind::TerminalFailure
             | MvBackgroundEngineErrorKind::InvalidDefinition
             | MvBackgroundEngineErrorKind::Corruption

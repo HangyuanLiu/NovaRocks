@@ -19,9 +19,11 @@ use crate::exec::expr::ExprId;
 use novarocks_types::SlotId;
 
 use super::ExecNode;
+pub use novarocks_local_program::ProjectRetentionAdmission;
 
 #[derive(Clone, Debug)]
 pub struct ProjectNode {
+    pub retention_admission: ProjectRetentionAdmission,
     pub input: Box<ExecNode>,
     pub node_id: i32,
     /// True for pipeline-internal projections inserted during lowering (e.g. layout fixes).

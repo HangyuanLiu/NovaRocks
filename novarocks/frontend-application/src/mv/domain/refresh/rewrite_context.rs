@@ -33,9 +33,9 @@ use novarocks_mv_application::persistence::{
 };
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
-    ConnectorChangeWindowAdmission, ConnectorControlRegistry, ConnectorExactSemanticRevision,
-    ConnectorReadSelector, ConnectorRequestContext, ConnectorScanAdmission,
-    ConnectorTableResolution,
+    ConnectorChangeWindowAdmission, ConnectorContentNetZeroBasis, ConnectorControlRegistry,
+    ConnectorExactSemanticRevision, ConnectorReadSelector, ConnectorRequestContext,
+    ConnectorScanAdmission, ConnectorTableResolution,
 };
 use novarocks_sql::planning::mv::SqlMvAggregateCalls;
 use novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout;
@@ -43,6 +43,7 @@ use novarocks_types::naming::TableIdentity;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AdmittedChangeFacts {
+    pub content_net_zero: Option<ConnectorContentNetZeroBasis>,
     pub has_inserts: bool,
     pub has_deletes: bool,
 }
@@ -51,12 +52,16 @@ pub fn admitted_change_facts(
     admission: &ConnectorChangeWindowAdmission,
 ) -> Result<AdmittedChangeFacts, String> {
     match admission {
-        ConnectorChangeWindowAdmission::MetadataOnly => Ok(AdmittedChangeFacts::default()),
+        ConnectorChangeWindowAdmission::ContentNetZero { basis } => Ok(AdmittedChangeFacts {
+            content_net_zero: Some(*basis),
+            ..AdmittedChangeFacts::default()
+        }),
         ConnectorChangeWindowAdmission::Incremental {
             has_inserts,
             has_deletes,
             ..
         } => Ok(AdmittedChangeFacts {
+            content_net_zero: None,
             has_inserts: *has_inserts,
             has_deletes: *has_deletes,
         }),
@@ -64,6 +69,33 @@ pub fn admitted_change_facts(
             crate::mv::domain::refresh::non_join_incremental::full_rebuild_reason_message(*reason),
         ),
     }
+}
+
+/// Source capability is frozen for every D occurrence, including inactive UNION branches.
+pub(crate) fn visible_apply_kind_from_frozen_sources(
+    connector_control: &dyn ConnectorControlRegistry,
+    storage_observation: &dyn MvStorageObservationPort,
+    rewrite: &IcebergMvRewriteContext,
+    context: &ConnectorRequestContext,
+) -> Result<novarocks_sql::compiler::SqlImvVisibleApplyKind, String> {
+    let mut has_deletes = false;
+    for base in rewrite.base_refs.iter() {
+        let (admission, _) = observe_and_admit_change_window_for_table(
+            connector_control,
+            storage_observation,
+            &base.table,
+            rewrite.previous_revision(base)?,
+            rewrite.previous_snapshot_id(base)?,
+            rewrite.pinned_snapshot_id(base)?,
+            context,
+        )?;
+        has_deletes |= admitted_change_facts(&admission)?.has_deletes;
+    }
+    Ok(if has_deletes {
+        novarocks_sql::compiler::SqlImvVisibleApplyKind::PotentialDeletes
+    } else {
+        novarocks_sql::compiler::SqlImvVisibleApplyKind::AppendOnly
+    })
 }
 
 /// Assemble the one canonical rewrite value from already frozen D/L/P/C and
@@ -274,4 +306,39 @@ pub(crate) fn observe_and_admit_change_window_for_table(
         )
     })?;
     Ok((admission.clone(), observation))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admitted_content_proof_is_independent_of_physical_flags() {
+        for basis in [
+            ConnectorContentNetZeroBasis::SameSnapshot,
+            ConnectorContentNetZeroBasis::PhysicalIdentity,
+            ConnectorContentNetZeroBasis::ValidatedReplaceChain,
+        ] {
+            let facts =
+                admitted_change_facts(&ConnectorChangeWindowAdmission::ContentNetZero { basis })
+                    .unwrap();
+            assert_eq!(facts.content_net_zero, Some(basis));
+        }
+        for (has_inserts, has_deletes) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let facts = admitted_change_facts(&ConnectorChangeWindowAdmission::Incremental {
+                has_inserts,
+                has_deletes,
+                partition_impact:
+                    novarocks_spi::connector::ConnectorChangeWindowPartitionImpact::Unavailable,
+            })
+            .unwrap();
+            assert_eq!(facts.content_net_zero, None);
+            assert_eq!(
+                (facts.has_inserts, facts.has_deletes),
+                (has_inserts, has_deletes)
+            );
+        }
+    }
 }

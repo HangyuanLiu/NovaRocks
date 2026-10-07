@@ -38,6 +38,22 @@ impl ProgramNodeId {
     }
 }
 
+/// Global native ID of the unique target QuotaPreclaim node.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct QuotaDomainId(i32);
+impl QuotaDomainId {
+    pub fn try_new(node: i32) -> Result<Self, &'static str> {
+        if node < 0 {
+            Err("quota domain node ID must be nonnegative")
+        } else {
+            Ok(Self(node))
+        }
+    }
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum ScanSourceKind {
     File,
@@ -50,6 +66,9 @@ pub enum ScanSourceKind {
 /// Instantiation must match the full set and each expected kind and layout.
 #[derive(Clone, Debug)]
 pub enum BindingRequirement {
+    QuotaDomain {
+        domain: QuotaDomainId,
+    },
     Scan {
         node: ProgramNodeId,
         kind: ScanSourceKind,
@@ -81,6 +100,7 @@ pub enum BindingRequirement {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum BindingKey {
+    QuotaDomain(QuotaDomainId),
     Scan(ProgramNodeId),
     ExchangeInput(ProgramNodeId),
     ExchangeOutput(usize),
@@ -93,6 +113,7 @@ enum BindingKey {
 impl BindingRequirement {
     fn key(&self) -> BindingKey {
         match self {
+            Self::QuotaDomain { domain } => BindingKey::QuotaDomain(*domain),
             Self::Scan { node, .. } => BindingKey::Scan(*node),
             Self::ExchangeInput { node, .. } => BindingKey::ExchangeInput(*node),
             Self::ExchangeOutput { branch, .. } => BindingKey::ExchangeOutput(*branch),

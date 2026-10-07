@@ -277,6 +277,22 @@ impl BridgeCtx<'_> {
                     is_left_join: op.is_left_join,
                 }))
             }
+            Operator::PhysicalQuotaPreclaim(op) => Ok(PhysicalPlanKind::QuotaPreclaim(op.clone())),
+            Operator::PhysicalQuotaTrim(op) => Ok(PhysicalPlanKind::QuotaTrim(op.clone())),
+            Operator::PhysicalFanoutConsume(op) => Ok(PhysicalPlanKind::FanoutConsume(op.clone())),
+            Operator::PhysicalFanoutAnchor(op) => Ok(PhysicalPlanKind::FanoutAnchor(
+                crate::planner::quota::PlanFanoutAnchorNode {
+                    id: op.id,
+                    branches: op
+                        .branches
+                        .iter()
+                        .map(|branch| crate::planner::quota::PlanFanoutBranch {
+                            predicate: materialize(self.scalars, branch.predicate),
+                            distribution: branch.distribution.clone(),
+                        })
+                        .collect(),
+                },
+            )),
             Operator::PhysicalCTEAnchor(op) => Ok(PhysicalPlanKind::CTEAnchor(PlanCTEAnchorNode {
                 cte_id: op.cte_id,
             })),
@@ -499,6 +515,7 @@ fn validate_shape(node: &OptimizedOperatorNode) -> Result<(), String> {
         Operator::PhysicalScan(_)
         | Operator::PhysicalValues(_)
         | Operator::PhysicalGenerateSeries(_)
+        | Operator::PhysicalFanoutConsume(_)
         | Operator::PhysicalCTEConsume(_) => expect_arity(node, operator_name(&node.op), 0),
 
         Operator::PhysicalFilter(_)
@@ -517,6 +534,9 @@ fn validate_shape(node: &OptimizedOperatorNode) -> Result<(), String> {
 
         Operator::PhysicalHashJoin(_)
         | Operator::PhysicalNestLoopJoin(_)
+        | Operator::PhysicalFanoutAnchor(_)
+        | Operator::PhysicalQuotaPreclaim(_)
+        | Operator::PhysicalQuotaTrim(_)
         | Operator::PhysicalCTEAnchor(_) => expect_arity(node, operator_name(&node.op), 2),
 
         Operator::PhysicalUnion(op) => {
@@ -584,6 +604,10 @@ fn operator_name(op: &Operator) -> &'static str {
         Operator::PhysicalTopN(_) => "PhysicalTopN",
         Operator::PhysicalWindow(_) => "PhysicalWindow",
         Operator::PhysicalDistribution(_) => "PhysicalDistribution",
+        Operator::PhysicalQuotaPreclaim(_) => "PhysicalQuotaPreclaim",
+        Operator::PhysicalQuotaTrim(_) => "PhysicalQuotaTrim",
+        Operator::PhysicalFanoutAnchor(_) => "PhysicalFanoutAnchor",
+        Operator::PhysicalFanoutConsume(_) => "PhysicalFanoutConsume",
         Operator::PhysicalCTEAnchor(_) => "PhysicalCTEAnchor",
         Operator::PhysicalCTEProduce(_) => "PhysicalCTEProduce",
         Operator::PhysicalCTEConsume(_) => "PhysicalCTEConsume",

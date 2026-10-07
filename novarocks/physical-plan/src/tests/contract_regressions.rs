@@ -197,6 +197,7 @@ fn null_safe_join_filter(
                 columns: Box::from([left_value, other_left_value]),
             },
             kind: NodeKind::Project {
+                retention_admission: crate::ProjectRetentionAdmission::Existing,
                 expressions: Box::from([
                     (left_identity, left_value),
                     (other_expression, other_left_value),
@@ -474,6 +475,7 @@ fn scan_lineage_filter(
                     columns: Box::from([projected, projected, other]),
                 },
                 kind: NodeKind::Project {
+                    retention_admission: crate::ProjectRetentionAdmission::Existing,
                     expressions: Box::from([
                         (identity, projected),
                         (identity, projected),
@@ -1093,7 +1095,8 @@ fn runtime_filter_consumer_requires_a_producer_for_its_exact_equality_witness() 
     match &mut filter.consumers[0].target {
         RuntimeFilterConsumerTarget::JoinProbeKey { equality }
         | RuntimeFilterConsumerTarget::ScanField { equality, .. } => *equality = second.id,
-        RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => {
+        RuntimeFilterConsumerTarget::AggregateTopNScanField { .. }
+        | RuntimeFilterConsumerTarget::QuotaContentScanField { .. } => {
             panic!("null-safe join fixture must use a join equality target")
         }
     }
@@ -2221,6 +2224,7 @@ fn higher_order_function_fragment(
                 columns: outputs.into_boxed_slice(),
             },
             kind: NodeKind::Project {
+                retention_admission: crate::ProjectRetentionAdmission::Existing,
                 expressions: projections.into_boxed_slice(),
             },
         })
@@ -3052,4 +3056,460 @@ fn writer_grouped_unpivot_rejects_nested_literal_collections_above_the_budget() 
         .unwrap_err()
         .to_string();
     assert!(error.contains("unpivot literal collections exceed the contract budget"));
+}
+
+fn quota_content_filter(
+    field_type: DataType,
+    key_arguments: &[usize],
+    attach: bool,
+) -> (Fragment, RuntimeFilter) {
+    let fragment_id = FragmentId::new(701);
+    let filter_id = RuntimeFilterId::new(701);
+    let witness = RuntimeFilterWitnessId::new(701);
+    let mut builder = FragmentBuilder::new(fragment_id);
+    let demand = builder.reserve_node_id().unwrap();
+    let demand_properties = PhysicalProperties {
+        distribution: Distribution::Broadcast,
+        row_multiplicity: RowMultiplicity::Replicated,
+        ordering: Box::default(),
+    };
+    let types = [
+        field_type.clone(),
+        field_type.clone(),
+        DataType::Binary,
+        DataType::Int64,
+    ];
+    let mut demand_values = Vec::new();
+    let mut literals = Vec::new();
+    for (ordinal, data_type) in types.iter().enumerate() {
+        let value_type = ty(data_type.clone(), false);
+        let literal = match data_type {
+            DataType::Binary => LiteralValue::Binary(Box::from([1u8])),
+            DataType::Float64 => LiteralValue::Float64Bits(11f64.to_bits()),
+            _ => LiteralValue::Int64(11),
+        };
+        literals.push(
+            builder
+                .add_expression(demand, value_type.clone(), ExprKind::Literal(literal))
+                .unwrap(),
+        );
+        demand_values.push(
+            builder
+                .add_value(
+                    value_type,
+                    ValueOrigin::NodeOutput {
+                        node: demand,
+                        output_ordinal: ordinal as u32,
+                    },
+                )
+                .unwrap(),
+        );
+    }
+    builder
+        .insert_node_unchecked(PhysicalNode {
+            id: demand,
+            inputs: Box::default(),
+            required_inputs: Box::default(),
+            output_properties: demand_properties.clone(),
+            output: OutputPort {
+                node: demand,
+                columns: demand_values.clone().into_boxed_slice(),
+            },
+            kind: NodeKind::Values {
+                rows: Box::from([literals.into_boxed_slice()]),
+            },
+        })
+        .unwrap();
+    let project = builder.reserve_node_id().unwrap();
+    let args = key_arguments
+        .iter()
+        .map(|ordinal| {
+            builder
+                .add_expression(
+                    project,
+                    ty(field_type.clone(), false),
+                    ExprKind::Value(demand_values[*ordinal]),
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let key_expr = builder
+        .add_expression(
+            project,
+            ty(DataType::Binary, false),
+            ExprKind::FunctionCall {
+                function: BoundFunction {
+                    function_id: FunctionId::try_new("builtin.scalar/mv_content_key/v1").unwrap(),
+                    overload: FunctionOverloadId::try_new("complete-visible-tuple").unwrap(),
+                    kind: FunctionKind::Scalar,
+                    argument_types: key_arguments
+                        .iter()
+                        .map(|_| {
+                            novarocks_type_contract::FunctionArgumentType::Value(ty(
+                                field_type.clone(),
+                                false,
+                            ))
+                        })
+                        .collect(),
+                    result_type: ty(DataType::Binary, false),
+                    volatility: FunctionVolatility::Immutable,
+                    argument_evaluation: FunctionArgumentEvaluation::Eager,
+                    failure_behavior: FunctionFailureBehavior::Propagate,
+                    intrinsic_row_error:
+                        novarocks_type_contract::FunctionIntrinsicRowError::MayRaise,
+                },
+                args: args.into_boxed_slice(),
+            },
+        )
+        .unwrap();
+    let key = builder
+        .add_value(
+            ty(DataType::Binary, false),
+            ValueOrigin::Expr {
+                node: project,
+                expr: key_expr,
+            },
+        )
+        .unwrap();
+    let mut expressions = demand_values
+        .iter()
+        .zip(&types)
+        .map(|(value, data_type)| {
+            (
+                builder
+                    .add_expression(
+                        project,
+                        ty(data_type.clone(), false),
+                        ExprKind::Value(*value),
+                    )
+                    .unwrap(),
+                *value,
+            )
+        })
+        .collect::<Vec<_>>();
+    expressions.push((key_expr, key));
+    let mut projected = demand_values.clone();
+    projected.push(key);
+    builder
+        .insert_node_unchecked(PhysicalNode {
+            id: project,
+            inputs: Box::from([demand]),
+            required_inputs: Box::from([demand_properties.clone()]),
+            output_properties: demand_properties.clone(),
+            output: OutputPort {
+                node: project,
+                columns: projected.into_boxed_slice(),
+            },
+            kind: NodeKind::Project {
+                retention_admission: crate::ProjectRetentionAdmission::Existing,
+                expressions: expressions.into_boxed_slice(),
+            },
+        })
+        .unwrap();
+    let scan = builder.reserve_node_id().unwrap();
+    let binding = connector_binding();
+    let columns = (0..4)
+        .map(|ordinal| ProviderColumnReference {
+            column_payload: encoded(&binding, ConnectorCodecCategory::ReadColumn, 80 + ordinal),
+        })
+        .collect::<Vec<_>>();
+    let scan_types = [
+        field_type.clone(),
+        field_type.clone(),
+        DataType::Utf8,
+        DataType::Int64,
+    ];
+    let mut relation = metadata_relation(&binding, columns[0].clone());
+    let Relation::Metadata(metadata) = &mut relation else {
+        unreachable!()
+    };
+    metadata.schema = columns
+        .iter()
+        .zip(&scan_types)
+        .map(|(column, data_type)| RelationField {
+            column: column.clone(),
+            ty: ty(data_type.clone(), false),
+        })
+        .collect();
+    let scan_values = columns
+        .iter()
+        .zip(&scan_types)
+        .map(|(column, data_type)| {
+            builder
+                .add_value(
+                    ty(data_type.clone(), false),
+                    ValueOrigin::ProviderField {
+                        scan_node: scan,
+                        field: column.clone(),
+                    },
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    builder
+        .insert_node_unchecked(PhysicalNode {
+            id: scan,
+            inputs: Box::default(),
+            required_inputs: Box::default(),
+            output_properties: unconstrained(),
+            output: OutputPort {
+                node: scan,
+                columns: scan_values.clone().into_boxed_slice(),
+            },
+            kind: NodeKind::Scan {
+                occurrence: ProviderReadOccurrenceId::new(0),
+                relation: Box::new(relation),
+                read_budget: scan_budget(),
+                provider_outputs: columns
+                    .into_iter()
+                    .zip(scan_values.iter().copied())
+                    .collect(),
+                residuals: Box::default(),
+                derived_values: Box::default(),
+            },
+        })
+        .unwrap();
+    let quota = builder.reserve_node_id().unwrap();
+    let output = [DataType::Binary, DataType::Utf8, DataType::Int64]
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, data_type)| {
+            builder
+                .add_value(
+                    ty(data_type, false),
+                    ValueOrigin::NodeOutput {
+                        node: quota,
+                        output_ordinal: ordinal as u32,
+                    },
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    builder
+        .insert_node_unchecked(PhysicalNode {
+            id: quota,
+            inputs: Box::from([project, scan]),
+            required_inputs: Box::from([demand_properties, unconstrained()]),
+            output_properties: unconstrained(),
+            output: OutputPort {
+                node: quota,
+                columns: output.into_boxed_slice(),
+            },
+            kind: NodeKind::QuotaPreclaim {
+                spec: QuotaPreclaimSpec {
+                    demand_entry_id: demand_values[2],
+                    demand_key: key,
+                    demand_need: QuotaNeed::Count {
+                        value: demand_values[3],
+                    },
+                    demand_values: Box::from([demand_values[0], demand_values[1]]),
+                    target_values: Box::from([scan_values[0], scan_values[1]]),
+                    target_file: scan_values[2],
+                    target_position: scan_values[3],
+                    content_equivalence:
+                        novarocks_type_contract::ResultContentEquivalence::NativeResultContentV1,
+                    preselection_domain: quota,
+                    max_state_bytes: 4096,
+                },
+            },
+        })
+        .unwrap();
+    if attach {
+        builder.attach_runtime_filter(filter_id).unwrap();
+    }
+    let fragment = builder
+        .finish_definition(quota, FragmentSink::Noop, dop())
+        .unwrap();
+    let filter = RuntimeFilter {
+        id: filter_id,
+        domain: RuntimeFilterDomain::Membership {
+            ty: ty(field_type, false),
+            null_semantics: RuntimeFilterNullSemantics::NullSafeEqual,
+        },
+        kind: RuntimeFilterKind::InList,
+        lifecycle: RuntimeFilterLifecycle::CompleteOnce,
+        reduction: RuntimeFilterReduction::SetUnion,
+        availability_coverage: coverage([witness], true),
+        terminal_coverage: coverage([witness], true),
+        equality_witnesses: Box::default(),
+        producers: Box::from([RuntimeFilterProducer {
+            witness,
+            endpoint: RuntimeFilterEndpoint {
+                fragment: fragment_id,
+                node: quota,
+                values: Box::from([demand_values[0]]),
+            },
+            apply_point: RuntimeFilterApplyPoint::NodeInput { input_ordinal: 0 },
+            contribution_kinds: Box::from([
+                RuntimeFilterContributionKind::ValueDomainDelta,
+                RuntimeFilterContributionKind::ProducerClosed,
+            ]),
+            completion: RuntimeFilterCompletion::ProducerClosed,
+            progress: RuntimeFilterProducerProgress {
+                build_edges: Box::default(),
+                non_build_edges: Box::default(),
+            },
+            target: RuntimeFilterProducerTarget::QuotaContentField {
+                field_ordinal: 0,
+                content_equivalence:
+                    novarocks_type_contract::ResultContentEquivalence::NativeResultContentV1,
+            },
+        }]),
+        consumers: Box::from([RuntimeFilterConsumer {
+            endpoint: RuntimeFilterEndpoint {
+                fragment: fragment_id,
+                node: scan,
+                values: Box::from([scan_values[0]]),
+            },
+            apply_point: RuntimeFilterApplyPoint::ScanSource,
+            capabilities: Box::from([
+                RuntimeFilterArtifactCapability::Membership,
+                RuntimeFilterArtifactCapability::EmptyDomain,
+            ]),
+            activation: RuntimeFilterConsumerActivation::BlockingSnapshot,
+            target: RuntimeFilterConsumerTarget::QuotaContentScanField {
+                producer: witness,
+                lineage: Box::default(),
+            },
+        }]),
+        policy: RuntimeFilterPolicy {
+            max_contribution_bytes: 1024,
+            max_artifact_bytes: 1024,
+            deadline_ms: 100,
+            max_retries: 1,
+        },
+    };
+    (fragment, filter)
+}
+
+#[test]
+fn quota_content_filter_replays_complete_key_and_exact_field() {
+    let (fragment, filter) = quota_content_filter(DataType::Int64, &[0, 1], true);
+    assert_runtime_filter_plan_accepted(fragment.clone(), filter.clone());
+    let mut wrong_field = filter.clone();
+    let NodeKind::QuotaPreclaim { spec } = &fragment.nodes()[&fragment.root()].kind else {
+        unreachable!()
+    };
+    wrong_field.consumers[0].endpoint.values[0] = spec.target_values[1];
+    assert_local_runtime_filter_rejected_at_both_boundaries(
+        fragment.clone(),
+        wrong_field,
+        "runtime filter scan consumer is not connected",
+    );
+    let mut wrong_ordinal = filter.clone();
+    wrong_ordinal.producers[0].target = RuntimeFilterProducerTarget::QuotaContentField {
+        field_ordinal: 1,
+        content_equivalence:
+            novarocks_type_contract::ResultContentEquivalence::NativeResultContentV1,
+    };
+    assert_local_runtime_filter_rejected_at_both_boundaries(
+        fragment.clone(),
+        wrong_ordinal,
+        "runtime filter quota producer",
+    );
+    let mut wrong_contract = filter.clone();
+    let RuntimeFilterDomain::Membership { null_semantics, .. } = &mut wrong_contract.domain else {
+        unreachable!()
+    };
+    *null_semantics = RuntimeFilterNullSemantics::NeverMatches;
+    assert_local_runtime_filter_rejected_at_both_boundaries(
+        fragment.clone(),
+        wrong_contract,
+        "runtime filter quota producer",
+    );
+    let mut incremental = filter.clone();
+    incremental.consumers[0].activation = RuntimeFilterConsumerActivation::NonBlockingLive {
+        late_apply: LateApplyGranularity::Batch,
+    };
+    assert_local_runtime_filter_rejected_at_both_boundaries(
+        fragment.clone(),
+        incremental,
+        "runtime filter quota consumer",
+    );
+    let mut final_live = filter;
+    final_live.consumers[0].activation =
+        RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
+            late_apply: LateApplyGranularity::Batch,
+        };
+    assert_runtime_filter_plan_accepted(fragment, final_live);
+}
+
+#[test]
+fn quota_content_filter_refuses_omitted_or_reordered_key_columns() {
+    for args in [&[0usize][..], &[1usize, 0][..]] {
+        let (fragment, filter) = quota_content_filter(DataType::Int64, args, true);
+        assert_local_runtime_filter_rejected_at_both_boundaries(
+            fragment,
+            filter,
+            "quota runtime-filter demand key is not computed",
+        );
+    }
+}
+
+#[test]
+fn quota_float_target_is_valid_without_filter_and_refuses_unsafe_filter() {
+    let (fragment, _) = quota_content_filter(DataType::Float64, &[0, 1], false);
+    let mut plan = PlanBuilder::new(version());
+    plan.add_fragment(fragment).unwrap();
+    plan.finish().unwrap();
+    let (fragment, filter) = quota_content_filter(DataType::Float64, &[0, 1], true);
+    assert_local_runtime_filter_rejected_at_both_boundaries(
+        fragment,
+        filter,
+        "runtime filter quota producer",
+    );
+}
+
+#[test]
+fn predicate_fanout_refuses_duplicate_edges_and_non_boolean_predicates() {
+    for boolean in [true, false] {
+        let mut builder = FragmentBuilder::new(FragmentId::new(702));
+        let (node, _) = append_literal(&mut builder, false);
+        let predicate = builder
+            .add_expression(
+                node,
+                ty(
+                    if boolean {
+                        DataType::Boolean
+                    } else {
+                        DataType::Int64
+                    },
+                    false,
+                ),
+                ExprKind::Literal(if boolean {
+                    LiteralValue::Boolean(true)
+                } else {
+                    LiteralValue::Int64(1)
+                }),
+            )
+            .unwrap();
+        let branches = vec![
+            PredicateFanoutBranch {
+                edge: EdgeId::new(1),
+                predicate,
+            },
+            PredicateFanoutBranch {
+                edge: EdgeId::new(if boolean { 1 } else { 2 }),
+                predicate,
+            },
+        ];
+        let error = builder
+            .finish_definition(
+                node,
+                FragmentSink::PredicateFanout {
+                    branches: branches.into_boxed_slice(),
+                },
+                dop(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(if boolean {
+                "fanout repeats an edge"
+            } else {
+                "fanout requires Boolean predicates"
+            }),
+            "{error}"
+        );
+    }
 }

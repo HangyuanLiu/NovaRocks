@@ -45,11 +45,12 @@ identity_fixture!(aggregate_id, AggregateIdentity);
 identity_fixture!(branch_id, BranchIdentity);
 identity_fixture!(apply_key_id, ApplyKeyIdentity);
 
-fn field(id: u8, name: &str, type_signature: &str, nullable: bool) -> SourceFieldBinding {
+fn field(id: u8, name: &str, data_type: &str, nullable: bool) -> SourceFieldBinding {
     SourceFieldBinding {
         field_id: field_id(id),
         name_at_binding: name.to_string(),
-        type_signature: type_signature.to_string(),
+        data_type: crate::persistence::codec::MvLogicalType::decode_signature(data_type)
+            .expect("valid fixture type"),
         nullable,
     }
 }
@@ -113,7 +114,7 @@ fn sample_definition() -> DefinitionDocument {
         vec![OutputDefinition {
             output_id: output_id(21),
             name: "average_amount".to_string(),
-            type_signature: "decimal(18,2)".to_string(),
+            data_type: crate::persistence::codec::MvLogicalType::decode_signature("decimal(18,2)").expect("valid fixture type"),
             nullable: true,
             expression: ExpressionShape {
                 kind: ExpressionKind::Function,
@@ -137,13 +138,14 @@ fn sample_definition() -> DefinitionDocument {
 fn physical(
     logical_identity: PhysicalFieldLogicalIdentity,
     target_field_value: u8,
-    type_signature: &str,
+    data_type: &str,
     nullable: bool,
 ) -> PhysicalFieldBinding {
     PhysicalFieldBinding {
         logical_identity,
         target_field_id: field_id(target_field_value),
-        type_signature: type_signature.to_string(),
+        data_type: crate::persistence::codec::MvLogicalType::decode_signature(data_type)
+            .expect("valid fixture type"),
         nullable,
     }
 }
@@ -155,14 +157,16 @@ fn sample_interpretation(definition: &EncodedDocument) -> InterpretationDocument
         outputs: vec![OutputBinding {
             output_id: output_id(21),
             target_field_id: field_id(31),
-            type_signature: "decimal(18,2)".to_string(),
+            data_type: crate::persistence::codec::MvLogicalType::decode_signature("decimal(18,2)")
+                .expect("valid fixture type"),
             nullable: true,
         }],
         state_slots: vec![
             StateSlot {
                 slot_id: state_slot_id(41),
                 target_field_id: field_id(33),
-                type_signature: "bigint".to_string(),
+                data_type: crate::persistence::codec::MvLogicalType::decode_signature("bigint")
+                    .expect("valid fixture type"),
                 nullable: false,
                 role: StateRole::AvgCount,
                 encoding: StateEncoding::NativeColumnV1,
@@ -170,19 +174,22 @@ fn sample_interpretation(definition: &EncodedDocument) -> InterpretationDocument
             StateSlot {
                 slot_id: state_slot_id(42),
                 target_field_id: field_id(32),
-                type_signature: "decimal(38,2)".to_string(),
+                data_type: crate::persistence::codec::MvLogicalType::decode_signature(
+                    "decimal(38,2)",
+                )
+                .expect("valid fixture type"),
                 nullable: true,
                 role: StateRole::AvgSum,
                 encoding: StateEncoding::NativeColumnV1,
             },
         ],
-        apply_key: ApplyKey {
+        apply_key: Some(ApplyKey {
             kind: ApplyKeyKind::GroupRowId,
             components: vec![ApplyKeyComponent {
                 logical_id: apply_key_id(44),
                 target_field_id: field_id(34),
             }],
-        },
+        }),
         aggregates: vec![AggregateInterpretation {
             aggregate_id: aggregate_id(51),
             function_identity: "avg".to_string(),
@@ -260,7 +267,8 @@ fn retraction_count_interpretation(definition: &EncodedDocument) -> Interpretati
         StateSlot {
             slot_id: state_slot_id(41),
             target_field_id: field_id(32),
-            type_signature: "binary".to_string(),
+            data_type: crate::persistence::codec::MvLogicalType::decode_signature("binary")
+                .expect("valid fixture type"),
             nullable: false,
             role: StateRole::Single,
             encoding: StateEncoding::NativeColumnV1,
@@ -268,7 +276,8 @@ fn retraction_count_interpretation(definition: &EncodedDocument) -> Interpretati
         StateSlot {
             slot_id: state_slot_id(42),
             target_field_id: field_id(33),
-            type_signature: "bigint".to_string(),
+            data_type: crate::persistence::codec::MvLogicalType::decode_signature("bigint")
+                .expect("valid fixture type"),
             nullable: false,
             role: StateRole::RetractionCount,
             encoding: StateEncoding::NativeColumnV1,
@@ -480,6 +489,7 @@ impl ProjectionFixture {
                 .output_version
                 .as_ref()
                 .map(MvAcceleratorCommittedVersionRevision::from_committed),
+            eligibility_revision: None,
             configuration_revision: encode_configuration(&self.configuration)
                 .map_err(|e| e.to_string())?
                 .revision(),
@@ -520,6 +530,8 @@ pub fn observed_current(
         ),
     };
     super::documents::MvObservedCurrentDocuments {
+        eligibility: None,
+        eligibility_revision: None,
         management_target: crate::management::ManagedMvTarget::try_new(
             catalog,
             source.target.clone(),

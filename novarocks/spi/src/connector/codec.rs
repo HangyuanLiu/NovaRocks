@@ -39,6 +39,9 @@ pub use novarocks_connector_contract::{
 };
 
 pub const MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH: usize = 64;
+// Carrier envelopes consume nesting independently of logical field depth and
+// the bounded diagnostic path. Providers still choose their own finite limit.
+const MAX_CONNECTOR_CODEC_DECODE_DEPTH: usize = 72;
 pub const MAX_CONNECTOR_CODEC_FIELD_NAME_BYTES: usize = 256;
 pub const MAX_CONNECTOR_CODEC_ERROR_DETAIL_BYTES: usize = 512;
 
@@ -243,7 +246,7 @@ impl ConnectorDecodeLimits {
             || max_scalar_bytes == 0
             || max_items == 0
             || max_depth == 0
-            || max_depth > MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH
+            || max_depth > MAX_CONNECTOR_CODEC_DECODE_DEPTH
         {
             return Err(ConnectorCodecError::new(
                 ConnectorFieldPath::root("decode_limits"),
@@ -716,7 +719,14 @@ mod tests {
     fn codec_revision_and_limits_are_finite() {
         assert!(ConnectorCodecRevision::try_new(0).is_err());
         assert!(ConnectorDecodeLimits::try_new(0, 1, 1, 1, 1).is_err());
-        assert!(ConnectorDecodeLimits::try_new(1, 1, 1, 1, 65).is_err());
+        assert!(ConnectorDecodeLimits::try_new(1, 1, 1, 1, 0).is_err());
+        assert!(
+            ConnectorDecodeLimits::try_new(1, 1, 1, 1, MAX_CONNECTOR_CODEC_DECODE_DEPTH).is_ok()
+        );
+        assert!(
+            ConnectorDecodeLimits::try_new(1, 1, 1, 1, MAX_CONNECTOR_CODEC_DECODE_DEPTH + 1)
+                .is_err()
+        );
     }
 
     #[test]

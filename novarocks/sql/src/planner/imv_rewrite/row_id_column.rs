@@ -93,6 +93,12 @@ impl LogicalRewriteRule for InjectRowIdRule {
     }
 
     fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
+        if ctx
+            .extension::<super::annotation::ImvExtension>()
+            .is_some_and(|e| e.snapshot.schema_contract.aggregate.is_none())
+        {
+            return false;
+        }
         let plan = opt_expr_to_plan(expr.clone(), ctx);
         match &plan.kind {
             LogicalPlanKind::Scan(scan) => {
@@ -180,7 +186,7 @@ mod tests {
         ctx.set_column_ref_factory(Rc::clone(&factory));
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         ctx.set_extension::<ImvExtension>(ImvExtension {
-            snapshot: crate::compiler::mv_rewrite::test_incremental_snapshot(),
+            snapshot: crate::compiler::mv_rewrite::test_aggregate_snapshot(vec![], None, None),
             annotation: ImvPlanAnnotation::default(),
         });
         ctx
@@ -390,5 +396,34 @@ mod tests {
         let mut arena = ScalarArena::new();
         let expr = to_optimizer_expr(&plan, &mut arena);
         assert!(!rule.matches(&expr, &ctx));
+    }
+
+    #[test]
+    fn nonaggregate_delta_and_version_scans_do_not_match_or_request_row_id() {
+        let rule = InjectRowIdRule;
+        let mut ctx = build_ctx();
+        ctx.set_extension::<ImvExtension>(ImvExtension {
+            snapshot: crate::compiler::mv_rewrite::test_incremental_snapshot(),
+            annotation: ImvPlanAnnotation::default(),
+        });
+        for scan in [delta_scan(), version_scan()] {
+            let plan = scan_plan(scan);
+            let expr = to_optimizer_expr(&plan, &mut ctx.scalar_arena().borrow_mut());
+            let factory = ctx.column_ref_factory().expect("test column factory");
+            let next_id = factory.borrow().peek_next_id();
+            assert!(!rule.matches(&expr, &ctx));
+            assert_eq!(factory.borrow().peek_next_id(), next_id);
+
+            let unchanged = opt_expr_to_plan(expr, &ctx);
+            let LogicalPlanKind::Scan(scan) = unchanged.kind else {
+                panic!("nonaggregate input remains a scan");
+            };
+            assert!(
+                scan.columns
+                    .iter()
+                    .all(|column| { !column.name.eq_ignore_ascii_case(ImvRowIdColumn::NAME) })
+            );
+            assert!(scan.table.iceberg_row_lineage_metadata_columns.is_empty());
+        }
     }
 }

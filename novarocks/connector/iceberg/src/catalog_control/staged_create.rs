@@ -185,10 +185,12 @@ pub(crate) fn prepare_rest_staged_table(
             "Iceberg column defaults require format-version 3".to_string(),
         ));
     }
-    let schema = crate::iceberg::spec::Schema::builder()
-        .with_fields(super::type_mapping::schema_fields(columns)?)
-        .build()
-        .map_err(|error| format!("build staged Iceberg schema: {error}"))?;
+    let schema = super::type_mapping::creation_schema(columns)?;
+    let domains = super::type_mapping::creation_domains(&schema, columns)?;
+    properties.insert(
+        crate::field_domain::PROPERTY.into(),
+        crate::field_domain::encode(&domains).map_err(|e| e.to_string())?,
+    );
     let partition_spec = super::catalog_mutation::initial_partition_spec(&schema, partitioning)?;
     properties.insert(
         "format-version".to_string(),
@@ -215,6 +217,7 @@ pub(crate) fn prepare_rest_staged_table(
         .filter(|(key, _)| !key.eq_ignore_ascii_case("format-version"))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<HashMap<_, _>>();
+    let expected_schema = schema.clone();
     let creation = TableCreation::builder()
         .name(table_name)
         .schema(schema)
@@ -337,6 +340,8 @@ pub(crate) fn prepare_rest_staged_table(
             ));
         }
     };
+    super::type_mapping::validate_creation_metadata(table.metadata(), &expected_schema, &domains)
+        .map_err(RestStagedPrepareFailure::CommitUnknown)?;
     if table.metadata().location() != location {
         return Err(RestStagedPrepareFailure::CommitUnknown(
             "REST stage-create returned a table at a location other than the requested CTAS staging location"
@@ -751,6 +756,8 @@ impl IcebergStagedCreateAdapter {
                     abort_handle: action_abort,
                     target_ref: "main",
                     snapshot_properties: &snapshot_properties,
+
+                    metadata_updates: &[],
                 })
                 .await
             })
@@ -1813,20 +1820,26 @@ fn unavailable(message: impl Into<String>) -> ConnectorError {
 fn prepared_document_field_bindings(
     metadata: &crate::iceberg::spec::TableMetadata,
 ) -> Result<Vec<ConnectorPreparedCreateFieldBinding>, ConnectorError> {
+    let logical_fields = crate::schema_mapping::exact_logical_fields(metadata).map_err(corrupt)?;
+    let domains = crate::field_domain::metadata_declarations(metadata)?;
     metadata
         .current_schema()
         .as_struct()
         .fields()
         .iter()
+        .zip(logical_fields)
         .enumerate()
-        .map(|(ordinal, field)| {
+        .map(|(ordinal, (field, logical))| {
             let ordinal = u32::try_from(ordinal)
                 .map_err(|_| invalid("Iceberg staged-create field ordinal exceeds u32"))?;
             ConnectorPreparedCreateFieldBinding::try_new(
                 ordinal,
                 Bytes::copy_from_slice(&field.id.to_be_bytes()),
                 field.name.clone(),
-                field.field_type.to_string(),
+                logical.data_type,
+                crate::schema_mapping::legacy_scalar_type(field),
+                crate::field_domain::exact_provider_type_binding(field, domains.fields())
+                    .map_err(corrupt)?,
                 !field.required,
             )
         })

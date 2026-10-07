@@ -31,6 +31,8 @@ pub mod lease;
 pub mod membership;
 pub mod operation;
 pub mod status;
+pub mod verification;
+pub use verification::*;
 pub mod task_convergence;
 pub mod transition;
 

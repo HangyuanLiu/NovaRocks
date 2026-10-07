@@ -156,7 +156,10 @@ pub use distributed_rewrite::{
 };
 pub use distribution::ProviderBindingEpoch;
 pub use document_storage::*;
-pub use error::{ConnectorError, ConnectorErrorKind, ConnectorTableObjectBindingFailure};
+pub use error::{
+    ConnectorError, ConnectorErrorKind, ConnectorTableObjectBindingFailure,
+    ConnectorTargetDeleteKind, ConnectorTargetFormatUnsupported,
+};
 pub use execution::{ConnectorPrepareSplitRequest, MAX_CONNECTOR_PREPARED_SCAN_UNITS_PER_SPLIT};
 pub use handle::{
     ConnectorPinnedFileSet, ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle,
@@ -254,9 +257,9 @@ pub use read::{
     ConnectorChangePartitionField, ConnectorChangePartitionTransform,
     ConnectorChangePartitionValue, ConnectorChangeWindow, ConnectorChangeWindowAdmission,
     ConnectorChangeWindowFullRebuildReason, ConnectorChangeWindowPartitionImpact,
-    ConnectorChangeWindowReplaceFailure, ConnectorReadPurpose, ConnectorReadSelector,
-    ConnectorScan, ConnectorScanAdmission, ConnectorScanSelection, ConnectorSplitPlanningMetrics,
-    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
+    ConnectorChangeWindowReplaceFailure, ConnectorContentNetZeroBasis, ConnectorReadPurpose,
+    ConnectorReadSelector, ConnectorScan, ConnectorScanAdmission, ConnectorScanSelection,
+    ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
 };
 pub use read_session::{
     ConnectorReadSession, ConnectorReadSessionFinalizationContext, ConnectorReadSessionLease,

@@ -353,6 +353,7 @@ mod validation_error_tests {
                     columns: output_values.clone().into_boxed_slice(),
                 },
                 kind: NodeKind::Project {
+                    retention_admission: crate::ProjectRetentionAdmission::Existing,
                     expressions: expressions.clone().into_boxed_slice(),
                 },
             })
@@ -650,6 +651,7 @@ mod validation_error_tests {
                         columns: Box::from([*value]),
                     },
                     kind: NodeKind::Project {
+                        retention_admission: crate::ProjectRetentionAdmission::Existing,
                         expressions: Box::from([(expression, *value)]),
                     },
                 })

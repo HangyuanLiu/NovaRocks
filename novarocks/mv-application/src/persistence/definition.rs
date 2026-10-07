@@ -86,6 +86,7 @@ pub struct MvAcceleratorSourceRevision {
     pub publication_revision: Option<DocumentRevision>,
     pub publication_output_version: Option<MvAcceleratorCommittedVersionRevision>,
     pub configuration_revision: DocumentRevision,
+    pub eligibility_revision: Option<DocumentRevision>,
     pub deployment_owner: DeploymentOwner,
     pub process_incarnation: ProcessIncarnation,
 }
@@ -105,6 +106,10 @@ impl MvAcceleratorSourceRevision {
                 .as_ref()
                 .map(|revision| *revision.as_bytes()),
             control_runtime_id,
+        )
+        .with_eligibility_revision(
+            self.eligibility_revision
+                .map(|revision| *revision.as_bytes()),
         )
     }
 }
@@ -145,6 +150,7 @@ pub fn test_source_revision(
         publication_output_version: published_snapshot_id
             .map(|snapshot_id| version(b"publication-output", Some(snapshot_id))),
         configuration_revision: DocumentRevision::from_canonical_bytes(b"configuration"),
+        eligibility_revision: None,
         deployment_owner: DeploymentOwner::parse("test-deployment").expect("test owner"),
         process_incarnation: ProcessIncarnation::parse("test-process").expect("test incarnation"),
     }
@@ -182,5 +188,23 @@ impl MvDesiredRefreshPolicy {
 
     pub(crate) fn accepts_interval(&self) -> bool {
         matches!(self, Self::AsyncInterval)
+    }
+}
+
+#[cfg(test)]
+mod eligibility_revision_tests {
+    use super::*;
+    #[test]
+    fn eligibility_is_part_of_exact_source_revision_and_management_dependencies() {
+        let object = ConnectorTableObjectId::try_new(bytes::Bytes::from_static(b"target")).unwrap();
+        let before = test_source_revision("ice", "ns", "mv", object, Some(1));
+        let mut after = before.clone();
+        after.eligibility_revision = Some(DocumentRevision::from_canonical_bytes(b"pending"));
+        assert_ne!(before, after);
+        let runtime = ConnectorControlRuntimeId::from_bytes([1; 16]);
+        assert_ne!(
+            before.management_dependencies(runtime),
+            after.management_dependencies(runtime)
+        );
     }
 }

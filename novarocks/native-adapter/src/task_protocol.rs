@@ -675,8 +675,12 @@ pub fn host_rejection_status(rejection: HostRejection) -> tonic::Status {
     let detail = rejection.detail().as_str().to_owned();
     match rejection.category() {
         TaskFailureCategory::Protocol => tonic::Status::invalid_argument(detail),
-        TaskFailureCategory::ResourceExhausted => tonic::Status::resource_exhausted(detail),
-        TaskFailureCategory::Execution
+        TaskFailureCategory::ResourceExhausted | TaskFailureCategory::CapacityRefused { .. } => {
+            tonic::Status::resource_exhausted(detail)
+        }
+        TaskFailureCategory::MvApplyConsistency { .. }
+        | TaskFailureCategory::TargetFormatUnsupported { .. }
+        | TaskFailureCategory::Execution
         | TaskFailureCategory::Exchange
         | TaskFailureCategory::Internal => tonic::Status::internal(detail),
     }

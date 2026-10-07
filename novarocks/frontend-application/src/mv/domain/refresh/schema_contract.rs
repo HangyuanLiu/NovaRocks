@@ -99,7 +99,16 @@ pub(crate) fn validate_relation_occurrence_schema(
                     occurrence.occurrence_id
                 )
             })?;
-        if current.type_signature != bound.type_signature || current.nullable != bound.nullable {
+        if !bound.data_type.matches_schema(
+            current.data_type.logical_type(),
+            current
+                .data_type
+                .provider_type_binding()
+                .ok_or("MV source observation is missing its exact schema binding")?
+                .as_ref(),
+            current.legacy_scalar_type.as_ref(),
+        ) || current.nullable != bound.nullable
+        {
             return Err(format!(
                 "MV source field type or nullability changed for relation occurrence {}",
                 occurrence.occurrence_id
@@ -195,7 +204,30 @@ mod tests {
         ConnectorTableObjectId, MvObservedSourceField,
         MvSchemaValidationObservation as SpiObservation,
     };
-    use std::sync::Arc;
+
+    // These fixtures model historical scalar documents and an independently
+    // observed provider domain. New bound recursive fixtures pass None.
+    fn fixture_legacy_scalar_type(
+        ty: &novarocks_types::logical_type::LogicalType,
+    ) -> Option<novarocks_types::logical_type::LogicalType> {
+        use novarocks_types::logical_type::LogicalType;
+        match ty {
+            LogicalType::Boolean
+            | LogicalType::Int32
+            | LogicalType::Int64
+            | LogicalType::Float32
+            | LogicalType::Float64
+            | LogicalType::Utf8
+            | LogicalType::Binary
+            | LogicalType::Date32
+            | LogicalType::Decimal { bits: 128, .. } => Some(ty.clone()),
+            LogicalType::Timestamp {
+                unit: arrow::datatypes::TimeUnit::Microsecond,
+                timezone: None,
+            } => Some(ty.clone()),
+            _ => None,
+        }
+    }
 
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
@@ -237,7 +269,13 @@ mod tests {
                     MvObservedSourceField::try_new(
                         Bytes::copy_from_slice(field.target_field_id.as_bytes()),
                         format!("physical_{ordinal}"),
-                        field.type_signature.clone(),
+                        field.data_type.logical_type().clone(),
+                        fixture_legacy_scalar_type(field.data_type.logical_type()),
+                        field
+                            .data_type
+                            .provider_type_binding()
+                            .cloned()
+                            .unwrap_or_else(|| Bytes::from_static(b"fixture-schema-binding")),
                         field.nullable,
                     )
                     .unwrap(),
@@ -282,7 +320,13 @@ mod tests {
                         } else {
                             field.name_at_binding.clone()
                         },
-                        field.type_signature.clone(),
+                        field.data_type.logical_type().clone(),
+                        fixture_legacy_scalar_type(field.data_type.logical_type()),
+                        field
+                            .data_type
+                            .provider_type_binding()
+                            .cloned()
+                            .unwrap_or_else(|| Bytes::from_static(b"fixture-schema-binding")),
                         field.nullable,
                     )
                     .unwrap(),
@@ -373,5 +417,176 @@ mod tests {
                 .unwrap_err()
                 .contains("source object changed")
         );
+    }
+    fn bound_occurrence(
+        logical_type: novarocks_types::logical_type::LogicalType,
+        provider_binding: &'static [u8],
+    ) -> RelationOccurrence {
+        let mut occurrence = projection().facts.definition().relation_occurrences[0].clone();
+        occurrence.fields.truncate(1);
+        occurrence.fields[0].data_type =
+            novarocks_mv_application::persistence::codec::MvLogicalType::from_schema_type(
+                logical_type,
+                Bytes::from_static(provider_binding),
+            )
+            .unwrap();
+        occurrence
+    }
+
+    fn recursive_type() -> novarocks_types::logical_type::LogicalType {
+        use novarocks_types::logical_type::{LogicalField, LogicalType};
+        LogicalType::Struct(vec![LogicalField {
+            name: "value".into(),
+            data_type: LogicalType::Int64,
+            nullable: true,
+        }])
+    }
+
+    fn observed_bound_field(
+        occurrence: &RelationOccurrence,
+        logical_type: novarocks_types::logical_type::LogicalType,
+        provider_binding: &'static [u8],
+        name: String,
+        legacy_scalar_type: Option<novarocks_types::logical_type::LogicalType>,
+    ) -> MvSchemaValidationObservation {
+        let object =
+            novarocks_mv_application::persistence::exact_revision::restore_persisted_object(
+                &occurrence.object_id,
+            )
+            .unwrap();
+        let field = &occurrence.fields[0];
+        crate::mv::domain::storage_observation::schema_validation_from_spi(
+            SpiObservation::try_new(
+                ConnectorTableIdentity {
+                    instance_id: ConnectorInstanceId::parse(&occurrence.catalog_at_binding)
+                        .unwrap(),
+                    namespace: occurrence.namespace_at_binding.clone().into(),
+                    table: occurrence.relation_at_binding.clone().into(),
+                },
+                object,
+                ConnectorCommittedVersion::try_new(
+                    Bytes::from_static(b"advanced-source-metadata"),
+                    Some(12),
+                )
+                .unwrap(),
+                Bytes::from_static(b"advanced-source-schema"),
+                Bytes::from_static(b"same-source-spec"),
+                true,
+                true,
+                vec![(
+                    0,
+                    MvObservedSourceField::try_new(
+                        Bytes::copy_from_slice(field.field_id.as_bytes()),
+                        name,
+                        logical_type,
+                        legacy_scalar_type,
+                        Bytes::from_static(provider_binding),
+                        field.nullable,
+                    )
+                    .unwrap(),
+                )],
+                vec![],
+                &context(),
+            )
+            .unwrap(),
+            &context(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn source_child_replacement_is_rejected_despite_same_public_type_and_parent_id() {
+        // The provider-owned bytes differ only in the nested child identity.
+        // Public names/order/type and the top field ID are deliberately equal.
+        let before = b"iceberg-fixture:struct:parent=1:child=2:optional:long";
+        let after = b"iceberg-fixture:struct:parent=1:child=3:optional:long";
+        let occurrence = bound_occurrence(recursive_type(), before);
+        let observed = observed_bound_field(
+            &occurrence,
+            recursive_type(),
+            after,
+            occurrence.fields[0].name_at_binding.clone(),
+            None,
+        );
+        assert_eq!(observed.fields()[0].field_id, occurrence.fields[0].field_id);
+        assert_eq!(
+            observed.fields()[0].data_type.logical_type(),
+            occurrence.fields[0].data_type.logical_type()
+        );
+        assert!(
+            validate_relation_occurrence_schema(&occurrence, &observed)
+                .unwrap_err()
+                .contains("field type or nullability changed")
+        );
+    }
+
+    #[test]
+    fn source_provider_family_change_is_rejected_despite_same_engine_carrier() {
+        use novarocks_types::logical_type::LogicalType;
+        let occurrence = bound_occurrence(LogicalType::LargeInt, b"iceberg-fixture:id=1:uuid");
+        let observed = observed_bound_field(
+            &occurrence,
+            LogicalType::LargeInt,
+            b"iceberg-fixture:id=1:fixed(16)",
+            occurrence.fields[0].name_at_binding.clone(),
+            None,
+        );
+        assert_eq!(
+            observed.fields()[0].data_type.logical_type(),
+            occurrence.fields[0].data_type.logical_type()
+        );
+        assert!(validate_relation_occurrence_schema(&occurrence, &observed).is_err());
+    }
+
+    #[test]
+    fn source_top_rename_preserves_complete_recursive_provider_binding() {
+        let binding = b"iceberg-fixture:struct:parent=1:child=2:optional:long";
+        let occurrence = bound_occurrence(recursive_type(), binding);
+        let observed = observed_bound_field(
+            &occurrence,
+            recursive_type(),
+            binding,
+            "renamed_payload".into(),
+            None,
+        );
+        assert_eq!(
+            observed.fields()[0].data_type.provider_type_binding(),
+            occurrence.fields[0].data_type.provider_type_binding()
+        );
+        let renames = validate_relation_occurrence_schema(&occurrence, &observed).unwrap();
+        assert_eq!(renames.len(), 1);
+        assert_eq!(renames[0].current_name, "renamed_payload");
+        assert_eq!(renames[0].field_id, occurrence.fields[0].field_id);
+    }
+
+    #[test]
+    fn historical_plain_timestamp_does_not_accept_zoned_read_normalization() {
+        use novarocks_types::logical_type::LogicalType;
+        let logical = LogicalType::Timestamp {
+            unit: arrow::datatypes::TimeUnit::Microsecond,
+            timezone: None,
+        };
+        let mut occurrence = bound_occurrence(logical.clone(), b"iceberg-fixture:id=1:timestamp");
+        occurrence.fields[0].data_type =
+            novarocks_mv_application::persistence::codec::MvLogicalType::decode_signature(
+                "timestamp",
+            )
+            .unwrap();
+        let plain = observed_bound_field(
+            &occurrence,
+            logical.clone(),
+            b"iceberg-fixture:id=1:timestamp",
+            occurrence.fields[0].name_at_binding.clone(),
+            Some(logical.clone()),
+        );
+        assert!(validate_relation_occurrence_schema(&occurrence, &plain).is_ok());
+        let zoned = observed_bound_field(
+            &occurrence,
+            logical,
+            b"iceberg-fixture:id=1:timestamptz",
+            occurrence.fields[0].name_at_binding.clone(),
+            None,
+        );
+        assert!(validate_relation_occurrence_schema(&occurrence, &zoned).is_err());
     }
 }

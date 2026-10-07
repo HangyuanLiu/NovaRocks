@@ -858,6 +858,17 @@ impl SourceSinkEdgeIndex {
                         );
                     }
                 }
+                FragmentSink::PredicateFanout { branches } => {
+                    for branch in branches {
+                        index.record(
+                            branch.edge,
+                            plan.edges().get(&branch.edge).is_some_and(|edge| {
+                                edge.source.fragment == source.id()
+                                    && edge.kind == crate::EdgeKind::PredicateFanout
+                            }),
+                        );
+                    }
+                }
                 FragmentSink::Router { routes, .. } => {
                     for route in routes {
                         index.record(

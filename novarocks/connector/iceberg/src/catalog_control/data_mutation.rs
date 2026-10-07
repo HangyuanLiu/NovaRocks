@@ -488,7 +488,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                     selected_rewrite: None,
                     target_ref,
                     snapshot_properties,
-                    atomic_partition_replacement: None,
+                    atomic_publication_updates: None,
                 })
                 .await
             })

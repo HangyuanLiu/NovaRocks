@@ -73,9 +73,25 @@ SELECT 1;
 -- @retry_interval_ms=500
 -- @skip_result_check=true
 -- @result_contains=10
+SET CATALOG lnp3d_ice_${uuid0};
+USE ns_${uuid0};
 SELECT k1, v1 FROM lnp3d_ice_${uuid0}.ns_${uuid0}.orders_mv ORDER BY k1;
 
 -- query 5
+-- A query-local lake read does not establish management admission. An explicit
+-- DROP observes Current and establishes the old incarnation's effect barrier
+-- if asynchronous catalog rediscovery has not already done so. Both paths
+-- must refuse the effect; the exact status assertion below checks the barrier.
+-- @expect_error=MV
+DROP MATERIALIZED VIEW ns_${uuid0}.orders_mv;
+
+-- query 6
+-- Both the first observation of the old incarnation and prior asynchronous
+-- rediscovery establish the same barrier. A second DROP must hit that barrier.
+-- @expect_error=admit MV DROP: EffectUnsettled
+DROP MATERIALIZED VIEW ns_${uuid0}.orders_mv;
+
+-- query 7
 -- The wiped Accelerator is rebuildable; the new process still needs a real
 -- readmission declaration before its DROP can have an effect.
 -- @retry_count=40
@@ -84,12 +100,12 @@ SELECT k1, v1 FROM lnp3d_ice_${uuid0}.ns_${uuid0}.orders_mv ORDER BY k1;
 -- @result_contains=AWAITING_EFFECT_SETTLEMENT
 CALL novarocks_mv_management_status('lnp3d_ice_${uuid0}', 'ns_${uuid0}', 'orders_mv');
 
--- query 6
+-- query 8
 -- @mv_resume_management=orders_mv,catalog=lnp3d_ice_${uuid0},database=ns_${uuid0}
 -- @skip_result_check=true
 SELECT 1;
 
--- query 7
+-- query 9
 -- @skip_result_check=true
 SET CATALOG lnp3d_ice_${uuid0};
 USE ns_${uuid0};

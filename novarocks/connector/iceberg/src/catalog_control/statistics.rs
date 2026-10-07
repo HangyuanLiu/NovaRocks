@@ -124,7 +124,7 @@ impl StatisticsReader for IcebergMetadata {
         self.validate_context(&request.context)?;
         let files = files_result.map_err(unavailable)?.map_err(unavailable)?;
         let arrow_schema =
-            crate::scalar_integer_domain::metadata_sql_schema(metadata, metadata.current_schema())?;
+            crate::field_domain::metadata_sql_schema(metadata, metadata.current_schema())?;
         for file in &files {
             for field in arrow_schema.fields() {
                 let domain = match field.data_type() {
@@ -157,6 +157,16 @@ impl StatisticsReader for IcebergMetadata {
             .iter()
             .map(|field| (field.name.to_ascii_lowercase(), field.id))
             .collect::<HashMap<_, _>>();
+        let declarations = crate::field_domain::metadata_declarations(metadata)?;
+        let active_domains =
+            crate::field_domain::active(metadata.current_schema(), declarations.fields())?;
+        let json_columns = field_ids
+            .iter()
+            .filter(|(_, id)| {
+                active_domains.get(id) == Some(&crate::field_domain::FieldDomain::Json)
+            })
+            .map(|(name, _)| name.clone())
+            .collect::<BTreeSet<_>>();
         let data_types = arrow_schema
             .fields()
             .iter()
@@ -180,7 +190,9 @@ impl StatisticsReader for IcebergMetadata {
             .filter(|metric| !matches!(metric, StatisticsMetric::ThetaNdv { .. }))
             .cloned()
             .map(|metric| {
-                let state = manifest_metric(&metric, &files, &data_types, has_deletes, &expected);
+                let state = json_statistic_rejection(&metric, &json_columns).unwrap_or_else(|| {
+                    manifest_metric(&metric, &files, &data_types, has_deletes, &expected)
+                });
                 (metric, state)
             })
             .collect();
@@ -194,6 +206,9 @@ impl StatisticsReader for IcebergMetadata {
             .filter(|metric| matches!(metric, StatisticsMetric::ThetaNdv { .. }))
             .filter_map(|metric| {
                 let column = statistics_metric_column(metric)?;
+                if json_columns.contains(&column.to_ascii_lowercase()) {
+                    return None;
+                }
                 let field_id = field_ids.get(&column.to_ascii_lowercase())?;
                 Some((*field_id, metric.clone()))
             })
@@ -222,6 +237,10 @@ impl StatisticsReader for IcebergMetadata {
         let row_count_ceiling = row_count_ceiling(&metrics);
         for metric in request.metrics.metrics() {
             if !matches!(metric, StatisticsMetric::ThetaNdv { .. }) {
+                continue;
+            }
+            if let Some(state) = json_statistic_rejection(metric, &json_columns) {
+                metrics.insert(metric.clone(), state);
                 continue;
             }
             let resolved = wanted_ndv
@@ -268,6 +287,27 @@ impl StatisticsReader for IcebergMetadata {
         )?;
         StatisticsEvidence::try_new(expected, revision, row_coverage, metrics)
     }
+}
+
+/// Physical STRING artifacts carry no proof of JSON comparison or equality.
+fn json_statistic_rejection(
+    metric: &StatisticsMetric,
+    json_columns: &BTreeSet<String>,
+) -> Option<StatisticsMetricState> {
+    let (column, message) = match metric {
+        StatisticsMetric::Minimum { column } | StatisticsMetric::Maximum { column } => (
+            column,
+            "Iceberg STRING bounds do not prove JSON logical comparison",
+        ),
+        StatisticsMetric::ThetaNdv { column } => (
+            column,
+            "Iceberg STRING sketches do not prove JSON logical equality",
+        ),
+        _ => return None,
+    };
+    json_columns
+        .contains(&column.to_ascii_lowercase())
+        .then(|| incomplete(message))
 }
 
 /// Row count usable as the ceiling for an NDV, when one is available.
@@ -1824,6 +1864,42 @@ mod tests {
             artifact,
             path,
         )
+    }
+
+    #[test]
+    fn string_artifacts_do_not_authorize_json_order_or_equality_statistics() {
+        let declared_json = BTreeSet::from(["json_payload".to_string()]);
+        for metric in [
+            StatisticsMetric::Minimum {
+                column: "json_payload".into(),
+            },
+            StatisticsMetric::Maximum {
+                column: "JSON_PAYLOAD".into(),
+            },
+            StatisticsMetric::ThetaNdv {
+                column: "json_payload".into(),
+            },
+        ] {
+            let Some(StatisticsMetricState::Missing(missing)) =
+                json_statistic_rejection(&metric, &declared_json)
+            else {
+                panic!("unproved JSON statistic must be unavailable");
+            };
+            assert!(missing.message.contains("do not prove JSON"));
+            assert!(
+                json_statistic_rejection(&metric, &BTreeSet::new()).is_none(),
+                "ordinary STRING artifacts retain their existing semantics"
+            );
+        }
+        assert!(
+            json_statistic_rejection(
+                &StatisticsMetric::NullCount {
+                    column: "json_payload".into()
+                },
+                &declared_json
+            )
+            .is_none()
+        );
     }
 
     #[test]

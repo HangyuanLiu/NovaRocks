@@ -44,7 +44,9 @@ pub struct MvPhysicalFieldFacts {
     pub field_id: FieldIdentity,
     pub name: String,
     pub ordinal: u32,
-    pub type_signature: String,
+    pub data_type: crate::persistence::codec::MvLogicalType,
+    /// Provider-projected exact historical scalar domain; not persisted.
+    pub legacy_scalar_type: Option<novarocks_type_contract::LogicalType>,
     pub nullable: bool,
 }
 
@@ -105,7 +107,7 @@ pub fn reconstruct_runtime_bindings(
     let mut names = BTreeSet::new();
     for field in &schema.fields {
         if field.name.is_empty()
-            || field.type_signature.is_empty()
+            || field.data_type.validate().is_err()
             || !ordinals.insert(field.ordinal)
             || !names.insert(&field.name)
             || by_id.insert(&field.field_id, field).is_some()
@@ -120,7 +122,15 @@ pub fn reconstruct_runtime_bindings(
         let field = by_id
             .get(&binding.target_field_id)
             .ok_or("MV runtime target schema is missing a bound physical field")?;
-        if field.type_signature != binding.type_signature || field.nullable != binding.nullable {
+        if !binding.data_type.matches_schema(
+            field.data_type.logical_type(),
+            field
+                .data_type
+                .provider_type_binding()
+                .map_or(&[], |bytes| bytes.as_ref()),
+            field.legacy_scalar_type.as_ref(),
+        ) || field.nullable != binding.nullable
+        {
             return Err("MV runtime target field type or nullability changed".into());
         }
         logical.insert(&binding.logical_identity, (*field).clone());
@@ -175,8 +185,8 @@ pub fn reconstruct_runtime_bindings(
         .collect::<Result<_, String>>()?;
     let apply_key = interpretation
         .apply_key
-        .components
         .iter()
+        .flat_map(|key| &key.components)
         .map(|component| {
             lookup(PhysicalFieldLogicalIdentity::ApplyKey(
                 component.logical_id.clone(),
@@ -233,7 +243,8 @@ mod tests {
                 field_id: field.target_field_id.clone(),
                 name: format!("physical_{ordinal}"),
                 ordinal: ordinal as u32,
-                type_signature: field.type_signature.clone(),
+                data_type: field.data_type.clone(),
+                legacy_scalar_type: Some(field.data_type.logical_type().clone()),
                 nullable: field.nullable,
             })
             .collect();
@@ -328,6 +339,36 @@ mod tests {
         let current = current_fixture.build().unwrap();
         let current_observation = schema_for(&current);
         reconstruct_runtime_bindings(&current, &current_observation).unwrap();
+    }
+
+    #[test]
+    fn reverse_binding_checks_opaque_identity_even_when_semantic_types_equal() {
+        let mut fixture =
+            ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(11));
+        for field in &mut fixture.interpretation.target.fields {
+            field.data_type = crate::persistence::codec::MvLogicalType::from_schema_type(
+                field.data_type.logical_type().clone(),
+                bytes::Bytes::from_static(b"provider-id-1"),
+            )
+            .unwrap();
+        }
+        let facts = fixture.build().unwrap();
+        let mut schema = schema_for(&facts);
+        reconstruct_runtime_bindings(&facts, &schema).unwrap();
+        let tree = schema.fields[0].data_type.logical_type().clone();
+        schema.fields[0].data_type = crate::persistence::codec::MvLogicalType::from_schema_type(
+            tree,
+            bytes::Bytes::from_static(b"provider-id-2"),
+        )
+        .unwrap();
+        assert_eq!(
+            schema.fields[0].data_type,
+            facts.interpretation().target.fields[0].data_type
+        );
+        assert!(reconstruct_runtime_bindings(&facts, &schema).is_err());
+        let (legacy, mut actual) = self::fixture(false);
+        actual.fields[0].legacy_scalar_type = None;
+        assert!(reconstruct_runtime_bindings(&legacy, &actual).is_err());
     }
 
     #[test]

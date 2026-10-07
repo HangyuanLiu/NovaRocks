@@ -57,6 +57,8 @@ use crate::{duplicate, inconsistent, invalid, missing, out_of_range};
 /// It is the same bound as the descriptor's split plan nodes: both are sets of
 /// one task's scan nodes, drawn from the same plan.
 pub const MAX_INITIAL_SCAN_NODES: usize = 1024;
+/// Largest number of distinct quota domains consumed by one fragment.
+pub const MAX_QUOTA_DOMAINS: usize = 256;
 
 /// A task assignment that passed its local structure checks.
 ///
@@ -179,6 +181,30 @@ pub fn decode_task_assignment(
                 "sink edge id is absent from the task topology",
             ));
         }
+    }
+
+    if src.quota_domain_bindings.len() > MAX_QUOTA_DOMAINS {
+        return Err(out_of_range(
+            path.clone().field("quota_domain_bindings"),
+            "quota domain count exceeds the hard limit",
+        ));
+    }
+    let mut previous = None;
+    for (index, binding) in src.quota_domain_bindings.iter().enumerate() {
+        let binding_path = path.clone().field("quota_domain_bindings").index(index);
+        if binding.preclaim_node_id < 0 || binding.task_count == 0 {
+            return Err(out_of_range(
+                binding_path,
+                "quota domain node id must be nonnegative and task count nonzero",
+            ));
+        }
+        if previous.is_some_and(|node| node >= binding.preclaim_node_id) {
+            return Err(duplicate(
+                binding_path,
+                "quota domain bindings must be strictly ascending and unique",
+            ));
+        }
+        previous = Some(binding.preclaim_node_id);
     }
 
     // This private carrier has no fingerprint and never participates in replay
@@ -326,7 +352,8 @@ fn decode_sink_kind(
         plan::data_sink::Kind::Noop(_) => FragmentSinkKind::Noop,
         plan::data_sink::Kind::DataStream(_) => FragmentSinkKind::DataStream,
         plan::data_sink::Kind::MultiCastDataStream(_) => FragmentSinkKind::MultiCastDataStream,
-        plan::data_sink::Kind::ChangeStreamRouter(_) => FragmentSinkKind::SplitDataStream,
+        plan::data_sink::Kind::ChangeStreamRouter(_)
+        | plan::data_sink::Kind::PredicateFanout(_) => FragmentSinkKind::SplitDataStream,
     })
 }
 
@@ -417,6 +444,36 @@ mod tests {
     }
 
     #[test]
+    fn quota_bindings_are_bounded_ordered_nonzero_and_preserved() {
+        let binding = |node, count| novarocks::TaskQuotaDomainBinding {
+            preclaim_node_id: node,
+            task_count: count,
+        };
+        let assignment = |bindings| novarocks::TaskAssignment {
+            quota_domain_bindings: bindings,
+            ..Default::default()
+        };
+        let legal = assignment(vec![binding(0, 2), binding(17, 5)]);
+        let decoded =
+            decode_task_assignment(legal.clone(), &descriptor(), FieldPath::root("a")).unwrap();
+        assert_eq!(decoded.into_wire().unwrap(), legal);
+        for illegal in [
+            vec![binding(-1, 1)],
+            vec![binding(0, 0)],
+            vec![binding(0, 1), binding(0, 2)],
+            vec![binding(1, 1), binding(0, 1)],
+            (0..=MAX_QUOTA_DOMAINS as i32)
+                .map(|node| binding(node, 1))
+                .collect(),
+        ] {
+            assert!(
+                decode_task_assignment(assignment(illegal), &descriptor(), FieldPath::root("a"))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn assignment_retains_exact_owned_bytes_and_restores_nested_scan_facts() {
         let file = novarocks::FileScanRange {
             full_path: Some("s3://warehouse/file.parquet".to_owned()),
@@ -427,6 +484,7 @@ mod tests {
             ..Default::default()
         };
         let assignment = novarocks::TaskAssignment {
+            quota_domain_bindings: Vec::new(),
             instance_ordinal: 0,
             initial_scan_ranges: vec![novarocks::TaskScanRanges {
                 plan_node_id: 1,
@@ -454,6 +512,7 @@ mod tests {
     fn an_assignment_orders_its_scan_nodes_and_binds_every_outbound_edge() {
         let descriptor = descriptor();
         let legal = novarocks::TaskAssignment {
+            quota_domain_bindings: Vec::new(),
             instance_ordinal: 3,
             initial_scan_ranges: vec![scan(1), scan(4)],
             sink_edge_ids: Vec::new(),

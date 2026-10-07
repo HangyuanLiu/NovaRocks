@@ -77,6 +77,10 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputCo
             );
             Ok(columns)
         }
+        LogicalPlanKind::QuotaPreclaim(node) => Ok(node.output_columns.clone()),
+        LogicalPlanKind::QuotaTrim(node) => Ok(node.output_columns.clone()),
+        LogicalPlanKind::FanoutConsume(node) => Ok(node.output_columns.clone()),
+        LogicalPlanKind::FanoutAnchor(_) => plan_output_columns(plan.child(1)),
         LogicalPlanKind::CTEAnchor(_) => plan_output_columns(plan.child(1)),
         LogicalPlanKind::CTEProduce(node) => Ok(node.output_columns.clone()),
         LogicalPlanKind::CTEConsume(node) => Ok(node.output_columns.clone()),

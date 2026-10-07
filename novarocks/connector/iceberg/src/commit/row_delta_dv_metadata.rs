@@ -183,14 +183,10 @@ async fn build_snapshot_index(
                     let file_seq = entry.file_sequence_number;
                     let snapshot_id = entry.snapshot_id().unwrap_or(mf.added_snapshot_id);
                     let file = entry.data_file().clone();
-                    validate_delete_file_for_row_lineage(&file)?;
-                    let referenced = file.referenced_data_file().ok_or_else(|| {
-                        format!(
-                            "Puffin DV {} missing referenced_data_file",
-                            file.file_path()
-                        )
-                    })?;
-                    if touched_files.contains(&referenced) {
+                    // Legacy equality/Parquet entries carry no exclusive DV
+                    // owner. They remain untouched; strict candidate admission
+                    // already refuses any such artifact applying to a target.
+                    if let Some(referenced) = touched_delete_reference(&file, touched_files)? {
                         if !replaced_delete_paths.insert(file.file_path().to_string()) {
                             return Err(format!(
                                 "duplicate live Puffin DV path {} in Iceberg manifest list",
@@ -271,6 +267,22 @@ async fn build_snapshot_index(
         replaced_delete_records,
         replaced_delete_files_size,
     })
+}
+
+fn touched_delete_reference(
+    file: &DataFile,
+    touched_files: &HashSet<String>,
+) -> Result<Option<String>, String> {
+    let referenced = file.referenced_data_file();
+    if referenced
+        .as_ref()
+        .is_some_and(|path| touched_files.contains(path))
+    {
+        validate_delete_file_for_row_lineage(file)?;
+        Ok(referenced)
+    } else {
+        Ok(None)
+    }
 }
 
 pub fn validate_delete_file_for_row_lineage(file: &DataFile) -> Result<(), String> {
@@ -521,4 +533,50 @@ pub fn dv_summary(
 
 pub fn to_iceberg_unexpected(s: String) -> crate::iceberg::Error {
     crate::iceberg::Error::new(crate::iceberg::ErrorKind::Unexpected, s)
+}
+
+#[cfg(test)]
+mod touched_delete_tests {
+    use super::*;
+    fn delete(
+        content: DataContentType,
+        format: DataFileFormat,
+        referenced: Option<&str>,
+    ) -> DataFile {
+        DataFileBuilder::default()
+            .content(content)
+            .file_path("file:///old-delete".into())
+            .file_format(format)
+            .partition(crate::iceberg::spec::Struct::empty())
+            .partition_spec_id(0)
+            .record_count(1)
+            .file_size_in_bytes(100)
+            .referenced_data_file(referenced.map(str::to_string))
+            .build()
+            .unwrap()
+    }
+    #[test]
+    fn untouched_legacy_delete_entries_are_preserved_without_validation() {
+        let touched = HashSet::from(["file:///selected.parquet".to_string()]);
+        for old in [
+            delete(
+                DataContentType::EqualityDeletes,
+                DataFileFormat::Parquet,
+                None,
+            ),
+            delete(
+                DataContentType::PositionDeletes,
+                DataFileFormat::Parquet,
+                Some("file:///unrelated.parquet"),
+            ),
+        ] {
+            assert_eq!(touched_delete_reference(&old, &touched).unwrap(), None);
+        }
+        let selected = delete(
+            DataContentType::PositionDeletes,
+            DataFileFormat::Parquet,
+            Some("file:///selected.parquet"),
+        );
+        assert!(touched_delete_reference(&selected, &touched).is_err());
+    }
 }

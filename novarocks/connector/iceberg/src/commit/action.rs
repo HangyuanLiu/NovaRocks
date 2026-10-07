@@ -50,6 +50,8 @@ pub struct CommitCtx<'a> {
     /// values are used for branch-qualified DML (`INSERT INTO t.branch_<x>`).
     pub target_ref: &'a str,
     pub snapshot_properties: &'a BTreeMap<String, String>,
+    /// Application properties staged in the same exact-base catalog mutation as the snapshot.
+    pub metadata_updates: &'a [crate::iceberg::TableUpdate],
 }
 
 pub(super) fn merge_snapshot_summary_properties(

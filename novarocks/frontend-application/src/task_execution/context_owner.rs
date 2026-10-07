@@ -76,6 +76,158 @@ pub struct ContextEstablishFacts {
     pub initial_credential: CredentialUpdate,
 }
 
+#[cfg(test)]
+mod failed_verification_release_tests {
+    use super::*;
+    use novarocks_execution_contract::{ContextVerificationFacts, QueryContextReceipt};
+    use novarocks_types::identity::{
+        AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId,
+    };
+
+    fn owner() -> QueryContextOwner {
+        let execution =
+            QueryExecutionId::new(QueryId::new(7, 3), AttemptId::new(1).unwrap()).unwrap();
+        QueryContextOwner::new(
+            QueryContextRef::new(
+                execution,
+                FrontendProcessId::new_v7(),
+                BackendProcessId::new_v7(),
+            ),
+            1,
+            NativeCompatibilityId::new([0x41; 32]),
+            AdmissionEpochCapability::try_from_bytes([0x61; 16]).unwrap(),
+        )
+    }
+
+    fn abort(owner: &mut QueryContextOwner) {
+        let request = owner.abort_intent(AbortCause::QueryFailed).unwrap();
+        owner
+            .on_abort_ack(&OperationAcknowledgement::new(
+                request.operation_id(),
+                OperationKind::AbortQueryContext,
+                OperationOutcome::Accepted,
+                AckPayload::Context(QueryContextReceipt::new(
+                    owner.context,
+                    QueryContextState::Aborting,
+                )),
+            ))
+            .unwrap();
+    }
+
+    fn release_ack(
+        owner: &QueryContextOwner,
+        operation: TaskOperationId,
+        outcome: ReleaseOutcome,
+    ) -> OperationAcknowledgement {
+        OperationAcknowledgement::new(
+            operation,
+            OperationKind::ReleaseQueryContext,
+            if outcome == ReleaseOutcome::AlreadyTerminal {
+                OperationOutcome::ContextTerminalReceipt
+            } else {
+                OperationOutcome::Accepted
+            },
+            AckPayload::Release {
+                receipt: QueryContextReceipt::new(
+                    owner.context,
+                    QueryContextState::TerminalRetained,
+                ),
+                outcome,
+                runtime_filter: None,
+                verification: (outcome != ReleaseOutcome::NotReady).then(|| {
+                    ContextVerificationFacts {
+                        context: owner.context,
+                        tasks: vec![],
+                        truncated: false,
+                    }
+                }),
+            },
+        )
+    }
+
+    #[test]
+    fn failed_verification_release_abort_ack_is_not_a_verification_receipt() {
+        let mut owner = owner();
+        owner.request_verification_release();
+        assert!(owner.release_intent(MonotonicInstant::ORIGIN).is_none());
+        abort(&mut owner);
+        assert!(owner.is_released());
+        assert!(owner.verification().is_none());
+        assert!(owner.verification_release_pending());
+        assert!(owner.release_intent(MonotonicInstant::ORIGIN).is_some());
+    }
+
+    #[test]
+    fn failed_verification_release_not_ready_replays_exact_request_then_seals() {
+        let mut owner = owner();
+        abort(&mut owner);
+        owner.request_verification_release();
+        let first = owner.release_intent(MonotonicInstant::ORIGIN).unwrap();
+        owner
+            .on_release_ack(
+                &release_ack(&owner, first.operation_id(), ReleaseOutcome::NotReady),
+                MonotonicInstant::ORIGIN,
+            )
+            .unwrap();
+        assert!(owner.verification().is_none());
+        assert!(owner.release_intent(MonotonicInstant::ORIGIN).is_none());
+        let later = MonotonicInstant::from_origin(Duration::from_secs(1));
+        let replay = owner.release_intent(later).unwrap();
+        assert_eq!(first.operation_id(), replay.operation_id());
+        let pending = OperationAcknowledgement::new(
+            replay.operation_id(),
+            OperationKind::ReleaseQueryContext,
+            OperationOutcome::ContextTerminalReceipt,
+            AckPayload::Release {
+                receipt: QueryContextReceipt::new(owner.context, QueryContextState::Aborting),
+                outcome: ReleaseOutcome::AlreadyTerminal,
+                runtime_filter: None,
+                verification: None,
+            },
+        );
+        owner.on_release_ack(&pending, later).unwrap();
+        assert!(owner.verification_release_pending());
+        assert!(owner.verification().is_none());
+        let sealed_at = MonotonicInstant::from_origin(Duration::from_secs(2));
+        let final_replay = owner.release_intent(sealed_at).unwrap();
+        assert_eq!(first.operation_id(), final_replay.operation_id());
+        owner
+            .on_release_ack(
+                &release_ack(
+                    &owner,
+                    final_replay.operation_id(),
+                    ReleaseOutcome::AlreadyTerminal,
+                ),
+                sealed_at,
+            )
+            .unwrap();
+        assert!(owner.verification().is_some());
+        assert!(!owner.verification_release_pending());
+        assert!(owner.release_intent(sealed_at).is_none());
+    }
+
+    #[test]
+    fn failed_verification_release_gone_never_invents_operator_facts() {
+        let mut owner = owner();
+        abort(&mut owner);
+        owner.request_verification_release();
+        let release = owner.release_intent(MonotonicInstant::ORIGIN).unwrap();
+        owner
+            .on_release_ack(
+                &OperationAcknowledgement::new(
+                    release.operation_id(),
+                    OperationKind::ReleaseQueryContext,
+                    OperationOutcome::Gone,
+                    AckPayload::None,
+                ),
+                MonotonicInstant::ORIGIN,
+            )
+            .unwrap();
+        assert!(!owner.verification_release_pending());
+        assert!(owner.verification().is_none());
+    }
+}
+
 impl std::fmt::Debug for ContextEstablishFacts {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -211,6 +363,9 @@ pub struct QueryContextOwner {
     /// here. `None` after a release means the backend installed no
     /// participant for this query.
     runtime_filter_contribution: Option<QueryTerminalProfileContributionTelemetry>,
+    verification: Option<novarocks_execution_contract::ContextVerificationFacts>,
+    verification_release_requested: bool,
+    verification_release_settled: bool,
 }
 
 impl QueryContextOwner {
@@ -257,6 +412,9 @@ impl QueryContextOwner {
             abort: None,
             progress: 0,
             runtime_filter_contribution: None,
+            verification: None,
+            verification_release_requested: false,
+            verification_release_settled: false,
         }
     }
 
@@ -316,6 +474,18 @@ impl QueryContextOwner {
     /// of the release acknowledgement's contribution, and a query whose
     /// backends never released has nothing here rather than an empty
     /// contribution.
+    pub fn verification(&self) -> Option<&novarocks_execution_contract::ContextVerificationFacts> {
+        self.verification.as_ref()
+    }
+
+    pub(crate) fn request_verification_release(&mut self) {
+        self.verification_release_requested = true;
+    }
+
+    pub(crate) const fn verification_release_pending(&self) -> bool {
+        self.verification_release_requested && !self.verification_release_settled
+    }
+
     pub const fn runtime_filter_contribution(
         &self,
     ) -> Option<&QueryTerminalProfileContributionTelemetry> {
@@ -647,14 +817,25 @@ impl QueryContextOwner {
 
     /// The release request, once every local obligation has closed.
     pub fn release_intent(&mut self, now: MonotonicInstant) -> Option<OperationIntent> {
-        if self.released || self.release_in_flight {
+        if self.release_in_flight {
             return None;
         }
-        if !matches!(self.state, QueryContextState::Quiescing) || self.quiesce_receipt.is_none() {
-            return None;
-        }
-        if !self.creates_closed() || !self.locally_drained() {
-            return None;
+        if self.verification_release_requested {
+            // Abort closes admission, but only Release can seal operator
+            // observations. Worker returns NOT_READY while local retirement
+            // is pending; frontend task-status convergence is not this proof.
+            if self.verification_release_settled || !self.released {
+                return None;
+            }
+        } else {
+            if self.released
+                || !matches!(self.state, QueryContextState::Quiescing)
+                || self.quiesce_receipt.is_none()
+                || !self.creates_closed()
+                || !self.locally_drained()
+            {
+                return None;
+            }
         }
         if self.release_blocked_at == Some(self.progress) {
             if self.release_retry_at.is_none_or(|retry_at| now < retry_at) {
@@ -1016,15 +1197,26 @@ impl QueryContextOwner {
             return Err(TaskExecutionError::UnknownOperation);
         }
         self.release_in_flight = false;
-        if ack.is_applied() {
-            let (outcome, runtime_filter) = match ack.payload() {
+        if ack.is_applied()
+            || (ack.worker_outcome() == Some(OperationOutcome::ContextTerminalReceipt)
+                && matches!(ack.payload(), AckPayload::Release { .. }))
+        {
+            let (outcome, runtime_filter, verification) = match ack.payload() {
                 AckPayload::Release {
                     receipt,
                     outcome,
                     runtime_filter,
+                    verification,
                 } => {
                     self.context.verify_matches(receipt.context())?;
-                    (*outcome, runtime_filter.clone())
+                    if verification.as_ref().is_some_and(|facts| {
+                        facts.context != self.context || facts.validate().is_err()
+                    }) {
+                        return Err(TaskExecutionError::MissingReceipt(
+                            OperationKind::ReleaseQueryContext,
+                        ));
+                    }
+                    (*outcome, runtime_filter.clone(), verification.clone())
                 }
                 _ => {
                     return Err(TaskExecutionError::MissingReceipt(
@@ -1034,12 +1226,22 @@ impl QueryContextOwner {
             };
             return Ok(match outcome {
                 ReleaseOutcome::Released | ReleaseOutcome::AlreadyTerminal => {
+                    if self.verification_release_requested && verification.is_none() {
+                        // Abort can report AlreadyTerminal before exact local
+                        // preparation/driver retirement seals the holder.
+                        // Replay Release until it carries evidence or the
+                        // attempt's bounded cleanup budget expires.
+                        self.defer_release_retry(now);
+                        return Ok(ReleaseSettlement::NotReadyKeepRenewing);
+                    }
+                    self.verification_release_settled = true;
                     self.state = QueryContextState::TerminalRetained;
                     self.released = true;
                     // Kept only on the answer that actually released the
                     // shared facts. A `NOT_READY` answer sealed nothing, and
                     // the identical request is resent.
                     self.runtime_filter_contribution = runtime_filter;
+                    self.verification = verification;
                     ReleaseSettlement::Released
                 }
                 ReleaseOutcome::NotReady => {
@@ -1072,11 +1274,13 @@ impl QueryContextOwner {
                 Ok(ReleaseSettlement::NotReadyKeepRenewing)
             }
             OperationOutcome::ContextTerminalReceipt | OperationOutcome::Gone => {
+                self.verification_release_settled = true;
                 self.state = QueryContextState::TerminalRetained;
                 self.released = true;
                 Ok(ReleaseSettlement::Released)
             }
             outcome => {
+                self.verification_release_settled = true;
                 self.state = QueryContextState::TerminalRetained;
                 self.released = true;
                 Ok(ReleaseSettlement::FailedClosed(outcome))

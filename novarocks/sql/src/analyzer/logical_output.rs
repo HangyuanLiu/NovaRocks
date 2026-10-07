@@ -41,9 +41,9 @@ impl AnalyzerContext<'_> {
                 matches!(part.value.to_ascii_lowercase().as_str(), "json" | "jsonb")
             });
             return match (&expression.kind, json_target) {
-                (ExprKind::Cast { expr: inner, .. }, true) => {
-                    self.logical_output_type(Some(&cast.expr), inner, scope)
-                }
+                (ExprKind::Cast { expr: inner, .. }, true) => self
+                    .logical_output_type(Some(&cast.expr), inner, scope)
+                    .filter(|logical| matches!(logical, SqlType::Json)),
                 _ => None,
             };
         }
@@ -62,9 +62,11 @@ impl AnalyzerContext<'_> {
         }
         match &expression.kind {
             ExprKind::Cast { expr: inner, .. } => self.logical_output_type(source, inner, scope),
-            ExprKind::ColumnRef { .. } => scope
-                .logical_type_of_expr(expression)
-                .filter(|logical| matches!(logical, SqlType::Json)),
+            ExprKind::ColumnRef { .. } => {
+                scope.logical_type_of_expr(expression).filter(|logical| {
+                    matches!(logical, SqlType::Json | SqlType::Bitmap | SqlType::Hll)
+                })
+            }
             ExprKind::FunctionCall { binding, .. } => {
                 crate::functions::scalar_output_logical_type(binding)
             }

@@ -148,6 +148,22 @@ fn validate_runtime_binding_shape(
     let mut expected_scans = BTreeSet::new();
     let mut expected_writers = BTreeSet::new();
     let mut expected_finishers = BTreeSet::new();
+    let expected_domains = program
+        .requirements()
+        .entries()
+        .iter()
+        .filter_map(|r| match r {
+            lp::BindingRequirement::QuotaDomain { domain } => Some(*domain),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    if expected_domains != bindings.quota_domains.keys().copied().collect()
+        || bindings.quota_domains.values().any(|count| *count == 0)
+    {
+        return Err(
+            "quota domain bindings do not match the exact local program requirements".into(),
+        );
+    }
     for (index, node) in program.nodes().iter().enumerate() {
         let id = lp::ProgramNodeId::new(index);
         match node.kind() {
@@ -177,6 +193,9 @@ fn validate_runtime_binding_shape(
         let effectful = matches!(
             node.kind(),
             lp::ProgramNodeKind::Scan { .. }
+                | lp::ProgramNodeKind::Membership { .. }
+                | lp::ProgramNodeKind::QuotaPreclaim { .. }
+                | lp::ProgramNodeKind::QuotaTrim { .. }
                 | lp::ProgramNodeKind::ExchangeSource { .. }
                 | lp::ProgramNodeKind::TableWriter { .. }
                 | lp::ProgramNodeKind::TableFinish { .. }
@@ -204,6 +223,20 @@ fn validate_runtime_binding_shape(
             | lp::ProgramNodeKind::TableWriter { input, .. }
             | lp::ProgramNodeKind::Sort { input, .. }
             | lp::ProgramNodeKind::TableFunction { input, .. } => stack.push(*input),
+            lp::ProgramNodeKind::Membership { probe, build, .. } => {
+                stack.push(*probe);
+                stack.push(*build);
+            }
+            lp::ProgramNodeKind::QuotaPreclaim { demand, target, .. } => {
+                stack.push(*demand);
+                stack.push(*target);
+            }
+            lp::ProgramNodeKind::QuotaTrim {
+                seeds, candidates, ..
+            } => {
+                stack.push(*seeds);
+                stack.push(*candidates);
+            }
             lp::ProgramNodeKind::Join { left, right, .. }
             | lp::ProgramNodeKind::NestedLoopJoin { left, right, .. } => {
                 stack.push(*left);
@@ -683,6 +716,133 @@ fn build_pipeline_for_program_node(
         .ok_or_else(|| format!("missing local program node {}", id.index()))?;
     let node_id = node.native_node_id();
     match node.kind() {
+        lp::ProgramNodeKind::Membership { .. } => {
+            Err("membership runtime integration is not installed".into())
+        }
+        lp::ProgramNodeKind::QuotaPreclaim {
+            demand,
+            target,
+            spec,
+            runtime_filters,
+        } => {
+            use crate::exec::operators::{
+                NativeQuotaContentFilterObserver, QuotaPreclaimBuildFactory,
+                QuotaPreclaimProbeFactory, QuotaPreclaimShared,
+            };
+            let domains = bindings
+                .quota_domain(spec.preselection_domain)
+                .ok_or_else(|| "quota preselection domain assignment is missing".to_string())?;
+            let build = build_pipeline_for_program_node(program, bindings, *demand, ctx)?;
+            let mut build = gather_to_one(build, ctx, node_id);
+            let mut probe = build_pipeline_for_program_node(program, bindings, *target, ctx)?;
+            let filters = runtime_filters
+                .iter()
+                .map(|f| Ok((expr(f.demand_expr), runtime_filter_producer(&f.producer)?)))
+                .collect::<Result<Vec<_>, String>>()?;
+            let observer = if filters.is_empty() {
+                None
+            } else {
+                Some(NativeQuotaContentFilterObserver::try_new(
+                    filters,
+                    ctx.arena.clone(),
+                    ctx.runtime_filter_execution
+                        .session
+                        .clone()
+                        .ok_or_else(|| "quota runtime filter session is missing".to_string())?,
+                )?
+                    as Arc<
+                        dyn crate::exec::operators::quota_preclaim::QuotaContentFilterObserver,
+                    >)
+            };
+            let shared = QuotaPreclaimShared::new(
+                node_id,
+                spec.clone(),
+                domains,
+                build.pipeline.dop as usize,
+                probe.pipeline.dop as usize,
+                &ctx.dep_manager,
+                observer,
+            );
+            build
+                .pipeline
+                .factories
+                .push(Box::new(QuotaPreclaimBuildFactory {
+                    shared: shared.clone(),
+                }));
+            build.pipeline.needs_sink = false;
+            let target_schema =
+                ChunkSchema::from_static_layout(program.nodes()[target.index()].output_layout())?;
+            probe
+                .pipeline
+                .factories
+                .push(Box::new(QuotaPreclaimProbeFactory {
+                    shared,
+                    target_schema,
+                    output: ChunkSchema::from_static_layout(node.output_layout())?,
+                }));
+            probe.extra_pipelines.append(&mut build.extra_pipelines);
+            probe.extra_pipelines.push(build.pipeline);
+            probe.stream = StreamDesc::any(probe.pipeline.dop);
+            Ok(probe)
+        }
+        lp::ProgramNodeKind::QuotaTrim {
+            seeds,
+            candidates,
+            spec,
+        } => {
+            use crate::exec::operators::{
+                QuotaTrimInputFactory, QuotaTrimShared, QuotaTrimSourceFactory,
+            };
+            let domains = bindings
+                .quota_domain(spec.preselection_domain)
+                .ok_or_else(|| "quota preselection domain assignment is missing".to_string())?;
+            let build = build_pipeline_for_program_node(program, bindings, *seeds, ctx)?;
+            let mut seeds = gather_to_one(build, ctx, node_id);
+            let mut candidates =
+                build_pipeline_for_program_node(program, bindings, *candidates, ctx)?;
+            let shared = QuotaTrimShared::new(
+                node_id,
+                spec.clone(),
+                domains,
+                seeds.pipeline.dop as usize,
+                candidates.pipeline.dop as usize,
+                &ctx.dep_manager,
+            );
+            seeds
+                .pipeline
+                .factories
+                .push(Box::new(QuotaTrimInputFactory {
+                    shared: shared.clone(),
+                    seeds: true,
+                }));
+            seeds.pipeline.needs_sink = false;
+            candidates
+                .pipeline
+                .factories
+                .push(Box::new(QuotaTrimInputFactory {
+                    shared: shared.clone(),
+                    seeds: false,
+                }));
+            candidates.pipeline.needs_sink = false;
+            let pipeline = new_source_pipeline_with_dop(
+                ctx,
+                Box::new(QuotaTrimSourceFactory {
+                    shared,
+                    output: ChunkSchema::from_static_layout(node.output_layout())?,
+                }),
+                1,
+            );
+            let mut extra = seeds.extra_pipelines;
+            extra.append(&mut candidates.extra_pipelines);
+            extra.push(seeds.pipeline);
+            extra.push(candidates.pipeline);
+            Ok(PipelineBuildResult {
+                pipeline,
+                extra_pipelines: extra,
+                stream: StreamDesc::single(),
+            })
+        }
+
         lp::ProgramNodeKind::RuntimeFilterConsumer {
             input,
             bindings: filter_bindings,
@@ -1440,6 +1600,7 @@ fn build_pipeline_for_program_node(
             }
         }
         lp::ProgramNodeKind::Project {
+            retention_admission,
             input,
             is_subordinate,
             exprs,
@@ -1447,6 +1608,11 @@ fn build_pipeline_for_program_node(
             expr_slot_schemas,
             output_indices,
         } => {
+            if *retention_admission != lp::ProjectRetentionAdmission::Existing {
+                return Err(
+                    "checked Project retention runtime integration is not installed".into(),
+                );
+            }
             let mut build = build_pipeline_for_program_node(program, bindings, *input, ctx)?;
             let schemas = expr_slot_schemas
                 .as_ref()
@@ -2139,6 +2305,7 @@ mod tests {
         };
         let root = ExecNode {
             kind: ExecNodeKind::Project(ProjectNode {
+                retention_admission: novarocks_local_program::ProjectRetentionAdmission::Existing,
                 input: Box::new(filter),
                 node_id: 3,
                 is_subordinate: false,
@@ -2331,6 +2498,7 @@ mod tests {
         )
         .unwrap();
         let bindings = LocalRuntimeBindings {
+            quota_domains: BTreeMap::new(),
             scans: BTreeMap::new(),
             writers: BTreeMap::new(),
             finishers: BTreeMap::new(),
@@ -2384,6 +2552,7 @@ mod tests {
         )
         .unwrap();
         let bindings = LocalRuntimeBindings {
+            quota_domains: BTreeMap::new(),
             scans: BTreeMap::new(),
             writers: BTreeMap::new(),
             finishers: BTreeMap::new(),

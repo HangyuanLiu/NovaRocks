@@ -572,7 +572,9 @@ impl ConnectorScanPlanning for Fixture {
             ConnectorScanSelection::ChangeWindow(window) => ConnectorScan::try_new_change_window(
                 owner,
                 window,
-                ConnectorChangeWindowAdmission::MetadataOnly,
+                ConnectorChangeWindowAdmission::ContentNetZero {
+                    basis: novarocks_spi::connector::ConnectorContentNetZeroBasis::PhysicalIdentity,
+                },
                 scan_handle,
                 output_schema,
                 predicate_dispositions,

@@ -117,33 +117,107 @@ pub(crate) fn encode_abort_cause(value: AbortCause) -> i32 {
 }
 
 fn decode_failure_category(
-    value: i32,
+    failure: &novarocks::TaskFailure,
     path: FieldPath,
 ) -> Result<TaskFailureCategory, ProtocolError> {
-    match novarocks::TaskFailureCategory::try_from(value) {
-        Ok(novarocks::TaskFailureCategory::Execution) => Ok(TaskFailureCategory::Execution),
-        Ok(novarocks::TaskFailureCategory::ResourceExhausted) => {
-            Ok(TaskFailureCategory::ResourceExhausted)
+    use novarocks::task_failure::BoundedPayload;
+    let category = novarocks::TaskFailureCategory::try_from(failure.category)
+        .map_err(|_| invalid_enum(path.clone(), "unknown task failure category"))?;
+    let value = match (category, failure.bounded_payload.as_ref()) {
+        (novarocks::TaskFailureCategory::Execution, None) => TaskFailureCategory::Execution,
+        (novarocks::TaskFailureCategory::ResourceExhausted, None) => {
+            TaskFailureCategory::ResourceExhausted
         }
-        Ok(novarocks::TaskFailureCategory::Exchange) => Ok(TaskFailureCategory::Exchange),
-        Ok(novarocks::TaskFailureCategory::Protocol) => Ok(TaskFailureCategory::Protocol),
-        Ok(novarocks::TaskFailureCategory::Internal) => Ok(TaskFailureCategory::Internal),
-        Ok(novarocks::TaskFailureCategory::Unspecified) | Err(_) => Err(invalid_enum(
-            path,
-            "failure category must be a known non-default value",
-        )),
-    }
+        (novarocks::TaskFailureCategory::Exchange, None) => TaskFailureCategory::Exchange,
+        (novarocks::TaskFailureCategory::Protocol, None) => TaskFailureCategory::Protocol,
+        (novarocks::TaskFailureCategory::Internal, None) => TaskFailureCategory::Internal,
+        (
+            novarocks::TaskFailureCategory::CapacityRefused,
+            Some(BoundedPayload::CapacityRefused(v)),
+        ) => TaskFailureCategory::CapacityRefused {
+            resource: decode_safe_detail(&v.resource, path.clone().field("resource"))?,
+            requested: v.requested,
+            limit: v.limit,
+        },
+        (
+            novarocks::TaskFailureCategory::MvApplyConsistency,
+            Some(BoundedPayload::MvApplyConsistency(v)),
+        ) => TaskFailureCategory::MvApplyConsistency {
+            requested: v.requested,
+            matched: v.matched,
+            sample: decode_safe_detail(&v.sample, path.clone().field("sample"))?,
+        },
+        (
+            novarocks::TaskFailureCategory::TargetFormatUnsupported,
+            Some(BoundedPayload::TargetFormatUnsupported(v)),
+        ) => TaskFailureCategory::TargetFormatUnsupported {
+            data_file: decode_safe_detail(&v.data_file, path.clone().field("data_file"))?,
+            delete_kind: decode_safe_detail(&v.delete_kind, path.clone().field("delete_kind"))?,
+        },
+        _ => {
+            return Err(invalid_enum(
+                path,
+                "task failure category and bounded payload disagree",
+            ));
+        }
+    };
+    Ok(value)
 }
 
-fn encode_failure_category(value: TaskFailureCategory) -> i32 {
-    let encoded = match value {
-        TaskFailureCategory::Execution => novarocks::TaskFailureCategory::Execution,
-        TaskFailureCategory::ResourceExhausted => novarocks::TaskFailureCategory::ResourceExhausted,
-        TaskFailureCategory::Exchange => novarocks::TaskFailureCategory::Exchange,
-        TaskFailureCategory::Protocol => novarocks::TaskFailureCategory::Protocol,
-        TaskFailureCategory::Internal => novarocks::TaskFailureCategory::Internal,
+fn encode_failure_category(
+    value: TaskFailureCategory,
+) -> (i32, Option<novarocks::task_failure::BoundedPayload>) {
+    use novarocks::task_failure::BoundedPayload;
+    let (category, payload) = match value {
+        TaskFailureCategory::Execution => (novarocks::TaskFailureCategory::Execution, None),
+        TaskFailureCategory::ResourceExhausted => {
+            (novarocks::TaskFailureCategory::ResourceExhausted, None)
+        }
+        TaskFailureCategory::Exchange => (novarocks::TaskFailureCategory::Exchange, None),
+        TaskFailureCategory::Protocol => (novarocks::TaskFailureCategory::Protocol, None),
+        TaskFailureCategory::Internal => (novarocks::TaskFailureCategory::Internal, None),
+        TaskFailureCategory::CapacityRefused {
+            resource,
+            requested,
+            limit,
+        } => (
+            novarocks::TaskFailureCategory::CapacityRefused,
+            Some(BoundedPayload::CapacityRefused(
+                novarocks::TaskCapacityRefused {
+                    resource: resource.as_str().to_owned(),
+                    requested,
+                    limit,
+                },
+            )),
+        ),
+        TaskFailureCategory::MvApplyConsistency {
+            requested,
+            matched,
+            sample,
+        } => (
+            novarocks::TaskFailureCategory::MvApplyConsistency,
+            Some(BoundedPayload::MvApplyConsistency(
+                novarocks::TaskMvApplyConsistency {
+                    requested,
+                    matched,
+                    sample: sample.as_str().to_owned(),
+                },
+            )),
+        ),
+        TaskFailureCategory::TargetFormatUnsupported {
+            data_file,
+            delete_kind,
+        } => (
+            novarocks::TaskFailureCategory::TargetFormatUnsupported,
+            Some(BoundedPayload::TargetFormatUnsupported(
+                novarocks::TaskTargetFormatUnsupported {
+                    data_file: data_file.as_str().to_owned(),
+                    delete_kind: delete_kind.as_str().to_owned(),
+                },
+            )),
+        ),
     };
-    encoded as i32
+    (category as i32, payload)
 }
 
 fn decode_failure_phase(value: i32, path: FieldPath) -> Result<TaskFailurePhase, ProtocolError> {
@@ -195,7 +269,7 @@ fn decode_termination(
         novarocks::task_termination::Cause::Failed(failure) => {
             let failure_path = path.field("failed");
             let category =
-                decode_failure_category(failure.category, failure_path.clone().field("category"))?;
+                decode_failure_category(failure, failure_path.clone().field("category"))?;
             let detail = decode_safe_detail(
                 &failure.safe_detail,
                 failure_path.clone().field("safe_detail"),
@@ -215,8 +289,10 @@ fn encode_termination(value: &TerminationDetail) -> novarocks::TaskTermination {
             novarocks::task_termination::Cause::Aborted(encode_abort_cause(*cause))
         }
         TerminationDetail::Failed(failure) => {
+            let (category, bounded_payload) = encode_failure_category(failure.category());
             novarocks::task_termination::Cause::Failed(novarocks::TaskFailure {
-                category: encode_failure_category(failure.category()),
+                category,
+                bounded_payload,
                 safe_detail: failure.detail().as_str().to_owned(),
                 phase: encode_failure_phase(failure.phase()),
             })
@@ -497,5 +573,255 @@ pub fn encode_final_task_info(value: &FinalTaskInfo) -> novarocks::FinalTaskInfo
             })
             .collect(),
         operator_statistics_truncated: value.operator_statistics_truncated(),
+    }
+}
+
+/// Validated before native encoding; no unbounded or ambiguous success shape is legal.
+pub fn encode_verification(
+    src: &novarocks_execution_contract::ContextVerificationFacts,
+) -> novarocks::ContextVerificationFacts {
+    use novarocks_execution_contract::{TaskVerificationObservation, VerificationState};
+    src.validate()
+        .expect("producer must seal valid verification facts");
+    novarocks::ContextVerificationFacts {
+        query_context: Some(crate::identity::encode_query_context_ref(src.context)),
+        truncated: src.truncated,
+        tasks: src
+            .tasks
+            .iter()
+            .map(|task| {
+                let (observation, records) = match &task.observation {
+                    TaskVerificationObservation::Available(records) => (
+                        1,
+                        records
+                            .iter()
+                            .map(|record| {
+                                let (state, requested, matched) = match record.state {
+                                    VerificationState::NotStarted => (1, None, None),
+                                    VerificationState::Started => (2, None, None),
+                                    VerificationState::Completed { requested, matched } => {
+                                        (3, Some(requested), Some(matched))
+                                    }
+                                };
+                                novarocks::VerificationRecord {
+                                    plan_node_id: record.instance.plan_node_id,
+                                    local_instance_id: record.instance.local_instance_id,
+                                    state,
+                                    requested,
+                                    matched,
+                                }
+                            })
+                            .collect(),
+                    ),
+                    TaskVerificationObservation::Truncated => (2, Vec::new()),
+                    TaskVerificationObservation::Unavailable => (3, Vec::new()),
+                };
+                novarocks::TaskVerificationFacts {
+                    task: Some(encode_task_identity(task.identity)),
+                    observation,
+                    records,
+                }
+            })
+            .collect(),
+    }
+}
+
+pub fn decode_verification(
+    src: &novarocks::ContextVerificationFacts,
+    expected: novarocks_execution_contract::QueryContextRef,
+    path: FieldPath,
+) -> Result<novarocks_execution_contract::ContextVerificationFacts, ProtocolError> {
+    use novarocks_execution_contract::*;
+    let context = crate::identity::decode_query_context_ref(
+        src.query_context.as_ref().ok_or_else(|| {
+            missing(
+                path.clone().field("query_context"),
+                "verification requires the exact released context",
+            )
+        })?,
+        path.clone().field("query_context"),
+    )?;
+    if context != expected {
+        return Err(inconsistent(
+            path,
+            "verification context differs from the release acknowledgement",
+        ));
+    }
+    if src.tasks.len() > VERIFICATION_MAX_TASKS_PER_CONTEXT {
+        return Err(out_of_range(path, "verification task budget exceeded"));
+    }
+    let mut tasks = Vec::with_capacity(src.tasks.len());
+    let mut total_instances = 0usize;
+    for (index, task) in src.tasks.iter().enumerate() {
+        let task_path = path.clone().field("tasks").index(index);
+        if task.records.len() > VERIFICATION_MAX_INSTANCES_PER_TASK {
+            return Err(out_of_range(
+                task_path,
+                "verification instance budget exceeded",
+            ));
+        }
+        total_instances += task.records.len();
+        if total_instances > VERIFICATION_MAX_INSTANCES_PER_CONTEXT {
+            return Err(out_of_range(
+                task_path,
+                "context verification instance budget exceeded",
+            ));
+        }
+        let identity = decode_task_identity(
+            task.task.as_ref().ok_or_else(|| {
+                missing(
+                    task_path.clone().field("task"),
+                    "verification requires an exact task identity",
+                )
+            })?,
+            task_path.clone().field("task"),
+        )?;
+        let observation = match task.observation {
+            1 => {
+                let mut records = Vec::with_capacity(task.records.len());
+                for record in &task.records {
+                    let state = match (record.state, record.requested, record.matched) {
+                        (1, None, None) => VerificationState::NotStarted,
+                        (2, None, None) => VerificationState::Started,
+                        (3, Some(requested), Some(matched)) if matched <= requested => {
+                            VerificationState::Completed { requested, matched }
+                        }
+                        _ => {
+                            return Err(invalid(
+                                task_path.clone(),
+                                "unknown or contradictory verification state payload",
+                            ));
+                        }
+                    };
+                    records.push(VerificationRecord {
+                        instance: VerificationInstance {
+                            plan_node_id: record.plan_node_id,
+                            local_instance_id: record.local_instance_id,
+                        },
+                        state,
+                    });
+                }
+                TaskVerificationObservation::Available(records)
+            }
+            2 if task.records.is_empty() => TaskVerificationObservation::Truncated,
+            3 if task.records.is_empty() => TaskVerificationObservation::Unavailable,
+            _ => {
+                return Err(invalid(
+                    task_path,
+                    "unknown or contradictory verification observation",
+                ));
+            }
+        };
+        tasks.push(TaskVerificationFacts {
+            identity,
+            observation,
+        });
+    }
+    let result = ContextVerificationFacts {
+        context,
+        tasks,
+        truncated: src.truncated,
+    };
+    result.validate().map_err(|error| invalid(path, error))?;
+    Ok(result)
+}
+
+#[cfg(test)]
+mod verification_tests {
+    use super::*;
+    use novarocks_execution_contract::*;
+    use novarocks_types::identity::*;
+
+    fn fixture() -> ContextVerificationFacts {
+        let execution =
+            QueryExecutionId::new(QueryId::new(7, 9), AttemptId::new(1).unwrap()).unwrap();
+        let backend = BackendProcessId::new_v7();
+        let context = QueryContextRef::new(execution, FrontendProcessId::new_v7(), backend);
+        let identity = TaskIdentity::new(
+            execution,
+            StageId::new(1).unwrap(),
+            TaskId::new(1).unwrap(),
+            backend,
+        );
+        ContextVerificationFacts {
+            context,
+            truncated: false,
+            tasks: vec![TaskVerificationFacts {
+                identity,
+                observation: TaskVerificationObservation::Available(vec![VerificationRecord {
+                    instance: VerificationInstance {
+                        plan_node_id: 8,
+                        local_instance_id: 0,
+                    },
+                    state: VerificationState::Completed {
+                        requested: 5,
+                        matched: 5,
+                    },
+                }]),
+            }],
+        }
+    }
+
+    #[test]
+    fn verification_wire_roundtrip_and_closed_state_payloads() {
+        let facts = fixture();
+        let path = FieldPath::root("verification");
+        let wire = encode_verification(&facts);
+        assert_eq!(
+            decode_verification(&wire, facts.context, path.clone()).unwrap(),
+            facts
+        );
+        for state in [0, 4, u32::MAX] {
+            let mut bad = wire.clone();
+            bad.tasks[0].records[0].state = state;
+            assert!(decode_verification(&bad, facts.context, path.clone()).is_err());
+        }
+        let mut bad = wire.clone();
+        bad.tasks[0].records[0].matched = Some(6);
+        assert!(decode_verification(&bad, facts.context, path.clone()).is_err());
+        bad.tasks[0].observation = 3;
+        assert!(decode_verification(&bad, facts.context, path.clone()).is_err());
+        let foreign = fixture();
+        assert!(decode_verification(&wire, foreign.context, path).is_err());
+    }
+
+    #[test]
+    fn verification_wire_rejects_duplicate_instances_identity_and_budget() {
+        let facts = fixture();
+        let mut wire = encode_verification(&facts);
+        let path = FieldPath::root("verification");
+        let duplicate = wire.tasks[0].records[0].clone();
+        wire.tasks[0].records.push(duplicate);
+        assert!(decode_verification(&wire, facts.context, path.clone()).is_err());
+        wire.tasks[0].records =
+            vec![wire.tasks[0].records[0].clone(); VERIFICATION_MAX_INSTANCES_PER_TASK + 1];
+        assert!(decode_verification(&wire, facts.context, path.clone()).is_err());
+        wire.tasks[0].records.clear();
+        wire.tasks[0].task = None;
+        assert!(decode_verification(&wire, facts.context, path).is_err());
+    }
+
+    #[test]
+    fn verification_wire_roundtrip_preserves_complete_deficit() {
+        let mut facts = fixture();
+        let TaskVerificationObservation::Available(records) = &mut facts.tasks[0].observation
+        else {
+            unreachable!()
+        };
+        records[0].state = VerificationState::Completed {
+            requested: 5,
+            matched: 2,
+        };
+        let wire = encode_verification(&facts);
+        let decoded =
+            decode_verification(&wire, facts.context, FieldPath::root("verification")).unwrap();
+        assert_eq!(decoded, facts);
+        assert!(!decoded.permits_rollback(&[(
+            facts.tasks[0].identity,
+            VerificationInstance {
+                plan_node_id: 8,
+                local_instance_id: 0
+            }
+        )]));
     }
 }

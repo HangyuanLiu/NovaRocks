@@ -584,7 +584,7 @@ impl ConnectorMetadata for IcebergMetadata {
         let definition_schema = metadata.current_schema().clone();
         let table_comment = metadata.properties().get("comment").cloned();
         let mut base_schema =
-            crate::scalar_integer_domain::metadata_sql_schema(metadata, metadata.current_schema())?;
+            crate::field_domain::metadata_sql_schema(metadata, metadata.current_schema())?;
         let hidden_columns = hidden_internal_columns(metadata.properties());
         base_schema = annotate_hidden_fields(base_schema, &hidden_columns);
         // Carry the same frozen field facts a scan output schema carries, so the
@@ -1450,11 +1450,11 @@ pub(crate) fn projected_schema(
     } else {
         metadata.current_schema().clone()
     };
-    let declarations = crate::scalar_integer_domain::metadata_declarations(&metadata)?;
-    let storage = crate::scalar_integer_domain::apply_schema(
+    let declarations = crate::field_domain::metadata_declarations(&metadata)?;
+    let storage = crate::field_domain::apply_schema(
         crate::schema_mapping::sql_read_schema_from_iceberg(&storage_schema).map_err(corrupt)?,
         &storage_schema,
-        &declarations,
+        declarations.fields(),
     )?;
     // Field IDs survive the Arrow conversion but initial defaults do not, so the
     // frozen schema has to re-stamp them before the scan schema leaves the
@@ -1968,7 +1968,9 @@ fn read_reference_facts(
     )
 }
 
-fn logical_type_columns(properties: &HashMap<String, String>) -> BTreeMap<String, String> {
+pub(crate) fn logical_type_columns(
+    properties: &HashMap<String, String>,
+) -> BTreeMap<String, String> {
     properties
         .iter()
         .filter_map(|(key, value)| {
@@ -2094,11 +2096,11 @@ mod hidden_column_tests {
     use super::{APPLY_KEY_COLUMN_PROPERTY, HIDDEN_COLUMNS_PROPERTY, hidden_internal_columns};
 
     #[test]
-    fn an_mv_targets_apply_key_and_state_columns_are_hidden_from_sql() {
+    fn an_aggregate_mv_targets_group_key_and_state_columns_are_hidden_from_sql() {
         let properties = HashMap::from([
             (
                 APPLY_KEY_COLUMN_PROPERTY.to_string(),
-                "__nova_base_row_id".to_string(),
+                "__nova_group_row_id".to_string(),
             ),
             (
                 HIDDEN_COLUMNS_PROPERTY.to_string(),
@@ -2111,7 +2113,7 @@ mod hidden_column_tests {
 
         assert_eq!(
             hidden,
-            vec!["__nova_base_row_id", "__sum_state_v1", "__count_state_v1"],
+            vec!["__nova_group_row_id", "__sum_state_v1", "__count_state_v1"],
             "the apply key comes first and both property lists contribute; missing \
              either one leaks an engine-owned column into every SELECT * on the target"
         );
@@ -2120,6 +2122,12 @@ mod hidden_column_tests {
     #[test]
     fn a_plain_table_hides_nothing() {
         assert!(hidden_internal_columns(&HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn a_visible_bag_mv_target_hides_no_persisted_columns() {
+        let properties = HashMap::from([("comment".to_string(), "visible tuple bag".to_string())]);
+        assert!(hidden_internal_columns(&properties).is_empty());
     }
 }
 

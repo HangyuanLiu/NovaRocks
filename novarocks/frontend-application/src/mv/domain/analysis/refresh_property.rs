@@ -43,13 +43,15 @@ pub(crate) fn map_sql_imv_refresh_contract(
     value: SqlImvRefreshContractFacts,
 ) -> ImvRefreshContract {
     let apply_key = match value.apply_key {
-        SqlImvApplyKeyFacts::ProjectionFilter => ApplyKeyContract::projection_filter(),
-        SqlImvApplyKeyFacts::UnionProjectionFilter => ApplyKeyContract::union_projection_filter(),
-        SqlImvApplyKeyFacts::JoinProjectionFilter => ApplyKeyContract::join_projection_filter(),
-        SqlImvApplyKeyFacts::AggregateGroupRow => ApplyKeyContract::aggregate_group_row(),
-        SqlImvApplyKeyFacts::JoinAggregateGroupRow => ApplyKeyContract::join_aggregate_group_row(),
+        SqlImvApplyKeyFacts::ProjectionFilter
+        | SqlImvApplyKeyFacts::UnionProjectionFilter
+        | SqlImvApplyKeyFacts::JoinProjectionFilter => None,
+        SqlImvApplyKeyFacts::AggregateGroupRow => Some(ApplyKeyContract::aggregate_group_row()),
+        SqlImvApplyKeyFacts::JoinAggregateGroupRow => {
+            Some(ApplyKeyContract::join_aggregate_group_row())
+        }
         SqlImvApplyKeyFacts::BranchUnionAggregateGroupRow => {
-            ApplyKeyContract::branch_union_aggregate_group_row()
+            Some(ApplyKeyContract::branch_union_aggregate_group_row())
         }
     };
     ImvRefreshContract {
@@ -95,7 +97,7 @@ mod tests {
         assert_eq!(mapped.branch.unwrap().branch_count, 4);
         assert_eq!(
             mapped.apply_key,
-            ApplyKeyContract::branch_union_aggregate_group_row()
+            Some(ApplyKeyContract::branch_union_aggregate_group_row())
         );
     }
 }

@@ -35,6 +35,44 @@ use crate::query_execution::mv_assembly::refresh_handoff::PreparedMvRefreshWrite
 use novarocks_mv_application::publication::{MvRefreshCommittedFacts, MvRefreshPublicationIntent};
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 
+/// Application-owned error boundary for preparing an MV write before dispatch.
+/// Provider errors retain their exact typed payload for durable refusal handling.
+#[derive(Debug)]
+pub enum MvWritePreparationError {
+    Connector(novarocks_spi::connector::ConnectorError),
+    Contract(String),
+}
+
+impl From<String> for MvWritePreparationError {
+    fn from(error: String) -> Self {
+        Self::Contract(error)
+    }
+}
+
+impl From<novarocks_spi::connector::ConnectorError> for MvWritePreparationError {
+    fn from(error: novarocks_spi::connector::ConnectorError) -> Self {
+        Self::Connector(error)
+    }
+}
+
+impl std::fmt::Display for MvWritePreparationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connector(error) => std::fmt::Display::fmt(error, formatter),
+            Self::Contract(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for MvWritePreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Connector(error) => Some(error),
+            Self::Contract(_) => None,
+        }
+    }
+}
+
 /// Exact completed-plan inputs for one Frontend-owned MV native assembly.
 ///
 /// The plan and its frozen read access are paired before encoding. Finishing
@@ -236,7 +274,7 @@ pub trait MvRefreshProviderActivation: Send + Sync {
         exact_lease: &ConnectorWriteLease,
         execution: &QueryExecutionContext,
         connector_context: ConnectorRequestContext,
-    ) -> Result<PreparedMvNativeWriteAssembly, String>;
+    ) -> Result<PreparedMvNativeWriteAssembly, MvWritePreparationError>;
 
     /// Open the session one metadata-only publication commits through.
     ///
@@ -274,4 +312,44 @@ pub trait MvRefreshProviderActivation: Send + Sync {
         operation_id: uuid::Uuid,
         connector_context: &ConnectorRequestContext,
     ) -> Result<(), String>;
+}
+
+#[cfg(test)]
+mod preparation_error_tests {
+    use super::MvWritePreparationError;
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorTargetDeleteKind};
+
+    #[test]
+    fn mv_write_preparation_preserves_connector_target_refusal_payload() {
+        for kind in [
+            ConnectorTargetDeleteKind::Equality,
+            ConnectorTargetDeleteKind::ParquetPosition,
+        ] {
+            let provider =
+                ConnectorError::target_format_unsupported("file:///exact-candidate.parquet", kind);
+            let expected = provider.clone();
+            let preparation = MvWritePreparationError::from(provider);
+            let MvWritePreparationError::Connector(actual) = preparation else {
+                panic!("connector preparation failure must retain its typed classification");
+            };
+            assert_eq!(actual, expected);
+            assert_eq!(actual.kind(), ConnectorErrorKind::Unsupported);
+            let target = actual
+                .target_format_failure()
+                .expect("target refusal payload");
+            assert_eq!(target.data_file, "file:///exact-candidate.parquet");
+            assert_eq!(target.delete_kind, kind);
+        }
+    }
+
+    #[test]
+    fn mv_write_preparation_contract_message_does_not_infer_connector_classification() {
+        let message =
+            "MV target data file file:///candidate uses unsupported Equality deletes".to_string();
+        let preparation = MvWritePreparationError::from(message.clone());
+        assert!(
+            matches!(&preparation, MvWritePreparationError::Contract(actual) if actual == &message)
+        );
+        assert_eq!(preparation.to_string(), message);
+    }
 }

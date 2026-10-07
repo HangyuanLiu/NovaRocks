@@ -131,7 +131,7 @@ pub struct RelationOccurrence {
 pub struct SourceFieldBinding {
     pub field_id: FieldIdentity,
     pub name_at_binding: String,
-    pub type_signature: String,
+    pub data_type: crate::persistence::codec::MvLogicalType,
     pub nullable: bool,
 }
 
@@ -139,7 +139,7 @@ pub struct SourceFieldBinding {
 pub struct OutputDefinition {
     pub output_id: OutputIdentity,
     pub name: String,
-    pub type_signature: String,
+    pub data_type: crate::persistence::codec::MvLogicalType,
     pub nullable: bool,
     pub expression: ExpressionShape,
 }
@@ -175,7 +175,7 @@ pub struct InterpretationDocument {
     pub outputs: Vec<OutputBinding>,
     /// Set semantics, canonically sorted by slot identity.
     pub state_slots: Vec<StateSlot>,
-    pub apply_key: ApplyKey,
+    pub apply_key: Option<ApplyKey>,
     /// Set semantics, canonically sorted by aggregate identity.
     pub aggregates: Vec<AggregateInterpretation>,
     /// Ordered UNION branches. Their position is semantic.
@@ -187,7 +187,7 @@ pub struct InterpretationDocument {
 pub struct OutputBinding {
     pub output_id: OutputIdentity,
     pub target_field_id: FieldIdentity,
-    pub type_signature: String,
+    pub data_type: crate::persistence::codec::MvLogicalType,
     pub nullable: bool,
 }
 
@@ -195,7 +195,7 @@ pub struct OutputBinding {
 pub struct StateSlot {
     pub slot_id: StateSlotIdentity,
     pub target_field_id: FieldIdentity,
-    pub type_signature: String,
+    pub data_type: crate::persistence::codec::MvLogicalType,
     pub nullable: bool,
     pub role: StateRole,
     pub encoding: StateEncoding,
@@ -229,8 +229,6 @@ pub struct ApplyKeyComponent {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApplyKeyKind {
-    BaseRowId,
-    JoinRowKey,
     GroupRowId,
 }
 
@@ -330,7 +328,7 @@ impl TryFrom<&novarocks_spi::connector::MvExactPartitionField> for TargetPartiti
 pub struct PhysicalFieldBinding {
     pub logical_identity: PhysicalFieldLogicalIdentity,
     pub target_field_id: FieldIdentity,
-    pub type_signature: String,
+    pub data_type: crate::persistence::codec::MvLogicalType,
     pub nullable: bool,
 }
 

@@ -48,7 +48,7 @@ use crate::commit::report::IcebergColumnStats;
 use crate::commit::write_stack::copy_on_write::IcebergCowBranchInput;
 use crate::commit::write_stack::old_delete::IcebergOldDeleteMergeTarget;
 use crate::delete_file::IcebergFileFormat;
-use crate::scan_model::IcebergSchemaDef;
+
 use crate::write_descriptor::IcebergPartitionDescriptor;
 
 pub(crate) fn invalid(message: impl Into<String>) -> ConnectorError {
@@ -841,7 +841,8 @@ impl IcebergWriterOutput {
 /// data writer writes through.
 #[derive(Clone, Debug)]
 pub struct IcebergDataBranchRecipe {
-    input_schema: Option<IcebergSchemaDef>,
+    input_schema: Option<Arc<crate::iceberg::spec::Schema>>,
+    field_domains: crate::field_domain::FieldDomains,
     partition_source_column_names: Vec<String>,
     partition_column_names: Vec<String>,
     transform_exprs: Vec<String>,
@@ -860,12 +861,43 @@ pub struct IcebergDataBranchRecipe {
 
 impl IcebergDataBranchRecipe {
     pub fn try_new(
-        input_schema: Option<IcebergSchemaDef>,
+        input_schema: Option<Arc<crate::iceberg::spec::Schema>>,
         partition_source_column_names: Vec<String>,
         partition_column_names: Vec<String>,
         transform_exprs: Vec<String>,
         row_lineage: bool,
     ) -> Result<Self, ConnectorError> {
+        Self::try_new_with_field_domains(
+            input_schema,
+            partition_source_column_names,
+            partition_column_names,
+            transform_exprs,
+            row_lineage,
+            Default::default(),
+        )
+    }
+
+    pub(crate) fn try_new_with_field_domains(
+        input_schema: Option<Arc<crate::iceberg::spec::Schema>>,
+        partition_source_column_names: Vec<String>,
+        partition_column_names: Vec<String>,
+        transform_exprs: Vec<String>,
+        row_lineage: bool,
+        field_domains: crate::field_domain::FieldDomains,
+    ) -> Result<Self, ConnectorError> {
+        // Capture validates retained history first; execution carries only
+        // active leaves of this exact schema, never unproved retired IDs.
+        crate::field_domain::encode(&field_domains)?;
+        if let Some(schema) = &input_schema {
+            crate::field_domain::validate_schema(schema, &field_domains)?;
+            if crate::field_domain::active(schema, &field_domains)? != field_domains {
+                return Err(invalid(
+                    "writer domain facts must all bind active schema leaves",
+                ));
+            }
+        } else if !field_domains.is_empty() {
+            return Err(invalid("writer domains require an exact input schema"));
+        }
         if partition_source_column_names.len() != partition_column_names.len()
             || partition_column_names.len() != transform_exprs.len()
         {
@@ -884,6 +916,7 @@ impl IcebergDataBranchRecipe {
         }
         Ok(Self {
             input_schema,
+            field_domains,
             partition_source_column_names,
             partition_column_names,
             transform_exprs,
@@ -891,8 +924,11 @@ impl IcebergDataBranchRecipe {
         })
     }
 
-    pub fn input_schema(&self) -> Option<&IcebergSchemaDef> {
-        self.input_schema.as_ref()
+    pub fn input_schema(&self) -> Option<&crate::iceberg::spec::Schema> {
+        self.input_schema.as_deref()
+    }
+    pub(crate) fn field_domains(&self) -> &crate::field_domain::FieldDomains {
+        &self.field_domains
     }
     pub fn partition_source_column_names(&self) -> &[String] {
         &self.partition_source_column_names
@@ -937,6 +973,14 @@ impl IcebergWriterHandle {
     ) -> Result<Self, ConnectorError> {
         if output.file_format() != IcebergFileFormat::Parquet {
             return Err(invalid("Iceberg data writer must produce Parquet"));
+        }
+        if data
+            .input_schema()
+            .is_some_and(|schema| schema.schema_id() != table.schema_id())
+        {
+            return Err(invalid(
+                "Iceberg data writer schema ID differs from its exact table generation",
+            ));
         }
         Ok(Self {
             branch: IcebergWriteBranch::Data,

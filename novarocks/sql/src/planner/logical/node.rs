@@ -27,6 +27,9 @@ use crate::planner::payload::{
     PlanFilterNode, PlanGenerateSeriesNode, PlanLimitNode, PlanProjectNode, PlanRepeatNode,
     PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode, PlanWindowNode,
 };
+use crate::planner::quota::{
+    PlanFanoutAnchorNode, PlanFanoutConsumeNode, PlanQuotaPreclaimNode, PlanQuotaTrimNode,
+};
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -58,6 +61,10 @@ pub(crate) enum LogicalPlanKind {
     Union(LogicalUnionNode),
     Intersect(LogicalIntersectNode),
     Except(LogicalExceptNode),
+    QuotaPreclaim(PlanQuotaPreclaimNode),
+    QuotaTrim(PlanQuotaTrimNode),
+    FanoutAnchor(PlanFanoutAnchorNode),
+    FanoutConsume(PlanFanoutConsumeNode),
     CTEAnchor(PlanCTEAnchorNode),
     CTEProduce(PlanCTEProduceNode),
     CTEConsume(PlanCTEConsumeNode),
@@ -85,6 +92,10 @@ impl LogicalPlanKind {
             LogicalPlanKind::Union(_) => "Union",
             LogicalPlanKind::Intersect(_) => "Intersect",
             LogicalPlanKind::Except(_) => "Except",
+            LogicalPlanKind::QuotaPreclaim(_) => "QuotaPreclaim",
+            LogicalPlanKind::QuotaTrim(_) => "QuotaTrim",
+            LogicalPlanKind::FanoutAnchor(_) => "FanoutAnchor",
+            LogicalPlanKind::FanoutConsume(_) => "FanoutConsume",
             LogicalPlanKind::CTEAnchor(_) => "CTEAnchor",
             LogicalPlanKind::CTEProduce(_) => "CTEProduce",
             LogicalPlanKind::CTEConsume(_) => "CTEConsume",
@@ -113,6 +124,10 @@ impl LogicalPlanKind {
             "Union",
             "Intersect",
             "Except",
+            "QuotaPreclaim",
+            "QuotaTrim",
+            "FanoutAnchor",
+            "FanoutConsume",
             "CTEAnchor",
             "CTEProduce",
             "CTEConsume",

@@ -50,7 +50,9 @@ pub use program::{
     AggregateTopNFilter, AnalyticOutputColumn, AssertRowsMode, ChangeEventOutputExpr,
     ChangeEventSpec, FilterConsumerAtExpr, FilterProducerAtExpr, JoinDistributionMode, JoinType,
     LocalProgram, LocalProgramError, MAX_PROGRAM_EXPANDED_OCCURRENCES, MAX_PROGRAM_NODE_DEPTH,
-    MAX_PROGRAM_NODES, NestedLoopJoinType, ProgramNode, ProgramNodeKind, ProjectExpressionSlot,
+    MAX_PROGRAM_NODES, MembershipComparison, MembershipDistribution, MembershipSpec,
+    NestedLoopJoinType, ProgramNode, ProgramNodeKind, ProjectExpressionSlot,
+    ProjectRetentionAdmission, QuotaContentFilter, QuotaNeed, QuotaPreclaimSpec, QuotaTrimSpec,
     RowAssertion, SetOpKind, SortExpression, SortTopNType, StaticAggregateCall,
     StaticAggregateOrder, StaticAggregateTypeSignature, StaticWindowFunction,
     StaticWriterProjection, StreamingPreaggregationMode, TableFunctionOutputSlot, UnpivotConstant,
@@ -60,7 +62,7 @@ pub use program::{
 };
 pub use requirements::{
     BindingRequirement, BindingRequirements, BindingRequirementsError, ProgramNodeId,
-    ScanSourceKind,
+    QuotaDomainId, ScanSourceKind,
 };
 pub use runtime_filter::{
     FilterConsumerActivation, FilterLateApplyGranularity, FilterNullOrder, FilterNullSemantics,

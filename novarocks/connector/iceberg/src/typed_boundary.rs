@@ -39,6 +39,10 @@
 //! untouched and keeps its own resolution rules.
 // Design: ADR-0123 (docs/adr/ADR-0123-task-update-watermark-retry-delivery.md)
 
+use crate::mv_target_candidates::{
+    freeze_mv_target_candidate_files, select_mv_target_files,
+    validate_mv_target_candidate_snapshot, validate_mv_target_partition_selection,
+};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -48,23 +52,22 @@ use novarocks_spi::connector::read_stack::adapter::{
     ProviderReadRuntime, ProviderReadSplitSource, ProviderReadSystemTablePlan,
 };
 use novarocks_spi::connector::read_stack::{
-    Assignment, Bound, ConnectorExpression, ConnectorMvPartitionValue,
-    ConnectorMvTargetPartitionSelection, ConnectorReadArtifactCoverage,
-    ConnectorReadAttemptAccessMint, ConnectorReadAttemptAccessReacquirer,
-    ConnectorReadAttemptAccessSealer, ConnectorReadAttemptAccessSource,
-    ConnectorReadAttemptRuntime, ConnectorReadChangeWindow, ConnectorReadDistribution,
-    ConnectorReadInputVersion, ConnectorReadMetadataRequest, ConnectorReadMetadataVersion,
-    ConnectorReadProperties, ConnectorReadRelationVersion, ConnectorReadRequestControl,
-    ConnectorReadRequestControlFactory, ConnectorReadStaticFacts, ConnectorReadTableHandle,
-    ConnectorSession, ConnectorSplitBatch, ConnectorSplitSource, ConnectorTableHandle as _,
-    ConnectorValue, ConnectorValueType, Constraint, Domain, DynamicFilterSnapshot,
-    OrderedAssignments, Range, SchemaTableName, SplitWeight, SystemTableDistribution, TupleDomain,
-    ValueSet,
+    Assignment, Bound, ConnectorExpression, ConnectorMvTargetPartitionSelection,
+    ConnectorReadArtifactCoverage, ConnectorReadAttemptAccessMint,
+    ConnectorReadAttemptAccessReacquirer, ConnectorReadAttemptAccessSealer,
+    ConnectorReadAttemptAccessSource, ConnectorReadAttemptRuntime, ConnectorReadChangeWindow,
+    ConnectorReadDistribution, ConnectorReadInputVersion, ConnectorReadMetadataRequest,
+    ConnectorReadMetadataVersion, ConnectorReadProperties, ConnectorReadRelationVersion,
+    ConnectorReadRequestControl, ConnectorReadRequestControlFactory, ConnectorReadStaticFacts,
+    ConnectorReadTableHandle, ConnectorSession, ConnectorSplitBatch, ConnectorSplitSource,
+    ConnectorTableHandle as _, ConnectorValue, ConnectorValueType, Constraint, Domain,
+    DynamicFilterSnapshot, OrderedAssignments, Range, SchemaTableName, SplitWeight,
+    SystemTableDistribution, TupleDomain, ValueSet,
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorOperationControl,
-    ConnectorPinnedFileSet, ConnectorRequestContext, MvExactPartitionTransform,
-    ProviderBindingEpoch, REWRITE_POSITION_DELETES_KIND,
+    ConnectorPinnedFileSet, ConnectorRequestContext, ProviderBindingEpoch,
+    REWRITE_POSITION_DELETES_KIND,
 };
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -415,10 +418,15 @@ impl IcebergTypedBoundary {
             .endpoint()
             .schema()
             .map_err(|e| corrupt(e.to_string()))?;
-        let integer_domains = crate::scalar_integer_domain::of_schema(
+        let selected = scoped_field_domains(
             &schema,
-            &crate::scalar_integer_domain::metadata_declarations(table.metadata())?,
+            &crate::field_domain::metadata_declarations(table.metadata())?,
         )?;
+        let integer_domains = selected
+            .fields()
+            .iter()
+            .filter_map(|(id, domain)| domain.integer().map(|d| (*id, d)))
+            .collect();
         let partition_specs = domain
             .endpoint()
             .partition_spec_jsons()
@@ -944,6 +952,88 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
         )))
     }
 
+    fn get_mv_target_candidate_handle(
+        &self,
+        _session: &ConnectorSession,
+        name: &SchemaTableName,
+        exact_snapshot_id: i64,
+        candidates: &novarocks_spi::connector::write_stack::ConnectorMvTargetCandidateSelection,
+    ) -> Result<Option<crate::typed_read::IcebergRuntimeRelation>, ConnectorError> {
+        if system_relation_of(name.table_name()).is_some() {
+            return Ok(None);
+        }
+        let Some(physical) = self.load_relation(name)? else {
+            return Ok(None);
+        };
+        let metadata = physical.table.metadata();
+        validate_mv_target_candidate_snapshot(metadata, exact_snapshot_id, candidates)?;
+        let schema = projection_schema_for_pinned_snapshot(metadata, exact_snapshot_id)?;
+        let empty = matches!(
+            candidates,
+            novarocks_spi::connector::write_stack::ConnectorMvTargetCandidateSelection::Partitions(selection)
+                if selection.keys().is_empty()
+        );
+        let files = if empty {
+            Vec::new()
+        } else {
+            self.check_request_active()?;
+            let table = physical.table.clone();
+            let control = self.request_context.clone();
+            let result = self
+                .runtime
+                .resources()
+                .catalog_runtime()
+                .block_on(async move {
+                    crate::manifest::extract_data_files_with_stats_at_with_control(
+                        &table,
+                        exact_snapshot_id,
+                        control
+                            .as_ref()
+                            .map(|control| control as &dyn ConnectorOperationControl),
+                    )
+                    .await
+                });
+            self.complete_sdk_read(result)?
+        };
+        #[cfg(debug_assertions)]
+        let trace_all = if crate::candidate_fixture::armed(metadata).map_err(invalid)? {
+            Some(
+                files
+                    .iter()
+                    .take(65)
+                    .map(|file| file.path.clone())
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
+        let selected =
+            freeze_mv_target_candidate_files(metadata, exact_snapshot_id, files, candidates)?;
+        #[cfg(debug_assertions)]
+        if let Some(all) = trace_all {
+            let paths = match selected.as_ref() {
+                Some(selected) => selected
+                    .paths()
+                    .iter()
+                    .map(|path| path.to_string())
+                    .collect(),
+                None => all,
+            };
+            crate::candidate_fixture::record(metadata, exact_snapshot_id, "reader-pinned", paths)
+                .map_err(invalid)?;
+        }
+        self.check_request_active()?;
+        Ok(Some(crate::typed_read::IcebergRuntimeRelation::Table(
+            pinned_table_handle_with_schema(
+                name,
+                metadata,
+                Some(exact_snapshot_id),
+                schema,
+                selected,
+            )?,
+        )))
+    }
+
     fn get_column_bindings(
         &self,
         _session: &ConnectorSession,
@@ -1017,9 +1107,7 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                     columns.push((
                         field.name.to_string(),
                         IcebergColumnHandle::base_column(field.as_ref())?
-                            .with_scalar_integer_domain(
-                                handle.scalar_integer_domains().get(&field.id).copied(),
-                            )?,
+                            .with_table_field_domains(handle.persisted_field_domains())?,
                         false,
                     ));
                 }
@@ -1860,136 +1948,6 @@ impl ProviderReadSplitSource<IcebergTypedBoundary> for OneRuntimeSplitSource {
 // Snapshot pinning and handle construction
 // ---------------------------------------------------------------------------
 
-/// Validate the persisted target identity and ordered partition contract
-/// against one provider metadata generation before any file can be excluded.
-fn validate_mv_target_partition_selection(
-    metadata: &TableMetadata,
-    selection: &ConnectorMvTargetPartitionSelection,
-) -> Result<(), ConnectorError> {
-    if selection.object_id().as_bytes().as_ref() != metadata.uuid().to_string().as_bytes() {
-        return Err(invalid(
-            "MV target selection names a different Iceberg table object",
-        ));
-    }
-    if metadata.snapshot_by_id(selection.snapshot_id()).is_none() {
-        return Err(not_found(format!(
-            "MV target selection snapshot {} no longer exists",
-            selection.snapshot_id()
-        )));
-    }
-    let spec_id = metadata.default_partition_spec_id();
-    if selection.partition_spec_version().as_ref()
-        != crate::storage_inspector::exact_partition_spec_version(spec_id).as_ref()
-    {
-        return Err(invalid(
-            "MV target selection disagrees with the current partition spec",
-        ));
-    }
-    let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
-        corrupt(format!(
-            "Iceberg table metadata does not carry default partition spec {spec_id}"
-        ))
-    })?;
-    if selection.partition_fields().len() != spec.fields().len() {
-        return Err(invalid(
-            "MV target partition field count disagrees with Iceberg metadata",
-        ));
-    }
-    for (provided, actual) in selection.partition_fields().iter().zip(spec.fields()) {
-        if provided.partition_field_id().as_ref() != actual.field_id.to_be_bytes()
-            || provided.source_target_field_id().as_ref() != actual.source_id.to_be_bytes()
-            || !mv_target_transform_matches(provided.transform(), &actual.transform)
-        {
-            return Err(invalid(
-                "MV target partition field disagrees with Iceberg metadata",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn mv_target_transform_matches(expected: &MvExactPartitionTransform, actual: &Transform) -> bool {
-    matches!(
-        (expected, actual),
-        (MvExactPartitionTransform::Identity, Transform::Identity)
-            | (MvExactPartitionTransform::Year, Transform::Year)
-            | (MvExactPartitionTransform::Month, Transform::Month)
-            | (MvExactPartitionTransform::Day, Transform::Day)
-            | (MvExactPartitionTransform::Hour, Transform::Hour)
-            | (MvExactPartitionTransform::Void, Transform::Void)
-    ) || matches!(
-        (expected, actual),
-        (
-            MvExactPartitionTransform::Bucket { num_buckets: left },
-            Transform::Bucket(right)
-        ) if left == right
-    ) || matches!(
-        (expected, actual),
-        (MvExactPartitionTransform::Truncate { width: left }, Transform::Truncate(right))
-            if left == right
-    )
-}
-
-/// A `None` result is an unrestricted scan of the same pinned snapshot. A
-/// historical/unknown file spec or an uncomparable value invalidates the
-/// entire selection, including candidates already found in earlier files.
-fn select_mv_target_files(
-    metadata: &TableMetadata,
-    snapshot: &IcebergReadSnapshot,
-    selection: &ConnectorMvTargetPartitionSelection,
-) -> Option<IcebergPinnedDataFileSet> {
-    if snapshot.snapshot_id != Some(selection.snapshot_id()) {
-        return None;
-    }
-    let current_spec_id = metadata.default_partition_spec_id();
-    let mut selected = Vec::new();
-    for file in &snapshot.files {
-        if file.partition_spec_id != Some(current_spec_id) {
-            return None;
-        }
-        let values = file.partition_values.as_ref()?.fields();
-        if values.len() != selection.partition_fields().len() {
-            return None;
-        }
-        let mut comparable = Vec::with_capacity(values.len());
-        for value in values {
-            comparable.push(mv_target_partition_value(value.as_ref())?);
-        }
-        if selection.keys().iter().any(|key| key == &comparable) {
-            selected.push(file.path.as_str());
-            if selected.len() > crate::typed_read::table_handle::MAX_PINNED_DATA_FILES {
-                return None;
-            }
-        }
-    }
-    IcebergPinnedDataFileSet::try_new(selected).ok()
-}
-
-/// The same primitive spelling as Iceberg's change-window partition impact.
-/// Values outside that vocabulary cannot justify excluding a target file.
-fn mv_target_partition_value(value: Option<&Literal>) -> Option<ConnectorMvPartitionValue> {
-    let Some(value) = value else {
-        return Some(ConnectorMvPartitionValue::Null);
-    };
-    let Literal::Primitive(value) = value else {
-        return None;
-    };
-    let string = match value {
-        PrimitiveLiteral::Boolean(value) => value.to_string(),
-        PrimitiveLiteral::Int(value) => value.to_string(),
-        PrimitiveLiteral::Long(value) => value.to_string(),
-        PrimitiveLiteral::Float(value) => value.0.to_string(),
-        PrimitiveLiteral::Double(value) => value.0.to_string(),
-        PrimitiveLiteral::String(value) => value.clone(),
-        PrimitiveLiteral::Binary(_)
-        | PrimitiveLiteral::Int128(_)
-        | PrimitiveLiteral::UInt128(_)
-        | PrimitiveLiteral::AboveMax
-        | PrimitiveLiteral::BelowMin => return None,
-    };
-    Some(ConnectorMvPartitionValue::String(Arc::from(string)))
-}
-
 /// Resolve the requested version to exactly one snapshot, once.
 ///
 /// A branch or tag is resolved here, by the connector, from the same metadata
@@ -2166,9 +2124,9 @@ fn pinned_table_handle_with_schema(
         storage_properties: reader_visible_storage_properties(metadata.properties()),
         pinned_data_files,
     })?
-    .with_scalar_integer_domains(crate::scalar_integer_domain::of_schema(
+    .with_field_domains(scoped_field_domains(
         &schema,
-        &crate::scalar_integer_domain::metadata_declarations(metadata)?,
+        &crate::field_domain::metadata_declarations(metadata)?,
     )?)
 }
 
@@ -2226,20 +2184,17 @@ fn pinned_change_window_handle(
         )));
     }
 
-    let domains = crate::scalar_integer_domain::metadata_declarations(metadata)?;
-    let from_domains = crate::scalar_integer_domain::of_schema(&from_schema, &domains)?;
-    let to_domains = crate::scalar_integer_domain::of_schema(&to_schema, &domains)?;
+    let domains = crate::field_domain::metadata_declarations(metadata)?;
+    let from_domains = scoped_field_domains(&from_schema, &domains)?;
+    let to_domains = scoped_field_domains(&to_schema, &domains)?;
     if from_domains != to_domains {
         return Err(unsupported(
-            "Iceberg change-window endpoints have different declared scalar integer domains",
+            "Iceberg change-window endpoints have different declared field domains",
         ));
     }
     let columns = change_window_columns(to_schema.as_ref(), row_lineage_enabled(metadata))?
         .into_iter()
-        .map(|column| {
-            let domain = to_domains.get(&column.base_field_id()).copied();
-            column.with_scalar_integer_domain(domain)
-        })
+        .map(|column| column.with_table_field_domains(&to_domains))
         .collect::<Result<Vec<_>, _>>()?;
     let table_schema_json = serde_json::to_string(to_schema.as_ref())
         .map_err(|error| corrupt(format!("iceberg table schema cannot be encoded: {error}")))?;
@@ -2271,6 +2226,7 @@ fn pinned_change_window_handle(
             .map_err(corrupt)?,
         partition_spec_jsons,
     })
+    .and_then(|handle| handle.with_field_domains(to_domains))
     .map(Some)
 }
 
@@ -2554,6 +2510,25 @@ fn check_manifest_control(control: Option<&dyn ConnectorOperationControl>) -> Re
 /// silently discard rows, so the query must fail rather than guess.
 /// Narrow logical declarations constrain every supplied physical INT fact,
 /// including facts used to discard a file before any rows are materialized.
+fn scoped_field_domains(
+    schema: &Schema,
+    declarations: &crate::field_domain::PersistedFieldDomains,
+) -> Result<crate::field_domain::PersistedFieldDomains, ConnectorError> {
+    use crate::field_domain::PersistedFieldDomains;
+    let active = crate::field_domain::active(schema, declarations.fields())?;
+    Ok(match declarations {
+        PersistedFieldDomains::None => PersistedFieldDomains::None,
+        PersistedFieldDomains::LegacyTopIntegerV1(_) => {
+            if active.is_empty() {
+                PersistedFieldDomains::None
+            } else {
+                PersistedFieldDomains::LegacyTopIntegerV1(active)
+            }
+        }
+        PersistedFieldDomains::FieldDomainsV1(_) => PersistedFieldDomains::FieldDomainsV1(active),
+    })
+}
+
 fn validate_scalar_integer_manifest_facts(
     declarations: &crate::scalar_integer_domain::ScalarIntegerDomains,
     facts: &DataFileManifestFacts,
@@ -2608,7 +2583,9 @@ fn manifest_statistics_domain(
     for column in dynamic_filter_columns {
         // Manifest metrics and partition constants describe whole top-level
         // fields.  A nested path has no independently addressable metric.
-        if !column.is_base_column() {
+        if !column.is_base_column()
+            || column.field_domain() == Some(crate::field_domain::FieldDomain::Json)
+        {
             continue;
         }
         let Some(field) = schema.field_by_id(column.base_field_id()) else {
@@ -3102,6 +3079,8 @@ fn unavailable(message: impl Into<String>) -> ConnectorError {
 mod mv_target_selection_tests {
     use super::*;
     use bytes::Bytes;
+    use novarocks_spi::connector::MvExactPartitionTransform;
+    use novarocks_spi::connector::read_stack::ConnectorMvPartitionValue;
 
     fn fixture() -> (
         TableMetadata,
@@ -3244,6 +3223,173 @@ mod mv_target_selection_tests {
     }
 
     #[test]
+    fn candidate_freeze_equals_read_baseline_and_does_not_validate_unrelated_legacy_deletes() {
+        use novarocks_spi::connector::write_stack::ConnectorMvTargetCandidateSelection;
+        let (metadata, selection, snapshot) = fixture();
+        let files = snapshot
+            .files
+            .iter()
+            .enumerate()
+            .map(|(ordinal, file)| crate::manifest::DataFileWithStats {
+                path: file.path.clone(),
+                size: file.size,
+                record_count: file.record_count,
+                column_stats: None,
+                partition_spec_id: file.partition_spec_id,
+                partition_key: file.partition_key.clone(),
+                partition_values: file.partition_values.clone(),
+                manifest_path: None,
+                partition_field_values: Vec::new(),
+                first_row_id: file.first_row_id,
+                data_sequence_number: file.data_sequence_number,
+                delete_files: if ordinal == 1 {
+                    vec![crate::scan_model::IcebergDeleteFileInfo {
+                        path: "file:///legacy.parquet".into(),
+                        file_format: crate::scan_model::IcebergDeleteFileFormat::Parquet,
+                        file_content: crate::scan_model::IcebergDeleteFileContent::Position,
+                        record_count: Some(1),
+                        partition_data_json: None,
+                        length: Some(50),
+                        content_offset: None,
+                        content_size_in_bytes: None,
+                        sequence_number: Some(2),
+                        partition_spec_id: file.partition_spec_id,
+                        partition_key: None,
+                        referenced_data_file: Some(file.path.clone()),
+                        equality_column_names: Vec::new(),
+                        equality_field_ids: Vec::new(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect::<Vec<_>>();
+        let read = select_mv_target_files(&metadata, &snapshot, &selection).unwrap();
+        let selected = ConnectorMvTargetCandidateSelection::Partitions(selection);
+        let candidate_read =
+            freeze_mv_target_candidate_files(&metadata, 41, files.clone(), &selected)
+                .expect("candidate read validates only its selected baseline")
+                .unwrap();
+        assert_eq!(candidate_read.len(), read.len());
+        assert!(
+            files
+                .iter()
+                .all(|file| candidate_read.contains(&file.path) == read.contains(&file.path))
+        );
+        let frozen = crate::commit::write_stack::control::freeze_target_delete_references(
+            files.clone(),
+            &metadata,
+            41,
+            Some(&selected),
+        )
+        .unwrap();
+        assert_eq!(frozen.len(), read.len());
+        assert!(
+            frozen
+                .iter()
+                .all(|file| read.contains(file.data_file_path()))
+        );
+        let all = crate::commit::write_stack::control::freeze_target_delete_references(
+            files.clone(),
+            &metadata,
+            41,
+            Some(&ConnectorMvTargetCandidateSelection::All),
+        )
+        .unwrap_err();
+        assert!(all.target_format_failure().is_some());
+        let candidate_all = freeze_mv_target_candidate_files(
+            &metadata,
+            41,
+            files.clone(),
+            &ConnectorMvTargetCandidateSelection::All,
+        )
+        .unwrap_err();
+        assert!(candidate_all.target_format_failure().is_some());
+        let mut historical_spec = files.clone();
+        historical_spec[1].partition_spec_id = Some(999);
+        let unrestricted =
+            freeze_mv_target_candidate_files(&metadata, 41, historical_spec, &selected)
+                .unwrap_err();
+        assert!(unrestricted.target_format_failure().is_some());
+        let mut equality = files;
+        equality[1].delete_files[0].file_content =
+            crate::scan_model::IcebergDeleteFileContent::Equality;
+        equality[1].delete_files[0].file_format =
+            crate::scan_model::IcebergDeleteFileFormat::Puffin;
+        let candidate_all = freeze_mv_target_candidate_files(
+            &metadata,
+            41,
+            equality,
+            &ConnectorMvTargetCandidateSelection::All,
+        )
+        .unwrap_err();
+        assert!(candidate_all.target_format_failure().is_some());
+    }
+
+    #[test]
+    fn mv_target_candidate_snapshot_never_falls_back_for_all_empty_or_mismatched_selection() {
+        use novarocks_spi::connector::write_stack::ConnectorMvTargetCandidateSelection;
+        let (metadata, selection, _) = fixture();
+        let error = validate_mv_target_candidate_snapshot(
+            &metadata,
+            99,
+            &ConnectorMvTargetCandidateSelection::All,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+        let empty = ConnectorMvTargetPartitionSelection::try_new(
+            selection.object_id().clone(),
+            selection.partition_spec_version().clone(),
+            selection.partition_fields().to_vec(),
+            Vec::new(),
+            41,
+        )
+        .unwrap();
+        assert!(
+            validate_mv_target_candidate_snapshot(
+                &metadata,
+                99,
+                &ConnectorMvTargetCandidateSelection::Partitions(empty.clone())
+            )
+            .is_err()
+        );
+        let pinned = freeze_mv_target_candidate_files(
+            &metadata,
+            41,
+            Vec::new(),
+            &ConnectorMvTargetCandidateSelection::Partitions(empty),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(pinned.len(), 0);
+        let other = ConnectorMvTargetPartitionSelection::try_new(
+            selection.object_id().clone(),
+            selection.partition_spec_version().clone(),
+            selection.partition_fields().to_vec(),
+            selection.keys().to_vec(),
+            40,
+        )
+        .unwrap();
+        let error = validate_mv_target_candidate_snapshot(
+            &metadata,
+            41,
+            &ConnectorMvTargetCandidateSelection::Partitions(other),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(
+            freeze_mv_target_candidate_files(
+                &metadata,
+                41,
+                Vec::new(),
+                &ConnectorMvTargetCandidateSelection::All
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
     fn target_partition_selection_rejects_different_object_spec_or_field() {
         let (metadata, selection, _) = fixture();
         let make = |object_id, spec_version, fields| {
@@ -3292,7 +3438,7 @@ mod mv_target_selection_tests {
 
     #[test]
     fn empty_known_target_partition_selection_pins_no_files() {
-        let (metadata, selection, snapshot) = fixture();
+        let (metadata, selection, mut snapshot) = fixture();
         let empty = ConnectorMvTargetPartitionSelection::try_new(
             selection.object_id().clone(),
             selection.partition_spec_version().clone(),
@@ -3301,8 +3447,31 @@ mod mv_target_selection_tests {
             selection.snapshot_id(),
         )
         .expect("empty selection");
+        snapshot.files[0].partition_spec_id = None;
+        snapshot.files[0].partition_values = None;
         let pinned = select_mv_target_files(&metadata, &snapshot, &empty).expect("pinned empty");
         assert!(pinned.is_empty());
+        let frozen = crate::commit::write_stack::control::freeze_target_delete_references(
+            vec![crate::manifest::DataFileWithStats {
+                path: snapshot.files[0].path.clone(),
+                size: 1,
+                record_count: Some(1),
+                column_stats: None,
+                partition_spec_id: None,
+                partition_key: None,
+                partition_values: None,
+                manifest_path: None,
+                partition_field_values: Vec::new(),
+                first_row_id: None,
+                data_sequence_number: Some(1),
+                delete_files: Vec::new(),
+            }],
+            &metadata,
+            41,
+            Some(&novarocks_spi::connector::write_stack::ConnectorMvTargetCandidateSelection::Partitions(empty)),
+        )
+        .expect("empty frozen candidates");
+        assert!(frozen.is_empty());
     }
 
     #[test]

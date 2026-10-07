@@ -109,7 +109,7 @@ impl AnalyticAggregateRetainedMemory {
         input: AggregateInputBatch<'_>,
     ) -> Result<(), String> {
         self.retained
-            .run_bounded_batch(&mut self.touched, kernel, state_ptrs, input, false)
+            .run_bounded_batch(&mut self.touched, kernel, state_ptrs, input, false, None)
     }
 
     pub(crate) fn build_final(
@@ -886,7 +886,7 @@ impl AggregateProcessorOperator {
         session.fail(reason)
     }
 
-    fn process(&mut self, chunk: Chunk) -> Result<Option<Chunk>, String> {
+    fn process(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<Option<Chunk>, String> {
         if self.finished {
             return Ok(None);
         }
@@ -967,6 +967,7 @@ impl AggregateProcessorOperator {
                     &self.state_ptrs,
                     batch,
                     merge,
+                    Some(state),
                 )?;
             }
             return Ok(None);
@@ -1132,6 +1133,7 @@ impl AggregateProcessorOperator {
                     &self.state_ptrs,
                     batch,
                     merge,
+                    Some(state),
                 )?;
             }
             Ok(())
@@ -1235,7 +1237,7 @@ impl ProcessorOperator for AggregateProcessorOperator {
         self.pending_output.is_some()
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
         let result = (|| {
             if self.finished {
                 return if self.final_domain_session_bound {
@@ -1251,7 +1253,7 @@ impl ProcessorOperator for AggregateProcessorOperator {
                 return Err("aggregate received input while output buffer is full".to_string());
             }
             let num_rows = chunk.len();
-            let out = self.process(chunk)?;
+            let out = self.process(state, chunk)?;
             if out.is_some() {
                 return Err("aggregate produced output before finishing".to_string());
             }
@@ -2408,6 +2410,75 @@ mod tests {
 
         finish_operator(&mut driver_1, [20]);
         assert_eq!(fixture.accepted_partitions(), vec![0, 1]);
+    }
+
+    #[test]
+    fn mv_weight_sum_processor_update_and_merge_publish_typed_failure() {
+        for merge in [false, true] {
+            let mut arena = ExprArena::default();
+            let input = arena.push_typed(ExprNode::SlotId(GROUP_SLOT), DataType::Int64);
+            let function = crate::exec::node::aggregate::AggFunction {
+                name: "mv_weight_sum".into(),
+                inputs: vec![input],
+                input_is_intermediate: merge,
+                types: Some(crate::exec::node::aggregate::AggTypeSignature {
+                    intermediate_type: Some(DataType::Int64),
+                    output_type: Some(DataType::Int64),
+                    input_arg_type: Some(DataType::Int64),
+                }),
+                order: Default::default(),
+            };
+            let function_set = empty_execution_function_set();
+            let selected = function_set
+                .catalog()
+                .resolve_aggregate_trusted("mv_weight_sum", &[DataType::Int64])
+                .unwrap();
+            let field = Field::new("weight", DataType::Int64, true);
+            let schema = Arc::new(
+                ChunkSchema::try_new(vec![
+                    ChunkSlotSchema::from_field(GROUP_SLOT, &field, None).unwrap(),
+                ])
+                .unwrap(),
+            );
+            let factory = AggregateProcessorFactory::new_native(
+                1,
+                Arc::new(arena),
+                Vec::new(),
+                vec![function],
+                function_set,
+                vec![selected],
+                false,
+                true,
+                schema,
+                Vec::new(),
+                None,
+                1,
+                None,
+            )
+            .unwrap();
+            let mut operator = factory.create(1, 0);
+            operator.prepare().unwrap();
+            let state = RuntimeState::default();
+            operator.bind_runtime_state(&state).unwrap();
+            let result = operator
+                .as_processor_mut()
+                .unwrap()
+                .push_chunk(&state, group_chunk([i64::MAX, 1]));
+            assert!(result.is_err());
+            assert_eq!(
+                state.error_state().task_failure().unwrap().category(),
+                novarocks_execution_contract::TaskFailureCategory::Execution
+            );
+            assert!(
+                state
+                    .error_state()
+                    .task_failure()
+                    .unwrap()
+                    .detail()
+                    .as_str()
+                    .contains("weight arithmetic overflow")
+            );
+        }
     }
 
     #[test]

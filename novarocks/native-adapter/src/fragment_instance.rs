@@ -54,6 +54,8 @@ pub struct NativeFragmentInstanceInput {
     /// In static sink/route order, the outbound topology edge whose
     /// destination set serves that sink or route.
     pub sink_edge_ids: Vec<u32>,
+    /// Exact placement counts for every quota domain required by this fragment.
+    pub quota_domains: BTreeMap<novarocks_local_program::QuotaDomainId, u32>,
 }
 
 /// Where a task's assignment lives on the wire, so a refusal names the field
@@ -144,6 +146,37 @@ pub fn project_task_instance(
         }
     }
 
+    let mut quota_domains = BTreeMap::new();
+    let mut previous = None;
+    if assignment.quota_domain_bindings.len() > novarocks_task_codec::creation::MAX_QUOTA_DOMAINS {
+        return Err(error(
+            path.clone().field("quota_domain_bindings"),
+            ProtocolErrorKind::OutOfRange,
+            "quota domain count exceeds the hard limit".to_string(),
+        ));
+    }
+    for (index, binding) in assignment.quota_domain_bindings.into_iter().enumerate() {
+        let binding_path = path.clone().field("quota_domain_bindings").index(index);
+        let domain = novarocks_local_program::QuotaDomainId::try_new(binding.preclaim_node_id)
+            .map_err(|detail| {
+                error(
+                    binding_path.clone(),
+                    ProtocolErrorKind::InvalidValue,
+                    detail.to_string(),
+                )
+            })?;
+        if binding.task_count == 0 || previous.is_some_and(|node| node >= binding.preclaim_node_id)
+        {
+            return Err(error(
+                binding_path,
+                ProtocolErrorKind::InvalidValue,
+                "quota domain bindings must be ordered, unique and nonzero".to_string(),
+            ));
+        }
+        previous = Some(binding.preclaim_node_id);
+        quota_domains.insert(domain, binding.task_count);
+    }
+
     // The complete inbound source set is the sender count; the topology froze
     // it once, so there is no second count to reconcile it with.
     let exchange_inputs = descriptor
@@ -168,6 +201,7 @@ pub fn project_task_instance(
         exchange_inputs: ExchangeInputAssignments::new(exchange_inputs),
         typed_result_sink: sink_kind == FragmentSinkKind::Result,
         sink_edge_ids: assignment.sink_edge_ids,
+        quota_domains,
     })
 }
 
@@ -301,6 +335,7 @@ mod tests {
 
     fn assignment() -> novarocks::TaskAssignment {
         novarocks::TaskAssignment {
+            quota_domain_bindings: Vec::new(),
             instance_ordinal: 4,
             initial_scan_ranges: vec![
                 novarocks::TaskScanRanges {
@@ -314,6 +349,59 @@ mod tests {
             ],
             sink_edge_ids: vec![5],
         }
+    }
+
+    #[test]
+    fn quota_counts_remain_exact_assignment_facts() {
+        let mut input = assignment();
+        input.quota_domain_bindings = vec![novarocks::TaskQuotaDomainBinding {
+            preclaim_node_id: 17,
+            task_count: 5,
+        }];
+        let projected = project_task_instance(
+            &descriptor(),
+            input.clone(),
+            QueryOptions::default(),
+            FragmentSinkKind::SplitDataStream,
+        )
+        .unwrap();
+        assert_eq!(
+            projected
+                .quota_domains
+                .get(&novarocks_local_program::QuotaDomainId::try_new(17).unwrap()),
+            Some(&5)
+        );
+        for (node, count) in [(-1, 1), (17, 0)] {
+            input.quota_domain_bindings = vec![novarocks::TaskQuotaDomainBinding {
+                preclaim_node_id: node,
+                task_count: count,
+            }];
+            assert!(
+                project_task_instance(
+                    &descriptor(),
+                    input.clone(),
+                    QueryOptions::default(),
+                    FragmentSinkKind::SplitDataStream
+                )
+                .is_err()
+            );
+        }
+        input.quota_domain_bindings = vec![
+            novarocks::TaskQuotaDomainBinding {
+                preclaim_node_id: 17,
+                task_count: 1
+            };
+            2
+        ];
+        assert!(
+            project_task_instance(
+                &descriptor(),
+                input,
+                QueryOptions::default(),
+                FragmentSinkKind::SplitDataStream
+            )
+            .is_err()
+        );
     }
 
     #[test]

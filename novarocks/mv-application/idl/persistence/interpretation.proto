@@ -30,6 +30,8 @@ message InterpretationDocument {
   optional bytes computation_identity = 3;
   repeated OutputBinding outputs = 4;
   repeated StateSlot state_slots = 5;
+  // Present only for aggregate state (GroupRowId). Visible tuple bags bind
+  // output fields directly and have neither apply key nor branch target facts.
   optional ApplyKey apply_key = 6;
   repeated AggregateInterpretation aggregates = 7;
   repeated BranchInterpretation branches = 8;
@@ -79,6 +81,7 @@ message ApplyKeyComponent {
 
 enum ApplyKeyKind {
   APPLY_KEY_KIND_UNSPECIFIED = 0;
+  // Legacy tags are retained only so the decoder can refuse old objects.
   APPLY_KEY_KIND_BASE_ROW_ID = 1;
   APPLY_KEY_KIND_JOIN_ROW_KEY = 2;
   APPLY_KEY_KIND_GROUP_ROW_ID = 3;

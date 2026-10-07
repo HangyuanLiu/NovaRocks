@@ -23,8 +23,11 @@ pub mod filter;
 pub mod join;
 pub mod limit;
 mod lowering;
+pub mod membership;
 pub mod nljoin;
 pub mod project;
+pub mod quota_preclaim;
+pub mod quota_trim;
 pub mod repeat;
 pub mod runtime_filter;
 pub mod scan;
@@ -77,6 +80,9 @@ pub type BoxedExecIter = Box<dyn Iterator<Item = ExecResult> + Send>;
 // than blanket-allowing it.
 #[derive(Clone, Debug)]
 pub enum ExecNodeKind {
+    Membership(membership::MembershipNode),
+    QuotaPreclaim(quota_preclaim::QuotaPreclaimNode),
+    QuotaTrim(quota_trim::QuotaTrimNode),
     AssertNumRows(AssertNumRowsNode),
     Values(ValuesNode),
     Project(ProjectNode),

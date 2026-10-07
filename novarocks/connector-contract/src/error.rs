@@ -47,6 +47,19 @@ pub enum ConnectorTableObjectBindingFailure {
     Missing,
 }
 
+/// The unsupported deletion representation of one candidate target file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorTargetDeleteKind {
+    Equality,
+    ParquetPosition,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorTargetFormatUnsupported {
+    pub data_file: String,
+    pub delete_kind: ConnectorTargetDeleteKind,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorError {
     kind: ConnectorErrorKind,
@@ -54,6 +67,7 @@ pub struct ConnectorError {
     retryable_before_progress: bool,
     cleanup_context: Option<String>,
     table_object_binding_failure: Option<ConnectorTableObjectBindingFailure>,
+    target_format_unsupported: Option<ConnectorTargetFormatUnsupported>,
 }
 
 impl ConnectorError {
@@ -64,6 +78,7 @@ impl ConnectorError {
             retryable_before_progress: false,
             cleanup_context: None,
             table_object_binding_failure: None,
+            target_format_unsupported: None,
         }
     }
 
@@ -81,7 +96,28 @@ impl ConnectorError {
             retryable_before_progress: false,
             cleanup_context: None,
             table_object_binding_failure: Some(failure),
+            target_format_unsupported: None,
         }
+    }
+
+    pub fn target_format_unsupported(
+        data_file: impl Into<String>,
+        delete_kind: ConnectorTargetDeleteKind,
+    ) -> Self {
+        let data_file = data_file.into();
+        let mut error = Self::new(
+            ConnectorErrorKind::Unsupported,
+            format!("MV target data file {data_file} uses unsupported {delete_kind:?} deletes"),
+        );
+        error.target_format_unsupported = Some(ConnectorTargetFormatUnsupported {
+            data_file,
+            delete_kind,
+        });
+        error
+    }
+
+    pub fn target_format_failure(&self) -> Option<&ConnectorTargetFormatUnsupported> {
+        self.target_format_unsupported.as_ref()
     }
 
     pub const fn kind(&self) -> ConnectorErrorKind {
@@ -107,7 +143,7 @@ impl ConnectorError {
     }
 
     pub fn with_retryable_before_progress(mut self) -> Self {
-        if self.table_object_binding_failure.is_none() {
+        if self.table_object_binding_failure.is_none() && self.target_format_unsupported.is_none() {
             self.retryable_before_progress = true;
         }
         self
@@ -146,6 +182,29 @@ mod tests {
         let error = ConnectorError::new(ConnectorErrorKind::Unavailable, "transient")
             .with_retryable_before_progress();
         assert!(error.retryable_before_progress());
+    }
+
+    #[test]
+    fn target_format_failure_keeps_exact_payload_and_is_terminal() {
+        for delete_kind in [
+            ConnectorTargetDeleteKind::Equality,
+            ConnectorTargetDeleteKind::ParquetPosition,
+        ] {
+            let error =
+                ConnectorError::target_format_unsupported("file:///candidate.parquet", delete_kind)
+                    .with_retryable_before_progress()
+                    .with_cleanup_context("no staged artifacts")
+                    .clone();
+            assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+            assert!(!error.retryable_before_progress());
+            assert_eq!(
+                error.target_format_failure(),
+                Some(&ConnectorTargetFormatUnsupported {
+                    data_file: "file:///candidate.parquet".into(),
+                    delete_kind,
+                })
+            );
+        }
     }
 
     #[test]

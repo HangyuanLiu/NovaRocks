@@ -36,6 +36,9 @@ use crate::planner::physical::{
     AggMode, AggregateOutputLayout, HashSource, JoinDistribution, JoinExecutionMode,
     PhysicalPlanStats, TopNPhase,
 };
+use crate::planner::quota::{
+    PlanFanoutAnchorNode, PlanFanoutConsumeNode, PlanQuotaPreclaimNode, PlanQuotaTrimNode,
+};
 #[cfg(test)]
 use novarocks_types::aggregate::mangle_distinct_aggregate_name;
 
@@ -264,6 +267,10 @@ pub enum PhysicalPlanKind {
     NestLoopJoin(PhysicalNestLoopJoinNode),
     SetOp(PhysicalSetOpNode),
     ChangeEventExpand(DistributedChangeEventExpandNode),
+    QuotaPreclaim(PlanQuotaPreclaimNode),
+    QuotaTrim(PlanQuotaTrimNode),
+    FanoutAnchor(PlanFanoutAnchorNode),
+    FanoutConsume(PlanFanoutConsumeNode),
     CTEAnchor(PlanCTEAnchorNode),
     CTEProduce(PlanCTEProduceNode),
     CTEConsume(PlanCTEConsumeNode),
@@ -292,6 +299,10 @@ impl PhysicalPlanKind {
             "NestLoopJoin",
             "SetOp",
             "ChangeEventExpand",
+            "QuotaPreclaim",
+            "QuotaTrim",
+            "FanoutAnchor",
+            "FanoutConsume",
             "CTEAnchor",
             "CTEProduce",
             "CTEConsume",

@@ -123,6 +123,9 @@ pub enum SqlScanKind {
     MvTargetState {
         facts: SqlMvTargetStateScan,
     },
+    MvTargetBag {
+        facts: SqlMvTargetBagScan,
+    },
     MvTargetLocator {
         facts: SqlMvTargetLocatorScan,
     },
@@ -362,6 +365,13 @@ pub struct SqlMvTargetStateScan {
 /// Metadata for an IMV target-locator scan source. It is a refresh-only
 /// placeholder that reads the MV target at the refresh-before snapshot and
 /// projects the physical apply-key columns plus Iceberg `_file` / `_pos`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlMvTargetBagScan {
+    pub(crate) target_table_uuid: String,
+    pub(crate) target_snapshot_id: Option<i64>,
+    pub(crate) visible_columns: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SqlMvTargetLocatorScan {
     pub(crate) target_table_uuid: String,
@@ -623,6 +633,12 @@ impl TableCompletionRetainedBytes {
                             self.add_string(&scope.branch_id_column_name);
                         }
                     }
+                }
+            }
+            SqlScanKind::MvTargetBag { facts } => {
+                self.add_string(&facts.target_table_uuid);
+                for column in &facts.visible_columns {
+                    self.add_string(column);
                 }
             }
             SqlScanKind::MvTargetLocator { facts } => {

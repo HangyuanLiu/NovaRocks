@@ -62,6 +62,7 @@ pub enum ExternalSinkRequirement {
 /// The exact runtime capabilities removed while a decoded plan is frozen.
 /// They are keyed by local node identity and never enter LocalProgram.
 pub struct LocalRuntimeBindings {
+    pub(crate) quota_domains: BTreeMap<lp::QuotaDomainId, u32>,
     pub(crate) scans: BTreeMap<lp::ProgramNodeId, Arc<dyn super::scan::ScanSource>>,
     pub(crate) writers: BTreeMap<lp::ProgramNodeId, super::table_writer::TableWriterRuntimeBinding>,
     pub(crate) finishers:
@@ -71,12 +72,27 @@ pub struct LocalRuntimeBindings {
 impl LocalRuntimeBindings {
     fn new() -> Self {
         Self {
+            quota_domains: BTreeMap::new(),
             scans: BTreeMap::new(),
             writers: BTreeMap::new(),
             finishers: BTreeMap::new(),
         }
     }
 
+    pub fn bind_quota_domain(
+        &mut self,
+        domain: lp::QuotaDomainId,
+        count: u32,
+    ) -> std::result::Result<(), String> {
+        if count == 0 || self.quota_domains.contains_key(&domain) {
+            return Err("quota domain assignment must be nonzero and unique".into());
+        }
+        self.quota_domains.insert(domain, count);
+        Ok(())
+    }
+    pub fn quota_domain(&self, domain: lp::QuotaDomainId) -> Option<u32> {
+        self.quota_domains.get(&domain).copied()
+    }
     pub fn scan_count(&self) -> usize {
         self.scans.len()
     }
@@ -226,6 +242,18 @@ fn preflight(root: &ExecNode) -> Result<()> {
             };
         }
         match &node.kind {
+            ExecNodeKind::Membership(n) => {
+                push!(&n.probe);
+                push!(&n.build);
+            }
+            ExecNodeKind::QuotaPreclaim(n) => {
+                push!(&n.demand);
+                push!(&n.target);
+            }
+            ExecNodeKind::QuotaTrim(n) => {
+                push!(&n.seeds);
+                push!(&n.candidates);
+            }
             ExecNodeKind::AssertNumRows(n) => push!(&n.input),
             ExecNodeKind::Project(n) => push!(&n.input),
             ExecNodeKind::Unpivot(n) => push!(&n.input),
@@ -271,6 +299,9 @@ struct Lowering<'a> {
 }
 
 impl Lowering<'_> {
+    fn quota_domain(&mut self, domain: lp::QuotaDomainId) {
+        if !self.requirements.iter().any(|r|matches!(r,lp::BindingRequirement::QuotaDomain{domain:existing} if *existing==domain)){self.requirements.push(lp::BindingRequirement::QuotaDomain{domain});}
+    }
     fn node(&mut self, node: ExecNode) -> Result<lp::ProgramNodeId> {
         let schema = crate::exec::pipeline::builder::output_chunk_schema_for_node(&node)
             .ok_or_else(|| LocalProgramLoweringError::new("node has no output chunk schema"))?;
@@ -333,6 +364,18 @@ impl Lowering<'_> {
     ) -> Result<(i32, lp::ProgramNodeKind)> {
         use lp::ProgramNodeKind as P;
         let mapped = match node {
+            ExecNodeKind::Membership(n) => {
+                let probe = self.node(*n.probe)?;
+                let build = self.node(*n.build)?;
+                (
+                    n.node_id,
+                    P::Membership {
+                        probe,
+                        build,
+                        spec: n.spec,
+                    },
+                )
+            }
             ExecNodeKind::AssertNumRows(n) => {
                 let input = self.node(*n.input)?;
                 let mode = match n.mode {
@@ -364,6 +407,46 @@ impl Lowering<'_> {
                 };
                 (n.node_id, P::AssertNumRows { input, mode })
             }
+            ExecNodeKind::QuotaPreclaim(n) => {
+                let demand = self.node(*n.demand)?;
+                let target = self.node(*n.target)?;
+                self.quota_domain(n.spec.preselection_domain);
+                let runtime_filters = n
+                    .runtime_filters
+                    .iter()
+                    .map(|filter| {
+                        Ok(lp::QuotaContentFilter {
+                            demand_expr: expr(filter.demand_expr_id),
+                            producer: freeze_producer(&filter.contract)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                for filter in &runtime_filters {
+                    self.filter_requirement(filter.producer.binding_id())?;
+                }
+                (
+                    n.node_id,
+                    P::QuotaPreclaim {
+                        demand,
+                        target,
+                        spec: n.spec,
+                        runtime_filters,
+                    },
+                )
+            }
+            ExecNodeKind::QuotaTrim(n) => {
+                let seeds = self.node(*n.seeds)?;
+                let candidates = self.node(*n.candidates)?;
+                self.quota_domain(n.spec.preselection_domain);
+                (
+                    n.node_id,
+                    P::QuotaTrim {
+                        seeds,
+                        candidates,
+                        spec: n.spec,
+                    },
+                )
+            }
             ExecNodeKind::Values(n) => {
                 let values = lp::StaticValues::try_new(n.chunk.batch, output.clone())
                     .map_err(|error| LocalProgramLoweringError::new(error.to_string()))?;
@@ -385,6 +468,7 @@ impl Lowering<'_> {
                 (
                     n.node_id,
                     P::Project {
+                        retention_admission: n.retention_admission,
                         input,
                         is_subordinate: n.is_subordinate,
                         exprs: n.exprs.into_iter().map(expr).collect(),
@@ -927,12 +1011,15 @@ impl Lowering<'_> {
                     },
                 )
             }
-            ExecNodeKind::AssertNumRows(_)
+            ExecNodeKind::Membership(_)
+            | ExecNodeKind::AssertNumRows(_)
             | ExecNodeKind::Values(_)
             | ExecNodeKind::Project(_)
             | ExecNodeKind::Unpivot(_)
             | ExecNodeKind::Filter(_)
             | ExecNodeKind::Repeat(_)
+            | ExecNodeKind::QuotaPreclaim(_)
+            | ExecNodeKind::QuotaTrim(_)
             | ExecNodeKind::ChangeEventExpand(_)
             | ExecNodeKind::UnionAll(_)
             | ExecNodeKind::Limit(_) => {
@@ -1209,6 +1296,123 @@ mod tests {
             layout.identity().unwrap(),
             lp::KernelAbiVersion::CURRENT,
         )
+    }
+
+    #[test]
+    fn membership_construction_lowers_ordered_children_and_exact_json_layout() {
+        use crate::exec::node::membership::{
+            MembershipComparison, MembershipDistribution, MembershipNode, MembershipSpec,
+        };
+        use novarocks_types::logical::LogicalType;
+        let make_input = |slot: u32, node_id: i32| {
+            let layout = lp::StaticLayout::try_new_exact(
+                Arc::new(Schema::new(vec![Field::new("json", DataType::Utf8, true)])),
+                Arc::from([SlotId::new(slot)]),
+                vec![(
+                    lp::StaticFieldSchema::new(Some(LogicalType::Json), vec![]),
+                    Some(slot as i32),
+                )],
+            )
+            .unwrap();
+            let schema = ChunkSchema::from_static_layout(&layout).unwrap();
+            let chunk = Chunk::try_new_with_chunk_schema(
+                RecordBatch::new_empty(schema.arrow_schema_ref()),
+                schema.clone(),
+            )
+            .unwrap();
+            (
+                ExecNode {
+                    kind: ExecNodeKind::Values(ValuesNode { chunk, node_id }),
+                },
+                schema,
+            )
+        };
+        let (probe, probe_schema) = make_input(1, 1);
+        let (build, _) = make_input(2, 2);
+        let output_layout = lp::StaticLayout::try_new_exact(
+            Arc::new(Schema::new(vec![
+                probe_schema.arrow_schema_ref().field(0).clone(),
+                Field::new("member", DataType::Boolean, true),
+            ])),
+            Arc::from([SlotId::new(1), SlotId::new(3)]),
+            vec![
+                (
+                    lp::StaticFieldSchema::new(Some(LogicalType::Json), vec![]),
+                    Some(1),
+                ),
+                (lp::StaticFieldSchema::new(None, vec![]), None),
+            ],
+        )
+        .unwrap();
+        let output_chunk_schema = ChunkSchema::from_static_layout(&output_layout).unwrap();
+        let expected = layout(&output_chunk_schema).unwrap();
+        let root = ExecNode {
+            kind: ExecNodeKind::Membership(MembershipNode {
+                probe: Box::new(probe),
+                build: Box::new(build),
+                node_id: 3,
+                spec: MembershipSpec {
+                    probe: SlotId::new(1),
+                    build: SlotId::new(2),
+                    result: SlotId::new(3),
+                    negated: true,
+                    comparison: MembershipComparison::JsonInListV1,
+                    distribution: MembershipDistribution::Singleton,
+                },
+                output_chunk_schema,
+            }),
+        };
+        let program = ExecPlan {
+            arena: ExprArena::default(),
+            root,
+        }
+        .into_local_program(profile(&expected), BTreeMap::new(), vec![])
+        .unwrap();
+        assert!(
+            matches!(program.nodes()[program.root().index()].kind(), lp::ProgramNodeKind::Membership { probe, build, spec } if probe.index() == 0 && build.index() == 1 && spec.negated)
+        );
+        assert_eq!(
+            program.nodes()[program.root().index()]
+                .output_layout()
+                .identity()
+                .unwrap(),
+            expected.identity().unwrap()
+        );
+    }
+
+    #[test]
+    fn membership_project_retention_survives_actual_construction_lowering() {
+        use crate::exec::node::project::{ProjectNode, ProjectRetentionAdmission};
+        for retention_admission in [
+            ProjectRetentionAdmission::Existing,
+            ProjectRetentionAdmission::CheckedTask,
+        ] {
+            let (input, layout) = values();
+            let output_chunk_schema =
+                crate::exec::pipeline::builder::output_chunk_schema_for_node(&input).unwrap();
+            let mut arena = ExprArena::default();
+            let slot = SlotId::new(1);
+            let expr = arena.push_typed(ExprNode::SlotId(slot), DataType::Int64);
+            let root = ExecNode {
+                kind: ExecNodeKind::Project(ProjectNode {
+                    input: Box::new(input),
+                    node_id: 2,
+                    retention_admission,
+                    is_subordinate: false,
+                    exprs: vec![expr],
+                    expr_slot_ids: vec![slot],
+                    expr_slot_schemas: None,
+                    output_indices: None,
+                    output_chunk_schema,
+                }),
+            };
+            let program = ExecPlan { arena, root }
+                .into_local_program(profile(&layout), BTreeMap::new(), vec![])
+                .unwrap();
+            assert!(
+                matches!(program.nodes()[program.root().index()].kind(), lp::ProgramNodeKind::Project { retention_admission: actual, .. } if *actual == retention_admission)
+            );
+        }
     }
 
     #[test]

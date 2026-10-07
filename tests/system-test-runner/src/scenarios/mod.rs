@@ -10,6 +10,7 @@ mod iceberg_delete_applicability;
 mod iceberg_delete_oracle;
 mod iceberg_delete_performance;
 mod memory_attribution;
+mod mv_physical_corruption;
 mod mv_recovery;
 mod mv_uea7;
 mod mv_uea7_handover;

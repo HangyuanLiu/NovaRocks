@@ -105,6 +105,15 @@ pub(crate) fn validate_value(
         fragment.id().get(),
         value.id.get()
     );
+    if value
+        .logical_kind
+        .is_some_and(|kind| !kind.admits_carrier(&value.ty.data_type))
+    {
+        errors.push(ValidationError::new(
+            &path,
+            "logical kind does not admit the physical carrier",
+        ));
+    }
     match &value.origin {
         ValueOrigin::ProviderField { scan_node, field } => {
             match fragment.nodes().get(scan_node) {
@@ -123,6 +132,15 @@ pub(crate) fn validate_value(
         ValueOrigin::Expr { node, expr } => {
             require_node(fragment, *node, &path, errors);
             if let Some(expression) = fragment.expressions().get(*expr) {
+                if let crate::ExprKind::Value(source) = expression.kind
+                    && let Some(source) = fragment.values().get(&source)
+                    && source.logical_kind != value.logical_kind
+                {
+                    errors.push(ValidationError::new(
+                        &path,
+                        "identity expression must preserve the source logical kind",
+                    ));
+                }
                 // The value names what the expression produces, and may admit
                 // null where the expression does not: an exact value standing
                 // where null is admitted is sound. The reverse is not.
@@ -157,7 +175,10 @@ pub(crate) fn validate_value(
                 None => require_node(fragment, *node, &path, errors),
             }
             if let Some(source) = fragment.values().get(of) {
-                if source.ty.data_type != value.ty.data_type || !value.ty.nullable {
+                if source.ty.data_type != value.ty.data_type
+                    || !value.ty.nullable
+                    || source.logical_kind != value.logical_kind
+                {
                     errors.push(ValidationError::new(
                         &path,
                         "null-extended value must preserve the data type and be nullable",
@@ -385,9 +406,16 @@ pub(crate) fn validate_node_output_closure(
         | NodeKind::TopN { .. }
         | NodeKind::Limit { .. }
         | NodeKind::AssertOneRow(_) => Some(input_columns.to_vec()),
-        NodeKind::Project { expressions } => {
+        NodeKind::Project { expressions, .. } => {
             Some(expressions.iter().map(|(_, value)| *value).collect())
         }
+        NodeKind::Membership { spec } => Some(
+            input_columns
+                .iter()
+                .copied()
+                .chain(std::iter::once(spec.result))
+                .collect(),
+        ),
         NodeKind::Aggregate {
             group_by, calls, ..
         } => Some(
@@ -450,7 +478,9 @@ pub(crate) fn validate_node_output_closure(
         | NodeKind::SetOp { .. }
         | NodeKind::Values { .. }
         | NodeKind::GenerateSeries { .. }
-        | NodeKind::ChangeEventExpand { .. } => None,
+        | NodeKind::ChangeEventExpand { .. }
+        | NodeKind::QuotaPreclaim { .. }
+        | NodeKind::QuotaTrim { .. } => None,
     };
     if let Some(exact) = exact
         && exact.as_slice() != node.output.columns.as_ref()
@@ -667,12 +697,25 @@ pub(crate) fn value_origin_allowed(
                     == Some(&definition.id)
         }
         (
+            NodeKind::Membership { spec },
+            ValueOrigin::NodeOutput {
+                node: owner,
+                output_ordinal,
+            },
+        ) => {
+            *owner == node.id
+                && definition.id == spec.result
+                && usize::try_from(*output_ordinal).ok() == Some(ordinal)
+        }
+        (
             NodeKind::Values { .. }
             | NodeKind::Repeat { .. }
             | NodeKind::Unpivot { .. }
             | NodeKind::GenerateSeries { .. }
             | NodeKind::TableFunction { .. }
-            | NodeKind::ChangeEventExpand { .. },
+            | NodeKind::ChangeEventExpand { .. }
+            | NodeKind::QuotaPreclaim { .. }
+            | NodeKind::QuotaTrim { .. },
             ValueOrigin::NodeOutput {
                 node: owner,
                 output_ordinal,
@@ -688,7 +731,11 @@ pub(crate) fn validate_node_arity(node: &PhysicalNode, path: &str, errors: &mut 
         | NodeKind::Values { .. }
         | NodeKind::GenerateSeries { .. }
         | NodeKind::ExchangeSource { .. } => node.inputs.is_empty(),
-        NodeKind::HashJoin { .. } | NodeKind::NestLoopJoin { .. } => node.inputs.len() == 2,
+        NodeKind::HashJoin { .. }
+        | NodeKind::NestLoopJoin { .. }
+        | NodeKind::Membership { .. }
+        | NodeKind::QuotaPreclaim { .. }
+        | NodeKind::QuotaTrim { .. } => node.inputs.len() == 2,
         NodeKind::SetOp { .. } => node.inputs.len() >= 2,
         NodeKind::TableFunction { .. } => node.inputs.len() <= 1,
         _ => node.inputs.len() == 1,
@@ -781,7 +828,7 @@ pub(crate) fn validate_node_semantics(
             }
             require_passthrough_output(fragment, node, path, errors);
         }
-        NodeKind::Project { expressions } => {
+        NodeKind::Project { expressions, .. } => {
             let input = node.inputs.first().and_then(|id| fragment.nodes().get(id));
             let input_values = input.and_then(|input| indexes.output(input.id));
             for (expression, value) in expressions {
@@ -1275,7 +1322,8 @@ pub(crate) fn validate_node_semantics(
                             fragment.values().get(input_value),
                             fragment.values().get(output_value),
                         )
-                        && (input_value.ty.data_type != output_value.ty.data_type
+                        && (input_value.logical_kind != output_value.logical_kind
+                            || input_value.ty.data_type != output_value.ty.data_type
                             || (input_value.ty.nullable && !output_value.ty.nullable))
                     {
                         // A set operation's column admits null when any branch
@@ -2001,7 +2049,67 @@ pub(crate) fn validate_node_semantics(
                 }
             }
         }
+        NodeKind::QuotaPreclaim { .. } | NodeKind::QuotaTrim { .. } => {
+            validate_quota(fragment, node, path, errors)
+        }
+        NodeKind::Membership { spec } => validate_membership(fragment, node, spec, path, errors),
         NodeKind::Unpivot { spec } => validate_unpivot(fragment, node, indexes, spec, path, errors),
+    }
+}
+
+fn validate_membership(
+    fragment: &Fragment,
+    node: &PhysicalNode,
+    spec: &crate::MembershipSpec,
+    path: &str,
+    errors: &mut ValidationContext,
+) {
+    let inputs = node
+        .inputs
+        .iter()
+        .filter_map(|id| fragment.nodes().get(id))
+        .collect::<Vec<_>>();
+    let [probe, build] = inputs.as_slice() else {
+        return;
+    };
+    for (child, slot) in [(*probe, spec.probe), (*build, spec.build)] {
+        require_value(fragment, slot, path, errors);
+        if child
+            .output
+            .columns
+            .iter()
+            .filter(|value| **value == slot)
+            .count()
+            != 1
+        {
+            errors.push(ValidationError::new(
+                path,
+                "membership operand is not one exact child output occurrence",
+            ));
+        }
+        if !fragment.values().get(&slot).is_some_and(|value| {
+            value.logical_kind == Some(crate::ValueLogicalKind::Json)
+                && value.ty.data_type == DataType::Utf8
+        }) {
+            errors.push(ValidationError::new(
+                path,
+                "membership requires declared JSON Utf8 operands",
+            ));
+        }
+    }
+    require_value(fragment, spec.result, path, errors);
+    let fresh = !probe.output.columns.contains(&spec.result)
+        && !build.output.columns.contains(&spec.result);
+    let exact_result = fragment.values().get(&spec.result).is_some_and(|value| {
+        value.ty.data_type == DataType::Boolean && value.ty.nullable && value.logical_kind.is_none()
+            && matches!(value.origin, ValueOrigin::NodeOutput { node: owner, output_ordinal }
+                if owner == node.id && usize::try_from(output_ordinal).ok() == Some(probe.output.columns.len()))
+    });
+    if !fresh || !exact_result {
+        errors.push(ValidationError::new(
+            path,
+            "membership result must be a fresh node-owned nullable Boolean",
+        ));
     }
 }
 
@@ -2416,7 +2524,7 @@ pub(crate) fn validate_unpivot(
         }
         if let (Some(input), Some(output)) =
             (fragment.values().get(input), fragment.values().get(output))
-            && input.ty != output.ty
+            && (input.ty != output.ty || input.logical_kind != output.logical_kind)
         {
             errors.push(ValidationError::new(
                 path,
@@ -2466,7 +2574,9 @@ pub(crate) fn validate_unpivot(
             fragment.values().get(&mapping.input),
             fragment.values().get(&spec.value_output),
         ) {
-            if input.ty.data_type != output.ty.data_type {
+            if input.ty.data_type != output.ty.data_type
+                || input.logical_kind != output.logical_kind
+            {
                 errors.push(ValidationError::new(
                     path,
                     "unpivot mapping input type differs from its value output",
@@ -3261,4 +3371,161 @@ pub(crate) fn writer_schema_shapes_match(
             .all(|(writer, finish)| {
                 writer.name == finish.name && writer.ty == finish.ty && writer.role == finish.role
             })
+}
+
+fn validate_quota(
+    fragment: &Fragment,
+    node: &PhysicalNode,
+    path: &str,
+    errors: &mut ValidationContext,
+) {
+    let inputs = node
+        .inputs
+        .iter()
+        .filter_map(|id| fragment.nodes().get(id))
+        .collect::<Vec<_>>();
+    if inputs.len() != 2 {
+        return;
+    }
+    let mut require_column = |input: usize, value: ValueId, types: &[DataType]| {
+        if !inputs[input].output.columns.contains(&value)
+            || !fragment
+                .values()
+                .get(&value)
+                .is_some_and(|v| types.contains(&v.ty.data_type))
+        {
+            errors.push(ValidationError::new(
+                path,
+                "quota field is absent from its exact input or has the wrong type",
+            ));
+        }
+    };
+    let (domains, max_bytes, output_types) = match &node.kind {
+        NodeKind::QuotaPreclaim { spec } => {
+            for value in &spec.demand_values {
+                if let Some(value_def) = fragment.values().get(value) {
+                    require_column(0, *value, std::slice::from_ref(&value_def.ty.data_type));
+                }
+            }
+            require_column(0, spec.demand_entry_id, &[DataType::Binary]);
+            require_column(0, spec.demand_key, &[DataType::Binary]);
+            require_column(
+                0,
+                spec.demand_need.value(),
+                match spec.demand_need {
+                    crate::QuotaNeed::Count { .. } => &[DataType::Int64, DataType::UInt64],
+                    crate::QuotaNeed::NegativeWeight { .. } => &[DataType::Int64],
+                },
+            );
+            require_column(1, spec.target_file, &[DataType::Utf8]);
+            require_column(1, spec.target_position, &[DataType::Int64]);
+            let mut seen = BTreeSet::new();
+            if spec.target_values.is_empty()
+                || spec.target_values.iter().any(|v| {
+                    !seen.insert(*v)
+                        || *v == spec.target_file
+                        || *v == spec.target_position
+                        || !inputs[1].output.columns.contains(v)
+                        || !fragment
+                            .values()
+                            .get(v)
+                            .is_some_and(|v| spec.content_equivalence.supports(&v.ty.data_type))
+                })
+            {
+                errors.push(ValidationError::new(
+                    path,
+                    "quota target content values must be distinct supported visible input fields",
+                ));
+            }
+            if !spec.demand_values.is_empty()
+                && (spec.demand_values.len() != spec.target_values.len()
+                    || spec.demand_values.iter().zip(&spec.target_values).any(
+                        |(demand, target)| {
+                            fragment.values().get(demand).map(|v| &v.ty)
+                                != fragment.values().get(target).map(|v| &v.ty)
+                        },
+                    ))
+            {
+                errors.push(ValidationError::new(path,"quota demand visible representatives must match target content-field order and types"));
+            }
+            if spec.demand_entry_id == spec.demand_key
+                || spec.demand_entry_id == spec.demand_need.value()
+                || spec.demand_key == spec.demand_need.value()
+            {
+                errors.push(ValidationError::new(
+                    path,
+                    "quota demand fields must be distinct",
+                ));
+            }
+            (
+                spec.preselection_domain,
+                spec.max_state_bytes,
+                vec![DataType::Binary, DataType::Utf8, DataType::Int64],
+            )
+        }
+        NodeKind::QuotaTrim { spec } => {
+            require_column(0, spec.seed_entry_id, &[DataType::Binary]);
+            require_column(
+                0,
+                spec.seed_need.value(),
+                match spec.seed_need {
+                    crate::QuotaNeed::Count { .. } => &[DataType::Int64, DataType::UInt64],
+                    crate::QuotaNeed::NegativeWeight { .. } => &[DataType::Int64],
+                },
+            );
+            require_column(1, spec.candidate_entry_id, &[DataType::Binary]);
+            require_column(1, spec.candidate_file, &[DataType::Utf8]);
+            require_column(1, spec.candidate_position, &[DataType::Int64]);
+            (
+                spec.preselection_domain,
+                spec.max_state_bytes,
+                vec![DataType::Utf8, DataType::Int64],
+            )
+        }
+        _ => return,
+    };
+    if matches!(&node.kind, NodeKind::QuotaPreclaim { .. }) {
+        let mut pending = vec![inputs[1].id];
+        let mut seen = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(target) = fragment.nodes().get(&id) {
+                if matches!(target.kind, NodeKind::ExchangeSource { .. }) {
+                    errors.push(ValidationError::new(
+                        path,
+                        "QuotaPreclaim target scan must remain in its exact owning fragment",
+                    ));
+                }
+                pending.extend(target.inputs.iter().copied());
+            }
+        }
+    }
+    if matches!(&node.kind, NodeKind::QuotaPreclaim { spec } if spec.preselection_domain != node.id)
+    {
+        errors.push(ValidationError::new(
+            path,
+            "QuotaPreclaim must define its own exact domain",
+        ));
+    }
+    if domains.get() > i32::MAX as u32 || max_bytes == 0 || max_bytes > i64::MAX as u64 {
+        errors.push(ValidationError::new(
+            path,
+            "quota state budget and exact domain reference must be representable",
+        ));
+    }
+    if node.output.columns.len() != output_types.len()
+        || node.output.columns.iter().zip(output_types).any(|(v, ty)| {
+            !fragment
+                .values()
+                .get(v)
+                .is_some_and(|v| v.ty.data_type == ty && !v.ty.nullable)
+        })
+    {
+        errors.push(ValidationError::new(
+            path,
+            "quota output must match its exact non-null narrow schema",
+        ));
+    }
 }

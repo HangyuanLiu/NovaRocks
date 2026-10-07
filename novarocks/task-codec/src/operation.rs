@@ -1655,6 +1655,7 @@ pub fn encode_release_ack(
         state: encode_context_state(state)?,
         termination_cause: None,
         runtime_filter: runtime_filter.map(|value| value.as_proto().clone()),
+        verification: None,
     })
 }
 
@@ -1674,6 +1675,7 @@ pub struct DecodedReleaseAck {
     /// The backend's sealed runtime-filter observation. Absent means the
     /// release held no participant to seal.
     pub runtime_filter: Option<QueryTerminalProfileContributionTelemetry>,
+    pub verification: Option<novarocks_execution_contract::ContextVerificationFacts>,
 }
 
 /// Decodes a release acknowledgement, returning the termination cause the
@@ -1717,12 +1719,20 @@ pub fn decode_release_ack(
             })
         })
         .transpose()?;
+    let verification = src
+        .verification
+        .as_ref()
+        .map(|facts| {
+            crate::status::decode_verification(facts, context, path.clone().field("verification"))
+        })
+        .transpose()?;
     Ok(DecodedReleaseAck {
         context,
         outcome,
         state,
         termination_cause: cause,
         runtime_filter,
+        verification,
     })
 }
 

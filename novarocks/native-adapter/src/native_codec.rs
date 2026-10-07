@@ -140,6 +140,8 @@ fn check_resource_shape<U: 'static>(raw: &[u8]) -> Result<(), Status> {
         resource_preflight::check_control_operation_batch(raw)
     } else if TypeId::of::<U>() == TypeId::of::<proto::SubscribeTaskStatusRequest>() {
         resource_preflight::check_status_subscription(raw)
+    } else if TypeId::of::<U>() == TypeId::of::<proto::ApplyTaskOperationsResponse>() {
+        resource_preflight::check_operation_response(raw)
     } else {
         Ok(())
     };
@@ -163,6 +165,17 @@ mod tests {
             tonic::Code::ResourceExhausted
         );
         assert!(check_resource_shape::<proto::HeartbeatRequest>(&raw).is_ok());
+
+        let response = proto::ApplyTaskOperationsResponse {
+            receipts: vec![proto::TaskOperationReceipt::default(); 33],
+        }
+        .encode_to_vec();
+        assert_eq!(
+            check_resource_shape::<proto::ApplyTaskOperationsResponse>(&response)
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
 
         let control = proto::ApplyTaskControlOperationsRequest {
             operations: vec![proto::TaskControlOperation::default(); 33],

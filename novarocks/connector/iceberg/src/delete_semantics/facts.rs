@@ -919,8 +919,18 @@ impl PinnedEndpointFacts {
         &self.partition_spec_jsons
     }
     pub fn schema(&self) -> Result<Schema> {
-        serde_json::from_str(&self.schema_json)
-            .map_err(|e| Error::new(Kind::InvalidFieldBinding, e.to_string()))
+        crate::schema_preflight::preflight_schema(&self.schema_json)
+            .map_err(|error| Error::new(Kind::InvalidFieldBinding, error))?;
+        let mut decoder = serde_json::Deserializer::from_str(&self.schema_json);
+        decoder.disable_recursion_limit();
+        let schema = <Schema as serde::Deserialize>::deserialize(&mut decoder)
+            .map_err(|error| Error::new(Kind::InvalidFieldBinding, error.to_string()))?;
+        decoder
+            .end()
+            .map_err(|error| Error::new(Kind::InvalidFieldBinding, error.to_string()))?;
+        crate::schema_mapping::validate_exact_schema(&schema)
+            .map_err(|error| Error::new(Kind::InvalidFieldBinding, error))?;
+        Ok(schema)
     }
 
     /// Checks type/scope proof against the relation's frozen spec set. The

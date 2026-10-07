@@ -264,38 +264,9 @@ pub struct ConnectorViewDefinition {
     pub source_format: Option<ConnectorViewSourceFormat>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum ConnectorDataType {
-    Boolean,
-    TinyInt,
-    SmallInt,
-    Int,
-    BigInt,
-    LargeInt,
-    Float,
-    Double,
-    Decimal { precision: u8, scale: i8 },
-    String,
-    Binary,
-    Json,
-    Bitmap,
-    Hll,
-    Date,
-    DateTime,
-    DateTimeNs,
-    Time,
-    Array(Box<ConnectorDataType>),
-    Map(Box<ConnectorDataType>, Box<ConnectorDataType>),
-    Struct(Vec<ConnectorStructField>),
-    Variant,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ConnectorStructField {
-    pub name: Arc<str>,
-    pub data_type: ConnectorDataType,
-    pub nullable: bool,
-}
+/// Mutation types share the public complete logical vocabulary.
+pub type ConnectorDataType = novarocks_type_contract::LogicalType;
+pub type ConnectorStructField = novarocks_type_contract::LogicalField;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConnectorDefaultValue {

@@ -23,8 +23,10 @@
 mod arithmetic;
 mod array_generate;
 mod comparison;
+mod content;
 mod function;
 mod largeint;
+pub mod logical_type;
 mod partition;
 
 pub use arithmetic::{
@@ -35,6 +37,10 @@ pub use arithmetic::{
 };
 pub use array_generate::array_generate_item_type;
 pub use comparison::OrderedComparisonAlgorithm;
+pub use content::{
+    NATIVE_RESULT_CONTENT_V1_CANONICAL_BYTES, ResultContentEquivalence,
+    quota_content_runtime_filter_type_supported,
+};
 pub use function::{
     AggregateStateFormatId, FunctionArgumentEvaluation, FunctionArgumentType,
     FunctionFailureBehavior, FunctionId, FunctionIdentityError, FunctionIntrinsicRowError,
@@ -45,4 +51,8 @@ pub use largeint::{LARGEINT_BYTE_WIDTH, is_largeint_data_type};
 pub use partition::{
     BucketLayoutAlgorithm, PartitionCountParameterId, PartitionCountParameterIdentityError,
     PartitionHashAlgorithm, PartitionSpaceId, PartitionSpaceIdentityError,
+};
+
+pub use logical_type::{
+    LogicalField, LogicalType, LogicalTypeLimits, LogicalTypeUsage, LogicalValue,
 };

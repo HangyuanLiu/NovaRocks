@@ -1569,13 +1569,12 @@ fn aggregate_state_names(
             crate::compiler::mv_rewrite::SqlImvAggregateStateRole::Single
             | crate::compiler::mv_rewrite::SqlImvAggregateStateRole::AvgSum
             | crate::compiler::mv_rewrite::SqlImvAggregateStateRole::AvgCount => {
-                if !contract_column
-                    .type_signature
-                    .eq_ignore_ascii_case("binary")
+                if contract_column.logical_type
+                    != novarocks_types::logical_type::LogicalType::Binary
                 {
                     return Err(format!(
-                        "Iceberg IMV aggregate rewrite aggregate state column {} must have binary type signature, got {}",
-                        contract_column.column_name, contract_column.type_signature
+                        "Iceberg IMV aggregate rewrite aggregate state column {} must have binary logical type, got {:?}",
+                        contract_column.column_name, contract_column.logical_type
                     ));
                 }
                 let call = aggregate_node
@@ -1605,14 +1604,11 @@ fn aggregate_state_names(
                 }
             }
             crate::compiler::mv_rewrite::SqlImvAggregateStateRole::RetractionCount => {
-                if !contract_column.type_signature.eq_ignore_ascii_case("long")
-                    && !contract_column
-                        .type_signature
-                        .eq_ignore_ascii_case("bigint")
+                if contract_column.logical_type != novarocks_types::logical_type::LogicalType::Int64
                 {
                     return Err(format!(
-                        "Iceberg IMV aggregate rewrite aggregate retraction count state column {} must have long type signature, got {}",
-                        contract_column.column_name, contract_column.type_signature
+                        "Iceberg IMV aggregate rewrite aggregate retraction count state column {} must have long logical type, got {:?}",
+                        contract_column.column_name, contract_column.logical_type
                     ));
                 }
             }
@@ -2414,10 +2410,12 @@ mod tests {
         );
     }
 
-    fn single_state_column(type_signature: &str) -> SqlImvAggregateStateColumnContract {
+    fn single_state_column(
+        logical_type: novarocks_types::logical_type::LogicalType,
+    ) -> SqlImvAggregateStateColumnContract {
         SqlImvAggregateStateColumnContract {
             column_name: "__agg_state_s".to_string(),
-            type_signature: type_signature.to_string(),
+            logical_type,
             role: SqlImvAggregateStateRoleContract::Single,
         }
     }
@@ -2425,14 +2423,14 @@ mod tests {
     fn retraction_count_state_column() -> SqlImvAggregateStateColumnContract {
         SqlImvAggregateStateColumnContract {
             column_name: "__agg_state___ivm_row_count".to_string(),
-            type_signature: "long".to_string(),
+            logical_type: novarocks_types::logical_type::LogicalType::Int64,
             role: SqlImvAggregateStateRoleContract::RetractionCount,
         }
     }
 
     fn build_ctx() -> RewriteContext {
         build_ctx_with_state_columns(vec![
-            single_state_column("binary"),
+            single_state_column(novarocks_types::logical_type::LogicalType::Binary),
             retraction_count_state_column(),
         ])
     }
@@ -2457,7 +2455,7 @@ mod tests {
     fn build_branch_ctx() -> RewriteContext {
         build_ctx_with_state_columns_target_partition_and_branch(
             vec![
-                single_state_column("binary"),
+                single_state_column(novarocks_types::logical_type::LogicalType::Binary),
                 retraction_count_state_column(),
             ],
             None,
@@ -3661,7 +3659,7 @@ mod tests {
         let rule = RewriteAggregateStateRule;
         let mut ctx = build_ctx_with_state_columns_and_target_partition(
             vec![
-                single_state_column("binary"),
+                single_state_column(novarocks_types::logical_type::LogicalType::Binary),
                 retraction_count_state_column(),
             ],
             Some(SqlImvPartitionContract {
@@ -3945,7 +3943,7 @@ mod tests {
     fn rewrite_aggregate_state_rejects_non_binary_state_column() {
         let rule = RewriteAggregateStateRule;
         let mut ctx = build_ctx_with_state_columns(vec![
-            single_state_column("string"),
+            single_state_column(novarocks_types::logical_type::LogicalType::Utf8),
             retraction_count_state_column(),
         ]);
         let arena_rc = ctx.scalar_arena();
@@ -3957,7 +3955,7 @@ mod tests {
             .apply(expr, &mut ctx)
             .expect_err("non-binary state column must fail");
         assert!(
-            err.contains("must have binary type signature"),
+            err.contains("must have binary logical type"),
             "unexpected error: {err}"
         );
     }
@@ -3965,7 +3963,9 @@ mod tests {
     #[test]
     fn rewrite_aggregate_state_rejects_missing_hidden_retraction_count_state() {
         let rule = RewriteAggregateStateRule;
-        let mut ctx = build_ctx_with_state_columns(vec![single_state_column("binary")]);
+        let mut ctx = build_ctx_with_state_columns(vec![single_state_column(
+            novarocks_types::logical_type::LogicalType::Binary,
+        )]);
         let arena_rc = ctx.scalar_arena();
         let expr = to_optimizer_expr(
             &delta(aggregate_over(leaf_scan())),

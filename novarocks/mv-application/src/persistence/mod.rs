@@ -24,6 +24,7 @@ pub mod definition;
 pub mod dependency;
 pub mod descriptor;
 pub mod documents;
+pub mod eligibility;
 pub mod exact_revision;
 pub mod identity;
 pub mod projection;

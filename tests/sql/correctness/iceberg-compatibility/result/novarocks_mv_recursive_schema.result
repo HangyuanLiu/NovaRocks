@@ -1,0 +1,28 @@
+-- query 3
+label	payload	ordered	js	smalls
+same	{"items":[-128,null,127],"attrs":{"a":-32768},"detail":{"code":-128,"note":'{"b":2,"a":1}'},"jsonitems":['{"b":2,"a":1}',null,'{}']}	{"a":1,"b":null}	{"b":2,"a":1}	[-32768,null,32767]
+same	{"items":[-128,null,127],"attrs":{"a":-32768},"detail":{"code":-128,"note":'{"b":2,"a":1}'},"jsonitems":['{"b":2,"a":1}',null,'{}']}	{"a":1,"b":null}	{"b":2,"a":1}	[-32768,null,32767]
+same	{"items":[-128,null,127],"attrs":{"a":-32768},"detail":{"code":-128,"note":'{"b":2,"a":1}'},"jsonitems":['{"b":2,"a":1}',null,'{}']}	{"b":null,"a":1}	{"b":2,"a":1}	[-32768,null,32767]
+NULL	NULL	NULL	NULL	NULL
+same	{"items":[],"attrs":{},"detail":null,"jsonitems":[]}	{}	{}	[]
+same	{"items":[-128,null,127],"attrs":{"a":-32768},"detail":{"code":-128,"note":null},"jsonitems":['{"b":2,"a":1}',null,'{}']}	{"a":1,"b":null}	{"b":2,"a":1}	[-32768,null,32767]
+
+-- query 6
+label	payload	ordered	js	smalls
+same	{"items":[-128,null,127],"attrs":{"a":-32768},"detail":{"code":-128,"note":'{"b":2,"a":1}'},"jsonitems":['{"b":2,"a":1}',null,'{}']}	{"a":1,"b":null}	{"b":2,"a":1}	[-32768,null,32767]
+same	{"items":[-128,null,127],"attrs":{"a":-32768},"detail":{"code":-128,"note":'{"b":2,"a":1}'},"jsonitems":['{"b":2,"a":1}',null,'{}']}	{"b":null,"a":1}	{"b":2,"a":1}	[-32768,null,32767]
+NULL	NULL	NULL	NULL	NULL
+same	{"items":[],"attrs":{},"detail":null,"jsonitems":[]}	{}	{}	[]
+same	{"items":[-128,null,127],"attrs":{"a":-32768},"detail":{"code":-128,"note":null},"jsonitems":['{"b":2,"a":1}',null,'{}']}	{"a":1,"b":null}	{"b":2,"a":1}	[-32768,null,32767]
+same	{"items":[-128,null,127],"attrs":{"a":-32768},"detail":{"code":127,"note":'{"b":2,"a":1}'},"jsonitems":['{"b":2,"a":1}',null,'{}']}	{"a":1,"b":null}	{"b":9,"a":1}	[-32768,null,32767]
+same	{"items":[-128,null,127],"attrs":{"a":-32768},"detail":{"code":127,"note":'{"b":2,"a":1}'},"jsonitems":['{"b":2,"a":1}',null,'{}']}	{"a":1,"b":null}	{"b":9,"a":1}	[-32768,null,32767]
+
+-- query 8
+label	payload	ordered	js	smalls
+same	{"items":[-128,null,127],"attrs":{"a":-32768},"detail":{"code":-128,"note":'{"b":2,"a":1}'},"jsonitems":['{"b":2,"a":1}',null,'{}']}	{"a":1,"b":null}	{"b":2,"a":1}	[-32768,null,32767]
+same	{"items":[-128,null,127],"attrs":{"a":-32768},"detail":{"code":-128,"note":'{"b":2,"a":1}'},"jsonitems":['{"b":2,"a":1}',null,'{}']}	{"b":null,"a":1}	{"b":2,"a":1}	[-32768,null,32767]
+NULL	NULL	NULL	NULL	NULL
+same	{"items":[],"attrs":{},"detail":null,"jsonitems":[]}	{}	{}	[]
+same	{"items":[-128,null,127],"attrs":{"a":-32768},"detail":{"code":-128,"note":null},"jsonitems":['{"b":2,"a":1}',null,'{}']}	{"a":1,"b":null}	{"b":2,"a":1}	[-32768,null,32767]
+same	{"items":[-128,null,127],"attrs":{"a":-32768},"detail":{"code":127,"note":'{"b":2,"a":1}'},"jsonitems":['{"b":2,"a":1}',null,'{}']}	{"a":1,"b":null}	{"b":9,"a":1}	[-32768,null,32767]
+same	{"items":[-128,null,127],"attrs":{"a":-32768},"detail":{"code":127,"note":'{"b":2,"a":1}'},"jsonitems":['{"b":2,"a":1}',null,'{}']}	{"a":1,"b":null}	{"b":9,"a":1}	[-32768,null,32767]

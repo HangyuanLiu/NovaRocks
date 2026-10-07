@@ -146,6 +146,30 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
+    // These fixtures model historical scalar documents and an independently
+    // observed provider domain. New bound recursive fixtures pass None.
+    fn fixture_legacy_scalar_type(
+        ty: &novarocks_types::logical_type::LogicalType,
+    ) -> Option<novarocks_types::logical_type::LogicalType> {
+        use novarocks_types::logical_type::LogicalType;
+        match ty {
+            LogicalType::Boolean
+            | LogicalType::Int32
+            | LogicalType::Int64
+            | LogicalType::Float32
+            | LogicalType::Float64
+            | LogicalType::Utf8
+            | LogicalType::Binary
+            | LogicalType::Date32
+            | LogicalType::Decimal { bits: 128, .. } => Some(ty.clone()),
+            LogicalType::Timestamp {
+                unit: arrow::datatypes::TimeUnit::Microsecond,
+                timezone: None,
+            } => Some(ty.clone()),
+            _ => None,
+        }
+    }
+
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             std::time::Instant::now() + std::time::Duration::from_secs(30),
@@ -193,7 +217,13 @@ mod tests {
                         } else {
                             field.name_at_binding.clone()
                         },
-                        field.type_signature.clone(),
+                        field.data_type.logical_type().clone(),
+                        fixture_legacy_scalar_type(field.data_type.logical_type()),
+                        field
+                            .data_type
+                            .provider_type_binding()
+                            .cloned()
+                            .unwrap_or_else(|| Bytes::from_static(b"fixture-schema-binding")),
                         field.nullable,
                     )
                     .unwrap(),
@@ -252,7 +282,13 @@ mod tests {
                     MvObservedSourceField::try_new(
                         Bytes::copy_from_slice(field.target_field_id.as_bytes()),
                         format!("{prefix}_{ordinal}"),
-                        field.type_signature.clone(),
+                        field.data_type.logical_type().clone(),
+                        fixture_legacy_scalar_type(field.data_type.logical_type()),
+                        field
+                            .data_type
+                            .provider_type_binding()
+                            .cloned()
+                            .unwrap_or_else(|| Bytes::from_static(b"fixture-schema-binding")),
                         field.nullable,
                     )
                     .unwrap(),

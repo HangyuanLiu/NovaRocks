@@ -150,6 +150,9 @@ message IcebergColumnHandle {
   bool nullable = 5;
   optional string comment = 6;
   optional string scalar_integer_domain = 7;
+  // Formal field-ID declarations for this complete base subtree. Mutually
+  // exclusive with the historical top-level integer declaration.
+  optional string field_domains_json = 8;
 }
 
 message HiveTransactionHandle {
@@ -192,6 +195,8 @@ message IcebergTableHandle {
   IcebergPinnedDataFileSet pinned_data_files = 14;
   optional IcebergReadDomain read_domain = 15;
   map<int32, string> scalar_integer_domains = 16;
+  // Exact active declarations of the selected schema, using field_domains.v1.
+  optional string field_domains_json = 17;
 }
 
 message TableChangesFunctionHandle {
@@ -201,6 +206,7 @@ message TableChangesFunctionHandle {
   optional string name_mapping_json = 4;
   int64 start_snapshot_id = 5;
   int64 end_snapshot_id = 6;
+  optional string field_domains_json = 7;
 }
 
 message IcebergChangeWindowHandle {
@@ -213,6 +219,7 @@ message IcebergChangeWindowHandle {
   map<int32, string> partition_spec_jsons = 7;
   optional IcebergReadDomain from_read_domain = 8;
   optional IcebergReadDomain to_read_domain = 9;
+  optional string field_domains_json = 10;
 }
 
 enum IcebergSystemTableType {

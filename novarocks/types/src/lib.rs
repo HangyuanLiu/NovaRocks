@@ -27,6 +27,7 @@ pub mod field_render_schema;
 pub mod identity;
 pub mod largeint;
 pub mod logical;
+pub mod logical_type;
 pub mod mv_aggregate_layout;
 pub mod naming;
 pub mod native_compatibility;

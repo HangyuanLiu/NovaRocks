@@ -177,8 +177,9 @@ pub fn ensure_native_fragment_sink_supported(
     has_stream_edge: bool,
     has_router_edges: bool,
     has_cte_id: bool,
+    has_predicate_fanout: bool,
 ) -> Result<(), String> {
-    if is_root || has_stream_edge || has_router_edges || has_cte_id {
+    if is_root || has_stream_edge || has_router_edges || has_cte_id || has_predicate_fanout {
         return Ok(());
     }
 
@@ -619,14 +620,16 @@ mod tests {
 
     #[test]
     fn validates_native_sink_and_output_roles() {
-        ensure_native_fragment_sink_supported(7, false, true, false, false)
+        ensure_native_fragment_sink_supported(11, false, false, false, false, true)
+            .expect("predicate fanout is a dedicated static sink");
+        ensure_native_fragment_sink_supported(7, false, true, false, false, false)
             .expect("stream sink is supported");
-        ensure_native_fragment_sink_supported(8, false, false, true, false)
+        ensure_native_fragment_sink_supported(8, false, false, true, false, false)
             .expect("router sink is supported");
-        ensure_native_fragment_sink_supported(9, false, false, false, true)
+        ensure_native_fragment_sink_supported(9, false, false, false, true, false)
             .expect("CTE multicast sink is supported");
         assert!(
-            ensure_native_fragment_sink_supported(10, false, false, false, false)
+            ensure_native_fragment_sink_supported(10, false, false, false, false, false)
                 .expect_err("unowned dynamic sink must be rejected")
                 .contains("unowned fragment sink")
         );

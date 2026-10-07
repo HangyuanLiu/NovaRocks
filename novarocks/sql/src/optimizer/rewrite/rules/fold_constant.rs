@@ -274,6 +274,13 @@ impl<'a> ConstantFolder<'a> {
     /// field set mirrors `rewrite::required_columns::tag_required_columns`.
     fn fold_operator(&mut self, op: &mut Operator) -> bool {
         match op {
+            Operator::LogicalFanoutAnchor(anchor) | Operator::PhysicalFanoutAnchor(anchor) => {
+                let mut changed = false;
+                for branch in &mut anchor.branches {
+                    changed |= self.fold_slot(&mut branch.predicate);
+                }
+                changed
+            }
             Operator::LogicalScan(scan) | Operator::PhysicalScan(scan) => {
                 self.fold_slots(&mut scan.predicates)
             }
@@ -371,6 +378,12 @@ impl<'a> ConstantFolder<'a> {
             | Operator::PhysicalGenerateSeries(_)
             | Operator::LogicalRepeat(_)
             | Operator::PhysicalRepeat(_)
+            | Operator::LogicalQuotaPreclaim(_)
+            | Operator::PhysicalQuotaPreclaim(_)
+            | Operator::LogicalQuotaTrim(_)
+            | Operator::PhysicalQuotaTrim(_)
+            | Operator::LogicalFanoutConsume(_)
+            | Operator::PhysicalFanoutConsume(_)
             | Operator::LogicalCTEAnchor(_)
             | Operator::PhysicalCTEAnchor(_)
             | Operator::LogicalCTEProduce(_)
@@ -393,6 +406,9 @@ impl<'a> ConstantFolder<'a> {
 /// exhaustive so a new operator cannot slip past either one.
 fn operator_has_scalars(op: &Operator) -> bool {
     match op {
+        Operator::LogicalFanoutAnchor(o) | Operator::PhysicalFanoutAnchor(o) => {
+            !o.branches.is_empty()
+        }
         Operator::LogicalScan(scan) | Operator::PhysicalScan(scan) => !scan.predicates.is_empty(),
         Operator::LogicalFilter(_) | Operator::PhysicalFilter(_) => true,
         Operator::LogicalProject(project) | Operator::PhysicalProject(project) => {
@@ -441,6 +457,12 @@ fn operator_has_scalars(op: &Operator) -> bool {
         | Operator::PhysicalGenerateSeries(_)
         | Operator::LogicalRepeat(_)
         | Operator::PhysicalRepeat(_)
+        | Operator::LogicalQuotaPreclaim(_)
+        | Operator::PhysicalQuotaPreclaim(_)
+        | Operator::LogicalQuotaTrim(_)
+        | Operator::PhysicalQuotaTrim(_)
+        | Operator::LogicalFanoutConsume(_)
+        | Operator::PhysicalFanoutConsume(_)
         | Operator::LogicalCTEAnchor(_)
         | Operator::PhysicalCTEAnchor(_)
         | Operator::LogicalCTEProduce(_)

@@ -122,12 +122,16 @@ fn is_hashable_pk_type(sql_type: &str) -> bool {
 }
 
 /// List materialized views from the readiness-filtered Accelerator projection.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn list_mv_rows_with_ports(
     readiness: &MvReadinessPort,
     entrance: Option<&novarocks_mv_application::management::ManagementEntrance>,
     current_catalog: Option<&str>,
     stmt: &MvShowStatement,
     storage_filter: Option<MvStorageEngine>,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+    product_service: &novarocks_mv_application::service::MvProductService,
 ) -> Result<Vec<MvListRow>, String> {
     let projections = readiness
         .list_listable_projections()
@@ -151,11 +155,34 @@ pub(crate) fn list_mv_rows_with_ports(
                 String::new()
             }
         };
-        rows.push(list_row_from_projection(
+        let mut row = list_row_from_projection(
             projection,
             dependencies,
             manageability_display(&listed.manageability, entrance, projection),
-        ));
+        );
+        let current = projection
+            .facts
+            .target()
+            .catalog()
+            .ok_or_else(|| "MV listing target has no catalog".to_string())
+            .and_then(|catalog| {
+                crate::connector::acquire_metadata_planning_lease(controls, catalog)
+            })
+            .and_then(|planning| {
+                super::eligibility_document::observe_current(
+                    &planning,
+                    projection.facts.source_revision(),
+                    context,
+                )
+                .map(|(_, documents)| documents.eligibility().cloned())
+            });
+        fill_eligibility_diagnostics(&mut row, &projection.facts, current);
+        if let Some(stop) = product_service
+            .automatic_refresh_stop_diagnostic(projection.mv_id, MAX_MV_DIAGNOSTIC_BYTES)
+        {
+            fill_automatic_stop_diagnostics(&mut row, &stop);
+        }
+        rows.push(row);
     }
     Ok(rows)
 }
@@ -173,8 +200,12 @@ fn manageability_display(
     use novarocks_mv_application::management::MvManagementPhase;
 
     match manageability {
-        MvListedManageability::ReadOnly(reason) => return format!("READ_ONLY: {reason}"),
-        MvListedManageability::Unavailable(reason) => return format!("UNAVAILABLE: {reason}"),
+        MvListedManageability::ReadOnly(reason) => {
+            return bounded_diagnostic(&format!("READ_ONLY: {}", bounded_diagnostic(reason)));
+        }
+        MvListedManageability::Unavailable(reason) => {
+            return bounded_diagnostic(&format!("UNAVAILABLE: {}", bounded_diagnostic(reason)));
+        }
         MvListedManageability::Manageable => {}
     }
     // Readiness says this process may read the target. Whether it may write
@@ -247,6 +278,15 @@ fn list_row_from_projection(
     };
     MvListRow {
         manageability,
+        eligibility_state: "UNKNOWN".into(),
+        eligibility_baseline: None,
+        eligibility_generation: None,
+        eligibility_attempt: None,
+        eligibility_requested: None,
+        eligibility_matched: None,
+        eligibility_conclusion: "UNAVAILABLE".into(),
+        eligibility_block_reason: None,
+        automatic_refresh_stop_reason: None,
         name: target.name().to_string(),
         database: target.namespace().to_string(),
         storage_engine: MvStorageEngine::Iceberg.as_sql_str().to_string(),
@@ -282,6 +322,118 @@ fn list_row_from_projection(
         refresh_state: refresh_status_for_configuration(configuration),
         retry_after_time: None,
     }
+}
+
+const MAX_MV_DIAGNOSTIC_BYTES: usize = 1024;
+
+fn bounded_diagnostic(message: &str) -> String {
+    let mut end = message.len().min(MAX_MV_DIAGNOSTIC_BYTES);
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message[..end].to_owned()
+}
+
+fn hex_identity(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut result, "{byte:02x}").expect("String formatting");
+    }
+    result
+}
+
+fn fill_eligibility_diagnostics(
+    row: &mut MvListRow,
+    facts: &novarocks_mv_application::persistence::projection::MvDocumentProjection,
+    observation: Result<
+        Option<novarocks_mv_application::persistence::eligibility::EligibilityDocument>,
+        String,
+    >,
+) {
+    use novarocks_mv_application::persistence::eligibility::EligibilityState;
+    let eligibility = match observation {
+        Ok(eligibility) => eligibility,
+        Err(error) => {
+            row.eligibility_block_reason = Some(bounded_diagnostic(&error));
+            return;
+        }
+    };
+    if !facts.interpretation().aggregates.is_empty() {
+        row.eligibility_state = "NOT_APPLICABLE".into();
+        row.eligibility_conclusion = "NOT_REQUIRED".into();
+        return;
+    }
+    let Some(eligibility) = eligibility else {
+        let never_published = matches!(facts.publication(), MvPublicationState::NeverPublished);
+        row.eligibility_state = if never_published {
+            "NEVER_PUBLISHED"
+        } else {
+            "MISSING"
+        }
+        .into();
+        row.eligibility_conclusion = "UNAVAILABLE".into();
+        row.eligibility_block_reason =
+            Some("REFRESH FULL is required to establish an eligible baseline".into());
+        return;
+    };
+    let binding = &eligibility.binding;
+    // Object identities can be wide. The fingerprint is explicitly labelled;
+    // publication identity (at most 256 bytes) and revision remain exact.
+    let fingerprint =
+        novarocks_mv_application::persistence::identity::DocumentRevision::from_canonical_bytes(
+            binding.object_id.as_bytes(),
+        );
+    row.eligibility_baseline = Some(format!(
+        "object_sha256={}; publication={}; revision={}",
+        hex_identity(fingerprint.as_bytes()),
+        hex_identity(binding.publication_id.as_bytes()),
+        hex_identity(binding.publication_revision.as_bytes())
+    ));
+    row.eligibility_generation = Some(binding.generation.to_string());
+    match &eligibility.state {
+        EligibilityState::Eligible => {
+            row.eligibility_state = "ELIGIBLE".into();
+            row.eligibility_conclusion = "NO_PENDING_VALIDATION".into();
+        }
+        EligibilityState::ValidationPending { attempt, .. } => {
+            row.eligibility_state = "VALIDATION_PENDING".into();
+            row.eligibility_attempt = Some(format!(
+                "{:016x}{:016x}/{}",
+                attempt.query_id().high(),
+                attempt.query_id().low(),
+                attempt.attempt_id().get()
+            ));
+            row.eligibility_conclusion = "VERIFICATION_RESULT_NOT_RECOVERED".into();
+            row.eligibility_block_reason =
+                Some("Verification result has not been recovered; REFRESH FULL is required".into());
+        }
+        EligibilityState::Invalid { evidence } => {
+            row.eligibility_state = "INVALID".into();
+            row.eligibility_requested = Some(evidence.requested.to_string());
+            row.eligibility_matched = Some(evidence.matched.to_string());
+            row.eligibility_conclusion = "COMPLETE_RETRACTION_SHORTAGE".into();
+            row.eligibility_block_reason = Some(
+                "Retraction demand exceeds visible target multiplicity; REFRESH FULL is required"
+                    .into(),
+            );
+        }
+    }
+}
+
+fn fill_automatic_stop_diagnostics(
+    row: &mut MvListRow,
+    stop: &novarocks_mv_application::scheduler_runtime::MvAutomaticRefreshStop,
+) {
+    use novarocks_mv_application::scheduler_runtime::MvAutomaticRefreshStopReason;
+    row.automatic_refresh_stop_reason = Some(
+        match stop.reason {
+            MvAutomaticRefreshStopReason::CapacityRefused => "CAPACITY_REFUSED",
+            MvAutomaticRefreshStopReason::TargetRefused => "TARGET_REFUSED",
+        }
+        .into(),
+    );
+    row.last_scheduler_error = Some(bounded_diagnostic(&stop.error));
 }
 
 fn refresh_status_for_configuration(configuration: &ConfigurationDocument) -> String {
@@ -362,6 +514,15 @@ pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, St
         ("RefreshState", false),
         ("RetryAfterTime", true),
         ("Manageability", false),
+        ("EligibilityState", false),
+        ("EligibilityBaseline", true),
+        ("EligibilityGeneration", true),
+        ("EligibilityAttempt", true),
+        ("EligibilityRequested", true),
+        ("EligibilityMatched", true),
+        ("EligibilityConclusion", false),
+        ("EligibilityBlockReason", true),
+        ("AutomaticRefreshStopReason", true),
     ];
     let rows = rows
         .iter()
@@ -383,6 +544,15 @@ pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, St
                 Some(row.refresh_state.clone()),
                 row.retry_after_time.clone(),
                 Some(row.manageability.clone()),
+                Some(row.eligibility_state.clone()),
+                row.eligibility_baseline.clone(),
+                row.eligibility_generation.clone(),
+                row.eligibility_attempt.clone(),
+                row.eligibility_requested.clone(),
+                row.eligibility_matched.clone(),
+                Some(row.eligibility_conclusion.clone()),
+                row.eligibility_block_reason.clone(),
+                row.automatic_refresh_stop_reason.clone(),
             ]
         })
         .collect();
@@ -678,6 +848,15 @@ mod manageability_tests {
             refresh_state: "IDLE".to_string(),
             retry_after_time: None,
             manageability: "READ_ONLY: closed after restart".to_string(),
+            eligibility_state: "UNKNOWN".into(),
+            eligibility_baseline: None,
+            eligibility_generation: None,
+            eligibility_attempt: None,
+            eligibility_requested: None,
+            eligibility_matched: None,
+            eligibility_conclusion: "UNAVAILABLE".into(),
+            eligibility_block_reason: None,
+            automatic_refresh_stop_reason: None,
         };
 
         let result = build_mv_rows_result(std::slice::from_ref(&row)).expect("one row");
@@ -688,5 +867,156 @@ mod manageability_tests {
                 .any(|column| column.name() == "Manageability"),
             "SHOW has to report why a listed MV cannot be refreshed"
         );
+    }
+
+    fn visible_projection() -> StoredMvProjection {
+        use novarocks_mv_application::persistence::codec::PhysicalFieldLogicalIdentity;
+        let mut fixture =
+            novarocks_mv_application::persistence::test_support::ProjectionFixture::new(
+                novarocks_mv_application::product::MvTarget::from_parts(
+                    Some("lake_alias"),
+                    "analytics",
+                    "orders_mv",
+                ),
+                Some(201),
+            );
+        fixture.interpretation.aggregates.clear();
+        fixture.interpretation.state_slots.clear();
+        fixture.interpretation.apply_key = None;
+        fixture.interpretation.branches.clear();
+        fixture.interpretation.target.fields.retain(|field| {
+            matches!(
+                field.logical_identity,
+                PhysicalFieldLogicalIdentity::Output(_)
+            )
+        });
+        StoredMvProjection {
+            mv_id: 42,
+            facts: fixture.build().expect("visible tuple projection"),
+        }
+    }
+
+    #[test]
+    fn show_current_eligibility_has_exact_baseline_attempt_and_complete_shortage() {
+        use novarocks_mv_application::persistence::eligibility::{
+            EligibilityDocument, EligibilityEvidence, EligibilityState,
+        };
+        use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
+        let projection = visible_projection();
+        let MvPublicationState::Published(publication) = projection.facts.publication() else {
+            panic!("published fixture")
+        };
+        let eligible = EligibilityDocument {
+            binding: super::super::eligibility_document::published_binding(
+                projection.facts.definition(),
+                publication.document(),
+                1,
+            )
+            .unwrap(),
+            state: EligibilityState::Eligible,
+        };
+        let attempt =
+            QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(3).unwrap()).unwrap();
+        let pending = super::super::eligibility_document::pending(&eligible, attempt, 201).unwrap();
+        let mut invalid = pending.clone();
+        invalid.binding.generation += 1;
+        invalid.state = EligibilityState::Invalid {
+            evidence: EligibilityEvidence {
+                requested: 9,
+                matched: 8,
+                samples: vec![],
+            },
+        };
+        for (document, state, conclusion) in [
+            (eligible, "ELIGIBLE", "NO_PENDING_VALIDATION"),
+            (
+                pending,
+                "VALIDATION_PENDING",
+                "VERIFICATION_RESULT_NOT_RECOVERED",
+            ),
+            (invalid, "INVALID", "COMPLETE_RETRACTION_SHORTAGE"),
+        ] {
+            let mut row = list_row_from_projection(
+                &projection,
+                String::new(),
+                "READ_ONLY: UNKNOWN_EFFECT".into(),
+            );
+            fill_eligibility_diagnostics(&mut row, &projection.facts, Ok(Some(document.clone())));
+            assert_eq!(row.eligibility_state, state);
+            assert_eq!(row.eligibility_conclusion, conclusion);
+            assert_eq!(
+                row.eligibility_generation,
+                Some(document.binding.generation.to_string())
+            );
+            let baseline = row.eligibility_baseline.as_ref().unwrap();
+            assert!(baseline.contains(&hex_identity(
+                document.binding.publication_revision.as_bytes()
+            )));
+            assert!(baseline.contains(&hex_identity(document.binding.publication_id.as_bytes())));
+            assert!(baseline.len() <= MAX_MV_DIAGNOSTIC_BYTES);
+            assert_eq!(row.manageability, "READ_ONLY: UNKNOWN_EFFECT");
+            if state == "VALIDATION_PENDING" {
+                assert_eq!(
+                    row.eligibility_attempt.as_deref(),
+                    Some("00000000000000010000000000000002/3")
+                );
+                assert!(row.eligibility_requested.is_none());
+                assert!(row.eligibility_matched.is_none());
+            } else if state == "INVALID" {
+                assert_eq!(row.eligibility_requested.as_deref(), Some("9"));
+                assert_eq!(row.eligibility_matched.as_deref(), Some("8"));
+            }
+            let result = build_mv_rows_result(&[row]).unwrap();
+            for name in [
+                "EligibilityState",
+                "EligibilityBaseline",
+                "EligibilityGeneration",
+                "EligibilityAttempt",
+                "EligibilityRequested",
+                "EligibilityMatched",
+                "EligibilityConclusion",
+                "EligibilityBlockReason",
+                "AutomaticRefreshStopReason",
+                "Manageability",
+            ] {
+                assert!(result.columns.iter().any(|column| column.name() == name));
+            }
+        }
+    }
+
+    #[test]
+    fn show_observation_failure_never_infers_eligible_and_keeps_bounded_stop_distinct() {
+        use novarocks_mv_application::scheduler_runtime::{
+            MvAutomaticRefreshStop, MvAutomaticRefreshStopReason,
+        };
+        let projection = visible_projection();
+        let mut row = list_row_from_projection(&projection, String::new(), "MANAGEABLE".into());
+        fill_eligibility_diagnostics(
+            &mut row,
+            &projection.facts,
+            Err("unavailable中".repeat(1000)),
+        );
+        fill_automatic_stop_diagnostics(
+            &mut row,
+            &MvAutomaticRefreshStop {
+                reason: MvAutomaticRefreshStopReason::CapacityRefused,
+                error: "capacity中".repeat(1000),
+            },
+        );
+        assert_eq!(row.eligibility_state, "UNKNOWN");
+        assert_eq!(row.eligibility_conclusion, "UNAVAILABLE");
+        assert!(row.eligibility_baseline.is_none());
+        assert!(row.eligibility_requested.is_none());
+        assert!(row.eligibility_block_reason.as_ref().unwrap().len() <= MAX_MV_DIAGNOSTIC_BYTES);
+        assert!(row.last_scheduler_error.as_ref().unwrap().len() <= MAX_MV_DIAGNOSTIC_BYTES);
+        assert_eq!(
+            row.automatic_refresh_stop_reason.as_deref(),
+            Some("CAPACITY_REFUSED")
+        );
+        assert_eq!(row.manageability, "MANAGEABLE");
+        assert_eq!(row.refresh_paused, "false");
+        let mut missing = list_row_from_projection(&projection, String::new(), "MANAGEABLE".into());
+        fill_eligibility_diagnostics(&mut missing, &projection.facts, Ok(None));
+        assert_eq!(missing.eligibility_state, "MISSING");
     }
 }

@@ -84,6 +84,7 @@ pub struct MemTracker {
     allocated: AtomicI64,
     deallocated: AtomicI64,
     children: Mutex<Vec<Weak<MemTracker>>>,
+    runtime_error: Mutex<Weak<crate::runtime::runtime_state::RuntimeErrorState>>,
 }
 
 impl MemTracker {
@@ -98,6 +99,7 @@ impl MemTracker {
             allocated: AtomicI64::new(0),
             deallocated: AtomicI64::new(0),
             children: Mutex::new(Vec::new()),
+            runtime_error: Mutex::new(Weak::new()),
         })
     }
 
@@ -112,6 +114,13 @@ impl MemTracker {
             allocated: AtomicI64::new(0),
             deallocated: AtomicI64::new(0),
             children: Mutex::new(Vec::new()),
+            runtime_error: Mutex::new(
+                parent
+                    .runtime_error
+                    .lock()
+                    .expect("tracker runtime error lock")
+                    .clone(),
+            ),
         });
         parent
             .children
@@ -119,6 +128,54 @@ impl MemTracker {
             .unwrap_or_else(|e| e.into_inner())
             .push(Arc::downgrade(&child));
         child
+    }
+
+    pub(crate) fn bind_runtime_error(
+        &self,
+        error: &Arc<crate::runtime::runtime_state::RuntimeErrorState>,
+    ) {
+        *self
+            .runtime_error
+            .lock()
+            .expect("tracker runtime error lock") = Arc::downgrade(error);
+        for child in self.children() {
+            child.bind_runtime_error(error);
+        }
+    }
+
+    fn capacity_failure(
+        &self,
+        current: i64,
+        limit: i64,
+    ) -> novarocks_execution_contract::TaskFailure {
+        use novarocks_execution_contract::{SafeDetail, TaskFailure, TaskFailureCategory};
+        TaskFailure::new(
+            TaskFailureCategory::CapacityRefused {
+                resource: SafeDetail::truncating(&self.label),
+                requested: current as u64,
+                limit: limit as u64,
+            },
+            SafeDetail::truncating(&format!(
+                "ResourceExhausted: memory limit exceeded for tracker {}: current {current} bytes, limit {limit} bytes",
+                self.label
+            )),
+        )
+    }
+
+    fn report_capacity_failure(
+        &self,
+        failure: novarocks_execution_contract::TaskFailure,
+    ) -> String {
+        let detail = failure.to_string();
+        if let Some(error) = self
+            .runtime_error
+            .lock()
+            .expect("tracker runtime error lock")
+            .upgrade()
+        {
+            error.set_failure(failure);
+        }
+        detail
     }
 
     pub fn label(&self) -> &str {
@@ -190,7 +247,7 @@ impl MemTracker {
 
     /// Increase consumption for this tracker and all ancestors.
     pub fn consume(&self, bytes: i64) {
-        let _ = self.consume_and_check_limit(bytes);
+        let _ = self.consume_checked(bytes);
     }
 
     /// Records newly owned bytes on this tracker and every ancestor, then
@@ -201,6 +258,16 @@ impl MemTracker {
     /// hide live memory. The owner must fail the operation and release the
     /// complete retained amount when the state is dropped.
     pub fn consume_and_check_limit(&self, bytes: i64) -> Result<(), String> {
+        self.consume_checked(bytes)
+            .map_err(|failure| self.report_capacity_failure(failure))
+    }
+
+    /// Checked admission preserving the bounded task failure for typed consumers.
+    /// The acquired charge remains live on refusal until the owner releases it.
+    pub fn consume_checked(
+        &self,
+        bytes: i64,
+    ) -> Result<(), novarocks_execution_contract::TaskFailure> {
         if bytes <= 0 {
             return Ok(());
         }
@@ -212,7 +279,7 @@ impl MemTracker {
             current.update_peak(new_value);
             let limit = current.limit();
             if exceeded.is_none() && limit > 0 && new_value > limit {
-                exceeded = Some(current.limit_exceeded_detail(new_value, limit));
+                exceeded = Some(current.capacity_failure(new_value, limit));
             }
             tracker = current.parent.as_deref();
         }
@@ -276,7 +343,7 @@ impl MemTracker {
                 for tracker in reserved.into_iter().rev() {
                     tracker.release_local(bytes);
                 }
-                return Err(error);
+                return Err(destination.report_capacity_failure(error));
             }
             reserved.push(Arc::clone(tracker));
         }
@@ -286,13 +353,16 @@ impl MemTracker {
         Ok(())
     }
 
-    fn try_consume_local(&self, bytes: i64) -> Result<(), String> {
+    fn try_consume_local(
+        &self,
+        bytes: i64,
+    ) -> Result<(), novarocks_execution_contract::TaskFailure> {
         let limit = self.limit();
         let mut current = self.current.load(Ordering::Acquire);
         loop {
             let next = current.saturating_add(bytes);
             if limit > 0 && next > limit {
-                return Err(self.limit_exceeded_detail(next, limit));
+                return Err(self.capacity_failure(next, limit));
             }
             match self.current.compare_exchange_weak(
                 current,
@@ -338,10 +408,7 @@ impl MemTracker {
     }
 
     fn limit_exceeded_detail(&self, current: i64, limit: i64) -> String {
-        format!(
-            "ResourceExhausted: memory limit exceeded for tracker {}: current {current} bytes, limit {limit} bytes",
-            self.label
-        )
+        self.report_capacity_failure(self.capacity_failure(current, limit))
     }
 }
 
@@ -388,6 +455,58 @@ pub fn query_tracker_label(high: i64, low: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::MemTracker;
+
+    #[test]
+    fn checked_capacity_failure_keeps_type_and_fragment_owner() {
+        use crate::runtime::runtime_state::RuntimeErrorState;
+        use novarocks_execution_contract::{SafeDetail, TaskFailure, TaskFailureCategory};
+        use std::sync::Arc;
+        let query = MemTracker::new_root("query");
+        query.install_limit_once(3).unwrap();
+        let fragment = MemTracker::new_child("fragment", &query);
+        let sibling = MemTracker::new_child("sibling", &query);
+        let error = Arc::new(RuntimeErrorState::default());
+        let sibling_error = Arc::new(RuntimeErrorState::default());
+        fragment.bind_runtime_error(&error);
+        sibling.bind_runtime_error(&sibling_error);
+        let operator = MemTracker::new_child("operator", &fragment);
+        operator.consume_and_check_limit(4).unwrap_err();
+        assert!(matches!(
+            error.task_failure().unwrap().category(),
+            TaskFailureCategory::CapacityRefused {
+                requested: 4,
+                limit: 3,
+                ..
+            }
+        ));
+        assert!(sibling_error.task_failure().is_none());
+        error.set_error("secondary text".into());
+        error.set_failure(TaskFailure::mv_apply_consistency(
+            2,
+            1,
+            SafeDetail::new("sample").unwrap(),
+        ));
+        assert!(matches!(
+            error.task_failure().unwrap().category(),
+            TaskFailureCategory::CapacityRefused { .. }
+        ));
+        assert_eq!(operator.current(), 4);
+        operator.release(4);
+        assert_eq!(query.current(), 0);
+    }
+
+    #[test]
+    fn unchecked_accounting_does_not_latch_a_task_failure() {
+        use crate::runtime::runtime_state::RuntimeErrorState;
+        use std::sync::Arc;
+        let tracker = MemTracker::new_root("fragment");
+        tracker.install_limit_once(1).unwrap();
+        let error = Arc::new(RuntimeErrorState::default());
+        tracker.bind_runtime_error(&error);
+        tracker.consume(2);
+        assert!(error.error().is_none());
+        tracker.release(2);
+    }
 
     #[test]
     fn immutable_limit_is_idempotent_and_rejects_drift() {

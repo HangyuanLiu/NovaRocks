@@ -24,6 +24,9 @@ use novarocks_cluster_harness::isolated_iceberg_rest::IsolatedIcebergRestFixture
 use novarocks_cluster_harness::{
     CrossProcessChildEnvironment, CrossProcessConfigOverlay, ServerHandle,
 };
+use novarocks_sql_test_runner::publication_fault_fixture::{
+    CatalogResponseLossControl, CatalogResponseLossFixture,
+};
 use std::path::Path;
 use std::sync::Mutex;
 use std::thread;
@@ -43,6 +46,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
 /// A restarted FE must still see the same external catalog and object store.
 pub(super) struct ManagedMvRestFixture {
     rest: IsolatedIcebergRestFixture,
+    catalog_proxy: Option<CatalogResponseLossFixture>,
     create_catalog_sql: String,
 }
 
@@ -53,7 +57,28 @@ impl ManagedMvRestFixture {
     ) -> Result<(Self, ScenarioLaunchConfig)> {
         let rest = IsolatedIcebergRestFixture::start(scenario_root)
             .context("start private Iceberg REST and MinIO fixture for managed MV")?;
+        Self::from_rest(rest, catalog, None)
+    }
+
+    pub(super) fn start_with_catalog_proxy(
+        scenario_root: &Path,
+        catalog: &str,
+    ) -> Result<(Self, ScenarioLaunchConfig)> {
+        let rest = IsolatedIcebergRestFixture::start(scenario_root)
+            .context("start private REST authority for commit response loss")?;
+        let proxy = CatalogResponseLossFixture::start(rest.endpoints().rest_uri.clone())?;
+        Self::from_rest(rest, catalog, Some(proxy))
+    }
+
+    fn from_rest(
+        rest: IsolatedIcebergRestFixture,
+        catalog: &str,
+        catalog_proxy: Option<CatalogResponseLossFixture>,
+    ) -> Result<(Self, ScenarioLaunchConfig)> {
         let endpoints = rest.endpoints().clone();
+        let catalog_uri = catalog_proxy
+            .as_ref()
+            .map_or(endpoints.rest_uri.as_str(), |proxy| proxy.uri());
         let identity = rest.static_s3_identity();
         let create_catalog_sql = format!(
             "CREATE EXTERNAL CATALOG {catalog} PROPERTIES(\
@@ -72,7 +97,7 @@ impl ManagedMvRestFixture {
              \"aws.s3.endpoint\"=\"{}\",\
              \"aws.s3.region\"=\"us-east-1\",\
              \"aws.s3.enable_path_style_access\"=\"true\")",
-            endpoints.rest_uri, endpoints.rest_warehouse, endpoints.minio_endpoint,
+            catalog_uri, endpoints.rest_warehouse, endpoints.minio_endpoint,
         );
         let mut child_environment = CrossProcessChildEnvironment::default();
         for child in [&mut child_environment.fe, &mut child_environment.be] {
@@ -107,6 +132,7 @@ access_key_secret = "${{ENV:{SECRET_KEY_ENV}}}"
         Ok((
             Self {
                 rest,
+                catalog_proxy,
                 create_catalog_sql,
             },
             launch,
@@ -121,7 +147,92 @@ access_key_secret = "${{ENV:{SECRET_KEY_ENV}}}"
         &self.rest.endpoints().rest_uri
     }
 
+    pub(super) fn run_recursive_spark_until(
+        &self,
+        receipt_root: &Path,
+        stage: &str,
+        invocation: &str,
+        deadline: std::time::Instant,
+    ) -> Result<serde_json::Value> {
+        let expected = recursive_spark_invocation(stage)?;
+        if invocation != expected {
+            bail!("recursive Spark invocation differs from its frozen stage");
+        }
+        // Compile the committed inputs into the runner. The isolated fixture's
+        // workspace is its private runtime, not the repository source checkout.
+        let inputs = [
+            include_str!("../../../sql/fixtures/iceberg-delete-applicability/generate.scala"),
+            include_str!("../../../sql/fixtures/mv-visible-content-encodings/fixture.scala"),
+        ];
+        let input_bytes = inputs.iter().try_fold(0usize, |n, input| {
+            n.checked_add(input.len() + 1)
+                .context("recursive input size overflow")
+        })?;
+        if input_bytes > 256 * 1024 {
+            bail!("compiled recursive Spark inputs exceed their byte budget");
+        }
+        let mut script = String::with_capacity(input_bytes + 512);
+        for input in inputs {
+            script.push_str(input);
+            script.push('\n');
+        }
+        script.push_str("try {\n  DeleteApplicabilityFixture.initialize(org.apache.spark.sql.SparkSession.active, \"ns\", \"recursive_types\")\n  ");
+        script.push_str(expected);
+        script.push_str(
+            "\n} catch { case failure: Throwable => failure.printStackTrace(); System.exit(1) }\n",
+        );
+        if script.len() > 256 * 1024 || std::time::Instant::now() >= deadline {
+            bail!("recursive Spark input exceeds its byte/time budget");
+        }
+        let directory = receipt_root.join("recursive-spark").join(stage);
+        std::fs::create_dir_all(&directory)?;
+        let job = self
+            .rest
+            .run_owned_spark_until(&script, &directory, deadline)?;
+        if job.exit_code != 0 || !job.cleanup.confirmed_gone {
+            bail!(
+                "recursive Spark stage {stage} failed or cleanup is unconfirmed; see {}",
+                directory.display()
+            );
+        }
+        let output = read_recursive_file(&job.stdout_path, 4 * 1024 * 1024, deadline)?;
+        let receipt = parse_recursive_spark_receipt(&output, stage)?;
+        std::fs::write(
+            directory.join("stage-receipt.json"),
+            serde_json::to_vec_pretty(&receipt)?,
+        )?;
+        Ok(receipt)
+    }
+
+    pub(super) fn corrupt_private_visible_tuple(
+        &self,
+        namespace: &str,
+        table: &str,
+        timeout: Duration,
+    ) -> Result<String> {
+        super::mv_physical_corruption::replace_visible_value(
+            self.rest_uri(),
+            &self.rest.endpoints().minio_endpoint,
+            self.rest.static_s3_identity(),
+            namespace,
+            table,
+            timeout,
+        )
+    }
+
+    pub(super) fn catalog_proxy_control(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<CatalogResponseLossControl> {
+        self.catalog_proxy
+            .as_ref()
+            .context("managed MV catalog proxy is not installed")?
+            .control(deadline)
+    }
+
     pub(super) fn shutdown(&mut self) -> Result<()> {
+        // Stop the transparent proxy before its authoritative downstream.
+        self.catalog_proxy.take();
         self.rest
             .shutdown()
             .context("shutdown private managed MV REST fixture")
@@ -469,4 +580,110 @@ pub(super) fn wait_for_status_phase(
         "timed out waiting for {action}: expected phase {expected}, last observation {last}; {}",
         context.diagnostics()
     )
+}
+
+fn recursive_spark_invocation(stage: &str) -> Result<&'static str> {
+    match stage {
+        "initialize" => Ok("RecursiveTypeFixture.initialize(\"ns\")"),
+        "mutate" => Ok("RecursiveTypeFixture.mutate(\"ns\")"),
+        "initial" => Ok("RecursiveTypeFixture.observe(\"ns\",\"initial\")"),
+        "restored" => Ok("RecursiveTypeFixture.observe(\"ns\",\"restored\")"),
+        "incremental" => Ok("RecursiveTypeFixture.observe(\"ns\",\"incremental\")"),
+        "full" => Ok("RecursiveTypeFixture.observe(\"ns\",\"full\")"),
+        _ => bail!("unknown frozen recursive Spark stage"),
+    }
+}
+
+fn read_recursive_file(path: &Path, cap: usize, deadline: std::time::Instant) -> Result<Vec<u8>> {
+    use std::io::Read;
+    if std::time::Instant::now() >= deadline {
+        bail!("recursive fixture absolute deadline elapsed");
+    }
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("open bounded recursive fixture file {}", path.display()))?;
+    if file.metadata()?.len() > cap as u64 {
+        bail!("recursive fixture file exceeds its byte budget");
+    }
+    let mut bytes = Vec::new();
+    file.take(cap as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > cap || std::time::Instant::now() >= deadline {
+        bail!("recursive fixture read exceeds its byte/time budget");
+    }
+    Ok(bytes)
+}
+
+fn parse_recursive_spark_receipt(output: &[u8], stage: &str) -> Result<serde_json::Value> {
+    recursive_spark_invocation(stage)?;
+    let expected_record = match stage {
+        "initialize" => "recursive_source_initial",
+        "mutate" => "recursive_source_changed",
+        _ => "recursive_mv_observed",
+    };
+    if output.len() > 4 * 1024 * 1024 {
+        bail!("recursive Spark log exceeds its byte budget");
+    }
+    let output = std::str::from_utf8(output).context("recursive Spark stdout is not UTF-8")?;
+    let mut receipt = None;
+    for line in output.lines() {
+        let Some(payload) = line.strip_prefix("UEA4G_RECEIPT ") else {
+            continue;
+        };
+        if payload.len() > 256 * 1024 {
+            bail!("recursive Spark receipt exceeds its byte budget");
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(payload).context("malformed recursive Spark receipt")?;
+        let record = value
+            .get("record")
+            .and_then(serde_json::Value::as_str)
+            .context("recursive Spark receipt lacks a record identity")?;
+        if record != expected_record {
+            continue;
+        }
+        if matches!(stage, "initial" | "restored" | "incremental" | "full")
+            && value.get("stage").and_then(serde_json::Value::as_str) != Some(stage)
+        {
+            bail!("recursive Spark observation stage differs from the frozen invocation");
+        }
+        if receipt.replace(value).is_some() {
+            bail!("recursive Spark exact stage receipt is duplicated");
+        }
+    }
+    receipt.context("recursive Spark exact stage receipt is absent")
+}
+
+#[cfg(test)]
+mod recursive_spark_receipt_tests {
+    use super::parse_recursive_spark_receipt;
+
+    #[test]
+    fn exact_stage_receipt_is_required_and_unique() {
+        let valid = br#"noise
+UEA4G_RECEIPT {"record":"runtime"}
+UEA4G_RECEIPT {"record":"recursive_mv_observed","stage":"restored","snapshot":7}
+"#;
+        assert_eq!(
+            parse_recursive_spark_receipt(valid, "restored").unwrap()["snapshot"],
+            7
+        );
+        assert!(parse_recursive_spark_receipt(valid, "initial").is_err());
+        assert!(
+            parse_recursive_spark_receipt(b"UEA4G_RECEIPT {\"record\":\"runtime\"}\n", "initial")
+                .is_err()
+        );
+        let mut duplicate = valid.to_vec();
+        duplicate.extend_from_slice(valid);
+        assert!(parse_recursive_spark_receipt(&duplicate, "restored").is_err());
+    }
+
+    #[test]
+    fn malformed_and_oversized_receipts_fail_closed() {
+        assert!(parse_recursive_spark_receipt(b"UEA4G_RECEIPT {bad}", "initialize").is_err());
+        let huge = format!(
+            "UEA4G_RECEIPT {{\"record\":\"runtime\",\"text\":\"{}\"}}",
+            "x".repeat(256 * 1024)
+        );
+        assert!(parse_recursive_spark_receipt(huge.as_bytes(), "initialize").is_err());
+        assert!(parse_recursive_spark_receipt(b"", "invented").is_err());
+    }
 }

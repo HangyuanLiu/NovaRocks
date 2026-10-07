@@ -31,6 +31,9 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+apache-avro.workspace = true
+arrow-schema.workspace = true
+parquet.workspace = true
 arrow-array.workspace = true
 bytes.workspace = true
 h2.workspace = true
@@ -44,6 +47,7 @@ novarocks-execution.workspace = true
 novarocks-native-trust.workspace = true
 novarocks-proto-models.workspace = true
 novarocks-secret.workspace = true
+novarocks-sql-test-runner = { path = "../sql/runner" }
 novarocks-types.workspace = true
 novarocks-version.workspace = true
 prost.workspace = true

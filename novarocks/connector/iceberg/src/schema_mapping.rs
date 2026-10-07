@@ -50,7 +50,9 @@ pub fn sql_read_schema_from_iceberg(
         .fields()
         .iter()
         .zip(iceberg_schema.as_struct().fields())
-        .map(|(field, iceberg_field)| sql_read_field(field.as_ref(), iceberg_field).map(Arc::new))
+        .map(|(field, iceberg_field)| {
+            provider_engine_field(field.as_ref(), iceberg_field, true).map(Arc::new)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Arc::new(Schema::new_with_metadata(
         fields,
@@ -58,14 +60,38 @@ pub fn sql_read_schema_from_iceberg(
     )))
 }
 
-fn sql_read_field(
+/// Writer projection applies the same recursive primitive carrier overrides,
+/// retaining exact provider required children instead of SQL read key widening.
+pub(crate) fn sql_write_schema_from_iceberg(
+    schema: &crate::iceberg::spec::Schema,
+) -> Result<SchemaRef, String> {
+    validate_exact_schema(schema)?;
+    let arrow = crate::iceberg::arrow::schema_to_arrow_schema(schema).map_err(|e| e.to_string())?;
+    if arrow.fields().len() != schema.as_struct().fields().len() {
+        return Err("provider write schema field count mismatch".into());
+    }
+    let fields = arrow
+        .fields()
+        .iter()
+        .zip(schema.as_struct().fields())
+        .map(|(f, p)| provider_engine_field(f, p, false).map(Arc::new))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        arrow.metadata().clone(),
+    )))
+}
+
+fn provider_engine_field(
     field: &Field,
     iceberg_field: &crate::iceberg::spec::NestedField,
+    widen_map_keys: bool,
 ) -> Result<Field, String> {
     Ok(field.clone().with_data_type(sql_read_data_type(
         field.data_type(),
         iceberg_field.field_type.as_ref(),
         field.name(),
+        widen_map_keys,
     )?))
 }
 
@@ -73,6 +99,7 @@ fn sql_read_data_type(
     arrow_type: &DataType,
     iceberg_type: &crate::iceberg::spec::Type,
     path: &str,
+    widen_map_keys: bool,
 ) -> Result<DataType, String> {
     use crate::iceberg::spec::{PrimitiveType, Type};
     use arrow::datatypes::TimeUnit;
@@ -80,10 +107,10 @@ fn sql_read_data_type(
     match iceberg_type {
         Type::Primitive(PrimitiveType::Binary) => Ok(DataType::Binary),
         Type::Primitive(PrimitiveType::Variant) => Ok(DataType::LargeBinary),
-        Type::Primitive(PrimitiveType::Timestamptz) => {
+        Type::Primitive(PrimitiveType::Timestamptz) if widen_map_keys => {
             Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
         }
-        Type::Primitive(PrimitiveType::TimestamptzNs) => {
+        Type::Primitive(PrimitiveType::TimestamptzNs) if widen_map_keys => {
             Ok(DataType::Timestamp(TimeUnit::Nanosecond, None))
         }
         Type::Primitive(_) => Ok(arrow_type.clone()),
@@ -102,7 +129,8 @@ fn sql_read_data_type(
                 .iter()
                 .zip(iceberg_struct.fields())
                 .map(|(field, iceberg_field)| {
-                    sql_read_field(field.as_ref(), iceberg_field).map(Arc::new)
+                    provider_engine_field(field.as_ref(), iceberg_field, widen_map_keys)
+                        .map(Arc::new)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(DataType::Struct(fields.into()))
@@ -124,9 +152,10 @@ fn sql_read_data_type(
                     ));
                 }
             };
-            Ok(wrap(Arc::new(sql_read_field(
+            Ok(wrap(Arc::new(provider_engine_field(
                 field,
                 &iceberg_list.element_field,
+                widen_map_keys,
             )?)))
         }
         Type::Map(iceberg_map) => {
@@ -154,12 +183,17 @@ fn sql_read_data_type(
             // NULL key appeared in them.
             let fields = vec![
                 Arc::new(
-                    sql_read_field(arrow_fields[0].as_ref(), &iceberg_map.key_field)?
-                        .with_nullable(true),
+                    provider_engine_field(
+                        arrow_fields[0].as_ref(),
+                        &iceberg_map.key_field,
+                        widen_map_keys,
+                    )?
+                    .with_nullable(widen_map_keys || !iceberg_map.key_field.required),
                 ),
-                Arc::new(sql_read_field(
+                Arc::new(provider_engine_field(
                     arrow_fields[1].as_ref(),
                     &iceberg_map.value_field,
+                    widen_map_keys,
                 )?),
             ];
             let entries = Arc::new(
@@ -169,6 +203,214 @@ fn sql_read_data_type(
                     .with_data_type(DataType::Struct(fields.into())),
             );
             Ok(DataType::Map(entries, *sorted))
+        }
+    }
+}
+
+/// Validate the complete provider tree before any recursive SDK conversion or
+/// private serialization. IDs and required remain provider facts, independent
+/// of the read carrier's map-key widening and timestamp normalization.
+pub(crate) fn validate_exact_schema(schema: &crate::iceberg::spec::Schema) -> Result<(), String> {
+    if schema.schema_id() < 0 {
+        return Err("provider schema ID must be nonnegative".into());
+    }
+    validate_provider_fields(schema.as_struct().fields().iter().map(AsRef::as_ref))
+}
+
+fn validate_provider_fields<'a>(
+    fields: impl ExactSizeIterator<Item = &'a crate::iceberg::spec::NestedField>,
+) -> Result<(), String> {
+    use crate::iceberg::spec::Type;
+    let limits = novarocks_types::logical_type::LogicalTypeLimits::default();
+    if fields.len() > limits.max_nodes {
+        return Err("provider schema exceeds its root field budget".into());
+    }
+    let mut pending = fields.map(|f| (f, 1usize)).collect::<Vec<_>>();
+    let mut ids = HashSet::new();
+    let mut nodes = 0usize;
+    let mut text = 0usize;
+    while let Some((field, depth)) = pending.pop() {
+        nodes += 1;
+        text = text
+            .checked_add(field.name.len())
+            .ok_or("provider schema text overflow")?;
+        if depth > limits.max_depth || nodes > limits.max_nodes || text > limits.max_text_bytes {
+            return Err("provider schema exceeds its recursive budget".into());
+        }
+        if field.id <= 0 || !ids.insert(field.id) {
+            return Err("provider schema has a duplicate or invalid nested field ID".into());
+        }
+        match field.field_type.as_ref() {
+            Type::Primitive(_) => {}
+            Type::Struct(v) => {
+                if v.fields().len() > limits.max_nodes.saturating_sub(nodes + pending.len()) {
+                    return Err("provider schema exceeds its recursive node budget".into());
+                }
+                pending.extend(v.fields().iter().map(|f| (f.as_ref(), depth + 1)))
+            }
+            Type::List(v) => pending.push((&v.element_field, depth + 1)),
+            Type::Map(v) => {
+                if !v.key_field.required {
+                    return Err("provider map key must be required".into());
+                }
+                pending.push((&v.value_field, depth + 1));
+                pending.push((&v.key_field, depth + 1));
+            }
+        }
+        if pending.len() > limits.max_nodes.saturating_sub(nodes) {
+            return Err("provider schema exceeds its recursive node budget".into());
+        }
+    }
+    Ok(())
+}
+
+/// Engine logical facts from one retained metadata generation. The SDK's
+/// generic Arrow schema is not itself an engine semantic type declaration.
+pub(crate) fn exact_logical_fields(
+    metadata: &crate::iceberg::spec::TableMetadata,
+) -> Result<Vec<novarocks_types::logical_type::LogicalField>, String> {
+    validate_exact_schema(metadata.current_schema())?;
+    let carrier = crate::field_domain::metadata_sql_schema(metadata, metadata.current_schema())
+        .map_err(|e| e.to_string())?;
+    let logical_markers = crate::metadata::logical_type_columns(metadata.properties());
+    carrier
+        .fields()
+        .iter()
+        .map(|f| {
+            let mut logical = novarocks_types::logical_type::logical_field_from_engine_arrow(f)?;
+            match logical_markers
+                .get(&f.name().to_ascii_lowercase())
+                .map(String::as_str)
+            {
+                Some("bitmap") => {
+                    logical.data_type = novarocks_types::logical_type::LogicalType::Bitmap
+                }
+                Some("hll") => logical.data_type = novarocks_types::logical_type::LogicalType::Hll,
+                _ => {}
+            }
+            Ok(logical)
+        })
+        .collect()
+}
+
+/// The closed historical scalar provider domain. Engine normalization cannot
+/// manufacture this fact: UUID/Fixed, zoned/nanosecond timestamps and Variant
+/// are explicitly outside the old leaf grammar.
+pub(crate) fn legacy_scalar_type(
+    field: &crate::iceberg::spec::NestedField,
+) -> Option<novarocks_types::logical_type::LogicalType> {
+    use crate::iceberg::spec::{PrimitiveType, Type};
+    use novarocks_types::logical_type::LogicalType;
+    match field.field_type.as_ref() {
+        Type::Primitive(PrimitiveType::Boolean) => Some(LogicalType::Boolean),
+        Type::Primitive(PrimitiveType::Int) => Some(LogicalType::Int32),
+        Type::Primitive(PrimitiveType::Long) => Some(LogicalType::Int64),
+        Type::Primitive(PrimitiveType::Float) => Some(LogicalType::Float32),
+        Type::Primitive(PrimitiveType::Double) => Some(LogicalType::Float64),
+        Type::Primitive(PrimitiveType::String) => Some(LogicalType::Utf8),
+        Type::Primitive(PrimitiveType::Binary) => Some(LogicalType::Binary),
+        Type::Primitive(PrimitiveType::Date) => Some(LogicalType::Date32),
+        Type::Primitive(PrimitiveType::Decimal { precision, scale }) => {
+            Some(LogicalType::Decimal {
+                bits: 128,
+                precision: u8::try_from(*precision).ok()?,
+                scale: i8::try_from(*scale).ok()?,
+            })
+        }
+        Type::Primitive(PrimitiveType::Timestamp) => Some(LogicalType::Timestamp {
+            unit: arrow::datatypes::TimeUnit::Microsecond,
+            timezone: None,
+        }),
+        _ => None,
+    }
+}
+
+/// Bounded provider-private exact subtree encoding. This binds IDs, required,
+/// physical families and parameters. Names belong to public logical facts;
+/// docs and defaults do not replace field identity. Consumers only compare bytes.
+pub(crate) fn exact_provider_type_binding(
+    field: &crate::iceberg::spec::NestedField,
+) -> Result<bytes::Bytes, String> {
+    validate_provider_fields(std::iter::once(field))?;
+    struct Sink(Vec<u8>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self
+                .0
+                .len()
+                .checked_add(bytes.len())
+                .is_none_or(|n| n > 64 * 1024)
+            {
+                return Err(std::io::Error::other(
+                    "provider field binding exceeds its byte budget",
+                ));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut sink = Sink(b"novarocks.iceberg.exact-field.v1:".to_vec());
+    serde_json::to_writer(&mut sink, &ProviderFieldIdentity(field))
+        .map_err(|e| format!("encode exact provider field: {e}"))?;
+    Ok(bytes::Bytes::from(sink.0))
+}
+
+// Borrowed wrappers avoid the SDK's serde `into` conversion, which clones
+// the complete subtree before writing and includes mutable docs/defaults.
+struct ProviderFieldIdentity<'a>(&'a crate::iceberg::spec::NestedField);
+struct ProviderTypeIdentity<'a>(&'a crate::iceberg::spec::Type);
+struct ProviderFieldsIdentity<'a>(&'a [Arc<crate::iceberg::spec::NestedField>]);
+
+impl serde::Serialize for ProviderFieldIdentity<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut output = serializer.serialize_struct("ProviderFieldIdentity", 3)?;
+        output.serialize_field("id", &self.0.id)?;
+        output.serialize_field("required", &self.0.required)?;
+        output.serialize_field("type", &ProviderTypeIdentity(&self.0.field_type))?;
+        output.end()
+    }
+}
+
+impl serde::Serialize for ProviderFieldsIdentity<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut output = serializer.serialize_seq(Some(self.0.len()))?;
+        for field in self.0 {
+            output.serialize_element(&ProviderFieldIdentity(field))?;
+        }
+        output.end()
+    }
+}
+
+impl serde::Serialize for ProviderTypeIdentity<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use crate::iceberg::spec::Type;
+        use serde::ser::SerializeStruct;
+        match self.0 {
+            Type::Primitive(primitive) => primitive.serialize(serializer),
+            Type::Struct(fields) => {
+                let mut output = serializer.serialize_struct("ProviderStructIdentity", 2)?;
+                output.serialize_field("kind", "struct")?;
+                output.serialize_field("fields", &ProviderFieldsIdentity(fields.fields()))?;
+                output.end()
+            }
+            Type::List(list) => {
+                let mut output = serializer.serialize_struct("ProviderListIdentity", 2)?;
+                output.serialize_field("kind", "list")?;
+                output.serialize_field("element", &ProviderFieldIdentity(&list.element_field))?;
+                output.end()
+            }
+            Type::Map(map) => {
+                let mut output = serializer.serialize_struct("ProviderMapIdentity", 3)?;
+                output.serialize_field("kind", "map")?;
+                output.serialize_field("key", &ProviderFieldIdentity(&map.key_field))?;
+                output.serialize_field("value", &ProviderFieldIdentity(&map.value_field))?;
+                output.end()
+            }
         }
     }
 }
@@ -271,6 +513,46 @@ pub fn apply_name_mapping_to_schema(
         fields,
         schema.metadata().clone(),
     )))
+}
+
+/// Recover the exact provider write projection from one sealed SDK schema.
+/// SQL input carriers can widen required children; that read policy must never
+/// determine Parquet repetition. Preserve input metadata while using the
+/// provider's recursive engine write mapping for types and nullability.
+pub(crate) fn annotate_write_schema_from_iceberg(
+    input: &SchemaRef,
+    provider: &crate::iceberg::spec::Schema,
+) -> Result<SchemaRef, String> {
+    let write = sql_write_schema_from_iceberg(provider)?;
+    let fields = input
+        .fields()
+        .iter()
+        .map(|field| {
+            if is_write_virtual_column(field.name())
+                || reserved_row_lineage_field_id(field)?.is_some()
+            {
+                return Ok(field.as_ref().clone());
+            }
+            let exact = write
+                .fields()
+                .iter()
+                .find(|p| p.name() == field.name())
+                .ok_or_else(|| {
+                    format!(
+                        "Iceberg writer field {} is absent from its exact provider schema",
+                        field.name()
+                    )
+                })?;
+            let mut metadata = field.metadata().clone();
+            metadata.extend(exact.metadata().clone());
+            Ok(exact.as_ref().clone().with_metadata(metadata))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let projected = Arc::new(Schema::new_with_metadata(fields, input.metadata().clone()));
+    annotate_schema_from_scan_model(
+        &projected,
+        &crate::schema_facts::iceberg_schema_def(provider),
+    )
 }
 
 /// Re-annotate a generic native writer schema with the frozen Iceberg field-ID
@@ -768,5 +1050,322 @@ mod tests {
             panic!("map entries are a struct")
         };
         assert_eq!(entries[1].data_type(), &DataType::LargeBinary);
+    }
+}
+
+#[cfg(test)]
+mod exact_logical_tests {
+    use super::*;
+    use crate::iceberg::spec::{
+        FormatVersion, ListType, MapType, NestedField, PartitionSpec, PrimitiveType, SortOrder,
+        StructType, TableMetadata, TableMetadataBuilder, Type,
+    };
+    use novarocks_types::logical_type::LogicalType;
+
+    fn metadata(fields: Vec<Arc<NestedField>>) -> TableMetadata {
+        let schema = crate::iceberg::spec::Schema::builder()
+            .with_fields(fields)
+            .build()
+            .unwrap();
+        TableMetadataBuilder::new(
+            schema.clone(),
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "file:///exact-logical-schema".into(),
+            FormatVersion::V3,
+            Default::default(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata
+        .into_builder(None)
+        .add_schema(schema)
+        .unwrap()
+        .set_current_schema(-1)
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata
+    }
+
+    #[test]
+    fn exact_provider_recursive_read_mutation_preserves_required_and_new_ids() {
+        let source = metadata(vec![Arc::new(NestedField::optional(
+            100,
+            "payload",
+            Type::Struct(StructType::new(vec![
+                Arc::new(NestedField::required(
+                    101,
+                    "items",
+                    Type::List(ListType::new(Arc::new(NestedField::list_element(
+                        102,
+                        Type::Primitive(PrimitiveType::Long),
+                        true,
+                    )))),
+                )),
+                Arc::new(NestedField::optional(
+                    103,
+                    "map",
+                    Type::Map(MapType::new(
+                        Arc::new(NestedField::map_key_element(
+                            104,
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                        Arc::new(NestedField::map_value_element(
+                            105,
+                            Type::Primitive(PrimitiveType::Long),
+                            true,
+                        )),
+                    )),
+                )),
+            ])),
+        ))]);
+        let logical = exact_logical_fields(&source).unwrap();
+        let LogicalType::Struct(children) = &logical[0].data_type else {
+            panic!("struct")
+        };
+        assert!(!children[0].nullable);
+        let LogicalType::Array { element, .. } = &children[0].data_type else {
+            panic!("list")
+        };
+        assert!(!element.nullable);
+        let LogicalType::Map { key, value } = &children[1].data_type else {
+            panic!("map")
+        };
+        assert!(
+            key.nullable,
+            "existing SQL read representation stays widened"
+        );
+        assert!(!value.nullable);
+        let columns = logical
+            .iter()
+            .map(|f| novarocks_spi::connector::ConnectorColumnDefinition {
+                name: f.name.clone().into(),
+                data_type: f.data_type.clone(),
+                nullable: f.nullable,
+                aggregation: None,
+                default: None,
+            })
+            .collect::<Vec<_>>();
+        let target_fields = crate::catalog_control::type_mapping::schema_fields(&columns).unwrap();
+        let target = metadata(target_fields);
+        assert_eq!(exact_logical_fields(&target).unwrap(), logical);
+        assert_ne!(
+            source.current_schema().as_struct().fields()[0].id,
+            target.current_schema().as_struct().fields()[0].id
+        );
+        let Type::Struct(fields) = target.current_schema().as_struct().fields()[0]
+            .field_type
+            .as_ref()
+        else {
+            panic!("struct")
+        };
+        let Type::Map(map) = fields.fields()[1].field_type.as_ref() else {
+            panic!("map")
+        };
+        assert!(map.key_field.required);
+        assert!(map.value_field.required);
+        assert_ne!(
+            exact_provider_type_binding(&source.current_schema().as_struct().fields()[0]).unwrap(),
+            exact_provider_type_binding(&target.current_schema().as_struct().fields()[0]).unwrap()
+        );
+    }
+
+    #[test]
+    fn exact_provider_identity_stays_distinct_from_normalized_engine_carriers() {
+        let table = metadata(vec![
+            Arc::new(NestedField::required(
+                1,
+                "uuid",
+                Type::Primitive(PrimitiveType::Uuid),
+            )),
+            Arc::new(NestedField::required(
+                2,
+                "fixed",
+                Type::Primitive(PrimitiveType::Fixed(16)),
+            )),
+            Arc::new(NestedField::required(
+                3,
+                "tz",
+                Type::Primitive(PrimitiveType::TimestamptzNs),
+            )),
+        ]);
+        let logical = exact_logical_fields(&table).unwrap();
+        assert_eq!(logical[0].data_type, LogicalType::LargeInt);
+        assert_eq!(logical[1].data_type, LogicalType::LargeInt);
+        assert_eq!(
+            logical[2].data_type,
+            LogicalType::Timestamp {
+                unit: arrow::datatypes::TimeUnit::Nanosecond,
+                timezone: None
+            }
+        );
+        assert_ne!(
+            exact_provider_type_binding(&table.current_schema().as_struct().fields()[0]).unwrap(),
+            exact_provider_type_binding(&table.current_schema().as_struct().fields()[1]).unwrap()
+        );
+    }
+
+    #[test]
+    fn legacy_scalar_domain_does_not_infer_from_normalized_carriers() {
+        let field = |ty| NestedField::optional(1, "value", Type::Primitive(ty));
+        assert_eq!(
+            legacy_scalar_type(&field(PrimitiveType::Timestamp)),
+            Some(LogicalType::Timestamp {
+                unit: arrow::datatypes::TimeUnit::Microsecond,
+                timezone: None
+            })
+        );
+        for ty in [
+            PrimitiveType::Timestamptz,
+            PrimitiveType::TimestampNs,
+            PrimitiveType::TimestamptzNs,
+            PrimitiveType::Uuid,
+            PrimitiveType::Fixed(16),
+            PrimitiveType::Variant,
+        ] {
+            assert_eq!(legacy_scalar_type(&field(ty)), None);
+        }
+        for (physical, expected) in [
+            (PrimitiveType::Boolean, LogicalType::Boolean),
+            (PrimitiveType::Int, LogicalType::Int32),
+            (PrimitiveType::Long, LogicalType::Int64),
+            (PrimitiveType::Float, LogicalType::Float32),
+            (PrimitiveType::Double, LogicalType::Float64),
+            (PrimitiveType::String, LogicalType::Utf8),
+            (PrimitiveType::Binary, LogicalType::Binary),
+            (PrimitiveType::Date, LogicalType::Date32),
+            (
+                PrimitiveType::Decimal {
+                    precision: 22,
+                    scale: 3,
+                },
+                LogicalType::Decimal {
+                    bits: 128,
+                    precision: 22,
+                    scale: 3,
+                },
+            ),
+        ] {
+            assert_eq!(legacy_scalar_type(&field(physical)), Some(expected));
+        }
+    }
+
+    #[test]
+    fn exact_provider_binding_ignores_metadata_and_binds_nested_replacement() {
+        use crate::iceberg::spec::Literal;
+        let child = NestedField::optional(2, "value", Type::Primitive(PrimitiveType::Long));
+        let original = NestedField::required(
+            1,
+            "payload",
+            Type::Struct(StructType::new(vec![Arc::new(child.clone())])),
+        );
+        let baseline = exact_provider_type_binding(&original).unwrap();
+        let mut renamed = original.clone();
+        renamed.name = "renamed".into();
+        renamed.doc = Some("x".repeat(128 * 1024));
+        let mut decorated_child = child.clone();
+        decorated_child.doc = Some("updated documentation".into());
+        decorated_child.initial_default = Some(Literal::long(11));
+        decorated_child.write_default = Some(Literal::long(12));
+        *renamed.field_type = Type::Struct(StructType::new(vec![Arc::new(decorated_child)]));
+        assert_eq!(exact_provider_type_binding(&renamed).unwrap(), baseline);
+
+        let mut replaced = child.clone();
+        replaced.id = 3;
+        let mut changed = original.clone();
+        *changed.field_type = Type::Struct(StructType::new(vec![Arc::new(replaced)]));
+        assert_ne!(exact_provider_type_binding(&changed).unwrap(), baseline);
+        let mut required = child;
+        required.required = true;
+        *changed.field_type = Type::Struct(StructType::new(vec![Arc::new(required)]));
+        assert_ne!(exact_provider_type_binding(&changed).unwrap(), baseline);
+
+        let uuid = NestedField::required(1, "uuid", Type::Primitive(PrimitiveType::Uuid));
+        let fixed = NestedField::required(1, "fixed", Type::Primitive(PrimitiveType::Fixed(16)));
+        assert_ne!(
+            exact_provider_type_binding(&uuid).unwrap(),
+            exact_provider_type_binding(&fixed).unwrap()
+        );
+        let ts = NestedField::required(1, "ts", Type::Primitive(PrimitiveType::Timestamp));
+        let tz = NestedField::required(1, "ts", Type::Primitive(PrimitiveType::Timestamptz));
+        assert_ne!(
+            exact_provider_type_binding(&ts).unwrap(),
+            exact_provider_type_binding(&tz).unwrap()
+        );
+    }
+
+    #[test]
+    fn exact_logical_fields_preserve_existing_bitmap_hll_property_semantics() {
+        let table = metadata(vec![
+            Arc::new(NestedField::required(
+                1,
+                "bits",
+                Type::Primitive(PrimitiveType::Binary),
+            )),
+            Arc::new(NestedField::optional(
+                2,
+                "sketch",
+                Type::Primitive(PrimitiveType::Binary),
+            )),
+        ])
+        .into_builder(None)
+        .set_properties(std::collections::HashMap::from([
+            ("novarocks.logical_type.BITS".into(), "BITMAP".into()),
+            ("novarocks.logical_type.sketch".into(), "hll".into()),
+        ]))
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let logical = exact_logical_fields(&table).unwrap();
+        assert_eq!(logical[0].data_type, LogicalType::Bitmap);
+        assert_eq!(logical[1].data_type, LogicalType::Hll);
+        assert!(!logical[0].nullable);
+        assert!(logical[1].nullable);
+    }
+
+    #[test]
+    fn exact_provider_schema_rejects_nested_budget_before_recursive_conversion() {
+        let mut ty = Type::Primitive(PrimitiveType::Long);
+        for id in 2..70 {
+            ty = Type::List(ListType::new(Arc::new(NestedField::list_element(
+                id, ty, true,
+            ))));
+        }
+        let table = metadata(vec![Arc::new(NestedField::required(1, "too_deep", ty))]);
+        assert!(exact_logical_fields(&table).unwrap_err().contains("budget"));
+        let field = NestedField::required(
+            1,
+            "x".repeat(70 * 1024),
+            Type::Primitive(PrimitiveType::Long),
+        );
+        assert!(
+            exact_provider_type_binding(&field)
+                .unwrap_err()
+                .contains("budget")
+        );
+        let wide = NestedField::required(
+            1,
+            "wide",
+            Type::Struct(StructType::new(
+                (2..3002)
+                    .map(|id| {
+                        Arc::new(NestedField::optional(
+                            id,
+                            format!("f{id}"),
+                            Type::Primitive(PrimitiveType::Long),
+                        ))
+                    })
+                    .collect(),
+            )),
+        );
+        validate_provider_fields(std::iter::once(&wide)).unwrap();
+        assert!(
+            exact_provider_type_binding(&wide)
+                .unwrap_err()
+                .contains("byte budget")
+        );
     }
 }

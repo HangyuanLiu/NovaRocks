@@ -34,8 +34,7 @@ pub(crate) enum PartitionPruningPolicy {
 /// The compact row-identity discriminant needed by refresh execution.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RefreshIdentity {
-    BaseRowId,
-    JoinRowKey,
+    VisibleTuple,
     GroupRowId,
     BranchScoped(Box<RefreshIdentity>),
 }
@@ -46,8 +45,8 @@ pub struct RefreshCapabilities {
     pub(crate) snapshot_policy: BaseSnapshotPolicy,
     pub has_agg_state: bool,
     pub(crate) identity: RefreshIdentity,
-    pub apply_key_column: String,
-    pub(crate) apply_key_value_type: ApplyKeyValueType,
+    pub apply_key_column: Option<String>,
+    pub(crate) apply_key_value_type: Option<ApplyKeyValueType>,
     pub(crate) partition_pruning: PartitionPruningPolicy,
 }
 
@@ -95,44 +94,46 @@ impl RefreshCapabilities {
             BaseSnapshotPolicy::SingleBase
         };
 
-        let kind_identity = apply_key_kind_to_refresh_identity(interpretation.apply_key.kind);
-        let identity = if has_branch {
-            RefreshIdentity::BranchScoped(Box::new(kind_identity))
+        let (identity, apply_key_column, apply_key_value_type) = if has_agg {
+            if interpretation.apply_key.as_ref().map(|key| key.kind)
+                != Some(ApplyKeyKind::GroupRowId)
+            {
+                return Err("aggregate MV requires the exact GroupRowId interpretation".into());
+            }
+            let [apply_key] = bindings.apply_key.as_slice() else {
+                return Err("aggregate MV requires one exact physical state key".into());
+            };
+            (
+                if has_branch {
+                    RefreshIdentity::BranchScoped(Box::new(RefreshIdentity::GroupRowId))
+                } else {
+                    RefreshIdentity::GroupRowId
+                },
+                Some(apply_key.name.clone()),
+                Some(if has_branch {
+                    ApplyKeyValueType::BranchUtf8
+                } else {
+                    ApplyKeyValueType::Utf8
+                }),
+            )
         } else {
-            kind_identity
-        };
-
-        let apply_key_value_type = match (interpretation.apply_key.kind, has_branch) {
-            (ApplyKeyKind::BaseRowId, false) => ApplyKeyValueType::Int64,
-            (ApplyKeyKind::BaseRowId, true) => ApplyKeyValueType::BranchInt64,
-            (ApplyKeyKind::JoinRowKey, _) => ApplyKeyValueType::Utf8,
-            (ApplyKeyKind::GroupRowId, false) => ApplyKeyValueType::Utf8,
-            (ApplyKeyKind::GroupRowId, true) => ApplyKeyValueType::BranchUtf8,
-        };
-
-        let [apply_key] = bindings.apply_key.as_slice() else {
-            return Err(
-                "materialized-view refresh requires exactly one physical apply-key column"
-                    .to_string(),
-            );
+            if interpretation.apply_key.is_some()
+                || !bindings.apply_key.is_empty()
+                || !bindings.branches.is_empty()
+            {
+                return Err("visible-tuple MV may not persist identity fields".into());
+            }
+            (RefreshIdentity::VisibleTuple, None, None)
         };
 
         Ok(RefreshCapabilities {
             snapshot_policy,
             has_agg_state: has_agg,
             identity,
-            apply_key_column: apply_key.name.clone(),
+            apply_key_column,
             apply_key_value_type,
             partition_pruning: PartitionPruningPolicy::BestEffort,
         })
-    }
-}
-
-const fn apply_key_kind_to_refresh_identity(kind: ApplyKeyKind) -> RefreshIdentity {
-    match kind {
-        ApplyKeyKind::BaseRowId => RefreshIdentity::BaseRowId,
-        ApplyKeyKind::JoinRowKey => RefreshIdentity::JoinRowKey,
-        ApplyKeyKind::GroupRowId => RefreshIdentity::GroupRowId,
     }
 }
 
@@ -148,6 +149,15 @@ mod tests {
             .interpretation
     }
 
+    fn visible_tuple_interpretation() -> InterpretationDocument {
+        let mut interpretation = interpretation();
+        interpretation.apply_key = None;
+        interpretation.aggregates.clear();
+        interpretation.state_slots.clear();
+        interpretation.branches.clear();
+        interpretation
+    }
+
     fn physical(name: &str) -> MvPhysicalFieldFacts {
         MvPhysicalFieldFacts {
             field_id: novarocks_mv_application::persistence::identity::FieldIdentity::try_new(
@@ -156,7 +166,13 @@ mod tests {
             .expect("test field identity"),
             name: name.to_string(),
             ordinal: 0,
-            type_signature: "bigint".to_string(),
+            data_type:
+                novarocks_mv_application::persistence::codec::MvLogicalType::from_schema_type(
+                    novarocks_types::logical_type::LogicalType::Int64,
+                    bytes::Bytes::from_static(b"exact-provider-int64"),
+                )
+                .unwrap(),
+            legacy_scalar_type: Some(novarocks_types::logical_type::LogicalType::Int64),
             nullable: false,
         }
     }
@@ -171,15 +187,12 @@ mod tests {
     }
 
     #[test]
-    fn single_relation_projection_keeps_one_base_and_its_physical_apply_key() {
-        let mut interpretation = interpretation();
-        interpretation.apply_key.kind = ApplyKeyKind::BaseRowId;
-        interpretation.aggregates.clear();
-        interpretation.branches.clear();
+    fn single_relation_projection_uses_visible_tuple_without_identity_fields() {
+        let interpretation = visible_tuple_interpretation();
 
         let capabilities = RefreshCapabilities::from_canonical_facts(
             &interpretation,
-            &bindings(vec![physical("__nova_row_id")]),
+            &bindings(Vec::new()),
             1,
             false,
         )
@@ -187,22 +200,18 @@ mod tests {
 
         assert_eq!(capabilities.snapshot_policy, BaseSnapshotPolicy::SingleBase);
         assert!(!capabilities.has_agg_state);
-        assert_eq!(capabilities.identity, RefreshIdentity::BaseRowId);
-        assert_eq!(capabilities.apply_key_value_type, ApplyKeyValueType::Int64);
-        // The physical name is the provider's, never a persisted one.
-        assert_eq!(capabilities.apply_key_column, "__nova_row_id");
+        assert_eq!(capabilities.identity, RefreshIdentity::VisibleTuple);
+        assert_eq!(capabilities.apply_key_value_type, None);
+        assert_eq!(capabilities.apply_key_column, None);
     }
 
     #[test]
     fn a_join_pair_and_a_fan_in_of_the_same_arity_choose_different_policies() {
-        let mut interpretation = interpretation();
-        interpretation.apply_key.kind = ApplyKeyKind::JoinRowKey;
-        interpretation.aggregates.clear();
-        interpretation.branches.clear();
+        let interpretation = visible_tuple_interpretation();
 
         let join = RefreshCapabilities::from_canonical_facts(
             &interpretation,
-            &bindings(vec![physical("__nova_join_key")]),
+            &bindings(Vec::new()),
             2,
             true,
         )
@@ -211,12 +220,13 @@ mod tests {
             join.snapshot_policy,
             BaseSnapshotPolicy::JoinPairPartialInitialSkip
         );
-        assert_eq!(join.identity, RefreshIdentity::JoinRowKey);
-        assert_eq!(join.apply_key_value_type, ApplyKeyValueType::Utf8);
+        assert_eq!(join.identity, RefreshIdentity::VisibleTuple);
+        assert_eq!(join.apply_key_value_type, None);
+        assert_eq!(join.apply_key_column, None);
 
         let fan_in = RefreshCapabilities::from_canonical_facts(
             &interpretation,
-            &bindings(vec![physical("__nova_join_key")]),
+            &bindings(Vec::new()),
             2,
             false,
         )
@@ -231,7 +241,10 @@ mod tests {
     #[test]
     fn branch_union_aggregate_scopes_its_identity_and_requires_every_base() {
         let interpretation = interpretation();
-        assert_eq!(interpretation.apply_key.kind, ApplyKeyKind::GroupRowId);
+        assert_eq!(
+            interpretation.apply_key.as_ref().unwrap().kind,
+            ApplyKeyKind::GroupRowId
+        );
         assert!(!interpretation.aggregates.is_empty());
         assert!(!interpretation.branches.is_empty());
 
@@ -254,19 +267,23 @@ mod tests {
         );
         assert_eq!(
             capabilities.apply_key_value_type,
-            ApplyKeyValueType::BranchUtf8
+            Some(ApplyKeyValueType::BranchUtf8)
+        );
+        assert_eq!(
+            capabilities.apply_key_column.as_deref(),
+            Some("__nova_group_row_id")
         );
     }
 
     #[test]
     fn join_over_branches_without_aggregate_state_is_rejected() {
         let mut interpretation = interpretation();
-        interpretation.apply_key.kind = ApplyKeyKind::BaseRowId;
+        interpretation.apply_key = None;
         interpretation.aggregates.clear();
 
         let error = RefreshCapabilities::from_canonical_facts(
             &interpretation,
-            &bindings(vec![physical("__nova_row_id")]),
+            &bindings(Vec::new()),
             2,
             true,
         )
@@ -279,10 +296,8 @@ mod tests {
     }
 
     #[test]
-    fn a_target_without_exactly_one_physical_apply_key_is_rejected() {
-        let mut interpretation = interpretation();
-        interpretation.aggregates.clear();
-        interpretation.branches.clear();
+    fn aggregate_target_without_exactly_one_physical_state_key_is_rejected() {
+        let interpretation = interpretation();
 
         assert_eq!(
             RefreshCapabilities::from_canonical_facts(
@@ -292,7 +307,7 @@ mod tests {
                 false
             )
             .expect_err("no apply key"),
-            "materialized-view refresh requires exactly one physical apply-key column"
+            "aggregate MV requires one exact physical state key"
         );
         assert!(
             RefreshCapabilities::from_canonical_facts(
@@ -303,6 +318,26 @@ mod tests {
             )
             .is_err(),
             "two physical apply-key columns must be rejected"
+        );
+    }
+
+    #[test]
+    fn visible_tuple_target_rejects_stale_persisted_identity_fields() {
+        let interpretation = visible_tuple_interpretation();
+        assert!(
+            RefreshCapabilities::from_canonical_facts(
+                &interpretation,
+                &bindings(vec![physical("__nova_row_id")]),
+                1,
+                false,
+            )
+            .is_err()
+        );
+        let mut stale = interpretation;
+        stale.apply_key = self::interpretation().apply_key;
+        assert!(
+            RefreshCapabilities::from_canonical_facts(&stale, &bindings(Vec::new()), 1, false,)
+                .is_err()
         );
     }
 }

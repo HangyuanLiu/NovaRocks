@@ -34,11 +34,19 @@ pub enum MvRefreshDisposition {
     Corruption(String),
     InvariantViolation(String),
     ShutdownCancelled,
+    CapacityRefused(String),
+    TargetRefused(String),
 }
 
 impl MvRefreshDisposition {
     pub fn from_background_error(error: MvBackgroundEngineError) -> Self {
         match error.kind() {
+            MvBackgroundEngineErrorKind::CapacityRefused => {
+                Self::CapacityRefused(error.message().to_owned())
+            }
+            MvBackgroundEngineErrorKind::TargetRefused => {
+                Self::TargetRefused(error.message().to_owned())
+            }
             MvBackgroundEngineErrorKind::TargetGone => Self::TargetGone,
             MvBackgroundEngineErrorKind::TransientUnavailable => {
                 Self::TransientUnavailable(error.message().to_owned())
@@ -58,11 +66,32 @@ impl MvRefreshDisposition {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MvAutomaticRefreshStopReason {
+    CapacityRefused,
+    TargetRefused,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MvAutomaticRefreshStop {
+    pub reason: MvAutomaticRefreshStopReason,
+    pub error: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MvRefreshRuntimeDecision {
     Success,
-    TransientBackoff { error: String, retry_at_ms: i64 },
-    Blocked { error: String },
+    TransientBackoff {
+        error: String,
+        retry_at_ms: i64,
+    },
+    Blocked {
+        error: String,
+    },
+    Stopped {
+        reason: MvAutomaticRefreshStopReason,
+        error: String,
+    },
     NoChange,
 }
 
@@ -78,6 +107,7 @@ pub struct MvRefreshSchedulerRuntime<K, R> {
     failures: BTreeMap<K, u32>,
     retry_not_before_ms: BTreeMap<K, i64>,
     blocked: BTreeMap<K, String>,
+    stopped: BTreeMap<K, MvAutomaticRefreshStop>,
 }
 
 /// The complete process-local refresh runtime.  In addition to queue and
@@ -162,6 +192,16 @@ where
         self.scheduler.record(key, disposition, now_ms)
     }
 
+    /// Only an explicitly successful manual refresh clears an automatic stop.
+    pub fn clear_automatic_stop_after_manual_success(&mut self, key: &K) -> bool {
+        self.scheduler
+            .clear_automatic_stop_after_manual_success(key)
+    }
+
+    pub fn automatic_stop(&self, key: &K) -> Option<&MvAutomaticRefreshStop> {
+        self.scheduler.automatic_stop(key)
+    }
+
     pub fn pending_len(&self) -> usize {
         self.scheduler.pending_len()
     }
@@ -184,6 +224,7 @@ where
             failures: BTreeMap::new(),
             retry_not_before_ms: BTreeMap::new(),
             blocked: BTreeMap::new(),
+            stopped: BTreeMap::new(),
         }
     }
 
@@ -196,12 +237,16 @@ where
             .get(key)
             .is_some_and(|retry_at_ms| now_ms < *retry_at_ms)
             || self.blocked.contains_key(key)
+            || self.stopped.contains_key(key)
             || self.queued.contains(key)
             || self.running.contains(key)
     }
 
     pub fn enqueue(&mut self, key: K, request: R) {
-        if !self.running.contains(&key) && self.queued.insert(key.clone()) {
+        if !self.stopped.contains_key(&key)
+            && !self.running.contains(&key)
+            && self.queued.insert(key.clone())
+        {
             self.queue.push_back((key, request));
         }
     }
@@ -218,7 +263,7 @@ where
                 break;
             };
             self.queued.remove(&key);
-            if !self.running.contains(&key) {
+            if !self.stopped.contains_key(&key) && !self.running.contains(&key) {
                 ready.push(request);
             }
         }
@@ -226,7 +271,8 @@ where
     }
 
     pub fn mark_started(&mut self, key: &K) -> bool {
-        if self.running.len() >= self.config.max_concurrent_refreshes().max(1)
+        if self.stopped.contains_key(key)
+            || self.running.len() >= self.config.max_concurrent_refreshes().max(1)
             || self.running.contains(key)
         {
             return false;
@@ -258,6 +304,14 @@ where
             MvRefreshDisposition::Completed | MvRefreshDisposition::NoOp => {
                 MvRefreshRuntimeDecision::Success
             }
+            MvRefreshDisposition::CapacityRefused(error) => MvRefreshRuntimeDecision::Stopped {
+                reason: MvAutomaticRefreshStopReason::CapacityRefused,
+                error,
+            },
+            MvRefreshDisposition::TargetRefused(error) => MvRefreshRuntimeDecision::Stopped {
+                reason: MvAutomaticRefreshStopReason::TargetRefused,
+                error,
+            },
             MvRefreshDisposition::TransientUnavailable(error) => {
                 let attempt = *self
                     .failures
@@ -294,6 +348,20 @@ where
                 self.retry_not_before_ms.remove(key);
                 self.blocked.insert(key.clone(), error.clone());
             }
+            MvRefreshRuntimeDecision::Stopped { reason, error } => {
+                self.failures.remove(key);
+                self.retry_not_before_ms.remove(key);
+                self.blocked.remove(key);
+                self.stopped.insert(
+                    key.clone(),
+                    MvAutomaticRefreshStop {
+                        reason: *reason,
+                        error: error.clone(),
+                    },
+                );
+                self.queue.retain(|(queued_key, _)| queued_key != key);
+                self.queued.remove(key);
+            }
             MvRefreshRuntimeDecision::NoChange => {}
         }
         decision
@@ -303,6 +371,15 @@ where
         self.failures.remove(key);
         self.retry_not_before_ms.remove(key);
         self.blocked.remove(key);
+    }
+
+    /// The caller must hold the confirmed outcome of a manual refresh.
+    pub fn clear_automatic_stop_after_manual_success(&mut self, key: &K) -> bool {
+        self.stopped.remove(key).is_some()
+    }
+
+    pub fn automatic_stop(&self, key: &K) -> Option<&MvAutomaticRefreshStop> {
+        self.stopped.get(key)
     }
 
     pub fn pending_len(&self) -> usize {
@@ -371,5 +448,49 @@ mod tests {
         ));
         assert!(!runtime.begin_observation(7, "first", 101));
         assert!(runtime.begin_observation(7, "changed", 101));
+    }
+    #[test]
+    fn automatic_stop_survives_source_change_projection_and_background_success() {
+        for disposition in [
+            MvRefreshDisposition::CapacityRefused("demand capacity".into()),
+            MvRefreshDisposition::TargetRefused("equality delete".into()),
+        ] {
+            let mut runtime = MvRefreshProductRuntime::<i64, &str, &str>::new(
+                MvSchedulerConfig::new(true, 1, 1, 10, 40),
+            );
+            assert!(runtime.begin_observation(7, "first", 100));
+            assert!(matches!(
+                runtime.record(&7, disposition, 100),
+                MvRefreshRuntimeDecision::Stopped { .. }
+            ));
+            assert!(!runtime.begin_observation(7, "source changed", 101));
+            assert!(!runtime.begin_observation(7, "projection reinstalled", 102));
+            runtime.record(&7, MvRefreshDisposition::Completed, 103);
+            assert!(!runtime.begin_observation(7, "another change", 104));
+            assert!(runtime.automatic_stop(&7).is_some());
+            runtime.enqueue(7, "suppressed");
+            assert!(runtime.take_ready().is_empty());
+            assert!(!runtime.mark_started(&7));
+            assert!(runtime.clear_automatic_stop_after_manual_success(&7));
+            assert!(runtime.begin_observation(7, "another change", 105));
+            runtime.enqueue(7, "manual success restored admission");
+            assert_eq!(runtime.take_ready(), ["manual success restored admission"]);
+        }
+    }
+
+    #[test]
+    fn refusal_removes_work_queued_before_stop() {
+        let mut runtime =
+            MvRefreshSchedulerRuntime::new(MvSchedulerConfig::new(true, 1, 1, 10, 40));
+        runtime.enqueue(7, "stale queued request");
+        runtime.record(
+            &7,
+            MvRefreshDisposition::CapacityRefused("capacity".into()),
+            100,
+        );
+        assert_eq!(runtime.pending_len(), 0);
+        assert!(runtime.take_ready().is_empty());
+        runtime.clear_automatic_stop_after_manual_success(&7);
+        assert!(runtime.take_ready().is_empty());
     }
 }

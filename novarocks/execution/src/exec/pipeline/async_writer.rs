@@ -1121,6 +1121,13 @@ mod tests {
                 [1; 16], 2, [3; 16], 0, 0,
             ),
             context: request_context(),
+            resources: {
+                let ledger = Arc::new(crate::connector::WriterResourceLedger::new());
+                ledger
+                    .install(MemTracker::new_root("test writer task"))
+                    .expect("install writer tracker");
+                ledger.resources()
+            },
         }
     }
 

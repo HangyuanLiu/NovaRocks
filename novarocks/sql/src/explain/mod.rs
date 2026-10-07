@@ -105,6 +105,40 @@ fn format_node(plan: &LogicalPlanNode, level: ExplainLevel, indent: usize, out: 
                 out.push(format!("{pad}     predicates: {}", preds.join(" AND ")));
             }
         }
+        LogicalPlanKind::QuotaPreclaim(node) => {
+            out.push(format!(
+                "{pad}QUOTA PRECLAIM domain={} key={} need={:?} budget={}",
+                node.domain.0, node.demand_key.0, node.demand_need, node.max_state_bytes
+            ));
+            for child in &plan.children {
+                format_node(child, level, indent + 1, out);
+            }
+        }
+        LogicalPlanKind::QuotaTrim(node) => {
+            out.push(format!(
+                "{pad}QUOTA TRIM domain={} need={:?} budget={}",
+                node.domain.0, node.seed_need, node.max_state_bytes
+            ));
+            for child in &plan.children {
+                format_node(child, level, indent + 1, out);
+            }
+        }
+        LogicalPlanKind::FanoutAnchor(node) => {
+            out.push(format!(
+                "{pad}PREDICATE FANOUT id={} branches={}",
+                node.id.0,
+                node.branches.len()
+            ));
+            for child in &plan.children {
+                format_node(child, level, indent + 1, out);
+            }
+        }
+        LogicalPlanKind::FanoutConsume(node) => {
+            out.push(format!(
+                "{pad}FANOUT INPUT id={} branch={} distribution={:?}",
+                node.anchor.0, node.branch, node.distribution
+            ));
+        }
         LogicalPlanKind::Filter(_) => {
             let header = format_shared_plan_node_header(&plan.kind, PlanNodeExplainStage::Logical)
                 .expect("Filter is a shared explain node");
@@ -292,6 +326,13 @@ fn logical_scan_source_label(source: &ScanSource) -> Option<String> {
                 facts.group_key_names.join(","),
                 facts.aggregate_state_names.join(","),
                 facts.constraint_summary()
+            )),
+            crate::planner::table::SqlScanKind::MvTargetBag { facts } => Some(format!(
+                "IcebergMvTargetBag target={}.{}.{} visible=[{}] candidates=admission-frozen",
+                source.table.catalog,
+                source.table.namespace,
+                source.table.table,
+                facts.visible_columns.join(", "),
             )),
             crate::planner::table::SqlScanKind::MvTargetLocator { facts } => Some(format!(
                 "IcebergMvTargetLocator target={}.{}.{} apply_key={}{}",

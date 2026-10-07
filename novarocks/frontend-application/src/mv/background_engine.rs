@@ -281,6 +281,9 @@ impl MvBackgroundEngine for FrontendMvBackgroundEngine {
 fn preparation_error(error: RefreshError) -> MvBackgroundEngineError {
     let kind = match error.kind {
         RefreshErrorKind::PreCommitFailed => MvBackgroundEngineErrorKind::TransientUnavailable,
+        RefreshErrorKind::CapacityRefused => MvBackgroundEngineErrorKind::CapacityRefused,
+        RefreshErrorKind::TargetRefused => MvBackgroundEngineErrorKind::TargetRefused,
+        RefreshErrorKind::ConsistencyFailed => MvBackgroundEngineErrorKind::TerminalFailure,
         RefreshErrorKind::UserError => MvBackgroundEngineErrorKind::InvalidDefinition,
         RefreshErrorKind::CommitFailedKnownUncommitted
         | RefreshErrorKind::CommitFailedKnownCommitted

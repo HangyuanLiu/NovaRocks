@@ -92,6 +92,7 @@ pub struct ConnectorOpenWriterRequest {
     pub expected_schema: SchemaRef,
     pub physical: ConnectorWriterPhysicalContext,
     pub context: ConnectorRequestContext,
+    pub resources: crate::connector::ConnectorExecutionResources,
 }
 
 /// A driver-local asynchronous writer.

@@ -227,7 +227,7 @@ fn prepare_iceberg_distributed_write(
             target,
             target_ref,
             intent,
-            input,
+            crate::connector::write_target::write_input_request_for_shape(preparation.input()),
             ConnectorWriteAdmissionPurpose::OrdinaryDml,
             novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::Ordinary,
             connector_context.clone(),

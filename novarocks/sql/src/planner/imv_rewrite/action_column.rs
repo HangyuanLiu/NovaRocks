@@ -43,7 +43,6 @@ use crate::planner::imv_rewrite::join_delta_shape::{
 };
 use crate::planner::imv_rewrite::opt_expr_to_plan;
 use crate::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
-use crate::planner::imv_rewrite::target_locator::is_target_locator_join;
 use crate::planner::logical::{LogicalPlanKind, LogicalPlanNode};
 use crate::planner::payload::PlanScanNode;
 use crate::planner::table::{ScanSource, SqlScanKind, SqlScanSource};
@@ -159,6 +158,9 @@ fn validate_with_change_stream(
     plan: &LogicalPlanNode,
     change_stream: &ImvChangeStreamDescriptor,
 ) -> Result<(), String> {
+    if let Some(bag) = &change_stream.visible_bag {
+        return super::visible_tuple_apply::validate_descriptor(plan, bag);
+    }
     if change_stream.has_aggregate() {
         if !has_visible_output(plan) {
             return Err(
@@ -176,22 +178,6 @@ fn validate_with_change_stream(
             "root plan has no user-visible output; action column or other internal column may have leaked"
                 .to_string(),
         );
-    }
-    // V6: if a delta subtree exists, root output must carry the apply key.
-    if contains_join_delta_union(plan) {
-        if !output_has_join_apply_key(plan) {
-            let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
-            return Err(format!(
-                "join refresh plan above delta-bound scan {fqn} is missing join apply-key column \
-                 {JOIN_APPLY_KEY_COLUMN_NAME}"
-            ));
-        }
-    } else if subtree_has_delta(plan) && !output_has_apply_key(plan) {
-        let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
-        return Err(format!(
-            "plan above delta-bound scan {fqn} is missing apply key column \
-             {HIDDEN_APPLY_KEY_COLUMN_NAME}"
-        ));
     }
     Ok(())
 }
@@ -230,10 +216,6 @@ fn validate_node(plan: &LogicalPlanNode) -> Result<(), String> {
             Err(format!(
                 "Iceberg IMV rewrite does not support this aggregate shape above delta-bound scan {fqn}"
             ))
-        }
-        LogicalPlanKind::Join(_) if is_target_locator_join(plan) => {
-            validate_node(plan.left())?;
-            validate_node(plan.right())
         }
         LogicalPlanKind::Join(_) if subtree_has_delta(plan) => {
             let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
@@ -340,10 +322,6 @@ fn validate_scan(scan: &PlanScanNode) -> Result<(), String> {
                 if col.nullable {
                     return Err(format!("Delta-bound scan {fqn} has nullable action column"));
                 }
-                // V7: _row_id must be present so the apply-key projection can reference it.
-                if !scan.columns.iter().any(ImvRowIdColumn::matches) {
-                    return Err(format!("Delta-bound scan {fqn} missing _row_id column"));
-                }
                 Ok(())
             }
             _ => Err(format!(
@@ -360,36 +338,6 @@ fn validate_scan(scan: &PlanScanNode) -> Result<(), String> {
         }
         _ => Ok(()),
     }
-}
-
-fn output_has_apply_key(plan: &LogicalPlanNode) -> bool {
-    match &plan.kind {
-        LogicalPlanKind::Project(p) => p.items.iter().any(|i| {
-            i.output_name
-                .eq_ignore_ascii_case(HIDDEN_APPLY_KEY_COLUMN_NAME)
-        }),
-        LogicalPlanKind::Filter(_) => output_has_apply_key(plan.unary_input()),
-        _ => false,
-    }
-}
-
-fn output_has_join_apply_key(plan: &LogicalPlanNode) -> bool {
-    match &plan.kind {
-        LogicalPlanKind::Project(p) => p.items.iter().any(|i| {
-            i.output_name
-                .eq_ignore_ascii_case(JOIN_APPLY_KEY_COLUMN_NAME)
-        }),
-        LogicalPlanKind::Union(u) => u
-            .output_columns
-            .iter()
-            .any(|c| c.name.eq_ignore_ascii_case(JOIN_APPLY_KEY_COLUMN_NAME)),
-        LogicalPlanKind::Filter(_) => output_has_join_apply_key(plan.unary_input()),
-        _ => false,
-    }
-}
-
-fn contains_join_delta_union(plan: &LogicalPlanNode) -> bool {
-    is_supported_join_delta_union(plan) || plan.children.iter().any(contains_join_delta_union)
 }
 
 fn subtree_has_delta(plan: &LogicalPlanNode) -> bool {
@@ -570,72 +518,7 @@ mod tests {
 
     #[test]
     fn validation_passes_on_well_formed_delta_scan() {
-        // Scan with k + action + _row_id, root Project carrying all three plus
-        // the apply key. This is the shape the IMV pipeline produces.
-        let mut scan = delta_scan_with(Some(ImvActionColumn::output_column(ColumnId(100))));
-        scan.columns
-            .push(ImvRowIdColumn::output_column(ColumnId(101)));
-        let project = LogicalPlanNode::new(
-            LogicalPlanKind::Project(PlanProjectNode {
-                items: vec![
-                    ProjectItem {
-                        expr: TypedExpr {
-                            kind: ExprKind::ColumnRef {
-                                column_id: ColumnId(1),
-                                qualifier: None,
-                                column: "k".to_string(),
-                            },
-                            data_type: DataType::Int64,
-                            nullable: false,
-                        },
-                        output_name: "k".to_string(),
-                        output_column_id: ColumnId(1),
-                    },
-                    ProjectItem {
-                        expr: TypedExpr {
-                            kind: ExprKind::ColumnRef {
-                                column_id: ColumnId(100),
-                                qualifier: None,
-                                column: ImvActionColumn::NAME.to_string(),
-                            },
-                            data_type: DataType::Int8,
-                            nullable: false,
-                        },
-                        output_name: ImvActionColumn::NAME.to_string(),
-                        output_column_id: ColumnId(100),
-                    },
-                    ProjectItem {
-                        expr: TypedExpr {
-                            kind: ExprKind::ColumnRef {
-                                column_id: ColumnId(101),
-                                qualifier: None,
-                                column: ImvRowIdColumn::NAME.to_string(),
-                            },
-                            data_type: DataType::Int64,
-                            nullable: false,
-                        },
-                        output_name: ImvRowIdColumn::NAME.to_string(),
-                        output_column_id: ColumnId(101),
-                    },
-                    ProjectItem {
-                        expr: TypedExpr {
-                            kind: ExprKind::ColumnRef {
-                                column_id: ColumnId(101),
-                                qualifier: None,
-                                column: ImvRowIdColumn::NAME.to_string(),
-                            },
-                            data_type: DataType::Int64,
-                            nullable: false,
-                        },
-                        output_name: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
-                        output_column_id: ColumnId(102),
-                    },
-                ],
-                output_qualifier: None,
-            }),
-            vec![scan_plan(scan)],
-            None,
-        );
+        let project = normalized_delta_project(ColumnId(100), ColumnId(1));
         validate(&project).expect("must validate");
     }
 
@@ -677,10 +560,7 @@ mod tests {
 
     #[test]
     fn validation_rejects_dropped_action_above_project() {
-        let mut scan = delta_scan_with(Some(ImvActionColumn::output_column(ColumnId(100))));
-        // Add _row_id so V7 passes; V3 fires because the Project below drops action.
-        scan.columns
-            .push(ImvRowIdColumn::output_column(ColumnId(101)));
+        let scan = delta_scan_with(Some(ImvActionColumn::output_column(ColumnId(100))));
         let project = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
@@ -777,8 +657,8 @@ mod tests {
                 output_columns: Vec::new(),
             }),
             vec![
-                normalized_delta_project(ColumnId(100), ColumnId(1), ColumnId(101)),
-                normalized_delta_project_without_action(ColumnId(10), ColumnId(111)),
+                normalized_delta_project(ColumnId(100), ColumnId(1)),
+                normalized_delta_project_without_action(ColumnId(10)),
             ],
             None,
         );
@@ -812,14 +692,9 @@ mod tests {
         }
     }
 
-    fn normalized_delta_project(
-        action_id: ColumnId,
-        user_col_id: ColumnId,
-        row_id: ColumnId,
-    ) -> LogicalPlanNode {
+    fn normalized_delta_project(action_id: ColumnId, user_col_id: ColumnId) -> LogicalPlanNode {
         let mut scan = delta_scan_with(Some(ImvActionColumn::output_column(action_id)));
         scan.columns[0].column_id = user_col_id;
-        scan.columns.push(ImvRowIdColumn::output_column(row_id));
         LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![
@@ -832,14 +707,6 @@ mod tests {
                         ImvActionColumn::NAME,
                         action_id,
                     ),
-                    column_ref_item(
-                        row_id,
-                        ImvRowIdColumn::NAME,
-                        DataType::Int64,
-                        false,
-                        ImvRowIdColumn::NAME,
-                        row_id,
-                    ),
                 ],
                 output_qualifier: None,
             }),
@@ -848,26 +715,19 @@ mod tests {
         )
     }
 
-    fn normalized_delta_project_without_action(
-        user_col_id: ColumnId,
-        row_id: ColumnId,
-    ) -> LogicalPlanNode {
+    fn normalized_delta_project_without_action(user_col_id: ColumnId) -> LogicalPlanNode {
         let mut scan = delta_scan_with(None);
         scan.columns[0].column_id = user_col_id;
-        scan.columns.push(ImvRowIdColumn::output_column(row_id));
         LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
-                items: vec![
-                    column_ref_item(user_col_id, "k", DataType::Int64, false, "k", user_col_id),
-                    column_ref_item(
-                        row_id,
-                        ImvRowIdColumn::NAME,
-                        DataType::Int64,
-                        false,
-                        ImvRowIdColumn::NAME,
-                        row_id,
-                    ),
-                ],
+                items: vec![column_ref_item(
+                    user_col_id,
+                    "k",
+                    DataType::Int64,
+                    false,
+                    "k",
+                    user_col_id,
+                )],
                 output_qualifier: None,
             }),
             vec![scan_plan(scan)],
@@ -888,136 +748,51 @@ mod tests {
                         is_internal: false,
                     },
                     ImvActionColumn::output_column(action_id),
-                    ImvRowIdColumn::output_column(ColumnId(101)),
                 ],
             }),
             vec![
-                normalized_delta_project(action_id, ColumnId(1), ColumnId(101)),
-                normalized_delta_project(action_id, ColumnId(10), ColumnId(111)),
+                normalized_delta_project(action_id, ColumnId(1)),
+                normalized_delta_project(action_id, ColumnId(10)),
             ],
-            None,
-        )
-    }
-
-    fn root_project_with_apply_key(input: LogicalPlanNode) -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanKind::Project(PlanProjectNode {
-                items: vec![
-                    column_ref_item(ColumnId(1), "k", DataType::Int64, false, "k", ColumnId(1)),
-                    column_ref_item(
-                        ColumnId(100),
-                        ImvActionColumn::NAME,
-                        DataType::Int8,
-                        false,
-                        ImvActionColumn::NAME,
-                        ColumnId(100),
-                    ),
-                    column_ref_item(
-                        ColumnId(101),
-                        ImvRowIdColumn::NAME,
-                        DataType::Int64,
-                        false,
-                        ImvRowIdColumn::NAME,
-                        ColumnId(101),
-                    ),
-                    column_ref_item(
-                        ColumnId(101),
-                        ImvRowIdColumn::NAME,
-                        DataType::Int64,
-                        false,
-                        HIDDEN_APPLY_KEY_COLUMN_NAME,
-                        ColumnId(102),
-                    ),
-                ],
-                output_qualifier: None,
-            }),
-            vec![input],
             None,
         )
     }
 
     #[test]
     fn validation_accepts_fan_in_delta_union_above_delta_scans() {
-        let plan = root_project_with_apply_key(fan_in_delta_union(ColumnId(100)));
-
-        validate(&plan).expect("fan-in delta union must validate");
-    }
-
-    // ── V6 / V7 failing tests (RED phase) ───────────────────────────────────
-
-    /// Helper: delta scan with both a valid action column and `_row_id`.
-    fn delta_scan_with_action_and_row_id() -> PlanScanNode {
-        let mut scan = delta_scan_with(Some(ImvActionColumn::output_column(ColumnId(100))));
-        scan.columns
-            .push(ImvRowIdColumn::output_column(ColumnId(101)));
-        scan
-    }
-
-    fn project_without_apply_key_above_delta() -> LogicalPlanNode {
-        // Project carries k + __change_op + _row_id but NOT __nova_base_row_id.
-        let scan = delta_scan_with_action_and_row_id();
-        LogicalPlanNode::new(
-            LogicalPlanKind::Project(PlanProjectNode {
-                items: vec![
-                    ProjectItem {
-                        expr: TypedExpr {
-                            kind: ExprKind::ColumnRef {
-                                column_id: ColumnId(1),
-                                qualifier: None,
-                                column: "k".to_string(),
-                            },
-                            data_type: DataType::Int64,
-                            nullable: false,
-                        },
-                        output_name: "k".to_string(),
-                        output_column_id: ColumnId(1),
-                    },
-                    ProjectItem {
-                        expr: TypedExpr {
-                            kind: ExprKind::ColumnRef {
-                                column_id: ColumnId(100),
-                                qualifier: None,
-                                column: ImvActionColumn::NAME.to_string(),
-                            },
-                            data_type: DataType::Int8,
-                            nullable: false,
-                        },
-                        output_name: ImvActionColumn::NAME.to_string(),
-                        output_column_id: ColumnId(100),
-                    },
-                    ProjectItem {
-                        expr: TypedExpr {
-                            kind: ExprKind::ColumnRef {
-                                column_id: ColumnId(101),
-                                qualifier: None,
-                                column: ImvRowIdColumn::NAME.to_string(),
-                            },
-                            data_type: DataType::Int64,
-                            nullable: false,
-                        },
-                        output_name: ImvRowIdColumn::NAME.to_string(),
-                        output_column_id: ColumnId(101),
-                    },
-                    // __nova_base_row_id is intentionally absent.
-                ],
-                output_qualifier: None,
-            }),
-            vec![scan_plan(scan)],
-            None,
-        )
+        validate(&fan_in_delta_union(ColumnId(100))).expect("fan-in delta union must validate");
     }
 
     #[test]
-    fn validation_rejects_missing_apply_key_above_delta() {
-        let project = project_without_apply_key_above_delta();
-        let err = validate(&project).expect_err("missing apply key must fail");
-        assert!(err.contains("apply key"), "got: {err}");
-        assert!(err.contains("ice.db.b"), "got: {err}");
+    fn validation_accepts_visible_delta_without_persisted_identity() {
+        let project = normalized_delta_project(ColumnId(100), ColumnId(1));
+        validate(&project).expect("visible delta and signed action need no persisted identity");
     }
 
     #[test]
     fn validation_uses_descriptor_for_aggregate_change_stream_bypass() {
-        let project = project_without_apply_key_above_delta();
+        let plan = LogicalPlanNode::new(
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
+                group_by: Vec::new(),
+                aggregates: Vec::new(),
+                already_pushed: false,
+                output_columns: vec![OutputColumn {
+                    column_id: ColumnId(1),
+                    name: "k".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                }],
+            }),
+            vec![scan_plan(delta_scan_with(Some(
+                ImvActionColumn::output_column(ColumnId(100)),
+            )))],
+            None,
+        );
+        assert!(
+            validate(&plan).is_err(),
+            "ordinary validation must reject an unconsumed aggregate"
+        );
         let descriptor = ImvChangeStreamDescriptor {
             aggregate: Some(AggregateChangeStreamDescriptor {
                 action_column_id: ColumnId(100),
@@ -1028,18 +803,15 @@ mod tests {
             }),
             ..Default::default()
         };
-
-        validate_with_change_stream(&project, &descriptor)
+        validate_with_change_stream(&plan, &descriptor)
             .expect("aggregate change-stream descriptor should own this semantic bypass");
     }
 
     #[test]
-    fn validation_rejects_delta_scan_missing_row_id() {
-        // Scan has action column but NOT _row_id.
+    fn validation_accepts_delta_scan_without_row_identity() {
         let plan = scan_plan(delta_scan_with(Some(ImvActionColumn::output_column(
             ColumnId(100),
         ))));
-        let err = validate(&plan).expect_err("missing _row_id must fail");
-        assert!(err.contains("_row_id"), "got: {err}");
+        validate(&plan).expect("source action validation must not require row identity");
     }
 }

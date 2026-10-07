@@ -19,11 +19,10 @@
 -- @order_sensitive=true
 -- @tags=mv,iceberg,ivm,row_lineage,target_apply,base_delete,projection,filter,equality_delete
 -- Test Objective:
--- 1. Validate Iceberg-backed projection/filter MV incremental refresh uses the
---    base Iceberg v3 _row_id as the hidden target apply key.
+-- 1. Validate Iceberg-backed projection/filter refresh applies visible tuple multiplicities.
 -- 2. Validate base DELETE, UPDATE, predicate in/out, and equality-delete
 --    changes are applied to the Iceberg MV target without a PRIMARY KEY.
--- 3. Validate the hidden apply-key column is not exposed to users.
+-- 3. Validate the retired hidden apply-key column is absent from the target schema.
 
 -- query 1
 -- @skip_result_check=true
@@ -74,6 +73,7 @@ REFRESH MATERIALIZED VIEW orders_mv_${uuid0};
 SELECT * FROM orders_mv_${uuid0} ORDER BY id;
 
 -- query 4
+-- The target has no physical identity column; unresolved-column diagnostics include its name.
 -- @expect_error=__nova_base_row_id
 SELECT __nova_base_row_id FROM orders_mv_${uuid0};
 

@@ -21,6 +21,7 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
     stmt: &MvRefreshRequest,
     level: novarocks_sql::compiler::ExplainLevel,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
 ) -> Result<Vec<String>, String> {
     let (rewrite, target_planning_lease) =
         crate::query_execution::mv_assembly::refresh_preparation::freeze_statement_refresh_rewrite_context(
@@ -39,6 +40,7 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
         &target_planning_lease,
         level,
         connector_context,
+        execution,
     )
 }
 
@@ -56,6 +58,7 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
     target_planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     level: novarocks_sql::compiler::ExplainLevel,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
 ) -> Result<Vec<String>, String> {
     let target = resolve_refresh_target(current_catalog, current_database, &stmt.name_parts)?;
     if rewrite.target.catalog != target.catalog
@@ -77,6 +80,25 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
     if target_binding.table_uuid() != rewrite.target_table_uuid {
         return Err("EXPLAIN REFRESH target UUID differs from its rewrite context".to_string());
     }
+    let kind = crate::mv::domain::refresh::rewrite_context::visible_apply_kind_from_frozen_sources(
+        ports.connector_control(),
+        ports.storage_observation(),
+        &rewrite,
+        connector_context,
+    )?;
+    let visible_apply = rewrite.visible_apply_facts(
+        kind,
+        execution
+            .optimizer_settings()
+            .optimizer_query_mem_limit_bytes,
+    )?;
+    let candidates =
+        crate::query_execution::mv_assembly::query_local_bindings::freeze_imv_target_candidates(
+            &rewrite,
+            None,
+            visible_apply.is_some()
+                && kind == novarocks_sql::compiler::SqlImvVisibleApplyKind::PotentialDeletes,
+        )?;
     let bindings = Arc::new(QueryTableBindingStore::try_new()?);
     let target_binding_id = bind_imv_target_query_table_in_store_from_rewrite(
         &rewrite,
@@ -84,6 +106,7 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
         target_binding.lease(),
         connector_context,
         None,
+        candidates.as_ref(),
     )?;
     let catalog_service_snapshot =
         crate::catalog_application::query_catalog::catalog_service_snapshot(ports);
@@ -107,12 +130,12 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
         novarocks_sql::compiler::SqlImvRefreshExplainContext {
             canonical_query: Box::new((*rewrite.canonical_select_query).clone()),
             imv_rewrite: novarocks_sql::compiler::SqlImvPlanningInput::new(
-                rewrite.to_sql_rewrite_snapshot(target_binding_id)?,
+                rewrite.to_sql_rewrite_snapshot(target_binding_id, visible_apply)?,
                 novarocks_sql::compiler::SqlImvRewriteValidation::None,
             ),
             current_catalog: rewrite.current_catalog.clone(),
             current_database: rewrite.current_database.clone(),
-            optimizer_settings: novarocks_sql::compiler::SessionOptimizerSettings::default(),
+            optimizer_settings: execution.optimizer_settings().clone(),
             environment: novarocks_sql::compiler::SqlPlanningEnvironment::NotApplicable,
             catalog: &catalog,
             functions: ports.function_catalog().as_ref(),

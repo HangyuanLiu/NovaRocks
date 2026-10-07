@@ -150,10 +150,13 @@ impl StagedWriteContext {
         table: &novarocks_connector_iceberg::iceberg::table::Table,
     ) -> Result<Self, String> {
         let writer_schema = table.metadata().current_schema().clone();
-        let annotated_schema = Arc::new(
-            schema_to_arrow_schema(&writer_schema)
-                .map_err(|e| format!("convert iceberg schema to arrow failed: {e}"))?,
-        );
+        let physical = crate::schema_mapping::sql_write_schema_from_iceberg(&writer_schema)?;
+        let domains = crate::field_domain::metadata_declarations(table.metadata())
+            .map_err(|e| e.to_string())?;
+        let active = crate::field_domain::active(&writer_schema, domains.fields())
+            .map_err(|e| e.to_string())?;
+        let annotated_schema =
+            super::frozen_write::writer_domain_schema(&physical, &writer_schema, &active)?;
         Self::from_table_with_schema(table, writer_schema, annotated_schema)
     }
 
@@ -922,7 +925,7 @@ fn annotate_batch(
         .zip(annotated_schema.fields().iter())
         .enumerate()
     {
-        let new_col = reannotate_array(col, target_field.data_type())
+        let new_col = reannotate_field(col, target_field, &vec![true; col.len()])
             .map_err(|e| format!("annotate_batch column {idx} ({}): {e}", target_field.name()))?;
         new_columns.push(new_col);
     }
@@ -1017,7 +1020,7 @@ fn annotate_batch_by_identity(
 
         let new_col = if let Some(source_idx) = source_idx {
             let col = batch.column(source_idx);
-            reannotate_array(col, target_field.data_type()).map_err(|e| {
+            reannotate_field(col, target_field, &vec![true; col.len()]).map_err(|e| {
                 format!(
                     "annotate_batch column {target_idx} ({}): {e}",
                     target_field.name()
@@ -1093,160 +1096,243 @@ fn is_nested_dtype(dtype: &arrow::datatypes::DataType) -> bool {
 ///   5. catch-all fail-fast `Err` for everything else (structural mismatches
 ///      such as List -> Int, scalar -> nested, or unsupported nested pairs),
 ///      per CLAUDE.md rule #2.
+#[cfg(test)]
 fn reannotate_array(
     array: &arrow::array::ArrayRef,
     target_dtype: &arrow::datatypes::DataType,
 ) -> Result<arrow::array::ArrayRef, String> {
-    use arrow::array::{ArrayRef, ListArray, MapArray, StructArray};
-    use arrow::buffer::OffsetBuffer;
+    reannotate_field(
+        array,
+        &arrow::datatypes::Field::new("value", target_dtype.clone(), true),
+        &vec![true; array.len()],
+    )
+}
+
+/// Validate only logically visible values. Parent NULLs and unused collection
+/// slots do not contain rows to be persisted; required hidden slots are made
+/// physically valid without changing any visible value or collection order.
+fn reannotate_field(
+    array: &arrow::array::ArrayRef,
+    target_field: &arrow::datatypes::Field,
+    visible: &[bool],
+) -> Result<arrow::array::ArrayRef, String> {
+    use arrow::array::{ArrayRef, LargeListArray, ListArray, MapArray, StructArray};
     use arrow::datatypes::DataType;
-
-    if array.data_type() == target_dtype {
-        return Ok(array.clone());
+    if visible.len() != array.len() {
+        return Err("writer visibility mask length differs from array".into());
     }
-
-    match (array.data_type(), target_dtype) {
-        (DataType::Map(_, _), DataType::Map(target_entries_field, target_sorted)) => {
-            let map = array.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
-                "reannotate_array: Map data_type but array is not MapArray".to_string()
-            })?;
-            let target_entries_struct_fields = match target_entries_field.data_type() {
-                DataType::Struct(fields) => fields,
-                other => {
-                    return Err(format!(
-                        "reannotate_array: target Map entries must be Struct, got {other:?}"
-                    ));
-                }
+    let target_dtype = target_field.data_type();
+    if !target_field.is_nullable()
+        && visible
+            .iter()
+            .enumerate()
+            .any(|(i, seen)| *seen && array.is_null(i))
+    {
+        return Err(format!(
+            "Iceberg required field `{}` contains a visible NULL",
+            target_field.name()
+        ));
+    }
+    let result: ArrayRef = match (array.data_type(), target_dtype) {
+        (DataType::Map(_, _), DataType::Map(entries, sorted)) => {
+            let map = array
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .ok_or("writer Map carrier differs")?;
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Err("writer Map entries are not Struct".into());
             };
-            if target_entries_struct_fields.len() != 2 {
-                return Err(format!(
-                    "reannotate_array: target Map entries Struct must have 2 fields, got {}",
-                    target_entries_struct_fields.len()
-                ));
+            if fields.len() != 2 {
+                return Err("writer Map entries must have two fields".into());
             }
-            let target_key_field = &target_entries_struct_fields[0];
-            let target_value_field = &target_entries_struct_fields[1];
-
-            let keys_in: ArrayRef = Arc::new(map.keys().clone());
-            let values_in: ArrayRef = Arc::new(map.values().clone());
-            let new_keys = reannotate_array(&keys_in, target_key_field.data_type())?;
-            let new_values = reannotate_array(&values_in, target_value_field.data_type())?;
-
-            // The Iceberg MAP key field is `required` per the Iceberg spec, so
-            // its Arrow representation is a non-nullable Struct field. A NULL map
-            // key is not representable in an Iceberg table. Building a
-            // StructArray with unmasked nulls on a non-nullable field panics
-            // inside Arrow's `StructArray::new`; fail fast with a clear error on
-            // user input instead (CLAUDE.md rule #2).
-            if !target_key_field.is_nullable() && new_keys.null_count() > 0 {
-                return Err(format!(
-                    "Iceberg MAP keys must be non-null (column key field `{}`); cannot insert a NULL map key",
-                    target_key_field.name()
-                ));
+            let mut seen = vec![false; map.entries().len()];
+            for i in 0..map.len() {
+                if visible[i] && map.is_valid(i) {
+                    seen[map.value_offsets()[i] as usize..map.value_offsets()[i + 1] as usize]
+                        .fill(true);
+                }
             }
-            let new_entries = StructArray::try_new(
-                target_entries_struct_fields.clone(),
-                vec![new_keys, new_values],
+            // Actual NULL keys are forbidden even when an exact incoming type
+            // uses the SQL nullable-key carrier; no type-equality fast path.
+            if seen
+                .iter()
+                .enumerate()
+                .any(|(i, s)| *s && map.keys().is_null(i))
+            {
+                return Err(
+                    "Iceberg MAP keys must be non-null; cannot insert a NULL map key".into(),
+                );
+            }
+            let keys = reannotate_field(map.keys(), &fields[0], &seen)?;
+            let values = reannotate_field(map.values(), &fields[1], &seen)?;
+            let children = StructArray::try_new(
+                fields.clone(),
+                vec![keys, values],
                 map.entries().nulls().cloned(),
             )
-            .map_err(|e| {
-                format!("reannotate_array: rebuild Map entries StructArray failed: {e}")
-            })?;
-            let new_map = MapArray::try_new(
-                target_entries_field.clone(),
-                OffsetBuffer::new(map.value_offsets().to_vec().into()),
-                new_entries,
-                map.nulls().cloned(),
-                *target_sorted,
+            .map_err(|e| format!("writer Map entries: {e}"))?;
+            Arc::new(
+                MapArray::try_new(
+                    entries.clone(),
+                    map.offsets().clone(),
+                    children,
+                    map.nulls().cloned(),
+                    *sorted,
+                )
+                .map_err(|e| format!("writer Map: {e}"))?,
             )
-            .map_err(|e| format!("reannotate_array: rebuild MapArray failed: {e}"))?;
-            Ok(Arc::new(new_map) as ArrayRef)
         }
-        (DataType::Struct(_), DataType::Struct(target_fields)) => {
-            let struct_arr = array
+        (DataType::Struct(_), DataType::Struct(fields)) => {
+            let values = array
                 .as_any()
                 .downcast_ref::<StructArray>()
-                .ok_or_else(|| {
-                    "reannotate_array: Struct data_type but array is not StructArray".to_string()
-                })?;
-            if struct_arr.num_columns() != target_fields.len() {
-                return Err(format!(
-                    "reannotate_array: Struct child count mismatch: array={} target={}",
-                    struct_arr.num_columns(),
-                    target_fields.len()
-                ));
+                .ok_or("writer Struct carrier differs")?;
+            if values.num_columns() != fields.len() {
+                return Err("writer Struct arity differs".into());
             }
-            let mut new_children: Vec<ArrayRef> = Vec::with_capacity(target_fields.len());
-            for (i, target_child_field) in target_fields.iter().enumerate() {
-                let child = struct_arr.column(i).clone();
-                let new_child = reannotate_array(&child, target_child_field.data_type())?;
-                new_children.push(new_child);
+            let seen = visible
+                .iter()
+                .enumerate()
+                .map(|(i, s)| *s && values.is_valid(i))
+                .collect::<Vec<_>>();
+            let children = fields
+                .iter()
+                .enumerate()
+                .map(|(i, f)| reannotate_field(values.column(i), f, &seen))
+                .collect::<Result<Vec<_>, _>>()?;
+            Arc::new(
+                StructArray::try_new(fields.clone(), children, values.nulls().cloned())
+                    .map_err(|e| format!("writer Struct: {e}"))?,
+            )
+        }
+        (DataType::List(_), DataType::List(child)) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or("writer List carrier differs")?;
+            let mut seen = vec![false; values.values().len()];
+            for i in 0..values.len() {
+                if visible[i] && values.is_valid(i) {
+                    seen[values.value_offsets()[i] as usize
+                        ..values.value_offsets()[i + 1] as usize]
+                        .fill(true);
+                }
             }
-            let new_struct = StructArray::try_new(
-                target_fields.clone(),
-                new_children,
-                struct_arr.nulls().cloned(),
+            let child_values = reannotate_field(values.values(), child, &seen)?;
+            Arc::new(
+                ListArray::try_new(
+                    child.clone(),
+                    values.offsets().clone(),
+                    child_values,
+                    values.nulls().cloned(),
+                )
+                .map_err(|e| format!("writer List: {e}"))?,
             )
-            .map_err(|e| format!("reannotate_array: rebuild StructArray failed: {e}"))?;
-            Ok(Arc::new(new_struct) as ArrayRef)
         }
-        (DataType::List(_), DataType::List(target_child_field)) => {
-            let list = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-                "reannotate_array: List data_type but array is not ListArray".to_string()
-            })?;
-            let values_in: ArrayRef = list.values().clone();
-            let new_values = reannotate_array(&values_in, target_child_field.data_type())?;
-            let new_list = ListArray::try_new(
-                target_child_field.clone(),
-                OffsetBuffer::new(list.value_offsets().to_vec().into()),
-                new_values,
-                list.nulls().cloned(),
+        (DataType::LargeList(_), DataType::LargeList(child)) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .ok_or("writer LargeList carrier differs")?;
+            let mut seen = vec![false; values.values().len()];
+            for i in 0..values.len() {
+                if visible[i] && values.is_valid(i) {
+                    seen[values.value_offsets()[i] as usize
+                        ..values.value_offsets()[i + 1] as usize]
+                        .fill(true);
+                }
+            }
+            let child_values = reannotate_field(values.values(), child, &seen)?;
+            Arc::new(
+                LargeListArray::try_new(
+                    child.clone(),
+                    values.offsets().clone(),
+                    child_values,
+                    values.nulls().cloned(),
+                )
+                .map_err(|e| format!("writer LargeList: {e}"))?,
             )
-            .map_err(|e| format!("reannotate_array: rebuild ListArray failed: {e}"))?;
-            Ok(Arc::new(new_list) as ArrayRef)
         }
-        (a, b) if a == b => Ok(array.clone()),
-        // Arrow `Null` source -> any target type. A `Null` array is produced
-        // when an INSERT supplies a bare NULL literal (no type information):
-        // every row is NULL. Build an all-null array of the target type
-        // directly rather than routing through a cast kernel; this is always
-        // valid for a nullable insert and avoids the kernel-specific holes
-        // around `Null -> <T>`. Length is preserved.
-        (DataType::Null, _) => Ok(arrow::array::new_null_array(target_dtype, array.len())),
-        // General scalar <-> scalar coercion. INSERT-SELECT may feed a source
-        // scalar column into a different-typed scalar sink column, e.g.
-        //   * numeric <-> numeric (integer narrowing, integer -> Decimal128,
-        //     Decimal128 -> Decimal128 narrowing with half-up rounding,
-        //     integer -> float widening, float narrowing/float -> integer);
-        //   * scalar -> STRING (numeric/boolean/temporal -> Utf8);
-        //   * STRING -> scalar and temporal <-> string, etc.
-        // The native Iceberg write path accepts these coercions. We delegate to
-        // the canonical relaxed scalar cast, which applies safe=true
-        // semantics (out-of-range values become NULL, matching the DECIMAL
-        // overflow convention) and identical textual formatting for ->STRING.
-        //
-        // This arm is GUARDED to scalar pairs only: if either side is a nested
-        // / composite type (`is_nested_dtype`), we fall through to the
-        // fail-fast catch-all below. Supported nested rebuilds (Struct/List/Map
-        // -> same kind) are handled by the dedicated arms ABOVE; a nested ->
-        // scalar pair (e.g. List -> Int), a scalar -> nested pair, or an
-        // unsupported nested -> nested pair MUST NOT reach the cast and instead
-        // errors out, preserving CLAUDE.md rule #2 (fail fast on structural
-        // mismatches).
+        _ if target_field
+            .metadata()
+            .get(super::frozen_write::WRITE_DOMAIN_KEY)
+            .is_some_and(|d| d == "tinyint" || d == "smallint") =>
+        {
+            if target_dtype != &DataType::Int32 || is_nested_dtype(array.data_type()) {
+                return Err("writer integer domain has an incompatible carrier".into());
+            }
+            let values = novarocks_types::arrow_cast::cast_scalar_with_special_rules(
+                array,
+                &DataType::Int64,
+            )
+            .map_err(|e| format!("writer integer domain coercion: {e}"))?;
+            let values = values
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .ok_or("writer integer domain coercion did not produce INT64")?;
+            let tiny = target_field.metadata()[super::frozen_write::WRITE_DOMAIN_KEY] == "tinyint";
+            let mut out = arrow::array::Int32Builder::with_capacity(array.len());
+            for (i, seen) in visible.iter().enumerate() {
+                if values.is_null(i) {
+                    if *seen && array.is_valid(i) {
+                        return Err("writer integer domain coercion lost a visible value".into());
+                    }
+                    out.append_null();
+                } else if *seen {
+                    let value = values.value(i);
+                    if (tiny && i8::try_from(value).is_err())
+                        || (!tiny && i16::try_from(value).is_err())
+                    {
+                        return Err(format!(
+                            "Iceberg declared integer domain rejects visible value {value}"
+                        ));
+                    }
+                    out.append_value(value as i32);
+                } else {
+                    out.append_value(0);
+                }
+            }
+            Arc::new(out.finish())
+        }
+        (a, b) if a == b => array.clone(),
+        (DataType::Null, _) => arrow::array::new_null_array(target_dtype, array.len()),
         (a, b) if !is_nested_dtype(a) && !is_nested_dtype(b) => {
             novarocks_types::arrow_cast::cast_scalar_with_special_rules(array, target_dtype)
                 .map_err(|e| {
-                    format!(
-                        "reannotate_array: coerce scalar {:?} to {:?} failed: {e}",
-                        array.data_type(),
-                        target_dtype
-                    )
-                })
+                    format!("reannotate_array: coerce scalar {a:?} to {b:?} failed: {e}")
+                })?
         }
-        (a, b) => Err(format!(
-            "reannotate_array: incompatible data types: array={a:?}, target={b:?}"
-        )),
+        (a, b) => {
+            return Err(format!(
+                "reannotate_array: incompatible data types: array={a:?}, target={b:?}"
+            ));
+        }
+    };
+    if !target_field.is_nullable() && result.null_count() > 0 {
+        if visible
+            .iter()
+            .enumerate()
+            .any(|(i, s)| *s && result.is_null(i))
+        {
+            return Err(format!(
+                "Iceberg required field `{}` contains a visible NULL after coercion",
+                target_field.name()
+            ));
+        }
+        let valid = arrow::buffer::NullBuffer::from(
+            (0..result.len())
+                .map(|i| result.is_valid(i) || !visible[i])
+                .collect::<Vec<_>>(),
+        );
+        let data = result
+            .to_data()
+            .into_builder()
+            .nulls(Some(valid))
+            .build()
+            .map_err(|e| format!("writer masked required field: {e}"))?;
+        return Ok(arrow::array::make_array(data));
     }
+    Ok(result)
 }
 
 fn unique_file_suffix() -> String {
@@ -1255,6 +1341,8 @@ fn unique_file_suffix() -> String {
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::{ArrayRef, Int32Array, Int64Array, StructArray};
+    use arrow::datatypes::{DataType, Field};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -3147,5 +3235,211 @@ mod tests {
                 expected
             );
         }
+    }
+    fn marked_integer_field(name: &str, domain: &str, nullable: bool) -> arrow::datatypes::Field {
+        arrow::datatypes::Field::new(name, DataType::Int32, nullable).with_metadata(
+            std::collections::HashMap::from([(
+                super::super::frozen_write::WRITE_DOMAIN_KEY.into(),
+                domain.into(),
+            )]),
+        )
+    }
+
+    #[test]
+    fn field_domain_checks_exact_carrier_range_and_parent_mask() {
+        let tiny = marked_integer_field("tiny", "tinyint", true);
+        for bad in [-129, 128, i64::MIN, i64::MAX] {
+            let array = Arc::new(Int64Array::from(vec![bad])) as ArrayRef;
+            assert!(
+                reannotate_field(&array, &tiny, &[true])
+                    .unwrap_err()
+                    .contains("declared integer domain")
+            );
+        }
+        let small = marked_integer_field("small", "smallint", true);
+        for bad in [-32769, 32768] {
+            let array = Arc::new(Int32Array::from(vec![bad])) as ArrayRef;
+            assert!(
+                reannotate_field(&array, &small, &[true])
+                    .unwrap_err()
+                    .contains("declared integer domain")
+            );
+        }
+        let fields = vec![Arc::new(marked_integer_field("tiny", "tinyint", false))].into();
+        let input_fields = vec![Arc::new(Field::new("tiny", DataType::Int32, true))].into();
+        let input = Arc::new(
+            StructArray::try_new(
+                input_fields,
+                vec![Arc::new(Int32Array::from(vec![
+                    Some(-128),
+                    Some(999),
+                    None,
+                ]))],
+                Some(arrow::buffer::NullBuffer::from(vec![true, false, false])),
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let target = Field::new("s", DataType::Struct(fields), true);
+        let unmasked = Arc::new(
+            StructArray::try_new(
+                input
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .unwrap()
+                    .fields()
+                    .clone(),
+                input
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .unwrap()
+                    .columns()
+                    .to_vec(),
+                None,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        assert!(reannotate_field(&unmasked, &target, &[true, true, true]).is_err());
+        let output = reannotate_field(&input, &target, &[true, true, true]).unwrap();
+        let output = output.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(output.column(0).null_count(), 0);
+        assert!(output.is_null(1));
+        assert!(output.is_null(2));
+        assert_eq!(
+            output
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            -128
+        );
+    }
+
+    #[test]
+    fn field_domain_list_slice_ignores_unused_overflow_and_keeps_visible_nulls() {
+        let child = Arc::new(marked_integer_field("element", "tinyint", true));
+        let source = Arc::new(
+            arrow::array::ListArray::try_new(
+                Arc::new(Field::new("element", DataType::Int32, true)),
+                arrow::buffer::OffsetBuffer::new(vec![0, 1, 3, 4].into()),
+                Arc::new(Int32Array::from(vec![
+                    Some(999),
+                    Some(-128),
+                    None,
+                    Some(128),
+                ])),
+                None,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let slice = source.slice(1, 1);
+        let target = Field::new("xs", DataType::List(child), true);
+        let output = reannotate_field(&slice, &target, &[true]).unwrap();
+        let output = output
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .unwrap();
+        assert_eq!(output.value_offsets(), &[1, 3]);
+        let values = output.value(0);
+        assert_eq!(
+            values
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(-128), None]
+        );
+        assert!(reannotate_field(&source.slice(2, 1), &target, &[true]).is_err());
+    }
+
+    #[test]
+    fn map_visible_null_keys_fail_even_exact_type_but_null_parent_and_slice_succeed() {
+        let input_children: arrow::datatypes::Fields = vec![
+            Arc::new(Field::new("key", DataType::Int32, true)),
+            Arc::new(Field::new("value", DataType::Int32, true)),
+        ]
+        .into();
+        let entries = arrow::array::StructArray::try_new(
+            input_children.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![None, Some(7), None, None])),
+                Arc::new(Int32Array::from(vec![Some(1), None, Some(3), None])),
+            ],
+            None,
+        )
+        .unwrap();
+        let input = Arc::new(
+            arrow::array::MapArray::try_new(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(input_children),
+                    false,
+                )),
+                arrow::buffer::OffsetBuffer::new(vec![0, 1, 2, 3, 4].into()),
+                entries,
+                Some(arrow::buffer::NullBuffer::from(vec![
+                    true, true, false, true,
+                ])),
+                false,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let exact = Field::new("m", input.data_type().clone(), true);
+        assert!(
+            reannotate_field(&input.slice(3, 1), &exact, &[true])
+                .unwrap_err()
+                .contains("NULL map key")
+        );
+        let target = Field::new(
+            "m",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(Field::new("key", DataType::Int32, false)),
+                            Arc::new(Field::new("value", DataType::Int32, true)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        );
+        let output = reannotate_field(&input.slice(1, 2), &target, &[true, true]).unwrap();
+        let output = output
+            .as_any()
+            .downcast_ref::<arrow::array::MapArray>()
+            .unwrap();
+        assert_eq!(output.value_offsets(), &[1, 2, 3]);
+        assert!(output.is_null(1));
+        assert_eq!(output.keys().null_count(), 0);
+        assert_eq!(
+            output
+                .value(0)
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            7
+        );
+        let parent = Arc::new(
+            StructArray::try_new(
+                vec![Arc::new(exact)].into(),
+                vec![input.slice(3, 1)],
+                Some(arrow::buffer::NullBuffer::from(vec![false])),
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let outer = Field::new(
+            "parent",
+            DataType::Struct(vec![Arc::new(target)].into()),
+            true,
+        );
+        assert!(reannotate_field(&parent, &outer, &[true]).is_ok());
     }
 }

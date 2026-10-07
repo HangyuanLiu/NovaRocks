@@ -55,6 +55,78 @@ fn verify_node(
         .collect::<Result<Vec<_>, _>>()?;
 
     let derived = match &node.op {
+        Operator::PhysicalQuotaPreclaim(op) => {
+            if child_outputs.len() != 2 {
+                return Err("QuotaPreclaim requires two exact input scopes".into());
+            }
+            for column in std::iter::once(op.demand_entry_id)
+                .chain([op.demand_key, op.demand_need.column()])
+                .chain(op.demand_values.iter().copied())
+            {
+                verify_scoped_quota_column(column, &child_outputs[0])?;
+            }
+            for column in op
+                .target_values
+                .iter()
+                .copied()
+                .chain([op.target_file, op.target_position])
+            {
+                verify_scoped_quota_column(column, &child_outputs[1])?;
+            }
+            verify_output_id(op.domain, "QuotaPreclaim domain")?;
+            Ok(output_ids(
+                op.output_columns.iter().map(|column| column.column_id),
+            ))
+        }
+        Operator::PhysicalQuotaTrim(op) => {
+            if child_outputs.len() != 2 {
+                return Err("QuotaTrim requires two exact input scopes".into());
+            }
+            for column in [op.seed_entry_id, op.seed_need.column()] {
+                verify_scoped_quota_column(column, &child_outputs[0])?;
+            }
+            for column in [
+                op.candidate_entry_id,
+                op.candidate_file,
+                op.candidate_position,
+            ] {
+                verify_scoped_quota_column(column, &child_outputs[1])?;
+            }
+            verify_output_id(op.domain, "QuotaTrim domain")?;
+            Ok(output_ids(
+                op.output_columns.iter().map(|column| column.column_id),
+            ))
+        }
+        Operator::PhysicalFanoutAnchor(op) => {
+            if child_outputs.len() != 2 || op.branches.is_empty() {
+                return Err("fanout requires its exact producer, body and branches".into());
+            }
+            verify_output_id(op.id, "fanout definition")?;
+            for branch in &op.branches {
+                let predicate = materialize(scalars, branch.predicate);
+                verify_expr(&predicate, &child_outputs[0], "fanout predicate")?;
+                if predicate.data_type != arrow::datatypes::DataType::Boolean {
+                    return Err("fanout predicate must be Boolean".into());
+                }
+                if let crate::planner::quota::PlanFanoutDistribution::Hash(keys) =
+                    &branch.distribution
+                {
+                    if keys.is_empty() {
+                        return Err("fanout hash branch requires keys".into());
+                    }
+                    for key in keys {
+                        verify_scoped_quota_column(*key, &child_outputs[0])?;
+                    }
+                }
+            }
+            Ok(child_outputs[1].clone())
+        }
+        Operator::PhysicalFanoutConsume(op) => {
+            op.validate_mapping()?;
+            Ok(output_ids(
+                op.output_columns.iter().map(|column| column.column_id),
+            ))
+        }
         Operator::PhysicalScan(op) => Ok(output_ids(op.columns.iter().map(|c| c.column_id))),
         Operator::PhysicalValues(op) => {
             let empty = HashSet::new();
@@ -685,6 +757,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fanout_mapping_id_binding_rejects_missing_hash_key_and_duplicate_producer() {
+        use crate::planner::quota::{PlanFanoutConsumeNode, PlanFanoutDistribution};
+
+        for (producers, keys, detail) in [
+            (vec![ColumnId(12)], vec![ColumnId(13)], "not materialized"),
+            (
+                vec![ColumnId(12), ColumnId(12)],
+                vec![ColumnId(12)],
+                "producer identities",
+            ),
+        ] {
+            let columns: Vec<_> = (0..producers.len())
+                .map(|ordinal| int_col(ColumnId(ordinal as u32 + 2), "seed"))
+                .collect();
+            let mut plan = values_node(columns.clone());
+            plan.op = Operator::PhysicalFanoutConsume(PlanFanoutConsumeNode {
+                anchor: ColumnId(1),
+                branch: 2,
+                output_columns: columns,
+                producer_column_ids: producers,
+                distribution: PlanFanoutDistribution::Hash(keys),
+            });
+            attach_scalar_arena(&mut plan, Arc::new(ScalarArena::new()));
+            let error = verify_optimized_tree_id_binding(&plan)
+                .expect_err("malformed fanout mapping must fail the physical bridge");
+            assert!(error.contains(detail), "unexpected error: {error}");
+        }
+    }
+
     fn project_over(
         child: OptimizedOperatorNode,
         expr: TypedExpr,
@@ -997,4 +1099,15 @@ mod tests {
             "unexpected err={err}"
         );
     }
+}
+
+fn verify_scoped_quota_column(column: ColumnId, input: &HashSet<ColumnId>) -> Result<(), String> {
+    verify_output_id(column, "quota input")?;
+    if !input.contains(&column) {
+        return Err(format!(
+            "quota column {} is not produced by its exact input scope",
+            column.0
+        ));
+    }
+    Ok(())
 }

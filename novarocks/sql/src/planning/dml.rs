@@ -849,6 +849,7 @@ impl DmlReadCompletion {
 /// stable capture fingerprint, and sealed write plan derived from it.
 #[derive(Clone, Debug)]
 pub struct DmlCtasSourcePlan {
+    output_columns: Vec<DmlSourceColumn>,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     optimized: crate::optimizer::OptimizedOperatorNode,
     function_catalog: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
@@ -860,19 +861,17 @@ pub struct DmlSourceColumn {
     pub name: String,
     pub data_type: arrow::datatypes::DataType,
     pub nullable: bool,
+    logical_type: novarocks_types::logical_type::LogicalType,
+}
+impl DmlSourceColumn {
+    pub fn logical_type(&self) -> &novarocks_types::logical_type::LogicalType {
+        &self.logical_type
+    }
 }
 
 impl DmlCtasSourcePlan {
     pub fn output_columns(&self) -> Vec<DmlSourceColumn> {
-        self.optimized
-            .output_columns
-            .iter()
-            .map(|column| DmlSourceColumn {
-                name: column.name.clone(),
-                data_type: column.data_type.clone(),
-                nullable: column.nullable,
-            })
-            .collect()
+        self.output_columns.clone()
     }
 
     /// Versioned digest of the frozen in-memory optimizer artifact used to
@@ -881,10 +880,12 @@ impl DmlCtasSourcePlan {
         use sha2::{Digest, Sha256};
 
         let material = format!("{:#?}", self.optimized);
+        let output_material = format!("{:?}", self.output_columns);
         let mut digest = Sha256::new();
         for part in [
-            b"novarocks.ctas-optimized-capture.v1".as_slice(),
+            b"novarocks.ctas-optimized-capture.v2".as_slice(),
             material.as_bytes(),
+            output_material.as_bytes(),
         ] {
             digest.update((part.len() as u64).to_be_bytes());
             digest.update(part);
@@ -903,7 +904,29 @@ pub fn compile_ctas_source(
         .map_err(|error| error.to_string())?
         .into_optimized_output()
         .map_err(|_| "CTAS source did not produce optimized SQL facts".to_string())?;
+    if compiled.optimized_tree.output_columns.len() != compiled.analyzed_output_fields.len() {
+        return Err("CTAS optimized output arity differs from its analyzed schema".into());
+    }
+    let output_columns = compiled
+        .optimized_tree
+        .output_columns
+        .iter()
+        .zip(&compiled.analyzed_output_fields)
+        .map(|(column, field)| {
+            if column.name != *field.name() || column.data_type != *field.data_type() {
+                return Err("CTAS optimized output differs from its frozen logical proof".into());
+            }
+            let value = novarocks_types::logical_type::logical_value_from_engine_arrow(field)?;
+            Ok(DmlSourceColumn {
+                name: column.name.clone(),
+                data_type: column.data_type.clone(),
+                nullable: field.is_nullable(),
+                logical_type: value.data_type,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     Ok(DmlCtasSourcePlan {
+        output_columns,
         query_statistics: compiled.statistics.snapshot,
         optimized: compiled.optimized_tree,
         function_catalog: compiled.function_catalog,

@@ -39,7 +39,8 @@ use novarocks_spi::connector::write_stack::{
 };
 use novarocks_spi::connector::{
     CatalogHandle, CatalogProperties, ConnectorError, ConnectorErrorKind,
-    ConnectorInstanceDescriptor, ConnectorRequestContext,
+    ConnectorExecutionResources, ConnectorInstanceDescriptor, ConnectorRequestContext,
+    ConnectorResourceClass, ConnectorResourceReservation,
 };
 
 use crate::access_binding::IcebergReadBinding;
@@ -247,12 +248,16 @@ impl IcebergDataStackWriter {
                 "Iceberg data writer handle carries no data branch recipe",
             )
         })?;
-        let input_schema = recipe.input_schema().cloned().ok_or_else(|| {
-            error(
-                ConnectorErrorKind::InvalidRequest,
-                "Iceberg data writer handle carries no frozen input schema",
-            )
-        })?;
+        let input_schema = recipe
+            .input_schema()
+            .cloned()
+            .map(Arc::new)
+            .ok_or_else(|| {
+                error(
+                    ConnectorErrorKind::InvalidRequest,
+                    "Iceberg data writer handle carries no frozen input schema",
+                )
+            })?;
         let binding = execution.binding.for_request(request.context.clone());
         let facts = FrozenDataWriteFacts {
             table_location: handle.table().table_location().to_string(),
@@ -262,6 +267,7 @@ impl IcebergDataStackWriter {
             partition_column_names: recipe.partition_column_names().to_vec(),
             transform_exprs: recipe.transform_exprs().to_vec(),
             data_input_schema: input_schema,
+            data_field_domains: recipe.field_domains().clone(),
             parquet_row_group_size_bytes: handle.output().parquet_row_group_size_bytes(),
         };
         let context =
@@ -403,6 +409,8 @@ struct IcebergDeleteStackWriter {
     request_context: ConnectorRequestContext,
     file_io: crate::iceberg::io::FileIO,
     pending: BTreeMap<String, roaring::RoaringTreemap>,
+    resources: ConnectorExecutionResources,
+    pending_reservation: ConnectorResourceReservation,
     staged_paths: Vec<String>,
     next_sequence: u64,
     terminal: bool,
@@ -417,6 +425,9 @@ impl IcebergDeleteStackWriter {
         let binding = execution.binding.for_request(request.context.clone());
         let file_io = build_staged_file_io(&binding, handle.table().data_location())
             .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
+        let pending_reservation = request
+            .resources
+            .try_reserve(ConnectorResourceClass::WriterState, 256)?;
         Ok(Self {
             adapter: execution.adapter.clone(),
             binding: execution.binding.clone(),
@@ -425,6 +436,8 @@ impl IcebergDeleteStackWriter {
             request_context: request.context,
             file_io,
             pending: BTreeMap::new(),
+            resources: request.resources,
+            pending_reservation,
             staged_paths: Vec::new(),
             next_sequence: 0,
             terminal: false,
@@ -655,10 +668,12 @@ impl ConnectorBatchWriter for IcebergDeleteStackWriter {
                     ),
                 ));
             }
-            self.pending
-                .entry(referenced.to_string())
-                .or_default()
-                .insert(position);
+            insert_pending_delete_position(
+                &mut self.pending,
+                &mut self.pending_reservation,
+                referenced,
+                position,
+            )?;
         }
         Ok(())
     }
@@ -683,6 +698,14 @@ impl ConnectorBatchWriter for IcebergDeleteStackWriter {
             // D10: the old artifacts are read here, on the backend, through
             // this request's storage lease. Any failure — missing, unreadable,
             // corrupt, mismatched, or stale — propagates and fails the query.
+            // The retained merge result and its temporary decoded bitmap,
+            // staging bitmap, ordered positions and serialized DV coexist.
+            // Bound them by the exact file row-position domain, not observed
+            // cardinality or a sample. This can refuse a very large domain.
+            let merge_bytes = delete_merge_reservation_bytes(&target, new_positions.len())?;
+            let _merge_reservation = self
+                .resources
+                .try_reserve(ConnectorResourceClass::WriterState, merge_bytes)?;
             let merged = read_and_merge_old_deletes(&target, &self.binding, &self.request_context)?;
             let merged_references = merged.merged_references().to_vec();
             let mut positions = merged.into_positions();
@@ -711,15 +734,96 @@ impl ConnectorBatchWriter for IcebergDeleteStackWriter {
             };
             fragments.push(self.adapter.wrap_commit_fragment(fragment));
         }
+        self.pending_reservation.shrink_to(0)?;
         Ok(fragments)
     }
 
     async fn abort(&mut self) -> Result<(), ConnectorError> {
         self.pending.clear();
+        self.pending_reservation.shrink_to(0)?;
         self.cleanup().await?;
         self.terminal = true;
         Ok(())
     }
+}
+
+fn insert_pending_delete_position(
+    pending: &mut BTreeMap<String, roaring::RoaringTreemap>,
+    reservation: &mut ConnectorResourceReservation,
+    referenced: &str,
+    position: u64,
+) -> Result<(), ConnectorError> {
+    // A sparse RoaringTreemap can allocate a high-key node and a
+    // bitmap container for one position. Charge the upper bound before
+    // mutating it; duplicates expose a broken unique-locator contract.
+    if pending
+        .get(referenced)
+        .is_some_and(|positions| positions.contains(position))
+    {
+        return Err(error(
+            ConnectorErrorKind::CorruptData,
+            format!("Iceberg delete writer repeats position {position} in {referenced}"),
+        ));
+    }
+    let key_bytes = if pending.contains_key(referenced) {
+        0
+    } else {
+        (referenced.len() as u64).checked_add(1024).ok_or_else(|| {
+            error(
+                ConnectorErrorKind::ResourceExhausted,
+                "Iceberg pending delete path reservation overflow",
+            )
+        })?
+    };
+    reservation.try_grow(1024_u64.checked_add(key_bytes).ok_or_else(|| {
+        error(
+            ConnectorErrorKind::ResourceExhausted,
+            "Iceberg pending delete reservation overflow",
+        )
+    })?)?;
+    let inserted = pending
+        .entry(referenced.to_string())
+        .or_default()
+        .insert(position);
+    debug_assert!(inserted);
+    Ok(())
+}
+
+/// A conservative upper bound for the resident valid merge/staging state.
+/// Each possible position is charged for four sparse container allocations;
+/// encoded old artifacts and retained path/reference bookkeeping are added.
+fn delete_merge_reservation_bytes(
+    target: &crate::commit::write_stack::old_delete::IcebergOldDeleteMergeTarget,
+    new_count: u64,
+) -> Result<u64, ConnectorError> {
+    let rows = if target.references().is_empty() {
+        new_count
+    } else {
+        target.data_file_record_count()
+    };
+    let mut bytes = rows
+        .checked_mul(1024)
+        .and_then(|value| value.checked_add(512))
+        .ok_or_else(|| {
+            error(
+                ConnectorErrorKind::ResourceExhausted,
+                "Iceberg delete merge row-domain reservation overflow",
+            )
+        })?;
+    for reference in target.references() {
+        bytes = reference
+            .file_size_in_bytes()
+            .checked_mul(4)
+            .and_then(|value| value.checked_add(reference.path().len() as u64 + 512))
+            .and_then(|value| bytes.checked_add(value))
+            .ok_or_else(|| {
+                error(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "Iceberg old delete merge reservation overflow",
+                )
+            })?;
+    }
+    Ok(bytes)
 }
 
 /// The per-driver equality-delete writer.
@@ -909,5 +1013,118 @@ impl ConnectorBatchWriter for IcebergEqualityDeleteStackWriter {
         self.fragments.clear();
         self.terminal = true;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod bounded_delete_tests {
+    use super::*;
+    use novarocks_spi::connector::{
+        ConnectorResourceCheckpoint, ConnectorResourceLease, ConnectorResourceLedger,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Ledger {
+        limit: u64,
+        used: Arc<AtomicU64>,
+    }
+    struct Lease {
+        limit: u64,
+        used: Arc<AtomicU64>,
+        held: u64,
+    }
+    impl ConnectorResourceLedger for Ledger {
+        fn checkpoint(&self) -> Result<ConnectorResourceCheckpoint, ConnectorError> {
+            Ok(ConnectorResourceCheckpoint::new(1))
+        }
+        fn try_reserve(
+            &self,
+            class: ConnectorResourceClass,
+            bytes: u64,
+        ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError> {
+            assert_eq!(class, ConnectorResourceClass::WriterState);
+            let mut lease = Lease {
+                limit: self.limit,
+                used: self.used.clone(),
+                held: 0,
+            };
+            lease.try_grow(bytes)?;
+            Ok(Box::new(lease))
+        }
+    }
+    impl ConnectorResourceLease for Lease {
+        fn bytes(&self) -> u64 {
+            self.held
+        }
+        fn try_grow(&mut self, additional: u64) -> Result<(), ConnectorError> {
+            if self
+                .used
+                .load(Ordering::SeqCst)
+                .checked_add(additional)
+                .is_none_or(|value| value > self.limit)
+            {
+                return Err(error(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "test writer capacity refused",
+                ));
+            }
+            self.used.fetch_add(additional, Ordering::SeqCst);
+            self.held += additional;
+            Ok(())
+        }
+        fn shrink_to(&mut self, bytes: u64) -> Result<(), ConnectorError> {
+            self.used.fetch_sub(self.held - bytes, Ordering::SeqCst);
+            self.held = bytes;
+            Ok(())
+        }
+    }
+    impl Drop for Lease {
+        fn drop(&mut self) {
+            self.used.fetch_sub(self.held, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn delete_writer_duplicate_locator_fails_without_mutating_or_growing_state() {
+        let used = Arc::new(AtomicU64::new(0));
+        let resources = ConnectorExecutionResources::from_admitted_ledger(Arc::new(Ledger {
+            limit: 10000,
+            used: used.clone(),
+        }));
+        let mut reservation = resources
+            .try_reserve(ConnectorResourceClass::WriterState, 256)
+            .unwrap();
+        let mut pending = BTreeMap::new();
+        insert_pending_delete_position(&mut pending, &mut reservation, "file", 7).unwrap();
+        let before = used.load(Ordering::SeqCst);
+        let error =
+            insert_pending_delete_position(&mut pending, &mut reservation, "file", 7).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        assert_eq!(pending["file"].len(), 1);
+        assert_eq!(used.load(Ordering::SeqCst), before);
+        drop(pending);
+        drop(reservation);
+        assert_eq!(used.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn delete_writer_capacity_refusal_happens_before_pending_allocation() {
+        let used = Arc::new(AtomicU64::new(0));
+        let resources = ConnectorExecutionResources::from_admitted_ledger(Arc::new(Ledger {
+            limit: 256,
+            used: used.clone(),
+        }));
+        let mut reservation = resources
+            .try_reserve(ConnectorResourceClass::WriterState, 256)
+            .unwrap();
+        let mut pending = BTreeMap::new();
+        assert_eq!(
+            insert_pending_delete_position(&mut pending, &mut reservation, "file", 7)
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::ResourceExhausted
+        );
+        assert!(pending.is_empty());
+        assert_eq!(used.load(Ordering::SeqCst), 256);
     }
 }

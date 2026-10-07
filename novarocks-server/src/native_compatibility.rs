@@ -147,7 +147,7 @@ mod tests {
                 .iter()
                 .map(|declaration| (declaration.provider_id(), declaration.contract_revision()))
                 .collect::<Vec<_>>(),
-            vec![("iceberg", 2), ("paimon", 1)]
+            vec![("iceberg", 4), ("paimon", 1)]
         );
         assert!(
             declarations
@@ -396,25 +396,46 @@ mod tests {
         let current =
             resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], [0x41; 32])
                 .unwrap();
-        let prior = novarocks_version::derive_repository_native_compatibility_material(
-            native_carrier_declarations(manifest.contracts()).unwrap(),
-            [0x31; 32],
-            [0x41; 32],
-            4,
-        )
-        .unwrap();
-        assert_eq!(current.plan_contract_revision(), 5);
-        assert_eq!(prior.plan_contract_revision(), 4);
-        assert_ne!(current.plan_contract_digest(), prior.plan_contract_digest());
-        assert_ne!(current.id(), prior.id());
-        assert_eq!(current.descriptor_digest(), prior.descriptor_digest());
         assert_eq!(
-            current.function_catalog_digest(),
-            prior.function_catalog_digest()
+            current.plan_contract_revision(),
+            novarocks_physical_plan::PLAN_CONTRACT_REVISION
         );
-        assert_eq!(
-            current.execution_implementation_manifest_digest(),
-            prior.execution_implementation_manifest_digest()
+        // Revision 4 lacks expression overflow policy. Revision 5 has that
+        // policy but predates the visible-bag/quota semantic vocabulary.
+        // Keep every other compatibility owner equal to isolate each plan
+        // semantic contract, independently of the descriptor's wire shape.
+        let peers = [4, 5].map(|revision| {
+            novarocks_version::derive_repository_native_compatibility_material(
+                native_carrier_declarations(manifest.contracts()).unwrap(),
+                [0x31; 32],
+                [0x41; 32],
+                revision,
+            )
+            .unwrap()
+        });
+        for prior in &peers {
+            assert!(current.plan_contract_revision() > prior.plan_contract_revision());
+            assert_ne!(current.plan_contract_digest(), prior.plan_contract_digest());
+            assert_ne!(current.id(), prior.id());
+            assert_eq!(current.carriers(), prior.carriers());
+            assert_eq!(current.descriptor_digest(), prior.descriptor_digest());
+            assert_eq!(
+                current.function_catalog_digest(),
+                prior.function_catalog_digest()
+            );
+            assert_eq!(
+                current.execution_implementation_manifest_digest(),
+                prior.execution_implementation_manifest_digest()
+            );
+        }
+        // The two retired semantic contracts remain distinct from each other,
+        // as well as from the current visible-bag/quota contract.
+        assert_eq!(peers[0].plan_contract_revision(), 4);
+        assert_eq!(peers[1].plan_contract_revision(), 5);
+        assert_ne!(
+            peers[0].plan_contract_digest(),
+            peers[1].plan_contract_digest()
         );
+        assert_ne!(peers[0].id(), peers[1].id());
     }
 }

@@ -135,6 +135,7 @@ impl IcebergCommitAction for RowDeltaDvFromFilesCommit {
             "RowDeltaDvFromFiles",
             None,
             ctx.snapshot_properties,
+            ctx.metadata_updates,
         )
         .await
         {

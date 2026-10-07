@@ -76,11 +76,16 @@ INSERT INTO pir8_mv_cut_${uuid0}.ns_${uuid0}.orders VALUES (4, 7);
 
 -- query 4
 -- @skip_result_check=true
--- @result_contains=LEFT OUTER JOIN
+-- @result_contains=QUOTA PRECLAIM
+-- @result_contains=QUOTA TRIM
+-- @result_contains=PREDICATE FANOUT
+-- @result_not_contains=LEFT OUTER JOIN
 -- @result_contains=predicate: v2 > 0
--- @result_contains=__nova_base_row_id
+-- @result_not_contains=__nova_base_row_id
+-- @result_not_contains=__nova_join_row_key
 -- @result_contains=source: IcebergDeltaTable
--- @result_contains=source: IcebergMvTargetLocator
+-- @result_contains=source: IcebergMvTargetBag
+-- @result_not_contains=source: IcebergMvTargetLocator
 EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW pir8_pf_mv_${uuid0};
 
 -- query 5

@@ -145,7 +145,12 @@ fn bind_relation_fields(
                 field_ordinal: reference.field_ordinal(),
                 field_name: field.name().to_string(),
                 provider_field_id: field.provider_field_id().clone(),
-                type_signature: field.type_signature().to_string(),
+                data_type:
+                    novarocks_mv_application::persistence::codec::MvLogicalType::from_schema_type(
+                        field.logical_type().clone(),
+                        field.provider_type_binding().clone(),
+                    )
+                    .map_err(|error| error.to_string())?,
                 nullable: field.nullable(),
             })
         })
@@ -187,6 +192,9 @@ fn validate_same_generation(
             .name()
             .eq_ignore_ascii_case(observed_field.name())
             || metadata_field.is_nullable() != observed_field.nullable()
+            || novarocks_types::logical_type::logical_value_from_engine_arrow(metadata_field)?
+                .data_type
+                != *observed_field.logical_type()
         {
             return Err(
                 "CREATE source observation schema facts do not match admitted metadata".to_string(),
@@ -274,7 +282,9 @@ mod tests {
                 MvObservedSourceField::try_new(
                     Bytes::from_static(b"field-1"),
                     "id".to_string(),
-                    "long".to_string(),
+                    novarocks_types::logical_type::LogicalType::Int64,
+                    Some(novarocks_types::logical_type::LogicalType::Int64),
+                    Bytes::from_static(b"fixture-schema-binding"),
                     false,
                 )
                 .expect("field"),

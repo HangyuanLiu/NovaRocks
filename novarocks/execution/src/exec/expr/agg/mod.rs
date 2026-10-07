@@ -49,6 +49,8 @@ pub use functions::hll_raw::{
     HLL_REGISTERS_COUNT, cardinality_from_serialized_hll, estimate_cardinality_from_registers,
     hash_array_value_for_hll, hash_bytes_for_hll, update_register_from_hash,
 };
+pub use functions::mv_weight_sum::{checked_weight_add, checked_weight_mul, checked_weight_neg};
+pub(crate) use registry::PreparedAggregateError;
 
 #[cfg(test)]
 pub(crate) fn test_builtin_execution_function_set() -> std::sync::Arc<SealedExecutionFunctionSet> {

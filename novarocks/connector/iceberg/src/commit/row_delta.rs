@@ -117,6 +117,7 @@ impl IcebergCommitAction for RowDeltaCommit {
             "RowDelta",
             None,
             ctx.snapshot_properties,
+            ctx.metadata_updates,
         )
         .await
         {
@@ -141,6 +142,55 @@ impl IcebergCommitAction for RowDeltaCommit {
             Err(error) => Err(error.into_detail()),
         }
     }
+}
+
+/// Runner-only composition of a real Equality artifact into an uncommitted
+/// initial MV transaction. It performs no catalog request.
+#[cfg(debug_assertions)]
+pub(crate) async fn stage_fixture_equality(
+    transaction: crate::iceberg::transaction::Transaction,
+    written: WrittenFile,
+    file_io: FileIO,
+    abort_handle: Arc<AbortLog>,
+    snapshot_properties: BTreeMap<String, String>,
+) -> Result<(crate::iceberg::transaction::Transaction, CommitOutcome), String> {
+    if written.content != DataContentType::EqualityDeletes
+        || written.equality_ids.as_ref().is_none_or(Vec::is_empty)
+    {
+        return Err("MV fixture stage accepts a real Equality artifact only".into());
+    }
+    let schema_id = transaction.staged_table().metadata().current_schema_id();
+    let manifest_paths_out = Arc::new(Mutex::new(Vec::new()));
+    let action = Arc::new(RowDeltaTxnAction {
+        written: vec![written],
+        commit_uuid: Uuid::new_v4(),
+        file_io,
+        schema_id,
+        abort_handle,
+        manifest_paths_out: Arc::clone(&manifest_paths_out),
+        target_ref: "main".into(),
+        snapshot_properties,
+    });
+    let transaction = transaction
+        .stage_action(action)
+        .await
+        .map_err(|error| format!("stage MV fixture Equality snapshot: {error}"))?;
+    let new_snapshot_id = transaction
+        .staged_table()
+        .metadata()
+        .current_snapshot_id()
+        .ok_or("MV fixture Equality action did not stage a snapshot")?;
+    let written_manifest_paths = manifest_paths_out
+        .lock()
+        .map_err(|_| "MV fixture manifest path lock poisoned")?
+        .clone();
+    Ok((
+        transaction,
+        CommitOutcome {
+            new_snapshot_id,
+            written_manifest_paths,
+        },
+    ))
 }
 
 struct RowDeltaTxnAction {
