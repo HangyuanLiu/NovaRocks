@@ -223,18 +223,74 @@ fn bind(
     recipe: &ConnectorReadProgramRecipe,
     layout: &StaticLayout,
 ) -> Result<Arc<dyn ScanSource>, CompiledScanBindingError> {
+    bind_filtered(
+        runtime,
+        recipe,
+        &[],
+        &CompiledRuntimeFilterEndpoints::default(),
+        layout,
+    )
+}
+
+/// Binds a scan whose consumer sites are `consumers`, under the package
+/// binding table `endpoints`.
+fn bind_filtered(
+    runtime: &TypedScanRuntime,
+    recipe: &ConnectorReadProgramRecipe,
+    consumers: &[FilterConsumerAtExpr],
+    endpoints: &CompiledRuntimeFilterEndpoints,
+    layout: &StaticLayout,
+) -> Result<Arc<dyn ScanSource>, CompiledScanBindingError> {
     let options = QueryOptions::default();
     bind_compiled_scan(
         SCAN_NODE,
         recipe,
+        consumers,
         layout,
         &CompiledScanTask {
             runtime,
             fragment_instance_id: UniqueId::new(3, 4),
             query_options: &options,
             stop: ConnectorStopOwner::new().view(),
+            runtime_filters: endpoints,
         },
     )
+}
+
+/// A blocking membership consumer site of `binding_id` over `v0`.
+fn consumer(binding_id: u32) -> FilterConsumerAtExpr {
+    use novarocks_local_program::{
+        FilterConsumerActivation, FilterNullSemantics, FilterReduction, ProgramExprId,
+        StaticFilterConsumer, StaticFilterContract,
+    };
+    FilterConsumerAtExpr {
+        expr_id: ProgramExprId::new(0),
+        consumer: StaticFilterConsumer::try_new(
+            binding_id,
+            7,
+            FilterConsumerActivation::BlockingSnapshot,
+            StaticFilterContract::membership(&DataType::Int64, FilterNullSemantics::NeverMatches)
+                .expect("membership contract"),
+            FilterReduction::SetUnion,
+        )
+        .expect("blocking membership consumer"),
+    }
+}
+
+/// Binding 3 consumes runtime filter 7 at the fixture scan's source.
+fn scan_source_binding() -> CompiledRuntimeFilterEndpoints {
+    use crate::compiled_runtime_filter::{
+        CompiledRuntimeFilterEndpoint, CompiledRuntimeFilterRole,
+    };
+    CompiledRuntimeFilterEndpoints::try_from_endpoints([(
+        3,
+        CompiledRuntimeFilterEndpoint::new(
+            7,
+            u32::try_from(SCAN_NODE).unwrap(),
+            CompiledRuntimeFilterRole::Consumer { scan_source: true },
+        ),
+    )])
+    .unwrap()
 }
 
 fn refusal(
@@ -348,25 +404,78 @@ fn facts_about_a_column_assigned_twice_are_bound_at_its_first_ordinal() {
     assert_unregistered(&runtime);
 }
 
+// The connector prunes nothing in this milestone, so a filtered read binds
+// the same typed source as an unfiltered one once its frozen dynamic filter
+// names exactly the scan's consumer binding of that filter.
 #[test]
-fn reads_a_compiled_scan_cannot_run_are_refused_before_registration() {
+fn a_compiled_read_binds_dynamic_filters_that_match_its_consumer_bindings() {
     let runtime = test_support::typed_scan_runtime();
-    let filtered = refusal(
+    let source = bind_filtered(
         &runtime,
         &recipe(&frozen_read(
             "fixture",
             TupleDomain::all(),
-            vec![StaticScanDynamicFilter::new(1, Arc::from("v0"))],
+            vec![StaticScanDynamicFilter::new(7, Arc::from("v0"))],
         )),
+        &[consumer(3)],
+        &scan_source_binding(),
         &layout(),
-    );
-    assert!(
-        filtered
-            .detail()
-            .contains("subscribes to no runtime filter yet"),
-        "{filtered}"
-    );
+    )
+    .expect("dynamic filter 7 is binding 3's");
+    assert_eq!(source.profile_name().as_deref(), Some("TypedConnectorScan"));
+    runtime
+        .register_read_execution(SCAN_NODE, test_support::installed_read_execution())
+        .expect_err("the filtered scan registered its read execution");
+}
 
+#[test]
+fn dynamic_filters_that_do_not_match_the_consumer_bindings_are_refused_before_registration() {
+    let filtered = |filter_id| {
+        recipe(&frozen_read(
+            "fixture",
+            TupleDomain::all(),
+            vec![StaticScanDynamicFilter::new(filter_id, Arc::from("v0"))],
+        ))
+    };
+    let unfiltered = recipe(&frozen_read("fixture", TupleDomain::all(), vec![]));
+    for (recipe, consumers, expected) in [
+        // A dynamic filter no consumer site of the scan binds.
+        (filtered(7), vec![], "has no scan-source consumer binding"),
+        // A dynamic filter of another filter than the site's binding.
+        (
+            filtered(8),
+            vec![consumer(3)],
+            "runtime filter 8 has no scan-source consumer binding",
+        ),
+        // A scan-source consumer whose dynamic filter the read does not state.
+        (
+            unfiltered,
+            vec![consumer(3)],
+            "have no frozen dynamic filter",
+        ),
+        // A site binding the package does not number.
+        (filtered(7), vec![consumer(4)], "is not numbered"),
+    ] {
+        let runtime = test_support::typed_scan_runtime();
+        let error = match bind_filtered(
+            &runtime,
+            &recipe,
+            &consumers,
+            &scan_source_binding(),
+            &layout(),
+        ) {
+            Ok(_) => panic!("the mismatched read must be refused"),
+            Err(error) => error,
+        };
+        assert_eq!(error.scan_node(), Some(SCAN_NODE));
+        assert!(error.detail().contains(expected), "{error}");
+        assert_unregistered(&runtime);
+    }
+}
+
+#[test]
+fn reads_a_compiled_scan_cannot_run_are_refused_before_registration() {
+    let runtime = test_support::typed_scan_runtime();
     let narrow = StaticLayout::try_new(
         Arc::new(Schema::new(vec![public_schema().field(0).clone()])),
         Arc::from([SlotId::new(1)]),

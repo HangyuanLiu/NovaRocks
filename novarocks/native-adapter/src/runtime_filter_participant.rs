@@ -22,7 +22,7 @@
 //! the installed channel sessions; no Core runtime-filter service is retained
 //! by this participant.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 #[cfg(debug_assertions)]
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -275,6 +275,63 @@ impl RuntimeFilterParticipant {
             self.state
                 .session_for_fragment(fragment_instance_id, outbound),
         ))
+    }
+
+    /// The bindings this participant installed for one fragment instance:
+    /// every producer and consumer binding whose expected fragment instances
+    /// name it.
+    pub fn fragment_bindings(&self, fragment_instance_id: UniqueId) -> BTreeSet<u32> {
+        let mut bindings = BTreeSet::new();
+        for channel in self.outbound.install.channels().values() {
+            for (binding_id, producer) in channel.producers() {
+                if producer
+                    .expected_fragment_instances()
+                    .contains(&fragment_instance_id)
+                {
+                    bindings.insert(binding_id.get());
+                }
+            }
+            for (binding_id, consumer) in channel.consumers() {
+                if consumer
+                    .expected_fragment_instances()
+                    .contains(&fragment_instance_id)
+                {
+                    bindings.insert(binding_id.get());
+                }
+            }
+        }
+        bindings
+    }
+
+    /// The session of a fragment whose program binds exactly `bindings`.
+    ///
+    /// The frontend deploys every binding of a fragment to each of its
+    /// instances, so the program's bindings and the ones installed here for
+    /// this instance must be the same set. A program binding this participant
+    /// does not host would find no channel to bind, and a hosted binding the
+    /// program does not bind would leave its channel waiting for an endpoint
+    /// that never opens; both are refused before anything is prepared. An
+    /// empty set is answered `None`.
+    pub fn session_for_fragment_bindings(
+        &self,
+        execution_id: QueryExecutionId,
+        fragment_instance_id: UniqueId,
+        bindings: &BTreeSet<u32>,
+    ) -> Result<Option<RuntimeFilterSessionRef>, RuntimeFilterContractError> {
+        if execution_id != self.execution_id {
+            return Err(RuntimeFilterContractError::new(
+                RuntimeFilterContractErrorCode::ParticipantClosed,
+                "runtime filter participant does not belong to this execution attempt",
+            ));
+        }
+        let hosted = self.fragment_bindings(fragment_instance_id);
+        if hosted != *bindings {
+            return Err(RuntimeFilterContractError::invalid_contract(format!(
+                "fragment instance {fragment_instance_id} binds runtime filters {bindings:?}, but \
+                 this backend's participant installed {hosted:?} for it"
+            )));
+        }
+        self.session_for_fragment(execution_id, fragment_instance_id, !bindings.is_empty())
     }
 
     pub fn dispatch_envelope(
@@ -1198,6 +1255,83 @@ mod tests {
             max_canonical_bytes,
         )
         .expect("FinalDomain payload is canonical")
+    }
+
+    // A compiled fragment binds the session only for exactly the bindings
+    // installed for its own instance: the participant hosts producer 71 for
+    // instance (709, 711) and nothing for any other instance.
+    #[test]
+    fn a_fragment_session_requires_exactly_the_bindings_installed_for_its_instance() {
+        let (participant, producer, fragment_instance) = final_domain_participant(1024);
+        let binding = producer.binding_id().get();
+        assert_eq!(
+            participant.fragment_bindings(fragment_instance),
+            BTreeSet::from([binding])
+        );
+
+        let session = participant
+            .session_for_fragment_bindings(
+                execution_id(),
+                fragment_instance,
+                &BTreeSet::from([binding]),
+            )
+            .expect("the program binds exactly the installed binding");
+        assert!(session.is_some(), "a binding program receives its session");
+
+        let other = UniqueId::new(709, 712);
+        assert!(
+            participant
+                .session_for_fragment_bindings(execution_id(), other, &BTreeSet::new())
+                .expect("an instance with no installed binding binds none")
+                .is_none()
+        );
+
+        for (instance, bindings) in [
+            // The program drops the installed producer.
+            (fragment_instance, BTreeSet::new()),
+            // The program binds one the participant never installed.
+            (fragment_instance, BTreeSet::from([binding, binding + 1])),
+            // Another instance claims this instance's binding.
+            (other, BTreeSet::from([binding])),
+        ] {
+            let error = match participant.session_for_fragment_bindings(
+                execution_id(),
+                instance,
+                &bindings,
+            ) {
+                Ok(_) => panic!("{bindings:?} on {instance} is not what was installed"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.code(),
+                RuntimeFilterContractErrorCode::InvalidContract
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("this backend's participant installed"),
+                "{error}"
+            );
+        }
+
+        let foreign = QueryExecutionId::new(
+            QueryId::new(17, 19),
+            AttemptId::new(24).expect("nonzero attempt"),
+        )
+        .expect("valid execution id");
+        match participant.session_for_fragment_bindings(
+            foreign,
+            fragment_instance,
+            &BTreeSet::from([binding]),
+        ) {
+            Ok(_) => panic!("another attempt's fragment binds nothing here"),
+            Err(error) => {
+                assert_eq!(
+                    error.code(),
+                    RuntimeFilterContractErrorCode::ParticipantClosed
+                )
+            }
+        }
     }
 
     #[test]

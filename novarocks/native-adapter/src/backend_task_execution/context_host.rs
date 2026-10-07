@@ -48,7 +48,7 @@
 //! `active` predicate of an in-flight install, so holding both would invert the
 //! order and deadlock.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -1889,6 +1889,51 @@ mod tests {
         }
     }
 
+    /// A compiled task names the exact bindings its program binds. With no
+    /// participant, or with one that installed nothing for its instance, only
+    /// a program that binds nothing is answered, and it is answered `None`.
+    #[test]
+    fn a_compiled_task_binds_exactly_the_filters_its_context_installed_for_it() {
+        use super::super::execution_host::TaskQueryContextFacts;
+        use std::collections::BTreeSet;
+
+        let finst = novarocks_types::UniqueId::new(4, 5);
+        for contribution in [no_contribution(), participant_contribution(1)] {
+            let fixture = Fixture::new();
+            let context = context(1);
+            fixture
+                .establish(
+                    context,
+                    vec![catalog_properties()],
+                    contribution,
+                    &credential(1, ANNOUNCED_SCOPE, live_until()),
+                )
+                .expect("the establish is legal");
+            let execution = context.query_execution_id();
+            assert!(
+                fixture
+                    .host
+                    .runtime_filter_session_for_bindings(execution, finst, &BTreeSet::new())
+                    .expect("a program that binds none is answered")
+                    .is_none()
+            );
+            match fixture.host.runtime_filter_session_for_bindings(
+                execution,
+                finst,
+                &BTreeSet::from([3]),
+            ) {
+                Err(refusal) => {
+                    assert_eq!(refusal.category(), TaskFailureCategory::Protocol);
+                    assert!(
+                        refusal.detail().as_str().contains("runtime filters {3}"),
+                        "the refusal names the program's bindings: {refusal}"
+                    );
+                }
+                Ok(_) => panic!("binding 3 was never installed for this instance"),
+            }
+        }
+    }
+
     #[test]
     fn storage_credentials_are_refused_rather_than_defaulted() {
         use super::super::execution_host::TaskQueryContextFacts;
@@ -2620,6 +2665,29 @@ impl TaskQueryContextFacts for NativeQueryContextHost {
         };
         participant
             .session_for_fragment(execution, fragment_instance_id, expects_bindings)
+            .map_err(|error| protocol(&format!("runtime filter session refused: {error}")))
+    }
+
+    fn runtime_filter_session_for_bindings(
+        &self,
+        execution: QueryExecutionId,
+        fragment_instance_id: UniqueId,
+        bindings: &BTreeSet<u32>,
+    ) -> Result<Option<RuntimeFilterSessionRef>, HostRejection> {
+        let Some(participant) = self.participant_for_execution(execution) else {
+            // As for a plan-tree task: no participant hosts nothing, which is
+            // the ordinary answer only for a program that binds nothing.
+            return if bindings.is_empty() {
+                Ok(None)
+            } else {
+                Err(protocol(&format!(
+                    "task of {execution:?} binds runtime filters {bindings:?} but its query \
+                     context installed none on this backend"
+                )))
+            };
+        };
+        participant
+            .session_for_fragment_bindings(execution, fragment_instance_id, bindings)
             .map_err(|error| protocol(&format!("runtime filter session refused: {error}")))
     }
 

@@ -97,8 +97,10 @@ use novarocks_worker::{TaskCompletionSignal, TaskCompletionSupervisor, TaskInbou
 use tracing::debug;
 
 use super::compiled_package::{
-    CompiledPackageCompiler, CompiledPackageError, CompiledTaskOptions, TaskPreparationControl,
+    CompiledPackageCompiler, CompiledPackageError, CompiledTaskOptions, CompiledTaskProgram,
+    TaskPreparationControl,
 };
+use crate::compiled_runtime_filter::program_runtime_filter_bindings;
 use crate::compiled_scan_binding::{CompiledScanTask, bind_compiled_scans};
 use crate::compiled_writer_binding::{CompiledWriteTask, bind_compiled_writers};
 use crate::fragment_instance::{NativeFragmentInstanceInput, project_task_instance};
@@ -141,6 +143,20 @@ pub trait TaskQueryContextFacts: Send + Sync {
         execution: QueryExecutionId,
         fragment_instance_id: UniqueId,
         expects_bindings: bool,
+    ) -> Result<Option<RuntimeFilterSessionRef>, HostRejection>;
+
+    /// The runtime-filter session of a task whose compiled program binds
+    /// exactly `bindings`, by plan-global binding identity.
+    ///
+    /// The participant this query installed on this backend must host exactly
+    /// these bindings for this fragment instance; any difference in either
+    /// direction refuses the task. An empty set with no hosted binding is the
+    /// ordinary answer `None`.
+    fn runtime_filter_session_for_bindings(
+        &self,
+        execution: QueryExecutionId,
+        fragment_instance_id: UniqueId,
+        bindings: &BTreeSet<u32>,
     ) -> Result<Option<RuntimeFilterSessionRef>, HostRejection>;
 
     /// Where a running fragment's runtime-filter evidence goes.
@@ -490,7 +506,10 @@ impl NativeTaskExecutionHost {
         )?;
 
         let control = TaskPreparationControl::new(task_stop.view());
-        let program = compiler
+        let CompiledTaskProgram {
+            program,
+            runtime_filters,
+        } = compiler
             .compile(
                 carrier.package(),
                 CompiledTaskOptions {
@@ -502,6 +521,17 @@ impl NativeTaskExecutionHost {
                 &control,
             )
             .map_err(|error| compiled_package_rejection(identity, error))?;
+        // The bindings this program's runtime-filter sites bind. They decide
+        // whether the task needs the query context's filter session, exactly
+        // as a plan-tree program's bindings do, and the session must host
+        // exactly them for this instance.
+        let runtime_filter_bindings =
+            program_runtime_filter_bindings(program.graph().requirements(), &runtime_filters)
+                .map_err(|error| {
+                    protocol(format!(
+                        "task {identity} runtime-filter bindings do not match its package: {error}"
+                    ))
+                })?;
         let sink = program.graph().sink().ok_or_else(|| {
             internal(format!(
                 "task {identity} compiled program has no static sink"
@@ -535,6 +565,7 @@ impl NativeTaskExecutionHost {
                 fragment_instance_id: kernel_key,
                 query_options: &instance_input.query_options,
                 stop: task_stop.view(),
+                runtime_filters: &runtime_filters,
             },
         )
         .map_err(|error| protocol(format!("task {identity} scan does not bind: {error}")))?;
@@ -615,10 +646,14 @@ impl NativeTaskExecutionHost {
                     .runtime_filter_event_sink(execution, kernel_key),
                 Arc::clone(&operator_statistics) as Arc<dyn FragmentEventSink>,
             ]));
-        // Compiled programs bind no runtime filter yet.
-        let runtime_filter = self
-            .context_facts
-            .runtime_filter_session(execution, kernel_key, false)?;
+        // Resolved before registration, so a task whose bindings differ from
+        // what its query context installed for it is refused with nothing to
+        // roll back but this attempt's local state.
+        let runtime_filter = self.context_facts.runtime_filter_session_for_bindings(
+            execution,
+            kernel_key,
+            &runtime_filter_bindings,
+        )?;
         let registration = self
             .queries
             .register_fragment_execution(execution, kernel_key, delivery_expire, query_expire)
@@ -2008,6 +2043,7 @@ mod tests {
     };
     use crate::task_query_context_options::query_options_fingerprint;
 
+    use std::collections::BTreeSet;
     use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2297,6 +2333,9 @@ mod tests {
         query_options: Mutex<QueryOptions>,
         query_options_fingerprint: Mutex<ContentFingerprint>,
         filter_sessions_requested: AtomicUsize,
+        /// The binding set of every compiled task's session request, in
+        /// request order.
+        compiled_filter_bindings: Mutex<Vec<BTreeSet<u32>>>,
         dynamic_filters_delivered: AtomicUsize,
         /// Every task this host offered as the context's feedback carrier.
         ///
@@ -2319,6 +2358,7 @@ mod tests {
                 }),
                 query_options_fingerprint: Mutex::new(query_options_fingerprint(wire)),
                 filter_sessions_requested: AtomicUsize::new(0),
+                compiled_filter_bindings: Mutex::new(Vec::new()),
                 dynamic_filters_delivered: AtomicUsize::new(0),
                 feedback_carriers: Mutex::new(Vec::new()),
             }
@@ -2373,6 +2413,28 @@ mod tests {
             self.filter_sessions_requested
                 .fetch_add(1, Ordering::SeqCst);
             Ok(None)
+        }
+
+        fn runtime_filter_session_for_bindings(
+            &self,
+            _execution: QueryExecutionId,
+            _fragment_instance_id: UniqueId,
+            bindings: &BTreeSet<u32>,
+        ) -> Result<Option<RuntimeFilterSessionRef>, HostRejection> {
+            self.compiled_filter_bindings
+                .lock()
+                .expect("stub compiled filter bindings")
+                .push(bindings.clone());
+            // No participant is installed in this stub, so it answers exactly
+            // as the real host answers a context that installed none.
+            if bindings.is_empty() {
+                Ok(None)
+            } else {
+                Err(HostRejection::new(
+                    TaskFailureCategory::Protocol,
+                    format!("stub context installed no participant for {bindings:?}"),
+                ))
+            }
         }
 
         fn runtime_filter_event_sink(
@@ -5159,7 +5221,11 @@ mod tests {
         use super::*;
         use std::collections::BTreeMap;
 
-        use crate::backend_task_execution::compiled_package::CompiledPackageInterpreter;
+        use crate::backend_task_execution::compiled_package::{
+            CompiledPackageCompiler, CompiledPackageError, CompiledPackageInterpreter,
+            CompiledTaskOptions, CompiledTaskProgram,
+        };
+        use crate::compiled_runtime_filter::CompiledRuntimeFilterEndpoints;
         use novarocks_connector_contract::PureProviderProgramCatalog;
         use novarocks_functions::{
             ConstantPolicy, EngineFunctionCatalogBuilder, FunctionId, FunctionKind,
@@ -5247,17 +5313,42 @@ mod tests {
                 .expect("sealed rand subset")
         }
 
-        fn compiled_host(facts: Arc<StubContextFacts>) -> NativeTaskExecutionHost {
+        fn interpreter() -> CompiledPackageInterpreter<std::io::Error> {
             let providers =
                 PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &Unbounded)
                     .expect("empty provider catalog");
-            host(facts).with_compiled_package_compiler(Arc::new(CompiledPackageInterpreter::new(
+            CompiledPackageInterpreter::new(
                 FragmentDecodeResourceModel::try_new(&Unbounded).expect("decode model"),
                 decode_limits(),
                 Arc::new(sealed_rand_subset()),
                 Arc::new(providers),
                 constants(),
-            )))
+            )
+        }
+
+        fn compiled_host(facts: Arc<StubContextFacts>) -> NativeTaskExecutionHost {
+            host(facts).with_compiled_package_compiler(Arc::new(interpreter()))
+        }
+
+        /// The real interpreter, with the package's runtime-filter binding
+        /// table replaced, so a host can be handed a program and a table that
+        /// disagree.
+        struct RenumberedCompiler {
+            inner: CompiledPackageInterpreter<std::io::Error>,
+            runtime_filters: CompiledRuntimeFilterEndpoints,
+        }
+
+        impl CompiledPackageCompiler for RenumberedCompiler {
+            fn compile(
+                &self,
+                package: &[u8],
+                options: CompiledTaskOptions,
+                control: &dyn PureCompileControl,
+            ) -> Result<CompiledTaskProgram, CompiledPackageError> {
+                let mut compiled = self.inner.compile(package, options, control)?;
+                compiled.runtime_filters = self.runtime_filters.clone();
+                Ok(compiled)
+            }
         }
 
         /// The producer fragment of a real `SELECT 1` in v2 bytes, and the
@@ -5448,7 +5539,71 @@ mod tests {
                 .expect("the compiled producer installs");
             assert_eq!(prepared.sink_kind(), FragmentSinkKind::DataStream);
             assert!(host.task_runtime(identity).is_some());
+            // A program with no runtime-filter site asks for the session of
+            // exactly no binding, which is the plan-tree task's
+            // `expects_bindings = false`; it never asks the plan-tree way.
+            assert_eq!(
+                *facts
+                    .compiled_filter_bindings
+                    .lock()
+                    .expect("stub compiled filter bindings"),
+                vec![BTreeSet::new()]
+            );
+            assert_eq!(facts.filter_sessions_requested.load(Ordering::SeqCst), 0);
             host.remove_receiver(&descriptor);
+            assert!(host.task_runtime(identity).is_none());
+        }
+
+        // A package that numbers a runtime-filter binding its compiled
+        // program has no site for would bind a session that disagrees with
+        // what the frontend deployed for the fragment. The task is refused
+        // as content before any session is requested or anything prepared.
+        #[test]
+        fn a_compiled_task_whose_program_drops_a_package_binding_is_refused() {
+            use crate::compiled_runtime_filter::{
+                CompiledRuntimeFilterEndpoint, CompiledRuntimeFilterRole,
+            };
+
+            let (package, receiver) = select_one_producer();
+            let facts = Arc::new(StubContextFacts::default());
+            let host = host(Arc::clone(&facts)).with_compiled_package_compiler(Arc::new(
+                RenumberedCompiler {
+                    inner: interpreter(),
+                    runtime_filters: CompiledRuntimeFilterEndpoints::try_from_endpoints([(
+                        3,
+                        CompiledRuntimeFilterEndpoint::new(
+                            7,
+                            receiver,
+                            CompiledRuntimeFilterRole::Producer,
+                        ),
+                    )])
+                    .expect("one binding"),
+                },
+            ));
+            let identity = super::identity(73, 1, 1);
+            let descriptor = producer_descriptor(identity, receiver, &[]);
+            let refused = host
+                .install_receiver(
+                    &descriptor,
+                    producer_input(&descriptor, package_carrier(&package)),
+                )
+                .expect_err("binding 3 has no site in the program");
+            assert_eq!(refused.category(), TaskFailureCategory::Protocol);
+            assert!(
+                refused.detail().as_str().contains(
+                    "runtime-filter bindings do not match its package: package runtime-filter \
+                     binding_id=3 has no requirement in its compiled program"
+                ),
+                "{refused}"
+            );
+            assert!(
+                facts
+                    .compiled_filter_bindings
+                    .lock()
+                    .expect("stub compiled filter bindings")
+                    .is_empty(),
+                "no session is requested for a refused program"
+            );
             assert!(host.task_runtime(identity).is_none());
         }
 
@@ -5523,6 +5678,19 @@ mod tests {
             ) -> Result<Option<RuntimeFilterSessionRef>, HostRejection> {
                 self.0
                     .runtime_filter_session(execution, fragment_instance_id, expects_bindings)
+            }
+
+            fn runtime_filter_session_for_bindings(
+                &self,
+                execution: QueryExecutionId,
+                fragment_instance_id: UniqueId,
+                bindings: &BTreeSet<u32>,
+            ) -> Result<Option<RuntimeFilterSessionRef>, HostRejection> {
+                self.0.runtime_filter_session_for_bindings(
+                    execution,
+                    fragment_instance_id,
+                    bindings,
+                )
             }
 
             fn runtime_filter_event_sink(
@@ -5641,7 +5809,8 @@ mod tests {
             use novarocks_execution_contract::task_execution::status::TerminationDetail;
 
             let (package, receiver) = scan_producer_package();
-            let host = scan_host(Arc::new(ScanContextFacts::default()));
+            let facts = Arc::new(ScanContextFacts::default());
+            let host = scan_host(Arc::clone(&facts));
             let identity = super::identity(72, 1, 1);
             let descriptor = producer_descriptor(identity, receiver, &[SCAN_NODE]);
             let prepared = host
@@ -5655,6 +5824,15 @@ mod tests {
                 )
                 .expect("the compiled scan producer installs");
             assert_eq!(prepared.sink_kind(), FragmentSinkKind::DataStream);
+            // An unfiltered scan binds no runtime filter.
+            assert_eq!(
+                *facts
+                    .0
+                    .compiled_filter_bindings
+                    .lock()
+                    .expect("stub compiled filter bindings"),
+                vec![BTreeSet::new()]
+            );
             host.install_inbound_capability(&descriptor)
                 .expect("installs");
             let (owner, reporter) = reporter_for(identity);
@@ -5764,6 +5942,19 @@ mod tests {
             ) -> Result<Option<RuntimeFilterSessionRef>, HostRejection> {
                 self.stub
                     .runtime_filter_session(execution, fragment_instance_id, expects_bindings)
+            }
+
+            fn runtime_filter_session_for_bindings(
+                &self,
+                execution: QueryExecutionId,
+                fragment_instance_id: UniqueId,
+                bindings: &BTreeSet<u32>,
+            ) -> Result<Option<RuntimeFilterSessionRef>, HostRejection> {
+                self.stub.runtime_filter_session_for_bindings(
+                    execution,
+                    fragment_instance_id,
+                    bindings,
+                )
             }
 
             fn runtime_filter_event_sink(

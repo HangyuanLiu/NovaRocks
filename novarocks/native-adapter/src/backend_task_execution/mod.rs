@@ -47,6 +47,7 @@ mod tests;
 
 pub use compiled_package::{
     CompiledPackageCompiler, CompiledPackageError, CompiledPackageInterpreter, CompiledTaskOptions,
+    CompiledTaskProgram,
 };
 pub use context_host::NativeQueryContextHost;
 pub use execution_host::{NativeTaskExecutionHost, TaskQueryContextFacts};

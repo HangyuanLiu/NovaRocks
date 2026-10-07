@@ -29,6 +29,13 @@
 //! Splits stay runtime work. The source polls the Task's split queue of its
 //! physical scan node, and that node is registered with the Task's read
 //! context so split delivery decodes against the same installed execution.
+//!
+//! A scan with runtime-filter consumers is bound too. Its frozen dynamic
+//! filters, keyed by runtime-filter id, must correspond one to one to its
+//! scan-source consumer bindings through the package's binding table. This
+//! milestone prunes nothing at the connector: the compiled scan source
+//! applies the consumers to rows, and the connector is handed the truthful
+//! complete-all filter, which never narrows a read.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -46,7 +53,7 @@ use novarocks_execution::runtime_filter::{
     RuntimeFilterConsumerContract, RuntimeFilterContractViolation,
     RuntimeFilterContractViolationKind, RuntimeFilterSessionRef,
 };
-use novarocks_local_program::{LocalProgram, ProgramNodeKind, StaticLayout};
+use novarocks_local_program::{FilterConsumerAtExpr, LocalProgram, ProgramNodeKind, StaticLayout};
 use novarocks_spi::connector::read_stack::runtime::ConnectorReadAssignment;
 use novarocks_spi::connector::read_stack::{
     Assignment, CompleteAllDynamicFilter, ConnectorDataCacheOptions,
@@ -62,12 +69,18 @@ use novarocks_worker::typed_connector_runtime::TypedConnectorScanSource;
 use novarocks_worker::typed_scan_filter::TypedScanLiveDynamicFilterFactory;
 use novarocks_worker::{TypedConnectorReadDescriptor, TypedScanRuntime};
 
+use crate::compiled_runtime_filter::{
+    CompiledRuntimeFilterEndpoints, validate_scan_dynamic_filters,
+};
+
 /// The Task facts every compiled scan of one task binds with.
 pub(crate) struct CompiledScanTask<'a> {
     pub(crate) runtime: &'a TypedScanRuntime,
     pub(crate) fragment_instance_id: UniqueId,
     pub(crate) query_options: &'a QueryOptions,
     pub(crate) stop: ConnectorStopView,
+    /// The runtime-filter bindings the task's package numbers.
+    pub(crate) runtime_filters: &'a CompiledRuntimeFilterEndpoints,
 }
 
 /// Why a compiled scan could not be bound to its Task.
@@ -134,7 +147,12 @@ pub(crate) fn bind_compiled_scans(
                 input.scan_node
             ))
         })?;
-        let ProgramNodeKind::Scan { source, .. } = node.kind() else {
+        let ProgramNodeKind::Scan {
+            source,
+            runtime_filters,
+            ..
+        } = node.kind()
+        else {
             return Err(CompiledScanBindingError::at(
                 scan_node,
                 format!("local node {} is not a Scan", id.index()),
@@ -143,16 +161,24 @@ pub(crate) fn bind_compiled_scans(
         let recipe = source.compiled().ok_or_else(|| {
             CompiledScanBindingError::at(scan_node, "the Scan carries no compiled provider read")
         })?;
-        let bound = bind_compiled_scan(scan_node, recipe, node.output_layout(), task)?;
+        let bound = bind_compiled_scan(
+            scan_node,
+            recipe,
+            runtime_filters,
+            node.output_layout(),
+            task,
+        )?;
         sources.insert(*id, bound);
     }
     Ok(sources)
 }
 
-/// Bind one compiled provider read as the typed scan source of `scan_node`.
+/// Bind one compiled provider read, whose scan's runtime-filter consumer
+/// sites are `consumers`, as the typed scan source of `scan_node`.
 pub(crate) fn bind_compiled_scan(
     scan_node: i32,
     recipe: &ConnectorReadProgramRecipe,
+    consumers: &[FilterConsumerAtExpr],
     layout: &StaticLayout,
     task: &CompiledScanTask<'_>,
 ) -> Result<Arc<dyn ScanSource>, CompiledScanBindingError> {
@@ -184,11 +210,18 @@ pub(crate) fn bind_compiled_scan(
             ));
         }
     }
-    if !scan.dynamic_filters().is_empty() {
-        return Err(refused(
-            "a compiled scan subscribes to no runtime filter yet".to_string(),
-        ));
-    }
+    // Each frozen dynamic filter names its consumer binding through the
+    // package's table; the source applies the consumers, the connector
+    // prunes nothing.
+    let physical_node = u32::try_from(scan_node)
+        .map_err(|_| refused(format!("compiled scan node {scan_node} is negative")))?;
+    validate_scan_dynamic_filters(
+        physical_node,
+        scan.dynamic_filters(),
+        consumers,
+        task.runtime_filters,
+    )
+    .map_err(|error| refused(format!("scan runtime filters: {error}")))?;
     // `slot_ids[i]` names page channel `i`, and a channel exists for each
     // assignment, so the layout is exactly one slot per assignment.
     if layout.slots().len() != scan.assignments().len() {
@@ -358,8 +391,10 @@ fn require_first_ordinal_facts(
 }
 
 /// The scan's dynamic filter as its frozen contract states it, for a scan
-/// that receives no live feedback: complete from the start, over the columns
-/// its dynamic-filter variables assign. No dynamic filter is complete-all.
+/// whose connector receives no live feedback: complete from the start, over
+/// the columns its dynamic-filter variables assign, and constraining none of
+/// them. No dynamic filter is complete-all. A compiled scan's runtime filters
+/// are applied to its rows by the compiled source, never by this filter.
 fn complete_all_dynamic_filter(
     scan: &FrozenConnectorScan,
     assignments: &[ConnectorReadAssignment],
@@ -377,8 +412,10 @@ fn complete_all_dynamic_filter(
     Arc::new(CompleteAllDynamicFilter::new(covered))
 }
 
-/// A compiled scan subscribes to no live runtime filter: its source never
-/// records a consumer contract, so a build request is a contract violation.
+/// A compiled scan's connector subscribes to no live runtime filter: its
+/// consumers run in the compiled scan source, which records no connector
+/// consumer contract, so a build request is a contract violation. Connector
+/// pruning keyed by binding identity is a later milestone.
 struct NoLiveDynamicFilter;
 
 impl TypedScanLiveDynamicFilterFactory for NoLiveDynamicFilter {

@@ -43,6 +43,8 @@ use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
 use novarocks_spi::connector::ConnectorStopView;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 
+use crate::compiled_runtime_filter::CompiledRuntimeFilterEndpoints;
+
 /// The task facts a compiled program is specialized for.
 #[derive(Clone, Copy, Debug)]
 pub struct CompiledTaskOptions {
@@ -72,6 +74,18 @@ impl fmt::Display for CompiledPackageError {
 
 impl Error for CompiledPackageError {}
 
+/// One task's compiled program and the runtime-filter bindings its package
+/// numbers.
+///
+/// The program names each runtime-filter site by its plan-global binding
+/// identity only; which filter and endpoint a binding is stays in the
+/// package's cuts, so it is projected here, before the package is consumed.
+#[derive(Debug)]
+pub struct CompiledTaskProgram {
+    pub program: LocalProgram,
+    pub runtime_filters: CompiledRuntimeFilterEndpoints,
+}
+
 /// Turns one task's package bytes into its LocalProgram.
 pub trait CompiledPackageCompiler: Send + Sync + 'static {
     fn compile(
@@ -79,7 +93,7 @@ pub trait CompiledPackageCompiler: Send + Sync + 'static {
         package: &[u8],
         options: CompiledTaskOptions,
         control: &dyn PureCompileControl,
-    ) -> Result<LocalProgram, CompiledPackageError>;
+    ) -> Result<CompiledTaskProgram, CompiledPackageError>;
 }
 
 /// Receiver, provider validation and local compiler over host-owned inputs.
@@ -119,12 +133,18 @@ where
         package: &[u8],
         options: CompiledTaskOptions,
         control: &dyn PureCompileControl,
-    ) -> Result<LocalProgram, CompiledPackageError> {
+    ) -> Result<CompiledTaskProgram, CompiledPackageError> {
         let package = decode_fragment_package(package, &self.model, &self.decode_limits, control)
             .map_err(|error| match error {
             PackageDecodeError::Control(cause) => CompiledPackageError::Control(cause),
             other => CompiledPackageError::Refused(format!("package is not receivable: {other}")),
         })?;
+        let runtime_filters =
+            CompiledRuntimeFilterEndpoints::from_package(&package).map_err(|error| {
+                CompiledPackageError::Refused(format!(
+                    "package runtime-filter bindings are not resolvable: {error}"
+                ))
+            })?;
         let validated = validate_fragment_providers(Arc::new(package), &self.providers, control)
             .map_err(|error| match error {
                 ProviderPreparationError::Control(cause) => CompiledPackageError::Control(cause),
@@ -132,7 +152,7 @@ where
                     CompiledPackageError::Refused(format!("package providers refuse it: {other}"))
                 }
             })?;
-        compile_fragment(
+        let program = compile_fragment(
             validated,
             &self.functions,
             LocalCompileOptions {
@@ -149,6 +169,10 @@ where
         .map_err(|error| match error {
             FragmentCompileError::Control(cause) => CompiledPackageError::Control(cause),
             other => CompiledPackageError::Refused(format!("package does not compile: {other}")),
+        })?;
+        Ok(CompiledTaskProgram {
+            program,
+            runtime_filters,
         })
     }
 }
