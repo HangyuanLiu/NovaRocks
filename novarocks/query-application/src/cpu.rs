@@ -177,6 +177,9 @@ impl ElasticPlanningPool {
                 let pool = Arc::clone(self);
                 match std::thread::Builder::new()
                     .name(format!("novarocks-query-planning-{id}"))
+                    // Planning traverses nested SQL trees on this worker,
+                    // outside the runtime's explicitly sized worker threads.
+                    .stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)
                     .spawn(move || worker_loop(pool, id, sender, receiver, job))
                 {
                     Ok(join) => {
@@ -568,6 +571,79 @@ mod tests {
     fn executor(keepalive: Duration) -> QueryCpuExecutorOwner {
         QueryCpuExecutorOwner::try_new(QueryCpuExecutorConfig::with_idle_keepalive(keepalive))
             .expect("open CPU executor")
+    }
+
+    #[tokio::test]
+    async fn planning_worker_compiles_branching_recursive_union() {
+        use novarocks_sql::compiler::{
+            SessionOptimizerSettings, SqlAnalyzeRequest, SqlCatalogSnapshot, SqlCompileControl,
+            SqlCompileIntent, SqlCompiler, SqlOptimizeRequest, SqlPlanningEnvironment,
+            SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog,
+        };
+        use novarocks_sql::planning::catalog::{PlannerTableProvider, ResolvedAnalyzerTable};
+        use novarocks_sql::planning::dml::DmlStatisticsSnapshot;
+
+        struct EmptyCatalog;
+        impl PlannerTableProvider for EmptyCatalog {
+            fn resolve_table_for_analysis(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+            ) -> Result<ResolvedAnalyzerTable, String> {
+                Err("recursive sequence has no external table".into())
+            }
+        }
+        impl SqlCatalogSnapshot for EmptyCatalog {
+            fn planner_table_provider(&self) -> &dyn PlannerTableProvider {
+                self
+            }
+        }
+
+        let mut owner = executor(Duration::from_secs(1));
+        owner
+            .executor()
+            .run(|| {
+                let request = SqlAnalyzeRequest::new(
+                    SqlStatementInput::sql(
+                        "WITH RECURSIVE numbers AS (
+                        SELECT CAST(1 AS BIGINT) AS n, CAST(1 AS BIGINT) AS category
+                        UNION SELECT n + 1, 1 FROM numbers WHERE n < 5
+                        UNION SELECT n, 2 FROM numbers
+                    ) SELECT /*+ SET_VAR(enable_recursive_cte=true)*/ DISTINCT n, category
+                      FROM numbers ORDER BY n, category",
+                    ),
+                    SqlCompileIntent::Query,
+                    SqlSessionContext {
+                        sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+                        current_catalog: None,
+                        current_database: "default".into(),
+                        optimizer_settings: SessionOptimizerSettings::default(),
+                    },
+                    SqlPlanningEnvironment::Distributed,
+                    &EmptyCatalog,
+                    builtin_sql_function_catalog(),
+                    novarocks_sql::compiler::noop_constant_evaluator(),
+                    None,
+                    SqlCompileControl::unbounded(),
+                );
+                let pending = SqlCompiler::analyze(request)
+                    .expect("analyze recursive UNION")
+                    .into_pending()
+                    .expect("recursive UNION requires optimization");
+                SqlCompiler::optimize(SqlOptimizeRequest::new(
+                    pending,
+                    &DmlStatisticsSnapshot::empty(),
+                    SqlCompileControl::unbounded(),
+                ))
+                .expect("optimize recursive UNION on the production planning worker");
+            })
+            .await
+            .expect("planning worker returns without aborting the process");
+        owner
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("planning worker actually exits");
     }
 
     #[tokio::test]
