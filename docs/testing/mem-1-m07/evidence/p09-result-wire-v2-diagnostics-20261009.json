@@ -1,0 +1,116 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "stage": "P09 first native result-delivery wire boundary run",
+  "actual_server_build_identity": "856e28f52f0c97e816835e44df77576bcb32d7c9",
+  "source_revision": "b2319d10fc5b1f1bc7c2512781164eb0216f539b",
+  "outcome": "one_pass_one_invalid_input_failure",
+  "topology": "1FE+3BE",
+  "cases": [
+    {
+      "name": "result-delivery/many-small-rows-cross-segment",
+      "outcome": "passed",
+      "process_launch_identities": [
+        {
+          "role": "fe",
+          "pid": 58367,
+          "process_start_token": "macos:1791496186:35867"
+        },
+        {
+          "role": "be-0",
+          "pid": 58368,
+          "process_start_token": "macos:1791496186:145258"
+        },
+        {
+          "role": "be-1",
+          "pid": 58369,
+          "process_start_token": "macos:1791496186:205719"
+        },
+        {
+          "role": "be-2",
+          "pid": 58370,
+          "process_start_token": "macos:1791496186:263065"
+        }
+      ],
+      "raw_artifacts": [
+        {
+          "path": "logs/mem-1-m07/p09-result-wire-v2-native-20261009/result-delivery-many-small-rows-cross-segment/owner-barrier-wire-boundary-after.json",
+          "sha256": "e3afc1cbd91c8db6fca72e7d67ec27f9bd9dceeb9b8b20e9761c798b38c42066"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-result-wire-v2-native-20261009/result-delivery-many-small-rows-cross-segment/owner-barrier-wire-boundary-before.json",
+          "sha256": "1b1d2134e7f3a61a061178a24fc72e2ed1064a807c68dfc3130bcf779de86070"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-result-wire-v2-native-20261009/result-delivery-many-small-rows-cross-segment/scenario-evidence.json",
+          "sha256": "e96fb7f75921690372518b4f480b7fd5581cabafd2bce4f0958a07be2defc445"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-result-wire-v2-native-20261009/result-delivery-many-small-rows-cross-segment/wire-boundary-observation.json",
+          "sha256": "7bf984d470b368a2bd52f4f03490355406046fb52f6865f22a081f0ea795a11d"
+        }
+      ]
+    },
+    {
+      "name": "result-delivery/large-row-cross-u24",
+      "outcome": "failed",
+      "process_launch_identities": [
+        {
+          "role": "fe",
+          "pid": 58436,
+          "process_start_token": "macos:1791496187:527555"
+        },
+        {
+          "role": "be-0",
+          "pid": 58437,
+          "process_start_token": "macos:1791496187:590288"
+        },
+        {
+          "role": "be-1",
+          "pid": 58438,
+          "process_start_token": "macos:1791496187:646854"
+        },
+        {
+          "role": "be-2",
+          "pid": 58439,
+          "process_start_token": "macos:1791496187:702455"
+        }
+      ],
+      "raw_artifacts": [
+        {
+          "path": "logs/mem-1-m07/p09-result-wire-v2-native-20261009/result-delivery-large-row-cross-u24/owner-barrier-wire-boundary-before.json",
+          "sha256": "eb0934472dcf57545eb37fb19245189b696f4225c79f8d0cb78781dd149c669d"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-result-wire-v2-native-20261009/result-delivery-large-row-cross-u24/scenario-evidence.json",
+          "sha256": "69dffc37ae3c3438881e0e0b5e559c850281c28b6da605bdaf3d5534a307a6f0"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-result-wire-v2-native-20261009/result-delivery-large-row-cross-u24/wire-boundary-observation.json",
+          "sha256": "e8bb1330f1b844f057bf49f07ce630ad9c1f8cfc40a30ad19aacf59bf5300748"
+        }
+      ]
+    }
+  ],
+  "diagnosis": "Many-small-rows passed with exact independent hash, 200000 rows /1288895 payload bytes /200004 packets, two actual Native tasks and two consecutive idle snapshots before and after. The large REPEAT input exceeded existing OLAP_STRING_MAX_LENGTH=1048576 and correctly produced NULL (1 byte/5 packets), so it never exercised U24. No product regression inferred.",
+  "next_input": "Use 17 legal 1048576-byte string columns in one row (17825860 bytes), preserving a >U24 row and enlarging rather than shrinking the workload. Freeze v3 before reexecution. Keep function/server/profile caps and deadlines.",
+  "processes_absent": 8,
+  "raw_artifacts": [
+    {
+      "path": "logs/mem-1-m07/p09-result-wire-v2-native-20261009/driver-status.json",
+      "sha256": "23c893baf8c68cd4471b0911a67e6e24ea33176bc8bec471f0367e6ac62bd852"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-result-wire-v2-native-20261009/driver.log",
+      "sha256": "ff5eb106b8eaf780df19c1041306354642836f61da35b4058fe6c0140aba70a9"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-result-wire-compile-failure-20261009.log",
+      "sha256": "44b3e609ebc72429c6b94b04f7d1c4ad892520e0ae3eeef226c59f1685c70f1d"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-result-wire-v2-clean-build-20261009.log",
+      "sha256": "43e55baee346613a42667ba6b9ebe3e43b5879d856f934330aa400d8273dcf9f"
+    }
+  ]
+}

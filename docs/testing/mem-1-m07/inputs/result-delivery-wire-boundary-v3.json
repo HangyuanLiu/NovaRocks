@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "topology": "1FE+3BE",
+  "segment_bytes": 1048576,
+  "mysql_u24_payload_bytes": 16777215,
+  "scope": "C9 wire correctness and public owner convergence only. v3 supersedes v2 invalid >1MiB REPEAT input; use 17 individually legal 1MiB fields in one larger >U24 row. Original small-row input and all caps/deadlines unchanged. Freeze before execution.",
+  "cases": [
+    {
+      "name": "result-delivery/many-small-rows-cross-segment",
+      "sql": "SELECT generate_series FROM generate_series(1, 200000) ORDER BY generate_series",
+      "expected_rows": 200000,
+      "expected_row_payload_bytes": 1288895,
+      "expected_packets": 200004,
+      "expected_row_sha256": "1bf6122c65bb585e58121bfe81b8b784aa0de130525dc9257d64ac474fc5dedf",
+      "expected_columns": 1
+    },
+    {
+      "name": "result-delivery/large-row-cross-u24",
+      "sql": "SELECT REPEAT('q', 1048575 + generate_series) AS c0, REPEAT('q', 1048575 + generate_series) AS c1, REPEAT('q', 1048575 + generate_series) AS c2, REPEAT('q', 1048575 + generate_series) AS c3, REPEAT('q', 1048575 + generate_series) AS c4, REPEAT('q', 1048575 + generate_series) AS c5, REPEAT('q', 1048575 + generate_series) AS c6, REPEAT('q', 1048575 + generate_series) AS c7, REPEAT('q', 1048575 + generate_series) AS c8, REPEAT('q', 1048575 + generate_series) AS c9, REPEAT('q', 1048575 + generate_series) AS c10, REPEAT('q', 1048575 + generate_series) AS c11, REPEAT('q', 1048575 + generate_series) AS c12, REPEAT('q', 1048575 + generate_series) AS c13, REPEAT('q', 1048575 + generate_series) AS c14, REPEAT('q', 1048575 + generate_series) AS c15, REPEAT('q', 1048575 + generate_series) AS c16 FROM generate_series(1, 1)",
+      "expected_rows": 1,
+      "expected_row_payload_bytes": 17825860,
+      "expected_packets": 22,
+      "expected_row_sha256": "51433c7930844aec5dca09a6dcb7e13e1a98801a483a30b04f9f3be064c9ffb4",
+      "expected_columns": 17
+    }
+  ],
+  "mysql_client_max_packet_bytes": 67108864
+}

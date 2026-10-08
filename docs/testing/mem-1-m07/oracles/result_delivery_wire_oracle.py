@@ -18,18 +18,21 @@ def expected_small_rows():
 
 
 def expected_large_row():
-    length = 16777474
-    digest = hashlib.sha256(b"\xfe" + length.to_bytes(8, "little"))
+    length = 1048576
+    digest = hashlib.sha256()
     block = b"q" * 65536
-    for start in range(0, length, len(block)):
-        digest.update(block[: min(len(block), length - start)])
-    digest.update((length + 9).to_bytes(8, "little"))
-    return 1, length + 9, 6, digest.hexdigest()
+    for _ in range(17):
+        digest.update(b"\xfd" + length.to_bytes(3, "little"))
+        for start in range(0, length, len(block)):
+            digest.update(block[: min(len(block), length - start)])
+    row_bytes = 17 * (length + 4)
+    digest.update(row_bytes.to_bytes(8, "little"))
+    return 1, row_bytes, 22, digest.hexdigest()
 
 
 if __name__ == "__main__":
     manifest = json.loads(
-        (Path(__file__).parent.parent / "inputs/result-delivery-wire-boundary-v2.json").read_text()
+        (Path(__file__).parent.parent / "inputs/result-delivery-wire-boundary-v3.json").read_text()
     )
     for case, expected in zip(manifest["cases"], [expected_small_rows(), expected_large_row()], strict=True):
         actual = tuple(case[key] for key in [

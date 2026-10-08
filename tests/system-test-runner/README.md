@@ -63,8 +63,8 @@ remove the generated runtime directory.
 
 `result-delivery/many-small-rows-cross-segment` 验证 200000 小行跨 Native
 1 MiB 段时的准确顺序与字节；`result-delivery/large-row-cross-u24` 验证一个
-16777474 字节字符串跨 MySQL U24 packet。输入在
-`docs/testing/mem-1-m07/inputs/result-delivery-wire-boundary-v2.json` 冻结，客户端
+17825860 字节大行跨 MySQL U24 packet（17 个合法 1 MiB 字符串字段）。输入在
+`docs/testing/mem-1-m07/inputs/result-delivery-wire-boundary-v3.json` 冻结，客户端
 明确声明 frozen profile 的 64 MiB logical packet allowance，独立
 Python literal oracle 生成期待摘要。原始 actor 以 64 KiB scratch 流式校验
 packet sequence、列数、行数、length-encoded 字段及数据摘要，不积累整行。

@@ -146,3 +146,5 @@ Ordinary governed OK、typed ERR 与 COM_INIT_DB 的实际 packet/flush/Closing 
 2026-10-09 MV rename six-case old-main native comparison: old9c7723bbe/candidate856e28f52相同步骤/相同guard五FAIL，unreferenced control两侧PASS；原SQL/golden不变，8PID退出cleanup0。见evidence/p09-mv-rename-old-main-native-comparison-20261009.json；确认已有失败，不说五PASS，非性能/final验收。
 
 2026-10-09 P09 result-delivery两wire场景预冻结/实现/registry/build/fmt PASS，native尚未运行；200000小行跨S和16777474B单行跨U24，独立oracle见oracles/result_delivery_wire_oracle.py。仅wire与public owner oracle范围，其他P09/CM/CP门保持OPEN。
+
+2026-10-09 result-delivery v2 native：200000小行准确wire与public owner barrier PASS（actual856）；大REPEAT超既有单字符串1MiB上限返回NULL，输入FAIL非编码结论，8PID退出，收据evidence/p09-result-wire-v2-diagnostics-20261009.json。v3在执行前冻结17合法1MiB列/17825860B大行，SQL功能目的及cap保持，native pending。

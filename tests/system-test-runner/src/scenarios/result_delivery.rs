@@ -41,6 +41,7 @@ struct Manifest {
 struct WireCase {
     name: String,
     sql: String,
+    expected_columns: u64,
     expected_rows: u64,
     expected_row_payload_bytes: u64,
     expected_packets: u64,
@@ -69,7 +70,7 @@ impl Scenario for WireBoundary {
             "wire boundary requires native 1FE+3BE"
         );
         let manifest: Manifest = serde_json::from_str(include_str!(
-            "../../../../docs/testing/mem-1-m07/inputs/result-delivery-wire-boundary-v2.json"
+            "../../../../docs/testing/mem-1-m07/inputs/result-delivery-wire-boundary-v3.json"
         ))?;
         ensure!(
             manifest.schema_version == 1
@@ -127,7 +128,7 @@ impl Scenario for WireBoundary {
             observation.error
         );
         ensure!(
-            observation.columns == 1 && observation.rows == case.expected_rows,
+            observation.columns == case.expected_columns && observation.rows == case.expected_rows,
             "wire result schema or row count disagrees with independent oracle"
         );
         ensure!(
