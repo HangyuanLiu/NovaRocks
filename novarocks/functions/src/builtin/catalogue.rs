@@ -1229,7 +1229,10 @@ impl BuiltinScalarResolver {
             resolved.argument_types[0] = value_type.clone();
             resolved.return_type = value_type.clone();
         }
-        if self.function_id.as_str() == "builtin.scalar/cardinality/v1" {
+        if matches!(
+            self.function_id.as_str(),
+            "builtin.scalar/cardinality/v1" | "builtin.scalar/map_size/v1"
+        ) {
             let ([FunctionArgument::Value { value_type, .. }], [target]) =
                 (request.arguments, resolved.argument_types.as_mut_slice())
             else {
@@ -2600,6 +2603,9 @@ pub(super) fn scalar_definition_parts(
                     name if super::makedate_owner::operation(name).is_some() => {
                         Some(super::makedate_owner::effects())
                     }
+                    name if super::map_size_owner::operation(name) => {
+                        Some(super::map_size_owner::effects())
+                    }
                     name if super::collection_cardinality_owner::operation(name).is_some() => {
                         Some(super::collection_cardinality_owner::effects())
                     }
@@ -2920,6 +2926,9 @@ pub fn contribute_builtin_functions(
             }
             name if super::makedate_owner::operation(name).is_some() => {
                 super::makedate_owner::definition(name, declaration, resolver)?
+            }
+            name if super::map_size_owner::operation(name) => {
+                super::map_size_owner::definition(name, declaration, resolver)?
             }
             name if super::collection_cardinality_owner::operation(name).is_some() => {
                 super::collection_cardinality_owner::definition(name, declaration, resolver)?
