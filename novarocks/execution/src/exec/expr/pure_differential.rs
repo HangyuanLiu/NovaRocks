@@ -1575,3 +1575,7 @@ mod string_case_tests;
 #[cfg(test)]
 #[path = "pure_differential/to_date_tests.rs"]
 mod to_date_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_xx_hash3_128_tests.rs"]
+mod xx_hash3_128_tests;

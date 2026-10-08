@@ -105,3 +105,7 @@ pub fn eval_xx_hash3_128(
     }
     cast(&out, target).map_err(|e| format!("xx_hash3_128: failed to cast output: {}", e))
 }
+
+#[cfg(test)]
+#[path = "legacy_xx_hash3_128_baseline_tests.rs"]
+mod legacy_xx_hash3_128_baseline_tests;
