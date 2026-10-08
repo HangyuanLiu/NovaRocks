@@ -155,12 +155,14 @@ impl Scenario for CatalogListing {
         }
         fixture.set_mode(ListingMode::ExactEntries)?;
         phases.push(measure(context, "exact-entries", || {
-            let tables = control.query::<String, _>("SHOW TABLES")?;
+            let views = control.query::<String, _>("SHOW VIEWS")?;
             ensure!(
-                tables.len() == 65536,
-                "exact-bound table list was truncated or incomplete"
+                views.len() == 65536
+                    && views.first().map(String::as_str) == Some("cl_view_000000")
+                    && views.last().map(String::as_str) == Some("cl_view_065535"),
+                "exact-bound view list was truncated or incomplete"
             );
-            Ok(json!({"rows":tables.len(),"provider":fixture.snapshot()?}))
+            Ok(json!({"rows":views.len(),"provider":fixture.snapshot()?}))
         })?);
         fixture.set_mode(ListingMode::Normal)?;
         phases.push(measure(context, "drop-success", || {
@@ -176,7 +178,7 @@ impl Scenario for CatalogListing {
         std::fs::write(
             context.scenario_root().join("listing-measurements.json"),
             serde_json::to_vec_pretty(&json!({
-                "input_freeze":"docs/testing/mem-1-m07/inputs/cl-listing-freeze-v1.json",
+                "input_freeze":"docs/testing/mem-1-m07/inputs/cl-listing-freeze-v2.json",
                 "fixture":"controlled standard REST protocol; no row data",
                 "scope":"sampled FE allocator high-water; not a hard SDK byte bound or cross-provider CL completion",
                 "phases":phases
@@ -288,7 +290,6 @@ fn measure(
             .map_err(|_| anyhow::anyhow!("allocator sampler panicked"))?;
         Ok::<_, anyhow::Error>((outcome, observed))
     })?;
-    let result = outcome.with_context(|| format!("listing phase {phase}"))?;
     let (peak, samples) = observed?;
     let after = allocator(&client, port)?;
     let after_identities = context.recheck_live_process_launch_identities()?;
@@ -296,12 +297,13 @@ fn measure(
         serde_json::to_value(&identities)? == serde_json::to_value(&after_identities)?,
         "listing target process identity changed"
     );
-    let measurement = json!({"phase":phase,"before":before,"sampled_peak":peak,"after":after,"samples":samples,"process_launch_identities":identities,"result":result});
+    let measurement = json!({"phase":phase,"before":before,"sampled_peak":peak,"after":after,"samples":samples,"process_launch_identities":identities,"outcome":if outcome.is_ok() {"passed"} else {"failed"},"error":outcome.as_ref().err().map(|error| format!("{error:#}")),"result":outcome.as_ref().ok()});
     std::fs::write(
         context
             .scenario_root()
             .join(format!("listing-phase-{sequence:03}.json")),
         serde_json::to_vec_pretty(&measurement)?,
     )?;
+    outcome.with_context(|| format!("listing phase {phase}"))?;
     Ok(measurement)
 }
