@@ -306,7 +306,6 @@ pub struct FrontendDistributedQueryCoordinator {
     /// while the process runs.
     coordination_budgets: novarocks_query_application::coordination::CoordinationBudgets,
     transport_budget: novarocks_task_codec::TransportBudget,
-    result_fetch_byte_limit: ResultByteLimit,
     /// This frontend process's own identity, minted once per process.
     ///
     /// It is half of every query context reference, so a backend can tell one
@@ -326,7 +325,6 @@ impl FrontendDistributedQueryCoordinator {
         connector_split_initial_dynamic_filter_wait_cap: Duration,
         coordination_budgets: novarocks_query_application::coordination::CoordinationBudgets,
         transport_budget: novarocks_task_codec::TransportBudget,
-        result_fetch_byte_limit: ResultByteLimit,
         backend_topology: novarocks_query_application::api::BackendTopologyService,
         data_runtime: FrontendDataRuntime,
         lifecycle_diagnostics: Arc<FrontendLifecycleDiagnostics>,
@@ -350,7 +348,6 @@ impl FrontendDistributedQueryCoordinator {
             internal_result_cpu: Some(internal_result_cpu),
             coordination_budgets,
             transport_budget,
-            result_fetch_byte_limit,
             frontend_process_id: FrontendProcessId::new_v7(),
             task_update_retry_policy,
             connector_split_initial_dynamic_filter_wait_cap,
@@ -401,8 +398,6 @@ impl FrontendDistributedQueryCoordinator {
             coordination_budgets:
                 novarocks_query_application::coordination::CoordinationBudgets::DEFAULT,
             transport_budget: novarocks_task_codec::TransportBudget::DEFAULT,
-            result_fetch_byte_limit: ResultByteLimit::new(TEST_RESULT_FETCH_BYTE_LIMIT)
-                .expect("the test result byte limit is nonzero"),
             frontend_process_id: FrontendProcessId::new_v7(),
             backend_topology,
             backend_services: Some(BackendServicesSource::Fixed { scheduler }),
@@ -464,8 +459,6 @@ impl FrontendDistributedQueryCoordinator {
             coordination_budgets:
                 novarocks_query_application::coordination::CoordinationBudgets::DEFAULT,
             transport_budget: novarocks_task_codec::TransportBudget::DEFAULT,
-            result_fetch_byte_limit: ResultByteLimit::new(TEST_RESULT_FETCH_BYTE_LIMIT)
-                .expect("the test result byte limit is nonzero"),
             frontend_process_id: FrontendProcessId::new_v7(),
             backend_topology,
             backend_services: Some(BackendServicesSource::Sequence {
@@ -559,7 +552,8 @@ impl FrontendDistributedQueryCoordinator {
                 .map(|binding| binding.window_alias()),
         )
         .map_err(|error| failed(error.to_string()))?;
-        if let ProductionRootDelivery::Relayed { kind, .. } = &delivery {
+        {
+            let ProductionRootDelivery::Relayed { kind, .. } = &delivery;
             use novarocks_result_contract::{InternalResultDomain as D, RootOutputKind as K};
             let matches = matches!(
                 (parts.completion.intent(), kind),
@@ -1047,7 +1041,6 @@ impl FrontendDistributedQueryCoordinator {
         );
         let root_task = round.root_task();
         let mut relayed_reader = match &delivery {
-            ProductionRootDelivery::Decoded => None,
             ProductionRootDelivery::Relayed { .. } => Some(Arc::new(
                 crate::native::fragment_transport::NativeBoundedRootReadPort::new(Arc::clone(
                     &result_transport,
@@ -1478,10 +1471,8 @@ impl FrontendDistributedQueryCoordinator {
                 match RootResultPolls::start_for_delivery(
                     &delivery,
                     relayed_reader.as_ref(),
-                    Arc::clone(&result_transport) as Arc<dyn TaskResultTransport>,
                     root_task,
                     statement_deadline,
-                    self.result_fetch_byte_limit,
                     Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
                     self.data_runtime.clone(),
                 ) {
@@ -2442,9 +2433,6 @@ impl FrontendDistributedQueryCoordinator {
             }
             DistributedQueryIntent::Profile => {
                 let output_rows = match &delivery {
-                    ProductionRootDelivery::Decoded => {
-                        expected_output.into_query_result(batches)?.row_count() as u64
-                    }
                     ProductionRootDelivery::Relayed { .. } => {
                         if !batches.is_empty() || relayed_end.is_none() {
                             return Err(failed(
@@ -4663,17 +4651,12 @@ impl RootResultPolls {
     fn start_for_delivery(
         delivery: &ProductionRootDelivery,
         port: Option<&Arc<dyn novarocks_query_application::api::BoundedRootReadPort>>,
-        transport: Arc<dyn TaskResultTransport>,
         root: TaskIdentity,
         deadline: Instant,
-        limit: ResultByteLimit,
         wake: Arc<dyn StatusIntakeWake>,
         runtime: FrontendDataRuntime,
     ) -> Result<Self, String> {
         match delivery {
-            ProductionRootDelivery::Decoded => {
-                Self::start(transport, root, deadline, limit, wake, runtime)
-            }
             ProductionRootDelivery::Relayed { kind, window, .. } => RelayedRootPolls::start(
                 port.cloned().ok_or("relayed root has no bounded reader")?,
                 root,

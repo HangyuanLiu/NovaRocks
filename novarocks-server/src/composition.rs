@@ -640,20 +640,12 @@ pub fn compose_frontend_role_config(
             novarocks_native_adapter::FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES
         );
     }
-    let (
-        logical_supervisor,
-        workload,
-        workload_resources,
-        decode_workers,
-        decode_queue,
-        abort_capacity,
-    ) = compose_frontend_workload_runtime(runtime_config, result_fetch_byte_limit)?;
+    let (logical_supervisor, workload, workload_resources, abort_capacity) =
+        compose_frontend_workload_runtime(runtime_config, result_fetch_byte_limit)?;
     let logical_runtime = FrontendLogicalExecutionRuntimeConfig::new(
         logical_supervisor,
         workload,
         workload_resources,
-        decode_workers,
-        decode_queue,
         abort_capacity,
     );
     let mut execution = FrontendExecutionConfig::new(
@@ -720,8 +712,7 @@ pub fn compose_frontend_role_config(
     .with_query_blocking_executor_config(QueryBlockingExecutorConfig::new(
         query_blocking_workers,
         query_blocking_queue,
-    ))
-    .with_result_fetch_byte_limit(result_fetch_byte_limit);
+    ));
     let (remote_effect_policy, management_audit, startup_isolation) =
         mv_management_continuation(config)?;
     execution =
@@ -835,8 +826,6 @@ fn compose_frontend_workload_runtime(
     WorkloadConfig,
     ResourceConfig,
     NonZeroUsize,
-    NonZeroUsize,
-    NonZeroUsize,
 )> {
     let input = &runtime.frontend_workload;
     let workload = WorkloadConfig {
@@ -890,14 +879,6 @@ fn compose_frontend_workload_runtime(
                 "runtime.frontend_workload.restarts_per_work cannot form a nonzero u32 attempt bound"
             )
         })?;
-    let decode_workers = nonzero(
-        "result_decode_worker_count",
-        input.result_decode_worker_count,
-    )?;
-    let decode_queue = nonzero(
-        "result_decode_queue_capacity",
-        input.result_decode_queue_capacity,
-    )?;
     let abort_capacity = nonzero(
         "logical_abort_effect_capacity",
         input.logical_abort_effect_capacity,
@@ -950,14 +931,7 @@ fn compose_frontend_workload_runtime(
     .with_remote_cleanup_timeout(Duration::from_millis(
         input.logical_remote_cleanup_timeout_ms,
     ));
-    Ok((
-        supervisor,
-        workload,
-        resources,
-        decode_workers,
-        decode_queue,
-        abort_capacity,
-    ))
+    Ok((supervisor, workload, resources, abort_capacity))
 }
 
 fn compose_task_execution_budgets(
@@ -1427,15 +1401,13 @@ mod tests {
         config.runtime.frontend_workload.control_bytes = 64 * 1024 * 1024;
         config.runtime.frontend_workload.per_scope_bytes = 512 * 1024 * 1024;
         let byte_limit = novarocks_execution_contract::ResultByteLimit::new(1024).unwrap();
-        let (_, workload, resources, decode_workers, decode_queue, abort_capacity) =
+        let (_, workload, resources, abort_capacity) =
             compose_frontend_workload_runtime(&config.runtime, byte_limit)
                 .expect("explicit frontend workload fields compose");
         assert_eq!(workload.query_concurrency_limit, 256);
         assert_eq!(workload.execution_limit, workload.scope_records_limit);
         assert_eq!(resources.total_bytes, 966_367_641);
         assert_eq!(resources.per_scope_bytes, 512 * 1024 * 1024);
-        assert_eq!(decode_workers.get(), 2);
-        assert_eq!(decode_queue.get(), 32);
         assert_eq!(abort_capacity.get(), 16);
 
         config

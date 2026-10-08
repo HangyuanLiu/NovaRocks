@@ -1199,8 +1199,6 @@ pub struct FrontendWorkloadRuntimeConfig {
     pub logical_context_admission_issue_capacity: usize,
     pub logical_context_establish_capacity: usize,
     pub logical_abort_effect_capacity: usize,
-    pub result_decode_worker_count: usize,
-    pub result_decode_queue_capacity: usize,
     pub logical_rows_delivery_capacity: usize,
     pub logical_replacement_reservation_ms: u64,
     pub logical_remote_cleanup_timeout_ms: u64,
@@ -1230,8 +1228,6 @@ impl Default for FrontendWorkloadRuntimeConfig {
             logical_context_admission_issue_capacity: 16,
             logical_context_establish_capacity: 16,
             logical_abort_effect_capacity: 16,
-            result_decode_worker_count: 2,
-            result_decode_queue_capacity: 32,
             logical_rows_delivery_capacity: 32,
             logical_replacement_reservation_ms: 30_000,
             logical_remote_cleanup_timeout_ms: 5_000,
@@ -3178,6 +3174,8 @@ mod tests {
             "executions_per_root",
             "waiting_bytes",
             "logical_start_capacity",
+            "result_decode_worker_count",
+            "result_decode_queue_capacity",
         ] {
             let document = format!("[runtime.frontend_workload]\n{field} = 1\n",);
             let error = match toml::from_str::<NovaRocksConfig>(&document) {

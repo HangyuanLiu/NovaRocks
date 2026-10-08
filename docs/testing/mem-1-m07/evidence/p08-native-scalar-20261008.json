@@ -1,0 +1,20 @@
+{
+  "scenario": "query-output/scalar-session",
+  "outcome": "passed",
+  "source_revision": "f1bdf3b904a377e9fa624fd2cee6ccb610bf27a1",
+  "source_dirty": false,
+  "cluster_size": 3,
+  "launch_profile": "fault-scenario",
+  "actions": [
+    "cluster launched and topology barrier passed",
+    "verified native 1FE+3BE topology",
+    "verified native Scalar numeric, aggregate, empty, and failed session publication",
+    "verified Scalar session resources converged after success and failure",
+    "scenario assertions passed",
+    "cluster and fixture cleanup passed"
+  ],
+  "status": "PASS_DEV_NATIVE_SCALAR_NOT_FINAL_ACCEPTANCE",
+  "evidence_path": "logs/mem-1-m07/p08-native-scalar-20261008/query-output-scalar-session/scenario-evidence.json",
+  "evidence_sha256": "12eac310a9c017d09cda547e24e1d89e39b13c88cbd97bca4220009e4ecee302",
+  "remaining": "FE legacy retirement; P00b; P09/P10; final same-HEAD evidence"
+}

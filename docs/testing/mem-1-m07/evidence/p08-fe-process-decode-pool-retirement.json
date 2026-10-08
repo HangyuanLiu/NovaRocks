@@ -1,0 +1,28 @@
+{
+  "status": "PASS_COMPONENT_FE_PROCESS_DECODE_POOL_RETIRED_P08_PARTIAL",
+  "base_revision": "f1bdf3b904a377e9fa624fd2cee6ccb610bf27a1",
+  "validation": [
+    {
+      "path": "logs/mem-1-m07/p08-fe-decode-pool-server-tests-v2.log",
+      "sha256": "efa774923cdc40c154244117d455623b95638d7f69c055cc82ae02f4c4dad2bc",
+      "result": "test result: ok. 169 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s"
+    },
+    {
+      "path": "logs/mem-1-m07/p08-fe-decode-pool-frontend-tests-v2.log",
+      "sha256": "07a8805bb3935aaaac2d78b25bd0c1f03b4895d18d88745d2e323959ce4d0972",
+      "result": "test result: ok. 1462 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.01s"
+    }
+  ],
+  "changes": [
+    "No generic Arrow decode worker owner or handle is created by Frontend composition, shutdown or exit.",
+    "The Frontend logical read adapter exposes only bounded root relay delivery.",
+    "Coordinator production binding has no decoded output branch or legacy fetch byte-limit argument.",
+    "The retired FE decode worker and queue keys are rejected by closed configuration parsing, with their exact key in the error.",
+    "Domain-owned Internal CPU workers and BE retained/process protection remain."
+  ],
+  "remaining": [
+    "Legacy FE transport and generic pump public APIs, LRA/credit stages, hardcoded fetch gate and old Supervisor fetch config",
+    "P00b measured coefficients and checked transport envelope",
+    "P09/P10 and same-HEAD full/native evidence"
+  ]
+}

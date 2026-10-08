@@ -47,7 +47,7 @@ use novarocks_query_application::coordination::{
     ReplacementQualificationEffectPort, ReplacementQualificationEffectReservation,
     ReplacementQualificationEffectSubmission, ReplacementQualificationFailure,
     ReplacementQualificationIdentity, ReplacementQualificationRequest, RootRelayBinding,
-    RootRelayFrontier, RootResultPumpBinding,
+    RootRelayFrontier,
 };
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::NativeCompatibilityId;
@@ -60,7 +60,6 @@ use crate::native::fragment_encoder::instance::encode_query_options;
 use crate::native::fragment_encoder::submission::encode_native_submission;
 use crate::native::fragment_transport::{
     NativeBoundedRootReadPort, NativeTaskResultTransport, TaskReadGrace,
-    native_root_result_pump_binding,
 };
 use crate::native::task_transport::{
     AttemptWireFacts, NativeTaskOperationSink, TaskAckIntake, TaskOperationIntakeEvent,
@@ -825,7 +824,6 @@ pub(crate) struct FrontendNativeLogicalExecutionRuntime {
     topology: BackendTopologyService,
     process_observation: BackendProcessObservationService,
     data_runtime: FrontendDataRuntime,
-    decode_runtime: novarocks_query_application::coordination::RootResultDecodeRuntime,
     native_compatibility_id: NativeCompatibilityId,
     runtime_filter_worker_count: NonZeroUsize,
     task_update_retry_policy: TaskUpdateRetryPolicy,
@@ -862,7 +860,6 @@ impl FrontendNativeLogicalExecutionRuntime {
         topology: BackendTopologyService,
         process_observation: BackendProcessObservationService,
         data_runtime: FrontendDataRuntime,
-        decode_runtime: novarocks_query_application::coordination::RootResultDecodeRuntime,
         native_compatibility_id: NativeCompatibilityId,
         runtime_filter_worker_count: NonZeroUsize,
         task_update_retry_policy: TaskUpdateRetryPolicy,
@@ -878,7 +875,6 @@ impl FrontendNativeLogicalExecutionRuntime {
             topology,
             process_observation,
             data_runtime,
-            decode_runtime,
             native_compatibility_id,
             runtime_filter_worker_count,
             task_update_retry_policy,
@@ -995,7 +991,6 @@ impl std::fmt::Debug for ProductionManifestAttemptProjection {
 /// relayed root cannot fall back to Arrow when its class has no capacity.
 #[derive(Clone)]
 pub(crate) enum ProductionRootDelivery {
-    Decoded,
     Relayed {
         kind: novarocks_result_contract::RootOutputKind,
         client_rows: Option<novarocks_result_contract::ClientRowProfile>,
@@ -1043,10 +1038,7 @@ impl ProductionRootDelivery {
     }
 }
 
-pub(crate) enum FrontendRootRowsRuntime {
-    Decoded(RootResultPumpBinding),
-    Relayed(RootRelayBinding),
-}
+pub(crate) type FrontendRootRowsRuntime = RootRelayBinding;
 
 /// Frontend-local Task protocol and transport behavior used by the fixed
 /// snapshot-owning dormant adapter.
@@ -1165,20 +1157,6 @@ pub(crate) struct ProjectedManifestAttempt {
 }
 
 impl ProjectedManifestAttempt {
-    pub(crate) fn rows(
-        round: ManifestAssembledRound,
-        binding: RootResultPumpBinding,
-        statuses: AcceptedRootStatusSource,
-    ) -> Self {
-        Self {
-            round,
-            rows: Some((FrontendRootRowsRuntime::Decoded(binding), statuses)),
-            _prepared: None,
-            _split_assignment: None,
-            _abort_route: None,
-        }
-    }
-
     fn production_rows(
         round: ManifestAssembledRound,
         binding: FrontendRootRowsRuntime,
@@ -1370,7 +1348,7 @@ impl ProductionManifestAttemptProjection {
                 .map_err(projection_failure)?,
         )
         .map_err(projection_message)?;
-        let (submissions, root_fetch, expected_output) = task_prepared
+        let (submissions, root_fetch, _expected_output) = task_prepared
             .seal_task_submission(submission)
             .map_err(projection_failure)?
             .into_parts();
@@ -1461,13 +1439,6 @@ impl ProductionManifestAttemptProjection {
             projection_message("logical read Task round has no accepted root status source")
         })?;
         let root_binding = match &self.delivery {
-            ProductionRootDelivery::Decoded => {
-                FrontendRootRowsRuntime::Decoded(native_root_result_pump_binding(
-                    self.runtime.decode_runtime.clone(),
-                    result_transport,
-                    Arc::clone(expected_output.fetch_view().chunk_schema()),
-                ))
-            }
             ProductionRootDelivery::Relayed {
                 kind,
                 client_rows,
@@ -1480,12 +1451,12 @@ impl ProductionManifestAttemptProjection {
                     *client_rows,
                 )
                 .map_err(|error| projection_message(error.to_string()))?;
-                FrontendRootRowsRuntime::Relayed(RootRelayBinding {
+                RootRelayBinding {
                     port: Arc::new(NativeBoundedRootReadPort::new(result_transport)),
                     frontier,
                     window: window.clone(),
                     max_wait: Duration::from_millis(250),
-                })
+                }
             }
         };
         Ok(ProjectedManifestAttempt::production_rows(
@@ -1868,10 +1839,7 @@ where
         Box::pin(async move {
             let (owner, rows) = activation.await?;
             Ok(match rows {
-                Some((FrontendRootRowsRuntime::Decoded(binding), statuses)) => {
-                    ActivatedNativeAttempt::rows(owner, binding, statuses)
-                }
-                Some((FrontendRootRowsRuntime::Relayed(binding), statuses)) => {
+                Some((binding, statuses)) => {
                     ActivatedNativeAttempt::relayed_rows(owner, binding, statuses)
                 }
                 None => ActivatedNativeAttempt::completion(owner),
