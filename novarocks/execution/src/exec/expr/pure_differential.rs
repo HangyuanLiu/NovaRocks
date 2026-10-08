@@ -1653,3 +1653,6 @@ mod time_slice_tests;
 
 #[path="pure_differential_array_append_tests.rs"]
 mod array_append_tests;
+
+#[path = "pure_differential/mod_pmod_shared_tests.rs"]
+mod mod_pmod_shared_tests;

@@ -1275,3 +1275,6 @@ mod legacy_time_slice_baseline_tests;
 #[cfg(test)]
 #[path="legacy_array_append_baseline_tests.rs"]
 mod legacy_array_append_baseline_tests;
+
+#[cfg(test)]
+mod legacy_mod_pmod_shared_baseline_tests;
