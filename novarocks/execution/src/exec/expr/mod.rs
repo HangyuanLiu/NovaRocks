@@ -1334,3 +1334,6 @@ mod cast_binary_text_oracle_tests;
 
 #[cfg(test)]
 mod legacy_array_match_baseline_tests;
+
+#[cfg(test)]
+mod legacy_array_difference_baseline_tests;

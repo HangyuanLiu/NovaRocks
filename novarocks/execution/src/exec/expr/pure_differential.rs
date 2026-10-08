@@ -1763,3 +1763,6 @@ mod aes_family_tests;
 
 #[path = "pure_differential_array_match_tests.rs"]
 mod array_match_tests;
+
+#[path = "pure_differential_array_difference_tests.rs"]
+mod array_difference_tests;
