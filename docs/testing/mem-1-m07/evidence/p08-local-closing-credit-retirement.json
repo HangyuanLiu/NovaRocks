@@ -1,0 +1,47 @@
+{
+  "status": "PASS_COMPONENT_LOCAL_CLOSING_CREDIT_RETIRED_P08_PARTIAL",
+  "base_revision": "e4283cf40",
+  "changes": [
+    "Removed ImmediateResultBatch and Local graph legacy governance charge. GovernedImmediateStatementResult hands off only the opaque graph and original protocol owner.",
+    "Local protocol buffers and initial/terminal Closing writers retain their original full-window guards without ResultCredit reservations or transitions.",
+    "Cancellation before metadata and actual source/schema/segment/alias drop before Closing remain. The Closing lease directly owns the final writer.",
+    "Strengthened original Local-window retention test: statement completion does not return capacity while protocol buffers remain; actual buffer exit returns it."
+  ],
+  "validation": [
+    {
+      "path": "logs/mem-1-m07/p08-local-credit-retirement-tests-v2.log",
+      "sha256": "f40e03a7853ddf6e13e99c5bf313e928612d86c53a1d9bcfde9552f82fbb4f60",
+      "result": [
+        "test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 64 filtered out; finished in 0.01s"
+      ]
+    },
+    {
+      "path": "logs/mem-1-m07/p08-local-credit-mysql-tests.log",
+      "sha256": "5efc7d050b11b0d165494381c9a9e6a1883ae9e0c3ef22da269d4c0de1019382",
+      "result": [
+        "test result: ok. 77 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s"
+      ]
+    },
+    {
+      "path": "logs/mem-1-m07/p08-local-credit-query-tests.log",
+      "sha256": "f11334b040fe2a6e466ffa6cf5259c6c33e207fd69e694e4e28dac213b38b216",
+      "result": [
+        "test result: ok. 500 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.38s"
+      ]
+    },
+    {
+      "path": "logs/mem-1-m07/p08-local-credit-frontend-check.log",
+      "sha256": "ddfb67e41e536716247cf6ce9ace62c26f49c5cd5ee547bcb1ceb393a109756c",
+      "result": [
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.31s"
+      ]
+    }
+  ],
+  "retained_failure": "logs/mem-1-m07/p08-local-credit-retirement-tests-v1.log: compile failure corrected by preserving mutable cursor access in close_local.",
+  "remaining": [
+    "Old decoded delivery/actor/MySQL APIs",
+    "Result-specific LRA stages, wait queue, observations and obsolete config",
+    "Clean C0/native rerun after the retirement wave",
+    "P00b measured transport coefficients, P09/P10 and final same-HEAD evidence"
+  ]
+}

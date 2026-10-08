@@ -36,9 +36,7 @@ use novarocks_query_application::{
 };
 use novarocks_result_contract::{ClientRowProfile, ClientRowStreamCursor, RootProfileV1};
 use novarocks_result_render::RenderTurnStatus;
-use novarocks_workload_control::{
-    LocalResourceAuthority, ResultCredit, ResultWindowAlias, WorkScope,
-};
+use novarocks_workload_control::ResultWindowAlias;
 use opensrv_mysql::{
     Column, ColumnFlags, ColumnType, ErrorKind, QueryResultWriter, StreamingResponseLease,
 };
@@ -52,7 +50,6 @@ struct LocalProtocolBuffers {
     bytes: Vec<u8>,
     metadata: Option<opensrv_mysql::FrozenMetadata>,
     _window: ResultWindowAlias,
-    _legacy_credit: Option<ResultCredit>,
 }
 
 pub(crate) async fn write_local_result_one<'writer, W: AsyncWrite + Unpin>(
@@ -60,7 +57,7 @@ pub(crate) async fn write_local_result_one<'writer, W: AsyncWrite + Unpin>(
     results: QueryResultWriter<'writer, W>,
     more_results: bool,
 ) -> io::Result<MysqlStatementWriteOutcome<'writer, W>> {
-    let (graph, decoded_bytes, mut protocol) = result.into_parts();
+    let (graph, mut protocol) = result.into_parts();
     let limits = results.protocol_limits();
     let capabilities = results.client_capabilities();
     if results.is_binary() || limits.row_bytes < RootProfileV1::ROW_PAYLOAD_BYTES as usize {
@@ -69,40 +66,23 @@ pub(crate) async fn write_local_result_one<'writer, W: AsyncWrite + Unpin>(
             protocol,
             results,
             invalid("Local delivery requires the supported text-row profile"),
-            None,
         )
         .await;
     }
     let deadline = Instant::now() + ACTIVE_WRITE_DEADLINE;
-    // This transitional reservation preserves old decoded and protocol LRA
-    // protection. P08 removes it only with the complete production switch.
-    let (resources, scope) = protocol.reservation_inputs();
-    let scratch_bytes = 8 * 1024 * 1024; // frozen Local root/render overlap
+    // The complete producer window was admitted before the source callback.
+    // Metadata, render scratch and socket work retain that same window.
     let cancellation = protocol.cancellation();
-    let reserve = legacy_credit(resources, scope, decoded_bytes, scratch_bytes);
-    let credit = tokio::select! {
-        biased;
-        reason = cancellation.cancelled() => Err(cancelled(reason)),
-        outcome = tokio::time::timeout_at(deadline, reserve) => outcome
-            .map_err(|_| QueryExecutionError::new(QueryExecutionErrorKind::DeadlineExceeded,
-                "MySQL result reservation deadline expired"))
-            .and_then(|outcome| outcome.map_err(|error| QueryExecutionError::new(
-                QueryExecutionErrorKind::Rejected, error.to_string()))),
-    };
-    let credit = match credit {
-        Ok(credit) => credit,
-        Err(error) => {
-            drop(graph);
-            return close_initial(protocol, results, error, None).await;
-        }
-    };
+    if let Some(reason) = cancellation.reason() {
+        drop(graph);
+        return close_initial(protocol, results, cancelled(reason)).await;
+    }
     let metadata = local_metadata(&graph, capabilities, limits);
     let metadata = match metadata {
         Ok(metadata) => metadata,
         Err(error) => {
             drop(graph);
-            return close_initial(protocol, results, invalid(error.to_string()), Some(credit))
-                .await;
+            return close_initial(protocol, results, invalid(error.to_string())).await;
         }
     };
     let cursor = graph.into_cursor();
@@ -111,7 +91,6 @@ pub(crate) async fn write_local_result_one<'writer, W: AsyncWrite + Unpin>(
         cursor,
         bytes: vec![0; RootProfileV1::SEGMENT_BYTES],
         metadata: Some(metadata),
-        _legacy_credit: Some(credit),
     };
     // From this point all socket/coalescer/metadata work is finite and the
     // actual writer task retains the same producer window throughout.
@@ -299,37 +278,6 @@ fn local_metadata(
         .collect::<Vec<_>>();
     crate::relay_metadata::frozen_result_metadata(&columns, capabilities, limits)
 }
-async fn legacy_credit(
-    resources: LocalResourceAuthority,
-    scope: WorkScope,
-    decoded_bytes: u64,
-    protocol_bytes: u64,
-) -> io::Result<ResultCredit> {
-    let error = |error: novarocks_workload_control::WorkError| io::Error::other(error.to_string());
-    let retained_error = |error: novarocks_workload_control::ResultCreditReservationError| {
-        io::Error::other(error.error().to_string())
-    };
-    let credit = resources
-        .reserve_result_credit_when_available(&scope, decoded_bytes)
-        .await
-        .map_err(error)?
-        .begin_fetch()
-        .map_err(error)?
-        .retain_raw(decoded_bytes)
-        .map_err(retained_error)?;
-    let credit = credit
-        .reserve_decode_when_available(&resources, decoded_bytes)
-        .await
-        .map_err(retained_error)?
-        .queue_decoded(decoded_bytes)
-        .map_err(retained_error)?;
-    credit
-        .reserve_protocol_when_available(&resources, protocol_bytes)
-        .await
-        .map_err(retained_error)?
-        .begin_protocol_write(protocol_bytes)
-        .map_err(retained_error)
-}
 enum LocalWriteInterruption {
     Query(QueryExecutionError),
     Io(io::Error),
@@ -365,7 +313,6 @@ async fn close_initial<'writer, W: AsyncWrite + Unpin>(
     mut protocol: GovernedProtocolOwner,
     results: QueryResultWriter<'writer, W>,
     error: QueryExecutionError,
-    legacy_credit: Option<ResultCredit>,
 ) -> io::Result<MysqlStatementWriteOutcome<'writer, W>> {
     if matches!(
         protocol.cancellation().reason(),
@@ -375,7 +322,6 @@ async fn close_initial<'writer, W: AsyncWrite + Unpin>(
                 | QueryCancellationReason::ClientDisconnected
         )
     ) {
-        drop(legacy_credit);
         let _ = protocol.client_disconnected();
         return Err(io_error(error));
     }
@@ -384,7 +330,6 @@ async fn close_initial<'writer, W: AsyncWrite + Unpin>(
     ) {
         Ok(capacity) if capacity.check_backing_total(CLOSING_OBJECT_BYTES).is_ok() => capacity,
         _ => {
-            drop(legacy_credit);
             let _ = protocol.client_disconnected();
             return Err(io_error(error));
         }
@@ -396,7 +341,6 @@ async fn close_initial<'writer, W: AsyncWrite + Unpin>(
     let writer = InitialLocalClosingWriter {
         writer: Some(results),
         error,
-        _legacy_credit: legacy_credit,
     };
     let mut closing = match protocol.into_closing_delivery(writer, capacity, CLOSING_OBJECT_BYTES) {
         Ok(closing) => closing,
@@ -427,7 +371,6 @@ async fn close_initial<'writer, W: AsyncWrite + Unpin>(
 struct InitialLocalClosingWriter<'writer, W: AsyncWrite + Unpin> {
     writer: Option<QueryResultWriter<'writer, W>>,
     error: QueryExecutionError,
-    _legacy_credit: Option<ResultCredit>,
 }
 impl<'writer, W: AsyncWrite + Unpin> InitialLocalClosingWriter<'writer, W> {
     async fn finish(&mut self) -> io::Result<QueryResultWriter<'writer, W>> {
@@ -540,35 +483,23 @@ async fn close_local<'writer, W: AsyncWrite + Unpin>(
     drop(payload);
     drop(error);
     // There can be no render/fetch in the closing waiter. Drop source/schema,
-    // segment and ordinary alias before its first poll. Transitional LRA
-    // protection follows the physical writer tail until P08 retires it.
-    let legacy_credit = buffers._legacy_credit.take();
+    // segment and ordinary alias before its first poll. The independently
+    // admitted Closing window owns every remaining writer-tail object.
     drop(buffers);
     finish_closing(
         protocol,
         writer,
         capacity,
         Instant::now() + CLOSING_DEADLINE,
-        legacy_credit,
     )
     .await
-}
-struct LocalClosingWriter<'writer, W> {
-    writer: opensrv_mysql::ClosingResponseLease<'writer, W>,
-    // Owned packets/coalescer/tail exit before the old protection.
-    _legacy_credit: Option<ResultCredit>,
 }
 async fn finish_closing<'writer, W: AsyncWrite + Unpin>(
     protocol: GovernedProtocolOwner,
     writer: opensrv_mysql::ClosingResponseLease<'writer, W>,
     capacity: novarocks_workload_control::ResultWindowGrant,
     deadline: Instant,
-    legacy_credit: Option<ResultCredit>,
 ) -> io::Result<MysqlStatementWriteOutcome<'writer, W>> {
-    let writer = LocalClosingWriter {
-        writer,
-        _legacy_credit: legacy_credit,
-    };
     let mut closing = match protocol.into_closing_delivery(writer, capacity, CLOSING_OBJECT_BYTES) {
         Ok(closing) => closing,
         Err((mut protocol, writer, _capacity)) => {
@@ -579,7 +510,7 @@ async fn finish_closing<'writer, W: AsyncWrite + Unpin>(
             )));
         }
     };
-    match tokio::time::timeout_at(deadline, closing.writer_mut().writer.finish()).await {
+    match tokio::time::timeout_at(deadline, closing.writer_mut().finish()).await {
         Ok(Ok(writer)) => {
             let _ = closing.settle_after_writer_exit().await;
             writer.no_more_results().await?;
@@ -1085,10 +1016,6 @@ mod tests {
                 tokio::task::yield_now().await;
             }
             assert!(
-                resources.snapshot().result_credit.protocol_writing_bytes > 0,
-                "old LRA still protects the slow physical writer"
-            );
-            assert!(
                 control.begin_statement(session).is_err(),
                 "closing retains the statement generation"
             );
@@ -1102,7 +1029,6 @@ mod tests {
             assert_eq!(sequence, 5);
             assert_eq!(&error[..3], &[0xff, 0x25, 0x05]);
             assert_eq!(capacity.snapshot().held_positions, [0; 4]);
-            assert_eq!(resources.snapshot().result_credit.held_bytes(), 0);
             packet(&mut client, 0, b"\x03again").await;
             assert_eq!(read_result(&mut client, 1).await.0, b"\x05again");
             packet(&mut client, 0, &[1]).await;
@@ -1140,7 +1066,6 @@ mod tests {
             );
             assert!(server.await.unwrap().is_err());
             assert_eq!(capacity.snapshot().held_positions, [0; 4]);
-            assert_eq!(resources.snapshot().result_credit.held_bytes(), 0);
         })
         .await
         .unwrap();
@@ -1324,33 +1249,26 @@ mod tests {
         .unwrap();
     }
     #[tokio::test]
-    async fn local_buffers_keep_legacy_credit_and_window_until_actual_exit() {
+    async fn local_buffers_keep_original_window_after_statement_owner_exits() {
         let fixture = Fixture::new();
-        let (graph, charge, mut protocol) = fixture.result("hello".into()).into_parts();
+        let capacity = fixture.host.resources().result_capacity().unwrap();
+        let (graph, mut protocol) = fixture.result("hello".into()).into_parts();
         let cursor = graph.into_cursor();
-        let (resources, scope) = protocol.reservation_inputs();
-        let credit = legacy_credit(resources.clone(), scope, charge, 8 * 1024 * 1024)
-            .await
-            .unwrap();
         let buffers = LocalProtocolBuffers {
             _window: cursor.retain_physical_guard(),
             cursor,
             bytes: vec![0; RootProfileV1::SEGMENT_BYTES],
             metadata: None,
-            _legacy_credit: Some(credit),
         };
-        assert!(resources.snapshot().result_credit.protocol_writing_bytes > 0);
-        let capacity = resources.result_capacity().unwrap();
-        assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
-        drop(buffers);
-        assert_eq!(resources.snapshot().result_credit.held_bytes(), 0);
-        // Original statement still retains its one position until EOF.
         assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
         assert_eq!(
             protocol.seal_success_visibility(),
             GovernedStatementVisibilitySealOutcome::Sealed
         );
         protocol.complete();
+        // Logical completion cannot free the actual cursor/segment owner.
+        assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+        drop(buffers);
         assert_eq!(capacity.snapshot().held_positions, [0; 4]);
     }
 }

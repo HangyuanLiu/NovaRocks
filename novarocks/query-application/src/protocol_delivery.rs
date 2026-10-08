@@ -20,7 +20,7 @@
 use crate::api::{
     ExecutionHandle, ExecutionOutput, LocalResultProducer, OwnedLocalResult, QueryExecutionError,
     QueryExecutionErrorKind, QueryResult, QueryResultStream, ResultDelivery, ResultFailureView,
-    SchemaDelivery, decoded_result_batch_governance_charge,
+    SchemaDelivery,
 };
 use crate::cancellation::QueryCancellationView;
 use crate::session_control::{
@@ -28,159 +28,9 @@ use crate::session_control::{
     GovernedStatementVisibilitySealOutcome,
 };
 use crate::session_error::QueryServiceError;
-use arrow::record_batch::RecordBatch;
 use novarocks_workload_control::{
-    LocalResourceAuthority, ResultCredit, ResultCreditStage, ResultWindowClass, ResultWindowGrant,
-    WorkError, WorkScope,
+    LocalResourceAuthority, ResultWindowClass, ResultWindowGrant, WorkError, WorkScope,
 };
-
-/// A move-only decoded Arrow batch for an immediate statement result.
-///
-/// Immediate statements have no execution identity or actor receipt, but the
-/// Arrow backing and its protocol bytes still require the same result-credit
-/// transitions as a streamed delivery.
-pub struct ImmediateResultBatch {
-    batch: Option<RecordBatch>,
-    decoded_bytes: u64,
-    credit: Option<ResultCredit>,
-}
-
-pub struct ImmediateResultBatchReservationError {
-    error: WorkError,
-    batch: ImmediateResultBatch,
-}
-
-impl ImmediateResultBatchReservationError {
-    pub const fn error(&self) -> &WorkError {
-        &self.error
-    }
-
-    pub fn into_parts(self) -> (WorkError, ImmediateResultBatch) {
-        (self.error, self.batch)
-    }
-}
-
-impl std::fmt::Debug for ImmediateResultBatchReservationError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ImmediateResultBatchReservationError")
-            .field("error", &self.error)
-            .field("decoded_bytes", &self.batch.decoded_bytes)
-            .finish()
-    }
-}
-
-impl ImmediateResultBatch {
-    pub fn try_new(batch: RecordBatch, credit: ResultCredit) -> Result<Self, QueryExecutionError> {
-        let decoded_bytes = decoded_result_batch_governance_charge(&batch)?;
-        if credit.stage() != ResultCreditStage::DecodedQueued {
-            return Err(QueryExecutionError::new(
-                QueryExecutionErrorKind::InvalidRequest,
-                format!(
-                    "immediate result batch credit must be DecodedQueued, got {:?}",
-                    credit.stage()
-                ),
-            ));
-        }
-        if credit.held_bytes() != decoded_bytes {
-            return Err(QueryExecutionError::new(
-                QueryExecutionErrorKind::InvalidRequest,
-                format!(
-                    "immediate result batch holds {decoded_bytes} bytes but its credit holds {}",
-                    credit.held_bytes()
-                ),
-            ));
-        }
-        Ok(Self {
-            batch: Some(batch),
-            decoded_bytes,
-            credit: Some(credit),
-        })
-    }
-
-    pub fn batch(&self) -> &RecordBatch {
-        self.batch
-            .as_ref()
-            .expect("immediate result batch retains its Arrow backing before completion")
-    }
-
-    pub const fn decoded_bytes(&self) -> u64 {
-        self.decoded_bytes
-    }
-
-    pub async fn reserve_protocol_when_available(
-        mut self,
-        authority: &LocalResourceAuthority,
-        bytes: u64,
-    ) -> Result<Self, ImmediateResultBatchReservationError> {
-        let credit = self
-            .credit
-            .take()
-            .expect("immediate result batch owns credit while awaiting protocol capacity");
-        match credit
-            .reserve_protocol_when_available(authority, bytes)
-            .await
-        {
-            Ok(credit) => {
-                self.credit = Some(credit);
-                Ok(self)
-            }
-            Err(rejection) => {
-                let (error, credit) = rejection.into_parts();
-                self.credit = Some(credit);
-                Err(ImmediateResultBatchReservationError { error, batch: self })
-            }
-        }
-    }
-
-    pub fn begin_protocol_write(mut self, bytes: u64) -> Result<Self, QueryExecutionError> {
-        let credit = self
-            .credit
-            .take()
-            .expect("immediate result batch owns credit before protocol write");
-        match credit.begin_protocol_write(bytes) {
-            Ok(credit) => {
-                self.credit = Some(credit);
-                Ok(self)
-            }
-            Err(rejection) => {
-                let (error, credit) = rejection.into_parts();
-                drop(self.batch.take());
-                drop(credit);
-                Err(QueryExecutionError::new(
-                    QueryExecutionErrorKind::Failed,
-                    format!("begin immediate result protocol write: {error}"),
-                ))
-            }
-        }
-    }
-
-    pub fn complete(mut self) -> Result<(), QueryExecutionError> {
-        drop(self.batch.take());
-        let credit = self
-            .credit
-            .take()
-            .expect("immediate result batch owns credit before completion");
-        credit.consume().map_err(|error| {
-            QueryExecutionError::new(
-                QueryExecutionErrorKind::Failed,
-                format!("consume immediate result protocol credit: {error}"),
-            )
-        })
-    }
-
-    pub fn fail(mut self) {
-        drop(self.batch.take());
-        drop(self.credit.take());
-    }
-}
-
-impl Drop for ImmediateResultBatch {
-    fn drop(&mut self) {
-        drop(self.batch.take());
-        drop(self.credit.take());
-    }
-}
 
 /// Shared move-only owner for any governed query result presented to a client.
 #[must_use = "the governed protocol owner must be settled by its protocol adapter"]
@@ -490,8 +340,6 @@ impl std::fmt::Debug for QuerySessionOutput {
 #[must_use = "the governed query result must be settled by its protocol owner"]
 pub struct GovernedImmediateStatementResult {
     result: OwnedLocalResult,
-    // Transitional LRA protection stays until the complete P08 switch.
-    legacy_decoded_bytes: u64,
     protocol: GovernedProtocolOwner,
 }
 
@@ -510,22 +358,19 @@ impl GovernedImmediateStatementResult {
                 .result_window_alias()
                 .ok_or("Local result has no admitted producer window")?;
             let producer = LocalResultProducer::try_new(statement.scope(), window)?;
-            let result = producer.produce(|| Ok(result))?;
-            let bytes = result.legacy_governance_charge()?;
-            Ok::<_, String>((result, bytes.max(1)))
+            producer.produce(|| Ok(result))
         })();
         match sealed {
-            Ok((result, legacy_decoded_bytes)) => Ok(Self {
+            Ok(result) => Ok(Self {
                 result,
-                legacy_decoded_bytes,
                 protocol: GovernedProtocolOwner::new(statement, resources),
             }),
             Err(error) => Err((error, statement)),
         }
     }
 
-    pub fn into_parts(self) -> (OwnedLocalResult, u64, GovernedProtocolOwner) {
-        (self.result, self.legacy_decoded_bytes, self.protocol)
+    pub fn into_parts(self) -> (OwnedLocalResult, GovernedProtocolOwner) {
+        (self.result, self.protocol)
     }
 }
 
@@ -744,74 +589,5 @@ impl Drop for StreamingStatementResult {
         if !self.settled {
             let _ = self.execution.request_cancel();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use arrow::array::{ArrayRef, Int64Array};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use novarocks_workload_control::{
-        ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
-    };
-
-    use super::*;
-
-    #[tokio::test]
-    async fn immediate_batch_keeps_result_credit_through_protocol_write() {
-        let control = WorkloadControl::try_new(
-            WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: 1024 * 1024,
-                control_bytes: 1024,
-                per_scope_bytes: 1024 * 1024 - 1024,
-            },
-        )
-        .expect("workload control");
-        control.mark_ready().expect("workload ready");
-        let root = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .expect("query root");
-        let authority = control.resources();
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                "value",
-                DataType::Int64,
-                false,
-            )])),
-            vec![Arc::new(Int64Array::from(vec![42])) as ArrayRef],
-        )
-        .expect("record batch");
-        let decoded_bytes = decoded_result_batch_governance_charge(&batch).expect("charge");
-        let credit = authority
-            .reserve_result_credit(&root.owner.scope(), decoded_bytes)
-            .expect("fetch credit")
-            .begin_fetch()
-            .expect("begin fetch")
-            .retain_raw(decoded_bytes)
-            .expect("retain raw")
-            .reserve_decode(&authority, decoded_bytes)
-            .expect("reserve decode")
-            .queue_decoded(decoded_bytes)
-            .expect("queue decoded");
-
-        let batch = ImmediateResultBatch::try_new(batch, credit).expect("immediate batch");
-        assert_eq!(
-            authority.snapshot().result_credit.held_bytes(),
-            decoded_bytes
-        );
-        let batch = batch
-            .reserve_protocol_when_available(&authority, 64)
-            .await
-            .expect("reserve protocol")
-            .begin_protocol_write(64)
-            .expect("begin protocol write");
-        assert!(authority.snapshot().result_credit.protocol_writing_bytes > 0);
-
-        batch.complete().expect("consume immediate batch");
-        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
-        drop(root);
     }
 }
