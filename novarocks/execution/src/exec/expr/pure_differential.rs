@@ -1587,3 +1587,7 @@ mod sec_to_time_tests;
 #[cfg(test)]
 #[path = "pure_differential_crc32_shared_tests.rs"]
 mod crc32_shared_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_regexp_position_tests.rs"]
+mod regexp_position_tests;

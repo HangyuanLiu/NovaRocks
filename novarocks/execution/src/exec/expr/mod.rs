@@ -1218,3 +1218,8 @@ mod legacy_calendar_sec_to_time_baseline_tests;
 
 #[cfg(test)]
 mod legacy_crc32_shared_baseline_tests;
+
+#[cfg(test)]
+mod legacy_regexp_position_baseline_tests;
+#[cfg(test)]
+mod legacy_regexp_count_provenance_baseline_tests;
