@@ -205,6 +205,17 @@ impl StatisticsCollectionProgram {
         columns
     }
 
+    pub(crate) fn result_decoder_with_capacity(
+        &self,
+        binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Result<StatisticsRootResultDecoder, String> {
+        let retention =
+            crate::query_execution::internal_result_cpu::InternalResultRetention::try_new(binding)?;
+        let mut decoder = self.result_decoder();
+        decoder.retention = Some(retention);
+        Ok(decoder)
+    }
+
     pub fn result_decoder(&self) -> StatisticsRootResultDecoder {
         StatisticsRootResultDecoder::new(
             self.required
@@ -515,6 +526,7 @@ pub struct StatisticsRootResultDecoder {
     body_bytes: usize,
     root_eof: bool,
     execution_succeeded: bool,
+    retention: Option<crate::query_execution::internal_result_cpu::InternalResultRetention>,
 }
 
 impl StatisticsRootResultDecoder {
@@ -527,6 +539,7 @@ impl StatisticsRootResultDecoder {
             body_bytes: 0,
             root_eof: false,
             execution_succeeded: false,
+            retention: None,
         }
     }
 
@@ -700,6 +713,10 @@ impl StatisticsRootResultDecoder {
             BTreeMap::new(),
         )
         .map_err(|error| error.to_string())?;
+        let draft = match &self.retention {
+            Some(retention) => draft.attach_guard(retention.spi_guard()),
+            None => draft,
+        };
         self.observed.insert(identity, draft);
         Ok(())
     }
@@ -857,6 +874,32 @@ mod tests {
         }
         assembly.finish().unwrap();
         records
+    }
+
+    #[test]
+    fn last_artifact_body_clone_retains_window_after_decoder_and_artifacts_exit() {
+        let (_control, root, binding, capacity) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        let mut decoder = StatisticsRootResultDecoder::new([identity(1, "theta-v1")]);
+        decoder.retention = Some(
+            crate::query_execution::internal_result_cpu::InternalResultRetention::try_new(&binding)
+                .unwrap(),
+        );
+        for record in statistics_records(&chunk(&[(&[1], "theta-v1", b"one", &[])])) {
+            decoder.apply_relay_body(&record).unwrap();
+        }
+        decoder.observe_root_eof().unwrap();
+        decoder.observe_execution_success().unwrap();
+        let artifacts = decoder.finish().unwrap();
+        let body = artifacts[0].body().clone();
+        drop(binding);
+        root.owner.complete();
+        root.business.release();
+        drop(artifacts);
+        assert_eq!(body.as_ref(), b"one");
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        drop(body);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
     }
 
     #[test]

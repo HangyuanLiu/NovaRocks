@@ -138,6 +138,7 @@ struct AccumulatedWriteSet {
     statistics: Vec<novarocks_spi::connector::write_stack::WriteStatisticsArtifact>,
     statistics_body_bytes: usize,
     statistics_property_bytes: usize,
+    retention: Option<crate::query_execution::internal_result_cpu::InternalResultRetention>,
 }
 
 impl ConnectorWriteSession {
@@ -497,7 +498,24 @@ impl ConnectorWriteSession {
             ));
         }
         let mut accumulated = self.lock_accumulated()?;
-        let (row_count, fragments, statistics) = prepared.into_parts();
+        let (row_count, fragments, statistics, retention) = prepared.into_parts();
+        if let (Some(current), Some(incoming)) = (&accumulated.retention, &retention) {
+            if !current.is_same_admission(incoming) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "write union received a different result allowance or attribution",
+                ));
+            }
+        } else if accumulated.retention.is_some() && retention.is_none()
+            || accumulated.retention.is_none()
+                && retention.is_some()
+                && (!accumulated.fragments.is_empty() || !accumulated.statistics.is_empty())
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "write union cannot mix governed and legacy payload ownership",
+            ));
+        }
         let mut next_rows = accumulated.rows;
         next_rows.add(row_count)?;
         let mut next_ledger = accumulated.ledger;
@@ -577,6 +595,9 @@ impl ConnectorWriteSession {
                     )
                 })?;
         }
+        if accumulated.retention.is_none() {
+            accumulated.retention = retention;
+        }
         accumulated.rows = next_rows;
         accumulated.ledger = next_ledger;
         accumulated.fragments.extend(fragments);
@@ -625,12 +646,13 @@ impl ConnectorWriteSession {
         context: ConnectorRequestContext,
         publication: ConnectorWriteFinishPublication,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        let (row_count, fragments, statistics) = {
+        let (row_count, fragments, statistics, _retention) = {
             let mut accumulated = self.lock_accumulated()?;
             (
                 accumulated.rows.get(),
                 std::mem::take(&mut accumulated.fragments),
                 std::mem::take(&mut accumulated.statistics),
+                accumulated.retention.take(),
             )
         };
         let prepared = self.interpret_parts(row_count, fragments)?;
@@ -2326,6 +2348,48 @@ pub(crate) mod tests {
     /// A copy-on-write mutation and a distributed rewrite drive several
     /// queries against one session and commit once. Each query's set is
     /// complete for its own graph; the statement commits their union.
+    #[test]
+    fn write_union_reuses_one_exact_window_and_rejects_foreign_admission() {
+        let (_control, root, binding, capacity) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        let (_foreign_control, foreign_root, foreign_binding, foreign_capacity) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        let fixture = fixture(1, 16);
+        let target = WriteTargetOrdinal::try_new(0).unwrap();
+        for path in ["s3://b/a.parquet", "s3://b/b.parquet"] {
+            fixture
+                .session
+                .accumulate(
+                    DecodedPreparedWriteSet::for_test(4, vec![(target, fragment_bytes(path))])
+                        .with_test_capacity(&binding),
+                )
+                .unwrap();
+        }
+        let error = fixture
+            .session
+            .accumulate(
+                DecodedPreparedWriteSet::for_test(
+                    4,
+                    vec![(target, fragment_bytes("s3://b/c.parquet"))],
+                )
+                .with_test_capacity(&foreign_binding),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("allowance"));
+        assert_eq!(fixture.session.accumulated_row_count().unwrap(), 8);
+        drop(foreign_binding);
+        foreign_root.owner.complete();
+        foreign_root.business.release();
+        assert_eq!(foreign_capacity.snapshot().held_positions, [0; 4]);
+        drop(binding);
+        root.owner.complete();
+        root.business.release();
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        let _ = fixture.session.finish_accumulated(request_context());
+        assert_eq!(fixture.session.finish_invocations(), 1);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+    }
+
     #[test]
     fn a_session_commits_the_union_of_every_query_it_drove() {
         let fixture = fixture(1, 16);

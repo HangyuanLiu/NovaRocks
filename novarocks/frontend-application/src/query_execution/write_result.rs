@@ -39,6 +39,7 @@
 //!
 //! Design: ADR-0136 (docs/adr/ADR-0136-ordinary-aggregate-statistics-dataflow.md)
 
+use crate::query_execution::internal_result_cpu::InternalResultRetention;
 use novarocks_native_adapter::root_record_assembly::{RootRecordAssembly, RootRecordDomain};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -73,6 +74,7 @@ pub(crate) struct DecodedPreparedWriteSet {
     row_count: u64,
     fragments: Vec<(WriteTargetOrdinal, Vec<u8>)>,
     statistics: Vec<WriteStatisticsArtifact>,
+    retention: Option<InternalResultRetention>,
 }
 
 impl DecodedPreparedWriteSet {
@@ -88,6 +90,7 @@ impl DecodedPreparedWriteSet {
             row_count,
             fragments,
             statistics: Vec::new(),
+            retention: None,
         }
     }
 
@@ -101,7 +104,17 @@ impl DecodedPreparedWriteSet {
             row_count,
             fragments,
             statistics,
+            retention: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_capacity(
+        mut self,
+        binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Self {
+        self.retention = Some(InternalResultRetention::try_new(binding).unwrap());
+        self
     }
 
     pub(crate) const fn row_count(&self) -> u64 {
@@ -118,8 +131,14 @@ impl DecodedPreparedWriteSet {
         u64,
         Vec<(WriteTargetOrdinal, Vec<u8>)>,
         Vec<WriteStatisticsArtifact>,
+        Option<InternalResultRetention>,
     ) {
-        (self.row_count, self.fragments, self.statistics)
+        (
+            self.row_count,
+            self.fragments,
+            self.statistics,
+            self.retention,
+        )
     }
 }
 
@@ -213,6 +232,7 @@ pub(crate) struct RootWriteResultDecoder {
     body_bytes: usize,
     property_bytes: usize,
     root_eof: bool,
+    retention: Option<InternalResultRetention>,
 }
 
 impl RootWriteResultDecoder {
@@ -232,7 +252,18 @@ impl RootWriteResultDecoder {
             body_bytes: 0,
             property_bytes: 0,
             root_eof: false,
+            retention: None,
         }
+    }
+
+    pub(crate) fn new_with_capacity(
+        contract: RootWriteDecodeContract,
+        binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Result<Self, String> {
+        let retention = InternalResultRetention::try_new(binding)?;
+        let mut decoder = Self::new(contract);
+        decoder.retention = Some(retention);
+        Ok(decoder)
     }
 
     pub(crate) fn apply_chunk(&mut self, chunk: &Chunk) -> Result<(), String> {
@@ -518,6 +549,10 @@ impl RootWriteResultDecoder {
                     property_map,
                 )
                 .map_err(|error| format!("write Root artifact draft: {error}"))?;
+                let draft = match &self.retention {
+                    Some(retention) => draft.attach_guard(retention.spi_guard()),
+                    None => draft,
+                };
                 self.statistics
                     .insert(key, WriteStatisticsArtifact::new(target, draft));
             }
@@ -555,6 +590,7 @@ impl RootWriteResultDecoder {
             row_count: self.rows.get(),
             fragments: self.fragments,
             statistics: self.statistics.into_values().collect(),
+            retention: self.retention,
         })
     }
 }
@@ -806,6 +842,60 @@ mod tests {
         }
         assembly.finish().unwrap();
         out
+    }
+
+    #[test]
+    fn prepared_payload_and_last_statistics_body_clone_retain_actual_capacity() {
+        let (_control, root, binding, capacity) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        let target = WriteTargetOrdinal::try_new(0).unwrap();
+        let contract = RootWriteDecodeContract::for_test(
+            [target],
+            [(
+                target,
+                StatisticsArtifactIdentity::try_new(vec![11], "theta-v1").unwrap(),
+            )],
+        );
+        let mut decoder = RootWriteResultDecoder::new_with_capacity(contract, &binding).unwrap();
+        for record in records(vec![
+            fragment(0, 5),
+            artifact(0, 11, "theta-v1", b"sketch"),
+            summary(9),
+        ]) {
+            decoder.apply_relay_body(&record).unwrap();
+        }
+        let prepared = finish(decoder).unwrap();
+        let body = prepared.statistics[0].draft().body().clone();
+        drop(binding);
+        root.owner.complete();
+        root.business.release();
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        drop(prepared);
+        assert_eq!(body.as_ref(), b"sketch");
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        drop(body);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+    }
+
+    #[test]
+    fn fragment_only_prepared_set_retains_capacity_until_its_payload_exits() {
+        let (_control, root, binding, capacity) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        let mut decoder = RootWriteResultDecoder::new_with_capacity(
+            RootWriteDecodeContract::for_test(targets(1), std::iter::empty()),
+            &binding,
+        )
+        .unwrap();
+        for record in records(vec![fragment(0, 5), summary(9)]) {
+            decoder.apply_relay_body(&record).unwrap();
+        }
+        let prepared = finish(decoder).unwrap();
+        drop(binding);
+        root.owner.complete();
+        root.business.release();
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        drop(prepared);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
     }
 
     #[test]

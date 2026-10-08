@@ -371,6 +371,11 @@ impl ResultWindowAlias {
         self.execution_scope().id == scope.id
             && Arc::ptr_eq(&self.execution_scope().inner, &scope.inner)
     }
+    /// Compare the actual physical allowance, independently of child attribution.
+    pub fn shares_capacity_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.holder, &other.holder)
+    }
+
     pub fn scope_id(&self) -> WorkId {
         self.execution_scope().id()
     }
@@ -457,6 +462,47 @@ mod tests {
         control.mark_ready().unwrap();
         (control, handle)
     }
+    #[test]
+    fn physical_window_equality_survives_child_attribution_but_refuses_other_allowances() {
+        let (control, _) = control();
+        let (root, window) = control
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Internal,
+            )
+            .unwrap();
+        let alias = window.retain_alias();
+        let child = root
+            .owner
+            .scope()
+            .child(WorkRequest::new(WorkClass::Management))
+            .unwrap();
+        let delegated = alias.for_child(&child.scope()).unwrap();
+        assert!(alias.shares_capacity_with(&delegated));
+        assert!(!alias.is_for_scope(&child.scope()));
+        assert!(delegated.is_for_scope(&child.scope()));
+        let (foreign_control, _) = self::control();
+        let (foreign, foreign_window) = foreign_control
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Internal,
+            )
+            .unwrap();
+        assert_eq!(alias.scope_id(), foreign_window.scope_id());
+        assert!(!alias.shares_capacity_with(&foreign_window.retain_alias()));
+        drop(delegated);
+        child.complete();
+        drop(alias);
+        drop(window);
+        root.owner.complete();
+        root.business.release();
+        drop(foreign_window);
+        foreign.owner.complete();
+        foreign.business.release();
+    }
+
     #[test]
     fn nonqueued_root_window_refusal_is_atomic_and_aliases_keep_the_root() {
         let (control, capacity) = control();

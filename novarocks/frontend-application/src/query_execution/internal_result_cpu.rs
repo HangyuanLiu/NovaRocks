@@ -58,6 +58,36 @@ pub(crate) fn require_internal_result_capacity(
     Ok(())
 }
 
+/// Private payload retention for a closed Internal handoff. A write union
+/// may reuse only this exact allowance and attribution, keeping one guard.
+#[derive(Clone)]
+pub(crate) struct InternalResultRetention {
+    binding: novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+}
+impl InternalResultRetention {
+    pub(crate) fn try_new(
+        binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Result<Self, String> {
+        require_internal_result_capacity(binding.scope(), &binding.window_alias())?;
+        Ok(Self {
+            binding: binding.clone(),
+        })
+    }
+    pub(crate) fn spi_guard(&self) -> novarocks_spi::connector::ConnectorPayloadRetentionGuard {
+        novarocks_spi::connector::ConnectorPayloadRetentionGuard::new(self.binding.window_alias())
+    }
+    pub(crate) fn is_same_admission(&self, other: &Self) -> bool {
+        let window = self.binding.window_alias();
+        window.is_for_scope(other.binding.scope())
+            && window.shares_capacity_with(&other.binding.window_alias())
+    }
+}
+impl std::fmt::Debug for InternalResultRetention {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InternalResultRetention")
+    }
+}
+
 pub(crate) struct InternalResultCpuOwner {
     workers: QueryBlockingExecutorOwner,
     runtime: InternalResultCpu,
@@ -200,6 +230,46 @@ impl InternalResultCpu {
             forwarder,
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn admitted_internal_fixture() -> (
+    novarocks_workload_control::WorkloadControl,
+    novarocks_workload_control::RootWork,
+    novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    novarocks_workload_control::ResultCapacityHandle,
+) {
+    use novarocks_workload_control::{
+        ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+    };
+    let control = WorkloadControl::try_new(
+        WorkloadConfig::default(),
+        ResourceConfig {
+            total_bytes: 1024 * 1024,
+            control_bytes: 1024,
+            per_scope_bytes: 1024 * 1024 - 1024,
+        },
+    )
+    .unwrap();
+    let capacity = control
+        .configure_result_capacity(ResultCapacityConfig::V1)
+        .unwrap();
+    control.mark_ready().unwrap();
+    let (root, window) = control
+        .root_admission()
+        .try_begin_root_with_result(
+            WorkRequest::new(WorkClass::Management),
+            ResultWindowClass::Internal,
+        )
+        .unwrap();
+    let binding =
+        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(
+            &root.owner.scope(),
+            window.retain_alias(),
+        )
+        .unwrap();
+    drop(window);
+    (control, root, binding, capacity)
 }
 
 #[cfg(test)]
