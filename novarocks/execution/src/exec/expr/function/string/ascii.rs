@@ -16,9 +16,11 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, StringArray};
+use arrow::array::ArrayRef;
+#[cfg(test)]
+use arrow::array::{Array, StringArray};
+#[cfg(test)]
 use std::sync::Arc;
-
 pub fn eval_ascii(
     arena: &ExprArena,
     expr: ExprId,
@@ -26,25 +28,9 @@ pub fn eval_ascii(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     let _ = expr;
-    let str_arr = arena.eval(args[0], chunk)?;
-    let s_arr = str_arr
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| "ascii expects string".to_string())?;
-    let len = s_arr.len();
-    let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        if s_arr.is_null(i) {
-            out.push(None);
-            continue;
-        }
-        let s = s_arr.value(i);
-        let code = s.as_bytes().first().copied().unwrap_or(0) as i32;
-        out.push(Some(code));
-    }
-    Ok(Arc::new(arrow::array::Int32Array::from(out)) as ArrayRef)
+    let array = arena.eval(args[0], chunk)?;
+    novarocks_functions::builtin::string_measure::evaluate_legacy_ascii(&array)
 }
-
 #[cfg(test)]
 mod legacy_string_measure_contract_tests {
     use super::*;

@@ -14,30 +14,110 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
-//! Selected UTF-8 byte and Unicode scalar measurements for exact owners.
-//! Output allocation checks establish representability, not host memory admission.
-
-use std::sync::Arc;
-
-use arrow_array::{Array, ArrayRef, StringArray, builder::Int32Builder};
-use arrow_schema::DataType;
-use novarocks_type_contract::ValueLogicalType;
-
+//! ONE original byte/scalar measurement with explicit carrier projections.
 use crate::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues,
+    Selection,
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
 };
-
-/// Frozen by the exact preparation owner, without runtime name resolution.
+use arrow_array::{Array, ArrayRef, Int32Array, StringArray, builder::Int32Builder};
+use arrow_schema::DataType;
+use novarocks_type_contract::ValueLogicalType;
+use std::sync::Arc;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StringMeasureOp {
     Ascii,
     Bytes,
     Characters,
 }
-
+#[derive(Debug)]
+enum MeasureFailure {
+    Kernel(KernelFailure),
+    Legacy(String),
+}
+impl From<KernelFailure> for MeasureFailure {
+    fn from(error: KernelFailure) -> Self {
+        Self::Kernel(error)
+    }
+}
+fn string_reader(array: &ArrayRef, op: StringMeasureOp) -> Result<&StringArray, MeasureFailure> {
+    array.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+        MeasureFailure::Legacy(
+            if op == StringMeasureOp::Ascii {
+                "ascii expects string"
+            } else {
+                "length expects string"
+            }
+            .to_string(),
+        )
+    })
+}
+fn original_value(
+    op: StringMeasureOp,
+    text: &str,
+    work: &mut Option<EvaluationCheckpoints<'_>>,
+) -> Result<i64, MeasureFailure> {
+    Ok(match op {
+        StringMeasureOp::Ascii => i64::from(text.as_bytes().first().copied().unwrap_or(0) as i32),
+        StringMeasureOp::Bytes => text.len() as i64,
+        StringMeasureOp::Characters => {
+            // Keep the original chars().count() author. Observe its original
+            // byte workload before the opaque library operation, preserving
+            // the existing byte quantum rather than replacing its mathematics.
+            if let Some(work) = work {
+                for _ in text.as_bytes() {
+                    work.step()?;
+                }
+            }
+            text.chars().count() as i64
+        }
+    })
+}
+fn compute_rows(
+    op: StringMeasureOp,
+    values: &StringArray,
+    address: impl Fn(usize, usize) -> usize,
+    selection: Selection<'_>,
+    nullable: Option<bool>,
+    work: &mut Option<EvaluationCheckpoints<'_>>,
+    mut output: impl FnMut(Option<i64>) -> Result<(), MeasureFailure>,
+) -> Result<(), MeasureFailure> {
+    for (ordinal, batch) in selection.iter().enumerate() {
+        if let Some(work) = work {
+            work.step()?;
+        }
+        let row = address(ordinal, batch);
+        if nullable.is_some() && row >= values.len() {
+            return Err(
+                internal("string measurement selected row is outside its checked carrier").into(),
+            );
+        }
+        if values.is_null(row) {
+            if nullable == Some(false) {
+                return Err(internal(
+                    "string measurement non-null input contains selected SQL NULL",
+                )
+                .into());
+            }
+            output(None)?;
+            continue;
+        }
+        output(Some(original_value(op, values.value(row), work)?))?;
+    }
+    Ok(())
+}
+fn int32_value(value: i64) -> Result<i32, MeasureFailure> {
+    i32::try_from(value)
+        .map_err(|_| MeasureFailure::Legacy(format!("length result out of INT range: {value}")))
+}
+fn length_int32(values: Vec<Option<i64>>) -> Result<ArrayRef, MeasureFailure> {
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        out.push(value.map(int32_value).transpose()?);
+    }
+    Ok(Arc::new(Int32Array::from(out)))
+}
 pub(super) fn evaluate_string_measure<'a>(
     op: StringMeasureOp,
     input: ScalarCallInput<'_, 'a>,
@@ -53,9 +133,10 @@ pub(super) fn evaluate_string_measure<'a>(
         ));
     };
     let target = input.contract().result_type();
-    let nullable = match op {
-        StringMeasureOp::Ascii => true,
-        StringMeasureOp::Bytes | StringMeasureOp::Characters => source.nullable,
+    let nullable = if op == StringMeasureOp::Ascii {
+        true
+    } else {
+        source.nullable
     };
     if source.logical_type != ValueLogicalType::Physical
         || source.data_type != DataType::Utf8
@@ -72,61 +153,101 @@ pub(super) fn evaluate_string_measure<'a>(
             "string measurement carrier differs from its checked argument",
         ));
     }
-    let values = argument
-        .array()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| internal("string measurement selected Utf8 carrier cannot be downcast"))?;
+    let values = string_reader(argument.array(), op)
+        .map_err(|_| internal("string measurement selected Utf8 carrier cannot be downcast"))?;
     let selection = input.selection();
     output_capacity(selection.len())?;
+    let mut work = Some(EvaluationCheckpoints::new(control));
     let mut builder = Int32Builder::with_capacity(selection.len());
-    let mut work = EvaluationCheckpoints::new(control);
-    for (ordinal, batch_row) in selection.iter().enumerate() {
-        work.step()?;
-        let row = argument.value_row(ordinal, batch_row);
-        if row >= values.len() {
-            return Err(internal(
-                "string measurement selected row is outside its checked carrier",
-            ));
+    compute_rows(
+        op,
+        values,
+        |ordinal, batch| argument.value_row(ordinal, batch),
+        selection,
+        Some(source.nullable),
+        &mut work,
+        |value| {
+            match value {
+                Some(value) => builder.append_value(int32_value(value)?),
+                None => builder.append_null(),
+            };
+            Ok(())
+        },
+    )
+    .map_err(|error| match error {
+        MeasureFailure::Kernel(cause) => cause,
+        MeasureFailure::Legacy(message)
+            if message == "ascii expects string" || message == "length expects string" =>
+        {
+            internal("string measurement selected Utf8 carrier cannot be downcast")
         }
-        if values.is_null(row) {
-            if !source.nullable {
-                return Err(internal(
-                    "string measurement non-null input contains selected SQL NULL",
-                ));
-            }
-            builder.append_null();
-            continue;
-        }
-        let text = values.value(row);
-        let value = match op {
-            StringMeasureOp::Ascii => i32::from(text.as_bytes().first().copied().unwrap_or(0)),
-            StringMeasureOp::Bytes => i32::try_from(text.len())
-                .map_err(|_| internal("checked Utf8 byte length exceeds its i32 offset domain"))?,
-            StringMeasureOp::Characters => {
-                let mut count = 0usize;
-                // A validated UTF-8 string has one non-continuation byte per
-                // Unicode scalar. Inspect every byte under the original control;
-                // an opaque chars().count() would delay cancellation on long text.
-                for &byte in text.as_bytes() {
-                    work.step()?;
-                    if byte & 0xc0 != 0x80 {
-                        count += 1;
-                    }
-                }
-                i32::try_from(count).map_err(|_| {
-                    internal("checked Utf8 character count exceeds its i32 offset domain")
-                })?
-            }
-        };
-        builder.append_value(value);
-    }
+        MeasureFailure::Legacy(message) => internal(&message),
+    })?;
     let output = Arc::new(builder.finish()) as ArrayRef;
-    work.finish()?;
+    work.take().unwrap().finish()?;
     SelectedValues::try_new(selection, &target.data_type, output, Box::default())
         .map_err(|_| internal("string measurement compact output violates its selected contract"))
 }
-
+fn legacy_failure(error: MeasureFailure) -> String {
+    match error {
+        MeasureFailure::Kernel(cause) => cause.to_string(),
+        MeasureFailure::Legacy(message) => message,
+    }
+}
+/// V1 retains its original source length and ignores the result type.
+pub fn evaluate_legacy_ascii(array: &ArrayRef) -> Result<ArrayRef, String> {
+    let values = string_reader(array, StringMeasureOp::Ascii).map_err(legacy_failure)?;
+    let mut rows = Vec::with_capacity(array.len());
+    compute_rows(
+        StringMeasureOp::Ascii,
+        values,
+        |_, batch| batch,
+        Selection::all(array.len()),
+        None,
+        &mut None,
+        |value| {
+            rows.push(value.map(int32_value).transpose()?);
+            Ok(())
+        },
+    )
+    .map_err(legacy_failure)?;
+    Ok(Arc::new(Int32Array::from(rows)))
+}
+/// V1 computes all input rows before checking its original requested carrier.
+pub fn evaluate_legacy_length(
+    array: &ArrayRef,
+    characters: bool,
+    target: Option<&DataType>,
+) -> Result<ArrayRef, String> {
+    let op = if characters {
+        StringMeasureOp::Characters
+    } else {
+        StringMeasureOp::Bytes
+    };
+    let values = string_reader(array, op).map_err(legacy_failure)?;
+    let mut rows = Vec::with_capacity(array.len());
+    compute_rows(
+        op,
+        values,
+        |_, batch| batch,
+        Selection::all(array.len()),
+        None,
+        &mut None,
+        |value| {
+            rows.push(value);
+            Ok(())
+        },
+    )
+    .map_err(legacy_failure)?;
+    match target.ok_or_else(|| "length return type is missing".to_string())? {
+        DataType::Int32 => length_int32(rows).map_err(legacy_failure),
+        DataType::Int64 => Ok(Arc::new(arrow_array::Int64Array::from(rows))),
+        other => Err(format!(
+            "length return type must be INT/BIGINT, got {:?}",
+            other
+        )),
+    }
+}
 /// Allocation representability only; the host owns formal memory admission.
 fn output_capacity(rows: usize) -> Result<(), KernelFailure> {
     let values = rows
@@ -634,3 +755,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "string_measure_shared_control_tests.rs"]
+mod shared_control_tests;
