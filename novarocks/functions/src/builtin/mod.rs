@@ -208,3 +208,6 @@ mod xx_hash3_128_owner;
 
 pub mod calendar_sec_to_time;
 mod calendar_sec_to_time_owner;
+
+pub mod regexp_position;
+mod regexp_position_owner;
