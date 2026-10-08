@@ -1458,5 +1458,5 @@ mod parse_url_tests;
 #[path = "to_base64_tests.rs"]
 mod to_base64_tests;
 
-#[path = "to_binary_before_tests.rs"]
-mod to_binary_before_tests;
+#[path = "to_binary_after_tests.rs"]
+mod to_binary_after_tests;

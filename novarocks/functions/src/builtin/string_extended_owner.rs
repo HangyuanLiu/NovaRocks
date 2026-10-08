@@ -75,7 +75,7 @@ pub(super) fn effects(operation: Operation) -> FunctionEffectDeclaration {
         },
         failure_behavior: FunctionFailureBehavior::Propagate,
         null_behavior: if matches!(operation, Operation::ToBinary) {
-            FunctionNullBehavior::ControlDefined
+            FunctionNullBehavior::CalledOnNull
         } else {
             FunctionNullBehavior::Strict
         },
