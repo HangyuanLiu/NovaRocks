@@ -31,7 +31,11 @@ use novarocks_query_application::{
 };
 use novarocks_result_contract::{RootOutputKind, RootProfileId};
 use novarocks_workload_control::ResultWindowAlias;
-use std::{num::NonZeroU64, sync::Arc, time::Instant};
+use std::{
+    num::NonZeroU64,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 pub(super) enum RelayedRootAnswer {
     Data(RetainedRootReply),
@@ -120,6 +124,23 @@ async fn drive(
             .await;
             return;
         }
+        // The wire wait is expressed in whole milliseconds. Round down so the
+        // request cannot extend the admitted absolute deadline. If no whole
+        // millisecond remains, wait for that exact deadline without issuing RPC.
+        let wait = Duration::from_millis(
+            deadline
+                .saturating_duration_since(now)
+                .min(super::execution::MAX_ROOT_RESULT_WAIT)
+                .as_millis() as u64,
+        );
+        if wait.is_zero() {
+            tokio::time::sleep_until(deadline.into()).await;
+            let _ = send(RelayedRootAnswer::Refused(
+                "root read deadline expired".into(),
+            ))
+            .await;
+            return;
+        }
         let Some(read) = frontier.next_read() else {
             let _ = send(RelayedRootAnswer::Refused(
                 "root reader has no next frontier".into(),
@@ -133,9 +154,7 @@ async fn drive(
             frontier.kind(),
             read.wanted,
             read.consumed,
-            deadline
-                .saturating_duration_since(now)
-                .min(super::execution::MAX_ROOT_RESULT_WAIT),
+            wait,
         ) {
             Ok(request) => request,
             Err(error) => {
@@ -241,6 +260,7 @@ mod tests {
     struct Port {
         outcomes: Mutex<VecDeque<RootReadOutcome>>,
         reads: Mutex<Vec<(Option<u64>, u64)>>,
+        waits: Mutex<Vec<Duration>>,
         sealed: AtomicBool,
     }
     impl Port {
@@ -248,6 +268,7 @@ mod tests {
             Arc::new(Self {
                 outcomes: Mutex::new(outcomes.into()),
                 reads: Mutex::new(Vec::new()),
+                waits: Mutex::new(Vec::new()),
                 sealed: AtomicBool::new(false),
             })
         }
@@ -267,6 +288,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((request.wanted().map(|n| n.get()), request.consumed()));
+            self.waits.lock().unwrap().push(request.max_wait());
             let outcome = self
                 .outcomes
                 .lock()
@@ -429,6 +451,57 @@ mod tests {
         assert_eq!(end.output_rows, 42);
         assert_eq!(*port.reads.lock().unwrap(), vec![(Some(1), 0)]);
     }
+    #[tokio::test]
+    async fn fractional_deadline_tail_uses_a_valid_bounded_wire_wait() {
+        let (_control, _capacity, _work, window) = window();
+        let port = Port::new(vec![RootReadOutcome::End(RootResultEnd {
+            sequence: NonZeroU64::MIN,
+            output_rows: 42,
+        })]);
+        let mut polls = RelayedRootPolls::start(
+            port.clone(),
+            root(),
+            RootOutputKind::CountOnly,
+            window.retain_alias(),
+            Instant::now() + Duration::from_micros(100_900),
+            Arc::new(Wake),
+            FrontendDataRuntime::new(tokio::runtime::Handle::current()),
+        )
+        .unwrap();
+        let RelayedRootAnswer::End(end) = next(&mut polls).await else {
+            panic!("fractional deadline tail must not violate the wire contract");
+        };
+        assert_eq!(end.output_rows, 42);
+        let waits = port.waits.lock().unwrap();
+        assert_eq!(waits.len(), 1);
+        assert!(waits[0] <= Duration::from_millis(100));
+        assert!(!waits[0].is_zero());
+        assert!(waits[0].subsec_nanos().is_multiple_of(1_000_000));
+    }
+
+    #[tokio::test]
+    async fn submillisecond_deadline_tail_expires_without_issuing_a_read() {
+        let (_control, _capacity, _work, window) = window();
+        let port = Port::new(Vec::new());
+        let deadline = Instant::now() + Duration::from_micros(900);
+        let mut polls = RelayedRootPolls::start(
+            port.clone(),
+            root(),
+            RootOutputKind::CountOnly,
+            window.retain_alias(),
+            deadline,
+            Arc::new(Wake),
+            FrontendDataRuntime::new(tokio::runtime::Handle::current()),
+        )
+        .unwrap();
+        let RelayedRootAnswer::Refused(message) = next(&mut polls).await else {
+            panic!("deadline tail must expire");
+        };
+        assert_eq!(message, "root read deadline expired");
+        assert!(Instant::now() >= deadline);
+        assert!(port.reads.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn wrong_receipt_refuses_and_last_delivery_alias_keeps_window() {
         let (_control, capacity, work, window) = window();
