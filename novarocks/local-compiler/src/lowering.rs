@@ -686,7 +686,21 @@ fn lower(
                 .inputs
                 .iter()
                 .all(|input| properties.get(input).is_some_and(|p| p.2));
+        // Projection may drop a checked hash key and therefore publish
+        // Unconstrained distribution. Its rows still run in the exact input
+        // instances; losing the key does not create a new placement source.
+        let projected_placement = matches!(node.kind, NodeKind::Project { .. })
+            && node.inputs.len() == 1
+            && physical.nodes().get(&node.inputs[0]).is_some_and(|input| {
+                input.output_properties.row_multiplicity
+                    == novarocks_physical_plan::RowMultiplicity::SingleCopy
+                    && matches!(
+                        input.output_properties.distribution,
+                        Distribution::Hash { .. } | Distribution::BucketShuffle { .. }
+                    )
+            });
         let scan_rooted = matches!(node.kind, NodeKind::Scan { .. })
+            || projected_placement
             || partial_groups
             || union_placed
             || ((transparent || partial_rows)

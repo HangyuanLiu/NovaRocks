@@ -942,3 +942,205 @@ fn compiled_hash_stream_places_rows_by_the_exchange_hash_of_its_key_roots() {
         );
     }
 }
+
+// Intended append to compiled_exchange_tests.rs; reuses its private fixture helpers.
+fn drop_distribution_key_project_plan(
+    hashed: bool,
+    values_rows: &[(i64, i64)],
+) -> (PhysicalPlan, NodeId) {
+    let edge = EdgeId::new(5);
+    let producer_id = FragmentId::new(1);
+    let consumer_id = FragmentId::new(2);
+
+    let mut producer = FragmentBuilder::new(producer_id);
+    let values = producer.reserve_node_id().unwrap();
+    let a = producer
+        .add_value(
+            int64(),
+            ValueOrigin::NodeOutput {
+                node: values,
+                output_ordinal: 0,
+            },
+        )
+        .unwrap();
+    let b = producer
+        .add_value(
+            int64(),
+            ValueOrigin::NodeOutput {
+                node: values,
+                output_ordinal: 1,
+            },
+        )
+        .unwrap();
+    let mut rows = Vec::new();
+    for &(a_value, b_value) in values_rows {
+        let a_cell = producer
+            .add_expression(
+                values,
+                int64(),
+                ExprKind::Literal(LiteralValue::Int64(a_value)),
+            )
+            .unwrap();
+        let b_cell = producer
+            .add_expression(
+                values,
+                int64(),
+                ExprKind::Literal(LiteralValue::Int64(b_value)),
+            )
+            .unwrap();
+        rows.push(vec![a_cell, b_cell].into_boxed_slice());
+    }
+    producer
+        .add_values(values, rows.into_boxed_slice(), Box::from([a, b]))
+        .unwrap();
+    let producer = producer
+        .finish_definition(values, FragmentSink::Stream { edge }, dop())
+        .unwrap();
+
+    let mut consumer = FragmentBuilder::new(consumer_id);
+    let exchange = consumer.reserve_node_id().unwrap();
+    let b_import = consumer
+        .add_value(
+            int64(),
+            ValueOrigin::ExchangeImport {
+                edge,
+                source_value: b,
+            },
+        )
+        .unwrap();
+    let a_import = consumer
+        .add_value(
+            int64(),
+            ValueOrigin::ExchangeImport {
+                edge,
+                source_value: a,
+            },
+        )
+        .unwrap();
+    consumer
+        .add_exchange_source(
+            exchange,
+            edge,
+            Box::from([(b, b_import), (a, a_import)]),
+            Box::from([b_import, a_import]),
+            if hashed {
+                hash([b_import, a_import])
+            } else {
+                Distribution::Unconstrained
+            },
+            RowMultiplicity::SingleCopy,
+        )
+        .unwrap();
+    let project = consumer.reserve_node_id().unwrap();
+    let selected = consumer
+        .add_expression(project, int64(), ExprKind::Value(b_import))
+        .unwrap();
+    consumer
+        .add_project(
+            project,
+            exchange,
+            Box::from([(selected, b_import)]),
+            Box::from([b_import]),
+        )
+        .unwrap();
+    let consumer = consumer
+        .finish_definition(project, FragmentSink::Result, dop())
+        .unwrap();
+    assert_eq!(
+        consumer.nodes()[&project].output_properties.distribution,
+        Distribution::Unconstrained
+    );
+    if hashed {
+        assert!(matches!(
+            consumer.nodes()[&exchange].output_properties.distribution,
+            Distribution::Hash { .. }
+        ));
+    } else {
+        assert_eq!(
+            consumer.nodes()[&exchange].output_properties.distribution,
+            Distribution::Unconstrained
+        );
+    }
+    let (source_distribution, destination_distribution) = if hashed {
+        (hash([b, a]), hash([b_import, a_import]))
+    } else {
+        (Distribution::Unconstrained, Distribution::Unconstrained)
+    };
+    let output = consumer.nodes()[&project].output.clone();
+
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([73; 16]).unwrap());
+    plan.add_fragment(producer).unwrap();
+    plan.add_fragment(consumer).unwrap();
+    plan.add_edge(Edge {
+        id: edge,
+        kind: EdgeKind::Stream,
+        source: EdgeSource {
+            fragment: producer_id,
+            projection: Box::from([b, a]),
+        },
+        destination: EdgeDestination {
+            fragment: consumer_id,
+            node: exchange,
+            receive_mapping: Box::from([(b, b_import), (a, a_import)]),
+        },
+        partitioning: EdgePartitioning {
+            source: source_distribution,
+            source_multiplicity: RowMultiplicity::SingleCopy,
+            destination: destination_distribution,
+            destination_multiplicity: RowMultiplicity::SingleCopy,
+        },
+    })
+    .unwrap();
+    plan.set_result_port(ResultPort {
+        fragment: consumer_id,
+        output,
+        fields: Box::from([ResultField {
+            name: "b".into(),
+            alias: None,
+            value: b_import,
+            ty: int64(),
+        }]),
+    })
+    .unwrap();
+    (plan.finish().unwrap(), exchange)
+}
+
+/// Literal cells are the only roots; each gets one eager use.
+#[test]
+fn checked_hash_receiver_project_may_drop_a_distribution_key() {
+    let (plan, _) = drop_distribution_key_project_plan(true, &ROWS);
+    let mut checked = packages(&plan);
+    let consumer = compile(
+        checked.remove(&FragmentId::new(2)).unwrap(),
+        Some(NonZeroUsize::new(1).unwrap()),
+    );
+    assert!(
+        consumer
+            .graph()
+            .nodes()
+            .iter()
+            .any(|node| matches!(node.kind(), ProgramNodeKind::Project { .. }))
+    );
+}
+
+#[test]
+fn unknown_exchange_source_does_not_gain_project_placement() {
+    let (plan, receiver) = drop_distribution_key_project_plan(false, &ROWS);
+    let mut checked = packages(&plan);
+    let consumer = checked.remove(&FragmentId::new(2)).unwrap();
+    let functions = crate::exec::expr::compiled_program::tests::rng_subset();
+    let providers =
+        PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &FixtureControl)
+            .unwrap();
+    let validated =
+        validate_fragment_providers(Arc::new(consumer), &providers, &FixtureControl).unwrap();
+    let result = compile_fragment(
+        validated,
+        &functions,
+        options(Some(NonZeroUsize::new(1).unwrap())),
+        &FixtureControl,
+    );
+    assert!(
+        matches!(result, Err(novarocks_local_compiler::FragmentCompileError::Unsupported { node: Some(node), feature: "unconstrained distribution without a runtime-split scan placement" }) if node == receiver)
+    );
+}
