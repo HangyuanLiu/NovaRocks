@@ -3801,7 +3801,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 .node_output_properties(receiver)
                 .expect("the exchange source was just inserted")
                 .clone();
-            self.plan_builder.add_edge(Edge {
+            let edge_contract = Edge {
                 id: edge,
                 kind: EdgeKind::ChangeStreamRouter,
                 source: EdgeSource {
@@ -3819,7 +3819,12 @@ impl<'a> ContractLoweringVisitor<'a> {
                     destination: destination_distribution,
                     destination_multiplicity: RowMultiplicity::SingleCopy,
                 },
-            })?;
+            };
+            self.work.flush()?;
+            self.plan_builder.add_edge(edge_contract.clone())?;
+            self.work.flush()?;
+            self.edges.insert(edge, edge_contract);
+            self.work.step()?;
             router_routes.push(ContractChangeStreamRoute {
                 route_id: route.route_id,
                 write_target_ordinal: route.write_target_ordinal,
@@ -3965,7 +3970,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                         .map_err(Self::state_source_error)?;
                 }
             }
-            self.plan_builder.add_edge(Edge {
+            let edge_contract = Edge {
                 id: edge,
                 kind: EdgeKind::Stream,
                 source: EdgeSource {
@@ -3983,7 +3988,12 @@ impl<'a> ContractLoweringVisitor<'a> {
                     destination: Distribution::Singleton,
                     destination_multiplicity: RowMultiplicity::SingleCopy,
                 },
-            })?;
+            };
+            self.work.flush()?;
+            self.plan_builder.add_edge(edge_contract.clone())?;
+            self.work.flush()?;
+            self.edges.insert(edge, edge_contract);
+            self.work.step()?;
             exchange_nodes.push(exchange);
             exchange_outputs.push(imported.into_boxed_slice());
         }

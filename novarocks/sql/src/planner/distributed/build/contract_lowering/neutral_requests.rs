@@ -215,9 +215,22 @@ fn aggregate_request<'a>(
             });
         }
         canonical.request()
+    } else if let Some(canonical) = entry.canonical.as_ref() {
+        // The same construction transaction authored this merge's current
+        // request from its actual contributors. Publication borrows that ONE
+        // receipt, retaining the consumer's own captured source and identity.
+        work.step()?;
+        let belongs = canonical.belongs_to(captured);
+        work.step()?;
+        if !belongs {
+            return Err(ContractLoweringError::InvalidAggregate {
+                detail: "neutral aggregate merge has another original source",
+            });
+        }
+        canonical.request()
     } else {
-        // Merge keeps its own full logical request, including original ORDER
-        // and its original optional constraint. State inputs stay independent.
+        // Original lowering has no current merge receipt. Preserve its exact
+        // captured request; absence does not synthesize computed metadata.
         captured.request()
     };
     Ok((request, captured.constant_policy()))
