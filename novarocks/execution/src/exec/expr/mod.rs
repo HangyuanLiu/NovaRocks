@@ -1337,3 +1337,6 @@ mod legacy_array_match_baseline_tests;
 
 #[cfg(test)]
 mod legacy_array_difference_baseline_tests;
+
+#[cfg(test)]
+mod numeric_unary_original_nonnull_sql_baseline_tests;

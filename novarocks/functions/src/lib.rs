@@ -2650,3 +2650,6 @@ mod native_negate;
 pub use native_negate::*;
 
 pub mod binary_text;
+
+#[cfg(test)]
+mod native_negate_original_decimal_carrier_baseline_tests;
