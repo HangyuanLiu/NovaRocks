@@ -211,10 +211,7 @@ pub(super) fn evaluate_calendar_diff<'a>(
                 let left = readers[0].read(rows[0], &mut work)?;
                 let right = readers[1].read(rows[1], &mut work)?;
                 work.flush()?;
-                let difference = match (left, right) {
-                    (Some(left), Some(right)) => Some((left - right).num_days()),
-                    _ => None,
-                };
+                let difference = crate::calendar_period_numeric::date_difference_days(left, right);
                 work.flush()?;
                 difference
             };

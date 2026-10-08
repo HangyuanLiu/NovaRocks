@@ -217,10 +217,7 @@ pub fn eval_datediff(
     let b = extract_date_array(&arena.eval(args[1], chunk)?)?;
     let mut out = Vec::with_capacity(a.len());
     for i in 0..a.len() {
-        let v = match (a[i], b[i]) {
-            (Some(x), Some(y)) => Some((x - y).num_days()),
-            _ => None,
-        };
+        let v = novarocks_functions::calendar_period_numeric::date_difference_days(a[i], b[i]);
         out.push(v);
     }
     Ok(Arc::new(Int64Array::from(out)) as ArrayRef)

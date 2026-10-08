@@ -18,7 +18,15 @@
 //! The original months_diff tail and years_diff anniversary formulas.
 //! This finite numeric author does not introduce end-of-month normalization.
 
-use chrono::{Datelike, NaiveDateTime, Timelike};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
+
+/// Original DATEDIFF/DAYS_DIFF row computation after both date extractions.
+pub fn date_difference_days(left: Option<NaiveDate>, right: Option<NaiveDate>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some((left - right).num_days()),
+        _ => None,
+    }
+}
 
 fn datetime_tail_value(dt: NaiveDateTime) -> i64 {
     dt.day() as i64 * 1_000_000_000_000
