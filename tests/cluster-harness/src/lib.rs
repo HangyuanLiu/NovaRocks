@@ -20,6 +20,7 @@ mod effective_launch_config;
 pub use effective_launch_config::EffectiveLaunchConfigEvidence;
 pub mod delayed_s3;
 pub mod isolated_iceberg_rest;
+pub mod listing_rest;
 pub mod loopback_s3;
 pub mod native_fault_proxy;
 pub mod process_resources;

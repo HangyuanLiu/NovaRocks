@@ -9,6 +9,7 @@ mod frontend_lifecycle;
 mod iceberg_delete_applicability;
 mod iceberg_delete_oracle;
 mod iceberg_delete_performance;
+mod listing;
 mod memory_attribution;
 mod mv_recovery;
 mod mv_uea7;
@@ -44,6 +45,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(query_concurrency::scenarios());
     scenarios.extend(query_output::scenarios());
     scenarios.extend(memory_attribution::scenarios());
+    scenarios.push(Box::new(listing::CatalogListing));
     scenarios.extend(uea1_performance::scenarios());
     scenarios.extend(result_delivery_baseline::scenarios());
     scenarios.extend(uea4_catalog_planning::scenarios());
