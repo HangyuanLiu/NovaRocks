@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "stage": "P09 private HMS harness v1 diagnostics",
+  "classification": "harness JSON-prefix parser failure after private REST startup; no HMS/native execution",
+  "matrix": {
+    "source_revision": "9310dfd8d91d69ee7a695f44fc0ecc37a4fdd56b",
+    "source_dirty": false,
+    "server_binary": "/Users/harbor/.codex/worktrees/b946/NovaRocks/target/debug/novarocks",
+    "server_sha256": "5cd6d2126bc2c2b565912a8d0581f87aa57c2e7cdf156366d2f5a4004cf72f65",
+    "owner_control_root": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-private-hms-native-20261009/fixture-owner",
+    "topology": "1FE+3BE",
+    "input_freeze_sha256": "f318a5e6e107a84af0d30e748eb3db8dd5ffbb7c6f3da2b3c1b6cda5ce02308b",
+    "rest-startup.log": {
+      "exit_code": 0,
+      "duration_seconds": 3.795
+    },
+    "cleanup_complete": true,
+    "recovery_cleanup": [
+      {
+        "log": "recovery-rest-unbind.log",
+        "exit_code": 0
+      },
+      {
+        "log": "recovery-catalog-delete.log",
+        "exit_code": 0
+      },
+      {
+        "log": "recovery-object-store-delete.log",
+        "exit_code": 0
+      }
+    ],
+    "classification": "harness JSON prefix parse failed after REST startup; no HMS or native FE/BE started",
+    "owner_locator": {
+      "control_root": "/Users/harbor/.codex/worktrees/b946/NovaRocks/logs/mem-1-m07/p09-private-hms-native-20261009/fixture-owner",
+      "daemon_id": "b79582e0-9a8f-4fa8-93bc-71e5d8ccba24"
+    },
+    "catalog_runtime": "cat-ff2bcfd3257a",
+    "object_store_runtime": "os-eec671f90159"
+  },
+  "raw": [
+    {
+      "path": "logs/mem-1-m07/p09-private-hms-native-20261009/matrix-status.json",
+      "sha256": "0211d84118ce35c3999ae72c8ace9f127d7fa6eee9d8d109e8e5055b51553767"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-private-hms-native-20261009/rest-startup.log",
+      "sha256": "3c03ec71e98051ae08997fd11b643f522d2a1bd4aaf8e9c84873c90d5819aa67"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-private-hms-native-20261009/recovery-rest-unbind.log",
+      "sha256": "650316e3162512d840537f987d196842967c8cd83e7c5591dfb50f8555dd97da"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-private-hms-native-20261009/recovery-catalog-delete.log",
+      "sha256": "ba8b684d454c78712998928c78f5c112791eeabd1a43ddd63d78a9ec933225fc"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-private-hms-native-20261009/recovery-object-store-delete.log",
+      "sha256": "bb6b66bcf67ec9e1faf4eb8a1d21009432ec92ca1c417c4eaaaa5a5e9f57e9f2"
+    }
+  ],
+  "native_pids": [],
+  "shared_fixture_mutated": false,
+  "local_only": true,
+  "scope": "No product/native PASS or FAIL inferred from this tool-format failure. Exact private owner cleanup recovered successfully before v2."
+}
