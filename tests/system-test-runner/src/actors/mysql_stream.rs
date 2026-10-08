@@ -267,8 +267,8 @@ impl AsyncMysqlStream {
                 .await?;
             ensure!(
                 first.first() != Some(&0xff),
-                "server error code {}",
-                error_code(&first)
+                "server error {}",
+                observation_error(&first)
             );
             let columns = decode_column_count(&first)?;
             ensure!(
@@ -288,8 +288,8 @@ impl AsyncMysqlStream {
                 metadata_digest.update(&column);
                 ensure!(
                     column.first() != Some(&0xff),
-                    "server metadata error code {}",
-                    error_code(&column)
+                    "server metadata error {}",
+                    observation_error(&column)
                 );
             }
             let end = self
@@ -325,7 +325,10 @@ impl AsyncMysqlStream {
                     .await?;
                     if first_chunk && !continuation {
                         if scratch[0] == 0xff {
-                            bail!("server result error code {}", error_code(&scratch[..count]));
+                            bail!(
+                                "server result error {}",
+                                observation_error(&scratch[..count])
+                            );
                         }
                         if scratch[0] == 0xfe && length < 9 {
                             validate_observation_eof(&scratch[..count])?;
@@ -627,6 +630,18 @@ impl TextRowValidator {
     }
 }
 
+fn observation_error(payload: &[u8]) -> String {
+    let offset = if payload.get(3) == Some(&b'#') { 9 } else { 3 };
+    let diagnostic = payload.get(offset..).unwrap_or_default();
+    // The complete error body need not be copied or retained by the probe.
+    let diagnostic = &diagnostic[..diagnostic.len().min(512)];
+    format!(
+        "code {}: {}",
+        error_code(payload),
+        String::from_utf8_lossy(diagnostic)
+    )
+}
+
 fn error_code(payload: &[u8]) -> u16 {
     payload
         .get(1..3)
@@ -740,6 +755,21 @@ mod tests {
     use super::{AsyncMysqlStream, mysql_error_text, read_wire_packet_async, write_packet_async};
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn observation_error_retains_the_server_reason_with_bounded_diagnostics() {
+        let mut payload = vec![0xff, 0x51, 0x04, b'#', b'H', b'Y', b'0', b'0', b'0'];
+        payload.extend_from_slice(b"result decode queue is full");
+        assert_eq!(
+            super::observation_error(&payload),
+            "code 1105: result decode queue is full"
+        );
+        payload.truncate(9);
+        payload.extend_from_slice(&[b'x'; 4096]);
+        let diagnostic = super::observation_error(&payload);
+        assert_eq!(diagnostic.len(), "code 1105: ".len() + 512);
+        assert_eq!(super::observation_error(&[0xff]), "code 0: ");
+    }
 
     #[tokio::test]
     async fn observation_counts_empty_first_cells_and_wrapped_sequences() {

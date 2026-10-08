@@ -103,6 +103,8 @@ struct Sample {
     client: usize,
     started_millis: u128,
     ended_millis: u128,
+    started_micros: u128,
+    ended_micros: u128,
     connect_micros: u128,
     observation: TextResultObservation,
 }
@@ -190,7 +192,9 @@ impl Scenario for ResultDeliveryBaseline {
                                     .and_then(|result| result);
                                     let connect_micros = connected.elapsed().as_micros();
                                     barrier.wait().await;
-                                    let started_millis = epoch.elapsed().as_millis();
+                                    let started = epoch.elapsed();
+                                    let started_millis = started.as_millis();
+                                    let started_micros = started.as_micros();
                                     let observation = match stream {
                                         Ok(mut stream) => {
                                             stream
@@ -210,13 +214,16 @@ impl Scenario for ResultDeliveryBaseline {
                                             ..Default::default()
                                         },
                                     };
+                                    let ended = epoch.elapsed();
                                     Sample {
                                         query: query.name,
                                         concurrency,
                                         repetition,
                                         client,
                                         started_millis,
-                                        ended_millis: epoch.elapsed().as_millis(),
+                                        ended_millis: ended.as_millis(),
+                                        started_micros,
+                                        ended_micros: ended.as_micros(),
                                         connect_micros,
                                         observation,
                                     }
