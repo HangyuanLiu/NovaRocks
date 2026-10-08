@@ -809,6 +809,21 @@ impl BackendApplicationHost {
                 format!("construct backend process descriptor: {error}"),
             )
         })?;
+        // The composed host has installed all V1 domain producers and their
+        // exact exit guards before this immutable descriptor can be announced.
+        let root_support =
+            novarocks_execution_contract::native_result_support::BoundedRootSupport::new(
+                process_descriptor.control_endpoint().clone(),
+                novarocks_result_contract::RootProfileId::V1,
+            );
+        let process_descriptor = process_descriptor
+            .with_bounded_root_support(root_support)
+            .map_err(|error| {
+                BackendApplicationError::new(
+                    BackendApplicationErrorKind::Configuration,
+                    format!("advertise backend bounded root support: {error}"),
+                )
+            })?;
         let metrics_registry = Arc::new(
             BackendMetricsRegistry::new()
                 .and_then(|registry| registry.with_process_memory(process_memory))

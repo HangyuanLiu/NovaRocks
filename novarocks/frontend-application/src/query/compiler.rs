@@ -450,6 +450,7 @@ impl FrontendQueryCompiler {
                     context.execution().sql_semantics(),
                 )?;
                 self.complete_distributed_read(
+                    purpose,
                     &query,
                     current_catalog,
                     current_database,
@@ -604,6 +605,7 @@ impl FrontendQueryCompiler {
     #[allow(clippy::too_many_arguments)]
     fn complete_distributed_read(
         &self,
+        purpose: FrontendQueryPurpose,
         query: &Query,
         current_catalog: Option<&str>,
         current_database: &str,
@@ -680,8 +682,43 @@ impl FrontendQueryCompiler {
             } => FrontendQueryCompilerError::Analyze(error.clone()),
             error => FrontendQueryCompilerError::Engine(error.to_string()),
         })?;
-        // What this statement delivers is a property of the plan, read before
-        // the plan is consumed by encoding.
+        // Resolve application purpose before the plan is shared with Native
+        // projection. Presentation uses one FE offset, never the BE clock.
+        let root_output = match purpose {
+            FrontendQueryPurpose::ClientRows => {
+                novarocks_result_contract::FrozenRootOutput::ClientRows(
+                    novarocks_sql::compiler::client_render_schema(
+                        completed.candidate().plan(),
+                        chrono::Local::now().offset().local_minus_utc(),
+                    )
+                    .map_err(FrontendQueryCompilerError::Engine)?,
+                )
+            }
+            FrontendQueryPurpose::ScalarValue => {
+                novarocks_result_contract::FrozenRootOutput::ScalarValue(
+                    completed
+                        .candidate()
+                        .plan()
+                        .result_port()
+                        .and_then(|port| port.scalar_schema.clone())
+                        .ok_or_else(|| {
+                            FrontendQueryCompilerError::Engine(
+                                "completed scalar query has no frozen SQL scalar schema".into(),
+                            )
+                        })?,
+                )
+            }
+            FrontendQueryPurpose::LocalRows | FrontendQueryPurpose::ProfileCountOnly => {
+                return Err(FrontendQueryCompilerError::Engine(
+                    "distributed read received a different application output purpose".into(),
+                ));
+            }
+        };
+        let completed = completed
+            .freeze_root_output(root_output)
+            .map_err(|(error, _returned)| FrontendQueryCompilerError::Engine(error.to_string()))?;
+        // What this statement delivers is a property of the frozen plan, read
+        // before the plan is consumed by encoding.
         let output = novarocks_query_application::preparation::OutputContract::from_completed_plan(
             novarocks_query_application::api::QueryExecutionKind::Read,
             completed.candidate().plan(),
@@ -811,6 +848,9 @@ impl FrontendQueryCompiler {
                 } => FrontendQueryCompilerError::Analyze(error.clone()),
                 error => FrontendQueryCompilerError::Engine(error.to_string()),
             })?;
+        let completed = completed
+            .freeze_root_output(novarocks_result_contract::FrozenRootOutput::CountOnly)
+            .map_err(|(error, _returned)| FrontendQueryCompilerError::Engine(error.to_string()))?;
         let plan = Arc::clone(completed.candidate().plan());
         let annotations: Arc<[novarocks_sql::compiler::SqlDisplayAnnotation]> =
             completed.candidate().display_annotations().to_vec().into();

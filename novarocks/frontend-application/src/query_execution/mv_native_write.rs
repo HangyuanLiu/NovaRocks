@@ -205,6 +205,13 @@ pub(crate) fn prepare_completed_mv_write(
     let plan = finish(version, dop_domain, reads, targets)?;
     let candidate =
         novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)
+            .and_then(|candidate| {
+                candidate.freeze_root_output(
+                    novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                        novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
+                    ),
+                )
+            })
             .map_err(|error| error.to_string())?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,

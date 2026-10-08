@@ -1011,7 +1011,10 @@ impl ProductionRootDelivery {
         use novarocks_result_contract::RootOutputKind as K;
         use novarocks_workload_control::ResultWindowClass as W;
         match carrier {
-            C::DecodedBatches => Ok(Self::Decoded),
+            C::DecodedBatches => Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "distributed execution requires a frozen bounded root output",
+            )),
             C::Relayed { kind, client_rows } => {
                 C::relayed(kind, client_rows)?;
                 let window = window.ok_or_else(|| {
@@ -2927,10 +2930,7 @@ mod tests {
             .unwrap();
         let scope = root.owner.scope();
         let profile = ClientRowProfile::try_new(P::SEGMENT_BYTES, P::ROW_PAYLOAD_BYTES).unwrap();
-        assert!(matches!(
-            ProductionRootDelivery::bind(C::DecodedBatches, None),
-            Ok(ProductionRootDelivery::Decoded)
-        ));
+        assert!(ProductionRootDelivery::bind(C::DecodedBatches, None).is_err());
         for kind in [
             K::ClientRows,
             K::InternalFacts(InternalResultDomain::ScalarValueV1),

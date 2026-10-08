@@ -1510,6 +1510,13 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     let version = plan.version();
     let candidate =
         novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)
+            .and_then(|candidate| {
+                candidate.freeze_root_output(
+                    novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                        novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
+                    ),
+                )
+            })
             .map_err(|error| error.to_string())?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,
