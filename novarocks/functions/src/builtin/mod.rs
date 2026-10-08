@@ -35,6 +35,7 @@ pub(crate) mod binding_control;
 mod binding_control_tests;
 
 mod abs;
+pub mod abs_core;
 mod abs_owner;
 mod aggregate_any_value;
 pub mod aggregate_any_value_core;

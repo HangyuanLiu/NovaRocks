@@ -37,17 +37,41 @@ pub fn i128_from_be_bytes(bytes: &[u8]) -> Result<i128, String> {
     Ok(i128::from_be_bytes(buf))
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum LargeIntObservation {
+    Step,
+    OpaqueBoundary,
+}
 pub fn array_from_i128(values: &[Option<i128>]) -> Result<ArrayRef, String> {
+    match array_from_i128_observed(values, &mut |_| Ok::<(), std::convert::Infallible>(())) {
+        Ok(result) => result,
+        Err(never) => match never {},
+    }
+}
+/// ONE original builder body; raw callers use an infallible no-op observer,
+/// selected callers preserve their exact typed refusal cause.
+pub fn array_from_i128_observed<E>(
+    values: &[Option<i128>],
+    observe: &mut dyn FnMut(LargeIntObservation) -> Result<(), E>,
+) -> Result<Result<ArrayRef, String>, E> {
+    observe(LargeIntObservation::OpaqueBoundary)?;
     let mut builder = FixedSizeBinaryBuilder::with_capacity(values.len(), LARGEINT_BYTE_WIDTH);
+    observe(LargeIntObservation::OpaqueBoundary)?;
     for value in values {
+        observe(LargeIntObservation::Step)?;
         match value {
-            Some(v) => builder
-                .append_value(i128_to_be_bytes(*v))
-                .map_err(|e| e.to_string())?,
+            Some(v) => {
+                if let Err(error) = builder.append_value(i128_to_be_bytes(*v)) {
+                    return Ok(Err(error.to_string()));
+                }
+            }
             None => builder.append_null(),
         }
     }
-    Ok(Arc::new(builder.finish()) as ArrayRef)
+    observe(LargeIntObservation::OpaqueBoundary)?;
+    let out = Arc::new(builder.finish()) as ArrayRef;
+    observe(LargeIntObservation::OpaqueBoundary)?;
+    Ok(Ok(out))
 }
 
 pub fn as_fixed_size_binary_array<'a>(

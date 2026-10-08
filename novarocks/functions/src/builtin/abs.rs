@@ -15,31 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Selected-row ABS computation for the exact builtin owner.
-//! Arrow builder allocation still requires the host's formal memory admission.
-
-use std::sync::Arc;
-
-use arrow_array::{
-    Array, ArrayRef, FixedSizeBinaryArray, PrimitiveArray,
-    builder::{FixedSizeBinaryBuilder, PrimitiveBuilder},
-    types::{
-        ArrowPrimitiveType, Decimal128Type, DecimalType, Float32Type, Float64Type, Int8Type,
-        Int16Type, Int32Type, Int64Type, validate_decimal_precision_and_scale,
-    },
-};
-use arrow_schema::DataType;
-use novarocks_type_contract::ValueLogicalType;
-
+//! Selected ABS contracts and addresses delegate to the ONE original core.
+use super::abs_core::{AbsError, AbsObservation, evaluate_abs_core};
+#[cfg(test)]
+use crate::{EvaluatedArgument, Selection};
 use crate::{
-    EvaluatedArgument, FunctionArgumentType, KernelEvaluationControl, KernelFailure,
-    ScalarCallInput, SelectedValues, Selection,
+    FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues,
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
 };
-
-/// The caller supplies the checked scalar contract and evaluated argument.
-/// Output ordinals follow Selection; no unselected input value is inspected.
+#[cfg(test)]
+use arrow_array::FixedSizeBinaryArray;
+#[cfg(test)]
+use arrow_array::builder::FixedSizeBinaryBuilder;
+use arrow_array::types::{Decimal128Type, DecimalType, validate_decimal_precision_and_scale};
+use arrow_array::{Array, ArrayRef, Decimal128Array, UInt64Array};
+use arrow_schema::DataType;
+use novarocks_type_contract::ValueLogicalType;
+use std::sync::Arc;
 pub(super) fn evaluate_abs<'a>(
     input: ScalarCallInput<'_, 'a>,
     control: &dyn KernelEvaluationControl,
@@ -58,8 +51,7 @@ pub(super) fn evaluate_abs<'a>(
             "ABS result must preserve selected input nullability",
         ));
     }
-    let selection = input.selection();
-    let values = match (
+    let width = match (
         source.logical_type,
         &source.data_type,
         target.logical_type,
@@ -70,95 +62,52 @@ pub(super) fn evaluate_abs<'a>(
             DataType::Int8,
             ValueLogicalType::Physical,
             DataType::Int16,
-        ) => primitive::<Int8Type, Int16Type>(input, *argument, control, |value| {
-            Ok(i16::from(value).abs())
-        })?,
+        ) => 2,
         (
             ValueLogicalType::Physical,
             DataType::Int16,
             ValueLogicalType::Physical,
             DataType::Int32,
-        ) => primitive::<Int16Type, Int32Type>(input, *argument, control, |value| {
-            Ok(i32::from(value).abs())
-        })?,
+        ) => 4,
         (
             ValueLogicalType::Physical,
             DataType::Int32,
             ValueLogicalType::Physical,
             DataType::Int64,
-        ) => primitive::<Int32Type, Int64Type>(input, *argument, control, |value| {
-            Ok(i64::from(value).abs())
-        })?,
+        ) => 8,
         (
             ValueLogicalType::Physical,
             DataType::Int64,
             ValueLogicalType::LargeInt,
             DataType::FixedSizeBinary(16),
-        ) => {
-            let array = argument
-                .array()
-                .as_any()
-                .downcast_ref::<PrimitiveArray<Int64Type>>()
-                .ok_or_else(|| internal("ABS selected Int64 carrier cannot be downcast"))?;
-            largeint(input, *argument, control, |row| {
-                Ok(i128::from(array.value(row)).abs())
-            })?
-        }
+        ) => 16,
         (
             ValueLogicalType::LargeInt,
             DataType::FixedSizeBinary(16),
             ValueLogicalType::LargeInt,
             DataType::FixedSizeBinary(16),
-        ) => {
-            let array = argument
-                .array()
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| internal("ABS selected LargeInt carrier cannot be downcast"))?;
-            if array.value_length() != 16 {
-                return Err(internal("ABS LargeInt carrier has an incorrect byte width"));
-            }
-            largeint(input, *argument, control, |row| {
-                let bytes = array
-                    .value(row)
-                    .try_into()
-                    .map_err(|_| internal("ABS LargeInt value has an incorrect byte width"))?;
-                // LARGEINT has no wider signed carrier. Preserve its existing
-                // two's-complement minimum-value contract, without a row error.
-                Ok(i128::from_be_bytes(bytes).wrapping_abs())
-            })?
-        }
+        ) => 16,
         (
             ValueLogicalType::Physical,
             DataType::Float32,
             ValueLogicalType::Physical,
             DataType::Float32,
-        ) => primitive::<Float32Type, Float32Type>(input, *argument, control, |value| {
-            Ok(value.abs())
-        })?,
+        ) => 4,
         (
             ValueLogicalType::Physical,
             DataType::Float64,
             ValueLogicalType::Physical,
             DataType::Float64,
-        ) => primitive::<Float64Type, Float64Type>(input, *argument, control, |value| {
-            Ok(value.abs())
-        })?,
+        ) => 8,
         (
             ValueLogicalType::Physical,
-            DataType::Decimal128(precision, scale),
+            DataType::Decimal128(p, s),
             ValueLogicalType::Physical,
-            DataType::Decimal128(output_precision, output_scale),
-        ) if precision == output_precision && scale == output_scale => {
-            validate_decimal_precision_and_scale::<Decimal128Type>(*precision, *scale)
+            DataType::Decimal128(op, os),
+        ) if p == op && s == os => {
+            validate_decimal_precision_and_scale::<Decimal128Type>(*p, *s)
                 .map_err(|_| invalid("ABS selected Decimal128 precision or scale is invalid"))?;
-            primitive::<Decimal128Type, Decimal128Type>(input, *argument, control, |value| {
-                Decimal128Type::validate_decimal_precision(value, *precision, *scale)
-                    .map_err(|_| internal("ABS input exceeds selected Decimal128 precision"))?;
-                value
-                    .checked_abs()
-                    .ok_or_else(|| internal("ABS admitted Decimal128 value cannot be represented"))
-            })?
+            16
         }
         _ => {
             return Err(invalid(
@@ -166,10 +115,85 @@ pub(super) fn evaluate_abs<'a>(
             ));
         }
     };
+    let selection = input.selection();
+    output_capacity(selection.len(), width.max(8))?;
+    let array = argument.array();
+    if array.data_type() != &source.data_type {
+        return Err(internal(
+            "ABS selected primitive carrier cannot be downcast",
+        ));
+    }
+    let decimal = if matches!(source.data_type, DataType::Decimal128(..)) {
+        Some(
+            array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| internal("ABS selected primitive carrier cannot be downcast"))?,
+        )
+    } else {
+        None
+    };
+    let mut work = EvaluationCheckpoints::new(control);
+    let mut identity = selection.len() == array.len();
+    for (ordinal, batch_row) in selection.iter().enumerate() {
+        work.step()?;
+        let row = argument.value_row(ordinal, batch_row);
+        if row >= array.len() {
+            return Err(internal(
+                "ABS selected argument row is outside its checked carrier",
+            ));
+        }
+        if array.is_null(row) {
+            if !target.nullable {
+                return Err(internal("ABS non-null selected argument contains SQL NULL"));
+            }
+        } else if let (Some(decimal), DataType::Decimal128(p, s)) = (decimal, &source.data_type) {
+            // This is the original selected input contract check, not a second ABS
+            // algorithm or another decimal rescaling author.
+            Decimal128Type::validate_decimal_precision(decimal.value(row), *p, *s)
+                .map_err(|_| internal("ABS input exceeds selected Decimal128 precision"))?;
+        }
+        identity &= row == ordinal;
+    }
+    work.flush()?;
+    let compact = if identity {
+        Arc::clone(array)
+    } else {
+        work.flush()?;
+        let mut addresses = Vec::with_capacity(selection.len());
+        work.flush()?;
+        for (ordinal, batch_row) in selection.iter().enumerate() {
+            work.step()?;
+            addresses.push(argument.value_row(ordinal, batch_row) as u64);
+        }
+        work.flush()?;
+        let addresses = UInt64Array::from(addresses);
+        work.flush()?;
+        let compact =
+            arrow_select::take::take(array.as_ref(), &addresses, None).map_err(|error| {
+                KernelFailure::Operational(crate::KernelDiagnostic::new(&format!(
+                    "ABS selected gather failed: {error}"
+                )))
+            })?;
+        work.flush()?;
+        compact
+    };
+    let values = evaluate_abs_core(
+        compact,
+        &target.data_type,
+        &mut |observation| match observation {
+            AbsObservation::Step => work.step(),
+            AbsObservation::OpaqueBoundary => work.flush(),
+        },
+    )
+    .map_err(|error| match error {
+        AbsError::Kernel(error) => error,
+        AbsError::Legacy(error) => KernelFailure::Operational(crate::KernelDiagnostic::new(&error)),
+    })?;
+    work.finish()?;
     SelectedValues::try_new(selection, &target.data_type, values, Box::default())
         .map_err(|_| internal("ABS compact output violates its selected contract"))
 }
-
 /// Check Rust allocation representability, not an application capacity grant.
 fn output_capacity(rows: usize, width: usize) -> Result<(), KernelFailure> {
     let values = rows
@@ -185,95 +209,6 @@ fn output_capacity(rows: usize, width: usize) -> Result<(), KernelFailure> {
         .checked_add(bitmap)
         .ok_or(KernelFailure::ResourceExhausted)?;
     Ok(())
-}
-
-fn selected_row(
-    argument: EvaluatedArgument<'_>,
-    selection: Selection<'_>,
-    ordinal: usize,
-    batch_row: usize,
-    nullable: bool,
-) -> Result<Option<usize>, KernelFailure> {
-    // Row identity comes from the same checked Selection walk. Constant uses
-    // its checked pool ordinal; Scalar and compact columns keep their own maps.
-    let row = argument.value_row(ordinal, batch_row);
-    if ordinal >= selection.len() || row >= argument.array().len() {
-        return Err(internal(
-            "ABS selected argument row is outside its checked carrier",
-        ));
-    }
-    if argument.array().is_null(row) {
-        if !nullable {
-            return Err(internal("ABS non-null selected argument contains SQL NULL"));
-        }
-        Ok(None)
-    } else {
-        Ok(Some(row))
-    }
-}
-
-fn primitive<I: ArrowPrimitiveType, O: ArrowPrimitiveType>(
-    input: ScalarCallInput<'_, '_>,
-    argument: EvaluatedArgument<'_>,
-    control: &dyn KernelEvaluationControl,
-    mut absolute: impl FnMut(I::Native) -> Result<O::Native, KernelFailure>,
-) -> Result<ArrayRef, KernelFailure> {
-    let array = argument
-        .array()
-        .as_any()
-        .downcast_ref::<PrimitiveArray<I>>()
-        .ok_or_else(|| internal("ABS selected primitive carrier cannot be downcast"))?;
-    let selection = input.selection();
-    output_capacity(selection.len(), std::mem::size_of::<O::Native>())?;
-    let mut builder = PrimitiveBuilder::<O>::with_capacity(selection.len())
-        .with_data_type(input.contract().result_type().data_type.clone());
-    let mut work = EvaluationCheckpoints::new(control);
-    for (ordinal, batch_row) in selection.iter().enumerate() {
-        work.step()?;
-        match selected_row(
-            argument,
-            selection,
-            ordinal,
-            batch_row,
-            input.contract().result_type().nullable,
-        )? {
-            Some(row) => builder.append_value(absolute(array.value(row))?),
-            None => builder.append_null(),
-        }
-    }
-    let result = Arc::new(builder.finish()) as ArrayRef;
-    work.finish()?;
-    Ok(result)
-}
-
-fn largeint(
-    input: ScalarCallInput<'_, '_>,
-    argument: EvaluatedArgument<'_>,
-    control: &dyn KernelEvaluationControl,
-    mut absolute: impl FnMut(usize) -> Result<i128, KernelFailure>,
-) -> Result<ArrayRef, KernelFailure> {
-    let selection = input.selection();
-    output_capacity(selection.len(), 16)?;
-    let mut builder = FixedSizeBinaryBuilder::with_capacity(selection.len(), 16);
-    let mut work = EvaluationCheckpoints::new(control);
-    for (ordinal, batch_row) in selection.iter().enumerate() {
-        work.step()?;
-        match selected_row(
-            argument,
-            selection,
-            ordinal,
-            batch_row,
-            input.contract().result_type().nullable,
-        )? {
-            Some(row) => builder
-                .append_value(absolute(row)?.to_be_bytes())
-                .map_err(|_| internal("ABS LargeInt output has an incorrect byte width"))?,
-            None => builder.append_null(),
-        }
-    }
-    let result = Arc::new(builder.finish()) as ArrayRef;
-    work.finish()?;
-    Ok(result)
 }
 
 #[cfg(test)]
@@ -762,6 +697,88 @@ mod tests {
                 control.calls().iter().filter(|units| **units == 0).count(),
                 3
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod shared_core_failure_tests {
+    use super::*;
+    use crate::{
+        EvaluatedArgument, FunctionValueType, KernelDiagnostic, ScalarEvaluationInstance, Selection,
+    };
+    use std::{sync::Mutex, time::Duration};
+
+    #[derive(Default)]
+    struct Control {
+        calls: Mutex<Vec<u32>>,
+        refusal: Option<(usize, KernelFailure)>,
+    }
+    impl KernelEvaluationControl for Control {
+        fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
+            assert!(units <= crate::MAX_UNOBSERVED_KERNEL_WORK);
+            let mut calls = self.calls.lock().unwrap();
+            let at = calls.len();
+            calls.push(units);
+            if let Some((wanted, error)) = &self.refusal {
+                if at == *wanted {
+                    return Err(error.clone());
+                }
+            }
+            Ok(())
+        }
+        fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
+            panic!("ABS cannot wait")
+        }
+    }
+    fn failures() -> [KernelFailure; 7] {
+        [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+            KernelFailure::InvalidProgram(KernelDiagnostic::new("ABS invalid")),
+            KernelFailure::Internal(KernelDiagnostic::new("ABS internal")),
+            KernelFailure::Operational(KernelDiagnostic::new("ABS operational")),
+            KernelFailure::InstanceFailed,
+        ]
+    }
+    #[test]
+    fn shared_abs_largeint_gather_builder_preserves_every_checkpoint_cause_and_latch() {
+        let scalar: ArrayRef = Arc::new(arrow_array::Int64Array::from(vec![i64::MIN]));
+        let source = FunctionValueType::new(DataType::Int64, false);
+        let make = || {
+            ScalarEvaluationInstance::instantiate(super::super::abs_owner::prepared_for_test(
+                source.clone(),
+            ))
+            .unwrap()
+        };
+        let args = [EvaluatedArgument::Scalar(&scalar)];
+        let selection = Selection::all(320);
+        let control = Control::default();
+        let mut baseline = make();
+        let values = baseline.evaluate(selection, &args, &control).unwrap();
+        assert!(values.errors().is_empty());
+        let expected = control.calls.lock().unwrap().clone();
+        assert!(expected.iter().any(|n| *n == 256));
+        for failure in failures() {
+            for at in 0..expected.len() {
+                let control = Control {
+                    calls: Mutex::new(Vec::new()),
+                    refusal: Some((at, failure.clone())),
+                };
+                let mut instance = make();
+                assert_eq!(
+                    instance.evaluate(selection, &args, &control).unwrap_err(),
+                    failure
+                );
+                assert_eq!(*control.calls.lock().unwrap(), expected[..=at]);
+                let retry = Control::default();
+                assert_eq!(
+                    instance.evaluate(selection, &args, &retry).unwrap_err(),
+                    KernelFailure::InstanceFailed
+                );
+                assert!(retry.calls.lock().unwrap().is_empty());
+            }
         }
     }
 }
