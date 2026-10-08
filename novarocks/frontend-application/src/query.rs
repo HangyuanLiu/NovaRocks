@@ -2786,8 +2786,8 @@ fn timeout_message_millis(timeout: Duration) -> u64 {
 }
 
 /// Work classification selects statement admission; the output purpose
-/// independently selects its result capacity. A foreground MV refresh is a
-/// management command whose distributed write still produces InternalFacts.
+/// independently selects its result capacity. Foreground MV refresh and
+/// repartition are management commands whose writes produce InternalFacts.
 fn typed_statement_result_window_class(statement: &ParsedStatement) -> ResultWindowClass {
     match statement {
         ParsedStatement::Dml(_)
@@ -2795,6 +2795,14 @@ fn typed_statement_result_window_class(statement: &ParsedStatement) -> ResultWin
             ResultWindowClass::Internal
         }
         ParsedStatement::ExplainQuery(explain) if explain.format == ast::ExplainFormat::Analyze => {
+            ResultWindowClass::Internal
+        }
+        ParsedStatement::MaterializedView(ast::MaterializedViewStatement::Alter(alter))
+            if matches!(
+                alter.action,
+                ast::MaterializedViewAlterAction::Repartition(_)
+            ) =>
+        {
             ResultWindowClass::Internal
         }
         _ => ResultWindowClass::Local,
@@ -3096,9 +3104,21 @@ mod tests {
                 "{sql}"
             );
         }
+        let repartition =
+            parse_single_statement("ALTER MATERIALIZED VIEW mv REPARTITION BY (bucket(id, 4))")
+                .expect("parse foreground MV repartition");
+        assert_eq!(
+            typed_statement_work_class(&repartition),
+            WorkClass::Management
+        );
+        assert_eq!(
+            typed_statement_result_window_class(&repartition),
+            ResultWindowClass::Internal
+        );
         for sql in [
             "EXPLAIN SELECT 1",
             "SHOW MATERIALIZED VIEWS",
+            "ALTER MATERIALIZED VIEW mv PAUSE REFRESH",
             "CREATE DATABASE result_capacity_test",
         ] {
             let statement = parse_single_statement(sql).expect("parse local output command");
