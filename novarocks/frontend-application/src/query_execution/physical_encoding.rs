@@ -176,6 +176,13 @@ pub(crate) fn encode_completed_plan(
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
     control.checkpoint(novarocks_type_contract::CompilePhase::Encode, 0)?;
+    if let Some(mode) = paired.candidate().sql_emission_mode()
+        && mode != carrier.sql_emission_mode()
+    {
+        return Err(novarocks_plan_codec::PhysicalEncodeError::Invalid(
+            "completed SQL emission mode differs from the process static plan carrier".to_string(),
+        ));
+    }
     let result = match carrier {
         StaticPlanCarrier::PlanTree => encode_completed_plan_tree(
             paired,
@@ -322,7 +329,7 @@ fn encode_completed_packages(
         carrier.admission(),
         control,
     )?;
-    let submission = compiled_plan_submission_facts(plan, &topology)?;
+    let submission = compiled_plan_submission_facts(&candidate, &topology)?;
     let provenance = mint_native_encoding_provenance();
     let native = NativeFragmentAttachment::for_completed_plan(
         freeze_completed_packages(
@@ -436,7 +443,8 @@ pub(crate) fn completed_plan_submission_facts(
     topology: &CompletedPlanTopology,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<SubmissionPlanFacts, novarocks_plan_codec::PhysicalEncodeError> {
-    let (fragments, stream_edge_sources) = completed_plan_submission_fragments(plan)?;
+    let (fragments, stream_edge_sources) =
+        completed_plan_submission_fragments(plan, plan.result_port())?;
     let mut cte_consumers = BTreeMap::<u32, Vec<CteMulticastConsumer>>::new();
     for consumer in novarocks_plan_codec::physical_v1_cte_consumers(plan, control)? {
         cte_consumers.entry(consumer.cte_id).or_default().push((
@@ -486,6 +494,7 @@ pub(crate) fn completed_plan_submission_facts(
 /// that feed a stream edge, both read from the plan alone.
 fn completed_plan_submission_fragments(
     plan: &PhysicalPlan,
+    public_result: Option<&novarocks_physical_plan::ResultPort>,
 ) -> Result<(Vec<SubmissionFragmentFacts>, BTreeSet<u32>), novarocks_plan_codec::PhysicalEncodeError>
 {
     let mut stream_edge_sources = BTreeSet::new();
@@ -515,7 +524,7 @@ fn completed_plan_submission_fragments(
         fragments.push(SubmissionFragmentFacts::for_completed_plan(
             u32::from(fragment.id().get()),
             role,
-            completed_fragment_output_columns(plan, fragment.id()),
+            completed_fragment_output_columns(public_result, fragment.id()),
             // A multicast sink is a CTE producer, and the plan names that CTE
             // by the fragment that produces it -- the same name its edges
             // carry, so a consumer and its producer agree without a second
@@ -534,10 +543,12 @@ fn completed_plan_submission_fragments(
 /// CTE multicast and change-stream routing, so there is no consumer to patch
 /// and no router edge to carry.
 fn compiled_plan_submission_facts(
-    plan: &PhysicalPlan,
+    candidate: &novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
     topology: &CompletedPlanTopology,
 ) -> Result<SubmissionPlanFacts, novarocks_plan_codec::PhysicalEncodeError> {
-    let (fragments, stream_edge_sources) = completed_plan_submission_fragments(plan)?;
+    let plan = candidate.plan();
+    let (fragments, stream_edge_sources) =
+        completed_plan_submission_fragments(plan, candidate.original_public_result_port())?;
     Ok(SubmissionPlanFacts::for_completed_plan(
         plan.version(),
         plan.required().plan_contract_revision,
@@ -559,10 +570,10 @@ fn compiled_plan_submission_facts(
 /// The name is the alias where the statement gave one, which is the name the
 /// client asked for and the same rule the wire encoder applies.
 fn completed_fragment_output_columns(
-    plan: &PhysicalPlan,
+    public_result: Option<&novarocks_physical_plan::ResultPort>,
     fragment_id: novarocks_physical_plan::FragmentId,
 ) -> Vec<PlanOutputColumn> {
-    plan.result_port()
+    public_result
         .filter(|result| result.fragment == fragment_id)
         .map(|result| {
             result
@@ -1232,7 +1243,7 @@ mod tests {
         let completed = runtime
             .block_on(
                 FinalPlanCompletionDriver::new(Arc::new(NoFacts))
-                    .complete(request_for(sql), &scope),
+                    .complete(request_for(sql,novarocks_sql::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration), &scope),
             )
             .unwrap_or_else(|error| panic!("{sql}: completes without facts: {error}"));
         let control = SqlCompileControl::unbounded();
@@ -1352,7 +1363,10 @@ mod tests {
 
     /// Complete one table-free statement with the production Frontend
     /// constant evaluator.
-    fn completed_for(sql: &str) -> CompletedPlanWithAccess<FrozenProviderRead> {
+    fn completed_for(
+        sql: &str,
+        emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
+    ) -> CompletedPlanWithAccess<FrozenProviderRead> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1361,7 +1375,7 @@ mod tests {
         runtime
             .block_on(
                 FinalPlanCompletionDriver::new(Arc::new(NoFacts))
-                    .complete(request_for(sql), &scope),
+                    .complete(request_for(sql, emission_mode), &scope),
             )
             .unwrap_or_else(|error| panic!("{sql}: completes without facts: {error}"))
     }
@@ -1373,7 +1387,7 @@ mod tests {
         Arc<PhysicalPlan>,
         Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError>,
     ) {
-        let completed = completed_for(sql);
+        let completed = completed_for(sql, carrier.sql_emission_mode());
         let plan = Arc::clone(completed.candidate().plan());
         let encoded = encode_completed_plan(
             completed,
@@ -2112,21 +2126,30 @@ mod tests {
     }
 
     fn request() -> SqlFinalPlanCompileRequest {
-        request_with("SELECT 1", noop_constant_evaluator())
+        request_with(
+            "SELECT 1",
+            noop_constant_evaluator(),
+            novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
+        )
     }
 
     /// A request folding constants with the production Frontend evaluator,
     /// so the frozen packages are the ones production would freeze.
-    fn request_for(sql: &str) -> SqlFinalPlanCompileRequest {
+    fn request_for(
+        sql: &str,
+        emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
+    ) -> SqlFinalPlanCompileRequest {
         request_with(
             sql,
             crate::query_execution::constant_eval::constant_evaluator(),
+            emission_mode,
         )
     }
 
     fn request_with(
         sql: &str,
         constant_evaluator: &'static dyn novarocks_sql::compiler::SqlConstantEvaluator,
+        emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
     ) -> SqlFinalPlanCompileRequest {
         SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([9; 16]).expect("plan version"),
@@ -2142,6 +2165,7 @@ mod tests {
             builtin_sql_function_catalog().snapshot(),
             constant_evaluator,
             crate::application::test_constant_policy(),
+            emission_mode,
             SqlCompileControl::unbounded(),
             PipelineDopDomain {
                 min: 1,

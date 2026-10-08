@@ -241,6 +241,7 @@ fn canonical_window_real_row_number_and_min_over_use_one_emitted_selection() {
             crate::functions::builtin_sql_function_catalog().snapshot(),
             false,
             policy(),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             &Control::default(),
         ),
         Err(ContractLoweringError::OutputColumnMismatch { .. })

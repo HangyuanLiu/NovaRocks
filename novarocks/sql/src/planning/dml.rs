@@ -459,6 +459,7 @@ impl DmlFinalizedProviderReadSet {
 /// Frozen inputs shared by every SQL-owned final write-plan constructor.
 /// Neither value may be inferred from process state or live topology.
 pub struct DmlFinalPlanContext {
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     version: novarocks_physical_plan::PlanVersionId,
     dop_domain: novarocks_physical_plan::PipelineDopDomain,
     provider_reads: DmlFinalizedProviderReadSet,
@@ -469,11 +470,13 @@ impl DmlFinalPlanContext {
         version: novarocks_physical_plan::PlanVersionId,
         dop_domain: novarocks_physical_plan::PipelineDopDomain,
         provider_reads: DmlFinalizedProviderReadSet,
+        emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     ) -> Self {
         Self {
             version,
             dop_domain,
             provider_reads,
+            emission_mode,
         }
     }
 
@@ -483,11 +486,13 @@ impl DmlFinalPlanContext {
         novarocks_physical_plan::PlanVersionId,
         novarocks_physical_plan::PipelineDopDomain,
         Option<crate::compiler::FinalizedProviderReadSet>,
+        crate::compiler::SqlPhysicalEmissionMode,
     ) {
         (
             self.version,
             self.dop_domain,
             self.provider_reads.into_optional(),
+            self.emission_mode,
         )
     }
 }
@@ -501,6 +506,9 @@ pub struct DmlFinalWritePlanContext {
 }
 
 impl DmlFinalWritePlanContext {
+    pub fn emission_mode(&self) -> crate::compiler::SqlPhysicalEmissionMode {
+        self.plan.emission_mode
+    }
     pub fn new(plan: DmlFinalPlanContext, targets: DmlFinalizedWriteTargetSet) -> Self {
         Self { plan, targets }
     }
@@ -662,6 +670,7 @@ pub fn build_final_frozen_connector_write_plan(
 /// accounted for under, so the two halves are separated here -- the needs
 /// leave, the facts come back, and the plan is lowered against them.
 pub struct DmlWriteCompletion {
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     constant_policy: novarocks_functions::ConstantPolicy,
     root_allow_throw_exception: bool,
     functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
@@ -680,6 +689,7 @@ pub fn begin_final_connector_write_plan(
     statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     settings: &crate::compiler::SessionOptimizerSettings,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
 ) -> Result<
     (DmlWriteCompletion, Box<[crate::compiler::ProviderReadNeed]>),
     crate::compiler::SqlCompileError,
@@ -720,6 +730,7 @@ pub fn begin_final_connector_write_plan(
     )?;
     Ok((
         DmlWriteCompletion {
+            emission_mode,
             constant_policy,
             root_allow_throw_exception: compiled.root_allow_throw_exception,
             functions: compiled.function_catalog,
@@ -757,6 +768,7 @@ impl DmlWriteCompletion {
             self.functions,
             self.root_allow_throw_exception,
             self.constant_policy,
+            self.emission_mode,
             control,
         )
         .map_err(final_lowering_error)?;
@@ -832,7 +844,7 @@ fn complete_connector_write_plan(
         settings,
     );
     let (final_context, finalized_targets) = final_write.into_parts();
-    let (version, dop_domain, reads) = final_context.into_parts();
+    let (version, dop_domain, reads, emission_mode) = final_context.into_parts();
     let mut draft = crate::planner::distributed::build::lower_final_physical_write_plan(
         &physical,
         version,
@@ -847,6 +859,7 @@ fn complete_connector_write_plan(
         functions,
         root_allow_throw_exception,
         constant_policy,
+        emission_mode,
         control,
     )
     .map_err(final_lowering_error)?;
@@ -858,6 +871,7 @@ fn complete_connector_write_plan(
 
 /// One internal DML read, optimized and waiting for its provider facts.
 pub struct DmlReadCompletion {
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     constant_policy: novarocks_functions::ConstantPolicy,
     root_allow_throw_exception: bool,
     functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
@@ -868,6 +882,7 @@ pub struct DmlReadCompletion {
 pub fn begin_final_dml_read_plan(
     request: crate::compiler::SqlOptimizeRequest<'_>,
     settings: &crate::compiler::SessionOptimizerSettings,
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
 ) -> Result<
     (DmlReadCompletion, Box<[crate::compiler::ProviderReadNeed]>),
     crate::compiler::SqlCompileError,
@@ -891,6 +906,7 @@ pub fn begin_final_dml_read_plan(
     )?;
     Ok((
         DmlReadCompletion {
+            emission_mode,
             constant_policy,
             root_allow_throw_exception: compiled.root_allow_throw_exception,
             functions: compiled.function_catalog,
@@ -919,6 +935,7 @@ impl DmlReadCompletion {
                     self.functions,
                     self.root_allow_throw_exception,
                     self.constant_policy,
+                    self.emission_mode,
                     control,
                 )
             }
@@ -929,6 +946,7 @@ impl DmlReadCompletion {
                 self.functions,
                 self.root_allow_throw_exception,
                 self.constant_policy,
+                self.emission_mode,
                 control,
             ),
         }
@@ -945,6 +963,7 @@ impl DmlReadCompletion {
 /// stable capture fingerprint, and sealed write plan derived from it.
 #[derive(Clone, Debug)]
 pub struct DmlCtasSourcePlan {
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     constant_policy: novarocks_functions::ConstantPolicy,
     root_allow_throw_exception: bool,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
@@ -998,12 +1017,14 @@ impl DmlCtasSourcePlan {
 /// completed target admission.
 pub fn compile_ctas_source(
     request: crate::compiler::SqlOptimizeRequest<'_>,
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
 ) -> Result<DmlCtasSourcePlan, crate::compiler::SqlCompileError> {
     let constant_policy = request.constant_policy();
     let compiled = crate::compiler::SqlCompiler::optimize(request)?
         .into_optimized_output()
         .map_err(|_| "CTAS source did not produce optimized SQL facts".to_string())?;
     Ok(DmlCtasSourcePlan {
+        emission_mode,
         constant_policy,
         root_allow_throw_exception: compiled.root_allow_throw_exception,
         query_statistics: compiled.statistics.snapshot,
@@ -1054,6 +1075,7 @@ pub fn begin_final_ctas_connector_write_plan(
     )?;
     Ok((
         DmlWriteCompletion {
+            emission_mode: source.emission_mode,
             constant_policy: source.constant_policy,
             root_allow_throw_exception: source.root_allow_throw_exception,
             functions: source.function_catalog.clone(),
@@ -1195,6 +1217,7 @@ pub struct DmlFinalChangeStreamPlan {
 /// An optimized change stream whose provider reads have been stated but not
 /// frozen. The application supplies their exact facts before lowering.
 pub struct DmlChangeStreamCompletion {
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     constant_policy: novarocks_functions::ConstantPolicy,
     root_allow_throw_exception: bool,
     functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
@@ -1211,7 +1234,14 @@ impl DmlChangeStreamCompletion {
         control: &crate::compiler::SqlCompileControl,
     ) -> Result<DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
         let (final_context, finalized_targets) = final_write.into_parts();
-        let (version, dop_domain, reads) = final_context.into_parts();
+        let (version, dop_domain, reads, emission_mode) = final_context.into_parts();
+        if emission_mode != self.emission_mode {
+            return Err(
+                "change-stream completion mode differs from its final write context"
+                    .to_string()
+                    .into(),
+            );
+        }
         let mut draft = crate::planner::distributed::build::lower_final_change_stream_write_plan(
             &self.physical,
             version,
@@ -1225,6 +1255,7 @@ impl DmlChangeStreamCompletion {
             self.functions,
             self.root_allow_throw_exception,
             self.constant_policy,
+            self.emission_mode,
             control,
         )
         .map_err(final_lowering_error)?;
@@ -1253,6 +1284,7 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     root_allow_throw_exception: bool,
     constant_policy: novarocks_functions::ConstantPolicy,
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
@@ -1312,6 +1344,7 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
     )?;
     Ok((
         DmlChangeStreamCompletion {
+            emission_mode,
             constant_policy,
             root_allow_throw_exception,
             functions,
@@ -1352,6 +1385,7 @@ impl DmlFinalChangeStreamPlan {
 pub fn begin_final_dml_change_stream(
     request: DmlChangeStreamCompileRequest<'_>,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
 ) -> Result<
     (
         DmlChangeStreamCompletion,
@@ -1407,6 +1441,7 @@ pub fn begin_final_dml_change_stream(
         decimal_overflow_policy,
         compiled.root_allow_throw_exception,
         constant_policy,
+        emission_mode,
         &control,
     )
 }
@@ -1576,7 +1611,7 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
         &settings,
     );
     let (final_context, finalized_targets) = context.final_write.into_parts();
-    let (version, dop_domain, reads) = final_context.into_parts();
+    let (version, dop_domain, reads, emission_mode) = final_context.into_parts();
     let mut draft = crate::planner::distributed::build::lower_final_change_stream_write_plan(
         &physical,
         version,
@@ -1590,6 +1625,7 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
         functions,
         root_allow_throw_exception,
         constant_policy,
+        emission_mode,
         control,
     )
     .map_err(final_lowering_error)?;
@@ -2343,7 +2379,7 @@ pub fn build_final_statistics_connector_plan(
     control.check()?;
     let functions = functions.snapshot();
     control.check()?;
-    let (version, dop_domain, reads) = final_context.into_parts();
+    let (version, dop_domain, reads, emission_mode) = final_context.into_parts();
     let reads = reads.ok_or_else(|| {
         "ANALYZE final planning requires exactly one finalized provider read".to_string()
     })?;
@@ -2371,6 +2407,7 @@ pub fn build_final_statistics_connector_plan(
         functions,
         root_allow_throw_exception,
         constant_policy,
+        emission_mode,
         control,
     )
     .map_err(final_lowering_error)?;
@@ -3048,6 +3085,7 @@ mod tests {
                     },
                 ),
             ),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         )
     }
 
@@ -4056,12 +4094,17 @@ mod tests {
             let (completion, reads) = super::begin_final_dml_read_plan(
                 request(SqlCompileIntent::DmlInternalRead),
                 &SessionOptimizerSettings::default(),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             )
             .unwrap();
             assert!(reads.is_empty());
             assert_eq!(completion.root_allow_throw_exception, expected);
             assert_eq!(completion.constant_policy, constant_policy);
-            let source = super::compile_ctas_source(request(SqlCompileIntent::Query)).unwrap();
+            let source = super::compile_ctas_source(
+                request(SqlCompileIntent::Query),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
+            )
+            .unwrap();
             assert_eq!(source.root_allow_throw_exception, expected);
             assert_eq!(source.constant_policy, constant_policy);
             assert_eq!(source.output_columns().len(), 1);
@@ -4100,11 +4143,10 @@ mod tests {
             .unwrap()
             .into_pending()
             .unwrap();
-            super::compile_ctas_source(SqlOptimizeRequest::new(
-                analyzed,
-                &statistics,
-                SqlCompileControl::unbounded(),
-            ))
+            super::compile_ctas_source(
+                SqlOptimizeRequest::new(analyzed, &statistics, SqlCompileControl::unbounded()),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
+            )
             .unwrap()
         });
         assert!(!sources[0].root_allow_throw_exception);

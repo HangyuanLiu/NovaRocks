@@ -672,8 +672,11 @@ fn plan_query_for_ctas_source(
     let optimize_request =
         novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control);
     let decimal_overflow_policy = optimize_request.decimal_overflow_policy();
-    let source = novarocks_sql::planning::dml::compile_ctas_source(optimize_request)
-        .map_err(CtasFailure::from_compile)?;
+    let source = novarocks_sql::planning::dml::compile_ctas_source(
+        optimize_request,
+        state.static_plan_carrier().sql_emission_mode(),
+    )
+    .map_err(CtasFailure::from_compile)?;
     Ok(PlannedCtasSourceQuery {
         decimal_overflow_policy,
         source,

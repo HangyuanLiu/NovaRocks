@@ -78,6 +78,19 @@ impl GroupConcatSourceFacts {
     }
 }
 
+/// Positive evidence of the constructor that supplied an exact result target.
+/// It is not inferred from a function name, selected result or source absence.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum SqlResultConstraintOrigin {
+    Unconstrained,
+    EmptyArrayLiteral,
+    ValueDomainConversion {
+        /// The original full final assignment/CAST target, before the one
+        /// conversion owner chose its explicit intermediate contract.
+        final_target: novarocks_functions::FunctionValueType,
+    },
+}
+
 /// One call's exact selection and authored semantic policy. The selected
 /// overload remains catalog-owned; a SQL scope does not redefine its identity.
 #[derive(Debug, Eq, Hash, PartialEq)]
@@ -86,6 +99,7 @@ struct SqlFunctionCallFacts {
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     /// A real producer-supplied result target, separate from inferred selection.
     result_constraint: Option<novarocks_functions::FunctionValueType>,
+    result_constraint_origin: SqlResultConstraintOrigin,
     group_concat: Option<GroupConcatSourceFacts>,
     aggregate_state_source: Option<Arc<novarocks_type_contract::AggregateStateInterpretation>>,
 }
@@ -99,6 +113,7 @@ impl SqlFunctionBinding {
             resolved,
             decimal_overflow_policy,
             result_constraint: None,
+            result_constraint_origin: SqlResultConstraintOrigin::Unconstrained,
             group_concat: None,
             aggregate_state_source: None,
         }))
@@ -106,7 +121,7 @@ impl SqlFunctionBinding {
 
     /// Preserve the exact target supplied to the original binding owner.
     /// An inferred selected result must never be passed as this constraint.
-    pub(crate) fn new_with_result_constraint(
+    pub(crate) fn new_with_empty_array_constraint(
         resolved: novarocks_functions::ResolvedFunctionBinding,
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
         result_constraint: novarocks_functions::FunctionValueType,
@@ -115,6 +130,28 @@ impl SqlFunctionBinding {
             resolved,
             decimal_overflow_policy,
             result_constraint: Some(result_constraint),
+            result_constraint_origin: SqlResultConstraintOrigin::EmptyArrayLiteral,
+            group_concat: None,
+            aggregate_state_source: None,
+        }))
+    }
+
+    /// The actual conversion constructors retain both original targets. The
+    /// captured request still borrows the original intermediate constraint.
+    /// A later computed target requires its own same-emission derivation.
+    pub(crate) fn new_with_conversion_constraint(
+        resolved: novarocks_functions::ResolvedFunctionBinding,
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+        result_constraint: novarocks_functions::FunctionValueType,
+        final_target: novarocks_functions::FunctionValueType,
+    ) -> Self {
+        Self(Arc::new(SqlFunctionCallFacts {
+            resolved,
+            decimal_overflow_policy,
+            result_constraint: Some(result_constraint),
+            result_constraint_origin: SqlResultConstraintOrigin::ValueDomainConversion {
+                final_target,
+            },
             group_concat: None,
             aggregate_state_source: None,
         }))
@@ -126,6 +163,7 @@ impl SqlFunctionBinding {
             resolved: old.resolved.clone(),
             decimal_overflow_policy: old.decimal_overflow_policy,
             result_constraint: old.result_constraint.clone(),
+            result_constraint_origin: old.result_constraint_origin.clone(),
             group_concat: Some(facts),
             aggregate_state_source: old.aggregate_state_source.clone(),
         });
@@ -142,6 +180,7 @@ impl SqlFunctionBinding {
             resolved: old.resolved.clone(),
             decimal_overflow_policy: old.decimal_overflow_policy,
             result_constraint: old.result_constraint.clone(),
+            result_constraint_origin: old.result_constraint_origin.clone(),
             group_concat: old.group_concat.clone(),
             aggregate_state_source: Some(Arc::new(facts)),
         });
@@ -159,6 +198,10 @@ impl SqlFunctionBinding {
 
     pub(crate) fn result_constraint(&self) -> Option<&novarocks_functions::FunctionValueType> {
         self.0.result_constraint.as_ref()
+    }
+
+    pub(crate) fn result_constraint_origin(&self) -> &SqlResultConstraintOrigin {
+        &self.0.result_constraint_origin
     }
 
     pub fn resolved(&self) -> &novarocks_functions::ResolvedFunctionBinding {

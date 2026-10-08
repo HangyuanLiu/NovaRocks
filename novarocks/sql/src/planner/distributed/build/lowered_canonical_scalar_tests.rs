@@ -94,6 +94,7 @@ pub(in crate::planner::distributed::build) fn finish(
         crate::functions::builtin_sql_function_catalog().snapshot(),
         false,
         policy(),
+        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         &control,
     )
     .unwrap()
@@ -401,6 +402,7 @@ fn canonical_scalar_actual_emission_preserves_each_success_and_ordinary_control_
                 functions.clone(),
                 false,
                 policy(),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 control,
             )
         };

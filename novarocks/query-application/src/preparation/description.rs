@@ -40,16 +40,32 @@ impl OutputContract {
     /// A completed plan states what it delivers as part of being complete:
     /// the port names each field, and the name is the alias where the
     /// statement gave one, which is the name the client asked for.
+    /// Preserve the original SQL public declaration from its actual source
+    /// owner. Program sources retain the original exact physical port path.
+    pub fn from_completed_candidate(
+        kind: QueryExecutionKind,
+        candidate: &CompletedPhysicalPlanCandidate,
+    ) -> Result<Self, String> {
+        Self::from_result_port(kind, candidate.original_public_result_port())
+    }
+
     pub fn from_completed_plan(
         kind: QueryExecutionKind,
         plan: &novarocks_physical_plan::PhysicalPlan,
+    ) -> Result<Self, String> {
+        Self::from_result_port(kind, plan.result_port())
+    }
+
+    fn from_result_port(
+        kind: QueryExecutionKind,
+        port: Option<&novarocks_physical_plan::ResultPort>,
     ) -> Result<Self, String> {
         // A write plan's root port carries the connector commit relation for
         // its internal finish. It is not a client row result.
         if kind == QueryExecutionKind::Write {
             return Ok(Self::CompletionOnly);
         }
-        match plan.result_port() {
+        match port {
             Some(result) if !result.fields.is_empty() => Ok(Self::Rows(
                 result
                     .fields
@@ -253,7 +269,7 @@ impl FrozenExecutionDescription {
         validate_frozen_cost(cost)?;
         validate_effect_recovery(effect, recovery)?;
         let plan = candidate.plan().version();
-        let expected_output = OutputContract::from_completed_plan(kind, candidate.plan())?;
+        let expected_output = OutputContract::from_completed_candidate(kind, &candidate)?;
         if output.fields() != expected_output.fields()
             || matches!(output, OutputContract::CompletionOnly)
                 != matches!(expected_output, OutputContract::CompletionOnly)

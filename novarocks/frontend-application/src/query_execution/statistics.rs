@@ -374,6 +374,7 @@ pub fn prepare_completed_statistics_collection(
                 },
             ])
             .map_err(contract_violation)?,
+            static_plan_carrier.sql_emission_mode(),
         ),
         execution
             .sql_semantics()
@@ -387,11 +388,12 @@ pub fn prepare_completed_statistics_collection(
     let version = plan.plan().version();
     let candidate = CompletedPhysicalPlanCandidate::for_sql_program(plan, &completion_control)
         .map_err(|error| contract_violation(error.to_string()))?;
-    let output = novarocks_query_application::preparation::OutputContract::from_completed_plan(
-        novarocks_query_application::api::QueryExecutionKind::Statistics,
-        candidate.plan(),
-    )
-    .map_err(contract_violation)?;
+    let output =
+        novarocks_query_application::preparation::OutputContract::from_completed_candidate(
+            novarocks_query_application::api::QueryExecutionKind::Statistics,
+            &candidate,
+        )
+        .map_err(contract_violation)?;
     let paired = CompletedPlanWithAccess::try_pair(candidate, access)
         .map_err(|(error, _returned)| contract_violation(error.to_string()))?;
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(

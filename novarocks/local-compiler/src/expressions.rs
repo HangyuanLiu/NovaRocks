@@ -382,7 +382,9 @@ fn lower_core(
                 | ExprKind::Conjunction { args }
                 | ExprKind::Disjunction { args } => args.get(next).copied(),
                 ExprKind::Unary {
-                    op: novarocks_physical_plan::UnaryOperator::Not,
+                    op:
+                        novarocks_physical_plan::UnaryOperator::Not
+                        | novarocks_physical_plan::UnaryOperator::Minus,
                     expr,
                 }
                 | ExprKind::IsNull { expr, .. }
@@ -492,6 +494,25 @@ fn lower_core(
                     } else {
                         StaticExprKind::NaryOr { args: local_args }
                     }
+                }
+                ExprKind::Unary {
+                    op: novarocks_physical_plan::UnaryOperator::Minus,
+                    expr,
+                } => {
+                    let child = *ids.get(expr).ok_or(ExpressionLoweringError::Invalid(
+                        "native negate operand was not lowered",
+                    ))?;
+                    let source_child = source.get(*expr).ok_or(
+                        ExpressionLoweringError::Invalid("native negate source operand is missing"),
+                    )?;
+                    work.flush()?;
+                    novarocks_functions::PreparedNativeNegateRecipe::try_new(
+                        &source_child.ty,
+                        &node.ty,
+                        control,
+                    )?;
+                    work.flush()?;
+                    StaticExprKind::PreparedNativeNegate(child)
                 }
                 ExprKind::Unary {
                     op: novarocks_physical_plan::UnaryOperator::Not,
@@ -1176,6 +1197,42 @@ fn prepare_core(
                         ));
                     }
                     ScopedExpressionEffects::pure_value(invocation.context)
+                }
+                (
+                    ExprKind::Unary {
+                        op: novarocks_physical_plan::UnaryOperator::Minus,
+                        expr,
+                    },
+                    StaticExprKind::PreparedNativeNegate(local_child),
+                ) => {
+                    if invocation.control != ControlShape::Eager
+                        || invocation.arguments.len() != 1
+                        || lowered.ids.get(expr) != Some(local_child)
+                        || flow.uses()[&invocation.arguments[0]].definition != *expr
+                    {
+                        return Err(ExpressionLoweringError::Invalid(
+                            "native negate differs from its actual ordered source",
+                        ));
+                    }
+                    let child = package.fragment().expressions().get(*expr).ok_or(
+                        ExpressionLoweringError::Invalid("missing native negate source"),
+                    )?;
+                    work.flush()?;
+                    let recipe = novarocks_functions::PreparedNativeNegateRecipe::try_new(
+                        &child.ty, &source.ty, control,
+                    )?;
+                    work.flush()?;
+                    recipe
+                        .own_effects(invocation.context)
+                        .join_control_argument(
+                            *effects.get(&invocation.arguments[0]).ok_or(
+                                ExpressionLoweringError::Invalid(
+                                    "native negate child effects were not prepared",
+                                ),
+                            )?,
+                            flow,
+                            0,
+                        )?
                 }
                 (
                     ExprKind::Unary {
@@ -1903,6 +1960,13 @@ fn literal_argument(
             )
             | (ExprKind::IsNull { negated: false, .. }, StaticExprKind::IsNull(_))
             | (ExprKind::IsNull { negated: true, .. }, StaticExprKind::IsNotNull(_)) => Ok(None),
+            (
+                ExprKind::Unary {
+                    op: novarocks_physical_plan::UnaryOperator::Minus,
+                    ..
+                },
+                StaticExprKind::PreparedNativeNegate(_),
+            ) => Ok(None),
             (ExprKind::Case { .. }, StaticExprKind::Case { .. }) => Ok(None),
             (ExprKind::Cast { .. }, StaticExprKind::PreparedCast { .. }) => Ok(None),
             (ExprKind::Binary { op, .. }, StaticExprKind::PreparedArithmetic { operator, .. })

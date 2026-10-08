@@ -52,7 +52,11 @@ use novarocks_sql::compiler::{
     SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog, noop_constant_evaluator,
 };
 
-fn original_sql(sql: &str, dtype: DataType) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
+pub(super) fn sql_source(
+    sql: &str,
+    dtype: DataType,
+    emission_mode: novarocks_sql::compiler::SqlPhysicalEmissionMode,
+) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     let control = SqlCompileControl::unbounded();
     let request = SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([91; 16]).unwrap(),
@@ -84,6 +88,7 @@ fn original_sql(sql: &str, dtype: DataType) -> novarocks_sql::compiler::SqlAutho
             max_library_validation_work: 1 << 20,
             max_library_validation_bytes: 1 << 20,
         },
+        emission_mode,
         control.clone(),
         PipelineDopDomain {
             min: 1,
@@ -191,7 +196,11 @@ fn numeric_unary_original_nonnull_sql_baseline_three_narrow_widths_remain_nonnul
         ("INT", "-2147483648", DataType::Int32),
     ] {
         let _ = (ty, min); // Values are runtime inputs, never used to manufacture plan types.
-        let source = original_sql("SELECT -k AS original_negated FROM fixture", dtype.clone());
+        let source = sql_source(
+            "SELECT -k AS original_negated FROM fixture",
+            dtype.clone(),
+            novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
+        );
         let port = source.plan().result_port().unwrap();
         assert_original_same_owner(port, &source);
         assert_eq!(port.fields.len(), 1);
@@ -222,9 +231,10 @@ fn numeric_unary_original_nonnull_sql_baseline_three_narrow_widths_remain_nonnul
 }
 #[test]
 fn numeric_unary_original_nonnull_sql_baseline_ordered_labels_and_values_are_actual_root() {
-    let source = original_sql(
+    let source = sql_source(
         "SELECT -k AS first_alias, k AS original_source, -k AS repeated_alias FROM fixture",
         DataType::Int8,
+        novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
     );
     let port = source.plan().result_port().unwrap();
     assert_original_same_owner(port, &source);

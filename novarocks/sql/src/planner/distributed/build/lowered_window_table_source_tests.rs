@@ -120,6 +120,7 @@ pub(in crate::planner::distributed::build) fn finish(
         crate::functions::builtin_sql_function_catalog().snapshot(),
         false,
         policy(),
+        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         &control,
     )
     .unwrap()
@@ -770,6 +771,7 @@ fn window_and_table_actual_capture_recording_preserve_every_lowering_control_pre
                 functions.clone(),
                 false,
                 policy(),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 control,
             )
         };
@@ -833,6 +835,7 @@ fn aggregate_window_argument_limit_refuses_before_any_channel_emission() {
         crate::functions::builtin_sql_function_catalog().snapshot(),
         false,
         policy(),
+        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         &control,
     )
     .unwrap();

@@ -540,6 +540,7 @@ impl FrontendQueryCompiler {
             novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
             crate::query_execution::constant_eval::constant_evaluator(),
             self.constant_policy(),
+            self.query.static_plan_carrier().sql_emission_mode(),
             SqlCompileControl::new(
                 execution.deadline(),
                 sql_cancellation_observation(execution.cancellation().clone()),
@@ -627,6 +628,7 @@ impl FrontendQueryCompiler {
             novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
             crate::query_execution::constant_eval::constant_evaluator(),
             self.constant_policy(),
+            self.query.static_plan_carrier().sql_emission_mode(),
             SqlCompileControl::new(
                 execution.deadline(),
                 sql_cancellation_observation(execution.cancellation().clone()),
@@ -654,11 +656,12 @@ impl FrontendQueryCompiler {
         .map_err(|failure| FrontendQueryCompilerError::from_completion(failure.error()))?;
         // What this statement delivers is a property of the plan, read before
         // the plan is consumed by encoding.
-        let output = novarocks_query_application::preparation::OutputContract::from_completed_plan(
-            novarocks_query_application::api::QueryExecutionKind::Read,
-            completed.candidate().plan(),
-        )
-        .map_err(FrontendQueryCompilerError::Engine)?;
+        let output =
+            novarocks_query_application::preparation::OutputContract::from_completed_candidate(
+                novarocks_query_application::api::QueryExecutionKind::Read,
+                completed.candidate(),
+            )
+            .map_err(FrontendQueryCompilerError::Engine)?;
         #[cfg(debug_assertions)]
         let selected_mv_rewrite = completed
             .candidate()
@@ -770,6 +773,7 @@ impl FrontendQueryCompiler {
             novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
             crate::query_execution::constant_eval::constant_evaluator(),
             self.constant_policy(),
+            self.query.static_plan_carrier().sql_emission_mode(),
             SqlCompileControl::new(
                 execution.deadline(),
                 sql_cancellation_observation(execution.cancellation().clone()),
@@ -787,11 +791,12 @@ impl FrontendQueryCompiler {
         let plan = Arc::clone(completed.candidate().plan());
         let annotations: Arc<[novarocks_sql::compiler::SqlDisplayAnnotation]> =
             completed.candidate().display_annotations().to_vec().into();
-        let output = novarocks_query_application::preparation::OutputContract::from_completed_plan(
-            novarocks_query_application::api::QueryExecutionKind::Read,
-            &plan,
-        )
-        .map_err(FrontendQueryCompilerError::Engine)?;
+        let output =
+            novarocks_query_application::preparation::OutputContract::from_completed_candidate(
+                novarocks_query_application::api::QueryExecutionKind::Read,
+                completed.candidate(),
+            )
+            .map_err(FrontendQueryCompilerError::Engine)?;
         let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
             completed,
             self.functions.as_ref(),

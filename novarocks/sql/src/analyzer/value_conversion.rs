@@ -124,10 +124,11 @@ pub(super) fn convert_value_domain_with_catalog(
         kind: ExprKind::FunctionCall {
             name: novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_NAME.to_string(),
             volatility: binding.semantics.volatility,
-            binding: crate::binding::SqlFunctionBinding::new_with_result_constraint(
+            binding: crate::binding::SqlFunctionBinding::new_with_conversion_constraint(
                 binding,
                 decimal_overflow_policy,
                 intermediate,
+                target.clone(),
             ),
             args: vec![source],
             distinct: false,

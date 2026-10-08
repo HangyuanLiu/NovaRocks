@@ -5374,6 +5374,7 @@ mod tests {
                 builtin_sql_function_catalog().snapshot(),
                 noop_constant_evaluator(),
                 constants(),
+                novarocks_sql::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
                 SqlCompileControl::unbounded(),
                 PipelineDopDomain {
                     min: 1,

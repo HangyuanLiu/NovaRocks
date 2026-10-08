@@ -623,6 +623,9 @@ impl std::error::Error for ExprArenaConstructionError {
 }
 
 impl ExprArena {
+    pub(crate) fn get_mut_for_construction(&mut self, id: ExprId) -> Option<&mut ExprNode> {
+        self.nodes.get_mut(&id)
+    }
     /// Own already-authored definitions while preserving every sparse ID.
     /// Zero and MAX are ordinary sparse keys; no next-ID allocator is involved.
     ///

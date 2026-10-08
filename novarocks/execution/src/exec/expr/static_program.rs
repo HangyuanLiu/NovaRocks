@@ -126,6 +126,11 @@ fn thaw_kind(kind: &StaticExprKind) -> Result<ExprNode, String> {
         Static::PreparedCast { .. } => {
             return Err("compiled cast cannot enter the legacy expression bridge".to_string());
         }
+        Static::PreparedNativeNegate(..) => {
+            return Err(
+                "compiled native negate cannot enter the legacy expression bridge".to_string(),
+            );
+        }
         Static::PreparedArithmetic { .. } => {
             return Err(
                 "compiled arithmetic cannot enter the legacy expression bridge".to_string(),

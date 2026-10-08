@@ -135,6 +135,25 @@ impl CompletedPhysicalPlanCandidate {
         }
     }
 
+    /// A structural program has no SQL emission certification. It is never
+    /// assigned a default SQL mode by this projection.
+    pub fn sql_emission_mode(&self) -> Option<novarocks_sql::compiler::SqlPhysicalEmissionMode> {
+        match &self.source {
+            CompletedPlanSource::Sql(source) => Some(source.emission_mode()),
+            CompletedPlanSource::Program(_) => None,
+        }
+    }
+    /// Same immutable source's publication-proved public output obligation.
+    /// No caller can replace it with another plan or supplied result schema.
+    pub fn original_public_result_port(&self) -> Option<&novarocks_physical_plan::ResultPort> {
+        match &self.source {
+            CompletedPlanSource::Sql(source) => source
+                .original_public_result_declaration()
+                .map(|loan| loan.original_port()),
+            CompletedPlanSource::Program(plan) => plan.result_port(),
+        }
+    }
+
     pub fn plan(&self) -> &Arc<PhysicalPlan> {
         match &self.source {
             CompletedPlanSource::Sql(source) => source.plan_arc(),
@@ -573,6 +592,7 @@ mod tests {
             builtin_sql_function_catalog().snapshot(),
             noop_constant_evaluator(),
             crate::completed_plan_fixture::test_constant_policy(),
+            novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             control,
             PipelineDopDomain {
                 min: 1,

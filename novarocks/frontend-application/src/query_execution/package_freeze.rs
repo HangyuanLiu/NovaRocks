@@ -63,6 +63,17 @@ pub enum StaticPlanCarrier {
     CompiledPackage(CompiledPackageCarrier),
 }
 
+impl StaticPlanCarrier {
+    /// Freeze the SQL emission policy before the statement's first completion.
+    /// This projects the already selected process carrier; it never guesses one.
+    pub const fn sql_emission_mode(self) -> novarocks_sql::compiler::SqlPhysicalEmissionMode {
+        match self {
+            Self::PlanTree=>novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
+            Self::CompiledPackage(_)=>novarocks_sql::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
+        }
+    }
+}
+
 /// Host-owned configuration of the compiled package carrier.
 ///
 /// Both values are deployment sizing the composition chooses; neither has a
@@ -170,6 +181,10 @@ pub(crate) fn extract_checked_packages(
 ) -> Result<BTreeMap<FragmentId, FragmentPackage>, PackageFreezeError> {
     let plan = candidate.plan();
     let scans = author_frozen_reads(plan, encodings, control)?;
+    if let Some(mode)=candidate.sql_emission_mode()
+        && mode!=novarocks_sql::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration {
+        return Err(PackageFreezeError::Facts("SQL source was not authored for the compiled package carrier".to_string()));
+    }
     let semantics = candidate
         .author_package_semantics(statement_constant_policy, control)
         .map_err(|error| match error {

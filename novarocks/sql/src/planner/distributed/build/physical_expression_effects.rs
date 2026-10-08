@@ -548,6 +548,18 @@ fn primitive_own_effects(
             ScopedExpressionEffects::pure_value(context)
         }
         ExprKind::Unary {
+            op: UnaryOperator::Minus,
+            expr,
+        } => {
+            let child = operand(*expr)?;
+            work.flush()?;
+            let recipe = novarocks_functions::PreparedNativeNegateRecipe::try_new(
+                &child.ty, &source.ty, control,
+            )?;
+            work.flush()?;
+            recipe.own_effects(context)
+        }
+        ExprKind::Unary {
             op: UnaryOperator::Not,
             ..
         }

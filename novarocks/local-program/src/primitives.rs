@@ -431,3 +431,62 @@ pub(crate) fn compile_null_safe_comparisons(
     work.finish()?;
     result
 }
+
+pub(crate) fn compile_native_negate(
+    checked: &ProgramLexicalBindings,
+    control: &dyn PureCompileControl,
+) -> Result<
+    BTreeMap<ProgramUseRef, novarocks_functions::PreparedNativeNegateRecipe>,
+    ProgramPrimitiveError,
+> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let result = (|| {
+        let typed = checked.channels().expressions();
+        let snapshot = typed.resolved_calls().snapshot();
+        let mut recipes = BTreeMap::new();
+        for (&arena, flow) in snapshot.flows() {
+            let definitions = &snapshot.roots().arenas()[&arena];
+            let types = &typed.types()[&arena];
+            let value = |id: crate::ProgramExprId| match types.get(id.index()) {
+                Some(FunctionArgumentType::Value(value)) => Ok(value),
+                _ => Err(ProgramPrimitiveError::Invalid(
+                    "arithmetic requires complete value types",
+                )),
+            };
+            for (&use_id, invocation) in flow.uses() {
+                work.step()?;
+                let kind = definitions
+                    .node(invocation.definition)
+                    .ok_or(ProgramPrimitiveError::Invalid(
+                        "missing arithmetic definition",
+                    ))?
+                    .kind();
+                let StaticExprKind::PreparedNativeNegate(child) = kind else {
+                    continue;
+                };
+                if invocation.control != ControlShape::Eager
+                    || invocation.arguments.len() != 1
+                    || flow.uses()[&invocation.arguments[0]].definition != *child
+                {
+                    return Err(ProgramPrimitiveError::Invalid(
+                        "native negate differs from its actual ordered occurrence",
+                    ));
+                }
+                work.flush()?;
+                let recipe = novarocks_functions::PreparedNativeNegateRecipe::try_new(
+                    value(*child)?,
+                    value(invocation.definition)?,
+                    control,
+                )?;
+                recipes.insert(ProgramUseRef { arena, use_id }, recipe);
+                work.step()?;
+            }
+        }
+        Ok(recipes)
+    })();
+    if matches!(result, Err(ProgramPrimitiveError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}

@@ -211,6 +211,7 @@ fn canonical_conversion_raw_lambda_uses_original_lexical_scope_and_none_request(
         crate::functions::builtin_sql_function_catalog().snapshot(),
         false,
         policy(),
+        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         &control,
     )
     .unwrap();

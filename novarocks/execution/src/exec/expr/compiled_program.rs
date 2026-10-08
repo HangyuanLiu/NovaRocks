@@ -268,6 +268,7 @@ impl CompiledExpressionInstance {
                     | StaticExprKind::IsNotNull(_)
                     | StaticExprKind::Case { .. }
                     | StaticExprKind::PreparedCast { .. }
+                    | StaticExprKind::PreparedNativeNegate(_)
                     | StaticExprKind::PreparedArithmetic { .. }
                     | StaticExprKind::PreparedNullSafeComparison { .. }
                     | StaticExprKind::Eq(..)
@@ -282,6 +283,14 @@ impl CompiledExpressionInstance {
                                     .arithmetic_recipe(occurrence)
                                     .ok_or_else(|| {
                                         invalid("missing mandatory arithmetic effect recipe")
+                                    })?
+                                    .own_effects(invocation.context)
+                            } else if matches!(node.kind(), StaticExprKind::PreparedNativeNegate(_))
+                            {
+                                program
+                                    .native_negate_recipe(occurrence)
+                                    .ok_or_else(|| {
+                                        invalid("missing mandatory native negate effect recipe")
                                     })?
                                     .own_effects(invocation.context)
                             } else if matches!(node.kind(), StaticExprKind::PreparedCast { .. }) {
@@ -362,6 +371,10 @@ impl CompiledExpressionInstance {
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 1
                         && program.cast_recipe(occurrence).is_some() => {}
+                StaticExprKind::PreparedNativeNegate(_)
+                    if invocation.control == ControlShape::Eager
+                        && invocation.arguments.len() == 1
+                        && program.native_negate_recipe(occurrence).is_some() => {}
                 StaticExprKind::PreparedArithmetic { .. }
                     if invocation.control == ControlShape::Eager
                         && invocation.arguments.len() == 2

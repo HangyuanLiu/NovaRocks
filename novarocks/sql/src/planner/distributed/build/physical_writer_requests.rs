@@ -140,7 +140,10 @@ impl<'entry, 'source> AuthoredPhysicalWriterRequest<'entry, 'source> {
     pub fn request(&self) -> FunctionBindingRequest<'_> {
         match &self.channels {
             WriterRequestChannels::Update(canonical) => canonical.request(),
-            WriterRequestChannels::Merge(_) => self.entry.captured().request(),
+            WriterRequestChannels::Merge(_) => match self.entry.canonical() {
+                Some(canonical) => canonical.request(),
+                None => self.entry.captured().request(),
+            },
         }
     }
     pub fn decimal_overflow_policy(&self) -> DecimalOverflowPolicy {
@@ -206,16 +209,22 @@ pub(crate) fn author_physical_writer_request_observed<'entry, 'source>(
         (AggregatePhase::Final { .. }, AggregateRuntimeDemand::WriterState(value))
             if value == source.input =>
         {
-            let absent_canonical = entry.canonical().is_none();
-            work.step()?;
-            if !absent_canonical {
-                return Err(PhysicalWriterRequestError::InvalidSource(
-                    "Writer merge unexpectedly carries an update operational request",
-                ));
-            }
-            let request = entry.captured().request();
+            let request = if let Some(canonical) = entry.canonical() {
+                work.step()?;
+                if !canonical.belongs_to(entry.captured()) {
+                    return Err(PhysicalWriterRequestError::InvalidSource(
+                        "Writer merge canonical request has a foreign original source revision",
+                    ));
+                }
+                canonical.request()
+            } else {
+                entry.captured().request()
+            };
             checked_request_shape_observed(source, request, work)?;
-            let selected = &entry.captured().binding().resolved().selected;
+            let selected = match entry.canonical() {
+                Some(canonical) => canonical.selected().as_ref(),
+                None => &entry.captured().binding().resolved().selected,
+            };
             selected_binding_correspondence_observed(
                 entry.captured(),
                 selected,
@@ -224,12 +233,20 @@ pub(crate) fn author_physical_writer_request_observed<'entry, 'source>(
                 work,
             )?;
             validate_installed_request_observed(entry, request, work)?;
-            let selected = author_scalar_result_selection_observed(
-                &source.binding.function,
-                Some(&source.binding),
-                work,
-            )
-            .map_err(PhysicalAggregateRequestError::from)?;
+            let selected = if let Some(canonical) = entry.canonical() {
+                work.flush()?;
+                let selected = Arc::clone(canonical.selected());
+                work.step()?;
+                work.flush()?;
+                selected
+            } else {
+                author_scalar_result_selection_observed(
+                    &source.binding.function,
+                    Some(&source.binding),
+                    work,
+                )
+                .map_err(PhysicalAggregateRequestError::from)?
+            };
             let inputs = entry.state_inputs_observed(work)?;
             // The original visitor retains its error ABI. Store the exact
             // callback failure before its immediate sentinel return; the walk

@@ -478,7 +478,10 @@ impl AuthoredPhysicalAggregateMergeRequest<'_, '_> {
         self.phase
     }
     pub fn request(&self) -> FunctionBindingRequest<'_> {
-        self.entry.captured().request()
+        match self.entry.canonical() {
+            Some(canonical) => canonical.request(),
+            None => self.entry.captured().request(),
+        }
     }
     pub fn decimal_overflow_policy(&self) -> novarocks_type_contract::DecimalOverflowPolicy {
         self.entry.captured().binding().decimal_overflow_policy()
@@ -537,7 +540,7 @@ pub(crate) fn author_physical_aggregate_merge_request_observed<'entry, 'source>(
     let state = entry.fragment().expressions().get(state_id);
     work.step()?;
     let state = state.ok_or(PhysicalAggregateRequestError::MissingArgument(state_id))?;
-    let selected = captured_selected_correspondence_observed(entry.captured(), source, work)?;
+    let selected = checked_merge_selected_observed(entry, work)?;
     // The original source graph lends every actual producer. This validates
     // each producer against its own request; cross-phase interpretation is
     // still the aggregate implementation/state owner's separate obligation.
@@ -590,13 +593,7 @@ pub(crate) fn author_physical_aggregate_merge_request_observed<'entry, 'source>(
                     author_physical_aggregate_update_request_from_journal_observed(&producer, work)
                         .map(|_| ())
                 } else {
-                    selected_correspondence_observed(
-                        producer.captured(),
-                        &producer.captured().binding().resolved().selected,
-                        producer.captured().request().logical_argument_count,
-                        producer.source(),
-                        work,
-                    )
+                    checked_merge_selected_observed(&producer,work).map(|_|())
                 };
                 result.map_err(|error| match error {
                     PhysicalAggregateRequestError::Control(cause) => {
@@ -627,6 +624,34 @@ pub(crate) fn author_physical_aggregate_merge_request_observed<'entry, 'source>(
         phase,
         selected,
     })
+}
+
+fn checked_merge_selected_observed(
+    entry: &super::lowered_draft::CheckedAggregateLogicalSourceEntry<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Arc<FunctionBindingSelection>, PhysicalAggregateRequestError> {
+    if let Some(canonical) = entry.canonical() {
+        work.step()?;
+        if !canonical.belongs_to(entry.captured()) {
+            return Err(PhysicalAggregateRequestError::InvalidSource(
+                "merge canonical request has a foreign original source revision",
+            ));
+        }
+        selected_correspondence_observed(
+            entry.captured(),
+            canonical.selected(),
+            canonical.request().logical_argument_count,
+            entry.source(),
+            work,
+        )?;
+        work.flush()?;
+        let selected = Arc::clone(canonical.selected());
+        work.step()?;
+        work.flush()?;
+        Ok(selected)
+    } else {
+        captured_selected_correspondence_observed(entry.captured(), entry.source(), work)
+    }
 }
 
 /// The one signature comparison author serves journal updates and merges.

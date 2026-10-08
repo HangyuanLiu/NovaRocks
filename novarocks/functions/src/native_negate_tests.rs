@@ -289,3 +289,154 @@ fn native_negate_large_selected_ref_projection_adds_actual_quantum() {
         "277 bounded original scalar operations plus actual 277-reference projection"
     );
 }
+
+#[test]
+fn native_negate_computed_domain_is_exact_for_every_original_full_carrier() {
+    for dtype in [
+        DataType::Int8,
+        DataType::Int16,
+        DataType::Int32,
+        DataType::Int64,
+        DataType::Float32,
+        DataType::Float64,
+        DataType::Decimal128(1, 0),
+        DataType::Decimal256(1, 0),
+        DataType::FixedSizeBinary(16),
+    ] {
+        for nullable in [false, true] {
+            let source = if dtype == DataType::FixedSizeBinary(16) {
+                FunctionValueType::try_with_logical_type(
+                    dtype.clone(),
+                    nullable,
+                    ValueLogicalType::LargeInt,
+                )
+                .unwrap()
+            } else {
+                FunctionValueType::new(dtype.clone(), nullable)
+            };
+            let computed = native_negate_computed_result_type(&source, &Compile).unwrap();
+            assert_eq!(computed.logical_type, source.logical_type);
+            assert_eq!(computed.data_type, source.data_type);
+            assert_eq!(
+                computed.nullable,
+                nullable
+                    || matches!(
+                        dtype,
+                        DataType::Int8
+                            | DataType::Int16
+                            | DataType::Int32
+                            | DataType::Decimal128(_, _)
+                            | DataType::Decimal256(_, _)
+                    )
+            );
+            let recipe = PreparedNativeNegateRecipe::try_new(&source, &computed, &Compile).unwrap();
+            assert_eq!(recipe.source_type(), &source);
+            assert_eq!(recipe.result_type(), &computed);
+        }
+    }
+}
+#[test]
+fn native_negate_computed_full_decimal_carriers_preserve_original_successful_null() {
+    // Original independent raw full-carrier baseline passed before extraction.
+    for input in [
+        Arc::new(
+            Decimal128Array::from(vec![Some(10), Some(-10), Some(1)])
+                .with_precision_and_scale(1, 0)
+                .unwrap(),
+        ) as ArrayRef,
+        Arc::new(
+            Decimal256Array::from(vec![
+                Some(i256::from_i128(10)),
+                Some(i256::from_i128(-10)),
+                Some(i256::ONE),
+            ])
+            .with_precision_and_scale(1, 0)
+            .unwrap(),
+        ) as ArrayRef,
+    ] {
+        let source = FunctionValueType::new(input.data_type().clone(), false);
+        let computed = native_negate_computed_result_type(&source, &Compile).unwrap();
+        let recipe = PreparedNativeNegateRecipe::try_new(&source, &computed, &Compile).unwrap();
+        let selected = recipe
+            .evaluate_selected(
+                EvaluatedArgument::Column(&input),
+                crate::Selection::all(3),
+                &Control::default(),
+            )
+            .unwrap();
+        let zero = crate::legacy_literal::eval(&recipe.zero, 3).unwrap();
+        let raw = crate::legacy_arithmetic::eval_sub_arrays(
+            zero,
+            input.clone(),
+            input.data_type().clone(),
+            false,
+            DecimalOverflowPolicy::OutputNull,
+        )
+        .unwrap();
+        assert!(selected.errors().is_empty());
+        assert_eq!(selected.values().to_data(), raw.to_data());
+        assert_eq!(selected.values().null_count(), 2);
+    }
+}
+#[test]
+fn native_negate_computed_specialization_keeps_actual_compile_primary_without_footer() {
+    struct Fail {
+        trace: Mutex<Vec<(CompilePhase, u32)>>,
+        at: usize,
+        cause: novarocks_type_contract::CompileControlError,
+    }
+    impl PureCompileControl for Fail {
+        fn checkpoint(
+            &self,
+            p: CompilePhase,
+            n: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            assert!(n <= 256);
+            let mut trace = self.trace.lock().unwrap();
+            assert!(trace.len() <= self.at, "callback after originating failure");
+            let at = trace.len();
+            trace.push((p, n));
+            if at == self.at {
+                Err(self.cause)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    struct Record(Mutex<Vec<(CompilePhase, u32)>>);
+    impl PureCompileControl for Record {
+        fn checkpoint(
+            &self,
+            p: CompilePhase,
+            n: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            assert!(n <= 256);
+            self.0.lock().unwrap().push((p, n));
+            Ok(())
+        }
+    }
+    let source = FunctionValueType::new(DataType::Decimal256(76, 6), false);
+    let success = Record(Mutex::new(Vec::new()));
+    native_negate_computed_result_type(&source, &success).unwrap();
+    let trace = success.0.into_inner().unwrap();
+    for at in 0..trace.len() {
+        for cause in [
+            novarocks_type_contract::CompileControlError::Cancelled,
+            novarocks_type_contract::CompileControlError::DeadlineExceeded,
+            novarocks_type_contract::CompileControlError::ResourceExhausted,
+        ] {
+            let control = Fail {
+                trace: Mutex::new(Vec::new()),
+                at,
+                cause,
+            };
+            assert_eq!(
+                native_negate_computed_result_type(&source, &control)
+                    .unwrap_err()
+                    .control_error(),
+                Some(cause)
+            );
+            assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+        }
+    }
+}

@@ -18,10 +18,12 @@
 
 mod contract_lowering;
 mod lowered_draft;
-pub use lowered_draft::SqlAuthoredPhysicalPlan;
 pub(crate) use lowered_draft::{
     AggregateRuntimeDemand, CheckedAggregateLogicalSourceEntry, LoweredSqlPhysicalDraft,
     SqlSourceJournalError,
+};
+pub use lowered_draft::{
+    CheckedSqlResultDeclaration, ResultDeclarationError, SqlAuthoredPhysicalPlan,
 };
 mod expression_occurrences;
 mod package_semantics;
@@ -32,10 +34,10 @@ mod physical_expression_effects;
 mod physical_fragment_effects;
 mod physical_relational_effects;
 mod physical_scalar_occurrences;
-mod physical_temporal_sources;
 mod physical_scalar_requests;
 mod physical_table_occurrences;
 mod physical_table_requests;
+mod physical_temporal_sources;
 mod physical_window_occurrences;
 mod physical_window_requests;
 mod physical_writer_occurrences;

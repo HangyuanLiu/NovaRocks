@@ -122,6 +122,7 @@ fn finish(expression: TypedExpr) -> SqlAuthoredPhysicalPlan {
         crate::functions::builtin_sql_function_catalog().snapshot(),
         false,
         policy(),
+        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         &control,
     )
     .unwrap()
@@ -332,6 +333,7 @@ fn conversion_journal_identity_and_null_fastpaths_have_no_phantom_source() {
         crate::functions::builtin_sql_function_catalog().snapshot(),
         false,
         policy(),
+        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         &control,
     )
     .unwrap();
@@ -383,6 +385,7 @@ fn conversion_journal_lambda_scope_matches_the_actual_intermediate_emission() {
         crate::functions::builtin_sql_function_catalog().snapshot(),
         false,
         policy(),
+        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         &control,
     )
     .unwrap();
@@ -483,6 +486,7 @@ fn conversion_emission_capture_and_record_stop_at_every_actual_control_refusal()
             functions.clone(),
             false,
             policy(),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             &control
         )
         .is_ok()
@@ -499,7 +503,7 @@ fn conversion_emission_capture_and_record_stop_at_every_actual_control_refusal()
                 ..Control::default()
             };
             assert!(
-                matches!(lower_final_physical_plan(&source,version(),dop(),functions.clone(),false,policy(),&control),
+                matches!(lower_final_physical_plan(&source,version(),dop(),functions.clone(),false,policy(),crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,&control),
             Err(ContractLoweringError::Control(actual)) if actual==cause)
             );
             assert_eq!(control.trace(), trace[..=stop]);

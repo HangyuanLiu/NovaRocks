@@ -1667,6 +1667,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
                         read_budget: rewrite_cohort_scan_read_budget(),
                     },
                 ])?,
+                static_plan_carrier.sql_emission_mode(),
             ),
             novarocks_sql::planning::dml::DmlFinalizedWriteTargetSet::try_new([
                 novarocks_sql::planning::dml::DmlFinalizedWriteTarget {

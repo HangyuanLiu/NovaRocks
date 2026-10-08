@@ -811,6 +811,28 @@ pub(super) fn evaluate_tree<'a>(
                         )?)
                     }
                 }
+                StaticExprKind::PreparedNativeNegate(_) => {
+                    if frame.children.len() != 1 {
+                        return Err(invalid("native negate requires its exact ordered operand"));
+                    }
+                    let child = frame
+                        .children
+                        .pop()
+                        .ok_or_else(|| internal("missing native negate operand"))?
+                        .value
+                        .into_value(local_selection, work)?;
+                    let recipe = program
+                        .native_negate_recipe(frame.occurrence)
+                        .ok_or_else(|| invalid("missing exact native negate recipe"))?;
+                    work.flush()?;
+                    let output = recipe.evaluate_selected(
+                        child.argument(),
+                        local_selection,
+                        work.control,
+                    )?;
+                    work.flush()?;
+                    OwnedValue::from_selected(output)
+                }
                 StaticExprKind::PreparedArithmetic { .. } => {
                     if frame.children.len() != 2 {
                         return Err(invalid("arithmetic requires its exact ordered operands"));

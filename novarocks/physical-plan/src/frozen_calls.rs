@@ -903,13 +903,27 @@ fn visit_calls<'a, E: From<FrozenCallError>>(
 pub fn visit_relational_calls_observed<'a, E: From<FrozenCallError>>(
     fragment: &'a Fragment,
     work: &mut CompileCheckpoints<'_>,
+    visit: impl FnMut(
+        PhysicalCallSite,
+        PhysicalCallBinding<'a>,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<(), E>,
+) -> Result<(), E> {
+    visit_relational_node_calls_observed(fragment.nodes().values(), work, visit)
+}
+
+/// Same ONE relational call walker for the owning unpublished builders.
+/// This borrows definitions only; no completion/source/kernel facts are minted.
+pub(crate) fn visit_relational_node_calls_observed<'a, E: From<FrozenCallError>>(
+    nodes: impl Iterator<Item = &'a crate::PhysicalNode>,
+    work: &mut CompileCheckpoints<'_>,
     mut visit: impl FnMut(
         PhysicalCallSite,
         PhysicalCallBinding<'a>,
         &mut CompileCheckpoints<'_>,
     ) -> Result<(), E>,
 ) -> Result<(), E> {
-    for node in fragment.nodes().values() {
+    for node in nodes {
         match &node.kind {
             NodeKind::Aggregate { calls, .. } => {
                 for (call, item) in calls.iter().enumerate() {

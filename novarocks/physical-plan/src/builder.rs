@@ -30,7 +30,9 @@ use crate::{
     validate_fragment_definition, validate_plan,
 };
 
+mod nullability_rebind;
 mod structure;
+pub use nullability_rebind::{NullabilityRebindError, UnpublishedNullabilityEditor};
 pub use structure::FragmentStructureError;
 pub(crate) use structure::admit_structure_counts;
 

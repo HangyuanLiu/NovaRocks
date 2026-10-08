@@ -267,6 +267,7 @@ fn values_request(version: [u8; 16]) -> SqlFinalPlanCompileRequest {
         builtin_sql_function_catalog().snapshot(),
         noop_constant_evaluator(),
         test_constant_policy(),
+        novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         SqlCompileControl::unbounded(),
         PipelineDopDomain {
             min: 1,

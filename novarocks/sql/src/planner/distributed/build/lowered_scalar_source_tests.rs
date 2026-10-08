@@ -137,6 +137,7 @@ pub(in crate::planner::distributed::build) fn authored(
         crate::functions::builtin_sql_function_catalog().snapshot(),
         false,
         policy(),
+        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         &control,
     )
     .unwrap()
@@ -375,6 +376,7 @@ fn scalar_journal_lambda_body_call_keeps_its_actual_emission_scope() {
         crate::functions::builtin_sql_function_catalog().snapshot(),
         false,
         policy(),
+        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         &control,
     )
     .unwrap();
@@ -520,6 +522,7 @@ fn scalar_journal_bare_null_and_cast_null_keep_distinct_original_request_sources
         crate::functions::builtin_sql_function_catalog().snapshot(),
         false,
         policy(),
+        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         &control,
     )
     .unwrap();
@@ -559,6 +562,7 @@ fn scalar_journal_capture_and_actual_recording_preserve_every_lowering_control_p
                 functions.clone(),
                 false,
                 policy(),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 control,
             )
         };

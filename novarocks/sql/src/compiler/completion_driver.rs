@@ -69,6 +69,7 @@ pub struct SqlFinalPlanCompileRequest {
     functions: Arc<dyn SqlFunctionCatalog>,
     constant_evaluator: &'static dyn SqlConstantEvaluator,
     constant_policy: novarocks_functions::ConstantPolicy,
+    emission_mode: super::SqlPhysicalEmissionMode,
     control: SqlCompileControl,
     dop_domain: PipelineDopDomain,
     scan_read_budget: ScanReadBudget,
@@ -84,6 +85,7 @@ impl fmt::Debug for SqlFinalPlanCompileRequest {
             .field("intent", &self.intent)
             .field("session", &self.session)
             .field("environment", &self.environment)
+            .field("emission_mode", &self.emission_mode)
             .field("dop_domain", &self.dop_domain)
             .field("scan_read_budget", &self.scan_read_budget)
             .field("limits", &self.limits)
@@ -105,6 +107,7 @@ impl SqlFinalPlanCompileRequest {
         functions: Arc<dyn SqlFunctionCatalog>,
         constant_evaluator: &'static dyn SqlConstantEvaluator,
         constant_policy: novarocks_functions::ConstantPolicy,
+        emission_mode: super::SqlPhysicalEmissionMode,
         control: SqlCompileControl,
         dop_domain: PipelineDopDomain,
         scan_read_budget: ScanReadBudget,
@@ -119,6 +122,7 @@ impl SqlFinalPlanCompileRequest {
             functions: functions.snapshot(),
             constant_evaluator,
             constant_policy,
+            emission_mode,
             control,
             dop_domain,
             scan_read_budget,
@@ -145,6 +149,7 @@ impl SqlFinalPlanCompileRequest {
             functions,
             constant_evaluator,
             constant_policy,
+            emission_mode,
             control,
             dop_domain,
             scan_read_budget,
@@ -168,6 +173,7 @@ impl SqlFinalPlanCompileRequest {
             functions,
             constant_evaluator,
             constant_policy,
+            emission_mode,
             dop_domain,
             scan_read_budget,
             display_intent,
@@ -292,6 +298,7 @@ struct FinalPlanCommon {
     functions: Arc<dyn SqlFunctionCatalog>,
     constant_evaluator: &'static dyn SqlConstantEvaluator,
     constant_policy: novarocks_functions::ConstantPolicy,
+    emission_mode: super::SqlPhysicalEmissionMode,
     dop_domain: PipelineDopDomain,
     scan_read_budget: ScanReadBudget,
     display_intent: SqlDisplayIntent,
@@ -863,6 +870,7 @@ fn provider_or_ready_step(
         common.functions,
         root_allow_throw_exception,
         common.constant_policy,
+        common.emission_mode,
         control,
     )
     .map_err(SqlCompileError::from)?;
@@ -1217,6 +1225,7 @@ pub(super) fn resume_provider_read(
             state.common.functions,
             state.root_allow_throw_exception,
             state.common.constant_policy,
+            state.common.emission_mode,
             control,
         )
         .map_err(SqlCompileError::from)?;
@@ -1297,6 +1306,7 @@ mod tests {
             builtin_sql_function_catalog().snapshot(),
             noop_constant_evaluator(),
             crate::constant::test_constant_policy(),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             control,
             PipelineDopDomain {
                 min: 1,
@@ -3035,6 +3045,7 @@ mod tests {
                 SqlCompileControl::unbounded(),
             ),
             &SessionOptimizerSettings::default(),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         )
         .expect("optimized DML source");
         drop(statistics);

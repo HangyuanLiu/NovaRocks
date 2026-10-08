@@ -474,6 +474,7 @@ fn compile_dml_change_stream_write(
             shape: novarocks_sql::planning::dml::DmlWritePlanShape::Dataflow,
         },
         decimal_overflow_policy,
+        state.static_plan_carrier().sql_emission_mode(),
     )?;
     let connector_session = crate::query_execution::compiler::typed_connector_session()?;
     let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();
@@ -521,7 +522,12 @@ fn compile_dml_change_stream_write(
     let dop_domain = crate::query_execution::contract::completed_plan_dop_domain(None)?;
     let finalized = completion.finish(
         novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
-            novarocks_sql::planning::dml::DmlFinalPlanContext::new(version, dop_domain, reads),
+            novarocks_sql::planning::dml::DmlFinalPlanContext::new(
+                version,
+                dop_domain,
+                reads,
+                state.static_plan_carrier().sql_emission_mode(),
+            ),
             targets,
         ),
         &completion_control,
@@ -3058,6 +3064,7 @@ fn execute_exact_cow_match_query(
     let (completion, needs) = novarocks_sql::planning::dml::begin_final_dml_read_plan(
         optimize_request,
         execution.optimizer_settings(),
+        state.static_plan_carrier().sql_emission_mode(),
     )?;
     let connector_session = crate::query_execution::compiler::typed_connector_session()?;
     let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();
@@ -3100,10 +3107,11 @@ fn execute_exact_cow_match_query(
             &completion_control,
         )
         .map_err(|error| error.to_string())?;
-    let output = novarocks_query_application::preparation::OutputContract::from_completed_plan(
-        novarocks_query_application::api::QueryExecutionKind::Read,
-        candidate.plan(),
-    )?;
+    let output =
+        novarocks_query_application::preparation::OutputContract::from_completed_candidate(
+            novarocks_query_application::api::QueryExecutionKind::Read,
+            &candidate,
+        )?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,
     )

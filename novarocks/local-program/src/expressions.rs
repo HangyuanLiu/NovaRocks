@@ -162,6 +162,7 @@ pub enum StaticExprKind {
     },
     /// Intrinsic arithmetic retaining its exact admitted semantic parameter.
     /// Legacy construction tags below confer no prepared recipe authority.
+    PreparedNativeNegate(ProgramExprId),
     PreparedArithmetic {
         operator: novarocks_type_contract::ArithmeticOperator,
         left: ProgramExprId,
@@ -313,6 +314,7 @@ impl StaticExprKind {
             | Self::Cast(child, _)
             | Self::CastTime(child, _)
             | Self::CastTimeFromDatetime(child, _)
+            | Self::PreparedNativeNegate(child)
             | Self::Not(child)
             | Self::IsNull(child)
             | Self::IsNotNull(child)

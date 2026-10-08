@@ -294,6 +294,7 @@ fn tracked_request(sql: &str, catalog: &Arc<CountingCatalog>) -> SqlFinalPlanCom
         catalog.clone(),
         template.constant_evaluator,
         template.constant_policy,
+        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         template.control,
         template.dop_domain,
         template.scan_read_budget,
@@ -399,6 +400,7 @@ fn catalogue_dml_read_completion_retains_its_optimized_owner_without_recapture()
     let (completion, needs) = crate::planning::dml::begin_final_dml_read_plan(
         crate::compiler::SqlOptimizeRequest::new(analyzed, &statistics, control.clone()),
         &SessionOptimizerSettings::default(),
+        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
     )
     .expect("actual DML optimization");
     let optimizer_snapshot = catalog.last_snapshot();

@@ -316,6 +316,7 @@ fn request_for(sql: &str) -> SqlFinalPlanCompileRequest {
         builtin_sql_function_catalog().snapshot(),
         crate::query_execution::constant_eval::constant_evaluator(),
         crate::application::test_constant_policy(),
+        novarocks_sql::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
         SqlCompileControl::unbounded(),
         PipelineDopDomain {
             min: 1,

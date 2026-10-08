@@ -1457,7 +1457,8 @@ mod tests {
                 },
                 crate::functions::builtin_sql_function_catalog().snapshot(),
                 false,
-                crate::constant::test_constant_policy(), // This test authors a statement with throwing disabled.
+                crate::constant::test_constant_policy(),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1, // This test authors a statement with throwing disabled.
                 &control,
             )
             .expect("lower final physical plan")

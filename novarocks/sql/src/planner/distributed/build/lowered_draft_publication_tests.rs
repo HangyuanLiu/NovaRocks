@@ -85,6 +85,7 @@ fn values_draft() -> LoweredSqlPhysicalDraft {
         crate::functions::builtin_sql_function_catalog().snapshot(),
         false,
         crate::constant::test_constant_policy(),
+        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         &crate::compiler::SqlCompileControl::unbounded(),
     )
     .unwrap()

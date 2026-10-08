@@ -34,12 +34,16 @@ pub use crate::functions::{
     builtin_sql_function_catalog, contribute_builtin_functions,
 };
 pub use crate::optimizer::options::SessionOptimizerSettings;
-pub use crate::planner::distributed::build::SqlAuthoredPhysicalPlan;
+mod emission_mode;
+pub use crate::planner::distributed::build::{
+    CheckedSqlResultDeclaration, ResultDeclarationError, SqlAuthoredPhysicalPlan,
+};
 pub use crate::planner::distributed::build::{
     FragmentPackageSemantics, PackageSemanticsError, author_fragment_package_semantics,
 };
 #[cfg(test)]
 pub(crate) use completion_driver::compile_authored_aggregate_for_test;
+pub use emission_mode::SqlPhysicalEmissionMode;
 pub use mv_rewrite::{
     MvRewriteDefinitionIndex, SqlImvAggregateContractFacts, SqlImvAggregateExecutionFacts,
     SqlImvAggregateExecutionStateColumnFacts, SqlImvAggregateStateColumnFacts,
@@ -2592,6 +2596,7 @@ mod tests {
                 optimized.function_catalog,
                 optimized.root_allow_throw_exception,
                 crate::constant::test_constant_policy(),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap()
@@ -3056,6 +3061,7 @@ mod tests {
                 optimized.function_catalog,
                 optimized.root_allow_throw_exception,
                 crate::constant::test_constant_policy(),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap()

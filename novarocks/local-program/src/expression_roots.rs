@@ -797,6 +797,7 @@ fn validate_intrinsic_correspondence(
             | StaticExprKind::CastTime(..)
             | StaticExprKind::CastTimeFromDatetime(..)
             | StaticExprKind::PreparedCast { .. }
+            | StaticExprKind::PreparedNativeNegate(..)
             | StaticExprKind::PreparedArithmetic { .. }
             | StaticExprKind::Add(..)
             | StaticExprKind::Sub(..)
@@ -868,6 +869,7 @@ fn validate_intrinsic_correspondence(
             | StaticExprKind::Cast(definition, _)
             | StaticExprKind::CastTime(definition, _)
             | StaticExprKind::CastTimeFromDatetime(definition, _)
+            | StaticExprKind::PreparedNativeNegate(definition)
             | StaticExprKind::Not(definition)
             | StaticExprKind::IsNull(definition)
             | StaticExprKind::IsNotNull(definition)

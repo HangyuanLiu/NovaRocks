@@ -160,6 +160,7 @@ pub(crate) fn authored_with_catalog(
             functions,
             false,
             crate::constant::test_constant_policy(),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             &setup,
         )
         .unwrap()
@@ -225,6 +226,7 @@ pub(crate) fn authored_with_catalog(
             functions,
             false,
             crate::constant::test_constant_policy(),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             &setup,
         )
         .unwrap()

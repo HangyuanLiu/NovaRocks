@@ -304,6 +304,7 @@ fn bind_first_refresh_write_dataflow(
             let analyzed = analyze_mv_first_refresh_connector_write(
                 physical_sql,
                 SqlMvFirstRefreshAnalyzeContext {
+                    emission_mode: query_kernel.static_plan_carrier().sql_emission_mode(),
                     current_catalog: current_catalog.clone(),
                     current_database: current_database.clone(),
                     optimizer_settings: execution.optimizer_settings().clone(),
@@ -411,6 +412,7 @@ fn bind_first_refresh_write_dataflow(
             );
             let analyzed =
                 analyze_join_first_refresh_connector_write(SqlMvJoinFirstRefreshAnalyzeContext {
+                    emission_mode: query_kernel.static_plan_carrier().sql_emission_mode(),
                     canonical_query: Box::new((*refresh_rewrite.canonical_select_query).clone()),
                     rewrite_snapshot: refresh_rewrite.to_sql_rewrite_snapshot(target_binding)?,
                     expected_root_hash_column: root_hash_column,

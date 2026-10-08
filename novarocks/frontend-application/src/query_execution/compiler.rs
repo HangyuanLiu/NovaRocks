@@ -1500,6 +1500,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         statistics_requirements,
         &optimizer_settings,
         decimal_overflow_policy,
+        state.static_plan_carrier().sql_emission_mode(),
     )?;
     let connector_session = typed_connector_session()?;
     let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();

@@ -184,6 +184,25 @@ impl ProgramTypedExpressions {
                             }
                             work.step()?;
                         }
+                        if let StaticExprKind::PreparedNativeNegate(child) = definition.kind() {
+                            let source = match entries.get(child.index()) {
+                                Some(FunctionArgumentType::Value(value)) => value,
+                                _ => return Err(ProgramExpressionTypeError::WrongKind),
+                            };
+                            work.flush()?;
+                            novarocks_functions::PreparedNativeNegateRecipe::try_new(
+                                source,
+                                value,
+                                work.control(),
+                            )
+                            .map_err(|error| {
+                                match error.control_error() {
+                                    Some(cause) => ProgramExpressionTypeError::Control(cause),
+                                    None => ProgramExpressionTypeError::TypeMismatch,
+                                }
+                            })?;
+                            work.step()?;
+                        }
                         if let StaticExprKind::PreparedArithmetic {
                             operator,
                             left,

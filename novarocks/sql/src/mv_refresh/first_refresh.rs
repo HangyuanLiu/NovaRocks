@@ -273,6 +273,7 @@ impl SqlMvFirstRefreshArtifact {
 /// source.  Connector handles, write leases, lifecycle state and wire payloads
 /// are deliberately absent.
 pub struct SqlMvFirstRefreshAnalyzeContext<'a> {
+    pub emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     pub current_catalog: Option<String>,
     pub current_database: String,
     pub optimizer_settings: crate::compiler::SessionOptimizerSettings,
@@ -286,6 +287,7 @@ pub struct SqlMvFirstRefreshAnalyzeContext<'a> {
 }
 
 pub struct SqlMvFirstRefreshAnalyzed {
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     analyzed: crate::compiler::SqlAnalyzedQuery,
     sink: crate::planning::dml::DmlWritePlanInput,
     settings: crate::compiler::SessionOptimizerSettings,
@@ -321,6 +323,7 @@ pub fn analyze_mv_first_refresh_connector_write(
     );
     let analyzed = crate::compiler::SqlCompiler::analyze(request)?.into_pending()?;
     Ok(SqlMvFirstRefreshAnalyzed {
+        emission_mode: context.emission_mode,
         analyzed,
         sink: context.sink,
         settings,
@@ -335,6 +338,13 @@ pub fn compile_final_mv_first_refresh_connector_write_plan(
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     final_write: crate::planning::dml::DmlFinalWritePlanContext,
 ) -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError> {
+    if final_write.emission_mode() != analyzed.emission_mode {
+        return Err(
+            "MV analyzed source mode differs from its final write context"
+                .to_string()
+                .into(),
+        );
+    }
     let decimal_overflow_policy = analyzed.analyzed.decimal_overflow_policy();
     crate::planning::dml::compile_final_connector_write_plan(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
@@ -368,6 +378,7 @@ pub fn begin_final_mv_first_refresh_connector_write_plan(
         required_aggregations,
         &analyzed.settings,
         decimal_overflow_policy,
+        analyzed.emission_mode,
     )
 }
 
@@ -375,6 +386,7 @@ pub fn begin_final_mv_first_refresh_connector_write_plan(
 /// already sealed by the compiler facade; the query is syntax only, not a
 /// logical or physical planner graph.
 pub struct SqlMvJoinFirstRefreshAnalyzeContext<'a> {
+    pub emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     pub canonical_query: Box<ast::Query>,
     pub rewrite_snapshot: crate::compiler::SqlImvRewriteSnapshotHandle,
     pub expected_root_hash_column: String,
@@ -391,6 +403,7 @@ pub struct SqlMvJoinFirstRefreshAnalyzeContext<'a> {
 }
 
 pub struct SqlMvJoinFirstRefreshAnalyzed {
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     analyzed: crate::compiler::SqlAnalyzedQuery,
     sink: crate::planning::dml::DmlWritePlanInput,
     settings: crate::compiler::SessionOptimizerSettings,
@@ -475,6 +488,7 @@ pub fn analyze_join_first_refresh_connector_write(
     .with_function_catalog(context.functions.snapshot());
     let analyzed = crate::compiler::SqlCompiler::analyze(logical_request)?.into_pending()?;
     Ok(SqlMvJoinFirstRefreshAnalyzed {
+        emission_mode: context.emission_mode,
         analyzed,
         sink: context.sink,
         settings,
@@ -489,6 +503,13 @@ pub fn compile_final_join_first_refresh_connector_write_plan(
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     final_write: crate::planning::dml::DmlFinalWritePlanContext,
 ) -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError> {
+    if final_write.emission_mode() != analyzed.emission_mode {
+        return Err(
+            "MV analyzed source mode differs from its final write context"
+                .to_string()
+                .into(),
+        );
+    }
     let decimal_overflow_policy = analyzed.analyzed.decimal_overflow_policy();
     crate::planning::dml::compile_final_connector_write_plan(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
@@ -522,6 +543,7 @@ pub fn begin_final_join_first_refresh_connector_write_plan(
         required_aggregations,
         &analyzed.settings,
         decimal_overflow_policy,
+        analyzed.emission_mode,
     )
 }
 
@@ -548,6 +570,7 @@ pub enum SqlMvIncrementalWriteMode {
 /// no logical/optimized plan, factory, mutable DAG, lease, or lifecycle state
 /// can cross this API.
 pub struct SqlMvJoinIncrementalRefreshAnalyzeContext<'a> {
+    pub emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     pub canonical_query: Box<ast::Query>,
     pub rewrite_snapshot: crate::compiler::SqlImvRewriteSnapshotHandle,
     pub join_mode: SqlMvJoinIncrementalRefreshMode,
@@ -565,6 +588,7 @@ pub struct SqlMvJoinIncrementalRefreshAnalyzeContext<'a> {
 }
 
 pub struct SqlMvJoinIncrementalRefreshAnalyzed {
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     analyzed: crate::compiler::SqlAnalyzedQuery,
     change_stream_override:
         Option<crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor>,
@@ -638,6 +662,7 @@ pub fn analyze_join_incremental_refresh_change_stream(
     .with_function_catalog(context.functions.snapshot());
     let analyzed = crate::compiler::SqlCompiler::analyze(logical_request)?.into_pending()?;
     Ok(SqlMvJoinIncrementalRefreshAnalyzed {
+        emission_mode: context.emission_mode,
         analyzed,
         change_stream_override,
         write_mode: context.write_mode,
@@ -653,6 +678,13 @@ pub fn compile_final_join_incremental_refresh_change_stream(
     shape: crate::planning::dml::DmlWritePlanShape,
     final_write: crate::planning::dml::DmlFinalWritePlanContext,
 ) -> Result<crate::planning::dml::DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
+    if final_write.emission_mode() != analyzed.emission_mode {
+        return Err(
+            "MV analyzed source mode differs from its final write context"
+                .to_string()
+                .into(),
+        );
+    }
     let constant_policy = analyzed.analyzed.constant_policy();
     let decimal_overflow_policy = analyzed.analyzed.decimal_overflow_policy();
     let compiled = crate::compiler::SqlCompiler::optimize(
@@ -750,6 +782,7 @@ pub fn begin_final_join_incremental_refresh_change_stream(
         decimal_overflow_policy,
         compiled.root_allow_throw_exception,
         constant_policy,
+        analyzed.emission_mode,
         &control,
     )
 }
@@ -759,6 +792,7 @@ pub fn begin_final_join_incremental_refresh_change_stream(
 /// provider-signed route facts are bound only after SQL has produced the
 /// complete change-stream producer.
 pub struct SqlMvIncrementalRefreshAnalyzeContext<'a> {
+    pub emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     pub canonical_query: Box<ast::Query>,
     pub imv_rewrite: crate::compiler::SqlImvPlanningInput,
     pub write_mode: SqlMvIncrementalWriteMode,
@@ -774,6 +808,7 @@ pub struct SqlMvIncrementalRefreshAnalyzeContext<'a> {
 }
 
 pub struct SqlMvIncrementalRefreshAnalyzed {
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     analyzed: crate::compiler::SqlAnalyzedQuery,
     write_mode: SqlMvIncrementalWriteMode,
     routes: Vec<crate::planning::dml::DmlChangeStreamRoute>,
@@ -814,6 +849,7 @@ pub fn analyze_mv_incremental_refresh_change_stream(
     );
     let analyzed = crate::compiler::SqlCompiler::analyze(request)?.into_pending()?;
     Ok(SqlMvIncrementalRefreshAnalyzed {
+        emission_mode: context.emission_mode,
         analyzed,
         write_mode: context.write_mode,
         routes: context.routes,
@@ -828,6 +864,13 @@ pub fn compile_final_mv_incremental_refresh_change_stream(
     shape: crate::planning::dml::DmlWritePlanShape,
     final_write: crate::planning::dml::DmlFinalWritePlanContext,
 ) -> Result<crate::planning::dml::DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
+    if final_write.emission_mode() != analyzed.emission_mode {
+        return Err(
+            "MV analyzed source mode differs from its final write context"
+                .to_string()
+                .into(),
+        );
+    }
     let constant_policy = analyzed.analyzed.constant_policy();
     let decimal_overflow_policy = analyzed.analyzed.decimal_overflow_policy();
     let compiled = crate::compiler::SqlCompiler::optimize(
@@ -915,6 +958,7 @@ pub fn begin_final_mv_incremental_refresh_change_stream(
         decimal_overflow_policy,
         compiled.root_allow_throw_exception,
         constant_policy,
+        analyzed.emission_mode,
         &control,
     )
 }

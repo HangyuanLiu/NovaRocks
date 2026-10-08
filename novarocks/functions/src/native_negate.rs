@@ -30,6 +30,42 @@ use novarocks_type_contract::{
     ExpressionEffects, FunctionValueType, PureCompileControl, ValueLogicalType,
 };
 
+/// Complete admission fact for the original native zero/Sub implementation.
+/// This does not change an original SQL result declaration or run row work.
+/// Carrier values that Arrow can hold outside decimal precision are retained
+/// in the original input domain: OutputNull remains a successful NULL there.
+pub fn native_negate_computed_result_type(
+    source: &FunctionValueType,
+    control: &dyn PureCompileControl,
+) -> Result<FunctionValueType, ArithmeticPrepareError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+    let outcome = (|| {
+        work.flush()?;
+        let mut result = source.clone();
+        work.step()?;
+        result.nullable |= matches!(
+            source.data_type,
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Decimal128(_, _)
+                | DataType::Decimal256(_, _)
+        );
+        work.step()?;
+        let prepared = PreparedNativeNegateRecipe::try_new(source, &result, control)?;
+        Ok(prepared.result)
+    })();
+    if outcome
+        .as_ref()
+        .err()
+        .is_some_and(|error: &ArithmeticPrepareError| error.control_error().is_some())
+    {
+        return outcome;
+    }
+    work.finish()?;
+    outcome
+}
+
 #[derive(Clone, Debug)]
 pub struct PreparedNativeNegateRecipe {
     source: FunctionValueType,
@@ -79,6 +115,16 @@ impl PreparedNativeNegateRecipe {
             {
                 return Err(ArithmeticPrepareError::Kernel(invalid(
                     "native NEGATE narrow signed result requires its actual nullable output domain",
+                )));
+            }
+            if !result.nullable
+                && matches!(
+                    source.data_type,
+                    DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
+                )
+            {
+                return Err(ArithmeticPrepareError::Kernel(invalid(
+                    "native NEGATE full decimal carrier requires its actual nullable output domain",
                 )));
             }
             work.step()?;

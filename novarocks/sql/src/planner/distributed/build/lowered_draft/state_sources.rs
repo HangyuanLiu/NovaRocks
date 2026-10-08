@@ -281,8 +281,37 @@ fn visit_state_sources_observed<'a>(
     owner: &'a SqlAuthoredPhysicalPlan,
     root: AggregateStateEndpoint,
     work: &mut CompileCheckpoints<'_>,
-    mut emission: impl FnMut(
+    emission: impl FnMut(
         CheckedStateEmission<'a>,
+        AggregateStateEndpoint,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<(), SqlSourceJournalError>,
+    transport: impl FnMut(
+        AggregateStateEndpoint,
+        AggregateStateTransport,
+        &[AggregateStateLink],
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<(), SqlSourceJournalError>,
+    no_contribution: impl FnMut(
+        AggregateStateEndpoint,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<(), SqlSourceJournalError>,
+) -> Result<(), SqlSourceJournalError> {
+    visit_state_graph_observed(
+        &PublishedStateGraph(owner),
+        root,
+        work,
+        emission,
+        transport,
+        no_contribution,
+    )
+}
+fn visit_state_graph_observed<'a, G: StateGraph<'a>>(
+    graph: &G,
+    root: AggregateStateEndpoint,
+    work: &mut CompileCheckpoints<'_>,
+    mut emission: impl FnMut(
+        G::Emission,
         AggregateStateEndpoint,
         &mut CompileCheckpoints<'_>,
     ) -> Result<(), SqlSourceJournalError>,
@@ -297,7 +326,7 @@ fn visit_state_sources_observed<'a>(
         &mut CompileCheckpoints<'_>,
     ) -> Result<(), SqlSourceJournalError>,
 ) -> Result<(), SqlSourceJournalError> {
-    let sources = &owner.call_sources.state_sources;
+    let sources = &graph.journal().state_sources;
     if !sources.contains_observed(root, work)? {
         return Err(SqlSourceJournalError::InvalidSource(
             "aggregate state input has no original emitted route",
@@ -328,67 +357,7 @@ fn visit_state_sources_observed<'a>(
         ))?;
         match &source.origin {
             StateOrigin::Emission(site) => {
-                work.flush()?;
-                let fragment = owner.plan.fragments().get(&endpoint.fragment);
-                work.step()?;
-                let fragment = fragment.ok_or(SqlSourceJournalError::MissingEntry)?;
-                work.flush()?;
-                let node = fragment.nodes().get(&endpoint.node);
-                work.step()?;
-                let node = node.ok_or(SqlSourceJournalError::MissingEntry)?;
-                let (entry, input) = match (site, &node.kind) {
-                    (
-                        PhysicalCallSite::WriterPartial { node: id, call },
-                        NodeKind::TableWriter { target },
-                    ) if *id == node.id => {
-                        let call = target.partial_aggregates.get(*call as usize);
-                        work.step()?;
-                        let call = call.ok_or(SqlSourceJournalError::InvalidSource(
-                            "Writer state route differs from its actual emission",
-                        ))?;
-                        let same_output = call.output == source.endpoint.value
-                            && matches!(call.binding.phase, AggregatePhase::Partial { .. });
-                        work.step()?;
-                        if !same_output {
-                            return Err(SqlSourceJournalError::InvalidSource(
-                                "Writer state route loans a result or foreign output",
-                            ));
-                        }
-                        let entry = owner.checked_writer_aggregate_source_observed(
-                            fragment, node, *site, call, work,
-                        )?;
-                        (CheckedStateEmission::Writer(entry), None)
-                    }
-                    _ => {
-                        let call = match (site, &node.kind) {
-                            (
-                                PhysicalCallSite::Aggregate { node: id, call },
-                                NodeKind::Aggregate { calls, .. },
-                            ) if *id == node.id => calls.get(*call as usize),
-                            _ => None,
-                        };
-                        work.step()?;
-                        let call = call.ok_or(SqlSourceJournalError::InvalidSource(
-                            "aggregate state route differs from its actual emission",
-                        ))?;
-                        let same_output = call.output == source.endpoint.value
-                            && !call.binding.phase.produces_final_result();
-                        work.step()?;
-                        if !same_output {
-                            return Err(SqlSourceJournalError::InvalidSource(
-                                "aggregate state route loans a result or foreign output",
-                            ));
-                        }
-                        let entry = owner
-                            .checked_aggregate_source_observed(fragment, node, *site, call, work)?;
-                        let input = if entry.phase().consumes_logical_arguments() {
-                            None
-                        } else {
-                            Some(check_state_inputs_observed(&entry, work)?.root)
-                        };
-                        (CheckedStateEmission::Aggregate(entry), input)
-                    }
-                };
+                let (entry, input) = graph.emission(endpoint, *site, work)?;
                 emission(entry, endpoint, work)?;
                 if let Some(input) = input {
                     enqueue_observed(sources, input, &mut queued, &mut pending, work)?;
@@ -396,7 +365,7 @@ fn visit_state_sources_observed<'a>(
             }
             StateOrigin::WriterNoContribution { auxiliary_ordinal } => {
                 check_writer_no_contribution_observed(
-                    owner,
+                    graph,
                     endpoint,
                     *auxiliary_ordinal,
                     &mut writer_outputs,
@@ -405,7 +374,7 @@ fn visit_state_sources_observed<'a>(
                 no_contribution(endpoint, work)?;
             }
             StateOrigin::Transport(kind, links) => {
-                check_transport_observed(owner, endpoint, *kind, links, work)?;
+                check_transport_observed(graph, endpoint, *kind, links, work)?;
                 transport(endpoint, *kind, links, work)?;
                 for link in links.iter().rev() {
                     enqueue_observed(sources, link.source, &mut queued, &mut pending, work)?;
@@ -416,8 +385,8 @@ fn visit_state_sources_observed<'a>(
     Ok(())
 }
 
-fn check_writer_no_contribution_observed(
-    owner: &SqlAuthoredPhysicalPlan,
+fn check_writer_no_contribution_observed<'a, G: StateGraph<'a>>(
+    graph: &G,
     endpoint: AggregateStateEndpoint,
     auxiliary_ordinal: u32,
     writer_outputs: &mut BTreeMap<(FragmentId, NodeId), BTreeSet<ValueId>>,
@@ -426,11 +395,7 @@ fn check_writer_no_contribution_observed(
     use novarocks_physical_plan::{ValueOrigin, WriterDerivedKind, WriterRelationFieldRole};
 
     work.flush()?;
-    let fragment = owner.plan.fragments().get(&endpoint.fragment);
-    work.step()?;
-    let fragment = fragment.ok_or(SqlSourceJournalError::MissingEntry)?;
-    work.flush()?;
-    let node = fragment.nodes().get(&endpoint.node);
+    let node = graph.node(endpoint.fragment, endpoint.node);
     work.step()?;
     let node = node.ok_or(SqlSourceJournalError::MissingEntry)?;
     let target = match &node.kind {
@@ -457,7 +422,7 @@ fn check_writer_no_contribution_observed(
         ));
     }
     work.flush()?;
-    let value = fragment.values().get(&endpoint.value);
+    let value = graph.value(endpoint.fragment, endpoint.value);
     work.step()?;
     let value = value.ok_or(SqlSourceJournalError::MissingEntry)?;
     let same_origin = matches!(value.origin, ValueOrigin::WriterDerived {
@@ -525,24 +490,20 @@ fn check_writer_no_contribution_observed(
 
 /// Check the retained record against this immutable emission, not against a
 /// separately inferred state grammar or implementation compatibility rule.
-fn check_transport_observed(
-    owner: &SqlAuthoredPhysicalPlan,
+fn check_transport_observed<'a, G: StateGraph<'a>>(
+    graph: &G,
     endpoint: AggregateStateEndpoint,
     kind: AggregateStateTransport,
     links: &[AggregateStateLink],
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), SqlSourceJournalError> {
     work.flush()?;
-    let fragment = owner.plan.fragments().get(&endpoint.fragment);
-    work.step()?;
-    let fragment = fragment.ok_or(SqlSourceJournalError::MissingEntry)?;
-    work.flush()?;
-    let node = fragment.nodes().get(&endpoint.node);
+    let node = graph.node(endpoint.fragment, endpoint.node);
     work.step()?;
     let node = node.ok_or(SqlSourceJournalError::MissingEntry)?;
     let edge = if let AggregateStateTransport::Stream(id) = kind {
         work.flush()?;
-        let edge = owner.plan.edges().get(&id);
+        let edge = graph.edge(id);
         work.step()?;
         Some(edge.ok_or(SqlSourceJournalError::MissingEntry)?)
     } else {
@@ -558,8 +519,8 @@ fn check_transport_observed(
                 let pair = expressions.get(ordinal).copied();
                 work.step()?;
                 work.flush()?;
-                let expression =
-                    pair.and_then(|(expression, _)| fragment.expressions().get(expression));
+                let expression = pair
+                    .and_then(|(expression, _)| graph.expression(endpoint.fragment, expression));
                 // ExprArena is an opaque owner lookup on the original meter.
                 work.step()?;
                 local_input && output && pair.is_some_and(|(_, value)| value == endpoint.value)
@@ -593,14 +554,14 @@ fn check_transport_observed(
             ) => {
                 let edge = edge.ok_or(SqlSourceJournalError::MissingEntry)?;
                 work.flush()?;
-                let sender = owner.plan.fragments().get(&link.source.fragment);
+                let sender = graph.root(link.source.fragment);
                 work.step()?;
                 *id == expected
                     && edge.kind == novarocks_physical_plan::EdgeKind::Stream
                     && edge.destination.fragment == endpoint.fragment
                     && edge.destination.node == endpoint.node
                     && edge.source.fragment == link.source.fragment
-                    && sender.is_some_and(|fragment| fragment.root() == link.source.node)
+                    && sender == Some(link.source.node)
                     && link.input_ordinal == 0
                     && output
                     && edge.source.projection.get(ordinal) == Some(&link.source.value)
@@ -746,4 +707,390 @@ pub(super) fn check_writer_state_inputs_observed<'a>(
         owner: entry.owner,
         root: endpoint,
     })
+}
+
+/// Read capabilities borrow one exact actual graph owner. Construction cannot
+/// mint a completed owner, clone a graph or manufacture logical captures.
+trait StateGraph<'a> {
+    type Emission;
+    fn journal(&self) -> &'a super::SqlLogicalSourceJournal;
+    fn node(
+        &self,
+        fragment: FragmentId,
+        node: NodeId,
+    ) -> Option<&'a novarocks_physical_plan::PhysicalNode>;
+    fn expression(
+        &self,
+        fragment: FragmentId,
+        expr: novarocks_physical_plan::ExprId,
+    ) -> Option<&'a novarocks_physical_plan::ExprNode>;
+    fn value(
+        &self,
+        fragment: FragmentId,
+        value: ValueId,
+    ) -> Option<&'a novarocks_physical_plan::ValueDef>;
+    fn edge(
+        &self,
+        edge: novarocks_physical_plan::EdgeId,
+    ) -> Option<&'a novarocks_physical_plan::Edge>;
+    fn root(&self, fragment: FragmentId) -> Option<NodeId>;
+    fn emission(
+        &self,
+        endpoint: AggregateStateEndpoint,
+        site: PhysicalCallSite,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(Self::Emission, Option<AggregateStateEndpoint>), SqlSourceJournalError>;
+}
+struct PublishedStateGraph<'a>(&'a SqlAuthoredPhysicalPlan);
+impl<'a> StateGraph<'a> for PublishedStateGraph<'a> {
+    type Emission = CheckedStateEmission<'a>;
+    fn journal(&self) -> &'a super::SqlLogicalSourceJournal {
+        &self.0.call_sources
+    }
+    fn node(&self, f: FragmentId, n: NodeId) -> Option<&'a novarocks_physical_plan::PhysicalNode> {
+        self.0.plan.fragments().get(&f)?.nodes().get(&n)
+    }
+    fn expression(
+        &self,
+        f: FragmentId,
+        e: novarocks_physical_plan::ExprId,
+    ) -> Option<&'a novarocks_physical_plan::ExprNode> {
+        self.0.plan.fragments().get(&f)?.expressions().get(e)
+    }
+    fn value(&self, f: FragmentId, v: ValueId) -> Option<&'a novarocks_physical_plan::ValueDef> {
+        self.0.plan.fragments().get(&f)?.values().get(&v)
+    }
+    fn edge(
+        &self,
+        e: novarocks_physical_plan::EdgeId,
+    ) -> Option<&'a novarocks_physical_plan::Edge> {
+        self.0.plan.edges().get(&e)
+    }
+    fn root(&self, f: FragmentId) -> Option<NodeId> {
+        Some(self.0.plan.fragments().get(&f)?.root())
+    }
+    fn emission(
+        &self,
+        endpoint: AggregateStateEndpoint,
+        site: PhysicalCallSite,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(Self::Emission, Option<AggregateStateEndpoint>), SqlSourceJournalError> {
+        work.flush()?;
+        let owner = self.0;
+        let fragment = owner.plan.fragments().get(&endpoint.fragment);
+        work.step()?;
+        let fragment = fragment.ok_or(SqlSourceJournalError::MissingEntry)?;
+        work.flush()?;
+        let node = fragment.nodes().get(&endpoint.node);
+        work.step()?;
+        let node = node.ok_or(SqlSourceJournalError::MissingEntry)?;
+        let (entry, input) = match (&site, &node.kind) {
+            (
+                PhysicalCallSite::WriterPartial { node: id, call },
+                NodeKind::TableWriter { target },
+            ) if *id == node.id => {
+                let call = target.partial_aggregates.get(*call as usize);
+                work.step()?;
+                let call = call.ok_or(SqlSourceJournalError::InvalidSource(
+                    "Writer state route differs from its actual emission",
+                ))?;
+                let same_output = call.output == endpoint.value
+                    && matches!(call.binding.phase, AggregatePhase::Partial { .. });
+                work.step()?;
+                if !same_output {
+                    return Err(SqlSourceJournalError::InvalidSource(
+                        "Writer state route loans a result or foreign output",
+                    ));
+                }
+                let entry = owner
+                    .checked_writer_aggregate_source_observed(fragment, node, site, call, work)?;
+                (CheckedStateEmission::Writer(entry), None)
+            }
+            _ => {
+                let call = match (&site, &node.kind) {
+                    (
+                        PhysicalCallSite::Aggregate { node: id, call },
+                        NodeKind::Aggregate { calls, .. },
+                    ) if *id == node.id => calls.get(*call as usize),
+                    (
+                        PhysicalCallSite::TopNState { node: id, call },
+                        NodeKind::TopN {
+                            reduction:
+                                novarocks_physical_plan::TopNReduction::GroupedStates { calls, .. },
+                            ..
+                        },
+                    ) if *id == node.id => calls.get(*call as usize),
+                    _ => None,
+                };
+                work.step()?;
+                let call = call.ok_or(SqlSourceJournalError::InvalidSource(
+                    "aggregate state route differs from its actual emission",
+                ))?;
+                let same_output =
+                    call.output == endpoint.value && !call.binding.phase.produces_final_result();
+                work.step()?;
+                if !same_output {
+                    return Err(SqlSourceJournalError::InvalidSource(
+                        "aggregate state route loans a result or foreign output",
+                    ));
+                }
+                let entry =
+                    owner.checked_aggregate_source_observed(fragment, node, site, call, work)?;
+                let input = if entry.phase().consumes_logical_arguments() {
+                    None
+                } else {
+                    Some(check_state_inputs_observed(&entry, work)?.root)
+                };
+                (CheckedStateEmission::Aggregate(entry), input)
+            }
+        };
+        Ok((entry, input))
+    }
+}
+
+pub(in crate::planner::distributed::build) struct ConstructionStateGraph<'a> {
+    journal: &'a super::SqlLogicalSourceJournal,
+    fragments: &'a BTreeMap<FragmentId, novarocks_physical_plan::FragmentBuilder>,
+    completions: &'a BTreeMap<FragmentId, (NodeId, novarocks_physical_plan::FragmentSink)>,
+    edges: &'a BTreeMap<novarocks_physical_plan::EdgeId, novarocks_physical_plan::Edge>,
+}
+pub(in crate::planner::distributed::build) struct ConstructionStateEmission<'a> {
+    pub(in crate::planner::distributed::build) entry: &'a super::LoweredAggregateSourceEntry,
+    pub(in crate::planner::distributed::build) binding:
+        &'a novarocks_physical_plan::AggregateBinding,
+    pub(in crate::planner::distributed::build) writer: bool,
+}
+impl<'a> ConstructionStateGraph<'a> {
+    pub(in crate::planner::distributed::build) fn borrow(
+        journal: &'a super::SqlLogicalSourceJournal,
+        fragments: &'a BTreeMap<FragmentId, novarocks_physical_plan::FragmentBuilder>,
+        completions: &'a BTreeMap<FragmentId, (NodeId, novarocks_physical_plan::FragmentSink)>,
+        edges: &'a BTreeMap<novarocks_physical_plan::EdgeId, novarocks_physical_plan::Edge>,
+    ) -> Self {
+        Self {
+            journal,
+            fragments,
+            completions,
+            edges,
+        }
+    }
+    pub(in crate::planner::distributed::build) fn visit_merge_observed(
+        &self,
+        fragment: FragmentId,
+        site: PhysicalCallSite,
+        work: &mut CompileCheckpoints<'_>,
+        emission: impl FnMut(
+            ConstructionStateEmission<'a>,
+            AggregateStateEndpoint,
+            &mut CompileCheckpoints<'_>,
+        ) -> Result<(), SqlSourceJournalError>,
+    ) -> Result<(), SqlSourceJournalError> {
+        let entry = self
+            .journal
+            .entries
+            .get(&(fragment, site))
+            .ok_or(SqlSourceJournalError::MissingEntry)?;
+        work.step()?;
+        let node_id = match site {
+            PhysicalCallSite::Aggregate { node, .. }
+            | PhysicalCallSite::TopNState { node, .. }
+            | PhysicalCallSite::WriterFinal { node, .. }
+            | PhysicalCallSite::WriterPartial { node, .. } => node,
+            _ => {
+                return Err(SqlSourceJournalError::InvalidSource(
+                    "merge uses a different actual lifecycle",
+                ));
+            }
+        };
+        let node = self
+            .node(fragment, node_id)
+            .ok_or(SqlSourceJournalError::MissingEntry)?;
+        let root = construction_input_root(self, fragment, node, site, entry.runtime, work)?;
+        visit_state_graph_observed(
+            self,
+            root,
+            work,
+            emission,
+            |_, _, _, _| Ok(()),
+            |_, _| Ok(()),
+        )
+    }
+}
+impl<'a> StateGraph<'a> for ConstructionStateGraph<'a> {
+    type Emission = ConstructionStateEmission<'a>;
+    fn journal(&self) -> &'a super::SqlLogicalSourceJournal {
+        self.journal
+    }
+    fn node(&self, f: FragmentId, n: NodeId) -> Option<&'a novarocks_physical_plan::PhysicalNode> {
+        self.fragments.get(&f)?.construction_node(n)
+    }
+    fn expression(
+        &self,
+        f: FragmentId,
+        e: novarocks_physical_plan::ExprId,
+    ) -> Option<&'a novarocks_physical_plan::ExprNode> {
+        self.fragments.get(&f)?.expressions().get(e)
+    }
+    fn value(&self, f: FragmentId, v: ValueId) -> Option<&'a novarocks_physical_plan::ValueDef> {
+        self.fragments.get(&f)?.value(v)
+    }
+    fn edge(
+        &self,
+        e: novarocks_physical_plan::EdgeId,
+    ) -> Option<&'a novarocks_physical_plan::Edge> {
+        self.edges.get(&e)
+    }
+    fn root(&self, f: FragmentId) -> Option<NodeId> {
+        self.completions.get(&f).map(|pair| pair.0)
+    }
+    fn emission(
+        &self,
+        endpoint: AggregateStateEndpoint,
+        site: PhysicalCallSite,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(Self::Emission, Option<AggregateStateEndpoint>), SqlSourceJournalError> {
+        use super::{AggregateSourceTarget, LoweredAggregateLogicalSource};
+        let node = self
+            .node(endpoint.fragment, endpoint.node)
+            .ok_or(SqlSourceJournalError::MissingEntry)?;
+        work.step()?;
+        let (binding, target, writer) = match (site, &node.kind) {
+            (PhysicalCallSite::Aggregate { node: id, call }, NodeKind::Aggregate { calls, .. })
+                if id == node.id =>
+            {
+                let c = calls
+                    .get(call as usize)
+                    .ok_or(SqlSourceJournalError::MissingEntry)?;
+                if c.output != endpoint.value || c.binding.phase.produces_final_result() {
+                    return Err(SqlSourceJournalError::InvalidSource(
+                        "construction state route loans a result or foreign output",
+                    ));
+                }
+                (&c.binding, AggregateSourceTarget::Aggregate(c.id), false)
+            }
+            (
+                PhysicalCallSite::TopNState { node: id, call },
+                NodeKind::TopN {
+                    reduction: novarocks_physical_plan::TopNReduction::GroupedStates { calls, .. },
+                    ..
+                },
+            ) if id == node.id => {
+                let c = calls
+                    .get(call as usize)
+                    .ok_or(SqlSourceJournalError::MissingEntry)?;
+                if c.output != endpoint.value || c.binding.phase.produces_final_result() {
+                    return Err(SqlSourceJournalError::InvalidSource(
+                        "construction state route loans a result or foreign output",
+                    ));
+                }
+                (&c.binding, AggregateSourceTarget::Aggregate(c.id), false)
+            }
+            (
+                PhysicalCallSite::WriterPartial { node: id, call },
+                NodeKind::TableWriter { target },
+            ) if id == node.id => {
+                let c = target
+                    .partial_aggregates
+                    .get(call as usize)
+                    .ok_or(SqlSourceJournalError::MissingEntry)?;
+                if c.output != endpoint.value
+                    || !matches!(c.binding.phase, AggregatePhase::Partial { .. })
+                {
+                    return Err(SqlSourceJournalError::InvalidSource(
+                        "construction Writer route loans a result or foreign output",
+                    ));
+                }
+                (&c.binding, AggregateSourceTarget::Writer(c.output), true)
+            }
+            _ => {
+                return Err(SqlSourceJournalError::InvalidSource(
+                    "construction emission differs from its actual site",
+                ));
+            }
+        };
+        work.step()?;
+        let entry = self
+            .journal
+            .entries
+            .get(&(endpoint.fragment, site))
+            .ok_or(SqlSourceJournalError::MissingEntry)?;
+        work.step()?;
+        if entry.target != target
+            || entry.phase != binding.phase
+            || matches!(&entry.logical, LoweredAggregateLogicalSource::Uncertified)
+        {
+            return Err(SqlSourceJournalError::InvalidSource(
+                "construction state source differs from its original producer",
+            ));
+        }
+        let input = if binding.phase.consumes_logical_arguments() {
+            None
+        } else {
+            Some(construction_input_root(
+                self,
+                endpoint.fragment,
+                node,
+                site,
+                entry.runtime,
+                work,
+            )?)
+        };
+        Ok((
+            ConstructionStateEmission {
+                entry,
+                binding,
+                writer,
+            },
+            input,
+        ))
+    }
+}
+fn construction_input_root<'a, G: StateGraph<'a>>(
+    graph: &G,
+    fragment: FragmentId,
+    node: &novarocks_physical_plan::PhysicalNode,
+    site: PhysicalCallSite,
+    demand: AggregateRuntimeDemand,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<AggregateStateEndpoint, SqlSourceJournalError> {
+    let root = graph
+        .journal()
+        .state_sources
+        .inputs
+        .get(&(fragment, site))
+        .copied();
+    work.step()?;
+    let root = root.ok_or(SqlSourceJournalError::InvalidSource(
+        "merge lacks its original state input association",
+    ))?;
+    if root.fragment != fragment || node.inputs.as_ref() != [root.node] {
+        return Err(SqlSourceJournalError::InvalidSource(
+            "merge differs from its original child association",
+        ));
+    }
+    let actual=match demand {
+        AggregateRuntimeDemand::ExpressionState(expr)=>graph.expression(fragment,expr).is_some_and(|expr|matches!(expr.kind,novarocks_physical_plan::ExprKind::Value(value) if value==root.value)),
+        AggregateRuntimeDemand::WriterState(value)=>value==root.value,
+        AggregateRuntimeDemand::Update=>false,
+    };
+    work.step()?;
+    if !actual {
+        return Err(SqlSourceJournalError::InvalidSource(
+            "merge state demand differs from its actual emitted channel",
+        ));
+    }
+    let child = graph
+        .node(fragment, root.node)
+        .ok_or(SqlSourceJournalError::MissingEntry)?;
+    let mut present = false;
+    for value in child.output.columns.iter() {
+        work.step()?;
+        present |= *value == root.value;
+    }
+    if !present {
+        return Err(SqlSourceJournalError::InvalidSource(
+            "merge state is absent from its original child port",
+        ));
+    }
+    Ok(root)
 }

@@ -59,6 +59,7 @@ url.workspace = true
 uuid = { workspace = true, features = ["v4", "v7", "serde"] }
 
 [dev-dependencies]
+novarocks-query-application.workspace = true
 libc.workspace = true
 novarocks-local-compiler.workspace = true
 novarocks-physical-plan.workspace = true
