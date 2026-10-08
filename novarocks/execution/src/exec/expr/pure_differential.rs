@@ -1717,3 +1717,6 @@ mod string_measure_shared_tests;
 
 #[path = "pure_differential/regexp_count_tests.rs"]
 mod regexp_count_tests;
+
+#[path = "pure_differential_sha2_shared_tests.rs"]
+mod sha2_shared_differential;
