@@ -1666,3 +1666,7 @@ mod round_disagreement_tests;
 #[cfg(test)]
 #[path = "pure_differential_array_append_multi_tests.rs"]
 mod array_append_multi_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_map_size_tests.rs"]
+mod map_size_tests;
