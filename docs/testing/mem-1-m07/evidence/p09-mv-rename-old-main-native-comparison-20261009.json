@@ -1,0 +1,178 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "stage": "P09 C7 MV referenced field rename actual old-main comparison",
+  "outcome": "conformance_verified_existing_five_failures_not_passed",
+  "topology": "1FE+3BE for each binary",
+  "input_freeze": {
+    "path": "docs/testing/mem-1-m07/inputs/mv-rename-old-new-freeze-v2.json",
+    "sha256": "4a68a48c772bf7402f63f80bf4bf65a626f352548bfa54517c7866653aae4221"
+  },
+  "runs": [
+    {
+      "actual_server_build_identity": "9c7723bbe45dbd5738b90ae86664b184e99bab2e",
+      "server_sha256": "5c5bdea5490f209cc0140c1b1e73a30f6ce32c48052673e5fee23ea1300f5756",
+      "source_revision": "e176842731b8fc18fdd0a2b4ffacb2f1503533f4",
+      "source_dirty": false,
+      "cases": [
+        {
+          "case": "iceberg_ivm_a11_base_rename_referenced",
+          "status": "FAIL",
+          "failed_step": "7",
+          "diagnostic": "MV refresh requires occurrence-aware SQL field rebinding",
+          "planned_steps": 9
+        },
+        {
+          "case": "iceberg_ivm_a11_base_rename_unreferenced",
+          "status": "PASS",
+          "failed_step": null,
+          "diagnostic": null,
+          "planned_steps": 9
+        },
+        {
+          "case": "iceberg_ivm_aggregate_a11_base_rename_group_key",
+          "status": "FAIL",
+          "failed_step": "5",
+          "diagnostic": "MV refresh requires occurrence-aware SQL field rebinding",
+          "planned_steps": 8
+        },
+        {
+          "case": "iceberg_ivm_aggregate_a11_base_rename_measure",
+          "status": "FAIL",
+          "failed_step": "5",
+          "diagnostic": "MV refresh requires occurrence-aware SQL field rebinding",
+          "planned_steps": 8
+        },
+        {
+          "case": "iceberg_ivm_join_aggregate_a11_base_rename_group_key",
+          "status": "FAIL",
+          "failed_step": "5",
+          "diagnostic": "MV refresh requires occurrence-aware SQL field rebinding",
+          "planned_steps": 8
+        },
+        {
+          "case": "iceberg_ivm_join_aggregate_a11_base_rename_join_key",
+          "status": "FAIL",
+          "failed_step": "5",
+          "diagnostic": "MV refresh requires occurrence-aware SQL field rebinding",
+          "planned_steps": 8
+        }
+      ],
+      "process_ids_absent": [
+        54912,
+        54913,
+        54914,
+        54915
+      ],
+      "fixture_cleanup_exit_code": 0,
+      "duration_seconds": 25.556,
+      "raw_artifacts": [
+        {
+          "path": "logs/mem-1-m07/p09-mv-rename-v2-old-main-native-20261009/matrix-status.json",
+          "sha256": "bb9e81d772ee8dcd31bb1853fc33920767939535364409b9c74a6b2d2c46527d"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-mv-rename-v2-old-main-native-20261009/iceberg-ivm.log",
+          "sha256": "afa67080e323adfa3b9c85a039b8c254332267c1f341d62f0542eee26bcf423b"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-mv-rename-v2-old-main-native-20261009/cleanup.log",
+          "sha256": "cddc4d067dacfe9bad01c12aa54adc13327ecd96e3e8815afcf9ea675a05a192"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-mv-rename-v2-old-main-native-20261009/startup.log",
+          "sha256": "4bdd00f41e01c82c1a15ad3880f561d7e0ee7d1c2fe3390790f564fe6c402024"
+        }
+      ]
+    },
+    {
+      "actual_server_build_identity": "856e28f52f0c97e816835e44df77576bcb32d7c9",
+      "server_sha256": "ea35836d891eabd0f96834708ea8c1c53bf0dbca9595f43bdccf159263d30418",
+      "source_revision": "e176842731b8fc18fdd0a2b4ffacb2f1503533f4",
+      "source_dirty": false,
+      "cases": [
+        {
+          "case": "iceberg_ivm_a11_base_rename_referenced",
+          "status": "FAIL",
+          "failed_step": "7",
+          "diagnostic": "MV refresh requires occurrence-aware SQL field rebinding",
+          "planned_steps": 9
+        },
+        {
+          "case": "iceberg_ivm_a11_base_rename_unreferenced",
+          "status": "PASS",
+          "failed_step": null,
+          "diagnostic": null,
+          "planned_steps": 9
+        },
+        {
+          "case": "iceberg_ivm_aggregate_a11_base_rename_group_key",
+          "status": "FAIL",
+          "failed_step": "5",
+          "diagnostic": "MV refresh requires occurrence-aware SQL field rebinding",
+          "planned_steps": 8
+        },
+        {
+          "case": "iceberg_ivm_aggregate_a11_base_rename_measure",
+          "status": "FAIL",
+          "failed_step": "5",
+          "diagnostic": "MV refresh requires occurrence-aware SQL field rebinding",
+          "planned_steps": 8
+        },
+        {
+          "case": "iceberg_ivm_join_aggregate_a11_base_rename_group_key",
+          "status": "FAIL",
+          "failed_step": "5",
+          "diagnostic": "MV refresh requires occurrence-aware SQL field rebinding",
+          "planned_steps": 8
+        },
+        {
+          "case": "iceberg_ivm_join_aggregate_a11_base_rename_join_key",
+          "status": "FAIL",
+          "failed_step": "5",
+          "diagnostic": "MV refresh requires occurrence-aware SQL field rebinding",
+          "planned_steps": 8
+        }
+      ],
+      "process_ids_absent": [
+        55377,
+        55378,
+        55379,
+        55380
+      ],
+      "fixture_cleanup_exit_code": 0,
+      "duration_seconds": 26.151,
+      "raw_artifacts": [
+        {
+          "path": "logs/mem-1-m07/p09-mv-rename-v2-candidate-native-20261009/matrix-status.json",
+          "sha256": "85ac66763ede383c43131eef35a919c591d4f5f976618515ce8ca05110a3ea79"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-mv-rename-v2-candidate-native-20261009/iceberg-ivm.log",
+          "sha256": "5e01491e71ec0a2c4e973cc6effaa542176316412306ed051aff7ea0248d0a2e"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-mv-rename-v2-candidate-native-20261009/cleanup.log",
+          "sha256": "cddc4d067dacfe9bad01c12aa54adc13327ecd96e3e8815afcf9ea675a05a192"
+        },
+        {
+          "path": "logs/mem-1-m07/p09-mv-rename-v2-candidate-native-20261009/startup.log",
+          "sha256": "60d0ab5fb7ccaab5989449b69b13304ed58c219af4ed6ef8751802de53cb3f90"
+        }
+      ]
+    }
+  ],
+  "conclusion": "All five referenced-field rename cases fail at the exact same refresh step with the exact occurrence-aware rebinding refusal in old main and candidate. The unreferenced-field positive case passes in both. These are confirmed existing fail-closed contract failures, not M07 regressions. Original SQL/golden remain unchanged; no UEA-7B7 design or guard bypass.",
+  "limits": "Functional comparison only: old release and current dev binaries use the same performance launch profile. This is not performance, final all-discovered CI, or five passing SQL cases. Original v1 fixture setup failures retained.",
+  "runner_build": {
+    "source_revision": "e17684273",
+    "build_log": {
+      "path": "logs/mem-1-m07/p09-final-fixture-sql-runner-build-20261009.log",
+      "sha256": "f6c6bb80fc3ce6c82460b0a17ccaebde4abee9ecfd63a9f39e2620a4c6d8c991"
+    },
+    "binary": {
+      "path": "target/debug/novarocks-sql-test",
+      "sha256": "f5704a17863dcc892534db49a5c2fd949bb037889de115a30d230dc6dc9ae11c"
+    }
+  }
+}

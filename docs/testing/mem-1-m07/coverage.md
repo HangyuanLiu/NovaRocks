@@ -142,3 +142,5 @@ Ordinary governed OK、typed ERR 与 COM_INIT_DB 的实际 packet/flush/Closing 
 2026-10-09 clean856e28f52前台rewrite C0全量PASS：12266/0fail/7ignored，524s，收据evidence/p09-foreground-rewrite-c0-pass-20261009.json。此次cargo-only不含native，不是final；MV rename六case原始输入已freeze v1，等待串行旧main/候选对照。
 
 2026-10-09 MV rename对照v1被错误fixture凭据挡在INSERT，非rename证据；runner final fixture secret binding修复通过SQLlib269/harness7/focused2/fmt。输入freeze v2，原SQL/golden保留，server不变，native pending。
+
+2026-10-09 MV rename six-case old-main native comparison: old9c7723bbe/candidate856e28f52相同步骤/相同guard五FAIL，unreferenced control两侧PASS；原SQL/golden不变，8PID退出cleanup0。见evidence/p09-mv-rename-old-main-native-comparison-20261009.json；确认已有失败，不说五PASS，非性能/final验收。
