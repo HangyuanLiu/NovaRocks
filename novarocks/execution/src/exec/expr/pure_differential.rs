@@ -1659,3 +1659,6 @@ mod mod_pmod_shared_tests;
 
 #[path = "pure_differential/numeric_binary_shared_tests.rs"]
 mod numeric_binary_shared_tests;
+
+mod round_expanded_tests;
+mod round_disagreement_tests;

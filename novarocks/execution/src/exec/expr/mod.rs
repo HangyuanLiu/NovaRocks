@@ -1288,3 +1288,6 @@ mod legacy_time_source_errors_baseline_tests;
 #[cfg(test)]
 #[path = "legacy_array_append_multi_constructor_baseline_tests.rs"]
 mod legacy_array_append_multi_constructor_baseline_tests;
+
+#[cfg(test)]
+mod legacy_round_additional_baseline_tests;
