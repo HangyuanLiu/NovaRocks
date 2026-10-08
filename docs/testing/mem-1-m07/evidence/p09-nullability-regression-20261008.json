@@ -1,0 +1,46 @@
+{
+  "status": "PASS_TARGETED_NULLABILITY_REGRESSION_NOT_FINAL_SQL_ACCEPTANCE",
+  "parent_revision": "ee233f0fd122e34666b65fd02bb22ff9f063d7b4",
+  "source_dirty_during_native_test": true,
+  "cause": "JOIN ON IN match-indicator producer is a non-null literal; its outer-join symbol is nullable. The same-value expression rewrite incorrectly compared a symbol declaration to the rewritten expression.",
+  "fix": "Capture pre-rewrite expression carrier and nullability and compare those at the expression rewrite boundary. Retain symbol provenance-transfer and output-adaptation nullability checks.",
+  "validation": {
+    "logical_build_tests": "79 passed / 0 failed",
+    "regression_test": "1 passed / 0 failed; non-null literal, nullable join symbol, nullable empty MAX",
+    "native_1fe_3be_single_case": "join_predicate_move_around PASS; duration 16.086s"
+  },
+  "original_failure": {
+    "suite": "join",
+    "passed_cases": 63,
+    "failed_cases": 1,
+    "step": 58,
+    "path": "logs/mem-1-m07/p09-native-sql-core-20261008/join.log"
+  },
+  "files": [
+    {
+      "path": "novarocks/sql/src/planner/logical/build/select.rs",
+      "sha256": "711c29f01b3a8a98afb07a25913aa4636427494199fb1949c02f2feebf55813d"
+    },
+    {
+      "path": "novarocks/sql/src/planner/logical/build/tests.rs",
+      "sha256": "3e0c23af91209c2465b4beeef58facb02e00c1f02ae387e3cd19866ba220d9be"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-nullability-focused.log",
+      "sha256": "2ad31eafd0925640ae29f25a307e42af1a8961241f7abcff32fe6289dfdd0c60"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-nullability-regression.log",
+      "sha256": "6b271c465d33a1fc733851bba3dd43118b9c5a7cc40ae49633b07285210e5652"
+    },
+    {
+      "path": "logs/mem-1-m07/p09-nullability-native-20261008/driver.log",
+      "sha256": "7414f9a999546bc8d84ebe27658c4ca9a40ddae177e0bc79b88a09c61a095cda"
+    }
+  ],
+  "remaining": [
+    "Complete core SQL suites on clean candidate",
+    "C0 and final same-HEAD native evidence",
+    "P08 ordinary carrying decision and P00b/P09 performance gates"
+  ]
+}

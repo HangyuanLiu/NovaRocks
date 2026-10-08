@@ -940,6 +940,43 @@ fn p2_aggregate_projection_rewrites_agg_call_to_output_id_ref() {
 }
 
 #[test]
+fn computed_aggregate_in_predicate_preserves_projection_nullability() {
+    let (resolved, registry, mut factory) = parse_analyze_query(
+        "SELECT x.a FROM t x INNER JOIN t y ON x.a = y.a AND y.b IN (SELECT MAX(b) - 501 FROM t)",
+    )
+    .unwrap();
+    let plan = plan_query(resolved, registry, &mut factory)
+        .expect("computed aggregate IN predicate must preserve its output contract");
+    fn find_indicator(node: &LogicalPlanNode) -> Option<&ProjectItem> {
+        if let LogicalPlanKind::Project(project) = &node.kind
+            && let Some(item) = project.items.iter().find(|item| {
+                item.output_name.starts_with("__match_")
+                    && matches!(item.expr.kind, ExprKind::Literal(LiteralValue::Int(1)))
+            })
+        {
+            return Some(item);
+        }
+        node.children.iter().find_map(find_indicator)
+    }
+    let indicator = find_indicator(&plan).expect("JOIN ON must retain its match indicator");
+    assert!(
+        !indicator.expr.nullable,
+        "the literal producer cannot emit NULL"
+    );
+    assert!(
+        factory.get(indicator.output_column_id).nullable,
+        "the outer-join symbol must remain nullable for non-matches"
+    );
+
+    let max_plan = plan_test_query("SELECT MAX(b) - 501 FROM t WHERE false");
+    let (project, _) = root_project_over_aggregate(&max_plan);
+    assert!(
+        project.items[0].expr.nullable,
+        "empty MAX must still admit NULL"
+    );
+}
+
+#[test]
 fn p2_computed_group_key_rewrites_to_group_output_id() {
     let plan = plan_test_query("SELECT a + 1 AS k, sum(b) AS s FROM t GROUP BY a + 1");
     let (project, aggregate) = root_project_over_aggregate(&plan);

@@ -51,10 +51,16 @@ pub(super) fn plan_select_scoped_with_source(
 
     // Keep the analyzer-owned occurrence identities before Repeat/Aggregate
     // substitute their same-value runtime symbols.
-    let analyzed_projection_ids: Vec<_> = select
+    let analyzed_projection_facts: Vec<_> = select
         .projection
         .iter()
-        .map(|item| item.output_column_id)
+        .map(|item| {
+            (
+                item.output_column_id,
+                item.expr.data_type.clone(),
+                item.expr.nullable,
+            )
+        })
         .collect();
 
     // Take ownership of all apply specs up-front. The wrap points below consume
@@ -226,7 +232,7 @@ pub(super) fn plan_select_scoped_with_source(
             factory,
         )?;
 
-        transfer_projection_provenance(&analyzed_projection_ids, &project_items, factory)?;
+        transfer_projection_provenance(&analyzed_projection_facts, &project_items, factory)?;
         current = build_window_and_project(current, project_items, factory)?;
     } else {
         // Projection placement (non-aggregated branch).
@@ -263,25 +269,29 @@ pub(super) fn plan_select_scoped_with_source(
 /// Carry its analyzed facts to the replacement symbol before duplicate output
 /// IDs are separated. Repeated symbols must agree even when one fact is None.
 fn transfer_projection_provenance(
-    analyzed_ids: &[ColumnId],
+    analyzed_facts: &[(ColumnId, arrow::datatypes::DataType, bool)],
     rewritten: &[ProjectItem],
     factory: &mut ColumnRefFactory,
 ) -> Result<(), String> {
-    if analyzed_ids.len() != rewritten.len() {
+    if analyzed_facts.len() != rewritten.len() {
         return Err("same-value projection rewrite changed its occurrence count".into());
     }
     let mut sources_by_target = std::collections::HashMap::new();
-    for (&source, item) in analyzed_ids.iter().zip(rewritten) {
+    for ((source, data_type, nullable), item) in analyzed_facts.iter().zip(rewritten) {
+        let source = *source;
         if source == ColumnId::UNSET || item.output_column_id == ColumnId::UNSET {
             // Legacy construction tests may omit analyzer IDs; there is no
             // source fact to transfer from an unset identity.
             continue;
         }
-        let original = factory.get(source);
-        if original.data_type != item.expr.data_type {
+        if *data_type != item.expr.data_type {
             return Err("same-value projection rewrite changed its declared carrier".into());
         }
-        if original.nullable && !item.expr.nullable {
+        // A symbol can be nullable at an outer-join boundary while its
+        // producing expression is non-null (for example a match indicator).
+        // Compare the expressions at this rewrite boundary; symbol transfer
+        // and output adaptation separately check their declared contracts.
+        if *nullable && !item.expr.nullable {
             return Err("same-value projection rewrite narrowed its declared nullability".into());
         }
         if let Some(previous) = sources_by_target.insert(item.output_column_id, source)
@@ -292,7 +302,8 @@ fn transfer_projection_provenance(
             return Err("same-value projection rewrite merged conflicting source domains".into());
         }
     }
-    for (&source, item) in analyzed_ids.iter().zip(rewritten) {
+    for ((source, _, _), item) in analyzed_facts.iter().zip(rewritten) {
+        let source = *source;
         if source != ColumnId::UNSET && item.output_column_id != ColumnId::UNSET {
             factory
                 .transfer_value_provenance(source, item.output_column_id)
